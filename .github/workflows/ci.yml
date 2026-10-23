@@ -73,7 +73,46 @@ jobs:
           key: postgresql-v1-${{ matrix.platform }}-pg${{ matrix.postgresql }}-${{ hashFiles('.config/dotnet-tools.json') }}
 
       - name: Install PostgreSQL
+        id: install
+        # EDB publishes no Windows archive for a PostgreSQL release candidate, so the next step builds it instead.
+        continue-on-error: ${{ runner.os == 'Windows' && matrix.postgresql == 19 }}
         run: dotnet ankus init --pg${{ matrix.postgresql }} download
+
+      - name: Select PostgreSQL source (Windows)
+        id: source
+        if: steps.install.outcome == 'failure'
+        shell: pwsh
+        run: |
+          $listing = (Invoke-WebRequest https://ftp.postgresql.org/pub/source/ -UseBasicParsing).Content
+          $version = [regex]::Matches($listing, 'href="v(${{ matrix.postgresql }}(?:beta|rc)\d+)/"') |
+            ForEach-Object { $_.Groups[1].Value } |
+            Sort-Object { $_ -replace 'beta', '0.' -replace 'rc', '1.' } |
+            Select-Object -Last 1
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Cache PostgreSQL source build (Windows)
+        id: source-cache
+        if: steps.install.outcome == 'failure'
+        uses: actions/cache@v6
+        with:
+          path: C:\pgsql-${{ steps.source.outputs.version }}
+          key: postgresql-source-v1-${{ matrix.platform }}-${{ steps.source.outputs.version }}
+
+      - name: Build PostgreSQL from source (Windows)
+        if: steps.install.outcome == 'failure' && steps.source-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $version = '${{ steps.source.outputs.version }}'
+          python -m pip install --quiet meson ninja
+          choco install winflexbison3 --no-progress -y
+          Invoke-WebRequest "https://ftp.postgresql.org/pub/source/v$version/postgresql-$version.tar.bz2" -OutFile "$env:RUNNER_TEMP\postgresql.tar.bz2"
+          tar -xjf "$env:RUNNER_TEMP\postgresql.tar.bz2" -C $env:RUNNER_TEMP
+          meson setup --vsenv --buildtype=release --prefix="C:\pgsql-$version" "$env:RUNNER_TEMP\postgresql-build" "$env:RUNNER_TEMP\postgresql-$version"
+          meson install -C "$env:RUNNER_TEMP\postgresql-build"
+
+      - name: Register PostgreSQL source build (Windows)
+        if: steps.install.outcome == 'failure'
+        run: dotnet ankus init --pg${{ matrix.postgresql }} "C:\pgsql-${{ steps.source.outputs.version }}\bin\pg_config.exe"
 
       - name: Run regression suite
         run: dotnet run eng/regress.cs -- --pg ${{ matrix.postgresql }}
