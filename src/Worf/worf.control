@@ -1,0 +1,4 @@
+# worf extension
+comment = 'PostgreSQL Logical Replication'
+relocatable = false
+schema = worf

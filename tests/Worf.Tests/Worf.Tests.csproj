@@ -1,0 +1,10 @@
+<Project Sdk="MSTest.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Worf.Tests</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Ankus.Testing" />
+    <PackageReference Include="Npgsql" />
+    <ProjectReference Include="../../src/Worf/Worf.csproj" />
+  </ItemGroup>
+</Project>

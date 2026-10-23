@@ -1,0 +1,10 @@
+<Project Sdk="Ankus.Sdk">
+  <PropertyGroup>
+    <AnkusExtensionName>worf</AnkusExtensionName>
+    <AnkusExtensionVersion>1.0.0</AnkusExtensionVersion>
+    <AnkusExtensionControlFile>worf.control</AnkusExtensionControlFile>
+    <AssemblyName>worf</AssemblyName>
+    <RootNamespace>Worf</RootNamespace>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+</Project>

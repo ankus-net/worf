@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # The nightly run adds the huge_tx tests and a stress run.
+    - cron: '17 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+  DOTNET_NOLOGO: '1'
+
+jobs:
+  test:
+    name: PostgreSQL ${{ matrix.postgresql }} on ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux-x64, osx-arm64, win-x64]
+        postgresql: [13, 14, 15, 16, 17, 18, 19]
+        include:
+          - platform: linux-x64
+            runner: ubuntu-24.04
+          - platform: osx-arm64
+            runner: macos-15
+          - platform: win-x64
+            runner: windows-2025
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      - name: Install LLVM and PostgreSQL build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor --yes --output /usr/share/keyrings/llvm.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] https://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-20 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends clang-20 libclang-20-dev bison flex libreadline-dev zlib1g-dev libicu-dev pkg-config
+          echo /usr/lib/llvm-20/bin >> "$GITHUB_PATH"
+
+      - name: Install LLVM and PostgreSQL build dependencies (macOS)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+        run: |
+          brew install llvm@20 icu4c pkg-config
+          echo "$(brew --prefix llvm@20)/bin" >> "$GITHUB_PATH"
+
+      - name: Select LLVM and diff (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "C:\\Program Files\\LLVM\\bin" >> "$GITHUB_PATH"
+          echo "C:\\Program Files\\Git\\usr\\bin" >> "$GITHUB_PATH"
+
+      - name: Restore tools
+        run: dotnet tool restore
+
+      - name: Cache PostgreSQL
+        uses: actions/cache@v6
+        with:
+          path: ~/.ankus/postgres
+          key: postgresql-v1-${{ matrix.platform }}-pg${{ matrix.postgresql }}-${{ hashFiles('.config/dotnet-tools.json') }}
+
+      - name: Install PostgreSQL
+        run: dotnet ankus init --pg${{ matrix.postgresql }} download
+
+      - name: Run regression suite
+        run: dotnet run eng/regress.cs -- --pg ${{ matrix.postgresql }}
+
+      - name: Save regression results
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: regression-${{ matrix.platform }}-pg${{ matrix.postgresql }}
+          path: |
+            src/Worf/pg_regress/results/
+            src/Worf/pg_regress/regression.diffs
+            artifacts/regress-home/clusters/*.log
+          if-no-files-found: ignore
+          retention-days: 7
