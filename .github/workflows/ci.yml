@@ -102,11 +102,14 @@ jobs:
         if: steps.install.outcome == 'failure' && steps.source-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           $version = '${{ steps.source.outputs.version }}'
           python -m pip install --quiet meson ninja
           choco install winflexbison3 --no-progress -y
           Invoke-WebRequest "https://ftp.postgresql.org/pub/source/v$version/postgresql-$version.tar.bz2" -OutFile "$env:RUNNER_TEMP\postgresql.tar.bz2"
-          tar -xjf "$env:RUNNER_TEMP\postgresql.tar.bz2" -C $env:RUNNER_TEMP
+          # Git's tar, which is earlier on the PATH, reads a drive letter as a remote host.
+          & "$env:SystemRoot\System32\tar.exe" -xjf "$env:RUNNER_TEMP\postgresql.tar.bz2" -C $env:RUNNER_TEMP
           meson setup --vsenv --buildtype=release --prefix="C:\pgsql-$version" "$env:RUNNER_TEMP\postgresql-build" "$env:RUNNER_TEMP\postgresql-$version"
           meson install -C "$env:RUNNER_TEMP\postgresql-build"
 
