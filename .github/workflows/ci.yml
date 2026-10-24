@@ -77,14 +77,21 @@ jobs:
 
       - name: Install PostgreSQL
         id: install
-        # EDB publishes no Windows archive for a PostgreSQL release candidate, so the next steps build it instead;
-        # https://github.com/ankus-net/ankus/issues/79
-        continue-on-error: ${{ runner.os == 'Windows' && matrix.postgresql == 19 }}
-        run: dotnet ankus init --pg${{ matrix.postgresql }} download
+        shell: bash
+        run: |
+          if dotnet ankus init --pg${{ matrix.postgresql }} download; then
+            echo "source=download" >> "$GITHUB_OUTPUT"
+          elif [ "$RUNNER_OS" = Windows ] && [ "${{ matrix.postgresql }}" = 19 ]; then
+            # EDB publishes no Windows archive for a PostgreSQL release candidate, so the next steps build it
+            # instead; https://github.com/ankus-net/ankus/issues/79
+            echo "source=build" >> "$GITHUB_OUTPUT"
+          else
+            exit 1
+          fi
 
       - name: Select PostgreSQL source (Windows)
         id: source
-        if: steps.install.outcome == 'failure'
+        if: steps.install.outputs.source == 'build'
         shell: pwsh
         run: |
           $listing = (Invoke-WebRequest https://ftp.postgresql.org/pub/source/ -UseBasicParsing).Content
@@ -96,14 +103,14 @@ jobs:
 
       - name: Cache PostgreSQL source build (Windows)
         id: source-cache
-        if: steps.install.outcome == 'failure'
+        if: steps.install.outputs.source == 'build'
         uses: actions/cache@v6
         with:
           path: C:\pgsql-${{ steps.source.outputs.version }}
           key: postgresql-source-v1-${{ matrix.platform }}-${{ steps.source.outputs.version }}
 
       - name: Build PostgreSQL from source (Windows)
-        if: steps.install.outcome == 'failure' && steps.source-cache.outputs.cache-hit != 'true'
+        if: steps.install.outputs.source == 'build' && steps.source-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -114,11 +121,12 @@ jobs:
           Invoke-WebRequest "https://ftp.postgresql.org/pub/source/v$version/postgresql-$version.tar.bz2" -OutFile "$env:RUNNER_TEMP\postgresql.tar.bz2"
           # Git's tar, which is earlier on the PATH, reads a drive letter as a remote host.
           & "$env:SystemRoot\System32\tar.exe" -xjf "$env:RUNNER_TEMP\postgresql.tar.bz2" -C $env:RUNNER_TEMP
-          meson setup --vsenv --buildtype=release --prefix="C:\pgsql-$version" "$env:RUNNER_TEMP\postgresql-build" "$env:RUNNER_TEMP\postgresql-$version"
+          # Git's MSYS Perl, also on the PATH, rewrites the MSVC tools' /options as paths.
+          meson setup --vsenv --buildtype=release --prefix="C:\pgsql-$version" -DPERL="C:\Strawberry\perl\bin\perl.exe" "$env:RUNNER_TEMP\postgresql-build" "$env:RUNNER_TEMP\postgresql-$version"
           meson install -C "$env:RUNNER_TEMP\postgresql-build"
 
       - name: Register PostgreSQL source build (Windows)
-        if: steps.install.outcome == 'failure'
+        if: steps.install.outputs.source == 'build'
         run: dotnet ankus init --pg${{ matrix.postgresql }} "C:\pgsql-${{ steps.source.outputs.version }}\bin\pg_config.exe"
 
       - name: Run regression suite
