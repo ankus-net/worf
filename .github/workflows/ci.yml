@@ -5,7 +5,7 @@ on:
   pull_request:
   workflow_call:
   schedule:
-    # The nightly run adds the huge_tx tests and a stress run.
+    # The nightly run builds PostgreSQL without assertions and adds the huge_tx tests and a stress run.
     - cron: '17 7 * * *'
   workflow_dispatch:
 
@@ -40,6 +40,7 @@ jobs:
         with:
           platform: ${{ matrix.platform }}
           postgresql: ${{ matrix.postgresql }}
+          release: ${{ github.event_name == 'schedule' }}
 
       - name: Run regression suite
         run: dotnet run eng/regress.cs -- --pg ${{ matrix.postgresql }} ${{ github.event_name == 'schedule' && '--huge-tx' || '' }}
