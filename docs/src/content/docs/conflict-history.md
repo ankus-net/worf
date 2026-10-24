@@ -3,7 +3,7 @@ title: Conflict history
 description: Record resolved conflicts in a table you can query.
 ---
 
-The **Conflict History** feature, which pglogical 2.5.0 introduced, records replication conflicts to a queryable table instead of just logging them to the PostgreSQL log files.
+The **Conflict History** feature records replication conflicts to a queryable table instead of just logging them to the PostgreSQL log files.
 
 ## Overview
 

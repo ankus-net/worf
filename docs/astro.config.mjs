@@ -13,7 +13,7 @@ export default defineConfig({
   integrations: [
     starlight({
       title: 'worf',
-      description: 'Logical replication for PostgreSQL, ported from pglogical to C# and .NET Native AOT.',
+      description: 'Logical replication for PostgreSQL, built with C# and .NET Native AOT.',
       disable404Route: true,
       social: [
         {

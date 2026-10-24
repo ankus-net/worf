@@ -1,12 +1,12 @@
 ---
 title: worf
-description: Logical replication for PostgreSQL, ported from pglogical to C# and .NET Native AOT.
+description: Logical replication for PostgreSQL, built with C# and .NET Native AOT.
 template: splash
 head:
   - tag: title
     content: worf
 hero:
-  tagline: Logical replication for PostgreSQL, ported from pglogical to C# and .NET Native AOT
+  tagline: Logical replication for PostgreSQL, built with C# and .NET Native AOT
   actions:
     - text: Get started
       link: ./getting-started/installation/
