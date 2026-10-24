@@ -584,11 +584,15 @@ internal static class Worker
         }
 
         nint supervisor = 0;
+        nint manager = 0;
+        WorfWorkerType type;
         using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = WorfCtx.Exclusive())
         {
             WorfContext ctx = guard.Header;
             WorfWorker worker = guard[MyWorfWorker];
             worker.Proc = 0;
+            type = worker.WorkerType;
+            uint dboid = worker.Dboid;
 
             // If we crashed we need to report it.
             //
@@ -633,6 +637,17 @@ internal static class Worker
                 supervisor = ctx.Supervisor;
             }
 
+            // Likewise wake the manager when an apply or sync worker exits: a subscription change that stops a worker
+            // wakes the manager when it commits, and the manager can look before the worker has gone.
+            if (type is WorfWorkerType.Apply or WorfWorkerType.Sync)
+            {
+                int managerSlot = guard.Read((in WorfContext _, ReadOnlySpan<WorfWorker> workers) => ManagerFind(workers, dboid));
+                if (managerSlot >= 0)
+                {
+                    manager = guard[managerSlot].Proc;
+                }
+            }
+
             guard[MyWorfWorker] = worker;
             guard.Header = ctx;
             MyWorfWorker = -1;
@@ -641,7 +656,15 @@ internal static class Worker
             {
                 SetProcLatch(supervisor);
             }
+
+            if (manager != 0)
+            {
+                SetProcLatch(manager);
+            }
         }
+
+        // pglogical logs the worker's exit here, which an exit callback can't yet;
+        // https://github.com/ankus-net/ankus/issues/101
     }
 
     private static void SignalWorkerXactCallback()
