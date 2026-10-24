@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using Ankus.Postgres;
 
 [assembly: PgSql("node-tables", """
@@ -37,136 +38,7 @@ using Ankus.Postgres;
 
 namespace Worf;
 
-/// <summary>
-/// A node.
-/// </summary>
-internal sealed class WorfNode
-{
-    /// <summary>
-    /// Gets or sets the node's id.
-    /// </summary>
-    public uint Id { get; set; }
-
-    /// <summary>
-    /// Gets or sets the node's name.
-    /// </summary>
-    public string Name { get; set; } = "";
-}
-
-/// <summary>
-/// A node's connection interface.
-/// </summary>
-internal sealed class WorfInterface
-{
-    /// <summary>
-    /// Gets or sets the interface's id.
-    /// </summary>
-    public uint Id { get; set; }
-
-    /// <summary>
-    /// Gets or sets the interface's name.
-    /// </summary>
-    public string Name { get; set; } = "";
-
-    /// <summary>
-    /// Gets or sets the node the interface belongs to.
-    /// </summary>
-    public uint NodeId { get; set; }
-
-    /// <summary>
-    /// Gets or sets the interface's connection string.
-    /// </summary>
-    public string Dsn { get; set; } = "";
-}
-
-/// <summary>
-/// The local node and its interface.
-/// </summary>
-/// <param name="node">The node.</param>
-/// <param name="nodeIf">The node's interface.</param>
-internal sealed class WorfLocalNode(WorfNode node, WorfInterface nodeIf)
-{
-    /// <summary>
-    /// Gets the node.
-    /// </summary>
-    public WorfNode Node { get; } = node;
-
-    /// <summary>
-    /// Gets the node's interface.
-    /// </summary>
-    public WorfInterface NodeIf { get; } = nodeIf;
-}
-
-/// <summary>
-/// A subscription.
-/// </summary>
-internal sealed class WorfSubscription
-{
-    /// <summary>
-    /// Gets or sets the subscription's id.
-    /// </summary>
-    public uint Id { get; set; }
-
-    /// <summary>
-    /// Gets or sets the subscription's name.
-    /// </summary>
-    public string Name { get; set; } = "";
-
-    /// <summary>
-    /// Gets or sets the provider node.
-    /// </summary>
-    public WorfNode Origin { get; set; } = new();
-
-    /// <summary>
-    /// Gets or sets the subscriber node.
-    /// </summary>
-    public WorfNode Target { get; set; } = new();
-
-    /// <summary>
-    /// Gets or sets the provider's interface.
-    /// </summary>
-    public WorfInterface OriginIf { get; set; } = new();
-
-    /// <summary>
-    /// Gets or sets the subscriber's interface.
-    /// </summary>
-    public WorfInterface TargetIf { get; set; } = new();
-
-    /// <summary>
-    /// Gets or sets whether the subscription is enabled.
-    /// </summary>
-    public bool Enabled { get; set; }
-
-    /// <summary>
-    /// Gets or sets the apply delay, or null.
-    /// </summary>
-    public PgInterval? ApplyDelay { get; set; }
-
-    /// <summary>
-    /// Gets or sets the slot name.
-    /// </summary>
-    public string SlotName { get; set; } = "";
-
-    /// <summary>
-    /// Gets or sets the subscribed replication sets.
-    /// </summary>
-    public List<string> ReplicationSets { get; set; } = [];
-
-    /// <summary>
-    /// Gets or sets the forwarded origins.
-    /// </summary>
-    public List<string> ForwardOrigins { get; set; } = [];
-
-    /// <summary>
-    /// Gets or sets whether to transfer data as text.
-    /// </summary>
-    public bool ForceTextTransfer { get; set; }
-}
-
-/// <summary>
-/// worf node and subscription catalog manipulation functions.
-/// </summary>
-internal static class Node
+internal sealed partial class WorfNode
 {
     /// <summary>
     /// The lock that <c>ShareUpdateExclusiveLock</c> names.
@@ -198,7 +70,7 @@ internal static class Node
         Spi.Execute("INSERT INTO worf.node (node_id, node_name) VALUES ($1, $2)",
             SpiParameter.Create(node.Id), SpiParameter.Create(node.Name));
 
-        Worker.SubscriptionChanged(0);
+        Worker.SubscriptionChanged(0, false);
     }
 
     /// <summary>
@@ -212,7 +84,7 @@ internal static class Node
             throw new PgException(PgSqlStates.InternalError, $"node {nodeid} not found");
         }
 
-        Worker.SubscriptionChanged(0);
+        Worker.SubscriptionChanged(0, false);
     }
 
     /// <summary>
@@ -220,16 +92,28 @@ internal static class Node
     /// </summary>
     /// <param name="nodeid">The node.</param>
     /// <returns>The node.</returns>
-    internal static WorfNode GetNode(uint nodeid)
+    internal static unsafe WorfNode GetNode(uint nodeid)
     {
-        SpiResult result = Spi.Select("SELECT node_id, node_name::text FROM worf.node WHERE node_id = $1",
-            SpiParameter.Create(nodeid));
-        if (result.Count == 0)
+        RelationData* rel = OpenCatalog(CatalogNode, RowExclusiveLock);
+
+        // Search for node record.
+        ScanKeyData key;
+        NativeMethods.ScanKeyInit(&key, AnumNodeId, BtEqualStrategyNumber, FOideq, nodeid);
+
+        SysScanDescData* scan = NativeMethods.systable_beginscan(rel, 0, true, null, 1, &key);
+        HeapTupleData* tuple = NativeMethods.systable_getnext(scan);
+
+        if (tuple is null)
         {
             throw new PgException(PgSqlStates.InternalError, $"node {nodeid} not found");
         }
 
-        return NodeFromRow(result[0]);
+        WorfNode node = NodeFromTuple(tuple, rel->rd_att);
+
+        NativeMethods.systable_endscan(scan);
+        NativeMethods.table_close(rel, RowExclusiveLock);
+
+        return node;
     }
 
     /// <summary>
@@ -238,21 +122,35 @@ internal static class Node
     /// <param name="name">The node's name.</param>
     /// <param name="missingOk">Whether to return null for a missing node.</param>
     /// <returns>The node.</returns>
-    internal static WorfNode? GetNodeByName(string name, bool missingOk)
+    internal static unsafe WorfNode? GetNodeByName(string name, bool missingOk)
     {
-        SpiResult result = Spi.Select("SELECT node_id, node_name::text FROM worf.node WHERE node_name = $1::name",
-            SpiParameter.Create(name));
-        if (result.Count == 0)
+        RelationData* rel = OpenCatalog(CatalogNode, RowExclusiveLock);
+
+        // Search for node record.
+        ScanKeyData key;
+        NativeMethods.ScanKeyInit(&key, AnumNodeName, BtEqualStrategyNumber, FNameeq, (ulong)Worf.PStrDup(name));
+
+        SysScanDescData* scan = NativeMethods.systable_beginscan(rel, 0, true, null, 1, &key);
+        HeapTupleData* tuple = NativeMethods.systable_getnext(scan);
+
+        if (tuple is null)
         {
             if (missingOk)
             {
+                NativeMethods.systable_endscan(scan);
+                NativeMethods.table_close(rel, RowExclusiveLock);
                 return null;
             }
 
             throw new PgException(PgSqlStates.InternalError, $"node {name} not found");
         }
 
-        return NodeFromRow(result[0]);
+        WorfNode node = NodeFromTuple(tuple, rel->rd_att);
+
+        NativeMethods.systable_endscan(scan);
+        NativeMethods.table_close(rel, RowExclusiveLock);
+
+        return node;
     }
 
     /// <summary>
@@ -291,12 +189,14 @@ internal static class Node
     /// Return local node.
     /// </summary>
     /// <param name="forUpdate">Whether to lock the local node against concurrent configuration changes.</param>
-    /// <param name="missingOk">Whether to return null when this database is not a node.</param>
+    /// <param name="missingOk">Whether to return null when this database is not a worf node.</param>
     /// <returns>The local node.</returns>
-    internal static WorfLocalNode? GetLocalNode(bool forUpdate, bool missingOk)
+    internal static unsafe WorfLocalNode? GetLocalNode(bool forUpdate, bool missingOk)
     {
-        uint? relid = Spi.ExecuteScalar<uint?>("SELECT pg_catalog.to_regclass('worf.local_node')::oid");
-        if (relid is null)
+        RangeVar* rv = NativeMethods.makeRangeVar(Worf.PStrDup(Worf.ExtensionName), Worf.PStrDup(CatalogLocalNode), -1);
+        RelationData* rel = NativeMethods.table_openrv_extended(rv, forUpdate ? ShareUpdateExclusiveLock : RowExclusiveLock, true);
+
+        if (rel is null)
         {
             if (missingOk)
             {
@@ -304,30 +204,33 @@ internal static class Node
             }
 
             throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState, "local worf node not found");
-        }
-
-        if (forUpdate)
-        {
-            unsafe
-            {
-                NativeMethods.LockRelationOid(relid.Value, ShareUpdateExclusiveLock);
-            }
         }
 
         // Find the local node tuple.
-        SpiResult result = Spi.Select("SELECT node_id, node_local_interface FROM worf.local_node LIMIT 1");
-        if (result.Count == 0)
+        SysScanDescData* scan = NativeMethods.systable_beginscan(rel, 0, true, null, 0, null);
+        HeapTupleData* tuple = NativeMethods.systable_getnext(scan);
+
+        // No local node record found.
+        if (tuple is null)
         {
             if (missingOk)
             {
+                NativeMethods.systable_endscan(scan);
+                NativeMethods.table_close(rel, forUpdate ? NoLock : RowExclusiveLock);
                 return null;
             }
 
             throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState, "local worf node not found");
         }
 
-        uint nodeid = result[0].Get<uint>(0);
-        uint nodeifid = result[0].Get<uint>(1);
+        TupleDescData* desc = rel->rd_att;
+        bool isnull;
+        uint nodeid = (uint)NativeMethods.heap_getattr(tuple, AnumNodeLocalId, desc, &isnull);
+        uint nodeifid = (uint)NativeMethods.heap_getattr(tuple, AnumNodeLocalNodeIf, desc, &isnull);
+
+        NativeMethods.systable_endscan(scan);
+        NativeMethods.table_close(rel, forUpdate ? NoLock : RowExclusiveLock);
+
         return new WorfLocalNode(GetNode(nodeid), GetNodeInterface(nodeifid));
     }
 
@@ -372,17 +275,29 @@ internal static class Node
     /// </summary>
     /// <param name="ifid">The interface.</param>
     /// <returns>The interface.</returns>
-    internal static WorfInterface GetNodeInterface(uint ifid)
+    internal static unsafe WorfInterface GetNodeInterface(uint ifid)
     {
-        SpiResult result = Spi.Select(
-            "SELECT if_id, if_name::text, if_nodeid, if_dsn FROM worf.node_interface WHERE if_id = $1",
-            SpiParameter.Create(ifid));
-        if (result.Count == 0)
+        RelationData* rel = OpenCatalog(CatalogNodeInterface, RowExclusiveLock);
+
+        // Search for node record.
+        ScanKeyData key;
+        NativeMethods.ScanKeyInit(&key, AnumIfId, BtEqualStrategyNumber, FOideq, ifid);
+
+        SysScanDescData* scan = NativeMethods.systable_beginscan(rel, 0, true, null, 1, &key);
+        HeapTupleData* tuple = NativeMethods.systable_getnext(scan);
+
+        if (tuple is null)
         {
             throw new PgException(PgSqlStates.InternalError, $"node interface {ifid} not found");
         }
 
-        return InterfaceFromRow(result[0]);
+        WorfInterface nodeif = InterfaceFromTuple(tuple, rel->rd_att);
+
+        // Cleanup.
+        NativeMethods.systable_endscan(scan);
+        NativeMethods.table_close(rel, RowExclusiveLock);
+
+        return nodeif;
     }
 
     /// <summary>
@@ -392,22 +307,37 @@ internal static class Node
     /// <param name="name">The interface's name.</param>
     /// <param name="missingOk">Whether to return null for a missing interface.</param>
     /// <returns>The interface.</returns>
-    internal static WorfInterface? GetNodeInterfaceByName(uint nodeid, string name, bool missingOk)
+    internal static unsafe WorfInterface? GetNodeInterfaceByName(uint nodeid, string name, bool missingOk)
     {
-        SpiResult result = Spi.Select(
-            "SELECT if_id, if_name::text, if_nodeid, if_dsn FROM worf.node_interface WHERE if_nodeid = $1 AND if_name = $2::name",
-            SpiParameter.Create(nodeid), SpiParameter.Create(name));
-        if (result.Count == 0)
+        RelationData* rel = OpenCatalog(CatalogNodeInterface, RowExclusiveLock);
+
+        // Search for interface record.
+        ScanKeyData* key = stackalloc ScanKeyData[2];
+        NativeMethods.ScanKeyInit(&key[0], AnumIfNodeid, BtEqualStrategyNumber, FOideq, nodeid);
+        NativeMethods.ScanKeyInit(&key[1], AnumIfName, BtEqualStrategyNumber, FNameeq, (ulong)Worf.PStrDup(name));
+
+        SysScanDescData* scan = NativeMethods.systable_beginscan(rel, 0, true, null, 2, key);
+        HeapTupleData* tuple = NativeMethods.systable_getnext(scan);
+
+        if (tuple is null)
         {
             if (missingOk)
             {
+                NativeMethods.systable_endscan(scan);
+                NativeMethods.table_close(rel, RowExclusiveLock);
                 return null;
             }
 
             throw new PgException(PgSqlStates.InternalError, $"node interface \"{name}\" not found for nod {nodeid}");
         }
 
-        return InterfaceFromRow(result[0]);
+        WorfInterface nodeif = InterfaceFromTuple(tuple, rel->rd_att);
+
+        // Cleanup.
+        NativeMethods.systable_endscan(scan);
+        NativeMethods.table_close(rel, RowExclusiveLock);
+
+        return nodeif;
     }
 
     /// <summary>
@@ -417,7 +347,7 @@ internal static class Node
     /// <returns>The subscription.</returns>
     internal static WorfSubscription GetSubscription(uint subid)
     {
-        SpiResult result = Spi.Select(SubscriptionQuery + " WHERE sub_id = $1", SpiParameter.Create(subid));
+        SpiResult result = Worf.SelectCatalog(SubscriptionQuery + " WHERE sub_id = $1", SpiParameter.Create(subid));
         if (result.Count == 0)
         {
             throw new PgException(PgSqlStates.InternalError, $"subscription {subid} not found");
@@ -434,7 +364,7 @@ internal static class Node
     /// <returns>The subscription.</returns>
     internal static WorfSubscription? GetSubscriptionByName(string name, bool missingOk)
     {
-        SpiResult result = Spi.Select(SubscriptionQuery + " WHERE sub_name = $1::name", SpiParameter.Create(name));
+        SpiResult result = Worf.SelectCatalog(SubscriptionQuery + " WHERE sub_name = $1::name", SpiParameter.Create(name));
         if (result.Count == 0)
         {
             if (missingOk)
@@ -449,6 +379,101 @@ internal static class Node
     }
 
     /// <summary>
+    /// Add new subscription to catalog.
+    /// </summary>
+    /// <param name="sub">The subscription, whose id is set when it has none.</param>
+    internal static void CreateSubscription(WorfSubscription sub)
+    {
+        // Validate the new subscription name.
+        ValidateSubscriptionName(sub.Name);
+
+        if (GetSubscriptionByName(sub.Name, true) is not null)
+        {
+            throw new PgException(PgSqlStates.InternalError, $"subscription {sub.Name} already exists");
+        }
+
+        // Generate new id unless one was already specified.
+        if (sub.Id == 0)
+        {
+            sub.Id = Worf.HashAny(sub.Name);
+        }
+
+        _ = Spi.Execute(
+            "INSERT INTO worf.subscription VALUES ($1, $2::name, $3, $4, $5, $6, $7, $8::name, $9, $10, $11, $12)",
+            SpiParameter.Create(sub.Id),
+            SpiParameter.Create(sub.Name),
+            SpiParameter.Create(sub.OriginIf.NodeId),
+            SpiParameter.Create(sub.TargetIf.NodeId),
+            SpiParameter.Create(sub.OriginIf.Id),
+            SpiParameter.Create(sub.TargetIf.Id),
+            SpiParameter.Create(sub.Enabled),
+            SpiParameter.Create(sub.SlotName),
+            SpiParameter.Create<string[]?>(sub.ReplicationSets.Count > 0 ? [.. sub.ReplicationSets] : null),
+            SpiParameter.Create<string[]?>(sub.ForwardOrigins.Count > 0 ? [.. sub.ForwardOrigins] : null),
+            SpiParameter.Create(sub.ApplyDelay),
+            SpiParameter.Create(sub.ForceTextTransfer));
+
+        NativeMethodsCommandCounterIncrement();
+
+        Worker.SubscriptionChanged(sub.Id, true);
+    }
+
+    /// <summary>
+    /// Change the subscription tuple.
+    /// </summary>
+    /// <param name="sub">The subscription.</param>
+    internal static void AlterSubscription(WorfSubscription sub)
+    {
+        SpiResult result = Spi.Query("SELECT sub_name::text FROM worf.subscription WHERE sub_id = $1 FOR UPDATE", false, 0,
+            SpiParameter.Create(sub.Id));
+        if (result.Count == 0)
+        {
+            throw new PgException(PgSqlStates.InternalError, $"subscription {sub.Id} not found");
+        }
+
+        if (result[0].Get<string>(0) != sub.Name)
+        {
+            PgLog.Log(new PgDiagnostic("subscription name change is not supported") { SqlState = PgSqlStates.FeatureNotSupported });
+        }
+
+        _ = Spi.Execute(
+            "UPDATE worf.subscription SET sub_origin = $2, sub_target = $3, sub_origin_if = $4, sub_target_if = $5, " +
+            "sub_enabled = $6, sub_slot_name = $7::name, sub_replication_sets = $8, sub_forward_origins = $9, " +
+            "sub_apply_delay = $10, sub_force_text_transfer = $11 WHERE sub_id = $1",
+            SpiParameter.Create(sub.Id),
+            SpiParameter.Create(sub.OriginIf.NodeId),
+            SpiParameter.Create(sub.TargetIf.NodeId),
+            SpiParameter.Create(sub.OriginIf.Id),
+            SpiParameter.Create(sub.TargetIf.Id),
+            SpiParameter.Create(sub.Enabled),
+            SpiParameter.Create(sub.SlotName),
+            SpiParameter.Create<string[]?>(sub.ReplicationSets.Count > 0 ? [.. sub.ReplicationSets] : null),
+            SpiParameter.Create<string[]?>(sub.ForwardOrigins.Count > 0 ? [.. sub.ForwardOrigins] : null),
+            SpiParameter.Create(sub.ApplyDelay),
+            SpiParameter.Create(sub.ForceTextTransfer));
+
+        NativeMethodsCommandCounterIncrement();
+
+        Worker.SubscriptionChanged(sub.Id, true);
+    }
+
+    /// <summary>
+    /// Delete the tuple from subsription catalog.
+    /// </summary>
+    /// <param name="subid">The subscription.</param>
+    internal static void DropSubscription(uint subid)
+    {
+        if (Spi.Execute("DELETE FROM worf.subscription WHERE sub_id = $1", SpiParameter.Create(subid)) == 0)
+        {
+            throw new PgException(PgSqlStates.InternalError, $"subscription {subid} not found");
+        }
+
+        NativeMethodsCommandCounterIncrement();
+
+        Worker.SubscriptionChanged(subid, true);
+    }
+
+    /// <summary>
     /// Return all target node subscriptions.
     /// </summary>
     /// <param name="nodeid">The node.</param>
@@ -456,7 +481,7 @@ internal static class Node
     /// <returns>The subscriptions.</returns>
     internal static List<WorfSubscription> GetNodeSubscriptions(uint nodeid, bool origin)
     {
-        SpiResult result = Spi.Select(SubscriptionQuery + (origin ? " WHERE sub_origin = $1" : " WHERE sub_target = $1"),
+        SpiResult result = Worf.SelectCatalog(SubscriptionQuery + (origin ? " WHERE sub_origin = $1" : " WHERE sub_target = $1"),
             SpiParameter.Create(nodeid));
         List<WorfSubscription> res = [];
         foreach (SpiRow row in result)
@@ -490,7 +515,38 @@ internal static class Node
     internal static uint HashIds(uint first, uint second)
     {
         ReadOnlySpan<uint> hashinput = [first, second];
-        return Worf.HashAny(System.Runtime.InteropServices.MemoryMarshal.AsBytes(hashinput));
+        return Worf.HashAny(MemoryMarshal.AsBytes(hashinput));
+    }
+
+    private static void ValidateSubscriptionName(string name)
+    {
+        byte[] bytes = Worf.ToServer(name);
+        if (bytes.Length == 0)
+        {
+            throw new PgException(PgSqlStates.InvalidName, $"subscription  name \"{name}\" is too short");
+        }
+
+        if (bytes.Length >= Worker.NameDataLen)
+        {
+            throw new PgException(PgSqlStates.NameTooLong, $"subscription name \"{name}\" is too long");
+        }
+
+        foreach (byte cp in bytes)
+        {
+            if (!((cp >= 'a' && cp <= 'z') || (cp >= '0' && cp <= '9') || cp == '_'))
+            {
+                throw new PgException(PgSqlStates.InvalidName, $"subscription name \"{name}\" contains invalid character",
+                    hint: "Subscription names may only contain lower case letters, numbers, and the underscore character.");
+            }
+        }
+    }
+
+    private static void NativeMethodsCommandCounterIncrement()
+    {
+        unsafe
+        {
+            NativeMethods.CommandCounterIncrement();
+        }
     }
 
     private const string SubscriptionQuery =
@@ -498,15 +554,54 @@ internal static class Node
         "sub_slot_name::text, sub_replication_sets, sub_forward_origins, sub_apply_delay, sub_force_text_transfer " +
         "FROM worf.subscription";
 
-    private static WorfNode NodeFromRow(SpiRow row) => new() { Id = row.Get<uint>(0), Name = row.Get<string>(1) };
-
-    private static WorfInterface InterfaceFromRow(SpiRow row) => new()
+    private static unsafe RelationData* OpenCatalog(string table, int lockmode)
     {
-        Id = row.Get<uint>(0),
-        Name = row.Get<string>(1),
-        NodeId = row.Get<uint>(2),
-        Dsn = row.Get<string>(3),
-    };
+        RangeVar* rv = NativeMethods.makeRangeVar(Worf.PStrDup(Worf.ExtensionName), Worf.PStrDup(table), -1);
+        return NativeMethods.table_openrv(rv, lockmode);
+    }
+
+    private static unsafe WorfNode NodeFromTuple(HeapTupleData* tuple, TupleDescData* desc)
+    {
+        bool isnull;
+        return new WorfNode
+        {
+            Id = (uint)NativeMethods.heap_getattr(tuple, AnumNodeId, desc, &isnull),
+            Name = Worf.FromServer((sbyte*)NativeMethods.heap_getattr(tuple, AnumNodeName, desc, &isnull)),
+        };
+    }
+
+    private static unsafe WorfInterface InterfaceFromTuple(HeapTupleData* tuple, TupleDescData* desc)
+    {
+        bool isnull;
+        return new WorfInterface
+        {
+            Id = (uint)NativeMethods.heap_getattr(tuple, AnumIfId, desc, &isnull),
+            Name = Worf.FromServer((sbyte*)NativeMethods.heap_getattr(tuple, AnumIfName, desc, &isnull)),
+            NodeId = (uint)NativeMethods.heap_getattr(tuple, AnumIfNodeid, desc, &isnull),
+            Dsn = Worf.FromServer(NativeMethods.text_to_cstring((varlena*)NativeMethods.heap_getattr(tuple, AnumIfDsn, desc, &isnull))),
+        };
+    }
+
+    private const string CatalogNode = "node";
+    private const string CatalogLocalNode = "local_node";
+    private const string CatalogNodeInterface = "node_interface";
+
+    private const short AnumNodeId = 1;
+    private const short AnumNodeName = 2;
+
+    private const short AnumNodeLocalId = 1;
+    private const short AnumNodeLocalNodeIf = 2;
+
+    private const short AnumIfId = 1;
+    private const short AnumIfName = 2;
+    private const short AnumIfNodeid = 3;
+    private const short AnumIfDsn = 4;
+
+    private const int NoLock = 0;
+    private const int RowExclusiveLock = 3;
+    private const ushort BtEqualStrategyNumber = 3;
+    private const uint FOideq = 184;
+    private const uint FNameeq = 62;
 
     private static WorfSubscription SubscriptionFromRow(SpiRow row)
     {

@@ -1,0 +1,91 @@
+name: Release
+
+# Runs on a v* tag: CI, then a package for each PostgreSQL version and platform, then a GitHub release with the
+# packages and their SHA-256 checksums. A tag with a hyphen, such as v1.0.0-rc1, makes a prerelease.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+  DOTNET_NOLOGO: '1'
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  package:
+    name: Package PostgreSQL ${{ matrix.postgresql }} for ${{ matrix.platform }}
+    needs: ci
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux-x64, osx-arm64, osx-x64, win-x64]
+        postgresql: [13, 14, 15, 16, 17, 18, 19]
+        include:
+          - platform: linux-x64
+            runner: ubuntu-24.04
+          - platform: osx-arm64
+            runner: macos-15
+          - platform: osx-x64
+            runner: macos-15-intel
+          - platform: win-x64
+            runner: windows-2025
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup
+        with:
+          platform: ${{ matrix.platform }}
+          postgresql: ${{ matrix.postgresql }}
+
+      - name: Install WiX (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add -g WixToolset.UI.wixext/5.0.2
+
+      - name: Package
+        shell: bash
+        run: dotnet run eng/package.cs -- --pg ${{ matrix.postgresql }} --version "${GITHUB_REF_NAME#v}" --output artifacts/packages
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: package-${{ matrix.platform }}-pg${{ matrix.postgresql }}
+          path: |
+            artifacts/packages/*.tar.gz
+            artifacts/packages/*.zip
+            artifacts/packages/*.msi
+          if-no-files-found: error
+
+  release:
+    name: Publish the release
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: packages
+          pattern: package-*
+          merge-multiple: true
+
+      - name: Write checksums
+        working-directory: packages
+        run: sha256sum * > SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=()
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then prerelease=(--prerelease); fi
+          gh release create "$GITHUB_REF_NAME" packages/* --repo "$GITHUB_REPOSITORY" \
+            --title "worf ${GITHUB_REF_NAME#v}" --generate-notes "${prerelease[@]}"

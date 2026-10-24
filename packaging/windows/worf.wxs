@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  worf MSI installer for Windows, built with WiX Toolset v5.
+
+  wix build -o worf-1.0.0-pg17-windows-x64.msi packaging/windows/worf.wxs ^
+    -ext WixToolset.UI.wixext ^
+    -d VERSION=1.0.0 -d MSI_VERSION=1.0.0 -d PG_VERSION=17 ^
+    -d PackageDir=C:\path\to\worf-1.0.0-pg17-windows-x64
+
+  VERSION     - worf version for display (e.g., 1.0.0-rc1)
+  MSI_VERSION - numeric version for the MSI, without a prerelease suffix
+  PG_VERSION  - PostgreSQL major version (13 to 19)
+  PackageDir  - absolute path to the package tree, with bin, lib and share\extension
+
+  The installer finds the PostgreSQL installation in the registry, falls back to
+  the standard path, and lets the user choose another directory. Each PostgreSQL
+  major version has its own upgrade code, so versions install side by side.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+
+  <?if $(var.PG_VERSION) = 13 ?>
+    <?define UpgradeGuid = "{9F227864-8182-452E-B564-E7CB09F21B6B}" ?>
+  <?elseif $(var.PG_VERSION) = 14 ?>
+    <?define UpgradeGuid = "{82A5DFE3-C210-4A1F-BF0C-F6E4E0EB01BE}" ?>
+  <?elseif $(var.PG_VERSION) = 15 ?>
+    <?define UpgradeGuid = "{7B9FDA6E-4C8F-4797-A75E-2739B958D18D}" ?>
+  <?elseif $(var.PG_VERSION) = 16 ?>
+    <?define UpgradeGuid = "{44897A99-DECC-446D-A1D6-4F85B8F0BD20}" ?>
+  <?elseif $(var.PG_VERSION) = 17 ?>
+    <?define UpgradeGuid = "{CCE9DB83-BE8A-4A58-86DD-0BC5905C9AD6}" ?>
+  <?elseif $(var.PG_VERSION) = 18 ?>
+    <?define UpgradeGuid = "{528DBE0B-D29A-4BA5-A20C-76BE56032823}" ?>
+  <?elseif $(var.PG_VERSION) = 19 ?>
+    <?define UpgradeGuid = "{C272A4A6-D2BC-44E2-BDFA-53F93D218285}" ?>
+  <?else?>
+    <?error PG_VERSION must be 13 to 19 ?>
+  <?endif?>
+
+  <Package Name="worf $(var.VERSION) for PostgreSQL $(var.PG_VERSION)"
+           Language="1033"
+           Version="$(var.MSI_VERSION).0"
+           Manufacturer="worf contributors"
+           UpgradeCode="$(var.UpgradeGuid)"
+           InstallerVersion="500"
+           Compressed="yes"
+           Scope="perMachine">
+
+    <SummaryInformation Description="worf logical replication extension for PostgreSQL $(var.PG_VERSION)"
+                        Manufacturer="worf contributors" />
+
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  Schedule="afterInstallValidate"
+                  DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <!-- The PostgreSQL installation, from the EDB installer's registry key. -->
+    <Property Id="POSTGRESQLDIR">
+      <RegistrySearch Id="PostgreSQLSearch64"
+                      Root="HKLM"
+                      Key="SOFTWARE\PostgreSQL\Installations\postgresql-x64-$(var.PG_VERSION)"
+                      Name="Base Directory"
+                      Type="raw"
+                      Bitness="always64" />
+    </Property>
+
+    <SetProperty Id="POSTGRESQLDIR" Action="SetPOSTGRESQLDIR_Default" After="AppSearch" Sequence="both"
+                 Value="[ProgramFiles64Folder]PostgreSQL\$(var.PG_VERSION)"
+                 Condition="NOT POSTGRESQLDIR" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="POSTGRESQLDIR" Name="PostgreSQL">
+        <Directory Id="BINDIR" Name="bin" />
+        <Directory Id="LIBDIR" Name="lib" />
+        <Directory Id="SHAREDIR" Name="share">
+          <Directory Id="EXTENSIONDIR" Name="extension" />
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <ComponentGroup Id="Executables" Directory="BINDIR">
+      <Component Id="worf_create_subscriber_exe" Guid="*">
+        <File Id="worf_create_subscriber.exe"
+              Source="$(var.PackageDir)\bin\worf_create_subscriber.exe"
+              KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id="Libraries" Directory="LIBDIR">
+      <Component Id="worf_dll" Guid="*">
+        <File Id="worf.dll"
+              Source="$(var.PackageDir)\lib\worf.dll"
+              KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id="Extensions" Directory="EXTENSIONDIR">
+      <Files Include="$(var.PackageDir)\share\extension\worf*" />
+    </ComponentGroup>
+
+    <Feature Id="Complete"
+             Title="worf Extension"
+             Description="Installs the worf logical replication extension for PostgreSQL $(var.PG_VERSION)."
+             Level="1"
+             ConfigurableDirectory="POSTGRESQLDIR">
+      <ComponentGroupRef Id="Executables" />
+      <ComponentGroupRef Id="Libraries" />
+      <ComponentGroupRef Id="Extensions" />
+    </Feature>
+
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="POSTGRESQLDIR" />
+
+    <WixVariable Id="WixUILicenseRtf" Value="packaging\windows\license.rtf" />
+
+  </Package>
+
+</Wix>

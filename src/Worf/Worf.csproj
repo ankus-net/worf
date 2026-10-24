@@ -7,4 +7,7 @@
     <RootNamespace>Worf</RootNamespace>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Worf.Tests" />
+  </ItemGroup>
 </Project>

@@ -1,6 +1,7 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/Worf/Worf.csproj" />
+    <Project Path="src/Worf.CreateSubscriber/Worf.CreateSubscriber.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Worf.Tests/Worf.Tests.csproj" />

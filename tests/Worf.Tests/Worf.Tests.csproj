@@ -3,6 +3,10 @@
     <RootNamespace>Worf.Tests</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
+    <None Include="TestFiles/**" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../src/Worf/pg_regress/regress-pg_hba.conf" Link="TestFiles/regress-pg_hba.conf" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup>
     <PackageReference Include="Ankus.Testing" />
     <PackageReference Include="Npgsql" />
     <ProjectReference Include="../../src/Worf/Worf.csproj" />

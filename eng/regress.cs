@@ -1,5 +1,6 @@
 // Runs the ported pglogical regression suite with ankus regress on a fresh development cluster, using the settings
-// from pglogical's regress-postgresql.conf. Usage: dotnet run eng/regress.cs -- --pg <major> [filter]
+// from pglogical's regress-postgresql.conf. --huge-tx adds the three huge_tx tests, which pglogical's default run leaves
+// out, after node_origin_cascade. Usage: dotnet run eng/regress.cs -- --pg <major> [--repeat <count>] [--huge-tx] [filter]
 
 using System.Diagnostics;
 using System.Globalization;
@@ -7,6 +8,7 @@ using System.Globalization;
 string? major = null;
 string? filter = null;
 int repeat = 1;
+bool hugeTx = false;
 for (int index = 0; index < args.Length; index++)
 {
     switch (args[index])
@@ -17,6 +19,9 @@ for (int index = 0; index < args.Length; index++)
         case "--repeat":
             repeat = int.Parse(args[++index], CultureInfo.InvariantCulture);
             break;
+        case "--huge-tx":
+            hugeTx = true;
+            break;
         default:
             filter = args[index];
             break;
@@ -25,7 +30,7 @@ for (int index = 0; index < args.Length; index++)
 
 if (major is null)
 {
-    Console.Error.WriteLine("usage: dotnet run eng/regress.cs -- --pg <major> [--repeat <count>] [filter]");
+    Console.Error.WriteLine("usage: dotnet run eng/regress.cs -- --pg <major> [--repeat <count>] [--huge-tx] [filter]");
     return 2;
 }
 
@@ -56,7 +61,10 @@ List<string> settings =
     "track_commit_timestamp=on",
 
     // Purely testing related:
+    "hba_file=" + Path.Join(root, "src", "Worf", "pg_regress", "regress-pg_hba.conf"),
     "DateStyle=ISO, DMY",
+    // pg_regress keeps PostgreSQL's default, which ankus regress otherwise replaces with warning.
+    "client_min_messages=notice",
     "log_line_prefix=[%m] [%p] [%d] ",
     "fsync=off",
 
@@ -69,6 +77,12 @@ List<string> settings =
     "worf.provider1_dsn=dbname=regression1",
     "worf.subscriber_dsn=dbname=postgres",
 ];
+
+// huge_tx_100k_tables creates 100,000 tables in one transaction; its header asks for this setting.
+if (hugeTx)
+{
+    settings.Add("max_locks_per_transaction=10000");
+}
 
 // Current PostgreSQL releases load only the output plugins this setting lists; PostgreSQL 13 has no such setting.
 if (int.Parse(major, CultureInfo.InvariantCulture) >= 14)
@@ -92,7 +106,36 @@ if (filter is not null)
     arguments.Add(filter);
 }
 
-int code = Run("dotnet", arguments, check: false);
+// The huge_tx tests run after node_origin_cascade and before drop, which removes the nodes they use.
+string suite = Path.Join(root, "src", "Worf", "pg_regress");
+List<string> added = [];
+if (hugeTx)
+{
+    foreach (string sql in Directory.GetFiles(Path.Join(suite, "huge_tx", "sql"), "*.sql").Order(StringComparer.Ordinal))
+    {
+        string name = Path.GetFileNameWithoutExtension(sql);
+        string expected = Path.Join(suite, "huge_tx", "expected", name + ".out");
+        string sqlCopy = Path.Join(suite, "sql", "29a_" + name + ".sql");
+        string expectedCopy = Path.Join(suite, "expected", "29a_" + name + ".out");
+        File.Copy(sql, sqlCopy, overwrite: true);
+        File.Copy(expected, expectedCopy, overwrite: true);
+        added.AddRange([sqlCopy, expectedCopy]);
+    }
+}
+
+int code;
+try
+{
+    code = Run("dotnet", arguments, check: false);
+}
+finally
+{
+    foreach (string file in added)
+    {
+        File.Delete(file);
+    }
+}
+
 Run("dotnet", ["ankus", "stop", "--pg", major, "--home", home], check: false);
 
 string diffs = Path.Join(root, "src", "Worf", "pg_regress", "regression.diffs");

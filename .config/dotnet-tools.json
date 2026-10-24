@@ -3,7 +3,7 @@
   "isRoot": true,
   "tools": {
     "ankus.tool": {
-      "version": "0.2.6",
+      "version": "0.2.7",
       "commands": ["ankus"]
     }
   }

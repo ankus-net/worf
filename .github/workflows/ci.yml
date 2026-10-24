@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_call:
   schedule:
     # The nightly run adds the huge_tx tests and a stress run.
     - cron: '17 7 * * *'
@@ -31,123 +32,17 @@ jobs:
           - platform: win-x64
             runner: windows-2025
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: ${{ github.event_name == 'schedule' && 360 || 120 }}
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-dotnet@v6
+      - uses: ./.github/actions/setup
         with:
-          global-json-file: global.json
-
-      - name: Install LLVM and PostgreSQL build dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor --yes --output /usr/share/keyrings/llvm.gpg
-          echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] https://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-20 main" | sudo tee /etc/apt/sources.list.d/llvm.list
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends clang-20 libclang-20-dev bison flex libreadline-dev zlib1g-dev libicu-dev pkg-config
-          echo /usr/lib/llvm-20/bin >> "$GITHUB_PATH"
-
-      - name: Install LLVM and PostgreSQL build dependencies (macOS)
-        if: runner.os == 'macOS'
-        env:
-          HOMEBREW_NO_AUTO_UPDATE: '1'
-        run: |
-          # Homebrew links a versioned LLVM only when no other version is installed; with the runner image's
-          # llvm@18 present it leaves llvm@20 unlinked and warns.
-          if brew list --versions llvm@18 > /dev/null; then brew uninstall --ignore-dependencies llvm@18; fi
-          brew install llvm@20 icu4c pkg-config
-          echo "$(brew --prefix llvm@20)/bin" >> "$GITHUB_PATH"
-
-      - name: Select LLVM and diff (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          echo "C:\\Program Files\\LLVM\\bin" >> "$GITHUB_PATH"
-          echo "C:\\Program Files\\Git\\usr\\bin" >> "$GITHUB_PATH"
-
-      - name: Restore tools
-        run: dotnet tool restore
-
-      - name: Restore PostgreSQL
-        id: postgresql-cache
-        uses: actions/cache/restore@v6
-        with:
-          path: ~/.ankus/postgres
-          key: postgresql-v1-${{ matrix.platform }}-pg${{ matrix.postgresql }}-${{ hashFiles('.config/dotnet-tools.json') }}
-
-      - name: Install PostgreSQL
-        id: install
-        shell: bash
-        run: |
-          if dotnet ankus init --pg${{ matrix.postgresql }} download; then
-            echo "source=download" >> "$GITHUB_OUTPUT"
-          elif [ "$RUNNER_OS" = Windows ] && [ "${{ matrix.postgresql }}" = 19 ]; then
-            # EDB publishes no Windows archive for a PostgreSQL release candidate, so the next steps build it
-            # instead; https://github.com/ankus-net/ankus/issues/79
-            echo "source=build" >> "$GITHUB_OUTPUT"
-          else
-            exit 1
-          fi
-
-      - name: Select PostgreSQL source (Windows)
-        id: source
-        if: steps.install.outputs.source == 'build'
-        shell: pwsh
-        run: |
-          $listing = (Invoke-WebRequest https://ftp.postgresql.org/pub/source/ -UseBasicParsing).Content
-          $version = [regex]::Matches($listing, 'href="v(${{ matrix.postgresql }}(?:beta|rc)\d+)/"') |
-            ForEach-Object { $_.Groups[1].Value } |
-            Sort-Object { $_ -replace 'beta', '0.' -replace 'rc', '1.' } |
-            Select-Object -Last 1
-          "version=$version" >> $env:GITHUB_OUTPUT
-
-      - name: Save PostgreSQL
-        # Saved as soon as it's installed, so a later failing step doesn't make the next run build it again.
-        if: steps.postgresql-cache.outputs.cache-hit != 'true' && steps.install.outputs.source == 'download'
-        uses: actions/cache/save@v6
-        with:
-          path: ~/.ankus/postgres
-          key: postgresql-v1-${{ matrix.platform }}-pg${{ matrix.postgresql }}-${{ hashFiles('.config/dotnet-tools.json') }}
-
-      - name: Restore PostgreSQL source build (Windows)
-        id: source-cache
-        if: steps.install.outputs.source == 'build'
-        uses: actions/cache/restore@v6
-        with:
-          path: C:\pgsql-${{ steps.source.outputs.version }}
-          key: postgresql-source-v1-${{ matrix.platform }}-${{ steps.source.outputs.version }}
-
-      - name: Build PostgreSQL from source (Windows)
-        if: steps.install.outputs.source == 'build' && steps.source-cache.outputs.cache-hit != 'true'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
-          $version = '${{ steps.source.outputs.version }}'
-          python -m pip install --quiet meson ninja
-          choco install winflexbison3 --no-progress -y
-          Invoke-WebRequest "https://ftp.postgresql.org/pub/source/v$version/postgresql-$version.tar.bz2" -OutFile "$env:RUNNER_TEMP\postgresql.tar.bz2"
-          # Git's tar, which is earlier on the PATH, reads a drive letter as a remote host.
-          & "$env:SystemRoot\System32\tar.exe" -xjf "$env:RUNNER_TEMP\postgresql.tar.bz2" -C $env:RUNNER_TEMP
-          # Git's MSYS Perl, also on the PATH, rewrites the MSVC tools' /options as paths.
-          meson setup --vsenv --buildtype=release --prefix="C:\pgsql-$version" -DPERL="C:\Strawberry\perl\bin\perl.exe" "$env:RUNNER_TEMP\postgresql-build" "$env:RUNNER_TEMP\postgresql-$version"
-          meson install -C "$env:RUNNER_TEMP\postgresql-build"
-
-      - name: Save PostgreSQL source build (Windows)
-        # Saved as soon as it's built, so a later failing step doesn't make the next run build it again.
-        if: steps.install.outputs.source == 'build' && steps.source-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
-        with:
-          path: C:\pgsql-${{ steps.source.outputs.version }}
-          key: postgresql-source-v1-${{ matrix.platform }}-${{ steps.source.outputs.version }}
-
-      - name: Register PostgreSQL source build (Windows)
-        if: steps.install.outputs.source == 'build'
-        run: dotnet ankus init --pg${{ matrix.postgresql }} "C:\pgsql-${{ steps.source.outputs.version }}\bin\pg_config.exe"
+          platform: ${{ matrix.platform }}
+          postgresql: ${{ matrix.postgresql }}
 
       - name: Run regression suite
-        run: dotnet run eng/regress.cs -- --pg ${{ matrix.postgresql }}
+        run: dotnet run eng/regress.cs -- --pg ${{ matrix.postgresql }} ${{ github.event_name == 'schedule' && '--huge-tx' || '' }}
 
       - name: Save regression results
         if: failure()
@@ -158,5 +53,33 @@ jobs:
             src/Worf/pg_regress/results/
             src/Worf/pg_regress/regression.diffs
             artifacts/regress-home/clusters/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Run multi-server tests
+        if: success() || failure()
+        run: dotnet ankus test --pg ${{ matrix.postgresql }} -- --project tests/Worf.Tests/Worf.Tests.csproj
+
+      - name: Save multi-server test logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tests-${{ matrix.platform }}-pg${{ matrix.postgresql }}
+          path: |
+            TestResults/
+            src/Worf/bin/ankus-test-logs/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Run stress test
+        if: github.event_name == 'schedule' && (success() || failure())
+        run: dotnet run eng/stress.cs -- --pg ${{ matrix.postgresql }} --runs 5
+
+      - name: Save stress test results
+        if: github.event_name == 'schedule' && failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: stress-${{ matrix.platform }}-pg${{ matrix.postgresql }}
+          path: artifacts/stress/
           if-no-files-found: ignore
           retention-days: 7

@@ -1,0 +1,79 @@
+name: Set up
+description: Installs .NET, LLVM, the Ankus tools and a PostgreSQL release for building and testing worf.
+
+inputs:
+  platform:
+    description: The runtime identifier, such as linux-x64.
+    required: true
+  postgresql:
+    description: The PostgreSQL major version.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-dotnet@v6
+      with:
+        global-json-file: global.json
+
+    - name: Install LLVM and PostgreSQL build dependencies (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor --yes --output /usr/share/keyrings/llvm.gpg
+        echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] https://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-20 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+        sudo apt-get update
+        sudo apt-get install --yes --no-install-recommends clang-20 libclang-20-dev bison flex libreadline-dev zlib1g-dev libicu-dev pkg-config
+        echo /usr/lib/llvm-20/bin >> "$GITHUB_PATH"
+
+    - name: Install LLVM and PostgreSQL build dependencies (macOS)
+      if: runner.os == 'macOS'
+      env:
+        HOMEBREW_NO_AUTO_UPDATE: '1'
+      shell: bash
+      run: |
+        # Homebrew links a versioned LLVM only when no other version is installed; with the runner image's
+        # llvm@18 present it leaves llvm@20 unlinked and warns.
+        if brew list --versions llvm@18 > /dev/null; then brew uninstall --ignore-dependencies llvm@18; fi
+        brew install llvm@20 icu4c pkg-config
+        echo "$(brew --prefix llvm@20)/bin" >> "$GITHUB_PATH"
+
+    - name: Select LLVM and diff (Windows)
+      if: runner.os == 'Windows'
+      shell: bash
+      run: |
+        echo "C:\\Program Files\\LLVM\\bin" >> "$GITHUB_PATH"
+        echo "C:\\Program Files\\Git\\usr\\bin" >> "$GITHUB_PATH"
+
+    - name: Restore tools
+      shell: bash
+      run: dotnet tool restore
+
+    - name: Restore PostgreSQL
+      id: postgresql-cache
+      uses: actions/cache/restore@v6
+      with:
+        path: ~/.ankus/postgres
+        key: postgresql-v1-${{ inputs.platform }}-pg${{ inputs.postgresql }}-${{ hashFiles('.config/dotnet-tools.json') }}
+
+    - name: Install PostgreSQL source build tools (Windows)
+      # EDB publishes no Windows archive for a PostgreSQL release candidate, so ankus init builds it from source.
+      if: runner.os == 'Windows' && inputs.postgresql == '19' && steps.postgresql-cache.outputs.cache-hit != 'true'
+      shell: pwsh
+      run: |
+        python -m pip install --quiet meson ninja
+        choco install winflexbison3 --no-progress -y
+        # Git's MSYS Perl, also on the PATH, rewrites the MSVC tools' /options as paths.
+        "C:\Strawberry\perl\bin" >> $env:GITHUB_PATH
+
+    - name: Install PostgreSQL
+      shell: bash
+      run: dotnet ankus init --pg${{ inputs.postgresql }} download
+
+    - name: Save PostgreSQL
+      # Saved as soon as it's installed, so a later failing step doesn't make the next run build it again.
+      if: steps.postgresql-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ~/.ankus/postgres
+        key: postgresql-v1-${{ inputs.platform }}-pg${{ inputs.postgresql }}-${{ hashFiles('.config/dotnet-tools.json') }}

@@ -1,3 +1,7 @@
+using System.Globalization;
+using System.Text;
+using Ankus.Postgres;
+
 [assembly: PgSql("conflict-history", """
     -- Conflict history persistence
 
@@ -300,4 +304,177 @@ internal static partial class ConflictHistory
         LongDescription = "Tuple field values exceeding this size will be truncated", Minimum = 64, Maximum = 65536,
         Context = PgGucContext.SuperuserSet)]
     internal static partial int MaxTupleSize { get; }
+
+    private const string InsertSql =
+        "INSERT INTO worf.conflict_history (" +
+        "sub_id, sub_name, conflict_type, resolution, " +
+        "schema_name, table_name, index_name, " +
+        "local_tuple, local_xid, local_origin, local_commit_ts, " +
+        "remote_tuple, remote_origin, remote_commit_ts, remote_commit_lsn, " +
+        "has_before_triggers" +
+        ") VALUES (" +
+        "$1, $2::name, $3, $4, " +
+        "$5::name, $6::name, $7::name, " +
+        "$8::jsonb, $9::text::xid, $10, $11, " +
+        "$12::jsonb, $13, $14, $15, " +
+        "$16" +
+        ")";
+
+    /// <summary>
+    /// Record a conflict to the worf.conflict_history table.
+    /// </summary>
+    /// <remarks>
+    /// This function is called from <see cref="Conflict.ReportConflict"/> after the conflict has been resolved. It
+    /// stores the conflict information for later querying and analysis. Any failures in recording do not abort the
+    /// apply worker transaction, because recording is purely observational and should never interfere with
+    /// replication.
+    /// </remarks>
+    internal static unsafe void RecordConflict(WorfConflictType conflictType, WorfRelation rel, HeapTupleData* localtuple,
+        HeapTupleData* remotetuple, WorfConflictResolution resolution, uint localTupleXid, bool foundLocalOrigin,
+        ushort localTupleOrigin, long localTupleCommitTs, uint conflictIdxOid, bool hasBeforeTriggers)
+    {
+        // Early exit if feature is disabled
+        if (!Enabled)
+        {
+            return;
+        }
+
+        // Early exit if no subscription context
+        WorfSubscription? sub = Apply.MySubscription;
+        if (sub is null)
+        {
+            return;
+        }
+
+        try
+        {
+            PgTransaction.RunInSubtransaction(() =>
+            {
+                // Ensure partition exists for current date
+                EnsurePartitionExists();
+
+                // Get tuple descriptor for JSONB conversion
+                RelationData* relation = rel.Rel;
+                TupleDescData* tupdesc = relation->rd_att;
+
+                // Get index name if available
+                string? idxname = null;
+                if (conflictIdxOid != 0)
+                {
+                    sbyte* name = NativeMethods.get_rel_name(conflictIdxOid);
+                    idxname = name is null ? null : Worf.FromServer(name);
+                }
+
+                _ = Spi.Execute(InsertSql,
+                    SpiParameter.Create(sub.Id),
+                    SpiParameter.Create(sub.Name),
+                    SpiParameter.Create(ConflictTypeToString(conflictType)),
+                    SpiParameter.Create(ResolutionToString(resolution)),
+                    SpiParameter.Create(Worf.FromServer(NativeMethods.get_namespace_name(relation->rd_rel->relnamespace))),
+                    SpiParameter.Create(Worf.FromServer((sbyte*)&relation->rd_rel->relname)),
+                    SpiParameter.Create<string?>(idxname),
+                    SpiParameter.Create<string?>(localtuple is not null && StoreTuples ? TupleToJson(tupdesc, localtuple, MaxTupleSize) : null),
+                    SpiParameter.Create<string?>(localTupleXid != 0 ? localTupleXid.ToString(CultureInfo.InvariantCulture) : null),
+                    SpiParameter.Create<int?>(foundLocalOrigin ? localTupleOrigin : null),
+                    SpiParameter.Create<PgTimestampTz?>(foundLocalOrigin ? new PgTimestampTz(localTupleCommitTs) : null),
+                    SpiParameter.Create<string?>(remotetuple is not null && StoreTuples ? TupleToJson(tupdesc, remotetuple, MaxTupleSize) : null),
+                    SpiParameter.Create((int)Worf.ReploriginSessionOrigin),
+                    SpiParameter.Create(new PgTimestampTz(Worf.ReploriginSessionOriginTimestamp)),
+                    Worf.LsnParameter(Worf.ReploriginSessionOriginLsn),
+                    SpiParameter.Create(hasBeforeTriggers));
+            });
+        }
+        catch (PgException)
+        {
+            // Log the error and continue - don't abort the apply transaction
+            PgLog.Warning("conflict_history: recording failed, continuing without recording");
+        }
+    }
+
+    /// <summary>
+    /// Convert a conflict type to its string representation for storage.
+    /// </summary>
+    private static string ConflictTypeToString(WorfConflictType type) => type switch
+    {
+        WorfConflictType.InsertInsert => "insert_insert",
+        WorfConflictType.UpdateUpdate => "update_update",
+        WorfConflictType.UpdateDelete => "update_delete",
+        WorfConflictType.DeleteDelete => "delete_delete",
+        _ => "unknown",
+    };
+
+    /// <summary>
+    /// Convert a resolution to its string representation for storage.
+    /// </summary>
+    private static string ResolutionToString(WorfConflictResolution res) => res switch
+    {
+        WorfConflictResolution.ApplyRemote => "apply_remote",
+        WorfConflictResolution.KeepLocal => "keep_local",
+        WorfConflictResolution.Skip => "skip",
+        _ => "unknown",
+    };
+
+    /// <summary>
+    /// Convert a tuple to a JSON object of its columns' text for storage.
+    /// </summary>
+    private static unsafe string TupleToJson(TupleDescData* tupdesc, HeapTupleData* tuple, int maxSize)
+    {
+        StringBuilder json = new("{");
+        bool first = true;
+
+        for (int natt = 0; natt < tupdesc->natts; natt++)
+        {
+            FormData_pg_attribute* attr = NativeMethods.TupleDescAttr(tupdesc, natt);
+
+            // Skip dropped columns
+            if (attr->attisdropped)
+            {
+                continue;
+            }
+
+            // Skip system columns
+            if (attr->attnum < 0)
+            {
+                continue;
+            }
+
+            if (!first)
+            {
+                json.Append(", ");
+            }
+
+            first = false;
+
+            // Add column name as key
+            Executor.EscapeJson(json, Worf.FromServer((sbyte*)&attr->attname));
+            json.Append(": ");
+
+            // Get the value
+            string? outputstr = Conflict.ColumnOutput(tupdesc, tuple, natt, out bool isnull);
+            if (isnull)
+            {
+                // NULL SQL value becomes JSON null
+                json.Append("null");
+            }
+            else
+            {
+                // Truncate if necessary
+                byte[] bytes = Worf.ToServer(outputstr!);
+                if (bytes.Length > maxSize && outputstr != "(unchanged-toast-datum)")
+                {
+                    outputstr = Worf.FromServer(bytes.AsSpan(0, maxSize));
+                }
+
+                Executor.EscapeJson(json, outputstr!);
+            }
+        }
+
+        json.Append('}');
+        return json.ToString();
+    }
+
+    /// <summary>
+    /// Ensure that a partition exists for the current date.
+    /// </summary>
+    private static void EnsurePartitionExists() => _ = Spi.Execute("SELECT worf.conflict_history_ensure_partition(CURRENT_DATE)");
 }

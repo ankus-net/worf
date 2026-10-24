@@ -38,6 +38,7 @@ BEGIN
 END;
 $$;
 ALTER EXTENSION worf UPDATE;
+NOTICE:  version "1.0.0" of extension "worf" is already installed
 SELECT worf.worf_version() = extversion
 FROM pg_extension
 WHERE extname = 'worf';

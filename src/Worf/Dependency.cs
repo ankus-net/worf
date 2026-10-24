@@ -76,6 +76,23 @@ internal static class Dependency
 
     private const int AccessExclusiveLock = 8;
 
+    private const int RowExclusiveLock = 3;
+
+    private const string CatalogDepend = "depend";
+
+    private const int NattsDepend = 7;
+    private const short AnumDependClassid = 1;
+    private const short AnumDependObjid = 2;
+    private const short AnumDependObjsubid = 3;
+    private const short AnumDependRefclassid = 4;
+    private const short AnumDependRefobjid = 5;
+    private const short AnumDependRefobjsubid = 6;
+    private const short AnumDependDeptype = 7;
+
+    private const ushort BtEqualStrategyNumber = 3;
+    private const uint FOideq = 184;
+    private const uint FInt4eq = 65;
+
     private const int Notice = 18;
 
     private const int Log = 15;
@@ -97,19 +114,75 @@ internal static class Dependency
     /// <param name="depender">The dependent object.</param>
     /// <param name="referenced">The referenced objects.</param>
     /// <param name="behavior">The dependency type.</param>
-    internal static void RecordMultipleDependencies(ObjectAddress depender, IReadOnlyList<ObjectAddress> referenced, sbyte behavior)
+    internal static unsafe void RecordMultipleDependencies(ObjectAddress depender, IReadOnlyList<ObjectAddress> referenced, sbyte behavior)
     {
+        if (referenced.Count == 0)
+        {
+            return;         // nothing to do
+        }
+
+        RelationData* dependDesc = NativeMethods.table_open(GetDependRelOid(), RowExclusiveLock);
+
+        ulong* values = stackalloc ulong[NattsDepend];
+        bool* nulls = stackalloc bool[NattsDepend];
+        new Span<bool>(nulls, NattsDepend).Clear();
+
         foreach (ObjectAddress reference in referenced)
         {
             // Record the Dependency. Note we don't bother to check for duplicate dependencies; there's no harm in
             // them.
-            Spi.Execute("INSERT INTO worf.depend (classid, objid, objsubid, refclassid, refobjid, refobjsubid, deptype) " +
-                "VALUES ($1, $2, $3, $4, $5, $6, $7)",
-                SpiParameter.Create(depender.classId), SpiParameter.Create(depender.objectId),
-                SpiParameter.Create(depender.objectSubId), SpiParameter.Create(reference.classId),
-                SpiParameter.Create(reference.objectId), SpiParameter.Create(reference.objectSubId),
-                SpiParameter.Create(behavior));
+            values[AnumDependClassid - 1] = depender.classId;
+            values[AnumDependObjid - 1] = depender.objectId;
+            values[AnumDependObjsubid - 1] = unchecked((uint)depender.objectSubId);
+
+            values[AnumDependRefclassid - 1] = reference.classId;
+            values[AnumDependRefobjid - 1] = reference.objectId;
+            values[AnumDependRefobjsubid - 1] = unchecked((uint)reference.objectSubId);
+
+            values[AnumDependDeptype - 1] = unchecked((byte)behavior);
+
+            HeapTupleData* tup = NativeMethods.heap_form_tuple(dependDesc->rd_att, values, nulls);
+
+            NativeMethods.CatalogTupleInsert(dependDesc, tup);
+
+            NativeMethods.heap_freetuple(tup);
         }
+
+        NativeMethods.table_close(dependDesc, RowExclusiveLock);
+    }
+
+    /// <summary>
+    /// Record dependencies on a set of objects referenced by an expression that refers to one relation, as
+    /// <c>recordDependencyOnSingleRelExpr</c> does.
+    /// </summary>
+    /// <param name="depender">The dependent object.</param>
+    /// <param name="expr">The expression.</param>
+    /// <param name="relId">The relation the expression's Vars refer to.</param>
+    /// <param name="behavior">The dependency type for other objects.</param>
+    /// <param name="selfBehavior">The dependency type for the relation itself.</param>
+    internal static unsafe void RecordDependencyOnSingleRelExpr(ObjectAddress depender, Node* expr, uint relId,
+        sbyte behavior, sbyte selfBehavior)
+    {
+        List<ObjectAddress> addrs = [];
+
+        // Scan the expression tree for referenceable objects
+        FindExprReferences(expr, relId, addrs);
+
+        // Remove any duplicates
+        EliminateDuplicateDependencies(addrs);
+
+        // Separate self-dependencies if necessary
+        if (behavior != selfBehavior && addrs.Count > 0)
+        {
+            List<ObjectAddress> selfAddrs = addrs.FindAll(thisobj => thisobj.classId == RelationRelationId && thisobj.objectId == relId);
+            _ = addrs.RemoveAll(thisobj => thisobj.classId == RelationRelationId && thisobj.objectId == relId);
+
+            // Record the self-dependencies
+            RecordMultipleDependencies(depender, selfAddrs, selfBehavior);
+        }
+
+        // Record the external dependencies
+        RecordMultipleDependencies(depender, addrs, behavior);
     }
 
     /// <summary>
@@ -139,6 +212,36 @@ internal static class Dependency
         DeleteObjectsInList(targetObjects);
 
         DeleteOneObjectDepencencyRecord(obj);
+
+        unsafe
+        {
+            NativeMethods.CommandCounterIncrement();
+        }
+    }
+
+    /// <summary>
+    /// Checks the dependencies of a relation being dropped and forgets its synchronization status.
+    /// </summary>
+    /// <param name="obj">The object being dropped.</param>
+    /// <param name="behavior">Whether the drop cascades.</param>
+    internal static void CheckDependency(ObjectAddress obj, DropBehavior behavior)
+    {
+        if (obj.classId != RelationRelationId)
+        {
+            return;
+        }
+
+        TryDropDependencies(obj, behavior == DropBehavior.DROP_CASCADE);
+
+        unsafe
+        {
+            // get_rel_relkind returns no kind for a relation that isn't there.
+            if (NativeMethods.get_rel_relkind(obj.objectId) == (sbyte)'r')
+            {
+                Sync.DropTableSyncStatus(Worf.FromServer(NativeMethods.get_namespace_name(NativeMethods.get_rel_namespace(obj.objectId))),
+                    Worf.FromServer(NativeMethods.get_rel_name(obj.objectId)));
+            }
+        }
     }
 
     /// <summary>
@@ -631,18 +734,23 @@ internal static class Dependency
     /// <summary>
     /// Remove any dependency records for the given object.
     /// </summary>
-    private static void DeleteOneObjectDepencencyRecord(ObjectAddress obj)
+    private static unsafe void DeleteOneObjectDepencencyRecord(ObjectAddress obj)
     {
-        if (obj.objectSubId != 0)
+        RelationData* depRel = NativeMethods.table_open(GetDependRelOid(), RowExclusiveLock);
+
+        ScanKeyData* key = stackalloc ScanKeyData[3];
+        int nkeys = InitDependKeys(key, AnumDependClassid, AnumDependObjid, AnumDependObjsubid, obj);
+
+        SysScanDescData* scan = NativeMethods.systable_beginscan(depRel, 0, false, null, nkeys, key);
+
+        HeapTupleData* tup;
+        while ((tup = NativeMethods.systable_getnext(scan)) is not null)
         {
-            Spi.Execute("DELETE FROM worf.depend WHERE classid = $1 AND objid = $2 AND objsubid = $3",
-                SpiParameter.Create(obj.classId), SpiParameter.Create(obj.objectId), SpiParameter.Create(obj.objectSubId));
+            NativeMethods.simple_heap_delete(depRel, &tup->t_self);
         }
-        else
-        {
-            Spi.Execute("DELETE FROM worf.depend WHERE classid = $1 AND objid = $2",
-                SpiParameter.Create(obj.classId), SpiParameter.Create(obj.objectId));
-        }
+
+        NativeMethods.systable_endscan(scan);
+        NativeMethods.table_close(depRel, RowExclusiveLock);
     }
 
     /// <summary>
@@ -657,6 +765,12 @@ internal static class Dependency
         // object should be gone already.) When dropping a whole object (subId = 0), remove all worf.depend records
         // for its sub-objects too.
         DeleteOneObjectDepencencyRecord(obj);
+
+        // CommandCounterIncrement here to ensure that preceding changes are all visible to the next deletion step.
+        unsafe
+        {
+            NativeMethods.CommandCounterIncrement();
+        }
     }
 
     /// <summary>
@@ -720,27 +834,37 @@ internal static class Dependency
     /// </summary>
     /// <param name="depender">Whether the object is the dependent end.</param>
     /// <param name="obj">The object.</param>
-    private static List<DependRow> ScanDepend(bool depender, ObjectAddress obj)
+    private static unsafe List<DependRow> ScanDepend(bool depender, ObjectAddress obj)
     {
-        SpiParameter classId = SpiParameter.Create(obj.classId);
-        SpiParameter objectId = SpiParameter.Create(obj.objectId);
-        SpiParameter objectSubId = SpiParameter.Create(obj.objectSubId);
-        SpiResult result = (depender, obj.objectSubId != 0) switch
-        {
-            (true, true) => Spi.Select("SELECT ctid, refclassid, refobjid, refobjsubid, deptype FROM worf.depend " +
-                "WHERE classid = $1 AND objid = $2 AND objsubid = $3", classId, objectId, objectSubId),
-            (true, false) => Spi.Select("SELECT ctid, refclassid, refobjid, refobjsubid, deptype FROM worf.depend " +
-                "WHERE classid = $1 AND objid = $2", classId, objectId),
-            (false, true) => Spi.Select("SELECT ctid, classid, objid, objsubid, deptype FROM worf.depend " +
-                "WHERE refclassid = $1 AND refobjid = $2 AND refobjsubid = $3", classId, objectId, objectSubId),
-            (false, false) => Spi.Select("SELECT ctid, classid, objid, objsubid, deptype FROM worf.depend " +
-                "WHERE refclassid = $1 AND refobjid = $2", classId, objectId),
-        };
+        RelationData* depRel = NativeMethods.table_open(GetDependRelOid(), RowExclusiveLock);
+
+        ScanKeyData* key = stackalloc ScanKeyData[3];
+        int nkeys = depender
+            ? InitDependKeys(key, AnumDependClassid, AnumDependObjid, AnumDependObjsubid, obj)
+            : InitDependKeys(key, AnumDependRefclassid, AnumDependRefobjid, AnumDependRefobjsubid, obj);
+
+        SysScanDescData* scan = NativeMethods.systable_beginscan(depRel, 0, false, null, nkeys, key);
+
+        // The other end of each dependency.
+        short classid = depender ? AnumDependRefclassid : AnumDependClassid;
+        short objid = depender ? AnumDependRefobjid : AnumDependObjid;
+        short objsubid = depender ? AnumDependRefobjsubid : AnumDependObjsubid;
+
         List<DependRow> rows = [];
-        foreach (SpiRow row in result)
+        HeapTupleData* tup;
+        while ((tup = NativeMethods.systable_getnext(scan)) is not null)
         {
-            rows.Add(new DependRow(row.Get<PgItemPointer>(0), row.Get<uint>(1), row.Get<uint>(2), row.Get<int>(3), row.Get<sbyte>(4)));
+            TupleDescData* desc = depRel->rd_att;
+            bool isnull;
+            rows.Add(new DependRow(tup->t_self,
+                (uint)NativeMethods.heap_getattr(tup, classid, desc, &isnull),
+                (uint)NativeMethods.heap_getattr(tup, objid, desc, &isnull),
+                unchecked((int)NativeMethods.heap_getattr(tup, objsubid, desc, &isnull)),
+                unchecked((sbyte)NativeMethods.heap_getattr(tup, AnumDependDeptype, desc, &isnull))));
         }
+
+        NativeMethods.systable_endscan(scan);
+        NativeMethods.table_close(depRel, RowExclusiveLock);
 
         return rows;
     }
@@ -748,8 +872,52 @@ internal static class Dependency
     /// <summary>
     /// Checks that a worf.depend row is still live, as systable_recheck_tuple does.
     /// </summary>
-    private static bool RecheckDepend(DependRow row)
-        => Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT FROM worf.depend WHERE ctid = $1)", SpiParameter.Create(row.Ctid));
+    private static unsafe bool RecheckDepend(DependRow row)
+    {
+        RelationData* depRel = NativeMethods.table_open(GetDependRelOid(), RowExclusiveLock);
+
+        HeapTupleData tuple = default;
+        tuple.t_self = row.Ctid;
+        int buffer;
+        SnapshotData* freshsnap = NativeMethods.RegisterSnapshot(NativeMethods.GetLatestSnapshot());
+#if ANKUS_PG13 || ANKUS_PG14
+        bool found = NativeMethods.heap_fetch(depRel, freshsnap, &tuple, &buffer);
+#else
+        bool found = NativeMethods.heap_fetch(depRel, freshsnap, &tuple, &buffer, false);
+#endif
+        if (found)
+        {
+            NativeMethods.ReleaseBuffer(buffer);
+        }
+
+        NativeMethods.UnregisterSnapshot(freshsnap);
+
+        NativeMethods.table_close(depRel, RowExclusiveLock);
+
+        return found;
+    }
+
+    /// <summary>
+    /// Sets up the keys that find an object's rows in worf.depend, by its depender or referenced columns.
+    /// </summary>
+    /// <returns>The number of keys.</returns>
+    private static unsafe int InitDependKeys(ScanKeyData* key, short anumClassid, short anumObjid, short anumObjsubid, ObjectAddress obj)
+    {
+        NativeMethods.ScanKeyInit(&key[0], anumClassid, BtEqualStrategyNumber, FOideq, obj.classId);
+        NativeMethods.ScanKeyInit(&key[1], anumObjid, BtEqualStrategyNumber, FOideq, obj.objectId);
+        if (obj.objectSubId != 0)
+        {
+            NativeMethods.ScanKeyInit(&key[2], anumObjsubid, BtEqualStrategyNumber, FInt4eq, unchecked((uint)obj.objectSubId));
+            return 3;
+        }
+
+        return 2;
+    }
+
+    /// <summary>
+    /// Gets the oid of the dependency catalog.
+    /// </summary>
+    private static uint GetDependRelOid() => Worf.GetWorfTableOid(CatalogDepend);
 
     private static int Atoi(string? value)
     {
@@ -763,60 +931,449 @@ internal static class Dependency
             ? parsed : 0;
     }
 
-    /// <summary>
-    /// A worf.depend row found by a scan.
-    /// </summary>
-    /// <param name="Ctid">The row's location.</param>
-    /// <param name="ClassId">The other object's catalog.</param>
-    /// <param name="ObjectId">The other object.</param>
-    /// <param name="ObjectSubId">The other object's column, or 0.</param>
-    /// <param name="DepType">The dependency type.</param>
-    private readonly record struct DependRow(PgItemPointer Ctid, uint ClassId, uint ObjectId, int ObjectSubId, sbyte DepType);
+    // Catalogs of the object classes expressions refer to.
+    private const uint TypeRelationId = 1247;
+    private const uint ProcedureRelationId = 1255;
+    private const uint ConstraintRelationId = 2606;
+    private const uint NamespaceRelationId = 2615;
+    private const uint OperatorRelationId = 2617;
+    private const uint OperatorFamilyRelationId = 2753;
+    private const uint CollationRelationId = 3456;
+    private const uint TsDictionaryRelationId = 3600;
+    private const uint TsConfigRelationId = 3602;
+    private const uint DefaultCollationOid = 100;
 
     /// <summary>
-    /// The additional state for each ObjectAddress that deletion processing plans to delete.
+    /// Recursively search an expression tree of a single relation for object references, as
+    /// <c>find_expr_references_walker</c> does for the expressions a row filter can hold.
     /// </summary>
-    /// <param name="Flags">Bitmask of the flag bits.</param>
-    /// <param name="Dependee">Object whose deletion forced this one.</param>
-    private readonly record struct ObjectAddressExtra(int Flags, ObjectAddress Dependee);
-
-    /// <summary>
-    /// An expansible list of ObjectAddresses.
-    /// </summary>
-    private sealed class ObjectAddresses
+    private static unsafe void FindExprReferences(Node* node, uint relId, List<ObjectAddress> addrs)
     {
-        /// <summary>
-        /// Gets the addresses.
-        /// </summary>
-        public List<ObjectAddress> Refs { get; } = [];
+        if (node is null)
+        {
+            return;
+        }
 
-        /// <summary>
-        /// Gets the addresses' extra data.
-        /// </summary>
-        public List<ObjectAddressExtra> Extras { get; } = [];
+        switch (node->type)
+        {
+            case NodeTag.T_Var:
+            {
+                Var* var = (Var*)node;
+
+                // Find matching rtable entry, or complain if not found
+                if (var->varlevelsup >= 1)
+                {
+                    throw new PgException(PgSqlStates.InternalError, $"invalid varlevelsup {var->varlevelsup}");
+                }
+
+                if (var->varno != 1)
+                {
+                    throw new PgException(PgSqlStates.InternalError, $"invalid varno {var->varno}");
+                }
+
+                // A whole-row Var references no specific columns, so adds no new dependency.
+                if (var->varattno == 0)
+                {
+                    return;
+                }
+
+                // If it's a plain relation, reference this column
+                addrs.Add(Address(RelationRelationId, relId, var->varattno));
+                return;
+            }
+
+            case NodeTag.T_Const:
+            {
+                Const* con = (Const*)node;
+
+                // A constant must depend on the constant's datatype
+                addrs.Add(Address(TypeRelationId, con->consttype, 0));
+
+                // We must also depend on the constant's collation: it could be different from the datatype's, if a
+                // CollateExpr was const-folded to a simple constant.
+                if (con->constcollid != 0 && con->constcollid != DefaultCollationOid)
+                {
+                    addrs.Add(Address(CollationRelationId, con->constcollid, 0));
+                }
+
+                // If it's a regclass or similar literal referring to an existing object, add a reference to that
+                // object.
+                if (!con->constisnull)
+                {
+                    uint objoid = (uint)con->constvalue;
+                    switch (con->consttype)
+                    {
+                        case 24:    // REGPROCOID
+                        case 2202:  // REGPROCEDUREOID
+                            AddIfExists("pg_proc", ProcedureRelationId, objoid, addrs);
+                            break;
+                        case 2203:  // REGOPEROID
+                        case 2204:  // REGOPERATOROID
+                            AddIfExists("pg_operator", OperatorRelationId, objoid, addrs);
+                            break;
+                        case 2205:  // REGCLASSOID
+                            AddIfExists("pg_class", RelationRelationId, objoid, addrs);
+                            break;
+                        case 2206:  // REGTYPEOID
+                            AddIfExists("pg_type", TypeRelationId, objoid, addrs);
+                            break;
+                        case 3734:  // REGCONFIGOID
+                            AddIfExists("pg_ts_config", TsConfigRelationId, objoid, addrs);
+                            break;
+                        case 3769:  // REGDICTIONARYOID
+                            AddIfExists("pg_ts_dict", TsDictionaryRelationId, objoid, addrs);
+                            break;
+                        case 4089:  // REGNAMESPACEOID
+                            AddIfExists("pg_namespace", NamespaceRelationId, objoid, addrs);
+                            break;
+
+                        // Dependencies for regrole should be shared among all databases, so explicitly inhibit to
+                        // have dependencies.
+                        case 4096:  // REGROLEOID
+                            throw new PgException(PgSqlStates.FeatureNotSupported, "constant of the type \"regrole\" cannot be used here");
+                        default:
+                            break;
+                    }
+                }
+
+                return;
+            }
+
+            case NodeTag.T_Param:
+            {
+                Param* param = (Param*)node;
+
+                // A parameter must depend on the parameter's datatype
+                addrs.Add(Address(TypeRelationId, param->paramtype, 0));
+
+                // and its collation, just as for Consts
+                if (param->paramcollid != 0 && param->paramcollid != DefaultCollationOid)
+                {
+                    addrs.Add(Address(CollationRelationId, param->paramcollid, 0));
+                }
+
+                return;
+            }
+
+            case NodeTag.T_FuncExpr:
+            {
+                FuncExpr* funcexpr = (FuncExpr*)node;
+                addrs.Add(Address(ProcedureRelationId, funcexpr->funcid, 0));
+                FindListReferences(funcexpr->args, relId, addrs);
+                return;
+            }
+
+            case NodeTag.T_OpExpr:
+            case NodeTag.T_DistinctExpr:
+            case NodeTag.T_NullIfExpr:
+            {
+                OpExpr* opexpr = (OpExpr*)node;
+                addrs.Add(Address(OperatorRelationId, opexpr->opno, 0));
+                FindListReferences(opexpr->args, relId, addrs);
+                return;
+            }
+
+            case NodeTag.T_ScalarArrayOpExpr:
+            {
+                ScalarArrayOpExpr* opexpr = (ScalarArrayOpExpr*)node;
+                addrs.Add(Address(OperatorRelationId, opexpr->opno, 0));
+                FindListReferences(opexpr->args, relId, addrs);
+                return;
+            }
+
+            case NodeTag.T_SubPlan:
+                // Extra work needed here if we ever need this case
+                throw new PgException(PgSqlStates.InternalError, "already-planned subqueries not supported");
+
+            case NodeTag.T_FieldSelect:
+            {
+                FieldSelect* fselect = (FieldSelect*)node;
+                uint argtype = NativeMethods.getBaseType(NativeMethods.exprType((Node*)fselect->arg));
+                uint reltype = NativeMethods.get_typ_typrelid(argtype);
+
+                // We need a dependency on the specific column named in FieldSelect, assuming we can identify the
+                // pg_class OID for it. If we can't, make a dependency on the type, as it might not appear anywhere
+                // else in the expression.
+                addrs.Add(reltype != 0
+                    ? Address(RelationRelationId, reltype, fselect->fieldnum)
+                    : Address(TypeRelationId, fselect->resulttype, 0));
+
+                // the collation might not be referenced anywhere else, either
+                if (fselect->resultcollid != 0 && fselect->resultcollid != DefaultCollationOid)
+                {
+                    addrs.Add(Address(CollationRelationId, fselect->resultcollid, 0));
+                }
+
+                FindExprReferences((Node*)fselect->arg, relId, addrs);
+                return;
+            }
+
+            case NodeTag.T_FieldStore:
+            {
+                FieldStore* fstore = (FieldStore*)node;
+                uint reltype = NativeMethods.get_typ_typrelid(fstore->resulttype);
+
+                // similar considerations to FieldSelect, but multiple column(s)
+                if (reltype != 0)
+                {
+                    for (int i = 0; fstore->fieldnums is not null && i < fstore->fieldnums->length; i++)
+                    {
+                        addrs.Add(Address(RelationRelationId, reltype, fstore->fieldnums->elements[i].int_value));
+                    }
+                }
+                else
+                {
+                    addrs.Add(Address(TypeRelationId, fstore->resulttype, 0));
+                }
+
+                FindExprReferences((Node*)fstore->arg, relId, addrs);
+                FindListReferences(fstore->newvals, relId, addrs);
+                return;
+            }
+
+            case NodeTag.T_RelabelType:
+            {
+                RelabelType* relab = (RelabelType*)node;
+
+                // since there is no function dependency, need to depend on type
+                addrs.Add(Address(TypeRelationId, relab->resulttype, 0));
+
+                // the collation might not be referenced anywhere else, either
+                if (relab->resultcollid != 0 && relab->resultcollid != DefaultCollationOid)
+                {
+                    addrs.Add(Address(CollationRelationId, relab->resultcollid, 0));
+                }
+
+                FindExprReferences((Node*)relab->arg, relId, addrs);
+                return;
+            }
+
+            case NodeTag.T_CoerceViaIO:
+            {
+                CoerceViaIO* iocoerce = (CoerceViaIO*)node;
+
+                // since there is no exposed function, need to depend on type
+                addrs.Add(Address(TypeRelationId, iocoerce->resulttype, 0));
+                FindExprReferences((Node*)iocoerce->arg, relId, addrs);
+                return;
+            }
+
+            case NodeTag.T_ArrayCoerceExpr:
+            {
+                ArrayCoerceExpr* acoerce = (ArrayCoerceExpr*)node;
+
+                addrs.Add(Address(TypeRelationId, acoerce->resulttype, 0));
+
+                // the collation might not be referenced anywhere else, either
+                if (acoerce->resultcollid != 0 && acoerce->resultcollid != DefaultCollationOid)
+                {
+                    addrs.Add(Address(CollationRelationId, acoerce->resultcollid, 0));
+                }
+
+                FindExprReferences((Node*)acoerce->arg, relId, addrs);
+                FindExprReferences((Node*)acoerce->elemexpr, relId, addrs);
+                return;
+            }
+
+            case NodeTag.T_ConvertRowtypeExpr:
+            {
+                ConvertRowtypeExpr* cvt = (ConvertRowtypeExpr*)node;
+
+                // since there is no function dependency, need to depend on type
+                addrs.Add(Address(TypeRelationId, cvt->resulttype, 0));
+                FindExprReferences((Node*)cvt->arg, relId, addrs);
+                return;
+            }
+
+            case NodeTag.T_CollateExpr:
+            {
+                CollateExpr* coll = (CollateExpr*)node;
+                addrs.Add(Address(CollationRelationId, coll->collOid, 0));
+                FindExprReferences((Node*)coll->arg, relId, addrs);
+                return;
+            }
+
+            case NodeTag.T_RowExpr:
+            {
+                RowExpr* rowexpr = (RowExpr*)node;
+                addrs.Add(Address(TypeRelationId, rowexpr->row_typeid, 0));
+                FindListReferences(rowexpr->args, relId, addrs);
+                return;
+            }
+
+            case NodeTag.T_RowCompareExpr:
+            {
+                RowCompareExpr* rcexpr = (RowCompareExpr*)node;
+                for (int i = 0; rcexpr->opnos is not null && i < rcexpr->opnos->length; i++)
+                {
+                    addrs.Add(Address(OperatorRelationId, rcexpr->opnos->elements[i].oid_value, 0));
+                }
+
+                for (int i = 0; rcexpr->opfamilies is not null && i < rcexpr->opfamilies->length; i++)
+                {
+                    addrs.Add(Address(OperatorFamilyRelationId, rcexpr->opfamilies->elements[i].oid_value, 0));
+                }
+
+                FindListReferences(rcexpr->largs, relId, addrs);
+                FindListReferences(rcexpr->rargs, relId, addrs);
+                return;
+            }
+
+            case NodeTag.T_CoerceToDomain:
+            {
+                CoerceToDomain* cd = (CoerceToDomain*)node;
+                addrs.Add(Address(TypeRelationId, cd->resulttype, 0));
+                FindExprReferences((Node*)cd->arg, relId, addrs);
+                return;
+            }
+
+            case NodeTag.T_NamedArgExpr:
+                FindExprReferences((Node*)((NamedArgExpr*)node)->arg, relId, addrs);
+                return;
+
+            case NodeTag.T_BoolExpr:
+                FindListReferences(((BoolExpr*)node)->args, relId, addrs);
+                return;
+
+            case NodeTag.T_CaseExpr:
+            {
+                CaseExpr* caseexpr = (CaseExpr*)node;
+                FindExprReferences((Node*)caseexpr->arg, relId, addrs);
+                FindListReferences(caseexpr->args, relId, addrs);
+                FindExprReferences((Node*)caseexpr->defresult, relId, addrs);
+                return;
+            }
+
+            case NodeTag.T_CaseWhen:
+            {
+                CaseWhen* when = (CaseWhen*)node;
+                FindExprReferences((Node*)when->expr, relId, addrs);
+                FindExprReferences((Node*)when->result, relId, addrs);
+                return;
+            }
+
+            case NodeTag.T_ArrayExpr:
+                FindListReferences(((ArrayExpr*)node)->elements, relId, addrs);
+                return;
+
+            case NodeTag.T_CoalesceExpr:
+                FindListReferences(((CoalesceExpr*)node)->args, relId, addrs);
+                return;
+
+            case NodeTag.T_MinMaxExpr:
+                FindListReferences(((MinMaxExpr*)node)->args, relId, addrs);
+                return;
+
+            case NodeTag.T_XmlExpr:
+            {
+                XmlExpr* xexpr = (XmlExpr*)node;
+                FindListReferences(xexpr->named_args, relId, addrs);
+                FindListReferences(xexpr->args, relId, addrs);
+                return;
+            }
+
+            case NodeTag.T_NullTest:
+                FindExprReferences((Node*)((NullTest*)node)->arg, relId, addrs);
+                return;
+
+            case NodeTag.T_BooleanTest:
+                FindExprReferences((Node*)((BooleanTest*)node)->arg, relId, addrs);
+                return;
+
+            case NodeTag.T_SubscriptingRef:
+            {
+                SubscriptingRef* sbsref = (SubscriptingRef*)node;
+                FindListReferences(sbsref->refupperindexpr, relId, addrs);
+                FindListReferences(sbsref->reflowerindexpr, relId, addrs);
+                FindExprReferences((Node*)sbsref->refexpr, relId, addrs);
+                FindExprReferences((Node*)sbsref->refassgnexpr, relId, addrs);
+                return;
+            }
+
+            case NodeTag.T_List:
+                FindListReferences((List*)node, relId, addrs);
+                return;
+
+            case NodeTag.T_CaseTestExpr:
+            case NodeTag.T_CoerceToDomainValue:
+            case NodeTag.T_SetToDefault:
+            case NodeTag.T_SQLValueFunction:
+                return;
+
+            default:
+                throw new PgException(PgSqlStates.InternalError, $"unrecognized node type: {(int)node->type}");
+        }
+    }
+
+    private static unsafe void FindListReferences(List* list, uint relId, List<ObjectAddress> addrs)
+    {
+        for (int i = 0; list is not null && i < list->length; i++)
+        {
+            FindExprReferences((Node*)list->elements[i].ptr_value, relId, addrs);
+        }
+    }
+
+    private static void AddIfExists(string catalog, uint classId, uint objoid, List<ObjectAddress> addrs)
+    {
+        if (Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT FROM pg_catalog." + Spi.QuoteIdentifier(catalog) + " WHERE oid = $1)",
+            SpiParameter.Create(objoid)))
+        {
+            addrs.Add(Address(classId, objoid, 0));
+        }
     }
 
     /// <summary>
-    /// A threaded list of ObjectAddresses, for recursion detection.
+    /// Given an array of dependency references, eliminate any duplicates.
     /// </summary>
-    /// <param name="obj">Object being visited.</param>
-    /// <param name="flags">Its current flag bits.</param>
-    /// <param name="next">Next outer stack level.</param>
-    private sealed class ObjectAddressStack(ObjectAddress obj, int flags, ObjectAddressStack? next)
+    private static void EliminateDuplicateDependencies(List<ObjectAddress> addrs)
     {
-        /// <summary>
-        /// Gets the object being visited.
-        /// </summary>
-        public ObjectAddress Object { get; } = obj;
+        if (addrs.Count <= 1)
+        {
+            return;    // nothing to do
+        }
 
-        /// <summary>
-        /// Gets or sets its current flag bits.
-        /// </summary>
-        public int Flags { get; set; } = flags;
+        // Sort the refs so that duplicates are adjacent; subId sorts unsigned so 0 comes first.
+        addrs.Sort(static (obja, objb) =>
+        {
+            int cmp = obja.classId.CompareTo(objb.classId);
+            if (cmp == 0)
+            {
+                cmp = obja.objectId.CompareTo(objb.objectId);
+            }
 
-        /// <summary>
-        /// Gets the next outer stack level.
-        /// </summary>
-        public ObjectAddressStack? Next { get; } = next;
+            return cmp != 0 ? cmp : ((uint)obja.objectSubId).CompareTo((uint)objb.objectSubId);
+        });
+
+        // Remove dups
+        int prior = 0;
+        for (int oldref = 1; oldref < addrs.Count; oldref++)
+        {
+            ObjectAddress priorobj = addrs[prior];
+            ObjectAddress thisobj = addrs[oldref];
+
+            if (priorobj.classId == thisobj.classId && priorobj.objectId == thisobj.objectId)
+            {
+                if (priorobj.objectSubId == thisobj.objectSubId)
+                {
+                    continue;    // identical, so drop thisobj
+                }
+
+                // If we have a whole-object reference and a reference to a part of the same object, we don't need the
+                // whole-object reference. The whole-object reference will always appear first in the sorted list.
+                if (priorobj.objectSubId == 0)
+                {
+                    // replace whole ref with partial
+                    priorobj.objectSubId = thisobj.objectSubId;
+                    addrs[prior] = priorobj;
+                    continue;
+                }
+            }
+
+            // Not identical, so add thisobj to output set
+            prior++;
+            addrs[prior] = thisobj;
+        }
+
+        addrs.RemoveRange(prior + 1, addrs.Count - prior - 1);
     }
 }

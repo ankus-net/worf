@@ -4,156 +4,6 @@ using Ankus.Postgres;
 namespace Worf;
 
 /// <summary>
-/// The kinds of worf worker.
-/// </summary>
-internal enum WorfWorkerType
-{
-    /// <summary>
-    /// Unused slot.
-    /// </summary>
-    None,
-
-    /// <summary>
-    /// Manager.
-    /// </summary>
-    Manager,
-
-    /// <summary>
-    /// Apply.
-    /// </summary>
-    Apply,
-
-    /// <summary>
-    /// Special type of Apply that synchronizes one table.
-    /// </summary>
-    Sync,
-}
-
-/// <summary>
-/// An apply worker's shared state.
-/// </summary>
-internal struct WorfApplyWorker
-{
-    /// <summary>
-    /// Subscription id for apply worker.
-    /// </summary>
-    public uint SubId;
-
-    /// <summary>
-    /// Is there new synchronization info pending?.
-    /// </summary>
-    public bool SyncPending;
-
-    /// <summary>
-    /// Replay should stop here if defined.
-    /// </summary>
-    public ulong ReplayStopLsn;
-}
-
-/// <summary>
-/// A sync worker's shared state.
-/// </summary>
-internal struct WorfSyncWorker
-{
-    /// <summary>
-    /// Apply worker info, must be first.
-    /// </summary>
-    public WorfApplyWorker Apply;
-
-    /// <summary>
-    /// Name of the schema of table to copy if any.
-    /// </summary>
-    public nameData Nspname;
-
-    /// <summary>
-    /// Name of the table to copy if any.
-    /// </summary>
-    public nameData Relname;
-}
-
-/// <summary>
-/// Type-specific worker info.
-/// </summary>
-[StructLayout(LayoutKind.Explicit)]
-internal struct WorfWorkerInfo
-{
-    /// <summary>
-    /// The apply worker's info.
-    /// </summary>
-    [FieldOffset(0)]
-    public WorfApplyWorker Apply;
-
-    /// <summary>
-    /// The sync worker's info.
-    /// </summary>
-    [FieldOffset(0)]
-    public WorfSyncWorker Sync;
-}
-
-/// <summary>
-/// A worker slot in shared memory.
-/// </summary>
-internal struct WorfWorker
-{
-    /// <summary>
-    /// The worker's type.
-    /// </summary>
-    public WorfWorkerType WorkerType;
-
-    /// <summary>
-    /// Generation counter incremented at each registration.
-    /// </summary>
-    public ushort Generation;
-
-    /// <summary>
-    /// Pointer to proc array. Zero if not running.
-    /// </summary>
-    public nint Proc;
-
-    /// <summary>
-    /// Time at which worker crashed (normally 0).
-    /// </summary>
-    public long CrashedAt;
-
-    /// <summary>
-    /// Database id to connect to.
-    /// </summary>
-    public uint Dboid;
-
-    /// <summary>
-    /// Set by manager before exiting due to missing extension. Prevents supervisor from being woken immediately,
-    /// avoiding rapid restart cycles for databases without worf.
-    /// </summary>
-    public bool SkipSupervisorWakeup;
-
-    /// <summary>
-    /// Type-specific worker info.
-    /// </summary>
-    public WorfWorkerInfo Worker;
-}
-
-/// <summary>
-/// The shared state that the worker slots follow.
-/// </summary>
-internal struct WorfContext
-{
-    /// <summary>
-    /// Supervisor process.
-    /// </summary>
-    public nint Supervisor;
-
-    /// <summary>
-    /// Signal that subscription info have changed.
-    /// </summary>
-    public bool SubscriptionsChanged;
-
-    /// <summary>
-    /// Background workers.
-    /// </summary>
-    public int TotalWorkers;
-}
-
-/// <summary>
 /// worf worker helper functions.
 /// </summary>
 internal static class Worker
@@ -228,6 +78,7 @@ internal static class Worker
             workerShm.Proc = 0;
             workerShm.WorkerType = worker.WorkerType;
             workerShm.SkipSupervisorWakeup = false;
+            workerShm.TerminateRequested = false;
             guard[slot] = workerShm;
         }
 
@@ -337,12 +188,70 @@ internal static class Worker
     /// </summary>
     /// <param name="name">The setting.</param>
     /// <param name="value">The value.</param>
-    internal static unsafe void SetConfigOption(string name, string value)
+    internal static void SetConfigOption(string name, string value) => SetConfigOption(name, value, GucContext.PGC_BACKEND);
+
+    /// <summary>
+    /// Sets a setting for the rest of the process with <c>PGC_S_OVERRIDE</c>, as <c>SetConfigOption</c> does.
+    /// </summary>
+    /// <param name="name">The setting.</param>
+    /// <param name="value">The value.</param>
+    /// <param name="context">The context to set it in.</param>
+    internal static unsafe void SetConfigOption(string name, string value, GucContext context)
     {
         fixed (byte* cname = Worf.ToServerCString(name))
         fixed (byte* cvalue = Worf.ToServerCString(value))
         {
-            NativeMethods.SetConfigOption((sbyte*)cname, (sbyte*)cvalue, GucContext.PGC_BACKEND, GucSource.PGC_S_OVERRIDE);
+            NativeMethods.SetConfigOption((sbyte*)cname, (sbyte*)cvalue, context, GucSource.PGC_S_OVERRIDE);
+        }
+    }
+
+    /// <summary>
+    /// Waits on the process latch for it to be set or for a timeout, then resets it, as an ordinary backend does
+    /// with <c>WaitLatch</c>, and exits when the postmaster has died.
+    /// </summary>
+    /// <param name="timeoutMs">The timeout in milliseconds.</param>
+    internal static void WaitLatch(int timeoutMs)
+    {
+        const int WlLatchSet = 1;
+        const int WlTimeout = 8;
+        const int WlPostmasterDeath = 16;
+        const uint PgWaitExtension = 0x07000000;
+
+        int rc;
+        unsafe
+        {
+            rc = NativeMethods.WaitLatch(NativeGlobals.MyLatch, WlLatchSet | WlTimeout | WlPostmasterDeath, timeoutMs, PgWaitExtension);
+            NativeMethods.ResetLatch(NativeGlobals.MyLatch);
+        }
+
+        // emergency bailout if postmaster has died
+        if ((rc & WlPostmasterDeath) != 0)
+        {
+            ProcExit(1);
+        }
+    }
+
+    /// <summary>
+    /// Exits the process with an exit code, as <c>proc_exit</c> does.
+    /// </summary>
+    /// <param name="code">The exit code.</param>
+    internal static void ProcExit(int code)
+    {
+        unsafe
+        {
+            NativeMethods.proc_exit(code);
+        }
+    }
+
+    /// <summary>
+    /// Gets a copy of this process's worker slot, as <c>MyPGLogicalWorker</c> points to it.
+    /// </summary>
+    internal static WorfWorker MyWorker
+    {
+        get
+        {
+            using PgLwLockShareGuard<WorfContext, WorfWorker> guard = WorfCtx.Share();
+            return guard[MyWorfWorker];
         }
     }
 
@@ -424,16 +333,21 @@ internal static class Worker
     /// <param name="workers">The worker slots.</param>
     /// <param name="dboid">The database.</param>
     /// <param name="subscriberid">The subscription.</param>
-    /// <param name="nspname">The table's schema.</param>
-    /// <param name="relname">The table's name.</param>
+    /// <param name="nspname">The table's schema, in the server encoding.</param>
+    /// <param name="relname">The table's name, in the server encoding.</param>
     /// <returns>The sync worker's slot, or -1.</returns>
-    internal static int SyncFind(ReadOnlySpan<WorfWorker> workers, uint dboid, uint subscriberid, string nspname, string relname)
+    /// <remarks>
+    /// The names are compared as the server's bytes, because no backend function can run while the slots are
+    /// borrowed.
+    /// </remarks>
+    internal static int SyncFind(ReadOnlySpan<WorfWorker> workers, uint dboid, uint subscriberid, byte[] nspname, byte[] relname)
     {
         for (int i = 0; i < workers.Length; i++)
         {
             WorfWorker w = workers[i];
             if (w.WorkerType == WorfWorkerType.Sync && dboid == w.Dboid && subscriberid == w.Worker.Apply.SubId &&
-                NameStr(w.Worker.Sync.Nspname) == nspname && NameStr(w.Worker.Sync.Relname) == relname)
+                NameBytes(w.Worker.Sync.Nspname).SequenceEqual(nspname) &&
+                NameBytes(w.Worker.Sync.Relname).SequenceEqual(relname))
             {
                 return i;
             }
@@ -482,7 +396,8 @@ internal static class Worker
     /// Enqueue signal for supervisor/manager at COMMIT.
     /// </summary>
     /// <param name="subid">The subscription whose apply worker to signal, or zero.</param>
-    internal static void SubscriptionChanged(uint subid)
+    /// <param name="kill">Whether to stop the apply worker.</param>
+    internal static void SubscriptionChanged(uint subid, bool kill)
     {
         if (!s_xacthookSignalWorkers)
         {
@@ -496,7 +411,7 @@ internal static class Worker
 
         if (subid != 0)
         {
-            s_signalWorkers.Add(new SignalWorkerItem(subid));
+            s_signalWorkers.Add(new SignalWorkerItem(subid, kill));
         }
 
         s_xacthookSignalWorkers = true;
@@ -521,11 +436,18 @@ internal static class Worker
     /// </summary>
     /// <param name="name">The name.</param>
     /// <returns>The text.</returns>
-    internal static string NameStr(in nameData name)
+    internal static string NameStr(in nameData name) => Worf.FromServer(NameBytes(name));
+
+    /// <summary>
+    /// Gets a name's bytes in the server encoding, up to its terminating zero.
+    /// </summary>
+    /// <param name="name">The name.</param>
+    /// <returns>The bytes.</returns>
+    internal static ReadOnlySpan<byte> NameBytes(in nameData name)
     {
         ReadOnlySpan<byte> bytes = MemoryMarshal.AsBytes((ReadOnlySpan<sbyte>)name.data);
         int length = bytes.IndexOf((byte)0);
-        return Worf.FromServer(length < 0 ? bytes : bytes[..length]);
+        return length < 0 ? bytes : bytes[..length];
     }
 
     /// <summary>
@@ -554,6 +476,7 @@ internal static class Worker
             CrashedAt = 0,
             Dboid = 0,
             SkipSupervisorWakeup = false,
+            TerminateRequested = false,
         };
         worker.Worker.Sync.Apply.SubId = 0;
         worker.Worker.Sync.Apply.SyncPending = false;
@@ -591,7 +514,7 @@ internal static class Worker
         {
             PgInterrupts.Check();
 
-            if (!PgBackgroundWorker.CanContinue)
+            if (GotSigterm)
             {
                 PgLog.Debug1("worf supervisor exiting on SIGTERM");
                 throw new OperationCanceledException("The worf worker is stopping.");
@@ -737,35 +660,38 @@ internal static class Worker
         List<nint> latches = [];
         using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = WorfCtx.Exclusive())
         {
-            guard.Mutate((ref WorfContext ctx, Span<WorfWorker> workers) =>
+            foreach (SignalWorkerItem item in s_signalWorkers)
             {
-                foreach (SignalWorkerItem item in s_signalWorkers)
+                int w = guard.Read((in WorfContext _, ReadOnlySpan<WorfWorker> workers) => ApplyFind(workers, myDatabaseId, item.SubId));
+                if (item.Kill)
                 {
-                    int w = ApplyFind(workers, myDatabaseId, item.SubId);
-                    if (WorkerRunning(workers, w))
-                    {
-                        workers[w].Worker.Apply.SyncPending = true;
-                        latches.Add(workers[w].Proc);
-                    }
+                    WorkerKill(guard, w);
                 }
-
-                ctx.SubscriptionsChanged = true;
-
-                // Signal the manager worker, if there's one
-                int manager = ManagerFind(workers, myDatabaseId);
-                if (WorkerRunning(workers, manager))
+                else if (w >= 0 && guard[w].Proc != 0)
                 {
-                    latches.Add(workers[manager].Proc);
+                    WorfWorker worker = guard[w];
+                    worker.Worker.Apply.SyncPending = true;
+                    guard[w] = worker;
+                    latches.Add(worker.Proc);
                 }
+            }
 
-                // and signal the supervisor, for good measure
-                if (ctx.Supervisor != 0)
-                {
-                    latches.Add(ctx.Supervisor);
-                }
+            WorfContext ctx = guard.Header;
+            ctx.SubscriptionsChanged = true;
+            guard.Header = ctx;
 
-                return true;
-            });
+            // Signal the manager worker, if there's one
+            int manager = guard.Read((in WorfContext _, ReadOnlySpan<WorfWorker> workers) => ManagerFind(workers, myDatabaseId));
+            if (manager >= 0 && guard[manager].Proc != 0)
+            {
+                latches.Add(guard[manager].Proc);
+            }
+
+            // and signal the supervisor, for good measure
+            if (ctx.Supervisor != 0)
+            {
+                latches.Add(ctx.Supervisor);
+            }
 
             foreach (nint proc in latches)
             {
@@ -778,8 +704,53 @@ internal static class Worker
     }
 
     /// <summary>
-    /// A worker to signal when the transaction commits.
+    /// Asks a running worker to stop. The caller holds the lock exclusively.
     /// </summary>
-    /// <param name="SubId">The subscription.</param>
-    private readonly record struct SignalWorkerItem(uint SubId);
+    /// <param name="guard">The caller's lock.</param>
+    /// <param name="slot">The worker's slot, or -1.</param>
+    internal static void WorkerKill(PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard, int slot)
+    {
+        if (slot < 0)
+        {
+            return;
+        }
+
+        WorfWorker worker = guard[slot];
+        if (worker.Proc != 0)
+        {
+            int pid;
+            unsafe
+            {
+                pid = ((PGPROC*)worker.Proc)->pid;
+            }
+
+            PgLog.Debug2($"killing worf {WorkerTypeName(worker.WorkerType)} worker [{pid}] at slot {slot}");
+            worker.TerminateRequested = true;
+            guard[slot] = worker;
+            SetProcLatch(worker.Proc);
+        }
+    }
+
+    /// <summary>
+    /// Gets whether this worker has been asked to stop, by another process or by PostgreSQL.
+    /// </summary>
+    internal static bool GotSigterm
+    {
+        get
+        {
+            if (!PgBackgroundWorker.CanContinue)
+            {
+                return true;
+            }
+
+            int slot = MyWorfWorker;
+            if (slot < 0)
+            {
+                return false;
+            }
+
+            using PgLwLockShareGuard<WorfContext, WorfWorker> guard = WorfCtx.Share();
+            return guard[slot].TerminateRequested;
+        }
+    }
 }
