@@ -160,17 +160,17 @@ A step is done when its tests pass in CI on every PostgreSQL version and
 platform. Check the step off here and link the CI run that proved it.
 
 - [x] **1. Catalog and nodes.** Settings, the `worf` schema and tables, node and interface functions, and version and info functions. Tests: `preseed`, `infofuncs`. Proved by [CI run 40045197753](https://github.com/ankus-net/worf/actions/runs/40045197753).
-- [ ] **2. One table end to end.** Tests: `init_fail`, `init`, `preseed_check`, `basic`. This step covers:
+- [x] **2. One table end to end.** Tests: `init_fail`, `init`, `preseed_check`, `basic`. Proved by [CI run 40108211458](https://github.com/ankus-net/worf/actions/runs/40108211458). This step covers:
   - shared memory, and the supervisor, manager and apply workers;
   - the output plugin and native protocol;
   - `create_subscription` with structure and data sync;
   - heap apply of inserts, updates and deletes;
   - origin tracking.
-- [ ] **3. Apply and conflicts.** Tests: `extended`, `conflict_secondary_unique`, `conflict_history`, `toasted`, `primary_key`, `foreign_key`, `copy`, `triggers`, `matview`. This step covers:
+- [x] **3. Apply and conflicts.** Tests: `extended`, `conflict_secondary_unique`, `conflict_history`, `toasted`, `primary_key`, `foreign_key`, `copy`, `triggers`, `matview`. Proved by [CI run 40108211458](https://github.com/ankus-net/worf/actions/runs/40108211458). This step covers:
   - every conflict resolution and conflict history;
   - SPI apply and batch inserts;
   - TOAST, triggers, foreign keys, primary key changes, COPY and materialized views.
-- [ ] **4. Replication sets, DDL and sequences.** Tests: `replication_set`, `add_table`, `interfaces`, `functions`, `sequence`, `row_filter`, `row_filter_sampling`, `att_list`, `column_filter`, plus a test that reads the JSON protocol. This step covers:
+- [x] **4. Replication sets, DDL and sequences.** Tests: `replication_set`, `add_table`, `interfaces`, `functions`, `sequence`, `row_filter`, `row_filter_sampling`, `att_list`, `column_filter`, plus a test that reads the JSON protocol. Proved by [CI run 40108211458](https://github.com/ankus-net/worf/actions/runs/40108211458). This step covers:
   - replication set management, row filters and column lists;
   - adding and removing tables, with resynchronization;
   - the queue, `replicate_ddl_command` and TRUNCATE;
