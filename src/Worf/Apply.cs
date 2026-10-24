@@ -1520,8 +1520,11 @@ internal static unsafe partial class Apply
                         }
                     }
 
+                    // The sync worker's catch-up can outlast wal_sender_timeout, so keep the walsender from dropping
+                    // this connection, which nothing reads from meanwhile.
                     if (caughtUp &&
-                        Sync.WaitForSyncStatusChange(subid, sync.Nspname, sync.Relname, Sync.SyncStatusSyncdone, out ulong statuslsn))
+                        Sync.WaitForSyncStatusChange(subid, sync.Nspname, sync.Relname, Sync.SyncStatusSyncdone, out ulong statuslsn,
+                            static () => SendFeedback(s_applyconn!, s_lastReceived, Worker.GetCurrentTimestamp(), true)))
                     {
                         sync.Statuslsn = statuslsn;
                         sync.Status = Sync.SyncStatusSyncdone;

@@ -766,8 +766,10 @@ internal static class Sync
     /// <param name="relname">The table's name.</param>
     /// <param name="desiredState">The status to wait for.</param>
     /// <param name="lsn">The position the status was reached at.</param>
+    /// <param name="keepalive">Called every second while waiting, or null to wait as long as the C does.</param>
     /// <returns>Whether the table reached the status.</returns>
-    internal static bool WaitForSyncStatusChange(uint subid, string nspname, string relname, char desiredState, out ulong lsn)
+    internal static bool WaitForSyncStatusChange(uint subid, string nspname, string relname, char desiredState, out ulong lsn,
+        Action? keepalive = null)
     {
         bool ret = false;
         ulong statuslsn = 0;
@@ -822,9 +824,12 @@ internal static class Sync
                 break;
             }
 
+            keepalive?.Invoke();
+
             // Wait for table sync progress. On Windows, use a shorter interval for faster detection of worker
             // failures.
-            if (!PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(OperatingSystem.IsWindows() ? 10000 : 60000)) &&
+            int timeout = keepalive is not null ? 1000 : OperatingSystem.IsWindows() ? 10000 : 60000;
+            if (!PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(timeout)) &&
                 !PgBackgroundWorker.CanContinue)
             {
                 break;

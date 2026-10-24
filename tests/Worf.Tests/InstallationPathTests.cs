@@ -76,7 +76,9 @@ public sealed class InstallationPathTests
 
     /// <summary>
     /// Copies the installation under <c>Program Files</c>: the system's folder on Windows when it's writable, as on
-    /// the CI runners, and otherwise one in the temporary directory.
+    /// the CI runners, and otherwise one in the temporary directory. Staging repeats the installation's own path, and
+    /// each test cluster stages the copy again under the temporary directory, so a short name keeps its files within
+    /// Windows' 260-character path limit.
     /// </summary>
     private static async Task<PostgresTestInstallation> StageAsync(PostgresInstallation installation, CancellationToken cancellationToken)
     {
@@ -85,7 +87,7 @@ public sealed class InstallationPathTests
             try
             {
                 return await PostgresTestInstallation.StageAsync(installation,
-                    Path.Join(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), $"worf-tests-{Guid.NewGuid():N}"),
+                    Path.Join(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), $"worf-{Guid.NewGuid():N}"[..13]),
                     cancellationToken);
             }
             catch (UnauthorizedAccessException)
@@ -95,6 +97,6 @@ public sealed class InstallationPathTests
         }
 
         return await PostgresTestInstallation.StageAsync(installation,
-            Path.Join(Path.GetTempPath(), $"worf-tests-{Guid.NewGuid():N}", "Program Files"), cancellationToken);
+            Path.Join(Path.GetTempPath(), $"worf-{Guid.NewGuid():N}"[..13], "Program Files"), cancellationToken);
     }
 }
