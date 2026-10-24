@@ -14,6 +14,9 @@ using Ankus.Postgres;
 
     	deptype "char" NOT NULL
     ) WITH (user_catalog_table=true);
+
+    CREATE INDEX depend_depender_index ON worf.depend (classid, objid, objsubid);
+    CREATE INDEX depend_reference_index ON worf.depend (refclassid, refobjid, refobjsubid);
     """)]
 
 namespace Worf;
@@ -79,6 +82,10 @@ internal static class Dependency
     private const int RowExclusiveLock = 3;
 
     private const string CatalogDepend = "depend";
+
+    private const string CatalogDependDependerIndex = "depend_depender_index";
+
+    private const string CatalogDependReferenceIndex = "depend_reference_index";
 
     private const int NattsDepend = 7;
     private const short AnumDependClassid = 1;
@@ -741,7 +748,7 @@ internal static class Dependency
         ScanKeyData* key = stackalloc ScanKeyData[3];
         int nkeys = InitDependKeys(key, AnumDependClassid, AnumDependObjid, AnumDependObjsubid, obj);
 
-        SysScanDescData* scan = NativeMethods.systable_beginscan(depRel, 0, false, null, nkeys, key);
+        SysScanDescData* scan = NativeMethods.systable_beginscan(depRel, GetDependIndexOid(true), true, null, nkeys, key);
 
         HeapTupleData* tup;
         while ((tup = NativeMethods.systable_getnext(scan)) is not null)
@@ -843,7 +850,7 @@ internal static class Dependency
             ? InitDependKeys(key, AnumDependClassid, AnumDependObjid, AnumDependObjsubid, obj)
             : InitDependKeys(key, AnumDependRefclassid, AnumDependRefobjid, AnumDependRefobjsubid, obj);
 
-        SysScanDescData* scan = NativeMethods.systable_beginscan(depRel, 0, false, null, nkeys, key);
+        SysScanDescData* scan = NativeMethods.systable_beginscan(depRel, GetDependIndexOid(depender), true, null, nkeys, key);
 
         // The other end of each dependency.
         short classid = depender ? AnumDependRefclassid : AnumDependClassid;
@@ -918,6 +925,14 @@ internal static class Dependency
     /// Gets the oid of the dependency catalog.
     /// </summary>
     private static uint GetDependRelOid() => Worf.GetWorfTableOid(CatalogDepend);
+
+    /// <summary>
+    /// Gets the oid of the dependency catalog's index on its depender or referenced columns. pglogical scans the
+    /// whole catalog instead, which makes dropping many replicated tables in one transaction take quadratic time.
+    /// </summary>
+    /// <param name="depender">Whether to get the index on the depender columns.</param>
+    private static uint GetDependIndexOid(bool depender) =>
+        Worf.GetWorfTableOid(depender ? CatalogDependDependerIndex : CatalogDependReferenceIndex);
 
     private static int Atoi(string? value)
     {

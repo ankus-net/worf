@@ -276,6 +276,12 @@ internal static unsafe partial class Apply
                 portal = NativeMethods.CreatePortal((sbyte*)name, true, true);
             }
 
+            // Run the statement under the current resource owner, as SPI does. Dropping a portal hands the locks
+            // its own owner took to the transaction, and once a statement took more than 15 that scans every lock
+            // the transaction holds, so a transaction that runs many DDL statements would take quadratic time.
+            NativeMethods.ResourceOwnerDelete(portal->resowner);
+            portal->resowner = NativeGlobals.CurrentResourceOwner;
+
             NativeMethods.PortalDefineQuery(portal, null, query, commandTag, plantreeList, null);
             NativeMethods.PortalStart(portal, null, 0, null);
 
@@ -288,6 +294,15 @@ internal static unsafe partial class Apply
 #endif
             receiver->rDestroy.Invoke(receiver);
 
+            // Dropping the portal would release and delete its resource owner, so take the current one back, along
+            // with the snapshot that a utility statement returning rows registers on it.
+            if (portal->holdSnapshot is not null)
+            {
+                NativeMethods.UnregisterSnapshotFromOwner(portal->holdSnapshot, portal->resowner);
+                portal->holdSnapshot = null;
+            }
+
+            portal->resowner = null;
             NativeMethods.PortalDrop(portal, false);
 
             NativeMethods.CommandCounterIncrement();

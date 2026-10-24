@@ -9,6 +9,12 @@ internal static partial class RelCache
 {
     private static Dictionary<uint, WorfRelation>? s_relationHash;
 
+    /// <summary>
+    /// The entries that map to each local relation. pglogical scans every entry on each invalidation instead, which
+    /// makes a transaction that changes many replicated tables take quadratic time.
+    /// </summary>
+    private static readonly Dictionary<uint, List<WorfRelation>> s_relationsByReloid = [];
+
     [PgNativeCallback(nameof(RelcacheInvalidateCallback))]
 #if ANKUS_PG13 || ANKUS_PG14 || ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
     private static partial RelcacheCallbackFunction InvalidateCallback { get; }
@@ -45,6 +51,13 @@ internal static partial class RelCache
             }
 
             entry.Reloid = entry.Rel->rd_id;
+            if (!s_relationsByReloid.TryGetValue(entry.Reloid, out List<WorfRelation>? entries))
+            {
+                entries = [];
+                s_relationsByReloid.Add(entry.Reloid, entries);
+            }
+
+            entries.Add(entry);
 
             // Cache trigger info.
             entry.HasTriggers = false;
@@ -83,6 +96,11 @@ internal static partial class RelCache
     internal static void RelationCacheUpdate(uint remoteid, string schemaname, string relname, string[] attnames)
     {
         Dictionary<uint, WorfRelation> hash = s_relationHash ??= RelcacheInit();
+
+        if (hash.TryGetValue(remoteid, out WorfRelation? old) && s_relationsByReloid.TryGetValue(old.Reloid, out List<WorfRelation>? entries))
+        {
+            _ = entries.Remove(old);
+        }
 
         // Make cached copy of the data
         hash[remoteid] = new WorfRelation
@@ -129,13 +147,25 @@ internal static partial class RelCache
             return;
         }
 
-        foreach (WorfRelation entry in s_relationHash.Values)
+        if (reloid != 0)
         {
-            // invalidate all cache entries, or the entries of the given relation
-            if (reloid == 0 || entry.Reloid == reloid)
+            if (s_relationsByReloid.Remove(reloid, out List<WorfRelation>? entries))
+            {
+                foreach (WorfRelation entry in entries)
+                {
+                    entry.Reloid = 0;
+                }
+            }
+        }
+        else
+        {
+            // invalidate all cache entries
+            foreach (WorfRelation entry in s_relationHash.Values)
             {
                 entry.Reloid = 0;
             }
+
+            s_relationsByReloid.Clear();
         }
     }
 
