@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
@@ -173,6 +174,7 @@ internal static unsafe partial class Apply
 
                 // Wait for data, the latch or the timeout.
                 PgReplicationReceiveStatus status = streamConn.Receive(TimeSpan.FromMilliseconds(1000), out ReadOnlySpan<byte> copybuf);
+                long feedbackAt = Stopwatch.GetTimestamp();
 
                 while (status == PgReplicationReceiveStatus.Message)
                 {
@@ -182,6 +184,14 @@ internal static unsafe partial class Apply
                     }
 
                     HandleCopyData(copybuf.ToArray(), inTransaction: false);
+
+                    // While apply is behind, the walsender's request for a reply waits behind the changes still to be
+                    // applied, so report progress every second rather than only once caught up.
+                    if (Stopwatch.GetElapsedTime(feedbackAt) >= TimeSpan.FromSeconds(1))
+                    {
+                        SendFeedback(streamConn, s_lastReceived, Worker.GetCurrentTimestamp(), false);
+                        feedbackAt = Stopwatch.GetTimestamp();
+                    }
 
                     status = streamConn.Receive(TimeSpan.Zero, out copybuf);
                 }
