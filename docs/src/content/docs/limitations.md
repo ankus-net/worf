@@ -63,10 +63,6 @@ subscriber database(s) remain compatible is the responsibility of the user.
 worf provides the `worf.replicate_ddl_command` function to allow DDL
 to be run on the provider and subscriber at a consistent point.
 
-If you need DDL replication, you can look at EnterpriseDB's [Postgres
-Distributed](https://www.enterprisedb.com/docs/pgd/latest/overview/)
-product which is built on worf.
-
 ## No replication queue flush
 
 There's no support for freezing transactions on the master and waiting until
