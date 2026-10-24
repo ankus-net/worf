@@ -2,6 +2,7 @@
 // from pglogical's regress-postgresql.conf. Usage: dotnet run eng/regress.cs -- --pg <major> [filter]
 
 using System.Diagnostics;
+using System.Globalization;
 
 string? major = null;
 string? filter = null;
@@ -14,7 +15,7 @@ for (int index = 0; index < args.Length; index++)
             major = args[++index];
             break;
         case "--repeat":
-            repeat = int.Parse(args[++index], System.Globalization.CultureInfo.InvariantCulture);
+            repeat = int.Parse(args[++index], CultureInfo.InvariantCulture);
             break;
         default:
             filter = args[index];
@@ -70,7 +71,7 @@ List<string> settings =
 ];
 
 // Current PostgreSQL releases load only the output plugins this setting lists; PostgreSQL 13 has no such setting.
-if (int.Parse(major, System.Globalization.CultureInfo.InvariantCulture) >= 14)
+if (int.Parse(major, CultureInfo.InvariantCulture) >= 14)
 {
     settings.Add("output_plugin_libraries=pgoutput, test_decoding, worf");
 }
@@ -78,7 +79,7 @@ if (int.Parse(major, System.Globalization.CultureInfo.InvariantCulture) >= 14)
 List<string> arguments =
 [
     "ankus", "regress", "--pg", major, "--home", home, "--project", Path.Join(root, "src", "Worf", "Worf.csproj"),
-    "--database", "regression", "--psql-verbosity", "default", "--repeat", repeat.ToString(System.Globalization.CultureInfo.InvariantCulture),
+    "--database", "regression", "--psql-verbosity", "default", "--repeat", repeat.ToString(CultureInfo.InvariantCulture),
 ];
 foreach (string setting in settings)
 {
