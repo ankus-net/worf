@@ -111,15 +111,14 @@ string suite = Path.Join(root, "src", "Worf", "pg_regress");
 List<string> added = [];
 if (hugeTx)
 {
-    foreach (string sql in Directory.GetFiles(Path.Join(suite, "huge_tx", "sql"), "*.sql").Order(StringComparer.Ordinal))
+    foreach (string directory in (string[])["sql", "expected"])
     {
-        string name = Path.GetFileNameWithoutExtension(sql);
-        string expected = Path.Join(suite, "huge_tx", "expected", name + ".out");
-        string sqlCopy = Path.Join(suite, "sql", "29a_" + name + ".sql");
-        string expectedCopy = Path.Join(suite, "expected", "29a_" + name + ".out");
-        File.Copy(sql, sqlCopy, overwrite: true);
-        File.Copy(expected, expectedCopy, overwrite: true);
-        added.AddRange([sqlCopy, expectedCopy]);
+        foreach (string file in Directory.GetFiles(Path.Join(suite, "huge_tx", directory)))
+        {
+            string copy = Path.Join(suite, directory, "29a_" + Path.GetFileName(file));
+            File.Copy(file, copy, overwrite: true);
+            added.Add(copy);
+        }
     }
 }
 
