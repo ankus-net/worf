@@ -53,8 +53,9 @@ jobs:
         env:
           HOMEBREW_NO_AUTO_UPDATE: '1'
         run: |
-          # The runner image links llvm@18, which would leave llvm@20 unlinked with a warning.
-          if brew list --versions llvm@18 > /dev/null; then brew unlink llvm@18; fi
+          # Homebrew links a versioned LLVM only when no other version is installed; with the runner image's
+          # llvm@18 present it leaves llvm@20 unlinked and warns.
+          if brew list --versions llvm@18 > /dev/null; then brew uninstall --ignore-dependencies llvm@18; fi
           brew install llvm@20 icu4c pkg-config
           echo "$(brew --prefix llvm@20)/bin" >> "$GITHUB_PATH"
 
