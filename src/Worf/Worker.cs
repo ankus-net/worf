@@ -134,6 +134,13 @@ internal static class Worker
             WaitForWorkerStartup(slot, generation, bgwHandle);
         }
 
+        // Waiting for startup resets the latch, which may have been set for the caller, as when the new worker has
+        // already crashed. Set it again so the caller's wait loop looks again instead of sleeping through it.
+        unsafe
+        {
+            NativeMethods.SetLatch(NativeGlobals.MyLatch);
+        }
+
         return slot;
     }
 
