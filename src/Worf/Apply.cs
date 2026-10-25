@@ -46,6 +46,7 @@ internal static unsafe partial class Apply
     private static ulong s_lastRecvpos;
     private static ulong s_lastWritepos;
     private static ulong s_lastFlushpos;
+    private static long s_lastSendTime;
 
     /// <summary>
     /// Gets or sets the subscription this worker applies.
@@ -1345,6 +1346,16 @@ internal static unsafe partial class Apply
                     break;
                 }
 
+                // The walsender drops a connection it hears nothing from for wal_sender_timeout, and the keepalive it
+                // sends to ask for a reply waits behind everything already sent, which a large transaction can take
+                // longer than that to apply. So report progress meanwhile, as often as a walreceiver does.
+                long now = Worker.GetCurrentTimestamp();
+                if (NativeGlobals.wal_receiver_status_interval > 0 &&
+                    now - s_lastSendTime >= NativeGlobals.wal_receiver_status_interval * 1000000L)
+                {
+                    _ = SendFeedback(conn, s_lastReceived, now, true);
+                }
+
                 // Cleanup the memory. pglogical does this after each read from the socket, which libpq empties before
                 // reading again, so a busy stream can't keep the context growing; this reads one message at a time, so
                 // it cleans up after each.
@@ -1450,6 +1461,7 @@ internal static unsafe partial class Apply
         PgLog.Debug2($"sending feedback (force {(force ? 1 : 0)}) to recv {Worf.FormatLsn(recvpos)}, write {Worf.FormatLsn(writepos)}, flush {Worf.FormatLsn(flushpos)}");
 
         conn.Send(replyMessage);
+        s_lastSendTime = now;
 
         if (recvpos > s_lastRecvpos)
         {
