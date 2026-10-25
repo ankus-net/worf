@@ -1336,14 +1336,8 @@ internal static unsafe partial class Apply
             DispatchChange(action, &s, true);
         }
 
-        // How often to report progress while applying, as a walreceiver does. The setting is read by name because
-        // NativeGlobals can't reach it on Windows before PostgreSQL 15: https://github.com/ankus-net/ankus/issues/116
-        long statusInterval;
-        fixed (byte* name = Worf.ToServerCString("wal_receiver_status_interval"))
-        {
-            statusInterval = long.Parse(Worf.FromServer(NativeMethods.GetConfigOption((sbyte*)name, false, false)),
-                CultureInfo.InvariantCulture) * 1000000L;
-        }
+        long statusInterval = StatusInterval();
+        bool reported = false;
 
         PgReplicationConnection conn = s_applyconn!;
         while (s_commitEndLsn is null)
@@ -1372,6 +1366,7 @@ internal static unsafe partial class Apply
                 if (statusInterval > 0 && now - s_lastSendTime >= statusInterval)
                 {
                     _ = SendFeedback(conn, s_lastReceived, now, true);
+                    reported = true;
                 }
 
                 // Cleanup the memory. pglogical does this after each read from the socket, which libpq empties before
@@ -1395,6 +1390,13 @@ internal static unsafe partial class Apply
                 // Cleanup the memory.
                 NativeMethods.MemoryContextReset(NativeGlobals.MessageContext);
             }
+        }
+
+        // Committing a transaction this large can take a while too, as when it dropped many tables, and nothing can be
+        // reported meanwhile, so give the commit all of wal_sender_timeout.
+        if (reported)
+        {
+            _ = SendFeedback(conn, s_lastReceived, Worker.GetCurrentTimestamp(), true);
         }
     }
 
@@ -1435,6 +1437,19 @@ internal static unsafe partial class Apply
     }
 
     /// <summary>
+    /// Gets how often to report progress, as a walreceiver does, in microseconds. The setting is read by name because
+    /// NativeGlobals can't reach it on Windows before PostgreSQL 15: https://github.com/ankus-net/ankus/issues/116
+    /// </summary>
+    private static long StatusInterval()
+    {
+        fixed (byte* name = Worf.ToServerCString("wal_receiver_status_interval"))
+        {
+            return long.Parse(Worf.FromServer(NativeMethods.GetConfigOption((sbyte*)name, false, false)),
+                CultureInfo.InvariantCulture) * 1000000L;
+        }
+    }
+
+    /// <summary>
     /// Send a Standby Status Update message to server.
     /// </summary>
     private static bool SendFeedback(PgReplicationConnection conn, ulong recvpos, long now, bool force)
@@ -1462,10 +1477,16 @@ internal static unsafe partial class Apply
             flushpos = s_lastFlushpos;
         }
 
-        // if we've already reported everything we're good
+        // if we've already reported everything we're good, unless nothing was reported for wal_receiver_status_interval.
+        // The walsender drops a connection it hears nothing from for wal_sender_timeout, and while one transaction's
+        // decoding keeps it busy that long it can't ask for a reply, so report anyway, as a walreceiver does.
         if (!force && writepos == s_lastWritepos && flushpos == s_lastFlushpos)
         {
-            return true;
+            long statusInterval = StatusInterval();
+            if (statusInterval <= 0 || now - s_lastSendTime < statusInterval)
+            {
+                return true;
+            }
         }
 
         Span<byte> replyMessage = stackalloc byte[1 + 8 + 8 + 8 + 8 + 1];
