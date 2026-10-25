@@ -3,9 +3,6 @@ using Ankus.Postgres;
 
 namespace Worf;
 
-// The first separator in each column list is a space rather than nothing, which ANKUS044 rejects;
-// https://github.com/ankus-net/ankus/issues/109
-
 /// <summary>
 /// worf apply functions using SPI.
 /// </summary>
@@ -54,7 +51,7 @@ internal static unsafe class ApplySpi
                 continue;
             }
 
-            cmd.Append(narg > 0 ? ", " : " ").Append(Spi.QuoteIdentifier(AttName(attr)));
+            cmd.Append(narg > 0 ? ", " : "").Append(Spi.QuoteIdentifier(AttName(attr)));
             narg++;
         }
 
@@ -74,7 +71,7 @@ internal static unsafe class ApplySpi
                 continue;
             }
 
-            cmd.Append(narg > 0 ? ", " : " ").Append(Spi.ParameterReference(narg + 1));
+            cmd.Append(narg > 0 ? ", " : "").Append(Spi.ParameterReference(narg + 1));
             args.Add(Arg(attr, newtup, att));
             narg++;
         }
@@ -119,7 +116,7 @@ internal static unsafe class ApplySpi
                 continue;
             }
 
-            cmd.Append(narg > 0 ? ", " : " ").Append(Spi.QuoteIdentifier(AttName(attr))).Append(" = ")
+            cmd.Append(narg > 0 ? ", " : "").Append(Spi.QuoteIdentifier(AttName(attr))).Append(" = ")
                 .Append(Spi.ParameterReference(narg + 1));
             args.Add(Arg(attr, newtup, att));
             narg++;
