@@ -1327,7 +1327,7 @@ internal static unsafe partial class Apply
         }
 
         // How often to report progress while applying, as a walreceiver does. The setting is read by name because
-        // PostgreSQL doesn't export it to extensions on Windows before 15.
+        // NativeGlobals can't reach it on Windows before PostgreSQL 15: https://github.com/ankus-net/ankus/issues/116
         long statusInterval;
         fixed (byte* name = Worf.ToServerCString("wal_receiver_status_interval"))
         {
