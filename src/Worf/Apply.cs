@@ -140,6 +140,16 @@ internal static unsafe partial class Apply
             // any of the results.
             _ = PgBackgroundWorker.RunTransaction(() => Worf.IdentifySystem(streamConn));
 
+            // The walsender of an apply worker that has just exited, as when the subscription's interface changes,
+            // can hold the slot a moment longer. Wait for it, as the sync worker's cleanup does, rather than failing
+            // and being restarted seconds later. A slot that stays busy fails below as before.
+            long deadline = Worker.GetCurrentTimestamp() + 5000000L;
+            while (!Worker.GotSigterm && Worker.GetCurrentTimestamp() < deadline &&
+                PgBackgroundWorker.RunTransaction(() => Rpc.RemoteSlotActive(streamConn, sub.SlotName)))
+            {
+                _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(50));
+            }
+
             Worf.StartReplication(streamConn, sub.SlotName, originStartpos, origins, repsets, null, sub.ForceTextTransfer);
 
             ApplyWork(streamConn);
