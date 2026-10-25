@@ -286,7 +286,7 @@ internal static class OutputConfig
                         throw new PgException(PgSqlStates.InternalError, $"Could not parse replication set name list {val}");
                     }
 
-                    data.ReplicationSets = OutputPlugin.ReplicationSetsByName(data.LocalNodeId, replicationSetNames);
+                    data.ReplicationSets = ReplicationSet.GetReplicationSets(data.LocalNodeId, replicationSetNames, false);
                     break;
                 }
 

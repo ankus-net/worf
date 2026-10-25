@@ -143,7 +143,8 @@ internal static unsafe partial class OutputPlugin
                 startedTx = true;
             }
 
-            data.LocalNodeId = LocalNodeId();
+            WorfLocalNode node = WorfNode.GetLocalNode(false, false)!;
+            data.LocalNodeId = node.Node.Id;
 
             // Ideally we'd send the startup message immediately. That way it'd arrive before any error we emit if we
             // see incompatible options sent by the client here.
@@ -767,69 +768,6 @@ internal static unsafe partial class OutputPlugin
     }
 
     private static WorfOutputData Data(LogicalDecodingContext* ctx) => s_outputData[(nint)ctx];
-
-    /// <summary>
-    /// Finds the local node, as <c>get_local_node</c> does for the output plugin.
-    /// </summary>
-    private static uint LocalNodeId()
-    {
-        RangeVar* rv = NativeMethods.makeRangeVar(Worf.PStrDup(Worf.ExtensionName), Worf.PStrDup("local_node"), -1);
-        uint relid = NativeMethods.RangeVarGetRelidExtended(rv, (int)PgLockMode.AccessShare, 1 /* RVR_MISSING_OK */, default, null);
-        if (relid == 0)
-        {
-            throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState, "local worf node not found");
-        }
-
-        RelationData* rel = NativeMethods.table_open(relid, (int)PgLockMode.None);
-        SysScanDescData* scan = NativeMethods.systable_beginscan(rel, 0, true, null, 0, null);
-        HeapTupleData* tuple = NativeMethods.systable_getnext(scan);
-        if (tuple is null)
-        {
-            throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState, "local worf node not found");
-        }
-
-        bool isnull;
-        uint nodeid = (uint)NativeMethods.heap_getattr(tuple, 1, rel->rd_att, &isnull);
-
-        NativeMethods.systable_endscan(scan);
-        NativeMethods.table_close(rel, (int)PgLockMode.None);
-
-        return nodeid;
-    }
-
-    /// <summary>
-    /// Finds the named replication sets of a node, as <c>get_replication_sets</c> does for the output plugin.
-    /// </summary>
-    internal static List<WorfRepSet> ReplicationSetsByName(uint nodeid, List<string> replicationSetNames)
-    {
-        List<WorfRepSet> nodeSets = [];
-        RangeVar* rv = NativeMethods.makeRangeVar(Worf.PStrDup(Worf.ExtensionName), Worf.PStrDup("replication_set"), -1);
-        RelationData* rel = NativeMethods.table_openrv(rv, (int)PgLockMode.RowExclusive);
-        SysScanDescData* scan = NativeMethods.systable_beginscan(rel, 0, true, null, 0, null);
-
-        HeapTupleData* tuple;
-        while ((tuple = NativeMethods.systable_getnext(scan)) is not null)
-        {
-            WorfRepSet repset = ReplicationSet.ReplicationSetFromTuple(tuple, rel->rd_att);
-            if (repset.NodeId == nodeid)
-            {
-                nodeSets.Add(repset);
-            }
-        }
-
-        NativeMethods.systable_endscan(scan);
-        NativeMethods.table_close(rel, (int)PgLockMode.RowExclusive);
-
-        List<WorfRepSet> replicationSets = [];
-        foreach (string name in replicationSetNames)
-        {
-            WorfRepSet repset = nodeSets.Find(set => set.Name == name)
-                ?? throw new PgException(PgSqlStates.InvalidParameterValue, $"replication set {name} not found");
-            replicationSets.Add(repset);
-        }
-
-        return replicationSets;
-    }
 
 #if ANKUS_PG13 || ANKUS_PG14 || ANKUS_PG15 || ANKUS_PG16
     private static HeapTupleData* NewTuple(ReorderBufferChange* change)

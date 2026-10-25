@@ -594,6 +594,8 @@ internal static class Worker
             type = worker.WorkerType;
             uint dboid = worker.Dboid;
 
+            PgLog.Log($"{WorkerTypeName(type)} worker [{Environment.ProcessId}] at slot {MyWorfWorker} generation {s_myWorfWorkerGeneration} {(crash ? "exiting with error" : "detaching cleanly")}");
+
             // If we crashed we need to report it.
             //
             // The crash logic only works because all of the workers are attached to shmem and the serious crashes
@@ -662,9 +664,6 @@ internal static class Worker
                 SetProcLatch(manager);
             }
         }
-
-        // pglogical logs the worker's exit here, which an exit callback can't yet;
-        // https://github.com/ankus-net/ankus/issues/101
     }
 
     private static void SignalWorkerXactCallback()

@@ -4,7 +4,7 @@ using Ankus.Postgres;
 namespace Worf;
 
 // The first separator in each column list is a space rather than nothing, which ANKUS044 rejects;
-// https://github.com/ankus-net/ankus/issues/93
+// https://github.com/ankus-net/ankus/issues/109
 
 /// <summary>
 /// worf apply functions using SPI.
