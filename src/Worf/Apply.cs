@@ -1326,6 +1326,15 @@ internal static unsafe partial class Apply
             DispatchChange(action, &s, true);
         }
 
+        // How often to report progress while applying, as a walreceiver does. The setting is read by name because
+        // PostgreSQL doesn't export it to extensions on Windows before 15.
+        long statusInterval;
+        fixed (byte* name = Worf.ToServerCString("wal_receiver_status_interval"))
+        {
+            statusInterval = long.Parse(Worf.FromServer(NativeMethods.GetConfigOption((sbyte*)name, false, false)),
+                CultureInfo.InvariantCulture) * 1000000L;
+        }
+
         PgReplicationConnection conn = s_applyconn!;
         while (s_commitEndLsn is null)
         {
@@ -1348,10 +1357,9 @@ internal static unsafe partial class Apply
 
                 // The walsender drops a connection it hears nothing from for wal_sender_timeout, and the keepalive it
                 // sends to ask for a reply waits behind everything already sent, which a large transaction can take
-                // longer than that to apply. So report progress meanwhile, as often as a walreceiver does.
+                // longer than that to apply. So report progress meanwhile.
                 long now = Worker.GetCurrentTimestamp();
-                if (NativeGlobals.wal_receiver_status_interval > 0 &&
-                    now - s_lastSendTime >= NativeGlobals.wal_receiver_status_interval * 1000000L)
+                if (statusInterval > 0 && now - s_lastSendTime >= statusInterval)
                 {
                     _ = SendFeedback(conn, s_lastReceived, now, true);
                 }
