@@ -866,24 +866,22 @@ internal static partial class ReplicationSet
         TupleDescData* repsetRelDesc = repsetRel->rd_att;
         TupleDescData* tableDesc = table->rd_att;
 
-        ScanKeyData key;
-        NativeMethods.ScanKeyInit(&key, AnumRepsetTableReloid, BtEqualStrategyNumber, FOideq, reloid);
+        // Look the table up in each of the connection's sets with the catalog's primary key, as a scan of every
+        // membership for each table makes a transaction that touches many tables quadratic.
+        NativeMethods.list_free(NativeMethods.RelationGetIndexList(repsetRel));
+        uint pkindex = repsetRel->rd_pkindex;
+        ScanKeyData* key = stackalloc ScanKeyData[2];
 
-        // TODO: use index
-        SysScanDescData* scan = NativeMethods.systable_beginscan(repsetRel, 0, true, null, 1, &key);
-
-        HeapTupleData* tuple;
-        while ((tuple = NativeMethods.systable_getnext(scan)) is not null)
+        foreach (WorfRepSet repset in subsReplicationSets)
         {
-            bool isnull;
-            uint setid = (uint)NativeMethods.heap_getattr(tuple, AnumRepsetTableSetid, repsetRelDesc, &isnull);
+            NativeMethods.ScanKeyInit(&key[0], AnumRepsetTableSetid, BtEqualStrategyNumber, FOideq, repset.Id);
+            NativeMethods.ScanKeyInit(&key[1], AnumRepsetTableReloid, BtEqualStrategyNumber, FOideq, reloid);
+            SysScanDescData* scan = NativeMethods.systable_beginscan(repsetRel, pkindex, true, null, 2, key);
 
-            foreach (WorfRepSet repset in subsReplicationSets)
+            HeapTupleData* tuple;
+            while ((tuple = NativeMethods.systable_getnext(scan)) is not null)
             {
-                if (setid != repset.Id)
-                {
-                    continue;
-                }
+                bool isnull;
 
                 // Update the action filter.
                 if (repset.ReplicateInsert)
@@ -929,9 +927,10 @@ internal static partial class ReplicationSet
                     }
                 }
             }
+
+            NativeMethods.systable_endscan(scan);
         }
 
-        NativeMethods.systable_endscan(scan);
         NativeMethods.table_close(repsetRel, (int)PgLockMode.RowExclusive);
         entry.IsValid = true;
 
