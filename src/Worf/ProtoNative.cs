@@ -502,8 +502,13 @@ internal static unsafe class ProtoNative
                 continue;
             }
 
-            char transferType = DecideDatumTransfer(att, data.AllowInternalBasetypes, data.AllowBinaryBasetypes,
-                out uint typsend, out uint typoutput);
+            HeapTupleData* typtup = NativeMethods.typeidType(att->atttypid);
+            FormData_pg_type* typclass = (FormData_pg_type*)NativeMethods.GETSTRUCT(typtup);
+            uint typsend = typclass->typsend;
+            uint typoutput = typclass->typoutput;
+
+            char transferType = DecideDatumTransfer(att, typclass, data.AllowInternalBasetypes, data.AllowBinaryBasetypes);
+            NativeMethods.ReleaseSysCache(typtup);
 
             switch (transferType)
             {
@@ -584,37 +589,14 @@ internal static unsafe class ProtoNative
     /// <summary>
     /// Make the executive decision about which protocol to use.
     /// </summary>
-    private static char DecideDatumTransfer(FormData_pg_attribute* att, bool allowInternalBasetypes,
-        bool allowBinaryBasetypes, out uint typsend, out uint typoutput)
+    private static char DecideDatumTransfer(FormData_pg_attribute* att, FormData_pg_type* typclass,
+        bool allowInternalBasetypes, bool allowBinaryBasetypes)
     {
-        short typlen;
-        bool typbyval;
-        sbyte typalign;
-        sbyte typdelim;
-        uint typioparam;
-        uint typreceive;
-        uint send;
-        uint output;
-
-        NativeMethods.get_type_io_data(att->atttypid, IOFuncSelector.IOFunc_receive, &typlen, &typbyval, &typalign,
-            &typdelim, &typioparam, &typreceive);
-        NativeMethods.get_type_io_data(att->atttypid, IOFuncSelector.IOFunc_send, &typlen, &typbyval, &typalign,
-            &typdelim, &typioparam, &send);
-        NativeMethods.get_type_io_data(att->atttypid, IOFuncSelector.IOFunc_output, &typlen, &typbyval, &typalign,
-            &typdelim, &typioparam, &output);
-        typsend = send;
-        typoutput = output;
-
-        sbyte typtype = NativeMethods.get_typtype(att->atttypid);
-
-        // A type's I/O parameter is its element type when it has one, and the type itself otherwise.
-        bool hasTypelem = typioparam != att->atttypid;
-
         // Use the binary protocol, if allowed, for builtin & plain datatypes.
         if (allowInternalBasetypes &&
-            typtype == 'b' &&
+            typclass->typtype == 'b' &&
             att->atttypid < FirstNormalObjectId &&
-            !hasTypelem)
+            typclass->typelem == 0)
         {
             return 'i';
         }
@@ -623,9 +605,9 @@ internal static unsafe class ProtoNative
         //
         // XXX: we can't use send/recv for array or composite types for now due to the embedded oids.
         else if (allowBinaryBasetypes &&
-                 typreceive != 0 &&
-                 (att->atttypid < FirstNormalObjectId || typtype != 'c') &&
-                 (att->atttypid < FirstNormalObjectId || !hasTypelem))
+                 typclass->typreceive != 0 &&
+                 (att->atttypid < FirstNormalObjectId || typclass->typtype != 'c') &&
+                 (att->atttypid < FirstNormalObjectId || typclass->typelem == 0))
         {
             return 'b';
         }
