@@ -47,6 +47,19 @@ jobs:
           postgresql: ${{ matrix.postgresql }}
           release: ${{ (github.event_name == 'schedule' || inputs.nightly == true) }}
 
+      # huge_tx_100k_tables needs about 30 GB of disk, more than a macOS runner has free.
+      - name: Free disk space (macOS)
+        if: runner.os == 'macOS' && (github.event_name == 'schedule' || inputs.nightly == true)
+        run: |
+          df -h /
+          xcrun simctl runtime delete all || true
+          selected=$(realpath "$(xcode-select -p)/../..")
+          for xcode in /Applications/Xcode*.app; do
+            [ -L "$xcode" ] || [ "$(realpath "$xcode")" = "$selected" ] || sudo rm -rf "$xcode"
+          done
+          rm -rf ~/Library/Android
+          df -h /
+
       - name: Run regression suite
         run: dotnet run eng/regress.cs -- --pg ${{ matrix.postgresql }} ${{ (github.event_name == 'schedule' || inputs.nightly == true) && '--huge-tx' || '' }}
 
