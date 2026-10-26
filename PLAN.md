@@ -176,16 +176,17 @@ platform. Check the step off here and link the CI run that proved it.
   - the queue, `replicate_ddl_command` and TRUNCATE;
   - executor and dependency handling;
   - sequences, the wait functions, interfaces and the JSON protocol.
-- [ ] **5. Topologies.** Origin forwarding, bidirectional replication, multiple upstreams, cascades, apply delay, parallel subscriptions and drop. Tests:
+- [x] **5. Topologies.** Origin forwarding, bidirectional replication, multiple upstreams, cascades, apply delay, parallel subscriptions and drop. Proved by [CI run 40409905502](https://github.com/ankus-net/worf/actions/runs/40409905502), with the `huge_tx` tests run on demand. Tests:
   - `bidirectional`, `apply_delay`, `multiple_upstreams`, `node_origin_cascade`, `parallel`, `drop`;
   - the three `huge_tx` tests;
   - the Perl tests `011`, `020` and `040`.
-- [ ] **6. `worf_create_subscriber`.** Tests: Perl test `010` and the command's options.
+- [x] **6. `worf_create_subscriber`.** Tests: Perl test `010` and the command's options. Proved by [CI run 40409905502](https://github.com/ankus-net/worf/actions/runs/40409905502).
 - [ ] **7. Release.** Packages, the MSI, the release workflow and docs.
 
 ### Progress notes
 
 - 2026-10-26: Dropped PostgreSQL 13 and 14. 13 is out of support and 14 reaches end of life on November 12, 2026. No alternate expected output was specific to them: psql titles `\dt` "List of relations" through 17, so the `huge_tx` `_1` files stay. The `huge_tx` tests can't finish within CI's limit, so they left CI and run on demand with `eng/regress.cs --huge-tx`. CI passed on all three platforms for 15–19 in [run 40375031087](https://github.com/ankus-net/worf/actions/runs/40375031087): Linux jobs took 7–9 minutes, macOS 9–11 and Windows 12–14, most of it [publishing the extension again for every test cluster](https://github.com/ankus-net/ankus/issues/122).
+- 2026-10-26: Ankus 0.2.11 publishes once per test run, and the create-subscriber test checkpoints the provider before its base backup, so warm CI jobs take about 5–9 minutes. [CI run 40409905502](https://github.com/ankus-net/worf/actions/runs/40409905502) passed on all three platforms for 15–19. `eng/regress.cs --huge-tx` passed all 33 tests on release builds of 15–19 on Linux, taking 51–71 minutes a version.
 
 ## Tests
 
