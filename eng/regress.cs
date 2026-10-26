@@ -78,10 +78,12 @@ List<string> settings =
     "worf.subscriber_dsn=dbname=postgres",
 ];
 
-// huge_tx_100k_tables creates 100,000 tables in one transaction; its header asks for this setting.
+// huge_tx_100k_tables creates 100,000 tables in one transaction; its header asks for this setting. The huge_tx tests
+// show table sizes, which an autovacuum of freshly inserted rows grows by a visibility map, so don't run one.
 if (hugeTx)
 {
     settings.Add("max_locks_per_transaction=10000");
+    settings.Add("autovacuum_vacuum_insert_threshold=-1");
 }
 
 // Current PostgreSQL releases load only the output plugins this setting lists; PostgreSQL 13 has no such setting.
