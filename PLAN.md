@@ -223,7 +223,7 @@ Add only these tests beyond pglogical's:
 
 - Runs on every push and pull request.
 - Builds and runs the full regression suite and the MSTest tests on PostgreSQL 15–19 on Linux x64, macOS ARM64 and Windows x64.
-- A nightly run adds the `huge_tx` tests and a stress run.
+- A nightly run on Linux adds the `huge_tx` tests and a stress run.
 
 **`release.yml`:**
 
