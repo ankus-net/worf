@@ -74,7 +74,7 @@ jobs:
         env:
           # pglogical's t/040 writes for 120 seconds by default; a shorter run still resynchronizes during writes.
           PGBENCH_TIME: '30'
-        run: dotnet ankus test --pg ${{ matrix.postgresql }} -c Release -- --project tests/Worf.Tests/Worf.Tests.csproj
+        run: dotnet ankus test --pg ${{ matrix.postgresql }} -c Release -- --project tests/Worf.Tests/Worf.Tests.csproj --output detailed
 
       - name: Save multi-server test logs
         if: failure()
