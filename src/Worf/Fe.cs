@@ -545,7 +545,7 @@ internal static class Fe
     {
         fixed (byte* cmd = Worf.ToServerCString($"\"{path}\" --version"))
         {
-#if ANKUS_PG13 || ANKUS_PG14 || ANKUS_PG15 || ANKUS_PG16
+#if ANKUS_PG15 || ANKUS_PG16
             byte* line = stackalloc byte[1024];
             sbyte* result = NativeMethods.pipe_read_line((sbyte*)cmd, (sbyte*)line, 1024);
             return result is null ? null : Worf.FromServer(result);

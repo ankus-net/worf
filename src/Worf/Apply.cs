@@ -271,11 +271,7 @@ internal static unsafe partial class Apply
 
             CommandTag commandTag = NativeMethods.CreateCommandTag(command->stmt);
 
-#if ANKUS_PG13 || ANKUS_PG14
-            List* querytreeList = NativeMethods.pg_analyze_and_rewrite(command, query, null, 0, null);
-#else
             List* querytreeList = NativeMethods.pg_analyze_and_rewrite_fixedparams(command, query, null, 0, null);
-#endif
 
             List* plantreeList = NativeMethods.pg_plan_queries(querytreeList, query, 0, null);
 
@@ -298,7 +294,7 @@ internal static unsafe partial class Apply
 
             _DestReceiver* receiver = NativeMethods.CreateDestReceiver(CommandDest.DestNone);
 
-#if ANKUS_PG13 || ANKUS_PG14 || ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
+#if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
             _ = NativeMethods.PortalRun(portal, NativeMethods.FETCH_ALL(), isTopLevel, true, receiver, receiver, null);
 #else
             _ = NativeMethods.PortalRun(portal, NativeMethods.FETCH_ALL(), isTopLevel, receiver, receiver, null);
@@ -1406,11 +1402,7 @@ internal static unsafe partial class Apply
     /// <returns>Whether there's no outstanding transactions that need to be flushed.</returns>
     private static bool GetFlushPosition(out ulong write, out ulong flush)
     {
-#if ANKUS_PG13 || ANKUS_PG14
-        ulong localFlush = NativeMethods.GetFlushRecPtr();
-#else
         ulong localFlush = NativeMethods.GetFlushRecPtr(null);
-#endif
 
         write = 0;
         flush = 0;
@@ -1437,17 +1429,9 @@ internal static unsafe partial class Apply
     }
 
     /// <summary>
-    /// Gets how often to report progress, as a walreceiver does, in microseconds. The setting is read by name because
-    /// postgres.exe doesn't export it before PostgreSQL 15, so NativeGlobals can't reach it on Windows there.
+    /// Gets how often to report progress, as a walreceiver does, in microseconds.
     /// </summary>
-    private static long StatusInterval()
-    {
-        fixed (byte* name = Worf.ToServerCString("wal_receiver_status_interval"))
-        {
-            return long.Parse(Worf.FromServer(NativeMethods.GetConfigOption((sbyte*)name, false, false)),
-                CultureInfo.InvariantCulture) * 1000000L;
-        }
-    }
+    private static long StatusInterval() => NativeGlobals.wal_receiver_status_interval * 1000000L;
 
     /// <summary>
     /// Send a Standby Status Update message to server.

@@ -53,11 +53,6 @@ internal static class Dependency
     internal const sbyte DependencyAutoExtension = (sbyte)'x';
 
     /// <summary>
-    /// <c>DEPENDENCY_PIN</c>, which PostgreSQL 15 removed.
-    /// </summary>
-    internal const sbyte DependencyPin = (sbyte)'p';
-
-    /// <summary>
     /// <c>RelationRelationId</c>, the oid of <c>pg_class</c>.
     /// </summary>
     internal const uint RelationRelationId = 1259;
@@ -394,12 +389,6 @@ internal static class Dependency
 
                     // And we're done here.
                     return;
-#if ANKUS_PG13 || ANKUS_PG14
-                case DependencyPin:
-                    // Should not happen; PIN dependencies should have zeroes in the depender fields...
-                    throw new PgException(PgSqlStates.InternalError,
-                        $"incorrect use of PIN dependency with {GetObjectDescription(obj)}");
-#endif
                 default:
                     throw new PgException(PgSqlStates.InternalError,
                         $"unrecognized dependency type '{(char)foundDep.DepType}' for {GetObjectDescription(obj)}");
@@ -437,11 +426,6 @@ internal static class Dependency
                 DependencyAuto or DependencyAutoExtension => DepflagAuto,
                 DependencyInternal => DepflagInternal,
                 DependencyExtension => DepflagExtension,
-#if ANKUS_PG13 || ANKUS_PG14
-                // For a PIN dependency we just ereport immediately; there won't be any others to report.
-                DependencyPin => throw new PgException(PgSqlStates.DependentObjectsStillExist,
-                    $"cannot drop {GetObjectDescription(obj)} because it is required by the database system"),
-#endif
                 _ => throw new PgException(PgSqlStates.InternalError,
                     $"unrecognized dependency type '{(char)foundDep.DepType}' for {GetObjectDescription(obj)}"),
             };
@@ -824,11 +808,7 @@ internal static class Dependency
 
         unsafe
         {
-#if ANKUS_PG13
-            sbyte* description = NativeMethods.getObjectDescription(&obj);
-#else
             sbyte* description = NativeMethods.getObjectDescription(&obj, false);
-#endif
             string result = Worf.FromServer(description);
             NativeMethods.pfree(description);
             return result;
@@ -887,11 +867,7 @@ internal static class Dependency
         tuple.t_self = row.Ctid;
         int buffer;
         SnapshotData* freshsnap = NativeMethods.RegisterSnapshot(NativeMethods.GetLatestSnapshot());
-#if ANKUS_PG13 || ANKUS_PG14
-        bool found = NativeMethods.heap_fetch(depRel, freshsnap, &tuple, &buffer);
-#else
         bool found = NativeMethods.heap_fetch(depRel, freshsnap, &tuple, &buffer, false);
-#endif
         if (found)
         {
             NativeMethods.ReleaseBuffer(buffer);

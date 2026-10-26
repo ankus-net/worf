@@ -89,11 +89,8 @@ if (hugeTx)
     settings.Add("wal_sender_timeout=15min");
 }
 
-// Current PostgreSQL releases load only the output plugins this setting lists; PostgreSQL 13 has no such setting.
-if (int.Parse(major, CultureInfo.InvariantCulture) >= 14)
-{
-    settings.Add("output_plugin_libraries=pgoutput, test_decoding, worf");
-}
+// Current PostgreSQL releases load only the output plugins this setting lists.
+settings.Add("output_plugin_libraries=pgoutput, test_decoding, worf");
 
 List<string> arguments =
 [

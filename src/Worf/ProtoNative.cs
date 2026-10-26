@@ -760,7 +760,7 @@ internal static unsafe class ProtoNative
 
     private static long CommitTime(ReorderBufferTXN* txn)
     {
-#if ANKUS_PG13 || ANKUS_PG14 || ANKUS_PG19
+#if ANKUS_PG19
         return txn->commit_time;
 #else
         return txn->xact_time.commit_time;

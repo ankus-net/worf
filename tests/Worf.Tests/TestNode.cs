@@ -288,7 +288,7 @@ internal sealed class TestNode : IAsyncDisposable
 
     /// <summary>
     /// Lists worf in output_plugin_libraries, which current PostgreSQL releases require of every output plugin, as a
-    /// DBA does. PostgreSQL 13 and earlier minor releases have no such setting.
+    /// DBA does. Earlier minor releases have no such setting.
     /// </summary>
     private async Task TrustOutputPluginAsync(CancellationToken cancellationToken)
     {

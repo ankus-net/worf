@@ -10,7 +10,7 @@ MSI installers, conflict history, and fixes for PostgreSQL 15–18 to pglogical 
 
 ## Scope
 
-Worf 1.0 does everything pglogical 2.5.3 does, on PostgreSQL 13 through 19, on
+Worf 1.0 does everything pglogical 2.5.3 does, on PostgreSQL 15 through 19, on
 Linux x64, macOS ARM64 and x64, and Windows x64.
 
 - **Provider:** the `worf` logical decoding output plugin, with:
@@ -43,9 +43,9 @@ Linux x64, macOS ARM64 and x64, and Windows x64.
 - **Packages:** tar.gz for Linux and macOS, and zip and MSI for Windows, each including `worf_create_subscriber`.
 
 These parts are not ported, because they exist only for PostgreSQL releases
-before 13 or for upgrading older pglogical installations:
+before 15 or for upgrading older pglogical installations:
 
-- `compat94` through `compat12`;
+- `compat94` through `compat14`;
 - `pglogical_dump`, a copy of PostgreSQL 9.4's `pg_dump` that pglogical runs only on 9.4. On later versions it runs the server's own `pg_dump`, as worf does;
 - the `pglogical_origin` extension;
 - the `pglogical_output` forwarding module;
@@ -222,7 +222,7 @@ Add only these tests beyond pglogical's:
 **`ci.yml`:**
 
 - Runs on every push and pull request.
-- Builds and runs the full regression suite and the MSTest tests on PostgreSQL 13–19 on Linux x64, macOS ARM64 and Windows x64.
+- Builds and runs the full regression suite and the MSTest tests on PostgreSQL 15–19 on Linux x64, macOS ARM64 and Windows x64.
 - A nightly run adds the `huge_tx` tests and a stress run.
 
 **`release.yml`:**

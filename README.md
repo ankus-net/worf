@@ -11,7 +11,7 @@ reused from the earlier Slony technology:
 * Providers and Subscribers - roles taken by Nodes
 * Replication Set - a collection of tables
 
-worf runs on PostgreSQL 13 through 19, on Linux x64, macOS ARM64 and x64, and
+worf runs on PostgreSQL 15 through 19, on Linux x64, macOS ARM64 and x64, and
 Windows x64. Provider and subscriber nodes may run different PostgreSQL major
 versions (see [PostgreSQL Version differences](#postgresql-version-differences)).
 
@@ -35,7 +35,7 @@ Architectural details:
 
 ## Requirements
 
-To use worf the provider and subscriber must be running PostgreSQL 13 or newer.
+To use worf the provider and subscriber must be running PostgreSQL 15 or newer.
 
 The `worf` extension must be installed on both provider and subscriber.
 You must `CREATE EXTENSION worf` on both.
@@ -117,9 +117,9 @@ postgresql.conf:
 
     track_commit_timestamp = on # needed for last/first update wins conflict resolution
 
-PostgreSQL 14.24, 15.19, 16.15, 17.11, 18.6, 19 and later releases load only the
+PostgreSQL 15.19, 16.15, 17.11, 18.6, 19 and later releases load only the
 logical decoding output plugins that `output_plugin_libraries` lists, so the
-provider must list `worf` there as well (PostgreSQL 13 has no such setting):
+provider must list `worf` there as well:
 
     output_plugin_libraries = 'pgoutput, test_decoding, worf'
 

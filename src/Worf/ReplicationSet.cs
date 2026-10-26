@@ -1024,7 +1024,7 @@ internal static partial class ReplicationSet
     internal const int FirstLowInvalidHeapAttributeNumber = -7;
 
     [PgNativeCallback(nameof(RepsetRelcacheInvalidateCallback))]
-#if ANKUS_PG13 || ANKUS_PG14 || ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
+#if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
     private static partial RelcacheCallbackFunction RepsetInvalidateCallback { get; }
 #else
     private static partial RelSyncCallbackFunction RepsetInvalidateCallback { get; }
