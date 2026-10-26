@@ -445,6 +445,16 @@ internal static class Functions
                 PgTransaction.RunInSubtransaction(() =>
                 {
                     using PgReplicationConnection originConn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "cleanup");
+
+                    // The walsender of the apply that just exited can hold the slot a moment longer, as when it is
+                    // still finishing a large transaction. Wait for it, as the apply does when it starts.
+                    long deadline = Worker.GetCurrentTimestamp() + 5000000L;
+                    while (Worker.GetCurrentTimestamp() < deadline && Rpc.RemoteSlotActive(originConn, sub.SlotName))
+                    {
+                        PgInterrupts.Check();
+                        Worker.WaitLatch(50);
+                    }
+
                     Rpc.DropRemoteSlot(originConn, sub.SlotName);
                 });
             }
