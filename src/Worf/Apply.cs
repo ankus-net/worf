@@ -1438,7 +1438,7 @@ internal static unsafe partial class Apply
 
     /// <summary>
     /// Gets how often to report progress, as a walreceiver does, in microseconds. The setting is read by name because
-    /// NativeGlobals can't reach it on Windows before PostgreSQL 15: https://github.com/ankus-net/ankus/issues/116
+    /// postgres.exe doesn't export it before PostgreSQL 15, so NativeGlobals can't reach it on Windows there.
     /// </summary>
     private static long StatusInterval()
     {
