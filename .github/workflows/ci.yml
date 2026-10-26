@@ -37,7 +37,7 @@ jobs:
           - platform: win-x64
             runner: windows-2025
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: ${{ (github.event_name == 'schedule' || inputs.nightly == true) && 360 || 120 }}
+    timeout-minutes: ${{ (github.event_name == 'schedule' || inputs.nightly == true) && 180 || 120 }}
     steps:
       - uses: actions/checkout@v7
 
@@ -72,7 +72,7 @@ jobs:
         run: dotnet run eng/regress.cs -- --pg ${{ matrix.postgresql }} ${{ (github.event_name == 'schedule' || inputs.nightly == true) && '--huge-tx' || '' }}
 
       - name: Save regression results
-        if: failure()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@v7
         with:
           name: regression-${{ matrix.platform }}-pg${{ matrix.postgresql }}
