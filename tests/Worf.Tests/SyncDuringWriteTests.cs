@@ -154,10 +154,13 @@ public sealed partial class SyncDuringWriteTests
                 while (true)
                 {
                     await Task.Delay(TimeSpan.FromMicroseconds(100), token);
-                    string running = await subscriber.SafePsqlAsync(Database,
-                        "SELECT pid FROM pg_stat_activity WHERE application_name LIKE '%sync%'", token);
-                    string status = await subscriber.SafePsqlAsync(Database,
-                        $"SELECT sync_status FROM worf.local_sync_status WHERE sync_relname = '{tbl}'", token);
+                    // Both are read in one query: read apart, a worker that starts between the two reads looks like
+                    // one that has exited.
+                    string[] state = (await subscriber.SafePsqlAsync(Database,
+                        "SELECT (SELECT string_agg(pid::text, ',') FROM pg_stat_activity WHERE application_name LIKE '%sync%'), " +
+                        $"(SELECT sync_status FROM worf.local_sync_status WHERE sync_relname = '{tbl}')", token)).Split('|');
+                    string running = state[0];
+                    string status = state.Length > 1 ? state[1] : "";
                     if (status == "r")
                     {
                         TestContext.WriteLine($"{tbl} synced on iteration {i} (elapsed {resyncStart.Elapsed.TotalSeconds})");
