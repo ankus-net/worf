@@ -114,6 +114,10 @@ public sealed class CreateSubscriberTests
             (await File.ReadAllLinesAsync(autoConf, token)).Where(static line => !line.TrimStart().StartsWith("port", StringComparison.Ordinal)),
             token);
 
+        // pg_basebackup asks for a spread checkpoint, which writes the provider's dirty buffers a few at a time for
+        // minutes; writing them now leaves it nothing to spread.
+        _ = await provider.SafePsqlAsync(Database, "CHECKPOINT", token);
+
         try
         {
             (int exitCode, string stdout, string stderr) = await CreateSubscriberCommand.RunAsync(command,
