@@ -79,11 +79,14 @@ List<string> settings =
 ];
 
 // huge_tx_100k_tables creates 100,000 tables in one transaction; its header asks for this setting. The huge_tx tests
-// show table sizes, which an autovacuum of freshly inserted rows grows by a visibility map, so don't run one.
+// show table sizes, which an autovacuum of freshly inserted rows grows by a visibility map, so don't run one. Nothing
+// can report to the walsender while an apply drops 100,000 tables and commits, which on a slow runner outlasts the
+// default wal_sender_timeout, and the reconnect then decodes it all again.
 if (hugeTx)
 {
     settings.Add("max_locks_per_transaction=10000");
     settings.Add("autovacuum_vacuum_insert_threshold=-1");
+    settings.Add("wal_sender_timeout=15min");
 }
 
 // Current PostgreSQL releases load only the output plugins this setting lists; PostgreSQL 13 has no such setting.
