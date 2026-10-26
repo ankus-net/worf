@@ -57,29 +57,8 @@ jobs:
       - name: Build
         run: dotnet ankus build --pg ${{ matrix.postgresql }} --project src/Worf/Worf.csproj
 
-      # The regression suite and the multi-server tests use separate clusters, so they run side by side on the one
-      # build. The tests start once the suite has installed the extension.
-      - name: Run regression suite and multi-server tests
-        shell: bash
-        env:
-          NIGHTLY: ${{ (github.event_name == 'schedule' || inputs.nightly == true) && 'true' || '' }}
-          # pglogical's t/040 writes for 120 seconds by default; a shorter run still resynchronizes during writes.
-          PGBENCH_TIME: '30'
-        run: |
-          log="$RUNNER_TEMP/regress.log"
-          dotnet run eng/regress.cs -- --pg ${{ matrix.postgresql }} --no-build > "$log" 2>&1 &
-          regress=$!
-          tests=0
-          if [ -z "$NIGHTLY" ]; then
-            until grep -q '^Regression run' "$log" || ! kill -0 $regress 2> /dev/null; do sleep 1; done
-            dotnet ankus test --pg ${{ matrix.postgresql }} -c Release -- --project tests/Worf.Tests/Worf.Tests.csproj --output detailed || tests=$?
-          fi
-          suite=0
-          wait $regress || suite=$?
-          echo "::group::Regression suite"
-          cat "$log"
-          echo "::endgroup::"
-          [ "$suite" -eq 0 ] && [ "$tests" -eq 0 ]
+      - name: Run regression suite
+        run: dotnet run eng/regress.cs -- --pg ${{ matrix.postgresql }} --no-build
 
       - name: Save regression results
         if: failure() || cancelled()
@@ -92,6 +71,15 @@ jobs:
             artifacts/regress-home/clusters/*.log
           if-no-files-found: ignore
           retention-days: 7
+
+      # The regression suite's timing-sensitive tests run alone, as pglogical's do, so the many clusters of the
+      # multi-server tests come after it.
+      - name: Run multi-server tests
+        if: github.event_name != 'schedule' && inputs.nightly != true && (success() || failure())
+        env:
+          # pglogical's t/040 writes for 120 seconds by default; a shorter run still resynchronizes during writes.
+          PGBENCH_TIME: '30'
+        run: dotnet ankus test --pg ${{ matrix.postgresql }} -c Release -- --project tests/Worf.Tests/Worf.Tests.csproj --output detailed
 
       - name: Save multi-server test logs
         if: failure()
