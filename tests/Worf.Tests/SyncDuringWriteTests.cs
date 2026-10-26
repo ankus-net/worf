@@ -111,9 +111,13 @@ public sealed partial class SyncDuringWriteTests
         Task<string> pgbenchStdout = pgbench.StandardOutput.ReadToEndAsync(token);
         Task<string> pgbenchStderr = pgbench.StandardError.ReadToEndAsync(token);
 
-        Assert.IsTrue(await provider.PollQueryUntilAsync(Database,
-            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE query like 'UPDATE pgbench%')", token),
-            "pgbench process is not running currently");
+        if (!await provider.PollQueryUntilAsync(Database,
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE query like 'UPDATE pgbench%')", token))
+        {
+            // Say why: pgbench may have failed to start its clients.
+            string output = pgbench.HasExited ? $"exited with {pgbench.ExitCode}: {await pgbenchStdout}{await pgbenchStderr}" : "still running";
+            Assert.Fail($"pgbench process is not running currently; pgbench {output}");
+        }
 
         _ = await provider.SafePsqlAsync(Database, "ALTER SYSTEM SET log_statement = 'ddl'", token);
         _ = await provider.SafePsqlAsync(Database, "SELECT pg_reload_conf();", token);
