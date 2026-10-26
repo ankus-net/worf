@@ -51,7 +51,7 @@ internal static unsafe partial class Executor
         EState* estate = NativeMethods.CreateExecutorState();
 
         List* rangeTable = NativeMethods.lappend(null, rte);
-#if ANKUS_PG13 || ANKUS_PG14 || ANKUS_PG15
+#if ANKUS_PG15
         NativeMethods.ExecInitRangeTable(estate, rangeTable);
 #else
         List* perminfos = null;
@@ -195,14 +195,9 @@ internal static unsafe partial class Executor
         TruncatedTables.Clear();
     }
 
-#if ANKUS_PG13
-    private static void WorfProcessUtility(PlannedStmt* pstmt, sbyte* queryString, ProcessUtilityContext context,
-        ParamListInfoData* @params, QueryEnvironment* queryEnv, _DestReceiver* dest, QueryCompletion* qc)
-#else
     private static void WorfProcessUtility(PlannedStmt* pstmt, sbyte* queryString, bool readOnlyTree,
         ProcessUtilityContext context, ParamListInfoData* @params, QueryEnvironment* queryEnv, _DestReceiver* dest,
         QueryCompletion* qc)
-#endif
     {
         Node* parsetree = pstmt->utilityStmt;
 
@@ -218,16 +213,6 @@ internal static unsafe partial class Executor
             s_lastDropBehavior = ((DropStmt*)parsetree)->behavior;
         }
 
-#if ANKUS_PG13
-        if (!s_nextProcessUtilityHook.IsNull)
-        {
-            s_nextProcessUtilityHook.Invoke(pstmt, queryString, context, @params, queryEnv, dest, qc);
-        }
-        else
-        {
-            NativeMethods.standard_ProcessUtility(pstmt, queryString, context, @params, queryEnv, dest, qc);
-        }
-#else
         if (!s_nextProcessUtilityHook.IsNull)
         {
             s_nextProcessUtilityHook.Invoke(pstmt, queryString, readOnlyTree, context, @params, queryEnv, dest, qc);
@@ -236,7 +221,6 @@ internal static unsafe partial class Executor
         {
             NativeMethods.standard_ProcessUtility(pstmt, queryString, readOnlyTree, context, @params, queryEnv, dest, qc);
         }
-#endif
 
         if (parsetree->type == NodeTag.T_TruncateStmt)
         {

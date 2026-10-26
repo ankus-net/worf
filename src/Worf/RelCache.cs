@@ -16,7 +16,7 @@ internal static partial class RelCache
     private static readonly Dictionary<uint, List<WorfRelation>> s_relationsByReloid = [];
 
     [PgNativeCallback(nameof(RelcacheInvalidateCallback))]
-#if ANKUS_PG13 || ANKUS_PG14 || ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
+#if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
     private static partial RelcacheCallbackFunction InvalidateCallback { get; }
 #else
     private static partial RelSyncCallbackFunction InvalidateCallback { get; }

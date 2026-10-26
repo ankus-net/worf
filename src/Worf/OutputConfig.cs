@@ -112,7 +112,7 @@ internal static class OutputConfig
     /// <returns>The name.</returns>
     internal static unsafe string EncodingToChar(int encoding)
     {
-#if ANKUS_PG13 || ANKUS_PG14 || ANKUS_PG15 || ANKUS_PG16
+#if ANKUS_PG15 || ANKUS_PG16
         return Worf.FromServer(NativeMethods.pg_encoding_to_char(encoding));
 #else
         return Worf.FromServer(NativeMethods.pg_encoding_to_char_private(encoding));
@@ -128,7 +128,7 @@ internal static class OutputConfig
     {
         fixed (byte* cname = Worf.ToServerCString(name))
         {
-#if ANKUS_PG13 || ANKUS_PG14 || ANKUS_PG15 || ANKUS_PG16
+#if ANKUS_PG15 || ANKUS_PG16
             return NativeMethods.pg_char_to_encoding((sbyte*)cname);
 #else
             return NativeMethods.pg_char_to_encoding_private((sbyte*)cname);

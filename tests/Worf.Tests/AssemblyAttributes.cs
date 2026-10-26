@@ -1,2 +1,2 @@
-// Each test starts its own PostgreSQL clusters, which would compete for the machine if tests ran in parallel.
-[assembly: DoNotParallelize]
+// Each test starts its own PostgreSQL clusters on free ports, so tests run side by side.
+[assembly: Parallelize(Scope = ExecutionScope.MethodLevel)]

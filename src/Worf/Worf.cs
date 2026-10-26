@@ -296,7 +296,7 @@ internal static partial class Worf
     /// <param name="datalen">The number of bytes.</param>
     internal static unsafe void AppendBinaryStringInfo(StringInfoData* str, void* data, int datalen)
     {
-#if ANKUS_PG13 || ANKUS_PG14 || ANKUS_PG15
+#if ANKUS_PG15
         NativeMethods.appendBinaryStringInfo(str, (sbyte*)data, datalen);
 #else
         NativeMethods.appendBinaryStringInfo(str, data, datalen);
@@ -311,7 +311,7 @@ internal static partial class Worf
     /// <param name="datalen">The number of bytes.</param>
     internal static unsafe void PqSendBytes(StringInfoData* buf, void* data, int datalen)
     {
-#if ANKUS_PG13 || ANKUS_PG14 || ANKUS_PG15
+#if ANKUS_PG15
         NativeMethods.pq_sendbytes(buf, (sbyte*)data, datalen);
 #else
         NativeMethods.pq_sendbytes(buf, data, datalen);
@@ -798,7 +798,7 @@ internal static partial class Worf
     internal static bool BigEndian => !BitConverter.IsLittleEndian;
 
     /// <summary>
-    /// Gets whether <c>USE_FLOAT4_BYVAL</c> is defined, which PostgreSQL 13 and later never do.
+    /// Gets whether <c>USE_FLOAT4_BYVAL</c> is defined, which no supported PostgreSQL release does.
     /// </summary>
     internal static bool Float4Byval => false;
 

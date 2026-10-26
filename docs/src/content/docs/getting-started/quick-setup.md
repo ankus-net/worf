@@ -19,9 +19,9 @@ postgresql.conf:
 
     track_commit_timestamp = on # needed for last/first update wins conflict resolution
 
-PostgreSQL 14.24, 15.19, 16.15, 17.11, 18.6, 19 and later releases load only the
+PostgreSQL 15.19, 16.15, 17.11, 18.6, 19 and later releases load only the
 logical decoding output plugins that `output_plugin_libraries` lists, so the
-provider must list `worf` there as well (PostgreSQL 13 has no such setting):
+provider must list `worf` there as well:
 
     output_plugin_libraries = 'pgoutput, test_decoding, worf'
 

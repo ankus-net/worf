@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Text;
 
@@ -46,7 +47,7 @@ internal static class ProcessRunner
             start.Environment[name] = value;
         }
 
-        using Process process = Process.Start(start) ?? throw new InvalidOperationException($"could not start {fileName}");
+        using Process process = await StartAsync(start, cancellationToken);
         StringBuilder stdout = new();
         StringBuilder stderr = new();
         Task pumps = Task.WhenAll(PumpAsync(process.StandardOutput, stdout), PumpAsync(process.StandardError, stderr));
@@ -57,6 +58,26 @@ internal static class ProcessRunner
             lock (stderr)
             {
                 return (process.ExitCode, stdout.ToString(), stderr.ToString());
+            }
+        }
+    }
+
+    /// <summary>
+    /// Starts a program. A program a test has just copied can't be run while another test's process, forked in the
+    /// meantime, still holds the copy open (ETXTBSY), so that is retried briefly.
+    /// </summary>
+    private static async Task<Process> StartAsync(ProcessStartInfo start, CancellationToken cancellationToken)
+    {
+        const int TextFileBusy = 26;
+        for (int attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return Process.Start(start) ?? throw new InvalidOperationException($"could not start {start.FileName}");
+            }
+            catch (Win32Exception error) when (error.NativeErrorCode == TextFileBusy && !OperatingSystem.IsWindows() && attempt < 50)
+            {
+                await Task.Delay(100, cancellationToken);
             }
         }
     }

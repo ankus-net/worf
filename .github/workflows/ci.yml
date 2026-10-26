@@ -2,10 +2,11 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_call:
   schedule:
-    # The nightly run builds PostgreSQL without assertions and adds the huge_tx tests and a stress run.
+    # The nightly run, on Linux, builds PostgreSQL without assertions and adds a stress run.
     - cron: '17 7 * * *'
   workflow_dispatch:
     inputs:
@@ -17,6 +18,11 @@ on:
 permissions:
   contents: read
 
+# A newer run for the same branch and event replaces one still running.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   DOTNET_CLI_TELEMETRY_OPTOUT: '1'
   DOTNET_NOLOGO: '1'
@@ -27,17 +33,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [linux-x64, osx-arm64, win-x64]
-        postgresql: [13, 14, 15, 16, 17, 18, 19]
-        include:
-          - platform: linux-x64
-            runner: ubuntu-24.04
-          - platform: osx-arm64
-            runner: macos-15
-          - platform: win-x64
-            runner: windows-2025
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: ${{ (github.event_name == 'schedule' || inputs.nightly == true) && 360 || 120 }}
+        # Every push runs the suite on all three platforms, so the nightly run needs only Linux.
+        platform: ${{ fromJSON((github.event_name == 'schedule' || inputs.nightly == true) && '["linux-x64"]' || '["linux-x64", "osx-arm64", "win-x64"]') }}
+        postgresql: [15, 16, 17, 18, 19]
+    runs-on: ${{ matrix.platform == 'linux-x64' && 'ubuntu-24.04' || matrix.platform == 'osx-arm64' && 'macos-15' || 'windows-2025' }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
@@ -47,32 +47,21 @@ jobs:
           postgresql: ${{ matrix.postgresql }}
           release: ${{ (github.event_name == 'schedule' || inputs.nightly == true) }}
 
-      # huge_tx_100k_tables needs about 30 GB of disk, more than a macOS runner has free.
-      - name: Free disk space (macOS)
-        if: runner.os == 'macOS' && (github.event_name == 'schedule' || inputs.nightly == true)
-        run: |
-          df -h /
-          xcrun simctl runtime delete all || true
-          selected=$(realpath "$(xcode-select -p)/../..")
-          for xcode in /Applications/Xcode*.app; do
-            [ -L "$xcode" ] || [ "$(realpath "$xcode")" = "$selected" ] || sudo rm -rf "$xcode"
-          done
-          rm -rf ~/Library/Android
-          df -h /
-
-      # With PostgreSQL 14, huge_tx_100k_tables needs more memory than a Windows runner's RAM and 3 GB pagefile.
-      - name: Enlarge the pagefile (Windows)
-        if: runner.os == 'Windows' && (github.event_name == 'schedule' || inputs.nightly == true)
-        uses: al-cheb/configure-pagefile-action@v1.5
+      # Generating and compiling the Ankus bindings for a PostgreSQL version takes about two minutes a build.
+      - name: Cache Ankus bindings
+        uses: actions/cache@v6
         with:
-          minimum-size: 32GB
-          disk-root: 'D:'
+          path: ${{ runner.temp }}/ankus-bindings
+          key: ankus-bindings-v2-${{ matrix.platform }}-pg${{ matrix.postgresql }}-${{ hashFiles('global.json') }}
+
+      - name: Build
+        run: dotnet ankus build --pg ${{ matrix.postgresql }} --project src/Worf/Worf.csproj
 
       - name: Run regression suite
-        run: dotnet run eng/regress.cs -- --pg ${{ matrix.postgresql }} ${{ (github.event_name == 'schedule' || inputs.nightly == true) && '--huge-tx' || '' }}
+        run: dotnet run eng/regress.cs -- --pg ${{ matrix.postgresql }} --no-build
 
       - name: Save regression results
-        if: failure()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@v7
         with:
           name: regression-${{ matrix.platform }}-pg${{ matrix.postgresql }}
@@ -83,9 +72,14 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      # The regression suite's timing-sensitive tests run alone, as pglogical's do, so the many clusters of the
+      # multi-server tests come after it.
       - name: Run multi-server tests
-        if: success() || failure()
-        run: dotnet ankus test --pg ${{ matrix.postgresql }} -- --project tests/Worf.Tests/Worf.Tests.csproj
+        if: github.event_name != 'schedule' && inputs.nightly != true && (success() || failure())
+        env:
+          # pglogical's t/040 writes for 120 seconds by default; a shorter run still resynchronizes during writes.
+          PGBENCH_TIME: '30'
+        run: dotnet ankus test --pg ${{ matrix.postgresql }} -c Release -- --project tests/Worf.Tests/Worf.Tests.csproj --output detailed
 
       - name: Save multi-server test logs
         if: failure()

@@ -992,12 +992,8 @@ internal static class Sync
             catch (PgRemoteException error)
             {
                 // If our slot already exist but is not used, it's leftover from previous unsucessful attempt to
-                // synchronize table, try dropping it and recreating. PostgreSQL 13 does not pass the SQLSTATE on, so
-                // match its message there.
-                bool duplicate = error.SqlState is null
-                    ? error.Message == $"replication slot \"{slotName}\" already exists"
-                    : error.SqlState == "42710";
-                if (duplicate && !Rpc.RemoteSlotActive(sqlConn, slotName))
+                // synchronize table, try dropping it and recreating.
+                if (error.SqlState == "42710" && !Rpc.RemoteSlotActive(sqlConn, slotName))
                 {
                     Rpc.DropRemoteSlot(sqlConn, slotName);
                     continue;

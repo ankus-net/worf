@@ -3,7 +3,7 @@ title: Installation
 description: Install worf from a release package or build it from source.
 ---
 
-To use worf the provider and subscriber must be running PostgreSQL 13 or newer.
+To use worf the provider and subscriber must be running PostgreSQL 15 or newer.
 
 The `worf` extension must be installed on both provider and subscriber.
 You must `CREATE EXTENSION worf` on both.

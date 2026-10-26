@@ -43,4 +43,4 @@ SELECT worf.create_subscription(
   </div>
 </div>
 
-<p class="platform-note">PostgreSQL 13 through 19 on Linux, macOS and Windows</p>
+<p class="platform-note">PostgreSQL 15 through 19 on Linux, macOS and Windows</p>

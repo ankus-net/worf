@@ -9,7 +9,7 @@
 
   VERSION     - worf version for display (e.g., 1.0.0-rc1)
   MSI_VERSION - numeric version for the MSI, without a prerelease suffix
-  PG_VERSION  - PostgreSQL major version (13 to 19)
+  PG_VERSION  - PostgreSQL major version (15 to 19)
   PackageDir  - absolute path to the package tree, with bin, lib and share\extension
 
   The installer finds the PostgreSQL installation in the registry, falls back to
@@ -19,11 +19,7 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
 
-  <?if $(var.PG_VERSION) = 13 ?>
-    <?define UpgradeGuid = "{9F227864-8182-452E-B564-E7CB09F21B6B}" ?>
-  <?elseif $(var.PG_VERSION) = 14 ?>
-    <?define UpgradeGuid = "{82A5DFE3-C210-4A1F-BF0C-F6E4E0EB01BE}" ?>
-  <?elseif $(var.PG_VERSION) = 15 ?>
+  <?if $(var.PG_VERSION) = 15 ?>
     <?define UpgradeGuid = "{7B9FDA6E-4C8F-4797-A75E-2739B958D18D}" ?>
   <?elseif $(var.PG_VERSION) = 16 ?>
     <?define UpgradeGuid = "{44897A99-DECC-446D-A1D6-4F85B8F0BD20}" ?>
@@ -34,7 +30,7 @@
   <?elseif $(var.PG_VERSION) = 19 ?>
     <?define UpgradeGuid = "{C272A4A6-D2BC-44E2-BDFA-53F93D218285}" ?>
   <?else?>
-    <?error PG_VERSION must be 13 to 19 ?>
+    <?error PG_VERSION must be 15 to 19 ?>
   <?endif?>
 
   <Package Name="worf $(var.VERSION) for PostgreSQL $(var.PG_VERSION)"

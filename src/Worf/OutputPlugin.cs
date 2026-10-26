@@ -37,7 +37,7 @@ internal static unsafe partial class OutputPlugin
     private static partial OutputPluginCallbacks_shutdown_cbCallback ShutdownCallback { get; }
 
     [PgNativeCallback(nameof(RelmetacacheInvalidationCb))]
-#if ANKUS_PG13 || ANKUS_PG14 || ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
+#if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
     private static partial RelcacheCallbackFunction RelmetacacheInvalidationCallback { get; }
 #else
     private static partial RelSyncCallbackFunction RelmetacacheInvalidationCallback { get; }
@@ -753,11 +753,7 @@ internal static unsafe partial class OutputPlugin
             string? value = null;
             if (elem->arg is not null)
             {
-#if ANKUS_PG13 || ANKUS_PG14
-                sbyte* str = ((Value*)elem->arg)->val.str;
-#else
                 sbyte* str = ((Ankus.Postgres.String*)elem->arg)->sval;
-#endif
                 value = str is null ? null : Worf.FromServer(str);
             }
 
@@ -769,7 +765,7 @@ internal static unsafe partial class OutputPlugin
 
     private static WorfOutputData Data(LogicalDecodingContext* ctx) => s_outputData[(nint)ctx];
 
-#if ANKUS_PG13 || ANKUS_PG14 || ANKUS_PG15 || ANKUS_PG16
+#if ANKUS_PG15 || ANKUS_PG16
     private static HeapTupleData* NewTuple(ReorderBufferChange* change)
         => change->data.tp.newtuple is null ? null : &change->data.tp.newtuple->tuple;
 
