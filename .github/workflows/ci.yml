@@ -60,6 +60,14 @@ jobs:
           rm -rf ~/Library/Android
           df -h /
 
+      # With PostgreSQL 14, huge_tx_100k_tables needs more memory than a Windows runner's RAM and 3 GB pagefile.
+      - name: Enlarge the pagefile (Windows)
+        if: runner.os == 'Windows' && (github.event_name == 'schedule' || inputs.nightly == true)
+        uses: al-cheb/configure-pagefile-action@v1.5
+        with:
+          minimum-size: 32GB
+          disk-root: 'D:'
+
       - name: Run regression suite
         run: dotnet run eng/regress.cs -- --pg ${{ matrix.postgresql }} ${{ (github.event_name == 'schedule' || inputs.nightly == true) && '--huge-tx' || '' }}
 
