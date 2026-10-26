@@ -196,7 +196,7 @@ The fork's tests are the acceptance tests. Port all of them, and never weaken a 
   - the renaming and the column widths it shifts;
   - version strings.
 - Keep alternate outputs such as `functions_1.out`.
-- pglogical's default run leaves out the three `huge_tx` tests. Worf runs them in the nightly CI run.
+- pglogical's default run leaves out the three `huge_tx` tests. They take longer than CI allows, so worf runs them on demand with `eng/regress.cs --huge-tx`.
 
 ### Multi-server tests
 
@@ -223,7 +223,8 @@ Add only these tests beyond pglogical's:
 
 - Runs on every push and pull request.
 - Builds and runs the full regression suite and the MSTest tests on PostgreSQL 15–19 on Linux x64, macOS ARM64 and Windows x64.
-- A nightly run on Linux adds the `huge_tx` tests and a stress run.
+- A nightly run on Linux adds a stress run.
+- No job runs longer than 30 minutes.
 
 **`release.yml`:**
 

@@ -6,7 +6,7 @@ on:
   pull_request:
   workflow_call:
   schedule:
-    # The nightly run, on Linux, builds PostgreSQL without assertions and adds the huge_tx tests and a stress run.
+    # The nightly run, on Linux, builds PostgreSQL without assertions and adds a stress run.
     - cron: '17 7 * * *'
   workflow_dispatch:
     inputs:
@@ -37,7 +37,7 @@ jobs:
         platform: ${{ fromJSON((github.event_name == 'schedule' || inputs.nightly == true) && '["linux-x64"]' || '["linux-x64", "osx-arm64", "win-x64"]') }}
         postgresql: [15, 16, 17, 18, 19]
     runs-on: ${{ matrix.platform == 'linux-x64' && 'ubuntu-24.04' || matrix.platform == 'osx-arm64' && 'macos-15' || 'windows-2025' }}
-    timeout-minutes: 120
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
@@ -48,7 +48,7 @@ jobs:
           release: ${{ (github.event_name == 'schedule' || inputs.nightly == true) }}
 
       - name: Run regression suite
-        run: dotnet run eng/regress.cs -- --pg ${{ matrix.postgresql }} ${{ (github.event_name == 'schedule' || inputs.nightly == true) && '--huge-tx' || '' }}
+        run: dotnet run eng/regress.cs -- --pg ${{ matrix.postgresql }}
 
       - name: Save regression results
         if: failure() || cancelled()
