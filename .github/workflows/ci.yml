@@ -71,6 +71,9 @@ jobs:
 
       - name: Run multi-server tests
         if: github.event_name != 'schedule' && inputs.nightly != true && (success() || failure())
+        env:
+          # pglogical's t/040 writes for 120 seconds by default; a shorter run still resynchronizes during writes.
+          PGBENCH_TIME: '30'
         run: dotnet ankus test --pg ${{ matrix.postgresql }} -- --project tests/Worf.Tests/Worf.Tests.csproj
 
       - name: Save multi-server test logs
