@@ -41,10 +41,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Packages are built against PostgreSQL without assertions, as installations users run are.
       - uses: ./.github/actions/setup
         with:
           platform: ${{ matrix.platform }}
           postgresql: ${{ matrix.postgresql }}
+          release: true
 
       - name: Install WiX (Windows)
         if: runner.os == 'Windows'
