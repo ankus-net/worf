@@ -7,9 +7,16 @@ namespace Worf;
 /// </summary>
 internal static unsafe class ApplyHeap
 {
+    // A writer keeps its executor state until it closes, so a transaction that writes to many tables keeps only the
+    // latest few open, as pglogical keeps one.
+    private const int MaxWriters = 64;
+
     // The writers of the remote transaction being applied, by table, with a row for its changes, one for their keys
     // and the table's replica identity index.
     private static readonly Dictionary<uint, (PgRelationWriter Writer, PgReplicatedRow Row, PgReplicatedRow Key, uint ReplicaIndex)> s_writers = [];
+
+    // The tables of those writers, in the order they were opened.
+    private static readonly Queue<uint> s_writerOrder = [];
 
     /// <summary>
     /// Handle the start of a remote transaction.
@@ -18,6 +25,7 @@ internal static unsafe class ApplyHeap
     {
         // A transaction that failed has released what its writers held.
         s_writers.Clear();
+        s_writerOrder.Clear();
     }
 
     /// <summary>
@@ -32,6 +40,7 @@ internal static unsafe class ApplyHeap
         }
 
         s_writers.Clear();
+        s_writerOrder.Clear();
     }
 
     /// <summary>
@@ -215,9 +224,16 @@ internal static unsafe class ApplyHeap
     {
         if (!s_writers.TryGetValue(rel.Reloid, out (PgRelationWriter Writer, PgReplicatedRow Row, PgReplicatedRow Key, uint ReplicaIndex) entry))
         {
+            if (s_writers.Count == MaxWriters)
+            {
+                _ = s_writers.Remove(s_writerOrder.Dequeue(), out (PgRelationWriter Writer, PgReplicatedRow, PgReplicatedRow, uint) oldest);
+                oldest.Writer.Dispose();
+            }
+
             PgRelationWriter writer = PgRelationWriter.Open(rel.Reloid);
             entry = (writer, writer.CreateReplicatedRow(), writer.CreateReplicatedRow(), NativeMethods.RelationGetReplicaIndex(rel.Rel));
             s_writers.Add(rel.Reloid, entry);
+            s_writerOrder.Enqueue(rel.Reloid);
         }
 
         return entry;
