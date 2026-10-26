@@ -47,12 +47,12 @@ jobs:
           postgresql: ${{ matrix.postgresql }}
           release: ${{ (github.event_name == 'schedule' || inputs.nightly == true) }}
 
-      # Compiling the Ankus bindings for a PostgreSQL version takes two minutes for each build configuration.
-      - name: Cache compiled Ankus bindings
+      # Generating and compiling the Ankus bindings for a PostgreSQL version takes about two minutes a build.
+      - name: Cache Ankus bindings
         uses: actions/cache@v6
         with:
-          path: src/Worf/obj/*/net10.0/*/ankus-bindings/compiled
-          key: ankus-bindings-v1-${{ matrix.platform }}-pg${{ matrix.postgresql }}-${{ hashFiles('global.json') }}
+          path: ${{ runner.temp }}/ankus-bindings
+          key: ankus-bindings-v2-${{ matrix.platform }}-pg${{ matrix.postgresql }}-${{ hashFiles('global.json') }}
 
       - name: Run regression suite
         run: dotnet run eng/regress.cs -- --pg ${{ matrix.postgresql }}
