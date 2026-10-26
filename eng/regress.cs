@@ -1,6 +1,7 @@
 // Runs the ported pglogical regression suite with ankus regress on a fresh development cluster, using the settings
 // from pglogical's regress-postgresql.conf. --huge-tx adds the three huge_tx tests, which pglogical's default run leaves
-// out, after node_origin_cascade. Usage: dotnet run eng/regress.cs -- --pg <major> [--repeat <count>] [--huge-tx] [filter]
+// out, after node_origin_cascade. --no-build tests the extension `ankus build` last published.
+// Usage: dotnet run eng/regress.cs -- --pg <major> [--repeat <count>] [--huge-tx] [--no-build] [filter]
 
 using System.Diagnostics;
 using System.Globalization;
@@ -9,6 +10,7 @@ string? major = null;
 string? filter = null;
 int repeat = 1;
 bool hugeTx = false;
+bool noBuild = false;
 for (int index = 0; index < args.Length; index++)
 {
     switch (args[index])
@@ -22,6 +24,9 @@ for (int index = 0; index < args.Length; index++)
         case "--huge-tx":
             hugeTx = true;
             break;
+        case "--no-build":
+            noBuild = true;
+            break;
         default:
             filter = args[index];
             break;
@@ -30,7 +35,7 @@ for (int index = 0; index < args.Length; index++)
 
 if (major is null)
 {
-    Console.Error.WriteLine("usage: dotnet run eng/regress.cs -- --pg <major> [--repeat <count>] [--huge-tx] [filter]");
+    Console.Error.WriteLine("usage: dotnet run eng/regress.cs -- --pg <major> [--repeat <count>] [--huge-tx] [--no-build] [filter]");
     return 2;
 }
 
@@ -101,6 +106,11 @@ foreach (string setting in settings)
 {
     arguments.Add("--postgresql-conf");
     arguments.Add(setting);
+}
+
+if (noBuild)
+{
+    arguments.Add("--no-build");
 }
 
 if (filter is not null)
