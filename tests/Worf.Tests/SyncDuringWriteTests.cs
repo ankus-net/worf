@@ -133,11 +133,12 @@ public sealed partial class SyncDuringWriteTests
             }
         }
 
+        TestContext.WriteLine($"polled {polls} times in {waiting.Elapsed.TotalSeconds:F1} seconds for pgbench's updates, the longest poll taking {longestPoll.TotalSeconds:F1}");
         if (!started)
         {
             // Say why: pgbench may have failed to start its clients.
             string output = pgbench.HasExited ? $"exited with {pgbench.ExitCode}: {await pgbenchStdout}{await pgbenchStderr}" : "still running";
-            Assert.Fail($"pgbench process is not running currently; pgbench {output}; {polls} polls in {waiting.Elapsed.TotalSeconds:F0} seconds, the longest taking {longestPoll.TotalSeconds:F1}");
+            Assert.Fail($"pgbench process is not running currently; pgbench {output}");
         }
 
         _ = await provider.SafePsqlAsync(Database, "ALTER SYSTEM SET log_statement = 'ddl'", token);
