@@ -5,6 +5,7 @@ updates:
   # together with `ankus upgrade`, following each release's notes, so Dependabot leaves them alone.
   - package-ecosystem: nuget
     directories:
+      - /
       - /src/*
       - /tests/*
     schedule:
