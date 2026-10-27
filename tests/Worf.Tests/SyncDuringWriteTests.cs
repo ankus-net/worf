@@ -55,6 +55,9 @@ public sealed partial class SyncDuringWriteTests
             "fsync=off",
             "worf.synchronous_commit = true",
             "log_line_prefix = '%t %p '",
+
+            // A walsender timeout means the apply stopped reading for that long; a lock it waited on shows here.
+            "log_lock_waits = on",
         ], token);
         _ = await subscriber.SafePsqlAsync("postgres", $"CREATE DATABASE {Database}", token);
 
@@ -192,7 +195,8 @@ public sealed partial class SyncDuringWriteTests
                     Match match = LogLinePid().Match(timeoutLine);
                     if (match.Success)
                     {
-                        TestContext.WriteLine(int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture) == walsenderPid
+                        string pid = match.Groups[1].Success ? match.Groups[1].Value : match.Groups[2].Value;
+                        TestContext.WriteLine(int.Parse(pid, CultureInfo.InvariantCulture) == walsenderPid
                             ? $"terminated walsender was the main walsender for the apply worker (apply pid {applyPid})"
                             : "terminated walsender was not for apply worker");
                     }
@@ -236,6 +240,7 @@ public sealed partial class SyncDuringWriteTests
 
     private static int ToPid(string value) => int.TryParse(value.Split('\n')[0], CultureInfo.InvariantCulture, out int pid) ? pid : 0;
 
-    [GeneratedRegex(@"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [A-Z]+ (\d+) LOG:")]
+    // The process ID in pglogical's '%t %p ' prefix, or in the '[%m] [%p] [%c] [%a]: ' one the test cluster logs with.
+    [GeneratedRegex(@"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [A-Z]+ (\d+) LOG:|\] \[(\d+)\] \[[^\]]*\] \[[^\]]*\]: LOG:")]
     private static partial Regex LogLinePid();
 }

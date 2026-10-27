@@ -294,10 +294,8 @@ WaitPrimaryConnection(sub);
 // Clean any per-node data that were copied by pg_basebackup.
 PrintMsg(VerbosityLevel.Verbose, "Removing old worf configuration ...\n");
 
-foreach (string db in databaseList)
+foreach (string subConnstr in databaseList.Select(db => GetConnstr(baseSubConnstr, db)))
 {
-    string subConnstr = GetConnstr(baseSubConnstr, db);
-
     if (string.IsNullOrEmpty(subConnstr))
     {
         throw Die("Subscriber connection string is not valid.\n");
@@ -1103,14 +1101,16 @@ void CopyFile(string fromfile, string tofile, bool append)
             throw Die($"could not create file \"{tofile}\"");
         }
 
-        try
+        using (dstfd)
         {
-            srcfd.CopyTo(dstfd);
-            dstfd.Dispose();
-        }
-        catch (IOException)
-        {
-            throw Die($"could not write to file \"{tofile}\"");
+            try
+            {
+                srcfd.CopyTo(dstfd);
+            }
+            catch (IOException)
+            {
+                throw Die($"could not write to file \"{tofile}\"");
+            }
         }
     }
 }

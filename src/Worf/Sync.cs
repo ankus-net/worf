@@ -60,7 +60,8 @@ internal static class Sync
     /// Synchronizes the subscription's structure and data, as its status asks.
     /// </summary>
     /// <param name="sub">The subscription.</param>
-    internal static void SyncSubscription(WorfSubscription sub)
+    /// <returns>Whether the subscription is catching up, to be marked ready once its changes stream.</returns>
+    internal static bool SyncSubscription(WorfSubscription sub)
     {
         WorfSyncStatus sync = PgBackgroundWorker.RunTransaction(() => GetSubscriptionSyncStatus(sub.Id, false)!);
         ulong lsn = 0;
@@ -70,7 +71,7 @@ internal static class Sync
         {
             // Already synced, nothing to do except cleanup.
             case SyncStatusReady:
-                return;
+                return false;
 
             // We can recover from crashes during these.
             case SyncStatusInit:
@@ -88,13 +89,14 @@ internal static class Sync
 
             PgLog.Info($"initializing subscriber {sub.Name}");
 
-            PgReplicationConnection originConn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "snap");
-            PgReplicationConnection originConnRepl = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, "snap");
+            using PgReplicationConnection originConnRepl = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, "snap");
 
-            string snapshot = PgBackgroundWorker.RunTransaction(() =>
-                EnsureReplicationSlotSnapshot(originConn, originConnRepl, sub.SlotName, useFailoverSlot, out lsn));
-
-            originConn.Dispose();
+            string snapshot;
+            using (PgReplicationConnection originConn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "snap"))
+            {
+                snapshot = PgBackgroundWorker.RunTransaction(() =>
+                    EnsureReplicationSlotSnapshot(originConn, originConnRepl, sub.SlotName, useFailoverSlot, out lsn));
+            }
 
             try
             {
@@ -184,19 +186,23 @@ internal static class Sync
                 throw;
             }
 
-            originConnRepl.Dispose();
-
             status = SyncStatusCatchup;
             PgBackgroundWorker.RunTransaction(() => SetSubscriptionSyncStatus(sub.Id, SyncStatusCatchup));
         }
 
-        if (status == SyncStatusCatchup)
-        {
-            // Nothing to do here yet.
-            PgBackgroundWorker.RunTransaction(() => SetSubscriptionSyncStatus(sub.Id, SyncStatusReady));
+        return status == SyncStatusCatchup;
+    }
 
-            PgLog.Info($"finished synchronization of subscriber {sub.Name}, ready to enter normal replication");
-        }
+    /// <summary>
+    /// Marks a subscription that has caught up ready, once its apply streams changes, so that a caller waiting for
+    /// the synchronization to complete finds the provider's slot in use.
+    /// </summary>
+    /// <param name="sub">The subscription.</param>
+    internal static void FinishSubscriptionSync(WorfSubscription sub)
+    {
+        PgBackgroundWorker.RunTransaction(() => SetSubscriptionSyncStatus(sub.Id, SyncStatusReady));
+
+        PgLog.Info($"finished synchronization of subscriber {sub.Name}, ready to enter normal replication");
     }
 
     /// <summary>
@@ -243,14 +249,17 @@ internal static class Sync
             return currentStatus;
         }
 
-        PgReplicationConnection originConnRepl = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, "copy");
+        using PgReplicationConnection originConnRepl = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, "copy");
 
-        PgReplicationConnection originConn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "copy_slot");
         ulong lsn = 0;
-        string snapshot = PgBackgroundWorker.RunTransaction(() =>
-            EnsureReplicationSlotSnapshot(originConn, originConnRepl, sub.SlotName, false, out lsn));
+        string snapshot;
+        using (PgReplicationConnection originConn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "copy_slot"))
+        {
+            snapshot = PgBackgroundWorker.RunTransaction(() =>
+                EnsureReplicationSlotSnapshot(originConn, originConnRepl, sub.SlotName, false, out lsn));
+        }
+
         statusLsn = lsn;
-        originConn.Dispose();
 
         // Make sure we cleanup the slot if something goes wrong.
         try
@@ -277,8 +286,6 @@ internal static class Sync
         {
             throw;
         }
-
-        originConnRepl.Dispose();
 
         return SyncStatusSyncwait;
     }

@@ -113,7 +113,7 @@ internal static unsafe partial class Apply
         }
 
         // If the subscription isn't initialized yet, initialize it.
-        Sync.SyncSubscription(sub);
+        bool catchingUp = Sync.SyncSubscription(sub);
 
         PgLog.Debug1($"connecting to provider {sub.Origin.Name}, dsn {sub.OriginIf.Dsn}");
 
@@ -151,6 +151,11 @@ internal static unsafe partial class Apply
             }
 
             Worf.StartReplication(streamConn, sub.SlotName, originStartpos, origins, repsets, null, sub.ForceTextTransfer);
+
+            if (catchingUp)
+            {
+                Sync.FinishSubscriptionSync(sub);
+            }
 
             ApplyWork(streamConn);
         }
