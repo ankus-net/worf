@@ -825,7 +825,9 @@ internal static class Functions
             using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
             {
                 apply = guard.Read((in WorfContext _, ReadOnlySpan<WorfWorker> workers) => Worker.ApplyFind(workers, myDatabaseId, sub.Id));
-                running = apply >= 0 && guard[apply].Proc != 0;
+                // An apply told to stop, as when the subscription's interface changes, is no longer replicating even
+                // before it exits, and reporting it as down until its replacement starts lets callers wait for that.
+                running = apply >= 0 && guard[apply].Proc != 0 && !guard[apply].TerminateRequested;
             }
 
             if (running)
