@@ -159,6 +159,7 @@ internal static unsafe partial class Executor
             return;
         }
 
+        StringBuilder json = new();
         foreach (uint reloid in TruncatedTables)
         {
             // Format the query.
@@ -168,7 +169,7 @@ internal static unsafe partial class Executor
             PgLog.Debug3($"truncating the table {nspname}.{relname}");
 
             // It's easier to construct json manually than via Jsonb API...
-            StringBuilder json = new();
+            json.Clear();
             json.Append("{\"schema_name\": ");
             EscapeJson(json, nspname);
             json.Append(",\"table_name\": ");

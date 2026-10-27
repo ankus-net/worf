@@ -78,7 +78,7 @@ public sealed class CreateSubscriberTests
 
         string command = await CreateSubscriberCommand.InstallAsync(provider.Installation, Path.Join(work, "bin"));
 
-        foreach (string sql in (string[])
+        string[] setup =
         [
             "CREATE USER super SUPERUSER",
             "CREATE SEQUENCE some_local_seq",
@@ -101,7 +101,8 @@ public sealed class CreateSubscriberTests
             "CREATE EXTENSION IF NOT EXISTS worf VERSION '1.0.0'",
             "ALTER EXTENSION worf UPDATE",
             "SELECT * FROM worf.create_node(node_name := 'test_provider', dsn := 'dbname=postgres user=super')",
-        ])
+        ];
+        foreach (string sql in setup)
         {
             _ = await provider.SafePsqlAsync(Database, sql, token);
         }

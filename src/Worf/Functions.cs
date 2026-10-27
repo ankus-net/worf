@@ -1596,7 +1596,7 @@ internal static class Functions
 
         // Parse it, providing proper error context, without the position in the fake query.
         List* rawParsetreeList = null;
-        using (PgErrorContext context = PgErrorContext.Push($"invalid row_filter expression \"{rowFilterStr}\""))
+        using (PgErrorContext.Push($"invalid row_filter expression \"{rowFilterStr}\""))
         {
             try
             {

@@ -587,21 +587,10 @@ internal static unsafe partial class OutputPlugin
     private static bool PgDecodeOriginFilter(LogicalDecodingContext* ctx, ushort originId)
     {
         WorfOutputData data = Data(ctx);
-        bool ret;
 
-        if (originId == 0)
-        {
-            // Never filter out locally originated tx's
-            ret = false;
-        }
-        else
-        {
-            // Otherwise, ignore the origin passed in txnfilter_args->origin_id, and just forward all or nothing
-            // based on the configuration option 'forward_origins'.
-            ret = data.ForwardOrigins.Count == 0;
-        }
-
-        return ret;
+        // Never filter out locally originated tx's. Otherwise, ignore the origin passed in txnfilter_args->origin_id,
+        // and just forward all or nothing based on the configuration option 'forward_origins'.
+        return originId != 0 && data.ForwardOrigins.Count == 0;
     }
 
     private static void SendStartupMessage(LogicalDecodingContext* ctx, WorfOutputData data, bool lastMessage)
@@ -725,10 +714,9 @@ internal static unsafe partial class OutputPlugin
             return;
         }
 
-        foreach (string spill in Directory.EnumerateFileSystemEntries(path))
+        foreach (string name in Directory.EnumerateFileSystemEntries(path).Select(spill => Path.GetFileName(spill)))
         {
             // only look at names that can be ours
-            string name = Path.GetFileName(spill);
             if (name.StartsWith("xid", StringComparison.Ordinal))
             {
                 try

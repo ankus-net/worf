@@ -178,7 +178,8 @@ internal static class Libpq
             return "localhost";
         }
 
-        foreach (string directory in (string[])["/tmp", "/var/run/postgresql"])
+        string[] directories = ["/tmp", "/var/run/postgresql"];
+        foreach (string directory in directories)
         {
             if (File.Exists(Path.Join(directory, $".s.PGSQL.{port}")))
             {
