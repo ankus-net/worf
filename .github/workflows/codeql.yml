@@ -68,6 +68,9 @@ jobs:
         with:
           path: ${{ runner.temp }}/ankus-bindings
           key: ankus-bindings-v2-linux-x64-pg18-${{ hashFiles('global.json') }}
+          # Ankus checks restored bindings before reusing them, so a global.json change that leaves the Ankus SDK alone,
+          # such as a test SDK update, starts from the last cache rather than generating them again.
+          restore-keys: ankus-bindings-v2-linux-x64-pg18-
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
