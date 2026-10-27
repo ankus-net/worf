@@ -114,8 +114,27 @@ public sealed partial class SyncDuringWriteTests
         Task<string> pgbenchStdout = pgbench.StandardOutput.ReadToEndAsync(token);
         Task<string> pgbenchStderr = pgbench.StandardError.ReadToEndAsync(token);
 
-        if (!await provider.PollQueryUntilAsync(Database,
-            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE query like 'UPDATE pgbench%')", token))
+        // Polled as poll_query_until does, counting the polls: once a Windows run never saw pgbench's updates during
+        // all 30 seconds of its writes, which only a few slow polls can explain.
+        Stopwatch waiting = Stopwatch.StartNew();
+        int polls = 0;
+        TimeSpan longestPoll = TimeSpan.Zero;
+        bool started = false;
+        while (!started && waiting.Elapsed < TestNode.PollTimeout)
+        {
+            Stopwatch poll = Stopwatch.StartNew();
+            started = await provider.SafePsqlAsync(Database,
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE query like 'UPDATE pgbench%')", token) == "t";
+            polls++;
+            longestPoll = poll.Elapsed > longestPoll ? poll.Elapsed : longestPoll;
+            if (!started)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(100), token);
+            }
+        }
+
+        TestContext.WriteLine($"polled {polls} times in {waiting.Elapsed.TotalSeconds:F1} seconds for pgbench's updates, the longest poll taking {longestPoll.TotalSeconds:F1}");
+        if (!started)
         {
             // Say why: pgbench may have failed to start its clients.
             string output = pgbench.HasExited ? $"exited with {pgbench.ExitCode}: {await pgbenchStdout}{await pgbenchStderr}" : "still running";
