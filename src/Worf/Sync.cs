@@ -89,13 +89,14 @@ internal static class Sync
 
             PgLog.Info($"initializing subscriber {sub.Name}");
 
-            PgReplicationConnection originConn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "snap");
-            PgReplicationConnection originConnRepl = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, "snap");
+            using PgReplicationConnection originConnRepl = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, "snap");
 
-            string snapshot = PgBackgroundWorker.RunTransaction(() =>
-                EnsureReplicationSlotSnapshot(originConn, originConnRepl, sub.SlotName, useFailoverSlot, out lsn));
-
-            originConn.Dispose();
+            string snapshot;
+            using (PgReplicationConnection originConn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "snap"))
+            {
+                snapshot = PgBackgroundWorker.RunTransaction(() =>
+                    EnsureReplicationSlotSnapshot(originConn, originConnRepl, sub.SlotName, useFailoverSlot, out lsn));
+            }
 
             try
             {
@@ -185,8 +186,6 @@ internal static class Sync
                 throw;
             }
 
-            originConnRepl.Dispose();
-
             status = SyncStatusCatchup;
             PgBackgroundWorker.RunTransaction(() => SetSubscriptionSyncStatus(sub.Id, SyncStatusCatchup));
         }
@@ -250,14 +249,17 @@ internal static class Sync
             return currentStatus;
         }
 
-        PgReplicationConnection originConnRepl = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, "copy");
+        using PgReplicationConnection originConnRepl = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, "copy");
 
-        PgReplicationConnection originConn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "copy_slot");
         ulong lsn = 0;
-        string snapshot = PgBackgroundWorker.RunTransaction(() =>
-            EnsureReplicationSlotSnapshot(originConn, originConnRepl, sub.SlotName, false, out lsn));
+        string snapshot;
+        using (PgReplicationConnection originConn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "copy_slot"))
+        {
+            snapshot = PgBackgroundWorker.RunTransaction(() =>
+                EnsureReplicationSlotSnapshot(originConn, originConnRepl, sub.SlotName, false, out lsn));
+        }
+
         statusLsn = lsn;
-        originConn.Dispose();
 
         // Make sure we cleanup the slot if something goes wrong.
         try
@@ -284,8 +286,6 @@ internal static class Sync
         {
             throw;
         }
-
-        originConnRepl.Dispose();
 
         return SyncStatusSyncwait;
     }

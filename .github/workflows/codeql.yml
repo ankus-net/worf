@@ -85,6 +85,18 @@ jobs:
         with:
           category: /language:${{ matrix.language }}
           output: artifacts/codeql-results
+          upload: never
+
+      # The traced C# build also compiles what the Ankus and regular expression source generators write under obj/,
+      # code worf does not own, so its results stay out of both code scanning and the check below.
+      - name: Drop results in generated code
+        run: dotnet run eng/codeql.cs -- drop-generated artifacts/codeql-results
+
+      - name: Upload CodeQL results
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: artifacts/codeql-results
+          category: /language:${{ matrix.language }}
 
       - name: Archive CodeQL results
         uses: actions/upload-artifact@v7
