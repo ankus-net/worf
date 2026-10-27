@@ -55,6 +55,9 @@ public sealed partial class SyncDuringWriteTests
             "fsync=off",
             "worf.synchronous_commit = true",
             "log_line_prefix = '%t %p '",
+
+            // A walsender timeout means the apply stopped reading for that long; a lock it waited on shows here.
+            "log_lock_waits = on",
         ], token);
         _ = await subscriber.SafePsqlAsync("postgres", $"CREATE DATABASE {Database}", token);
 

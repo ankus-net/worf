@@ -79,9 +79,6 @@ jobs:
         env:
           # pglogical's t/040 writes for 120 seconds by default; a shorter run still resynchronizes during writes.
           PGBENCH_TIME: '30'
-          # Its 5-second wal_sender_timeout catches an apply that stops reporting during a synchronization. On a runner
-          # shared with the other tests' clusters, a busy apply can go that long unscheduled, so allow 15.
-          PGBENCH_TIMEOUT: '15s'
         run: dotnet ankus test --pg ${{ matrix.postgresql }} -c Release -- --project tests/Worf.Tests/Worf.Tests.csproj --output detailed
 
       - name: Save multi-server test logs

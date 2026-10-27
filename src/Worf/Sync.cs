@@ -60,7 +60,8 @@ internal static class Sync
     /// Synchronizes the subscription's structure and data, as its status asks.
     /// </summary>
     /// <param name="sub">The subscription.</param>
-    internal static void SyncSubscription(WorfSubscription sub)
+    /// <returns>Whether the subscription is catching up, to be marked ready once its changes stream.</returns>
+    internal static bool SyncSubscription(WorfSubscription sub)
     {
         WorfSyncStatus sync = PgBackgroundWorker.RunTransaction(() => GetSubscriptionSyncStatus(sub.Id, false)!);
         ulong lsn = 0;
@@ -70,7 +71,7 @@ internal static class Sync
         {
             // Already synced, nothing to do except cleanup.
             case SyncStatusReady:
-                return;
+                return false;
 
             // We can recover from crashes during these.
             case SyncStatusInit:
@@ -190,13 +191,19 @@ internal static class Sync
             PgBackgroundWorker.RunTransaction(() => SetSubscriptionSyncStatus(sub.Id, SyncStatusCatchup));
         }
 
-        if (status == SyncStatusCatchup)
-        {
-            // Nothing to do here yet.
-            PgBackgroundWorker.RunTransaction(() => SetSubscriptionSyncStatus(sub.Id, SyncStatusReady));
+        return status == SyncStatusCatchup;
+    }
 
-            PgLog.Info($"finished synchronization of subscriber {sub.Name}, ready to enter normal replication");
-        }
+    /// <summary>
+    /// Marks a subscription that has caught up ready, once its apply streams changes, so that a caller waiting for
+    /// the synchronization to complete finds the provider's slot in use.
+    /// </summary>
+    /// <param name="sub">The subscription.</param>
+    internal static void FinishSubscriptionSync(WorfSubscription sub)
+    {
+        PgBackgroundWorker.RunTransaction(() => SetSubscriptionSyncStatus(sub.Id, SyncStatusReady));
+
+        PgLog.Info($"finished synchronization of subscriber {sub.Name}, ready to enter normal replication");
     }
 
     /// <summary>
