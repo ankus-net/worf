@@ -82,7 +82,37 @@ internal static class ProcessRunner
         }
     }
 
-    private static async Task PumpAsync(StreamReader reader, StringBuilder output)
+    /// <summary>
+    /// Reads a program's output to its end. Windows gives a program's output a synchronous pipe, whose asynchronous
+    /// reads each hold a thread-pool worker until the program exits, so there a dedicated thread reads it, as Ankus
+    /// does; a busy runner adds workers so slowly that the test host's timers and connections otherwise stall.
+    /// </summary>
+    /// <param name="reader">The program's standard output or error.</param>
+    /// <returns>The output.</returns>
+    public static Task<string> ReadToEndAsync(StreamReader reader)
+        => OperatingSystem.IsWindows()
+            ? Task.Factory.StartNew(reader.ReadToEnd, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default)
+            : reader.ReadToEndAsync(CancellationToken.None);
+
+    private static Task PumpAsync(StreamReader reader, StringBuilder output)
+        => OperatingSystem.IsWindows()
+            ? Task.Factory.StartNew(() => Pump(reader, output), CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default)
+            : PumpAsyncCore(reader, output);
+
+    private static void Pump(StreamReader reader, StringBuilder output)
+    {
+        char[] buffer = new char[4096];
+        int read;
+        while ((read = reader.Read(buffer)) > 0)
+        {
+            lock (output)
+            {
+                _ = output.Append(buffer, 0, read);
+            }
+        }
+    }
+
+    private static async Task PumpAsyncCore(StreamReader reader, StringBuilder output)
     {
         char[] buffer = new char[4096];
         int read;
