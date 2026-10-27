@@ -111,8 +111,8 @@ public sealed partial class SyncDuringWriteTests
             "-T", pgbenchTime.ToString(CultureInfo.InvariantCulture), "-j", pgbenchJobs, "-s", pgbenchScale, "-c", pgbenchClients,
             provider.Dsn(Database, "postgres"),
         ]);
-        Task<string> pgbenchStdout = pgbench.StandardOutput.ReadToEndAsync(token);
-        Task<string> pgbenchStderr = pgbench.StandardError.ReadToEndAsync(token);
+        Task<string> pgbenchStdout = ProcessRunner.ReadToEndAsync(pgbench.StandardOutput);
+        Task<string> pgbenchStderr = ProcessRunner.ReadToEndAsync(pgbench.StandardError);
 
         // Polled as poll_query_until does, counting the polls: once a Windows run never saw pgbench's updates during
         // all 30 seconds of its writes, which only a few slow polls can explain.
