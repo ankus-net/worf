@@ -798,7 +798,7 @@ internal static unsafe partial class Apply
                 throw new PgException(PgSqlStates.ProtocolViolation, "invalid startup message: key has zero length");
             }
 
-            if (s->cursor == s->len)
+            if (Worf.UnreadLength(s) == 0)
             {
                 throw new PgException(PgSqlStates.ProtocolViolation, $"invalid startup message: key '{k}' has no following value");
             }
@@ -808,7 +808,7 @@ internal static unsafe partial class Apply
 
             HandleStartupParam(k, v);
         }
-        while (s->cursor != s->len);
+        while (Worf.UnreadLength(s) != 0);
     }
 
     private static bool ParseBoolParam(string key, string value)
@@ -1335,7 +1335,7 @@ internal static unsafe partial class Apply
         long statusInterval = StatusInterval();
         bool reported = false;
 
-        PgReplicationConnection conn = s_applyconn!;
+        PgReplicationConnection conn = s_applyconn ?? throw new InvalidOperationException("The apply connection is not open.");
         while (s_commitEndLsn is null)
         {
             if (Worker.GotSigterm)
@@ -1625,10 +1625,7 @@ internal static unsafe partial class Apply
                     int running = 0;
                     foreach (int worker in Worker.SyncFindAll(workers, myDatabaseId, subid))
                     {
-                        if (Worker.WorkerRunning(workers, worker))
-                        {
-                            running++;
-                        }
+                        running += Worker.WorkerRunning(workers, worker) ? 1 : 0;
                     }
 
                     return running;

@@ -17,21 +17,15 @@ internal static class Rpc
     internal static List<WorfRemoteRel> GetRemoteRepsetTables(PgReplicationConnection conn, List<string> replicationSets)
     {
         string repsetarr = RepsetArray(replicationSets);
-        string query;
-        if (RemoteFunctionExists(conn, Worf.ExtensionName, "show_repset_table_info", 2, null))
-        {
-            query = "SELECT i.relid, i.nspname, i.relname, i.att_list," +
-                "       i.has_row_filter" +
-                "  FROM (SELECT DISTINCT relid FROM worf.tables WHERE set_name = ANY(ARRAY[" + repsetarr + "])) t," +
-                "       LATERAL worf.show_repset_table_info(t.relid, ARRAY[" + repsetarr + "]) i";
-        }
-        else
-        {
-            query = "SELECT r.oid AS relid, t.nspname, t.relname, ARRAY(SELECT attname FROM pg_attribute WHERE attrelid = r.oid AND NOT attisdropped AND attnum > 0) AS att_list," +
-                "       false AS has_row_filter" +
-                "  FROM worf.tables t, pg_catalog.pg_class r, pg_catalog.pg_namespace n" +
-                " WHERE t.set_name = ANY(ARRAY[" + repsetarr + "]) AND r.relname = t.relname AND n.oid = r.relnamespace AND n.nspname = t.nspname";
-        }
+        string query = RemoteFunctionExists(conn, Worf.ExtensionName, "show_repset_table_info", 2, null)
+            ? "SELECT i.relid, i.nspname, i.relname, i.att_list," +
+                    "       i.has_row_filter" +
+                    "  FROM (SELECT DISTINCT relid FROM worf.tables WHERE set_name = ANY(ARRAY[" + repsetarr + "])) t," +
+                    "       LATERAL worf.show_repset_table_info(t.relid, ARRAY[" + repsetarr + "]) i"
+            : "SELECT r.oid AS relid, t.nspname, t.relname, ARRAY(SELECT attname FROM pg_attribute WHERE attrelid = r.oid AND NOT attisdropped AND attnum > 0) AS att_list," +
+                    "       false AS has_row_filter" +
+                    "  FROM worf.tables t, pg_catalog.pg_class r, pg_catalog.pg_namespace n" +
+                    " WHERE t.set_name = ANY(ARRAY[" + repsetarr + "]) AND r.relname = t.relname AND n.oid = r.relnamespace AND n.nspname = t.nspname";
 
         IReadOnlyList<string?[]> res;
         try
@@ -65,20 +59,14 @@ internal static class Rpc
     {
         string qualified = Spi.QuoteQualifiedIdentifier(schemaname, relname);
         string repsetarr = RepsetArray(replicationSets);
-        string query;
-        if (RemoteFunctionExists(conn, Worf.ExtensionName, "show_repset_table_info", 2, null))
-        {
-            query = "SELECT i.relid, i.nspname, i.relname, i.att_list," +
-                "       i.has_row_filter" +
-                "  FROM worf.show_repset_table_info(" + Spi.QuoteLiteral(qualified) + "::regclass, ARRAY[" + repsetarr + "]) i";
-        }
-        else
-        {
-            query = "SELECT r.oid AS relid, t.nspname, t.relname, ARRAY(SELECT attname FROM pg_attribute WHERE attrelid = r.oid AND NOT attisdropped AND attnum > 0) AS att_list," +
-                "       false AS has_row_filter" +
-                "  FROM worf.tables t, pg_catalog.pg_class r, pg_catalog.pg_namespace n" +
-                " WHERE r.oid = " + Spi.QuoteLiteral(qualified) + "::regclass AND t.set_name = ANY(ARRAY[" + repsetarr + "]) AND r.relname = t.relname AND n.oid = r.relnamespace AND n.nspname = t.nspname";
-        }
+        string query = RemoteFunctionExists(conn, Worf.ExtensionName, "show_repset_table_info", 2, null)
+            ? "SELECT i.relid, i.nspname, i.relname, i.att_list," +
+                    "       i.has_row_filter" +
+                    "  FROM worf.show_repset_table_info(" + Spi.QuoteLiteral(qualified) + "::regclass, ARRAY[" + repsetarr + "]) i"
+            : "SELECT r.oid AS relid, t.nspname, t.relname, ARRAY(SELECT attname FROM pg_attribute WHERE attrelid = r.oid AND NOT attisdropped AND attnum > 0) AS att_list," +
+                    "       false AS has_row_filter" +
+                    "  FROM worf.tables t, pg_catalog.pg_class r, pg_catalog.pg_namespace n" +
+                    " WHERE r.oid = " + Spi.QuoteLiteral(qualified) + "::regclass AND t.set_name = ANY(ARRAY[" + repsetarr + "]) AND r.relname = t.relname AND n.oid = r.relnamespace AND n.nspname = t.nspname";
 
         IReadOnlyList<string?[]> res;
         try

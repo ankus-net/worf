@@ -102,7 +102,10 @@ internal static unsafe class ApplyHeap
         (PgRelationWriter writer, PgReplicatedRow row, PgReplicatedRow key, uint replicaIndex) = Writer(rel);
         RelationData* relation = rel.Rel;
         CheckReplicaIndex(rel, replicaIndex);
-        bool replicated = SetRow(key, oldtup) & SetRow(row, newtup);
+        // Both rows are always filled, so neither call is skipped.
+        bool keyReplicated = SetRow(key, oldtup);
+        bool rowReplicated = SetRow(row, newtup);
+        bool replicated = keyReplicated && rowReplicated;
 
         // Search for existing tuple with same key
         PgFoundRow? local = replicated ? writer.Find(key) : writer.Find(HeapRow(rel, oldtup));

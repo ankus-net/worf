@@ -587,21 +587,10 @@ internal static unsafe partial class OutputPlugin
     private static bool PgDecodeOriginFilter(LogicalDecodingContext* ctx, ushort originId)
     {
         WorfOutputData data = Data(ctx);
-        bool ret;
 
-        if (originId == 0)
-        {
-            // Never filter out locally originated tx's
-            ret = false;
-        }
-        else
-        {
-            // Otherwise, ignore the origin passed in txnfilter_args->origin_id, and just forward all or nothing
-            // based on the configuration option 'forward_origins'.
-            ret = data.ForwardOrigins.Count == 0;
-        }
-
-        return ret;
+        // Never filter out locally originated tx's. Otherwise, ignore the origin passed in txnfilter_args->origin_id,
+        // and just forward all or nothing based on the configuration option 'forward_origins'.
+        return originId != 0 && data.ForwardOrigins.Count == 0;
     }
 
     private static void SendStartupMessage(LogicalDecodingContext* ctx, WorfOutputData data, bool lastMessage)
@@ -725,21 +714,20 @@ internal static unsafe partial class OutputPlugin
             return;
         }
 
-        foreach (string spill in Directory.EnumerateFileSystemEntries(path))
+        // only look at names that can be ours
+        IEnumerable<string> spills = Directory.EnumerateFileSystemEntries(path)
+            .Select(spill => Path.GetFileName(spill))
+            .Where(name => name.StartsWith("xid", StringComparison.Ordinal));
+        foreach (string name in spills)
         {
-            // only look at names that can be ours
-            string name = Path.GetFileName(spill);
-            if (name.StartsWith("xid", StringComparison.Ordinal))
+            try
             {
-                try
-                {
-                    File.Delete($"pg_replslot/{slotname}/{name}");
-                }
-                catch (IOException error)
-                {
-                    throw new PgException(PgSqlStates.IoError,
-                        $"could not remove file \"pg_replslot/{slotname}/{name}\" during removal of pg_replslot/{slotname}/*.xid: {error.Message}");
-                }
+                File.Delete($"pg_replslot/{slotname}/{name}");
+            }
+            catch (IOException error)
+            {
+                throw new PgException(PgSqlStates.IoError,
+                    $"could not remove file \"pg_replslot/{slotname}/{name}\" during removal of pg_replslot/{slotname}/*.xid: {error.Message}");
             }
         }
     }

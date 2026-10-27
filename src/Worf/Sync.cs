@@ -119,7 +119,6 @@ internal static class Sync
                     {
                         PgLog.Info("synchronizing structure");
 
-                        status = SyncStatusStructure;
                         PgBackgroundWorker.RunTransaction(() => SetSubscriptionSyncStatus(sub.Id, SyncStatusStructure));
 
                         // Dump structure to temp storage.
@@ -134,7 +133,6 @@ internal static class Sync
                     {
                         PgLog.Info("synchronizing data");
 
-                        status = SyncStatusData;
                         PgBackgroundWorker.RunTransaction(() => SetSubscriptionSyncStatus(sub.Id, SyncStatusData));
 
                         List<WorfRemoteRel> tables = CopyReplicationSetsData(sub.Name, sub.OriginIf.Dsn, snapshot,
@@ -171,7 +169,6 @@ internal static class Sync
                     {
                         PgLog.Info("synchronizing constraints");
 
-                        status = SyncStatusConstraints;
                         PgBackgroundWorker.RunTransaction(() => SetSubscriptionSyncStatus(sub.Id, SyncStatusConstraints));
 
                         RestoreStructure(sub, tmpfile, "post-data");

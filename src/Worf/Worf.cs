@@ -289,6 +289,13 @@ internal static partial class Worf
     }
 
     /// <summary>
+    /// Gets how many bytes of a message are still to be read.
+    /// </summary>
+    /// <param name="str">The message.</param>
+    /// <returns>The number of unread bytes.</returns>
+    internal static unsafe int UnreadLength(StringInfoData* str) => str->len - str->cursor;
+
+    /// <summary>
     /// Appends bytes to a StringInfo, whose data argument is <c>char *</c> before PostgreSQL 16.
     /// </summary>
     /// <param name="str">The StringInfo.</param>

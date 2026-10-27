@@ -86,7 +86,7 @@ internal sealed class WorfTupleData
 
                 Values[attid] = NativeMethods.OidReceiveFunctionCall(typreceive, &buf, typioparam, att->atttypmod);
 
-                if (buf.len != buf.cursor)
+                if (Worf.UnreadLength(&buf) != 0)
                 {
                     throw new PgException(PgSqlStates.InvalidBinaryRepresentation, "incorrect binary data format");
                 }

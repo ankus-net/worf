@@ -158,7 +158,7 @@ internal static class Fe
         bool needquotes = false;
         foreach (char s in str)
         {
-            if (!((s >= 'a' && s <= 'z') || (s >= 'A' && s <= 'Z') || (s >= '0' && s <= '9') || s == '_' || s == '.'))
+            if (!(char.IsAsciiLetterOrDigit(s) || s is '_' or '.'))
             {
                 needquotes = true;
                 break;

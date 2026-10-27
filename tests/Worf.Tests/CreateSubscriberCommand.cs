@@ -43,7 +43,8 @@ internal static class CreateSubscriberCommand
 
             string installationRoot = Path.GetDirectoryName(installation.BinDirectory.TrimEnd(Path.DirectorySeparatorChar))!;
             string root = Path.GetDirectoryName(directory.TrimEnd(Path.DirectorySeparatorChar))!;
-            foreach (string name in (string[])["lib", "share"])
+            string[] names = ["lib", "share"];
+            foreach (string name in names)
             {
                 await CreateJunctionAsync(Path.Join(root, name), Path.Join(installationRoot, name));
             }
@@ -51,7 +52,8 @@ internal static class CreateSubscriberCommand
         else
         {
             // Unix programs resolve their links to find the rest of the installation.
-            foreach (string program in (string[])["pg_ctl", "pg_basebackup"])
+            string[] programs = ["pg_ctl", "pg_basebackup"];
+            foreach (string program in programs)
             {
                 File.CreateSymbolicLink(Path.Join(directory, program), Path.Join(installation.BinDirectory, program));
             }

@@ -831,22 +831,22 @@ internal static partial class ReplicationSet
         // It might seem that it's weird to use just reloid here for the cache key when we are searching for nodeid +
         // relation. But this function is only used by the output plugin which means the nodeid is always the same as
         // only one node is connected to current process.
-        if (s_repSetTableHash.TryGetValue(reloid, out WorfTableRepInfo? entry) && entry.IsValid)
+        if (s_repSetTableHash.TryGetValue(reloid, out WorfTableRepInfo? cached))
         {
-            return entry;
-        }
+            if (cached.IsValid)
+            {
+                return cached;
+            }
 
-        // If an entry was found but entry is Invalid, free its row_filter nodes.
-        if (entry is not null)
-        {
-            foreach (nint node in entry.RowFilter)
+            // The entry is invalid, so free its row_filter nodes.
+            foreach (nint node in cached.RowFilter)
             {
                 NativeMethods.pfree((void*)node);
             }
         }
 
         // Fill the entry
-        entry = new WorfTableRepInfo { Reloid = reloid };
+        WorfTableRepInfo entry = new() { Reloid = reloid };
         s_repSetTableHash[reloid] = entry;
 
         // Check for match between table's replication sets and the subscription list of replication sets that was
