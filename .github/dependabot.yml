@@ -1,0 +1,45 @@
+# Dependabot reads this file from the default branch and opens a pull request for each update it finds.
+version: 2
+updates:
+  # Directory.Packages.props holds the test packages, and global.json the SDKs. The Ankus packages and tool move
+  # together with `ankus upgrade`, following each release's notes, so Dependabot leaves them alone.
+  - package-ecosystem: nuget
+    directories:
+      - /src/*
+      - /tests/*
+    schedule:
+      interval: weekly
+    assignees:
+      - willibrandon
+    labels:
+      - dependencies
+    ignore:
+      - dependency-name: Ankus.*
+
+  # One pull request for the actions the workflows use, since they are tested together anyway.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    assignees:
+      - willibrandon
+    labels:
+      - dependencies
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  # The documentation site. Its packages never reach worf, so they also arrive as one pull request.
+  - package-ecosystem: npm
+    directory: /docs
+    schedule:
+      interval: weekly
+    assignees:
+      - willibrandon
+    labels:
+      - dependencies
+    groups:
+      docs:
+        patterns:
+          - "*"
