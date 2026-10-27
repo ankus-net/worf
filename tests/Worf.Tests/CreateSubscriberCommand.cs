@@ -70,10 +70,23 @@ internal static class CreateSubscriberCommand
     /// <param name="workingDirectory">The working directory, where the command writes its server log.</param>
     /// <param name="environment">Environment variables to set.</param>
     /// <param name="cancellationToken">Cancels waiting.</param>
-    /// <returns>The exit code, standard output and standard error.</returns>
-    public static Task<(int ExitCode, string Stdout, string Stderr)> RunAsync(string command, IReadOnlyList<string> arguments,
+    /// <returns>The exit code, standard output and standard error, followed by the server log when the command
+    /// failed.</returns>
+    public static async Task<(int ExitCode, string Stdout, string Stderr)> RunAsync(string command, IReadOnlyList<string> arguments,
         string workingDirectory, IReadOnlyDictionary<string, string>? environment, CancellationToken cancellationToken)
-        => ProcessRunner.RunAsync(command, arguments, cancellationToken, workingDirectory, environment);
+    {
+        (int exitCode, string stdout, string stderr) = await ProcessRunner.RunAsync(command, arguments, cancellationToken,
+            workingDirectory, environment);
+
+        // The server the command starts logs why it failed in the working directory, which no test run keeps.
+        string log = Path.Join(workingDirectory, "worf_create_subscriber_postgres.log");
+        if (exitCode != 0 && File.Exists(log))
+        {
+            stderr += $"\n##### {Path.GetFileName(log)} #####\n{await File.ReadAllTextAsync(log, cancellationToken)}";
+        }
+
+        return (exitCode, stdout, stderr);
+    }
 
     /// <summary>
     /// Finds a TCP port nothing listens on.
