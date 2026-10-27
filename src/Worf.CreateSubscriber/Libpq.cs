@@ -89,6 +89,11 @@ internal static class Libpq
             Username = user,
             Database = Option("dbname", "PGDATABASE") ?? user,
             Pooling = false,
+
+            // libpq waits as long as connecting and each command take, where Npgsql gives up after 15 and 30 seconds:
+            // the first connection to a node that has just been promoted can take longer on a busy machine.
+            Timeout = 0,
+            CommandTimeout = 0,
         };
 
         if (Option("password", "PGPASSWORD") is { } password)
@@ -103,7 +108,9 @@ internal static class Libpq
 
         if (Option("connect_timeout", "PGCONNECT_TIMEOUT") is { } timeout)
         {
-            builder.Timeout = int.Parse(timeout, CultureInfo.InvariantCulture);
+            // As in libpq, zero or less waits indefinitely and the shortest timeout is 2 seconds.
+            int seconds = int.Parse(timeout, CultureInfo.InvariantCulture);
+            builder.Timeout = seconds <= 0 ? 0 : Math.Max(seconds, 2);
         }
 
         if ((Option("application_name", "PGAPPNAME") ?? Option("fallback_application_name")) is { } applicationName)
