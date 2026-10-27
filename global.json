@@ -6,7 +6,7 @@
   },
   "msbuild-sdks": {
     "Ankus.Sdk": "0.2.11",
-    "MSTest.Sdk": "4.4.1"
+    "MSTest.Sdk": "4.5.1"
   },
   "test": {
     "runner": "Microsoft.Testing.Platform"
