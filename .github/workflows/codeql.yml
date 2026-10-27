@@ -36,24 +36,49 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # JavaScript and TypeScript are the documentation site.
-        language: [actions, csharp, javascript-typescript]
+        include:
+          - language: actions
+            build-mode: none
+          # Most of the C# calls PostgreSQL through types Ankus generates in the build, so the scan follows a build.
+          - language: csharp
+            build-mode: manual
+          # JavaScript and TypeScript are the documentation site.
+          - language: javascript-typescript
+            build-mode: none
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - uses: actions/setup-dotnet@v6
+        if: matrix.build-mode == 'none'
         with:
           global-json-file: global.json
 
-      # These languages are read from source, so the scan needs neither a build nor PostgreSQL.
+      - uses: ./.github/actions/setup
+        if: matrix.build-mode == 'manual'
+        with:
+          platform: linux-x64
+          postgresql: 18
+
+      # Ankus compiles its bindings once and reuses them, so the scan reads worf and not the generated bindings.
+      - name: Cache Ankus bindings
+        if: matrix.build-mode == 'manual'
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/ankus-bindings
+          key: ankus-bindings-v2-linux-x64-pg18-${{ hashFiles('global.json') }}
+
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
           languages: ${{ matrix.language }}
-          build-mode: none
+          build-mode: ${{ matrix.build-mode }}
           config-file: ./.github/codeql-config.yml
+
+      - name: Build
+        if: matrix.build-mode == 'manual'
+        run: dotnet build Worf.slnx -c Release
 
       - name: Analyze
         uses: github/codeql-action/analyze@v4
