@@ -42,7 +42,7 @@ public sealed class NonDefaultReplicationSetTests
         _ = await provider.SafePsqlAsync(Database, "CREATE USER super SUPERUSER", token);
         _ = await subscriber.SafePsqlAsync(Database, "CREATE USER super SUPERUSER", token);
 
-        _ = await provider.SafePsqlAsync(Database, "CREATE EXTENSION IF NOT EXISTS worf VERSION '1.0.0'", token);
+        _ = await provider.SafePsqlAsync(Database, "CREATE EXTENSION IF NOT EXISTS worf VERSION '0.1.0'", token);
         _ = await provider.SafePsqlAsync(Database, "ALTER EXTENSION worf UPDATE", token);
 
         _ = await subscriber.SafePsqlAsync(Database, "CREATE EXTENSION IF NOT EXISTS worf", token);

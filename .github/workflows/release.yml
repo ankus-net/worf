@@ -1,7 +1,7 @@
 name: Release
 
 # Runs on a v* tag: CI, then a package for each PostgreSQL version and platform, then a GitHub release with the
-# packages and their SHA-256 checksums. A tag with a hyphen, such as v1.0.0-rc1, makes a prerelease.
+# packages and their SHA-256 checksums. A tag with a hyphen, such as v0.1.0-rc1, makes a prerelease.
 
 on:
   push:
