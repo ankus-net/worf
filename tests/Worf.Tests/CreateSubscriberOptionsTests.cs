@@ -35,17 +35,17 @@ public sealed class CreateSubscriberOptionsTests
     public async Task InvalidOptionsFail(string message, string[] arguments)
     {
         CancellationToken token = TestContext.CancellationToken;
-        string work = TemporaryDirectory();
-        string command = await CreateSubscriberCommand.InstallAsync(await TestInstallations.CurrentAsync(token), Path.Join(work, "bin"));
+        using TemporaryDirectory work = new($"worf-create-subscriber-options-{Guid.NewGuid():N}");
+        string command = await CreateSubscriberCommand.InstallAsync(await TestInstallations.CurrentAsync(token), Path.Join(work.FullName, "bin"));
         string[] expanded = [.. arguments.Select(argument => argument
-            .Replace("{data}", Path.Join(work, "data"), StringComparison.Ordinal)
-            .Replace("{missing}", Path.Join(work, "missing.conf"), StringComparison.Ordinal))];
+            .Replace("{data}", Path.Join(work.FullName, "data"), StringComparison.Ordinal)
+            .Replace("{missing}", Path.Join(work.FullName, "missing.conf"), StringComparison.Ordinal))];
 
-        (int exitCode, string stdout, string stderr) = await CreateSubscriberCommand.RunAsync(command, expanded, work, null, token);
+        (int exitCode, string stdout, string stderr) = await CreateSubscriberCommand.RunAsync(command, expanded, work.FullName, null, token);
 
         Assert.AreEqual(1, exitCode, stdout + stderr);
         Assert.StartsWith(message, stderr, stdout + stderr);
-        Assert.IsFalse(Directory.Exists(Path.Join(work, "data")), "the command created no data directory");
+        Assert.IsFalse(Directory.Exists(Path.Join(work.FullName, "data")), "the command created no data directory");
     }
 
     /// <summary>
@@ -57,7 +57,7 @@ public sealed class CreateSubscriberOptionsTests
     public async Task SubscribesDatabasesWithOptions()
     {
         CancellationToken token = TestContext.CancellationToken;
-        string work = TemporaryDirectory();
+        using TemporaryDirectory work = new($"worf-create-subscriber-options-{Guid.NewGuid():N}");
         string[] databases = ["postgres", "otherdb"];
 
         await using TestNode provider = await TestNode.StartAsync("provider",
@@ -70,8 +70,8 @@ public sealed class CreateSubscriberOptionsTests
         ], token);
         int providerPort = provider.Cluster.Port;
         int pgport = CreateSubscriberCommand.FreePort();
-        string backupDir = Path.Join(work, "backupdir");
-        string command = await CreateSubscriberCommand.InstallAsync(provider.Installation, Path.Join(work, "bin"));
+        string backupDir = Path.Join(work.FullName, "backupdir");
+        string command = await CreateSubscriberCommand.InstallAsync(provider.Installation, Path.Join(work.FullName, "bin"));
 
         _ = await provider.SafePsqlAsync("postgres", "CREATE USER super SUPERUSER", token);
         _ = await provider.SafePsqlAsync("postgres", "CREATE DATABASE otherdb", token);
@@ -100,7 +100,7 @@ public sealed class CreateSubscriberOptionsTests
                 "--databases=postgres,otherdb", "--replication-sets=default ddl_sql", "--apply-delay=5", "--text-types",
                 "--extra-basebackup-args=-c fast", "--stop", "-v", "-v",
                 $"--hba-conf={Path.Join(AppContext.BaseDirectory, "TestFiles", "regress-pg_hba.conf")}",
-            ], work, new Dictionary<string, string> { ["PGPORT"] = pgport.ToString(CultureInfo.InvariantCulture) }, token);
+            ], work.FullName, new Dictionary<string, string> { ["PGPORT"] = pgport.ToString(CultureInfo.InvariantCulture) }, token);
             TestContext.WriteLine(stdout);
             TestContext.WriteLine(stderr);
             Assert.AreEqual(0, exitCode, "worf_create_subscriber");
@@ -109,7 +109,7 @@ public sealed class CreateSubscriberOptionsTests
             Assert.IsFalse(File.Exists(Path.Join(backupDir, "postmaster.pid")), "--stop stops the server");
 
             (int startExit, string startOutput) = await provider.RunProgramAsync("pg_ctl",
-                ["start", "-D", backupDir, "-l", Path.Join(work, "subscriber.log"), "-w", "-o", $"-p {pgport.ToString(CultureInfo.InvariantCulture)}"], token);
+                ["start", "-D", backupDir, "-l", Path.Join(work.FullName, "subscriber.log"), "-w", "-o", $"-p {pgport.ToString(CultureInfo.InvariantCulture)}"], token);
             Assert.AreEqual(0, startExit, startOutput);
 
             foreach (string db in databases)
@@ -152,12 +152,5 @@ public sealed class CreateSubscriberOptionsTests
             cancellationToken);
         Assert.AreEqual(0, exitCode, output);
         return output.Trim();
-    }
-
-    private static string TemporaryDirectory()
-    {
-        string directory = Path.Join(Path.GetTempPath(), $"worf-create-subscriber-options-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(directory);
-        return directory;
     }
 }
