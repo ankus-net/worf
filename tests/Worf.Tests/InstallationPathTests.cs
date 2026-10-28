@@ -28,9 +28,10 @@ public sealed class InstallationPathTests
     {
         CancellationToken token = TestContext.CancellationToken;
         PostgresInstallation current = await TestInstallations.CurrentAsync(token);
+        using TemporaryDirectory temporary = new($"worf-{Guid.NewGuid():N}"[..13]);
         await using PostgresTestInstallation? staged = current.BinDirectory.Contains(' ', StringComparison.Ordinal)
             ? null
-            : await StageAsync(current, token);
+            : await StageAsync(current, temporary.FullName, token);
         PostgresInstallation installation = staged?.Installation ?? current;
         TestContext.WriteLine($"PostgreSQL installed in {installation.BinDirectory}");
         Assert.Contains(' ', installation.BinDirectory, "the installation's path has a space");
@@ -76,11 +77,12 @@ public sealed class InstallationPathTests
 
     /// <summary>
     /// Copies the installation under <c>Program Files</c>: the system's folder on Windows when it's writable, as on
-    /// the CI runners, and otherwise one in the temporary directory. Staging repeats the installation's own path, and
-    /// each test cluster stages the copy again under the temporary directory, so a short name keeps its files within
-    /// Windows' 260-character path limit.
+    /// the CI runners, and otherwise one in the given temporary directory. Staging repeats the installation's own
+    /// path, and each test cluster stages the copy again under the temporary directory, so a short name keeps its
+    /// files within Windows' 260-character path limit.
     /// </summary>
-    private static async Task<PostgresTestInstallation> StageAsync(PostgresInstallation installation, CancellationToken cancellationToken)
+    private static async Task<PostgresTestInstallation> StageAsync(PostgresInstallation installation, string temporary,
+        CancellationToken cancellationToken)
     {
         if (OperatingSystem.IsWindows())
         {
@@ -97,6 +99,6 @@ public sealed class InstallationPathTests
         }
 
         return await PostgresTestInstallation.StageAsync(installation,
-            Path.Join(Path.GetTempPath(), $"worf-{Guid.NewGuid():N}"[..13], "Program Files"), cancellationToken);
+            Path.Join(temporary, "Program Files"), cancellationToken);
     }
 }

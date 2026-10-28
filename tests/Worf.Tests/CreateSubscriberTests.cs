@@ -23,7 +23,8 @@ public sealed class CreateSubscriberTests
     public async Task ProgramHelp()
     {
         CancellationToken token = TestContext.CancellationToken;
-        string command = await CreateSubscriberCommand.InstallAsync(await TestInstallations.CurrentAsync(token), Path.Join(TemporaryDirectory("help"), "bin"));
+        using TemporaryDirectory work = new($"worf-create-subscriber-help-{Guid.NewGuid():N}");
+        string command = await CreateSubscriberCommand.InstallAsync(await TestInstallations.CurrentAsync(token), Path.Join(work.FullName, "bin"));
 
         (int exitCode, string stdout, string stderr) = await CreateSubscriberCommand.RunAsync(command, ["--help"],
             Path.GetTempPath(), null, token);
@@ -40,7 +41,8 @@ public sealed class CreateSubscriberTests
     public async Task ProgramOptionsHandling()
     {
         CancellationToken token = TestContext.CancellationToken;
-        string command = await CreateSubscriberCommand.InstallAsync(await TestInstallations.CurrentAsync(token), Path.Join(TemporaryDirectory("options"), "bin"));
+        using TemporaryDirectory work = new($"worf-create-subscriber-options-{Guid.NewGuid():N}");
+        string command = await CreateSubscriberCommand.InstallAsync(await TestInstallations.CurrentAsync(token), Path.Join(work.FullName, "bin"));
 
         (int exitCode, _, string stderr) = await CreateSubscriberCommand.RunAsync(command, ["--not-a-valid-option"],
             Path.GetTempPath(), null, token);
@@ -57,7 +59,7 @@ public sealed class CreateSubscriberTests
     public async Task CreateSubscriberFromBaseBackup()
     {
         CancellationToken token = TestContext.CancellationToken;
-        string work = TemporaryDirectory("create");
+        using TemporaryDirectory work = new($"worf-create-subscriber-create-{Guid.NewGuid():N}");
 
         await using TestNode provider = await TestNode.StartAsync("provider",
         [
@@ -74,9 +76,9 @@ public sealed class CreateSubscriberTests
         int pgport = CreateSubscriberCommand.FreePort();
         string providerDsn = $"postgresql://super@localhost:{providerPort.ToString(CultureInfo.InvariantCulture)}/postgres";
         string subscriberDsn = $"postgresql://super@localhost:{pgport.ToString(CultureInfo.InvariantCulture)}/postgres";
-        string backupDir = Path.Join(work, "backupdir");
+        string backupDir = Path.Join(work.FullName, "backupdir");
 
-        string command = await CreateSubscriberCommand.InstallAsync(provider.Installation, Path.Join(work, "bin"));
+        string command = await CreateSubscriberCommand.InstallAsync(provider.Installation, Path.Join(work.FullName, "bin"));
 
         string[] setup =
         [
@@ -127,7 +129,7 @@ public sealed class CreateSubscriberTests
                 $"--provider-dsn={providerDsn}", "--drop-slot-if-exists", "-v",
                 $"--hba-conf={Path.Join(AppContext.BaseDirectory, "TestFiles", "regress-pg_hba.conf")}",
                 $"--postgresql-conf={Path.Join(provider.Cluster.DataDirectory, "postgresql.conf")}",
-            ], work, new Dictionary<string, string> { ["PGPORT"] = pgport.ToString(CultureInfo.InvariantCulture) }, token);
+            ], work.FullName, new Dictionary<string, string> { ["PGPORT"] = pgport.ToString(CultureInfo.InvariantCulture) }, token);
             TestContext.WriteLine(stdout);
             TestContext.WriteLine(stderr);
             Assert.AreEqual(0, exitCode, "worf_create_subscriber check");
@@ -173,12 +175,5 @@ public sealed class CreateSubscriberTests
         {
             _ = await provider.RunProgramAsync("pg_ctl", ["stop", "-D", dataDirectory, "-m", "immediate"], CancellationToken.None);
         }
-    }
-
-    private static string TemporaryDirectory(string name)
-    {
-        string directory = Path.Join(Path.GetTempPath(), $"worf-create-subscriber-{name}-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(directory);
-        return directory;
     }
 }
