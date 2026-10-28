@@ -16,6 +16,20 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Select LLVM and diff, and keep files on the fast drive (Windows)
+      if: runner.os == 'Windows'
+      shell: bash
+      run: |
+        echo "C:\\Program Files\\LLVM\\bin" >> "$GITHUB_PATH"
+        echo "C:\\Program Files\\Git\\usr\\bin" >> "$GITHUB_PATH"
+        # The runner's C: drive is much slower than D:, which holds the workspace, so keep .NET, packages and
+        # temporary files, where Ankus compiles bindings and the tests copy installations and data directories, on
+        # D: too.
+        echo "DOTNET_INSTALL_DIR=D:\\dotnet" >> "$GITHUB_ENV"
+        echo "NUGET_PACKAGES=D:\\nuget\\packages" >> "$GITHUB_ENV"
+        echo "TEMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
+        echo "TMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
+
     - uses: actions/setup-dotnet@v6
       with:
         global-json-file: global.json
@@ -41,15 +55,6 @@ runs:
         if brew list --versions llvm@18 > /dev/null; then brew uninstall --ignore-dependencies llvm@18; fi
         brew install llvm@20 icu4c pkg-config
         echo "$(brew --prefix llvm@20)/bin" >> "$GITHUB_PATH"
-
-    - name: Select LLVM and diff (Windows)
-      if: runner.os == 'Windows'
-      shell: bash
-      run: |
-        echo "C:\\Program Files\\LLVM\\bin" >> "$GITHUB_PATH"
-        echo "C:\\Program Files\\Git\\usr\\bin" >> "$GITHUB_PATH"
-        # The runner's C: drive is much slower than D:, which holds the workspace, so keep packages on D: too.
-        echo "NUGET_PACKAGES=D:\\nuget\\packages" >> "$GITHUB_ENV"
 
     - name: Keep PostgreSQL on the fast drive (Windows)
       # Every PostgreSQL backend on Windows is a new process that loads the installation's binaries, so they belong
