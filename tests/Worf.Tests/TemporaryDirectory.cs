@@ -13,8 +13,7 @@ internal sealed class TemporaryDirectory(string name) : IDisposable
 
     /// <summary>
     /// Deletes the directory. Links in it, such as the junctions a Windows test makes to an installation's lib and
-    /// share, are removed without deleting what they point to. A file a process still holds is left for the system's
-    /// own cleanup.
+    /// share, are removed without deleting what they point to.
     /// </summary>
     public void Dispose()
     {
@@ -24,6 +23,8 @@ internal sealed class TemporaryDirectory(string name) : IDisposable
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException)
         {
+            // A file a process still holds is left for the system's own cleanup, rather than replacing the test's
+            // own failure.
         }
     }
 }

@@ -16,19 +16,15 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Select LLVM and diff, and keep files on the fast drive (Windows)
+    - name: Select LLVM and diff, and keep .NET on the fast drive (Windows)
       if: runner.os == 'Windows'
       shell: bash
       run: |
         echo "C:\\Program Files\\LLVM\\bin" >> "$GITHUB_PATH"
         echo "C:\\Program Files\\Git\\usr\\bin" >> "$GITHUB_PATH"
-        # The runner's C: drive is much slower than D:, which holds the workspace, so keep .NET, packages and
-        # temporary files, where Ankus compiles bindings and the tests copy installations and data directories, on
-        # D: too.
+        # The runner's C: drive is much slower than D:, which holds the workspace, so keep .NET and packages on D: too.
         echo "DOTNET_INSTALL_DIR=D:\\dotnet" >> "$GITHUB_ENV"
         echo "NUGET_PACKAGES=D:\\nuget\\packages" >> "$GITHUB_ENV"
-        echo "TEMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
-        echo "TMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
 
     - uses: actions/setup-dotnet@v6
       with:
@@ -56,14 +52,21 @@ runs:
         brew install llvm@20 icu4c pkg-config
         echo "$(brew --prefix llvm@20)/bin" >> "$GITHUB_PATH"
 
-    - name: Keep PostgreSQL on the fast drive (Windows)
+    - name: Keep PostgreSQL and temporary files on the fast drive (Windows)
       # Every PostgreSQL backend on Windows is a new process that loads the installation's binaries, so they belong
-      # on D: rather than the much slower C:, and outside real-time scanning.
+      # on D: rather than the much slower C:, and outside real-time scanning. Temporary files, where Ankus compiles
+      # bindings and the tests copy installations and data directories, go there too, in a directory the runner's
+      # account owns: pg_ctl starts the server without the account's administrator rights, which the runner's own
+      # temporary directory requires.
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
         New-Item -ItemType Directory -Force -Path D:\ankus | Out-Null
         New-Item -ItemType Junction -Path "$HOME\.ankus" -Target D:\ankus | Out-Null
+        New-Item -ItemType Directory -Force -Path D:\temp | Out-Null
+        icacls D:\temp /grant "${env:USERNAME}:(OI)(CI)F" | Out-Null
+        "TEMP=D:\temp" >> $env:GITHUB_ENV
+        "TMP=D:\temp" >> $env:GITHUB_ENV
         Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
 
     - name: Place the Ankus binding cache
