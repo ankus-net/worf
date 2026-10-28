@@ -61,6 +61,7 @@ jobs:
         run: dotnet ankus build --pg ${{ matrix.postgresql }} --project src/Worf/Worf.csproj
 
       - name: Run regression suite
+        if: github.event_name != 'schedule' && inputs.nightly != true
         run: dotnet run eng/regress.cs -- --pg ${{ matrix.postgresql }} --no-build
 
       - name: Save regression results
@@ -76,9 +77,9 @@ jobs:
           retention-days: 7
 
       # The regression suite's timing-sensitive tests run alone, as pglogical's do, so the many clusters of the
-      # multi-server tests come after it. Their data goes on D: on Windows: the temporary directory is on C:, which
-      # pgbench's commits keep so busy that a backend creating a WAL segment there waits seconds, and an apply worker
-      # waiting that long misses t/040's 5-second walsender timeout.
+      # multi-server tests come after it. Their data goes on D: on Windows rather than C:, which pgbench's commits keep
+      # so busy that a backend creating a WAL segment there waits seconds, and an apply worker waiting that long misses
+      # t/040's 5-second walsender timeout.
       - name: Run multi-server tests
         if: github.event_name != 'schedule' && inputs.nightly != true && (success() || failure())
         env:
@@ -101,9 +102,11 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      # The nightly run's suite runs all come from the stress test, which keeps each failed run's diffs. Two of them
+      # fit within 10 minutes even when the job builds PostgreSQL.
       - name: Run stress test
         if: (github.event_name == 'schedule' || inputs.nightly == true) && (success() || failure())
-        run: dotnet run eng/stress.cs -- --pg ${{ matrix.postgresql }} --runs 5
+        run: dotnet run eng/stress.cs -- --pg ${{ matrix.postgresql }} --runs 2
 
       - name: Save stress test results
         if: (github.event_name == 'schedule' || inputs.nightly == true) && failure()

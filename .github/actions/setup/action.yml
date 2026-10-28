@@ -82,7 +82,10 @@ runs:
       uses: actions/cache/restore@v6
       with:
         path: ~/.ankus/postgres
-        key: postgresql-v1-${{ inputs.platform }}-pg${{ inputs.postgresql }}${{ inputs.release == 'true' && '-release' || '' }}-${{ hashFiles('.config/dotnet-tools.json') }}
+        key: postgresql-v1-${{ inputs.platform }}${{ inputs.release == 'true' && '-release' || '' }}-pg${{ inputs.postgresql }}-${{ hashFiles('.config/dotnet-tools.json') }}
+        # An Ankus update starts from the last installation, which ankus init reuses when the update leaves its build
+        # alone, rather than downloading or building PostgreSQL again.
+        restore-keys: postgresql-v1-${{ inputs.platform }}${{ inputs.release == 'true' && '-release' || '' }}-pg${{ inputs.postgresql }}-
 
     - name: Install PostgreSQL source build tools (Windows)
       # EDB publishes no Windows archive for a PostgreSQL release candidate, so ankus init builds it from source.
@@ -99,9 +102,10 @@ runs:
       run: dotnet ankus init ${{ inputs.release == 'true' && '--release' || '' }} --pg${{ inputs.postgresql }} download
 
     - name: Save PostgreSQL
-      # Saved as soon as it's installed, so a later failing step doesn't make the next run build it again.
-      if: steps.postgresql-cache.outputs.cache-hit != 'true'
+      # Saved as soon as it's installed, so a later failing step doesn't make the next run build it again. Pull
+      # requests use main's installations rather than storing copies of their own, which crowd main's out of the cache.
+      if: steps.postgresql-cache.outputs.cache-hit != 'true' && github.event_name != 'pull_request'
       uses: actions/cache/save@v6
       with:
         path: ~/.ankus/postgres
-        key: postgresql-v1-${{ inputs.platform }}-pg${{ inputs.postgresql }}${{ inputs.release == 'true' && '-release' || '' }}-${{ hashFiles('.config/dotnet-tools.json') }}
+        key: postgresql-v1-${{ inputs.platform }}${{ inputs.release == 'true' && '-release' || '' }}-pg${{ inputs.postgresql }}-${{ hashFiles('.config/dotnet-tools.json') }}
