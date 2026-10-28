@@ -131,34 +131,32 @@ internal static unsafe partial class Apply
         });
 
         // Start the replication.
-        using (PgReplicationConnection streamConn = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, null))
+        using PgReplicationConnection streamConn = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, null);
+        string repsets = ReplicationSet.StringlistToIdentifierstr(sub.ReplicationSets);
+        string origins = ReplicationSet.StringlistToIdentifierstr(sub.ForwardOrigins);
+
+        // IDENTIFY_SYSTEM sets up some internal state on walsender so call it even if we don't (yet) want to use
+        // any of the results.
+        _ = PgBackgroundWorker.RunTransaction(() => Worf.IdentifySystem(streamConn));
+
+        // The walsender of an apply worker that has just exited, as when the subscription's interface changes,
+        // can hold the slot a moment longer. Wait for it, as the sync worker's cleanup does, rather than failing
+        // and being restarted seconds later. A slot that stays busy fails below as before.
+        long deadline = Worker.GetCurrentTimestamp() + 5000000L;
+        while (!Worker.GotSigterm && Worker.GetCurrentTimestamp() < deadline &&
+            PgBackgroundWorker.RunTransaction(() => Rpc.RemoteSlotActive(streamConn, sub.SlotName)))
         {
-            string repsets = ReplicationSet.StringlistToIdentifierstr(sub.ReplicationSets);
-            string origins = ReplicationSet.StringlistToIdentifierstr(sub.ForwardOrigins);
-
-            // IDENTIFY_SYSTEM sets up some internal state on walsender so call it even if we don't (yet) want to use
-            // any of the results.
-            _ = PgBackgroundWorker.RunTransaction(() => Worf.IdentifySystem(streamConn));
-
-            // The walsender of an apply worker that has just exited, as when the subscription's interface changes,
-            // can hold the slot a moment longer. Wait for it, as the sync worker's cleanup does, rather than failing
-            // and being restarted seconds later. A slot that stays busy fails below as before.
-            long deadline = Worker.GetCurrentTimestamp() + 5000000L;
-            while (!Worker.GotSigterm && Worker.GetCurrentTimestamp() < deadline &&
-                PgBackgroundWorker.RunTransaction(() => Rpc.RemoteSlotActive(streamConn, sub.SlotName)))
-            {
-                _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(50));
-            }
-
-            Worf.StartReplication(streamConn, sub.SlotName, originStartpos, origins, repsets, null, sub.ForceTextTransfer);
-
-            if (catchingUp)
-            {
-                Sync.FinishSubscriptionSync(sub);
-            }
-
-            ApplyWork(streamConn);
+            _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(50));
         }
+
+        Worf.StartReplication(streamConn, sub.SlotName, originStartpos, origins, repsets, null, sub.ForceTextTransfer);
+
+        if (catchingUp)
+        {
+            Sync.FinishSubscriptionSync(sub);
+        }
+
+        ApplyWork(streamConn);
 
         // We should only get here if we received sigTERM
     }
@@ -1563,7 +1561,7 @@ internal static unsafe partial class Apply
                     byte[] syncRelname = Worf.ToServer(sync.Relname);
                     using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
                     {
-                        int worker = guard.Read((in WorfContext _, ReadOnlySpan<WorfWorker> workers) =>
+                        int worker = guard.Read((in _, workers) =>
                             Worker.SyncFind(workers, myDatabaseId, subid, syncNspname, syncRelname));
 
                         if (worker >= 0 && guard[worker].Proc != 0 && endLsn >= guard[worker].Worker.Apply.ReplayStopLsn)
@@ -1625,7 +1623,7 @@ internal static unsafe partial class Apply
             int nworkers = 0;
             using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
             {
-                nworkers = guard.Read((in WorfContext _, ReadOnlySpan<WorfWorker> workers) =>
+                nworkers = guard.Read((in _, workers) =>
                 {
                     int running = 0;
                     foreach (int worker in Worker.SyncFindAll(workers, myDatabaseId, subid))

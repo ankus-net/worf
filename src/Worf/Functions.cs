@@ -411,7 +411,7 @@ internal static class Functions
             // Kill the apply to unlock the resources.
             using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
             {
-                int apply = guard.Read((in WorfContext _, ReadOnlySpan<WorfWorker> workers) => Worker.ApplyFind(workers, myDatabaseId, sub.Id));
+                int apply = guard.Read((in _, workers) => Worker.ApplyFind(workers, myDatabaseId, sub.Id));
                 Worker.WorkerKill(guard, apply);
             }
 
@@ -421,7 +421,7 @@ internal static class Functions
                 bool running;
                 using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
                 {
-                    running = guard.Read((in WorfContext _, ReadOnlySpan<WorfWorker> workers) =>
+                    running = guard.Read((in _, workers) =>
                         Worker.WorkerRunning(workers, Worker.ApplyFind(workers, myDatabaseId, sub.Id)));
                 }
 
@@ -505,7 +505,7 @@ internal static class Functions
             }
 
             using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive();
-            int apply = guard.Read((in WorfContext _, ReadOnlySpan<WorfWorker> workers) => Worker.ApplyFind(workers, myDatabaseId, sub.Id));
+            int apply = guard.Read((in _, workers) => Worker.ApplyFind(workers, myDatabaseId, sub.Id));
             Worker.WorkerKill(guard, apply);
         }
 
@@ -824,7 +824,7 @@ internal static class Functions
 
             using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
             {
-                apply = guard.Read((in WorfContext _, ReadOnlySpan<WorfWorker> workers) => Worker.ApplyFind(workers, myDatabaseId, sub.Id));
+                apply = guard.Read((in _, workers) => Worker.ApplyFind(workers, myDatabaseId, sub.Id));
                 // An apply told to stop, as when the subscription's interface changes, is no longer replicating even
                 // before it exits, and reporting it as down until its replacement starts lets callers wait for that.
                 running = apply >= 0 && guard[apply].Proc != 0 && !guard[apply].TerminateRequested;

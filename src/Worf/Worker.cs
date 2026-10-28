@@ -59,7 +59,7 @@ internal static class Worker
         ushort generation;
         using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = WorfCtx.Exclusive())
         {
-            slot = guard.Mutate((ref WorfContext ctx, Span<WorfWorker> workers) => FindEmptyWorkerSlot(workers, worker.Dboid));
+            slot = guard.Mutate((ref ctx, workers) => FindEmptyWorkerSlot(workers, worker.Dboid));
             if (slot == -1)
             {
                 throw new PgException(PgSqlStates.InternalError,
@@ -593,83 +593,81 @@ internal static class Worker
         nint supervisor = 0;
         nint manager = 0;
         WorfWorkerType type;
-        using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = WorfCtx.Exclusive())
+        using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = WorfCtx.Exclusive();
+        WorfContext ctx = guard.Header;
+        WorfWorker worker = guard[MyWorfWorker];
+        worker.Proc = 0;
+        type = worker.WorkerType;
+        uint dboid = worker.Dboid;
+
+        PgLog.Log($"{WorkerTypeName(type)} worker [{Environment.ProcessId}] at slot {MyWorfWorker} generation {s_myWorfWorkerGeneration} {(crash ? "exiting with error" : "detaching cleanly")}");
+
+        // If we crashed we need to report it.
+        //
+        // The crash logic only works because all of the workers are attached to shmem and the serious crashes
+        // that we can't catch here cause postmaster to restart whole server killing all our workers and cleaning
+        // shmem so we start from clean state in that scenario.
+        //
+        // It's vital NOT to clear or change the generation field here; see WaitForWorkerStartup(...).
+        if (crash)
         {
-            WorfContext ctx = guard.Header;
-            WorfWorker worker = guard[MyWorfWorker];
-            worker.Proc = 0;
-            type = worker.WorkerType;
-            uint dboid = worker.Dboid;
+            worker.CrashedAt = GetCurrentTimestamp();
 
-            PgLog.Log($"{WorkerTypeName(type)} worker [{Environment.ProcessId}] at slot {MyWorfWorker} generation {s_myWorfWorkerGeneration} {(crash ? "exiting with error" : "detaching cleanly")}");
-
-            // If we crashed we need to report it.
+            // Manager crash, make sure supervisor notices.
+            if (worker.WorkerType == WorfWorkerType.Manager)
+            {
+                ctx.SubscriptionsChanged = true;
+            }
+        }
+        else
+        {
+            // Worker has finished work, clean up its state from shmem. If this was a manager, notify the
+            // supervisor so it can restart the manager if needed (e.g., if the database still has
+            // subscriptions).
             //
-            // The crash logic only works because all of the workers are attached to shmem and the serious crashes
-            // that we can't catch here cause postmaster to restart whole server killing all our workers and cleaning
-            // shmem so we start from clean state in that scenario.
-            //
-            // It's vital NOT to clear or change the generation field here; see WaitForWorkerStartup(...).
-            if (crash)
+            // However, if SkipSupervisorWakeup is set, the manager is exiting because the extension isn't
+            // installed in this database. Don't wake the supervisor immediately - let it restart on its normal
+            // timeout. This prevents rapid cycling for databases without worf.
+            if (worker.WorkerType == WorfWorkerType.Manager && !worker.SkipSupervisorWakeup)
             {
-                worker.CrashedAt = GetCurrentTimestamp();
-
-                // Manager crash, make sure supervisor notices.
-                if (worker.WorkerType == WorfWorkerType.Manager)
-                {
-                    ctx.SubscriptionsChanged = true;
-                }
-            }
-            else
-            {
-                // Worker has finished work, clean up its state from shmem. If this was a manager, notify the
-                // supervisor so it can restart the manager if needed (e.g., if the database still has
-                // subscriptions).
-                //
-                // However, if SkipSupervisorWakeup is set, the manager is exiting because the extension isn't
-                // installed in this database. Don't wake the supervisor immediately - let it restart on its normal
-                // timeout. This prevents rapid cycling for databases without worf.
-                if (worker.WorkerType == WorfWorkerType.Manager && !worker.SkipSupervisorWakeup)
-                {
-                    ctx.SubscriptionsChanged = true;
-                }
-
-                worker.WorkerType = WorfWorkerType.None;
-                worker.Dboid = 0;
-                worker.SkipSupervisorWakeup = false;
+                ctx.SubscriptionsChanged = true;
             }
 
-            // If we notified that subscriptions changed (manager exit), wake up the supervisor so it can restart the
-            // manager immediately rather than waiting for the latch timeout.
-            if (ctx.SubscriptionsChanged && ctx.Supervisor != 0)
-            {
-                supervisor = ctx.Supervisor;
-            }
+            worker.WorkerType = WorfWorkerType.None;
+            worker.Dboid = 0;
+            worker.SkipSupervisorWakeup = false;
+        }
 
-            // Likewise wake the manager when an apply or sync worker exits: a subscription change that stops a worker
-            // wakes the manager when it commits, and the manager can look before the worker has gone.
-            if (type is WorfWorkerType.Apply or WorfWorkerType.Sync)
-            {
-                int managerSlot = guard.Read((in WorfContext _, ReadOnlySpan<WorfWorker> workers) => ManagerFind(workers, dboid));
-                if (managerSlot >= 0)
-                {
-                    manager = guard[managerSlot].Proc;
-                }
-            }
+        // If we notified that subscriptions changed (manager exit), wake up the supervisor so it can restart the
+        // manager immediately rather than waiting for the latch timeout.
+        if (ctx.SubscriptionsChanged && ctx.Supervisor != 0)
+        {
+            supervisor = ctx.Supervisor;
+        }
 
-            guard[MyWorfWorker] = worker;
-            guard.Header = ctx;
-            MyWorfWorker = -1;
-
-            if (supervisor != 0)
+        // Likewise wake the manager when an apply or sync worker exits: a subscription change that stops a worker
+        // wakes the manager when it commits, and the manager can look before the worker has gone.
+        if (type is WorfWorkerType.Apply or WorfWorkerType.Sync)
+        {
+            int managerSlot = guard.Read((in _, workers) => ManagerFind(workers, dboid));
+            if (managerSlot >= 0)
             {
-                SetProcLatch(supervisor);
+                manager = guard[managerSlot].Proc;
             }
+        }
 
-            if (manager != 0)
-            {
-                SetProcLatch(manager);
-            }
+        guard[MyWorfWorker] = worker;
+        guard.Header = ctx;
+        MyWorfWorker = -1;
+
+        if (supervisor != 0)
+        {
+            SetProcLatch(supervisor);
+        }
+
+        if (manager != 0)
+        {
+            SetProcLatch(manager);
         }
     }
 
@@ -691,7 +689,7 @@ internal static class Worker
         {
             foreach (SignalWorkerItem item in s_signalWorkers)
             {
-                int w = guard.Read((in WorfContext _, ReadOnlySpan<WorfWorker> workers) => ApplyFind(workers, myDatabaseId, item.SubId));
+                int w = guard.Read((in _, workers) => ApplyFind(workers, myDatabaseId, item.SubId));
                 if (item.Kill)
                 {
                     WorkerKill(guard, w);
@@ -710,7 +708,7 @@ internal static class Worker
             guard.Header = ctx;
 
             // Signal the manager worker, if there's one
-            int manager = guard.Read((in WorfContext _, ReadOnlySpan<WorfWorker> workers) => ManagerFind(workers, myDatabaseId));
+            int manager = guard.Read((in _, workers) => ManagerFind(workers, myDatabaseId));
             if (manager >= 0 && guard[manager].Proc != 0)
             {
                 latches.Add(guard[manager].Proc);

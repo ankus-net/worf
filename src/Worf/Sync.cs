@@ -91,12 +91,7 @@ internal static class Sync
 
             using PgReplicationConnection originConnRepl = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, "snap");
 
-            string snapshot;
-            using (PgReplicationConnection originConn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "snap"))
-            {
-                snapshot = PgBackgroundWorker.RunTransaction(() =>
-                    EnsureReplicationSlotSnapshot(originConn, originConnRepl, sub.SlotName, useFailoverSlot, out lsn));
-            }
+            string snapshot = EnsureReplicationSlotSnapshot(sub, originConnRepl, "snap", useFailoverSlot, out lsn);
 
             try
             {
@@ -251,13 +246,7 @@ internal static class Sync
 
         using PgReplicationConnection originConnRepl = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, "copy");
 
-        ulong lsn = 0;
-        string snapshot;
-        using (PgReplicationConnection originConn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "copy_slot"))
-        {
-            snapshot = PgBackgroundWorker.RunTransaction(() =>
-                EnsureReplicationSlotSnapshot(originConn, originConnRepl, sub.SlotName, false, out lsn));
-        }
+        string snapshot = EnsureReplicationSlotSnapshot(sub, originConnRepl, "copy_slot", false, out ulong lsn);
 
         statusLsn = lsn;
 
@@ -343,7 +332,7 @@ internal static class Sync
         uint dboid = Worker.MyWorker.Dboid;
         using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
         {
-            int apply = guard.Read((in WorfContext _, ReadOnlySpan<WorfWorker> workers) =>
+            int apply = guard.Read((in _, workers) =>
                 Worker.ApplyFind(workers, dboid, mySyncWorker.Apply.SubId));
             if (apply >= 0 && guard[apply].Proc != 0)
             {
@@ -422,7 +411,7 @@ internal static class Sync
         WorfWorker me = Worker.MyWorker;
         using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
         {
-            int apply = guard.Read((in WorfContext _, ReadOnlySpan<WorfWorker> workers) =>
+            int apply = guard.Read((in _, workers) =>
                 Worker.ApplyFind(workers, me.Dboid, me.Worker.Sync.Apply.SubId));
             if (apply >= 0 && guard[apply].Proc != 0)
             {
@@ -819,7 +808,7 @@ internal static class Sync
             byte[] serverRelname = Worf.ToServer(relname);
             using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
             {
-                worker = guard.Read((in WorfContext _, ReadOnlySpan<WorfWorker> workers) =>
+                worker = guard.Read((in _, workers) =>
                     Worker.SyncFind(workers, myDatabaseId, subid, serverNspname, serverRelname));
             }
 
@@ -974,6 +963,21 @@ internal static class Sync
         {
             throw new PgException(PgSqlStates.InternalError, $"could not execute pg_restore (\"{pgRestore}\"): {LastErrorMessage()}");
         }
+    }
+
+    /// <summary>
+    /// Creates the subscription's slot and gets its exported snapshot, using a SQL connection of its own that is closed
+    /// once the slot exists.
+    /// </summary>
+    private static string EnsureReplicationSlotSnapshot(WorfSubscription sub, PgReplicationConnection replConn, string appName,
+        bool useFailoverSlot, out ulong lsn)
+    {
+        using PgReplicationConnection sqlConn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, appName);
+        ulong slotLsn = 0;
+        string snapshot = PgBackgroundWorker.RunTransaction(() =>
+            EnsureReplicationSlotSnapshot(sqlConn, replConn, sub.SlotName, useFailoverSlot, out slotLsn));
+        lsn = slotLsn;
+        return snapshot;
     }
 
     /// <summary>
