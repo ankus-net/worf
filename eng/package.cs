@@ -1,6 +1,6 @@
 // Packages worf for one PostgreSQL major version on this machine: the extension from ankus package and
-// worf_create_subscriber, laid out as bin, lib and share/extension, in a tar.gz on Linux and macOS or a zip and an
-// MSI on Windows. Usage: dotnet run eng/package.cs -- --pg <major> --version <version> [--output <directory>]
+// worf_create_subscriber, laid out as bin, lib and share/extension beside the licenses, in a tar.gz on Linux and
+// macOS or a zip and an MSI on Windows. Usage: dotnet run eng/package.cs -- --pg <major> --version <version> [--output <directory>]
 
 using System.Diagnostics;
 using System.IO.Compression;
@@ -60,6 +60,10 @@ foreach (string directory in (string[])[tree, work])
 Directory.CreateDirectory(Path.Join(tree, "bin"));
 Directory.CreateDirectory(Path.Join(tree, "lib"));
 Directory.CreateDirectory(Path.Join(tree, "share", "extension"));
+foreach (string notice in (string[])["LICENSE", "THIRD-PARTY-NOTICES.txt"])
+{
+    File.Copy(Path.Join(root, notice), Path.Join(tree, notice));
+}
 
 // The extension, in the installation's layout, moved to the package's.
 string extension = Path.Join(work, "extension");
