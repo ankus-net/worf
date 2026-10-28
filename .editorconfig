@@ -49,6 +49,10 @@ csharp_style_prefer_collection_expression = when_types_loosely_match:error
 dotnet_diagnostic.IDE0005.severity = warning
 dotnet_diagnostic.IDE0270.severity = error
 dotnet_style_coalesce_expression = true:error
+dotnet_diagnostic.IDE0063.severity = error
+csharp_prefer_simple_using_statement = true:error
+dotnet_diagnostic.IDE0350.severity = error
+csharp_style_prefer_implicitly_typed_lambda_expression = true:error
 
 # Match dotnet/runtime and dotnet/msbuild: require explicit types unless the RHS names the type.
 # Apparent types permit either spelling; do not force var with IDE0007.

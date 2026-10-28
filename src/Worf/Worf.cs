@@ -963,7 +963,7 @@ internal static partial class Worf
             // Worker already attached, nothing to do.
             using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
             {
-                if (guard.Read((in WorfContext _, ReadOnlySpan<WorfWorker> workers) =>
+                if (guard.Read((in _, workers) =>
                     Worker.WorkerRunning(workers, Worker.ManagerFind(workers, dboid))))
                 {
                     continue;

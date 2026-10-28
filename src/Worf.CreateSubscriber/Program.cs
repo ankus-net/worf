@@ -1079,39 +1079,28 @@ bool IsPgDir(string path)
 // copy one file.
 void CopyFile(string fromfile, string tofile, bool append)
 {
-    FileStream srcfd;
+    using FileStream srcfd = OpenFile(fromfile, FileMode.Open, FileAccess.Read, $"could not open file \"{fromfile}\"");
+    using FileStream dstfd = OpenFile(tofile, append ? FileMode.Append : FileMode.Create, FileAccess.Write,
+        $"could not create file \"{tofile}\"");
     try
     {
-        srcfd = new FileStream(fromfile, FileMode.Open, FileAccess.Read);
+        srcfd.CopyTo(dstfd);
+    }
+    catch (IOException)
+    {
+        throw Die($"could not write to file \"{tofile}\"");
+    }
+}
+
+FileStream OpenFile(string path, FileMode mode, FileAccess access, string message)
+{
+    try
+    {
+        return new FileStream(path, mode, access);
     }
     catch (Exception error) when (error is IOException or UnauthorizedAccessException)
     {
-        throw Die($"could not open file \"{fromfile}\"");
-    }
-
-    using (srcfd)
-    {
-        FileStream dstfd;
-        try
-        {
-            dstfd = new FileStream(tofile, append ? FileMode.Append : FileMode.Create, FileAccess.Write);
-        }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
-        {
-            throw Die($"could not create file \"{tofile}\"");
-        }
-
-        using (dstfd)
-        {
-            try
-            {
-                srcfd.CopyTo(dstfd);
-            }
-            catch (IOException)
-            {
-                throw Die($"could not write to file \"{tofile}\"");
-            }
-        }
+        throw Die(message);
     }
 }
 

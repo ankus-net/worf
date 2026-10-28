@@ -69,12 +69,10 @@ internal static class Manager
         {
             // Mark that we're exiting due to missing extension so the detach handler doesn't wake the supervisor.
             // This prevents rapid restart cycles for databases that don't have worf installed.
-            using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
-            {
-                WorfWorker me = guard[Worker.MyWorfWorker];
-                me.SkipSupervisorWakeup = true;
-                guard[Worker.MyWorfWorker] = me;
-            }
+            using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive();
+            WorfWorker me = guard[Worker.MyWorfWorker];
+            me.SkipSupervisorWakeup = true;
+            guard[Worker.MyWorfWorker] = me;
 
             return;
         }
@@ -125,7 +123,7 @@ internal static class Manager
         List<int> workers;
         using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
         {
-            workers = guard.Read((in WorfContext _, ReadOnlySpan<WorfWorker> slots) => Worker.ApplyFindAll(slots, dboid));
+            workers = guard.Read((in _, slots) => Worker.ApplyFindAll(slots, dboid));
         }
 
         bool found = PgBackgroundWorker.RunTransaction(() =>
