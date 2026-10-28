@@ -83,6 +83,9 @@ runs:
       with:
         path: ~/.ankus/postgres
         key: postgresql-v1-${{ inputs.platform }}-pg${{ inputs.postgresql }}${{ inputs.release == 'true' && '-release' || '' }}-${{ hashFiles('.config/dotnet-tools.json') }}
+        # An Ankus update starts from the last installation, which ankus init reuses when the update leaves its build
+        # alone, rather than downloading or building PostgreSQL again.
+        restore-keys: postgresql-v1-${{ inputs.platform }}-pg${{ inputs.postgresql }}${{ inputs.release == 'true' && '-release' || '' }}-
 
     - name: Install PostgreSQL source build tools (Windows)
       # EDB publishes no Windows archive for a PostgreSQL release candidate, so ankus init builds it from source.
