@@ -10,7 +10,7 @@ MSI installers, conflict history, and fixes for PostgreSQL 15–18 to pglogical 
 
 ## Scope
 
-Worf 1.0 does everything pglogical 2.5.3 does, on PostgreSQL 15 through 19, on
+Worf 0.1.0 does everything pglogical 2.5.3 does, on PostgreSQL 15 through 19, on
 Linux x64, macOS ARM64 and x64, and Windows x64.
 
 - **Provider:** the `worf` logical decoding output plugin, with:
@@ -143,7 +143,7 @@ Each pglogical C file becomes one C# file in `src/Worf`, with its header folded 
 | `pglogical_output_proto.c` | `OutputProto.cs` |
 | `pglogical_proto_native.c` | `ProtoNative.cs` |
 | `pglogical_proto_json.c` | `ProtoJson.cs` |
-| `pglogical--2.5.0.sql` | `worf--1.0.0.sql` content, declared through Ankus |
+| `pglogical--2.5.0.sql` | `worf--0.1.0.sql` content, declared through Ankus |
 | `pglogical_create_subscriber.c` | `src/Worf.CreateSubscriber/Program.cs` |
 
 How to port the code:
@@ -154,7 +154,7 @@ How to port the code:
 
 ## Order of work
 
-This order only decides what is built first. Worf 1.0 needs every step.
+This order only decides what is built first. Worf 0.1.0 needs every step.
 
 A step is done when its tests pass in CI on every PostgreSQL version and
 platform. Check the step off here and link the CI run that proved it.

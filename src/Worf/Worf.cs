@@ -15,12 +15,12 @@ internal static partial class Worf
     /// <summary>
     /// The extension version.
     /// </summary>
-    internal const string Version = "1.0.0";
+    internal const string Version = "0.1.0";
 
     /// <summary>
     /// The extension version as a number.
     /// </summary>
-    internal const int VersionNum = 10000;
+    internal const int VersionNum = 100;
 
     /// <summary>
     /// The oldest protocol version this worf speaks.

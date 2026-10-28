@@ -100,7 +100,7 @@ public sealed class CreateSubscriberTests
             "INSERT INTO some_local_tbl3(key, data) VALUES('key1', 'data1')",
             "INSERT INTO some_local_tbl3(key, data) VALUES('key2', NULL)",
             "INSERT INTO some_local_tbl3(key, data) VALUES('key3', 'data3')",
-            "CREATE EXTENSION IF NOT EXISTS worf VERSION '1.0.0'",
+            "CREATE EXTENSION IF NOT EXISTS worf VERSION '0.1.0'",
             "ALTER EXTENSION worf UPDATE",
             "SELECT * FROM worf.create_node(node_name := 'test_provider', dsn := 'dbname=postgres user=super')",
         ];

@@ -2,12 +2,12 @@
 <!--
   worf MSI installer for Windows, built with WiX Toolset v5.
 
-  wix build -o worf-1.0.0-pg17-windows-x64.msi packaging/windows/worf.wxs ^
+  wix build -o worf-0.1.0-pg17-windows-x64.msi packaging/windows/worf.wxs ^
     -ext WixToolset.UI.wixext ^
-    -d VERSION=1.0.0 -d MSI_VERSION=1.0.0 -d PG_VERSION=17 ^
-    -d PackageDir=C:\path\to\worf-1.0.0-pg17-windows-x64
+    -d VERSION=0.1.0 -d MSI_VERSION=0.1.0 -d PG_VERSION=17 ^
+    -d PackageDir=C:\path\to\worf-0.1.0-pg17-windows-x64
 
-  VERSION     - worf version for display (e.g., 1.0.0-rc1)
+  VERSION     - worf version for display (e.g., 0.1.0-rc1)
   MSI_VERSION - numeric version for the MSI, without a prerelease suffix
   PG_VERSION  - PostgreSQL major version (15 to 19)
   PackageDir  - absolute path to the package tree, with bin, lib and share\extension

@@ -62,7 +62,7 @@ public sealed partial class SyncDuringWriteTests
         _ = await subscriber.SafePsqlAsync("postgres", $"CREATE DATABASE {Database}", token);
 
         _ = await provider.SafePsqlAsync(Database, $"CREATE USER {SuperUser} SUPERUSER;", token);
-        _ = await provider.SafePsqlAsync(Database, "CREATE EXTENSION IF NOT EXISTS worf VERSION '1.0.0';", token);
+        _ = await provider.SafePsqlAsync(Database, "CREATE EXTENSION IF NOT EXISTS worf VERSION '0.1.0';", token);
         _ = await provider.SafePsqlAsync(Database, "ALTER EXTENSION worf UPDATE;", token);
 
         string providerConnstr = provider.Dsn(Database, SuperUser);
@@ -71,7 +71,7 @@ public sealed partial class SyncDuringWriteTests
             $"SELECT * FROM worf.create_node(node_name := 'test_provider', dsn := '{providerConnstr}');", token);
 
         _ = await subscriber.SafePsqlAsync(Database, $"CREATE USER {SuperUser} SUPERUSER;", token);
-        _ = await subscriber.SafePsqlAsync(Database, "CREATE EXTENSION IF NOT EXISTS worf VERSION '1.0.0';", token);
+        _ = await subscriber.SafePsqlAsync(Database, "CREATE EXTENSION IF NOT EXISTS worf VERSION '0.1.0';", token);
         _ = await subscriber.SafePsqlAsync(Database, "ALTER EXTENSION worf UPDATE;", token);
 
         TestContext.WriteLine($"node_subscriber - connstr : {subscriber.ConnStr}");
