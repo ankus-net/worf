@@ -268,16 +268,32 @@ internal sealed class TestNode : IAsyncDisposable
     /// <param name="cancellationToken">Cancels waiting for the server.</param>
     /// <returns>The work.</returns>
     public Task StartServerAsync(CancellationToken cancellationToken)
-        => RunPgCtlAsync(["start", "-D", Cluster.DataDirectory, "-l", Cluster.LogFilePath, "-w", "-t", "180"], cancellationToken);
+        => RunPgCtlAsync(["start", "-D", Cluster.DataDirectory, "-l", RestartLogPath, "-w", "-t", "180"], cancellationToken);
 
     /// <summary>
-    /// Reads the node's server log.
+    /// Reads the node's server log, and what the server wrote after <see cref="StartServerAsync"/>.
     /// </summary>
     /// <returns>The log.</returns>
-    public string ReadLog() => Cluster.ReadServerLog();
+    public string ReadLog()
+    {
+        string log = Cluster.ReadServerLog();
+        if (!File.Exists(RestartLogPath))
+        {
+            return log;
+        }
+
+        // The server may still write it.
+        using FileStream stream = new(RestartLogPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using StreamReader reader = new(stream);
+        return log + reader.ReadToEnd();
+    }
 
     /// <inheritdoc/>
     public ValueTask DisposeAsync() => _extension.DisposeAsync();
+
+    // A server started again logs to a file beside the harness's: on Windows the cmd.exe that pg_ctl runs it under
+    // holds the log until a moment after the server stops, when the harness replaces its own log.
+    private string RestartLogPath => Cluster.LogFilePath + ".restart.log";
 
     private static string FormatValue(object value) => value switch
     {

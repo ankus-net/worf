@@ -54,7 +54,7 @@ internal static class SequenceRangeExchange
 
         // Backends reload their blocks, which an activation or a grant may have changed, once this commits.
         uint senderId = root.GetProperty("node_id").GetUInt32();
-        _ = Process(node, root, senderId, root.GetProperty("node_name").GetString() ?? "");
+        _ = Process(node, root, senderId, root.GetProperty("node_name").GetString() ?? "", true);
         SequenceRanges.ChangedOnCommit();
         return Build(node, senderId, null);
     }
@@ -75,6 +75,9 @@ internal static class SequenceRangeExchange
             s_exchangedAt.Clear();
         }
 
+        // The manager and the range worker exchange one at a time, so that this node's calls carry its WAL position in
+        // order.
+        _ = Spi.Execute("SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('worf.sequence_range_exchange'))");
         bool changed = false;
         foreach (WorfSubscription sub in WorfNode.GetNodeSubscriptions(node.Node.Id, false))
         {
@@ -121,7 +124,7 @@ internal static class SequenceRangeExchange
             string message = Build(node, sub.Origin.Id, sub.SlotName);
             string reply = conn.Query("SELECT worf.sequence_range_exchange(" + Spi.QuoteLiteral(message) + ")", 1)[0][0] ?? "{}";
             using JsonDocument document = JsonDocument.Parse(reply);
-            (bool granted, bool received) = Process(node, document.RootElement, sub.Origin.Id, sub.Origin.Name);
+            (bool granted, bool received) = Process(node, document.RootElement, sub.Origin.Id, sub.Origin.Name, false);
             changed |= received;
             if (received)
             {
@@ -325,8 +328,13 @@ internal static class SequenceRangeExchange
     /// Takes in a neighbor's message: joins the sequences it manages that exist here, records its reports, answers
     /// its request when this node is its parent, records grants for this node and the neighbor's acknowledgements.
     /// </summary>
+    /// <param name="node">This node.</param>
+    /// <param name="root">The message.</param>
+    /// <param name="senderId">The neighbor's node id.</param>
+    /// <param name="senderName">The neighbor's name.</param>
+    /// <param name="call">Whether the neighbor called this node, rather than answered its call.</param>
     /// <returns>Whether this node granted the neighbor a block, and whether it received one.</returns>
-    private static (bool Granted, bool Received) Process(WorfLocalNode node, JsonElement root, uint senderId, string senderName)
+    private static (bool Granted, bool Received) Process(WorfLocalNode node, JsonElement root, uint senderId, string senderName, bool call)
     {
         bool granted = false;
         bool received = false;
@@ -385,8 +393,10 @@ internal static class SequenceRangeExchange
             string walLsn = root.GetProperty("wal_lsn").GetString() ?? "0/0";
 
             // A neighbor whose WAL position moved backwards on the same timeline was rolled back, by a restored backup
-            // or snapshot, and may issue values it issued before. It must reset its blocks.
-            string? rolledBack = Spi.ExecuteScalar<string?>("""
+            // or snapshot, and may issue values it issued before. It must reset its blocks. Only the positions in its
+            // calls, which it makes one at a time, are compared: an answer to this node's call may pass a call the
+            // neighbor sent before it.
+            string? rolledBack = !call ? null : Spi.ExecuteScalar<string?>("""
                 UPDATE worf.sequence_range_node SET reset_lsn = wal_lsn
                 WHERE seqoid = $1 AND node_id = $2 AND via_node = node_id AND sysid = $3::numeric AND timeline = $4 AND wal_lsn > $5::pg_lsn
                 RETURNING wal_lsn::text
@@ -400,15 +410,16 @@ internal static class SequenceRangeExchange
             _ = Spi.Execute("""
                 INSERT INTO worf.sequence_range_node (seqoid, node_id, node_name, via_node, sysid, timeline, wal_lsn, epoch, state, distance,
                     high_water, watermark, reported_at)
-                VALUES ($1, $2, $3, $2, $4::numeric, $5, $6::pg_lsn, $7, $8, $9, $10, $11, now())
+                VALUES ($1, $2, $3, $2, $4::numeric, $5, CASE WHEN $12 THEN $6::pg_lsn END, $7, $8, $9, $10, $11, now())
                 ON CONFLICT (seqoid, node_id) DO UPDATE SET node_name = excluded.node_name, via_node = excluded.via_node,
-                    sysid = excluded.sysid, timeline = excluded.timeline, wal_lsn = excluded.wal_lsn, epoch = excluded.epoch,
+                    sysid = excluded.sysid, timeline = excluded.timeline,
+                    wal_lsn = CASE WHEN $12 THEN excluded.wal_lsn ELSE sequence_range_node.wal_lsn END, epoch = excluded.epoch,
                     state = excluded.state, distance = excluded.distance, high_water = excluded.high_water, watermark = excluded.watermark,
                     reported_at = excluded.reported_at
                 """, SpiParameter.Create(seqoid), SpiParameter.Create(senderId), SpiParameter.Create(senderName),
                 SpiParameter.Create(sysid), SpiParameter.Create(timeline), SpiParameter.Create(walLsn), SpiParameter.Create(epoch),
                 SpiParameter.Create(entry.GetProperty("state").GetString()), SpiParameter.Create(Nullable32(entry, "distance")),
-                SpiParameter.Create(high), SpiParameter.Create(watermark));
+                SpiParameter.Create(high), SpiParameter.Create(watermark), SpiParameter.Create(call));
 
             // The neighbor asks this node to reset, once per rollback it saw, or has reset as this node asked.
             if (Text(entry, "reset") is string reset && Spi.Execute(
