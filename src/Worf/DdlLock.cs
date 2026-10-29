@@ -183,12 +183,19 @@ internal static unsafe partial class DdlLock
         }
 
         PlannedStmt* plan = queryDesc->plannedstmt;
+#if ANKUS_PG19
+        Bitmapset* results = plan->resultRelationRelids;
+        for (int rti = NativeMethods.bms_next_member(results, -1); rti >= 0; rti = NativeMethods.bms_next_member(results, rti))
+        {
+            CheckWrite(((RangeTblEntry*)NativeMethods.list_nth(plan->rtable, rti - 1))->relid);
+        }
+#else
         List* results = plan->resultRelations;
         for (int i = 0; results is not null && i < results->length; i++)
         {
-            RangeTblEntry* rte = (RangeTblEntry*)NativeMethods.list_nth(plan->rtable, results->elements[i].int_value - 1);
-            CheckWrite(rte->relid);
+            CheckWrite(((RangeTblEntry*)NativeMethods.list_nth(plan->rtable, results->elements[i].int_value - 1))->relid);
         }
+#endif
     }
 
     /// <summary>
