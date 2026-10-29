@@ -94,6 +94,34 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   Replicates DDL that functions and procedures run too. The default is
   `off`.
 
+- `worf.global_ddl_lock`
+  With `worf.enable_ddl_replication`, locks every node for DDL that can't
+  apply in any order: changing a column's type, renaming a table, column or
+  schema, moving a table to another schema, adding a constraint, a unique
+  index or a `NOT NULL` column without a default, dropping a table or a schema
+  with `CASCADE`, adding a domain constraint, renaming an enum value, or
+  changing a composite type. It covers a partitioned table's partitions and
+  every table with a column of a changed type. In a transaction block, any
+  DDL takes the lock for its tables, so later DDL there needn't wait. Before
+  the DDL runs, each node this node subscribes to that receives its DDL
+  through `ddl_sql` holds back writes to those tables it replicates, which
+  fail with SQLSTATE `55P03`, and DDL on them, until the DDL has applied
+  there. Every node applies the others' changes up to that point first. A
+  node keeps holding back across a restart, and lets go once the DDL applies
+  or the transaction that ran it aborts. Only the table's, schema's or type's
+  owner takes the lock. `CREATE UNIQUE INDEX CONCURRENTLY`, which commits
+  partway, can't take it. The user in each provider connection string needs
+  `EXECUTE` on `worf.fence_writes` and `worf.keep_fence`, which `PUBLIC`
+  doesn't have. The default is `on`.
+
+- `worf.ddl_lock_timeout`
+  How long DDL waits for the other nodes to hold back their writes and catch
+  up before it fails. The default is `1min`.
+
+- `worf.max_fenced_tables`
+  How many tables other nodes' DDL can hold back on this server at once.
+  Takes effect at server start. The default is `4096`.
+
 - `worf.batch_inserts`
   Tells worf to use batch insert mechanism if possible. Batch mechanism
   uses PostgreSQL internal batch insert mode which is also used by `COPY`

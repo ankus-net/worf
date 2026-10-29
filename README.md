@@ -554,6 +554,12 @@ by extensions will go to `default` replication set.
   - `replication_sets` - array of replication sets which this command should be
     associated with, default "{ddl_sql}"
 
+- `worf.release_fence(fence_id bigint)`
+  Lets local writes and DDL through the fence that `worf.global_ddl_lock` put
+  up for DDL from another node, or through every fence in this database when
+  `fence_id` is NULL, as when that DDL won't reach this node because its node
+  is gone for good. Returns the number of tables let through.
+
 - `worf.synchronize_sequence(relation regclass)`
   Push sequence state to all subscribers. Unlike the subscription and table
   synchronization function, this function should be run on provider. It forces
@@ -714,6 +720,34 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   Replicates DDL that functions and procedures run too. The default is
   `off`.
 
+- `worf.global_ddl_lock`
+  With `worf.enable_ddl_replication`, locks every node for DDL that can't
+  apply in any order: changing a column's type, renaming a table, column or
+  schema, moving a table to another schema, adding a constraint, a unique
+  index or a `NOT NULL` column without a default, dropping a table or a schema
+  with `CASCADE`, adding a domain constraint, renaming an enum value, or
+  changing a composite type. It covers a partitioned table's partitions and
+  every table with a column of a changed type. In a transaction block, any
+  DDL takes the lock for its tables, so later DDL there needn't wait. Before
+  the DDL runs, each node this node subscribes to that receives its DDL
+  through `ddl_sql` holds back writes to those tables it replicates, which
+  fail with SQLSTATE `55P03`, and DDL on them, until the DDL has applied
+  there. Every node applies the others' changes up to that point first. A
+  node keeps holding back across a restart, and lets go once the DDL applies
+  or the transaction that ran it aborts. Only the table's, schema's or type's
+  owner takes the lock. `CREATE UNIQUE INDEX CONCURRENTLY`, which commits
+  partway, can't take it. The user in each provider connection string needs
+  `EXECUTE` on `worf.fence_writes` and `worf.keep_fence`, which `PUBLIC`
+  doesn't have. The default is `on`.
+
+- `worf.ddl_lock_timeout`
+  How long DDL waits for the other nodes to hold back their writes and catch
+  up before it fails. The default is `1min`.
+
+- `worf.max_fenced_tables`
+  How many tables other nodes' DDL can hold back on this server at once.
+  Takes effect at server start. The default is `4096`.
+
 - `worf.batch_inserts`
   Tells worf to use batch insert mechanism if possible. Batch mechanism
   uses PostgreSQL internal batch insert mode which is also used by `COPY`
@@ -849,6 +883,12 @@ to be run on the provider and subscriber at a consistent point.
 A replicated `ALTER TABLE ... ADD COLUMN` with a volatile default, such as
 `now()` or `gen_random_uuid()`, fills existing rows with each node's own
 values.
+
+With `worf.global_ddl_lock`, a statement in the same transaction that writes
+rows another node is about to change, before DDL that takes the lock, can
+make the DDL wait until `worf.ddl_lock_timeout`. A node notices within about a
+minute that a node holding back its writes for DDL died before the DDL
+committed.
 
 ### No replication queue flush
 

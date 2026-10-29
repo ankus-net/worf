@@ -69,6 +69,12 @@ A replicated `ALTER TABLE ... ADD COLUMN` with a volatile default, such as
 `now()` or `gen_random_uuid()`, fills existing rows with each node's own
 values.
 
+With `worf.global_ddl_lock`, a statement in the same transaction that writes
+rows another node is about to change, before DDL that takes the lock, can
+make the DDL wait until `worf.ddl_lock_timeout`. A node notices within about a
+minute that a node holding back its writes for DDL died before the DDL
+committed.
+
 ## No replication queue flush
 
 There's no support for freezing transactions on the master and waiting until

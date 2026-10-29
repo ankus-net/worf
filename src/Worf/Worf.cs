@@ -617,6 +617,7 @@ internal static partial class Worf
 
         // Init workers.
         Worker.WorkerShmemInit();
+        DdlLock.ShmemInit();
 
         // Init executor module
         Executor.ExecutorInit();
