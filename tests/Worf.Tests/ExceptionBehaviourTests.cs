@@ -1,3 +1,5 @@
+using Npgsql;
+
 namespace Worf.Tests;
 
 /// <summary>
@@ -189,6 +191,76 @@ public sealed class ExceptionBehaviourTests
         Assert.AreEqual("10", await subscriber.SafePsqlAsync(Database, "SELECT count(*) FROM t WHERE id BETWEEN 11 AND 20", token));
     }
 
+    /// <summary>
+    /// A change that deadlocks with a local transaction while discard applies its transaction again is applied
+    /// again with it once the deadlock clears, rather than skipped as if its data were at fault.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task DeadlocksDuringADiscardReplayAreRetried()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+
+        await using TestNode provider = await StartNodeAsync("provider", token);
+        await using TestNode subscriber = await StartNodeAsync("subscriber", token, "worf.exception_behaviour = discard");
+        _ = await provider.SafePsqlAsync(Database, """
+            CREATE TABLE t (id integer PRIMARY KEY, v text);
+            CREATE TABLE a (id integer PRIMARY KEY, v text);
+            CREATE TABLE b (id integer PRIMARY KEY, v text);
+            INSERT INTO a VALUES (1, 'initial');
+            INSERT INTO b VALUES (1, 'initial');
+            SELECT * FROM worf.replication_set_add_all_tables('default', '{public}');
+            """, token);
+        _ = await subscriber.SafePsqlAsync(Database, """
+            CREATE TABLE t (id integer PRIMARY KEY, v text CONSTRAINT not_bad CHECK (v <> 'bad'));
+            CREATE TABLE a (id integer PRIMARY KEY, v text);
+            CREATE TABLE b (id integer PRIMARY KEY, v text);
+            INSERT INTO a VALUES (1, 'initial');
+            INSERT INTO b VALUES (1, 'initial');
+            """, token);
+        await SubscribeAsync(provider, subscriber, token);
+
+        // The bad row makes discard apply the transaction again.
+        int logpos = subscriber.ReadLog().Length;
+        _ = await provider.SafePsqlAsync(Database, """
+            UPDATE a SET v = 'remote' WHERE id = 1;
+            UPDATE b SET v = 'remote' WHERE id = 1;
+            INSERT INTO t VALUES (1, 'bad');
+            """, token);
+        Assert.IsTrue(await PollLogAsync(subscriber, logpos, "once the worker restarts", token), "the first attempt");
+
+        // The replay updates a, then waits for b, which this transaction holds and which then waits for a. The replay
+        // waited first and detects the deadlock first, so it's the transaction that's cancelled.
+        await using (NpgsqlConnection local = await subscriber.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction transaction = await local.BeginTransactionAsync(token);
+            await using (NpgsqlCommand command = new("SET LOCAL deadlock_timeout = '1min'; UPDATE b SET v = 'local' WHERE id = 1",
+                local, transaction))
+            {
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+
+            Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND backend_type <> 'client backend')",
+                token), "the replay waiting for b");
+            await using (NpgsqlCommand command = new("UPDATE a SET v = 'local' WHERE id = 1", local, transaction))
+            {
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+
+            await transaction.CommitAsync(token);
+        }
+
+        Assert.IsTrue(await PollLogAsync(subscriber, logpos, "deadlock detected", token), "the deadlock");
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT v = 'remote' FROM b", token), "the retried replay");
+        Assert.AreEqual("remote", await subscriber.SafePsqlAsync(Database, "SELECT v FROM a", token));
+        Assert.AreEqual("discard|INSERT|public|t|1|bad|23514", await subscriber.SafePsqlAsync(Database, """
+            SELECT string_agg(concat_ws('|', behaviour, operation, schema_name, table_name, remote_new_tuple->>'id',
+                remote_new_tuple->>'v', error_sqlstate), ',')
+            FROM worf.exception_log
+            """, token));
+    }
+
     private static async Task<TestNode> StartNodeAsync(string name, CancellationToken token, params string[] settings)
     {
         TestNode node = await TestNode.StartAsync(name,
@@ -246,6 +318,23 @@ public sealed class ExceptionBehaviourTests
                 SELECT 1 FROM worf.show_subscription_status()
                     WHERE subscription_name = 'sub' AND status = '{status}')
             """, token), $"subscription failed to reach \"{status}\" state");
+
+    private static async Task<bool> PollLogAsync(TestNode node, int logpos, string text, CancellationToken token)
+    {
+        using CancellationTokenSource timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+        timeout.CancelAfter(TestNode.PollTimeout);
+        while (!node.ReadLog()[logpos..].Contains(text, StringComparison.Ordinal))
+        {
+            if (timeout.IsCancellationRequested)
+            {
+                return false;
+            }
+
+            await Task.Delay(TimeSpan.FromMilliseconds(100), token);
+        }
+
+        return true;
+    }
 
     private static Task<string> LastLogAsync(TestNode subscriber, CancellationToken token)
         => subscriber.SafePsqlAsync(Database, """

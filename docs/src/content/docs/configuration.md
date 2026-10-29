@@ -62,9 +62,12 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   - `sub_disable` - disable the subscription, which applies the transaction
     again once it's enabled
 
-  Skipped changes and disabled subscriptions are recorded in
-  `worf.exception_log`, with the error, the change's rows or queued DDL, and
-  the transaction it belongs to. The default is `error`.
+  Errors that don't come from the data, such as deadlocks, serialization
+  failures, lock and statement timeouts, cancellations, shutdowns and running
+  out of resources, are retried as under `error`. Skipped changes and
+  disabled subscriptions are recorded in `worf.exception_log`, with the error,
+  the change's rows or queued DDL, and the transaction it belongs to. The
+  default is `error`.
 
 - `worf.batch_inserts`
   Tells worf to use batch insert mechanism if possible. Batch mechanism

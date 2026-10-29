@@ -1525,11 +1525,24 @@ internal static unsafe partial class Apply
                 s_applyApi.OnCommit();
             }, PgSubtransactionMode.Atomic);
         }
-        catch (PgException error)
+        catch (PgException error) when (!IsTransient(error))
         {
             ForgetFailedChange();
             ExceptionLog.Record(FailedChange(), WorfExceptionBehaviour.Discard, error);
         }
+    }
+
+    /// <summary>
+    /// Checks whether an error says nothing about the change's data, as a deadlock, a serialization failure, a lock or
+    /// statement timeout, a cancellation, a shutdown, running out of resources, a lost connection or an I/O error do,
+    /// so applying the transaction again can get past it.
+    /// </summary>
+    private static bool IsTransient(PgException error)
+    {
+        string state = error.SqlState;
+        return state is "40000" or "40001" or "40003" or "40P01" or "55P03" or "58030" ||
+            state.StartsWith("08", StringComparison.Ordinal) || state.StartsWith("53", StringComparison.Ordinal) ||
+            state.StartsWith("57", StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -1570,7 +1583,8 @@ internal static unsafe partial class Apply
     /// </summary>
     private static void OnRemoteTransactionError(PgException error)
     {
-        if (s_changeOperation is null || Worker.MyWorker.WorkerType != WorfWorkerType.Apply)
+        // An error that applying the transaction again can get past is retried, as without worf.exception_behaviour.
+        if (s_changeOperation is null || IsTransient(error) || Worker.MyWorker.WorkerType != WorfWorkerType.Apply)
         {
             return;
         }
@@ -1749,7 +1763,7 @@ internal static unsafe partial class Apply
                 _ = Spi.Execute("SET CONSTRAINTS ALL IMMEDIATE");
             }, PgSubtransactionMode.Atomic);
         }
-        catch (PgException error)
+        catch (PgException error) when (!IsTransient(error))
         {
             ForgetFailedChange();
             ExceptionLog.Record(FailedChange(), WorfExceptionBehaviour.Transdiscard, error);
