@@ -222,8 +222,11 @@ internal static partial class RelCache
     }
 
     private static bool ColumnDropped(uint relid, string attname)
-        => Worf.SelectCatalog("SELECT 1 FROM worf.dropped_column WHERE relid = $1 AND attname = $2::name",
-            SpiParameter.Create(relid), SpiParameter.Create(attname)).Count > 0;
+        => Worf.SelectCatalog("""
+            SELECT 1 FROM worf.dropped_column d
+                JOIN pg_catalog.pg_attribute a ON a.attrelid = d.relid AND a.attnum = d.attnum AND a.attisdropped
+            WHERE d.relid = $1 AND d.attname = $2::name
+            """, SpiParameter.Create(relid), SpiParameter.Create(attname)).Count > 0;
 
     private const sbyte TriggerFiresOnOrigin = (sbyte)'O';
     private const sbyte TriggerDisabled = (sbyte)'D';

@@ -664,9 +664,17 @@ internal static unsafe class ProtoNative
             // A column dropped here is read past.
             if (attid < 0)
             {
-                if (kind is 'i' or 'b' or 't')
+                switch (kind)
                 {
-                    _ = NativeMethods.pq_getmsgbytes(@in, (int)NativeMethods.pq_getmsgint(@in, 4));
+                    case 'n' or 'u':
+                        break;
+
+                    case 'i' or 'b' or 't':
+                        _ = NativeMethods.pq_getmsgbytes(@in, (int)NativeMethods.pq_getmsgint(@in, 4));
+                        break;
+
+                    default:
+                        throw new PgException(PgSqlStates.InternalError, $"unknown data representation type '{kind}'");
                 }
 
                 continue;

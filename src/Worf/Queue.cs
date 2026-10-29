@@ -48,8 +48,7 @@ internal static class Queue
         long ts = Worker.GetCurrentTimestamp();
         sbyte* role = NativeMethods.GetUserNameFromId(roleoid, false);
 
-        RangeVar* rv = NativeMethods.makeRangeVar(Worf.PStrDup(Worf.ExtensionName), Worf.PStrDup(CatalogQueue), -1);
-        RelationData* rel = NativeMethods.table_openrv(rv, (int)PgLockMode.RowExclusive);
+        RelationData* rel = Worf.OpenCatalog(CatalogQueue, (int)PgLockMode.RowExclusive);
         TupleDescData* tupDesc = rel->rd_att;
 
         // Form a tuple.
@@ -91,8 +90,7 @@ internal static class Queue
     internal static unsafe QueuedMessage QueuedMessageFromTuple(HeapTupleData* queueTup)
     {
         // Open relation to get the tuple descriptor.
-        RangeVar* rv = NativeMethods.makeRangeVar(Worf.PStrDup(Worf.ExtensionName), Worf.PStrDup(CatalogQueue), -1);
-        RelationData* rel = NativeMethods.table_openrv(rv, (int)PgLockMode.None);
+        RelationData* rel = Worf.OpenCatalog(CatalogQueue, (int)PgLockMode.None);
         TupleDescData* tupDesc = rel->rd_att;
         QueuedMessage res = new();
         bool isnull;
