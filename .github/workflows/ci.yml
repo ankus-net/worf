@@ -141,13 +141,21 @@ jobs:
       # fit within 10 minutes even when the job builds PostgreSQL.
       - name: Run stress test
         if: (github.event_name == 'schedule' || inputs.nightly == true) && (success() || failure())
+        # A hang fails the step, rather than the job's timeout cancelling the job, so that its results are saved.
+        timeout-minutes: 10
         run: dotnet run eng/stress.cs -- --pg ${{ matrix.postgresql }} --runs 2
 
+      # A run that hangs never reaches the copy of its results, so its results and server log come from where it left
+      # them.
       - name: Save stress test results
-        if: (github.event_name == 'schedule' || inputs.nightly == true) && failure()
+        if: (github.event_name == 'schedule' || inputs.nightly == true) && (failure() || cancelled())
         uses: actions/upload-artifact@v7
         with:
           name: stress-${{ matrix.platform }}-pg${{ matrix.postgresql }}
-          path: artifacts/stress/
+          path: |
+            artifacts/stress/
+            src/Worf/pg_regress/results/
+            src/Worf/pg_regress/regression.diffs
+            artifacts/regress-home/clusters/*.log
           if-no-files-found: ignore
           retention-days: 7
