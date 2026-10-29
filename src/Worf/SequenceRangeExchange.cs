@@ -44,8 +44,10 @@ internal static class SequenceRangeExchange
             throw new PgException("42501", $"no worf replication slot \"{slot}\" carries this sequence range exchange");
         }
 
+        // Backends reload their blocks, which an activation or a grant may have changed, once this commits.
         uint senderId = root.GetProperty("node_id").GetUInt32();
         _ = Process(node, root, senderId, root.GetProperty("node_name").GetString() ?? "");
+        SequenceRanges.ChangedOnCommit();
         return Build(node, senderId, null);
     }
 
@@ -81,7 +83,7 @@ internal static class SequenceRangeExchange
                 PgTransaction.RunInSubtransaction(() => changed |= ExchangeWith(node, sub));
                 s_exchangedAt[sub.Id] = now;
             }
-            catch (PgException error)
+            catch (Exception error) when (error is PgException or PgRemoteException)
             {
                 PgLog.Warning($"sequence range exchange with node {sub.Origin.Name} failed: {error.Message}");
             }

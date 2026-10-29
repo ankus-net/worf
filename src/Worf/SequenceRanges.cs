@@ -214,7 +214,26 @@ internal static unsafe partial class SequenceRanges
     internal static void EnableSequenceRange([PgSqlType("regclass", Schema = "pg_catalog")] PgDatum? sequence,
         string?[]? participants, long? rangeSize, long? maxRangeSize, long? poolStart, bool? force)
     {
-        uint seqoid = RequireSequence(sequence);
+        // A sequence's bounds need two values at least.
+        if (rangeSize is < 2)
+        {
+            throw new PgException(PgSqlStates.InvalidParameterValue, "range_size must be at least 2");
+        }
+
+        Enable(RequireSequence(sequence), participants, rangeSize, maxRangeSize, poolStart, force == true);
+    }
+
+    /// <summary>
+    /// Puts a sequence under range management, with this node as its owner.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    /// <param name="participants">The other nodes that issue its values, or null to wait for activation.</param>
+    /// <param name="rangeSize">The size of a node's first block, or null for its type's default.</param>
+    /// <param name="maxRangeSize">The largest block a node requests, or null for its type's default.</param>
+    /// <param name="poolStart">Where the root starts at the lowest.</param>
+    /// <param name="force">Whether to take over from an owner that seems live.</param>
+    internal static void Enable(uint seqoid, string?[]? participants, long? rangeSize, long? maxRangeSize, long? poolStart, bool force)
+    {
         WorfLocalNode node = WorfNode.GetLocalNode(true, false)!;
 
         SequenceInfo info = GetInfo(seqoid);
@@ -268,7 +287,7 @@ internal static unsafe partial class SequenceRanges
                     hint: "Disable it with worf.disable_sequence_range first.");
             }
 
-            if (force != true && Worf.SelectCatalog("""
+            if (!force && Worf.SelectCatalog("""
                 SELECT 1 FROM worf.sequence_range_node
                 WHERE seqoid = $1 AND node_id <> $2 AND epoch = $3 AND state <> 'disabled' AND reported_at > now() - interval '1 minute'
                 """, SpiParameter.Create(seqoid), SpiParameter.Create(node.Node.Id), SpiParameter.Create(current)).Count > 0)
@@ -439,7 +458,7 @@ internal static unsafe partial class SequenceRanges
     internal static bool Check(uint seqoid, WorfLocalNode node, double rate)
     {
         SpiResult rows = Worf.SelectCatalog(
-            "SELECT state, epoch, owner_node, request_size FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(seqoid));
+            "SELECT state, epoch, owner_node, max_range_size FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(seqoid));
         if (rows.Count == 0)
         {
             return false;
@@ -487,8 +506,10 @@ internal static unsafe partial class SequenceRanges
         }
 
         // The owner grants its own next block from the root. Another node requests one from its parent, committed
-        // before the exchange sends it.
-        if (next is null && state != "disabled" && NodeBlock(seqoid, epoch, "next") is null)
+        // before the exchange sends it. Blocks of a single value, such as Snowflake node numbers, are never used up,
+        // so a node that has one needs no next.
+        bool single = rows[0].Get<long>(3) == 1 && active is not null;
+        if (next is null && !single && state != "disabled" && NodeBlock(seqoid, epoch, "next") is null)
         {
             if (owner == node.Node.Id)
             {
@@ -1366,19 +1387,25 @@ internal static unsafe partial class SequenceRanges
         string lo = block.Lo.ToString(CultureInfo.InvariantCulture);
         string hi = block.Hi.ToString(CultureInfo.InvariantCulture);
         string start = info.Ascending ? lo : hi;
-        try
+
+        // A block of one value, as a Snowflake node number, can't be a sequence's bounds, so the sequence stays
+        // quarantined and the block only marks the value as this node's.
+        if (block.Lo != block.Hi)
         {
-            PgTransaction.RunInSubtransaction(() =>
+            try
             {
-                _ = Spi.Execute("SELECT pg_catalog.set_config('lock_timeout', $1, true)", SpiParameter.Create(
-                    Math.Max(lockTimeout, 1).ToString(CultureInfo.InvariantCulture)));
-                RunInternalDdl($"ALTER SEQUENCE {info.Name} NO CYCLE CACHE 1 MINVALUE {lo} MAXVALUE {hi} START WITH {start} RESTART WITH {start}");
-                _ = Spi.Execute("SET LOCAL lock_timeout = 0");
-            });
-        }
-        catch (PgException error) when (error.SqlState == "55P03")
-        {
-            return false;
+                PgTransaction.RunInSubtransaction(() =>
+                {
+                    _ = Spi.Execute("SELECT pg_catalog.set_config('lock_timeout', $1, true)", SpiParameter.Create(
+                        Math.Max(lockTimeout, 1).ToString(CultureInfo.InvariantCulture)));
+                    RunInternalDdl($"ALTER SEQUENCE {info.Name} NO CYCLE CACHE 1 MINVALUE {lo} MAXVALUE {hi} START WITH {start} RESTART WITH {start}");
+                    _ = Spi.Execute("SET LOCAL lock_timeout = 0");
+                });
+            }
+            catch (PgException error) when (error.SqlState == "55P03")
+            {
+                return false;
+            }
         }
 
         // A block that lasted less than an hour makes the next request bigger, and one that lasted more than a day

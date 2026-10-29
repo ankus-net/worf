@@ -59,6 +59,19 @@ internal static class SequenceRangeWorker
                         PgLog.Warning($"could not check managed sequence {seqoid}: {error.Message}");
                     }
                 }
+
+                // Snowflake IDs never pass the time reserved ahead.
+                if (sequences.Count > 0)
+                {
+                    try
+                    {
+                        PgTransaction.RunInSubtransaction(SnowflakeIds.Reserve);
+                    }
+                    catch (PgException error)
+                    {
+                        PgLog.Warning($"could not reserve the Snowflake clock: {error.Message}");
+                    }
+                }
             });
 
             // Requests are committed before the exchanges send them, including those that sessions handed over.

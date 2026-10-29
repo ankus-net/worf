@@ -636,6 +636,14 @@ rejects values written by hand outside this node's blocks with SQLSTATE
 - `worf.reserve_sequence_values(sequence regclass, lo bigint, hi bigint, timeout interval)`
   Gives this node exactly `[lo, hi]`, for rows that already carry those keys.
 
+Where the schema can change, Snowflake IDs need no blocks. Run
+`worf.enable_snowflake(participants text[])` on one node, naming the others,
+and use `worf.snowflake_id()` as a `bigint` column's default. An ID holds the
+milliseconds since 2025 in its top 41 bits, the node's number from the same
+allocator in the next 10 and a counter in the last 12, and each node's IDs
+only grow, even when its clock goes back across a restart.
+`worf.snowflake_node()` shows this node's number.
+
 ## Synchronous Replication
 
 Synchronous replication is supported using same standard mechanism provided

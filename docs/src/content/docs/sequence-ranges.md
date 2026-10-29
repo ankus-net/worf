@@ -57,6 +57,19 @@ A node whose node id, system identifier or timeline changes, as after a promotio
 
 An owner or pool holder whose timeline changes may have lost grants. It grants nothing until the nodes it granted to report the blocks they hold. A synchronous standby for each of them prevents the loss.
 
+## Snowflake IDs
+
+Where the schema can change, a `bigint` column can take Snowflake IDs instead, which need no blocks:
+
+```sql
+-- On one node, naming the others
+SELECT worf.enable_snowflake(participants := '{node_beta}');
+
+CREATE TABLE events (id bigint PRIMARY KEY DEFAULT worf.snowflake_id(), payload jsonb);
+```
+
+An ID holds the milliseconds since 2025 in its top 41 bits, the node's number in the next 10 and a counter in the last 12, so up to 1,024 nodes each issue up to 4,096 IDs a millisecond, and the IDs sort by time. Node numbers come from the same allocator as sequence ranges, so no number is handed out twice, and `worf.snowflake_node()` shows this node's. Each node's IDs only grow, even when its clock goes back across a restart, since the range worker records how far ahead the clock may run.
+
 ## Restrictions
 
 Managed sequences can't cycle, be temporary or unlogged, or be in a replication set. worf rejects `ALTER SEQUENCE` on them, `GRANT UPDATE` on them, changing the default or identity of a column that uses one, dropping or disabling the trigger, and `TRUNCATE ... RESTART IDENTITY`. Superusers and members of `pg_write_all_data` can still call `setval`.

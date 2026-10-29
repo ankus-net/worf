@@ -492,6 +492,58 @@ public sealed class SequenceRangeTests
         }
     }
 
+    /// <summary>
+    /// Snowflake IDs carry each node's own number, from the owner of the numbers, so they never collide, and each
+    /// node's IDs only grow, across a restart too.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task SnowflakeIdsAreUniqueAndOnlyGrow()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        TestNode[] nodes = [nodeA, nodeB];
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_snowflake('{node_b}')", token);
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+
+        HashSet<long> ids = [];
+        Dictionary<TestNode, string> numbers = [];
+        foreach (TestNode node in nodes)
+        {
+            Assert.IsTrue(await node.PollQueryUntilAsync(Database, "SELECT worf.snowflake_node() IS NOT NULL", token), $"{node.Name}'s node number");
+
+            numbers[node] = await node.SafePsqlAsync(Database, "SELECT worf.snowflake_node()", token);
+            _ = await node.SafePsqlAsync(Database, """
+                CREATE TABLE s (n serial PRIMARY KEY, id bigint NOT NULL DEFAULT worf.snowflake_id());
+                INSERT INTO s DEFAULT VALUES;
+                INSERT INTO s (n) SELECT g FROM generate_series(2, 5000) g;
+                """, token);
+        }
+
+        Assert.AreNotEqual(numbers[nodeA], numbers[nodeB]);
+
+        // A restart keeps the clock where it was.
+        await nodeA.StopAsync("fast", token);
+        await nodeA.StartServerAsync(token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT worf.snowflake_node() IS NOT NULL", token), "node_a's node number after a restart");
+        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO s (n) SELECT g FROM generate_series(5001, 5100) g", token);
+
+        foreach (TestNode node in nodes)
+        {
+            Assert.AreEqual($"t|t|{numbers[node]}", await node.SafePsqlAsync(Database, """
+                SELECT bool_and(id > prev),
+                    bool_and(timestamptz '2025-01-01 00:00:00+00' + (id >> 22) * interval '1 millisecond' BETWEEN now() - interval '5 minutes' AND now() + interval '1 minute'),
+                    min((id >> 12) & 1023)
+                FROM (SELECT id, lag(id) OVER (ORDER BY n) AS prev FROM s) ids WHERE prev IS NOT NULL
+                """, token), $"{node.Name}'s IDs grow, carry the time and its number");
+            foreach (string id in (await node.SafePsqlAsync(Database, "SELECT id FROM s", token)).Split('\n'))
+            {
+                Assert.IsTrue(ids.Add(long.Parse(id, CultureInfo.InvariantCulture)), $"{node.Name}'s ID {id} is another node's too");
+            }
+        }
+    }
+
     private static async Task SubscribeAsync(TestNode subscriber, string name, TestNode provider, CancellationToken token)
     {
         _ = await subscriber.SafePsqlAsync(Database, $$"""
