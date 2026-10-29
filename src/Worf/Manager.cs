@@ -115,7 +115,7 @@ internal static class Manager
     }
 
     /// <summary>
-    /// Starts the database's sequence range worker when it has managed sequences and the worker isn't running, or
+    /// Starts the database's sequence range worker when it has managed sequences or subscriptions and the worker isn't running, or
     /// once a crashed one's restart delay has passed.
     /// </summary>
     /// <returns>Whether nothing is left to retry.</returns>
@@ -144,9 +144,13 @@ internal static class Manager
             return false;
         }
 
+        // A node with subscriptions learns from its providers of the sequences they manage.
         bool managed = PgBackgroundWorker.RunTransaction(() =>
             Spi.ExecuteScalar<bool>("SELECT to_regclass('worf.sequence_range') IS NOT NULL") &&
-            Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range)"));
+            Spi.ExecuteScalar<bool>("""
+                SELECT EXISTS (SELECT 1 FROM worf.sequence_range)
+                    OR EXISTS (SELECT 1 FROM worf.subscription s JOIN worf.local_node n ON n.node_id = s.sub_target WHERE s.sub_enabled)
+                """));
         if (managed)
         {
             _ = Worker.WorkerRegister(new WorfWorker { WorkerType = WorfWorkerType.Range, Dboid = dboid });

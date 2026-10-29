@@ -20,6 +20,7 @@ internal static class SequenceRangeExchange
     // When each link last exchanged, by subscription, and the links with acknowledgements to send.
     private static readonly Dictionary<uint, long> s_exchangedAt = [];
     private static readonly HashSet<uint> s_acksWaiting = [];
+    private static long s_requested;
 
     /// <summary>
     /// Answers a neighbor's exchange on the provider end of its subscription.
@@ -58,6 +59,14 @@ internal static class SequenceRangeExchange
     /// <returns>Whether this node's blocks changed.</returns>
     internal static bool ExchangeAll(WorfLocalNode node)
     {
+        // A backend that answered an exchange learned of a node or sequence the neighbors should hear of.
+        long requested = SequenceRanges.ExchangeRequested.Value;
+        if (requested != s_requested)
+        {
+            s_requested = requested;
+            s_exchangedAt.Clear();
+        }
+
         bool changed = false;
         foreach (WorfSubscription sub in WorfNode.GetNodeSubscriptions(node.Node.Id, false))
         {
@@ -184,25 +193,46 @@ internal static class SequenceRangeExchange
                 WriteNullable(writer, "watermark", row.Get<long?>(8));
                 writer.WriteString("state", row.Get<string>(10));
 
-                // The open request, when the neighbor is this node's parent.
+                // The open requests, for a node block or a pool block, when the neighbor is this node's parent.
+                writer.WriteStartArray("requests");
                 if (row.Get<uint?>(9) == neighbor)
                 {
-                    SpiResult request = Worf.SelectCatalog(
-                        "SELECT request_id, size FROM worf.sequence_range_request WHERE seqoid = $1 AND parent_node = $2 ORDER BY created_at LIMIT 1",
+                    SpiResult requests = Worf.SelectCatalog(
+                        "SELECT request_id, size, kind::text FROM worf.sequence_range_request WHERE seqoid = $1 AND parent_node = $2",
                         SpiParameter.Create(seqoid), SpiParameter.Create(neighbor));
-                    if (request.Count > 0)
+                    for (int r = 0; r < requests.Count; r++)
                     {
-                        writer.WriteStartObject("request");
-                        writer.WriteString("id", request[0].Get<Guid>(0));
-                        writer.WriteNumber("size", request[0].Get<long>(1));
+                        writer.WriteStartObject();
+                        writer.WriteString("id", requests[r].Get<Guid>(0));
+                        writer.WriteNumber("size", requests[r].Get<long>(1));
+                        writer.WriteString("kind", requests[r].Get<string>(2));
                         writer.WriteEndObject();
                     }
                 }
 
+                writer.WriteEndArray();
+
+                // Every node this node has heard from, so that reports reach the owner hop by hop.
+                writer.WriteStartArray("reports");
+                SpiResult reports = Worf.SelectCatalog(
+                    "SELECT node_id, node_name::text, high_water, watermark FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id <> $2",
+                    SpiParameter.Create(seqoid), SpiParameter.Create(neighbor));
+                for (int r = 0; r < reports.Count; r++)
+                {
+                    writer.WriteStartObject();
+                    writer.WriteNumber("node_id", reports[r].Get<uint>(0));
+                    writer.WriteString("node_name", reports[r].Get<string>(1));
+                    WriteNullable(writer, "high_water", reports[r].Get<long?>(2));
+                    WriteNullable(writer, "watermark", reports[r].Get<long?>(3));
+                    writer.WriteEndObject();
+                }
+
+                writer.WriteEndArray();
+
                 // Grants for the neighbor that it hasn't acknowledged, and acknowledgements of its grants.
                 writer.WriteStartArray("grants");
                 SpiResult grants = Worf.SelectCatalog(
-                    "SELECT grant_id, request_id, lo, hi FROM worf.sequence_range_grant WHERE seqoid = $1 AND grantee_id = $2 AND state = 'sent'",
+                    "SELECT grant_id, request_id, lo, hi, kind::text FROM worf.sequence_range_grant WHERE seqoid = $1 AND grantee_id = $2 AND state = 'sent'",
                     SpiParameter.Create(seqoid), SpiParameter.Create(neighbor));
                 for (int g = 0; g < grants.Count; g++)
                 {
@@ -211,13 +241,14 @@ internal static class SequenceRangeExchange
                     writer.WriteString("request_id", grants[g].Get<Guid>(1));
                     writer.WriteNumber("lo", grants[g].Get<long>(2));
                     writer.WriteNumber("hi", grants[g].Get<long>(3));
+                    writer.WriteString("kind", grants[g].Get<string>(4));
                     writer.WriteEndObject();
                 }
 
                 writer.WriteEndArray();
                 writer.WriteStartArray("acks");
                 SpiResult received = Worf.SelectCatalog(
-                    "SELECT block_id FROM worf.sequence_range_block WHERE seqoid = $1 AND from_node = $2 AND kind = 'n' AND state IN ('next', 'active')",
+                    "SELECT block_id FROM worf.sequence_range_block WHERE seqoid = $1 AND from_node = $2 AND kind IN ('n', 'p') AND state IN ('next', 'active', 'open')",
                     SpiParameter.Create(seqoid), SpiParameter.Create(neighbor));
                 for (int b = 0; b < received.Count; b++)
                 {
@@ -244,6 +275,7 @@ internal static class SequenceRangeExchange
     {
         bool granted = false;
         bool received = false;
+        bool learned = false;
         if (!root.TryGetProperty("sequences", out JsonElement sequences))
         {
             return (false, false);
@@ -283,6 +315,8 @@ internal static class SequenceRangeExchange
             }
 
             SequenceInfo info = SequenceRanges.GetInfo(seqoid);
+            learned |= local.Count == 0 || Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2",
+                SpiParameter.Create(seqoid), SpiParameter.Create(senderId)).Count == 0;
             long? high = Nullable(entry, "high_water");
             long? watermark = Nullable(entry, "watermark");
             _ = Spi.Execute("""
@@ -302,16 +336,50 @@ internal static class SequenceRangeExchange
                     SpiParameter.Create(seqoid), SpiParameter.Create(mark));
             }
 
+            // Reports of other nodes, relayed toward the owner. A neighbor's own report outranks a relayed one.
+            if (entry.TryGetProperty("reports", out JsonElement reports))
+            {
+                foreach (JsonElement report in reports.EnumerateArray())
+                {
+                    uint reported = report.GetProperty("node_id").GetUInt32();
+                    if (reported == node.Node.Id)
+                    {
+                        continue;
+                    }
+
+                    learned |= Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2",
+                        SpiParameter.Create(seqoid), SpiParameter.Create(reported)).Count == 0;
+
+                    _ = Spi.Execute("""
+                        INSERT INTO worf.sequence_range_node (seqoid, node_id, node_name, via_node, high_water, watermark, reported_at)
+                        VALUES ($1, $2, $3, $4, $5, $6, now())
+                        ON CONFLICT (seqoid, node_id) DO UPDATE SET high_water = excluded.high_water, watermark = excluded.watermark,
+                            reported_at = excluded.reported_at
+                        WHERE sequence_range_node.via_node = excluded.via_node
+                        """, SpiParameter.Create(seqoid), SpiParameter.Create(reported), SpiParameter.Create(report.GetProperty("node_name").GetString()),
+                        SpiParameter.Create(senderId), SpiParameter.Create(Nullable(report, "high_water")), SpiParameter.Create(Nullable(report, "watermark")));
+                }
+            }
+
             bool isOwner = owner == node.Node.Id;
             if (!isOwner)
             {
                 Route(seqoid, node);
             }
 
-            // The neighbor asks this node, its parent, for a block.
-            if (isOwner && entry.TryGetProperty("request", out JsonElement request))
+            // The neighbor asks this node, its parent, for blocks. The owner grants from the root, and another node
+            // from its pool blocks, asking its own parent for a pool block when they can't serve the request.
+            if (entry.TryGetProperty("requests", out JsonElement requests))
             {
-                granted |= Grant(seqoid, info, epoch, request, senderId, senderName, high);
+                foreach (JsonElement request in requests.EnumerateArray())
+                {
+                    bool answered = Grant(seqoid, info, epoch, request, senderId, senderName, high, isOwner);
+                    granted |= answered;
+                    if (!answered && !isOwner)
+                    {
+                        RequestPool(seqoid, request.GetProperty("size").GetInt64());
+                    }
+                }
             }
 
             foreach (JsonElement grant in entry.GetProperty("grants").EnumerateArray())
@@ -331,6 +399,12 @@ internal static class SequenceRangeExchange
             }
         }
 
+        // Neighbors hear of what this node learned at their next exchange, which happens now.
+        if (learned)
+        {
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () => _ = PgAtomic.Add(SequenceRanges.ExchangeRequested, 1L));
+        }
+
         return (granted, received);
     }
 
@@ -338,26 +412,46 @@ internal static class SequenceRangeExchange
     /// Grants a neighbor's request, unless its values might already lie in the root, which happens when it joins
     /// after the root started and its high-water mark reaches into it.
     /// </summary>
-    private static bool Grant(uint seqoid, SequenceInfo info, int epoch, JsonElement request, uint granteeId, string granteeName, long? high)
+    private static bool Grant(uint seqoid, SequenceInfo info, int epoch, JsonElement request, uint granteeId, string granteeName, long? high,
+        bool isOwner)
     {
-        SpiResult root = Worf.SelectCatalog(
-            "SELECT lo, hi FROM worf.sequence_range_block WHERE seqoid = $1 AND epoch = $2 AND kind = 'r'",
-            SpiParameter.Create(seqoid), SpiParameter.Create(epoch));
-        if (root.Count == 0)
+        // The owner refuses a node that joins after the root started, with values that reach into it.
+        if (isOwner)
         {
-            return false;
+            SpiResult root = Worf.SelectCatalog(
+                "SELECT lo, hi FROM worf.sequence_range_block WHERE seqoid = $1 AND epoch = $2 AND kind = 'r'",
+                SpiParameter.Create(seqoid), SpiParameter.Create(epoch));
+            if (root.Count == 0)
+            {
+                return false;
+            }
+
+            bool holds = Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range_grant WHERE seqoid = $1 AND grantee_id = $2",
+                SpiParameter.Create(seqoid), SpiParameter.Create(granteeId)).Count > 0;
+            if (!holds && high is long h && (info.Ascending ? h >= root[0].Get<long>(0) : h <= root[0].Get<long>(1)))
+            {
+                PgLog.Warning($"sequence {info.Name}: node {granteeName} joined with values up to {h}, which reach into the root; it stays quarantined");
+                return false;
+            }
         }
 
-        bool holds = Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range_grant WHERE seqoid = $1 AND grantee_id = $2",
-            SpiParameter.Create(seqoid), SpiParameter.Create(granteeId)).Count > 0;
-        if (!holds && high is long h && (info.Ascending ? h >= root[0].Get<long>(0) : h <= root[0].Get<long>(1)))
-        {
-            PgLog.Warning($"sequence {info.Name}: node {granteeName} joined with values up to {h}, which reach into the root; it stays quarantined");
-            return false;
-        }
-
+        string kind = request.TryGetProperty("kind", out JsonElement value) ? value.GetString() ?? "n" : "n";
         return SequenceRanges.Allocate(seqoid, info, epoch, request.GetProperty("size").GetInt64(), granteeId, granteeName,
-            request.GetProperty("id").GetGuid()) is not null;
+            request.GetProperty("id").GetGuid(), kind[0]) is not null;
+    }
+
+    /// <summary>
+    /// Asks this node's parent for a pool block sixteen times a child's request, unless one is already open.
+    /// </summary>
+    private static void RequestPool(uint seqoid, long childSize)
+    {
+        _ = Spi.Execute("""
+            INSERT INTO worf.sequence_range_request (request_id, seqoid, parent_node, kind, size, created_at)
+            SELECT gen_random_uuid(), r.seqoid, r.parent_node, 'p', least($2 * 16, 9223372036854775807 / 2), now()
+            FROM worf.sequence_range r
+            WHERE r.seqoid = $1 AND r.parent_node IS NOT NULL
+                AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_request q WHERE q.seqoid = r.seqoid AND q.kind = 'p')
+            """, SpiParameter.Create(seqoid), SpiParameter.Create(childSize));
     }
 
     /// <summary>
@@ -371,8 +465,17 @@ internal static class SequenceRangeExchange
             return false;
         }
 
-        _ = SequenceRanges.InsertBlock(seqoid, epoch, 'n', grant.GetProperty("lo").GetInt64(), grant.GetProperty("hi").GetInt64(), "next",
-            from, node, id);
+        // A pool block is this node's to grant from.
+        long lo = grant.GetProperty("lo").GetInt64();
+        long hi = grant.GetProperty("hi").GetInt64();
+        bool pool = grant.TryGetProperty("kind", out JsonElement kind) && kind.GetString() == "p";
+        _ = SequenceRanges.InsertBlock(seqoid, epoch, pool ? 'p' : 'n', lo, hi, pool ? "open" : "next", from, node, id);
+        if (pool)
+        {
+            _ = Spi.Execute("INSERT INTO worf.sequence_range_free VALUES ($1, $2, $3)", SpiParameter.Create(id), SpiParameter.Create(lo),
+                SpiParameter.Create(hi));
+        }
+
         _ = Spi.Execute("DELETE FROM worf.sequence_range_request WHERE request_id = $1", SpiParameter.Create(grant.GetProperty("request_id").GetGuid()));
         _ = Spi.Execute("SET LOCAL synchronous_commit = on");
         return true;

@@ -160,9 +160,19 @@ internal static unsafe partial class SequenceRanges
     internal static PgAtomic<long> Version { get; } = new("worf_sequence_range_version");
 
     /// <summary>
+    /// Gets the counter that tells the range worker to exchange with every neighbor now, as when a backend that
+    /// answered an exchange learned of a new node or sequence.
+    /// </summary>
+    internal static PgAtomic<long> ExchangeRequested { get; } = new("worf_sequence_range_exchange");
+
+    /// <summary>
     /// Sets up the shared memory.
     /// </summary>
-    internal static void ShmemInit() => PgSharedMemory.Initialize(Version, static () => 0L);
+    internal static void ShmemInit()
+    {
+        PgSharedMemory.Initialize(Version, static () => 0L);
+        PgSharedMemory.Initialize(ExchangeRequested, static () => 0L);
+    }
 
     /// <summary>
     /// Puts a sequence under range management, with this node as its owner.
@@ -447,7 +457,7 @@ internal static unsafe partial class SequenceRanges
                     SELECT gen_random_uuid(), r.seqoid, r.parent_node, 'n', r.request_size, now()
                     FROM worf.sequence_range r
                     WHERE r.seqoid = $1 AND r.parent_node IS NOT NULL
-                        AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_request q WHERE q.seqoid = r.seqoid)
+                        AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_request q WHERE q.seqoid = r.seqoid AND q.kind = 'n')
                     """, SpiParameter.Create(seqoid));
             }
         }
@@ -1022,7 +1032,7 @@ internal static unsafe partial class SequenceRanges
     /// </summary>
     /// <returns>The grant and its bounds, or null when no free span holds the size.</returns>
     internal static (Guid Grant, long Lo, long Hi)? Allocate(uint seqoid, SequenceInfo info, int epoch, long size, uint granteeId,
-        string granteeName, Guid requestId)
+        string granteeName, Guid requestId, char kind = 'n')
     {
         SpiResult granted = Worf.SelectCatalog("SELECT grant_id, lo, hi FROM worf.sequence_range_grant WHERE request_id = $1",
             SpiParameter.Create(requestId));
@@ -1064,9 +1074,10 @@ internal static unsafe partial class SequenceRanges
         Guid grant = Guid.NewGuid();
         _ = Spi.Execute("""
             INSERT INTO worf.sequence_range_grant
-            VALUES ($1, $2, $3, $4, $5, $6, 'n', $7, $8, 'sent', now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7::"char", $8, $9, 'sent', now())
             """, SpiParameter.Create(grant), SpiParameter.Create(requestId), SpiParameter.Create(seqoid), SpiParameter.Create(from),
-            SpiParameter.Create(granteeId), SpiParameter.Create(granteeName), SpiParameter.Create(lo), SpiParameter.Create(hi));
+            SpiParameter.Create(granteeId), SpiParameter.Create(granteeName), SpiParameter.Create(kind.ToString()), SpiParameter.Create(lo),
+            SpiParameter.Create(hi));
         _ = Spi.Execute($"UPDATE worf.sequence_range SET watermark = {(info.Ascending ? "greatest" : "least")}(coalesce(watermark, $2), $2) WHERE seqoid = $1",
             SpiParameter.Create(seqoid), SpiParameter.Create(info.Ascending ? hi : lo));
 

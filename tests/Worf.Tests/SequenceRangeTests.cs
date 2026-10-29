@@ -210,6 +210,50 @@ public sealed class SequenceRangeTests
         }
     }
 
+    /// <summary>
+    /// In a cascade, a node two links from the owner gets its blocks from its parent's pool block, and every node's
+    /// keys stay apart.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task CascadedNodesDrawFromPoolBlocks()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        await using TestNode nodeC = await StartNodeAsync("node_c", token);
+        TestNode[] nodes = [nodeA, nodeB, nodeC];
+        foreach (TestNode node in nodes)
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database,
+            "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b,node_c}', range_size := 100)", token);
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        await SubscribeAsync(nodeC, "c_from_b", nodeB, token);
+        foreach (TestNode node in nodes)
+        {
+            Assert.IsTrue(await node.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges", token),
+                $"{node.Name} drawing from a block");
+        }
+
+        Assert.AreEqual("node_b|2", await nodeC.SafePsqlAsync(Database,
+            "SELECT p.node_name, r.distance FROM worf.sequence_range r JOIN worf.node p ON p.node_id = r.parent_node", token));
+        Assert.AreEqual("1", await nodeB.SafePsqlAsync(Database,
+            "SELECT count(*) FROM worf.sequence_range_block WHERE kind = 'p'", token), "node_b's pool block");
+
+        HashSet<long> keys = [];
+        foreach (TestNode node in nodes)
+        {
+            _ = await node.SafePsqlAsync(Database, "INSERT INTO t (v) SELECT 'x' FROM generate_series(1, 50)", token);
+            foreach (string id in (await node.SafePsqlAsync(Database, "SELECT id FROM t", token)).Split('\n'))
+            {
+                Assert.IsTrue(keys.Add(long.Parse(id, CultureInfo.InvariantCulture)), $"{node.Name}'s key {id} is another node's too");
+            }
+        }
+    }
+
     private static async Task SubscribeAsync(TestNode subscriber, string name, TestNode provider, CancellationToken token)
     {
         _ = await subscriber.SafePsqlAsync(Database, $$"""
