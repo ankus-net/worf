@@ -328,7 +328,10 @@ internal static unsafe partial class DdlLock
         uint subxact = NativeMethods.GetCurrentSubTransactionId();
         foreach ((uint nodeId, string dsn) in peers)
         {
-            PgReplicationConnection conn = Worf.Connect(dsn, "worf_ddl_lock", null);
+            // The connection holds the fence until the transaction ends, which closes it however this fails.
+            int held = s_heldFences.Count;
+            s_heldFences.Add((fenceId, nodeId, 0, Worf.Connect(dsn, "worf_ddl_lock", null), subxact, relids));
+            PgReplicationConnection conn = s_heldFences[held].Connection;
             string? lsn;
             try
             {
@@ -337,18 +340,18 @@ internal static unsafe partial class DdlLock
             }
             catch (PgRemoteException error)
             {
-                conn.Dispose();
                 throw new PgException(LockNotAvailable, $"could not hold back writes on node {nodeId}: {error.Message}");
             }
 
             // A node that doesn't receive this node's DDL holds nothing back.
-            if (!Worf.TryParseLsn(lsn!, out ulong position) || position == 0)
+            if (!Worf.TryParseLsn(lsn ?? "", out ulong position) || position == 0)
             {
-                conn.Dispose();
+                s_heldFences.RemoveAt(held);
+                Close(conn);
                 continue;
             }
 
-            s_heldFences.Add((fenceId, nodeId, position, conn, subxact, relids));
+            s_heldFences[held] = s_heldFences[held] with { Lsn = position };
             positions.Add((nodeId, position));
         }
 
