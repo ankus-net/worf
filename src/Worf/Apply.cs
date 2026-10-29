@@ -296,7 +296,8 @@ internal static unsafe partial class Apply
     /// <param name="cmdstr">The commands.</param>
     /// <param name="role">The role that ran them on the origin.</param>
     /// <param name="isTopLevel">Whether the commands may run as a top level statement.</param>
-    internal static void ExecuteSqlCommand(string cmdstr, string role, bool isTopLevel)
+    /// <param name="withoutConcurrently">Whether commands that would run concurrently run in the transaction.</param>
+    internal static void ExecuteSqlCommand(string cmdstr, string role, bool isTopLevel, bool withoutConcurrently = false)
     {
         sbyte* saveDebugQueryString = NativeGlobals.debug_query_string;
 
@@ -318,15 +319,26 @@ internal static unsafe partial class Apply
         for (int i = 0; commands is not null && i < commands->length; i++)
         {
             RawStmt* command = (RawStmt*)commands->elements[i].ptr_value;
+            if (withoutConcurrently)
+            {
+                RemoveConcurrently(command->stmt);
+            }
 
             // temporarily push snapshot for parse analysis/planning
             NativeMethods.PushActiveSnapshot(NativeMethods.GetTransactionSnapshot());
 
             oldcontext = Worf.MemoryContextSwitchTo(NativeGlobals.MessageContext);
 
-            // Set the current role to the user that executed the command on the origin server.
+            // Set the current role to the user that executed the command on the origin server, until the command ends. An
+            // override would become the session's default role, which no nesting level restores, so later changes would
+            // apply as that role.
             int saveNestlevel = NativeMethods.NewGUCNestLevel();
-            Worker.SetConfigOption("role", role, GucContext.PGC_INTERNAL);
+            fixed (byte* name = Worf.ToServerCString("role"))
+            fixed (byte* value = Worf.ToServerCString(role))
+            {
+                _ = NativeMethods.set_config_option((sbyte*)name, (sbyte*)value, GucContext.PGC_INTERNAL, GucSource.PGC_S_SESSION,
+                    GucAction.GUC_ACTION_SAVE, true, 0, false);
+            }
 
             CommandTag commandTag = NativeMethods.CreateCommandTag(command->stmt);
 
@@ -1268,6 +1280,82 @@ internal static unsafe partial class Apply
     }
 
     /// <summary>
+    /// Runs DDL that worf.enable_ddl_replication queued, with the search path it ran with.
+    /// </summary>
+    private static void HandleDdl(QueuedMessage queuedMessage, bool txJustStarted)
+    {
+        using JsonDocument document = JsonDocument.Parse(queuedMessage.Message);
+        JsonElement root = document.RootElement;
+        if (root.ValueKind != JsonValueKind.Object ||
+            !root.TryGetProperty("search_path", out JsonElement searchPath) || searchPath.ValueKind != JsonValueKind.String ||
+            !root.TryGetProperty("command", out JsonElement command) || command.ValueKind != JsonValueKind.String)
+        {
+            throw new PgException(PgSqlStates.InternalError, "malformed message in queued message tuple: expected search_path and command");
+        }
+
+        // The statement runs with the settings it ran with, which change what it means.
+        int saveNestlevel = NativeMethods.NewGUCNestLevel();
+        SetDdlSetting("search_path", searchPath.GetString()!);
+        if (root.TryGetProperty("settings", out JsonElement settings) && settings.ValueKind == JsonValueKind.Object)
+        {
+            foreach (JsonProperty setting in settings.EnumerateObject())
+            {
+                SetDdlSetting(setting.Name, setting.Value.GetString() ?? "");
+            }
+        }
+
+        // A statement that runs concurrently commits along the way, which apply's transaction can't, so it runs
+        // in that transaction instead.
+        ExecuteSqlCommand(command.GetString()!, queuedMessage.Role, false, true);
+
+        NativeMethods.AtEOXact_GUC(true, saveNestlevel);
+    }
+
+    private static void SetDdlSetting(string name, string value)
+    {
+        fixed (byte* cname = Worf.ToServerCString(name))
+        fixed (byte* cvalue = Worf.ToServerCString(value))
+        {
+            _ = NativeMethods.set_config_option((sbyte*)cname, (sbyte*)cvalue, GucContext.PGC_USERSET, GucSource.PGC_S_SESSION,
+                GucAction.GUC_ACTION_SAVE, true, 0, false);
+        }
+    }
+
+    /// <summary>
+    /// Makes a statement that would build or drop an index or detach a partition concurrently do it in its
+    /// transaction.
+    /// </summary>
+    private static void RemoveConcurrently(Node* stmt)
+    {
+        switch (stmt->type)
+        {
+            case NodeTag.T_IndexStmt:
+                ((IndexStmt*)stmt)->concurrent = false;
+                break;
+
+            case NodeTag.T_DropStmt:
+                ((DropStmt*)stmt)->concurrent = false;
+                break;
+
+            case NodeTag.T_AlterTableStmt:
+                List* cmds = ((AlterTableStmt*)stmt)->cmds;
+                for (int i = 0; cmds is not null && i < cmds->length; i++)
+                {
+                    AlterTableCmd* cmd = (AlterTableCmd*)cmds->elements[i].ptr_value;
+                    if (cmd->subtype == AlterTableType.AT_DetachPartition)
+                    {
+                        ((PartitionCmd*)cmd->def)->concurrent = false;
+                    }
+                }
+
+                break;
+
+            default:
+                break;
+        }
+    }
+
+    /// <summary>
     /// Handles messages comming from the queue.
     /// </summary>
     private static void HandleQueuedMessage(HeapTupleData* msgtup, bool txJustStarted)
@@ -1307,6 +1395,13 @@ internal static unsafe partial class Apply
                 s_changeOperation = s_actionName;
                 UpdateErrorContext();
                 HandleSequence(queuedMessage);
+                break;
+
+            case Queue.QueueCommandTypeDdl:
+                s_actionName = "QUEUED_DDL";
+                s_changeOperation = s_actionName;
+                UpdateErrorContext();
+                HandleDdl(queuedMessage, txJustStarted);
                 break;
 
             default:
