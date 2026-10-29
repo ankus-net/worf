@@ -145,12 +145,12 @@ internal static class Manager
             return false;
         }
 
-        (bool managed, bool subscribed) = PgBackgroundWorker.RunTransaction(static () =>
+        bool managed = PgBackgroundWorker.RunTransaction(static () =>
         {
             if (!Spi.ExecuteScalar<bool>("SELECT to_regclass('worf.sequence_range') IS NOT NULL") ||
                 WorfNode.GetLocalNode(false, true) is not WorfLocalNode node)
             {
-                return (false, false);
+                return false;
             }
 
             if (!Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range)"))
@@ -158,17 +158,16 @@ internal static class Manager
                 _ = SequenceRangeExchange.ExchangeAll(node);
             }
 
-            return (Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range)"),
-                WorfNode.GetNodeSubscriptions(node.Node.Id, false).Any(sub => sub.Enabled));
+            return Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range)");
         });
         if (managed)
         {
             _ = Worker.WorkerRegister(new WorfWorker { WorkerType = WorfWorkerType.Range, Dboid = dboid });
         }
 
-        // Until the database manages a sequence, the manager looks again soon: a provider's exchange that teaches it
-        // of one may wake the manager while it waits on a connection, which takes the wakeup.
-        return managed || !subscribed;
+        // The check after the exchange sees a sequence that another backend learned of while the exchange's connection
+        // took the manager's wakeup. A failed exchange is tried again soon.
+        return managed || !SequenceRangeExchange.RetryPending;
     }
 
     /// <summary>

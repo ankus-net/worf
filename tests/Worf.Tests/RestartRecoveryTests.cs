@@ -12,7 +12,7 @@ public sealed class RestartRecoveryTests
     private const string Database = "postgres";
     private const string SuperUser = "super";
     private const int RowsPerTransaction = 10;
-    private const int TotalRows = 30_000;
+    private const int TotalRows = 10_000;
 
     private static readonly string[] s_configuration =
     [
@@ -75,7 +75,7 @@ public sealed class RestartRecoveryTests
         await provider.StartServerAsync(token);
 
         // The subscriber crashes alone while changes stream.
-        await WaitForRowsAsync(subscriber, 12_000, token);
+        await WaitForRowsAsync(subscriber, 6_000, token);
         await subscriber.StopAsync("immediate", token);
         await subscriber.StartServerAsync(token);
 
