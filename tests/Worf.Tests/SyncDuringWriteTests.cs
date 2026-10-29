@@ -121,8 +121,9 @@ public sealed partial class SyncDuringWriteTests
         Task<string> pgbenchStdout = ProcessRunner.ReadToEndAsync(pgbench.StandardOutput);
         Task<string> pgbenchStderr = ProcessRunner.ReadToEndAsync(pgbench.StandardError);
 
-        // Polled as poll_query_until does, counting the polls: once a Windows run never saw pgbench's updates during
-        // all 30 seconds of its writes, which only a few slow polls can explain.
+        // Polled as poll_query_until does, counting the polls. Each pgbench transaction adds a row to pgbench_history,
+        // which pgbench -i leaves empty; a client's statement shows in pg_stat_activity only while it runs, which a
+        // client that pgbench's rate keeps mostly idle may never be seen doing.
         Stopwatch waiting = Stopwatch.StartNew();
         int polls = 0;
         TimeSpan longestPoll = TimeSpan.Zero;
@@ -130,8 +131,7 @@ public sealed partial class SyncDuringWriteTests
         while (!started && waiting.Elapsed < TestNode.PollTimeout)
         {
             Stopwatch poll = Stopwatch.StartNew();
-            started = await provider.SafePsqlAsync(Database,
-                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE query like 'UPDATE pgbench%')", token) == "t";
+            started = await provider.SafePsqlAsync(Database, "SELECT EXISTS (SELECT 1 FROM pgbench_history)", token) == "t";
             polls++;
             longestPoll = poll.Elapsed > longestPoll ? poll.Elapsed : longestPoll;
             if (!started)
