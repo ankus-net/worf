@@ -27,7 +27,7 @@ internal struct WorfApplyWorker
     public ulong ExceptionLsn;
 
     /// <summary>
-    /// Whether that transaction is skipped as a whole, rather than change by change.
+    /// How that transaction is applied: change by change, as a whole in a subtransaction, or not at all.
     /// </summary>
-    public bool ExceptionSkipsTransaction;
+    public int ExceptionLevel;
 }

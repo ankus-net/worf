@@ -15,6 +15,12 @@ internal static unsafe partial class Apply
     // Number of tuples inserted after which we switch to multi-insert.
     private const int MinMultiInsertTuples = 5;
 
+    // How worf.exception_behaviour applies a failed transaction again: change by change, as a whole in a subtransaction,
+    // or, when its commit fails however it's applied, not at all.
+    private const int ExceptionByChange = 1;
+    private const int ExceptionByTransaction = 2;
+    private const int ExceptionWithoutApplying = 3;
+
     private static readonly LinkedList<(ulong LocalEnd, ulong RemoteEnd)> s_lsnMapping = new();
 
     private static bool s_inRemoteTransaction;
@@ -35,10 +41,10 @@ internal static unsafe partial class Apply
     private static ulong s_remoteCommitLsn;
     private static long s_remoteCommitTime;
 
-    // A failed remote transaction that worf.exception_behaviour applies again, whether it's skipped as a whole, and
-    // whether the transaction being applied is that one.
+    // A failed remote transaction that worf.exception_behaviour applies again, how, and whether the transaction being
+    // applied is that one.
     private static ulong s_exceptionLsn;
-    private static bool s_exceptionSkipsTransaction;
+    private static int s_exceptionLevel;
     private static bool s_exceptionMode;
 
     // The change being applied, for the exception log, or a null operation between changes.
@@ -143,7 +149,7 @@ internal static unsafe partial class Apply
 
         // A crashed worker's failed transaction is applied again under worf.exception_behaviour.
         s_exceptionLsn = MyApplyWorker.ExceptionLsn;
-        s_exceptionSkipsTransaction = MyApplyWorker.ExceptionSkipsTransaction;
+        s_exceptionLevel = MyApplyWorker.ExceptionLevel;
 
         PgLog.Log($"starting apply for subscription {sub.Name}");
 
@@ -1503,7 +1509,7 @@ internal static unsafe partial class Apply
     /// </summary>
     private static void ApplyChange(byte[] message, bool startedTx)
     {
-        if (!s_exceptionMode || s_exceptionSkipsTransaction)
+        if (!s_exceptionMode || s_exceptionLevel != ExceptionByChange)
         {
             DispatchChangeMessage(message, startedTx);
             return;
@@ -1589,15 +1595,28 @@ internal static unsafe partial class Apply
             case WorfExceptionBehaviour.Discard:
             case WorfExceptionBehaviour.Transdiscard:
                 // A transaction whose commit fails, as on a deferred constraint, or that fails again change by change
-                // is skipped as a whole next time. One that fails as it's skipped stops the worker until the error is
-                // fixed.
-                if (!s_exceptionMode || !s_exceptionSkipsTransaction)
+                // is skipped as a whole next time. One whose commit fails even then, outside its subtransaction, is
+                // recorded now and not applied at all. One that fails when it isn't applied stops the worker until
+                // the error is fixed.
+                int level = s_exceptionMode ? s_exceptionLevel + 1
+                    : ExceptionBehaviour == WorfExceptionBehaviour.Transdiscard || s_changeOperation == "COMMIT"
+                        ? ExceptionByTransaction
+                        : ExceptionByChange;
+                if (level > ExceptionWithoutApplying)
                 {
-                    SetExceptionMarker(s_remoteCommitLsn, ExceptionBehaviour == WorfExceptionBehaviour.Transdiscard ||
-                        s_exceptionMode || s_changeOperation == "COMMIT");
-                    PgLog.Log($"applying the remote transaction at {lsn} under worf.exception_behaviour once the worker restarts");
+                    break;
                 }
 
+                if (level == ExceptionWithoutApplying)
+                {
+                    RelCache.ForgetOpenRelations();
+                    WorfFailedChange failed = FailedChange();
+                    PgBackgroundWorker.RunTransaction(() =>
+                        ExceptionLog.Record(failed, WorfExceptionBehaviour.Transdiscard, error));
+                }
+
+                SetExceptionMarker(s_remoteCommitLsn, level);
+                PgLog.Log($"applying the remote transaction at {lsn} under worf.exception_behaviour once the worker restarts");
                 break;
 
             default:
@@ -1605,13 +1624,33 @@ internal static unsafe partial class Apply
         }
     }
 
-    private static void SetExceptionMarker(ulong lsn, bool skipsTransaction)
+    private static void SetExceptionMarker(ulong lsn, int level)
     {
         using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive();
         WorfWorker worker = guard[Worker.MyWorfWorker];
         worker.Worker.Apply.ExceptionLsn = lsn;
-        worker.Worker.Apply.ExceptionSkipsTransaction = skipsTransaction;
+        worker.Worker.Apply.ExceptionLevel = level;
         guard[Worker.MyWorfWorker] = worker;
+    }
+
+    /// <summary>
+    /// Moves the origin back to the failed remote transaction's commit position, from which the provider sends the
+    /// transaction again. An abort advances the origin as a commit does, and one after the end position was set for
+    /// the commit, as when the commit fails a serialization check, would skip the transaction.
+    /// </summary>
+    private static void RewindOrigin()
+    {
+        Worf.ReploriginSessionOriginLsn = s_remoteCommitLsn;
+        ushort origin = PgReplicationOrigin.SessionOrigin;
+        if (origin == 0)
+        {
+            return;
+        }
+
+        // Only an origin no session uses can move back. The worker stops after this, so it stays released.
+        PgReplicationOrigin.ResetSession();
+        ulong lsn = s_remoteCommitLsn;
+        PgBackgroundWorker.RunTransaction(() => PgReplicationOrigin.Advance(origin, new PgLsn(lsn), PgLsn.Invalid, true, true));
     }
 
     /// <summary>
@@ -1641,6 +1680,7 @@ internal static unsafe partial class Apply
         }
         catch (PgException error)
         {
+            RewindOrigin();
             OnRemoteTransactionError(error);
             throw;
         }
@@ -1649,7 +1689,7 @@ internal static unsafe partial class Apply
         {
             s_exceptionMode = false;
             s_exceptionLsn = 0;
-            SetExceptionMarker(0, false);
+            SetExceptionMarker(0, 0);
         }
 
         ulong endLsn = s_commitEndLsn!.Value;
@@ -1682,8 +1722,18 @@ internal static unsafe partial class Apply
             return;
         }
 
-        if (!s_exceptionSkipsTransaction)
+        if (s_exceptionLevel == ExceptionByChange)
         {
+            ApplyChanges(firstChange);
+            return;
+        }
+
+        // A transaction whose commit failed however it was applied was recorded then, and is skipped. Its commit
+        // still advances the origin past it.
+        if (s_exceptionLevel == ExceptionWithoutApplying)
+        {
+            s_skipRemoteTransaction = true;
+            _ = NativeMethods.GetTopTransactionId();
             ApplyChanges(firstChange);
             return;
         }

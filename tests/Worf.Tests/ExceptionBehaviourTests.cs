@@ -33,6 +33,7 @@ public sealed class ExceptionBehaviourTests
             CREATE TABLE t (id integer PRIMARY KEY, v text);
             CREATE TABLE parent (id integer PRIMARY KEY);
             CREATE TABLE child (id integer PRIMARY KEY, parent_id integer);
+            CREATE TABLE u (id integer PRIMARY KEY, v text);
             SELECT * FROM worf.replication_set_add_all_tables('default', '{public}');
             """, token);
         _ = await subscriber.SafePsqlAsync(Database, """
@@ -49,6 +50,18 @@ public sealed class ExceptionBehaviourTests
             CREATE CONSTRAINT TRIGGER child_parent AFTER INSERT ON child DEFERRABLE INITIALLY DEFERRED
                 FOR EACH ROW EXECUTE FUNCTION check_parent();
             ALTER TABLE child ENABLE ALWAYS TRIGGER child_parent;
+
+            -- Temporary tables with different ON COMMIT settings and a foreign key between them fail the commit after
+            -- its pre-commit callbacks.
+            CREATE TABLE u (id integer PRIMARY KEY, v text);
+            CREATE FUNCTION fail_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                CREATE TEMP TABLE IF NOT EXISTS on_commit_a (id integer PRIMARY KEY) ON COMMIT DELETE ROWS;
+                CREATE TEMP TABLE IF NOT EXISTS on_commit_b (id integer REFERENCES on_commit_a);
+                RETURN NULL;
+            END $$;
+            CREATE TRIGGER fail_commit AFTER INSERT ON u FOR EACH ROW EXECUTE FUNCTION fail_commit();
+            ALTER TABLE u ENABLE ALWAYS TRIGGER fail_commit;
             """, token);
         await SubscribeAsync(provider, subscriber, token);
 
@@ -91,12 +104,21 @@ public sealed class ExceptionBehaviourTests
         Assert.AreEqual("1|1", await subscriber.SafePsqlAsync(Database, "SELECT * FROM child", token));
         Assert.AreEqual("transdiscard|COMMIT|||||23503", await LastLogAsync(subscriber, token));
 
+        // A commit that fails after its pre-commit callbacks, however the transaction is applied, is recorded and
+        // the transaction skipped.
+        _ = await provider.SafePsqlAsync(Database, "INSERT INTO u VALUES (1, 'fails at commit')", token);
+        _ = await provider.SafePsqlAsync(Database, "INSERT INTO t VALUES (8, 'good')", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM t WHERE id = 8)", token),
+            "the transaction after the one whose commit fails");
+        Assert.AreEqual("0", await subscriber.SafePsqlAsync(Database, "SELECT count(*) FROM u", token));
+        Assert.AreEqual("transdiscard|COMMIT|||||0A000", await LastLogAsync(subscriber, token));
+
         await SetBehaviourAsync(subscriber, "transdiscard", token);
         _ = await provider.SafePsqlAsync(Database, "INSERT INTO t VALUES (11, 'good'), (12, 'bad'), (13, 'good')", token);
         _ = await provider.SafePsqlAsync(Database, "INSERT INTO t VALUES (14, 'good')", token);
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM t WHERE id = 14)", token),
             "the transaction after the discarded one");
-        Assert.AreEqual("1\n3\n4\n6\n7\n14", await subscriber.SafePsqlAsync(Database, "SELECT id FROM t ORDER BY id", token));
+        Assert.AreEqual("1\n3\n4\n6\n7\n8\n14", await subscriber.SafePsqlAsync(Database, "SELECT id FROM t ORDER BY id", token));
         Assert.AreEqual("transdiscard|INSERT|public|t|12|bad|23514", await LastLogAsync(subscriber, token));
 
         await SetBehaviourAsync(subscriber, "sub_disable", token);

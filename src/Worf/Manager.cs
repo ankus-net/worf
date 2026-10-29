@@ -213,7 +213,7 @@ internal static class Manager
 
                 // A crashed worker's failed transaction is applied again under worf.exception_behaviour.
                 apply.Worker.Apply.ExceptionLsn = crashed.ExceptionLsn;
-                apply.Worker.Apply.ExceptionSkipsTransaction = crashed.ExceptionSkipsTransaction;
+                apply.Worker.Apply.ExceptionLevel = crashed.ExceptionLevel;
 
                 _ = Worker.WorkerRegister(apply);
             }
