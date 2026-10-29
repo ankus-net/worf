@@ -168,8 +168,26 @@ public sealed class DdlReplicationTests
             Assert.AreEqual("", await SetsAsync(node, "ul", token), $"{node.Name}: an unlogged table");
         }
 
+        // DDL a table's owner runs applies as that owner, and later changes apply as before.
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE ROLE owner", token);
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database, """
+            ALTER TABLE pk OWNER TO owner;
+            SET ROLE owner;
+            ALTER TABLE pk ADD COLUMN w text;
+            RESET ROLE;
+            INSERT INTO d VALUES (1);
+            """, token);
+        await WaitAsync(nodeA, token);
+        Assert.AreEqual("owner|1", await nodeB.SafePsqlAsync(Database,
+            "SELECT pg_get_userbyid(relowner), (SELECT count(*) FROM d) FROM pg_class WHERE oid = 'pk'::regclass", token));
+
         // A subscriber whose structure comes from node_a queues none of it.
         await using TestNode nodeC = await StartNodeAsync("node_c", token);
+        _ = await nodeC.SafePsqlAsync(Database, "CREATE ROLE owner", token);
         _ = await nodeC.SafePsqlAsync(Database, $$"""
             SELECT worf.create_subscription(
                 subscription_name := 'c_from_a',

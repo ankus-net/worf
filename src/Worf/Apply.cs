@@ -329,9 +329,16 @@ internal static unsafe partial class Apply
 
             oldcontext = Worf.MemoryContextSwitchTo(NativeGlobals.MessageContext);
 
-            // Set the current role to the user that executed the command on the origin server.
+            // Set the current role to the user that executed the command on the origin server, until the command ends. An
+            // override would become the session's default role, which no nesting level restores, so later changes would
+            // apply as that role.
             int saveNestlevel = NativeMethods.NewGUCNestLevel();
-            Worker.SetConfigOption("role", role, GucContext.PGC_INTERNAL);
+            fixed (byte* name = Worf.ToServerCString("role"))
+            fixed (byte* value = Worf.ToServerCString(role))
+            {
+                _ = NativeMethods.set_config_option((sbyte*)name, (sbyte*)value, GucContext.PGC_INTERNAL, GucSource.PGC_S_SESSION,
+                    GucAction.GUC_ACTION_SAVE, true, 0, false);
+            }
 
             CommandTag commandTag = NativeMethods.CreateCommandTag(command->stmt);
 
