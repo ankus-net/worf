@@ -643,6 +643,8 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   When the timestamps are equal, `last_update_wins` and `first_update_wins`
   keep the change written by the node with the higher node id, including
   changes another node forwarded, so every node keeps the same version.
+  Nodes that replicate both ways need the same one of these two settings to
+  keep the same rows, and `create_subscription` warns when they don't.
 
   The default value is `apply_remote`.
 
@@ -658,6 +660,13 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   Possible values are same as for `log_min_messages` PostgreSQL setting.
 
   The default is `LOG`.
+
+- `worf.max_clock_skew`
+  How far ahead of the local clock a remote transaction's commit time can be
+  for apply to wait until the local clock passes it, so that local changes
+  made afterwards commit later and win under `last_update_wins`. A remote
+  transaction further ahead applies at once, with a warning at most once a
+  minute. `-1` never waits. The default is `1s`.
 
 - `worf.batch_inserts`
   Tells worf to use batch insert mechanism if possible. Batch mechanism

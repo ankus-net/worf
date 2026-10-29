@@ -213,7 +213,8 @@ The fork's tests are the acceptance tests. Port all of them, and never weaken a 
 - Keep the order of the Makefile's `REGRESS` list. `ankus regress` runs files in name order, so prefix each file name with its position.
 - Record each output with `ankus regress --add` and compare it with the renamed pglogical file. The only differences allowed are:
   - the renaming and the column widths it shifts;
-  - version strings.
+  - version strings;
+  - the multi-master steps' warnings.
 - Keep alternate outputs such as `functions_1.out`.
 - pglogical's default run leaves out the three `huge_tx` tests. They take longer than CI allows, so worf runs them on demand with `eng/regress.cs --huge-tx`.
 

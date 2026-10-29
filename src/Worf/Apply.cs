@@ -31,6 +31,7 @@ internal static unsafe partial class Apply
     private static WorfRelation? s_lastInsertRel;
     private static int s_lastInsertRelCnt;
     private static bool s_useMultiInsert;
+    private static long s_clockSkewReportedAt;
 
     // A message counter for the xact, for debugging. We don't send the remote change LSN with messages, so this aids
     // identification of which change causes an error.
@@ -41,6 +42,14 @@ internal static unsafe partial class Apply
     private static bool s_isDdlOrDrop;
     private static uint s_remoteXid;
     private static PgErrorContext? s_errorContext;
+
+    /// <summary>
+    /// Gets how far ahead of the local clock a remote transaction's commit time can be for apply to wait for the clock
+    /// to pass it, or -1 to never wait.
+    /// </summary>
+    [PgGucInt("worf.max_clock_skew", 1000, "Sets how long apply waits for the local clock to pass a remote commit time.",
+        Minimum = -1, Maximum = int.MaxValue, Unit = PgGucUnit.Milliseconds, Context = PgGucContext.Sighup)]
+    internal static partial int MaxClockSkew { get; }
 
     // Set by the commit message while the remote transaction's local transaction runs.
     private static ulong? s_commitEndLsn;
@@ -488,7 +497,62 @@ internal static unsafe partial class Apply
             }
         }
 
+        WaitForClock(commitTime);
+
         s_inRemoteTransaction = true;
+    }
+
+    /// <summary>
+    /// Waits for the local clock to pass a remote transaction's commit time, so that local changes made after the
+    /// transaction applies commit later than it did, as last_update_wins needs.
+    /// </summary>
+    /// <param name="commitTime">The remote commit time.</param>
+    private static void WaitForClock(long commitTime)
+    {
+        long ahead = commitTime - Worker.GetCurrentTimestamp();
+        int maxClockSkew = MaxClockSkew;
+        if (maxClockSkew < 0)
+        {
+            return;
+        }
+
+        if (ahead > maxClockSkew * 1000L)
+        {
+            // Reported at most once a minute, so that skew hovering at the limit doesn't flood the log.
+            long now = Worker.GetCurrentTimestamp();
+            if (now - s_clockSkewReportedAt >= 60_000_000)
+            {
+                s_clockSkewReportedAt = now;
+                PgLog.Warning(new PgDiagnostic(
+                    $"remote commit time is {ahead / 1000} ms ahead of the local clock, more than worf.max_clock_skew")
+                {
+                    Hint = "Synchronize the nodes' clocks. Until then, local changes can lose to earlier remote ones.",
+                });
+            }
+
+            return;
+        }
+
+        // Wait on the latch a second at most at a time, so that the worker stops when asked to and keeps the
+        // provider's walsender from timing out.
+        while (ahead >= 0)
+        {
+            if (Worker.GotSigterm)
+            {
+                throw new OperationCanceledException("The worf worker is stopping.");
+            }
+
+            _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(Math.Min((ahead / 1000) + 1, 1000)));
+            PgInterrupts.Check();
+
+            long now = Worker.GetCurrentTimestamp();
+            if (s_applyconn is not null)
+            {
+                _ = SendFeedback(s_applyconn, s_lastReceived, now, false);
+            }
+
+            ahead = commitTime - now;
+        }
     }
 
     /// <summary>

@@ -98,6 +98,37 @@ internal static partial class Conflict
     }
 
     /// <summary>
+    /// Warns when two nodes that replicate both ways resolve conflicts differently, or by keeping their own rows or
+    /// taking each other's, which can leave them with different rows.
+    /// </summary>
+    /// <param name="localNode">This node's name.</param>
+    /// <param name="remoteNode">The other node's name.</param>
+    /// <param name="remoteResolution">The other node's <c>worf.conflict_resolution</c>.</param>
+    internal static void CheckTwoWayResolution(string localNode, string remoteNode, string remoteResolution)
+    {
+        string localResolution = ConflictResolver switch
+        {
+            WorfResolveOption.Error => "error",
+            WorfResolveOption.ApplyRemote => "apply_remote",
+            WorfResolveOption.KeepLocal => "keep_local",
+            WorfResolveOption.LastUpdateWins => "last_update_wins",
+            _ => "first_update_wins",
+        };
+
+        if (localResolution == remoteResolution && localResolution is "error" or "last_update_wins" or "first_update_wins")
+        {
+            return;
+        }
+
+        PgLog.Warning(new PgDiagnostic(
+            $"nodes \"{localNode}\" and \"{remoteNode}\" replicate both ways, and their conflict resolution can leave them with different rows")
+        {
+            Detail = $"worf.conflict_resolution is {localResolution} on node \"{localNode}\" and {remoteResolution} on node \"{remoteNode}\".",
+            Hint = "Set worf.conflict_resolution to last_update_wins or first_update_wins on both nodes.",
+        });
+    }
+
+    /// <summary>
     /// Gets a resolution's name.
     /// </summary>
     /// <param name="resolution">The resolution.</param>
