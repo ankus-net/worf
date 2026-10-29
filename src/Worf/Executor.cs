@@ -324,8 +324,9 @@ internal static unsafe partial class Executor
             return;
         }
 
+        // A temporary table's columns are its session's, and its rows are dropped with the session.
         sbyte* attname = NativeMethods.get_attname(relid, (short)attnum, true);
-        if (attnum > 0 && attname is not null)
+        if (attnum > 0 && attname is not null && NativeMethods.get_rel_persistence(relid) != (sbyte)'t')
         {
             _ = Spi.Execute("INSERT INTO worf.dropped_column VALUES ($1, $2::name) ON CONFLICT DO NOTHING",
                 SpiParameter.Create(relid), SpiParameter.Create(Worf.FromServer(attname)));
