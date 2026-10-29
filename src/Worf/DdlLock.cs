@@ -155,13 +155,10 @@ internal static unsafe partial class DdlLock
         {
             // A ShareLock waits for the writes already under way. Later ones fail on the fence.
             Worker.SetConfigOption("lock_timeout", timeoutMs.ToString(CultureInfo.InvariantCulture), GucContext.PGC_USERSET);
-            foreach ((uint relid, bool blocksWrites) in fenced)
+            foreach (uint relid in fenced.Where(fence => fence.BlocksWrites).Select(fence => fence.Relid))
             {
-                if (blocksWrites)
-                {
-                    NativeMethods.LockRelationOid(relid, (int)PgLockMode.Share);
-                    NativeMethods.UnlockRelationOid(relid, (int)PgLockMode.Share);
-                }
+                NativeMethods.LockRelationOid(relid, (int)PgLockMode.Share);
+                NativeMethods.UnlockRelationOid(relid, (int)PgLockMode.Share);
             }
         }
         catch
