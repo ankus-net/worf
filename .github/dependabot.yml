@@ -47,3 +47,8 @@ updates:
       docs:
         patterns:
           - "*"
+    ignore:
+      # astro check doesn't support TypeScript 7.
+      - dependency-name: typescript
+        update-types:
+          - version-update:semver-major
