@@ -394,7 +394,8 @@ internal static unsafe partial class SequenceRanges
         string state = rows[0].Get<string>(0);
         int epoch = rows[0].Get<int>(1);
         uint owner = rows[0].Get<uint>(2);
-        if (state is "collecting" or "refused" or "disabled")
+        // A node keeps using the blocks it holds while disabled or without a route to the owner.
+        if (state is "collecting" or "refused")
         {
             return false;
         }
@@ -431,10 +432,24 @@ internal static unsafe partial class SequenceRanges
             }
         }
 
-        // The owner grants its own next block from the root.
-        if (next is null && owner == node.Node.Id && NodeBlock(seqoid, epoch, "next") is null)
+        // The owner grants its own next block from the root. Another node requests one from its parent, committed
+        // before the exchange sends it.
+        if (next is null && NodeBlock(seqoid, epoch, "next") is null)
         {
-            changed |= GrantOwnBlock(seqoid, info, node, epoch);
+            if (owner == node.Node.Id)
+            {
+                changed |= GrantOwnBlock(seqoid, info, node, epoch);
+            }
+            else
+            {
+                _ = Spi.Execute("""
+                    INSERT INTO worf.sequence_range_request (request_id, seqoid, parent_node, kind, size, created_at)
+                    SELECT gen_random_uuid(), r.seqoid, r.parent_node, 'n', r.request_size, now()
+                    FROM worf.sequence_range r
+                    WHERE r.seqoid = $1 AND r.parent_node IS NOT NULL
+                        AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_request q WHERE q.seqoid = r.seqoid)
+                    """, SpiParameter.Create(seqoid));
+            }
         }
 
         return changed;
@@ -777,9 +792,61 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
+    /// Joins this node to a sequence that a neighbor reports under range management, which this node has too.
+    /// </summary>
+    /// <param name="seqoid">The sequence here.</param>
+    /// <param name="owner">Its owner.</param>
+    /// <param name="epoch">Its epoch.</param>
+    /// <param name="rangeSize">The size of a node's first block.</param>
+    /// <param name="maxRangeSize">The largest block a node requests.</param>
+    /// <param name="node">This node.</param>
+    internal static void JoinFromNeighbor(uint seqoid, uint owner, int epoch, long rangeSize, long maxRangeSize, WorfLocalNode node)
+    {
+        SequenceInfo info = GetInfo(seqoid);
+        string? refused = info.Persistence != 'p' ? "the sequence is temporary or unlogged here"
+            : info.Cycle ? "the sequence cycles here"
+            : Worf.SelectCatalog("SELECT 1 FROM worf.replication_set_seq WHERE set_seqoid = $1", SpiParameter.Create(seqoid)).Count > 0
+                ? "the sequence is in a replication set here"
+                : null;
+        _ = Spi.Execute("""
+            INSERT INTO worf.sequence_range (seqoid, owner_node, epoch, range_size, max_range_size, state, request_size, root_end, detail)
+            VALUES ($1, $2, $3, $4, $5, $6, $4, $7, $8)
+            """, SpiParameter.Create(seqoid), SpiParameter.Create(owner), SpiParameter.Create(epoch), SpiParameter.Create(rangeSize),
+            SpiParameter.Create(maxRangeSize), SpiParameter.Create(refused is null ? "quarantined" : "refused"),
+            SpiParameter.Create(info.Ascending ? info.Max : info.Min), SpiParameter.Create(refused));
+        if (refused is null)
+        {
+            Join(seqoid, node);
+            PgLog.Log($"sequence {info.Name} joined range management");
+        }
+
+        // The manager starts this database's range worker, if it hasn't one.
+        Worker.SubscriptionChanged(0, false);
+    }
+
+    /// <summary>
+    /// Starts the root once every listed participant has reported.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    /// <param name="node">This node, its owner.</param>
+    internal static void ActivateWhenReported(uint seqoid, WorfLocalNode node)
+    {
+        bool ready = Spi.ExecuteScalar<bool>("""
+            SELECT r.state = 'collecting' AND r.participants IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM unnest(r.participants) p(name)
+                WHERE NOT EXISTS (SELECT 1 FROM worf.sequence_range_node n WHERE n.seqoid = r.seqoid AND n.node_name = p.name))
+            FROM worf.sequence_range r WHERE r.seqoid = $1
+            """, SpiParameter.Create(seqoid));
+        if (ready)
+        {
+            Activate(seqoid, node);
+        }
+    }
+
+    /// <summary>
     /// Starts the root, above every value any reported node may have used, and gives the owner its first block.
     /// </summary>
-    private static void Activate(uint seqoid, WorfLocalNode node)
+    internal static void Activate(uint seqoid, WorfLocalNode node)
     {
         SequenceInfo info = GetInfo(seqoid);
         SpiResult range = Worf.SelectCatalog("SELECT epoch, pool_start, root_end, state FROM worf.sequence_range WHERE seqoid = $1",
@@ -938,6 +1005,31 @@ internal static unsafe partial class SequenceRanges
     private static bool GrantOwnBlock(uint seqoid, SequenceInfo info, WorfLocalNode node, int epoch)
     {
         long size = Worf.SelectCatalog("SELECT request_size FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(seqoid))[0].Get<long>(0);
+        if (Allocate(seqoid, info, epoch, size, node.Node.Id, node.Node.Name, Guid.NewGuid()) is not (Guid grant, long lo, long hi))
+        {
+            return false;
+        }
+
+        _ = InsertBlock(seqoid, epoch, 'n', lo, hi, "next", node.Node.Id, node, grant);
+        _ = Spi.Execute("UPDATE worf.sequence_range_grant SET state = 'acknowledged' WHERE grant_id = $1", SpiParameter.Create(grant));
+        return true;
+    }
+
+    /// <summary>
+    /// Grants a block of a size, in steps of the increment, from the start of the lowest free span of this node's root
+    /// or pool blocks that holds it, under a row lock, committed with synchronous_commit on. A request granted before
+    /// gets the same grant again.
+    /// </summary>
+    /// <returns>The grant and its bounds, or null when no free span holds the size.</returns>
+    internal static (Guid Grant, long Lo, long Hi)? Allocate(uint seqoid, SequenceInfo info, int epoch, long size, uint granteeId,
+        string granteeName, Guid requestId)
+    {
+        SpiResult granted = Worf.SelectCatalog("SELECT grant_id, lo, hi FROM worf.sequence_range_grant WHERE request_id = $1",
+            SpiParameter.Create(requestId));
+        if (granted.Count > 0)
+        {
+            return (granted[0].Get<Guid>(0), granted[0].Get<long>(1), granted[0].Get<long>(2));
+        }
 
         // A block of size steps spans size times the increment, less one step.
         decimal span = ((decimal)size - 1) * Math.Abs(info.Increment);
@@ -953,7 +1045,7 @@ internal static unsafe partial class SequenceRanges
             """), false, 1);
         if (free.Count == 0)
         {
-            return false;
+            return null;
         }
 
         Guid from = free[0].Get<Guid>(0);
@@ -969,26 +1061,30 @@ internal static unsafe partial class SequenceRanges
                 SpiParameter.Create(info.Ascending ? hi + 1 : freeLo), SpiParameter.Create(info.Ascending ? freeHi : lo - 1));
         }
 
-        Guid block = InsertBlock(seqoid, epoch, 'n', lo, hi, "next", node.Node.Id, node);
+        Guid grant = Guid.NewGuid();
         _ = Spi.Execute("""
             INSERT INTO worf.sequence_range_grant
-            VALUES ($1, gen_random_uuid(), $2, $3, $4, $5, 'n', $6, $7, 'acknowledged', now())
-            """, SpiParameter.Create(block), SpiParameter.Create(seqoid), SpiParameter.Create(from), SpiParameter.Create(node.Node.Id),
-            SpiParameter.Create(node.Node.Name), SpiParameter.Create(lo), SpiParameter.Create(hi));
+            VALUES ($1, $2, $3, $4, $5, $6, 'n', $7, $8, 'sent', now())
+            """, SpiParameter.Create(grant), SpiParameter.Create(requestId), SpiParameter.Create(seqoid), SpiParameter.Create(from),
+            SpiParameter.Create(granteeId), SpiParameter.Create(granteeName), SpiParameter.Create(lo), SpiParameter.Create(hi));
         _ = Spi.Execute($"UPDATE worf.sequence_range SET watermark = {(info.Ascending ? "greatest" : "least")}(coalesce(watermark, $2), $2) WHERE seqoid = $1",
             SpiParameter.Create(seqoid), SpiParameter.Create(info.Ascending ? hi : lo));
 
         // A grant that a crash lost could be granted again.
         _ = Spi.Execute("SET LOCAL synchronous_commit = on");
-        PgLog.Log($"sequence {info.Name} granted block [{lo}, {hi}] to node {node.Node.Name}");
-        return true;
+        PgLog.Log($"sequence {info.Name} granted block [{lo}, {hi}] to node {granteeName}");
+        return (grant, lo, hi);
     }
 
-    private static Guid InsertBlock(uint seqoid, int epoch, char kind, long lo, long hi, string state, uint? fromNode, WorfLocalNode node)
+    /// <summary>
+    /// Records a block this node holds, under its identity now.
+    /// </summary>
+    internal static Guid InsertBlock(uint seqoid, int epoch, char kind, long lo, long hi, string state, uint? fromNode, WorfLocalNode node,
+        Guid? id = null)
     {
         ulong sysid = NativeMethods.GetSystemIdentifier();
         uint timeline = NativeMethods.GetWALInsertionTimeLine();
-        Guid block = Guid.NewGuid();
+        Guid block = id ?? Guid.NewGuid();
         _ = Spi.Execute("""
             INSERT INTO worf.sequence_range_block
                 (block_id, seqoid, epoch, kind, lo, hi, state, from_node, node_id, sysid, timeline, received_at)

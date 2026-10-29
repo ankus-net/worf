@@ -160,6 +160,73 @@ public sealed class SequenceRangeTests
             "SELECT root_end FROM worf.sequence_range", token));
     }
 
+    /// <summary>
+    /// Two nodes that replicate both ways insert into the same table at once with keys from the same sequence, which the
+    /// first node manages: the second learns of it through the exchange, gets blocks from the first, and no key is
+    /// written on both nodes.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task BidirectionalNodesNeverShareAKey()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, """
+                CREATE TABLE t (id bigserial PRIMARY KEY, v text);
+                SELECT * FROM worf.replication_set_add_table('default', 't');
+                """, token);
+        }
+
+        await SubscribeAsync(nodeA, "a_from_b", nodeB, token);
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 1000)", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            Assert.IsTrue(await node.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges", token),
+                $"{node.Name} drawing from a block");
+        }
+
+        await Task.WhenAll(InsertAsync(nodeA, "a"), InsertAsync(nodeB, "b"));
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
+        _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            Assert.AreEqual("600|600|300|300", await node.SafePsqlAsync(Database,
+                "SELECT count(*), count(DISTINCT id), count(*) FILTER (WHERE v = 'a'), count(*) FILTER (WHERE v = 'b') FROM t", token),
+                node.Name);
+        }
+
+        async Task InsertAsync(TestNode node, string value)
+        {
+            await using NpgsqlConnection connection = await node.OpenAsync(Database, token);
+            for (int i = 0; i < 300; i++)
+            {
+                await using NpgsqlCommand insert = new($"INSERT INTO t (v) VALUES ('{value}')", connection);
+                _ = await insert.ExecuteNonQueryAsync(token);
+            }
+        }
+    }
+
+    private static async Task SubscribeAsync(TestNode subscriber, string name, TestNode provider, CancellationToken token)
+    {
+        _ = await subscriber.SafePsqlAsync(Database, $$"""
+            SELECT worf.create_subscription(
+                subscription_name := '{{name}}',
+                provider_dsn := '{{provider.Dsn(Database, SuperUser)}}',
+                synchronize_structure := false,
+                synchronize_data := false,
+                forward_origins := '{}')
+            """, token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, $"""
+            SELECT EXISTS (
+                SELECT 1 FROM worf.show_subscription_status()
+                    WHERE subscription_name = '{name}' AND status = 'replicating')
+            """, token), "subscription failed to reach \"replicating\" state");
+    }
+
     private static string Next(string value)
         => (long.Parse(value, CultureInfo.InvariantCulture) + 1).ToString(CultureInfo.InvariantCulture);
 

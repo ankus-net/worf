@@ -51,6 +51,18 @@ internal static class SequenceRangeWorker
                 }
             });
 
+            // Requests are committed before the exchanges send them.
+            if (managed)
+            {
+                PgBackgroundWorker.RunTransaction(() =>
+                {
+                    if (WorfNode.GetLocalNode(false, true) is WorfLocalNode node)
+                    {
+                        changed |= SequenceRangeExchange.ExchangeAll(node);
+                    }
+                });
+            }
+
             // Backends reload their blocks once the change is committed.
             if (changed)
             {
