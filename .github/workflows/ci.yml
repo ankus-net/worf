@@ -67,15 +67,24 @@ jobs:
         id: build
         run: |
           set -o pipefail
+          touch "$RUNNER_TEMP/build-start"
           dotnet ankus build --pg ${{ matrix.postgresql }} --project src/Worf/Worf.csproj | tee "$RUNNER_TEMP/build.log"
           if grep -q "Managed binding compilation: built" "$RUNNER_TEMP/build.log"; then
             echo "compiled-bindings=true" >> "$GITHUB_OUTPUT"
           fi
 
       # Bindings depend on the PostgreSQL symbols worf uses, so restored ones go stale when worf starts using another.
-      # Main saves them again whenever its build compiles them. Pull requests use main's rather than storing their own.
+      # Main saves them again whenever its build compiles them, without the sets the build no longer uses: Ankus names
+      # each set by a 64-digit key and updates its time whenever a build uses it. Other branches and tags use main's
+      # rather than storing their own.
+      - name: Prune Ankus bindings
+        if: steps.build.outputs.compiled-bindings == 'true' && github.ref == 'refs/heads/main'
+        run: |
+          key=$(printf '[0-9A-F]%.0s' {1..64})
+          find "$AnkusBindingCacheDirectory" -mindepth 1 -maxdepth 2 -name "$key*" ! -newer "$RUNNER_TEMP/build-start" -prune -exec rm -rf {} +
+
       - name: Save Ankus bindings
-        if: steps.build.outputs.compiled-bindings == 'true' && github.event_name != 'pull_request'
+        if: steps.build.outputs.compiled-bindings == 'true' && github.ref == 'refs/heads/main'
         uses: actions/cache/save@v6
         with:
           path: ${{ runner.temp }}/ankus-bindings

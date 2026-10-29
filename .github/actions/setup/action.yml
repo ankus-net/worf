@@ -102,9 +102,10 @@ runs:
       run: dotnet ankus init ${{ inputs.release == 'true' && '--release' || '' }} --pg${{ inputs.postgresql }} download
 
     - name: Save PostgreSQL
-      # Saved as soon as it's installed, so a later failing step doesn't make the next run build it again. Pull
-      # requests use main's installations rather than storing copies of their own, which crowd main's out of the cache.
-      if: steps.postgresql-cache.outputs.cache-hit != 'true' && github.event_name != 'pull_request'
+      # Saved as soon as it's installed, so a later failing step doesn't make the next run build it again. Only main
+      # stores installations: every branch and tag can restore main's, while copies of their own, which only they can
+      # restore, crowd main's out of the cache.
+      if: steps.postgresql-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
       uses: actions/cache/save@v6
       with:
         path: ~/.ankus/postgres
