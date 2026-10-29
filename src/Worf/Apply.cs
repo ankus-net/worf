@@ -289,6 +289,7 @@ internal static unsafe partial class Apply
                 if (!s_inRemoteTransaction)
                 {
                     ProcessSyncingTables(s_lastReceived);
+                    DdlLock.Reconcile(MySubscription!);
                 }
             }
         }
@@ -1306,7 +1307,8 @@ internal static unsafe partial class Apply
         }
 
         // DDL that locked the other nodes first applies each node's changes as far as its WAL had reached when it held
-        // back its writes.
+        // back its writes. This node held back its writes for the DDL until it applies here, or is skipped, and lets
+        // them go once that commits.
         if (root.TryGetProperty("positions", out JsonElement positions) && positions.ValueKind == JsonValueKind.Object)
         {
             List<(uint NodeId, ulong Lsn)> nodes = [];
@@ -1322,6 +1324,12 @@ internal static unsafe partial class Apply
             }
 
             DdlLock.WaitForNodes(MySubscription!.Target.Id, nodes, DdlLock.DdlLockTimeout);
+        }
+
+        if (root.TryGetProperty("fence", out JsonElement fence) &&
+            ulong.TryParse(fence.GetString(), NumberStyles.None, CultureInfo.InvariantCulture, out ulong fenceId))
+        {
+            DdlLock.ReleaseOnCommit(fenceId);
         }
 
         // The statement runs with the settings it ran with, which change what it means.
@@ -1340,13 +1348,6 @@ internal static unsafe partial class Apply
         ExecuteSqlCommand(command.GetString()!, queuedMessage.Role, false, true);
 
         NativeMethods.AtEOXact_GUC(true, saveNestlevel);
-
-        // This node held back its writes for the DDL until it applied here.
-        if (root.TryGetProperty("fence", out JsonElement fence) &&
-            ulong.TryParse(fence.GetString(), NumberStyles.None, CultureInfo.InvariantCulture, out ulong fenceId))
-        {
-            _ = DdlLock.ReleaseFences(fenceId);
-        }
     }
 
     private static void SetDdlSetting(string name, string value)

@@ -234,17 +234,18 @@ internal static unsafe partial class Executor
             s_lastDropBehavior = ((DropStmt*)parsetree)->behavior;
         }
 
-        // A COPY into or TRUNCATE of a table another node changes waits for the change.
+        // A COPY into or TRUNCATE of a table another node changes waits for the change. Each takes its table's lock
+        // first, as an INSERT does, so that it can't start writing after a fence has reported how far it waited.
         if (parsetree->type == NodeTag.T_CopyStmt && ((CopyStmt*)parsetree)->is_from)
         {
-            CheckWrite(((CopyStmt*)parsetree)->relation);
+            CheckWrite(((CopyStmt*)parsetree)->relation, PgLockMode.RowExclusive);
         }
         else if (parsetree->type == NodeTag.T_TruncateStmt)
         {
             List* relations = ((TruncateStmt*)parsetree)->relations;
             for (int i = 0; relations is not null && i < relations->length; i++)
             {
-                CheckWrite((RangeVar*)relations->elements[i].ptr_value);
+                CheckWrite((RangeVar*)relations->elements[i].ptr_value, PgLockMode.AccessExclusive);
             }
         }
 
@@ -372,7 +373,7 @@ internal static unsafe partial class Executor
 
     private static void WorfExecutorStart(QueryDesc* queryDesc, int eflags)
     {
-        DdlLock.CheckWrites(queryDesc);
+        DdlLock.CheckWrites(queryDesc, eflags);
 
         if (!s_nextExecutorStartHook.IsNull)
         {
@@ -384,9 +385,9 @@ internal static unsafe partial class Executor
         }
     }
 
-    private static void CheckWrite(RangeVar* relation)
+    private static void CheckWrite(RangeVar* relation, PgLockMode lockmode)
     {
-        uint relid = relation is null ? 0 : NativeMethods.RangeVarGetRelidExtended(relation, 0, 1, default, null);
+        uint relid = relation is null ? 0 : NativeMethods.RangeVarGetRelidExtended(relation, (int)lockmode, 1, default, null);
         if (relid != 0)
         {
             DdlLock.CheckWrite(relid);

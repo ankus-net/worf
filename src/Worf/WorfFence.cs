@@ -1,7 +1,7 @@
 namespace Worf;
 
 /// <summary>
-/// A table whose local writes this node holds back while another node changes its definition.
+/// A table whose local writes and DDL this node holds back while another node changes its definition.
 /// </summary>
 internal struct WorfFence
 {
@@ -25,4 +25,9 @@ internal struct WorfFence
     /// zero once it has, after which the fence holds until the change applies here.
     /// </summary>
     public int HolderPid;
+
+    /// <summary>
+    /// Whether the fence holds back writes as well as DDL, as it does for a table this node replicates.
+    /// </summary>
+    public bool BlocksWrites;
 }
