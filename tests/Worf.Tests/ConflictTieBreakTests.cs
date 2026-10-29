@@ -49,7 +49,9 @@ public sealed class ConflictTieBreakTests
 
     /// <summary>
     /// A tie between changes from two nodes keeps the same change on a node that relays one of them to the other, as
-    /// on that other node, which compares the node that wrote the relayed change rather than the relay.
+    /// on that other node, which compares the node that wrote the relayed change rather than the relay. A node's own
+    /// changes that come back, and relayed changes to rows the same node last wrote, aren't conflicts, and a first
+    /// relayed transaction that fails under discard is skipped.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -74,9 +76,19 @@ public sealed class ConflictTieBreakTests
 
         // The writer and the relay replicate both ways, and the relay relays the leaf's changes to the writer. The relay
         // takes only the writer's own changes, so nothing comes back to the writer but its own.
+        _ = await writer.SafePsqlAsync(Database, "ALTER SYSTEM SET worf.exception_behaviour = discard", token);
+        _ = await writer.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
+        _ = await writer.SafePsqlAsync(Database, "ALTER TABLE quiet ADD CONSTRAINT not_bad CHECK (v <> 'bad')", token);
         await SubscribeAsync(relay, "relay_from_writer", writer, false, token);
         await SubscribeAsync(relay, "relay_from_leaf", leaf, true, token);
         await SubscribeAsync(writer, "writer_from_relay", relay, true, token);
+
+        // The first transaction relayed to the writer creates its relay origin, and fails there.
+        _ = await leaf.SafePsqlAsync(Database, "UPDATE quiet SET v = 'bad' WHERE id = 2", token);
+        await WaitForAllAsync([leaf, relay], token);
+        Assert.IsTrue(await writer.PollQueryUntilAsync(Database,
+            "SELECT EXISTS (SELECT 1 FROM worf.exception_log WHERE table_name = 'quiet' AND remote_new_tuple->>'v' = 'bad')", token),
+            "the failed relayed change recorded");
 
         string committed = await UpdateAsync(writer, "writer", token);
         await UpdateAtAsync(leaf, "leaf", committed, token);
@@ -86,6 +98,19 @@ public sealed class ConflictTieBreakTests
 
         Assert.AreEqual("leaf", await ValueAsync(relay, token), "the relay's row");
         Assert.AreEqual("leaf", await ValueAsync(writer, token), "the writer's row");
+
+        // The relay's change to a row the writer inserted is a conflict there. The leaf's later change to it, which
+        // the relay applied after its own, isn't, nor is the writer's own change coming back through the relay.
+        _ = await relay.SafePsqlAsync(Database, "UPDATE quiet SET v = 'first' WHERE id = 2", token);
+        await WaitForAllAsync([relay], token);
+        int logpos = writer.ReadLog().Length;
+        _ = await leaf.SafePsqlAsync(Database, "UPDATE quiet SET v = 'second' WHERE id = 2", token);
+        _ = await writer.SafePsqlAsync(Database, "UPDATE quiet SET v = 'own' WHERE id = 1", token);
+        await WaitForAllAsync([leaf, writer, relay], token);
+        Assert.AreEqual("own\nsecond", await writer.SafePsqlAsync(Database, "SELECT v FROM quiet ORDER BY id", token));
+        string log = writer.ReadLog()[logpos..];
+        Assert.DoesNotContain("CONFLICT", log, "the writer's log");
+        Assert.DoesNotContain("does not exist", writer.ReadLog(), "the writer's log");
     }
 
     /// <summary>
@@ -122,6 +147,34 @@ public sealed class ConflictTieBreakTests
         _ = await second.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
 
         Assert.AreEqual("second", await ValueAsync(subscriber, token));
+
+        // Dropping a subscription whose name sub_via_2 starts with leaves sub_via_2's origin and replication alone.
+        _ = await second.SafePsqlAsync(Database, "SELECT worf.create_replication_set('other')", token);
+        _ = await subscriber.SafePsqlAsync(Database, $$"""
+            SELECT worf.create_subscription(
+                subscription_name := 'sub',
+                provider_dsn := '{{second.Dsn(Database, SuperUser)}}',
+                replication_sets := '{other}',
+                synchronize_structure := false,
+                synchronize_data := false)
+            """, token);
+        _ = await subscriber.SafePsqlAsync(Database, "SELECT worf.drop_subscription('sub')", token);
+        Assert.AreEqual("1", await subscriber.SafePsqlAsync(Database,
+            "SELECT count(*) FROM pg_replication_origin WHERE roname LIKE '%sub_via_2'", token), "sub_via_2's origin");
+        _ = await UpdateAsync(second, "after the drop", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT v = 'after the drop' FROM tie", token),
+            "sub_via_2 replicating after the drop");
+    }
+
+    /// <summary>
+    /// Waits for each node's subscribers to confirm its changes, in order.
+    /// </summary>
+    private static async Task WaitForAllAsync(TestNode[] nodes, CancellationToken token)
+    {
+        foreach (TestNode node in nodes)
+        {
+            _ = await node.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
+        }
     }
 
     private static async Task<TestNode> StartNodeAsync(string name, CancellationToken token)
@@ -145,6 +198,9 @@ public sealed class ConflictTieBreakTests
                 CREATE TABLE tie (id integer PRIMARY KEY, v text);
                 INSERT INTO tie VALUES (1, 'initial');
                 SELECT * FROM worf.replication_set_add_table('default', 'tie');
+                CREATE TABLE quiet (id integer PRIMARY KEY, v text);
+                INSERT INTO quiet VALUES (1, 'initial'), (2, 'initial');
+                SELECT * FROM worf.replication_set_add_table('default', 'quiet');
                 """, token);
         }
         catch

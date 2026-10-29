@@ -21,6 +21,16 @@ using Ankus.Postgres;
         node_local_interface oid NOT NULL REFERENCES node_interface(if_id)
     );
 
+    CREATE TABLE worf.origin_writer (
+        roident oid NOT NULL,
+        writer_node oid NOT NULL,
+        since_xid xid8 NOT NULL,
+        PRIMARY KEY (roident, since_xid)
+    );
+
+    COMMENT ON TABLE worf.origin_writer IS
+        'The node whose changes each replication origin worf created applies, from the transaction that created it';
+
     CREATE TABLE worf.subscription (
         sub_id oid NOT NULL PRIMARY KEY,
         sub_name name NOT NULL UNIQUE,
@@ -469,6 +479,8 @@ internal sealed partial class WorfNode
             throw new PgException(PgSqlStates.InternalError, $"subscription {subid} not found");
         }
 
+        _ = Spi.Execute("DELETE FROM worf.exception_state WHERE sub_id = $1", SpiParameter.Create(subid));
+
         NativeMethodsCommandCounterIncrement();
 
         Worker.SubscriptionChanged(subid, true);
@@ -557,7 +569,8 @@ internal sealed partial class WorfNode
 
     /// <summary>
     /// Names the replication origin under which apply commits the changes its provider relays from another node, so
-    /// that conflict resolution can tell which node wrote a row.
+    /// that conflict resolution can tell which node wrote a row. Slot names, and so workers' own origins, can't
+    /// contain the separator, so no subscription's origin can look like another's relay origin.
     /// </summary>
     /// <param name="originName">The apply or table sync worker's own origin.</param>
     /// <param name="nodeId">The node that wrote the changes.</param>
@@ -573,8 +586,7 @@ internal sealed partial class WorfNode
     /// <returns>The node's id, or null when no subscription owns the origin.</returns>
     internal static unsafe uint? GetOriginNodeId(string originName)
     {
-        // A relay origin is a worker's origin followed by the id of the node that wrote its changes. A worker's own
-        // origin can end the same way when its subscription's name does, so a match on it comes first.
+        // A relay origin is a worker's origin followed by the id of the node that wrote its changes.
         string? relayed = null;
         uint writer = 0;
         int relay = originName.LastIndexOf(RelaySeparator, StringComparison.Ordinal);
@@ -610,6 +622,40 @@ internal sealed partial class WorfNode
     }
 
     /// <summary>
+    /// Creates a replication origin and records the node whose changes it applies, from this transaction on, since
+    /// PostgreSQL reuses a dropped origin's id while rows committed under it keep the id.
+    /// </summary>
+    /// <param name="originName">The origin.</param>
+    /// <param name="writerNodeId">The node whose changes it applies.</param>
+    /// <returns>The origin's id.</returns>
+    internal static ushort CreateOrigin(string originName, uint writerNodeId)
+    {
+        ushort origin = PgReplicationOrigin.Create(originName);
+        _ = Spi.Execute("""
+            INSERT INTO worf.origin_writer
+            VALUES ($1, $2, coalesce(pg_catalog.pg_current_xact_id_if_assigned(), pg_catalog.pg_snapshot_xmax(pg_catalog.pg_current_snapshot())))
+            ON CONFLICT DO NOTHING
+            """, SpiParameter.Create((uint)origin), SpiParameter.Create(writerNodeId));
+        return origin;
+    }
+
+    /// <summary>
+    /// Gets the node whose changes a replication origin applied when a transaction ran, from what worf recorded.
+    /// </summary>
+    /// <param name="originId">The origin's id.</param>
+    /// <param name="xid">The transaction, within the last two billion.</param>
+    /// <returns>The node, or null when worf didn't record the origin.</returns>
+    internal static uint? OriginWriter(ushort originId, uint xid)
+        => Spi.ExecuteScalar<uint?>("""
+            SELECT w.writer_node FROM worf.origin_writer w,
+                (SELECT pg_catalog.pg_snapshot_xmax(pg_catalog.pg_current_snapshot())::text::bigint AS next) n
+            WHERE w.roident = $1 AND w.since_xid::text::bigint <= CASE WHEN $2 <= n.next & 4294967295 THEN n.next >> 32 << 32 | $2
+                ELSE (n.next >> 32) - 1 << 32 | $2 END
+            ORDER BY w.since_xid DESC
+            LIMIT 1
+            """, SpiParameter.Create((uint)originId), SpiParameter.Create((long)xid));
+
+    /// <summary>
     /// Drops a worker's replication origin and its relay origins.
     /// </summary>
     /// <param name="originName">The worker's origin.</param>
@@ -629,16 +675,12 @@ internal sealed partial class WorfNode
     /// <returns>The relay origins' ids and names.</returns>
     internal static List<(ushort Id, string Name)> RelayOrigins(string originName)
     {
+        string prefix = originName + RelaySeparator;
         SpiResult result = Worf.SelectCatalog(
-            "SELECT roident, roname FROM pg_catalog.pg_replication_origin WHERE starts_with(roname, $1)",
-            SpiParameter.Create(originName + RelaySeparator));
-        List<(ushort Id, string Name)> relays = [];
-        for (int i = 0; i < result.Count; i++)
-        {
-            relays.Add(((ushort)result[i].Get<uint>(0), result[i].Get<string>(1)));
-        }
-
-        return relays;
+            "SELECT roident, roname FROM pg_catalog.pg_replication_origin WHERE starts_with(roname, $1)", SpiParameter.Create(prefix));
+        return [.. Enumerable.Range(0, result.Count)
+            .Select(i => ((ushort)result[i].Get<uint>(0), result[i].Get<string>(1)))
+            .Where(relay => uint.TryParse(relay.Item2.AsSpan(prefix.Length), NumberStyles.None, CultureInfo.InvariantCulture, out _))];
     }
 
     /// <summary>
@@ -676,7 +718,7 @@ internal sealed partial class WorfNode
 
     private const string CatalogNode = "node";
     private const string CatalogSubscription = "subscription";
-    private const string RelaySeparator = "_via_";
+    private const string RelaySeparator = "@";
     private const string CatalogLocalNode = "local_node";
     private const string CatalogNodeInterface = "node_interface";
 

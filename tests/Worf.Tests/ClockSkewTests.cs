@@ -1,3 +1,5 @@
+using System.Diagnostics;
+
 namespace Worf.Tests;
 
 /// <summary>
@@ -15,8 +17,9 @@ public sealed class ClockSkewTests
     public TestContext TestContext { get; set; } = null!;
 
     /// <summary>
-    /// A local change made after a remote one from a clock half a second ahead commits after it, and a remote change
-    /// from a clock further ahead than <c>worf.max_clock_skew</c> applies at once, with a warning.
+    /// Between nodes that replicate both ways under last_update_wins, a local change made after a remote one from a
+    /// clock half a second ahead commits after it, and a remote change from a clock further ahead than
+    /// <c>worf.max_clock_skew</c> applies at once, with a warning. One way, or under apply_remote, apply doesn't wait.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -44,6 +47,29 @@ public sealed class ClockSkewTests
             """, token), "subscription failed to reach \"replicating\" state");
         _ = await provider.SafePsqlAsync(Database, "SELECT pg_replication_origin_create('skew')", token);
 
+        // One way, a change from a clock six seconds ahead applies without waiting.
+        await AppliesAtOnceAsync(provider, subscriber, "one way", token);
+
+        // Once the provider subscribes back, under last_update_wins on both nodes, which a session's setting doesn't
+        // change, the subscriber's restarted worker waits.
+        _ = await provider.SafePsqlAsync(Database, $$"""
+            SET worf.conflict_resolution = error;
+            SELECT worf.create_subscription(
+                subscription_name := 'back',
+                provider_dsn := '{{subscriber.Dsn(Database, SuperUser)}}',
+                synchronize_structure := false,
+                synchronize_data := false,
+                forward_origins := '{}')
+            """, token);
+        Assert.DoesNotContain("replicate both ways", provider.ReadLog());
+        _ = await subscriber.SafePsqlAsync(Database, "SELECT worf.alter_subscription_disable('skew', true)", token);
+        _ = await subscriber.SafePsqlAsync(Database, "SELECT worf.alter_subscription_enable('skew', true)", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, """
+            SELECT EXISTS (
+                SELECT 1 FROM worf.show_subscription_status()
+                    WHERE subscription_name = 'skew' AND status = 'replicating')
+            """, token), "the restarted subscription");
+
         string ahead = await UpdateAheadAsync(provider, "remote", "500 milliseconds", token);
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT v = 'remote' FROM skew", token), "the remote change");
         _ = await subscriber.SafePsqlAsync(Database, "UPDATE skew SET v = 'local'", token);
@@ -53,6 +79,23 @@ public sealed class ClockSkewTests
         _ = await UpdateAheadAsync(provider, "far", "1 hour", token);
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT v = 'far' FROM skew", token), "the far change");
         Assert.Contains("more than worf.max_clock_skew", subscriber.ReadLog());
+
+        // Under apply_remote, apply doesn't wait.
+        _ = await subscriber.SafePsqlAsync(Database, "ALTER SYSTEM SET worf.conflict_resolution = apply_remote", token);
+        _ = await subscriber.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
+        await Task.Delay(TimeSpan.FromSeconds(1), token);
+        await AppliesAtOnceAsync(provider, subscriber, "apply_remote", token);
+    }
+
+    /// <summary>
+    /// Checks that a change from a clock six seconds ahead applies well before the clock catches up.
+    /// </summary>
+    private static async Task AppliesAtOnceAsync(TestNode provider, TestNode subscriber, string value, CancellationToken token)
+    {
+        Stopwatch applying = Stopwatch.StartNew();
+        _ = await UpdateAheadAsync(provider, value, "6 seconds", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, $"SELECT v = '{value}' FROM skew", token), $"the change {value}");
+        Assert.IsLessThan(4500, applying.ElapsedMilliseconds, $"apply waited out the skew {value}");
     }
 
     private static async Task<TestNode> StartNodeAsync(string name, CancellationToken token)
@@ -63,6 +106,8 @@ public sealed class ClockSkewTests
             "max_wal_senders = 10",
             "max_replication_slots = 10",
             "track_commit_timestamp = on",
+            "worf.conflict_resolution = last_update_wins",
+            "worf.max_clock_skew = '10s'",
         ], token);
         try
         {

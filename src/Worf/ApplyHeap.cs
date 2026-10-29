@@ -77,7 +77,7 @@ internal static unsafe class ApplyHeap
         HeapTupleData* remotetuple = FormTuple(relation, newtup);
         long localTs = local.CommitTime?.MicrosecondsSinceEpoch ?? 0;
 
-        bool apply = Conflict.TryResolveConflict(local.CommitOrigin, localTs, localtuple, remotetuple,
+        bool apply = Conflict.TryResolveConflict(local.CommitOrigin, local.TransactionId, localTs, localtuple, remotetuple,
             out HeapTupleData* applytuple, out WorfConflictResolution resolution);
 
         Conflict.ReportConflict(WorfConflictType.InsertInsert, rel, localtuple, null, remotetuple, applytuple, resolution,
@@ -125,15 +125,16 @@ internal static unsafe class ApplyHeap
         HeapTupleData* localtuple = null;
 
         // If the local tuple was previously updated by different transaction on different server, consider this to be
-        // conflict and resolve it.
+        // conflict and resolve it. One that came through this subscription, from any node its provider relays, came
+        // in order.
         if (local.CommitTime is not null &&
             local.TransactionId != NativeMethods.GetTopTransactionId() &&
-            local.CommitOrigin != Worf.ReploriginSessionOrigin)
+            !Apply.IsOwnStream(local.CommitOrigin))
         {
             localtuple = LocalTuple(local);
             HeapTupleData* remotetuple = ModifyTuple(localtuple, relation, newtup);
 
-            apply = Conflict.TryResolveConflict(local.CommitOrigin, localTs, localtuple, remotetuple,
+            apply = Conflict.TryResolveConflict(local.CommitOrigin, local.TransactionId, localTs, localtuple, remotetuple,
                 out HeapTupleData* applytuple, out WorfConflictResolution resolution);
 
             Conflict.ReportConflict(WorfConflictType.UpdateUpdate, rel, localtuple, oldtup, remotetuple, applytuple,

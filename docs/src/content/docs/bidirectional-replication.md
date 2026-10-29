@@ -226,11 +226,9 @@ SELECT * FROM inventory ORDER BY id;
 -- 'first_update_wins' - Oldest change wins (requires track_commit_timestamp)
 -- 'error'             - Raise error on conflict (requires manual intervention)
 
--- Set for current session
-SET worf.conflict_resolution = 'last_update_wins';
-
--- Set permanently in postgresql.conf
--- worf.conflict_resolution = 'last_update_wins'
+-- Set for the apply workers, on both nodes
+ALTER SYSTEM SET worf.conflict_resolution = 'last_update_wins';
+SELECT pg_reload_conf();
 ```
 
 ### Test 4: Creating and Resolving Conflicts
@@ -239,8 +237,9 @@ SET worf.conflict_resolution = 'last_update_wins';
 
 ```sql
 -- On both nodes
-SET worf.conflict_resolution = 'last_update_wins';
-SET worf.conflict_history_enabled = true;
+ALTER SYSTEM SET worf.conflict_resolution = 'last_update_wins';
+ALTER SYSTEM SET worf.conflict_history_enabled = true;
+SELECT pg_reload_conf();
 ```
 
 **Create a conflict:**

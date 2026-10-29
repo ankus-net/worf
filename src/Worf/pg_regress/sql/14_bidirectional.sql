@@ -14,12 +14,15 @@ BEGIN
 	END IF;
 END;$$;
 
+-- The apply workers don't run with the session's setting, so the warning stands.
+SET worf.conflict_resolution = last_update_wins;
 SELECT * FROM worf.create_subscription(
     subscription_name := 'test_bidirectional',
     provider_dsn := (SELECT subscriber_dsn FROM worf_regress_variables()) || ' user=super',
     synchronize_structure := false,
     synchronize_data := false,
     forward_origins := '{}');
+RESET worf.conflict_resolution;
 
 BEGIN;
 SET LOCAL statement_timeout = '180s';

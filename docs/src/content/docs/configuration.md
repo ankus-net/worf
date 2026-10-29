@@ -26,7 +26,10 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   keep the change written by the node with the higher node id, including
   changes another node forwarded, so every node keeps the same version.
   Nodes that replicate both ways need the same one of these two settings to
-  keep the same rows, and `create_subscription` warns when they don't.
+  keep the same rows, and `create_subscription` warns when they don't. It
+  compares the settings the apply workers run with, from the configuration
+  files and `ALTER SYSTEM`, `ALTER DATABASE` or `ALTER ROLE`, not a session's
+  `SET`.
 
   The default value is `apply_remote`.
 
@@ -46,9 +49,11 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
 - `worf.max_clock_skew`
   How far ahead of the local clock a remote transaction's commit time can be
   for apply to wait until the local clock passes it, so that local changes
-  made afterwards commit later and win under `last_update_wins`. A remote
-  transaction further ahead applies at once, with a warning at most once a
-  minute. `-1` never waits. The default is `1s`.
+  made afterwards commit later than it, as `last_update_wins` and
+  `first_update_wins` need. Only the apply worker of a subscription whose
+  provider also subscribes to this node waits, and only under those two
+  settings. A remote transaction further ahead applies at once, with a warning
+  at most once a minute. `-1` never waits. The default is `1s`.
 
 - `worf.exception_behaviour`
   What apply does with a remote transaction that fails, as on a constraint
@@ -64,10 +69,13 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
 
   Errors that don't come from the data, such as deadlocks, serialization
   failures, lock and statement timeouts, cancellations, shutdowns and running
-  out of resources, are retried as under `error`. Skipped changes and
-  disabled subscriptions are recorded in `worf.exception_log`, with the error,
-  the change's rows or queued DDL, and the transaction it belongs to. The
-  default is `error`.
+  out of resources, are retried as under `error`. Every skipped change,
+  including each change of a transaction skipped as a whole, and disabled
+  subscriptions are recorded in `worf.exception_log`, with the error, the
+  change's rows or queued DDL, and the transaction it belongs to. The
+  transaction that a subscription applies again, and how, is kept in
+  `worf.exception_state` across restarts. Table sync workers catching up
+  after a copy handle failures the same way. The default is `error`.
 
 - `worf.enable_ddl_replication`
   Replicates DDL as it runs, through the `ddl_sql` replication set as

@@ -26,6 +26,17 @@ using Ankus.Postgres;
 
     COMMENT ON TABLE worf.exception_log IS
         'Remote changes and transactions that failed to apply, and what worf.exception_behaviour did with them';
+
+    CREATE TABLE worf.exception_state (
+        sub_id oid PRIMARY KEY,
+        commit_lsn pg_lsn NOT NULL,
+        level integer NOT NULL,
+        error_sqlstate text NOT NULL,
+        error_message text NOT NULL
+    );
+
+    COMMENT ON TABLE worf.exception_state IS
+        'The remote transaction each subscription applies again under worf.exception_behaviour, and how';
     """, Requires = ["node-tables"])]
 
 namespace Worf;
@@ -51,11 +62,17 @@ internal static class ExceptionLog
     internal static void Record(WorfFailedChange change, WorfExceptionBehaviour behaviour, PgException error)
     {
         (string? oldTuple, string? newTuple) = (null, null);
+        (string? schemaName, string? tableName) = (change.Relation?.Nspname, change.Relation?.Relname);
         if (change.Message is not null)
         {
             try
             {
-                PgTransaction.RunInSubtransaction(() => (oldTuple, newTuple) = ReadTuples(change.Message));
+                PgTransaction.RunInSubtransaction(() =>
+                {
+                    (oldTuple, newTuple, string schema, string table) = ReadTuples(change.Message);
+                    schemaName ??= schema;
+                    tableName ??= table;
+                });
             }
             catch (PgException)
             {
@@ -74,8 +91,8 @@ internal static class ExceptionLog
                 Worf.LsnParameter(change.CommitLsn),
                 SpiParameter.Create((int)change.ActionCounter),
                 SpiParameter.Create<string?>(change.Operation),
-                SpiParameter.Create<string?>(change.Relation?.Nspname),
-                SpiParameter.Create<string?>(change.Relation?.Relname),
+                SpiParameter.Create<string?>(schemaName),
+                SpiParameter.Create<string?>(tableName),
                 SpiParameter.Create<string?>(oldTuple),
                 SpiParameter.Create<string?>(newTuple),
                 SpiParameter.Create<string?>(change.QueuedMessage),
@@ -95,11 +112,48 @@ internal static class ExceptionLog
     }
 
     /// <summary>
+    /// Records the remote transaction a subscription applies again under <c>worf.exception_behaviour</c>, how, and
+    /// the error that made it, so that whichever worker applies it next, even after a restart, knows.
+    /// </summary>
+    /// <param name="subId">The subscription.</param>
+    /// <param name="commitLsn">The transaction's commit position.</param>
+    /// <param name="level">How it's applied again.</param>
+    /// <param name="error">The error.</param>
+    internal static void SaveState(uint subId, ulong commitLsn, int level, PgException error)
+        => _ = Spi.Execute("""
+            INSERT INTO worf.exception_state VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (sub_id) DO UPDATE SET commit_lsn = excluded.commit_lsn, level = excluded.level,
+                error_sqlstate = excluded.error_sqlstate, error_message = excluded.error_message
+            """, SpiParameter.Create(subId), Worf.LsnParameter(commitLsn), SpiParameter.Create(level), SpiParameter.Create(error.SqlState),
+            SpiParameter.Create(error.Message));
+
+    /// <summary>
+    /// Reads the remote transaction a subscription applies again under <c>worf.exception_behaviour</c>.
+    /// </summary>
+    /// <param name="subId">The subscription.</param>
+    /// <returns>Its commit position, how it's applied again and the error, or zeros and null for none.</returns>
+    internal static (ulong CommitLsn, int Level, PgException? Error) State(uint subId)
+    {
+        SpiResult state = Worf.SelectCatalog(
+            "SELECT commit_lsn::text, level, error_sqlstate, error_message FROM worf.exception_state WHERE sub_id = $1",
+            SpiParameter.Create(subId));
+        return state.Count == 0 || !Worf.TryParseLsn(state[0].Get<string>(0), out ulong lsn) ? (0, 0, null)
+            : (lsn, state[0].Get<int>(1), new PgException(state[0].Get<string>(2), state[0].Get<string>(3)));
+    }
+
+    /// <summary>
+    /// Forgets the remote transaction a subscription applied again.
+    /// </summary>
+    /// <param name="subId">The subscription.</param>
+    internal static void ForgetState(uint subId)
+        => _ = Spi.Execute("DELETE FROM worf.exception_state WHERE sub_id = $1", SpiParameter.Create(subId));
+
+    /// <summary>
     /// Reads a change's rows from its message again, as JSON objects of the text of the columns it sent.
     /// </summary>
     /// <param name="message">The INSERT, UPDATE or DELETE message.</param>
     /// <returns>The key of the row an update or delete changes, and the row an insert or update writes.</returns>
-    private static unsafe (string? OldTuple, string? NewTuple) ReadTuples(byte[] message)
+    private static unsafe (string? OldTuple, string? NewTuple, string Schema, string Table) ReadTuples(byte[] message)
     {
         fixed (byte* data = message)
         {
@@ -135,7 +189,7 @@ internal static class ExceptionLog
             try
             {
                 TupleDescData* desc = rel.Rel->rd_att;
-                return (TupleToJson(desc, oldtup), TupleToJson(desc, newtup));
+                return (TupleToJson(desc, oldtup), TupleToJson(desc, newtup), rel.Nspname, rel.Relname);
             }
             finally
             {

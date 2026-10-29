@@ -1,5 +1,7 @@
 using Npgsql;
 
+using System.Diagnostics;
+
 namespace Worf.Tests;
 
 /// <summary>
@@ -67,10 +69,14 @@ public sealed class ExceptionBehaviourTests
             """, token);
         await SubscribeAsync(provider, subscriber, token);
 
+        // The worker that stops to apply a transaction again change by change restarts at once, rather than after
+        // the usual five seconds.
         await SetBehaviourAsync(subscriber, "discard", token);
+        Stopwatch restarting = Stopwatch.StartNew();
         _ = await provider.SafePsqlAsync(Database, "INSERT INTO t VALUES (1, 'good'), (2, 'bad'), (3, 'good')", token);
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM t WHERE id = 3)", token),
             "the discarded change's transaction");
+        Assert.IsLessThan(4500, restarting.ElapsedMilliseconds, "the worker restarted at once");
         Assert.AreEqual("1\n3", await subscriber.SafePsqlAsync(Database, "SELECT id FROM t ORDER BY id", token));
         Assert.AreEqual("discard|INSERT|public|t|2|bad|23514", await LastLogAsync(subscriber, token));
 
@@ -104,7 +110,7 @@ public sealed class ExceptionBehaviourTests
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM t WHERE id = 7)", token),
             "the transaction after the one that failed its deferred check");
         Assert.AreEqual("1|1", await subscriber.SafePsqlAsync(Database, "SELECT * FROM child", token));
-        Assert.AreEqual("transdiscard|COMMIT|||||23503", await LastLogAsync(subscriber, token));
+        Assert.AreEqual("discard|INSERT|public|child|2||23503", await LastLogAsync(subscriber, token));
 
         // A commit that fails after its pre-commit callbacks, however the transaction is applied, is recorded and
         // the transaction skipped.
@@ -113,7 +119,7 @@ public sealed class ExceptionBehaviourTests
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM t WHERE id = 8)", token),
             "the transaction after the one whose commit fails");
         Assert.AreEqual("0", await subscriber.SafePsqlAsync(Database, "SELECT count(*) FROM u", token));
-        Assert.AreEqual("transdiscard|COMMIT|||||0A000", await LastLogAsync(subscriber, token));
+        Assert.AreEqual("discard|INSERT|public|u|1|fails at commit|0A000", await LastLogAsync(subscriber, token));
 
         await SetBehaviourAsync(subscriber, "transdiscard", token);
         _ = await provider.SafePsqlAsync(Database, "INSERT INTO t VALUES (11, 'good'), (12, 'bad'), (13, 'good')", token);
@@ -121,7 +127,14 @@ public sealed class ExceptionBehaviourTests
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM t WHERE id = 14)", token),
             "the transaction after the discarded one");
         Assert.AreEqual("1\n3\n4\n6\n7\n8\n14", await subscriber.SafePsqlAsync(Database, "SELECT id FROM t ORDER BY id", token));
-        Assert.AreEqual("transdiscard|INSERT|public|t|12|bad|23514", await LastLogAsync(subscriber, token));
+        Assert.AreEqual("""
+            transdiscard|INSERT|public|t|11|good|23514
+            transdiscard|INSERT|public|t|12|bad|23514
+            transdiscard|INSERT|public|t|13|good|23514
+            """, await subscriber.SafePsqlAsync(Database, """
+            SELECT behaviour, operation, schema_name, table_name, remote_new_tuple->>'id', remote_new_tuple->>'v', error_sqlstate
+            FROM worf.exception_log WHERE remote_new_tuple->>'id' IN ('11', '12', '13') ORDER BY log_id
+            """, token), "every change of the skipped transaction");
 
         await SetBehaviourAsync(subscriber, "sub_disable", token);
         _ = await provider.SafePsqlAsync(Database, "INSERT INTO t VALUES (21, 'bad')", token);
@@ -193,7 +206,8 @@ public sealed class ExceptionBehaviourTests
 
     /// <summary>
     /// A change that deadlocks with a local transaction while discard applies its transaction again is applied
-    /// again with it once the deadlock clears, rather than skipped as if its data were at fault.
+    /// again with it once the deadlock clears, rather than skipped as if its data were at fault. A table sync worker
+    /// catching up after its copy discards a failed change as the apply worker does, rather than copying again.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -249,7 +263,7 @@ public sealed class ExceptionBehaviourTests
             await transaction.CommitAsync(token);
         }
 
-        Assert.IsTrue(await PollLogAsync(subscriber, logpos, "deadlock detected", token), "the deadlock");
+        Assert.IsTrue(await subscriber.PollLogAsync(logpos, "deadlock detected", token), "the deadlock");
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT v = 'remote' FROM b", token), "the retried replay");
         Assert.AreEqual("remote", await subscriber.SafePsqlAsync(Database, "SELECT v FROM a", token));
         Assert.AreEqual("discard|INSERT|public|t|1|bad|23514", await subscriber.SafePsqlAsync(Database, """
@@ -257,6 +271,35 @@ public sealed class ExceptionBehaviourTests
                 remote_new_tuple->>'v', error_sqlstate), ',')
             FROM worf.exception_log
             """, token));
+
+        // The sync worker's copy waits on a lock here until a change it applies after the copy has committed.
+        foreach (TestNode node in new[] { provider, subscriber })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE synced (id integer PRIMARY KEY, v text CHECK (v <> 'bad'))", token);
+        }
+
+        _ = await provider.SafePsqlAsync(Database, "ALTER TABLE synced DROP CONSTRAINT synced_v_check; INSERT INTO synced VALUES (1, 'copied')", token);
+        await using (NpgsqlConnection local = await subscriber.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction transaction = await local.BeginTransactionAsync(token);
+            await using (NpgsqlCommand command = new("LOCK TABLE synced", local, transaction))
+            {
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+
+            _ = await provider.SafePsqlAsync(Database,
+                "SELECT * FROM worf.replication_set_add_table('default', 'synced', synchronize_data := true)", token);
+            Assert.IsTrue(await provider.PollQueryUntilAsync(Database,
+                "SELECT count(*) = 2 FROM pg_replication_slots WHERE slot_name LIKE 'worf%'", token), "the sync worker's slot");
+            _ = await provider.SafePsqlAsync(Database, "INSERT INTO synced VALUES (2, 'bad'), (3, 'good')", token);
+            await transaction.RollbackAsync(token);
+        }
+
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+            "SELECT sync_status = 'r' FROM worf.local_sync_status WHERE sync_relname = 'synced'", token), "the table synchronized");
+        Assert.AreEqual("1\n3", await subscriber.SafePsqlAsync(Database, "SELECT id FROM synced ORDER BY id", token));
+        Assert.AreEqual("discard|INSERT|public|synced|2|bad|23514", await LastLogAsync(subscriber, token));
+        Assert.AreEqual(1, subscriber.ReadLog().Split("starting sync of table public.synced").Length - 1, "copies of the table");
     }
 
     private static async Task<TestNode> StartNodeAsync(string name, CancellationToken token, params string[] settings)
@@ -298,16 +341,14 @@ public sealed class ExceptionBehaviourTests
     }
 
     /// <summary>
-    /// Sets the subscriber's behaviour, and restarts its apply worker so the change takes effect before the next
-    /// transaction.
+    /// Sets the subscriber's behaviour, which its running apply worker reads when the configuration reloads, before
+    /// the next transaction it receives.
     /// </summary>
     private static async Task SetBehaviourAsync(TestNode subscriber, string behaviour, CancellationToken token)
     {
         _ = await subscriber.SafePsqlAsync(Database, $"ALTER SYSTEM SET worf.exception_behaviour = '{behaviour}'", token);
         _ = await subscriber.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
-        _ = await subscriber.SafePsqlAsync(Database, "SELECT worf.alter_subscription_disable('sub', true)", token);
-        _ = await subscriber.SafePsqlAsync(Database, "SELECT worf.alter_subscription_enable('sub', true)", token);
-        await WaitForStatusAsync(subscriber, "replicating", token);
+        await Task.Delay(TimeSpan.FromSeconds(1), token);
     }
 
     private static async Task WaitForStatusAsync(TestNode subscriber, string status, CancellationToken token)
@@ -316,23 +357,6 @@ public sealed class ExceptionBehaviourTests
                 SELECT 1 FROM worf.show_subscription_status()
                     WHERE subscription_name = 'sub' AND status = '{status}')
             """, token), $"subscription failed to reach \"{status}\" state");
-
-    private static async Task<bool> PollLogAsync(TestNode node, int logpos, string text, CancellationToken token)
-    {
-        using CancellationTokenSource timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
-        timeout.CancelAfter(TestNode.PollTimeout);
-        while (!node.ReadLog()[logpos..].Contains(text, StringComparison.Ordinal))
-        {
-            if (timeout.IsCancellationRequested)
-            {
-                return false;
-            }
-
-            await Task.Delay(TimeSpan.FromMilliseconds(100), token);
-        }
-
-        return true;
-    }
 
     private static Task<string> LastLogAsync(TestNode subscriber, CancellationToken token)
         => subscriber.SafePsqlAsync(Database, """

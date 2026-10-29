@@ -15,6 +15,8 @@ BEGIN
 		CREATE EXTENSION IF NOT EXISTS worf_origin;
 	END IF;
 END;$$;
+-- The apply workers don't run with the session's setting, so the warning stands.
+SET worf.conflict_resolution = last_update_wins;
 SELECT * FROM worf.create_subscription(
     subscription_name := 'test_bidirectional',
     provider_dsn := (SELECT subscriber_dsn FROM worf_regress_variables()) || ' user=super',
@@ -29,6 +31,7 @@ HINT:  Set worf.conflict_resolution to last_update_wins or first_update_wins on 
           4269973126
 (1 row)
 
+RESET worf.conflict_resolution;
 BEGIN;
 SET LOCAL statement_timeout = '180s';
 SELECT worf.wait_for_subscription_sync_complete('test_bidirectional');
