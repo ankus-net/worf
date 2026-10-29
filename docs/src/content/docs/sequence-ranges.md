@@ -35,7 +35,7 @@ A node's first block has `range_size` values: 100 for `smallint`, 10,000 for `in
 
 ## How it works
 
-The owner holds the root, the values not yet granted. Each node draws from its active block and keeps a next block ready. The range worker switches to the next block when the active one runs low, by setting the sequence's `MINVALUE` and `MAXVALUE` to the block, and asks for another. Nodes reach the owner over their subscriptions: a node asks its neighbor nearest the owner, and a node that serves others holds pool blocks to grant from.
+The owner holds the root, the values not yet granted. Each node draws from its active block and keeps a next block ready. Each database that manages a sequence runs a range worker, which takes one of `max_worker_processes`; a database that only subscribes has its manager ask its providers, every `worf.sequence_range_exchange_interval`, whether they manage any. The range worker switches to the next block when the active one runs low, by setting the sequence's `MINVALUE` and `MAXVALUE` to the block, and asks for another. Nodes reach the owner over their subscriptions: a node asks its neighbor nearest the owner, and a node that serves others holds pool blocks to grant from.
 
 A trigger on each table that uses the sequence checks values written by hand. A value passes when it is in one of this node's blocks and the sequence has passed it, or when a row with it already exists. Any other value fails with SQLSTATE `23514`. Apply and sync workers write other nodes' rows unchecked.
 

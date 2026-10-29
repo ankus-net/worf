@@ -19,6 +19,11 @@ internal static class SequenceRangeExchange
     // When each subscription's provider is next tried after a failed exchange, and the delay before that.
     private static readonly Dictionary<uint, (long At, long Delay)> s_retries = [];
 
+    /// <summary>
+    /// Gets whether a failed exchange waits to be tried again.
+    /// </summary>
+    internal static bool RetryPending => s_retries.Count > 0;
+
     private static readonly Dictionary<uint, long> s_exchangedAt = [];
     private static readonly HashSet<uint> s_acksWaiting = [];
     private static long s_requested;
@@ -518,10 +523,15 @@ internal static class SequenceRangeExchange
             }
         }
 
-        // Neighbors hear of what this node learned at their next exchange, which happens now.
+        // Neighbors hear of what this node learned at their next exchange, which happens now, from the range worker the
+        // manager starts if none is running.
         if (learned)
         {
-            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () => _ = PgAtomic.Add(SequenceRanges.ExchangeRequested, 1L));
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () =>
+            {
+                _ = PgAtomic.Add(SequenceRanges.ExchangeRequested, 1L);
+                Worker.WakeManager();
+            });
         }
 
         return (granted, received);

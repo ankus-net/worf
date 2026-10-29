@@ -72,6 +72,9 @@ internal static class SequenceRangeReservations
         Guid requestId = Guid.NewGuid();
         while (true)
         {
+            // Whether the worker still had the request before this look at the blocks, so that a block it granted
+            // between the look and the check isn't missed.
+            bool pending = requested && Pending(requestId);
             if (SequenceRanges.NodeBlock(seqoid, epoch, "active") is (Guid, long, long) active &&
                 SequenceRanges.StepsLeft(seqoid, info, active) >= needed)
             {
@@ -100,7 +103,7 @@ internal static class SequenceRangeReservations
                 requested = true;
                 Post(new WorfReservation { RequestId = requestId, Seqoid = seqoid, Kind = (byte)'n', Size = needed });
             }
-            else if (!Pending(requestId))
+            else if (!pending)
             {
                 throw new PgException("2200H", $"sequence {info.Name} has no free span of {needed} values left");
             }
@@ -124,10 +127,17 @@ internal static class SequenceRangeReservations
         Guid requestId = Guid.NewGuid();
         long deadline = Worker.GetCurrentTimestamp() + (long)Int128.Min(timeout.ToComparisonMicroseconds(), long.MaxValue / 2);
         Post(new WorfReservation { RequestId = requestId, Seqoid = seqoid, Kind = (byte)'i', Size = SequenceRanges.Steps(info, lo, hi), Lo = lo, Hi = hi });
-        while (Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range_block WHERE seqoid = $1 AND kind = 'i' AND state = 'imported' AND lo = $2 AND hi = $3",
-            SpiParameter.Create(seqoid), SpiParameter.Create(lo), SpiParameter.Create(hi)).Count == 0)
+        while (true)
         {
-            if (!Pending(requestId))
+            // As for a range, whether the worker still had the request is read before the blocks.
+            bool pending = Pending(requestId);
+            if (Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range_block WHERE seqoid = $1 AND kind = 'i' AND state = 'imported' AND lo = $2 AND hi = $3",
+                SpiParameter.Create(seqoid), SpiParameter.Create(lo), SpiParameter.Create(hi)).Count > 0)
+            {
+                break;
+            }
+
+            if (!pending)
             {
                 throw new PgException(PgSqlStates.InvalidParameterValue, $"values [{lo}, {hi}] of sequence {info.Name} may already be in use",
                     hint: "Load the rows without their keys so that the sequence numbers them, or load them before enabling range management.");

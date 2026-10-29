@@ -115,8 +115,9 @@ internal static class Manager
     }
 
     /// <summary>
-    /// Starts the database's sequence range worker when it has managed sequences or subscriptions and the worker isn't running, or
-    /// once a crashed one's restart delay has passed.
+    /// Starts the database's sequence range worker when it has managed sequences and the worker isn't running, or once
+    /// a crashed one's restart delay has passed. Until it manages one, a database with subscriptions asks their
+    /// providers, at the exchange interval, of the sequences they manage.
     /// </summary>
     /// <returns>Whether nothing is left to retry.</returns>
     private static bool ManageRangeWorker()
@@ -144,19 +145,30 @@ internal static class Manager
             return false;
         }
 
-        // A node with subscriptions learns from its providers of the sequences they manage.
-        bool managed = PgBackgroundWorker.RunTransaction(() =>
-            Spi.ExecuteScalar<bool>("SELECT to_regclass('worf.sequence_range') IS NOT NULL") &&
-            Spi.ExecuteScalar<bool>("""
-                SELECT EXISTS (SELECT 1 FROM worf.sequence_range)
-                    OR EXISTS (SELECT 1 FROM worf.subscription s JOIN worf.local_node n ON n.node_id = s.sub_target WHERE s.sub_enabled)
-                """));
+        (bool managed, bool subscribed) = PgBackgroundWorker.RunTransaction(static () =>
+        {
+            if (!Spi.ExecuteScalar<bool>("SELECT to_regclass('worf.sequence_range') IS NOT NULL") ||
+                WorfNode.GetLocalNode(false, true) is not WorfLocalNode node)
+            {
+                return (false, false);
+            }
+
+            if (!Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range)"))
+            {
+                _ = SequenceRangeExchange.ExchangeAll(node);
+            }
+
+            return (Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range)"),
+                WorfNode.GetNodeSubscriptions(node.Node.Id, false).Any(sub => sub.Enabled));
+        });
         if (managed)
         {
             _ = Worker.WorkerRegister(new WorfWorker { WorkerType = WorfWorkerType.Range, Dboid = dboid });
         }
 
-        return true;
+        // Until the database manages a sequence, the manager looks again soon: a provider's exchange that teaches it
+        // of one may wake the manager while it waits on a connection, which takes the wakeup.
+        return managed || !subscribed;
     }
 
     /// <summary>

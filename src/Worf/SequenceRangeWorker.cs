@@ -35,8 +35,7 @@ internal static class SequenceRangeWorker
                 }
 
                 SpiResult sequences = Worf.SelectCatalog("SELECT seqoid::oid FROM worf.sequence_range");
-                managed = sequences.Count > 0 || Worf.SelectCatalog(
-                    "SELECT 1 FROM worf.subscription WHERE sub_target = $1 AND sub_enabled", SpiParameter.Create(node.Node.Id)).Count > 0;
+                managed = sequences.Count > 0;
                 if (sequences.Count > 0)
                 {
                     changed |= SequenceRanges.CheckIdentity(node);
@@ -98,7 +97,7 @@ internal static class SequenceRangeWorker
 
             if (!managed)
             {
-                PgLog.Log("no managed sequences or subscriptions left, sequence range worker exiting");
+                PgLog.Log("no managed sequences left, sequence range worker exiting");
                 return;
             }
 

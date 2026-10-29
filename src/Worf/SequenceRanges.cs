@@ -1159,6 +1159,7 @@ internal static unsafe partial class SequenceRanges
         }
 
         Guid block = from[0].Get<Guid>(0);
+        LockLedger(seqoid);
         _ = Spi.Execute("""
             INSERT INTO worf.sequence_range_grant
             VALUES ($1, gen_random_uuid(), $2, $3, $4, $5, $6::"char", $7, $8, $9, now())
@@ -1170,6 +1171,13 @@ internal static unsafe partial class SequenceRanges
             SpiParameter.Create(seqoid), SpiParameter.Create(info.Ascending ? hi : lo));
         PgLog.Warning($"sequence {info.Name}: node {holderName} holds block [{lo}, {hi}], which this allocator had no record of; it is back in the ledger");
     }
+
+    /// <summary>
+    /// Locks a sequence's range row before its free spans, as an exchange that updates the row and then grants does, so
+    /// that two allocations don't wait on each other.
+    /// </summary>
+    private static void LockLedger(uint seqoid)
+        => _ = Spi.Execute("SELECT 1 FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE", SpiParameter.Create(seqoid));
 
     /// <summary>
     /// Removes values from a block's free spans. Each span shrinks in place, or is deleted once empty, so that a
@@ -1464,6 +1472,7 @@ internal static unsafe partial class SequenceRanges
 
         // A block of size steps spans size times the increment, less one step. An allocator whose system identifier or
         // timeline changed grants nothing, even before its worker fences it, since a grant on the old timeline may be lost.
+        LockLedger(seqoid);
         decimal span = ((decimal)size - 1) * Math.Abs(info.Increment);
         bool ascending = info.Ascending;
         SpiResult free = Spi.Query(Spi.Sql($"""
@@ -1539,10 +1548,12 @@ internal static unsafe partial class SequenceRanges
             return answered[0].Get<Guid>(0);
         }
 
+        LockLedger(seqoid);
         SpiResult free = Spi.Query(Spi.Sql($"""
             SELECT f.block_id, f.lo, f.hi
             FROM worf.sequence_range_free f JOIN worf.sequence_range_block b ON b.block_id = f.block_id
             WHERE b.seqoid = {seqoid}::oid AND b.epoch = {epoch} AND b.kind IN ('r', 'p') AND b.state = 'open'
+                AND b.sysid = {NativeMethods.GetSystemIdentifier().ToString(CultureInfo.InvariantCulture)}::numeric AND b.timeline = {(long)NativeMethods.GetWALInsertionTimeLine()}
                 AND f.lo <= {lo} AND {hi} <= f.hi
             LIMIT 1
             FOR UPDATE OF f

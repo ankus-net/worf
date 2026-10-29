@@ -148,7 +148,10 @@ public sealed class CreateSubscriberOptionsTests
             string log = Path.Join(work.FullName, "subscriber.log");
             if (TestContext.CurrentTestOutcome != UnitTestOutcome.Passed && File.Exists(log))
             {
-                TestContext.WriteLine(await File.ReadAllTextAsync(log, CancellationToken.None));
+                // On Windows the server may still hold it.
+                await using FileStream stream = new(log, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                using StreamReader reader = new(stream);
+                TestContext.WriteLine(await reader.ReadToEndAsync(CancellationToken.None));
             }
         }
     }
