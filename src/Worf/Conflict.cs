@@ -79,13 +79,13 @@ internal static partial class Conflict
                 break;
 
             case WorfResolveOption.LastUpdateWins:
-                apply = ConflictResolveByTimestamp(localOrigin, Worf.ReploriginSessionOrigin, localTs,
-                    Worf.ReploriginSessionOriginTimestamp, true, out resolution);
+                apply = ConflictResolveByTimestamp(localOrigin, localTs, Worf.ReploriginSessionOriginTimestamp, true,
+                    out resolution);
                 break;
 
             case WorfResolveOption.FirstUpdateWins:
-                apply = ConflictResolveByTimestamp(localOrigin, Worf.ReploriginSessionOrigin, localTs,
-                    Worf.ReploriginSessionOriginTimestamp, false, out resolution);
+                apply = ConflictResolveByTimestamp(localOrigin, localTs, Worf.ReploriginSessionOriginTimestamp, false,
+                    out resolution);
                 break;
 
             default:
@@ -255,11 +255,9 @@ internal static partial class Conflict
     /// <summary>
     /// Resolve conflict based on commit timestamp.
     /// </summary>
-    private static bool ConflictResolveByTimestamp(ushort localOriginId, ushort remoteOriginId, long localTs, long remoteTs,
-        bool lastUpdateWins, out WorfConflictResolution resolution)
+    private static bool ConflictResolveByTimestamp(ushort localOriginId, long localTs, long remoteTs, bool lastUpdateWins,
+        out WorfConflictResolution resolution)
     {
-        _ = localOriginId;
-        _ = remoteOriginId;
         int cmp = remoteTs.CompareTo(localTs);
 
         // The logic bellow assumes last update wins, we invert the logic by inverting result of timestamp comparison
@@ -269,26 +267,48 @@ internal static partial class Conflict
             cmp = -cmp;
         }
 
+        // The timestamps were equal, break the tie in a manner that is consistent across all nodes: the change from
+        // the node with the higher id wins. A local row from the provider itself, or from a writer that isn't a
+        // worf node, loses to the remote change.
+        if (cmp == 0)
+        {
+            WorfSubscription sub = Apply.MySubscription!;
+            uint? localNodeId = localOriginId == 0 ? sub.Target.Id : OriginNodeId(localOriginId);
+            cmp = localNodeId is uint nodeId && nodeId != sub.Origin.Id ? sub.Origin.Id.CompareTo(nodeId) : 1;
+        }
+
         if (cmp > 0)
         {
             // The remote row wins, update the local one.
             resolution = WorfConflictResolution.ApplyRemote;
             return true;
         }
-        else if (cmp < 0)
+        else
         {
             // The local row wins, retain it
             resolution = WorfConflictResolution.KeepLocal;
             return false;
         }
-        else
-        {
-            // The timestamps were equal, break the tie in a manner that is consistent across all nodes.
-            //
-            // XXX: TODO, for now we just always apply remote change.
-            resolution = WorfConflictResolution.ApplyRemote;
-            return true;
-        }
+    }
+
+    /// <summary>
+    /// Gets the node whose changes a replication origin applies: the provider of the subscription whose apply or
+    /// table sync worker uses it.
+    /// </summary>
+    /// <param name="originId">The replication origin.</param>
+    /// <returns>The provider node's id, or null when no subscription uses the origin.</returns>
+    private static uint? OriginNodeId(ushort originId)
+    {
+        SpiResult result = Worf.SelectCatalog("""
+            SELECT s.sub_origin
+            FROM pg_catalog.pg_replication_origin o
+                JOIN worf.subscription s ON o.roname = s.sub_slot_name::text
+                    OR (length(o.roname) = length(s.sub_slot_name::text) + 9 AND starts_with(o.roname, s.sub_slot_name || '_'))
+            WHERE o.roident = $1
+            ORDER BY o.roname = s.sub_slot_name::text DESC
+            LIMIT 1
+            """, SpiParameter.Create((uint)originId));
+        return result.Count == 0 ? null : result[0].Get<uint>(0);
     }
 
     /// <summary>

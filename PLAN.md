@@ -10,8 +10,8 @@ MSI installers, conflict history, and fixes for PostgreSQL 15–18 to pglogical 
 
 ## Scope
 
-Worf 0.1.0 does everything pglogical 2.5.3 does, on PostgreSQL 15 through 19, on
-Linux x64, macOS ARM64 and x64, and Windows x64.
+Worf 0.1.0 does everything pglogical 2.5.3 does, and runs multi-master, on
+PostgreSQL 15 through 19, on Linux x64, macOS ARM64 and x64, and Windows x64.
 
 - **Provider:** the `worf` logical decoding output plugin, with:
   - pglogical's native and JSON protocols and their startup parameters;
@@ -188,6 +188,20 @@ platform. Check the step off here and link the CI run that proved it.
 - 2026-10-26: Dropped PostgreSQL 13 and 14. 13 is out of support and 14 reaches end of life on November 12, 2026. No alternate expected output was specific to them: psql titles `\dt` "List of relations" through 17, so the `huge_tx` `_1` files stay. The `huge_tx` tests can't finish within CI's limit, so they left CI and run on demand with `eng/regress.cs --huge-tx`. CI passed on all three platforms for 15–19 in [run 40375031087](https://github.com/ankus-net/worf/actions/runs/40375031087): Linux jobs took 7–9 minutes, macOS 9–11 and Windows 12–14, most of it [publishing the extension again for every test cluster](https://github.com/ankus-net/ankus/issues/122).
 - 2026-10-26: Ankus 0.2.11 publishes once per test run, and the create-subscriber test checkpoints the provider before its base backup, so warm CI jobs take about 5–9 minutes. [CI run 40409905502](https://github.com/ankus-net/worf/actions/runs/40409905502) passed on all three platforms for 15–19. `eng/regress.cs --huge-tx` passed all 33 tests on release builds of 15–19 on Linux, taking 51–71 minutes a version.
 
+## Multi-master
+
+Worf goes beyond pglogical to run multi-master on stock PostgreSQL, with no
+patched server. Worf 0.1.0 needs every step, before the release. The porting
+rules don't apply to these steps, and each adds multi-server tests.
+
+- [ ] **1. Convergence.** Equal commit timestamps resolve by node id. A warning when `apply_remote` or `keep_local` resolves conflicts between nodes that replicate both ways. Apply waits out a configured maximum clock skew.
+- [ ] **2. Apply errors.** A failing statement or transaction is skipped, or its subscription disabled, and recorded in an exception log, so errors don't stop replication.
+- [ ] **3. DDL.** Apply tolerates columns one node has dropped or not yet added. DDL is captured and queued automatically, and new tables join replication sets. DDL that can't apply in any order locks every node first.
+- [ ] **4. Sequences.** Automatic sequence ranges, for schemas that can't change, and Snowflake IDs, for those that can.
+- [ ] **5. Membership.** Joining and leaving a group of nodes, a sync barrier across them, and a lag view.
+- [ ] **6. Delta apply.** Columns that merge as increments rather than overwrite.
+- [ ] **7. Constraints.** Apply checks every unique index and foreign key and records violations as conflicts. Those checks find a violation after it has happened; only eager commit, which commits a transaction on every node or none, prevents it.
+
 ## Tests
 
 The fork's tests are the acceptance tests. Port all of them, and never weaken a test to make it pass.
@@ -215,6 +229,7 @@ Add only these tests beyond pglogical's:
 - **Restart and crash recovery:** stop the provider and the subscriber with an immediate shutdown while changes are streaming. After restart, no rows are lost or applied twice.
 - **Windows installation paths:** `pg_dump` and `pg_restore` work when PostgreSQL is installed under `C:\Program Files`.
 - **`worf_create_subscriber` options.**
+- **Multi-master:** each multi-master step's tests.
 
 ### Test rules
 
@@ -246,7 +261,7 @@ Add only these tests beyond pglogical's:
 
 ## Rules
 
-- Add no interfaces, layers or types that pglogical does not have, and no projects beyond the three above.
+- Outside the multi-master steps, add no interfaces, layers or types that pglogical does not have. Add no projects beyond the three above.
 - Do not build or vendor the C pglogical. Its expected outputs are the reference.
 - Keep test-run logs, generated reports, local paths and machine names out of the repository.
 - Follow Ankus's C# conventions in its `AGENTS.md` and `.editorconfig`.
