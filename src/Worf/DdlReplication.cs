@@ -59,6 +59,16 @@ internal static unsafe partial class DdlReplication
             return false;
         }
 
+        // Reorganizing a table's storage is the node's own.
+#if ANKUS_PG19
+        if (parsetree->type == NodeTag.T_RepackStmt)
+#else
+        if (parsetree->type == NodeTag.T_ClusterStmt)
+#endif
+        {
+            return false;
+        }
+
         bool replicated = parsetree->type switch
         {
             // Databases, tablespaces, roles, settings and PostgreSQL's own replication are the cluster's, not the
@@ -69,7 +79,7 @@ internal static unsafe partial class DdlReplication
                 NodeTag.T_CreateRoleStmt or NodeTag.T_AlterRoleStmt or NodeTag.T_AlterRoleSetStmt or
                 NodeTag.T_DropRoleStmt or NodeTag.T_GrantRoleStmt or NodeTag.T_AlterSystemStmt or
                 NodeTag.T_CreateSubscriptionStmt or NodeTag.T_AlterSubscriptionStmt or NodeTag.T_DropSubscriptionStmt or
-                NodeTag.T_CreatePublicationStmt or NodeTag.T_AlterPublicationStmt or NodeTag.T_ClusterStmt => false,
+                NodeTag.T_CreatePublicationStmt or NodeTag.T_AlterPublicationStmt => false,
 
             // Temporary objects are the session's, and worf's own the node's.
             NodeTag.T_CreateStmt => !StaysLocal(((CreateStmt*)parsetree)->relation),
