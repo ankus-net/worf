@@ -113,12 +113,11 @@ internal static class SequenceRangeWorker
     {
         long now = Worker.GetCurrentTimestamp();
         SpiResult state = Worf.SelectCatalog("""
-            SELECT pg_catalog.pg_sequence_last_value($1::regclass), s.seqincrement,
-                (SELECT lo FROM worf.sequence_range_block WHERE seqoid = $1 AND kind = 'n' AND state = 'active')
+            SELECT s.seqincrement, (SELECT lo FROM worf.sequence_range_block WHERE seqoid = $1 AND kind = 'n' AND state = 'active')
             FROM pg_catalog.pg_sequence s WHERE s.seqrelid = $1
             """, SpiParameter.Create(seqoid));
         bool known = rates.TryGetValue(seqoid, out (long Block, long Position, long At, double Peak) previous);
-        if (state.Count == 0 || state[0].Get<long?>(0) is not long position || state[0].Get<long?>(2) is not long block)
+        if (state.Count == 0 || SequenceRanges.LastValue(seqoid) is not long position || state[0].Get<long?>(1) is not long block)
         {
             return known ? previous.Peak : 0;
         }
@@ -127,7 +126,7 @@ internal static class SequenceRangeWorker
         if (known && previous.Block == block && now > previous.At)
         {
             double seconds = (now - previous.At) / 1e6;
-            double rate = Math.Max(((double)position - previous.Position) / state[0].Get<long>(1), 0) / seconds;
+            double rate = Math.Max(((double)position - previous.Position) / state[0].Get<long>(0), 0) / seconds;
             peak = Math.Max(rate, previous.Peak * Math.Pow(0.99, seconds));
             if (Math.Abs(peak - previous.Peak) > Math.Max(previous.Peak * 0.1, 1))
             {

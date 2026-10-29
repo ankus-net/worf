@@ -20,9 +20,16 @@ internal static class SequenceRangeExchange
     private static readonly Dictionary<uint, (long At, long Delay)> s_retries = [];
 
     /// <summary>
-    /// Gets whether a failed exchange waits to be tried again.
+    /// Gets whether the last <see cref="ExchangeAll"/> connected to a neighbor, whose connection's waits reset the
+    /// process's latch.
     /// </summary>
-    internal static bool RetryPending => s_retries.Count > 0;
+    internal static bool Contacted { get; private set; }
+
+    /// <summary>
+    /// Gets when the next exchange that the last <see cref="ExchangeAll"/> left for later is due, or
+    /// <see cref="long.MaxValue"/> for none.
+    /// </summary>
+    internal static long NextDueAt { get; private set; } = long.MaxValue;
 
     private static readonly Dictionary<uint, long> s_exchangedAt = [];
     private static readonly HashSet<uint> s_acksWaiting = [];
@@ -79,27 +86,34 @@ internal static class SequenceRangeExchange
         // order.
         _ = Spi.Execute("SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('worf.sequence_range_exchange'))");
         bool changed = false;
-        foreach (WorfSubscription sub in WorfNode.GetNodeSubscriptions(node.Node.Id, false))
+        Contacted = false;
+        NextDueAt = long.MaxValue;
+        foreach (WorfSubscription sub in WorfNode.GetNodeSubscriptions(node.Node.Id, false).Where(sub => sub.Enabled))
         {
             long now = Worker.GetCurrentTimestamp();
+            bool retrying = s_retries.TryGetValue(sub.Id, out (long At, long Delay) retry) && now < retry.At;
             bool due = !s_exchangedAt.TryGetValue(sub.Id, out long at) || now - at >= SequenceRanges.ExchangeInterval * 1000L ||
                 s_acksWaiting.Contains(sub.Id) || Waiting(sub.Origin.Id);
-            if (!sub.Enabled || !due || (s_retries.TryGetValue(sub.Id, out (long At, long Delay) retry) && now < retry.At))
+            if (!due || retrying)
             {
+                NextDueAt = Math.Min(NextDueAt, Math.Max(due ? now : at + (SequenceRanges.ExchangeInterval * 1000L), retrying ? retry.At : 0));
                 continue;
             }
 
+            Contacted = true;
             try
             {
                 PgTransaction.RunInSubtransaction(() => changed |= ExchangeWith(node, sub));
                 s_exchangedAt[sub.Id] = now;
                 _ = s_retries.Remove(sub.Id);
+                NextDueAt = Math.Min(NextDueAt, now + (SequenceRanges.ExchangeInterval * 1000L));
             }
             catch (Exception error) when (error is PgException or PgRemoteException)
             {
                 // A failed exchange is tried again after a delay that doubles, up to the exchange interval.
                 long delay = Math.Min(Math.Max(retry.Delay * 2, SequenceRanges.CheckInterval * 1000L), SequenceRanges.ExchangeInterval * 1000L);
                 s_retries[sub.Id] = (now + delay, delay);
+                NextDueAt = Math.Min(NextDueAt, now + delay);
                 PgLog.Warning($"sequence range exchange with node {sub.Origin.Name} failed: {error.Message}");
             }
         }

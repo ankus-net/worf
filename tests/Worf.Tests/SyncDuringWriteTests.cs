@@ -288,8 +288,9 @@ public sealed partial class SyncDuringWriteTests
                     FROM pg_stat_replication r JOIN pg_stat_activity a ON a.pid = r.pid WHERE r.application_name = 'test_subscription'
                     """, token);
                 samples.Enqueue($"{DateTime.UtcNow:HH:mm:ss.fff} subscriber: {workers} | walsender: {walsender}");
-                while (samples.Count > 60 && samples.TryDequeue(out _))
+                if (samples.Count > 60)
                 {
+                    _ = samples.TryDequeue(out _);
                 }
 
                 await Task.Delay(TimeSpan.FromMilliseconds(500), token);

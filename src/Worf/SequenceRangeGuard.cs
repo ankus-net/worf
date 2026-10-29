@@ -105,8 +105,7 @@ internal static class SequenceRangeGuard
                         return true;
                     }
 
-                    long? last = Elevated.Run(() => Spi.ExecuteScalar<long?>("SELECT pg_catalog.pg_sequence_last_value($1::regclass)",
-                        SpiParameter.Create(seqoid)));
+                    long? last = SequenceRanges.LastValue(seqoid);
                     if (last is long position && (sequence.Ascending ? position >= value : position <= value))
                     {
                         s_reached[seqoid] = position;

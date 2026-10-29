@@ -14,6 +14,9 @@ internal static class Manager
     /// Gets the minimum time the manager sleeps between checking for subscription changes. On Windows, process
     /// startup is slower and we need more responsive checking to avoid test timeouts.
     /// </summary>
+    // When the manager next asks this database's providers of the sequences they manage, or long.MaxValue.
+    private static long s_discoveryAt = long.MaxValue;
+
     private static long MinSleep => OperatingSystem.IsWindows() ? 1000 : 5000;
 
     /// <summary>
@@ -104,7 +107,14 @@ internal static class Manager
                 ? Math.Min(sleepTimer * 2, MaxSleep)
                 : Math.Max(sleepTimer / 2, MinSleep);
 
-            if (!PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(processedAll ? sleepTimer : MinSleep)) &&
+            // A database that subscribes but manages no sequence asks its providers again when the next exchange is due.
+            long sleep = processedAll ? sleepTimer : MinSleep;
+            if (s_discoveryAt != long.MaxValue)
+            {
+                sleep = Math.Clamp((s_discoveryAt - Worker.GetCurrentTimestamp()) / 1000, 1, sleep);
+            }
+
+            if (!PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(sleep)) &&
                 !PgBackgroundWorker.CanContinue)
             {
                 break;
@@ -119,9 +129,10 @@ internal static class Manager
     /// a crashed one's restart delay has passed. Until it manages one, a database with subscriptions asks their
     /// providers, at the exchange interval, of the sequences they manage.
     /// </summary>
-    /// <returns>Whether nothing is left to retry.</returns>
+    /// <returns>Whether nothing is left to retry; an exchange to retry sets when the manager wakes.</returns>
     private static bool ManageRangeWorker()
     {
+        s_discoveryAt = long.MaxValue;
         uint dboid = Worker.MyWorker.Dboid;
         long crashedAt = -1;
         using (PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share())
@@ -156,6 +167,7 @@ internal static class Manager
             if (!Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range)"))
             {
                 _ = SequenceRangeExchange.ExchangeAll(node);
+                s_discoveryAt = SequenceRangeExchange.NextDueAt;
             }
 
             return Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range)");
@@ -165,9 +177,23 @@ internal static class Manager
             _ = Worker.WorkerRegister(new WorfWorker { WorkerType = WorfWorkerType.Range, Dboid = dboid });
         }
 
-        // The check after the exchange sees a sequence that another backend learned of while the exchange's connection
-        // took the manager's wakeup. A failed exchange is tried again soon.
-        return managed || !SequenceRangeExchange.RetryPending;
+        // The exchange's connection waits on the latch and resets it, which may have been set for the manager, as when
+        // an apply worker exited to apply its transaction again. Set it again so the manager looks again instead of
+        // sleeping through it.
+        if (SequenceRangeExchange.Contacted)
+        {
+            unsafe
+            {
+                NativeMethods.SetLatch(NativeGlobals.MyLatch);
+            }
+        }
+
+        if (managed)
+        {
+            s_discoveryAt = long.MaxValue;
+        }
+
+        return true;
     }
 
     /// <summary>

@@ -1624,11 +1624,29 @@ internal static unsafe partial class SequenceRanges
         => (long)Math.Min(((decimal)hi - lo) / Math.Abs(info.Increment) + 1, long.MaxValue);
 
     /// <summary>
+    /// Reads the last value a sequence issued, or null before its first, from its row. pg_sequence_last_value locks
+    /// the sequence as nextval does, until the transaction ends, and ALTER SEQUENCE waits on that lock, so two
+    /// transactions that each read a sequence that way and then switch it to a block deadlock. Reading the row takes
+    /// a lock that ALTER SEQUENCE doesn't wait on.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    /// <returns>The last value, or null.</returns>
+    internal static long? LastValue(uint seqoid) => Elevated.Run(() =>
+    {
+        SpiResult name = Spi.Query("""
+            SELECT n.nspname::text, c.relname::text FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.oid = $1
+            """, false, 1, SpiParameter.Create(seqoid));
+        return Spi.ExecuteScalar<long?>("SELECT CASE WHEN is_called THEN last_value END FROM " +
+            Spi.QuoteQualifiedIdentifier(name[0].Get<string>(0), name[0].Get<string>(1)));
+    });
+
+    /// <summary>
     /// Counts the values the sequence has left in its active block.
     /// </summary>
     internal static long StepsLeft(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) block)
     {
-        long? last = Worf.SelectCatalog("SELECT pg_catalog.pg_sequence_last_value($1::regclass)", SpiParameter.Create(seqoid))[0].Get<long?>(0);
+        long? last = LastValue(seqoid);
         if (last is not long position)
         {
             return Steps(info, block.Lo, block.Hi);
@@ -1656,7 +1674,7 @@ internal static unsafe partial class SequenceRanges
         SpiParameter seq = SpiParameter.Create(info.Seqoid);
         string pick = info.Ascending ? "max" : "min";
         // The value a quarantine reserves is never issued.
-        long? last = Spi.ExecuteScalar<long?>("SELECT pg_catalog.pg_sequence_last_value($1::regclass)", seq);
+        long? last = LastValue(info.Seqoid);
         Take(last == info.QuarantineEdge ? null : last);
         Take(Spi.ExecuteScalar<long?>("SELECT last_value FROM worf.sequence_state WHERE seqoid = $1", seq));
         Take(Spi.ExecuteScalar<long?>("SELECT watermark FROM worf.sequence_range WHERE seqoid = $1", seq));
