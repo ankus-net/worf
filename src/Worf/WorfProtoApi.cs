@@ -25,7 +25,7 @@ internal sealed unsafe class WorfProtoApi
     /// <summary>
     /// Gets or sets the function writing ORIGIN, or null when the protocol has none.
     /// </summary>
-    public delegate*<StringInfoData*, sbyte*, ulong, void> WriteOrigin { get; set; }
+    public delegate*<StringInfoData*, sbyte*, ulong, uint, void> WriteOrigin { get; set; }
 
     /// <summary>
     /// Gets or sets the function writing INSERT.

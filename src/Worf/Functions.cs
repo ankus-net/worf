@@ -464,7 +464,7 @@ internal static class Functions
             }
 
             // Drop the origin tracking locally.
-            PgReplicationOrigin.Drop(sub.SlotName, true);
+            WorfNode.DropOrigins(sub.SlotName);
         }
 
         return BoolDatum(sub is not null);

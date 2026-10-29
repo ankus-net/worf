@@ -79,13 +79,13 @@ internal static partial class Conflict
                 break;
 
             case WorfResolveOption.LastUpdateWins:
-                apply = ConflictResolveByTimestamp(localOrigin, Worf.ReploriginSessionOrigin, localTs,
-                    Worf.ReploriginSessionOriginTimestamp, true, out resolution);
+                apply = ConflictResolveByTimestamp(localOrigin, localTs, Worf.ReploriginSessionOriginTimestamp, true,
+                    out resolution);
                 break;
 
             case WorfResolveOption.FirstUpdateWins:
-                apply = ConflictResolveByTimestamp(localOrigin, Worf.ReploriginSessionOrigin, localTs,
-                    Worf.ReploriginSessionOriginTimestamp, false, out resolution);
+                apply = ConflictResolveByTimestamp(localOrigin, localTs, Worf.ReploriginSessionOriginTimestamp, false,
+                    out resolution);
                 break;
 
             default:
@@ -255,11 +255,9 @@ internal static partial class Conflict
     /// <summary>
     /// Resolve conflict based on commit timestamp.
     /// </summary>
-    private static bool ConflictResolveByTimestamp(ushort localOriginId, ushort remoteOriginId, long localTs, long remoteTs,
-        bool lastUpdateWins, out WorfConflictResolution resolution)
+    private static bool ConflictResolveByTimestamp(ushort localOriginId, long localTs, long remoteTs, bool lastUpdateWins,
+        out WorfConflictResolution resolution)
     {
-        _ = localOriginId;
-        _ = remoteOriginId;
         int cmp = remoteTs.CompareTo(localTs);
 
         // The logic bellow assumes last update wins, we invert the logic by inverting result of timestamp comparison
@@ -269,26 +267,42 @@ internal static partial class Conflict
             cmp = -cmp;
         }
 
+        // The timestamps were equal, break the tie in a manner that is consistent across all nodes: the change
+        // written by the node with the higher id wins, whichever node relayed it.
+        if (cmp == 0)
+        {
+            uint localNodeId = WriterNodeId(localOriginId);
+            uint remoteNodeId = Apply.WriterNodeId;
+            cmp = localNodeId == remoteNodeId ? 1 : remoteNodeId.CompareTo(localNodeId);
+        }
+
         if (cmp > 0)
         {
             // The remote row wins, update the local one.
             resolution = WorfConflictResolution.ApplyRemote;
             return true;
         }
-        else if (cmp < 0)
+        else
         {
             // The local row wins, retain it
             resolution = WorfConflictResolution.KeepLocal;
             return false;
         }
-        else
-        {
-            // The timestamps were equal, break the tie in a manner that is consistent across all nodes.
-            //
-            // XXX: TODO, for now we just always apply remote change.
-            resolution = WorfConflictResolution.ApplyRemote;
-            return true;
-        }
+    }
+
+    /// <summary>
+    /// Gets the node that wrote a local row: the node whose changes its commit's replication origin applies, or this
+    /// node for a row written here or under an origin no subscription owns.
+    /// </summary>
+    /// <param name="originId">The replication origin of the row's commit.</param>
+    /// <returns>The node's id.</returns>
+    private static unsafe uint WriterNodeId(ushort originId)
+    {
+        uint localNodeId = Apply.MySubscription!.Target.Id;
+        sbyte* name;
+        return originId != 0 && NativeMethods.replorigin_by_oid(originId, true, &name)
+            ? WorfNode.GetOriginNodeId(Worf.FromServer(name)) ?? localNodeId
+            : localNodeId;
     }
 
     /// <summary>

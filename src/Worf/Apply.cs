@@ -20,6 +20,9 @@ internal static unsafe partial class Apply
     private static bool s_inRemoteTransaction;
     private static ulong s_remoteOriginLsn;
     private static ushort s_remoteOriginId;
+    private static uint s_writerNodeId;
+    private static uint s_sessionWriterNodeId;
+    private static bool s_skipRemoteTransaction;
     private static long s_applyDelay;
     private static uint s_queueRelid;
     private static List<WorfSyncStatus> s_syncingTables = [];
@@ -52,6 +55,11 @@ internal static unsafe partial class Apply
     /// Gets or sets the subscription this worker applies.
     /// </summary>
     internal static WorfSubscription? MySubscription { get; set; }
+
+    /// <summary>
+    /// Gets the node that wrote the remote transaction being applied.
+    /// </summary>
+    internal static uint WriterNodeId => s_writerNodeId;
 
     /// <summary>
     /// Gets or sets the slot of the worker whose apply state this process uses.
@@ -127,7 +135,15 @@ internal static unsafe partial class Apply
                 ?? throw new PgException(PgSqlStates.UndefinedObject, $"replication origin \"{sub.SlotName}\" does not exist");
             PgLog.Debug2($"setting up replication origin {sub.SlotName} (oid {originid})");
             PgReplicationOrigin.SetupSession(originid);
-            return PgReplicationOrigin.GetSessionProgress(false).Value;
+
+            // Relayed transactions advance their relay origins instead, so start after the latest of them all.
+            ulong startpos = PgReplicationOrigin.GetSessionProgress(false).Value;
+            foreach ((ushort relay, _) in WorfNode.RelayOrigins(sub.SlotName))
+            {
+                startpos = Math.Max(startpos, PgReplicationOrigin.GetProgress(relay, false).Value);
+            }
+
+            return startpos;
         });
 
         // Start the replication.
@@ -451,6 +467,8 @@ internal static unsafe partial class Apply
         Worf.ReploriginSessionOriginTimestamp = commitTime;
         Worf.ReploriginSessionOriginLsn = commitLsn;
         s_remoteOriginId = 0;
+        s_writerNodeId = MySubscription!.Origin.Id;
+        s_skipRemoteTransaction = false;
         UpdateErrorContext();
 
         // don't want the overhead otherwise
@@ -580,8 +598,44 @@ internal static unsafe partial class Apply
     /// </summary>
     private static void HandleOrigin(StringInfoData* s)
     {
-        string origin = ProtoNative.ReadOrigin(s, out s_remoteOriginLsn);
+        string origin = ProtoNative.ReadOrigin(s, out s_remoteOriginLsn, out uint nodeId);
         s_remoteOriginId = PgReplicationOrigin.Find(origin) ?? 0;
+
+        // The provider relays a transaction another node wrote. One this node wrote has come back, and is skipped.
+        if (nodeId != 0)
+        {
+            s_writerNodeId = nodeId;
+            s_skipRemoteTransaction = nodeId == MySubscription!.Target.Id;
+        }
+
+        UseWriterOrigin();
+    }
+
+    /// <summary>
+    /// Commits the remote transaction under the origin for the node that wrote it, so that its commit timestamps
+    /// record that node: the worker's own origin for its provider's transactions, or a relay origin for another
+    /// node's.
+    /// </summary>
+    private static void UseWriterOrigin()
+    {
+        WorfSubscription sub = MySubscription!;
+        uint writer = s_writerNodeId == sub.Origin.Id ? 0 : s_writerNodeId;
+        if (writer == s_sessionWriterNodeId || s_skipRemoteTransaction)
+        {
+            return;
+        }
+
+        string name = writer == 0 ? sub.SlotName : WorfNode.RelayOriginName(sub.SlotName, writer);
+        ushort origin = PgReplicationOrigin.Find(name) ?? PgReplicationOrigin.Create(name);
+
+        // Keep the transaction's remote commit position and time across the change of origin.
+        long commitTime = Worf.ReploriginSessionOriginTimestamp;
+        ulong commitLsn = Worf.ReploriginSessionOriginLsn;
+        PgReplicationOrigin.ResetSession();
+        PgReplicationOrigin.SetupSession(origin);
+        Worf.ReploriginSessionOriginTimestamp = commitTime;
+        Worf.ReploriginSessionOriginLsn = commitLsn;
+        s_sessionWriterNodeId = writer;
     }
 
     /// <summary>
@@ -597,6 +651,11 @@ internal static unsafe partial class Apply
 
     private static void HandleInsert(StringInfoData* s, bool startedTx)
     {
+        if (s_skipRemoteTransaction)
+        {
+            return;
+        }
+
         NativeMethods.PushActiveSnapshot(NativeMethods.GetTransactionSnapshot());
 
         s_actionName = "INSERT";
@@ -720,6 +779,11 @@ internal static unsafe partial class Apply
 
     private static void HandleUpdate(StringInfoData* s)
     {
+        if (s_skipRemoteTransaction)
+        {
+            return;
+        }
+
         s_actionName = "UPDATE";
         s_xactActionCounter++;
         UpdateErrorContext();
@@ -752,6 +816,11 @@ internal static unsafe partial class Apply
 
     private static void HandleDelete(StringInfoData* s)
     {
+        if (s_skipRemoteTransaction)
+        {
+            return;
+        }
+
         s_actionName = null;
         s_errRel = null;
         s_isDdlOrDrop = false;
@@ -1332,6 +1401,13 @@ internal static unsafe partial class Apply
             s.cursor = 0;
 
             char action = (char)NativeMethods.pq_getmsgbyte(&s);
+
+            // An ORIGIN message names the node that wrote the transaction first.
+            if (action != 'O')
+            {
+                UseWriterOrigin();
+            }
+
             DispatchChange(action, &s, true);
         }
 

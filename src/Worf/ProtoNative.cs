@@ -10,6 +10,9 @@ internal static unsafe class ProtoNative
 {
     private const byte IsReplicaIdentity = 1;
 
+    // An ORIGIN message's flag for the id of the node that wrote the transaction, which follows the origin's name.
+    private const byte OriginFlagNodeId = 1;
+
     // FirstNormalObjectId from access/transam.h.
     private const uint FirstNormalObjectId = 16384;
 
@@ -93,9 +96,13 @@ internal static unsafe class ProtoNative
     /// <summary>
     /// Write ORIGIN to the output stream.
     /// </summary>
-    internal static void WriteOrigin(StringInfoData* @out, sbyte* origin, ulong originLsn)
+    /// <param name="out">The output.</param>
+    /// <param name="origin">The origin's name.</param>
+    /// <param name="originLsn">The transaction's position at its origin.</param>
+    /// <param name="nodeId">The node that wrote the transaction, or zero when it isn't known.</param>
+    internal static void WriteOrigin(StringInfoData* @out, sbyte* origin, ulong originLsn, uint nodeId)
     {
-        byte flags = 0;
+        byte flags = nodeId != 0 ? OriginFlagNodeId : (byte)0;
 
         NativeMethods.pq_sendbyte(@out, (byte)'O');      // ORIGIN
 
@@ -109,6 +116,11 @@ internal static unsafe class ProtoNative
         byte len = (byte)(Worf.StrLen(origin) + 1);
         NativeMethods.pq_sendbyte(@out, len);
         Worf.PqSendBytes(@out, origin, len);
+
+        if (nodeId != 0)
+        {
+            NativeMethods.pq_sendint32(@out, nodeId);
+        }
     }
 
     /// <summary>
@@ -233,10 +245,14 @@ internal static unsafe class ProtoNative
     /// <summary>
     /// Read ORIGIN from the output stream.
     /// </summary>
-    internal static string ReadOrigin(StringInfoData* @in, out ulong originLsn)
+    /// <param name="in">The input.</param>
+    /// <param name="originLsn">The transaction's position at its origin.</param>
+    /// <param name="nodeId">The node that wrote the transaction, or zero when the provider didn't say.</param>
+    /// <returns>The origin's name.</returns>
+    internal static string ReadOrigin(StringInfoData* @in, out ulong originLsn, out uint nodeId)
     {
         // read the flags
-        _ = NativeMethods.pq_getmsgbyte(@in);
+        int flags = NativeMethods.pq_getmsgbyte(@in);
 
         // fixed fields
         originLsn = unchecked((ulong)NativeMethods.pq_getmsgint64(@in));
@@ -249,6 +265,8 @@ internal static unsafe class ProtoNative
         {
             strlen++;
         }
+
+        nodeId = (flags & OriginFlagNodeId) != 0 ? NativeMethods.pq_getmsgint(@in, 4) : 0;
 
         return Worf.FromServer(new ReadOnlySpan<byte>(origin, strlen));
     }

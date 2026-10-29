@@ -1331,7 +1331,7 @@ internal static class Sync
         if (PgReplicationOrigin.SessionOrigin != 0)
         {
             PgReplicationOrigin.ResetSession();
-            PgReplicationOrigin.Drop(sub.SlotName, true);
+            WorfNode.DropOrigins(sub.SlotName);
         }
     }
 
