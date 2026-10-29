@@ -177,7 +177,7 @@ internal static class SequenceRangeExchange
             SpiResult sequences = Worf.SelectCatalog("""
                 SELECT r.seqoid::oid, pg_catalog.quote_ident(n.nspname) || '.' || pg_catalog.quote_ident(c.relname), r.owner_node,
                     r.epoch, r.range_size, r.max_range_size, r.distance, r.high_water, r.watermark, r.parent_node,
-                    CASE WHEN r.fenced_at IS NOT NULL THEN 'fenced' ELSE r.state END
+                    CASE WHEN r.fenced_at IS NOT NULL THEN 'fenced' ELSE r.state END, r.root_start, r.root_end
                 FROM worf.sequence_range r
                     JOIN pg_catalog.pg_class c ON c.oid = r.seqoid
                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -196,6 +196,8 @@ internal static class SequenceRangeExchange
                 WriteNullable(writer, "high_water", row.Get<long?>(7));
                 WriteNullable(writer, "watermark", row.Get<long?>(8));
                 writer.WriteString("state", row.Get<string>(10));
+                WriteNullable(writer, "root_start", row.Get<long?>(11));
+                WriteNullable(writer, "root_end", row.Get<long?>(12));
 
                 // A reset this node asks of the neighbor, whose WAL position moved backwards, and one it honored.
                 SpiResult neighborRow = Worf.SelectCatalog(
@@ -236,7 +238,7 @@ internal static class SequenceRangeExchange
                 if (row.Get<uint?>(9) == neighbor)
                 {
                     SpiResult requests = Worf.SelectCatalog(
-                        "SELECT request_id, size, kind::text FROM worf.sequence_range_request WHERE seqoid = $1 AND parent_node = $2 AND state = 'open'",
+                        "SELECT request_id, size, kind::text, lo, hi FROM worf.sequence_range_request WHERE seqoid = $1 AND parent_node = $2 AND state = 'open'",
                         SpiParameter.Create(seqoid), SpiParameter.Create(neighbor));
                     for (int r = 0; r < requests.Count; r++)
                     {
@@ -244,6 +246,8 @@ internal static class SequenceRangeExchange
                         writer.WriteString("id", requests[r].Get<Guid>(0));
                         writer.WriteNumber("size", requests[r].Get<long>(1));
                         writer.WriteString("kind", requests[r].Get<string>(2));
+                        WriteNullable(writer, "lo", requests[r].Get<long?>(3));
+                        WriteNullable(writer, "hi", requests[r].Get<long?>(4));
                         writer.WriteEndObject();
                     }
                 }
@@ -289,9 +293,13 @@ internal static class SequenceRangeExchange
                 }
 
                 writer.WriteEndArray();
+
+                // A refusal needs no acknowledgement: a request that lost it is sent again and refused again.
+                _ = Spi.Execute("UPDATE worf.sequence_range_grant SET state = 'acknowledged' WHERE seqoid = $1 AND grantee_id = $2 AND kind = 'x' AND state = 'sent'",
+                    SpiParameter.Create(seqoid), SpiParameter.Create(neighbor));
                 writer.WriteStartArray("acks");
                 SpiResult received = Worf.SelectCatalog(
-                    "SELECT block_id FROM worf.sequence_range_block WHERE seqoid = $1 AND from_node = $2 AND kind IN ('n', 'p') AND state IN ('next', 'active', 'open')",
+                    "SELECT block_id FROM worf.sequence_range_block WHERE seqoid = $1 AND from_node = $2 AND kind IN ('n', 'p', 'i') AND state IN ('next', 'active', 'open', 'imported')",
                     SpiParameter.Create(seqoid), SpiParameter.Create(neighbor));
                 for (int b = 0; b < received.Count; b++)
                 {
@@ -344,7 +352,7 @@ internal static class SequenceRangeExchange
                 }
 
                 SequenceRanges.JoinFromNeighbor(seqoid, owner, epoch, entry.GetProperty("range_size").GetInt64(),
-                    entry.GetProperty("max_range_size").GetInt64(), node);
+                    entry.GetProperty("max_range_size").GetInt64(), Nullable(entry, "root_start"), Nullable(entry, "root_end"), node);
             }
             else if (local[0].Get<int>(1) > epoch)
             {
@@ -478,6 +486,13 @@ internal static class SequenceRangeExchange
             {
                 foreach (JsonElement request in requests.EnumerateArray())
                 {
+                    string kind = Text(request, "kind") ?? "n";
+                    if (kind is "i" or "f")
+                    {
+                        granted |= GrantExact(seqoid, info, epoch, request, kind[0], senderId, senderName, isOwner);
+                        continue;
+                    }
+
                     bool answered = Grant(seqoid, info, epoch, request, senderId, senderName, high, isOwner);
                     granted |= answered;
                     if (!answered && !isOwner)
@@ -546,16 +561,59 @@ internal static class SequenceRangeExchange
     }
 
     /// <summary>
+    /// Answers a request for exact values. The owner grants them from the root or refuses them. Another node grants
+    /// them from a pool block that holds them, which its own parent granted for this request, passes on its parent's
+    /// refusal, or else forwards the request.
+    /// </summary>
+    private static bool GrantExact(uint seqoid, SequenceInfo info, int epoch, JsonElement request, char kind, uint granteeId, string granteeName,
+        bool isOwner)
+    {
+        long lo = request.GetProperty("lo").GetInt64();
+        long hi = request.GetProperty("hi").GetInt64();
+        Guid requestId = request.GetProperty("id").GetGuid();
+        if (SequenceRanges.AllocateExact(seqoid, info, epoch, lo, hi, granteeId, granteeName, requestId, kind, isOwner) is not null)
+        {
+            return true;
+        }
+
+        if (isOwner)
+        {
+            return true;
+        }
+
+        SpiParameter seq = SpiParameter.Create(seqoid);
+        if (Spi.Execute("DELETE FROM worf.sequence_range_request WHERE seqoid = $1 AND kind = 'f' AND lo = $2 AND hi = $3 AND state = 'refused'",
+            seq, SpiParameter.Create(lo), SpiParameter.Create(hi)) > 0)
+        {
+            _ = Spi.Execute("""
+                INSERT INTO worf.sequence_range_grant VALUES (gen_random_uuid(), $1, $2, NULL, $3, $4, 'x', $5, $6, 'sent', now())
+                ON CONFLICT (request_id) DO UPDATE SET state = 'sent'
+                """, SpiParameter.Create(requestId), seq, SpiParameter.Create(granteeId), SpiParameter.Create(granteeName),
+                SpiParameter.Create(lo), SpiParameter.Create(hi));
+            return true;
+        }
+
+        _ = Spi.Execute("""
+            INSERT INTO worf.sequence_range_request (request_id, seqoid, parent_node, kind, size, lo, hi, created_at)
+            SELECT gen_random_uuid(), r.seqoid, r.parent_node, 'f', $4, $2, $3, now()
+            FROM worf.sequence_range r
+            WHERE r.seqoid = $1 AND r.parent_node IS NOT NULL
+                AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_request q WHERE q.seqoid = r.seqoid AND q.kind = 'f' AND q.lo = $2 AND q.hi = $3)
+            """, seq, SpiParameter.Create(lo), SpiParameter.Create(hi), SpiParameter.Create(SequenceRanges.Steps(info, lo, hi)));
+        return false;
+    }
+
+    /// <summary>
     /// Asks this node's parent for a pool block sixteen times a child's request, unless one is already open.
     /// </summary>
     private static void RequestPool(uint seqoid, long childSize)
     {
         _ = Spi.Execute("""
             INSERT INTO worf.sequence_range_request (request_id, seqoid, parent_node, kind, size, created_at)
-            SELECT gen_random_uuid(), r.seqoid, r.parent_node, 'p', least($2 * 16, 9223372036854775807 / 2), now()
+            SELECT gen_random_uuid(), r.seqoid, r.parent_node, 'p', least($2::numeric * 16, 4611686018427387903)::bigint, now()
             FROM worf.sequence_range r
             WHERE r.seqoid = $1 AND r.parent_node IS NOT NULL
-                AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_request q WHERE q.seqoid = r.seqoid AND q.kind = 'p')
+                AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_request q WHERE q.seqoid = r.seqoid AND q.kind = 'p' AND q.state = 'open')
             """, SpiParameter.Create(seqoid), SpiParameter.Create(childSize));
     }
 
@@ -565,16 +623,30 @@ internal static class SequenceRangeExchange
     private static bool Receive(uint seqoid, int epoch, JsonElement grant, uint from, WorfLocalNode node)
     {
         Guid id = grant.GetProperty("id").GetGuid();
+        string kind = Text(grant, "kind") ?? "n";
+        if (kind == "x")
+        {
+            return Spi.Execute("UPDATE worf.sequence_range_request SET state = 'refused' WHERE request_id = $1 AND state = 'open'",
+                SpiParameter.Create(grant.GetProperty("request_id").GetGuid())) > 0;
+        }
+
         if (Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range_block WHERE block_id = $1", SpiParameter.Create(id)).Count > 0)
         {
             return false;
         }
 
-        // A pool block is this node's to grant from.
+        // A pool block, or exact values to grant on, are this node's to grant from. Exact values for this node are an
+        // imported block, which the sequence never switches to.
         long lo = grant.GetProperty("lo").GetInt64();
         long hi = grant.GetProperty("hi").GetInt64();
-        bool pool = grant.TryGetProperty("kind", out JsonElement kind) && kind.GetString() == "p";
-        _ = SequenceRanges.InsertBlock(seqoid, epoch, pool ? 'p' : 'n', lo, hi, pool ? "open" : "next", from, node, id);
+        bool pool = kind is "p" or "f";
+        (char blockKind, string state) = kind switch
+        {
+            "p" or "f" => ('p', "open"),
+            "i" => ('i', "imported"),
+            _ => ('n', "next"),
+        };
+        _ = SequenceRanges.InsertBlock(seqoid, epoch, blockKind, lo, hi, state, from, node, id);
         if (pool)
         {
             _ = Spi.Execute("INSERT INTO worf.sequence_range_free VALUES ($1, $2, $3)", SpiParameter.Create(id), SpiParameter.Create(lo),

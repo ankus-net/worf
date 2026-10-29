@@ -250,6 +250,10 @@ internal static unsafe partial class Executor
         }
 
         SequenceRanges.CheckDdl(parsetree);
+        if (SequenceRanges.SkipsDumpedGuard(parsetree))
+        {
+            return;
+        }
 
         // Which objects a DROP drops is known only before it runs, and whether a statement uses temporary objects only
         // as it runs.
@@ -292,6 +296,8 @@ internal static unsafe partial class Executor
         {
             DdlReplication.AfterDdl(parsetree);
         }
+
+        SequenceRanges.AfterDdl(parsetree);
 
         if (parsetree->type == NodeTag.T_TruncateStmt)
         {

@@ -375,6 +375,123 @@ public sealed class SequenceRangeTests
             "the new root starts above the old epoch's blocks");
     }
 
+    /// <summary>
+    /// A bulk load reserves a block that holds all its rows, and rows that already carry keys reserve exactly those keys,
+    /// on the owner and on a node that asks the owner, which refuses keys that may be in use.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task ReservationsServeBulkLoads()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        TestNode[] nodes = [nodeA, nodeB];
+        foreach (TestNode node in nodes)
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100)", token);
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        foreach (TestNode node in nodes)
+        {
+            Assert.IsTrue(await node.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges", token),
+                $"{node.Name} drawing from a block");
+
+            // A load larger than a block fails at the block's end, and succeeds once reserved.
+            PostgresException shortBlock = await Assert.ThrowsExactlyAsync<PostgresException>(() => node.SafePsqlAsync(Database,
+                "INSERT INTO t (v) SELECT 'bulk' FROM generate_series(1, 1000)", token));
+            Assert.AreEqual("2200H", shortBlock.SqlState);
+            _ = await node.SafePsqlAsync(Database, "SELECT worf.reserve_sequence_range('t_id_seq', 1000)", token);
+
+            _ = await node.SafePsqlAsync(Database, "INSERT INTO t (v) SELECT 'bulk' FROM generate_series(1, 1000)", token);
+        }
+
+        // Keys that rows carry: free ones are granted exactly, and ones another node holds are refused.
+        _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.reserve_sequence_values('t_id_seq', 1000000, 1000099)", token);
+        _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO t (id, v) SELECT g, 'imported' FROM generate_series(1000000, 1000099) g", token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.reserve_sequence_values('t_id_seq', 2000000, 2000009)", token);
+        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO t (id, v) SELECT g, 'imported' FROM generate_series(2000000, 2000009) g", token);
+        string held = await nodeA.SafePsqlAsync(Database, "SELECT active_lo FROM worf.sequence_ranges", token);
+        PostgresException refused = await Assert.ThrowsExactlyAsync<PostgresException>(() => nodeB.SafePsqlAsync(Database,
+            $"SELECT worf.reserve_sequence_values('t_id_seq', {held}, {held})", token));
+        Assert.AreEqual("22023", refused.SqlState);
+
+        HashSet<long> keys = [];
+        foreach (TestNode node in nodes)
+        {
+            foreach (string id in (await node.SafePsqlAsync(Database, "SELECT id FROM t", token)).Split('\n'))
+            {
+                Assert.IsTrue(keys.Add(long.Parse(id, CultureInfo.InvariantCulture)), $"{node.Name}'s key {id} is another node's too");
+            }
+        }
+
+        Assert.HasCount(2110, keys);
+    }
+
+    /// <summary>
+    /// A subscriber whose structure comes from the provider gets the provider's managed sequences quarantined as they
+    /// are created and joins them before rows are copied, so the copied rows don't count against it, and then draws from
+    /// blocks of its own.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task StructureSyncJoinsBeforeCopying()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE TABLE t (id bigserial PRIMARY KEY, v text);
+            CREATE TABLE u (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text);
+            SELECT * FROM worf.replication_set_add_table('default', 't');
+            SELECT * FROM worf.replication_set_add_table('default', 'u');
+            SELECT worf.enable_sequence_range('t_id_seq', participants := '{}', range_size := 100);
+            SELECT worf.enable_sequence_range('u_id_seq', participants := '{}', range_size := 100);
+            INSERT INTO t (v) SELECT 'a' FROM generate_series(1, 20);
+            INSERT INTO u (v) SELECT 'a' FROM generate_series(1, 20);
+            """, token);
+
+        _ = await nodeB.SafePsqlAsync(Database, $"""
+            SELECT worf.create_subscription(
+                subscription_name := 'b_from_a',
+                provider_dsn := '{nodeA.Dsn(Database, SuperUser)}',
+                synchronize_structure := true,
+                synchronize_data := true,
+                forward_origins := '{"{}"}')
+            """, token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, """
+            SELECT count(*) = 2 AND bool_and(state = 'active') FROM worf.sequence_ranges
+            """, token), "node_b drawing from blocks of both sequences");
+
+
+        Assert.AreEqual("20|20|2|0", await nodeB.SafePsqlAsync(Database, """
+            SELECT (SELECT count(*) FROM t), (SELECT count(*) FROM u),
+                (SELECT count(*) FROM pg_catalog.pg_trigger WHERE tgname = 'worf_sequence_range_guard'),
+                (SELECT count(high_water) FROM worf.sequence_range)
+            """, token), "rows copied, one guard per table, and no high-water mark from the copied rows");
+
+        HashSet<long> keys = [];
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, $"INSERT INTO t (v) SELECT '{node.Name}' FROM generate_series(1, 10)", token);
+            _ = await node.SafePsqlAsync(Database, $"INSERT INTO u (v) SELECT '{node.Name}' FROM generate_series(1, 10)", token);
+        }
+
+        foreach (string table in new[] { "t", "u" })
+        {
+            keys.Clear();
+            foreach (TestNode node in new[] { nodeA, nodeB })
+            {
+                foreach (string id in (await node.SafePsqlAsync(Database, $"SELECT id FROM {table} WHERE v = '{node.Name}'", token)).Split('\n'))
+                {
+                    Assert.IsTrue(keys.Add(long.Parse(id, CultureInfo.InvariantCulture)), $"{node.Name}'s key {id} in {table} is another node's too");
+                }
+            }
+        }
+    }
+
     private static async Task SubscribeAsync(TestNode subscriber, string name, TestNode provider, CancellationToken token)
     {
         _ = await subscriber.SafePsqlAsync(Database, $$"""

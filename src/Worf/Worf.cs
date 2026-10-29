@@ -619,6 +619,7 @@ internal static partial class Worf
         Worker.WorkerShmemInit();
         DdlLock.ShmemInit();
         SequenceRanges.ShmemInit();
+        SequenceRangeReservations.ShmemInit();
 
         // Init executor module
         Executor.ExecutorInit();

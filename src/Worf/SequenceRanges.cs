@@ -42,6 +42,16 @@ using Ankus.Postgres;
         retired_at timestamptz
     );
 
+    CREATE TABLE worf.sequence_range_restore (
+        name text PRIMARY KEY,
+        owner_node oid NOT NULL,
+        epoch integer NOT NULL,
+        range_size bigint NOT NULL,
+        max_range_size bigint NOT NULL,
+        root_start bigint,
+        root_end bigint
+    );
+
     CREATE TABLE worf.sequence_range_free (
         block_id uuid NOT NULL REFERENCES worf.sequence_range_block,
         lo bigint NOT NULL,
@@ -53,7 +63,7 @@ using Ankus.Postgres;
         grant_id uuid PRIMARY KEY,
         request_id uuid NOT NULL UNIQUE,
         seqoid regclass NOT NULL,
-        from_block uuid NOT NULL REFERENCES worf.sequence_range_block,
+        from_block uuid REFERENCES worf.sequence_range_block,
         grantee_id oid NOT NULL,
         grantee_name name NOT NULL,
         kind "char" NOT NULL,
@@ -507,8 +517,9 @@ internal static unsafe partial class SequenceRanges
     /// <param name="parsetree">The statement, before it runs.</param>
     internal static void CheckDdl(Node* parsetree)
     {
+        // The restore of a subscription's structure is worf's own.
         if (InternalDdl || parsetree->type is not (NodeTag.T_AlterSeqStmt or NodeTag.T_GrantStmt or NodeTag.T_AlterTableStmt or
-            NodeTag.T_DropStmt or NodeTag.T_RenameStmt or NodeTag.T_TruncateStmt) || !AnyManaged())
+            NodeTag.T_DropStmt or NodeTag.T_RenameStmt or NodeTag.T_TruncateStmt) || !AnyManaged() || SequenceRangeSync.Restoring())
         {
             return;
         }
@@ -516,7 +527,7 @@ internal static unsafe partial class SequenceRanges
         switch (parsetree->type)
         {
             case NodeTag.T_AlterSeqStmt:
-                if (IsManaged(Resolve(((AlterSeqStmt*)parsetree)->sequence)))
+                if (!OnlyOwnedBy(((AlterSeqStmt*)parsetree)->options) && IsManaged(Resolve(((AlterSeqStmt*)parsetree)->sequence)))
                 {
                     throw Rejected("ALTER SEQUENCE on a managed sequence", "Use worf.alter_sequence_range, or disable range management first.");
                 }
@@ -579,6 +590,78 @@ internal static unsafe partial class SequenceRanges
                     }
                 }
 
+                break;
+
+            default:
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Checks whether ALTER SEQUENCE only changes the column that owns the sequence, which leaves its values alone.
+    /// </summary>
+    private static bool OnlyOwnedBy(List* options)
+    {
+        for (int i = 0; options is not null && i < options->length; i++)
+        {
+            if (Worf.FromServer(((DefElem*)options->elements[i].ptr_value)->defname) != "owned_by")
+            {
+                return false;
+            }
+        }
+
+        return options is not null && options->length > 0;
+    }
+
+    /// <summary>
+    /// Skips the guard that a provider's dumped structure creates, since the restore installs the guards itself.
+    /// </summary>
+    /// <param name="parsetree">The statement, before it runs.</param>
+    /// <returns>Whether to skip it.</returns>
+    internal static bool SkipsDumpedGuard(Node* parsetree)
+        => !InternalDdl && parsetree->type == NodeTag.T_CreateTrigStmt && Worf.FromServer(((CreateTrigStmt*)parsetree)->trigname) == GuardName &&
+            SequenceRangeSync.Restoring();
+
+    /// <summary>
+    /// Puts managed sequences in place after DDL: the restore of a subscription's structure quarantines and joins the
+    /// provider's managed sequences as it creates them, and a table that comes to use a managed sequence gets the guard
+    /// in the same transaction.
+    /// </summary>
+    /// <param name="parsetree">The statement, which has run.</param>
+    internal static void AfterDdl(Node* parsetree)
+    {
+        if (InternalDdl || parsetree->type is not (NodeTag.T_CreateSeqStmt or NodeTag.T_AlterSeqStmt or NodeTag.T_AlterTableStmt or NodeTag.T_CreateStmt))
+        {
+            return;
+        }
+
+        if (parsetree->type is NodeTag.T_CreateSeqStmt or NodeTag.T_AlterTableStmt && SequenceRangeSync.Restoring())
+        {
+            SequenceRangeSync.JoinRestored();
+        }
+
+        if (!AnyManaged())
+        {
+            return;
+        }
+
+        switch (parsetree->type)
+        {
+            case NodeTag.T_AlterSeqStmt:
+                uint seqoid = Resolve(((AlterSeqStmt*)parsetree)->sequence);
+                if (seqoid != 0 && IsManaged(seqoid))
+                {
+                    InstallGuards(seqoid);
+                }
+
+                break;
+
+            case NodeTag.T_AlterTableStmt:
+                InstallGuard(Resolve(((AlterTableStmt*)parsetree)->relation));
+                break;
+
+            case NodeTag.T_CreateStmt:
+                InstallGuard(Resolve(((CreateStmt*)parsetree)->relation));
                 break;
 
             default:
@@ -800,7 +883,7 @@ internal static unsafe partial class SequenceRanges
         return end;
     }
 
-    private static uint RequireSequence(PgDatum? sequence)
+    internal static uint RequireSequence(PgDatum? sequence)
     {
         if (sequence is null || sequence.IsNull)
         {
@@ -1070,7 +1153,8 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
-    /// Removes values from a block's free spans.
+    /// Removes values from a block's free spans. Each span shrinks in place, or is deleted once empty, so that a
+    /// concurrent allocation waiting on its lock rechecks what is left of it.
     /// </summary>
     private static void TakeFromFree(Guid block, long lo, long hi)
     {
@@ -1080,17 +1164,23 @@ internal static unsafe partial class SequenceRanges
         {
             long spanLo = spans[i].Get<long>(0);
             long spanHi = spans[i].Get<long>(1);
-            _ = Spi.Execute("DELETE FROM worf.sequence_range_free WHERE block_id = $1 AND lo = $2", SpiParameter.Create(block), SpiParameter.Create(spanLo));
+            SpiParameter id = SpiParameter.Create(block);
+            SpiParameter start = SpiParameter.Create(spanLo);
             if (spanLo < lo)
             {
-                _ = Spi.Execute("INSERT INTO worf.sequence_range_free VALUES ($1, $2, $3)", SpiParameter.Create(block), SpiParameter.Create(spanLo),
-                    SpiParameter.Create(lo - 1));
+                _ = Spi.Execute("UPDATE worf.sequence_range_free SET hi = $3 WHERE block_id = $1 AND lo = $2", id, start, SpiParameter.Create(lo - 1));
+                if (spanHi > hi)
+                {
+                    _ = Spi.Execute("INSERT INTO worf.sequence_range_free VALUES ($1, $2, $3)", id, SpiParameter.Create(hi + 1), SpiParameter.Create(spanHi));
+                }
             }
-
-            if (spanHi > hi)
+            else if (spanHi > hi)
             {
-                _ = Spi.Execute("INSERT INTO worf.sequence_range_free VALUES ($1, $2, $3)", SpiParameter.Create(block), SpiParameter.Create(hi + 1),
-                    SpiParameter.Create(spanHi));
+                _ = Spi.Execute("UPDATE worf.sequence_range_free SET lo = $3 WHERE block_id = $1 AND lo = $2", id, start, SpiParameter.Create(hi + 1));
+            }
+            else
+            {
+                _ = Spi.Execute("DELETE FROM worf.sequence_range_free WHERE block_id = $1 AND lo = $2", id, start);
             }
         }
     }
@@ -1103,8 +1193,11 @@ internal static unsafe partial class SequenceRanges
     /// <param name="epoch">Its epoch.</param>
     /// <param name="rangeSize">The size of a node's first block.</param>
     /// <param name="maxRangeSize">The largest block a node requests.</param>
+    /// <param name="rootStart">Where the root may start, or null to take the sequence's first value here.</param>
+    /// <param name="rootEnd">Where the root ends, or null to take the sequence's limits here.</param>
     /// <param name="node">This node.</param>
-    internal static void JoinFromNeighbor(uint seqoid, uint owner, int epoch, long rangeSize, long maxRangeSize, WorfLocalNode node)
+    internal static void JoinFromNeighbor(uint seqoid, uint owner, int epoch, long rangeSize, long maxRangeSize, long? rootStart, long? rootEnd,
+        WorfLocalNode node)
     {
         SequenceInfo info = GetInfo(seqoid);
         string? refused = info.Persistence != 'p' ? "the sequence is temporary or unlogged here"
@@ -1113,11 +1206,12 @@ internal static unsafe partial class SequenceRanges
                 ? "the sequence is in a replication set here"
                 : null;
         _ = Spi.Execute("""
-            INSERT INTO worf.sequence_range (seqoid, owner_node, epoch, range_size, max_range_size, state, request_size, root_end, detail)
-            VALUES ($1, $2, $3, $4, $5, $6, $4, $7, $8)
+            INSERT INTO worf.sequence_range (seqoid, owner_node, epoch, range_size, max_range_size, state, request_size, root_start, root_end, detail)
+            VALUES ($1, $2, $3, $4, $5, $6, $4, $9, $7, $8)
             """, SpiParameter.Create(seqoid), SpiParameter.Create(owner), SpiParameter.Create(epoch), SpiParameter.Create(rangeSize),
             SpiParameter.Create(maxRangeSize), SpiParameter.Create(refused is null ? "quarantined" : "refused"),
-            SpiParameter.Create(RootEnd(info)), SpiParameter.Create(refused));
+            SpiParameter.Create(rootEnd ?? RootEnd(info)), SpiParameter.Create(refused),
+            SpiParameter.Create(rootStart ?? (info.Ascending ? info.Min : info.Max)));
         if (refused is null)
         {
             Join(seqoid, node);
@@ -1262,8 +1356,12 @@ internal static unsafe partial class SequenceRanges
     /// <summary>
     /// Switches a sequence to a block: the block becomes its bounds and its position the block's start.
     /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    /// <param name="info">The sequence's details.</param>
+    /// <param name="block">The block.</param>
+    /// <param name="lockTimeout">How long to wait for transactions that called nextval, in milliseconds.</param>
     /// <returns>Whether it switched; it doesn't when a transaction that called nextval holds the sequence.</returns>
-    private static bool Switch(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) block)
+    internal static bool Switch(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) block, int lockTimeout = 200)
     {
         string lo = block.Lo.ToString(CultureInfo.InvariantCulture);
         string hi = block.Hi.ToString(CultureInfo.InvariantCulture);
@@ -1272,7 +1370,8 @@ internal static unsafe partial class SequenceRanges
         {
             PgTransaction.RunInSubtransaction(() =>
             {
-                _ = Spi.Execute("SET LOCAL lock_timeout = '200ms'");
+                _ = Spi.Execute("SELECT pg_catalog.set_config('lock_timeout', $1, true)", SpiParameter.Create(
+                    Math.Max(lockTimeout, 1).ToString(CultureInfo.InvariantCulture)));
                 RunInternalDdl($"ALTER SEQUENCE {info.Name} NO CYCLE CACHE 1 MINVALUE {lo} MAXVALUE {hi} START WITH {start} RESTART WITH {start}");
                 _ = Spi.Execute("SET LOCAL lock_timeout = 0");
             });
@@ -1331,7 +1430,7 @@ internal static unsafe partial class SequenceRanges
     internal static (Guid Grant, long Lo, long Hi)? Allocate(uint seqoid, SequenceInfo info, int epoch, long size, uint granteeId,
         string granteeName, Guid requestId, char kind = 'n')
     {
-        SpiResult granted = Worf.SelectCatalog("SELECT grant_id, lo, hi FROM worf.sequence_range_grant WHERE request_id = $1",
+        SpiResult granted = Worf.SelectCatalog("SELECT grant_id, lo, hi FROM worf.sequence_range_grant WHERE request_id = $1 AND kind <> 'x'",
             SpiParameter.Create(requestId));
         if (granted.Count > 0)
         {
@@ -1361,12 +1460,8 @@ internal static unsafe partial class SequenceRanges
         long lo = info.Ascending ? freeLo : (long)(freeHi - span);
         long hi = info.Ascending ? (long)(freeLo + span) : freeHi;
 
-        _ = Spi.Execute("DELETE FROM worf.sequence_range_free WHERE block_id = $1 AND lo = $2", SpiParameter.Create(from), SpiParameter.Create(freeLo));
-        if (info.Ascending ? hi < freeHi : lo > freeLo)
-        {
-            _ = Spi.Execute("INSERT INTO worf.sequence_range_free VALUES ($1, $2, $3)", SpiParameter.Create(from),
-                SpiParameter.Create(info.Ascending ? hi + 1 : freeLo), SpiParameter.Create(info.Ascending ? freeHi : lo - 1));
-        }
+        // The span shrinks in place, so that a concurrent allocation waiting on its lock sees what is left of it.
+        TakeFromFree(from, lo, hi);
 
         Guid grant = Guid.NewGuid();
         _ = Spi.Execute("""
@@ -1382,6 +1477,76 @@ internal static unsafe partial class SequenceRanges
         _ = Spi.Execute("SET LOCAL synchronous_commit = on");
         PgLog.Log($"sequence {info.Name} granted block [{lo}, {hi}] to node {granteeName}");
         return (grant, lo, hi);
+    }
+
+    /// <summary>
+    /// Grants exactly [lo, hi] from a free span of this node's root or pool blocks that holds all of it, as for rows that
+    /// already carry those keys. A request granted or refused before gets the same answer again.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    /// <param name="info">The sequence's details.</param>
+    /// <param name="epoch">The sequence's epoch.</param>
+    /// <param name="lo">The span's start.</param>
+    /// <param name="hi">The span's end.</param>
+    /// <param name="granteeId">The node it goes to.</param>
+    /// <param name="granteeName">That node's name.</param>
+    /// <param name="requestId">The request.</param>
+    /// <param name="kind">'i' for the node that loads the rows, 'f' for a node that grants it on.</param>
+    /// <param name="refuse">Whether to record a refusal when no free span holds it, as the owner does, since then some of
+    /// the values might be in use.</param>
+    /// <returns>The grant, or null when there is none; then <paramref name="refuse"/> says whether it was refused.</returns>
+    internal static Guid? AllocateExact(uint seqoid, SequenceInfo info, int epoch, long lo, long hi, uint granteeId, string granteeName,
+        Guid requestId, char kind, bool refuse)
+    {
+        SpiResult answered = Worf.SelectCatalog("SELECT grant_id, kind::text FROM worf.sequence_range_grant WHERE request_id = $1",
+            SpiParameter.Create(requestId));
+        if (answered.Count > 0)
+        {
+            // A refusal whose answer was lost goes out again.
+            if (answered[0].Get<string>(1) == "x")
+            {
+                _ = Spi.Execute("UPDATE worf.sequence_range_grant SET state = 'sent' WHERE request_id = $1", SpiParameter.Create(requestId));
+                return null;
+            }
+
+            return answered[0].Get<Guid>(0);
+        }
+
+        SpiResult free = Spi.Query(Spi.Sql($"""
+            SELECT f.block_id, f.lo, f.hi
+            FROM worf.sequence_range_free f JOIN worf.sequence_range_block b ON b.block_id = f.block_id
+            WHERE b.seqoid = {seqoid}::oid AND b.epoch = {epoch} AND b.kind IN ('r', 'p') AND b.state = 'open'
+                AND f.lo <= {lo} AND {hi} <= f.hi
+            LIMIT 1
+            FOR UPDATE OF f
+            """), false, 1);
+        Guid grant = Guid.NewGuid();
+        if (free.Count == 0)
+        {
+            if (refuse)
+            {
+                _ = Spi.Execute("""
+                    INSERT INTO worf.sequence_range_grant VALUES ($1, $2, $3, NULL, $4, $5, 'x', $6, $7, 'sent', now())
+                    """, SpiParameter.Create(grant), SpiParameter.Create(requestId), SpiParameter.Create(seqoid), SpiParameter.Create(granteeId),
+                    SpiParameter.Create(granteeName), SpiParameter.Create(lo), SpiParameter.Create(hi));
+                PgLog.Log($"sequence {info.Name} refused [{lo}, {hi}] to node {granteeName}: some of those values may be in use");
+            }
+
+            return null;
+        }
+
+        Guid from = free[0].Get<Guid>(0);
+        TakeFromFree(from, lo, hi);
+        _ = Spi.Execute("""
+            INSERT INTO worf.sequence_range_grant VALUES ($1, $2, $3, $4, $5, $6, $7::"char", $8, $9, 'sent', now())
+            """, SpiParameter.Create(grant), SpiParameter.Create(requestId), SpiParameter.Create(seqoid), SpiParameter.Create(from),
+            SpiParameter.Create(granteeId), SpiParameter.Create(granteeName), SpiParameter.Create(kind.ToString()), SpiParameter.Create(lo),
+            SpiParameter.Create(hi));
+        _ = Spi.Execute($"UPDATE worf.sequence_range SET watermark = {(info.Ascending ? "greatest" : "least")}(coalesce(watermark, $2), $2) WHERE seqoid = $1",
+            SpiParameter.Create(seqoid), SpiParameter.Create(info.Ascending ? hi : lo));
+        _ = Spi.Execute("SET LOCAL synchronous_commit = on");
+        PgLog.Log($"sequence {info.Name} granted [{lo}, {hi}] exactly to node {granteeName}");
+        return grant;
     }
 
     /// <summary>
@@ -1404,7 +1569,7 @@ internal static unsafe partial class SequenceRanges
         return block;
     }
 
-    private static (Guid Id, long Lo, long Hi)? NodeBlock(uint seqoid, int epoch, string state)
+    internal static (Guid Id, long Lo, long Hi)? NodeBlock(uint seqoid, int epoch, string state)
     {
         SpiResult result = Worf.SelectCatalog("""
             SELECT block_id, lo, hi FROM worf.sequence_range_block
@@ -1417,13 +1582,13 @@ internal static unsafe partial class SequenceRanges
     /// <summary>
     /// Counts the values, in steps of the increment, a block holds.
     /// </summary>
-    private static long Steps(SequenceInfo info, long lo, long hi)
+    internal static long Steps(SequenceInfo info, long lo, long hi)
         => (long)Math.Min(((decimal)hi - lo) / Math.Abs(info.Increment) + 1, long.MaxValue);
 
     /// <summary>
     /// Counts the values the sequence has left in its active block.
     /// </summary>
-    private static long StepsLeft(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) block)
+    internal static long StepsLeft(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) block)
     {
         long? last = Worf.SelectCatalog("SELECT pg_catalog.pg_sequence_last_value($1::regclass)", SpiParameter.Create(seqoid))[0].Get<long?>(0);
         if (last is not long position)
@@ -1452,7 +1617,9 @@ internal static unsafe partial class SequenceRanges
 
         SpiParameter seq = SpiParameter.Create(info.Seqoid);
         string pick = info.Ascending ? "max" : "min";
-        Take(Spi.ExecuteScalar<long?>("SELECT pg_catalog.pg_sequence_last_value($1::regclass)", seq));
+        // The value a quarantine reserves is never issued.
+        long? last = Spi.ExecuteScalar<long?>("SELECT pg_catalog.pg_sequence_last_value($1::regclass)", seq);
+        Take(last == info.QuarantineEdge ? null : last);
         Take(Spi.ExecuteScalar<long?>("SELECT last_value FROM worf.sequence_state WHERE seqoid = $1", seq));
         Take(Spi.ExecuteScalar<long?>("SELECT watermark FROM worf.sequence_range WHERE seqoid = $1", seq));
         Take(Spi.ExecuteScalar<long?>("SELECT " + pick + "(" + (info.Ascending ? "hi" : "lo") +
@@ -1476,27 +1643,42 @@ internal static unsafe partial class SequenceRanges
     /// </summary>
     private static void InstallGuards(uint seqoid)
     {
-        HashSet<uint> tables = [.. UsingColumns(seqoid).Select(column => column.Relid)];
-        foreach (uint relid in tables)
+        foreach (uint relid in UsingColumns(seqoid).Select(column => column.Relid).Distinct())
         {
-            List<string> arguments = [];
-            List<string> columns = [];
-            SpiResult managed = Worf.SelectCatalog("SELECT seqoid::oid FROM worf.sequence_range");
-            for (int i = 0; i < managed.Count; i++)
+            InstallGuard(relid);
+        }
+    }
+
+    /// <summary>
+    /// Puts the guard on a table, checking each of its columns that uses a managed sequence, if it has any.
+    /// </summary>
+    private static void InstallGuard(uint relid)
+    {
+        if (relid == 0)
+        {
+            return;
+        }
+
+        List<string> arguments = [];
+        List<string> columns = [];
+        SpiResult managed = Worf.SelectCatalog("SELECT seqoid::oid FROM worf.sequence_range");
+        for (int i = 0; i < managed.Count; i++)
+        {
+            uint managedSeq = managed[i].Get<uint>(0);
+            foreach ((uint table, string column, uint typeOid) in UsingColumns(managedSeq))
             {
-                uint managedSeq = managed[i].Get<uint>(0);
-                foreach ((uint table, string column, uint typeOid) in UsingColumns(managedSeq))
+                if (table == relid)
                 {
-                    if (table == relid)
-                    {
-                        columns.Add(Spi.QuoteIdentifier(column));
-                        arguments.Add(Spi.QuoteLiteral(column));
-                        arguments.Add(Spi.QuoteLiteral(managedSeq.ToString(CultureInfo.InvariantCulture)));
-                        arguments.Add(Spi.QuoteLiteral(typeOid.ToString(CultureInfo.InvariantCulture)));
-                    }
+                    columns.Add(Spi.QuoteIdentifier(column));
+                    arguments.Add(Spi.QuoteLiteral(column));
+                    arguments.Add(Spi.QuoteLiteral(managedSeq.ToString(CultureInfo.InvariantCulture)));
+                    arguments.Add(Spi.QuoteLiteral(typeOid.ToString(CultureInfo.InvariantCulture)));
                 }
             }
+        }
 
+        if (columns.Count > 0)
+        {
             RunInternalDdl($"""
                 CREATE OR REPLACE TRIGGER {GuardName} BEFORE INSERT OR UPDATE OF {string.Join(", ", columns)} ON {QualifiedName(relid)}
                 FOR EACH ROW EXECUTE FUNCTION worf.sequence_range_guard({string.Join(", ", arguments)})

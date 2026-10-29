@@ -61,9 +61,13 @@ internal static class SequenceRangeWorker
                 }
             });
 
-            // Requests are committed before the exchanges send them.
+            // Requests are committed before the exchanges send them, including those that sessions handed over.
             if (managed)
             {
+                List<Guid> recorded = PgBackgroundWorker.RunTransaction(() =>
+                    WorfNode.GetLocalNode(false, true) is WorfLocalNode node ? SequenceRangeReservations.Record(node) : []);
+                SequenceRangeReservations.Forget(recorded);
+                changed |= recorded.Count > 0;
                 PgBackgroundWorker.RunTransaction(() =>
                 {
                     if (WorfNode.GetLocalNode(false, true) is WorfLocalNode node)

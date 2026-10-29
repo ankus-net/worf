@@ -603,6 +603,39 @@ It is required to mark any such triggers as either `ENABLE REPLICA` or
 `ENABLE ALWAYS` otherwise they will not be executed by the replication
 process.
 
+### Sequence ranges
+
+Sequence ranges give each node blocks of a sequence's values that no other node
+uses, so rows inserted on different nodes never share a key, with no change to
+the tables. On the node that will own the values, name the other nodes that
+issue values from the sequence:
+
+```sql
+SELECT worf.enable_sequence_range('inventory_id_seq', participants := '{node_beta}');
+```
+
+The other nodes learn of the sequence over their subscriptions. `nextval`
+fails with SQLSTATE `2200H` until a node has its first block, and a trigger
+rejects values written by hand outside this node's blocks with SQLSTATE
+`23514`. `worf.sequence_ranges` shows each sequence's state and blocks.
+
+- `worf.enable_sequence_range(sequence regclass, participants text[], range_size bigint, max_range_size bigint, pool_start bigint, force boolean)`
+  Puts a sequence under range management, owned by this node.
+- `worf.activate_sequence_range(sequence regclass)`
+  Starts granting with the nodes that have reported so far, or lifts a fence.
+- `worf.alter_sequence_range(sequence regclass, range_size bigint, max_range_size bigint)`
+  Changes the block sizes.
+- `worf.disable_sequence_range(sequence regclass)`
+  Stops granting. Each node keeps using its blocks. Enabling it on another
+  node then moves the owner.
+- `worf.reset_sequence_range(sequence regclass)`
+  Abandons this node's blocks and requests new ones, as after a restore.
+- `worf.reserve_sequence_range(sequence regclass, count bigint, timeout interval)`
+  Returns once the active block has at least `count` values left, before a
+  load that numbers its rows with the sequence.
+- `worf.reserve_sequence_values(sequence regclass, lo bigint, hi bigint, timeout interval)`
+  Gives this node exactly `[lo, hi]`, for rows that already carry those keys.
+
 ## Synchronous Replication
 
 Synchronous replication is supported using same standard mechanism provided
@@ -739,6 +772,18 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   partway, can't take it. The user in each provider connection string needs
   `EXECUTE` on `worf.fence_writes` and `worf.keep_fence`, which `PUBLIC`
   doesn't have. The default is `on`.
+
+- `worf.sequence_range_check_interval`
+  How often the range worker checks each managed sequence, switching it to
+  its next block when the active one runs low. The default is `1s`.
+
+- `worf.sequence_range_exchange_interval`
+  How often each node exchanges sequence range reports with its neighbors
+  when no request, grant or reset is waiting. The default is `1min`.
+
+- `worf.sequence_range_timeout`
+  The connection and statement timeout of a sequence range exchange. The
+  default is `10s`.
 
 - `worf.ddl_lock_timeout`
   How long DDL waits for the other nodes to hold back their writes and catch
@@ -946,8 +991,12 @@ It's generally recommended to use `bigserial` and `bigint` types for sequences
 on multi-node systems as smaller sequences might reach end of the sequence
 space fast.
 
+Nodes that insert into the same table can give each node its own blocks of a
+sequence's values with `worf.enable_sequence_range`, described under
+[Sequence ranges](#sequence-ranges).
+
 Users who want to have independent sequences on provider and subscriber can
-avoid adding sequences to replication sets and create sequences with step
+also avoid adding sequences to replication sets and create sequences with step
 interval equal to or greater than the number of nodes. And then setting a
 different offset on each node. Use the `INCREMENT BY` option for
 `CREATE SEQUENCE` or `ALTER SEQUENCE`, and use `setval(...)` to set the start

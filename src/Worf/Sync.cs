@@ -89,6 +89,9 @@ internal static class Sync
 
             PgLog.Info($"initializing subscriber {sub.Name}");
 
+            // The provider's managed sequences are joined before any rows arrive.
+            List<WorfManagedSequence> managedSequences = PgBackgroundWorker.RunTransaction(() => SequenceRangeSync.FetchManaged(sub.OriginIf.Dsn, sub.Name));
+
             using PgReplicationConnection originConnRepl = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, "snap");
 
             string snapshot = EnsureReplicationSlotSnapshot(sub, originConnRepl, "snap", useFailoverSlot, out lsn);
@@ -116,7 +119,11 @@ internal static class Sync
                     {
                         PgLog.Info("synchronizing structure");
 
-                        PgBackgroundWorker.RunTransaction(() => SetSubscriptionSyncStatus(sub.Id, SyncStatusStructure));
+                        PgBackgroundWorker.RunTransaction(() =>
+                        {
+                            SetSubscriptionSyncStatus(sub.Id, SyncStatusStructure);
+                            SequenceRangeSync.RecordForRestore(managedSequences);
+                        });
 
                         // Dump structure to temp storage.
                         DumpStructure(sub, tmpfile, snapshot);
@@ -130,7 +137,11 @@ internal static class Sync
                     {
                         PgLog.Info("synchronizing data");
 
-                        PgBackgroundWorker.RunTransaction(() => SetSubscriptionSyncStatus(sub.Id, SyncStatusData));
+                        PgBackgroundWorker.RunTransaction(() =>
+                        {
+                            SetSubscriptionSyncStatus(sub.Id, SyncStatusData);
+                            SequenceRangeSync.JoinBeforeCopy(managedSequences, 0);
+                        });
 
                         List<WorfRemoteRel> tables = CopyReplicationSetsData(sub.Name, sub.OriginIf.Dsn, snapshot,
                             sub.ReplicationSets, sub.SlotName);
@@ -169,6 +180,7 @@ internal static class Sync
                         PgBackgroundWorker.RunTransaction(() => SetSubscriptionSyncStatus(sub.Id, SyncStatusConstraints));
 
                         RestoreStructure(sub, tmpfile, "post-data");
+                        PgBackgroundWorker.RunTransaction(SequenceRangeSync.ClearRestore);
                     }
                 }
                 finally
@@ -244,6 +256,7 @@ internal static class Sync
             return currentStatus;
         }
 
+        List<WorfManagedSequence> managedSequences = PgBackgroundWorker.RunTransaction(() => SequenceRangeSync.FetchManaged(sub.OriginIf.Dsn, sub.Name));
         using PgReplicationConnection originConnRepl = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, "copy");
 
         string snapshot = EnsureReplicationSlotSnapshot(sub, originConnRepl, "copy_slot", false, out ulong lsn);
@@ -255,6 +268,10 @@ internal static class Sync
         {
             PgBackgroundWorker.RunTransaction(() =>
             {
+                // The table's managed sequences are joined before any rows arrive.
+                SequenceRangeSync.JoinBeforeCopy(managedSequences, Spi.ExecuteScalar<uint?>("SELECT to_regclass($1)::oid",
+                    SpiParameter.Create(Spi.QuoteQualifiedIdentifier(nspname, relname))) ?? 0);
+
                 ushort originid = EnsureReplicationOrigin(sub.SlotName);
                 ulong xactLastCommitEnd;
                 unsafe
