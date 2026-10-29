@@ -9,6 +9,11 @@ namespace Worf.CreateSubscriber;
 internal static class Libpq
 {
     /// <summary>
+    /// The longest connection timeout Npgsql takes, in seconds.
+    /// </summary>
+    private const int NpgsqlTimeoutLimit = 1024;
+
+    /// <summary>
     /// Opens a connection.
     /// </summary>
     /// <param name="conninfo">A libpq connection string or URI.</param>
@@ -17,10 +22,25 @@ internal static class Libpq
     /// <exception cref="NpgsqlException">The connection failed.</exception>
     public static NpgsqlConnection Connect(string conninfo)
     {
-        NpgsqlDataSource dataSource = new NpgsqlSlimDataSourceBuilder(ToNpgsql(conninfo)).Build();
+        NpgsqlDataSource dataSource = new NpgsqlSlimDataSourceBuilder(ToNpgsql(conninfo, out int connectTimeout)).Build();
         try
         {
-            return dataSource.OpenConnection();
+            if (connectTimeout <= NpgsqlTimeoutLimit)
+            {
+                return dataSource.OpenConnection();
+            }
+
+            // libpq takes any timeout, but Npgsql none longer than its limit, so a longer one cancels a wait Npgsql
+            // leaves unbounded, with libpq's message.
+            using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(connectTimeout));
+            try
+            {
+                return dataSource.OpenConnectionAsync(timeout.Token).AsTask().GetAwaiter().GetResult();
+            }
+            catch (OperationCanceledException error) when (timeout.IsCancellationRequested)
+            {
+                throw new NpgsqlException("timeout expired", error);
+            }
         }
         catch
         {
@@ -66,9 +86,10 @@ internal static class Libpq
     /// defaults.
     /// </summary>
     /// <param name="conninfo">The libpq connection string.</param>
+    /// <param name="connectTimeout">The seconds to wait while connecting, or zero to wait indefinitely.</param>
     /// <returns>The Npgsql connection string.</returns>
     /// <exception cref="ArgumentException">The connection string is invalid.</exception>
-    public static string ToNpgsql(string conninfo)
+    public static string ToNpgsql(string conninfo, out int connectTimeout)
     {
         Dictionary<string, string> options = Fe.ConninfoParse(conninfo, out string? errmsg)
             ?? throw new ArgumentException(errmsg, nameof(conninfo));
@@ -106,11 +127,14 @@ internal static class Libpq
             builder.Passfile = passfile;
         }
 
+        connectTimeout = 0;
         if (Option("connect_timeout", "PGCONNECT_TIMEOUT") is { } timeout)
         {
-            // As in libpq, zero or less waits indefinitely and the shortest timeout is 2 seconds.
+            // As in libpq, zero or less waits indefinitely and the shortest timeout is 2 seconds. Connect times one
+            // longer than Npgsql takes itself.
             int seconds = int.Parse(timeout, CultureInfo.InvariantCulture);
-            builder.Timeout = seconds <= 0 ? 0 : Math.Max(seconds, 2);
+            connectTimeout = seconds <= 0 ? 0 : Math.Max(seconds, 2);
+            builder.Timeout = connectTimeout <= NpgsqlTimeoutLimit ? connectTimeout : 0;
         }
 
         if ((Option("application_name", "PGAPPNAME") ?? Option("fallback_application_name")) is { } applicationName)
