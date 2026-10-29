@@ -395,7 +395,10 @@ internal static class SequenceRangeExchange
             // A neighbor whose WAL position moved backwards on the same timeline was rolled back, by a restored backup
             // or snapshot, and may issue values it issued before. It must reset its blocks. Only the positions in its
             // calls, which it makes one at a time, are compared: an answer to this node's call may pass a call the
-            // neighbor sent before it.
+            // neighbor sent before it. The neighbor's row is locked first, so that the position compared is the one
+            // this report replaces, and none written in between is lost.
+            _ = Spi.Execute("SELECT 1 FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2 FOR UPDATE",
+                SpiParameter.Create(seqoid), SpiParameter.Create(senderId));
             string? rolledBack = !call ? null : Spi.ExecuteScalar<string?>("""
                 UPDATE worf.sequence_range_node SET reset_lsn = wal_lsn
                 WHERE seqoid = $1 AND node_id = $2 AND via_node = node_id AND sysid = $3::numeric AND timeline = $4 AND wal_lsn > $5::pg_lsn

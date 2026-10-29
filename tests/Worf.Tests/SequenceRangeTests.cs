@@ -300,15 +300,17 @@ public sealed class SequenceRangeTests
             "SELECT reset_lsn IS NULL FROM worf.sequence_range_node WHERE node_name = 'node_b'", token), "node_b's reset acknowledged");
 
         // node_a loses its grants to node_b with an old timeline, fences its root, and recovers them from node_b's report.
+        // The loss holds the ledger's lock, as a grant does, so that none lands between its statements.
+        int logpos = nodeA.ReadLog().Length;
         _ = await nodeA.SafePsqlAsync(Database, """
+            BEGIN;
+            SELECT 1 FROM worf.sequence_range FOR UPDATE;
             INSERT INTO worf.sequence_range_free SELECT from_block, lo, hi FROM worf.sequence_range_grant WHERE grantee_name = 'node_b';
             DELETE FROM worf.sequence_range_grant WHERE grantee_name = 'node_b';
             UPDATE worf.sequence_range_block SET timeline = 99;
+            COMMIT;
             """, token);
-        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, """
-            SELECT fenced_at IS NULL AND EXISTS (SELECT 1 FROM worf.sequence_range_grant WHERE grantee_name = 'node_b')
-            FROM worf.sequence_range
-            """, token), "node_a's fence lifted");
+        Assert.IsTrue(await nodeA.PollLogAsync(logpos, "the allocator's fence lifted", token), "node_a's fence lifted");
         Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges", token), "node_a drawing again");
 
         string[] grants = (await nodeA.SafePsqlAsync(Database, "SELECT lo, hi FROM worf.sequence_range_grant WHERE grantee_name = 'node_b'", token)).Split('\n');

@@ -212,6 +212,29 @@ internal sealed class TestNode : IAsyncDisposable
     }
 
     /// <summary>
+    /// Polls the node's server log until it has the text after a position.
+    /// </summary>
+    /// <param name="logpos">The position in the log to look from.</param>
+    /// <param name="text">The text.</param>
+    /// <param name="cancellationToken">Cancels polling.</param>
+    /// <returns>Whether the text appeared before the timeout.</returns>
+    public async Task<bool> PollLogAsync(int logpos, string text, CancellationToken cancellationToken)
+    {
+        Stopwatch elapsed = Stopwatch.StartNew();
+        while (elapsed.Elapsed < PollTimeout)
+        {
+            if (ReadLog()[logpos..].Contains(text, StringComparison.Ordinal))
+            {
+                return true;
+            }
+
+            await Task.Delay(TimeSpan.FromMilliseconds(100), cancellationToken);
+        }
+
+        return false;
+    }
+
+    /// <summary>
     /// Runs one of the installation's programs against this node and waits for it to exit.
     /// </summary>
     /// <param name="program">The program's name, such as <c>pgbench</c>.</param>
