@@ -691,18 +691,24 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
 
 - `worf.enable_ddl_replication`
   Replicates DDL as it runs, through the `ddl_sql` replication set as
-  `worf.replicate_ddl_command` does, with the search path it ran with.
-  Statements about databases, tablespaces, roles, server settings and
-  PostgreSQL's own publications and subscriptions stay on their node, as do
-  temporary objects. Other nodes run concurrent statements, such as
-  `CREATE INDEX CONCURRENTLY`, in their apply transaction. The default is
-  `off`.
+  `worf.replicate_ddl_command` does, with the settings that change what it
+  means: `search_path`, `DateStyle`, `IntervalStyle`, `TimeZone`,
+  `standard_conforming_strings`, `default_tablespace`,
+  `default_table_access_method` and `default_toast_compression`. Statements
+  about databases, tablespaces, roles, server settings and PostgreSQL's own
+  publications and subscriptions stay on their node, as do statements that use
+  the session's temporary objects or prepared statements, and what they create.
+  A `DROP` of temporary and other objects drops the others everywhere. worf
+  itself can only be dropped in a statement of its own. Other nodes run
+  concurrent statements, such as `CREATE INDEX CONCURRENTLY`, in their apply
+  transaction. The default is `off`.
 
 - `worf.include_ddl_repset`
   Adds the tables DDL creates to the `default` replication set, or to
-  `default_insert_only` when they have no primary key, and moves a table to
-  `default` once it gets one. A dropped table leaves its replication sets
-  with it. The default is `off`.
+  `default_insert_only` when they have no replica identity, and moves a table
+  and its partitions between the two as they gain or lose one. A table that
+  becomes unlogged leaves its replication sets, since its changes can't
+  replicate, and a dropped table leaves them too. The default is `off`.
 
 - `worf.allow_ddl_from_functions`
   Replicates DDL that functions and procedures run too. The default is
@@ -839,6 +845,10 @@ compatible is the responsibility of the user.
 
 worf provides the `worf.replicate_ddl_command` function to allow DDL
 to be run on the provider and subscriber at a consistent point.
+
+A replicated `ALTER TABLE ... ADD COLUMN` with a volatile default, such as
+`now()` or `gen_random_uuid()`, fills existing rows with each node's own
+values.
 
 ### No replication queue flush
 

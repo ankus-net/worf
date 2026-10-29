@@ -65,6 +65,10 @@ compatible is the responsibility of the user.
 worf provides the `worf.replicate_ddl_command` function to allow DDL
 to be run on the provider and subscriber at a consistent point.
 
+A replicated `ALTER TABLE ... ADD COLUMN` with a volatile default, such as
+`now()` or `gen_random_uuid()`, fills existing rows with each node's own
+values.
+
 ## No replication queue flush
 
 There's no support for freezing transactions on the master and waiting until

@@ -42,21 +42,42 @@ internal static unsafe partial class DdlReplication
     /// </summary>
     internal static bool Suppressed { get; set; }
 
+    // Settings that change what a statement means, which travel with it.
+    private static readonly string[] s_travelingSettings =
+    [
+        "search_path", "DateStyle", "IntervalStyle", "TimeZone", "standard_conforming_strings", "default_tablespace",
+        "default_table_access_method", "default_toast_compression",
+    ];
+
+    // XACT_FLAGS_ACCESSEDTEMPNAMESPACE from access/xact.h.
+    private const uint AccessedTempNamespace = 1;
+
+    // How deep the session is in DDL being replicated: DDL that runs inside it, as from a function it calls, runs
+    // again when it applies on the other nodes.
+    private static int s_depth;
+
     /// <summary>
-    /// Checks, before a utility statement runs, whether it's DDL to queue for replication once it succeeds.
+    /// Decides, before a utility statement runs, whether it's DDL to queue for replication once it succeeds, and the
+    /// command to queue: the statement itself, or for a DROP of local and other objects, a DROP of the others.
     /// </summary>
     /// <param name="pstmt">The statement.</param>
+    /// <param name="queryString">The text it came from.</param>
     /// <param name="context">Where it runs from.</param>
-    /// <returns>Whether to queue it.</returns>
-    internal static bool ShouldQueue(PlannedStmt* pstmt, ProcessUtilityContext context)
+    /// <param name="local">Whether it uses the session's own objects, so that what it creates stays on this node.</param>
+    /// <returns>The command to queue, or null.</returns>
+    internal static string? CommandToQueue(PlannedStmt* pstmt, sbyte* queryString, ProcessUtilityContext context, out bool local)
     {
         Node* parsetree = pstmt->utilityStmt;
-        if (!EnableDdlReplication || Suppressed || NativeGlobals.creating_extension ||
+        local = parsetree->type == NodeTag.T_CreateTableAsStmt && ExecutesPrepared((CreateTableAsStmt*)parsetree);
+
+        // Statements PostgreSQL runs as parts of another, and DDL inside DDL being replicated, replicate with it.
+        if (!EnableDdlReplication || Suppressed || NativeGlobals.creating_extension || s_depth > 0 ||
             NativeGlobals.SessionReplicationRole == SessionReplicationRoleReplica ||
+            context == ProcessUtilityContext.PROCESS_UTILITY_SUBCOMMAND ||
             (context != ProcessUtilityContext.PROCESS_UTILITY_TOPLEVEL && !AllowDdlFromFunctions) ||
-            NativeMethods.GetCommandLogLevel(parsetree) != LogStmtLevel.LOGSTMT_DDL)
+            NativeMethods.GetCommandLogLevel(parsetree) != LogStmtLevel.LOGSTMT_DDL || Restoring())
         {
-            return false;
+            return null;
         }
 
         // Reorganizing a table's storage is the node's own.
@@ -66,7 +87,7 @@ internal static unsafe partial class DdlReplication
         if (parsetree->type == NodeTag.T_ClusterStmt)
 #endif
         {
-            return false;
+            return null;
         }
 
         bool replicated = parsetree->type switch
@@ -81,47 +102,86 @@ internal static unsafe partial class DdlReplication
                 NodeTag.T_CreateSubscriptionStmt or NodeTag.T_AlterSubscriptionStmt or NodeTag.T_DropSubscriptionStmt or
                 NodeTag.T_CreatePublicationStmt or NodeTag.T_AlterPublicationStmt => false,
 
-            // Temporary objects are the session's, and worf's own the node's.
-            NodeTag.T_CreateStmt => !StaysLocal(((CreateStmt*)parsetree)->relation),
-            NodeTag.T_CreateTableAsStmt => !StaysLocal(((CreateTableAsStmt*)parsetree)->into->rel),
-            NodeTag.T_ViewStmt => !StaysLocal(((ViewStmt*)parsetree)->view),
-            NodeTag.T_CreateSeqStmt => !StaysLocal(((CreateSeqStmt*)parsetree)->sequence),
-            NodeTag.T_AlterSeqStmt => !StaysLocal(((AlterSeqStmt*)parsetree)->sequence),
-            NodeTag.T_IndexStmt => !StaysLocal(((IndexStmt*)parsetree)->relation),
-            NodeTag.T_AlterTableStmt => !StaysLocal(((AlterTableStmt*)parsetree)->relation),
-            NodeTag.T_DropStmt => !DropsLocal((DropStmt*)parsetree),
+            // A prepared statement is the session's.
+            NodeTag.T_CreateTableAsStmt when local => false,
 
             // Each node creates, updates and drops worf itself.
             NodeTag.T_CreateExtensionStmt => !IsWorf(((CreateExtensionStmt*)parsetree)->extname),
             NodeTag.T_AlterExtensionStmt => !IsWorf(((AlterExtensionStmt*)parsetree)->extname),
             NodeTag.T_AlterExtensionContentsStmt => !IsWorf(((AlterExtensionContentsStmt*)parsetree)->extname),
-            _ => true,
+            NodeTag.T_DropStmt => true,
+
+            // Temporary objects are the session's, and worf's own the node's. Finishing a concurrent detach is the
+            // node's own too, since the others detached the partition at once.
+            NodeTag.T_AlterTableStmt when FinishesDetach((AlterTableStmt*)parsetree) => false,
+            _ => !TargetsLocal(parsetree),
         };
 
-        return replicated && WithSnapshot(() => WorfNode.GetLocalNode(false, true) is not null);
-    }
+        if (!replicated || !WithSnapshot(() => WorfNode.GetLocalNode(false, true) is not null))
+        {
+            return null;
+        }
 
-    /// <summary>
-    /// Queues a DDL statement that ran, with the search path it ran with.
-    /// </summary>
-    /// <param name="pstmt">The statement.</param>
-    /// <param name="queryString">The text it came from.</param>
-    internal static void QueueDdl(PlannedStmt* pstmt, sbyte* queryString)
-    {
         int length = Worf.StrLen(queryString);
         int start = Math.Clamp(pstmt->stmt_location, 0, length);
         int count = pstmt->stmt_len > 0 ? Math.Min(pstmt->stmt_len, length - start) : length - start;
         string command = Worf.FromServer(new ReadOnlySpan<byte>((byte*)queryString + start, count)).Trim();
+        return parsetree->type == NodeTag.T_DropStmt ? DropCommand((DropStmt*)parsetree, command) : command;
+    }
 
-        sbyte* searchPath;
-        fixed (byte* name = Worf.ToServerCString("search_path"))
+    /// <summary>
+    /// Starts running a utility statement, noting from here on whether it uses temporary objects.
+    /// </summary>
+    /// <param name="replicated">Whether it's DDL being replicated.</param>
+    /// <returns>The transaction's flags before it, for <see cref="EndStatement"/>.</returns>
+    internal static uint BeginStatement(bool replicated)
+    {
+        uint flags = (uint)NativeGlobals.MyXactFlags;
+        NativeGlobals.MyXactFlags = (int)(flags & ~AccessedTempNamespace);
+        if (replicated)
         {
-            searchPath = NativeMethods.GetConfigOption((sbyte*)name, false, false);
+            s_depth++;
         }
 
+        return flags;
+    }
+
+    /// <summary>
+    /// Ends running a utility statement, which has run or failed.
+    /// </summary>
+    /// <param name="flags">The transaction's flags before it.</param>
+    /// <param name="replicated">Whether it's DDL being replicated.</param>
+    /// <returns>Whether it used temporary objects.</returns>
+    internal static bool EndStatement(uint flags, bool replicated)
+    {
+        if (replicated)
+        {
+            s_depth--;
+        }
+
+        bool usedTemp = ((uint)NativeGlobals.MyXactFlags & AccessedTempNamespace) != 0;
+        NativeGlobals.MyXactFlags |= (int)(flags & AccessedTempNamespace);
+        return usedTemp;
+    }
+
+    /// <summary>
+    /// Queues a DDL statement that ran, with the settings that change what it means.
+    /// </summary>
+    /// <param name="command">The statement.</param>
+    internal static void QueueDdl(string command)
+    {
         StringBuilder json = new("{\"search_path\": ");
-        Executor.EscapeJson(json, searchPath is null ? "" : Worf.FromServer(searchPath));
-        json.Append(", \"command\": ");
+        Executor.EscapeJson(json, Setting("search_path"));
+        json.Append(", \"settings\": {");
+        for (int i = 1; i < s_travelingSettings.Length; i++)
+        {
+            json.Append(i > 1 ? ", " : "");
+            Executor.EscapeJson(json, s_travelingSettings[i]);
+            json.Append(": ");
+            Executor.EscapeJson(json, Setting(s_travelingSettings[i]));
+        }
+
+        json.Append("}, \"command\": ");
         Executor.EscapeJson(json, command);
         json.Append('}');
 
@@ -133,11 +193,29 @@ internal static unsafe partial class DdlReplication
     }
 
     /// <summary>
-    /// Adds a table that DDL created to the default replication set, or to the insert-only one when it has no
-    /// replica identity, and moves a table from the insert-only set to the default one once it has.
+    /// Checks whether this session restores a subscription's structure, which DDL replication leaves alone, since the
+    /// nodes it would reach already have it.
+    /// </summary>
+    /// <returns>Whether it does.</returns>
+    internal static bool Restoring() => Setting("worf.subscription_schema_restore") is "true" or "on" or "1";
+
+    private static string Setting(string name)
+    {
+        fixed (byte* cname = Worf.ToServerCString(name))
+        {
+            sbyte* value = NativeMethods.GetConfigOption((sbyte*)cname, true, false);
+            return value is null ? "" : Worf.FromServer(value);
+        }
+    }
+
+    /// <summary>
+    /// Keeps the tables DDL creates or changes in the replication sets that suit them. Under
+    /// <c>worf.include_ddl_repset</c>, a new table joins the default set, or the insert-only one while it has no
+    /// replica identity, and a table and its partitions move between the two as they gain or lose one. A table that
+    /// becomes unlogged, whose changes can't replicate, leaves its sets, or with the setting off, warns.
     /// </summary>
     /// <param name="parsetree">The statement that ran.</param>
-    internal static void AddCreatedTable(Node* parsetree)
+    internal static void AfterDdl(Node* parsetree)
     {
         RangeVar* relation = parsetree->type switch
         {
@@ -147,48 +225,105 @@ internal static unsafe partial class DdlReplication
             NodeTag.T_AlterTableStmt => ((AlterTableStmt*)parsetree)->relation,
             _ => null,
         };
+
         // Extensions' tables, such as worf's own, aren't replicated.
-        if (!IncludeDdlRepset || relation is null || NativeGlobals.creating_extension)
+        if (relation is null || NativeGlobals.creating_extension)
         {
             return;
         }
 
         uint reloid = NativeMethods.RangeVarGetRelidExtended(relation, 0, RangeVarMissingOk, default, null);
-        if (reloid != 0 && NativeMethods.get_rel_relkind(reloid) == (sbyte)'r' &&
-            NativeMethods.get_rel_persistence(reloid) == (sbyte)'p' && NativeMethods.get_rel_namespace(reloid) != WorfNamespace())
+        if (reloid == 0 || NativeMethods.get_rel_namespace(reloid) == WorfNamespace())
         {
-            _ = WithSnapshot(() => AddTable(parsetree, reloid));
+            return;
         }
+
+        bool join = parsetree->type != NodeTag.T_AlterTableStmt || HasCommand((AlterTableStmt*)parsetree, AlterTableType.AT_SetLogged);
+        _ = WithSnapshot(() => Reconcile(reloid, join));
     }
 
-    private static bool AddTable(Node* parsetree, uint reloid)
+    private static bool Reconcile(uint reloid, bool join)
     {
         if (WorfNode.GetLocalNode(false, true) is not WorfLocalNode node)
         {
             return false;
         }
 
-        RelationData* rel = NativeMethods.table_open(reloid, (int)PgLockMode.AccessShare);
-        bool hasReplicaIndex = NativeMethods.RelationGetReplicaIndex(rel) != 0;
-        NativeMethods.table_close(rel, (int)PgLockMode.None);
-
-        List<string> sets = [.. ReplicationSet.GetTableReplicationSets(node.Node.Id, reloid).Select(set => set.Name)];
         WorfRepSet? defaultSet = ReplicationSet.GetReplicationSetByName(node.Node.Id, DefaultSet, true);
         WorfRepSet? insertOnlySet = ReplicationSet.GetReplicationSetByName(node.Node.Id, DefaultInsertOnlySet, true);
-        if (parsetree->type != NodeTag.T_AlterTableStmt && sets.Count == 0)
+        List* relids = NativeMethods.find_all_inheritors(reloid, 0, null);
+        for (int i = 0; relids is not null && i < relids->length; i++)
         {
-            if ((hasReplicaIndex ? defaultSet : insertOnlySet) is WorfRepSet set)
+            uint relid = relids->elements[i].oid_value;
+            if (NativeMethods.get_rel_relkind(relid) != (sbyte)'r')
             {
-                ReplicationSet.ReplicationSetAddTable(set.Id, reloid, [], null);
+                continue;
             }
-        }
-        else if (hasReplicaIndex && sets is [DefaultInsertOnlySet] && defaultSet is not null && insertOnlySet is not null)
-        {
-            ReplicationSet.ReplicationSetRemoveTable(insertOnlySet.Id, reloid, false);
-            ReplicationSet.ReplicationSetAddTable(defaultSet.Id, reloid, [], null);
+
+            string name = Worf.FromServer(NativeMethods.get_rel_name(relid));
+            List<WorfRepSet> sets = ReplicationSet.GetTableReplicationSets(node.Node.Id, relid);
+            sbyte persistence = NativeMethods.get_rel_persistence(relid);
+            if (persistence == (sbyte)'u')
+            {
+                if (sets.Count > 0 && IncludeDdlRepset)
+                {
+                    sets.ForEach(set => ReplicationSet.ReplicationSetRemoveTable(set.Id, relid, false));
+                    PgLog.Notice($"table {name} is unlogged now, so it left its replication sets");
+                }
+                else if (sets.Count > 0)
+                {
+                    PgLog.Warning($"table {name} is unlogged now, so its changes no longer replicate");
+                }
+
+                continue;
+            }
+
+            if (!IncludeDdlRepset || persistence != (sbyte)'p' || defaultSet is null || insertOnlySet is null)
+            {
+                continue;
+            }
+
+            RelationData* rel = NativeMethods.table_open(relid, (int)PgLockMode.AccessShare);
+            bool hasReplicaIndex = NativeMethods.RelationGetReplicaIndex(rel) != 0;
+            NativeMethods.table_close(rel, (int)PgLockMode.None);
+
+            bool inDefault = sets.Exists(set => set.Id == defaultSet.Id);
+            bool inInsertOnly = sets.Exists(set => set.Id == insertOnlySet.Id);
+            if (sets.Count == 0 && join && relid == reloid)
+            {
+                ReplicationSet.ReplicationSetAddTable(hasReplicaIndex ? defaultSet.Id : insertOnlySet.Id, relid, [], null);
+            }
+            else if (hasReplicaIndex && inInsertOnly && sets.Count == 1)
+            {
+                ReplicationSet.ReplicationSetRemoveTable(insertOnlySet.Id, relid, false);
+                ReplicationSet.ReplicationSetAddTable(defaultSet.Id, relid, [], null);
+            }
+            else if (!hasReplicaIndex && inDefault)
+            {
+                // Updates and deletes of a table with no replica identity can't apply elsewhere.
+                ReplicationSet.ReplicationSetRemoveTable(defaultSet.Id, relid, false);
+                if (!inInsertOnly)
+                {
+                    ReplicationSet.ReplicationSetAddTable(insertOnlySet.Id, relid, [], null);
+                }
+            }
         }
 
         return true;
+    }
+
+    private static bool HasCommand(AlterTableStmt* stmt, AlterTableType subtype)
+    {
+        List* cmds = stmt->cmds;
+        for (int i = 0; cmds is not null && i < cmds->length; i++)
+        {
+            if (((AlterTableCmd*)cmds->elements[i].ptr_value)->subtype == subtype)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -244,39 +379,161 @@ internal static unsafe partial class DdlReplication
     }
 
     /// <summary>
-    /// Checks whether a DROP drops temporary relations, worf's own, worf itself, or PostgreSQL's own publications.
+    /// Checks whether a statement's target is a temporary relation or one of worf's own, or worf's schema. Statements
+    /// that use temporary objects otherwise are found as they run.
     /// </summary>
-    private static bool DropsLocal(DropStmt* stmt)
+    private static bool TargetsLocal(Node* parsetree)
     {
-        if (stmt->removeType == ObjectType.OBJECT_PUBLICATION)
+        switch (parsetree->type)
         {
-            return true;
-        }
+            case NodeTag.T_CreateStmt:
+                return StaysLocal(((CreateStmt*)parsetree)->relation);
+            case NodeTag.T_CreateTableAsStmt:
+                return StaysLocal(((CreateTableAsStmt*)parsetree)->into->rel);
+            case NodeTag.T_ViewStmt:
+                return StaysLocal(((ViewStmt*)parsetree)->view);
+            case NodeTag.T_CreateSeqStmt:
+                return StaysLocal(((CreateSeqStmt*)parsetree)->sequence);
+            case NodeTag.T_AlterSeqStmt:
+                return StaysLocal(((AlterSeqStmt*)parsetree)->sequence);
+            case NodeTag.T_IndexStmt:
+                return StaysLocal(((IndexStmt*)parsetree)->relation);
+            case NodeTag.T_AlterTableStmt:
+                return StaysLocal(((AlterTableStmt*)parsetree)->relation);
+            case NodeTag.T_CreateTrigStmt:
+                return StaysLocal(((CreateTrigStmt*)parsetree)->relation);
+            case NodeTag.T_CreatePolicyStmt:
+                return StaysLocal(((CreatePolicyStmt*)parsetree)->table);
+            case NodeTag.T_AlterPolicyStmt:
+                return StaysLocal(((AlterPolicyStmt*)parsetree)->table);
+            case NodeTag.T_RuleStmt:
+                return StaysLocal(((RuleStmt*)parsetree)->relation);
+            case NodeTag.T_RenameStmt:
+                return StaysLocal(((RenameStmt*)parsetree)->relation);
+            case NodeTag.T_AlterObjectSchemaStmt:
+                return StaysLocal(((AlterObjectSchemaStmt*)parsetree)->relation);
+            case NodeTag.T_AlterOwnerStmt:
+                return StaysLocal(((AlterOwnerStmt*)parsetree)->relation);
+            case NodeTag.T_GrantStmt:
+                GrantStmt* grant = (GrantStmt*)parsetree;
+                List* objects = grant->objects;
+                for (int i = 0; objects is not null && i < objects->length; i++)
+                {
+                    void* target = objects->elements[i].ptr_value;
+                    bool local = grant->targtype == GrantTargetType.ACL_TARGET_ALL_IN_SCHEMA
+                        ? NameIs((Node*)target, Worf.ExtensionName)
+                        : grant->objtype is ObjectType.OBJECT_TABLE or ObjectType.OBJECT_SEQUENCE && StaysLocal((RangeVar*)target);
+                    if (local)
+                    {
+                        return true;
+                    }
+                }
 
-        // An extension's or schema's name is a list of one name each, which NameListToString joins with dots.
-        List* objects = stmt->objects;
-        if (stmt->removeType is ObjectType.OBJECT_EXTENSION or ObjectType.OBJECT_SCHEMA)
-        {
-            return objects is not null &&
-                Worf.FromServer(NativeMethods.NameListToString(objects)).Split('.').Contains(Worf.ExtensionName);
+                return false;
+            default:
+                return false;
         }
-
-        if (stmt->removeType is not (ObjectType.OBJECT_TABLE or ObjectType.OBJECT_VIEW or ObjectType.OBJECT_SEQUENCE or
-            ObjectType.OBJECT_INDEX or ObjectType.OBJECT_MATVIEW or ObjectType.OBJECT_FOREIGN_TABLE))
-        {
-            return false;
-        }
-
-        for (int i = 0; objects is not null && i < objects->length; i++)
-        {
-            if (StaysLocal(NativeMethods.makeRangeVarFromNameList((List*)objects->elements[i].ptr_value)))
-            {
-                return true;
-            }
-        }
-
-        return false;
     }
+
+    /// <summary>
+    /// Returns the DROP to queue: none when every object stays local, the statement itself when none does, and a DROP
+    /// of the others otherwise. worf, which each node drops itself, can't be dropped with other objects.
+    /// </summary>
+    private static string? DropCommand(DropStmt* stmt, string command)
+    {
+        List* objects = stmt->objects;
+        int count = objects is null ? 0 : objects->length;
+        switch (stmt->removeType)
+        {
+            case ObjectType.OBJECT_PUBLICATION:
+                return null;
+
+            case ObjectType.OBJECT_EXTENSION or ObjectType.OBJECT_SCHEMA:
+                int worf = 0;
+                for (int i = 0; i < count; i++)
+                {
+                    worf += NameIs((Node*)objects->elements[i].ptr_value, Worf.ExtensionName) ? 1 : 0;
+                }
+
+                return worf == 0 ? command
+                    : worf == count ? null
+                    : throw new PgException("55000", "worf can't be dropped together with other objects while worf.enable_ddl_replication is on",
+                        hint: "Drop it in a statement of its own.");
+
+            // A trigger's, policy's or rule's name follows its table's.
+            case ObjectType.OBJECT_TRIGGER or ObjectType.OBJECT_POLICY or ObjectType.OBJECT_RULE:
+                for (int i = 0; i < count; i++)
+                {
+                    List* names = (List*)objects->elements[i].ptr_value;
+                    if (names is not null && names->length > 1 &&
+                        StaysLocal(NativeMethods.makeRangeVarFromNameList(NativeMethods.list_truncate(NativeMethods.list_copy(names), names->length - 1))))
+                    {
+                        return null;
+                    }
+                }
+
+                return command;
+
+            case ObjectType.OBJECT_TABLE or ObjectType.OBJECT_VIEW or ObjectType.OBJECT_MATVIEW or ObjectType.OBJECT_SEQUENCE or
+                ObjectType.OBJECT_INDEX or ObjectType.OBJECT_FOREIGN_TABLE:
+                List<string> kept = [];
+                for (int i = 0; i < count; i++)
+                {
+                    List* names = (List*)objects->elements[i].ptr_value;
+                    if (!StaysLocal(NativeMethods.makeRangeVarFromNameList(names)))
+                    {
+                        kept.Add(Worf.FromServer(NativeMethods.NameListToQuotedString(names)));
+                    }
+                }
+
+                if (kept.Count == count)
+                {
+                    return command;
+                }
+
+                if (kept.Count == 0)
+                {
+                    return null;
+                }
+
+                string kind = stmt->removeType switch
+                {
+                    ObjectType.OBJECT_TABLE => "TABLE",
+                    ObjectType.OBJECT_VIEW => "VIEW",
+                    ObjectType.OBJECT_MATVIEW => "MATERIALIZED VIEW",
+                    ObjectType.OBJECT_SEQUENCE => "SEQUENCE",
+                    ObjectType.OBJECT_INDEX => "INDEX",
+                    _ => "FOREIGN TABLE",
+                };
+                return $"DROP {kind}{(stmt->concurrent ? " CONCURRENTLY" : "")}{(stmt->missing_ok ? " IF EXISTS" : "")} " +
+                    $"{string.Join(", ", kept)}{(stmt->behavior == DropBehavior.DROP_CASCADE ? " CASCADE" : "")}";
+
+            default:
+                return command;
+        }
+    }
+
+    /// <summary>
+    /// Checks whether CREATE TABLE AS runs a prepared statement, which parse analysis wraps in a utility query.
+    /// </summary>
+    private static bool ExecutesPrepared(CreateTableAsStmt* stmt)
+    {
+        Node* query = stmt->query;
+        return query is not null && (query->type == NodeTag.T_ExecuteStmt ||
+            (query->type == NodeTag.T_Query && ((Query*)query)->commandType == CmdType.CMD_UTILITY &&
+                ((Query*)query)->utilityStmt is not null && ((Query*)query)->utilityStmt->type == NodeTag.T_ExecuteStmt));
+    }
+
+    /// <summary>
+    /// Checks whether ALTER TABLE finishes a concurrent detach.
+    /// </summary>
+    private static bool FinishesDetach(AlterTableStmt* stmt) => HasCommand(stmt, AlterTableType.AT_DetachPartitionFinalize);
+
+    /// <summary>
+    /// Checks whether a name in a statement's list of names, a String node, is a given name.
+    /// </summary>
+    private static bool NameIs(Node* name, string expected)
+        => name is not null && Worf.FromServer(NativeMethods.NameListToString(NativeMethods.lappend(null, name))) == expected;
 
     private static bool IsWorf(sbyte* name) => name is not null && Worf.FromServer(name) == Worf.ExtensionName;
 

@@ -1,3 +1,5 @@
+using Npgsql;
+
 namespace Worf.Tests;
 
 /// <summary>
@@ -77,14 +79,109 @@ public sealed class DdlReplicationTests
         await WaitAsync(nodeA, token);
         Assert.AreEqual("", await nodeB.SafePsqlAsync(Database, "SELECT to_regclass('app.nopk')", token));
 
-        // worf's own tables stay out of replication sets, and each node drops worf itself.
-        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.conflict_history_ensure_partition(CURRENT_DATE + 60)", token);
-        Assert.AreEqual("0", await nodeA.SafePsqlAsync(Database, """
-            SELECT count(*) FROM worf.replication_set_table r JOIN pg_class c ON c.oid = r.set_reloid
-            WHERE c.relnamespace = 'worf'::regnamespace
+        // worf's own tables stay out of replication sets and the queue, even created from functions, and each node
+        // drops worf itself.
+        _ = await nodeA.SafePsqlAsync(Database, """
+            SET worf.allow_ddl_from_functions = on;
+            SELECT worf.conflict_history_ensure_partition(CURRENT_DATE + 60);
+            """, token);
+        Assert.AreEqual("0|0", await nodeA.SafePsqlAsync(Database, """
+            SELECT (SELECT count(*) FROM worf.replication_set_table r JOIN pg_class c ON c.oid = r.set_reloid
+                    WHERE c.relnamespace = 'worf'::regnamespace),
+                (SELECT count(*) FROM worf.queue WHERE message::text LIKE '%conflict_history%')
             """, token));
         _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.drop_subscription('b_from_a')", token);
+        PostgresException together = await Assert.ThrowsExactlyAsync<PostgresException>(
+            () => nodeB.SafePsqlAsync(Database, "DROP EXTENSION worf, plpgsql CASCADE", token));
+        Assert.AreEqual("55000", together.SqlState);
         _ = await nodeB.SafePsqlAsync(Database, "DROP EXTENSION worf CASCADE", token);
+        _ = await nodeA.SafePsqlAsync(Database, "CREATE TABLE app.after (id integer PRIMARY KEY)", token);
+        Assert.AreEqual("1|replicating", await nodeA.SafePsqlAsync(Database, """
+            SELECT (SELECT count(*) FROM pg_extension WHERE extname = 'worf'),
+                (SELECT status FROM worf.show_subscription_status() WHERE subscription_name = 'a_from_b')
+            """, token), "node_a keeps worf");
+        Assert.AreEqual("", await nodeB.SafePsqlAsync(Database, "SELECT extname FROM pg_extension WHERE extname = 'worf'", token));
+    }
+
+    /// <summary>
+    /// Statements that use the session's own objects stay on their node, DDL from functions is queued once, a DROP of
+    /// local and other tables replicates the others, the settings a statement ran with apply with it, tables follow
+    /// their replica identity between the default sets, and a subscriber's structure sync doesn't queue the schema.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task OnlyDdlOtherNodesCanRunReplicates()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+
+        _ = await nodeA.SafePsqlAsync(Database, """
+            SET worf.allow_ddl_from_functions = on;
+            CREATE FUNCTION make_s() RETURNS void LANGUAGE plpgsql AS $$ BEGIN CREATE TABLE s (id serial PRIMARY KEY, v text); END $$;
+            SELECT make_s();
+            CREATE TABLE orders (id integer PRIMARY KEY);
+            CREATE TABLE pk (id integer PRIMARY KEY, v text);
+            CREATE TABLE parted (id integer NOT NULL, v text) PARTITION BY RANGE (id);
+            CREATE TABLE parted_1 PARTITION OF parted FOR VALUES FROM (0) TO (100);
+            CREATE TABLE ul (id integer PRIMARY KEY);
+            SET DateStyle = 'ISO, DMY';
+            CREATE TABLE d (id integer PRIMARY KEY, day date DEFAULT '01/02/2026');
+            """, token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE TEMP TABLE tmp (id integer, v text);
+            ALTER TABLE tmp RENAME TO tmp2;
+            COMMENT ON TABLE tmp2 IS 'scratch';
+            CREATE VIEW tmp_view AS SELECT * FROM tmp2;
+            CREATE TABLE from_temp AS SELECT * FROM tmp2;
+            CREATE TABLE like_temp (LIKE tmp2);
+            PREPARE p AS SELECT 1 AS x;
+            CREATE TABLE from_prepared AS EXECUTE p;
+            GRANT SELECT ON tmp2 TO PUBLIC;
+            CREATE FUNCTION nothing() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+            CREATE TRIGGER tmp_trigger BEFORE INSERT ON tmp2 FOR EACH ROW EXECUTE FUNCTION nothing();
+            DROP TRIGGER tmp_trigger ON tmp2;
+            CREATE POLICY tmp_policy ON tmp2 USING (true);
+            DROP TABLE tmp2, orders CASCADE;
+            ALTER TABLE pk DROP CONSTRAINT pk_pkey;
+            ALTER TABLE parted ADD PRIMARY KEY (id);
+            ALTER TABLE ul SET UNLOGGED;
+            """, token);
+        await WaitAsync(nodeA, token);
+
+        Assert.AreEqual("1|0|0", await nodeA.SafePsqlAsync(Database, """
+            SELECT (SELECT count(*) FROM worf.queue WHERE message->>'command' LIKE 'CREATE TABLE s %'),
+                (SELECT count(*) FROM worf.queue WHERE message::text LIKE '%tmp%' OR message::text LIKE '%EXECUTE p%'),
+                (SELECT count(*) FROM worf.replication_set_table WHERE set_reloid IN ('from_temp'::regclass, 'like_temp'::regclass, 'from_prepared'::regclass))
+            """, token), "DDL from a function queued once, and nothing that used the session's objects");
+        Assert.AreEqual("s||||'2026-02-01'::date", await nodeB.SafePsqlAsync(Database, """
+            SELECT to_regclass('s')::text, to_regclass('orders')::text, to_regclass('from_temp')::text, to_regclass('from_prepared')::text,
+                pg_get_expr(adbin, adrelid)
+            FROM pg_attrdef WHERE adrelid = 'd'::regclass
+            """, token), "what reached node_b");
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            Assert.AreEqual("default_insert_only", await SetsAsync(node, "pk", token), $"{node.Name}: a table that lost its primary key");
+            Assert.AreEqual("default", await SetsAsync(node, "parted_1", token), $"{node.Name}: a partition whose parent gained one");
+            Assert.AreEqual("", await SetsAsync(node, "ul", token), $"{node.Name}: an unlogged table");
+        }
+
+        // A subscriber whose structure comes from node_a queues none of it.
+        await using TestNode nodeC = await StartNodeAsync("node_c", token);
+        _ = await nodeC.SafePsqlAsync(Database, $$"""
+            SELECT worf.create_subscription(
+                subscription_name := 'c_from_a',
+                provider_dsn := '{{nodeA.Dsn(Database, SuperUser)}}',
+                synchronize_structure := true,
+                synchronize_data := true,
+                forward_origins := '{}')
+            """, token);
+        Assert.IsTrue(await nodeC.PollQueryUntilAsync(Database, """
+            SELECT EXISTS (SELECT 1 FROM worf.show_subscription_status() WHERE subscription_name = 'c_from_a' AND status = 'replicating')
+            """, token), "node_c's structure sync");
+        Assert.AreEqual("0", await nodeC.SafePsqlAsync(Database, "SELECT count(*) FROM worf.queue WHERE message_type = 'D'", token));
     }
 
     private static async Task<TestNode> StartNodeAsync(string name, CancellationToken token)

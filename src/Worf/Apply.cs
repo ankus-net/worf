@@ -1286,12 +1286,15 @@ internal static unsafe partial class Apply
             throw new PgException(PgSqlStates.InternalError, "malformed message in queued message tuple: expected search_path and command");
         }
 
+        // The statement runs with the settings it ran with, which change what it means.
         int saveNestlevel = NativeMethods.NewGUCNestLevel();
-        fixed (byte* name = Worf.ToServerCString("search_path"))
-        fixed (byte* value = Worf.ToServerCString(searchPath.GetString()!))
+        SetDdlSetting("search_path", searchPath.GetString()!);
+        if (root.TryGetProperty("settings", out JsonElement settings) && settings.ValueKind == JsonValueKind.Object)
         {
-            _ = NativeMethods.set_config_option((sbyte*)name, (sbyte*)value, GucContext.PGC_USERSET, GucSource.PGC_S_SESSION,
-                GucAction.GUC_ACTION_SAVE, true, 0, false);
+            foreach (JsonProperty setting in settings.EnumerateObject())
+            {
+                SetDdlSetting(setting.Name, setting.Value.GetString() ?? "");
+            }
         }
 
         // A statement that runs concurrently commits along the way, which apply's transaction can't, so it runs
@@ -1299,6 +1302,16 @@ internal static unsafe partial class Apply
         ExecuteSqlCommand(command.GetString()!, queuedMessage.Role, false, true);
 
         NativeMethods.AtEOXact_GUC(true, saveNestlevel);
+    }
+
+    private static void SetDdlSetting(string name, string value)
+    {
+        fixed (byte* cname = Worf.ToServerCString(name))
+        fixed (byte* cvalue = Worf.ToServerCString(value))
+        {
+            _ = NativeMethods.set_config_option((sbyte*)cname, (sbyte*)cvalue, GucContext.PGC_USERSET, GucSource.PGC_S_SESSION,
+                GucAction.GUC_ACTION_SAVE, true, 0, false);
+        }
     }
 
     /// <summary>
