@@ -1261,6 +1261,13 @@ internal static unsafe partial class Apply
             reloid = NativeMethods.get_relname_relid((sbyte*)crelname, nspoid);
         }
 
+        // A managed sequence's position is this node's own, and the provider's would fall outside its block.
+        if (SequenceRanges.IsManaged(reloid))
+        {
+            PgLog.Warning($"skipping the state of sequence {nspname}.{relname}, which is under range management here");
+            return;
+        }
+
         long lastValue = ParseInt64Prefix(lastValueRaw);
 
         _ = Spi.Execute("SELECT pg_catalog.setval($1, $2)", SpiParameter.Create(reloid), SpiParameter.Create(lastValue));

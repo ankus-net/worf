@@ -249,6 +249,8 @@ internal static unsafe partial class Executor
             }
         }
 
+        SequenceRanges.CheckDdl(parsetree);
+
         // Which objects a DROP drops is known only before it runs, and whether a statement uses temporary objects only
         // as it runs.
         string? ddl = DdlReplication.CommandToQueue(pstmt, queryString, context, out bool sessionLocal);
@@ -346,10 +348,15 @@ internal static unsafe partial class Executor
                 return;
             }
 
-            // Dropped columns are recorded whether or not this database is a node yet.
+            // Dropped columns are recorded whether or not this database is a node yet, and a dropped managed sequence
+            // leaves range management.
             if (classId == Dependency.RelationRelationId)
             {
                 RecordDroppedColumn(objectId, subId);
+                if (subId == 0 && NativeMethods.get_rel_relkind(objectId) == (sbyte)'S')
+                {
+                    Elevated.Run(() => SequenceRanges.Forget(objectId));
+                }
             }
 
             // No local node?

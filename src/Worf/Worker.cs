@@ -95,6 +95,11 @@ internal static class Worker
             name = $"worf sync {Worf.ShortenHash(NameStr(worker.Worker.Sync.Relname), NameDataLen - 37),27} " +
                 $"{worker.Dboid}:{worker.Worker.Sync.Apply.SubId}";
         }
+        else if (worker.WorkerType == WorfWorkerType.Range)
+        {
+            function = "worf_range_main";
+            name = $"worf range {worker.Dboid}";
+        }
         else
         {
             function = "worf_apply_main";
@@ -435,6 +440,7 @@ internal static class Worker
         WorfWorkerType.Manager => "manager",
         WorfWorkerType.Apply => "apply",
         WorfWorkerType.Sync => "sync",
+        WorfWorkerType.Range => "range",
         _ => throw new ArgumentOutOfRangeException(nameof(type)),
     };
 

@@ -95,8 +95,9 @@ internal static class Manager
         {
             Worker.ProcessConfigReload();
 
-            // Launch the apply workers.
+            // Launch the apply workers, and the range worker for managed sequences.
             bool processedAll = ManageApplyWorkers();
+            processedAll &= ManageRangeWorker();
 
             // Handle sequences and update our sleep timer as necessary.
             sleepTimer = Sequences.SynchronizeSequences()
@@ -111,6 +112,47 @@ internal static class Manager
 
             PgInterrupts.Check();
         }
+    }
+
+    /// <summary>
+    /// Starts the database's sequence range worker when it has managed sequences and the worker isn't running, or
+    /// once a crashed one's restart delay has passed.
+    /// </summary>
+    /// <returns>Whether nothing is left to retry.</returns>
+    private static bool ManageRangeWorker()
+    {
+        uint dboid = Worker.MyWorker.Dboid;
+        long crashedAt = -1;
+        using (PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share())
+        {
+            for (int i = 0; i < guard.Length && crashedAt < 0; i++)
+            {
+                if (guard[i].WorkerType == WorfWorkerType.Range && guard[i].Dboid == dboid)
+                {
+                    crashedAt = guard[i].CrashedAt;
+                }
+            }
+        }
+
+        if (crashedAt == 0)
+        {
+            return true;
+        }
+
+        if (crashedAt > 0 && crashedAt + (MinSleep * 1000) > Worker.GetCurrentTimestamp())
+        {
+            return false;
+        }
+
+        bool managed = PgBackgroundWorker.RunTransaction(() =>
+            Spi.ExecuteScalar<bool>("SELECT to_regclass('worf.sequence_range') IS NOT NULL") &&
+            Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range)"));
+        if (managed)
+        {
+            _ = Worker.WorkerRegister(new WorfWorker { WorkerType = WorfWorkerType.Range, Dboid = dboid });
+        }
+
+        return true;
     }
 
     /// <summary>

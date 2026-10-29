@@ -763,6 +763,7 @@ internal static class Functions
         // Check that this is actually a node.
         _ = WorfNode.GetLocalNode(true, false);
 
+        RejectManagedSequence(Oid(relation));
         Sequences.SynchronizeSequence(Oid(relation));
 
         return true;
@@ -1077,6 +1078,7 @@ internal static class Functions
         uint reloid = Oid(relation);
 
         WorfLocalNode node = CheckLocalNode(true);
+        RejectManagedSequence(reloid);
 
         // Find the replication set.
         WorfRepSet repset = ReplicationSet.GetReplicationSetByName(node.Node.Id, NameArg(setName), false)!;
@@ -1587,6 +1589,19 @@ internal static class Functions
     };
 
     private static uint Oid(PgDatum? value) => (uint)value!.DangerousGetBits();
+
+    /// <summary>
+    /// Rejects replicating the state of a sequence under range management, whose setval would put it into another
+    /// node's block.
+    /// </summary>
+    private static void RejectManagedSequence(uint seqoid)
+    {
+        if (SequenceRanges.IsManaged(seqoid))
+        {
+            throw new PgException(PgSqlStates.InvalidParameterValue, "a sequence under range management can't replicate its state",
+                hint: "Range management keeps the nodes' values apart; disable it first.");
+        }
+    }
 
     /// <summary>
     /// Returns a boolean as the oid that pglogical's drop_subscription returns it as.
