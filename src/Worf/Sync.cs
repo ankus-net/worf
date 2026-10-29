@@ -1395,11 +1395,7 @@ internal static class Sync
         return sync;
     }
 
-    private static unsafe RelationData* OpenSyncStatus()
-    {
-        RangeVar* rv = NativeMethods.makeRangeVar(Worf.PStrDup(Worf.ExtensionName), Worf.PStrDup(CatalogLocalSyncStatus), -1);
-        return NativeMethods.table_openrv(rv, RowExclusiveLock);
-    }
+    private static unsafe RelationData* OpenSyncStatus() => Worf.OpenCatalog(CatalogLocalSyncStatus, RowExclusiveLock);
 
     // The subscription's own status is the row with no table.
     private static unsafe bool IsSubscriptionStatus(HeapTupleData* tuple, TupleDescData* desc)

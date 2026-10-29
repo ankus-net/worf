@@ -46,6 +46,8 @@ same schema. Future revisions may add mapping features.
 Tables on the provider and subscriber must have the same columns, with the same
 data types in each column. `CHECK` constraints, `NOT NULL` constraints, etc., must
 be the same or weaker (more permissive) on the subscriber than the provider.
+A subscriber ignores a column it dropped in rows from a provider that still
+has it.
 
 Tables must have the same `PRIMARY KEY`s. It is not recommended to add additional
 `UNIQUE` constraints other than the `PRIMARY KEY` (see below).

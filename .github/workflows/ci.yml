@@ -79,6 +79,8 @@ jobs:
 
       - name: Run regression suite
         if: github.event_name != 'schedule' && inputs.nightly != true
+        # A hang fails the step so that its results are saved.
+        timeout-minutes: 8
         run: dotnet run eng/regress.cs -- --pg ${{ matrix.postgresql }} --no-build
 
       - name: Save regression results
@@ -99,6 +101,9 @@ jobs:
       # t/040's 5-second walsender timeout.
       - name: Run multi-server tests
         if: github.event_name != 'schedule' && inputs.nightly != true && (success() || failure())
+        # A hang fails the step, rather than the job's timeout cancelling the job, so that its logs are saved. Each
+        # test also times out on its own, in tests/Worf.Tests/testconfig.json.
+        timeout-minutes: 12
         env:
           # pglogical's t/040 writes for 120 seconds by default; a shorter run still resynchronizes during writes.
           PGBENCH_TIME: '30'
@@ -109,7 +114,7 @@ jobs:
         run: dotnet ankus test --pg ${{ matrix.postgresql }} -c Release ${{ runner.os == 'Windows' && '--pgdata D:\ankus\pgdata' || '' }} -- --project tests/Worf.Tests/Worf.Tests.csproj --output detailed
 
       - name: Save multi-server test logs
-        if: failure()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@v7
         with:
           name: tests-${{ matrix.platform }}-pg${{ matrix.postgresql }}

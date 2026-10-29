@@ -254,12 +254,13 @@ internal static partial class ReplicationSet
     {
         List<WorfRepSet> replicationSets = [];
 
-        RangeVar* rv = NativeMethods.makeRangeVar(Worf.PStrDup(Worf.ExtensionName), Worf.PStrDup(catalog), -1);
-        uint relid = NativeMethods.RangeVarGetRelidExtended(rv, RowExclusiveLock, 1 /* RVR_MISSING_OK */, default, null);
+        uint relid = Worf.CatalogOid(catalog);
         if (relid == 0)
         {
             throw new PgException(PgSqlStates.UndefinedTable, $"relation \"{Worf.ExtensionName}.{catalog}\" does not exist");
         }
+
+        NativeMethods.LockRelationOid(relid, RowExclusiveLock);
 
         RelationData* rel = NativeMethods.table_open(relid, NoLock);
 
@@ -474,8 +475,7 @@ internal static partial class ReplicationSet
         NativeMethods.table_close(targetrel, (int)PgLockMode.None);
 
         // Open the catalog.
-        RangeVar* rv = NativeMethods.makeRangeVar(Worf.PStrDup(Worf.ExtensionName), Worf.PStrDup("replication_set_table"), -1);
-        RelationData* rel = NativeMethods.table_openrv(rv, (int)PgLockMode.RowExclusive);
+        RelationData* rel = Worf.OpenCatalog("replication_set_table", (int)PgLockMode.RowExclusive);
         TupleDescData* tupDesc = rel->rd_att;
 
         // Form a tuple.
@@ -855,12 +855,13 @@ internal static partial class ReplicationSet
         // Note that tables can have no replication sets. This will be commonly true for example for internal tables
         // which are created during table rewrites, so if we'll want to support replicating those, we'll have to have
         // special handling for them.
-        RangeVar* rv = NativeMethods.makeRangeVar(Worf.PStrDup(Worf.ExtensionName), Worf.PStrDup("replication_set_table"), -1);
-        uint repsetReloid = NativeMethods.RangeVarGetRelidExtended(rv, (int)PgLockMode.RowExclusive, 1 /* RVR_MISSING_OK */, default, null);
+        uint repsetReloid = Worf.CatalogOid("replication_set_table");
         if (repsetReloid == 0)
         {
             throw new PgException(PgSqlStates.UndefinedTable, $"relation \"{Worf.ExtensionName}.replication_set_table\" does not exist");
         }
+
+        NativeMethods.LockRelationOid(repsetReloid, (int)PgLockMode.RowExclusive);
 
         RelationData* repsetRel = NativeMethods.table_open(repsetReloid, (int)PgLockMode.None);
         TupleDescData* repsetRelDesc = repsetRel->rd_att;
@@ -988,11 +989,7 @@ internal static partial class ReplicationSet
         return FirstLowInvalidHeapAttributeNumber;
     }
 
-    private static unsafe RelationData* OpenCatalog(string table)
-    {
-        RangeVar* rv = NativeMethods.makeRangeVar(Worf.PStrDup(Worf.ExtensionName), Worf.PStrDup(table), -1);
-        return NativeMethods.table_openrv(rv, RowExclusiveLock);
-    }
+    private static unsafe RelationData* OpenCatalog(string table) => Worf.OpenCatalog(table, RowExclusiveLock);
 
     private const string CatalogRepset = "replication_set";
     private const string CatalogRepsetSeq = "replication_set_seq";

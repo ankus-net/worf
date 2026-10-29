@@ -2,6 +2,18 @@ using System.Globalization;
 using System.Text;
 using Ankus.Postgres;
 
+[assembly: PgSql("dropped-columns", """
+    CREATE TABLE worf.dropped_column (
+        relid oid NOT NULL,
+        attname name NOT NULL,
+        attnum smallint NOT NULL,
+        PRIMARY KEY (relid, attname)
+    );
+
+    COMMENT ON TABLE worf.dropped_column IS
+        'Columns dropped from local tables, which apply ignores in rows from nodes that still have them';
+    """)]
+
 namespace Worf;
 
 /// <summary>
@@ -278,6 +290,12 @@ internal static unsafe partial class Executor
                 return;
             }
 
+            // Dropped columns are recorded whether or not this database is a node yet.
+            if (classId == Dependency.RelationRelationId)
+            {
+                RecordDroppedColumn(objectId, subId);
+            }
+
             // No local node?
             if (WorfNode.GetLocalNode(false, true) is null)
             {
@@ -292,6 +310,53 @@ internal static unsafe partial class Executor
 
             Dependency.CheckDependency(obj, behavior);
         }
+    }
+
+    /// <summary>
+    /// Records a column dropped from a table, so that apply ignores it in rows from nodes that drop it later, and
+    /// forgets a dropped table's columns.
+    /// </summary>
+    /// <param name="relid">The table.</param>
+    /// <param name="attnum">The column's number, or zero for the whole table.</param>
+    private static void RecordDroppedColumn(uint relid, int attnum)
+    {
+        // Only tables replicate rows, and a temporary table's columns are its session's.
+        sbyte relkind = NativeMethods.get_rel_relkind(relid);
+        if (relkind is not ((sbyte)'r' or (sbyte)'p') || NativeMethods.get_rel_persistence(relid) == (sbyte)'t' || !HasDroppedColumnTable())
+        {
+            return;
+        }
+
+        if (attnum == 0)
+        {
+            ForgetDroppedColumns(relid);
+            return;
+        }
+
+        sbyte* attname = NativeMethods.get_attname(relid, (short)attnum, true);
+        if (attnum > 0 && attname is not null)
+        {
+            string column = Worf.FromServer(attname);
+            // worf's catalog is its own, whoever drops the column.
+            Elevated.Run(() => _ = Spi.Execute("""
+                INSERT INTO worf.dropped_column VALUES ($1, $2::name, $3) ON CONFLICT (relid, attname) DO UPDATE SET attnum = excluded.attnum
+                """, SpiParameter.Create(relid), SpiParameter.Create(column), SpiParameter.Create((short)attnum)));
+        }
+    }
+
+    /// <summary>
+    /// Forgets the dropped columns recorded for a table.
+    /// </summary>
+    private static void ForgetDroppedColumns(uint relid)
+        => Elevated.Run(() => _ = Spi.Execute("DELETE FROM worf.dropped_column WHERE relid = $1", SpiParameter.Create(relid)));
+
+    /// <summary>
+    /// Checks whether this database has worf's table of dropped columns, as it doesn't before worf is installed.
+    /// </summary>
+    private static bool HasDroppedColumnTable()
+    {
+        uint nspoid = NativeMethods.get_namespace_oid(Worf.PStrDup(Worf.ExtensionName), true);
+        return nspoid != 0 && NativeMethods.get_relname_relid(Worf.PStrDup("dropped_column"), nspoid) != 0;
     }
 
     /// <summary>

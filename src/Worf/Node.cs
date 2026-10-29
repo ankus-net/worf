@@ -194,8 +194,8 @@ internal sealed partial class WorfNode
     /// <returns>The local node.</returns>
     internal static unsafe WorfLocalNode? GetLocalNode(bool forUpdate, bool missingOk)
     {
-        RangeVar* rv = NativeMethods.makeRangeVar(Worf.PStrDup(Worf.ExtensionName), Worf.PStrDup(CatalogLocalNode), -1);
-        RelationData* rel = NativeMethods.table_openrv_extended(rv, forUpdate ? ShareUpdateExclusiveLock : RowExclusiveLock, true);
+        uint relid = Worf.CatalogOid(CatalogLocalNode);
+        RelationData* rel = relid == 0 ? null : NativeMethods.table_open(relid, forUpdate ? ShareUpdateExclusiveLock : RowExclusiveLock);
 
         if (rel is null)
         {
@@ -650,11 +650,7 @@ internal sealed partial class WorfNode
             (originName.Length == slotName.Length + 9 && originName.StartsWith(slotName + "_", StringComparison.Ordinal) &&
                 uint.TryParse(originName.AsSpan(slotName.Length + 1), NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out _));
 
-    private static unsafe RelationData* OpenCatalog(string table, int lockmode)
-    {
-        RangeVar* rv = NativeMethods.makeRangeVar(Worf.PStrDup(Worf.ExtensionName), Worf.PStrDup(table), -1);
-        return NativeMethods.table_openrv(rv, lockmode);
-    }
+    private static unsafe RelationData* OpenCatalog(string table, int lockmode) => Worf.OpenCatalog(table, lockmode);
 
     private static unsafe WorfNode NodeFromTuple(HeapTupleData* tuple, TupleDescData* desc)
     {

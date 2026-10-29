@@ -352,6 +352,31 @@ internal static partial class Worf
     }
 
     /// <summary>
+    /// Opens one of worf's catalogs without checking the user's access to worf's schema, since worf reads and writes its
+    /// catalogs for whoever runs the statement, as from its hooks.
+    /// </summary>
+    /// <param name="table">The catalog's name.</param>
+    /// <param name="lockmode">The lock to take.</param>
+    /// <returns>The catalog.</returns>
+    internal static unsafe RelationData* OpenCatalog(string table, int lockmode)
+    {
+        uint relid = CatalogOid(table);
+        return relid != 0 ? NativeMethods.table_open(relid, lockmode)
+            : throw new PgException(PgSqlStates.UndefinedTable, $"relation \"{ExtensionName}.{table}\" does not exist");
+    }
+
+    /// <summary>
+    /// Finds one of worf's catalogs.
+    /// </summary>
+    /// <param name="table">The catalog's name.</param>
+    /// <returns>The catalog, or zero when worf isn't installed.</returns>
+    internal static unsafe uint CatalogOid(string table)
+    {
+        uint nspoid = NativeMethods.get_namespace_oid(PStrDup(ExtensionName), true);
+        return nspoid == 0 ? 0 : NativeMethods.get_relname_relid(PStrDup(table), nspoid);
+    }
+
+    /// <summary>
     /// Reads a setting's display value, as <c>GetConfigOptionByName</c> returns it.
     /// </summary>
     /// <param name="name">The setting's name.</param>

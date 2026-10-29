@@ -658,9 +658,29 @@ internal static unsafe class ProtoNative
         for (int i = 0; i < natts; i++)
         {
             int attid = rel.Attmap[i];
-            FormData_pg_attribute* att = NativeMethods.TupleDescAttr(desc, attid);
             char kind = (char)NativeMethods.pq_getmsgbyte(@in);
             int len;
+
+            // A column dropped here is read past.
+            if (attid < 0)
+            {
+                switch (kind)
+                {
+                    case 'n' or 'u':
+                        break;
+
+                    case 'i' or 'b' or 't':
+                        _ = NativeMethods.pq_getmsgbytes(@in, (int)NativeMethods.pq_getmsgint(@in, 4));
+                        break;
+
+                    default:
+                        throw new PgException(PgSqlStates.InternalError, $"unknown data representation type '{kind}'");
+                }
+
+                continue;
+            }
+
+            FormData_pg_attribute* att = NativeMethods.TupleDescAttr(desc, attid);
 
             tuple.Kinds[attid] = kind;
             switch (kind)
