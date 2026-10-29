@@ -554,6 +554,12 @@ by extensions will go to `default` replication set.
   - `replication_sets` - array of replication sets which this command should be
     associated with, default "{ddl_sql}"
 
+- `worf.release_fence(fence_id bigint)`
+  Lets local writes through the fence that `worf.global_ddl_lock` put up for
+  DDL from another node, or through every fence when `fence_id` is NULL, as
+  when that DDL won't reach this node. Returns the number of tables let
+  through.
+
 - `worf.synchronize_sequence(relation regclass)`
   Push sequence state to all subscribers. Unlike the subscription and table
   synchronization function, this function should be run on provider. It forces
@@ -713,6 +719,19 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
 - `worf.allow_ddl_from_functions`
   Replicates DDL that functions and procedures run too. The default is
   `off`.
+
+- `worf.global_ddl_lock`
+  With `worf.enable_ddl_replication`, locks every node for DDL that can't
+  apply in any order: changing a column's type, renaming, moving a table to
+  another schema, adding a constraint, a unique index or a `NOT NULL` column
+  without a default, or dropping a table. Before the DDL runs, each node this
+  node subscribes to holds back local writes to its tables, which fail with
+  SQLSTATE `55P03` until the DDL has applied there, and every node applies
+  their changes up to that point before it runs the DDL. The default is `on`.
+
+- `worf.ddl_lock_timeout`
+  How long DDL waits for the other nodes to hold back their writes and catch
+  up before it fails. The default is `1min`.
 
 - `worf.batch_inserts`
   Tells worf to use batch insert mechanism if possible. Batch mechanism

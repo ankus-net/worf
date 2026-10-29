@@ -31,6 +31,7 @@ internal static unsafe partial class Executor
     private static bool s_droppingWorfObj;
     private static object_access_hook_type s_nextObjectAccessHook;
     private static ProcessUtility_hook_type s_nextProcessUtilityHook;
+    private static ExecutorStart_hook_type s_nextExecutorStartHook;
     private static bool s_installed;
 
     /// <summary>
@@ -43,6 +44,9 @@ internal static unsafe partial class Executor
 
     [PgNativeCallback(nameof(WorfObjectAccess))]
     private static partial object_access_hook_type ObjectAccessCallback { get; }
+
+    [PgNativeCallback(nameof(WorfExecutorStart))]
+    private static partial ExecutorStart_hook_type ExecutorStartCallback { get; }
 
     /// <summary>
     /// Creates the executor state for one relation, as a query that reads or writes it would.
@@ -157,6 +161,10 @@ internal static unsafe partial class Executor
         // Object access hook
         s_nextObjectAccessHook = NativeGlobals.object_access_hook;
         NativeGlobals.object_access_hook = ObjectAccessCallback;
+
+        // Executor start hook, which holds back writes to tables another node changes.
+        s_nextExecutorStartHook = NativeGlobals.ExecutorStart_hook;
+        NativeGlobals.ExecutorStart_hook = ExecutorStartCallback;
         s_installed = true;
     }
 
@@ -226,9 +234,32 @@ internal static unsafe partial class Executor
             s_lastDropBehavior = ((DropStmt*)parsetree)->behavior;
         }
 
+        // A COPY into or TRUNCATE of a table another node changes waits for the change.
+        if (parsetree->type == NodeTag.T_CopyStmt && ((CopyStmt*)parsetree)->is_from)
+        {
+            CheckWrite(((CopyStmt*)parsetree)->relation);
+        }
+        else if (parsetree->type == NodeTag.T_TruncateStmt)
+        {
+            List* relations = ((TruncateStmt*)parsetree)->relations;
+            for (int i = 0; relations is not null && i < relations->length; i++)
+            {
+                CheckWrite((RangeVar*)relations->elements[i].ptr_value);
+            }
+        }
+
         // Which objects a DROP drops is known only before it runs, and whether a statement uses temporary objects only
         // as it runs.
         string? ddl = DdlReplication.CommandToQueue(pstmt, queryString, context, out bool sessionLocal);
+        if (ddl is not null)
+        {
+            DdlReplication.WithSnapshot(() =>
+            {
+                DdlLock.LockNodes(parsetree);
+                return true;
+            });
+        }
+
         uint xactFlags = DdlReplication.BeginStatement(ddl is not null);
         bool usedTemp;
         try
@@ -336,6 +367,29 @@ internal static unsafe partial class Executor
                 : s_lastDropBehavior;
 
             Dependency.CheckDependency(obj, behavior);
+        }
+    }
+
+    private static void WorfExecutorStart(QueryDesc* queryDesc, int eflags)
+    {
+        DdlLock.CheckWrites(queryDesc);
+
+        if (!s_nextExecutorStartHook.IsNull)
+        {
+            s_nextExecutorStartHook.Invoke(queryDesc, eflags);
+        }
+        else
+        {
+            NativeMethods.standard_ExecutorStart(queryDesc, eflags);
+        }
+    }
+
+    private static void CheckWrite(RangeVar* relation)
+    {
+        uint relid = relation is null ? 0 : NativeMethods.RangeVarGetRelidExtended(relation, 0, 1, default, null);
+        if (relid != 0)
+        {
+            DdlLock.CheckWrite(relid);
         }
     }
 

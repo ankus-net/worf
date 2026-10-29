@@ -40,6 +40,8 @@ internal static unsafe partial class Apply
     private static long s_clockSkewReportedAt;
     private static ulong s_remoteCommitLsn;
     private static long s_remoteCommitTime;
+    private static ulong s_publishedFlushpos;
+    private static bool s_publishesFlushpos;
 
     // A failed remote transaction that worf.exception_behaviour applies again, how, and whether the transaction being
     // applied is that one.
@@ -146,6 +148,16 @@ internal static unsafe partial class Apply
         uint subid = MyApplyWorker.SubId;
         WorfSubscription sub = PgBackgroundWorker.RunTransaction(() => WorfNode.GetSubscription(subid));
         MySubscription = sub;
+
+        // Other processes find this worker by its provider, for how far it has applied, as DDL from other nodes needs.
+        using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
+        {
+            WorfWorker worker = guard[Worker.MyWorfWorker];
+            worker.Worker.Apply.OriginNodeId = sub.Origin.Id;
+            guard[Worker.MyWorfWorker] = worker;
+        }
+
+        s_publishesFlushpos = true;
 
         // A crashed worker's failed transaction is applied again under worf.exception_behaviour.
         s_exceptionLsn = MyApplyWorker.ExceptionLsn;
@@ -1293,6 +1305,23 @@ internal static unsafe partial class Apply
             throw new PgException(PgSqlStates.InternalError, "malformed message in queued message tuple: expected search_path and command");
         }
 
+        // DDL that locked the other nodes first applies each node's changes as far as its WAL had reached when it held
+        // back its writes.
+        if (root.TryGetProperty("positions", out JsonElement positions) && positions.ValueKind == JsonValueKind.Object)
+        {
+            List<(uint NodeId, ulong Lsn)> nodes = [];
+            foreach (JsonProperty position in positions.EnumerateObject())
+            {
+                if (uint.TryParse(position.Name, NumberStyles.None, CultureInfo.InvariantCulture, out uint nodeId) &&
+                    Worf.TryParseLsn(position.Value.GetString() ?? "", out ulong lsn))
+                {
+                    nodes.Add((nodeId, lsn));
+                }
+            }
+
+            DdlLock.WaitForNodes(MySubscription!.Target.Id, nodes, DdlLock.DdlLockTimeout);
+        }
+
         // The statement runs with the settings it ran with, which change what it means.
         int saveNestlevel = NativeMethods.NewGUCNestLevel();
         SetDdlSetting("search_path", searchPath.GetString()!);
@@ -1309,6 +1338,13 @@ internal static unsafe partial class Apply
         ExecuteSqlCommand(command.GetString()!, queuedMessage.Role, false, true);
 
         NativeMethods.AtEOXact_GUC(true, saveNestlevel);
+
+        // This node held back its writes for the DDL until it applied here.
+        if (root.TryGetProperty("fence", out JsonElement fence) &&
+            ulong.TryParse(fence.GetString(), NumberStyles.None, CultureInfo.InvariantCulture, out ulong fenceId))
+        {
+            _ = DdlLock.ReleaseFences(fenceId);
+        }
     }
 
     private static void SetDdlSetting(string name, string value)
@@ -2008,6 +2044,16 @@ internal static unsafe partial class Apply
         if (flushpos < s_lastFlushpos)
         {
             flushpos = s_lastFlushpos;
+        }
+
+        // Published for DDL from other nodes, which waits until this node has applied a node's changes so far.
+        if (s_publishesFlushpos && flushpos > s_publishedFlushpos)
+        {
+            using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive();
+            WorfWorker worker = guard[Worker.MyWorfWorker];
+            worker.Worker.Apply.FlushLsn = flushpos;
+            guard[Worker.MyWorfWorker] = worker;
+            s_publishedFlushpos = flushpos;
         }
 
         // if we've already reported everything we're good, unless nothing was reported for wal_receiver_status_interval.

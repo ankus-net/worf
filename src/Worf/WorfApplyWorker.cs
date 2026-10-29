@@ -21,6 +21,17 @@ internal struct WorfApplyWorker
     public ulong ReplayStopLsn;
 
     /// <summary>
+    /// The node the worker's subscription applies changes from.
+    /// </summary>
+    public uint OriginNodeId;
+
+    /// <summary>
+    /// How far the worker has applied the provider's WAL, as it reports to the provider: every transaction that
+    /// committed before it is applied and flushed here.
+    /// </summary>
+    public ulong FlushLsn;
+
+    /// <summary>
     /// The commit position of a remote transaction that failed, which the next apply worker applies again under
     /// <c>worf.exception_behaviour</c>, or zero.
     /// </summary>

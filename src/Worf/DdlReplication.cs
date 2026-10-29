@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 using Ankus.Postgres;
 
@@ -183,6 +184,19 @@ internal static unsafe partial class DdlReplication
 
         json.Append("}, \"command\": ");
         Executor.EscapeJson(json, command);
+
+        // DDL that locked the other nodes tells each node the fence to release and how far to apply first.
+        if (DdlLock.TakeStatementFence() is (ulong fenceId, List<(uint NodeId, ulong Lsn)> positions))
+        {
+            json.Append(CultureInfo.InvariantCulture, $", \"fence\": \"{fenceId}\", \"positions\": {{");
+            for (int i = 0; i < positions.Count; i++)
+            {
+                json.Append(CultureInfo.InvariantCulture, $"{(i == 0 ? "" : ", ")}\"{positions[i].NodeId}\": \"{Worf.FormatLsn(positions[i].Lsn)}\"");
+            }
+
+            json.Append('}');
+        }
+
         json.Append('}');
 
         _ = WithSnapshot(() =>
@@ -331,7 +345,7 @@ internal static unsafe partial class DdlReplication
     /// as after CREATE INDEX CONCURRENTLY. Taking one is left to statements that need it, since SET TRANSACTION
     /// can't follow it.
     /// </summary>
-    private static bool WithSnapshot(Func<bool> work)
+    internal static bool WithSnapshot(Func<bool> work)
     {
         if (NativeMethods.ActiveSnapshotSet())
         {

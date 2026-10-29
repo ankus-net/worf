@@ -13,6 +13,12 @@ description: Replicate DDL and wait for replication.
   - `replication_sets` - array of replication sets which this command should be
     associated with, default "{ddl_sql}"
 
+- `worf.release_fence(fence_id bigint)`
+  Lets local writes through the fence that `worf.global_ddl_lock` put up for
+  DDL from another node, or through every fence when `fence_id` is NULL, as
+  when that DDL won't reach this node. Returns the number of tables let
+  through.
+
 - `worf.synchronize_sequence(relation regclass)`
   Push sequence state to all subscribers. Unlike the subscription and table
   synchronization function, this function should be run on provider. It forces

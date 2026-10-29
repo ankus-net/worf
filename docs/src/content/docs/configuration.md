@@ -94,6 +94,19 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   Replicates DDL that functions and procedures run too. The default is
   `off`.
 
+- `worf.global_ddl_lock`
+  With `worf.enable_ddl_replication`, locks every node for DDL that can't
+  apply in any order: changing a column's type, renaming, moving a table to
+  another schema, adding a constraint, a unique index or a `NOT NULL` column
+  without a default, or dropping a table. Before the DDL runs, each node this
+  node subscribes to holds back local writes to its tables, which fail with
+  SQLSTATE `55P03` until the DDL has applied there, and every node applies
+  their changes up to that point before it runs the DDL. The default is `on`.
+
+- `worf.ddl_lock_timeout`
+  How long DDL waits for the other nodes to hold back their writes and catch
+  up before it fails. The default is `1min`.
+
 - `worf.batch_inserts`
   Tells worf to use batch insert mechanism if possible. Batch mechanism
   uses PostgreSQL internal batch insert mode which is also used by `COPY`
