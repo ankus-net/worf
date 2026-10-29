@@ -759,6 +759,17 @@ internal static class Worker
     }
 
     /// <summary>
+    /// Reloads the configuration when the worker got SIGHUP.
+    /// </summary>
+    internal static void ProcessConfigReload()
+    {
+        if (PgBackgroundWorker.ConsumeSignals(PgBackgroundWorkerSignals.Reload) != PgBackgroundWorkerSignals.None)
+        {
+            PgBackgroundWorker.ReloadConfiguration();
+        }
+    }
+
+    /// <summary>
     /// Gets whether this worker has been asked to stop, by another process or by PostgreSQL.
     /// </summary>
     internal static bool GotSigterm

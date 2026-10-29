@@ -898,6 +898,7 @@ internal static partial class Worf
         while (!Worker.GotSigterm)
         {
             PgInterrupts.Check();
+            Worker.ProcessConfigReload();
 
             bool subscriptionsChanged;
             using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())

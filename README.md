@@ -668,6 +668,21 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   transaction further ahead applies at once, with a warning at most once a
   minute. `-1` never waits. The default is `1s`.
 
+- `worf.exception_behaviour`
+  What apply does with a remote transaction that fails, as on a constraint
+  only the subscriber has:
+  - `error` - stop, and apply the transaction again when the worker
+    restarts, until the error is fixed
+  - `discard` - apply the transaction again change by change, skipping the
+    changes that fail
+  - `transdiscard` - skip the whole transaction
+  - `sub_disable` - disable the subscription, which applies the transaction
+    again once it's enabled
+
+  Skipped changes and disabled subscriptions are recorded in
+  `worf.exception_log`, with the error, the change's rows or queued DDL, and
+  the transaction it belongs to. The default is `error`.
+
 - `worf.batch_inserts`
   Tells worf to use batch insert mechanism if possible. Batch mechanism
   uses PostgreSQL internal batch insert mode which is also used by `COPY`

@@ -93,6 +93,8 @@ internal static class Manager
         // Main wait loop.
         while (!Worker.GotSigterm)
         {
+            Worker.ProcessConfigReload();
+
             // Launch the apply workers.
             bool processedAll = ManageApplyWorkers();
 
@@ -138,7 +140,7 @@ internal static class Manager
 
             // Get list of subscribers.
             List<WorfSubscription> subscriptions = WorfNode.GetNodeSubscriptions(node.Node.Id, false);
-            List<WorfSubscription> subsToStart = [];
+            List<(WorfSubscription Sub, WorfApplyWorker Crashed)> subsToStart = [];
 
             // Check for active workers for each subscription.
             foreach (WorfSubscription sub in subscriptions)
@@ -197,10 +199,10 @@ internal static class Manager
                     }
                 }
 
-                subsToStart.Add(sub);
+                subsToStart.Add((sub, applyWorker.Worker.Apply));
             }
 
-            foreach (WorfSubscription sub in subsToStart)
+            foreach ((WorfSubscription sub, WorfApplyWorker crashed) in subsToStart)
             {
                 WorfWorker apply = default;
                 apply.WorkerType = WorfWorkerType.Apply;
@@ -208,6 +210,10 @@ internal static class Manager
                 apply.Worker.Apply.SubId = sub.Id;
                 apply.Worker.Apply.SyncPending = true;
                 apply.Worker.Apply.ReplayStopLsn = 0;
+
+                // A crashed worker's failed transaction is applied again under worf.exception_behaviour.
+                apply.Worker.Apply.ExceptionLsn = crashed.ExceptionLsn;
+                apply.Worker.Apply.ExceptionSkipsTransaction = crashed.ExceptionSkipsTransaction;
 
                 _ = Worker.WorkerRegister(apply);
             }
