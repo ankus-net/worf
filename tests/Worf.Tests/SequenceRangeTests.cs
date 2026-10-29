@@ -74,6 +74,18 @@ public sealed class SequenceRangeTests
         _ = await node.SafePsqlAsync(Database,
             "INSERT INTO t (id, v) VALUES (500, 'upserted') ON CONFLICT (id) DO UPDATE SET v = excluded.v", token);
         Assert.AreEqual("upserted", await node.SafePsqlAsync(Database, "SELECT v FROM t WHERE id = 500", token));
+
+        // A role that isn't a superuser numbers rows from the block, and the guard checks its own values too.
+        _ = await node.SafePsqlAsync(Database, """
+            CREATE ROLE app;
+            GRANT INSERT, SELECT ON t TO app;
+            GRANT USAGE ON SEQUENCE t_id_seq TO app;
+            """, token);
+        Assert.AreEqual("t", await node.SafePsqlAsync(Database,
+            "SET ROLE app; INSERT INTO t (v) VALUES ('app') RETURNING id > 500", token));
+        PostgresException appError = await Assert.ThrowsExactlyAsync<PostgresException>(
+            () => node.SafePsqlAsync(Database, "SET ROLE app; INSERT INTO t (id, v) VALUES (1, 'app by hand')", token));
+        Assert.AreEqual("23514", appError.SqlState);
     }
 
     /// <summary>
@@ -516,7 +528,12 @@ public sealed class SequenceRangeTests
             numbers[node] = await node.SafePsqlAsync(Database, "SELECT worf.snowflake_node()", token);
             _ = await node.SafePsqlAsync(Database, """
                 CREATE TABLE s (n serial PRIMARY KEY, id bigint NOT NULL DEFAULT worf.snowflake_id());
+                CREATE ROLE app;
+                GRANT INSERT ON s TO app;
+                GRANT USAGE ON SEQUENCE s_n_seq TO app;
+                SET ROLE app;
                 INSERT INTO s DEFAULT VALUES;
+                RESET ROLE;
                 INSERT INTO s (n) SELECT g FROM generate_series(2, 5000) g;
                 """, token);
         }

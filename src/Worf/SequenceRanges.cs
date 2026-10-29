@@ -445,7 +445,7 @@ internal static unsafe partial class SequenceRanges
     /// <param name="seqoid">The sequence.</param>
     /// <returns>Whether it is.</returns>
     internal static bool IsManaged(uint seqoid)
-        => Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(seqoid)).Count > 0;
+        => Elevated.Run(() => Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(seqoid)).Count > 0);
 
     /// <summary>
     /// Checks a managed sequence: switches to its next block once the active one runs low, and gets a new next block.
@@ -540,7 +540,7 @@ internal static unsafe partial class SequenceRanges
     {
         // The restore of a subscription's structure is worf's own.
         if (InternalDdl || parsetree->type is not (NodeTag.T_AlterSeqStmt or NodeTag.T_GrantStmt or NodeTag.T_AlterTableStmt or
-            NodeTag.T_DropStmt or NodeTag.T_RenameStmt or NodeTag.T_TruncateStmt) || !AnyManaged() || SequenceRangeSync.Restoring())
+            NodeTag.T_DropStmt or NodeTag.T_RenameStmt or NodeTag.T_TruncateStmt) || !AnyManaged() || DdlReplication.Restoring())
         {
             return;
         }
@@ -641,7 +641,7 @@ internal static unsafe partial class SequenceRanges
     /// <returns>Whether to skip it.</returns>
     internal static bool SkipsDumpedGuard(Node* parsetree)
         => !InternalDdl && parsetree->type == NodeTag.T_CreateTrigStmt && Worf.FromServer(((CreateTrigStmt*)parsetree)->trigname) == GuardName &&
-            SequenceRangeSync.Restoring();
+            DdlReplication.Restoring();
 
     /// <summary>
     /// Puts managed sequences in place after DDL: the restore of a subscription's structure quarantines and joins the
@@ -656,9 +656,9 @@ internal static unsafe partial class SequenceRanges
             return;
         }
 
-        if (parsetree->type is NodeTag.T_CreateSeqStmt or NodeTag.T_AlterTableStmt && SequenceRangeSync.Restoring())
+        if (parsetree->type is NodeTag.T_CreateSeqStmt or NodeTag.T_AlterTableStmt && DdlReplication.Restoring())
         {
-            SequenceRangeSync.JoinRestored();
+            Elevated.Run(SequenceRangeSync.JoinRestored);
         }
 
         if (!AnyManaged())
@@ -739,8 +739,7 @@ internal static unsafe partial class SequenceRanges
     }
 
     private static bool AnyManaged()
-        => Spi.ExecuteScalar<bool>("SELECT to_regclass('worf.sequence_range') IS NOT NULL") &&
-            Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range)");
+        => Worf.CatalogOid("sequence_range") != 0 && Elevated.Run(() => Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range)"));
 
     private static bool IsGuarded(uint relid)
         => relid != 0 && Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid = $1 AND tgname = $2)",
@@ -748,16 +747,12 @@ internal static unsafe partial class SequenceRanges
 
     private static bool ColumnUsesManaged(uint relid, string column)
     {
-        SpiResult managed = Spi.Select("SELECT seqoid::oid FROM worf.sequence_range");
-        for (int i = 0; i < managed.Count; i++)
+        return Elevated.Run(() =>
         {
-            if (UsingColumns(managed[i].Get<uint>(0)).Exists(c => c.Relid == relid && c.Column == column))
-            {
-                return true;
-            }
-        }
-
-        return false;
+            SpiResult managed = Spi.Select("SELECT seqoid::oid FROM worf.sequence_range");
+            return Enumerable.Range(0, managed.Count)
+                .Any(i => UsingColumns(managed[i].Get<uint>(0)).Exists(c => c.Relid == relid && c.Column == column));
+        });
     }
 
     private static uint Resolve(RangeVar* relation)
@@ -811,7 +806,8 @@ internal static unsafe partial class SequenceRanges
         DdlReplication.Suppressed = true;
         try
         {
-            _ = Spi.Execute(sql);
+            // worf runs it for whoever's statement needs it, as when a table comes to use a managed sequence.
+            Elevated.Run(() => _ = Spi.Execute(sql));
         }
         finally
         {
@@ -1692,15 +1688,12 @@ internal static unsafe partial class SequenceRanges
         for (int i = 0; i < managed.Count; i++)
         {
             uint managedSeq = managed[i].Get<uint>(0);
-            foreach ((uint table, string column, uint typeOid) in UsingColumns(managedSeq))
+            foreach ((_, string column, uint typeOid) in UsingColumns(managedSeq).Where(entry => entry.Relid == relid))
             {
-                if (table == relid)
-                {
-                    columns.Add(Spi.QuoteIdentifier(column));
-                    arguments.Add(Spi.QuoteLiteral(column));
-                    arguments.Add(Spi.QuoteLiteral(managedSeq.ToString(CultureInfo.InvariantCulture)));
-                    arguments.Add(Spi.QuoteLiteral(typeOid.ToString(CultureInfo.InvariantCulture)));
-                }
+                columns.Add(Spi.QuoteIdentifier(column));
+                arguments.Add(Spi.QuoteLiteral(column));
+                arguments.Add(Spi.QuoteLiteral(managedSeq.ToString(CultureInfo.InvariantCulture)));
+                arguments.Add(Spi.QuoteLiteral(typeOid.ToString(CultureInfo.InvariantCulture)));
             }
         }
 

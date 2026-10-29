@@ -27,7 +27,7 @@ internal static class SequenceRangeExchange
     /// <returns>This node's message to the neighbor.</returns>
     [PgFunction(Sql = """
         CREATE FUNCTION worf.sequence_range_exchange(message text)
-        RETURNS text STRICT VOLATILE SECURITY DEFINER LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
+        RETURNS text STRICT VOLATILE SECURITY DEFINER SET search_path = pg_catalog, pg_temp LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
         REVOKE ALL ON FUNCTION worf.sequence_range_exchange(text) FROM public;
         """)]
     internal static string Exchange(string message)

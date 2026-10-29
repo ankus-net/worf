@@ -33,7 +33,26 @@ internal static class SequenceRangeReservations
         """)]
     internal static void ReserveSequenceRange([PgSqlType("regclass", Schema = "pg_catalog")] PgDatum sequence, long count, PgInterval timeout)
     {
-        uint seqoid = SequenceRanges.RequireSequence(sequence);
+        uint seqoid = RequireUsage(sequence);
+        Elevated.Run(() => ReserveRange(seqoid, count, timeout));
+    }
+
+    /// <summary>
+    /// Allocates exactly [<paramref name="lo"/>, <paramref name="hi"/>] to this node as an imported block, so that rows
+    /// that already carry those keys can be loaded here.
+    /// </summary>
+    [PgFunction(Sql = """
+        CREATE FUNCTION worf.reserve_sequence_values(sequence regclass, lo bigint, hi bigint, timeout interval DEFAULT '1 minute')
+        RETURNS void STRICT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
+        """)]
+    internal static void ReserveSequenceValues([PgSqlType("regclass", Schema = "pg_catalog")] PgDatum sequence, long lo, long hi, PgInterval timeout)
+    {
+        uint seqoid = RequireUsage(sequence);
+        Elevated.Run(() => ReserveValues(seqoid, lo, hi, timeout));
+    }
+
+    private static void ReserveRange(uint seqoid, long count, PgInterval timeout)
+    {
         _ = WorfNode.GetLocalNode(true, false);
         if (count <= 0)
         {
@@ -89,17 +108,8 @@ internal static class SequenceRangeReservations
         SequenceRanges.ChangedOnCommit();
     }
 
-    /// <summary>
-    /// Allocates exactly [<paramref name="lo"/>, <paramref name="hi"/>] to this node as an imported block, so that rows
-    /// that already carry those keys can be loaded here.
-    /// </summary>
-    [PgFunction(Sql = """
-        CREATE FUNCTION worf.reserve_sequence_values(sequence regclass, lo bigint, hi bigint, timeout interval DEFAULT '1 minute')
-        RETURNS void STRICT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
-        """)]
-    internal static void ReserveSequenceValues([PgSqlType("regclass", Schema = "pg_catalog")] PgDatum sequence, long lo, long hi, PgInterval timeout)
+    private static void ReserveValues(uint seqoid, long lo, long hi, PgInterval timeout)
     {
-        uint seqoid = SequenceRanges.RequireSequence(sequence);
         _ = WorfNode.GetLocalNode(true, false);
         if (lo > hi)
         {
@@ -224,6 +234,16 @@ internal static class SequenceRangeReservations
         {
             Remove(requests.Contains);
         }
+    }
+
+    /// <summary>
+    /// Checks that the caller may draw values from the sequence, as nextval does.
+    /// </summary>
+    private static uint RequireUsage(PgDatum sequence)
+    {
+        uint seqoid = SequenceRanges.RequireSequence(sequence);
+        return Spi.ExecuteScalar<bool>("SELECT pg_catalog.has_sequence_privilege($1, 'USAGE')", SpiParameter.Create(seqoid)) ? seqoid
+            : throw new PgException("42501", $"permission denied for sequence {SequenceRanges.GetInfo(seqoid).Name}");
     }
 
     /// <summary>

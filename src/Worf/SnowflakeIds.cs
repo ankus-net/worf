@@ -217,11 +217,11 @@ internal static class SnowflakeIds
             timeline = NativeMethods.GetWALInsertionTimeLine();
         }
 
-        long? lo = Spi.ExecuteScalar<long?>("""
+        long? lo = Elevated.Run(() => Spi.ExecuteScalar<long?>("""
             SELECT b.lo FROM worf.sequence_range_block b JOIN worf.local_node l ON l.node_id = b.node_id
             WHERE b.seqoid = 'worf.snowflake_node'::regclass AND b.kind = 'n' AND b.state = 'active'
                 AND b.sysid = $1::numeric AND b.timeline = $2
-            """, SpiParameter.Create(sysid.ToString(CultureInfo.InvariantCulture)), SpiParameter.Create((long)timeline));
+            """, SpiParameter.Create(sysid.ToString(CultureInfo.InvariantCulture)), SpiParameter.Create((long)timeline)));
         s_node = lo is long value ? (int)value : null;
         s_nodeVersion = version;
         return s_node;

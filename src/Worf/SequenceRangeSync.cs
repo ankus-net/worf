@@ -1,5 +1,4 @@
 using System.Globalization;
-using Ankus.Postgres;
 
 namespace Worf;
 
@@ -76,30 +75,16 @@ internal static class SequenceRangeSync
             return;
         }
 
-        foreach (WorfManagedSequence sequence in managed)
+        foreach ((WorfManagedSequence sequence, uint seqoid) in managed
+            .Select(sequence => (sequence, Spi.ExecuteScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(sequence.Name)) ?? 0))
+            .Where(found => found.Item2 != 0 && !SequenceRanges.IsManaged(found.Item2) &&
+                (relid == 0 || SequenceRanges.UsingColumns(found.Item2).Exists(column => column.Relid == relid))))
         {
-            if (Spi.ExecuteScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(sequence.Name)) is uint seqoid &&
-                !SequenceRanges.IsManaged(seqoid) && (relid == 0 || SequenceRanges.UsingColumns(seqoid).Exists(column => column.Relid == relid)))
-            {
-                SequenceRanges.JoinFromNeighbor(seqoid, sequence.Owner, sequence.Epoch, sequence.RangeSize, sequence.MaxRangeSize, sequence.RootStart,
-                    sequence.RootEnd, node);
-            }
+            SequenceRanges.JoinFromNeighbor(seqoid, sequence.Owner, sequence.Epoch, sequence.RangeSize, sequence.MaxRangeSize, sequence.RootStart,
+                sequence.RootEnd, node);
         }
 
         SequenceRanges.ChangedOnCommit();
-    }
-
-    /// <summary>
-    /// Checks whether this session restores a subscription's structure.
-    /// </summary>
-    /// <returns>Whether it does.</returns>
-    internal static unsafe bool Restoring()
-    {
-        fixed (byte* name = Worf.ToServerCString("worf.subscription_schema_restore"))
-        {
-            sbyte* value = NativeMethods.GetConfigOption((sbyte*)name, true, false);
-            return value is not null && Worf.FromServer(value) is "true" or "on" or "1";
-        }
     }
 
     /// <summary>

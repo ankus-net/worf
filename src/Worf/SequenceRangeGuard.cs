@@ -105,8 +105,8 @@ internal static class SequenceRangeGuard
                         return true;
                     }
 
-                    long? last = Spi.ExecuteScalar<long?>("SELECT pg_catalog.pg_sequence_last_value($1::regclass)",
-                        SpiParameter.Create(seqoid));
+                    long? last = Elevated.Run(() => Spi.ExecuteScalar<long?>("SELECT pg_catalog.pg_sequence_last_value($1::regclass)",
+                        SpiParameter.Create(seqoid)));
                     if (last is long position && (sequence.Ascending ? position >= value : position <= value))
                     {
                         s_reached[seqoid] = position;
@@ -124,11 +124,15 @@ internal static class SequenceRangeGuard
     }
 
     /// <summary>
-    /// Locks the row that already holds a value, so that the write can only reach it.
+    /// Locks the row that already holds a value, so that the write can only reach it. The lock is worf's, since the
+    /// writer may not be allowed to lock rows; a unique index would tell the writer that the row exists anyway.
     /// </summary>
     private static bool LockExisting(PgTriggerContext context, string column, long value)
-        => Spi.ExecuteScalar<int?>("SELECT 1 FROM " + Spi.QuoteQualifiedIdentifier(context.TableSchema, context.TableName) +
-            " WHERE " + Spi.QuoteIdentifier(column) + " = $1 FOR KEY SHARE", SpiParameter.Create(value)) is not null;
+    {
+        string table = Spi.QuoteQualifiedIdentifier(context.TableSchema, context.TableName);
+        return Elevated.Run(() => Spi.ExecuteScalar<int?>("SELECT 1 FROM " + table + " WHERE " + Spi.QuoteIdentifier(column) +
+            " = $1 FOR KEY SHARE", SpiParameter.Create(value)) is not null);
+    }
 
     /// <summary>
     /// Reads the blocks this node holds again once the range worker or a function has changed them.
@@ -152,7 +156,7 @@ internal static class SequenceRangeGuard
             timeline = NativeMethods.GetWALInsertionTimeLine();
         }
 
-        SpiResult result = Spi.Select("""
+        SpiResult result = Elevated.Run(() => Spi.Select("""
             SELECT r.seqoid::oid, s.seqincrement > 0, b.lo, b.hi, b.state,
                 b.node_id = l.node_id AND b.sysid = $1::numeric AND b.timeline = $2
             FROM worf.sequence_range r
@@ -160,7 +164,7 @@ internal static class SequenceRangeGuard
                 CROSS JOIN worf.local_node l
                 LEFT JOIN worf.sequence_range_block b ON b.seqoid = r.seqoid AND b.kind IN ('n', 'i')
                     AND b.state IN ('next', 'active', 'retired', 'imported')
-            """, SpiParameter.Create(sysid.ToString(CultureInfo.InvariantCulture)), SpiParameter.Create((long)timeline));
+            """, SpiParameter.Create(sysid.ToString(CultureInfo.InvariantCulture)), SpiParameter.Create((long)timeline)));
         for (int i = 0; i < result.Count; i++)
         {
             SpiRow row = result[i];
