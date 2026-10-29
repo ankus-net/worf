@@ -1312,11 +1312,13 @@ internal static unsafe partial class Apply
             List<(uint NodeId, ulong Lsn)> nodes = [];
             foreach (JsonProperty position in positions.EnumerateObject())
             {
-                if (uint.TryParse(position.Name, NumberStyles.None, CultureInfo.InvariantCulture, out uint nodeId) &&
-                    Worf.TryParseLsn(position.Value.GetString() ?? "", out ulong lsn))
+                if (!uint.TryParse(position.Name, NumberStyles.None, CultureInfo.InvariantCulture, out uint nodeId) ||
+                    !Worf.TryParseLsn(position.Value.GetString() ?? "", out ulong lsn))
                 {
-                    nodes.Add((nodeId, lsn));
+                    throw new PgException(PgSqlStates.InternalError, "malformed message in queued message tuple: expected node positions");
                 }
+
+                nodes.Add((nodeId, lsn));
             }
 
             DdlLock.WaitForNodes(MySubscription!.Target.Id, nodes, DdlLock.DdlLockTimeout);

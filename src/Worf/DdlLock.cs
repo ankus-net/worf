@@ -223,14 +223,10 @@ internal static unsafe partial class DdlLock
         }
 
         WorfLocalNode node = WorfNode.GetLocalNode(false, false)!;
-        List<(uint NodeId, string Dsn)> peers = [];
-        foreach (WorfSubscription sub in WorfNode.GetNodeSubscriptions(node.Node.Id, false))
-        {
-            if (sub.Enabled && !peers.Exists(peer => peer.NodeId == sub.Origin.Id))
-            {
-                peers.Add((sub.Origin.Id, sub.OriginIf.Dsn));
-            }
-        }
+        List<(uint NodeId, string Dsn)> peers = [.. WorfNode.GetNodeSubscriptions(node.Node.Id, false)
+            .Where(sub => sub.Enabled)
+            .DistinctBy(sub => sub.Origin.Id)
+            .Select(sub => (sub.Origin.Id, sub.OriginIf.Dsn))];
 
         if (peers.Count == 0)
         {
@@ -555,7 +551,7 @@ internal static unsafe partial class DdlLock
             {
                 conn.Dispose();
             }
-            catch (Exception)
+            catch (Exception error) when (error is PgException or PgRemoteException)
             {
                 // A connection that won't close ends with this process.
             }
