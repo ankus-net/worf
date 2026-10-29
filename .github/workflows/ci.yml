@@ -38,6 +38,11 @@ jobs:
         postgresql: [15, 16, 17, 18, 19]
     runs-on: ${{ matrix.platform == 'linux-x64' && 'ubuntu-24.04' || matrix.platform == 'osx-arm64' && 'macos-15' || 'windows-2025' }}
     timeout-minutes: 30
+    # Ankus keys compiled bindings by environment variables such as PATH and HOME, which Git Bash and PowerShell set
+    # differently on Windows, so the tests reuse the build's bindings only when every step runs in the same shell.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v7
 
@@ -60,7 +65,6 @@ jobs:
 
       - name: Build
         id: build
-        shell: bash
         run: |
           set -o pipefail
           dotnet ankus build --pg ${{ matrix.postgresql }} --project src/Worf/Worf.csproj | tee "$RUNNER_TEMP/build.log"
@@ -111,7 +115,7 @@ jobs:
           # statement, keep the runner's four processors from the resynchronizing copy, the apply and the walsender
           # until the walsender times out. Three leave a processor for them.
           PGBENCH_CLIENTS: ${{ runner.os == 'Windows' && '3' || '10' }}
-        run: dotnet ankus test --pg ${{ matrix.postgresql }} -c Release ${{ runner.os == 'Windows' && '--pgdata D:\ankus\pgdata' || '' }} -- --project tests/Worf.Tests/Worf.Tests.csproj --output detailed
+        run: dotnet ankus test --pg ${{ matrix.postgresql }} -c Release ${{ runner.os == 'Windows' && '--pgdata ''D:\ankus\pgdata''' || '' }} -- --project tests/Worf.Tests/Worf.Tests.csproj --output detailed
 
       - name: Save multi-server test logs
         if: failure() || cancelled()
