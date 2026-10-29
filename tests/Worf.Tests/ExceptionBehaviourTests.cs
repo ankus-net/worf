@@ -127,11 +127,9 @@ public sealed class ExceptionBehaviourTests
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM t WHERE id = 14)", token),
             "the transaction after the discarded one");
         Assert.AreEqual("1\n3\n4\n6\n7\n8\n14", await subscriber.SafePsqlAsync(Database, "SELECT id FROM t ORDER BY id", token));
-        Assert.AreEqual("""
-            transdiscard|INSERT|public|t|11|good|23514
-            transdiscard|INSERT|public|t|12|bad|23514
-            transdiscard|INSERT|public|t|13|good|23514
-            """, await subscriber.SafePsqlAsync(Database, """
+        // Joined with \n, as the rows come, rather than written out, which takes the checkout's line endings.
+        Assert.AreEqual(string.Join('\n', "transdiscard|INSERT|public|t|11|good|23514", "transdiscard|INSERT|public|t|12|bad|23514",
+            "transdiscard|INSERT|public|t|13|good|23514"), await subscriber.SafePsqlAsync(Database, """
             SELECT behaviour, operation, schema_name, table_name, remote_new_tuple->>'id', remote_new_tuple->>'v', error_sqlstate
             FROM worf.exception_log WHERE remote_new_tuple->>'id' IN ('11', '12', '13') ORDER BY log_id
             """, token), "every change of the skipped transaction");
