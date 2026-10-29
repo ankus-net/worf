@@ -242,7 +242,7 @@ Add only these tests beyond pglogical's:
 
 **`ci.yml`:**
 
-- Runs on every push and pull request.
+- Runs on pushes to main, on pull requests and nightly.
 - Builds and runs the full regression suite and the MSTest tests on PostgreSQL 15–19 on Linux x64, macOS ARM64 and Windows x64.
 - A nightly run on Linux adds a stress run.
 - No job runs longer than 30 minutes.

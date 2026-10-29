@@ -50,7 +50,8 @@ public sealed class CreateSubscriberOptionsTests
 
     /// <summary>
     /// The command subscribes every listed database with the replication sets, apply delay and text transfer it's
-    /// given, passes extra arguments to pg_basebackup, and stops the server when asked.
+    /// given, passes extra arguments to pg_basebackup, and stops the server when asked. It connects with a timeout
+    /// longer than Npgsql's limit, which libpq takes.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -96,7 +97,7 @@ public sealed class CreateSubscriberOptionsTests
             [
                 "--pgdata", backupDir, "--subscriber-name", "test_subscriber",
                 $"--subscriber-dsn=host=localhost port={pgport.ToString(CultureInfo.InvariantCulture)} user=super",
-                $"--provider-dsn=host=localhost port={providerPort.ToString(CultureInfo.InvariantCulture)} user=super",
+                $"--provider-dsn=host=localhost port={providerPort.ToString(CultureInfo.InvariantCulture)} user=super connect_timeout=2000",
                 "--databases=postgres,otherdb", "--replication-sets=default ddl_sql", "--apply-delay=5", "--text-types",
                 "--extra-basebackup-args=-c fast", "--stop", "-v", "-v",
                 $"--hba-conf={Path.Join(AppContext.BaseDirectory, "TestFiles", "regress-pg_hba.conf")}",

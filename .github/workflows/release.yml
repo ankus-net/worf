@@ -8,15 +8,39 @@ on:
     tags:
       - 'v*'
 
+# Only the job that publishes the release can write to the repository.
 permissions:
-  contents: write
+  contents: read
 
 env:
   DOTNET_CLI_TELEMETRY_OPTOUT: '1'
   DOTNET_NOLOGO: '1'
 
 jobs:
+  # The packages take their version from the tag and their SQL from the extension, so a tag that doesn't match the
+  # extension's version stops the release before anything is built.
+  version:
+    name: Check the version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Compare the tag with the extension version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          version="${version%%-*}"
+          project=$(sed -n 's:.*<AnkusExtensionVersion>\(.*\)</AnkusExtensionVersion>.*:\1:p' src/Worf/Worf.csproj)
+          source=$(sed -n 's:.*const string Version = "\(.*\)";.*:\1:p' src/Worf/Worf.cs)
+          if [[ "$project" != "$version" || "$source" != "$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME is version $version, but AnkusExtensionVersion in src/Worf/Worf.csproj is '$project' and Worf.Version in src/Worf/Worf.cs is '$source'. Set both to $version before tagging."
+            exit 1
+          fi
+
   ci:
+    needs: version
     uses: ./.github/workflows/ci.yml
 
   package:
@@ -40,6 +64,8 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       # Packages are built against PostgreSQL without assertions, as installations users run are.
       - uses: ./.github/actions/setup
@@ -72,6 +98,8 @@ jobs:
     needs: package
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v8
         with:

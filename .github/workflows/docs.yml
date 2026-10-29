@@ -1,8 +1,13 @@
 name: Docs
 
+# Pull requests that change the site check and build it; main also deploys it.
 on:
   push:
     branches: [main]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/docs.yml'
+  pull_request:
     paths:
       - 'docs/**'
       - '.github/workflows/docs.yml'
@@ -10,14 +15,12 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 # Pages accepts one deployment at a time, so commits merged in quick succession wait for the deployment ahead of them
-# instead of failing.
+# instead of failing. A pull request's newer run replaces one still running.
 concurrency:
-  group: pages
-  cancel-in-progress: false
+  group: ${{ github.event_name == 'pull_request' && format('docs-{0}', github.ref) || 'pages' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
@@ -25,6 +28,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
@@ -40,24 +45,33 @@ jobs:
         run: pnpm install --frozen-lockfile
         working-directory: docs
 
+      - name: Check the site
+        run: pnpm check
+        working-directory: docs
+
       - name: Build the site
         run: pnpm build
         working-directory: docs
 
-      - uses: actions/configure-pages@v6
-
       - uses: actions/upload-pages-artifact@v5
+        if: github.event_name != 'pull_request'
         with:
           path: artifacts/docs
 
   deploy:
+    if: github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - uses: actions/configure-pages@v6
+
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v5

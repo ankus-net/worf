@@ -94,8 +94,14 @@ if (hugeTx)
     settings.Add("wal_sender_timeout=15min");
 }
 
-// Current PostgreSQL releases load only the output plugins this setting lists.
-settings.Add("output_plugin_libraries=pgoutput, test_decoding, worf");
+// Current PostgreSQL releases load only the output plugins this setting lists. Earlier minor releases have no such
+// setting, and a server whose configuration sets it doesn't start, so it's set only where the server describes it.
+string pgConfig = Capture("dotnet", ["ankus", "info", "pg-config", major, "--home", home]).Trim();
+string postgres = Path.Join(Path.GetDirectoryName(pgConfig), OperatingSystem.IsWindows() ? "postgres.exe" : "postgres");
+if (Capture(postgres, ["--describe-config"]).Split('\n').Any(static line => line.StartsWith("output_plugin_libraries\t", StringComparison.Ordinal)))
+{
+    settings.Add("output_plugin_libraries=pgoutput, test_decoding, worf");
+}
 
 List<string> arguments =
 [
@@ -123,7 +129,8 @@ string suite = Path.Join(root, "src", "Worf", "pg_regress");
 List<string> added = [];
 if (hugeTx)
 {
-    foreach (string directory in (string[])["sql", "expected"])
+    string[] directories = ["sql", "expected"];
+    foreach (string directory in directories)
     {
         foreach (string file in Directory.GetFiles(Path.Join(suite, "huge_tx", directory)))
         {
@@ -181,4 +188,23 @@ static int Run(string fileName, IEnumerable<string> arguments, bool check = true
     }
 
     return process.ExitCode;
+}
+
+static string Capture(string fileName, IEnumerable<string> arguments)
+{
+    ProcessStartInfo start = new(fileName) { UseShellExecute = false, RedirectStandardOutput = true };
+    foreach (string argument in arguments)
+    {
+        start.ArgumentList.Add(argument);
+    }
+
+    using Process process = Process.Start(start)!;
+    string output = process.StandardOutput.ReadToEnd();
+    process.WaitForExit();
+    if (process.ExitCode != 0)
+    {
+        throw new InvalidOperationException($"{fileName} exited with code {process.ExitCode}.");
+    }
+
+    return output;
 }

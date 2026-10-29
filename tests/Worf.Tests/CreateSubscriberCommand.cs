@@ -12,6 +12,7 @@ namespace Worf.Tests;
 internal static class CreateSubscriberCommand
 {
     private static readonly Lazy<Task<string>> s_published = new(PublishAsync);
+    private static readonly HashSet<int> s_ports = [];
 
     /// <summary>
     /// Gets the command's file name.
@@ -89,14 +90,35 @@ internal static class CreateSubscriberCommand
     }
 
     /// <summary>
-    /// Finds a TCP port nothing listens on.
+    /// Finds a TCP port nothing listens on, for a server the command starts long after. Other tests' clusters and every
+    /// outgoing connection take ports the operating system assigns, from 32768 up on Linux and 49152 up on macOS and
+    /// Windows, so the port comes from below those, and no other test here gets it.
     /// </summary>
     /// <returns>The port.</returns>
     public static int FreePort()
     {
-        using TcpListener listener = new(IPAddress.Loopback, 0);
-        listener.Start();
-        return ((IPEndPoint)listener.LocalEndpoint).Port;
+        lock (s_ports)
+        {
+            while (true)
+            {
+                int port = Random.Shared.Next(20000, 30000);
+                if (!s_ports.Add(port))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    using TcpListener listener = new(IPAddress.Loopback, port);
+                    listener.Start();
+                    return port;
+                }
+                catch (SocketException)
+                {
+                    // Something else has it.
+                }
+            }
+        }
     }
 
     private static async Task CreateJunctionAsync(string link, string target)

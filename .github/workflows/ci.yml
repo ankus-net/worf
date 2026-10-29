@@ -38,6 +38,11 @@ jobs:
         postgresql: [15, 16, 17, 18, 19]
     runs-on: ${{ matrix.platform == 'linux-x64' && 'ubuntu-24.04' || matrix.platform == 'osx-arm64' && 'macos-15' || 'windows-2025' }}
     timeout-minutes: 30
+    # Ankus keys compiled bindings by environment variables such as PATH and HOME, which Git Bash and PowerShell set
+    # differently on Windows, so the tests reuse the build's bindings only when every step runs in the same shell.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v7
 
@@ -60,18 +65,26 @@ jobs:
 
       - name: Build
         id: build
-        shell: bash
         run: |
           set -o pipefail
+          touch "$RUNNER_TEMP/build-start"
           dotnet ankus build --pg ${{ matrix.postgresql }} --project src/Worf/Worf.csproj | tee "$RUNNER_TEMP/build.log"
           if grep -q "Managed binding compilation: built" "$RUNNER_TEMP/build.log"; then
             echo "compiled-bindings=true" >> "$GITHUB_OUTPUT"
           fi
 
       # Bindings depend on the PostgreSQL symbols worf uses, so restored ones go stale when worf starts using another.
-      # Main saves them again whenever its build compiles them. Pull requests use main's rather than storing their own.
+      # Main saves them again whenever its build compiles them, without the sets the build no longer uses: Ankus names
+      # each set by a 64-digit key and updates its time whenever a build uses it. Other branches and tags use main's
+      # rather than storing their own.
+      - name: Prune Ankus bindings
+        if: steps.build.outputs.compiled-bindings == 'true' && github.ref == 'refs/heads/main'
+        run: |
+          key=$(printf '[0-9A-F]%.0s' {1..64})
+          find "$AnkusBindingCacheDirectory" -mindepth 1 -maxdepth 2 -name "$key*" ! -newer "$RUNNER_TEMP/build-start" -prune -exec rm -rf {} +
+
       - name: Save Ankus bindings
-        if: steps.build.outputs.compiled-bindings == 'true' && github.event_name != 'pull_request'
+        if: steps.build.outputs.compiled-bindings == 'true' && github.ref == 'refs/heads/main'
         uses: actions/cache/save@v6
         with:
           path: ${{ runner.temp }}/ankus-bindings
@@ -111,7 +124,7 @@ jobs:
           # statement, keep the runner's four processors from the resynchronizing copy, the apply and the walsender
           # until the walsender times out. Three leave a processor for them.
           PGBENCH_CLIENTS: ${{ runner.os == 'Windows' && '3' || '10' }}
-        run: dotnet ankus test --pg ${{ matrix.postgresql }} -c Release ${{ runner.os == 'Windows' && '--pgdata D:\ankus\pgdata' || '' }} -- --project tests/Worf.Tests/Worf.Tests.csproj --output detailed
+        run: dotnet ankus test --pg ${{ matrix.postgresql }} -c Release ${{ runner.os == 'Windows' && '--pgdata ''D:\ankus\pgdata''' || '' }} -- --project tests/Worf.Tests/Worf.Tests.csproj --output detailed
 
       - name: Save multi-server test logs
         if: failure() || cancelled()
@@ -128,13 +141,21 @@ jobs:
       # fit within 10 minutes even when the job builds PostgreSQL.
       - name: Run stress test
         if: (github.event_name == 'schedule' || inputs.nightly == true) && (success() || failure())
+        # A hang fails the step, rather than the job's timeout cancelling the job, so that its results are saved.
+        timeout-minutes: 10
         run: dotnet run eng/stress.cs -- --pg ${{ matrix.postgresql }} --runs 2
 
+      # A run that hangs never reaches the copy of its results, so its results and server log come from where it left
+      # them.
       - name: Save stress test results
-        if: (github.event_name == 'schedule' || inputs.nightly == true) && failure()
+        if: (github.event_name == 'schedule' || inputs.nightly == true) && (failure() || cancelled())
         uses: actions/upload-artifact@v7
         with:
           name: stress-${{ matrix.platform }}-pg${{ matrix.postgresql }}
-          path: artifacts/stress/
+          path: |
+            artifacts/stress/
+            src/Worf/pg_regress/results/
+            src/Worf/pg_regress/regression.diffs
+            artifacts/regress-home/clusters/*.log
           if-no-files-found: ignore
           retention-days: 7

@@ -10,7 +10,7 @@
   VERSION     - worf version for display (e.g., 0.1.0-rc1)
   MSI_VERSION - numeric version for the MSI, without a prerelease suffix
   PG_VERSION  - PostgreSQL major version (15 to 19)
-  PackageDir  - absolute path to the package tree, with bin, lib and share\extension
+  PackageDir  - absolute path to the package tree, with bin, lib and share\extension beside the license notices
 
   The installer finds the PostgreSQL installation in the registry, falls back to
   the standard path, and lets the user choose another directory. Each PostgreSQL
@@ -72,6 +72,9 @@
         <Directory Id="SHAREDIR" Name="share">
           <Directory Id="EXTENSIONDIR" Name="extension" />
         </Directory>
+        <Directory Id="DOCDIR" Name="doc">
+          <Directory Id="WORFDOCDIR" Name="worf" />
+        </Directory>
       </Directory>
     </StandardDirectory>
 
@@ -95,6 +98,20 @@
       <Files Include="$(var.PackageDir)\share\extension\worf*" />
     </ComponentGroup>
 
+    <!-- The licenses of worf and of the software it includes, which those licenses require in every copy. -->
+    <ComponentGroup Id="Notices" Directory="WORFDOCDIR">
+      <Component Id="worf_license" Guid="*">
+        <File Id="LICENSE"
+              Source="$(var.PackageDir)\LICENSE"
+              KeyPath="yes" />
+      </Component>
+      <Component Id="worf_third_party_notices" Guid="*">
+        <File Id="THIRD_PARTY_NOTICES.txt"
+              Source="$(var.PackageDir)\THIRD-PARTY-NOTICES.txt"
+              KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
     <Feature Id="Complete"
              Title="worf Extension"
              Description="Installs the worf logical replication extension for PostgreSQL $(var.PG_VERSION)."
@@ -103,6 +120,7 @@
       <ComponentGroupRef Id="Executables" />
       <ComponentGroupRef Id="Libraries" />
       <ComponentGroupRef Id="Extensions" />
+      <ComponentGroupRef Id="Notices" />
     </Feature>
 
     <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="POSTGRESQLDIR" />
