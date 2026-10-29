@@ -217,20 +217,21 @@ internal static class Rpc
     /// </summary>
     /// <param name="conn">The provider connection, inside a local transaction.</param>
     /// <param name="nodeId">The node.</param>
-    /// <returns>Whether the remote node subscribes to the node, and its <c>worf.conflict_resolution</c>.</returns>
-    internal static (bool Subscribes, string ConflictResolution) RemoteSubscribesTo(PgReplicationConnection conn, uint nodeId)
+    /// <returns>Whether the remote node subscribes to the node, and its <c>worf.conflict_resolution</c>, or null when
+    /// its session doesn't have the setting.</returns>
+    internal static (bool Subscribes, string? ConflictResolution) RemoteSubscribesTo(PgReplicationConnection conn, uint nodeId)
     {
         IReadOnlyList<string?[]> res;
         try
         {
-            res = conn.Query($"SELECT EXISTS (SELECT 1 FROM worf.subscription WHERE sub_origin = {nodeId.ToString(CultureInfo.InvariantCulture)}), current_setting('worf.conflict_resolution')", 2);
+            res = conn.Query($"SELECT EXISTS (SELECT 1 FROM worf.subscription WHERE sub_origin = {nodeId.ToString(CultureInfo.InvariantCulture)}), current_setting('worf.conflict_resolution', true)", 2);
         }
         catch (PgRemoteException error)
         {
             throw new PgException(PgSqlStates.InternalError, $"could not fetch remote subscriptions: ERROR:  {error.Message}\n\n");
         }
 
-        return (res[0][0] == "t", res[0][1] ?? "");
+        return (res[0][0] == "t", res[0][1]);
     }
 
     /// <summary>

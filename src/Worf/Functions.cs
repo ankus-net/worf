@@ -274,8 +274,8 @@ internal static class Functions
             (uint nodeId, string nodeName, _, _, _) = Rpc.RemoteNodeInfo(conn);
             origin = new WorfNode { Id = nodeId, Name = nodeName };
 
-            (bool subscribes, string remoteResolution) = Rpc.RemoteSubscribesTo(conn, localnode.Node.Id);
-            if (subscribes)
+            (bool subscribes, string? remoteResolution) = Rpc.RemoteSubscribesTo(conn, localnode.Node.Id);
+            if (subscribes && remoteResolution is not null)
             {
                 Conflict.CheckTwoWayResolution(localnode.Node.Name, origin.Name, remoteResolution);
             }

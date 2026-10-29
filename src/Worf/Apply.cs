@@ -511,7 +511,7 @@ internal static unsafe partial class Apply
     {
         long ahead = commitTime - Worker.GetCurrentTimestamp();
         int maxClockSkew = MaxClockSkew;
-        if (ahead < 0 || maxClockSkew < 0)
+        if (maxClockSkew < 0)
         {
             return;
         }
@@ -531,11 +531,28 @@ internal static unsafe partial class Apply
             return;
         }
 
-        // The sleep can end early, so check the clock again.
+        // Skew that comes back after the clocks are fixed is reported again.
+        s_clockSkewReported = false;
+
+        // Wait on the latch a second at most at a time, so that the worker stops when asked to and keeps the
+        // provider's walsender from timing out.
         while (ahead >= 0)
         {
-            NativeMethods.pg_usleep(ahead + 1);
-            ahead = commitTime - Worker.GetCurrentTimestamp();
+            if (Worker.GotSigterm)
+            {
+                throw new OperationCanceledException("The worf worker is stopping.");
+            }
+
+            _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(Math.Min((ahead / 1000) + 1, 1000)));
+            PgInterrupts.Check();
+
+            long now = Worker.GetCurrentTimestamp();
+            if (s_applyconn is not null)
+            {
+                _ = SendFeedback(s_applyconn, s_lastReceived, now, false);
+            }
+
+            ahead = commitTime - now;
         }
     }
 
