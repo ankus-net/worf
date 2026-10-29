@@ -665,8 +665,8 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   How far ahead of the local clock a remote transaction's commit time can be
   for apply to wait until the local clock passes it, so that local changes
   made afterwards commit later and win under `last_update_wins`. A remote
-  transaction further ahead applies at once, with a warning. `-1` never
-  waits. The default is `1s`.
+  transaction further ahead applies at once, with a warning at most once a
+  minute. `-1` never waits. The default is `1s`.
 
 - `worf.batch_inserts`
   Tells worf to use batch insert mechanism if possible. Batch mechanism

@@ -31,7 +31,7 @@ internal static unsafe partial class Apply
     private static WorfRelation? s_lastInsertRel;
     private static int s_lastInsertRelCnt;
     private static bool s_useMultiInsert;
-    private static bool s_clockSkewReported;
+    private static long s_clockSkewReportedAt;
 
     // A message counter for the xact, for debugging. We don't send the remote change LSN with messages, so this aids
     // identification of which change causes an error.
@@ -518,9 +518,11 @@ internal static unsafe partial class Apply
 
         if (ahead > maxClockSkew * 1000L)
         {
-            if (!s_clockSkewReported)
+            // Reported at most once a minute, so that skew hovering at the limit doesn't flood the log.
+            long now = Worker.GetCurrentTimestamp();
+            if (now - s_clockSkewReportedAt >= 60_000_000)
             {
-                s_clockSkewReported = true;
+                s_clockSkewReportedAt = now;
                 PgLog.Warning(new PgDiagnostic(
                     $"remote commit time is {ahead / 1000} ms ahead of the local clock, more than worf.max_clock_skew")
                 {
@@ -530,9 +532,6 @@ internal static unsafe partial class Apply
 
             return;
         }
-
-        // Skew that comes back after the clocks are fixed is reported again.
-        s_clockSkewReported = false;
 
         // Wait on the latch a second at most at a time, so that the worker stops when asked to and keeps the
         // provider's walsender from timing out.
