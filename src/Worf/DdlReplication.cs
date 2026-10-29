@@ -71,18 +71,20 @@ internal static unsafe partial class DdlReplication
                 NodeTag.T_CreateSubscriptionStmt or NodeTag.T_AlterSubscriptionStmt or NodeTag.T_DropSubscriptionStmt or
                 NodeTag.T_CreatePublicationStmt or NodeTag.T_AlterPublicationStmt or NodeTag.T_ClusterStmt => false,
 
-            // Temporary objects are the session's.
-            NodeTag.T_CreateStmt => !IsTemp(((CreateStmt*)parsetree)->relation),
-            NodeTag.T_CreateTableAsStmt => !IsTemp(((CreateTableAsStmt*)parsetree)->into->rel),
-            NodeTag.T_ViewStmt => !IsTemp(((ViewStmt*)parsetree)->view),
-            NodeTag.T_CreateSeqStmt => !IsTemp(((CreateSeqStmt*)parsetree)->sequence),
-            NodeTag.T_AlterSeqStmt => !IsTemp(((AlterSeqStmt*)parsetree)->sequence),
-            NodeTag.T_IndexStmt => !IsTemp(((IndexStmt*)parsetree)->relation),
-            NodeTag.T_AlterTableStmt => !IsTemp(((AlterTableStmt*)parsetree)->relation),
-            NodeTag.T_DropStmt => !DropsTemp((DropStmt*)parsetree),
+            // Temporary objects are the session's, and worf's own the node's.
+            NodeTag.T_CreateStmt => !StaysLocal(((CreateStmt*)parsetree)->relation),
+            NodeTag.T_CreateTableAsStmt => !StaysLocal(((CreateTableAsStmt*)parsetree)->into->rel),
+            NodeTag.T_ViewStmt => !StaysLocal(((ViewStmt*)parsetree)->view),
+            NodeTag.T_CreateSeqStmt => !StaysLocal(((CreateSeqStmt*)parsetree)->sequence),
+            NodeTag.T_AlterSeqStmt => !StaysLocal(((AlterSeqStmt*)parsetree)->sequence),
+            NodeTag.T_IndexStmt => !StaysLocal(((IndexStmt*)parsetree)->relation),
+            NodeTag.T_AlterTableStmt => !StaysLocal(((AlterTableStmt*)parsetree)->relation),
+            NodeTag.T_DropStmt => !DropsLocal((DropStmt*)parsetree),
 
-            // Each node creates and drops worf itself.
-            NodeTag.T_CreateExtensionStmt => Worf.FromServer(((CreateExtensionStmt*)parsetree)->extname) != Worf.ExtensionName,
+            // Each node creates, updates and drops worf itself.
+            NodeTag.T_CreateExtensionStmt => !IsWorf(((CreateExtensionStmt*)parsetree)->extname),
+            NodeTag.T_AlterExtensionStmt => !IsWorf(((AlterExtensionStmt*)parsetree)->extname),
+            NodeTag.T_AlterExtensionContentsStmt => !IsWorf(((AlterExtensionContentsStmt*)parsetree)->extname),
             _ => true,
         };
 
@@ -135,14 +137,15 @@ internal static unsafe partial class DdlReplication
             NodeTag.T_AlterTableStmt => ((AlterTableStmt*)parsetree)->relation,
             _ => null,
         };
-        if (!IncludeDdlRepset || relation is null)
+        // Extensions' tables, such as worf's own, aren't replicated.
+        if (!IncludeDdlRepset || relation is null || NativeGlobals.creating_extension)
         {
             return;
         }
 
         uint reloid = NativeMethods.RangeVarGetRelidExtended(relation, 0, RangeVarMissingOk, default, null);
         if (reloid != 0 && NativeMethods.get_rel_relkind(reloid) == (sbyte)'r' &&
-            NativeMethods.get_rel_persistence(reloid) == (sbyte)'p')
+            NativeMethods.get_rel_persistence(reloid) == (sbyte)'p' && NativeMethods.get_rel_namespace(reloid) != WorfNamespace())
         {
             _ = WithSnapshot(() => AddTable(parsetree, reloid));
         }
@@ -201,40 +204,77 @@ internal static unsafe partial class DdlReplication
         }
     }
 
-    private static bool IsTemp(RangeVar* relation)
+    /// <summary>
+    /// Checks whether a relation is temporary, or one of worf's own.
+    /// </summary>
+    private static bool StaysLocal(RangeVar* relation)
     {
         if (relation is null)
         {
             return false;
         }
 
-        if (relation->relpersistence == (sbyte)'t' ||
-            (relation->schemaname is not null && Worf.FromServer(relation->schemaname).StartsWith("pg_temp", StringComparison.Ordinal)))
+        if (relation->relpersistence == (sbyte)'t')
         {
             return true;
         }
 
+        if (relation->schemaname is not null)
+        {
+            string schema = Worf.FromServer(relation->schemaname);
+            if (schema == Worf.ExtensionName || schema.StartsWith("pg_temp", StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
         uint reloid = NativeMethods.RangeVarGetRelidExtended(relation, 0, RangeVarMissingOk, default, null);
-        return reloid != 0 && NativeMethods.get_rel_persistence(reloid) == (sbyte)'t';
+        return reloid != 0 &&
+            (NativeMethods.get_rel_persistence(reloid) == (sbyte)'t' || NativeMethods.get_rel_namespace(reloid) == WorfNamespace());
     }
 
-    private static bool DropsTemp(DropStmt* stmt)
+    /// <summary>
+    /// Checks whether a DROP drops temporary relations, worf's own, worf itself, or PostgreSQL's own publications.
+    /// </summary>
+    private static bool DropsLocal(DropStmt* stmt)
     {
+        if (stmt->removeType == ObjectType.OBJECT_PUBLICATION)
+        {
+            return true;
+        }
+
+        // An extension's or schema's name is a list of one name each, which NameListToString joins with dots.
+        List* objects = stmt->objects;
+        if (stmt->removeType is ObjectType.OBJECT_EXTENSION or ObjectType.OBJECT_SCHEMA)
+        {
+            return objects is not null &&
+                Worf.FromServer(NativeMethods.NameListToString(objects)).Split('.').Contains(Worf.ExtensionName);
+        }
+
         if (stmt->removeType is not (ObjectType.OBJECT_TABLE or ObjectType.OBJECT_VIEW or ObjectType.OBJECT_SEQUENCE or
             ObjectType.OBJECT_INDEX or ObjectType.OBJECT_MATVIEW or ObjectType.OBJECT_FOREIGN_TABLE))
         {
             return false;
         }
 
-        List* objects = stmt->objects;
         for (int i = 0; objects is not null && i < objects->length; i++)
         {
-            if (IsTemp(NativeMethods.makeRangeVarFromNameList((List*)objects->elements[i].ptr_value)))
+            if (StaysLocal(NativeMethods.makeRangeVarFromNameList((List*)objects->elements[i].ptr_value)))
             {
                 return true;
             }
         }
 
         return false;
+    }
+
+    private static bool IsWorf(sbyte* name) => name is not null && Worf.FromServer(name) == Worf.ExtensionName;
+
+    private static uint WorfNamespace()
+    {
+        fixed (byte* name = Worf.ToServerCString(Worf.ExtensionName))
+        {
+            return NativeMethods.get_namespace_oid((sbyte*)name, true);
+        }
     }
 }

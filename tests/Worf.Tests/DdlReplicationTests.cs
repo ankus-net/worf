@@ -76,6 +76,15 @@ public sealed class DdlReplicationTests
         _ = await nodeA.SafePsqlAsync(Database, "DROP TABLE app.nopk", token);
         await WaitAsync(nodeA, token);
         Assert.AreEqual("", await nodeB.SafePsqlAsync(Database, "SELECT to_regclass('app.nopk')", token));
+
+        // worf's own tables stay out of replication sets, and each node drops worf itself.
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.conflict_history_ensure_partition(CURRENT_DATE + 60)", token);
+        Assert.AreEqual("0", await nodeA.SafePsqlAsync(Database, """
+            SELECT count(*) FROM worf.replication_set_table r JOIN pg_class c ON c.oid = r.set_reloid
+            WHERE c.relnamespace = 'worf'::regnamespace
+            """, token));
+        _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.drop_subscription('b_from_a')", token);
+        _ = await nodeB.SafePsqlAsync(Database, "DROP EXTENSION worf CASCADE", token);
     }
 
     private static async Task<TestNode> StartNodeAsync(string name, CancellationToken token)
