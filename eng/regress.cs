@@ -123,7 +123,8 @@ string suite = Path.Join(root, "src", "Worf", "pg_regress");
 List<string> added = [];
 if (hugeTx)
 {
-    foreach (string directory in (string[])["sql", "expected"])
+    string[] directories = ["sql", "expected"];
+    foreach (string directory in directories)
     {
         foreach (string file in Directory.GetFiles(Path.Join(suite, "huge_tx", directory)))
         {

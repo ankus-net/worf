@@ -79,9 +79,14 @@ jobs:
           build-mode: ${{ matrix.build-mode }}
           config-file: ./.github/codeql-config.yml
 
+      # The engineering apps are file-based apps outside the solution, so they build on their own.
       - name: Build
         if: matrix.build-mode == 'manual'
-        run: dotnet build Worf.slnx -c Release
+        run: |
+          dotnet build Worf.slnx -c Release
+          for app in eng/*.cs; do
+            dotnet build "$app"
+          done
 
       - name: Analyze
         uses: github/codeql-action/analyze@v4

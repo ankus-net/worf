@@ -49,18 +49,17 @@ string name = $"worf-{version}-pg{major}-{platform}";
 string tree = Path.Join(output, name);
 string work = Path.Join(root, "artifacts", "package-work", name);
 
-foreach (string directory in (string[])[tree, work])
+string[] previous = [tree, work];
+foreach (string directory in previous.Where(Directory.Exists))
 {
-    if (Directory.Exists(directory))
-    {
-        Directory.Delete(directory, recursive: true);
-    }
+    Directory.Delete(directory, recursive: true);
 }
 
 Directory.CreateDirectory(Path.Join(tree, "bin"));
 Directory.CreateDirectory(Path.Join(tree, "lib"));
 Directory.CreateDirectory(Path.Join(tree, "share", "extension"));
-foreach (string notice in (string[])["LICENSE", "THIRD-PARTY-NOTICES.txt"])
+string[] notices = ["LICENSE", "THIRD-PARTY-NOTICES.txt"];
+foreach (string notice in notices)
 {
     File.Copy(Path.Join(root, notice), Path.Join(tree, notice));
 }
