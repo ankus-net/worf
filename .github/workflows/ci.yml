@@ -47,18 +47,35 @@ jobs:
           postgresql: ${{ matrix.postgresql }}
           release: ${{ (github.event_name == 'schedule' || inputs.nightly == true) }}
 
-      # Generating and compiling the Ankus bindings for a PostgreSQL version takes about two minutes a build.
-      - name: Cache Ankus bindings
-        uses: actions/cache@v6
+      # Generating and compiling the Ankus bindings for a PostgreSQL version takes about two minutes a build. The newest
+      # bindings for the Ankus SDK are restored, or else the newest for the version.
+      - name: Restore Ankus bindings
+        uses: actions/cache/restore@v6
         with:
           path: ${{ runner.temp }}/ankus-bindings
-          key: ankus-bindings-v2-${{ matrix.platform }}-pg${{ matrix.postgresql }}-${{ hashFiles('global.json') }}
-          # Ankus checks restored bindings before reusing them, so a global.json change that leaves the Ankus SDK alone,
-          # such as a test SDK update, starts from the last cache rather than generating them again.
-          restore-keys: ankus-bindings-v2-${{ matrix.platform }}-pg${{ matrix.postgresql }}-
+          key: ankus-bindings-v2-${{ matrix.platform }}-pg${{ matrix.postgresql }}-${{ hashFiles('global.json') }}-${{ github.run_id }}
+          restore-keys: |
+            ankus-bindings-v2-${{ matrix.platform }}-pg${{ matrix.postgresql }}-${{ hashFiles('global.json') }}-
+            ankus-bindings-v2-${{ matrix.platform }}-pg${{ matrix.postgresql }}-
 
       - name: Build
-        run: dotnet ankus build --pg ${{ matrix.postgresql }} --project src/Worf/Worf.csproj
+        id: build
+        shell: bash
+        run: |
+          set -o pipefail
+          dotnet ankus build --pg ${{ matrix.postgresql }} --project src/Worf/Worf.csproj | tee "$RUNNER_TEMP/build.log"
+          if grep -q "Managed binding compilation: built" "$RUNNER_TEMP/build.log"; then
+            echo "compiled-bindings=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Bindings depend on the PostgreSQL symbols worf uses, so restored ones go stale when worf starts using another.
+      # Main saves them again whenever its build compiles them. Pull requests use main's rather than storing their own.
+      - name: Save Ankus bindings
+        if: steps.build.outputs.compiled-bindings == 'true' && github.event_name != 'pull_request'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/ankus-bindings
+          key: ankus-bindings-v2-${{ matrix.platform }}-pg${{ matrix.postgresql }}-${{ hashFiles('global.json') }}-${{ github.run_id }}
 
       - name: Run regression suite
         if: github.event_name != 'schedule' && inputs.nightly != true
