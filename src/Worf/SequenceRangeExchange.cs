@@ -186,130 +186,7 @@ internal static class SequenceRangeExchange
                 """);
             for (int i = 0; i < sequences.Count; i++)
             {
-                SpiRow row = sequences[i];
-                uint seqoid = row.Get<uint>(0);
-                writer.WriteStartObject();
-                writer.WriteString("name", row.Get<string>(1));
-                writer.WriteNumber("owner_id", row.Get<uint>(2));
-                writer.WriteNumber("epoch", row.Get<int>(3));
-                writer.WriteNumber("range_size", row.Get<long>(4));
-                writer.WriteNumber("max_range_size", row.Get<long>(5));
-                WriteNullable(writer, "distance", row.Get<int?>(6));
-                WriteNullable(writer, "high_water", row.Get<long?>(7));
-                WriteNullable(writer, "watermark", row.Get<long?>(8));
-                writer.WriteString("state", row.Get<string>(10));
-                WriteNullable(writer, "root_start", row.Get<long?>(11));
-                WriteNullable(writer, "root_end", row.Get<long?>(12));
-
-                // A reset this node asks of the neighbor, whose WAL position moved backwards, and one it honored.
-                SpiResult neighborRow = Worf.SelectCatalog(
-                    "SELECT reset_lsn::text, reset_done::text, state = 'fenced' FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2",
-                    SpiParameter.Create(seqoid), SpiParameter.Create(neighbor));
-                bool neighborFenced = false;
-                if (neighborRow.Count > 0)
-                {
-                    WriteNullable(writer, "reset", neighborRow[0].Get<string?>(0));
-                    WriteNullable(writer, "reset_done", neighborRow[0].Get<string?>(1));
-                    neighborFenced = neighborRow[0].Get<bool?>(2) == true;
-                }
-
-                // The blocks this node holds from the neighbor: every one while the neighbor is a fenced allocator, so
-                // that it can rebuild its ledger, and otherwise those abandoned lately, which it marks so.
-                writer.WriteBoolean("held_complete", neighborFenced);
-                writer.WriteStartArray("held");
-                SpiResult held = Worf.SelectCatalog("""
-                    SELECT block_id, kind::text, lo, hi, state = 'abandoned' FROM worf.sequence_range_block
-                    WHERE seqoid = $1 AND from_node = $2 AND kind IN ('n', 'p', 'i')
-                        AND ($3 OR state = 'abandoned' AND retired_at > now() - interval '10 minutes')
-                    """, SpiParameter.Create(seqoid), SpiParameter.Create(neighbor), SpiParameter.Create(neighborFenced));
-                for (int h = 0; h < held.Count; h++)
-                {
-                    writer.WriteStartObject();
-                    writer.WriteString("id", held[h].Get<Guid>(0));
-                    writer.WriteString("kind", held[h].Get<string>(1));
-                    writer.WriteNumber("lo", held[h].Get<long>(2));
-                    writer.WriteNumber("hi", held[h].Get<long>(3));
-                    writer.WriteBoolean("abandoned", held[h].Get<bool>(4));
-                    writer.WriteEndObject();
-                }
-
-                writer.WriteEndArray();
-
-                // The open requests, for a node block or a pool block, when the neighbor is this node's parent.
-                writer.WriteStartArray("requests");
-                if (row.Get<uint?>(9) == neighbor)
-                {
-                    SpiResult requests = Worf.SelectCatalog(
-                        "SELECT request_id, size, kind::text, lo, hi FROM worf.sequence_range_request WHERE seqoid = $1 AND parent_node = $2 AND state = 'open'",
-                        SpiParameter.Create(seqoid), SpiParameter.Create(neighbor));
-                    for (int r = 0; r < requests.Count; r++)
-                    {
-                        writer.WriteStartObject();
-                        writer.WriteString("id", requests[r].Get<Guid>(0));
-                        writer.WriteNumber("size", requests[r].Get<long>(1));
-                        writer.WriteString("kind", requests[r].Get<string>(2));
-                        WriteNullable(writer, "lo", requests[r].Get<long?>(3));
-                        WriteNullable(writer, "hi", requests[r].Get<long?>(4));
-                        writer.WriteEndObject();
-                    }
-                }
-
-                writer.WriteEndArray();
-
-                // Every node this node has heard from, so that reports reach the owner hop by hop.
-                writer.WriteStartArray("reports");
-                SpiResult reports = Worf.SelectCatalog("""
-                    SELECT n.node_id, n.node_name::text, n.high_water, n.watermark, n.epoch,
-                        CASE WHEN n.node_id <> l.node_id THEN n.state WHEN r.fenced_at IS NOT NULL THEN 'fenced' ELSE r.state END
-                    FROM worf.sequence_range_node n JOIN worf.sequence_range r ON r.seqoid = n.seqoid CROSS JOIN worf.local_node l
-                    WHERE n.seqoid = $1 AND n.node_id <> $2
-                    """, SpiParameter.Create(seqoid), SpiParameter.Create(neighbor));
-                for (int r = 0; r < reports.Count; r++)
-                {
-                    writer.WriteStartObject();
-                    writer.WriteNumber("node_id", reports[r].Get<uint>(0));
-                    writer.WriteString("node_name", reports[r].Get<string>(1));
-                    WriteNullable(writer, "high_water", reports[r].Get<long?>(2));
-                    WriteNullable(writer, "watermark", reports[r].Get<long?>(3));
-                    WriteNullable(writer, "epoch", reports[r].Get<int?>(4));
-                    WriteNullable(writer, "state", reports[r].Get<string?>(5));
-                    writer.WriteEndObject();
-                }
-
-                writer.WriteEndArray();
-
-                // Grants for the neighbor that it hasn't acknowledged, and acknowledgements of its grants.
-                writer.WriteStartArray("grants");
-                SpiResult grants = Worf.SelectCatalog(
-                    "SELECT grant_id, request_id, lo, hi, kind::text FROM worf.sequence_range_grant WHERE seqoid = $1 AND grantee_id = $2 AND state = 'sent'",
-                    SpiParameter.Create(seqoid), SpiParameter.Create(neighbor));
-                for (int g = 0; g < grants.Count; g++)
-                {
-                    writer.WriteStartObject();
-                    writer.WriteString("id", grants[g].Get<Guid>(0));
-                    writer.WriteString("request_id", grants[g].Get<Guid>(1));
-                    writer.WriteNumber("lo", grants[g].Get<long>(2));
-                    writer.WriteNumber("hi", grants[g].Get<long>(3));
-                    writer.WriteString("kind", grants[g].Get<string>(4));
-                    writer.WriteEndObject();
-                }
-
-                writer.WriteEndArray();
-
-                // A refusal needs no acknowledgement: a request that lost it is sent again and refused again.
-                _ = Spi.Execute("UPDATE worf.sequence_range_grant SET state = 'acknowledged' WHERE seqoid = $1 AND grantee_id = $2 AND kind = 'x' AND state = 'sent'",
-                    SpiParameter.Create(seqoid), SpiParameter.Create(neighbor));
-                writer.WriteStartArray("acks");
-                SpiResult received = Worf.SelectCatalog(
-                    "SELECT block_id FROM worf.sequence_range_block WHERE seqoid = $1 AND from_node = $2 AND kind IN ('n', 'p', 'i') AND state IN ('next', 'active', 'open', 'imported')",
-                    SpiParameter.Create(seqoid), SpiParameter.Create(neighbor));
-                for (int b = 0; b < received.Count; b++)
-                {
-                    writer.WriteStringValue(received[b].Get<Guid>(0));
-                }
-
-                writer.WriteEndArray();
-                writer.WriteEndObject();
+                WriteSequence(writer, sequences[i], neighbor);
             }
 
             writer.WriteEndArray();
@@ -317,6 +194,119 @@ internal static class SequenceRangeExchange
         }
 
         return Encoding.UTF8.GetString(stream.ToArray());
+    }
+
+    /// <summary>
+    /// Writes one managed sequence's part of this node's message to a neighbor.
+    /// </summary>
+    private static void WriteSequence(Utf8JsonWriter writer, SpiRow row, uint neighbor)
+    {
+        uint seqoid = row.Get<uint>(0);
+        SpiParameter seq = SpiParameter.Create(seqoid);
+        SpiParameter peer = SpiParameter.Create(neighbor);
+        writer.WriteStartObject();
+        writer.WriteString("name", row.Get<string>(1));
+        writer.WriteNumber("owner_id", row.Get<uint>(2));
+        writer.WriteNumber("epoch", row.Get<int>(3));
+        writer.WriteNumber("range_size", row.Get<long>(4));
+        writer.WriteNumber("max_range_size", row.Get<long>(5));
+        WriteNullable(writer, "distance", row.Get<int?>(6));
+        WriteNullable(writer, "high_water", row.Get<long?>(7));
+        WriteNullable(writer, "watermark", row.Get<long?>(8));
+        writer.WriteString("state", row.Get<string>(10));
+        WriteNullable(writer, "root_start", row.Get<long?>(11));
+        WriteNullable(writer, "root_end", row.Get<long?>(12));
+
+        // A reset this node asks of the neighbor, whose WAL position moved backwards, and one it honored.
+        SpiResult neighborRow = Worf.SelectCatalog(
+            "SELECT reset_lsn::text, reset_done::text, state = 'fenced' FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2",
+            seq, peer);
+        bool neighborFenced = neighborRow.Count > 0 && neighborRow[0].Get<bool?>(2) == true;
+        WriteNullable(writer, "reset", neighborRow.Count > 0 ? neighborRow[0].Get<string?>(0) : null);
+        WriteNullable(writer, "reset_done", neighborRow.Count > 0 ? neighborRow[0].Get<string?>(1) : null);
+
+        // The blocks this node holds from the neighbor: every one while the neighbor is a fenced allocator, so
+        // that it can rebuild its ledger, and otherwise those abandoned lately, which it marks so.
+        writer.WriteBoolean("held_complete", neighborFenced);
+        WriteArray(writer, "held", Worf.SelectCatalog("""
+            SELECT block_id, kind::text, lo, hi, state = 'abandoned' FROM worf.sequence_range_block
+            WHERE seqoid = $1 AND from_node = $2 AND kind IN ('n', 'p', 'i')
+                AND ($3 OR state = 'abandoned' AND retired_at > now() - interval '10 minutes')
+            """, seq, peer, SpiParameter.Create(neighborFenced)), held =>
+        {
+            writer.WriteStartObject();
+            writer.WriteString("id", held.Get<Guid>(0));
+            writer.WriteString("kind", held.Get<string>(1));
+            writer.WriteNumber("lo", held.Get<long>(2));
+            writer.WriteNumber("hi", held.Get<long>(3));
+            writer.WriteBoolean("abandoned", held.Get<bool>(4));
+            writer.WriteEndObject();
+        });
+
+        // The open requests, for a node block or a pool block, when the neighbor is this node's parent.
+        WriteArray(writer, "requests", Worf.SelectCatalog(
+            "SELECT request_id, size, kind::text, lo, hi FROM worf.sequence_range_request WHERE seqoid = $1 AND parent_node = $2 AND state = 'open' AND $3",
+            seq, peer, SpiParameter.Create(row.Get<uint?>(9) == neighbor)), request =>
+        {
+            writer.WriteStartObject();
+            writer.WriteString("id", request.Get<Guid>(0));
+            writer.WriteNumber("size", request.Get<long>(1));
+            writer.WriteString("kind", request.Get<string>(2));
+            WriteNullable(writer, "lo", request.Get<long?>(3));
+            WriteNullable(writer, "hi", request.Get<long?>(4));
+            writer.WriteEndObject();
+        });
+
+        // Every node this node has heard from, so that reports reach the owner hop by hop.
+        WriteArray(writer, "reports", Worf.SelectCatalog("""
+            SELECT n.node_id, n.node_name::text, n.high_water, n.watermark, n.epoch,
+                CASE WHEN n.node_id <> l.node_id THEN n.state WHEN r.fenced_at IS NOT NULL THEN 'fenced' ELSE r.state END
+            FROM worf.sequence_range_node n JOIN worf.sequence_range r ON r.seqoid = n.seqoid CROSS JOIN worf.local_node l
+            WHERE n.seqoid = $1 AND n.node_id <> $2
+            """, seq, peer), report =>
+        {
+            writer.WriteStartObject();
+            writer.WriteNumber("node_id", report.Get<uint>(0));
+            writer.WriteString("node_name", report.Get<string>(1));
+            WriteNullable(writer, "high_water", report.Get<long?>(2));
+            WriteNullable(writer, "watermark", report.Get<long?>(3));
+            WriteNullable(writer, "epoch", report.Get<int?>(4));
+            WriteNullable(writer, "state", report.Get<string?>(5));
+            writer.WriteEndObject();
+        });
+
+        // Grants for the neighbor that it hasn't acknowledged, and acknowledgements of its grants.
+        WriteArray(writer, "grants", Worf.SelectCatalog(
+            "SELECT grant_id, request_id, lo, hi, kind::text FROM worf.sequence_range_grant WHERE seqoid = $1 AND grantee_id = $2 AND state = 'sent'",
+            seq, peer), grant =>
+        {
+            writer.WriteStartObject();
+            writer.WriteString("id", grant.Get<Guid>(0));
+            writer.WriteString("request_id", grant.Get<Guid>(1));
+            writer.WriteNumber("lo", grant.Get<long>(2));
+            writer.WriteNumber("hi", grant.Get<long>(3));
+            writer.WriteString("kind", grant.Get<string>(4));
+            writer.WriteEndObject();
+        });
+
+        // A refusal needs no acknowledgement: a request that lost it is sent again and refused again.
+        _ = Spi.Execute("UPDATE worf.sequence_range_grant SET state = 'acknowledged' WHERE seqoid = $1 AND grantee_id = $2 AND kind = 'x' AND state = 'sent'",
+            seq, peer);
+        WriteArray(writer, "acks", Worf.SelectCatalog(
+            "SELECT block_id FROM worf.sequence_range_block WHERE seqoid = $1 AND from_node = $2 AND kind IN ('n', 'p', 'i') AND state IN ('next', 'active', 'open', 'imported')",
+            seq, peer), received => writer.WriteStringValue(received.Get<Guid>(0)));
+        writer.WriteEndObject();
+    }
+
+    private static void WriteArray(Utf8JsonWriter writer, string name, SpiResult rows, Action<SpiRow> write)
+    {
+        writer.WriteStartArray(name);
+        for (int i = 0; i < rows.Count; i++)
+        {
+            write(rows[i]);
+        }
+
+        writer.WriteEndArray();
     }
 
     /// <summary>

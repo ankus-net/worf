@@ -13,6 +13,9 @@ internal static class SequenceRangeReservations
     private const int MaxReservations = 64;
     private const int PollInterval = 100;
 
+    // The largest block a reservation asks for, half of bigint's range.
+    private const decimal MaxNeeded = 4_611_686_018_427_387_903m;
+
     /// <summary>
     /// Gets the shared table of requests that sessions hand to their database's range worker.
     /// </summary>
@@ -63,7 +66,7 @@ internal static class SequenceRangeReservations
         SequenceInfo info = SequenceRanges.GetInfo(seqoid);
 
         // Sessions inserting at the same time can't run the load short.
-        long needed = (long)Math.Min((decimal)count + Math.Max(count / 20, (long)(rate * 60)), long.MaxValue / 2);
+        long needed = (long)Math.Min(count + Math.Ceiling(Math.Max(count / 20m, (decimal)rate * 60)), MaxNeeded);
         long deadline = Worker.GetCurrentTimestamp() + (long)Int128.Min(timeout.ToComparisonMicroseconds(), long.MaxValue / 2);
         bool requested = false;
         Guid requestId = Guid.NewGuid();
