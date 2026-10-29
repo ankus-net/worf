@@ -28,6 +28,9 @@ internal static unsafe partial class DdlLock
     // The fences this transaction asked other nodes for, with the connections that hold them.
     private static readonly List<(ulong Id, uint NodeId, ulong Lsn, PgReplicationConnection Connection)> s_heldFences = [];
 
+    // Whether this session lets its fences go when it ends.
+    private static bool s_releasesOnExit;
+
     // The fence of the DDL statement that runs now, and how far each fenced node's WAL had reached.
     private static (ulong Id, List<(uint NodeId, ulong Lsn)> Positions)? s_statementFence;
 
@@ -82,6 +85,13 @@ internal static unsafe partial class DdlLock
             {
                 relids.Add(relid);
             }
+        }
+
+        // A fence that isn't kept goes with the session that asked for it, as when the other node's DDL fails.
+        if (!s_releasesOnExit)
+        {
+            _ = PgProcess.OnExit(static _ => _ = Release(fence => fence.HolderPid == Environment.ProcessId));
+            s_releasesOnExit = true;
         }
 
         AddFences(unchecked((ulong)fenceId), relids);
@@ -339,7 +349,9 @@ internal static unsafe partial class DdlLock
     /// </summary>
     /// <param name="fenceId">The fence, or zero.</param>
     /// <returns>The number of tables let through.</returns>
-    internal static int ReleaseFences(ulong fenceId)
+    internal static int ReleaseFences(ulong fenceId) => Release(fence => fenceId == 0 || fence.Id == fenceId);
+
+    private static int Release(Func<WorfFence, bool> matches)
     {
         int released = 0;
         using (PgLwLockExclusiveGuard<WorfFenceTable, WorfFence> guard = Fences.Exclusive())
@@ -347,7 +359,7 @@ internal static unsafe partial class DdlLock
             WorfFenceTable table = guard.Header;
             for (int i = 0; i < MaxFences; i++)
             {
-                if (guard[i].Id != 0 && (fenceId == 0 || guard[i].Id == fenceId))
+                if (guard[i].Id != 0 && matches(guard[i]))
                 {
                     guard[i] = default;
                     released++;
