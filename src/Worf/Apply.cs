@@ -1644,6 +1644,7 @@ internal static unsafe partial class Apply
         WorfWorker worker = guard[Worker.MyWorfWorker];
         worker.Worker.Apply.ExceptionLsn = lsn;
         worker.Worker.Apply.ExceptionLevel = level;
+        worker.Worker.Apply.ExceptionRestartsAtOnce = lsn != 0;
         guard[Worker.MyWorfWorker] = worker;
     }
 

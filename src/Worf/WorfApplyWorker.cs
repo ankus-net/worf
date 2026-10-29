@@ -30,4 +30,10 @@ internal struct WorfApplyWorker
     /// How that transaction is applied: change by change, as a whole in a subtransaction, or not at all.
     /// </summary>
     public int ExceptionLevel;
+
+    /// <summary>
+    /// Whether the worker stopped to apply that transaction in a new way, which starts at once rather than after the
+    /// delay before restarting a worker that failed.
+    /// </summary>
+    public bool ExceptionRestartsAtOnce;
 }

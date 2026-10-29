@@ -618,6 +618,16 @@ internal static class Worker
             {
                 ctx.SubscriptionsChanged = true;
             }
+
+            // An apply worker that stopped to apply its failed transaction in a new way is restarted at once.
+            if (worker.WorkerType == WorfWorkerType.Apply && worker.Worker.Apply.ExceptionRestartsAtOnce)
+            {
+                int managerSlot = guard.Read((in _, workers) => ManagerFind(workers, dboid));
+                if (managerSlot >= 0 && guard[managerSlot].Proc != 0)
+                {
+                    SetProcLatch(guard[managerSlot].Proc);
+                }
+            }
         }
         else
         {

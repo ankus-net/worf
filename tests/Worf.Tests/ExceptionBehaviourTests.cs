@@ -220,17 +220,10 @@ public sealed class ExceptionBehaviourTests
             """, token);
         await SubscribeAsync(provider, subscriber, token);
 
-        // The bad row makes discard apply the transaction again.
+        // This transaction holds b. The remote transaction updates a, then fails on its bad row before it updates b,
+        // so discard applies it again, and the replay updates a and waits for b. This transaction then waits for a,
+        // and the replay, which waited first, detects the deadlock and is cancelled.
         int logpos = subscriber.ReadLog().Length;
-        _ = await provider.SafePsqlAsync(Database, """
-            UPDATE a SET v = 'remote' WHERE id = 1;
-            UPDATE b SET v = 'remote' WHERE id = 1;
-            INSERT INTO t VALUES (1, 'bad');
-            """, token);
-        Assert.IsTrue(await PollLogAsync(subscriber, logpos, "once the worker restarts", token), "the first attempt");
-
-        // The replay updates a, then waits for b, which this transaction holds and which then waits for a. The replay
-        // waited first and detects the deadlock first, so it's the transaction that's cancelled.
         await using (NpgsqlConnection local = await subscriber.OpenAsync(Database, token))
         {
             await using NpgsqlTransaction transaction = await local.BeginTransactionAsync(token);
@@ -240,6 +233,11 @@ public sealed class ExceptionBehaviourTests
                 _ = await command.ExecuteNonQueryAsync(token);
             }
 
+            _ = await provider.SafePsqlAsync(Database, """
+                UPDATE a SET v = 'remote' WHERE id = 1;
+                INSERT INTO t VALUES (1, 'bad');
+                UPDATE b SET v = 'remote' WHERE id = 1;
+                """, token);
             Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
                 "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND backend_type <> 'client backend')",
                 token), "the replay waiting for b");

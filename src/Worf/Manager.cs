@@ -186,7 +186,8 @@ internal static class Manager
                     {
                         long restartTime = applyWorker.CrashedAt + (MinSleep * 1000);
 
-                        if (restartTime > Worker.GetCurrentTimestamp())
+                        // One that stopped to apply its failed transaction in a new way restarts at once.
+                        if (restartTime > Worker.GetCurrentTimestamp() && !applyWorker.Worker.Apply.ExceptionRestartsAtOnce)
                         {
                             ret = false;
                             continue;
