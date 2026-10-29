@@ -32,6 +32,10 @@ public sealed partial class SyncDuringWriteTests
         string pgbenchScale = Environment.GetEnvironmentVariable("PGBENCH_SCALE") ?? "1";
         string pgbenchClients = Environment.GetEnvironmentVariable("PGBENCH_CLIENTS") ?? "10";
         string pgbenchJobs = Environment.GetEnvironmentVariable("PGBENCH_JOBS") ?? "1";
+
+        // pgbench writes as fast as it can unless given a rate in transactions a second, which bounds what the run takes
+        // from the tests beside it.
+        string? pgbenchRate = Environment.GetEnvironmentVariable("PGBENCH_RATE");
         int pgbenchTime = int.Parse(Environment.GetEnvironmentVariable("PGBENCH_TIME") ?? "120", CultureInfo.InvariantCulture);
         string walsenderTimeout = Environment.GetEnvironmentVariable("PGBENCH_TIMEOUT") ?? "5s";
 
@@ -111,6 +115,7 @@ public sealed partial class SyncDuringWriteTests
         using Process pgbench = provider.StartProgram("pgbench",
         [
             "-T", pgbenchTime.ToString(CultureInfo.InvariantCulture), "-j", pgbenchJobs, "-s", pgbenchScale, "-c", pgbenchClients,
+            .. pgbenchRate is null ? Array.Empty<string>() : ["-R", pgbenchRate],
             provider.Dsn(Database, "postgres"),
         ]);
         Task<string> pgbenchStdout = ProcessRunner.ReadToEndAsync(pgbench.StandardOutput);
@@ -186,7 +191,9 @@ public sealed partial class SyncDuringWriteTests
 
                 while (true)
                 {
-                    await Task.Delay(TimeSpan.FromMicroseconds(100), token);
+                    // pglogical's test polls every 100 microseconds, which here would keep a processor busy with
+                    // connections and queries that slow the sync it watches.
+                    await Task.Delay(TimeSpan.FromMilliseconds(100), token);
                     // Both are read in one query: read apart, a worker that starts between the two reads looks like
                     // one that has exited.
                     string[] state = (await subscriber.SafePsqlAsync(Database,
