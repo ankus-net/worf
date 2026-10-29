@@ -48,6 +48,12 @@ internal static partial class RelCache
             for (int i = 0; i < entry.Natts; i++)
             {
                 entry.Attmap[i] = TupdescGetAttByName(desc, entry.Attnames[i]);
+
+                // A column dropped here is ignored in rows from a node that still has it.
+                if (entry.Attmap[i] < 0 && !ColumnDropped(entry.Rel->rd_id, entry.Attnames[i]))
+                {
+                    throw new PgException(PgSqlStates.InternalError, $"unknown column name {entry.Attnames[i]}");
+                }
             }
 
             entry.Reloid = entry.Rel->rd_id;
@@ -212,8 +218,12 @@ internal static partial class RelCache
             }
         }
 
-        throw new PgException(PgSqlStates.InternalError, $"unknown column name {attname}");
+        return -1;
     }
+
+    private static bool ColumnDropped(uint relid, string attname)
+        => Worf.SelectCatalog("SELECT 1 FROM worf.dropped_column WHERE relid = $1 AND attname = $2::name",
+            SpiParameter.Create(relid), SpiParameter.Create(attname)).Count > 0;
 
     private const sbyte TriggerFiresOnOrigin = (sbyte)'O';
     private const sbyte TriggerDisabled = (sbyte)'D';

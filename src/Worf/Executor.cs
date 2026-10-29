@@ -2,6 +2,17 @@ using System.Globalization;
 using System.Text;
 using Ankus.Postgres;
 
+[assembly: PgSql("dropped-columns", """
+    CREATE TABLE worf.dropped_column (
+        relid oid NOT NULL,
+        attname name NOT NULL,
+        PRIMARY KEY (relid, attname)
+    );
+
+    COMMENT ON TABLE worf.dropped_column IS
+        'Columns dropped from local tables, which apply ignores in rows from nodes that still have them';
+    """)]
+
 namespace Worf;
 
 /// <summary>
@@ -284,6 +295,11 @@ internal static unsafe partial class Executor
                 return;
             }
 
+            if (classId == Dependency.RelationRelationId)
+            {
+                RecordDroppedColumn(objectId, subId);
+            }
+
             ObjectAddress obj = Dependency.Address(classId, objectId, subId);
 
             DropBehavior behavior = NativeGlobals.SessionReplicationRole == SessionReplicationRoleReplica
@@ -291,6 +307,28 @@ internal static unsafe partial class Executor
                 : s_lastDropBehavior;
 
             Dependency.CheckDependency(obj, behavior);
+        }
+    }
+
+    /// <summary>
+    /// Records a column dropped from a table, so that apply ignores it in rows from nodes that drop it later, and
+    /// forgets a dropped table's columns.
+    /// </summary>
+    /// <param name="relid">The table.</param>
+    /// <param name="attnum">The column's number, or zero for the whole table.</param>
+    private static void RecordDroppedColumn(uint relid, int attnum)
+    {
+        if (attnum == 0)
+        {
+            _ = Spi.Execute("DELETE FROM worf.dropped_column WHERE relid = $1", SpiParameter.Create(relid));
+            return;
+        }
+
+        sbyte* attname = NativeMethods.get_attname(relid, (short)attnum, true);
+        if (attnum > 0 && attname is not null)
+        {
+            _ = Spi.Execute("INSERT INTO worf.dropped_column VALUES ($1, $2::name) ON CONFLICT DO NOTHING",
+                SpiParameter.Create(relid), SpiParameter.Create(Worf.FromServer(attname)));
         }
     }
 
