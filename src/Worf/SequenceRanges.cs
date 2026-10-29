@@ -112,8 +112,8 @@ using Ankus.Postgres;
             CASE
                 WHEN a.block_id IS NULL THEN NULL
                 WHEN s.seqincrement > 0 THEN
-                    (a.hi::numeric - coalesce(pg_catalog.pg_sequence_last_value(r.seqoid), a.lo - s.seqincrement)) / s.seqincrement
-                ELSE (coalesce(pg_catalog.pg_sequence_last_value(r.seqoid), a.hi - s.seqincrement)::numeric - a.lo) / -s.seqincrement
+                    (a.hi - CASE WHEN l.last_value BETWEEN a.lo AND a.hi THEN l.last_value ELSE a.lo::numeric - s.seqincrement END) / s.seqincrement
+                ELSE (CASE WHEN l.last_value BETWEEN a.lo AND a.hi THEN l.last_value ELSE a.hi::numeric - s.seqincrement END - a.lo) / -s.seqincrement
             END::bigint AS values_left,
             n.lo AS next_lo, n.hi AS next_hi, r.peak_rate AS insert_rate, r.switched_at AS last_switch,
             r.exchanged_at AS last_exchange, r.detail
@@ -126,7 +126,9 @@ using Ankus.Postgres;
             LEFT JOIN worf.sequence_range_block a
                 ON a.seqoid = r.seqoid AND a.epoch = r.epoch AND a.kind = 'n' AND a.state = 'active'
             LEFT JOIN worf.sequence_range_block n
-                ON n.seqoid = r.seqoid AND n.epoch = r.epoch AND n.kind = 'n' AND n.state = 'next';
+                ON n.seqoid = r.seqoid AND n.epoch = r.epoch AND n.kind = 'n' AND n.state = 'next'
+            -- A sequence that hasn't switched to its active block yet, as while it resets, has all of the block left.
+            CROSS JOIN LATERAL (SELECT pg_catalog.pg_sequence_last_value(r.seqoid)::numeric AS last_value) l;
 
     CREATE VIEW worf.sequence_range_grants AS
         SELECT g.seqoid AS sequence, g.grantee_name AS grantee, g.kind, g.lo, g.hi, g.state, g.granted_at
@@ -1460,13 +1462,15 @@ internal static unsafe partial class SequenceRanges
             return (granted[0].Get<Guid>(0), granted[0].Get<long>(1), granted[0].Get<long>(2));
         }
 
-        // A block of size steps spans size times the increment, less one step.
+        // A block of size steps spans size times the increment, less one step. An allocator whose system identifier or
+        // timeline changed grants nothing, even before its worker fences it, since a grant on the old timeline may be lost.
         decimal span = ((decimal)size - 1) * Math.Abs(info.Increment);
         bool ascending = info.Ascending;
         SpiResult free = Spi.Query(Spi.Sql($"""
             SELECT f.block_id, f.lo, f.hi
             FROM worf.sequence_range_free f JOIN worf.sequence_range_block b ON b.block_id = f.block_id
             WHERE b.seqoid = {seqoid}::oid AND b.epoch = {epoch} AND b.kind IN ('r', 'p') AND b.state = 'open'
+                AND b.sysid = {NativeMethods.GetSystemIdentifier().ToString(CultureInfo.InvariantCulture)}::numeric AND b.timeline = {(long)NativeMethods.GetWALInsertionTimeLine()}
                 AND f.hi::numeric - f.lo >= {span}
             ORDER BY CASE WHEN {ascending} THEN f.lo END, CASE WHEN NOT {ascending} THEN f.hi END DESC
             LIMIT 1

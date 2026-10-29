@@ -167,9 +167,10 @@ internal static unsafe partial class DdlLock
             throw;
         }
 
-        // Write and flush a record, so that walsenders move past it and their subscribers report that they have.
+        // Write and flush a record, so that walsenders move past it and their subscribers report that they have. Its end,
+        // unlike the insert position, which skips a page header when the record fills its page, has been written.
         _ = Spi.Execute("SELECT pg_catalog.pg_logical_emit_message(false, 'worf_fence', '')");
-        ulong lsn = NativeMethods.GetXLogInsertRecPtr();
+        ulong lsn = NativeGlobals.XactLastRecEnd;
         NativeMethods.XLogFlush(lsn);
         return PgDatum.DangerousCreate((nuint)lsn, LsnOid, PgMemoryContext.Current);
     }

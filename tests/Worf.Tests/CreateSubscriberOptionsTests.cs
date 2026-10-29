@@ -143,6 +143,13 @@ public sealed class CreateSubscriberOptionsTests
             {
                 _ = await provider.RunProgramAsync("pg_ctl", ["stop", "-D", backupDir, "-m", "immediate"], CancellationToken.None);
             }
+
+            // The subscriber's log goes with the temporary directory, so a failure shows it.
+            string log = Path.Join(work.FullName, "subscriber.log");
+            if (TestContext.CurrentTestOutcome != UnitTestOutcome.Passed && File.Exists(log))
+            {
+                TestContext.WriteLine(await File.ReadAllTextAsync(log, CancellationToken.None));
+            }
         }
     }
 

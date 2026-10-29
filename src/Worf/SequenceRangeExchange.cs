@@ -16,6 +16,9 @@ internal static class SequenceRangeExchange
     private const int MaxDistance = 32;
 
     // When each link last exchanged, by subscription, and the links with acknowledgements to send.
+    // When each subscription's provider is next tried after a failed exchange, and the delay before that.
+    private static readonly Dictionary<uint, (long At, long Delay)> s_retries = [];
+
     private static readonly Dictionary<uint, long> s_exchangedAt = [];
     private static readonly HashSet<uint> s_acksWaiting = [];
     private static long s_requested;
@@ -73,7 +76,7 @@ internal static class SequenceRangeExchange
             long now = Worker.GetCurrentTimestamp();
             bool due = !s_exchangedAt.TryGetValue(sub.Id, out long at) || now - at >= SequenceRanges.ExchangeInterval * 1000L ||
                 s_acksWaiting.Contains(sub.Id) || Waiting(sub.Origin.Id);
-            if (!sub.Enabled || !due)
+            if (!sub.Enabled || !due || (s_retries.TryGetValue(sub.Id, out (long At, long Delay) retry) && now < retry.At))
             {
                 continue;
             }
@@ -82,9 +85,13 @@ internal static class SequenceRangeExchange
             {
                 PgTransaction.RunInSubtransaction(() => changed |= ExchangeWith(node, sub));
                 s_exchangedAt[sub.Id] = now;
+                _ = s_retries.Remove(sub.Id);
             }
             catch (Exception error) when (error is PgException or PgRemoteException)
             {
+                // A failed exchange is tried again after a delay that doubles, up to the exchange interval.
+                long delay = Math.Min(Math.Max(retry.Delay * 2, SequenceRanges.CheckInterval * 1000L), SequenceRanges.ExchangeInterval * 1000L);
+                s_retries[sub.Id] = (now + delay, delay);
                 PgLog.Warning($"sequence range exchange with node {sub.Origin.Name} failed: {error.Message}");
             }
         }
