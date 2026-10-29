@@ -1,0 +1,240 @@
+using System.Text;
+using Ankus.Postgres;
+
+namespace Worf;
+
+/// <summary>
+/// Replicates DDL as it runs, and adds the tables it creates to replication sets.
+/// </summary>
+internal static unsafe partial class DdlReplication
+{
+    // SESSION_REPLICATION_ROLE_REPLICA from commands/trigger.h.
+    private const int SessionReplicationRoleReplica = 1;
+
+    // RVR_MISSING_OK from catalog/namespace.h.
+    private const uint RangeVarMissingOk = 1;
+
+    private const string DefaultSet = "default";
+    private const string DefaultInsertOnlySet = "default_insert_only";
+
+    /// <summary>
+    /// Gets whether DDL is replicated as it runs.
+    /// </summary>
+    [PgGucBool("worf.enable_ddl_replication", false, "Replicate DDL as it runs.", Context = PgGucContext.SuperuserSet)]
+    internal static partial bool EnableDdlReplication { get; }
+
+    /// <summary>
+    /// Gets whether the tables DDL creates are added to the default replication sets.
+    /// </summary>
+    [PgGucBool("worf.include_ddl_repset", false, "Add the tables DDL creates to the default replication sets.",
+        Context = PgGucContext.SuperuserSet)]
+    internal static partial bool IncludeDdlRepset { get; }
+
+    /// <summary>
+    /// Gets whether DDL that functions and procedures run is replicated too.
+    /// </summary>
+    [PgGucBool("worf.allow_ddl_from_functions", false, "Replicate DDL that functions and procedures run.",
+        Context = PgGucContext.SuperuserSet)]
+    internal static partial bool AllowDdlFromFunctions { get; }
+
+    /// <summary>
+    /// Gets or sets whether DDL runs for <c>replicate_ddl_command</c>, which queues it itself.
+    /// </summary>
+    internal static bool Suppressed { get; set; }
+
+    /// <summary>
+    /// Checks, before a utility statement runs, whether it's DDL to queue for replication once it succeeds.
+    /// </summary>
+    /// <param name="pstmt">The statement.</param>
+    /// <param name="context">Where it runs from.</param>
+    /// <returns>Whether to queue it.</returns>
+    internal static bool ShouldQueue(PlannedStmt* pstmt, ProcessUtilityContext context)
+    {
+        Node* parsetree = pstmt->utilityStmt;
+        if (!EnableDdlReplication || Suppressed || NativeGlobals.creating_extension ||
+            NativeGlobals.SessionReplicationRole == SessionReplicationRoleReplica ||
+            (context != ProcessUtilityContext.PROCESS_UTILITY_TOPLEVEL && !AllowDdlFromFunctions) ||
+            NativeMethods.GetCommandLogLevel(parsetree) != LogStmtLevel.LOGSTMT_DDL)
+        {
+            return false;
+        }
+
+        bool replicated = parsetree->type switch
+        {
+            // Databases, tablespaces, roles, settings and PostgreSQL's own replication are the cluster's, not the
+            // database's.
+            NodeTag.T_CreatedbStmt or NodeTag.T_DropdbStmt or NodeTag.T_AlterDatabaseStmt or
+                NodeTag.T_AlterDatabaseSetStmt or NodeTag.T_AlterDatabaseRefreshCollStmt or
+                NodeTag.T_CreateTableSpaceStmt or NodeTag.T_DropTableSpaceStmt or NodeTag.T_AlterTableSpaceOptionsStmt or
+                NodeTag.T_CreateRoleStmt or NodeTag.T_AlterRoleStmt or NodeTag.T_AlterRoleSetStmt or
+                NodeTag.T_DropRoleStmt or NodeTag.T_GrantRoleStmt or NodeTag.T_AlterSystemStmt or
+                NodeTag.T_CreateSubscriptionStmt or NodeTag.T_AlterSubscriptionStmt or NodeTag.T_DropSubscriptionStmt or
+                NodeTag.T_CreatePublicationStmt or NodeTag.T_AlterPublicationStmt or NodeTag.T_ClusterStmt => false,
+
+            // Temporary objects are the session's.
+            NodeTag.T_CreateStmt => !IsTemp(((CreateStmt*)parsetree)->relation),
+            NodeTag.T_CreateTableAsStmt => !IsTemp(((CreateTableAsStmt*)parsetree)->into->rel),
+            NodeTag.T_ViewStmt => !IsTemp(((ViewStmt*)parsetree)->view),
+            NodeTag.T_CreateSeqStmt => !IsTemp(((CreateSeqStmt*)parsetree)->sequence),
+            NodeTag.T_AlterSeqStmt => !IsTemp(((AlterSeqStmt*)parsetree)->sequence),
+            NodeTag.T_IndexStmt => !IsTemp(((IndexStmt*)parsetree)->relation),
+            NodeTag.T_AlterTableStmt => !IsTemp(((AlterTableStmt*)parsetree)->relation),
+            NodeTag.T_DropStmt => !DropsTemp((DropStmt*)parsetree),
+
+            // Each node creates and drops worf itself.
+            NodeTag.T_CreateExtensionStmt => Worf.FromServer(((CreateExtensionStmt*)parsetree)->extname) != Worf.ExtensionName,
+            _ => true,
+        };
+
+        return replicated && WithSnapshot(() => WorfNode.GetLocalNode(false, true) is not null);
+    }
+
+    /// <summary>
+    /// Queues a DDL statement that ran, with the search path it ran with.
+    /// </summary>
+    /// <param name="pstmt">The statement.</param>
+    /// <param name="queryString">The text it came from.</param>
+    internal static void QueueDdl(PlannedStmt* pstmt, sbyte* queryString)
+    {
+        int length = Worf.StrLen(queryString);
+        int start = Math.Clamp(pstmt->stmt_location, 0, length);
+        int count = pstmt->stmt_len > 0 ? Math.Min(pstmt->stmt_len, length - start) : length - start;
+        string command = Worf.FromServer(new ReadOnlySpan<byte>((byte*)queryString + start, count)).Trim();
+
+        sbyte* searchPath;
+        fixed (byte* name = Worf.ToServerCString("search_path"))
+        {
+            searchPath = NativeMethods.GetConfigOption((sbyte*)name, false, false);
+        }
+
+        StringBuilder json = new("{\"search_path\": ");
+        Executor.EscapeJson(json, searchPath is null ? "" : Worf.FromServer(searchPath));
+        json.Append(", \"command\": ");
+        Executor.EscapeJson(json, command);
+        json.Append('}');
+
+        _ = WithSnapshot(() =>
+        {
+            Queue.QueueMessage(["ddl_sql"], NativeMethods.GetUserId(), Queue.QueueCommandTypeDdl, json.ToString());
+            return true;
+        });
+    }
+
+    /// <summary>
+    /// Adds a table that DDL created to the default replication set, or to the insert-only one when it has no
+    /// replica identity, and moves a table from the insert-only set to the default one once it has.
+    /// </summary>
+    /// <param name="parsetree">The statement that ran.</param>
+    internal static void AddCreatedTable(Node* parsetree)
+    {
+        RangeVar* relation = parsetree->type switch
+        {
+            NodeTag.T_CreateStmt => ((CreateStmt*)parsetree)->relation,
+            NodeTag.T_CreateTableAsStmt when ((CreateTableAsStmt*)parsetree)->objtype == ObjectType.OBJECT_TABLE =>
+                ((CreateTableAsStmt*)parsetree)->into->rel,
+            NodeTag.T_AlterTableStmt => ((AlterTableStmt*)parsetree)->relation,
+            _ => null,
+        };
+        if (!IncludeDdlRepset || relation is null)
+        {
+            return;
+        }
+
+        uint reloid = NativeMethods.RangeVarGetRelidExtended(relation, 0, RangeVarMissingOk, default, null);
+        if (reloid != 0 && NativeMethods.get_rel_relkind(reloid) == (sbyte)'r' &&
+            NativeMethods.get_rel_persistence(reloid) == (sbyte)'p')
+        {
+            _ = WithSnapshot(() => AddTable(parsetree, reloid));
+        }
+    }
+
+    private static bool AddTable(Node* parsetree, uint reloid)
+    {
+        if (WorfNode.GetLocalNode(false, true) is not WorfLocalNode node)
+        {
+            return false;
+        }
+
+        RelationData* rel = NativeMethods.table_open(reloid, (int)PgLockMode.AccessShare);
+        bool hasReplicaIndex = NativeMethods.RelationGetReplicaIndex(rel) != 0;
+        NativeMethods.table_close(rel, (int)PgLockMode.None);
+
+        List<string> sets = [.. ReplicationSet.GetTableReplicationSets(node.Node.Id, reloid).Select(set => set.Name)];
+        WorfRepSet? defaultSet = ReplicationSet.GetReplicationSetByName(node.Node.Id, DefaultSet, true);
+        WorfRepSet? insertOnlySet = ReplicationSet.GetReplicationSetByName(node.Node.Id, DefaultInsertOnlySet, true);
+        if (parsetree->type != NodeTag.T_AlterTableStmt && sets.Count == 0)
+        {
+            if ((hasReplicaIndex ? defaultSet : insertOnlySet) is WorfRepSet set)
+            {
+                ReplicationSet.ReplicationSetAddTable(set.Id, reloid, [], null);
+            }
+        }
+        else if (hasReplicaIndex && sets is [DefaultInsertOnlySet] && defaultSet is not null && insertOnlySet is not null)
+        {
+            ReplicationSet.ReplicationSetRemoveTable(insertOnlySet.Id, reloid, false);
+            ReplicationSet.ReplicationSetAddTable(defaultSet.Id, reloid, [], null);
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Runs work that reads worf's tables with the active snapshot, or with the transaction's when none is active,
+    /// as after CREATE INDEX CONCURRENTLY. Taking one is left to statements that need it, since SET TRANSACTION
+    /// can't follow it.
+    /// </summary>
+    private static bool WithSnapshot(Func<bool> work)
+    {
+        if (NativeMethods.ActiveSnapshotSet())
+        {
+            return work();
+        }
+
+        NativeMethods.PushActiveSnapshot(NativeMethods.GetTransactionSnapshot());
+        try
+        {
+            return work();
+        }
+        finally
+        {
+            NativeMethods.PopActiveSnapshot();
+        }
+    }
+
+    private static bool IsTemp(RangeVar* relation)
+    {
+        if (relation is null)
+        {
+            return false;
+        }
+
+        if (relation->relpersistence == (sbyte)'t' ||
+            (relation->schemaname is not null && Worf.FromServer(relation->schemaname).StartsWith("pg_temp", StringComparison.Ordinal)))
+        {
+            return true;
+        }
+
+        uint reloid = NativeMethods.RangeVarGetRelidExtended(relation, 0, RangeVarMissingOk, default, null);
+        return reloid != 0 && NativeMethods.get_rel_persistence(reloid) == (sbyte)'t';
+    }
+
+    private static bool DropsTemp(DropStmt* stmt)
+    {
+        if (stmt->removeType is not (ObjectType.OBJECT_TABLE or ObjectType.OBJECT_VIEW or ObjectType.OBJECT_SEQUENCE or
+            ObjectType.OBJECT_INDEX or ObjectType.OBJECT_MATVIEW or ObjectType.OBJECT_FOREIGN_TABLE))
+        {
+            return false;
+        }
+
+        List* objects = stmt->objects;
+        for (int i = 0; objects is not null && i < objects->length; i++)
+        {
+            if (IsTemp(NativeMethods.makeRangeVarFromNameList((List*)objects->elements[i].ptr_value)))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+}

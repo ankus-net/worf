@@ -21,6 +21,7 @@ internal static class Queue
     internal const char QueueCommandTypeTruncate = 'T';
     internal const char QueueCommandTypeTablesync = 'A';
     internal const char QueueCommandTypeSequence = 'S';
+    internal const char QueueCommandTypeDdl = 'D';
 
     private const string CatalogQueue = "queue";
     private const int NatsQueue = 5;

@@ -226,6 +226,9 @@ internal static unsafe partial class Executor
             s_lastDropBehavior = ((DropStmt*)parsetree)->behavior;
         }
 
+        // Whether a temporary object is involved is known only before a DROP runs.
+        bool queueDdl = DdlReplication.ShouldQueue(pstmt, context);
+
         if (!s_nextProcessUtilityHook.IsNull)
         {
             s_nextProcessUtilityHook.Invoke(pstmt, queryString, readOnlyTree, context, @params, queryEnv, dest, qc);
@@ -234,6 +237,13 @@ internal static unsafe partial class Executor
         {
             NativeMethods.standard_ProcessUtility(pstmt, queryString, readOnlyTree, context, @params, queryEnv, dest, qc);
         }
+
+        if (queueDdl)
+        {
+            DdlReplication.QueueDdl(pstmt, queryString);
+        }
+
+        DdlReplication.AddCreatedTable(parsetree);
 
         if (parsetree->type == NodeTag.T_TruncateStmt)
         {
@@ -304,7 +314,9 @@ internal static unsafe partial class Executor
 
             ObjectAddress obj = Dependency.Address(classId, objectId, subId);
 
-            DropBehavior behavior = NativeGlobals.SessionReplicationRole == SessionReplicationRoleReplica
+            // Membership that worf.include_ddl_repset added goes with the table, as it came.
+            DropBehavior behavior = NativeGlobals.SessionReplicationRole == SessionReplicationRoleReplica ||
+                DdlReplication.IncludeDdlRepset
                 ? DropBehavior.DROP_CASCADE
                 : s_lastDropBehavior;
 

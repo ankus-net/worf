@@ -1213,8 +1213,16 @@ internal static class Functions
         uint userId = NativeMethods.GetUserId();
         Queue.QueueMessage(replicationSetList, userId, Queue.QueueCommandTypeSql, cmd.ToString());
 
-        // Execute the query locally.
-        Apply.ExecuteSqlCommand(command, Worf.FromServer(NativeMethods.GetUserNameFromId(userId, false)), false);
+        // Execute the query locally, which the queued command replicates.
+        DdlReplication.Suppressed = true;
+        try
+        {
+            Apply.ExecuteSqlCommand(command, Worf.FromServer(NativeMethods.GetUserNameFromId(userId, false)), false);
+        }
+        finally
+        {
+            DdlReplication.Suppressed = false;
+        }
 
         // Restore the GUC variables we set above.
         NativeMethods.AtEOXact_GUC(true, saveNestlevel);

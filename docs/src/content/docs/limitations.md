@@ -57,8 +57,10 @@ if such an index is present when it attempts to apply changes to a table.
 
 ## DDL
 
-Automatic DDL replication is not supported. Managing DDL so that the provider and
-subscriber database(s) remain compatible is the responsibility of the user.
+With `worf.enable_ddl_replication` on, DDL replicates as it runs, and
+`worf.include_ddl_repset` adds the tables it creates to replication sets.
+Otherwise, managing DDL so that the provider and subscriber database(s) remain
+compatible is the responsibility of the user.
 
 worf provides the `worf.replicate_ddl_command` function to allow DDL
 to be run on the provider and subscriber at a consistent point.

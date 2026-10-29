@@ -689,6 +689,25 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   the change's rows or queued DDL, and the transaction it belongs to. The
   default is `error`.
 
+- `worf.enable_ddl_replication`
+  Replicates DDL as it runs, through the `ddl_sql` replication set as
+  `worf.replicate_ddl_command` does, with the search path it ran with.
+  Statements about databases, tablespaces, roles, server settings and
+  PostgreSQL's own publications and subscriptions stay on their node, as do
+  temporary objects. Other nodes run concurrent statements, such as
+  `CREATE INDEX CONCURRENTLY`, in their apply transaction. The default is
+  `off`.
+
+- `worf.include_ddl_repset`
+  Adds the tables DDL creates to the `default` replication set, or to
+  `default_insert_only` when they have no primary key, and moves a table to
+  `default` once it gets one. A dropped table leaves its replication sets
+  with it. The default is `off`.
+
+- `worf.allow_ddl_from_functions`
+  Replicates DDL that functions and procedures run too. The default is
+  `off`.
+
 - `worf.batch_inserts`
   Tells worf to use batch insert mechanism if possible. Batch mechanism
   uses PostgreSQL internal batch insert mode which is also used by `COPY`
@@ -813,8 +832,10 @@ if such an index is present when it attempts to apply changes to a table.
 
 ### DDL
 
-Automatic DDL replication is not supported. Managing DDL so that the provider and
-subscriber database(s) remain compatible is the responsibility of the user.
+With `worf.enable_ddl_replication` on, DDL replicates as it runs, and
+`worf.include_ddl_repset` adds the tables it creates to replication sets.
+Otherwise, managing DDL so that the provider and subscriber database(s) remain
+compatible is the responsibility of the user.
 
 worf provides the `worf.replicate_ddl_command` function to allow DDL
 to be run on the provider and subscriber at a consistent point.
