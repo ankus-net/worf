@@ -12,6 +12,9 @@ internal static unsafe partial class OutputPlugin
 
     private static readonly Dictionary<nint, WorfOutputData> s_outputData = [];
 
+    // The node that wrote the transactions under each replication origin, or zero for an origin no subscription owns.
+    private static readonly Dictionary<string, uint> s_originNodeIds = [];
+
     private static bool s_startupMessageSent;
 
     private static Dictionary<uint, RelMetaCacheEntry>? s_relMetaCache;
@@ -300,7 +303,15 @@ internal static unsafe partial class OutputPlugin
             {
                 // Name the node that wrote the transaction, which the subscriber resolves conflicts by. An origin no
                 // subscription owns, it treats as this node's.
-                uint nodeId = WorfNode.GetOriginNodeId(Worf.FromServer(origin)) ?? 0;
+                // An origin's name fixes its node, as the slot name in it names the provider, so the node is looked up
+                // once.
+                string originName = Worf.FromServer(origin);
+                if (!s_originNodeIds.TryGetValue(originName, out uint nodeId))
+                {
+                    nodeId = WorfNode.GetOriginNodeId(originName) ?? 0;
+                    s_originNodeIds[originName] = nodeId;
+                }
+
                 api.WriteOrigin(ctx->@out, origin, txn->origin_lsn, nodeId);
             }
         }

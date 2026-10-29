@@ -88,6 +88,42 @@ public sealed class ConflictTieBreakTests
         Assert.AreEqual("leaf", await ValueAsync(writer, token), "the writer's row");
     }
 
+    /// <summary>
+    /// A row applied under the origin of a subscription whose name ends like a relay origin's counts as written by
+    /// that subscription's provider.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task SubscriptionNamesEndingLikeRelayOriginsKeepTheirProvider()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+
+        await using TestNode node1 = await StartNodeAsync("node_1", token);
+        await using TestNode node2 = await StartNodeAsync("node_2", token);
+        await using TestNode node3 = await StartNodeAsync("node_3", token);
+
+        // The subscriber has the highest id, so taking its row for its own would keep the first provider's change,
+        // which loses to the second provider's.
+        List<(uint Id, TestNode Node)> byId = [];
+        foreach (TestNode node in new[] { node1, node2, node3 })
+        {
+            byId.Add((await NodeIdAsync(node, token), node));
+        }
+
+        byId.Sort((x, y) => x.Id.CompareTo(y.Id));
+        (TestNode first, TestNode second, TestNode subscriber) = (byId[0].Node, byId[1].Node, byId[2].Node);
+
+        await SubscribeAsync(subscriber, "sub_via_1", first, false, token);
+        await SubscribeAsync(subscriber, "sub_via_2", second, true, token);
+
+        string committed = await UpdateAsync(first, "first", token);
+        _ = await first.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
+        await UpdateAtAsync(second, "second", committed, token);
+        _ = await second.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
+
+        Assert.AreEqual("second", await ValueAsync(subscriber, token));
+    }
+
     private static async Task<TestNode> StartNodeAsync(string name, CancellationToken token)
     {
         TestNode node = await TestNode.StartAsync(name,

@@ -573,14 +573,15 @@ internal sealed partial class WorfNode
     /// <returns>The node's id, or null when no subscription owns the origin.</returns>
     internal static unsafe uint? GetOriginNodeId(string originName)
     {
-        string workerOrigin = originName;
-        uint? writer = null;
+        // A relay origin is a worker's origin followed by the id of the node that wrote its changes. A worker's own
+        // origin can end the same way when its subscription's name does, so a match on it comes first.
+        string? relayed = null;
+        uint writer = 0;
         int relay = originName.LastIndexOf(RelaySeparator, StringComparison.Ordinal);
         if (relay > 0 && uint.TryParse(originName.AsSpan(relay + RelaySeparator.Length), NumberStyles.None,
-            CultureInfo.InvariantCulture, out uint nodeId))
+            CultureInfo.InvariantCulture, out writer))
         {
-            workerOrigin = originName[..relay];
-            writer = nodeId;
+            relayed = originName[..relay];
         }
 
         RelationData* rel = OpenCatalog(CatalogSubscription, AccessShareLock);
@@ -591,13 +592,15 @@ internal sealed partial class WorfNode
         {
             bool isnull;
             string slotName = Worf.FromServer((sbyte*)NativeMethods.heap_getattr(tuple, AnumSubSlotName, rel->rd_att, &isnull));
-
-            // A table sync worker's origin is the slot's name followed by the table's hash.
-            if (workerOrigin == slotName ||
-                (workerOrigin.Length == slotName.Length + 9 && workerOrigin.StartsWith(slotName + "_", StringComparison.Ordinal)))
+            if (IsWorkerOrigin(originName, slotName))
             {
-                result = writer ?? (uint)NativeMethods.heap_getattr(tuple, AnumSubOrigin, rel->rd_att, &isnull);
+                result = (uint)NativeMethods.heap_getattr(tuple, AnumSubOrigin, rel->rd_att, &isnull);
                 break;
+            }
+
+            if (relayed is not null && IsWorkerOrigin(relayed, slotName))
+            {
+                result = writer;
             }
         }
 
@@ -637,6 +640,15 @@ internal sealed partial class WorfNode
 
         return relays;
     }
+
+    /// <summary>
+    /// Checks whether an origin is the apply or a table sync worker's own origin for a subscription: the slot's name,
+    /// or for a table sync worker, the slot's name followed by the table's hash.
+    /// </summary>
+    private static bool IsWorkerOrigin(string originName, string slotName)
+        => originName == slotName ||
+            (originName.Length == slotName.Length + 9 && originName.StartsWith(slotName + "_", StringComparison.Ordinal) &&
+                uint.TryParse(originName.AsSpan(slotName.Length + 1), NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out _));
 
     private static unsafe RelationData* OpenCatalog(string table, int lockmode)
     {
