@@ -16,10 +16,12 @@ using Ankus.Postgres;
         watermark bigint,
         participants name[],
         pool_start bigint,
+        root_start bigint,
         root_end bigint NOT NULL,
         peak_rate double precision NOT NULL DEFAULT 0,
         switched_at timestamptz,
         exchanged_at timestamptz,
+        fenced_at timestamptz,
         detail text
     );
 
@@ -69,6 +71,7 @@ using Ankus.Postgres;
         size bigint NOT NULL,
         lo bigint,
         hi bigint,
+        state text NOT NULL DEFAULT 'open',
         created_at timestamptz NOT NULL
     );
 
@@ -80,15 +83,21 @@ using Ankus.Postgres;
         sysid numeric(20,0),
         timeline bigint,
         wal_lsn pg_lsn,
+        epoch integer,
+        state text,
         distance integer,
         high_water bigint,
         watermark bigint,
+        reset_lsn pg_lsn,
+        reset_done pg_lsn,
+        held_at timestamptz,
         reported_at timestamptz NOT NULL,
         PRIMARY KEY (seqoid, node_id)
     );
 
     CREATE VIEW worf.sequence_ranges AS
-        SELECT r.seqoid AS sequence, o.node_name AS owner, r.epoch, p.node_name AS parent, r.state,
+        SELECT r.seqoid AS sequence, coalesce(o.node_name, ro.node_name) AS owner, r.epoch, coalesce(p.node_name, rp.node_name) AS parent,
+            CASE WHEN r.fenced_at IS NOT NULL THEN 'fenced' ELSE r.state END AS state,
             a.lo AS active_lo, a.hi AS active_hi,
             CASE
                 WHEN a.block_id IS NULL THEN NULL
@@ -102,6 +111,8 @@ using Ankus.Postgres;
             JOIN pg_catalog.pg_sequence s ON s.seqrelid = r.seqoid
             LEFT JOIN worf.node o ON o.node_id = r.owner_node
             LEFT JOIN worf.node p ON p.node_id = r.parent_node
+            LEFT JOIN worf.sequence_range_node ro ON ro.seqoid = r.seqoid AND ro.node_id = r.owner_node
+            LEFT JOIN worf.sequence_range_node rp ON rp.seqoid = r.seqoid AND rp.node_id = r.parent_node
             LEFT JOIN worf.sequence_range_block a
                 ON a.seqoid = r.seqoid AND a.epoch = r.epoch AND a.kind = 'n' AND a.state = 'active'
             LEFT JOIN worf.sequence_range_block n
@@ -150,6 +161,13 @@ internal static unsafe partial class SequenceRanges
     internal static partial int ExchangeTimeout { get; }
 
     /// <summary>
+    /// Gets how often each node exchanges with its neighbors when nothing is waiting.
+    /// </summary>
+    [PgGucInt("worf.sequence_range_exchange_interval", 60000, "Sets how often each node exchanges sequence ranges with its neighbors.",
+        Minimum = 100, Maximum = int.MaxValue, Unit = PgGucUnit.Milliseconds, Context = PgGucContext.Sighup)]
+    internal static partial int ExchangeInterval { get; }
+
+    /// <summary>
     /// Gets or sets whether worf itself runs the DDL that managed sequences otherwise reject.
     /// </summary>
     internal static bool InternalDdl { get; set; }
@@ -188,7 +206,6 @@ internal static unsafe partial class SequenceRanges
     {
         uint seqoid = RequireSequence(sequence);
         WorfLocalNode node = WorfNode.GetLocalNode(true, false)!;
-        _ = force;
 
         SequenceInfo info = GetInfo(seqoid);
         if (info.Persistence != 'p')
@@ -214,14 +231,6 @@ internal static unsafe partial class SequenceRanges
             throw new PgException(PgSqlStates.InvalidParameterValue, $"pool_start {start} is at or beyond the value {quarantine} reserved for quarantine");
         }
 
-        // The root ends at the sequence's own limit, its type's, and those of the columns it fills.
-        long end = info.Ascending ? info.Max : info.Min;
-        foreach ((_, _, uint typeOid) in UsingColumns(seqoid))
-        {
-            (long min, long max) = TypeRange(typeOid);
-            end = info.Ascending ? Math.Min(end, max) : Math.Max(end, min);
-        }
-
         (long defaultSize, long defaultMax) = DefaultSizes(info.TypeOid);
         long size = rangeSize ?? defaultSize;
         long maxSize = Math.Max(maxRangeSize ?? defaultMax, size);
@@ -230,28 +239,53 @@ internal static unsafe partial class SequenceRanges
             throw new PgException(PgSqlStates.InvalidParameterValue, "range_size must be positive");
         }
 
-        SpiResult existing = Worf.SelectCatalog("SELECT epoch, state FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(seqoid));
+        // Moving the owner starts the next epoch. Two live roots could overlap, so it waits until no neighbor has
+        // reported the old owner's epoch as live within the last minute, unless forced because the old owner is gone.
+        SpiResult existing = Worf.SelectCatalog(
+            "SELECT epoch, state, owner_node, watermark, root_start, root_end FROM worf.sequence_range WHERE seqoid = $1",
+            SpiParameter.Create(seqoid));
         int epoch = 1;
+        long? watermark = null;
+        long? rootStart = info.Ascending ? info.Min : info.Max;
+        long end = RootEnd(info);
         if (existing.Count > 0)
         {
-            if (existing[0].Get<string>(1) != "disabled")
+            int current = existing[0].Get<int>(0);
+            bool live = existing[0].Get<string>(1) != "disabled";
+            if (live && existing[0].Get<uint>(2) == node.Node.Id)
             {
                 throw new PgException(PgSqlStates.ObjectInUse, $"sequence {info.Name} is already under range management",
                     hint: "Disable it with worf.disable_sequence_range first.");
             }
 
-            epoch = existing[0].Get<int>(0) + 1;
+            if (force != true && Worf.SelectCatalog("""
+                SELECT 1 FROM worf.sequence_range_node
+                WHERE seqoid = $1 AND node_id <> $2 AND epoch = $3 AND state <> 'disabled' AND reported_at > now() - interval '1 minute'
+                """, SpiParameter.Create(seqoid), SpiParameter.Create(node.Node.Id), SpiParameter.Create(current)).Count > 0)
+            {
+                throw new PgException(PgSqlStates.ObjectInUse, $"sequence {info.Name} is still under range management by its owner",
+                    hint: "Disable it with worf.disable_sequence_range on its owner first, or pass force := true if the owner is gone for good.");
+            }
+
+            epoch = Math.Max(current, Spi.ExecuteScalar<int?>("SELECT max(epoch) FROM worf.sequence_range_node WHERE seqoid = $1",
+                SpiParameter.Create(seqoid)) ?? 0) + 1;
+            watermark = existing[0].Get<long?>(3);
+
+            // The sequence's bounds are a block's now, so the root spans what the last one did.
+            rootStart = existing[0].Get<long?>(4);
+            end = existing[0].Get<long>(5);
+            Disable(seqoid);
             _ = Spi.Execute("DELETE FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(seqoid));
         }
 
         _ = Spi.Execute("""
             INSERT INTO worf.sequence_range (seqoid, owner_node, epoch, range_size, max_range_size, state, distance,
-                request_size, participants, pool_start, root_end)
-            VALUES ($1, $2, $3, $4, $5, 'collecting', 0, $4, $6::name[], $7, $8)
+                request_size, participants, pool_start, root_start, root_end, watermark)
+            VALUES ($1, $2, $3, $4, $5, 'collecting', 0, $4, $6::name[], $7, $8, $9, $10)
             """,
             SpiParameter.Create(seqoid), SpiParameter.Create(node.Node.Id), SpiParameter.Create(epoch),
             SpiParameter.Create(size), SpiParameter.Create(maxSize), SpiParameter.Create(participants),
-            SpiParameter.Create(poolStart), SpiParameter.Create(end));
+            SpiParameter.Create(poolStart), SpiParameter.Create(rootStart), SpiParameter.Create(end), SpiParameter.Create(watermark));
 
         Join(seqoid, node);
 
@@ -279,7 +313,11 @@ internal static unsafe partial class SequenceRanges
         uint seqoid = RequireSequence(sequence);
         WorfLocalNode node = WorfNode.GetLocalNode(true, false)!;
         RequireOwner(seqoid, node);
-        Activate(seqoid, node);
+        if (!LiftFence(seqoid, node, true))
+        {
+            Activate(seqoid, node);
+        }
+
         ChangedOnCommit();
     }
 
@@ -324,11 +362,7 @@ internal static unsafe partial class SequenceRanges
         uint seqoid = RequireSequence(sequence);
         WorfLocalNode node = WorfNode.GetLocalNode(true, false)!;
         RequireOwner(seqoid, node);
-        _ = Spi.Execute("UPDATE worf.sequence_range SET state = 'disabled' WHERE seqoid = $1", SpiParameter.Create(seqoid));
-        _ = Spi.Execute("""
-            UPDATE worf.sequence_range_block SET state = 'spent'
-            WHERE seqoid = $1 AND kind IN ('r', 'p') AND state = 'open'
-            """, SpiParameter.Create(seqoid));
+        Disable(seqoid);
         ChangedOnCommit();
     }
 
@@ -444,7 +478,7 @@ internal static unsafe partial class SequenceRanges
 
         // The owner grants its own next block from the root. Another node requests one from its parent, committed
         // before the exchange sends it.
-        if (next is null && NodeBlock(seqoid, epoch, "next") is null)
+        if (next is null && state != "disabled" && NodeBlock(seqoid, epoch, "next") is null)
         {
             if (owner == node.Node.Id)
             {
@@ -750,6 +784,22 @@ internal static unsafe partial class SequenceRanges
         _ => (1000000, 1000000000000),
     };
 
+    /// <summary>
+    /// Computes where a root of a sequence that isn't managed yet ends: at the sequence's own limit, its type's, and
+    /// those of the columns it fills.
+    /// </summary>
+    private static long RootEnd(SequenceInfo info)
+    {
+        long end = info.Ascending ? info.Max : info.Min;
+        foreach ((_, _, uint typeOid) in UsingColumns(info.Seqoid))
+        {
+            (long min, long max) = TypeRange(typeOid);
+            end = info.Ascending ? Math.Min(end, max) : Math.Max(end, min);
+        }
+
+        return end;
+    }
+
     private static uint RequireSequence(PgDatum? sequence)
     {
         if (sequence is null || sequence.IsNull)
@@ -787,18 +837,262 @@ internal static unsafe partial class SequenceRanges
     /// </summary>
     private static void Join(uint seqoid, WorfLocalNode node)
     {
-        // The guard's and the quarantine's locks hold off writers and nextval, so the high-water mark sees every value.
+        // The guard's and the quarantine's locks hold off writers and nextval, so the high-water mark sees every value. A
+        // node that draws from a block of an earlier epoch keeps drawing from it, since the mark covers the block.
         InstallGuards(seqoid);
         SequenceInfo info = GetInfo(seqoid);
-        Quarantine(info);
+        if (Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range_block WHERE seqoid = $1 AND kind = 'n' AND state = 'active'",
+            SpiParameter.Create(seqoid)).Count == 0)
+        {
+            Quarantine(info);
+        }
+
+        Report(seqoid, info, node);
+    }
+
+    /// <summary>
+    /// Records this node's high-water mark, its own report, under the sequence's epoch.
+    /// </summary>
+    private static void Report(uint seqoid, SequenceInfo info, WorfLocalNode node)
+    {
         long? high = HighWater(info);
         _ = Spi.Execute("UPDATE worf.sequence_range SET high_water = $2 WHERE seqoid = $1", SpiParameter.Create(seqoid), SpiParameter.Create(high));
         _ = Spi.Execute("""
-            INSERT INTO worf.sequence_range_node (seqoid, node_id, node_name, via_node, distance, high_water, reported_at)
-            VALUES ($1, $2, $3, $2, 0, $4, now())
-            ON CONFLICT (seqoid, node_id) DO UPDATE SET high_water = excluded.high_water, reported_at = excluded.reported_at
+            INSERT INTO worf.sequence_range_node (seqoid, node_id, node_name, via_node, distance, high_water, epoch, state, reported_at)
+            SELECT $1, $2, $3, $2, 0, $4, r.epoch, r.state, now() FROM worf.sequence_range r WHERE r.seqoid = $1
+            ON CONFLICT (seqoid, node_id) DO UPDATE SET high_water = excluded.high_water, epoch = excluded.epoch, state = excluded.state,
+                reported_at = excluded.reported_at
             """, SpiParameter.Create(seqoid), SpiParameter.Create(node.Node.Id), SpiParameter.Create(node.Node.Name),
             SpiParameter.Create(high));
+    }
+
+    /// <summary>
+    /// Takes up a newer epoch of a sequence that a neighbor reports: its owner, a high-water mark that covers this
+    /// node's blocks of earlier epochs, which it keeps drawing from, and a new route. Its root and pool blocks stop
+    /// granting.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    /// <param name="owner">The epoch's owner.</param>
+    /// <param name="epoch">The epoch.</param>
+    /// <param name="node">This node.</param>
+    internal static void TakeEpoch(uint seqoid, uint owner, int epoch, WorfLocalNode node)
+    {
+        SpiParameter seq = SpiParameter.Create(seqoid);
+        _ = Spi.Execute("UPDATE worf.sequence_range_block SET state = 'spent' WHERE seqoid = $1 AND kind IN ('r', 'p') AND state IN ('open', 'fenced')", seq);
+        _ = Spi.Execute("DELETE FROM worf.sequence_range_request WHERE seqoid = $1", seq);
+        _ = Spi.Execute("""
+            UPDATE worf.sequence_range r SET owner_node = $2, epoch = $3, parent_node = NULL, distance = NULL, fenced_at = NULL, detail = NULL,
+                state = CASE WHEN EXISTS (SELECT 1 FROM worf.sequence_range_block b WHERE b.seqoid = r.seqoid AND b.kind = 'n' AND b.state = 'active')
+                    THEN 'active' ELSE 'quarantined' END
+            WHERE seqoid = $1
+            """, seq, SpiParameter.Create(owner), SpiParameter.Create(epoch));
+        Report(seqoid, GetInfo(seqoid), node);
+        PgLog.Log($"sequence {GetInfo(seqoid).Name} moved to epoch {epoch}");
+    }
+
+    /// <summary>
+    /// Stops granting a sequence's values on this node, as its owner or a neighbor reported. The node keeps drawing from
+    /// the blocks it holds.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    internal static void Disable(uint seqoid)
+    {
+        SpiParameter seq = SpiParameter.Create(seqoid);
+        _ = Spi.Execute("UPDATE worf.sequence_range SET state = 'disabled', fenced_at = NULL WHERE seqoid = $1", seq);
+        _ = Spi.Execute("UPDATE worf.sequence_range_block SET state = 'spent' WHERE seqoid = $1 AND kind IN ('r', 'p') AND state IN ('open', 'fenced')", seq);
+        _ = Spi.Execute("DELETE FROM worf.sequence_range_request WHERE seqoid = $1", seq);
+        _ = Spi.Execute("UPDATE worf.sequence_range_node n SET state = 'disabled' FROM worf.local_node l WHERE n.seqoid = $1 AND n.node_id = l.node_id", seq);
+    }
+
+    /// <summary>
+    /// Checks the identity recorded on this node's blocks: a node whose node id, system identifier or timeline changed
+    /// abandons its node blocks and requests new ones. An allocator whose system identifier or timeline changed fences its
+    /// root and pool blocks, since a grant committed on the old timeline might be lost, and a clone abandons the ones
+    /// that belong to another node id.
+    /// </summary>
+    /// <param name="node">This node.</param>
+    /// <returns>Whether anything changed.</returns>
+    internal static bool CheckIdentity(WorfLocalNode node)
+    {
+        ulong sysid = NativeMethods.GetSystemIdentifier();
+        uint timeline = NativeMethods.GetWALInsertionTimeLine();
+        SpiParameter id = SpiParameter.Create(node.Node.Id);
+        SpiParameter system = SpiParameter.Create(sysid.ToString(CultureInfo.InvariantCulture));
+        SpiParameter line = SpiParameter.Create((long)timeline);
+        bool changed = false;
+
+        // Allocator blocks first, so that a node that resets doesn't grant itself from a root it is about to fence.
+        _ = Spi.Execute("UPDATE worf.sequence_range_block SET state = 'abandoned' WHERE kind IN ('r', 'p') AND state IN ('open', 'fenced') AND node_id <> $1", id);
+        SpiResult fenced = Spi.Query(Spi.Sql($"""
+            UPDATE worf.sequence_range_block SET state = 'fenced'
+            WHERE kind IN ('r', 'p') AND state = 'open' AND (sysid <> {sysid.ToString(CultureInfo.InvariantCulture)}::numeric OR timeline <> {(long)timeline})
+            RETURNING seqoid::oid
+            """), false, 0);
+        for (int i = 0; i < fenced.Count; i++)
+        {
+            uint seqoid = fenced[i].Get<uint>(0);
+            if (Spi.Execute("UPDATE worf.sequence_range SET fenced_at = now() WHERE seqoid = $1 AND fenced_at IS NULL", SpiParameter.Create(seqoid)) > 0)
+            {
+                PgLog.Warning($"sequence {GetInfo(seqoid).Name}: this allocator's timeline or system identifier changed, so it grants nothing until every node it granted to reports");
+            }
+        }
+
+        SpiResult moved = Worf.SelectCatalog("""
+            SELECT DISTINCT seqoid::oid FROM worf.sequence_range_block
+            WHERE kind IN ('n', 'i') AND state IN ('next', 'active', 'imported')
+                AND (node_id <> $1 OR sysid <> $2::numeric OR timeline <> $3)
+            """, id, system, line);
+        for (int i = 0; i < moved.Count; i++)
+        {
+            uint seqoid = moved[i].Get<uint>(0);
+            PgLog.Warning($"sequence {GetInfo(seqoid).Name}: this node's identity changed, so it abandons its blocks and requests new ones");
+            Reset(seqoid, node);
+            changed = true;
+        }
+
+        return changed;
+    }
+
+    /// <summary>
+    /// Lifts an allocator's fence once every node with a grant from its fenced blocks, and on the owner every listed
+    /// participant, has exchanged since the fence began, unless two grants overlap.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    /// <param name="node">This node.</param>
+    /// <param name="force">Whether to lift it without waiting for reports, as <c>activate_sequence_range</c> does.</param>
+    /// <returns>Whether it lifted.</returns>
+    internal static bool LiftFence(uint seqoid, WorfLocalNode node, bool force)
+    {
+        SpiParameter seq = SpiParameter.Create(seqoid);
+        SpiResult range = Worf.SelectCatalog("SELECT fenced_at IS NOT NULL, owner_node, participants FROM worf.sequence_range WHERE seqoid = $1", seq);
+        if (range.Count == 0 || !range[0].Get<bool>(0))
+        {
+            return false;
+        }
+
+        SpiResult overlap = Worf.SelectCatalog("""
+            SELECT a.grantee_name::text, a.lo, a.hi, b.grantee_name::text, b.lo, b.hi
+            FROM worf.sequence_range_grant a JOIN worf.sequence_range_grant b
+                ON b.seqoid = a.seqoid AND a.grant_id < b.grant_id AND a.lo <= b.hi AND b.lo <= a.hi
+            WHERE a.seqoid = $1 AND a.kind <> 'x' AND b.kind <> 'x'
+            LIMIT 1
+            """, seq);
+        if (overlap.Count > 0)
+        {
+            string detail = $"grants to {overlap[0].Get<string>(0)} [{overlap[0].Get<long>(1)}, {overlap[0].Get<long>(2)}] and to " +
+                $"{overlap[0].Get<string>(3)} [{overlap[0].Get<long>(4)}, {overlap[0].Get<long>(5)}] overlap";
+            _ = Spi.Execute("UPDATE worf.sequence_range SET detail = $2 WHERE seqoid = $1 AND detail IS DISTINCT FROM $2", seq, SpiParameter.Create(detail));
+            return false;
+        }
+
+        if (!force && Spi.ExecuteScalar<bool>("""
+            SELECT EXISTS (
+                SELECT 1 FROM worf.sequence_range_grant g JOIN worf.sequence_range_block b ON b.block_id = g.from_block
+                WHERE g.seqoid = $1 AND b.state = 'fenced' AND g.grantee_id <> $2 AND g.state <> 'abandoned'
+                    AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_node n
+                        WHERE n.seqoid = g.seqoid AND n.node_id = g.grantee_id AND n.held_at > r.fenced_at))
+                OR (r.owner_node = $2 AND EXISTS (
+                SELECT 1 FROM unnest(r.participants) p(name)
+                WHERE NOT EXISTS (SELECT 1 FROM worf.sequence_range_node n
+                    WHERE n.seqoid = r.seqoid AND n.node_name = p.name
+                        AND (n.held_at > r.fenced_at OR n.via_node <> n.node_id AND n.reported_at > r.fenced_at))))
+            FROM worf.sequence_range r WHERE r.seqoid = $1
+            """, seq, SpiParameter.Create(node.Node.Id)))
+        {
+            return false;
+        }
+
+        _ = Spi.Execute("""
+            UPDATE worf.sequence_range_block SET state = 'open', sysid = $2::numeric, timeline = $3
+            WHERE seqoid = $1 AND state = 'fenced'
+            """, seq, SpiParameter.Create(NativeMethods.GetSystemIdentifier().ToString(CultureInfo.InvariantCulture)),
+            SpiParameter.Create((long)NativeMethods.GetWALInsertionTimeLine()));
+        _ = Spi.Execute("UPDATE worf.sequence_range SET fenced_at = NULL, detail = NULL WHERE seqoid = $1", seq);
+        PgLog.Log($"sequence {GetInfo(seqoid).Name}: the allocator's fence lifted");
+        return true;
+    }
+
+    /// <summary>
+    /// Records a block a neighbor reports holding from this allocator: one the allocator has no record of, as when the
+    /// grant was lost with an old timeline, goes back into the ledger and leaves the free spans, and an abandoned one is
+    /// marked so.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    /// <param name="info">The sequence's details.</param>
+    /// <param name="id">The block, which is its grant.</param>
+    /// <param name="kind">Its kind.</param>
+    /// <param name="lo">Its start.</param>
+    /// <param name="hi">Its end.</param>
+    /// <param name="abandoned">Whether the holder abandoned it.</param>
+    /// <param name="fenced">Whether this allocator is fenced, which alone takes unknown blocks back into its ledger.</param>
+    /// <param name="holderId">The holder.</param>
+    /// <param name="holderName">The holder's name.</param>
+    internal static void RecordHeld(uint seqoid, SequenceInfo info, Guid id, char kind, long lo, long hi, bool abandoned, bool fenced,
+        uint holderId, string holderName)
+    {
+        if (Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range_grant WHERE grant_id = $1", SpiParameter.Create(id)).Count > 0)
+        {
+            if (abandoned)
+            {
+                _ = Spi.Execute("UPDATE worf.sequence_range_grant SET state = 'abandoned' WHERE grant_id = $1 AND state <> 'abandoned'",
+                    SpiParameter.Create(id));
+            }
+
+            return;
+        }
+
+        if (!fenced)
+        {
+            return;
+        }
+
+        SpiResult from = Worf.SelectCatalog("""
+            SELECT block_id FROM worf.sequence_range_block
+            WHERE seqoid = $1 AND kind IN ('r', 'p') AND state IN ('open', 'fenced') AND lo <= $2 AND $3 <= hi
+            LIMIT 1
+            """, SpiParameter.Create(seqoid), SpiParameter.Create(lo), SpiParameter.Create(hi));
+        if (from.Count == 0)
+        {
+            return;
+        }
+
+        Guid block = from[0].Get<Guid>(0);
+        _ = Spi.Execute("""
+            INSERT INTO worf.sequence_range_grant
+            VALUES ($1, gen_random_uuid(), $2, $3, $4, $5, $6::"char", $7, $8, $9, now())
+            """, SpiParameter.Create(id), SpiParameter.Create(seqoid), SpiParameter.Create(block), SpiParameter.Create(holderId),
+            SpiParameter.Create(holderName), SpiParameter.Create(kind.ToString()), SpiParameter.Create(lo), SpiParameter.Create(hi),
+            SpiParameter.Create(abandoned ? "abandoned" : "acknowledged"));
+        TakeFromFree(block, lo, hi);
+        _ = Spi.Execute($"UPDATE worf.sequence_range SET watermark = {(info.Ascending ? "greatest" : "least")}(coalesce(watermark, $2), $2) WHERE seqoid = $1",
+            SpiParameter.Create(seqoid), SpiParameter.Create(info.Ascending ? hi : lo));
+        PgLog.Warning($"sequence {info.Name}: node {holderName} holds block [{lo}, {hi}], which this allocator had no record of; it is back in the ledger");
+    }
+
+    /// <summary>
+    /// Removes values from a block's free spans.
+    /// </summary>
+    private static void TakeFromFree(Guid block, long lo, long hi)
+    {
+        SpiResult spans = Spi.Query(Spi.Sql($"SELECT lo, hi FROM worf.sequence_range_free WHERE block_id = {block} AND lo <= {hi} AND {lo} <= hi FOR UPDATE"),
+            false, 0);
+        for (int i = 0; i < spans.Count; i++)
+        {
+            long spanLo = spans[i].Get<long>(0);
+            long spanHi = spans[i].Get<long>(1);
+            _ = Spi.Execute("DELETE FROM worf.sequence_range_free WHERE block_id = $1 AND lo = $2", SpiParameter.Create(block), SpiParameter.Create(spanLo));
+            if (spanLo < lo)
+            {
+                _ = Spi.Execute("INSERT INTO worf.sequence_range_free VALUES ($1, $2, $3)", SpiParameter.Create(block), SpiParameter.Create(spanLo),
+                    SpiParameter.Create(lo - 1));
+            }
+
+            if (spanHi > hi)
+            {
+                _ = Spi.Execute("INSERT INTO worf.sequence_range_free VALUES ($1, $2, $3)", SpiParameter.Create(block), SpiParameter.Create(hi + 1),
+                    SpiParameter.Create(spanHi));
+            }
+        }
     }
 
     /// <summary>
@@ -823,7 +1117,7 @@ internal static unsafe partial class SequenceRanges
             VALUES ($1, $2, $3, $4, $5, $6, $4, $7, $8)
             """, SpiParameter.Create(seqoid), SpiParameter.Create(owner), SpiParameter.Create(epoch), SpiParameter.Create(rangeSize),
             SpiParameter.Create(maxRangeSize), SpiParameter.Create(refused is null ? "quarantined" : "refused"),
-            SpiParameter.Create(info.Ascending ? info.Max : info.Min), SpiParameter.Create(refused));
+            SpiParameter.Create(RootEnd(info)), SpiParameter.Create(refused));
         if (refused is null)
         {
             Join(seqoid, node);
@@ -844,7 +1138,7 @@ internal static unsafe partial class SequenceRanges
         bool ready = Spi.ExecuteScalar<bool>("""
             SELECT r.state = 'collecting' AND r.participants IS NOT NULL AND NOT EXISTS (
                 SELECT 1 FROM unnest(r.participants) p(name)
-                WHERE NOT EXISTS (SELECT 1 FROM worf.sequence_range_node n WHERE n.seqoid = r.seqoid AND n.node_name = p.name))
+                WHERE NOT EXISTS (SELECT 1 FROM worf.sequence_range_node n WHERE n.seqoid = r.seqoid AND n.node_name = p.name AND n.epoch = r.epoch))
             FROM worf.sequence_range r WHERE r.seqoid = $1
             """, SpiParameter.Create(seqoid));
         if (ready)
@@ -859,8 +1153,11 @@ internal static unsafe partial class SequenceRanges
     internal static void Activate(uint seqoid, WorfLocalNode node)
     {
         SequenceInfo info = GetInfo(seqoid);
-        SpiResult range = Worf.SelectCatalog("SELECT epoch, pool_start, root_end, state FROM worf.sequence_range WHERE seqoid = $1",
-            SpiParameter.Create(seqoid));
+        // The root starts no lower than the sequence's own first value, or pool_start if higher.
+        SpiResult range = Worf.SelectCatalog("""
+            SELECT epoch, CASE WHEN $2 THEN greatest(pool_start, root_start) ELSE least(pool_start, root_start) END, root_end, state
+            FROM worf.sequence_range WHERE seqoid = $1
+            """, SpiParameter.Create(seqoid), SpiParameter.Create(info.Ascending));
         int epoch = range[0].Get<int>(0);
         long? poolStart = range[0].Get<long?>(1);
         long end = range[0].Get<long>(2);
@@ -870,9 +1167,9 @@ internal static unsafe partial class SequenceRanges
         }
 
         long? high = Worf.SelectCatalog(info.Ascending
-                ? "SELECT max(high_water) FROM worf.sequence_range_node WHERE seqoid = $1"
-                : "SELECT min(high_water) FROM worf.sequence_range_node WHERE seqoid = $1",
-            SpiParameter.Create(seqoid))[0].Get<long?>(0);
+                ? "SELECT max(high_water) FROM worf.sequence_range_node WHERE seqoid = $1 AND epoch = $2"
+                : "SELECT min(high_water) FROM worf.sequence_range_node WHERE seqoid = $1 AND epoch = $2",
+            SpiParameter.Create(seqoid), SpiParameter.Create(epoch))[0].Get<long?>(0);
 
         long start;
         if (info.Ascending)
@@ -914,11 +1211,11 @@ internal static unsafe partial class SequenceRanges
     /// Abandons this node's node blocks of a sequence, quarantines it, and on the owner grants and switches to a new
     /// block.
     /// </summary>
-    private static void Reset(uint seqoid, WorfLocalNode node)
+    internal static void Reset(uint seqoid, WorfLocalNode node)
     {
         SequenceInfo info = GetInfo(seqoid);
         _ = Spi.Execute("""
-            UPDATE worf.sequence_range_block SET state = 'abandoned'
+            UPDATE worf.sequence_range_block SET state = 'abandoned', retired_at = now()
             WHERE seqoid = $1 AND kind IN ('n', 'i') AND state IN ('next', 'active', 'imported')
             """, SpiParameter.Create(seqoid));
         Quarantine(info);

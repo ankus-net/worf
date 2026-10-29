@@ -4,7 +4,7 @@ using Npgsql;
 namespace Worf.Tests;
 
 /// <summary>
-/// Sequence range management on a single node, its owner.
+/// Sequence range management.
 /// </summary>
 [TestClass]
 public sealed class SequenceRangeTests
@@ -254,6 +254,127 @@ public sealed class SequenceRangeTests
         }
     }
 
+    /// <summary>
+    /// A node whose WAL position a neighbor sees move backwards abandons its blocks for new ones. An allocator whose
+    /// timeline changed fences its root until its neighbors report the blocks they hold, and takes back into its ledger
+    /// the grants it lost.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task RollbacksResetBlocksAndFencedAllocatorsRecoverLostGrants()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100)", token);
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            Assert.IsTrue(await node.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges", token),
+                $"{node.Name} drawing from a block");
+        }
+
+        // node_a sees node_b's WAL position move backwards, and node_b resets.
+        string before = await nodeB.SafePsqlAsync(Database, "SELECT active_lo FROM worf.sequence_ranges", token);
+        _ = await nodeA.SafePsqlAsync(Database, "UPDATE worf.sequence_range_node SET wal_lsn = 'FFFFFFFF/0' WHERE node_name = 'node_b'", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
+            $"SELECT state = 'active' AND active_lo <> {before} FROM worf.sequence_ranges", token), "node_b reset");
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database,
+            "SELECT reset_lsn IS NULL FROM worf.sequence_range_node WHERE node_name = 'node_b'", token), "node_b's reset acknowledged");
+
+        // node_a loses its grants to node_b with an old timeline, fences its root, and recovers them from node_b's report.
+        _ = await nodeA.SafePsqlAsync(Database, """
+            INSERT INTO worf.sequence_range_free SELECT from_block, lo, hi FROM worf.sequence_range_grant WHERE grantee_name = 'node_b';
+            DELETE FROM worf.sequence_range_grant WHERE grantee_name = 'node_b';
+            UPDATE worf.sequence_range_block SET timeline = 99;
+            """, token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, """
+            SELECT fenced_at IS NULL AND EXISTS (SELECT 1 FROM worf.sequence_range_grant WHERE grantee_name = 'node_b')
+            FROM worf.sequence_range
+            """, token), "node_a's fence lifted");
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges", token), "node_a drawing again");
+
+        string[] grants = (await nodeA.SafePsqlAsync(Database, "SELECT lo, hi FROM worf.sequence_range_grant WHERE grantee_name = 'node_b'", token)).Split('\n');
+        foreach (string block in (await nodeB.SafePsqlAsync(Database, "SELECT lo, hi FROM worf.sequence_range_block", token)).Split('\n'))
+        {
+            Assert.Contains(block, grants, "node_b's block back in node_a's ledger");
+        }
+
+        Assert.AreEqual("0", await nodeA.SafePsqlAsync(Database, """
+            SELECT count(*) FROM worf.sequence_range_free f JOIN worf.sequence_range_grant g ON f.lo <= g.hi AND g.lo <= f.hi
+            """, token), "granted values left in the free spans");
+    }
+
+    /// <summary>
+    /// Moving the owner starts a new epoch, whose root starts above every block of the old one, while each node keeps
+    /// drawing from the blocks it holds until the new epoch's arrive.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task MovingTheOwnerStartsAnEpochAboveTheOldBlocks()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        TestNode[] nodes = [nodeA, nodeB];
+        foreach (TestNode node in nodes)
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100)", token);
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        foreach (TestNode node in nodes)
+        {
+            Assert.IsTrue(await node.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges", token),
+                $"{node.Name} drawing from a block");
+            _ = await node.SafePsqlAsync(Database, "INSERT INTO t (v) SELECT 'old' FROM generate_series(1, 5)", token);
+        }
+
+        // node_b can't take over while node_a's epoch is live.
+        PostgresException live = await Assert.ThrowsExactlyAsync<PostgresException>(() => nodeB.SafePsqlAsync(Database,
+            "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_a}', range_size := 100)", token));
+        Assert.AreEqual("55006", live.SqlState);
+
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.disable_sequence_range('t_id_seq')", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'disabled' FROM worf.sequence_ranges", token), "the disable reached node_b");
+        Assert.AreEqual("6", await nodeB.SafePsqlAsync(Database, "INSERT INTO t (v) VALUES ('disabled') RETURNING (SELECT count(*) FROM t) + 1", token));
+
+        _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_a}', range_size := 100)", token);
+        foreach (TestNode node in nodes)
+        {
+            Assert.IsTrue(await node.PollQueryUntilAsync(Database, "SELECT state = 'active' AND epoch = 2 FROM worf.sequence_ranges", token),
+                $"{node.Name} drawing from the new epoch");
+
+            Assert.AreEqual("node_b", await node.SafePsqlAsync(Database, "SELECT owner FROM worf.sequence_ranges", token));
+        }
+
+        long oldEnd = long.MinValue;
+        HashSet<long> keys = [];
+        foreach (TestNode node in nodes)
+        {
+            oldEnd = Math.Max(oldEnd, long.Parse(await node.SafePsqlAsync(Database, """
+                SELECT greatest(
+                    (SELECT max(hi) FROM worf.sequence_range_block WHERE epoch = 1 AND kind = 'n'),
+                    (SELECT max(g.hi) FROM worf.sequence_range_grant g JOIN worf.sequence_range_block b ON b.block_id = g.from_block WHERE b.epoch = 1))
+                """, token), CultureInfo.InvariantCulture));
+            _ = await node.SafePsqlAsync(Database, "INSERT INTO t (v) SELECT 'new' FROM generate_series(1, 5)", token);
+            foreach (string id in (await node.SafePsqlAsync(Database, "SELECT id FROM t", token)).Split('\n'))
+            {
+                Assert.IsTrue(keys.Add(long.Parse(id, CultureInfo.InvariantCulture)), $"{node.Name}'s key {id} is another node's too");
+            }
+        }
+
+        Assert.IsGreaterThan(oldEnd, long.Parse(await nodeB.SafePsqlAsync(Database,
+            "SELECT lo FROM worf.sequence_range_block WHERE kind = 'r' AND epoch = 2", token), CultureInfo.InvariantCulture),
+            "the new root starts above the old epoch's blocks");
+    }
+
     private static async Task SubscribeAsync(TestNode subscriber, string name, TestNode provider, CancellationToken token)
     {
         _ = await subscriber.SafePsqlAsync(Database, $$"""
@@ -282,6 +403,7 @@ public sealed class SequenceRangeTests
             "max_wal_senders = 10",
             "max_replication_slots = 10",
             "worf.sequence_range_check_interval = 100",
+            "worf.sequence_range_exchange_interval = 500",
         ], token);
         try
         {

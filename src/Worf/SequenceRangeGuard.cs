@@ -1,4 +1,5 @@
 using System.Globalization;
+using Ankus.Postgres;
 
 namespace Worf;
 
@@ -11,8 +12,10 @@ internal static class SequenceRangeGuard
 {
     private const string CheckViolation = "23514";
 
-    // The blocks this node holds, by sequence, as of the version of the shared counter they were read at.
+    // The blocks this node holds under its current identity, by sequence, as of the version of the shared counter they
+    // were read at, and the sequences whose blocks were received under another identity.
     private static readonly Dictionary<uint, (bool Ascending, List<(long Lo, long Hi, string State)> Blocks)> s_sequences = [];
+    private static readonly HashSet<uint> s_moved = [];
     private static long s_version = -1;
 
     // The furthest position each sequence is known to have reached, which only moves forward within a block.
@@ -43,6 +46,15 @@ internal static class SequenceRangeGuard
             if (Read(row, column, typeOid) is not long value || (old is not null && Read(old, column, typeOid) == value))
             {
                 continue;
+            }
+
+            // After a restore, failover or point-in-time recovery, nothing passes until the range worker has reset the
+            // node's blocks.
+            if (s_moved.Contains(seqoid))
+            {
+                throw new PgException(CheckViolation,
+                    $"this node's identity changed, so the sequence range blocks of column \"{column}\" in table \"{context.TableName}\" are no longer its own",
+                    hint: "The range worker abandons them and requests new blocks; try again once it has.");
             }
 
             if (!Admits(seqoid, value) && !LockExisting(context, column, value))
@@ -130,14 +142,25 @@ internal static class SequenceRangeGuard
         }
 
         s_sequences.Clear();
+        s_moved.Clear();
         s_reached.Clear();
+        ulong sysid;
+        uint timeline;
+        unsafe
+        {
+            sysid = NativeMethods.GetSystemIdentifier();
+            timeline = NativeMethods.GetWALInsertionTimeLine();
+        }
+
         SpiResult result = Spi.Select("""
-            SELECT r.seqoid::oid, s.seqincrement > 0, b.lo, b.hi, b.state
+            SELECT r.seqoid::oid, s.seqincrement > 0, b.lo, b.hi, b.state,
+                b.node_id = l.node_id AND b.sysid = $1::numeric AND b.timeline = $2
             FROM worf.sequence_range r
                 JOIN pg_catalog.pg_sequence s ON s.seqrelid = r.seqoid
+                CROSS JOIN worf.local_node l
                 LEFT JOIN worf.sequence_range_block b ON b.seqoid = r.seqoid AND b.kind IN ('n', 'i')
                     AND b.state IN ('next', 'active', 'retired', 'imported')
-            """);
+            """, SpiParameter.Create(sysid.ToString(CultureInfo.InvariantCulture)), SpiParameter.Create((long)timeline));
         for (int i = 0; i < result.Count; i++)
         {
             SpiRow row = result[i];
@@ -148,9 +171,19 @@ internal static class SequenceRangeGuard
                 s_sequences.Add(seqoid, sequence);
             }
 
-            if (row.Get<long?>(2) is long lo)
+            if (row.Get<long?>(2) is not long lo)
             {
-                sequence.Blocks.Add((lo, row.Get<long>(3), row.Get<string>(4)));
+                continue;
+            }
+
+            string state = row.Get<string>(4);
+            if (row.Get<bool>(5))
+            {
+                sequence.Blocks.Add((lo, row.Get<long>(3), state));
+            }
+            else if (state is not "retired")
+            {
+                _ = s_moved.Add(seqoid);
             }
         }
 
