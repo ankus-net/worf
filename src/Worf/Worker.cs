@@ -95,6 +95,11 @@ internal static class Worker
             name = $"worf sync {Worf.ShortenHash(NameStr(worker.Worker.Sync.Relname), NameDataLen - 37),27} " +
                 $"{worker.Dboid}:{worker.Worker.Sync.Apply.SubId}";
         }
+        else if (worker.WorkerType == WorfWorkerType.Range)
+        {
+            function = "worf_range_main";
+            name = $"worf range {worker.Dboid}";
+        }
         else
         {
             function = "worf_apply_main";
@@ -400,6 +405,25 @@ internal static class Worker
     internal static unsafe void SetProcLatch(nint proc) => NativeMethods.SetLatch(&((PGPROC*)proc)->procLatch);
 
     /// <summary>
+    /// Wakes this database's manager worker, if it runs.
+    /// </summary>
+    internal static void WakeManager()
+    {
+        uint dboid;
+        unsafe
+        {
+            dboid = NativeGlobals.MyDatabaseId;
+        }
+
+        using PgLwLockShareGuard<WorfContext, WorfWorker> guard = WorfCtx.Share();
+        int manager = guard.Read((in _, workers) => ManagerFind(workers, dboid));
+        if (manager >= 0 && guard[manager].Proc != 0)
+        {
+            SetProcLatch(guard[manager].Proc);
+        }
+    }
+
+    /// <summary>
     /// Enqueue signal for supervisor/manager at COMMIT.
     /// </summary>
     /// <param name="subid">The subscription whose apply worker to signal, or zero.</param>
@@ -435,6 +459,7 @@ internal static class Worker
         WorfWorkerType.Manager => "manager",
         WorfWorkerType.Apply => "apply",
         WorfWorkerType.Sync => "sync",
+        WorfWorkerType.Range => "range",
         _ => throw new ArgumentOutOfRangeException(nameof(type)),
     };
 
@@ -655,9 +680,9 @@ internal static class Worker
             supervisor = ctx.Supervisor;
         }
 
-        // Likewise wake the manager when an apply or sync worker exits: a subscription change that stops a worker
+        // Likewise wake the manager when an apply, sync or range worker exits: a subscription change that stops a worker
         // wakes the manager when it commits, and the manager can look before the worker has gone.
-        if (type is WorfWorkerType.Apply or WorfWorkerType.Sync)
+        if (type is WorfWorkerType.Apply or WorfWorkerType.Sync or WorfWorkerType.Range)
         {
             int managerSlot = guard.Read((in _, workers) => ManagerFind(workers, dboid));
             if (managerSlot >= 0)

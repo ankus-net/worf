@@ -1,6 +1,8 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using System.Text.RegularExpressions;
+using Npgsql;
 
 namespace Worf.Tests;
 
@@ -30,6 +32,10 @@ public sealed partial class SyncDuringWriteTests
         string pgbenchScale = Environment.GetEnvironmentVariable("PGBENCH_SCALE") ?? "1";
         string pgbenchClients = Environment.GetEnvironmentVariable("PGBENCH_CLIENTS") ?? "10";
         string pgbenchJobs = Environment.GetEnvironmentVariable("PGBENCH_JOBS") ?? "1";
+
+        // pgbench writes as fast as it can unless given a rate in transactions a second, which bounds what the run takes
+        // from the tests beside it.
+        string? pgbenchRate = Environment.GetEnvironmentVariable("PGBENCH_RATE");
         int pgbenchTime = int.Parse(Environment.GetEnvironmentVariable("PGBENCH_TIME") ?? "120", CultureInfo.InvariantCulture);
         string walsenderTimeout = Environment.GetEnvironmentVariable("PGBENCH_TIMEOUT") ?? "5s";
 
@@ -109,6 +115,7 @@ public sealed partial class SyncDuringWriteTests
         using Process pgbench = provider.StartProgram("pgbench",
         [
             "-T", pgbenchTime.ToString(CultureInfo.InvariantCulture), "-j", pgbenchJobs, "-s", pgbenchScale, "-c", pgbenchClients,
+            .. pgbenchRate is null ? Array.Empty<string>() : ["-R", pgbenchRate],
             provider.Dsn(Database, "postgres"),
         ]);
         Task<string> pgbenchStdout = ProcessRunner.ReadToEndAsync(pgbench.StandardOutput);
@@ -156,6 +163,11 @@ public sealed partial class SyncDuringWriteTests
 
         List<string> failures = [];
         int publogpos = provider.ReadLog().Length;
+
+        // What the workers and the walsender wait on, so that a walsender timeout shows what kept apply from replying.
+        ConcurrentQueue<string> samples = new();
+        using CancellationTokenSource samplerStop = CancellationTokenSource.CreateLinkedTokenSource(token);
+        Task sampler = SampleAsync(provider, subscriber, samples, samplerStop.Token);
         int i = 1;
         do
         {
@@ -179,7 +191,9 @@ public sealed partial class SyncDuringWriteTests
 
                 while (true)
                 {
-                    await Task.Delay(TimeSpan.FromMicroseconds(100), token);
+                    // pglogical's test polls every 100 microseconds, which here would keep a processor busy with
+                    // connections and queries that slow the sync it watches.
+                    await Task.Delay(TimeSpan.FromMilliseconds(100), token);
                     // Both are read in one query: read apart, a worker that starts between the two reads looks like
                     // one that has exited.
                     string[] state = (await subscriber.SafePsqlAsync(Database,
@@ -197,7 +211,7 @@ public sealed partial class SyncDuringWriteTests
                         // 'i': worker still starting. 'y': worker done but master hasn't noticed yet; keep looping
                         // until master notices and switches to 'r'.
                     }
-                    else if (running.Length == 0)
+                    else if (running.Length == 0 && await SyncWorkerGoneAsync(subscriber, tbl, status, token))
                     {
                         failures.Add($"{tbl} didn't sync on iteration {i}, sync worker exited (running={running}) while sync state was '{status}' (elapsed {resyncStart.Elapsed.TotalSeconds})");
                     }
@@ -225,6 +239,8 @@ public sealed partial class SyncDuringWriteTests
                     }
 
                     failures.Add($"walsender timeout since last test: {timeoutLine}");
+                    TestContext.WriteLine("##### waits before the timeout #####");
+                    TestContext.WriteLine(string.Join(Environment.NewLine, samples));
                 }
             }
 
@@ -233,6 +249,9 @@ public sealed partial class SyncDuringWriteTests
             // and repeat until pgbench exits
         }
         while (await provider.SafePsqlAsync(Database, "SELECT 1 FROM pg_stat_activity WHERE application_name = 'pgbench'", token) != "");
+
+        await samplerStop.CancelAsync();
+        await sampler;
 
         await pgbench.WaitForExitAsync(token);
         TestContext.WriteLine("##### output of pgbench #####");
@@ -256,6 +275,53 @@ public sealed partial class SyncDuringWriteTests
 
         Assert.IsEmpty(failures, string.Join(Environment.NewLine, failures));
     }
+
+    /// <summary>
+    /// Samples, every half second until cancelled, the wait of each worker on the subscriber and of the walsender, with
+    /// the positions apply reported last, keeping the last thirty seconds.
+    /// </summary>
+    private static async Task SampleAsync(TestNode provider, TestNode subscriber, ConcurrentQueue<string> samples, CancellationToken token)
+    {
+        while (!token.IsCancellationRequested)
+        {
+            try
+            {
+                string workers = await subscriber.SafePsqlAsync(Database, """
+                    SELECT string_agg(concat_ws(' ', pid, application_name, state, wait_event_type, wait_event, left(query, 40)), '; ')
+                    FROM pg_stat_activity WHERE application_name ~ '(apply|sync|manager)'
+                    """, token);
+                string walsender = await provider.SafePsqlAsync(Database, """
+                    SELECT concat_ws(' ', r.sent_lsn, r.write_lsn, r.flush_lsn, r.reply_time, a.wait_event_type, a.wait_event)
+                    FROM pg_stat_replication r JOIN pg_stat_activity a ON a.pid = r.pid WHERE r.application_name = 'test_subscription'
+                    """, token);
+                samples.Enqueue($"{DateTime.UtcNow:HH:mm:ss.fff} subscriber: {workers} | walsender: {walsender}");
+                if (samples.Count > 60)
+                {
+                    _ = samples.TryDequeue(out _);
+                }
+
+                await Task.Delay(TimeSpan.FromMilliseconds(500), token);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+            catch (NpgsqlException)
+            {
+                // A sample that fails, as while the walsender restarts, is skipped.
+            }
+        }
+    }
+
+    /// <summary>
+    /// Checks again whether a table's sync worker exited without moving its status on. The query that saw no worker
+    /// read the status from its snapshot and the workers after it, so a worker that moved the status on and exited in
+    /// between looks gone. A worker moves the status on before it exits, so reading the workers and then, in a later
+    /// snapshot, the status, finds that status unchanged only when the worker died.
+    /// </summary>
+    private static async Task<bool> SyncWorkerGoneAsync(TestNode subscriber, string table, string status, CancellationToken token)
+        => await subscriber.SafePsqlAsync(Database, "SELECT count(*) FROM pg_stat_activity WHERE application_name LIKE '%sync%'", token) == "0" &&
+            await subscriber.SafePsqlAsync(Database, $"SELECT sync_status FROM worf.local_sync_status WHERE sync_relname = '{table}'", token) == status;
 
     private static int ToPid(string value) => int.TryParse(value.Split('\n')[0], CultureInfo.InvariantCulture, out int pid) ? pid : 0;
 

@@ -131,8 +131,11 @@ It's generally recommended to use `bigserial` and `bigint` types for sequences
 on multi-node systems as smaller sequences might reach end of the sequence
 space fast.
 
+Nodes that insert into the same table can give each node its own blocks of a
+sequence's values with [sequence ranges](../sequence-ranges/).
+
 Users who want to have independent sequences on provider and subscriber can
-avoid adding sequences to replication sets and create sequences with step
+also avoid adding sequences to replication sets and create sequences with step
 interval equal to or greater than the number of nodes. And then setting a
 different offset on each node. Use the `INCREMENT BY` option for
 `CREATE SEQUENCE` or `ALTER SEQUENCE`, and use `setval(...)` to set the start

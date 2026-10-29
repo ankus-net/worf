@@ -123,6 +123,13 @@ CREATE TABLE inventory (
 SELECT worf.replication_set_add_table('default', 'inventory', true);
 ```
 
+Both nodes number new rows from their own `inventory_id_seq`, so rows inserted on both would share keys. Once the subscriptions below are up, give each node its own blocks of keys with [sequence ranges](../sequence-ranges/):
+
+```sql
+-- On node_alpha
+SELECT worf.enable_sequence_range('inventory_id_seq', participants := '{node_beta}');
+```
+
 ### 4. Create Subscriptions (Both Directions)
 
 **On Node B - Subscribe to Node A:**

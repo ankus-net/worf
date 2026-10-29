@@ -618,6 +618,9 @@ internal static partial class Worf
         // Init workers.
         Worker.WorkerShmemInit();
         DdlLock.ShmemInit();
+        SequenceRanges.ShmemInit();
+        SequenceRangeReservations.ShmemInit();
+        SnowflakeIds.ShmemInit();
 
         // Init executor module
         Executor.ExecutorInit();

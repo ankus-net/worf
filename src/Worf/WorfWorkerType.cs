@@ -24,4 +24,9 @@ internal enum WorfWorkerType
     /// Special type of Apply that synchronizes one table.
     /// </summary>
     Sync,
+
+    /// <summary>
+    /// Keeps a database's managed sequences supplied with blocks.
+    /// </summary>
+    Range,
 }

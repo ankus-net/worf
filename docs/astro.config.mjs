@@ -44,6 +44,7 @@ export default defineConfig({
             { label: 'Conflicts', slug: 'conflicts' },
             { label: 'Conflict history', slug: 'conflict-history' },
             { label: 'Bidirectional replication', slug: 'bidirectional-replication' },
+            { label: 'Sequence ranges', slug: 'sequence-ranges' },
           ],
         },
         {

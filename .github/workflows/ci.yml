@@ -122,8 +122,12 @@ jobs:
           PGBENCH_TIME: '30'
           # Windows raises the priority of a thread its socket wakes, so ten pgbench backends, woken by every
           # statement, keep the runner's four processors from the resynchronizing copy, the apply and the walsender
-          # until the walsender times out. Three leave a processor for them.
-          PGBENCH_CLIENTS: ${{ runner.os == 'Windows' && '3' || '10' }}
+          # until the walsender times out. Three leave a processor for them, and on macOS's three processors keep
+          # the other tests running beside it.
+          PGBENCH_CLIENTS: ${{ runner.os == 'Linux' && '10' || '3' }}
+          # Unbounded, pgbench takes every processor for its run, slowing the tests beside it; 300 transactions a second
+          # still writes throughout each resynchronization.
+          PGBENCH_RATE: '300'
         run: dotnet ankus test --pg ${{ matrix.postgresql }} -c Release ${{ runner.os == 'Windows' && '--pgdata ''D:\ankus\pgdata''' || '' }} -- --project tests/Worf.Tests/Worf.Tests.csproj --output detailed
 
       - name: Save multi-server test logs

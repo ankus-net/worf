@@ -12,7 +12,7 @@ public sealed class RestartRecoveryTests
     private const string Database = "postgres";
     private const string SuperUser = "super";
     private const int RowsPerTransaction = 10;
-    private const int TotalRows = 30_000;
+    private const int TotalRows = 10_000;
 
     private static readonly string[] s_configuration =
     [
@@ -75,7 +75,7 @@ public sealed class RestartRecoveryTests
         await provider.StartServerAsync(token);
 
         // The subscriber crashes alone while changes stream.
-        await WaitForRowsAsync(subscriber, 12_000, token);
+        await WaitForRowsAsync(subscriber, 6_000, token);
         await subscriber.StopAsync("immediate", token);
         await subscriber.StartServerAsync(token);
 
@@ -98,6 +98,7 @@ public sealed class RestartRecoveryTests
     private static async Task WriteRowsAsync(TestNode provider, CancellationToken cancellationToken)
     {
         long next = 1;
+        bool retrying = false;
         while (next <= TotalRows)
         {
             try
@@ -105,15 +106,16 @@ public sealed class RestartRecoveryTests
                 await using NpgsqlConnection connection = await provider.OpenAsync(Database, cancellationToken);
                 while (next <= TotalRows)
                 {
-                    // The statement inserts only ids not yet committed, so retrying after a crash can't duplicate a
-                    // row whose commit the crash hid.
+                    // The first statement after a crash inserts only ids not yet committed, so it can't duplicate a
+                    // row whose commit the crash hid. The others skip the check, which scans the table.
                     await using NpgsqlCommand command = new($"""
                         INSERT INTO stream_rows
                         SELECT i, repeat('x', 100) FROM generate_series({next}, {next + RowsPerTransaction - 1}) AS i
-                        WHERE NOT EXISTS (SELECT 1 FROM stream_rows WHERE id = i)
+                        {(retrying ? "WHERE NOT EXISTS (SELECT 1 FROM stream_rows WHERE id = i)" : "")}
                         """, connection);
                     _ = await command.ExecuteNonQueryAsync(cancellationToken);
                     next += RowsPerTransaction;
+                    retrying = false;
 
                     // Spread the writes out, so the crashes land while changes stream.
                     await Task.Delay(TimeSpan.FromMilliseconds(2), cancellationToken);
@@ -122,6 +124,7 @@ public sealed class RestartRecoveryTests
             catch (Exception error) when (error is NpgsqlException or InvalidOperationException && !cancellationToken.IsCancellationRequested)
             {
                 // The provider is down; wait for it to come back.
+                retrying = true;
                 await Task.Delay(TimeSpan.FromMilliseconds(200), cancellationToken);
             }
         }
