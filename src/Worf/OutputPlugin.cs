@@ -298,7 +298,10 @@ internal static unsafe partial class OutputPlugin
             //  - send some special "unknown" origin
             if (api.WriteOrigin is not null && NativeMethods.replorigin_by_oid(txn->origin_id, true, &origin))
             {
-                api.WriteOrigin(ctx->@out, origin, txn->origin_lsn);
+                // Name the node that wrote the transaction, which the subscriber resolves conflicts by. An origin no
+                // subscription owns, it treats as this node's.
+                uint nodeId = WorfNode.GetOriginNodeId(Worf.FromServer(origin)) ?? 0;
+                api.WriteOrigin(ctx->@out, origin, txn->origin_lsn, nodeId);
             }
         }
 

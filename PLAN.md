@@ -194,7 +194,7 @@ Worf goes beyond pglogical to run multi-master on stock PostgreSQL, with no
 patched server. Worf 0.1.0 needs every step, before the release. The porting
 rules don't apply to these steps, and each adds multi-server tests.
 
-- [ ] **1. Convergence.** Equal commit timestamps resolve by node id. A warning when `apply_remote` or `keep_local` resolves conflicts between nodes that replicate both ways. Apply waits out a configured maximum clock skew.
+- [ ] **1. Convergence.** Equal commit timestamps resolve by the id of the node that wrote each change, wherever it was relayed from. A warning when `apply_remote` or `keep_local` resolves conflicts between nodes that replicate both ways. Apply waits out a configured maximum clock skew.
 - [ ] **2. Apply errors.** A failing statement or transaction is skipped, or its subscription disabled, and recorded in an exception log, so errors don't stop replication.
 - [ ] **3. DDL.** Apply tolerates columns one node has dropped or not yet added. DDL is captured and queued automatically, and new tables join replication sets. DDL that can't apply in any order locks every node first.
 - [ ] **4. Sequences.** Automatic sequence ranges, for schemas that can't change, and Snowflake IDs, for those that can.

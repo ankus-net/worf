@@ -23,8 +23,8 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
      be kept (this can be either local or remote version)
 
   When the timestamps are equal, `last_update_wins` and `first_update_wins`
-  keep the change from the node with the higher node id, so every node keeps
-  the same version.
+  keep the change written by the node with the higher node id, including
+  changes another node forwarded, so every node keeps the same version.
 
   The default value is `apply_remote`.
 

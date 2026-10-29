@@ -22,7 +22,8 @@ description: Create, alter, synchronize and drop subscriptions.
     supported values are empty array meaning don't forward any changes
     that didn't originate on provider node (this is useful for two-way
     replication between the nodes), or "{all}" which means replicate all
-    changes no matter what is their origin, default is "{all}"
+    changes no matter what is their origin, default is "{all}"; a node
+    skips its own changes when another node forwards them back
   - `apply_delay` - how much to delay replication, default is 0 seconds
   - `force_text_transfer` - force the provider to replicate all columns
     using a text representation (which is slower, but may be used to

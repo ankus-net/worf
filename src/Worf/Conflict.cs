@@ -267,14 +267,13 @@ internal static partial class Conflict
             cmp = -cmp;
         }
 
-        // The timestamps were equal, break the tie in a manner that is consistent across all nodes: the change from
-        // the node with the higher id wins. A local row from the provider itself, or from a writer that isn't a
-        // worf node, loses to the remote change.
+        // The timestamps were equal, break the tie in a manner that is consistent across all nodes: the change
+        // written by the node with the higher id wins, whichever node relayed it.
         if (cmp == 0)
         {
-            WorfSubscription sub = Apply.MySubscription!;
-            uint? localNodeId = localOriginId == 0 ? sub.Target.Id : OriginNodeId(localOriginId);
-            cmp = localNodeId is uint nodeId && nodeId != sub.Origin.Id ? sub.Origin.Id.CompareTo(nodeId) : 1;
+            uint localNodeId = WriterNodeId(localOriginId);
+            uint remoteNodeId = Apply.WriterNodeId;
+            cmp = localNodeId == remoteNodeId ? 1 : remoteNodeId.CompareTo(localNodeId);
         }
 
         if (cmp > 0)
@@ -292,23 +291,18 @@ internal static partial class Conflict
     }
 
     /// <summary>
-    /// Gets the node whose changes a replication origin applies: the provider of the subscription whose apply or
-    /// table sync worker uses it.
+    /// Gets the node that wrote a local row: the node whose changes its commit's replication origin applies, or this
+    /// node for a row written here or under an origin no subscription owns.
     /// </summary>
-    /// <param name="originId">The replication origin.</param>
-    /// <returns>The provider node's id, or null when no subscription uses the origin.</returns>
-    private static uint? OriginNodeId(ushort originId)
+    /// <param name="originId">The replication origin of the row's commit.</param>
+    /// <returns>The node's id.</returns>
+    private static unsafe uint WriterNodeId(ushort originId)
     {
-        SpiResult result = Worf.SelectCatalog("""
-            SELECT s.sub_origin
-            FROM pg_catalog.pg_replication_origin o
-                JOIN worf.subscription s ON o.roname = s.sub_slot_name::text
-                    OR (length(o.roname) = length(s.sub_slot_name::text) + 9 AND starts_with(o.roname, s.sub_slot_name || '_'))
-            WHERE o.roident = $1
-            ORDER BY o.roname = s.sub_slot_name::text DESC
-            LIMIT 1
-            """, SpiParameter.Create((uint)originId));
-        return result.Count == 0 ? null : result[0].Get<uint>(0);
+        uint localNodeId = Apply.MySubscription!.Target.Id;
+        sbyte* name;
+        return originId != 0 && NativeMethods.replorigin_by_oid(originId, true, &name)
+            ? WorfNode.GetOriginNodeId(Worf.FromServer(name)) ?? localNodeId
+            : localNodeId;
     }
 
     /// <summary>

@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Runtime.InteropServices;
 using Ankus.Postgres;
 
@@ -33,7 +34,7 @@ using Ankus.Postgres;
         sub_forward_origins text[],
         sub_apply_delay interval NOT NULL DEFAULT '0',
         sub_force_text_transfer boolean NOT NULL DEFAULT 'f'
-    );
+    ) WITH (user_catalog_table=true);
     """)]
 
 namespace Worf;
@@ -554,6 +555,89 @@ internal sealed partial class WorfNode
         "sub_slot_name::text, sub_replication_sets, sub_forward_origins, sub_apply_delay, sub_force_text_transfer " +
         "FROM worf.subscription";
 
+    /// <summary>
+    /// Names the replication origin under which apply commits the changes its provider relays from another node, so
+    /// that conflict resolution can tell which node wrote a row.
+    /// </summary>
+    /// <param name="originName">The apply or table sync worker's own origin.</param>
+    /// <param name="nodeId">The node that wrote the changes.</param>
+    /// <returns>The origin's name.</returns>
+    internal static string RelayOriginName(string originName, uint nodeId)
+        => $"{originName}{RelaySeparator}{nodeId.ToString(CultureInfo.InvariantCulture)}";
+
+    /// <summary>
+    /// Gets the node that wrote the changes a replication origin applies: the node a relay origin names, or the
+    /// provider of the subscription whose apply or table sync worker owns the origin. This works while decoding too.
+    /// </summary>
+    /// <param name="originName">The origin's name.</param>
+    /// <returns>The node's id, or null when no subscription owns the origin.</returns>
+    internal static unsafe uint? GetOriginNodeId(string originName)
+    {
+        string workerOrigin = originName;
+        uint? writer = null;
+        int relay = originName.LastIndexOf(RelaySeparator, StringComparison.Ordinal);
+        if (relay > 0 && uint.TryParse(originName.AsSpan(relay + RelaySeparator.Length), NumberStyles.None,
+            CultureInfo.InvariantCulture, out uint nodeId))
+        {
+            workerOrigin = originName[..relay];
+            writer = nodeId;
+        }
+
+        RelationData* rel = OpenCatalog(CatalogSubscription, AccessShareLock);
+        SysScanDescData* scan = NativeMethods.systable_beginscan(rel, 0, false, null, 0, null);
+        uint? result = null;
+        HeapTupleData* tuple;
+        while ((tuple = NativeMethods.systable_getnext(scan)) is not null)
+        {
+            bool isnull;
+            string slotName = Worf.FromServer((sbyte*)NativeMethods.heap_getattr(tuple, AnumSubSlotName, rel->rd_att, &isnull));
+
+            // A table sync worker's origin is the slot's name followed by the table's hash.
+            if (workerOrigin == slotName ||
+                (workerOrigin.Length == slotName.Length + 9 && workerOrigin.StartsWith(slotName + "_", StringComparison.Ordinal)))
+            {
+                result = writer ?? (uint)NativeMethods.heap_getattr(tuple, AnumSubOrigin, rel->rd_att, &isnull);
+                break;
+            }
+        }
+
+        NativeMethods.systable_endscan(scan);
+        NativeMethods.table_close(rel, AccessShareLock);
+        return result;
+    }
+
+    /// <summary>
+    /// Drops a worker's replication origin and its relay origins.
+    /// </summary>
+    /// <param name="originName">The worker's origin.</param>
+    internal static void DropOrigins(string originName)
+    {
+        PgReplicationOrigin.Drop(originName, true);
+        foreach ((_, string relay) in RelayOrigins(originName))
+        {
+            PgReplicationOrigin.Drop(relay, true);
+        }
+    }
+
+    /// <summary>
+    /// Lists a worker's relay origins.
+    /// </summary>
+    /// <param name="originName">The worker's origin.</param>
+    /// <returns>The relay origins' ids and names.</returns>
+    internal static List<(ushort Id, string Name)> RelayOrigins(string originName)
+    {
+        SpiResult result = Worf.SelectCatalog(
+            "SELECT roident, roname FROM pg_catalog.pg_replication_origin WHERE starts_with(roname, $1)",
+            SpiParameter.Create(originName + RelaySeparator));
+        List<(ushort Id, string Name)> relays = [];
+        for (int i = 0; i < result.Count; i++)
+        {
+            relays.Add(((ushort)result[i].Get<uint>(0), result[i].Get<string>(1)));
+        }
+
+        return relays;
+    }
+
     private static unsafe RelationData* OpenCatalog(string table, int lockmode)
     {
         RangeVar* rv = NativeMethods.makeRangeVar(Worf.PStrDup(Worf.ExtensionName), Worf.PStrDup(table), -1);
@@ -583,6 +667,8 @@ internal sealed partial class WorfNode
     }
 
     private const string CatalogNode = "node";
+    private const string CatalogSubscription = "subscription";
+    private const string RelaySeparator = "_via_";
     private const string CatalogLocalNode = "local_node";
     private const string CatalogNodeInterface = "node_interface";
 
@@ -597,7 +683,11 @@ internal sealed partial class WorfNode
     private const short AnumIfNodeid = 3;
     private const short AnumIfDsn = 4;
 
+    private const short AnumSubOrigin = 3;
+    private const short AnumSubSlotName = 8;
+
     private const int NoLock = 0;
+    private const int AccessShareLock = 1;
     private const int RowExclusiveLock = 3;
     private const ushort BtEqualStrategyNumber = 3;
     private const uint FOideq = 184;
