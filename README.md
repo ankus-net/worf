@@ -674,7 +674,8 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   - `error` - stop, and apply the transaction again when the worker
     restarts, until the error is fixed
   - `discard` - apply the transaction again change by change, skipping the
-    changes that fail
+    changes that fail, or the whole transaction when it fails at commit, as
+    on a deferred constraint
   - `transdiscard` - skip the whole transaction
   - `sub_disable` - disable the subscription, which applies the transaction
     again once it's enabled

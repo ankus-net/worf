@@ -604,8 +604,10 @@ internal static unsafe partial class Apply
 
             s_applyApi.OnCommit();
 
-            // We need to write end_lsn to the commit record.
-            Worf.ReploriginSessionOriginLsn = endLsn;
+            // We need to write end_lsn to the commit record. It's set once deferred triggers have run, just before the
+            // record is written: an abort advances the origin too, and has to leave it at the remote commit position
+            // that BEGIN set, from which the provider sends the transaction again.
+            PgTransaction.RegisterCallback(PgTransactionEvent.PreCommit, () => Worf.ReploriginSessionOriginLsn = endLsn);
 
             s_commitEndLsn = endLsn;
             return;
@@ -863,9 +865,13 @@ internal static unsafe partial class Apply
         {
             string? oldAction = s_actionName;
             WorfRelation? oldRel = s_errRel;
+            string? oldOperation = s_changeOperation;
             s_actionName = "multi INSERT";
             s_errRel = s_lastInsertRel;
             UpdateErrorContext();
+
+            // A failure belongs to the batch, whichever message made apply write it.
+            s_changeOperation = s_actionName;
 
             s_applyApi.MultiInsertFinish(s_lastInsertRel!);
             RelCache.RelationClose(s_lastInsertRel!, PgLockMode.None);
@@ -875,6 +881,7 @@ internal static unsafe partial class Apply
 
             s_errRel = oldRel;
             s_actionName = oldAction;
+            s_changeOperation = oldOperation;
             UpdateErrorContext();
         }
     }
@@ -1581,11 +1588,13 @@ internal static unsafe partial class Apply
 
             case WorfExceptionBehaviour.Discard:
             case WorfExceptionBehaviour.Transdiscard:
-                // A transaction that fails again change by change, as when its commit fails, is skipped as a whole
-                // next time. One that fails as it's skipped stops the worker until the error is fixed.
+                // A transaction whose commit fails, as on a deferred constraint, or that fails again change by change
+                // is skipped as a whole next time. One that fails as it's skipped stops the worker until the error is
+                // fixed.
                 if (!s_exceptionMode || !s_exceptionSkipsTransaction)
                 {
-                    SetExceptionMarker(s_remoteCommitLsn, ExceptionBehaviour == WorfExceptionBehaviour.Transdiscard || s_exceptionMode);
+                    SetExceptionMarker(s_remoteCommitLsn, ExceptionBehaviour == WorfExceptionBehaviour.Transdiscard ||
+                        s_exceptionMode || s_changeOperation == "COMMIT");
                     PgLog.Log($"applying the remote transaction at {lsn} under worf.exception_behaviour once the worker restarts");
                 }
 
@@ -1673,8 +1682,6 @@ internal static unsafe partial class Apply
             return;
         }
 
-        // Deferred constraints are checked as each change applies, so that a failure belongs to its change.
-        _ = Spi.Execute("SET CONSTRAINTS ALL IMMEDIATE");
         if (!s_exceptionSkipsTransaction)
         {
             ApplyChanges(firstChange);
@@ -1684,7 +1691,13 @@ internal static unsafe partial class Apply
         // A failure rolls the whole transaction back, and the rest of it is skipped.
         try
         {
-            PgTransaction.RunInSubtransaction(() => ApplyChanges(firstChange), PgSubtransactionMode.Atomic);
+            PgTransaction.RunInSubtransaction(() =>
+            {
+                ApplyChanges(firstChange);
+
+                // Deferred constraints are checked here, where a failure rolls back with the rest.
+                _ = Spi.Execute("SET CONSTRAINTS ALL IMMEDIATE");
+            }, PgSubtransactionMode.Atomic);
         }
         catch (PgException error)
         {
