@@ -15,6 +15,12 @@ internal static unsafe partial class Apply
     // Number of tuples inserted after which we switch to multi-insert.
     private const int MinMultiInsertTuples = 5;
 
+    // How worf.exception_behaviour applies a failed transaction again: change by change, as a whole in a subtransaction,
+    // or, when its commit fails however it's applied, not at all.
+    private const int ExceptionByChange = 1;
+    private const int ExceptionByTransaction = 2;
+    private const int ExceptionWithoutApplying = 3;
+
     private static readonly LinkedList<(ulong LocalEnd, ulong RemoteEnd)> s_lsnMapping = new();
 
     private static bool s_inRemoteTransaction;
@@ -32,6 +38,19 @@ internal static unsafe partial class Apply
     private static int s_lastInsertRelCnt;
     private static bool s_useMultiInsert;
     private static long s_clockSkewReportedAt;
+    private static ulong s_remoteCommitLsn;
+    private static long s_remoteCommitTime;
+
+    // A failed remote transaction that worf.exception_behaviour applies again, how, and whether the transaction being
+    // applied is that one.
+    private static ulong s_exceptionLsn;
+    private static int s_exceptionLevel;
+    private static bool s_exceptionMode;
+
+    // The change being applied, for the exception log, or a null operation between changes.
+    private static string? s_changeOperation;
+    private static byte[]? s_changeMessage;
+    private static string? s_changeQueuedMessage;
 
     // A message counter for the xact, for debugging. We don't send the remote change LSN with messages, so this aids
     // identification of which change causes an error.
@@ -50,6 +69,13 @@ internal static unsafe partial class Apply
     [PgGucInt("worf.max_clock_skew", 1000, "Sets how long apply waits for the local clock to pass a remote commit time.",
         Minimum = -1, Maximum = int.MaxValue, Unit = PgGucUnit.Milliseconds, Context = PgGucContext.Sighup)]
     internal static partial int MaxClockSkew { get; }
+
+    /// <summary>
+    /// Gets what apply does with a remote transaction that fails.
+    /// </summary>
+    [PgGucEnum("worf.exception_behaviour", WorfExceptionBehaviour.Error,
+        "Sets what apply does with a remote transaction that fails.", Context = PgGucContext.Sighup)]
+    internal static partial WorfExceptionBehaviour ExceptionBehaviour { get; }
 
     // Set by the commit message while the remote transaction's local transaction runs.
     private static ulong? s_commitEndLsn;
@@ -120,6 +146,10 @@ internal static unsafe partial class Apply
         uint subid = MyApplyWorker.SubId;
         WorfSubscription sub = PgBackgroundWorker.RunTransaction(() => WorfNode.GetSubscription(subid));
         MySubscription = sub;
+
+        // A crashed worker's failed transaction is applied again under worf.exception_behaviour.
+        s_exceptionLsn = MyApplyWorker.ExceptionLsn;
+        s_exceptionLevel = MyApplyWorker.ExceptionLevel;
 
         PgLog.Log($"starting apply for subscription {sub.Name}");
 
@@ -210,6 +240,7 @@ internal static unsafe partial class Apply
             while (!Worker.GotSigterm)
             {
                 PgInterrupts.Check();
+                Worker.ProcessConfigReload();
 
                 // Wait for data, the latch or the timeout.
                 PgReplicationReceiveStatus status = streamConn.Receive(TimeSpan.FromMilliseconds(1000), out ReadOnlySpan<byte> copybuf);
@@ -478,6 +509,11 @@ internal static unsafe partial class Apply
         s_remoteOriginId = 0;
         s_writerNodeId = MySubscription!.Origin.Id;
         s_skipRemoteTransaction = false;
+        s_remoteCommitLsn = commitLsn;
+        s_remoteCommitTime = commitTime;
+        s_changeOperation = null;
+        s_exceptionMode = s_exceptionLsn != 0 && commitLsn == s_exceptionLsn &&
+            ExceptionBehaviour is WorfExceptionBehaviour.Discard or WorfExceptionBehaviour.Transdiscard;
         UpdateErrorContext();
 
         // don't want the overhead otherwise
@@ -564,6 +600,7 @@ internal static unsafe partial class Apply
         s_actionName = "COMMIT";
         s_xactActionCounter++;
         UpdateErrorContext();
+        TrackChange("COMMIT");
 
         ProtoNative.ReadCommit(s, out _, out ulong endLsn, out _);
 
@@ -573,8 +610,10 @@ internal static unsafe partial class Apply
 
             s_applyApi.OnCommit();
 
-            // We need to write end_lsn to the commit record.
-            Worf.ReploriginSessionOriginLsn = endLsn;
+            // We need to write end_lsn to the commit record. It's set once deferred triggers have run, just before the
+            // record is written: an abort advances the origin too, and has to leave it at the remote commit position
+            // that BEGIN set, from which the provider sends the transaction again.
+            PgTransaction.RegisterCallback(PgTransactionEvent.PreCommit, () => Worf.ReploriginSessionOriginLsn = endLsn);
 
             s_commitEndLsn = endLsn;
             return;
@@ -725,6 +764,7 @@ internal static unsafe partial class Apply
         s_actionName = "INSERT";
         s_xactActionCounter++;
         UpdateErrorContext();
+        TrackChange("INSERT");
 
         WorfRelation rel = ProtoNative.ReadInsert(s, PgLockMode.RowExclusive, out WorfTupleData newtup);
         s_errRel = rel;
@@ -756,6 +796,7 @@ internal static unsafe partial class Apply
             }
         }
         else if (Worf.BatchInserts &&
+                 !s_exceptionMode &&
                  rel.Reloid != s_queueRelid &&
                  s_applyApi.CanMultiInsert(rel))
         {
@@ -791,22 +832,27 @@ internal static unsafe partial class Apply
             }
 
             NativeMethods.LockRelationIdForSession(&lockid, (int)PgLockMode.RowExclusive);
-            RelCache.RelationClose(rel, PgLockMode.None);
+            try
+            {
+                RelCache.RelationClose(rel, PgLockMode.None);
 
-            NativeMethods.PopActiveSnapshot();
-            NativeMethods.CommandCounterIncrement();
+                NativeMethods.PopActiveSnapshot();
+                NativeMethods.CommandCounterIncrement();
 
-            s_applyApi.OnCommit();
+                s_applyApi.OnCommit();
 
-            HandleQueuedMessage(ht, startedTx);
+                HandleQueuedMessage(ht, startedTx);
 
-            NativeMethods.heap_freetuple(ht);
+                NativeMethods.heap_freetuple(ht);
 
-            RelationData* qrel = NativeMethods.table_open(s_queueRelid, (int)PgLockMode.RowExclusive);
-
-            NativeMethods.UnlockRelationIdForSession(&lockid, (int)PgLockMode.RowExclusive);
-
-            NativeMethods.table_close(qrel, (int)PgLockMode.None);
+                RelationData* qrel = NativeMethods.table_open(s_queueRelid, (int)PgLockMode.RowExclusive);
+                NativeMethods.table_close(qrel, (int)PgLockMode.None);
+            }
+            finally
+            {
+                // A session lock outlives a subtransaction that worf.exception_behaviour rolls back.
+                NativeMethods.UnlockRelationIdForSession(&lockid, (int)PgLockMode.RowExclusive);
+            }
 
             s_applyApi.OnBegin();
         }
@@ -825,9 +871,13 @@ internal static unsafe partial class Apply
         {
             string? oldAction = s_actionName;
             WorfRelation? oldRel = s_errRel;
+            string? oldOperation = s_changeOperation;
             s_actionName = "multi INSERT";
             s_errRel = s_lastInsertRel;
             UpdateErrorContext();
+
+            // A failure belongs to the batch, whichever message made apply write it.
+            s_changeOperation = s_actionName;
 
             s_applyApi.MultiInsertFinish(s_lastInsertRel!);
             RelCache.RelationClose(s_lastInsertRel!, PgLockMode.None);
@@ -837,6 +887,7 @@ internal static unsafe partial class Apply
 
             s_errRel = oldRel;
             s_actionName = oldAction;
+            s_changeOperation = oldOperation;
             UpdateErrorContext();
         }
     }
@@ -851,6 +902,7 @@ internal static unsafe partial class Apply
         s_actionName = "UPDATE";
         s_xactActionCounter++;
         UpdateErrorContext();
+        TrackChange("UPDATE");
 
         MultiInsertFinish();
 
@@ -890,6 +942,7 @@ internal static unsafe partial class Apply
         s_isDdlOrDrop = false;
         s_xactActionCounter++;
         UpdateErrorContext();
+        TrackChange("DELETE");
 
         MultiInsertFinish();
 
@@ -1223,29 +1276,35 @@ internal static unsafe partial class Apply
         s_isDdlOrDrop = true;
 
         QueuedMessage queuedMessage = Queue.QueuedMessageFromTuple(msgtup);
+        TrackChange(null);
+        s_changeQueuedMessage = queuedMessage.Message;
 
         switch (queuedMessage.MessageType)
         {
             case Queue.QueueCommandTypeSql:
                 s_actionName = "QUEUED_SQL";
+                s_changeOperation = s_actionName;
                 UpdateErrorContext();
                 HandleSql(queuedMessage, txJustStarted);
                 break;
 
             case Queue.QueueCommandTypeTruncate:
                 s_actionName = "QUEUED_TRUNCATE";
+                s_changeOperation = s_actionName;
                 UpdateErrorContext();
                 HandleTruncate(queuedMessage);
                 break;
 
             case Queue.QueueCommandTypeTablesync:
                 s_actionName = "QUEUED_TABLESYNC";
+                s_changeOperation = s_actionName;
                 UpdateErrorContext();
                 HandleTableSync(queuedMessage);
                 break;
 
             case Queue.QueueCommandTypeSequence:
                 s_actionName = "QUEUED_SEQUENCE";
+                s_changeOperation = s_actionName;
                 UpdateErrorContext();
                 HandleSequence(queuedMessage);
                 break;
@@ -1381,9 +1440,14 @@ internal static unsafe partial class Apply
                 case 'I':
                 case 'U':
                 case 'D':
+                    s_changeMessage = message;
                     if (!inTransaction)
                     {
                         RunRemoteTransaction(message);
+                    }
+                    else if (s_exceptionMode)
+                    {
+                        ApplyChange(message, false);
                     }
                     else
                     {
@@ -1420,6 +1484,188 @@ internal static unsafe partial class Apply
                 HandleDelete(s);
                 break;
         }
+
+        s_changeOperation = null;
+    }
+
+    private static void DispatchChangeMessage(byte[] message, bool startedTx)
+    {
+        fixed (byte* data = message)
+        {
+            StringInfoData s;
+            s.data = (sbyte*)data;
+            s.len = message.Length;
+            s.maxlen = -1;
+            s.cursor = 0;
+
+            char action = (char)NativeMethods.pq_getmsgbyte(&s);
+            DispatchChange(action, &s, startedTx);
+        }
+    }
+
+    /// <summary>
+    /// Applies a change message. When <c>worf.exception_behaviour</c> discards changes, a change that fails is rolled
+    /// back on its own, recorded and skipped.
+    /// </summary>
+    private static void ApplyChange(byte[] message, bool startedTx)
+    {
+        if (!s_exceptionMode || s_exceptionLevel != ExceptionByChange)
+        {
+            DispatchChangeMessage(message, startedTx);
+            return;
+        }
+
+        try
+        {
+            PgTransaction.RunInSubtransaction(() =>
+            {
+                DispatchChangeMessage(message, startedTx);
+
+                // The change's writers can't outlive its subtransaction.
+                s_applyApi.OnCommit();
+            }, PgSubtransactionMode.Atomic);
+        }
+        catch (PgException error) when (!IsTransient(error))
+        {
+            ForgetFailedChange();
+            ExceptionLog.Record(FailedChange(), WorfExceptionBehaviour.Discard, error);
+        }
+    }
+
+    /// <summary>
+    /// Checks whether an error says nothing about the change's data, as a deadlock, a serialization failure, a lock or
+    /// statement timeout, a cancellation, a shutdown, running out of resources, a lost connection or an I/O error do,
+    /// so applying the transaction again can get past it.
+    /// </summary>
+    private static bool IsTransient(PgException error)
+    {
+        string state = error.SqlState;
+        return state is "40000" or "40001" or "40003" or "40P01" or "55P03" or "58030" ||
+            state.StartsWith("08", StringComparison.Ordinal) || state.StartsWith("53", StringComparison.Ordinal) ||
+            state.StartsWith("57", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Forgets the relations, writers and batched inserts that a rolled back subtransaction opened, and released.
+    /// </summary>
+    private static void ForgetFailedChange()
+    {
+        s_applyApi.OnBegin();
+        RelCache.ForgetOpenRelations();
+        s_useMultiInsert = false;
+        s_lastInsertRel = null;
+        s_lastInsertRelCnt = 0;
+    }
+
+    private static void TrackChange(string? operation)
+    {
+        s_changeOperation = operation;
+        s_changeQueuedMessage = null;
+    }
+
+    private static WorfFailedChange FailedChange() => new()
+    {
+        Subscription = MySubscription!,
+        WriterNodeId = s_writerNodeId,
+        RemoteXid = s_remoteXid,
+        CommitTime = s_remoteCommitTime,
+        CommitLsn = s_remoteCommitLsn,
+        ActionCounter = s_xactActionCounter,
+        Operation = s_changeOperation,
+        Relation = s_errRel,
+        Message = s_changeOperation is "INSERT" or "UPDATE" or "DELETE" ? s_changeMessage : null,
+        QueuedMessage = s_changeQueuedMessage,
+    };
+
+    /// <summary>
+    /// Handles a remote transaction whose change failed, after its local transaction rolled back, as
+    /// <c>worf.exception_behaviour</c> selects. The error then stops the worker.
+    /// </summary>
+    private static void OnRemoteTransactionError(PgException error)
+    {
+        // An error that applying the transaction again can get past is retried, as without worf.exception_behaviour.
+        if (s_changeOperation is null || IsTransient(error) || Worker.MyWorker.WorkerType != WorfWorkerType.Apply)
+        {
+            return;
+        }
+
+        string lsn = Worf.FormatLsn(s_remoteCommitLsn);
+        switch (ExceptionBehaviour)
+        {
+            case WorfExceptionBehaviour.SubDisable:
+                // The rollback released the relations the transaction opened.
+                RelCache.ForgetOpenRelations();
+                WorfFailedChange change = FailedChange();
+                PgBackgroundWorker.RunTransaction(() =>
+                {
+                    ExceptionLog.Record(change, WorfExceptionBehaviour.SubDisable, error);
+                    WorfSubscription sub = WorfNode.GetSubscription(change.Subscription.Id);
+                    sub.Enabled = false;
+                    WorfNode.AlterSubscription(sub);
+                });
+                PgLog.Log($"disabling subscription {change.Subscription.Name} after its remote transaction at {lsn} failed");
+                break;
+
+            case WorfExceptionBehaviour.Discard:
+            case WorfExceptionBehaviour.Transdiscard:
+                // A transaction whose commit fails, as on a deferred constraint, or that fails again change by change
+                // is skipped as a whole next time. One whose commit fails even then, outside its subtransaction, is
+                // recorded now and not applied at all. One that fails when it isn't applied stops the worker until
+                // the error is fixed.
+                int level = s_exceptionMode ? s_exceptionLevel + 1
+                    : ExceptionBehaviour == WorfExceptionBehaviour.Transdiscard || s_changeOperation == "COMMIT"
+                        ? ExceptionByTransaction
+                        : ExceptionByChange;
+                if (level > ExceptionWithoutApplying)
+                {
+                    break;
+                }
+
+                if (level == ExceptionWithoutApplying)
+                {
+                    RelCache.ForgetOpenRelations();
+                    WorfFailedChange failed = FailedChange();
+                    PgBackgroundWorker.RunTransaction(() =>
+                        ExceptionLog.Record(failed, WorfExceptionBehaviour.Transdiscard, error));
+                }
+
+                SetExceptionMarker(s_remoteCommitLsn, level);
+                PgLog.Log($"applying the remote transaction at {lsn} under worf.exception_behaviour once the worker restarts");
+                break;
+
+            default:
+                break;
+        }
+    }
+
+    private static void SetExceptionMarker(ulong lsn, int level)
+    {
+        using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive();
+        WorfWorker worker = guard[Worker.MyWorfWorker];
+        worker.Worker.Apply.ExceptionLsn = lsn;
+        worker.Worker.Apply.ExceptionLevel = level;
+        worker.Worker.Apply.ExceptionRestartsAtOnce = lsn != 0;
+        guard[Worker.MyWorfWorker] = worker;
+    }
+
+    /// <summary>
+    /// Moves the origin back to the failed remote transaction's commit position, from which the provider sends the
+    /// transaction again. An abort advances the origin as a commit does, and one after the end position was set for
+    /// the commit, as when the commit fails a serialization check, would skip the transaction.
+    /// </summary>
+    private static void RewindOrigin()
+    {
+        Worf.ReploriginSessionOriginLsn = s_remoteCommitLsn;
+        ushort origin = PgReplicationOrigin.SessionOrigin;
+        if (origin == 0)
+        {
+            return;
+        }
+
+        // Only an origin no session uses can move back. The worker stops after this, so it stays released.
+        PgReplicationOrigin.ResetSession();
+        ulong lsn = s_remoteCommitLsn;
+        PgBackgroundWorker.RunTransaction(() => PgReplicationOrigin.Advance(origin, new PgLsn(lsn), PgLsn.Invalid, true, true));
     }
 
     /// <summary>
@@ -1430,20 +1676,36 @@ internal static unsafe partial class Apply
     {
         s_commitEndLsn = null;
 
-        PgBackgroundWorker.RunTransaction(() =>
+        try
         {
-            // The changes are applied in MessageContext, which is reset after each batch of messages so that a large
-            // transaction doesn't keep every row's memory until it commits.
-            MemoryContextData* oldcontext = Worf.MemoryContextSwitchTo(NativeGlobals.MessageContext);
-            try
+            PgBackgroundWorker.RunTransaction(() =>
             {
-                ApplyRemoteTransaction(firstMessage);
-            }
-            finally
-            {
-                _ = Worf.MemoryContextSwitchTo(oldcontext);
-            }
-        });
+                // The changes are applied in MessageContext, which is reset after each batch of messages so that a
+                // large transaction doesn't keep every row's memory until it commits.
+                MemoryContextData* oldcontext = Worf.MemoryContextSwitchTo(NativeGlobals.MessageContext);
+                try
+                {
+                    ApplyRemoteTransaction(firstMessage);
+                }
+                finally
+                {
+                    _ = Worf.MemoryContextSwitchTo(oldcontext);
+                }
+            });
+        }
+        catch (PgException error)
+        {
+            RewindOrigin();
+            OnRemoteTransactionError(error);
+            throw;
+        }
+
+        if (s_exceptionMode)
+        {
+            s_exceptionMode = false;
+            s_exceptionLsn = 0;
+            SetExceptionMarker(0, 0);
+        }
 
         ulong endLsn = s_commitEndLsn!.Value;
         s_commitEndLsn = null;
@@ -1456,23 +1718,72 @@ internal static unsafe partial class Apply
         // transaction's start sets the transaction timestamp used by current_timestamp.
         s_applyApi.OnBegin();
 
-        fixed (byte* data = firstMessage)
+        // An ORIGIN message names the node that wrote the transaction first. Its change of origin stays out of the
+        // subtransactions that worf.exception_behaviour rolls back.
+        bool origin = firstMessage[0] == 'O';
+        if (origin)
         {
-            StringInfoData s;
-            s.data = (sbyte*)data;
-            s.len = firstMessage.Length;
-            s.maxlen = -1;
-            s.cursor = 0;
+            DispatchChangeMessage(firstMessage, true);
+        }
+        else
+        {
+            UseWriterOrigin();
+        }
 
-            char action = (char)NativeMethods.pq_getmsgbyte(&s);
+        byte[]? firstChange = origin ? null : firstMessage;
+        if (!s_exceptionMode)
+        {
+            ApplyChanges(firstChange);
+            return;
+        }
 
-            // An ORIGIN message names the node that wrote the transaction first.
-            if (action != 'O')
+        if (s_exceptionLevel == ExceptionByChange)
+        {
+            ApplyChanges(firstChange);
+            return;
+        }
+
+        // A transaction whose commit failed however it was applied was recorded then, and is skipped. Its commit
+        // still advances the origin past it.
+        if (s_exceptionLevel == ExceptionWithoutApplying)
+        {
+            s_skipRemoteTransaction = true;
+            _ = NativeMethods.GetTopTransactionId();
+            ApplyChanges(firstChange);
+            return;
+        }
+
+        // A failure rolls the whole transaction back, and the rest of it is skipped.
+        try
+        {
+            PgTransaction.RunInSubtransaction(() =>
             {
-                UseWriterOrigin();
-            }
+                ApplyChanges(firstChange);
 
-            DispatchChange(action, &s, true);
+                // Deferred constraints are checked here, where a failure rolls back with the rest.
+                _ = Spi.Execute("SET CONSTRAINTS ALL IMMEDIATE");
+            }, PgSubtransactionMode.Atomic);
+        }
+        catch (PgException error) when (!IsTransient(error))
+        {
+            ForgetFailedChange();
+            ExceptionLog.Record(FailedChange(), WorfExceptionBehaviour.Transdiscard, error);
+            s_skipRemoteTransaction = true;
+            if (s_commitEndLsn is null)
+            {
+                ApplyChanges(null);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Applies the remote transaction's changes from the given one, or from the next message, until its COMMIT.
+    /// </summary>
+    private static void ApplyChanges(byte[]? firstChange)
+    {
+        if (firstChange is not null)
+        {
+            ApplyChange(firstChange, true);
         }
 
         long statusInterval = StatusInterval();

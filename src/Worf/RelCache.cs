@@ -137,6 +137,23 @@ internal static partial class RelCache
         rel.Rel = null;
     }
 
+    /// <summary>
+    /// Forgets the local relations that are open, after the subtransaction that opened them rolled back and released
+    /// them.
+    /// </summary>
+    internal static unsafe void ForgetOpenRelations()
+    {
+        if (s_relationHash is null)
+        {
+            return;
+        }
+
+        foreach (WorfRelation rel in s_relationHash.Values)
+        {
+            rel.Rel = null;
+        }
+    }
+
     private static void RelcacheInvalidateCallback(ulong arg, uint reloid)
     {
         _ = arg;

@@ -19,4 +19,21 @@ internal struct WorfApplyWorker
     /// Replay should stop here if defined.
     /// </summary>
     public ulong ReplayStopLsn;
+
+    /// <summary>
+    /// The commit position of a remote transaction that failed, which the next apply worker applies again under
+    /// <c>worf.exception_behaviour</c>, or zero.
+    /// </summary>
+    public ulong ExceptionLsn;
+
+    /// <summary>
+    /// How that transaction is applied: change by change, as a whole in a subtransaction, or not at all.
+    /// </summary>
+    public int ExceptionLevel;
+
+    /// <summary>
+    /// Whether the worker stopped to apply that transaction in a new way, which starts at once rather than after the
+    /// delay before restarting a worker that failed.
+    /// </summary>
+    public bool ExceptionRestartsAtOnce;
 }

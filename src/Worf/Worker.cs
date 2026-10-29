@@ -618,6 +618,16 @@ internal static class Worker
             {
                 ctx.SubscriptionsChanged = true;
             }
+
+            // An apply worker that stopped to apply its failed transaction in a new way is restarted at once.
+            if (worker.WorkerType == WorfWorkerType.Apply && worker.Worker.Apply.ExceptionRestartsAtOnce)
+            {
+                int managerSlot = guard.Read((in _, workers) => ManagerFind(workers, dboid));
+                if (managerSlot >= 0 && guard[managerSlot].Proc != 0)
+                {
+                    SetProcLatch(guard[managerSlot].Proc);
+                }
+            }
         }
         else
         {
@@ -755,6 +765,17 @@ internal static class Worker
             worker.TerminateRequested = true;
             guard[slot] = worker;
             SetProcLatch(worker.Proc);
+        }
+    }
+
+    /// <summary>
+    /// Reloads the configuration when the worker got SIGHUP.
+    /// </summary>
+    internal static void ProcessConfigReload()
+    {
+        if (PgBackgroundWorker.ConsumeSignals(PgBackgroundWorkerSignals.Reload) != PgBackgroundWorkerSignals.None)
+        {
+            PgBackgroundWorker.ReloadConfiguration();
         }
     }
 
