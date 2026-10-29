@@ -10,13 +10,13 @@ internal static class Manager
     private const long InitialSleep = 10000;
     private const long MaxSleep = 180000;
 
+    // When the manager next asks this database's providers of the sequences they manage, or long.MaxValue.
+    private static long s_discoveryAt = long.MaxValue;
+
     /// <summary>
     /// Gets the minimum time the manager sleeps between checking for subscription changes. On Windows, process
     /// startup is slower and we need more responsive checking to avoid test timeouts.
     /// </summary>
-    // When the manager next asks this database's providers of the sequences they manage, or long.MaxValue.
-    private static long s_discoveryAt = long.MaxValue;
-
     private static long MinSleep => OperatingSystem.IsWindows() ? 1000 : 5000;
 
     /// <summary>
