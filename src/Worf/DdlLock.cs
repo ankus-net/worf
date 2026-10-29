@@ -737,7 +737,13 @@ internal static unsafe partial class DdlLock
                 AddTable(tables, Relid(((IndexStmt*)parsetree)->relation));
                 break;
 
+            // Changing a domain's default, or dropping a constraint, leaves its values valid.
+#if ANKUS_PG19
+            case NodeTag.T_AlterDomainStmt when ((AlterDomainStmt*)parsetree)->subtype is not
+                (AlterDomainType.AD_AlterDefault or AlterDomainType.AD_DropNotNull or AlterDomainType.AD_DropConstraint):
+#else
             case NodeTag.T_AlterDomainStmt when ((AlterDomainStmt*)parsetree)->subtype is not ((sbyte)'T' or (sbyte)'N' or (sbyte)'X'):
+#endif
                 AddTypeUsers(tables, TypeOid(((AlterDomainStmt*)parsetree)->typeName));
                 break;
 
