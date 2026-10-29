@@ -273,6 +273,12 @@ internal static class Functions
         {
             (uint nodeId, string nodeName, _, _, _) = Rpc.RemoteNodeInfo(conn);
             origin = new WorfNode { Id = nodeId, Name = nodeName };
+
+            (bool subscribes, string remoteResolution) = Rpc.RemoteSubscribesTo(conn, localnode.Node.Id);
+            if (subscribes)
+            {
+                Conflict.CheckTwoWayResolution(localnode.Node.Name, origin.Name, remoteResolution);
+            }
         }
 
         // Check that we can connect remotely also in replication mode.

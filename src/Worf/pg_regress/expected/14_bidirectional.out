@@ -21,6 +21,9 @@ SELECT * FROM worf.create_subscription(
     synchronize_structure := false,
     synchronize_data := false,
     forward_origins := '{}');
+WARNING:  nodes "test_provider" and "test_subscriber" replicate both ways, and their conflict resolution can leave them with different rows
+DETAIL:  worf.conflict_resolution is apply_remote on node "test_provider" and apply_remote on node "test_subscriber".
+HINT:  Set worf.conflict_resolution to last_update_wins or first_update_wins on both nodes.
  create_subscription 
 ---------------------
           4269973126

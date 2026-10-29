@@ -31,6 +31,7 @@ internal static unsafe partial class Apply
     private static WorfRelation? s_lastInsertRel;
     private static int s_lastInsertRelCnt;
     private static bool s_useMultiInsert;
+    private static bool s_clockSkewReported;
 
     // A message counter for the xact, for debugging. We don't send the remote change LSN with messages, so this aids
     // identification of which change causes an error.
@@ -41,6 +42,14 @@ internal static unsafe partial class Apply
     private static bool s_isDdlOrDrop;
     private static uint s_remoteXid;
     private static PgErrorContext? s_errorContext;
+
+    /// <summary>
+    /// Gets how far ahead of the local clock a remote transaction's commit time can be for apply to wait for the clock
+    /// to pass it, or -1 to never wait.
+    /// </summary>
+    [PgGucInt("worf.max_clock_skew", 1000, "Sets how long apply waits for the local clock to pass a remote commit time.",
+        Minimum = -1, Maximum = int.MaxValue, Unit = PgGucUnit.Milliseconds, Context = PgGucContext.Sighup)]
+    internal static partial int MaxClockSkew { get; }
 
     // Set by the commit message while the remote transaction's local transaction runs.
     private static ulong? s_commitEndLsn;
@@ -488,7 +497,46 @@ internal static unsafe partial class Apply
             }
         }
 
+        WaitForClock(commitTime);
+
         s_inRemoteTransaction = true;
+    }
+
+    /// <summary>
+    /// Waits for the local clock to pass a remote transaction's commit time, so that local changes made after the
+    /// transaction applies commit later than it did, as last_update_wins needs.
+    /// </summary>
+    /// <param name="commitTime">The remote commit time.</param>
+    private static void WaitForClock(long commitTime)
+    {
+        long ahead = commitTime - Worker.GetCurrentTimestamp();
+        int maxClockSkew = MaxClockSkew;
+        if (ahead < 0 || maxClockSkew < 0)
+        {
+            return;
+        }
+
+        if (ahead > maxClockSkew * 1000L)
+        {
+            if (!s_clockSkewReported)
+            {
+                s_clockSkewReported = true;
+                PgLog.Warning(new PgDiagnostic(
+                    $"remote commit time is {ahead / 1000} ms ahead of the local clock, more than worf.max_clock_skew")
+                {
+                    Hint = "Synchronize the nodes' clocks. Until then, local changes can lose to earlier remote ones.",
+                });
+            }
+
+            return;
+        }
+
+        // The sleep can end early, so check the clock again.
+        while (ahead >= 0)
+        {
+            NativeMethods.pg_usleep(ahead + 1);
+            ahead = commitTime - Worker.GetCurrentTimestamp();
+        }
     }
 
     /// <summary>
