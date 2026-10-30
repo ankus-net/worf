@@ -548,6 +548,8 @@ internal static partial class ReplicationSet
             throw new PgException(PgSqlStates.InvalidParameterValue, "UNLOGGED and TEMP sequences cannot be replicated");
         }
 
+        SequenceRanges.RejectReplicatedState(seqoid);
+
         // Ensure track the state of the sequence.
         Sequences.CreateSequenceStateRecord(seqoid);
 

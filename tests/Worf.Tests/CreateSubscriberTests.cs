@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 
 namespace Worf.Tests;
@@ -71,6 +72,8 @@ public sealed class CreateSubscriberTests
             "log_line_prefix = '[%m] [%p] [%d] '",
             "log_statement = 'all'",
             "worf.synchronous_commit = true",
+            "worf.sequence_range_check_interval = 100",
+            "worf.sequence_range_exchange_interval = 500",
         ], token);
         int providerPort = provider.Cluster.Port;
         int pgport = CreateSubscriberCommand.FreePort();
@@ -103,6 +106,9 @@ public sealed class CreateSubscriberTests
             "CREATE EXTENSION IF NOT EXISTS worf VERSION '0.1.0'",
             "ALTER EXTENSION worf UPDATE",
             "SELECT * FROM worf.create_node(node_name := 'test_provider', dsn := 'dbname=postgres user=super')",
+            "CREATE TABLE ranged (id bigserial PRIMARY KEY, v text)",
+            "SELECT worf.enable_sequence_range('ranged_id_seq', participants := '{}', range_size := 100)",
+            "INSERT INTO ranged (v) SELECT 'before' FROM generate_series(1, 10)",
         ];
         foreach (string sql in setup)
         {
@@ -149,6 +155,34 @@ public sealed class CreateSubscriberTests
             await AssertPsqlOkAsync(provider, pgport, ["-c", "\\d"], "replication check 1 ", token);
             await AssertPsqlOkAsync(provider, pgport, ["-c", "SELECT * from basic_dml"], "replication check 2 ", token);
             await AssertPsqlOkAsync(provider, pgport, ["-c", "SELECT * from public.basic_dml"], "replication check 3 ", token);
+
+            // The clone gave up the provider's blocks of a managed sequence before it took a node id of its own, and its
+            // copied rows reach into the root, so it is refused until the sequence moves to a new epoch, whose root
+            // starts above them. It then draws from blocks of its own, never sharing a key with the provider.
+            await PollSubscriberAsync(provider, pgport,
+                "SELECT state = 'refused' FROM worf.sequence_ranges WHERE sequence = 'ranged_id_seq'::regclass", "the clone refused", token);
+            (int refusedExit, string refused) = await provider.RunProgramAsync("psql",
+                ["-X", "-p", pgport.ToString(CultureInfo.InvariantCulture), "-d", Database, "-c", "INSERT INTO ranged (v) VALUES ('clone')"], token);
+            Assert.AreNotEqual(0, refusedExit, refused);
+            _ = await provider.SafePsqlAsync(Database, """
+                SELECT worf.disable_sequence_range('ranged_id_seq');
+                SELECT worf.enable_sequence_range('ranged_id_seq', participants := '{test_subscriber}', range_size := 100);
+                """, token);
+            await PollSubscriberAsync(provider, pgport, """
+                SELECT r.state = 'active' AND r.epoch = 2 AND b.node_id = l.node_id
+                FROM worf.sequence_ranges r
+                    JOIN worf.sequence_range_block b ON b.seqoid = r.sequence AND b.state = 'active' AND b.lo = r.active_lo
+                    CROSS JOIN worf.local_node l
+                WHERE r.sequence = 'ranged_id_seq'::regclass
+                """, "the clone drawing from a block of its own", token);
+
+            _ = await SubscriberAsync(provider, pgport, "INSERT INTO ranged (v) SELECT 'clone' FROM generate_series(1, 20)", token);
+            _ = await provider.SafePsqlAsync(Database, "INSERT INTO ranged (v) SELECT 'provider' FROM generate_series(1, 20)", token);
+            HashSet<string> keys = [.. (await provider.SafePsqlAsync(Database, "SELECT id FROM ranged WHERE v = 'provider'", token)).Split('\n')];
+            foreach (string key in (await SubscriberAsync(provider, pgport, "SELECT id FROM ranged WHERE v = 'clone'", token)).Split('\n'))
+            {
+                Assert.DoesNotContain(key, keys, "a key the clone shares with the provider");
+            }
         }
         finally
         {
@@ -167,6 +201,31 @@ public sealed class CreateSubscriberTests
             cancellationToken);
         TestContext.WriteLine(output);
         Assert.AreEqual(0, exitCode, $"{name}: {output}");
+    }
+
+    /// <summary>
+    /// Runs a query on the subscriber until it returns <c>t</c>.
+    /// </summary>
+    private static async Task PollSubscriberAsync(TestNode provider, int port, string sql, string what, CancellationToken cancellationToken)
+    {
+        Stopwatch waited = Stopwatch.StartNew();
+        while (await SubscriberAsync(provider, port, sql, cancellationToken) != "t")
+        {
+            Assert.IsLessThan(TestNode.PollTimeout, waited.Elapsed, what);
+            await Task.Delay(TimeSpan.FromMilliseconds(100), cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// Runs SQL on the subscriber and returns its unaligned, tuples-only output.
+    /// </summary>
+    private static async Task<string> SubscriberAsync(TestNode provider, int port, string sql, CancellationToken cancellationToken)
+    {
+        (int exitCode, string output) = await provider.RunProgramAsync("psql",
+            ["-X", "-A", "-t", "-q", "-p", port.ToString(CultureInfo.InvariantCulture), "-d", Database, "-v", "ON_ERROR_STOP=1", "-c", sql],
+            cancellationToken);
+        Assert.AreEqual(0, exitCode, output);
+        return output.Trim();
     }
 
     private static async Task StopAsync(TestNode provider, string dataDirectory)

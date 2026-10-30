@@ -1612,13 +1612,7 @@ internal static class Functions
     /// node's block.
     /// </summary>
     private static void RejectManagedSequence(uint seqoid)
-    {
-        if (SequenceRanges.IsManaged(seqoid))
-        {
-            throw new PgException(PgSqlStates.InvalidParameterValue, "a sequence under range management can't replicate its state",
-                hint: "Range management keeps the nodes' values apart; disable it first.");
-        }
-    }
+        => SequenceRanges.RejectReplicatedState(seqoid);
 
     /// <summary>
     /// Returns a boolean as the oid that pglogical's drop_subscription returns it as.

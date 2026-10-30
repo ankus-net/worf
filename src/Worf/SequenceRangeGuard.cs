@@ -4,77 +4,134 @@ using Ankus.Postgres;
 namespace Worf;
 
 /// <summary>
-/// The trigger on tables that use a managed sequence, which checks values local sessions write. A value passes when it
-/// lies in a block this node holds and the sequence can never return it, or when a row with it already exists, which
-/// the trigger then locks so the write can only reach that row.
+/// The guard on tables that use a managed sequence, which checks the values local sessions write. Its triggers run after
+/// each row is written, so that they see the row as every BEFORE trigger left it, and their conditions call
+/// <c>worf.sequence_range_check</c>, which fails the statement for a value outside this node's blocks. A value passes when
+/// it lies in a block this node holds and the sequence can never return it.
 /// </summary>
 internal static class SequenceRangeGuard
 {
     private const string CheckViolation = "23514";
 
-    // The blocks this node holds under its current identity, by sequence, as of the version of the shared counter they
-    // were read at, and the sequences whose blocks were received under another identity.
+    // The blocks this node holds under its current identity, by sequence, as of the versions of the shared and this
+    // backend's counters they were read at, and the sequences whose blocks were received under another identity.
     private static readonly Dictionary<uint, (bool Ascending, List<(long Lo, long Hi, string State)> Blocks)> s_sequences = [];
     private static readonly HashSet<uint> s_moved = [];
     private static long s_version = -1;
+    private static long s_localVersion = -1;
 
     // The furthest position each sequence is known to have reached, which only moves forward within a block.
     private static readonly Dictionary<uint, long> s_reached = [];
 
     /// <summary>
-    /// Checks the values a local session writes into columns that use managed sequences.
+    /// The guard's trigger function. The triggers' conditions do the checking and are never true, so this never runs.
     /// </summary>
-    /// <param name="context">The trigger's context, whose arguments are each column, its sequence and its type.</param>
-    /// <returns>The row, unchanged.</returns>
+    /// <param name="context">The trigger's context.</param>
+    /// <returns>Nothing, as an AFTER trigger returns.</returns>
     [PgTrigger]
     [PgFunction(Sql = """
         CREATE FUNCTION worf.sequence_range_guard()
         RETURNS trigger LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
         """)]
-    internal static PgHeapTuple? Guard(PgTriggerContext context)
+    internal static PgHeapTuple? Guard(PgTriggerContext context) => null;
+
+    /// <summary>
+    /// Checks a value a new row holds in a column that uses a managed sequence.
+    /// </summary>
+    /// <param name="sequence">The sequence.</param>
+    /// <param name="value">The value.</param>
+    /// <returns>False, so that the trigger whose condition this is never runs; a value outside this node's blocks fails.</returns>
+    [PgFunction(Sql = """
+        CREATE FUNCTION worf.sequence_range_check(sequence regclass, value bigint)
+        RETURNS boolean STRICT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
+        """)]
+    internal static bool CheckValue([PgSqlType("regclass", Schema = "pg_catalog")] PgDatum sequence, long value)
+        => Check((uint)sequence.DangerousGetBits(), value);
+
+    /// <summary>
+    /// Checks a value a new row holds in a numeric column that uses a managed sequence.
+    /// </summary>
+    /// <param name="sequence">The sequence.</param>
+    /// <param name="value">The value.</param>
+    /// <returns>False; a value outside this node's blocks fails.</returns>
+    [PgFunction(Sql = """
+        CREATE FUNCTION worf.sequence_range_check(sequence regclass, value numeric)
+        RETURNS boolean STRICT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
+        """)]
+    internal static bool CheckNumeric([PgSqlType("regclass", Schema = "pg_catalog")] PgDatum sequence, PgNumeric value)
+        => Check((uint)sequence.DangerousGetBits(), value);
+
+    /// <summary>
+    /// Checks a value an update writes into a column that uses a managed sequence, when it changes the column.
+    /// </summary>
+    /// <param name="sequence">The sequence.</param>
+    /// <param name="old">The column's value before.</param>
+    /// <param name="value">Its value after.</param>
+    /// <returns>False; a changed value outside this node's blocks fails.</returns>
+    [PgFunction(Sql = """
+        CREATE FUNCTION worf.sequence_range_check(sequence regclass, old bigint, value bigint)
+        RETURNS boolean CALLED ON NULL INPUT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
+        """)]
+    internal static bool CheckUpdate([PgSqlType("regclass", Schema = "pg_catalog")] PgDatum sequence, long? old, long? value)
+        => value is long changed && old != changed && Check((uint)sequence.DangerousGetBits(), changed);
+
+    /// <summary>
+    /// Checks a value an update writes into a numeric column that uses a managed sequence, when it changes the column.
+    /// </summary>
+    /// <param name="sequence">The sequence.</param>
+    /// <param name="old">The column's value before.</param>
+    /// <param name="value">Its value after.</param>
+    /// <returns>False; a changed value outside this node's blocks fails.</returns>
+    [PgFunction(Sql = """
+        CREATE FUNCTION worf.sequence_range_check(sequence regclass, old numeric, value numeric)
+        RETURNS boolean CALLED ON NULL INPUT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
+        """)]
+    internal static bool CheckNumericUpdate([PgSqlType("regclass", Schema = "pg_catalog")] PgDatum sequence, PgNumeric? old, PgNumeric? value)
+        => value is PgNumeric changed && !(old is PgNumeric before && before.Equals(changed)) && Check((uint)sequence.DangerousGetBits(), changed);
+
+    /// <summary>
+    /// Checks a numeric value: only a whole number within bigint can be one of the sequence's values.
+    /// </summary>
+    private static bool Check(uint seqoid, PgNumeric value)
     {
-        PgHeapTuple row = context.New!;
-        PgHeapTuple? old = context.Old;
-        IReadOnlyList<string> arguments = context.Arguments;
-        Reload();
-
-        for (int i = 0; i + 2 < arguments.Count; i += 3)
+        // A value too large for a decimal, or not finite, doesn't parse, and is no bigint either.
+        if (!decimal.TryParse(value.Text, NumberStyles.Number, CultureInfo.InvariantCulture, out decimal exact) ||
+            decimal.Truncate(exact) != exact || exact is < long.MinValue or > long.MaxValue)
         {
-            string column = arguments[i];
-            uint seqoid = uint.Parse(arguments[i + 1], CultureInfo.InvariantCulture);
-            uint typeOid = uint.Parse(arguments[i + 2], CultureInfo.InvariantCulture);
-            if (Read(row, column, typeOid) is not long value || (old is not null && Read(old, column, typeOid) == value))
-            {
-                continue;
-            }
-
-            // After a restore, failover or point-in-time recovery, nothing passes until the range worker has reset the
-            // node's blocks.
-            if (s_moved.Contains(seqoid))
-            {
-                throw new PgException(CheckViolation,
-                    $"this node's identity changed, so the sequence range blocks of column \"{column}\" in table \"{context.TableName}\" are no longer its own",
-                    hint: "The range worker abandons them and requests new blocks; try again once it has.");
-            }
-
-            if (!Admits(seqoid, value) && !LockExisting(context, column, value))
-            {
-                throw new PgException(CheckViolation,
-                    $"value {value} of column \"{column}\" in table \"{context.TableName}\" is not in a sequence range this node holds",
-                    detail: "Only values this node's sequence has passed, or that rows already hold, can be written here.",
-                    hint: "Let the column's default number the row, or reserve the values first with worf.reserve_sequence_values.");
-            }
+            throw Outside(seqoid, value.Text);
         }
 
-        return row;
+        return Check(seqoid, (long)exact);
     }
 
-    private static long? Read(PgHeapTuple row, string column, uint typeOid) => typeOid switch
+    /// <summary>
+    /// Checks a value, and fails unless it lies in a block this node holds and the sequence can never return it.
+    /// </summary>
+    private static bool Check(uint seqoid, long value)
     {
-        21 => row.Get<short?>(column),
-        23 => row.Get<int?>(column),
-        _ => row.Get<long?>(column),
-    };
+        Reload();
+
+        // After a restore, failover or point-in-time recovery, nothing passes until the range worker has reset the
+        // node's blocks.
+        if (s_moved.Contains(seqoid))
+        {
+            throw new PgException(CheckViolation,
+                $"this node's identity changed, so its sequence range blocks of sequence {SequenceRanges.GetInfo(seqoid).Name} are no longer its own",
+                hint: "The range worker abandons them and requests new blocks; try again once it has.");
+        }
+
+        if (!Admits(seqoid, value))
+        {
+            throw Outside(seqoid, value.ToString(CultureInfo.InvariantCulture));
+        }
+
+        return false;
+    }
+
+    private static PgException Outside(uint seqoid, string value)
+        => new(CheckViolation, $"value {value} of a column that uses sequence {SequenceRanges.GetInfo(seqoid).Name} is not in a sequence range this node holds",
+            detail: "Only values this node's sequence has passed can be written here.",
+            hint: "Let the column's default number the row, or reserve the values first with worf.reserve_sequence_values.");
 
     /// <summary>
     /// Checks whether a value lies in a block this node holds and its sequence can never return it.
@@ -123,23 +180,14 @@ internal static class SequenceRangeGuard
     }
 
     /// <summary>
-    /// Locks the row that already holds a value, so that the write can only reach it. The lock is worf's, since the
-    /// writer may not be allowed to lock rows; a unique index would tell the writer that the row exists anyway.
-    /// </summary>
-    private static bool LockExisting(PgTriggerContext context, string column, long value)
-    {
-        string table = Spi.QuoteQualifiedIdentifier(context.TableSchema, context.TableName);
-        return Elevated.Run(() => Spi.ExecuteScalar<int?>("SELECT 1 FROM " + table + " WHERE " + Spi.QuoteIdentifier(column) +
-            " = $1 FOR KEY SHARE", SpiParameter.Create(value)) is not null);
-    }
-
-    /// <summary>
-    /// Reads the blocks this node holds again once the range worker or a function has changed them.
+    /// Reads the blocks this node holds again once the range worker, a function or this backend's own transaction has
+    /// changed them.
     /// </summary>
     private static void Reload()
     {
         long version = SequenceRanges.Version.Value;
-        if (version == s_version)
+        long localVersion = SequenceRanges.LocalVersion;
+        if (version == s_version && localVersion == s_localVersion)
         {
             return;
         }
@@ -191,5 +239,6 @@ internal static class SequenceRangeGuard
         }
 
         s_version = version;
+        s_localVersion = localVersion;
     }
 }

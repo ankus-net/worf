@@ -774,8 +774,42 @@ void RemoveUnwantedData(NpgsqlConnection conn)
         throw Die($"Could not remove existing replication origins: {ErrorMessage(error)}\n");
     }
 
+    // The copy's managed sequences would go on drawing from the source node's blocks once worf is gone, so each stops
+    // first, at the value worf's quarantine reserves, which no block holds; the new node joins them again under its own
+    // identity. worf isn't loaded here, so plain SQL does it.
     try
     {
+        _ = Query(conn, """
+            DO $$
+            DECLARE
+                s record;
+                lo bigint;
+                hi bigint;
+                edge bigint;
+            BEGIN
+                IF to_regclass('worf.sequence_range') IS NULL THEN
+                    RETURN;
+                END IF;
+
+                FOR s IN
+                    SELECT r.seqoid::regclass AS seq, q.seqincrement > 0 AS ascending, q.seqtypid::regtype::text AS type
+                    FROM worf.sequence_range r JOIN pg_catalog.pg_sequence q ON q.seqrelid = r.seqoid
+                LOOP
+                    lo := CASE s.type WHEN 'smallint' THEN -32768 WHEN 'integer' THEN -2147483648 ELSE -9223372036854775808 END;
+                    hi := CASE s.type WHEN 'smallint' THEN 32767 WHEN 'integer' THEN 2147483647 ELSE 9223372036854775807 END;
+                    IF s.ascending THEN
+                        hi := lo + 1;
+                        edge := hi;
+                    ELSE
+                        lo := hi - 1;
+                        edge := lo;
+                    END IF;
+
+                    EXECUTE format('ALTER SEQUENCE %s NO CYCLE CACHE 1 MINVALUE %s MAXVALUE %s START WITH %s RESTART WITH %s', s.seq, lo, hi, edge, edge);
+                    PERFORM pg_catalog.setval(s.seq, edge, true);
+                END LOOP;
+            END$$;
+            """);
         _ = Query(conn, "DROP EXTENSION worf CASCADE;");
     }
     catch (NpgsqlException error)
