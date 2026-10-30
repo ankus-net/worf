@@ -294,15 +294,33 @@ public sealed class ExceptionBehaviourTests
             FROM worf.exception_log
             """, token));
 
-        // The sync worker's copy waits on a lock here until a change it applies after the copy has committed.
-        int providerLogpos;
+        // The sync worker's copy waits on a lock here until a change it applies after the copy has committed. Its apply
+        // of the bad row waits on an advisory lock, so that it fails only once its walsender holds its slot.
+        await using NpgsqlConnection holder = await subscriber.OpenAsync(Database, token);
         await using NpgsqlConnection blocker = await provider.OpenAsync(Database, token);
         foreach (TestNode node in new[] { provider, subscriber })
         {
             _ = await node.SafePsqlAsync(Database, "CREATE TABLE synced (id integer PRIMARY KEY, v text CHECK (v <> 'bad'))", token);
         }
 
+        _ = await subscriber.SafePsqlAsync(Database, """
+            CREATE FUNCTION hold_bad() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                IF NEW.v = 'bad' THEN
+                    PERFORM pg_advisory_xact_lock(4242);
+                END IF;
+                RETURN NEW;
+            END
+            $$;
+            CREATE TRIGGER hold_bad BEFORE INSERT ON synced FOR EACH ROW EXECUTE FUNCTION hold_bad();
+            ALTER TABLE synced ENABLE ALWAYS TRIGGER hold_bad;
+            """, token);
         _ = await provider.SafePsqlAsync(Database, "ALTER TABLE synced DROP CONSTRAINT synced_v_check; INSERT INTO synced VALUES (1, 'copied')", token);
+        await using (NpgsqlCommand command = new("SELECT pg_advisory_lock(4242)", holder))
+        {
+            _ = await command.ExecuteNonQueryAsync(token);
+        }
+
         await using (NpgsqlConnection local = await subscriber.OpenAsync(Database, token))
         {
             await using NpgsqlTransaction transaction = await local.BeginTransactionAsync(token);
@@ -319,7 +337,6 @@ public sealed class ExceptionBehaviourTests
 
             // Having sent the bad row, the walsender waits for this lock to name the origin of the next transaction
             // from the provider's subscriptions, and holds the sync worker's slot meanwhile.
-            providerLogpos = provider.ReadLog().Length;
             await using NpgsqlTransaction subscriptions = await blocker.BeginTransactionAsync(token);
             await using (NpgsqlCommand command = new("LOCK TABLE worf.subscription", blocker, subscriptions))
             {
@@ -331,7 +348,21 @@ public sealed class ExceptionBehaviourTests
                 "SELECT pg_replication_origin_session_setup('elsewhere'); INSERT INTO synced VALUES (4, 'elsewhere')", token);
             await transaction.RollbackAsync(token);
 
-            // The sync worker stops it rather than failing, which would copy the table again.
+            string slot = await subscriber.SafePsqlAsync(Database, "SELECT sub_slot_name FROM worf.subscription", token);
+            Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event = 'advisory')", token), "the bad row's apply waiting");
+            Assert.IsTrue(await provider.PollQueryUntilAsync(Database, $"""
+                SELECT EXISTS (SELECT 1 FROM pg_replication_slots s JOIN pg_stat_activity a ON a.pid = s.active_pid
+                    WHERE starts_with(s.slot_name, '{slot}_') AND a.wait_event_type = 'Lock')
+                """, token), "the sync worker's walsender waiting");
+
+            // The sync worker stops the walsender rather than failing, which would copy the table again.
+            int providerLogpos = provider.ReadLog().Length;
+            await using (NpgsqlCommand command = new("SELECT pg_advisory_unlock(4242)", holder))
+            {
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+
             Assert.IsTrue(await provider.PollLogAsync(providerLogpos, "terminating connection due to administrator command", token),
                 "the walsender holding the slot stopped");
             await subscriptions.CommitAsync(token);
