@@ -3,7 +3,11 @@ using System.Data;
 using System.Diagnostics;
 using System.Globalization;
 using System.Net;
+using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Authentication;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using Npgsql;
 using Worf.CreateSubscriber;
@@ -99,6 +103,33 @@ public sealed class LibpqTests
     }
 
     /// <summary>
+    /// A connection that requires TLS gets it from a server that offers it.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task RequiredTlsIsNegotiated()
+    {
+        using CancellationTokenSource stop = CancellationTokenSource.CreateLinkedTokenSource(TestContext.CancellationToken);
+        using RSA key = RSA.Create(2048);
+        CertificateRequest request = new("CN=127.0.0.1", key, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        using X509Certificate2 created = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
+
+        // Windows' TLS takes a certificate's key only from a store or a PKCS #12 file, not one in memory.
+        using X509Certificate2 certificate = X509CertificateLoader.LoadPkcs12(created.Export(X509ContentType.Pkcs12), null);
+        TcpListener rejecting = Listen();
+        Task rejections = RejectAsync(rejecting, stop.Token, certificate);
+        try
+        {
+            Assert.AreEqual(PingStatus.Reject, Libpq.Ping(Conninfo([Port(rejecting)], "sslmode=require connect_timeout=10")));
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            await StopAsync(rejecting, rejections);
+        }
+    }
+
+    /// <summary>
     /// A list of ports has one port for every host, or one for all of them.
     /// </summary>
     [TestMethod]
@@ -146,11 +177,13 @@ public sealed class LibpqTests
             Assert.AreEqual($"{server}: session is not read-only", error.Message);
             Assert.AreEqual(PingStatus.Ok, Libpq.Ping($"{primary} target_session_attrs=standby"), "the server answered");
 
+
             // A server that never answers is passed over after its timeout.
             using NpgsqlConnection second = Libpq.Connect(
                 $"host=127.0.0.1,127.0.0.1 port={Port(silent)},{node.Cluster.Port.ToString(CultureInfo.InvariantCulture)} " +
                 "dbname=postgres user=postgres connect_timeout=2 target_session_attrs=read-write");
             Assert.AreEqual(ConnectionState.Open, second.State);
+
         }
         finally
         {
@@ -184,9 +217,9 @@ public sealed class LibpqTests
             $"dbname=postgres user=postgres {options}";
 
     /// <summary>
-    /// Answers every connection as a server that is starting up does.
+    /// Answers every connection as a server that is starting up does, over TLS when it has a certificate.
     /// </summary>
-    private static async Task RejectAsync(TcpListener listener, CancellationToken cancellationToken)
+    private static async Task RejectAsync(TcpListener listener, CancellationToken cancellationToken, X509Certificate2? certificate = null)
     {
         byte[] fields = Encoding.ASCII.GetBytes("SFATAL\0VFATAL\0C57P03\0Mthe database system is starting up\0\0");
         byte[] error = new byte[5 + fields.Length];
@@ -197,30 +230,55 @@ public sealed class LibpqTests
         while (!cancellationToken.IsCancellationRequested)
         {
             using TcpClient client = await listener.AcceptTcpClientAsync(cancellationToken);
-            NetworkStream stream = client.GetStream();
+            await using NetworkStream connection = client.GetStream();
             try
             {
-                // Encryption requests are declined, and the startup packet answered with the error.
-                while (true)
+                // A TLS request is accepted when there's a certificate, and the startup packet answered with the error.
+                if (await ReadRequestsAsync(connection, certificate is not null, cancellationToken))
                 {
-                    byte[] length = new byte[4];
-                    await stream.ReadExactlyAsync(length, cancellationToken);
-                    byte[] packet = new byte[BinaryPrimitives.ReadInt32BigEndian(length) - 4];
-                    await stream.ReadExactlyAsync(packet, cancellationToken);
-                    if (BinaryPrimitives.ReadInt32BigEndian(packet) is not (80877103 or 80877104))
-                    {
-                        break;
-                    }
-
-                    await stream.WriteAsync("N"u8.ToArray(), cancellationToken);
+                    await using SslStream tls = new(connection, leaveInnerStreamOpen: true);
+                    await tls.AuthenticateAsServerAsync(new SslServerAuthenticationOptions { ServerCertificate = certificate }, cancellationToken);
+                    _ = await ReadRequestsAsync(tls, false, cancellationToken);
+                    await tls.WriteAsync(error, cancellationToken);
                 }
-
-                await stream.WriteAsync(error, cancellationToken);
+                else
+                {
+                    await connection.WriteAsync(error, cancellationToken);
+                }
             }
-            catch (Exception failure) when (failure is IOException or EndOfStreamException)
+            catch (Exception failure) when (failure is IOException or EndOfStreamException or AuthenticationException)
             {
                 // The client went away.
             }
+        }
+    }
+
+    /// <summary>
+    /// Reads a client's requests up to its startup packet, declining encryption, or until it asks for TLS when that's
+    /// accepted.
+    /// </summary>
+    /// <returns>Whether the client asked for TLS and was told to go ahead.</returns>
+    private static async Task<bool> ReadRequestsAsync(Stream stream, bool acceptTls, CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            byte[] length = new byte[4];
+            await stream.ReadExactlyAsync(length, cancellationToken);
+            byte[] packet = new byte[BinaryPrimitives.ReadInt32BigEndian(length) - 4];
+            await stream.ReadExactlyAsync(packet, cancellationToken);
+            int code = BinaryPrimitives.ReadInt32BigEndian(packet);
+            if (code == 80877103 && acceptTls)
+            {
+                await stream.WriteAsync("S"u8.ToArray(), cancellationToken);
+                return true;
+            }
+
+            if (code is not (80877103 or 80877104))
+            {
+                return false;
+            }
+
+            await stream.WriteAsync("N"u8.ToArray(), cancellationToken);
         }
     }
 

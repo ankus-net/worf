@@ -323,7 +323,8 @@ internal static class Libpq
         // the wait as well.
         long seconds = (long)connectTimeout * Addresses(builder.Host!);
         builder.Timeout = seconds <= NpgsqlTimeoutLimit ? (int)seconds : 0;
-        NpgsqlDataSource dataSource = new NpgsqlSlimDataSourceBuilder(builder.ConnectionString).Build();
+        // The slim builder leaves TLS out unless asked, and then any sslmode but disable, allow and prefer fails.
+        NpgsqlDataSource dataSource = new NpgsqlSlimDataSourceBuilder(builder.ConnectionString).EnableTransportSecurity().Build();
         try
         {
             return seconds == 0
