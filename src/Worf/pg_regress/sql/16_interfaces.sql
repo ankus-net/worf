@@ -24,6 +24,16 @@ SELECT pg_sleep(0.1);
 SELECT subscription_name, status, provider_node, replication_sets, forward_origins FROM worf.show_subscription_status();
 
 \c :provider_dsn
+-- Wait for the walsender to connect as the interface's user, which the subscriber's status doesn't say.
+DO $$
+BEGIN
+    FOR i IN 1..300 LOOP
+        IF EXISTS (SELECT 1 FROM pg_stat_replication WHERE application_name = 'test_subscription' AND usename = 'super2') THEN
+            EXIT;
+        END IF;
+        PERFORM pg_sleep(0.1);
+    END LOOP;
+END;$$;
 SELECT plugin, slot_type, active FROM pg_replication_slots;
 SELECT usename FROM pg_stat_replication WHERE application_name = 'test_subscription';
 
@@ -44,6 +54,16 @@ SELECT pg_sleep(0.1);
 SELECT subscription_name, status, provider_node, replication_sets, forward_origins FROM worf.show_subscription_status();
 
 \c :provider_dsn
+-- Wait for the walsender to connect as the interface's user, which the subscriber's status doesn't say.
+DO $$
+BEGIN
+    FOR i IN 1..300 LOOP
+        IF EXISTS (SELECT 1 FROM pg_stat_replication WHERE application_name = 'test_subscription' AND usename = 'super') THEN
+            EXIT;
+        END IF;
+        PERFORM pg_sleep(0.1);
+    END LOOP;
+END;$$;
 DROP USER super2;
 SELECT plugin, slot_type, active FROM pg_replication_slots;
 SELECT usename FROM pg_stat_replication WHERE application_name = 'test_subscription';
