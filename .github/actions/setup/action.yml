@@ -77,19 +77,35 @@ runs:
       shell: bash
       run: dotnet tool restore
 
+    # Each installation is saved under the Ankus version that installed it and its directory, which names its release
+    # and Ankus's build of it, so that a new minor release, which ankus init downloads, is saved too. The newest
+    # installation for the Ankus version is restored, or else the newest for the major version: an Ankus update starts
+    # from the last installation, which ankus init reuses when the update leaves its build alone, rather than
+    # downloading or building PostgreSQL again.
+    - name: Key PostgreSQL
+      id: postgresql-keys
+      shell: bash
+      run: |
+        prefix='postgresql-v1-${{ inputs.platform }}${{ inputs.release == 'true' && '-release' || '' }}-pg${{ inputs.postgresql }}'
+        echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+        echo "ankus=$prefix-${{ hashFiles('.config/dotnet-tools.json') }}" >> "$GITHUB_OUTPUT"
+
     - name: Restore PostgreSQL
       id: postgresql-cache
       uses: actions/cache/restore@v6
       with:
         path: ~/.ankus/postgres
-        key: postgresql-v1-${{ inputs.platform }}${{ inputs.release == 'true' && '-release' || '' }}-pg${{ inputs.postgresql }}-${{ hashFiles('.config/dotnet-tools.json') }}
-        # An Ankus update starts from the last installation, which ankus init reuses when the update leaves its build
-        # alone, rather than downloading or building PostgreSQL again.
-        restore-keys: postgresql-v1-${{ inputs.platform }}${{ inputs.release == 'true' && '-release' || '' }}-pg${{ inputs.postgresql }}-
+        key: ${{ steps.postgresql-keys.outputs.ankus }}-
+        restore-keys: |
+          ${{ steps.postgresql-keys.outputs.ankus }}-
+          ${{ steps.postgresql-keys.outputs.prefix }}-
 
     - name: Install PostgreSQL source build tools (Windows)
-      # EDB publishes no Windows archive for a PostgreSQL release candidate, so ankus init builds it from source.
-      if: runner.os == 'Windows' && inputs.postgresql == '19' && steps.postgresql-cache.outputs.cache-hit != 'true'
+      # EDB publishes no Windows archive for a PostgreSQL release candidate, so ankus init builds it from source, unless
+      # this Ankus version installed it before.
+      if: >-
+        runner.os == 'Windows' && inputs.postgresql == '19' &&
+        !startsWith(steps.postgresql-cache.outputs.cache-matched-key, format('{0}-', steps.postgresql-keys.outputs.ankus))
       shell: pwsh
       run: |
         python -m pip install --quiet meson ninja
@@ -98,15 +114,31 @@ runs:
         "C:\Strawberry\perl\bin" >> $env:GITHUB_PATH
 
     - name: Install PostgreSQL
+      id: postgresql
       shell: bash
-      run: dotnet ankus init ${{ inputs.release == 'true' && '--release' || '' }} --pg${{ inputs.postgresql }} download
+      env:
+        ANKUS_KEY: ${{ steps.postgresql-keys.outputs.ankus }}
+      run: |
+        dotnet ankus init ${{ inputs.release == 'true' && '--release' || '' }} --pg${{ inputs.postgresql }} download
+        installation=$(dotnet ankus info path ${{ inputs.postgresql }} | tr -d '\r')
+        installation=${installation%[\\/]}
+        echo "directory=${installation##*[\\/]}" >> "$GITHUB_OUTPUT"
+        echo "key=$ANKUS_KEY-${installation##*[\\/]}" >> "$GITHUB_OUTPUT"
+
+    # Saved as soon as it's installed, so a later failing step doesn't make the next run build it again, and only when
+    # the cache didn't have it. Only main stores installations: every branch and tag can restore main's, while copies of
+    # their own, which only they can restore, crowd main's out of the cache.
+    - name: Prune PostgreSQL
+      # An installation ankus init replaced stays beside the new one.
+      if: github.ref == 'refs/heads/main' && steps.postgresql-cache.outputs.cache-matched-key != steps.postgresql.outputs.key
+      shell: bash
+      env:
+        INSTALLATION: ${{ steps.postgresql.outputs.directory }}
+      run: find ~/.ankus/postgres -mindepth 1 -maxdepth 1 -type d ! -name "$INSTALLATION" -prune -exec rm -rf {} +
 
     - name: Save PostgreSQL
-      # Saved as soon as it's installed, so a later failing step doesn't make the next run build it again. Only main
-      # stores installations: every branch and tag can restore main's, while copies of their own, which only they can
-      # restore, crowd main's out of the cache.
-      if: steps.postgresql-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+      if: github.ref == 'refs/heads/main' && steps.postgresql-cache.outputs.cache-matched-key != steps.postgresql.outputs.key
       uses: actions/cache/save@v6
       with:
         path: ~/.ankus/postgres
-        key: postgresql-v1-${{ inputs.platform }}${{ inputs.release == 'true' && '-release' || '' }}-pg${{ inputs.postgresql }}-${{ hashFiles('.config/dotnet-tools.json') }}
+        key: ${{ steps.postgresql.outputs.key }}

@@ -15,4 +15,7 @@
   <ItemGroup>
     <PackageReference Include="Npgsql" />
   </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Worf.Tests" />
+  </ItemGroup>
 </Project>

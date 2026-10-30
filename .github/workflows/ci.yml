@@ -52,16 +52,30 @@ jobs:
           postgresql: ${{ matrix.postgresql }}
           release: ${{ (github.event_name == 'schedule' || inputs.nightly == true) }}
 
-      # Generating and compiling the Ankus bindings for a PostgreSQL version takes about two minutes a build. The newest
-      # bindings for the Ankus SDK are restored, or else the newest for the version.
+      # Generating and compiling the Ankus bindings for a PostgreSQL version takes about two minutes a build. Ankus keeps
+      # a set for each environment, keyed by variables such as PATH and HOME, which a runner image's tools change, and
+      # by the PostgreSQL build, which the nightly run makes without assertions. Each image and build has bindings of its
+      # own in the cache, so that pruning one's leaves the others'. The newest for the image and Ankus SDK are restored,
+      # or else the newest for the Ankus SDK, or else the newest for the version.
+      - name: Key Ankus bindings
+        id: bindings
+        run: |
+          version='ankus-bindings-v2-${{ matrix.platform }}${{ (github.event_name == 'schedule' || inputs.nightly == true) && '-release' || '' }}-pg${{ matrix.postgresql }}'
+          {
+            echo "version=$version"
+            echo "sdk=$version-${{ hashFiles('global.json') }}"
+            echo "image=$version-${{ hashFiles('global.json') }}-$ImageOS-$ImageVersion"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Restore Ankus bindings
         uses: actions/cache/restore@v6
         with:
           path: ${{ runner.temp }}/ankus-bindings
-          key: ankus-bindings-v2-${{ matrix.platform }}-pg${{ matrix.postgresql }}-${{ hashFiles('global.json') }}-${{ github.run_id }}
+          key: ${{ steps.bindings.outputs.image }}-${{ github.run_id }}
           restore-keys: |
-            ankus-bindings-v2-${{ matrix.platform }}-pg${{ matrix.postgresql }}-${{ hashFiles('global.json') }}-
-            ankus-bindings-v2-${{ matrix.platform }}-pg${{ matrix.postgresql }}-
+            ${{ steps.bindings.outputs.image }}-
+            ${{ steps.bindings.outputs.sdk }}-
+            ${{ steps.bindings.outputs.version }}-
 
       - name: Build
         id: build
@@ -76,7 +90,8 @@ jobs:
       # Bindings depend on the PostgreSQL symbols worf uses, so restored ones go stale when worf starts using another.
       # Main saves them again whenever its build compiles them, without the sets the build no longer uses: Ankus names
       # each set by a 64-digit key and updates its time whenever a build uses it. Other branches and tags use main's
-      # rather than storing their own.
+      # rather than storing their own. Each image and build saves under its own key, so the sets pruned are only ones an
+      # earlier build of the same kind left.
       - name: Prune Ankus bindings
         if: steps.build.outputs.compiled-bindings == 'true' && github.ref == 'refs/heads/main'
         run: |
@@ -88,7 +103,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: ${{ runner.temp }}/ankus-bindings
-          key: ankus-bindings-v2-${{ matrix.platform }}-pg${{ matrix.postgresql }}-${{ hashFiles('global.json') }}-${{ github.run_id }}
+          key: ${{ steps.bindings.outputs.image }}-${{ github.run_id }}
 
       # The regression suite runs in the background of the multi-server tests' step. Run beside them while pgbench wrote
       # as fast as it could, pglogical's timing-sensitive regression tests failed; with pgbench's rate bounded they pass.
@@ -96,6 +111,7 @@ jobs:
       # backend creating a WAL segment there waits seconds, and an apply worker waiting that long misses t/040's 5-second
       # walsender timeout.
       - name: Run regression suite and multi-server tests
+        id: tests
         if: github.event_name != 'schedule' && inputs.nightly != true
         # A hang fails the step, rather than the job's timeout cancelling the job, so that its logs are saved. Each
         # test also times out on its own, in tests/Worf.Tests/testconfig.json.
@@ -113,7 +129,8 @@ jobs:
           # still writes throughout each resynchronization.
           PGBENCH_RATE: '300'
         run: |
-          dotnet run eng/regress.cs -- --pg ${{ matrix.postgresql }} --no-build > "$RUNNER_TEMP/regress.log" 2>&1 &
+          mkdir -p artifacts
+          dotnet run eng/regress.cs -- --pg ${{ matrix.postgresql }} --no-build > artifacts/regress.log 2>&1 &
           regress=$!
           status=0
           pgdata=()
@@ -125,10 +142,13 @@ jobs:
             echo "::error::The regression suite failed."
             status=1
           fi
-          echo "::group::Regression suite"
-          cat "$RUNNER_TEMP/regress.log"
-          echo "::endgroup::"
           exit "$status"
+
+      # The suite's output gets a step of its own, which runs even when the step above times out, so that a hang still
+      # shows how far the suite got.
+      - name: Show regression suite output
+        if: always() && steps.tests.outcome != 'skipped'
+        run: cat artifacts/regress.log
 
       - name: Save regression results
         if: failure() || cancelled()
@@ -136,6 +156,7 @@ jobs:
         with:
           name: regression-${{ matrix.platform }}-pg${{ matrix.postgresql }}
           path: |
+            artifacts/regress.log
             src/Worf/pg_regress/results/
             src/Worf/pg_regress/regression.diffs
             artifacts/regress-home/clusters/*.log
