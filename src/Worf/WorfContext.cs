@@ -19,4 +19,10 @@ internal struct WorfContext
     /// Background workers.
     /// </summary>
     public int TotalWorkers;
+
+    /// <summary>
+    /// When a worker last found no replication origin slot free, for others to give up the slots of relay origins they
+    /// no longer need.
+    /// </summary>
+    public long OriginSlotWantedAt;
 }

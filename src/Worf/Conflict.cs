@@ -107,7 +107,7 @@ internal static partial class Conflict
     /// <param name="remoteResolution">The other node's <c>worf.conflict_resolution</c>.</param>
     internal static void CheckTwoWayResolution(string localNode, string remoteNode, string remoteResolution)
     {
-        string localResolution = Elevated.Run(() => Worf.ReadScalar<string>(WorkerResolutionSql(true)));
+        string localResolution = Elevated.Run(() => Worf.ReadScalar<string>(WorkerResolutionSql(true, true)));
         if (localResolution == remoteResolution && localResolution is "last_update_wins" or "first_update_wins")
         {
             return;
@@ -123,16 +123,18 @@ internal static partial class Conflict
 
     /// <summary>
     /// Gets the query for the <c>worf.conflict_resolution</c> that the apply workers on a node run with, rather than
-    /// the session's: the database's and the workers' role's settings, then the server's, which the configuration
-    /// files, ALTER SYSTEM and the server's command line set. The session's value is the server's unless the
-    /// session's role, its database or its connection set it; then the configuration files have it, which a role
-    /// without the privileges of <c>pg_read_all_settings</c> can't read, and the value the session started with is
-    /// taken.
+    /// the session's: the database's and the workers' role's settings, then the server's, which its command line, then
+    /// the configuration files and ALTER SYSTEM set. The session's value is the server's unless the session's role, its
+    /// database or its connection set it; then the command line is in <c>postmaster.opts</c>, which a role that can't
+    /// run <c>pg_read_file</c> can't read, and the configuration files in <c>pg_file_settings</c>, which a role without
+    /// the privileges of <c>pg_read_all_settings</c> can't read, when the value the session started with is taken.
     /// </summary>
     /// <param name="readFiles">Whether the session can read the configuration files.</param>
+    /// <param name="readCommandLine">Whether the session can read the server's command line.</param>
     /// <returns>The query.</returns>
-    internal static string WorkerResolutionSql(bool readFiles)
-        => readFiles ? WorkerResolutionHeadSql + WorkerResolutionFileSql : WorkerResolutionHeadSql + WorkerResolutionResetSql;
+    internal static string WorkerResolutionSql(bool readFiles, bool readCommandLine)
+        => WorkerResolutionHeadSql + (readCommandLine ? WorkerResolutionCommandLineSql : "") +
+            (readFiles ? WorkerResolutionFileSql : WorkerResolutionResetSql);
 
     private const string WorkerResolutionHeadSql = """
         SELECT coalesce(
@@ -145,6 +147,17 @@ internal static partial class Conflict
              LIMIT 1),
             (SELECT setting FROM pg_catalog.pg_settings WHERE name = 'worf.conflict_resolution'
                 AND source IN ('default', 'environment variable', 'configuration file', 'command line')),
+
+        """;
+
+    // The postmaster writes each argument quoted, and takes -c name=value, -cname=value and --name=value, with dashes
+    // in the name for underscores and its letters in either case. The last one counts.
+    private const string WorkerResolutionCommandLineSql = """
+            (SELECT o.m[1]
+             FROM regexp_matches(lower(pg_catalog.pg_read_file('postmaster.opts', 0, 1048576, true)),
+                '"(?:-c" "|-c|--)worf\.conflict[-_]resolution=([^"]*)"', 'g') WITH ORDINALITY o(m, n)
+             ORDER BY o.n DESC
+             LIMIT 1),
 
         """;
 
@@ -355,13 +368,14 @@ internal static partial class Conflict
 
     /// <summary>
     /// Gets the node that wrote a local row: the node whose changes its commit's replication origin applied when the
-    /// row's transaction ran, or this node for a row written here. An origin's id is reused once it's dropped, as
-    /// every table sync's is, so the writer comes from what worf recorded for the id as of the row's transaction.
+    /// row's transaction ran, or this node for a row written here or under an origin worf didn't create. An origin's id
+    /// is reused once it's dropped, as every table sync's is, so the writer comes from what worf recorded for the id as
+    /// of the row's transaction.
     /// </summary>
     /// <param name="originId">The replication origin of the row's commit.</param>
     /// <param name="xid">The row's transaction.</param>
     /// <returns>The node's id.</returns>
-    private static unsafe uint WriterNodeId(ushort originId, uint xid)
+    private static uint WriterNodeId(ushort originId, uint xid)
     {
         uint localNodeId = Apply.MySubscription!.Target.Id;
         if (originId == 0)
@@ -369,11 +383,12 @@ internal static partial class Conflict
             return localNodeId;
         }
 
-        uint? recorded = Apply.OriginWriter(originId, xid)?.Writer;
-        sbyte* name;
-        return recorded ?? (NativeMethods.replorigin_by_oid(originId, true, &name)
-            ? WorfNode.GetOriginNodeId(Worf.FromServer(name)) ?? localNodeId
-            : localNodeId);
+        if (Apply.OriginWriter(originId, xid) is (uint writer, _))
+        {
+            return writer != 0 ? writer : localNodeId;
+        }
+
+        return WorfNode.OriginName(originId) is string name ? WorfNode.GetOriginNodeId(name) ?? localNodeId : localNodeId;
     }
 
     /// <summary>

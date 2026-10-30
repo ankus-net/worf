@@ -268,6 +268,30 @@ internal static class Worker
     }
 
     /// <summary>
+    /// Gets when a worker last found no replication origin slot free.
+    /// </summary>
+    internal static long OriginSlotWantedAt
+    {
+        get
+        {
+            using PgLwLockShareGuard<WorfContext, WorfWorker> guard = WorfCtx.Share();
+            return guard.Header.OriginSlotWantedAt;
+        }
+    }
+
+    /// <summary>
+    /// Records that this worker found no replication origin slot free, so that the workers of other subscriptions give
+    /// up the slots of relay origins they no longer need.
+    /// </summary>
+    internal static void WantOriginSlot()
+    {
+        using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = WorfCtx.Exclusive();
+        WorfContext ctx = guard.Header;
+        ctx.OriginSlotWantedAt = GetCurrentTimestamp();
+        guard.Header = ctx;
+    }
+
+    /// <summary>
     /// Gets the current time as a <c>TimestampTz</c>.
     /// </summary>
     /// <returns>Microseconds since 2000-01-01.</returns>

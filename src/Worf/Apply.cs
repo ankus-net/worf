@@ -28,7 +28,9 @@ internal static unsafe partial class Apply
     private static string? s_remoteOriginName;
     private static ushort s_remoteOriginId;
     private static uint s_writerNodeId;
-    private static uint s_sessionWriterNodeId;
+
+    // The node whose transactions the session's origin commits, or null when it's not set up for one.
+    private static uint? s_sessionWriterNodeId;
 
     // The error of the failed transaction that a whole skip records with each of its changes, and whether this
     // transaction's changes are recorded as they're skipped.
@@ -48,15 +50,15 @@ internal static unsafe partial class Apply
     private static bool s_replicated;
     private static long s_replicatedCheckedAt;
 
-    // The replication origins of this worker's subscription that exist, each with the full id of the transaction that
-    // created it: the apply and table sync workers' own origins and their relay origins.
+    // This worker's own replication origin and relay origins that exist, each with the full id of the transaction that
+    // created it.
     private static Dictionary<ushort, ulong> s_streamOrigins = [];
 
     // The writer and subscription of the origin of the last local row whose stream was looked up.
     private static (ushort Origin, uint Xid, (uint Writer, uint SubId)? Recorded) s_lastOriginWriter;
 
-    // When this worker last warned that it dropped relay origins for want of replication origin slots, and last
-    // checked whether others want them.
+    // When this worker last warned that it dropped relay origins for want of replication origin slots, and when the
+    // want that it last answered was.
     private static long s_reclaimWarnedAt;
     private static long s_reclaimCheckedAt;
     private static bool s_skipRemoteTransaction;
@@ -209,7 +211,7 @@ internal static unsafe partial class Apply
 
         // Cache the queue relation id.
         // TODO: invalidation
-        ulong originStartpos = PgBackgroundWorker.RunTransaction(() =>
+        ulong originStartpos = RunTakingOriginSlot(() =>
         {
             s_queueRelid = Queue.GetQueueTableOid();
 
@@ -271,6 +273,9 @@ internal static unsafe partial class Apply
         s_applyconn = streamConn;
         s_lastReceived = 0;
         s_restreamFrom = 0;
+
+        // Only workers that find no replication origin slot free from now on have relay origins give theirs up.
+        s_reclaimCheckedAt = Worker.OriginSlotWantedAt;
 
         // Init the MessageContext which we use for easier cleanup, once, as a table sync worker streams again.
         if (!s_messageContextCreated)
@@ -336,15 +341,8 @@ internal static unsafe partial class Apply
                     DdlLock.Reconcile(MySubscription!);
 
                     // Relay origins this worker no longer needs give their slots up to another subscription's, a
-                    // table sync's or a relay origin that wants one.
-                    if (Worker.GetCurrentTimestamp() - s_reclaimCheckedAt >= 10_000_000)
-                    {
-                        s_reclaimCheckedAt = Worker.GetCurrentTimestamp();
-                        if (PgBackgroundWorker.RunTransaction(WorfNode.OriginSlotsFull))
-                        {
-                            _ = ReclaimRelayOrigins(PgReplicationOrigin.SessionOrigin);
-                        }
-                    }
+                    // table sync's or a relay origin that found none free.
+                    ReclaimRelayOriginsIfWanted();
                 }
             }
         }
@@ -864,43 +862,57 @@ internal static unsafe partial class Apply
             PgReplicationOrigin.ResetSession();
         }
 
-        // An origin that exists is set up at once; one created is set up once its transaction commits.
-        bool setUp = false;
-        ushort origin = PgBackgroundWorker.RunTransaction(() =>
-        {
-            ushort? found = PgReplicationOrigin.Find(name);
-            ushort id = found ?? WorfNode.CreateOrigin(name, writer == 0 ? sub.Origin.Id : writer, sub.Id);
-            if (!s_streamOrigins.ContainsKey(id))
-            {
-                LoadStreamOrigins();
-            }
-
-            setUp = found is not null && TrySetupSession(id);
-            return id;
-        });
-
         // Each origin in use takes one of max_active_replication_origins, or max_replication_slots before PostgreSQL
         // 18, until it's dropped. Without one free, the worker's relay origins that its restart doesn't start from
-        // give theirs up, as worf.origin_writer still names the node that wrote the rows committed under them.
-        while (!setUp && !PgBackgroundWorker.RunTransaction(() => TrySetupSession(origin)))
+        // give theirs up, as worf.origin_writer still names the node that wrote the rows committed under them, all in
+        // one transaction with the origin's creation. Failing that, other subscriptions' workers give theirs up.
+        s_sessionWriterNodeId = null;
+        List<ushort> dropped = [];
+        (ushort origin, ulong? sinceXid) = RunTakingOriginSlot(() =>
         {
-            if (!ReclaimRelayOrigins(origin))
+            dropped = [];
+            ushort id;
+            ulong? created = null;
+            if (PgReplicationOrigin.Find(name) is ushort existing)
+            {
+                id = existing;
+            }
+            else
+            {
+                (id, ulong since) = WorfNode.CreateOrigin(name, writer == 0 ? sub.Origin.Id : writer, sub.Id);
+                created = since;
+            }
+
+            if (!TrySetupSession(id) && (!DropRelayOrigins(id, dropped) || !TrySetupSession(id)))
             {
                 throw new PgException(PgSqlStates.ConfigurationLimitExceeded,
                     $"no replication origin slot is free for replication origin \"{name}\"", null!,
                     "Raise max_active_replication_origins, or max_replication_slots before PostgreSQL 18.", null!);
             }
 
-            long now = Worker.GetCurrentTimestamp();
-            if (now - s_reclaimWarnedAt >= 60_000_000)
+            return (id, created);
+        });
+
+        // An id that another origin takes doesn't apply this subscription's changes from then on.
+        foreach (ushort id in dropped)
+        {
+            _ = s_streamOrigins.Remove(id);
+        }
+
+        if (sinceXid is ulong since)
+        {
+            s_streamOrigins[origin] = since;
+        }
+
+        long now = Worker.GetCurrentTimestamp();
+        if (dropped.Count > 0 && now - s_reclaimWarnedAt >= 60_000_000)
+        {
+            s_reclaimWarnedAt = now;
+            PgLog.Warning(new PgDiagnostic($"subscription \"{sub.Name}\" dropped relay origins to free replication origin slots")
             {
-                s_reclaimWarnedAt = now;
-                PgLog.Warning(new PgDiagnostic($"subscription \"{sub.Name}\" dropped relay origins to free replication origin slots")
-                {
-                    Detail = "Each node whose changes a provider forwards takes a replication origin slot, and dropping and creating relay origins slows apply.",
-                    Hint = "Raise max_active_replication_origins, or max_replication_slots before PostgreSQL 18.",
-                });
-            }
+                Detail = "Each node whose changes a provider forwards takes a replication origin slot, and dropping and creating relay origins slows apply.",
+                Hint = "Raise max_active_replication_origins, or max_replication_slots before PostgreSQL 18.",
+            });
         }
 
         s_sessionWriterNodeId = writer;
@@ -915,9 +927,83 @@ internal static unsafe partial class Apply
             PgTransaction.RunInSubtransaction(() => PgReplicationOrigin.SetupSession(origin));
             return true;
         }
-        catch (PgException error) when (error.SqlState == "53400")
+        catch (PgException error) when (error.SqlState == PgSqlStates.ConfigurationLimitExceeded)
         {
             return false;
+        }
+    }
+
+    /// <summary>
+    /// Runs a transaction that takes a replication origin slot. When none is free, the workers of other subscriptions
+    /// give up the slots of relay origins they no longer need, and the transaction runs again until one is free or a
+    /// few seconds have passed.
+    /// </summary>
+    /// <typeparam name="T">The transaction's result.</typeparam>
+    /// <param name="work">The transaction's work.</param>
+    /// <returns>Its result.</returns>
+    internal static T RunTakingOriginSlot<T>(Func<T> work)
+    {
+        long deadline = Worker.GetCurrentTimestamp() + 10_000_000;
+        while (true)
+        {
+            try
+            {
+                return PgBackgroundWorker.RunTransaction(work);
+            }
+            catch (PgException error) when (error.SqlState == PgSqlStates.ConfigurationLimitExceeded)
+            {
+                Worker.WantOriginSlot();
+                if (Worker.GotSigterm || Worker.GetCurrentTimestamp() >= deadline)
+                {
+                    throw;
+                }
+
+                _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(100));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Runs a transaction that takes a replication origin slot, as the other overload does.
+    /// </summary>
+    /// <param name="work">The transaction's work.</param>
+    internal static void RunTakingOriginSlot(Action work) => _ = RunTakingOriginSlot(() =>
+    {
+        work();
+        return true;
+    });
+
+    /// <summary>
+    /// Has this worker give up the slots of relay origins it no longer needs when a worker found none free since it
+    /// last looked.
+    /// </summary>
+    private static void ReclaimRelayOriginsIfWanted()
+    {
+        long wantedAt = Worker.OriginSlotWantedAt;
+        if (wantedAt > s_reclaimCheckedAt)
+        {
+            s_reclaimCheckedAt = wantedAt;
+            ReclaimRelayOrigins();
+        }
+    }
+
+    /// <summary>
+    /// Gives up the slots of relay origins this worker no longer needs when every slot is taken.
+    /// </summary>
+    private static void ReclaimRelayOrigins()
+    {
+        List<ushort> dropped = [];
+        PgBackgroundWorker.RunTransaction(() =>
+        {
+            if (WorfNode.OriginSlotsFull())
+            {
+                _ = DropRelayOrigins(PgReplicationOrigin.SessionOrigin, dropped);
+            }
+        });
+
+        foreach (ushort id in dropped)
+        {
+            _ = s_streamOrigins.Remove(id);
         }
     }
 
@@ -926,39 +1012,30 @@ internal static unsafe partial class Apply
     /// starts from the latest of its origins.
     /// </summary>
     /// <param name="keep">An origin the worker uses next, which stays.</param>
+    /// <param name="dropped">The ids of those dropped, once the transaction commits.</param>
     /// <returns>Whether any was dropped.</returns>
-    private static bool ReclaimRelayOrigins(ushort keep)
+    private static bool DropRelayOrigins(ushort keep, List<ushort> dropped)
     {
         string slotName = MySubscription!.SlotName;
         ushort session = PgReplicationOrigin.SessionOrigin;
-        List<ushort> dropped = PgBackgroundWorker.RunTransaction(() =>
+        List<(ushort Id, ulong Progress)> origins = [.. s_streamOrigins.Keys.Select(id => (id, PgReplicationOrigin.GetProgress(id, false).Value))];
+        ulong latest = origins.Count == 0 ? 0 : origins.Max(o => o.Progress);
+        bool any = false;
+        foreach ((ushort id, ulong progress) in origins)
         {
-            List<(string Name, ulong Progress)> tracked = WorfNode.TrackedOrigins(slotName);
-            ulong latest = tracked.Count == 0 ? 0 : tracked.Max(o => o.Progress);
-            List<ushort> ids = [];
-            foreach ((string name, ulong progress) in tracked)
+            if (progress >= latest || id == keep || id == session || WorfNode.OriginName(id) is not string name || name == slotName)
             {
-                if (name == slotName || progress >= latest || PgReplicationOrigin.Find(name) is not ushort id || id == keep || id == session)
-                {
-                    continue;
-                }
-
-                if (TryDropOrigin(name))
-                {
-                    ids.Add(id);
-                }
+                continue;
             }
 
-            return ids;
-        });
-
-        // An id that another origin takes doesn't apply this subscription's changes from then on.
-        foreach (ushort id in dropped)
-        {
-            _ = s_streamOrigins.Remove(id);
+            if (TryDropOrigin(name))
+            {
+                dropped.Add(id);
+                any = true;
+            }
         }
 
-        return dropped.Count > 0;
+        return any;
     }
 
     /// <summary>
@@ -968,7 +1045,7 @@ internal static unsafe partial class Apply
     {
         try
         {
-            PgTransaction.RunInSubtransaction(() => PgReplicationOrigin.Drop(name, true));
+            PgTransaction.RunInSubtransaction(() => WorfNode.DropOrigin(name));
             return true;
         }
         catch (PgException)
@@ -978,10 +1055,11 @@ internal static unsafe partial class Apply
     }
 
     /// <summary>
-    /// Loads the replication origins of this worker's subscription that exist, with which it tells the rows that came
-    /// through the subscription quickly.
+    /// Loads this worker's own replication origin and relay origins that exist, with which it tells the rows that came
+    /// through them quickly. Others, such as a finished table sync's, can be dropped and their ids taken by origins
+    /// that apply other changes while the worker runs, so their rows are looked up in what worf recorded.
     /// </summary>
-    internal static void LoadStreamOrigins() => s_streamOrigins = WorfNode.SubscriptionOrigins(MySubscription!.Id);
+    internal static void LoadStreamOrigins() => s_streamOrigins = WorfNode.WorkerOrigins(MySubscription!.Id, MySubscription.SlotName);
 
     /// <summary>
     /// Checks whether a local row came through this worker's subscription, under one of its apply or table sync
@@ -1004,7 +1082,8 @@ internal static unsafe partial class Apply
     /// </summary>
     /// <param name="originId">The origin of the row's commit.</param>
     /// <param name="xid">The row's transaction.</param>
-    /// <returns>The node and the subscription, or null when worf didn't record the origin.</returns>
+    /// <returns>The node and the subscription, zeros when worf had dropped the origin, or null when worf didn't record
+    /// the origin.</returns>
     internal static (uint Writer, uint SubId)? OriginWriter(ushort originId, uint xid)
     {
         if (s_lastOriginWriter.Origin != originId || s_lastOriginWriter.Xid != xid)
@@ -2605,10 +2684,7 @@ internal static unsafe partial class Apply
             if (nworkers < 1 && Worker.GetCurrentTimestamp() - crashedAt >= Manager.RestartDelay * 1000)
             {
                 // Relay origins this worker no longer needs give their slots up to the sync worker's origin.
-                if (PgBackgroundWorker.RunTransaction(WorfNode.OriginSlotsFull))
-                {
-                    _ = ReclaimRelayOrigins(PgReplicationOrigin.SessionOrigin);
-                }
+                ReclaimRelayOrigins();
 
                 StartSyncWorker(sync.Nspname, sync.Relname);
                 break;
