@@ -51,7 +51,7 @@ public sealed class ClockSkewTests
         await AppliesAtOnceAsync(provider, subscriber, "one way", token);
 
         // Once the provider subscribes back, under last_update_wins on both nodes, which a session's setting doesn't
-        // change, the subscriber's restarted worker waits.
+        // change, the subscriber's restarted worker waits, as the subscriber's changes reach the provider.
         _ = await provider.SafePsqlAsync(Database, $$"""
             SET worf.conflict_resolution = error;
             SELECT worf.create_subscription(
@@ -62,6 +62,11 @@ public sealed class ClockSkewTests
                 forward_origins := '{}')
             """, token);
         Assert.DoesNotContain("replicate both ways", provider.ReadLog());
+        Assert.IsTrue(await provider.PollQueryUntilAsync(Database, """
+            SELECT EXISTS (
+                SELECT 1 FROM worf.show_subscription_status()
+                    WHERE subscription_name = 'back' AND status = 'replicating')
+            """, token), "the subscription back");
         _ = await subscriber.SafePsqlAsync(Database, "SELECT worf.alter_subscription_disable('skew', true)", token);
         _ = await subscriber.SafePsqlAsync(Database, "SELECT worf.alter_subscription_enable('skew', true)", token);
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, """

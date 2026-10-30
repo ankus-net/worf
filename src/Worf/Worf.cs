@@ -210,6 +210,23 @@ internal static partial class Worf
     }
 
     /// <summary>
+    /// Widens a transaction id from the last two billion to its full, 64-bit id.
+    /// </summary>
+    /// <param name="xid">The transaction id.</param>
+    /// <returns>The full transaction id.</returns>
+    internal static ulong FullTransactionId(uint xid)
+    {
+        ulong next;
+        unsafe
+        {
+            next = NativeMethods.ReadNextFullTransactionId().value;
+        }
+
+        ulong epoch = next >> 32;
+        return ((xid <= (uint)next || epoch == 0 ? epoch : epoch - 1) << 32) | xid;
+    }
+
+    /// <summary>
     /// Gets the replication origin of this session, <c>replorigin_session_origin</c>.
     /// </summary>
     internal static ushort ReploriginSessionOrigin

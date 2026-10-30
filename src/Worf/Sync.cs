@@ -369,6 +369,7 @@ internal static class Sync
                 ?? throw new PgException(PgSqlStates.UndefinedObject, $"replication origin \"{sub.SlotName}\" does not exist");
             PgLog.Debug2($"setting origin {sub.SlotName} (oid {originid}) for subscription sync");
             PgReplicationOrigin.SetupSession(originid);
+            Apply.LoadStreamOrigins();
 
             // In case there is nothing to catchup, finish immediately.
             if (statusLsn >= Worker.MyWorker.Worker.Sync.Apply.ReplayStopLsn)
@@ -387,17 +388,28 @@ internal static class Sync
             return;
         }
 
-        // Start the replication.
-        using (PgReplicationConnection streamConn = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, "catchup"))
+        // Start the replication. To apply a failed transaction again under worf.exception_behaviour, it streams again
+        // from that transaction.
+        for (ulong startLsn = statusLsn; startLsn != 0;)
         {
+            using PgReplicationConnection streamConn = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, "catchup");
+
             // IDENTIFY_SYSTEM sets up some internal state on walsender so call it even if we don't (yet) want to use
             // any of the results.
             _ = PgBackgroundWorker.RunTransaction(() => Worf.IdentifySystem(streamConn));
 
-            Worf.StartReplication(streamConn, sub.SlotName, statusLsn, "all", null, tablename, sub.ForceTextTransfer);
+            // The walsender that streamed before can hold the slot a moment longer.
+            long deadline = Worker.GetCurrentTimestamp() + 5000000L;
+            while (!Worker.GotSigterm && Worker.GetCurrentTimestamp() < deadline &&
+                PgBackgroundWorker.RunTransaction(() => Rpc.RemoteSlotActive(streamConn, sub.SlotName)))
+            {
+                _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(50));
+            }
+
+            Worf.StartReplication(streamConn, sub.SlotName, startLsn, "all", null, tablename, sub.ForceTextTransfer);
 
             // Leave it to standard apply code to do the replication.
-            Apply.ApplyWork(streamConn);
+            startLsn = Apply.ApplyWork(streamConn);
         }
 
         // We should only get here if we received sigTERM, which in case of sync worker is not expected.
@@ -1041,7 +1053,7 @@ internal static class Sync
     /// Get or create replication origin for a given slot.
     /// </summary>
     private static ushort EnsureReplicationOrigin(WorfSubscription sub)
-        => PgReplicationOrigin.Find(sub.SlotName) ?? WorfNode.CreateOrigin(sub.SlotName, sub.Origin.Id);
+        => PgReplicationOrigin.Find(sub.SlotName) ?? WorfNode.CreateOrigin(sub.SlotName, sub.Origin.Id, sub.Id);
 
     /// <summary>
     /// Transaction management for COPY.

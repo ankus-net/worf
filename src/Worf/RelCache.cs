@@ -23,6 +23,14 @@ internal static partial class RelCache
 #endif
 
     /// <summary>
+    /// Gets the schema and name of a remote relation, without opening the local relation it maps to.
+    /// </summary>
+    /// <param name="remoteid">The remote relation's id.</param>
+    /// <returns>The schema and the name, or nulls when the provider hasn't described the relation.</returns>
+    internal static (string? Nspname, string? Relname) RemoteName(uint remoteid)
+        => s_relationHash is not null && s_relationHash.TryGetValue(remoteid, out WorfRelation? entry) ? (entry.Nspname, entry.Relname) : (null, null);
+
+    /// <summary>
     /// Opens the local relation a remote relation maps to.
     /// </summary>
     /// <param name="remoteid">The remote relation's id.</param>

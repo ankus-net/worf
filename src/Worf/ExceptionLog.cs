@@ -53,13 +53,15 @@ internal static class ExceptionLog
         "VALUES ($1, $2, $3, $4::text::xid, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13, $14, $15, $16)";
 
     /// <summary>
-    /// Records a failed change, or the change that made a transaction fail. A failure to record is reported and
-    /// otherwise ignored.
+    /// Records a failed change, or the change that made a transaction fail.
     /// </summary>
     /// <param name="change">The change, and the transaction it belongs to.</param>
     /// <param name="behaviour">What apply did with it.</param>
     /// <param name="error">The error.</param>
-    internal static void Record(WorfFailedChange change, WorfExceptionBehaviour behaviour, PgException error)
+    /// <param name="isolated">Whether a failure to record is reported and otherwise ignored, which takes a
+    /// subtransaction of its own; otherwise it fails the transaction, as each change of a transaction skipped as a
+    /// whole is recorded without a subtransaction's xid each.</param>
+    internal static void Record(WorfFailedChange change, WorfExceptionBehaviour behaviour, PgException error, bool isolated = true)
     {
         (string? oldTuple, string? newTuple) = (null, null);
         (string? schemaName, string? tableName) = (change.Relation?.Nspname, change.Relation?.Relname);
@@ -80,30 +82,38 @@ internal static class ExceptionLog
             }
         }
 
+        void Insert() => _ = Spi.Execute(InsertSql,
+            SpiParameter.Create(change.Subscription.Id),
+            SpiParameter.Create(change.Subscription.Name),
+            SpiParameter.Create(change.WriterNodeId),
+            SpiParameter.Create(change.RemoteXid.ToString(CultureInfo.InvariantCulture)),
+            SpiParameter.Create(new PgTimestampTz(change.CommitTime)),
+            Worf.LsnParameter(change.CommitLsn),
+            SpiParameter.Create((int)change.ActionCounter),
+            SpiParameter.Create<string?>(change.Operation),
+            SpiParameter.Create<string?>(schemaName),
+            SpiParameter.Create<string?>(tableName),
+            SpiParameter.Create<string?>(oldTuple),
+            SpiParameter.Create<string?>(newTuple),
+            SpiParameter.Create<string?>(change.QueuedMessage),
+            SpiParameter.Create(behaviour switch
+            {
+                WorfExceptionBehaviour.Discard => "discard",
+                WorfExceptionBehaviour.Transdiscard => "transdiscard",
+                _ => "sub_disable",
+            }),
+            SpiParameter.Create(error.SqlState),
+            SpiParameter.Create(error.Message));
+
+        if (!isolated)
+        {
+            Insert();
+            return;
+        }
+
         try
         {
-            PgTransaction.RunInSubtransaction(() => _ = Spi.Execute(InsertSql,
-                SpiParameter.Create(change.Subscription.Id),
-                SpiParameter.Create(change.Subscription.Name),
-                SpiParameter.Create(change.WriterNodeId),
-                SpiParameter.Create(change.RemoteXid.ToString(CultureInfo.InvariantCulture)),
-                SpiParameter.Create(new PgTimestampTz(change.CommitTime)),
-                Worf.LsnParameter(change.CommitLsn),
-                SpiParameter.Create((int)change.ActionCounter),
-                SpiParameter.Create<string?>(change.Operation),
-                SpiParameter.Create<string?>(schemaName),
-                SpiParameter.Create<string?>(tableName),
-                SpiParameter.Create<string?>(oldTuple),
-                SpiParameter.Create<string?>(newTuple),
-                SpiParameter.Create<string?>(change.QueuedMessage),
-                SpiParameter.Create(behaviour switch
-                {
-                    WorfExceptionBehaviour.Discard => "discard",
-                    WorfExceptionBehaviour.Transdiscard => "transdiscard",
-                    _ => "sub_disable",
-                }),
-                SpiParameter.Create(error.SqlState),
-                SpiParameter.Create(error.Message)));
+            PgTransaction.RunInSubtransaction(Insert);
         }
         catch (PgException)
         {

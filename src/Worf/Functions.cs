@@ -1541,9 +1541,10 @@ internal static class Functions
 
     /// <summary>
     /// Generate slot name (used also for origin identifier). The current format is
-    /// <c>worf_&lt;subscriber database name&gt;_&lt;provider node name&gt;_&lt;subscription name&gt;</c>. Note that
-    /// we want to leave enough free space for 8 bytes of suffix which in practice means 9 bytes including the
-    /// underscore.
+    /// <c>worf_&lt;subscriber database name&gt;_&lt;provider node name&gt;_&lt;subscription name&gt;</c>, at most 54
+    /// bytes, which leaves room in a 63-byte name for a table sync's suffix of an underscore and 8 hex digits. The
+    /// <c>worf_</c> prefix is a byte longer than pglogical's <c>pgl_</c>, so the database's name takes 15 bytes at
+    /// most, rather than 16.
     /// </summary>
     /// <param name="dbname">The subscriber's database.</param>
     /// <param name="providerNode">The provider node's name.</param>
@@ -1552,15 +1553,11 @@ internal static class Functions
     internal static string GenSlotName(string dbname, string providerNode, string subscriptionName)
     {
         List<byte> name = [.. "worf_"u8];
-        name.AddRange(Worf.ShortenHash(Worf.ToServer(dbname), 16));
+        name.AddRange(Worf.ShortenHash(Worf.ToServer(dbname), 15));
         name.Add((byte)'_');
         name.AddRange(Worf.ShortenHash(Worf.ToServer(providerNode), 16));
         name.Add((byte)'_');
         name.AddRange(Worf.ShortenHash(Worf.ToServer(subscriptionName), 16));
-        if (name.Count > 63)
-        {
-            name.RemoveRange(63, name.Count - 63);
-        }
 
         // Replace all the invalid characters in slot name with underscore.
         char[] slot = new char[name.Count];
