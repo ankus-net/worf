@@ -28,9 +28,9 @@ Architectural details:
   physical streaming replication
 * One Provider may feed multiple Subscribers without incurring additional disk
   write overhead
-* One Subscriber can merge changes from several origins and detect conflict
-  between changes with automatic and configurable conflict resolution (some,
-  but not all aspects required for multi-master).
+* One subscriber can merge changes from several origins, and nodes can all
+  write to the same tables, with conflicts between their changes detected and
+  resolved automatically as configured.
 * Cascading replication is implemented in the form of changeset forwarding.
 
 ## Requirements
@@ -762,9 +762,14 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   publications and subscriptions stay on their node, including renaming them,
   changing their owners, commenting on them and granting on them, as do
   statements that use the session's temporary objects or prepared statements,
-  and what they create. A statement uses a temporary object when it names one,
-  runs a temporary function, or makes an object depend on one, as a column of a
-  temporary type or a default that calls a temporary function does. A `DROP` of
+  and what they create. A statement uses a temporary object when it opens a
+  temporary table, view or sequence; creates, changes, drops, comments on,
+  labels or grants on a temporary object; names any object with the temporary
+  schema, as `pg_temp` or by its own name; names a temporary type without a
+  schema in a cast written with `::`, `CAST` or `TREAT`; runs or inlines a
+  temporary function; or makes what it creates or changes depend on a temporary
+  object, as a column of a temporary type or a default that calls a temporary
+  function does. A `DROP` of
   temporary and other tables drops the others everywhere; temporary objects of
   other kinds, and worf itself, can only be dropped in a statement of their own.
   Other nodes run concurrent statements, such as `CREATE INDEX CONCURRENTLY`, in
@@ -799,12 +804,13 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   or a schema with `CASCADE`, adding a domain constraint, renaming an enum
   value, or changing a composite type. It covers a partitioned table's
   partitions, and every table with a column of a changed type, or of a
-  domain, array, range or composite type built on it. Detaching a partition
-  applies in any order. In a transaction block, any DDL that locks a table
-  against writes, such as `DROP INDEX` or `CREATE TRIGGER`, takes the lock for
-  it first, so later DDL there needn't wait. Before the DDL runs, each node
-  this node subscribes to that receives its DDL through `ddl_sql` holds back
-  writes to those tables it replicates, including writes through a
+  domain, array, range, composite type or table row type built on it.
+  Detaching a partition applies in any order. In a transaction block, any DDL
+  that locks a table against writes, such as `DROP INDEX` or `CREATE TRIGGER`,
+  takes the lock for it first, so later DDL there needn't wait. Before the DDL
+  runs, each node this node subscribes to that receives its DDL through
+  `ddl_sql` holds back writes to those tables it replicates, including writes
+  through a
   partitioned table, which fail with SQLSTATE `55P03`, and DDL on them, until
   the DDL has applied there. Every node applies the others' changes up to
   that point first. A node keeps holding back across a restart, and lets go
@@ -814,7 +820,9 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   the lock: the owner of the table, schema or type, a user with the `TRIGGER`
   privilege for `CREATE TRIGGER`, and for a `DROP`, the owner of the object's
   schema too. `CREATE UNIQUE INDEX CONCURRENTLY` holds the lock across the
-  transactions it commits. A transaction holds each node back through one
+  transactions it commits, until the last commits or the statement fails. An
+  index such a build leaves invalid when it fails stays on its node, as do
+  statements on it. A transaction holds each node back through one
   connection, whatever the `idle_session_timeout` of its role. The user in
   each provider connection string needs `USAGE` on schema `worf` and
   `EXECUTE` on `worf.fence_writes`, `worf.unfence_writes` and
@@ -989,9 +997,12 @@ before the DDL committed.
 `worf.replicate_ddl_command` doesn't take the global DDL lock: the DDL it
 queues applies on each node wherever it falls among that node's own writes.
 
-DDL that uses the session's temporary objects, such as a temporary function
-in `ALTER TABLE ... USING`, or a temporary type as a column's type, runs on
-its node alone, without a notice.
+DDL that uses the session's temporary objects, as
+`worf.enable_ddl_replication` describes, runs on its node alone, without a
+notice. A temporary type named without a schema before a string constant, as
+in `tmp_type '1'`, in an expression the statement doesn't keep, such as in
+`ALTER TABLE ... USING`, isn't noticed, and the statement replicates; qualify
+the type with `pg_temp`, or write the cast with `::`.
 
 ### Schema changes without the global DDL lock
 

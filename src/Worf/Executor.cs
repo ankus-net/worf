@@ -295,6 +295,7 @@ internal static unsafe partial class Executor
 
         uint xactFlags = DdlReplication.BeginStatement(ddl is not null);
         bool usedTemp;
+        bool ran = false;
         try
         {
             if (!s_nextProcessUtilityHook.IsNull)
@@ -305,19 +306,29 @@ internal static unsafe partial class Executor
             {
                 NativeMethods.standard_ProcessUtility(pstmt, queryString, readOnlyTree, context, @params, queryEnv, dest, qc);
             }
+
+            ran = true;
         }
         finally
         {
             usedTemp = DdlReplication.EndStatement(xactFlags, ddl is not null);
+
+            // A statement that failed after committing on its way lets the other nodes know its DDL won't come.
+            if (!ran)
+            {
+                DdlLock.EndStatement(false);
+            }
         }
 
         // A DROP leaves out its temporary objects itself, and any other statement that used one stays on this node.
-        bool usedTemporary = usedTemp || (ddl is not null && DdlReplication.UsedTemporaryObjects(parsetree));
+        bool usedTemporary = usedTemp || (ddl is not null && TemporaryObjectUse.UsedBy(parsetree, ddl));
         bool local = sessionLocal || (usedTemporary && parsetree->type != NodeTag.T_DropStmt);
         if (ddl is not null && !local)
         {
             DdlReplication.QueueDdl(ddl);
         }
+
+        DdlLock.EndStatement(ddl is not null && !local);
 
         if (!local)
         {
@@ -342,7 +353,7 @@ internal static unsafe partial class Executor
             s_nextObjectAccessHook.Invoke(access, classId, objectId, subId, arg);
         }
 
-        DdlReplication.NoteObjectAccess(access, classId, objectId, subId);
+        TemporaryObjectUse.NoteObjectAccess(access, classId, objectId, subId);
 
         if (access == ObjectAccessType.OAT_DROP)
         {
@@ -432,7 +443,7 @@ internal static unsafe partial class Executor
     /// </summary>
     private static bool WorfNeedsFmgrHook(uint fnOid)
     {
-        DdlReplication.NoteFunctionUse(fnOid);
+        TemporaryObjectUse.NoteFunctionUse(fnOid);
         return !s_nextNeedsFmgrHook.IsNull && s_nextNeedsFmgrHook.Invoke(fnOid);
     }
 
