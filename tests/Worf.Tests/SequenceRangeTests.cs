@@ -662,10 +662,20 @@ public sealed class SequenceRangeTests
             $"SELECT state = 'active' AND active_lo > {granted} FROM worf.sequence_ranges", token), "node_b drawing from a block granted after the rollback");
         await InsertAsync(nodeB, 50, token);
 
-        // node_a, which only answers node_b's calls, is copied, grants node_b more, and goes back to the copy.
+        // node_a, which only answers node_b's calls, is copied, grants node_b more, and goes back to the copy. node_b
+        // may draw hundreds of values from the blocks it already holds, so it inserts until node_a grants it one.
         string copyA = Path.Join(copies.FullName, "node_a");
         await CopyDataAsync(nodeA, copyA, token);
-        await InsertAsync(nodeB, 300, token);
+        string copied = await nodeA.SafePsqlAsync(Database, "SELECT max(hi) FROM worf.sequence_range_grant WHERE grantee_name = 'node_b'", token);
+        bool grantedAfterCopy = false;
+        for (int i = 0; i < 30 && !grantedAfterCopy; i++)
+        {
+            await InsertAsync(nodeB, 100, token);
+            grantedAfterCopy = await nodeA.SafePsqlAsync(Database,
+                $"SELECT max(hi) > {copied} FROM worf.sequence_range_grant WHERE grantee_name = 'node_b'", token) == "t";
+        }
+
+        Assert.IsTrue(grantedAfterCopy, "node_a granting node_b a block after the copy");
         int logpos = nodeA.ReadLog().Length;
         await RestoreDataAsync(nodeA, copyA, token);
         Assert.IsTrue(await nodeA.PollLogAsync(logpos, "this allocator reset", token), "node_a fenced its root");
