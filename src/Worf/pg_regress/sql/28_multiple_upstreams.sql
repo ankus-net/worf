@@ -70,6 +70,17 @@ SELECT * from multi_ups_tbl ORDER BY id;
 
 -- Make sure we see the slot and active connection
 \c :provider1_dsn
+-- Wait for every slot to be held by its walsender: a table sync's slot goes, and the apply's walsender comes back,
+-- a moment after the subscription reports it.
+DO $$
+BEGIN
+    FOR i IN 1..300 LOOP
+        IF (SELECT bool_and(active) AND count(*) = (SELECT count(*) FROM pg_stat_replication) FROM pg_replication_slots) THEN
+            EXIT;
+        END IF;
+        PERFORM pg_sleep(0.1);
+    END LOOP;
+END;$$;
 SELECT plugin, slot_type, active FROM pg_replication_slots;
 SELECT count(*) FROM pg_stat_replication;
 
@@ -90,5 +101,16 @@ SELECT * FROM worf.drop_subscription('test_subscription1');
 
 \c :provider1_dsn
 SELECT * FROM worf.drop_node(node_name := 'test_provider1');
+-- Wait for every slot to be held by its walsender: a table sync's slot goes, and the apply's walsender comes back,
+-- a moment after the subscription reports it.
+DO $$
+BEGIN
+    FOR i IN 1..300 LOOP
+        IF (SELECT bool_and(active) AND count(*) = (SELECT count(*) FROM pg_stat_replication) FROM pg_replication_slots) THEN
+            EXIT;
+        END IF;
+        PERFORM pg_sleep(0.1);
+    END LOOP;
+END;$$;
 SELECT plugin, slot_type, active FROM pg_replication_slots;
 SELECT count(*) FROM pg_stat_replication;

@@ -423,7 +423,9 @@ internal static class Functions
 
             // Wait for the apply to die. It looks for the request to stop between statements, so an apply that waits on
             // a row this transaction deleted, as one that is initializing the subscription does, never sees it until
-            // its statement is cancelled. A cancellation is no error of the data, so exception_behaviour leaves it be.
+            // its statement is cancelled. Only an apply this transaction blocks is cancelled: it can't exit before this
+            // transaction ends, so it's still there to cancel. A cancellation is no error of the data, so
+            // exception_behaviour leaves it be.
             for (int waits = 0; ; waits++)
             {
                 int pid = 0;
@@ -446,7 +448,9 @@ internal static class Functions
 
                 if (waits > 0)
                 {
-                    _ = Elevated.Run(() => Spi.ExecuteScalar<bool>("SELECT pg_catalog.pg_cancel_backend($1)", SpiParameter.Create(pid)));
+                    _ = Elevated.Run(() => Spi.Execute(
+                        "SELECT pg_catalog.pg_cancel_backend($1) WHERE pg_catalog.pg_backend_pid() = ANY (pg_catalog.pg_blocking_pids($1))",
+                        SpiParameter.Create(pid)));
                 }
 
                 PgInterrupts.Check();

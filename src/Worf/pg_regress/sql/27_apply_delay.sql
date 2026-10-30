@@ -37,6 +37,17 @@ SELECT status FROM worf.show_subscription_status() WHERE subscription_name = 'te
 
 -- Make sure we see the slot and active connection
 \c :provider_dsn
+-- Wait for every slot to be held by its walsender: a table sync's slot goes, and the apply's walsender comes back,
+-- a moment after the subscription reports it.
+DO $$
+BEGIN
+    FOR i IN 1..300 LOOP
+        IF (SELECT bool_and(active) AND count(*) = (SELECT count(*) FROM pg_stat_replication) FROM pg_replication_slots) THEN
+            EXIT;
+        END IF;
+        PERFORM pg_sleep(0.1);
+    END LOOP;
+END;$$;
 SELECT plugin, slot_type, database, active FROM pg_replication_slots;
 SELECT count(*) FROM pg_stat_replication;
 
