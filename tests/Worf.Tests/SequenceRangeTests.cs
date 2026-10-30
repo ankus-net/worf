@@ -313,8 +313,10 @@ public sealed class SequenceRangeTests
         Assert.IsTrue(await nodeA.PollLogAsync(logpos, "the allocator's fence lifted", token), "node_a's fence lifted");
         Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges", token), "node_a drawing again");
 
+        // node_b's blocks are read first: node_a, drawing again, may grant it another between the reads.
+        string[] blocks = (await nodeB.SafePsqlAsync(Database, "SELECT lo, hi FROM worf.sequence_range_block", token)).Split('\n');
         string[] grants = (await nodeA.SafePsqlAsync(Database, "SELECT lo, hi FROM worf.sequence_range_grant WHERE grantee_name = 'node_b'", token)).Split('\n');
-        foreach (string block in (await nodeB.SafePsqlAsync(Database, "SELECT lo, hi FROM worf.sequence_range_block", token)).Split('\n'))
+        foreach (string block in blocks)
         {
             Assert.Contains(block, grants, "node_b's block back in node_a's ledger");
         }
