@@ -53,6 +53,12 @@ internal static unsafe partial class DdlLock
 
     private const string LockNotAvailable = "55P03";
 
+    // ExclusiveLock from storage/lockdefs.h, and LOCKTAG_ADVISORY from storage/lock.h, which shows in pg_locks as an
+    // advisory lock, taken with DEFAULT_LOCKMETHOD, whose session locks PostgreSQL lets go of when a transaction aborts.
+    private const int ExclusiveLock = 7;
+    private const byte LockTagAdvisory = 10;
+    private const byte DefaultLockMethod = 1;
+
     private const uint LsnOid = 3220;
 
     // How long a kept fence's DDL may take to arrive before apply asks its origin whether it ever will.
@@ -69,9 +75,13 @@ internal static unsafe partial class DdlLock
     // The fences of the DDL this transaction queued, which the other nodes keep until it applies there.
     private static readonly HashSet<ulong> s_queuedFences = [];
 
-    // Whether a statement that commits on its way, such as CREATE INDEX CONCURRENTLY, holds its fences through its
-    // commits on their connections, until the transaction that queues its DDL keeps them, or the statement fails.
-    private static bool s_statementHeld;
+    // The fence of a statement that commits on its way, such as CREATE INDEX CONCURRENTLY, which the other nodes keep
+    // from its first commit, so that a lost connection doesn't let it go while the statement builds, and which names a
+    // lock the statement holds, for the other nodes to ask about, until the transaction that queues its DDL ends; or
+    // zero. Every transaction the statement commits or aborts is seen by a callback of its own, registered once, since
+    // the statement's commits end the callbacks registered for a transaction.
+    private static ulong s_statementLock;
+    private static bool s_statementCallbackRegistered;
 
     // The tables this transaction fenced, which later DDL in it needs no new fence for.
     private static readonly HashSet<uint> s_transactionTables = [];
@@ -124,6 +134,9 @@ internal static unsafe partial class DdlLock
 
     // Whether any fence is held, read without the lock before every write.
     private static PgAtomic<int> FenceCount { get; } = new("worf_fence_count");
+
+    [PgNativeCallback(nameof(StatementTransactionEnded))]
+    private static partial XactCallback StatementTransactionCallback { get; }
 
     /// <summary>
     /// Sets up the fences' shared memory.
@@ -216,9 +229,9 @@ internal static unsafe partial class DdlLock
     }
 
     /// <summary>
-    /// Lets go of a fence this session asked for and hasn't kept, as when the savepoint of the DDL it was for rolls back.
-    /// A procedure, since the node that asked calls it as the savepoint rolls back, when only commands without rows
-    /// can run.
+    /// Lets go of a fence this session asked for and hasn't kept, as when the savepoint of the DDL it was for rolls back,
+    /// or one kept for a statement that commits on its way and then failed. A procedure, since the node that asked
+    /// calls it as the savepoint or the statement's transaction rolls back, when only commands without rows can run.
     /// </summary>
     [PgFunction(Sql = """
         CREATE PROCEDURE worf.unfence_writes(fence_id bigint)
@@ -230,6 +243,13 @@ internal static unsafe partial class DdlLock
         ulong id = unchecked((ulong)fenceId);
         uint dboid = DatabaseId();
         _ = Release(fence => fence.Id == id && fence.Dboid == dboid && fence.HolderPid == Environment.ProcessId);
+
+        // A kept fence goes once its rows have.
+        if (Elevated.Run(() => Worf.ReadScalar<bool>("SELECT EXISTS (SELECT FROM worf.fence WHERE fence_id = $1)", SpiParameter.Create(fenceId))))
+        {
+            Elevated.Run(() => _ = Spi.Execute("DELETE FROM worf.fence WHERE fence_id = $1", SpiParameter.Create(fenceId)));
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, () => _ = Release(fence => fence.Id == id && fence.Dboid == dboid));
+        }
     }
 
     /// <summary>
@@ -531,9 +551,16 @@ internal static unsafe partial class DdlLock
                     long fenceId = kept[i].Get<long>(0);
 
                     // A transaction the origin hasn't reached never ran there, as on an origin restored to an earlier
-                    // point, and one too old for the origin to know of finished long ago.
+                    // point, and one too old for the origin to know of finished long ago. A statement that commits on
+                    // its way holds a lock named for its fence until the transaction that queues its DDL ends.
+                    ulong key = unchecked((ulong)fenceId);
                     string?[] row = conn.Query($"""
-                        SELECT CASE WHEN x >= pg_catalog.pg_snapshot_xmax(pg_catalog.pg_current_snapshot()) THEN 'aborted'
+                        SELECT CASE WHEN EXISTS (SELECT FROM pg_catalog.pg_locks l JOIN pg_catalog.pg_database d ON d.oid = l.database
+                                WHERE l.locktype = 'advisory' AND d.datname = pg_catalog.current_database() AND l.objsubid = 1
+                                    AND l.classid = {(key >> 32).ToString(CultureInfo.InvariantCulture)}
+                                    AND l.objid = {(key & uint.MaxValue).ToString(CultureInfo.InvariantCulture)})
+                            THEN 'in progress'
+                            WHEN x >= pg_catalog.pg_snapshot_xmax(pg_catalog.pg_current_snapshot()) THEN 'aborted'
                             ELSE pg_catalog.pg_xact_status(x) END, pg_catalog.pg_current_wal_insert_lsn()
                         FROM (SELECT '{kept[i].Get<long>(1).ToString(CultureInfo.InvariantCulture)}'::pg_catalog.xid8 AS x) AS fence
                         """, 2)[0];
@@ -1473,34 +1500,23 @@ internal static unsafe partial class DdlLock
     }
 
     /// <summary>
-    /// Ends a statement's hold of its fences through its commits, if it committed on its way: the transaction that
-    /// queued its DDL keeps them as it commits, and a statement that failed, or ran without queuing its DDL, lets them
-    /// go now.
+    /// Ends a statement that committed on its way, once it has run: the transaction that queued its DDL lets the
+    /// statement's lock go as it commits, and the other nodes its fence once the DDL applies there, while a statement
+    /// that ran without queuing its DDL lets its fence go now.
     /// </summary>
     /// <param name="queued">Whether the statement queued its DDL.</param>
     internal static void EndStatement(bool queued)
     {
-        if (!s_statementHeld)
+        if (s_statementLock != 0 && !queued)
         {
-            return;
-        }
-
-        s_statementHeld = false;
-        if (queued)
-        {
-            RegisterCallbacks();
-        }
-        else
-        {
-            CloseHeldFences();
+            EndStatementHold(false, true);
         }
     }
 
     /// <summary>
     /// Keeps the fences of the DDL the transaction queued, under the transaction that queued it, which the other nodes
     /// ask about if the DDL doesn't arrive. The other fences go with their connections. A statement that commits on
-    /// its way, such as CREATE INDEX CONCURRENTLY, holds its fences through its commits on their connections, which
-    /// outlast them, until the transaction that queues its DDL keeps them.
+    /// its way, such as CREATE INDEX CONCURRENTLY, keeps its fence at its first commit instead.
     /// </summary>
     private static void KeepHeldFences()
     {
@@ -1511,12 +1527,28 @@ internal static unsafe partial class DdlLock
 
         if (DdlReplication.Running && s_statementFence is not null)
         {
-            s_statementHeld = true;
+            if (s_statementLock == 0)
+            {
+                KeepStatementFence(s_statementFence.Value.Id);
+            }
+
             return;
         }
 
-        List<(ulong Id, uint NodeId)> kept = [.. s_heldFences
+        Keep([.. s_heldFences
             .Where(fence => s_queuedFences.Contains(fence.Id))
+            .Select(fence => (fence.Id, fence.NodeId))
+            .Distinct()]);
+    }
+
+    /// <summary>
+    /// Keeps the fence of a statement that commits on its way, at its first commit, on each node that holds it, and
+    /// takes the lock named for it, which PostgreSQL lets go of if a transaction of the statement aborts.
+    /// </summary>
+    private static void KeepStatementFence(ulong fenceId)
+    {
+        List<(ulong Id, uint NodeId)> kept = [.. s_heldFences
+            .Where(fence => fence.Id == fenceId)
             .Select(fence => (fence.Id, fence.NodeId))
             .Distinct()];
         if (kept.Count == 0)
@@ -1524,40 +1556,146 @@ internal static unsafe partial class DdlLock
             return;
         }
 
+        if (!s_statementCallbackRegistered)
+        {
+            NativeMethods.RegisterXactCallback(StatementTransactionCallback, null);
+            s_statementCallbackRegistered = true;
+        }
+
+        LOCKTAG tag = StatementLockTag(fenceId);
+        _ = NativeMethods.LockAcquire(&tag, ExclusiveLock, true, false);
+        s_statementLock = fenceId;
+        Keep(kept);
+    }
+
+    /// <summary>
+    /// Keeps fences on the nodes that hold them, under this transaction.
+    /// </summary>
+    private static void Keep(List<(ulong Id, uint NodeId)> fences)
+    {
+        if (fences.Count == 0)
+        {
+            return;
+        }
+
         string nodeId = WorfNode.GetLocalNode(false, false)!.Node.Id.ToString(CultureInfo.InvariantCulture);
         string xid = Spi.ExecuteScalar<long>("SELECT pg_catalog.txid_current()").ToString(CultureInfo.InvariantCulture);
-        foreach ((ulong fenceId, uint node) in kept)
+        foreach ((ulong fenceId, uint node) in fences)
         {
-            _ = s_fenceConnections[node].Query($"SELECT worf.keep_fence({unchecked((long)fenceId).ToString(CultureInfo.InvariantCulture)}, {nodeId}, {xid})", 1);
+            try
+            {
+                _ = s_fenceConnections[node].Query($"SELECT worf.keep_fence({unchecked((long)fenceId).ToString(CultureInfo.InvariantCulture)}, {nodeId}, {xid})", 1);
+            }
+            catch (Exception error) when (error is PgException or PgRemoteException)
+            {
+                throw new PgException(LockNotAvailable,
+                    $"lost the hold on node {node}'s writes for this transaction's DDL: {error.Message.Split('\n')[0]}");
+            }
         }
     }
 
-    private static void CloseHeldFences()
+    /// <summary>
+    /// Sees each transaction of a statement that commits on its way end: once one aborts, the statement lets its fence
+    /// go, and once the transaction that queued its DDL commits, its lock.
+    /// </summary>
+    private static void StatementTransactionEnded(XactEvent xactEvent, void* arg)
     {
-        // The other nodes drop a fence whose session ends before it's kept. A statement that commits on its way holds
-        // its fences through its commits, and still queues its DDL with its fence.
-        if (!s_statementHeld)
+        if (s_statementLock == 0)
+        {
+            return;
+        }
+
+        if (xactEvent == XactEvent.XACT_EVENT_ABORT)
+        {
+            EndStatementHold(true, true);
+        }
+        else if (xactEvent == XactEvent.XACT_EVENT_COMMIT && !DdlReplication.Running)
+        {
+            EndStatementHold(false, false);
+        }
+    }
+
+    /// <summary>
+    /// Ends the hold of a statement that committed on its way: lets its lock go, unless its transaction aborted, which
+    /// let it go, and its fence on the other nodes, unless its DDL was queued, and closes its connections. A node that
+    /// can't be told lets the fence go once it finds the lock gone.
+    /// </summary>
+    private static void EndStatementHold(bool aborted, bool unfence)
+    {
+        ulong fenceId = s_statementLock;
+        s_statementLock = 0;
+        if (!aborted)
+        {
+            LOCKTAG tag = StatementLockTag(fenceId);
+            _ = NativeMethods.LockRelease(&tag, ExclusiveLock, true);
+        }
+
+        if (unfence)
         {
             foreach (PgReplicationConnection conn in s_fenceConnections.Values)
             {
-                Close(conn);
+                try
+                {
+                    conn.Execute($"CALL worf.unfence_writes({unchecked((long)fenceId).ToString(CultureInfo.InvariantCulture)})");
+                }
+                catch (Exception error) when (error is PgException or PgRemoteException)
+                {
+                    PgLog.Debug1($"could not let go of fence {fenceId}: {error.Message}");
+                }
             }
+        }
 
-            s_fenceConnections.Clear();
-            s_heldFences.Clear();
-            s_lostNodes.Clear();
-            s_queuedFences.Clear();
-            s_transactionTables.Clear();
-            if (!DdlReplication.Running)
-            {
-                s_statementFence = null;
-            }
+        CloseConnections();
+    }
+
+    /// <summary>
+    /// Names the lock of a statement's fence, as <c>pg_advisory_lock</c> names one for a bigint key, which shows in
+    /// <c>pg_locks</c> with the key's halves as its class and object.
+    /// </summary>
+    private static LOCKTAG StatementLockTag(ulong fenceId) => new()
+    {
+        locktag_field1 = DatabaseId(),
+        locktag_field2 = (uint)(fenceId >> 32),
+        locktag_field3 = (uint)fenceId,
+        locktag_field4 = 1,
+        locktag_type = LockTagAdvisory,
+        locktag_lockmethodid = DefaultLockMethod,
+    };
+
+    private static void CloseHeldFences()
+    {
+        // A statement that commits on its way keeps its connections through its commits, and still queues its DDL with
+        // its fence.
+        if (s_statementLock == 0)
+        {
+            CloseConnections();
         }
 
         s_subtransactionAbort?.Dispose();
         s_subtransactionCommit?.Dispose();
         s_subtransactionAbort = null;
         s_subtransactionCommit = null;
+    }
+
+    /// <summary>
+    /// Closes the connections that hold this transaction's fences, which the other nodes drop unless they're kept.
+    /// </summary>
+    private static void CloseConnections()
+    {
+        foreach (PgReplicationConnection conn in s_fenceConnections.Values)
+        {
+            Close(conn);
+        }
+
+        s_fenceConnections.Clear();
+        s_heldFences.Clear();
+        s_lostNodes.Clear();
+        s_queuedFences.Clear();
+        s_transactionTables.Clear();
+        if (!DdlReplication.Running)
+        {
+            s_statementFence = null;
+        }
     }
 
     private static void Close(PgReplicationConnection conn)

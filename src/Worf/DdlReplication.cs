@@ -117,9 +117,7 @@ internal static unsafe partial class DdlReplication
             NodeTag.T_AlterExtensionContentsStmt => !IsWorf(((AlterExtensionContentsStmt*)parsetree)->extname),
             NodeTag.T_DropStmt => true,
 
-            // Temporary objects are the session's, and worf's own the node's. Finishing a concurrent detach is the
-            // node's own too, since the others detached the partition at once.
-            NodeTag.T_AlterTableStmt when FinishesDetach((AlterTableStmt*)parsetree) => false,
+            // Temporary objects are the session's, and worf's own the node's.
             _ => !TargetsLocal(parsetree),
         };
 
@@ -450,6 +448,19 @@ internal static unsafe partial class DdlReplication
                 return StaysLocal(((AlterObjectSchemaStmt*)parsetree)->relation);
             case NodeTag.T_AlterOwnerStmt:
                 return StaysLocal(((AlterOwnerStmt*)parsetree)->relation);
+            case NodeTag.T_AlterObjectDependsStmt:
+                return StaysLocal(((AlterObjectDependsStmt*)parsetree)->relation);
+            case NodeTag.T_CommentStmt:
+                CommentStmt* comment = (CommentStmt*)parsetree;
+                List* names = (List*)comment->@object;
+                return comment->objtype switch
+                {
+                    ObjectType.OBJECT_INDEX or ObjectType.OBJECT_TABLE or ObjectType.OBJECT_VIEW or ObjectType.OBJECT_MATVIEW or
+                        ObjectType.OBJECT_SEQUENCE or ObjectType.OBJECT_FOREIGN_TABLE => StaysLocal(NativeMethods.makeRangeVarFromNameList(names)),
+                    ObjectType.OBJECT_COLUMN => names->length > 1 &&
+                        StaysLocal(NativeMethods.makeRangeVarFromNameList(NativeMethods.list_truncate(NativeMethods.list_copy(names), names->length - 1))),
+                    _ => false,
+                };
             case NodeTag.T_GrantStmt:
                 GrantStmt* grant = (GrantStmt*)parsetree;
                 List* objects = grant->objects;
@@ -560,6 +571,57 @@ internal static unsafe partial class DdlReplication
     }
 
     /// <summary>
+    /// Fails a REINDEX that would make valid an index left invalid here, which only a concurrent build or reindex that
+    /// failed here leaves, while DDL replicates: the other nodes don't have the index, so DDL on it stays on this node.
+    /// A concurrent REINDEX of a table, schema or database leaves out invalid indexes itself.
+    /// </summary>
+    /// <param name="parsetree">The statement about to run.</param>
+    internal static void CheckReindex(Node* parsetree)
+    {
+        if (parsetree->type != NodeTag.T_ReindexStmt || !EnableDdlReplication || Suppressed ||
+            NativeGlobals.SessionReplicationRole == SessionReplicationRoleReplica || Restoring())
+        {
+            return;
+        }
+
+        ReindexStmt* stmt = (ReindexStmt*)parsetree;
+        bool concurrently = false;
+        for (int i = 0; stmt->@params is not null && i < stmt->@params->length; i++)
+        {
+            DefElem* option = (DefElem*)stmt->@params->elements[i].ptr_value;
+            concurrently |= Worf.FromServer(option->defname) == "concurrently" && NativeMethods.defGetBoolean(option);
+        }
+
+        (string? scope, uint target) = stmt->kind switch
+        {
+            ReindexObjectType.REINDEX_OBJECT_INDEX => ("index", NativeMethods.RangeVarGetRelidExtended(stmt->relation, 0, RangeVarMissingOk, default, null)),
+            ReindexObjectType.REINDEX_OBJECT_TABLE when !concurrently =>
+                ("table", NativeMethods.RangeVarGetRelidExtended(stmt->relation, 0, RangeVarMissingOk, default, null)),
+            ReindexObjectType.REINDEX_OBJECT_SCHEMA when !concurrently => ("schema", NativeMethods.get_namespace_oid(stmt->name, true)),
+            ReindexObjectType.REINDEX_OBJECT_DATABASE when !concurrently => ("database", 0u),
+            _ => (null, 0u),
+        };
+        if (scope is null || (target == 0 && scope != "database") || !WithSnapshot(() => WorfNode.GetLocalNode(false, true) is not null))
+        {
+            return;
+        }
+
+        string? index = Worf.ReadScalar<string?>("""
+            SELECT c.relname::text FROM pg_catalog.pg_index i
+                JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid JOIN pg_catalog.pg_class t ON t.oid = i.indrelid
+            WHERE NOT i.indisvalid AND c.relkind = 'i' AND c.relpersistence <> 't'
+                AND t.relnamespace NOT IN ($3, 'pg_catalog'::pg_catalog.regnamespace, 'pg_toast'::pg_catalog.regnamespace)
+                AND CASE $1 WHEN 'index' THEN i.indexrelid = $2 WHEN 'table' THEN i.indrelid = $2 WHEN 'schema' THEN t.relnamespace = $2 ELSE true END
+            LIMIT 1
+            """, SpiParameter.Create(scope), SpiParameter.Create(target), SpiParameter.Create(WorfNamespace()));
+        if (index is not null)
+        {
+            throw new PgException("55000", $"index \"{index}\" is invalid on this node alone, so it can't be rebuilt while worf.enable_ddl_replication is on",
+                hint: "Drop it, and create it again to build it on every node.");
+        }
+    }
+
+    /// <summary>
     /// Checks whether CREATE TABLE AS runs a prepared statement, which parse analysis wraps in a utility query.
     /// </summary>
     private static bool ExecutesPrepared(CreateTableAsStmt* stmt)
@@ -569,11 +631,6 @@ internal static unsafe partial class DdlReplication
             (query->type == NodeTag.T_Query && ((Query*)query)->commandType == CmdType.CMD_UTILITY &&
                 ((Query*)query)->utilityStmt is not null && ((Query*)query)->utilityStmt->type == NodeTag.T_ExecuteStmt));
     }
-
-    /// <summary>
-    /// Checks whether ALTER TABLE finishes a concurrent detach.
-    /// </summary>
-    private static bool FinishesDetach(AlterTableStmt* stmt) => HasCommand(stmt, AlterTableType.AT_DetachPartitionFinalize);
 
     /// <summary>
     /// Checks whether a name in a statement's list of names, a String node, is a given name.

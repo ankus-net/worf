@@ -276,6 +276,7 @@ internal static unsafe partial class Executor
         }
 
         SequenceRanges.CheckDdl(parsetree);
+        DdlReplication.CheckReindex(parsetree);
         if (SequenceRanges.SkipsDumpedGuard(parsetree))
         {
             return;
@@ -293,9 +294,9 @@ internal static unsafe partial class Executor
             });
         }
 
+        // A statement that commits on its way, and then fails, lets its fence go as its transaction aborts.
         uint xactFlags = DdlReplication.BeginStatement(ddl is not null);
         bool usedTemp;
-        bool ran = false;
         try
         {
             if (!s_nextProcessUtilityHook.IsNull)
@@ -306,18 +307,10 @@ internal static unsafe partial class Executor
             {
                 NativeMethods.standard_ProcessUtility(pstmt, queryString, readOnlyTree, context, @params, queryEnv, dest, qc);
             }
-
-            ran = true;
         }
         finally
         {
             usedTemp = DdlReplication.EndStatement(xactFlags, ddl is not null);
-
-            // A statement that failed after committing on its way lets the other nodes know its DDL won't come.
-            if (!ran)
-            {
-                DdlLock.EndStatement(false);
-            }
         }
 
         // A DROP leaves out its temporary objects itself, and any other statement that used one stays on this node.

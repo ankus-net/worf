@@ -1,3 +1,5 @@
+using System.Globalization;
+using System.Text;
 using Ankus.Postgres;
 
 namespace Worf;
@@ -161,17 +163,22 @@ internal static unsafe class TemporaryObjectUse
 
     /// <summary>
     /// Scans a statement with PostgreSQL's own lexer, as the parser read it, for a name qualified with the session's
-    /// temporary schema, by its pg_temp alias or its own name, and for a type named without a schema in a cast,
-    /// written with <c>::</c>, <c>CAST</c> or <c>TREAT</c>, that is temporary, as PostgreSQL looks types up in the
-    /// temporary schema first. Names of tables and of the types of what the statement stores are found otherwise.
+    /// temporary schema, by its pg_temp alias or its own name, for a type named without a schema in a cast, written
+    /// with <c>::</c>, <c>CAST</c> or <c>TREAT</c>, that is temporary, as PostgreSQL looks types up in the temporary
+    /// schema first, and for a column's type taken with <c>%TYPE</c> from a temporary table. Names of tables and of
+    /// the types of what the statement stores are found otherwise.
     /// </summary>
     private static bool NamesTemporaryObjects(string command, string schema)
     {
-        int identifier = Lex("x", -1)[0].Token;
-        int typecast = Lex("::", -1)[0].Token;
-        List<(int Token, string? Text)> tokens = Lex(command, identifier);
-        bool IsName(int i) => i < tokens.Count && tokens[i].Text is not null;
-        bool Qualifies(int i) => i < tokens.Count && tokens[i].Token == '.';
+        List<(int Token, string? Text)> samples = Lex("x U&\"x\" 'x' ::", []);
+        int identifier = samples[0].Token;
+        int unicodeIdentifier = samples[1].Token;
+        int stringConstant = samples[2].Token;
+        int typecast = samples[3].Token;
+        List<(int Token, string? Text)> tokens = Names(Lex(command, [identifier, unicodeIdentifier, stringConstant]), identifier, unicodeIdentifier,
+            stringConstant);
+        bool IsName(int i) => i >= 0 && i < tokens.Count && tokens[i].Text is not null;
+        bool Qualifies(int i) => i >= 0 && i < tokens.Count && tokens[i].Token == '.';
 
         Stack<int> casts = [];
         int depth = 0;
@@ -187,6 +194,21 @@ internal static unsafe class TemporaryObjectUse
             if (castsTo && IsName(i + 1) && !Qualifies(i + 2) && IsTemporaryType(tokens[i + 1].Text!))
             {
                 return true;
+            }
+
+            // A column's type taken from a table, as a function's argument's tt.v%TYPE, leaves no dependency on it.
+            if (token == '%' && i + 1 < tokens.Count && tokens[i + 1] is (KeywordToken, "type") && IsName(i - 1))
+            {
+                List<string> names = [tokens[i - 1].Text!];
+                for (int j = i - 2; Qualifies(j) && IsName(j - 1); j -= 2)
+                {
+                    names.Insert(0, tokens[j - 1].Text!);
+                }
+
+                if (names.Count > 1 && IsTemporaryTable(names[..^1]))
+                {
+                    return true;
+                }
             }
 
             if (token == KeywordToken && text is "cast" or "treat" && i + 1 < tokens.Count && tokens[i + 1].Token == '(')
@@ -212,10 +234,10 @@ internal static unsafe class TemporaryObjectUse
     }
 
     /// <summary>
-    /// Splits text into PostgreSQL's tokens, with the text of each keyword and identifier, and every keyword as one
-    /// token.
+    /// Splits text into PostgreSQL's tokens, with the text of each keyword and of each token of the given kinds, and
+    /// every keyword as one token.
     /// </summary>
-    private static List<(int Token, string? Text)> Lex(string text, int identifier)
+    private static List<(int Token, string? Text)> Lex(string text, int[] named)
     {
         ScanKeywordList* keywords = NativeGlobals.DangerousAddressOf_ScanKeywords();
         ushort[] keywordTokens = new ushort[keywords->num_keywords];
@@ -238,7 +260,7 @@ internal static unsafe class TemporaryObjectUse
                     token = NativeMethods.core_yylex(&value, &location, scanner))
                 {
                     tokens.Add((token, token == KeywordToken ? Worf.FromServer(value.keyword)
-                        : token == identifier ? Worf.FromServer(value.str)
+                        : Array.IndexOf(named, token) >= 0 ? Worf.FromServer(value.str)
                         : null));
                 }
             }
@@ -250,6 +272,77 @@ internal static unsafe class TemporaryObjectUse
 
         return tokens;
     }
+
+    /// <summary>
+    /// Gives each identifier written with Unicode escapes, <c>U&amp;"..."</c>, its name, as the parser does with the
+    /// escape character that <c>UESCAPE</c> after it sets, and leaves string constants without text.
+    /// </summary>
+    private static List<(int Token, string? Text)> Names(List<(int Token, string? Text)> tokens, int identifier, int unicodeIdentifier,
+        int stringConstant)
+    {
+        List<(int Token, string? Text)> names = [];
+        for (int i = 0; i < tokens.Count; i++)
+        {
+            if (tokens[i].Token == unicodeIdentifier)
+            {
+                string text = tokens[i].Text!;
+                char escape = '\\';
+                if (i + 2 < tokens.Count && tokens[i + 1] is (KeywordToken, "uescape") && tokens[i + 2].Token == stringConstant &&
+                    tokens[i + 2].Text is { Length: 1 } escapeText)
+                {
+                    escape = escapeText[0];
+                    i += 2;
+                }
+
+                names.Add((identifier, Unescape(text, escape)));
+            }
+            else
+            {
+                names.Add(tokens[i].Token == stringConstant ? (stringConstant, null) : tokens[i]);
+            }
+        }
+
+        return names;
+    }
+
+    /// <summary>
+    /// Replaces the Unicode escapes in an identifier, the escape character followed by four hexadecimal digits, or by
+    /// <c>+</c> and six, with what they stand for, and a doubled escape character with one.
+    /// </summary>
+    private static string Unescape(string text, char escape)
+    {
+        StringBuilder name = new();
+        for (int i = 0; i < text.Length; i++)
+        {
+            int digits = text[i] != escape || i + 1 >= text.Length ? 0 : text[i + 1] == '+' ? 6 : text[i + 1] == escape ? -1 : 4;
+            int start = i + (digits == 6 ? 2 : 1);
+            if (digits == -1)
+            {
+                name.Append(escape);
+                i++;
+            }
+            else if (digits > 0 && start + digits <= text.Length &&
+                int.TryParse(text.AsSpan(start, digits), NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out int codePoint) &&
+                codePoint <= 0x10FFFF && codePoint is < 0xD800 or > 0xDFFF)
+            {
+                name.Append(char.ConvertFromUtf32(codePoint));
+                i = start + digits - 1;
+            }
+            else
+            {
+                name.Append(text[i]);
+            }
+        }
+
+        return name.ToString();
+    }
+
+    /// <summary>
+    /// Checks whether a table, by its name's parts, is temporary.
+    /// </summary>
+    private static bool IsTemporaryTable(List<string> names)
+        => Worf.ReadScalar<bool>("SELECT coalesce((SELECT relpersistence = 't' FROM pg_catalog.pg_class WHERE oid = pg_catalog.to_regclass($1)), false)",
+            SpiParameter.Create(string.Join('.', names.Select(Spi.QuoteIdentifier))));
 
     /// <summary>
     /// Checks whether a type named without a schema is temporary.

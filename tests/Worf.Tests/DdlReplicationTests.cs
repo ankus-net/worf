@@ -174,14 +174,15 @@ public sealed class DdlReplicationTests
             ALTER TABLE ul SET UNLOGGED;
             """, token);
 
-        // The session's temporary functions, types and operators, named with the temporary schema or, for types, without,
-        // keep what uses them on this node. Partitions and inheritance change as ever in a session with temporary
-        // objects, and DROP INDEX CONCURRENTLY can run.
+        // The session's temporary functions, types and operators, named with the temporary schema, however it's
+        // written, or, for types, without, and its temporary tables' column types, keep what uses them on this node.
+        // Partitions and inheritance change as ever in a session with temporary objects, and DROP INDEX CONCURRENTLY
+        // can run.
         await using (NpgsqlConnection session = await nodeA.OpenAsync(Database, token))
         {
             foreach (string sql in new[]
             {
-                "CREATE TABLE conv (id integer PRIMARY KEY, a integer, b integer, c integer, d integer, e integer, f integer, g integer, h integer)",
+                "CREATE TABLE conv (id integer PRIMARY KEY, a integer, b integer, c integer, d integer, e integer, f integer, g integer, h integer, i integer, j integer, k integer)",
                 "CREATE FUNCTION pg_temp.tmp_conv(integer) RETURNS bigint LANGUAGE sql AS 'SELECT $1::bigint'",
                 "CREATE FUNCTION pg_temp.tmp_secure(integer) RETURNS bigint LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog AS 'SELECT $1::bigint'",
                 "CREATE DOMAIN pg_temp.tmp_dom AS integer",
@@ -200,6 +201,11 @@ public sealed class DdlReplicationTests
                 "ALTER TABLE conv ADD COLUMN x tmp_type",
                 "ALTER TABLE conv ALTER COLUMN g SET DEFAULT tmp_dom '1'",
                 "ALTER TABLE conv ALTER COLUMN h TYPE bigint USING h::tmp_dom",
+                "ALTER TABLE conv ALTER COLUMN i TYPE bigint USING i::U&\"pg\\005ftemp\".tmp_dom",
+                "ALTER TABLE conv ALTER COLUMN j TYPE bigint USING j::U&\"tmp_dom\"",
+                "ALTER TABLE conv ALTER COLUMN k TYPE bigint USING k::U&\"pg!005ftemp\" UESCAPE '!'.tmp_dom",
+                "CREATE TEMP TABLE tmp_tt (v integer)",
+                "CREATE FUNCTION tmp_typed(x tmp_tt.v%TYPE) RETURNS integer LANGUAGE sql AS 'SELECT 1'",
                 "DROP TYPE pg_temp.tmp_type CASCADE",
                 "DROP FUNCTION pg_temp.tmp_conv(integer) CASCADE",
                 "CREATE TABLE pp (id integer PRIMARY KEY) PARTITION BY RANGE (id)",
@@ -256,7 +262,7 @@ public sealed class DdlReplicationTests
                 (SELECT count(*) FROM worf.replication_set_table WHERE set_reloid IN ('from_temp'::regclass, 'like_temp'::regclass, 'from_prepared'::regclass)),
                 (SELECT count(*) FROM worf.queue WHERE message->>'command' ~ '(ROLE|DATABASE|PUBLICATION|SUBSCRIPTION)')
             """, token), "DDL from a function queued once, and nothing that used the session's objects or was the cluster's");
-        Assert.AreEqual("id a b c d e f g h|0|ic,io|", await nodeB.SafePsqlAsync(Database, """
+        Assert.AreEqual("id a b c d e f g h i j k|0|ic,io|", await nodeB.SafePsqlAsync(Database, """
             SELECT (SELECT string_agg(attname, ' ' ORDER BY attnum) FROM pg_attribute
                     WHERE attrelid = 'conv'::regclass AND attnum > 0 AND NOT attisdropped AND atttypid = 'integer'::regtype),
                 (SELECT count(*) FROM pg_attrdef WHERE adrelid = 'conv'::regclass),

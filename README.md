@@ -820,11 +820,14 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   the lock: the owner of the table, schema or type, a user with the `TRIGGER`
   privilege for `CREATE TRIGGER`, and for a `DROP`, the owner of the object's
   schema too. `CREATE UNIQUE INDEX CONCURRENTLY` holds the lock across the
-  transactions it commits, until the last commits or the statement fails. An
-  index such a build leaves invalid when it fails stays on its node, as do
-  statements on it. A transaction holds each node back through one
-  connection, whatever the `idle_session_timeout` of its role. The user in
-  each provider connection string needs `USAGE` on schema `worf` and
+  transactions it commits, until the last commits or the statement fails, and
+  from its first commit, a node keeps holding back if its connection is lost.
+  An index such a build leaves invalid when it fails stays on its node, as do
+  statements on it, and `REINDEX` can't make it valid there alone. Drop it:
+  until then it still rejects duplicates, so apply on its node stops at a row
+  the other nodes wrote that it rejects. A transaction holds each node back
+  through one connection, whatever the `idle_session_timeout` of its role. The user in each provider connection
+  string needs `USAGE` on schema `worf` and
   `EXECUTE` on `worf.fence_writes`, `worf.unfence_writes` and
   `worf.keep_fence`, which `PUBLIC` doesn't have. They let that user hold back
   writes to any table on the node, across restarts, so grant them only to the

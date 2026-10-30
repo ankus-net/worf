@@ -15,6 +15,9 @@ internal static unsafe partial class Apply
     // Number of tuples inserted after which we switch to multi-insert.
     private const int MinMultiInsertTuples = 5;
 
+    // RVR_MISSING_OK from catalog/namespace.h.
+    private const uint RangeVarMissingOk = 1;
+
     // How worf.exception_behaviour applies a failed transaction again: change by change, as a whole in a subtransaction,
     // or, when its commit fails however it's applied, not at all.
     private const int ExceptionByChange = 1;
@@ -1469,7 +1472,8 @@ internal static unsafe partial class Apply
 
     /// <summary>
     /// Makes a statement that would build or drop an index or detach a partition concurrently do it in its
-    /// transaction.
+    /// transaction, and one that finishes a concurrent detach detach the partition at once where none is under way,
+    /// since a concurrent detach replicates only once it has finished.
     /// </summary>
     private static void RemoveConcurrently(Node* stmt)
     {
@@ -1492,6 +1496,10 @@ internal static unsafe partial class Apply
                     {
                         ((PartitionCmd*)cmd->def)->concurrent = false;
                     }
+                    else if (cmd->subtype == AlterTableType.AT_DetachPartitionFinalize && !DetachPending(((PartitionCmd*)cmd->def)->name))
+                    {
+                        cmd->subtype = AlterTableType.AT_DetachPartition;
+                    }
                 }
 
                 break;
@@ -1499,6 +1507,16 @@ internal static unsafe partial class Apply
             default:
                 break;
         }
+    }
+
+    /// <summary>
+    /// Checks whether a partition's concurrent detach is under way here.
+    /// </summary>
+    private static bool DetachPending(RangeVar* partition)
+    {
+        uint relid = NativeMethods.RangeVarGetRelidExtended(partition, 0, RangeVarMissingOk, default, null);
+        return relid != 0 && Worf.ReadScalar<bool>("SELECT EXISTS (SELECT FROM pg_catalog.pg_inherits WHERE inhrelid = $1 AND inhdetachpending)",
+            SpiParameter.Create(relid));
     }
 
     /// <summary>
