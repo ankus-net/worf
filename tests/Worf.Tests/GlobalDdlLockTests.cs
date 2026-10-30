@@ -12,6 +12,9 @@ public sealed class GlobalDdlLockTests
     private const string Database = "postgres";
     private const string SuperUser = "super";
 
+    // How many databases shared memory notes as having read their kept fences back, WorfFenceTable.MaxDatabases.
+    private const int WorfFenceTableDatabases = 64;
+
     /// <summary>
     /// Gets or sets the test context.
     /// </summary>
@@ -363,7 +366,7 @@ public sealed class GlobalDdlLockTests
     /// <summary>
     /// A node that doesn't receive the DDL holds nothing back and isn't waited for, and the DDL's message carries the
     /// position of each node that does, which each node applying the DDL waits for. A unique index built concurrently
-    /// on a node with no subscriptions needs no lock, and fences are read back in any number of databases.
+    /// on a node with no subscriptions needs no lock.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -425,13 +428,32 @@ public sealed class GlobalDdlLockTests
             "SELECT EXISTS (SELECT FROM pg_attribute WHERE attrelid = 't'::regclass AND attname = 'c') AND EXISTS (SELECT FROM seen WHERE id = 10)",
             token), "node_a's DDL and node_c's write on node_b");
         Assert.AreEqual("f", await nodeB.SafePsqlAsync(Database, "SELECT had_c FROM seen WHERE id = 10", token), "node_c's earlier write applied first");
+    }
 
-        // Every database worf is in reads its kept fences back, however many there are.
-        _ = await nodeC.SafePsqlAsync("template1", "CREATE EXTENSION worf; CREATE TABLE w (id integer)", token);
-        for (int i = 0; i < 70; i++)
+    /// <summary>
+    /// Every database worf is in reads its kept fences back before its first write, however many databases there are,
+    /// although shared memory notes only some of them as read.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task WritesWorkInAnyNumberOfDatabases()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+
+        // Each database is copied from template1 between two checkpoints, which needn't reach the disk.
+        await using TestNode node = await StartNodeAsync("node", token, "fsync = off");
+        _ = await node.SafePsqlAsync("template1", "CREATE EXTENSION worf; CREATE TABLE w (id integer)", token);
+        await using NpgsqlConnection admin = await node.OpenAsync(Database, token);
+        for (int i = 0; i < WorfFenceTableDatabases + 6; i++)
         {
-            _ = await nodeC.SafePsqlAsync(Database, $"CREATE DATABASE many{i} STRATEGY FILE_COPY", token);
-            _ = await nodeC.SafePsqlAsync($"many{i}", "INSERT INTO w VALUES (1)", token);
+            await using (NpgsqlCommand create = new($"CREATE DATABASE many{i} STRATEGY FILE_COPY", admin))
+            {
+                _ = await create.ExecuteNonQueryAsync(token);
+            }
+
+            await using NpgsqlConnection connection = await node.OpenAsync($"many{i}", token);
+            await using NpgsqlCommand insert = new("INSERT INTO w VALUES (1)", connection);
+            _ = await insert.ExecuteNonQueryAsync(token);
         }
     }
 
