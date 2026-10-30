@@ -27,11 +27,22 @@ internal static unsafe partial class Executor
     // SESSION_REPLICATION_ROLE_REPLICA from commands/trigger.h.
     private const int SessionReplicationRoleReplica = 1;
 
+    // RVR_MISSING_OK from catalog/namespace.h.
+    private const uint RangeVarMissingOk = 1;
+
+    // ACL_TRUNCATE from nodes/parsenodes.h, whose AclMode is 32 bits wide before PostgreSQL 16.
+#if ANKUS_PG15
+    private const uint AclTruncate = 1 << 4;
+#else
+    private const ulong AclTruncate = 1 << 4;
+#endif
+
     private static DropBehavior s_lastDropBehavior = DropBehavior.DROP_RESTRICT;
     private static bool s_droppingWorfObj;
     private static object_access_hook_type s_nextObjectAccessHook;
     private static ProcessUtility_hook_type s_nextProcessUtilityHook;
     private static ExecutorStart_hook_type s_nextExecutorStartHook;
+    private static amvalidate_function s_nextNeedsFmgrHook;
     private static bool s_installed;
 
     /// <summary>
@@ -47,6 +58,12 @@ internal static unsafe partial class Executor
 
     [PgNativeCallback(nameof(WorfExecutorStart))]
     private static partial ExecutorStart_hook_type ExecutorStartCallback { get; }
+
+    [PgNativeCallback(nameof(CheckTruncatePrivilege))]
+    private static partial RangeVarGetRelidCallback TruncatePrivilegeCallback { get; }
+
+    [PgNativeCallback(nameof(WorfNeedsFmgrHook))]
+    private static partial amvalidate_function NeedsFmgrHookCallback { get; }
 
     /// <summary>
     /// Creates the executor state for one relation, as a query that reads or writes it would.
@@ -165,6 +182,11 @@ internal static unsafe partial class Executor
         // Executor start hook, which holds back writes to tables another node changes.
         s_nextExecutorStartHook = NativeGlobals.ExecutorStart_hook;
         NativeGlobals.ExecutorStart_hook = ExecutorStartCallback;
+
+        // The fmgr hook check, which PostgreSQL makes before it runs or inlines a function that isn't built in, notes
+        // the functions DDL being replicated uses.
+        s_nextNeedsFmgrHook = NativeGlobals.needs_fmgr_hook;
+        NativeGlobals.needs_fmgr_hook = NeedsFmgrHookCallback;
         s_installed = true;
     }
 
@@ -234,18 +256,22 @@ internal static unsafe partial class Executor
             s_lastDropBehavior = ((DropStmt*)parsetree)->behavior;
         }
 
-        // A COPY into or TRUNCATE of a table another node changes waits for the change. Each takes its table's lock
-        // first, as an INSERT does, so that it can't start writing after a fence has reported how far it waited.
-        if (parsetree->type == NodeTag.T_CopyStmt && ((CopyStmt*)parsetree)->is_from)
+        // A COPY into or TRUNCATE of a table another node changes waits for the change, where worf is, which alone
+        // holds fences. Each takes its table's lock first, as an INSERT does, so that it can't start writing after a
+        // fence has reported how far it waited. TRUNCATE checks the privilege before it locks, as PostgreSQL does.
+        if (parsetree->type is NodeTag.T_CopyStmt or NodeTag.T_TruncateStmt && DdlLock.MayHoldFences())
         {
-            CheckWrite(((CopyStmt*)parsetree)->relation, PgLockMode.RowExclusive);
-        }
-        else if (parsetree->type == NodeTag.T_TruncateStmt)
-        {
-            List* relations = ((TruncateStmt*)parsetree)->relations;
-            for (int i = 0; relations is not null && i < relations->length; i++)
+            if (parsetree->type == NodeTag.T_CopyStmt && ((CopyStmt*)parsetree)->is_from)
             {
-                CheckWrite((RangeVar*)relations->elements[i].ptr_value, PgLockMode.AccessExclusive);
+                CheckWrite(((CopyStmt*)parsetree)->relation, PgLockMode.RowExclusive, default);
+            }
+            else if (parsetree->type == NodeTag.T_TruncateStmt)
+            {
+                List* relations = ((TruncateStmt*)parsetree)->relations;
+                for (int i = 0; relations is not null && i < relations->length; i++)
+                {
+                    CheckWrite((RangeVar*)relations->elements[i].ptr_value, PgLockMode.AccessExclusive, TruncatePrivilegeCallback);
+                }
             }
         }
 
@@ -286,7 +312,8 @@ internal static unsafe partial class Executor
         }
 
         // A DROP leaves out its temporary objects itself, and any other statement that used one stays on this node.
-        bool local = sessionLocal || (usedTemp && parsetree->type != NodeTag.T_DropStmt);
+        bool usedTemporary = usedTemp || (ddl is not null && DdlReplication.UsedTemporaryObjects(parsetree));
+        bool local = sessionLocal || (usedTemporary && parsetree->type != NodeTag.T_DropStmt);
         if (ddl is not null && !local)
         {
             DdlReplication.QueueDdl(ddl);
@@ -314,6 +341,8 @@ internal static unsafe partial class Executor
         {
             s_nextObjectAccessHook.Invoke(access, classId, objectId, subId, arg);
         }
+
+        DdlReplication.NoteObjectAccess(access, classId, objectId, subId);
 
         if (access == ObjectAccessType.OAT_DROP)
         {
@@ -398,12 +427,47 @@ internal static unsafe partial class Executor
         }
     }
 
-    private static void CheckWrite(RangeVar* relation, PgLockMode lockmode)
+    /// <summary>
+    /// Notes a function about to run or be inlined, asking for the fmgr hook only as the next hook does.
+    /// </summary>
+    private static bool WorfNeedsFmgrHook(uint fnOid)
     {
-        uint relid = relation is null ? 0 : NativeMethods.RangeVarGetRelidExtended(relation, (int)lockmode, 1, default, null);
-        if (relid != 0)
+        DdlReplication.NoteFunctionUse(fnOid);
+        return !s_nextNeedsFmgrHook.IsNull && s_nextNeedsFmgrHook.Invoke(fnOid);
+    }
+
+    private static void CheckWrite(RangeVar* relation, PgLockMode lockmode, RangeVarGetRelidCallback callback)
+    {
+        uint relid = relation is null ? 0 : NativeMethods.RangeVarGetRelidExtended(relation, (int)lockmode, RangeVarMissingOk, callback, null);
+        if (relid == 0)
         {
-            DdlLock.CheckWrite(relid);
+            return;
+        }
+
+        // TRUNCATE without ONLY empties the tables under the table too, which it locks as PostgreSQL will.
+        List<uint> tables = [relid];
+        if (lockmode == PgLockMode.AccessExclusive && relation->inh)
+        {
+            List* inheritors = NativeMethods.find_all_inheritors(relid, (int)lockmode, null);
+            for (int i = 0; inheritors is not null && i < inheritors->length; i++)
+            {
+                tables.Add(inheritors->elements[i].oid_value);
+            }
+        }
+
+        DdlLock.CheckWrite(tables);
+    }
+
+    /// <summary>
+    /// Fails a TRUNCATE of a table the user may not truncate before the table is locked, as PostgreSQL does, so that
+    /// it doesn't queue for the lock ahead of others.
+    /// </summary>
+    private static void CheckTruncatePrivilege(RangeVar* relation, uint relId, uint oldRelId, void* arg)
+    {
+        if (relId != 0 && NativeMethods.pg_class_aclcheck(relId, NativeMethods.GetUserId(), AclTruncate) != AclResult.ACLCHECK_OK)
+        {
+            NativeMethods.aclcheck_error(AclResult.ACLCHECK_NO_PRIV, NativeMethods.get_relkind_objtype(NativeMethods.get_rel_relkind(relId)),
+                relation->relname);
         }
     }
 

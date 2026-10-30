@@ -37,6 +37,15 @@ internal static unsafe partial class DdlLock
     // EXEC_FLAG_EXPLAIN_ONLY from executor/executor.h.
     private const int ExplainOnly = 0x0001;
 
+    // ACL_REFERENCES and ACL_TRIGGER from nodes/parsenodes.h, whose AclMode is 32 bits wide before PostgreSQL 16.
+#if ANKUS_PG15
+    private const uint AclReferences = 1 << 5;
+    private const uint AclTrigger = 1 << 6;
+#else
+    private const ulong AclReferences = 1 << 5;
+    private const ulong AclTrigger = 1 << 6;
+#endif
+
     // The catalogs of relations, namespaces and types, from catalog/pg_*_d.h.
     private const uint RelationRelationId = 1259;
     private const uint NamespaceRelationId = 2615;
@@ -49,15 +58,26 @@ internal static unsafe partial class DdlLock
     // How long a kept fence's DDL may take to arrive before apply asks its origin whether it ever will.
     private static readonly TimeSpan s_reconcileAfter = TimeSpan.FromSeconds(10);
 
-    // The fences this transaction asked other nodes for, with the connections that hold them and the subtransaction
-    // that did.
-    private static readonly List<(ulong Id, uint NodeId, ulong Lsn, PgReplicationConnection Connection, uint Subxact, List<uint> Relids)> s_heldFences = [];
+    // The fences this transaction asked other nodes for, with the subtransaction that did.
+    private static readonly List<(ulong Id, uint NodeId, uint Subxact, List<uint> Relids)> s_heldFences = [];
+
+    // The connection to each node that holds this transaction's fences there until it ends, and the nodes whose
+    // connection broke while it held fences the transaction still needs.
+    private static readonly Dictionary<uint, PgReplicationConnection> s_fenceConnections = [];
+    private static readonly HashSet<uint> s_lostNodes = [];
+
+    // The fences of the DDL this transaction queued, which the other nodes keep until it applies there.
+    private static readonly HashSet<ulong> s_queuedFences = [];
 
     // The tables this transaction fenced, which later DDL in it needs no new fence for.
     private static readonly HashSet<uint> s_transactionTables = [];
 
     // The fences that the DDL this apply transaction ran, or skipped, was for, to let go once it commits.
     private static readonly HashSet<ulong> s_appliedFences = [];
+
+    // How far each kept fence's origin had written once apply learned that the fence's transaction had committed, a
+    // point fixed in its WAL that apply passes once it has applied or skipped the DDL.
+    private static readonly Dictionary<long, ulong> s_reconcileBounds = [];
 
     private static PgSubtransactionCallback? s_subtransactionAbort;
     private static PgSubtransactionCallback? s_subtransactionCommit;
@@ -124,21 +144,35 @@ internal static unsafe partial class DdlLock
     [return: PgSqlType("pg_lsn", Schema = "pg_catalog")]
     internal static PgDatum FenceWrites(long fenceId, uint originNode, string?[] relations, int timeoutMs)
     {
+        long deadline = Worker.GetCurrentTimestamp() + (timeoutMs * 1000L);
+
+        // worf reads its catalogs for the role that the other node connects as.
         WorfLocalNode? node = WorfNode.GetLocalNode(false, true);
-        if (node is null || !WorfNode.GetNodeSubscriptions(node.Node.Id, false)
-            .Exists(sub => sub.Enabled && sub.Origin.Id == originNode && sub.ReplicationSets.Contains("ddl_sql")))
+        if (node is null || !Elevated.Run(() => WorfNode.GetNodeSubscriptions(node.Node.Id, false)
+            .Exists(sub => sub.Enabled && sub.Origin.Id == originNode && sub.ReplicationSets.Contains("ddl_sql"))))
         {
             return PgDatum.DangerousCreate(0, LsnOid, PgMemoryContext.Current);
         }
 
-        // Writes to a table this node doesn't replicate never reach the other node, so only its DDL is held back.
+        // Writes to a table this node doesn't replicate never reach the other node, so only its DDL is held back. A
+        // table's partitions and children here are held back with it.
         List<(uint Relid, bool BlocksWrites)> fenced = [];
         foreach (string? relation in relations)
         {
-            SpiResult result = Worf.SelectCatalog("SELECT to_regclass($1)::oid", SpiParameter.Create(relation));
-            if (result.Count > 0 && result[0].Get<uint?>(0) is uint relid)
+            SpiResult result = Worf.SelectCatalog("SELECT pg_catalog.to_regclass($1)::oid", SpiParameter.Create(relation));
+            if (result.Count == 0 || result[0].Get<uint?>(0) is not uint relid)
             {
-                fenced.Add((relid, ReplicationSet.GetTableReplicationSets(node.Node.Id, relid).Count > 0));
+                continue;
+            }
+
+            List* tables = NativeMethods.find_all_inheritors(relid, (int)PgLockMode.None, null);
+            for (int i = 0; tables is not null && i < tables->length; i++)
+            {
+                uint table = tables->elements[i].oid_value;
+                if (!fenced.Exists(fence => fence.Relid == table))
+                {
+                    fenced.Add((table, Elevated.Run(() => ReplicationSet.GetTableReplicationSets(node.Node.Id, table).Count > 0)));
+                }
             }
         }
 
@@ -150,20 +184,22 @@ internal static unsafe partial class DdlLock
         }
 
         EnsureLoaded();
-        AddFences(unchecked((ulong)fenceId), fenced);
+        ulong id = unchecked((ulong)fenceId);
+        _ = AddFences([.. fenced.Select(fence => (id, fence.Relid, fence.BlocksWrites))], Environment.ProcessId, null);
         try
         {
-            // A ShareLock waits for the writes already under way. Later ones fail on the fence.
-            Worker.SetConfigOption("lock_timeout", timeoutMs.ToString(CultureInfo.InvariantCulture), GucContext.PGC_USERSET);
+            // A ShareLock waits for the writes already under way. Later ones fail on the fence. Every wait shares the
+            // timeout.
             foreach (uint relid in fenced.Where(fence => fence.BlocksWrites).Select(fence => fence.Relid))
             {
+                Worker.SetConfigOption("lock_timeout", RemainingMs(deadline).ToString(CultureInfo.InvariantCulture), GucContext.PGC_USERSET);
                 NativeMethods.LockRelationOid(relid, (int)PgLockMode.Share);
                 NativeMethods.UnlockRelationOid(relid, (int)PgLockMode.Share);
             }
         }
         catch
         {
-            _ = Release(fence => fence.Id == unchecked((ulong)fenceId) && fence.Dboid == DatabaseId());
+            _ = Release(fence => fence.Id == id && fence.Dboid == DatabaseId());
             throw;
         }
 
@@ -176,7 +212,24 @@ internal static unsafe partial class DdlLock
     }
 
     /// <summary>
-    /// Keeps a fence after the session that asked for it ends, across restarts, until the change it's for applies
+    /// Lets go of a fence this session asked for and hasn't kept, as when the savepoint of the DDL it was for rolls back.
+    /// A procedure, since the node that asked calls it as the savepoint rolls back, when only commands without rows
+    /// can run.
+    /// </summary>
+    [PgFunction(Sql = """
+        CREATE PROCEDURE worf.unfence_writes(fence_id bigint)
+        LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
+        REVOKE ALL ON PROCEDURE worf.unfence_writes(bigint) FROM public;
+        """)]
+    internal static void UnfenceWrites(long fenceId)
+    {
+        ulong id = unchecked((ulong)fenceId);
+        uint dboid = DatabaseId();
+        _ = Release(fence => fence.Id == id && fence.Dboid == dboid && fence.HolderPid == Environment.ProcessId);
+    }
+
+    /// <summary>
+    /// Keeps a fence this session asked for after the session ends, across restarts, until the change it's for applies
     /// here, or its origin says the transaction that made the change aborted.
     /// </summary>
     [PgFunction(Sql = """
@@ -186,17 +239,17 @@ internal static unsafe partial class DdlLock
         """)]
     internal static void KeepFence(long fenceId, uint originNode, long originXid)
     {
+        ulong id = unchecked((ulong)fenceId);
+        uint dboid = DatabaseId();
+        int pid = Environment.ProcessId;
         List<(uint Relid, bool BlocksWrites)> kept = [];
-        using (PgLwLockExclusiveGuard<WorfFenceTable, WorfFence> guard = Fences.Exclusive())
+        using (PgLwLockShareGuard<WorfFenceTable, WorfFence> guard = Fences.Share())
         {
             for (int i = 0; i < guard.Length; i++)
             {
-                if (guard[i].Id == unchecked((ulong)fenceId) && guard[i].Dboid == DatabaseId())
+                if (guard[i].Id == id && guard[i].Dboid == dboid && guard[i].HolderPid == pid)
                 {
-                    WorfFence fence = guard[i];
-                    fence.HolderPid = 0;
-                    guard[i] = fence;
-                    kept.Add((fence.Relid, fence.BlocksWrites));
+                    kept.Add((guard[i].Relid, guard[i].BlocksWrites));
                 }
             }
         }
@@ -209,6 +262,21 @@ internal static unsafe partial class DdlLock
                     INSERT INTO worf.fence VALUES ($1, $2, $3, $4, $5, now()) ON CONFLICT DO NOTHING
                     """, SpiParameter.Create(fenceId), SpiParameter.Create(relid), SpiParameter.Create(blocksWrites),
                     SpiParameter.Create(originNode), SpiParameter.Create(originXid));
+            }
+        });
+
+        // The fence outlasts this session once the rows that keep it across restarts have committed.
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, () =>
+        {
+            using PgLwLockExclusiveGuard<WorfFenceTable, WorfFence> guard = Fences.Exclusive();
+            for (int i = 0; i < guard.Length; i++)
+            {
+                if (guard[i].Id == id && guard[i].Dboid == dboid && guard[i].HolderPid == pid)
+                {
+                    WorfFence fence = guard[i];
+                    fence.HolderPid = 0;
+                    guard[i] = fence;
+                }
             }
         });
     }
@@ -226,15 +294,32 @@ internal static unsafe partial class DdlLock
     {
         _ = Spi.Execute("DELETE FROM worf.fence WHERE $1 IS NULL OR fence_id = $1", SpiParameter.Create(fenceId));
         uint dboid = DatabaseId();
-        return Release(fence => fence.Dboid == dboid && (fenceId is null || fence.Id == unchecked((ulong)fenceId.Value)));
+        Func<WorfFence, bool> matches = fence => fence.Dboid == dboid && (fenceId is null || fence.Id == unchecked((ulong)fenceId.Value));
+
+        // The fences go once their rows have, so that a release that rolls back keeps them.
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, () => _ = Release(matches));
+        int released = 0;
+        using PgLwLockShareGuard<WorfFenceTable, WorfFence> guard = Fences.Share();
+        for (int i = 0; i < guard.Length; i++)
+        {
+            released += guard[i].Id != 0 && matches(guard[i]) ? 1 : 0;
+        }
+
+        return released;
     }
 
     /// <summary>
-    /// Fails a local write to a table this node holds back, as an executor's result relations or a COPY's or
-    /// TRUNCATE's table, which the caller has locked.
+    /// Checks whether this database may hold fences, as only one with worf may.
     /// </summary>
-    /// <param name="relid">The table.</param>
-    internal static void CheckWrite(uint relid) => Check([relid], false);
+    /// <returns>Whether it may.</returns>
+    internal static bool MayHoldFences() => Worf.CatalogOid("fence") != 0;
+
+    /// <summary>
+    /// Fails a local write to tables this node holds back, as a COPY's or TRUNCATE's tables, which the caller has
+    /// locked.
+    /// </summary>
+    /// <param name="relids">The tables.</param>
+    internal static void CheckWrite(List<uint> relids) => Check(relids, false);
 
     /// <summary>
     /// Checks the result relations of a statement about to run, unless it's only explained.
@@ -267,8 +352,8 @@ internal static unsafe partial class DdlLock
     /// <summary>
     /// Locks every node this node subscribes to for DDL that can't apply in any order, before it runs, and waits until
     /// this node has applied their changes as far as their WAL had reached once they held back their writes. In a
-    /// transaction block, any DDL locks the tables it touches, since later DDL there can't wait for other nodes' changes
-    /// to tables the transaction has locked.
+    /// transaction block, any DDL that locks out writes locks the tables it touches, since later DDL there can't wait
+    /// for other nodes' changes to tables the transaction has locked.
     /// </summary>
     /// <param name="parsetree">The DDL.</param>
     internal static void LockNodes(Node* parsetree)
@@ -277,12 +362,6 @@ internal static unsafe partial class DdlLock
         if (!GlobalDdlLock)
         {
             return;
-        }
-
-        if (parsetree->type == NodeTag.T_IndexStmt && ((IndexStmt*)parsetree)->unique && ((IndexStmt*)parsetree)->concurrent)
-        {
-            throw new PgException(LockNotAvailable, "worf.global_ddl_lock can't hold for CREATE UNIQUE INDEX CONCURRENTLY, which commits partway",
-                hint: "Build the index without CONCURRENTLY, or with worf.global_ddl_lock off.");
         }
 
         // DDL that someone who may not run it asks for fails by itself, holding back nothing.
@@ -309,7 +388,7 @@ internal static unsafe partial class DdlLock
         }
 
         ulong fenceId = BitConverter.ToUInt64(RandomNumberGenerator.GetBytes(8)) | 1;
-        if (s_heldFences.Count == 0)
+        if (s_subtransactionAbort is null)
         {
             RegisterCallbacks();
         }
@@ -322,22 +401,18 @@ internal static unsafe partial class DdlLock
 
         array.Append("]::text[]");
 
-        // A node whose server notices only late that this one died keeps its fence that long, so the fence's session
-        // probes the connection.
+        // Holding back each node's writes and catching up with them all share worf.ddl_lock_timeout.
+        long deadline = Worker.GetCurrentTimestamp() + (DdlLockTimeout * 1000L);
         List<(uint NodeId, ulong Lsn)> positions = [];
-        int timeout = DdlLockTimeout;
         uint subxact = NativeMethods.GetCurrentSubTransactionId();
         foreach ((uint nodeId, string dsn) in peers)
         {
-            // The connection holds the fence until the transaction ends, which closes it however this fails.
-            int held = s_heldFences.Count;
-            s_heldFences.Add((fenceId, nodeId, 0, Worf.Connect(dsn, "worf_ddl_lock", null), subxact, relids));
-            PgReplicationConnection conn = s_heldFences[held].Connection;
+            PgReplicationConnection conn = FenceConnection(nodeId, dsn);
+            s_heldFences.Add((fenceId, nodeId, subxact, relids));
             string? lsn;
             try
             {
-                _ = conn.Query("SELECT pg_catalog.set_config('tcp_keepalives_idle', '10', false), pg_catalog.set_config('tcp_keepalives_interval', '5', false)", 2);
-                lsn = conn.Query($"SELECT worf.fence_writes({unchecked((long)fenceId).ToString(CultureInfo.InvariantCulture)}, {node.Node.Id.ToString(CultureInfo.InvariantCulture)}, {array}, {timeout.ToString(CultureInfo.InvariantCulture)})", 1)[0][0];
+                lsn = conn.Query($"SELECT worf.fence_writes({unchecked((long)fenceId).ToString(CultureInfo.InvariantCulture)}, {node.Node.Id.ToString(CultureInfo.InvariantCulture)}, {array}, {RemainingMs(deadline).ToString(CultureInfo.InvariantCulture)})", 1)[0][0];
             }
             catch (PgRemoteException error)
             {
@@ -347,16 +422,14 @@ internal static unsafe partial class DdlLock
             // A node that doesn't receive this node's DDL holds nothing back.
             if (!Worf.TryParseLsn(lsn ?? "", out ulong position) || position == 0)
             {
-                s_heldFences.RemoveAt(held);
-                Close(conn);
+                s_heldFences.RemoveAt(s_heldFences.Count - 1);
                 continue;
             }
 
-            s_heldFences[held] = s_heldFences[held] with { Lsn = position };
             positions.Add((nodeId, position));
         }
 
-        WaitForNodes(node.Node.Id, positions, timeout);
+        WaitUntilApplied(node.Node.Id, positions, deadline);
 
         // Another node may have begun DDL on these tables meanwhile, and both give way.
         Check(relids, true);
@@ -365,13 +438,19 @@ internal static unsafe partial class DdlLock
     }
 
     /// <summary>
-    /// Takes the fence of the DDL statement that runs now, for its queued message.
+    /// Takes the fence of the DDL statement that runs now, for its queued message, which the other nodes then keep
+    /// until it applies there.
     /// </summary>
     /// <returns>The fence and how far each fenced node's WAL had reached, or null.</returns>
     internal static (ulong Id, List<(uint NodeId, ulong Lsn)> Positions)? TakeStatementFence()
     {
         (ulong Id, List<(uint NodeId, ulong Lsn)> Positions)? fence = s_statementFence;
         s_statementFence = null;
+        if (fence is not null && s_heldFences.Exists(held => held.Id == fence.Value.Id))
+        {
+            _ = s_queuedFences.Add(fence.Value.Id);
+        }
+
         return fence;
     }
 
@@ -383,50 +462,7 @@ internal static unsafe partial class DdlLock
     /// <param name="positions">The nodes and positions.</param>
     /// <param name="timeoutMs">How long to wait.</param>
     internal static void WaitForNodes(uint localNodeId, List<(uint NodeId, ulong Lsn)> positions, int timeoutMs)
-    {
-        List<(uint SubId, uint NodeId, ulong Lsn)> waiting = Elevated.Run(() => positions
-            .Where(position => position.NodeId != localNodeId)
-            .SelectMany(position => WorfNode.GetNodeSubscriptions(position.NodeId, true)
-                .Where(sub => sub.Enabled)
-                .Select(sub => (sub.Id, position.NodeId, position.Lsn)))
-            .ToList());
-
-        long deadline = Worker.GetCurrentTimestamp() + (timeoutMs * 1000L);
-        while (waiting.Count > 0)
-        {
-            using (PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share())
-            {
-                _ = waiting.RemoveAll(position =>
-                {
-                    for (int i = 0; i < guard.Length; i++)
-                    {
-                        WorfWorker worker = guard[i];
-                        if (worker.WorkerType == WorfWorkerType.Apply && worker.Dboid == DatabaseId() &&
-                            worker.Worker.Apply.SubId == position.SubId && worker.Worker.Apply.FlushLsn >= position.Lsn)
-                        {
-                            return true;
-                        }
-                    }
-
-                    return false;
-                });
-            }
-
-            if (waiting.Count == 0)
-            {
-                break;
-            }
-
-            if (Worker.GetCurrentTimestamp() > deadline)
-            {
-                throw new PgException(LockNotAvailable,
-                    $"timed out waiting to apply node {waiting[0].NodeId}'s changes up to {Worf.FormatLsn(waiting[0].Lsn)} before DDL");
-            }
-
-            Worker.WaitLatch(10);
-            PgInterrupts.Check();
-        }
-    }
+        => WaitUntilApplied(localNodeId, positions, Worker.GetCurrentTimestamp() + (timeoutMs * 1000L));
 
     /// <summary>
     /// Lets a fence go once the apply transaction that ran or skipped its DDL commits.
@@ -474,6 +510,12 @@ internal static unsafe partial class DdlLock
                     SELECT DISTINCT fence_id, origin_xid FROM worf.fence
                     WHERE origin_node = $1 AND kept_at < now() - $2 * interval '1 microsecond'
                     """, SpiParameter.Create(sub.Origin.Id), SpiParameter.Create((long)s_reconcileAfter.TotalMicroseconds));
+                List<long> fences = [.. kept.Select(row => row.Get<long>(0))];
+                foreach (long forgotten in s_reconcileBounds.Keys.Where(fence => !fences.Contains(fence)).ToList())
+                {
+                    _ = s_reconcileBounds.Remove(forgotten);
+                }
+
                 if (kept.Count == 0)
                 {
                     return;
@@ -483,14 +525,32 @@ internal static unsafe partial class DdlLock
                 for (int i = 0; i < kept.Count; i++)
                 {
                     long fenceId = kept[i].Get<long>(0);
-                    string?[] row = conn.Query(
-                        $"SELECT pg_catalog.pg_xact_status('{kept[i].Get<long>(1).ToString(CultureInfo.InvariantCulture)}'::xid8), pg_catalog.pg_current_wal_insert_lsn()", 2)[0];
-                    bool processed = row[0] == "committed" && Worf.TryParseLsn(row[1] ?? "", out ulong position) &&
-                        AppliedPast(sub.Origin.Id, position);
-                    if (row[0] == "aborted" || processed)
+
+                    // A transaction the origin hasn't reached never ran there, as on an origin restored to an earlier
+                    // point, and one too old for the origin to know of finished long ago.
+                    string?[] row = conn.Query($"""
+                        SELECT CASE WHEN x >= pg_catalog.pg_snapshot_xmax(pg_catalog.pg_current_snapshot()) THEN 'aborted'
+                            ELSE pg_catalog.pg_xact_status(x) END, pg_catalog.pg_current_wal_insert_lsn()
+                        FROM (SELECT '{kept[i].Get<long>(1).ToString(CultureInfo.InvariantCulture)}'::pg_catalog.xid8 AS x) AS fence
+                        """, 2)[0];
+                    if (row[0] == "in progress")
                     {
-                        PgLog.Log($"letting go of fence {fenceId} from node {sub.Origin.Name}, whose DDL {(processed ? "this node has gone past" : "never committed")}");
+                        continue;
+                    }
+
+                    // The origin's WAL had passed the transaction's commit once the origin said it committed, so once
+                    // this node has applied that far, it has applied or skipped the DDL.
+                    bool aborted = row[0] == "aborted";
+                    if (!aborted && !s_reconcileBounds.ContainsKey(fenceId) && Worf.TryParseLsn(row[1] ?? "", out ulong bound))
+                    {
+                        s_reconcileBounds[fenceId] = bound;
+                    }
+
+                    if (aborted || (s_reconcileBounds.TryGetValue(fenceId, out ulong past) && AppliedPast(sub.Origin.Id, past)))
+                    {
+                        PgLog.Log($"letting go of fence {fenceId} from node {sub.Origin.Name}, whose DDL {(aborted ? "never committed" : "this node has gone past")}");
                         _ = Spi.Execute("DELETE FROM worf.fence WHERE fence_id = $1", SpiParameter.Create(fenceId));
+                        _ = s_reconcileBounds.Remove(fenceId);
                         _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, () =>
                             _ = Release(fence => fence.Dboid == DatabaseId() && fence.Id == unchecked((ulong)fenceId)));
                     }
@@ -500,6 +560,77 @@ internal static unsafe partial class DdlLock
         catch (Exception error) when (error is PgException or PgRemoteException)
         {
             PgLog.Debug1($"could not ask node {sub.Origin.Name} about its fences: {error.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Waits until this node has applied each node's changes as far as the given WAL position, through every enabled
+    /// subscription to it, for the nodes other than itself, failing at once when this transaction holds a lock that
+    /// those changes wait for.
+    /// </summary>
+    private static void WaitUntilApplied(uint localNodeId, List<(uint NodeId, ulong Lsn)> positions, long deadline)
+    {
+        List<(uint SubId, uint NodeId, ulong Lsn)> waiting = Elevated.Run(() => positions
+            .Where(position => position.NodeId != localNodeId)
+            .SelectMany(position => WorfNode.GetNodeSubscriptions(position.NodeId, true)
+                .Where(sub => sub.Enabled)
+                .Select(sub => (sub.Id, position.NodeId, position.Lsn)))
+            .ToList());
+
+        for (int polls = 1; waiting.Count > 0; polls++)
+        {
+            List<long> blocked = [];
+            using (PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share())
+            {
+                _ = waiting.RemoveAll(position =>
+                {
+                    for (int i = 0; i < guard.Length; i++)
+                    {
+                        WorfWorker worker = guard[i];
+                        if (worker.WorkerType == WorfWorkerType.Apply && worker.Dboid == DatabaseId() &&
+                            worker.Worker.Apply.SubId == position.SubId)
+                        {
+                            if (worker.Worker.Apply.FlushLsn >= position.Lsn)
+                            {
+                                return true;
+                            }
+
+                            if (worker.Proc != 0)
+                            {
+                                blocked.Add(((PGPROC*)worker.Proc)->pid);
+                            }
+                        }
+                    }
+
+                    return false;
+                });
+            }
+
+            if (waiting.Count == 0)
+            {
+                break;
+            }
+
+            if (Worker.GetCurrentTimestamp() > deadline)
+            {
+                throw new PgException(LockNotAvailable,
+                    $"timed out waiting to apply node {waiting[0].NodeId}'s changes up to {Worf.FormatLsn(waiting[0].Lsn)} before DDL");
+            }
+
+            // Apply can't pass a lock this transaction holds, as on a table that an earlier statement in it locked or
+            // wrote to.
+            if (polls % 50 == 0 && blocked.Count > 0 && Spi.ExecuteScalar<bool>("""
+                SELECT EXISTS (SELECT FROM pg_catalog.unnest($1::pg_catalog.int8[]) AS a (pid)
+                    WHERE pg_catalog.pg_backend_pid() = ANY (pg_catalog.pg_blocking_pids(a.pid::pg_catalog.int4)))
+                """, SpiParameter.Create(blocked.ToArray())))
+            {
+                throw new PgException(LockNotAvailable,
+                    $"cannot apply node {waiting[0].NodeId}'s changes before DDL while this transaction holds a lock they need",
+                    hint: "Run the DDL before the statements that lock or write to its tables, or in a transaction of its own.");
+            }
+
+            Worker.WaitLatch(10);
+            PgInterrupts.Check();
         }
     }
 
@@ -527,7 +658,8 @@ internal static unsafe partial class DdlLock
     }
 
     /// <summary>
-    /// Fails a local write, or local DDL, on tables another node holds back, unless apply runs it.
+    /// Fails a local write, or local DDL, on tables another node holds back, unless apply runs it. A write to a
+    /// partitioned table checks the partitions it can reach.
     /// </summary>
     private static void Check(List<uint> relids, bool ddl)
     {
@@ -542,6 +674,7 @@ internal static unsafe partial class DdlLock
             return;
         }
 
+        List<uint> tables = ddl ? relids : [.. relids.SelectMany(Partitions)];
         uint dboid = DatabaseId();
         uint held = 0;
         using (PgLwLockShareGuard<WorfFenceTable, WorfFence> guard = Fences.Share())
@@ -549,7 +682,7 @@ internal static unsafe partial class DdlLock
             for (int i = 0; i < guard.Length && held == 0; i++)
             {
                 WorfFence fence = guard[i];
-                if (fence.Id != 0 && fence.Dboid == dboid && (ddl || fence.BlocksWrites) && relids.Contains(fence.Relid) &&
+                if (fence.Id != 0 && fence.Dboid == dboid && (ddl || fence.BlocksWrites) && tables.Contains(fence.Relid) &&
                     (fence.HolderPid == 0 || NativeMethods.BackendPidGetProc(fence.HolderPid) is not null))
                 {
                     held = fence.Relid;
@@ -566,7 +699,27 @@ internal static unsafe partial class DdlLock
     }
 
     /// <summary>
-    /// Reads back this database's kept fences once after the server starts, before any write is checked.
+    /// Lists a table, and for a partitioned table, the partitions under it that tuple routing can write to.
+    /// </summary>
+    private static List<uint> Partitions(uint relid)
+    {
+        List<uint> tables = [relid];
+        if (NativeMethods.get_rel_relkind(relid) == (sbyte)'p')
+        {
+            List* inheritors = NativeMethods.find_all_inheritors(relid, (int)PgLockMode.None, null);
+            for (int i = 1; inheritors is not null && i < inheritors->length; i++)
+            {
+                tables.Add(inheritors->elements[i].oid_value);
+            }
+        }
+
+        return tables;
+    }
+
+    /// <summary>
+    /// Reads back this database's kept fences once after the server starts, before any write is checked. Reading them
+    /// again adds only those it lacks, so the databases noted as read are only a cache, which forgets one with no
+    /// fences when it's full.
     /// </summary>
     private static void EnsureLoaded()
     {
@@ -576,6 +729,7 @@ internal static unsafe partial class DdlLock
         }
 
         uint dboid = DatabaseId();
+        long generation;
         using (PgLwLockShareGuard<WorfFenceTable, WorfFence> guard = Fences.Share())
         {
             WorfFenceTable table = guard.Header;
@@ -587,50 +741,36 @@ internal static unsafe partial class DdlLock
                     return;
                 }
             }
+
+            generation = table.Generation;
         }
 
-        if (Worf.CatalogOid("fence") == 0)
+        if (!MayHoldFences())
         {
             return;
         }
 
-        List<(ulong Id, uint Relid, bool BlocksWrites)> kept = [];
-        Elevated.Run(() =>
+        // A fence let go of while its row was read would come back, so the rows are read again when one was.
+        while (true)
         {
-            SpiResult rows = Spi.Select("SELECT fence_id, relid, blocks_writes FROM worf.fence");
-            for (int i = 0; i < rows.Count; i++)
+            List<(ulong Id, uint Relid, bool BlocksWrites)> kept = [];
+            Elevated.Run(() =>
             {
-                kept.Add((unchecked((ulong)rows[i].Get<long>(0)), rows[i].Get<uint>(1), rows[i].Get<bool>(2)));
-            }
-        });
-
-        using (PgLwLockExclusiveGuard<WorfFenceTable, WorfFence> guard = Fences.Exclusive())
-        {
-            WorfFenceTable table = guard.Header;
-            for (int i = 0; i < table.LoadedCount; i++)
-            {
-                if (table.Loaded[i] == dboid)
+                SpiResult rows = Worf.SelectCatalog("SELECT fence_id, relid, blocks_writes FROM worf.fence");
+                for (int i = 0; i < rows.Count; i++)
                 {
-                    s_loaded = true;
-                    return;
+                    kept.Add((unchecked((ulong)rows[i].Get<long>(0)), rows[i].Get<uint>(1), rows[i].Get<bool>(2)));
                 }
-            }
+            });
 
-            if (table.LoadedCount >= WorfFenceTable.MaxDatabases)
+            if (AddFences(kept, 0, generation) is not long newer)
             {
-                throw new PgException("53000", $"worf holds fences in at most {WorfFenceTable.MaxDatabases} databases");
+                s_loaded = true;
+                return;
             }
 
-            table.Loaded[table.LoadedCount++] = dboid;
-            guard.Header = table;
+            generation = newer;
         }
-
-        foreach (IGrouping<ulong, (ulong Id, uint Relid, bool BlocksWrites)> fence in kept.GroupBy(fence => fence.Id))
-        {
-            AddFences(fence.Key, [.. fence.Select(entry => (entry.Relid, entry.BlocksWrites))], 0);
-        }
-
-        s_loaded = true;
     }
 
     private static int Release(Func<WorfFence, bool> matches)
@@ -649,6 +789,7 @@ internal static unsafe partial class DdlLock
             }
 
             table.Used -= released;
+            table.Generation++;
             guard.Header = table;
             _ = PgAtomic.Add(FenceCount, -released);
         }
@@ -656,13 +797,49 @@ internal static unsafe partial class DdlLock
         return released;
     }
 
-    private static void AddFences(ulong fenceId, List<(uint Relid, bool BlocksWrites)> relids, int holderPid = -1)
+    /// <summary>
+    /// Adds fences for this database. Fences read back from worf.fence add only those it lacks, and in the same hold
+    /// of the lock note the database as read, unless a fence was let go of since the read.
+    /// </summary>
+    /// <param name="fences">The fences.</param>
+    /// <param name="holderPid">The session that holds them, or zero for kept fences.</param>
+    /// <param name="readAt">For fences read back, the generation of releases the read saw, or null.</param>
+    /// <returns>The newer generation, when a fence was let go of since the read, or null.</returns>
+    private static long? AddFences(List<(ulong Id, uint Relid, bool BlocksWrites)> fences, int holderPid, long? readAt)
     {
+        uint dboid = DatabaseId();
         using PgLwLockExclusiveGuard<WorfFenceTable, WorfFence> guard = Fences.Exclusive();
         WorfFenceTable table = guard.Header;
-        int next = 0;
-        foreach ((uint relid, bool blocksWrites) in relids)
+        if (readAt is long generation)
         {
+            for (int i = 0; i < table.LoadedCount; i++)
+            {
+                if (table.Loaded[i] == dboid)
+                {
+                    return null;
+                }
+            }
+
+            if (table.Generation != generation)
+            {
+                return table.Generation;
+            }
+        }
+
+        int next = 0;
+        foreach ((ulong id, uint relid, bool blocksWrites) in fences)
+        {
+            bool present = false;
+            for (int i = 0; readAt is not null && i < guard.Length && !present; i++)
+            {
+                present = guard[i].Id == id && guard[i].Dboid == dboid && guard[i].Relid == relid;
+            }
+
+            if (present)
+            {
+                continue;
+            }
+
             int free = -1;
             for (; next < guard.Length && free < 0; next++)
             {
@@ -690,23 +867,91 @@ internal static unsafe partial class DdlLock
 
             guard[free] = new WorfFence
             {
-                Id = fenceId,
-                Dboid = DatabaseId(),
+                Id = id,
+                Dboid = dboid,
                 Relid = relid,
-                HolderPid = holderPid < 0 ? Environment.ProcessId : holderPid,
+                HolderPid = holderPid,
                 BlocksWrites = blocksWrites,
             };
             table.Used++;
             _ = PgAtomic.Add(FenceCount, 1);
         }
 
+        // A database with no fences can be read again at no risk, so a full cache forgets one.
+        if (readAt is not null)
+        {
+            int slot = table.LoadedCount < WorfFenceTable.MaxDatabases ? table.LoadedCount++ : -1;
+            if (slot < 0)
+            {
+                HashSet<uint> fenced = [];
+                for (int i = 0; i < guard.Length; i++)
+                {
+                    if (guard[i].Id != 0)
+                    {
+                        _ = fenced.Add(guard[i].Dboid);
+                    }
+                }
+
+                for (int i = 0; i < WorfFenceTable.MaxDatabases && slot < 0; i++)
+                {
+                    slot = fenced.Contains(table.Loaded[i]) ? -1 : i;
+                }
+            }
+
+            if (slot >= 0)
+            {
+                table.Loaded[slot] = dboid;
+            }
+        }
+
         guard.Header = table;
+        return null;
+    }
+
+    /// <summary>
+    /// Opens the connection that holds this transaction's fences on a node, or returns the one it has opened, which
+    /// stays open while the transaction lasts however long it idles. A node whose server notices only late that this
+    /// one died keeps its fence that long, so the connection is probed.
+    /// </summary>
+    private static PgReplicationConnection FenceConnection(uint nodeId, string dsn)
+    {
+        if (s_fenceConnections.TryGetValue(nodeId, out PgReplicationConnection? open))
+        {
+            return open;
+        }
+
+        PgReplicationConnection conn = Worf.Connect(dsn, "worf_ddl_lock", null);
+        s_fenceConnections[nodeId] = conn;
+        try
+        {
+            _ = conn.Query("""
+                SELECT pg_catalog.set_config('tcp_keepalives_idle', '10', false), pg_catalog.set_config('tcp_keepalives_interval', '5', false),
+                    pg_catalog.set_config('idle_session_timeout', '0', false), pg_catalog.set_config('idle_in_transaction_session_timeout', '0', false)
+                """, 4);
+        }
+        catch (PgRemoteException error)
+        {
+            throw new PgException(LockNotAvailable, $"could not hold back writes on node {nodeId}: {error.Message}");
+        }
+
+        return conn;
+    }
+
+    /// <summary>
+    /// Gets the milliseconds left before a deadline, failing once it has passed.
+    /// </summary>
+    private static long RemainingMs(long deadline)
+    {
+        long remaining = (deadline - Worker.GetCurrentTimestamp()) / 1000;
+        return remaining > 0 ? remaining
+            : throw new PgException(LockNotAvailable, "timed out holding back other nodes' writes before DDL");
     }
 
     /// <summary>
     /// Lists the tables whose rows from other nodes the DDL could fail to apply if it ran before them, or the reverse:
-    /// a table's partitions, a schema's tables, and the tables with columns of a changed domain, enum or composite type.
-    /// In a transaction block, it lists the tables of any DDL.
+    /// a table's partitions, a partition it attaches, a schema's tables, the tables a new foreign key references, and
+    /// the tables with columns of a changed domain, enum or composite type. In a transaction block, it lists the tables that any DDL locks
+    /// against writes.
     /// </summary>
     private static List<uint> LockedTables(Node* parsetree, bool inBlock)
     {
@@ -719,7 +964,22 @@ internal static unsafe partial class DdlLock
                 break;
 
             case NodeTag.T_AlterTableStmt when inBlock || !AppliesInAnyOrder((AlterTableStmt*)parsetree):
-                AddTable(tables, Relid(((AlterTableStmt*)parsetree)->relation));
+                AlterTableStmt* alter = (AlterTableStmt*)parsetree;
+                AddTable(tables, Relid(alter->relation));
+                List* cmds = alter->cmds;
+                for (int i = 0; cmds is not null && i < cmds->length; i++)
+                {
+                    AlterTableCmd* cmd = (AlterTableCmd*)cmds->elements[i].ptr_value;
+                    if (cmd->subtype is AlterTableType.AT_AddConstraint or AlterTableType.AT_AddColumn)
+                    {
+                        AddReferencedTables(tables, cmd->def);
+                    }
+                    else if (cmd->subtype == AlterTableType.AT_AttachPartition)
+                    {
+                        AddTable(tables, Relid(((PartitionCmd*)cmd->def)->name));
+                    }
+                }
+
                 break;
 
             case NodeTag.T_RenameStmt when ((RenameStmt*)parsetree)->renameType == ObjectType.OBJECT_SCHEMA:
@@ -736,6 +996,43 @@ internal static unsafe partial class DdlLock
 
             case NodeTag.T_IndexStmt when inBlock || ((IndexStmt*)parsetree)->unique:
                 AddTable(tables, Relid(((IndexStmt*)parsetree)->relation));
+                break;
+
+            case NodeTag.T_CreateTrigStmt when inBlock:
+                AddTable(tables, Relid(((CreateTrigStmt*)parsetree)->relation));
+                break;
+
+            case NodeTag.T_RuleStmt when inBlock:
+                AddTable(tables, Relid(((RuleStmt*)parsetree)->relation));
+                break;
+
+            case NodeTag.T_CreatePolicyStmt when inBlock:
+                AddTable(tables, Relid(((CreatePolicyStmt*)parsetree)->table));
+                break;
+
+            case NodeTag.T_AlterPolicyStmt when inBlock:
+                AddTable(tables, Relid(((AlterPolicyStmt*)parsetree)->table));
+                break;
+
+            // A new partition locks its parent, and a foreign key the tables it references.
+            case NodeTag.T_CreateStmt when inBlock:
+                CreateStmt* create = (CreateStmt*)parsetree;
+                if (create->partbound is not null && create->inhRelations is not null)
+                {
+                    AddTable(tables, Relid((RangeVar*)create->inhRelations->elements[0].ptr_value));
+                }
+
+                List* elements = create->tableElts;
+                for (int i = 0; elements is not null && i < elements->length; i++)
+                {
+                    AddReferencedTables(tables, (Node*)elements->elements[i].ptr_value);
+                }
+
+                for (int i = 0; create->constraints is not null && i < create->constraints->length; i++)
+                {
+                    AddReferencedTables(tables, (Node*)create->constraints->elements[i].ptr_value);
+                }
+
                 break;
 
             // Changing a domain's default, or dropping a constraint, leaves its values valid.
@@ -757,13 +1054,32 @@ internal static unsafe partial class DdlLock
                 List* objects = drop->objects;
                 for (int i = 0; objects is not null && i < objects->length; i++)
                 {
-                    if (drop->removeType == ObjectType.OBJECT_TABLE)
+                    List* names = (List*)objects->elements[i].ptr_value;
+                    switch (drop->removeType)
                     {
-                        AddTable(tables, Relid(NativeMethods.makeRangeVarFromNameList((List*)objects->elements[i].ptr_value)));
-                    }
-                    else if (drop->removeType == ObjectType.OBJECT_SCHEMA && drop->behavior == DropBehavior.DROP_CASCADE)
-                    {
-                        AddSchema(tables, Worf.FromServer(NativeMethods.NameListToString(NativeMethods.lappend(null, objects->elements[i].ptr_value))));
+                        case ObjectType.OBJECT_TABLE:
+                            AddTable(tables, Relid(NativeMethods.makeRangeVarFromNameList(names)));
+                            break;
+
+                        case ObjectType.OBJECT_SCHEMA when drop->behavior == DropBehavior.DROP_CASCADE:
+                            AddSchema(tables, Worf.FromServer(NativeMethods.NameListToString(NativeMethods.lappend(null, names))));
+                            break;
+
+                        case ObjectType.OBJECT_INDEX when inBlock:
+                            uint index = Relid(NativeMethods.makeRangeVarFromNameList(names));
+                            AddTable(tables, index == 0 ? 0 : NativeMethods.IndexGetRelation(index, true));
+                            break;
+
+                        case ObjectType.OBJECT_TRIGGER or ObjectType.OBJECT_RULE or ObjectType.OBJECT_POLICY when inBlock:
+                            AddTable(tables, Relid(TableOf(names)));
+                            break;
+
+                        case ObjectType.OBJECT_TYPE or ObjectType.OBJECT_DOMAIN when inBlock && drop->behavior == DropBehavior.DROP_CASCADE:
+                            AddTypeUsers(tables, TypeOid(((TypeName*)names)->names));
+                            break;
+
+                        default:
+                            break;
                     }
                 }
 
@@ -777,8 +1093,33 @@ internal static unsafe partial class DdlLock
     }
 
     /// <summary>
+    /// Adds the table that a new foreign key, as a table constraint or a column's, references.
+    /// </summary>
+    private static void AddReferencedTables(List<uint> tables, Node* element)
+    {
+        if (element is null)
+        {
+            return;
+        }
+
+        if (element->type == NodeTag.T_Constraint && ((Constraint*)element)->contype == ConstrType.CONSTR_FOREIGN)
+        {
+            AddTable(tables, Relid(((Constraint*)element)->pktable));
+        }
+        else if (element->type == NodeTag.T_ColumnDef)
+        {
+            List* constraints = ((ColumnDef*)element)->constraints;
+            for (int i = 0; constraints is not null && i < constraints->length; i++)
+            {
+                AddReferencedTables(tables, (Node*)constraints->elements[i].ptr_value);
+            }
+        }
+    }
+
+    /// <summary>
     /// Checks whether every part of an ALTER TABLE leaves rows from other nodes that don't have it yet applying as
-    /// they did, as adding a column that can be missing, dropping a column or a constraint, or changing settings do.
+    /// they did, as adding a column that can be missing, dropping a column or a constraint, detaching a partition,
+    /// whose rows apply to it alone either way, or changing settings do.
     /// </summary>
     private static bool AppliesInAnyOrder(AlterTableStmt* stmt)
     {
@@ -800,7 +1141,8 @@ internal static unsafe partial class DdlLock
                     AlterTableType.AT_EnableTrigUser or AlterTableType.AT_DisableTrigUser or
                     AlterTableType.AT_EnableRowSecurity or AlterTableType.AT_DisableRowSecurity or
                     AlterTableType.AT_ForceRowSecurity or AlterTableType.AT_NoForceRowSecurity or
-                    AlterTableType.AT_GenericOptions => true,
+                    AlterTableType.AT_GenericOptions or AlterTableType.AT_DetachPartition or
+                    AlterTableType.AT_DetachPartitionFinalize => true,
                 _ => false,
             };
             if (!inAnyOrder)
@@ -846,48 +1188,123 @@ internal static unsafe partial class DdlLock
     }
 
     /// <summary>
-    /// Checks whether the user may run the DDL, by owning its table, schema or type, so that someone who may not
-    /// doesn't hold back other nodes.
+    /// Checks whether the user may run the DDL, as PostgreSQL will check, so that someone who may not doesn't hold
+    /// back other nodes: by owning its table, schema or type, by holding the privilege a trigger or foreign key
+    /// needs, or, for a DROP, by owning the dropped object's schema.
     /// </summary>
     private static bool MayRun(Node* parsetree)
     {
         uint user = NativeMethods.GetUserId();
-        (uint classId, uint objectId) = parsetree->type switch
+        switch (parsetree->type)
         {
-            NodeTag.T_AlterTableStmt => (RelationRelationId, Relid(((AlterTableStmt*)parsetree)->relation)),
-            NodeTag.T_RenameStmt when ((RenameStmt*)parsetree)->renameType == ObjectType.OBJECT_SCHEMA =>
-                (NamespaceRelationId, NamespaceOid(Worf.FromServer(((RenameStmt*)parsetree)->subname))),
-            NodeTag.T_RenameStmt => (RelationRelationId, Relid(((RenameStmt*)parsetree)->relation)),
-            NodeTag.T_AlterObjectSchemaStmt => (RelationRelationId, Relid(((AlterObjectSchemaStmt*)parsetree)->relation)),
-            NodeTag.T_IndexStmt => (RelationRelationId, Relid(((IndexStmt*)parsetree)->relation)),
-            NodeTag.T_AlterDomainStmt => (TypeRelationId, TypeOid(((AlterDomainStmt*)parsetree)->typeName)),
-            NodeTag.T_AlterEnumStmt => (TypeRelationId, TypeOid(((AlterEnumStmt*)parsetree)->typeName)),
-            _ => (0u, 0u),
-        };
+            case NodeTag.T_AlterTableStmt:
+                return Owns(RelationRelationId, Relid(((AlterTableStmt*)parsetree)->relation), user);
 
-        if (parsetree->type == NodeTag.T_DropStmt)
-        {
-            DropStmt* drop = (DropStmt*)parsetree;
-            List* objects = drop->objects;
-            for (int i = 0; objects is not null && i < objects->length; i++)
-            {
-                uint id = drop->removeType == ObjectType.OBJECT_SCHEMA
-                    ? NamespaceOid(Worf.FromServer(NativeMethods.NameListToString(NativeMethods.lappend(null, objects->elements[i].ptr_value))))
-                    : Relid(NativeMethods.makeRangeVarFromNameList((List*)objects->elements[i].ptr_value));
-                if (id != 0 && !Owns(drop->removeType == ObjectType.OBJECT_SCHEMA ? NamespaceRelationId : RelationRelationId, id, user))
+            case NodeTag.T_RenameStmt when ((RenameStmt*)parsetree)->renameType == ObjectType.OBJECT_SCHEMA:
+                return Owns(NamespaceRelationId, NamespaceOid(Worf.FromServer(((RenameStmt*)parsetree)->subname)), user);
+
+            case NodeTag.T_RenameStmt:
+                return Owns(RelationRelationId, Relid(((RenameStmt*)parsetree)->relation), user);
+
+            case NodeTag.T_AlterObjectSchemaStmt:
+                return Owns(RelationRelationId, Relid(((AlterObjectSchemaStmt*)parsetree)->relation), user);
+
+            case NodeTag.T_IndexStmt:
+                return Owns(RelationRelationId, Relid(((IndexStmt*)parsetree)->relation), user);
+
+            case NodeTag.T_CreateTrigStmt:
+                uint triggered = Relid(((CreateTrigStmt*)parsetree)->relation);
+                return triggered != 0 && NativeMethods.pg_class_aclcheck(triggered, user, AclTrigger) == AclResult.ACLCHECK_OK;
+
+            case NodeTag.T_RuleStmt:
+                return Owns(RelationRelationId, Relid(((RuleStmt*)parsetree)->relation), user);
+
+            case NodeTag.T_CreatePolicyStmt:
+                return Owns(RelationRelationId, Relid(((CreatePolicyStmt*)parsetree)->table), user);
+
+            case NodeTag.T_AlterPolicyStmt:
+                return Owns(RelationRelationId, Relid(((AlterPolicyStmt*)parsetree)->table), user);
+
+            case NodeTag.T_CreateStmt:
+                CreateStmt* create = (CreateStmt*)parsetree;
+                if (create->partbound is not null && create->inhRelations is not null &&
+                    !Owns(RelationRelationId, Relid((RangeVar*)create->inhRelations->elements[0].ptr_value), user))
                 {
                     return false;
                 }
-            }
 
+                List<uint> referenced = [];
+                for (int i = 0; create->tableElts is not null && i < create->tableElts->length; i++)
+                {
+                    AddReferencedTables(referenced, (Node*)create->tableElts->elements[i].ptr_value);
+                }
+
+                for (int i = 0; create->constraints is not null && i < create->constraints->length; i++)
+                {
+                    AddReferencedTables(referenced, (Node*)create->constraints->elements[i].ptr_value);
+                }
+
+                return referenced.TrueForAll(relid => NativeMethods.pg_class_aclcheck(relid, user, AclReferences) == AclResult.ACLCHECK_OK ||
+                    NativeMethods.pg_attribute_aclcheck_all(relid, user, AclReferences, AclMaskHow.ACLMASK_ANY) == AclResult.ACLCHECK_OK);
+
+            case NodeTag.T_AlterDomainStmt:
+                return Owns(TypeRelationId, TypeOid(((AlterDomainStmt*)parsetree)->typeName), user);
+
+            case NodeTag.T_AlterEnumStmt:
+                return Owns(TypeRelationId, TypeOid(((AlterEnumStmt*)parsetree)->typeName), user);
+
+            case NodeTag.T_DropStmt:
+                DropStmt* drop = (DropStmt*)parsetree;
+                List* objects = drop->objects;
+                for (int i = 0; objects is not null && i < objects->length; i++)
+                {
+                    List* names = (List*)objects->elements[i].ptr_value;
+                    bool may = drop->removeType switch
+                    {
+                        ObjectType.OBJECT_SCHEMA => Owns(NamespaceRelationId,
+                            NamespaceOid(Worf.FromServer(NativeMethods.NameListToString(NativeMethods.lappend(null, names)))), user),
+                        ObjectType.OBJECT_TABLE or ObjectType.OBJECT_INDEX => OwnsOrItsSchema(RelationRelationId,
+                            Relid(NativeMethods.makeRangeVarFromNameList(names)), user),
+                        ObjectType.OBJECT_TRIGGER or ObjectType.OBJECT_RULE or ObjectType.OBJECT_POLICY =>
+                            Owns(RelationRelationId, Relid(TableOf(names)), user),
+                        ObjectType.OBJECT_TYPE or ObjectType.OBJECT_DOMAIN => OwnsOrItsSchema(TypeRelationId,
+                            TypeOid(((TypeName*)names)->names), user),
+                        _ => true,
+                    };
+                    if (!may)
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+
+            default:
+                return false;
+        }
+    }
+
+    /// <summary>
+    /// Checks whether the user owns an object, or the schema it's in, which lets them drop it.
+    /// </summary>
+    private static bool OwnsOrItsSchema(uint classId, uint objectId, uint user)
+    {
+        if (objectId == 0)
+        {
             return true;
         }
 
-        return objectId != 0 && Owns(classId, objectId, user);
+        ObjectAddress address = new() { classId = classId, objectId = objectId };
+        return Owns(classId, objectId, user) || Owns(NamespaceRelationId, NativeMethods.get_object_namespace(&address), user);
     }
 
     private static bool Owns(uint classId, uint objectId, uint user)
     {
+        if (objectId == 0)
+        {
+            return false;
+        }
+
 #if ANKUS_PG15
         return classId switch
         {
@@ -902,6 +1319,13 @@ internal static unsafe partial class DdlLock
 
     private static uint Relid(RangeVar* relation)
         => relation is null ? 0 : NativeMethods.RangeVarGetRelidExtended(relation, 0, RangeVarMissingOk, default, null);
+
+    /// <summary>
+    /// Gets the table of a trigger, rule or policy from its qualified name, whose last part is its own.
+    /// </summary>
+    private static RangeVar* TableOf(List* names)
+        => names is null || names->length < 2 ? null
+            : NativeMethods.makeRangeVarFromNameList(NativeMethods.list_truncate(NativeMethods.list_copy(names), names->length - 1));
 
     private static uint NamespaceOid(string name) => NativeMethods.get_namespace_oid(Worf.PStrDup(name), true);
 
@@ -938,6 +1362,10 @@ internal static unsafe partial class DdlLock
         }
     }
 
+    /// <summary>
+    /// Adds the tables with a column of a type, or of a type built on it: a domain over it, an array, range or
+    /// multirange of it, or a composite type with an attribute of it, however deep.
+    /// </summary>
     private static void AddTypeUsers(List<uint> tables, uint typeOid)
     {
         if (typeOid == 0)
@@ -946,9 +1374,19 @@ internal static unsafe partial class DdlLock
         }
 
         SpiResult result = Worf.SelectCatalog("""
+            WITH RECURSIVE built (base, derived) AS (
+                SELECT typbasetype, oid FROM pg_catalog.pg_type WHERE typtype = 'd'
+                UNION ALL SELECT oid, typarray FROM pg_catalog.pg_type WHERE typarray <> 0
+                UNION ALL SELECT a.atttypid, c.reltype FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+                    WHERE c.relkind = 'c' AND a.attnum > 0 AND NOT a.attisdropped
+                UNION ALL SELECT rngsubtype, rngtypid FROM pg_catalog.pg_range
+                UNION ALL SELECT rngtypid, rngmultitypid FROM pg_catalog.pg_range
+            ), types (oid) AS (
+                SELECT $1::pg_catalog.oid
+                UNION SELECT built.derived FROM built JOIN types ON built.base = types.oid
+            )
             SELECT DISTINCT a.attrelid FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
-            WHERE a.atttypid IN ($1, (SELECT typarray FROM pg_catalog.pg_type WHERE oid = $1)) AND NOT a.attisdropped
-                AND c.relkind IN ('r', 'p')
+            WHERE a.atttypid IN (SELECT oid FROM types) AND NOT a.attisdropped AND c.relkind IN ('r', 'p')
             """, SpiParameter.Create(typeOid));
         for (int i = 0; i < result.Count; i++)
         {
@@ -961,8 +1399,8 @@ internal static unsafe partial class DdlLock
             Worf.FromServer(NativeMethods.get_rel_name(relid)));
 
     /// <summary>
-    /// Keeps the fences when the transaction commits or is prepared, closes their connections once it ends, and in a
-    /// subtransaction that rolls back, closes the connections it opened, which lets their fences go.
+    /// Keeps the fences of the queued DDL when the transaction commits or is prepared, closes their connections once it
+    /// ends, and in a subtransaction that rolls back, lets its fences go.
     /// </summary>
     private static void RegisterCallbacks()
     {
@@ -973,16 +1411,20 @@ internal static unsafe partial class DdlLock
         _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, CloseHeldFences);
         s_subtransactionAbort = PgTransaction.RegisterSubtransactionCallback(PgSubtransactionEvent.Abort, static (subxact, parent) =>
         {
-            foreach ((ulong Id, uint NodeId, ulong Lsn, PgReplicationConnection Connection, uint Subxact, List<uint> Relids) fence in
-                s_heldFences.Where(fence => fence.Subxact == subxact.Value).ToList())
+            List<(ulong Id, uint NodeId, uint Subxact, List<uint> Relids)> aborted = s_heldFences.FindAll(fence => fence.Subxact == subxact.Value);
+            foreach ((ulong Id, uint NodeId, uint Subxact, List<uint> Relids) fence in aborted)
             {
-                Close(fence.Connection);
                 _ = s_heldFences.Remove(fence);
                 s_transactionTables.ExceptWith(fence.Relids);
                 if (s_statementFence?.Id == fence.Id)
                 {
                     s_statementFence = null;
                 }
+            }
+
+            foreach (IGrouping<uint, (ulong Id, uint NodeId, uint Subxact, List<uint> Relids)> node in aborted.GroupBy(fence => fence.NodeId))
+            {
+                Unfence(node.Key, [.. node.Select(fence => fence.Id).Distinct()]);
             }
         });
         s_subtransactionCommit = PgTransaction.RegisterSubtransactionCallback(PgSubtransactionEvent.Commit, static (subxact, parent) =>
@@ -997,32 +1439,83 @@ internal static unsafe partial class DdlLock
         });
     }
 
+    /// <summary>
+    /// Lets a node's fences go while the transaction holds others there. A connection that fails to is closed, which
+    /// lets them all go, so the transaction can't commit.
+    /// </summary>
+    private static void Unfence(uint nodeId, List<ulong> fenceIds)
+    {
+        if (!s_fenceConnections.TryGetValue(nodeId, out PgReplicationConnection? conn))
+        {
+            return;
+        }
+
+        try
+        {
+            foreach (ulong id in fenceIds)
+            {
+                conn.Execute($"CALL worf.unfence_writes({unchecked((long)id).ToString(CultureInfo.InvariantCulture)})");
+            }
+        }
+        catch (Exception error) when (error is PgException or PgRemoteException)
+        {
+            Close(conn);
+            _ = s_fenceConnections.Remove(nodeId);
+            if (s_heldFences.Exists(fence => fence.NodeId == nodeId))
+            {
+                _ = s_lostNodes.Add(nodeId);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Keeps the fences of the DDL the transaction queued, and of the statement that commits partway now. The other
+    /// fences go with their connections.
+    /// </summary>
     private static void KeepHeldFences()
     {
-        if (s_heldFences.Count == 0)
+        if (s_lostNodes.Count > 0)
+        {
+            throw new PgException(LockNotAvailable, $"lost the hold on node {s_lostNodes.First()}'s writes for this transaction's DDL");
+        }
+
+        List<(ulong Id, uint NodeId)> kept = [.. s_heldFences
+            .Where(fence => s_queuedFences.Contains(fence.Id) || (DdlReplication.Running && s_statementFence?.Id == fence.Id))
+            .Select(fence => (fence.Id, fence.NodeId))
+            .Distinct()];
+        if (kept.Count == 0)
         {
             return;
         }
 
         string nodeId = WorfNode.GetLocalNode(false, false)!.Node.Id.ToString(CultureInfo.InvariantCulture);
         string xid = Spi.ExecuteScalar<long>("SELECT pg_catalog.txid_current()").ToString(CultureInfo.InvariantCulture);
-        foreach ((ulong id, _, _, PgReplicationConnection conn, _, _) in s_heldFences)
+        foreach ((ulong id, uint node) in kept)
         {
-            _ = conn.Query($"SELECT worf.keep_fence({unchecked((long)id).ToString(CultureInfo.InvariantCulture)}, {nodeId}, {xid})", 1);
+            _ = s_fenceConnections[node].Query($"SELECT worf.keep_fence({unchecked((long)id).ToString(CultureInfo.InvariantCulture)}, {nodeId}, {xid})", 1);
         }
     }
 
     private static void CloseHeldFences()
     {
         // The other nodes drop a fence whose session ends before it's kept.
-        foreach ((_, _, _, PgReplicationConnection conn, _, _) in s_heldFences)
+        foreach (PgReplicationConnection conn in s_fenceConnections.Values)
         {
             Close(conn);
         }
 
+        s_fenceConnections.Clear();
         s_heldFences.Clear();
+        s_lostNodes.Clear();
+        s_queuedFences.Clear();
         s_transactionTables.Clear();
-        s_statementFence = null;
+
+        // A statement that commits partway still queues its DDL with its fence.
+        if (!DdlReplication.Running)
+        {
+            s_statementFence = null;
+        }
+
         s_subtransactionAbort?.Dispose();
         s_subtransactionCommit?.Dispose();
         s_subtransactionAbort = null;

@@ -57,6 +57,12 @@ internal static unsafe partial class DdlReplication
     // again when it applies on the other nodes.
     private static int s_depth;
 
+    // The objects that the DDL being replicated creates or changes, and whether it runs or inlines one of the
+    // session's temporary functions, noted while the session has temporary objects. PostgreSQL notes only the use of
+    // temporary tables, so an object that depends on another temporary object is found by its dependencies.
+    private static readonly List<(uint ClassId, uint ObjectId, int SubId)> s_changedObjects = [];
+    private static bool s_ranTemporaryFunction;
+
     /// <summary>
     /// Decides, before a utility statement runs, whether it's DDL to queue for replication once it succeeds, and the
     /// command to queue: the statement itself, or for a DROP of local and other objects, a DROP of the others.
@@ -102,6 +108,11 @@ internal static unsafe partial class DdlReplication
                 NodeTag.T_DropRoleStmt or NodeTag.T_GrantRoleStmt or NodeTag.T_AlterSystemStmt or
                 NodeTag.T_CreateSubscriptionStmt or NodeTag.T_AlterSubscriptionStmt or NodeTag.T_DropSubscriptionStmt or
                 NodeTag.T_CreatePublicationStmt or NodeTag.T_AlterPublicationStmt => false,
+            NodeTag.T_RenameStmt when IsClusterObject(((RenameStmt*)parsetree)->renameType) => false,
+            NodeTag.T_AlterOwnerStmt when IsClusterObject(((AlterOwnerStmt*)parsetree)->objectType) => false,
+            NodeTag.T_CommentStmt when IsClusterObject(((CommentStmt*)parsetree)->objtype) => false,
+            NodeTag.T_SecLabelStmt when IsClusterObject(((SecLabelStmt*)parsetree)->objtype) => false,
+            NodeTag.T_GrantStmt when IsClusterObject(((GrantStmt*)parsetree)->objtype) => false,
 
             // A prepared statement is the session's.
             NodeTag.T_CreateTableAsStmt when local => false,
@@ -139,12 +150,179 @@ internal static unsafe partial class DdlReplication
     {
         uint flags = (uint)NativeGlobals.MyXactFlags;
         NativeGlobals.MyXactFlags = (int)(flags & ~AccessedTempNamespace);
-        if (replicated)
+        if (replicated && s_depth++ == 0)
         {
-            s_depth++;
+            s_changedObjects.Clear();
+            s_ranTemporaryFunction = false;
         }
 
         return flags;
+    }
+
+    /// <summary>
+    /// Gets whether DDL being replicated runs now, as when a statement that commits partway, such as
+    /// <c>CREATE INDEX CONCURRENTLY</c>, commits.
+    /// </summary>
+    internal static bool Running => s_depth > 0;
+
+    /// <summary>
+    /// Notes an object that DDL being replicated creates or changes, from the object access hook, to find whether it
+    /// uses the session's temporary objects once it has run.
+    /// </summary>
+    /// <param name="access">What the DDL does with the object.</param>
+    /// <param name="classId">The object's catalog.</param>
+    /// <param name="objectId">The object.</param>
+    /// <param name="subId">The object's column, or zero.</param>
+    internal static void NoteObjectAccess(ObjectAccessType access, uint classId, uint objectId, int subId)
+    {
+        if (access is ObjectAccessType.OAT_POST_CREATE or ObjectAccessType.OAT_POST_ALTER && s_depth > 0 && TemporaryNamespace() != 0)
+        {
+            s_changedObjects.Add((classId, objectId, subId));
+        }
+    }
+
+    /// <summary>
+    /// Notes a function that DDL being replicated is about to run or inline, as an expression of
+    /// <c>ALTER TABLE ... USING</c> does, which leaves no dependency behind.
+    /// </summary>
+    /// <param name="funcid">The function.</param>
+    internal static void NoteFunctionUse(uint funcid)
+    {
+        if (s_depth > 0 && TemporaryNamespace() != 0 && NativeMethods.isTempNamespace(NativeMethods.get_func_namespace(funcid)))
+        {
+            s_ranTemporaryFunction = true;
+        }
+    }
+
+    /// <summary>
+    /// Checks whether DDL being replicated that has run used the session's temporary objects other than tables,
+    /// which PostgreSQL doesn't note: ran or inlined a temporary function, changed a temporary object, made an object
+    /// depend on one, or commented on, labeled or granted on one. A DROP leaves out its temporary objects itself.
+    /// </summary>
+    /// <param name="parsetree">The DDL.</param>
+    /// <returns>Whether it did.</returns>
+    internal static bool UsedTemporaryObjects(Node* parsetree)
+    {
+        uint nspoid = TemporaryNamespace();
+        if (nspoid == 0 || parsetree->type == NodeTag.T_DropStmt)
+        {
+            return false;
+        }
+
+        if (s_ranTemporaryFunction)
+        {
+            return true;
+        }
+
+        AddTargets(parsetree);
+        if (s_changedObjects.Count == 0)
+        {
+            return false;
+        }
+
+        NativeMethods.CommandCounterIncrement();
+        string schema = Worf.FromServer(NativeMethods.get_namespace_name(nspoid));
+        long[] classIds = [.. s_changedObjects.Select(changed => (long)changed.ClassId)];
+        long[] objectIds = [.. s_changedObjects.Select(changed => (long)changed.ObjectId)];
+        long[] subIds = [.. s_changedObjects.Select(changed => (long)changed.SubId)];
+        return Elevated.Run(() => Spi.ExecuteScalar<bool>("""
+            SELECT EXISTS (
+                SELECT FROM ROWS FROM (pg_catalog.unnest($1::pg_catalog.oid[]), pg_catalog.unnest($2::pg_catalog.oid[]),
+                    pg_catalog.unnest($3::pg_catalog.int4[])) AS o (classid, objid, objsubid)
+                WHERE (pg_catalog.pg_identify_object(o.classid, o.objid, 0)).schema = $4
+                    OR EXISTS (
+                        SELECT FROM pg_catalog.pg_depend d
+                        WHERE d.classid = o.classid AND d.objid = o.objid AND (o.objsubid = 0 OR d.objsubid IN (0, o.objsubid))
+                            AND (pg_catalog.pg_identify_object(d.refclassid, d.refobjid, 0)).schema = $4))
+            """, SpiParameter.Create(classIds), SpiParameter.Create(objectIds), SpiParameter.Create(subIds), SpiParameter.Create(schema)));
+    }
+
+    /// <summary>
+    /// Adds the objects that COMMENT, SECURITY LABEL and GRANT name to the changed objects, which the object access
+    /// hook doesn't see.
+    /// </summary>
+    private static void AddTargets(Node* parsetree)
+    {
+        switch (parsetree->type)
+        {
+            case NodeTag.T_CommentStmt:
+                AddTarget(((CommentStmt*)parsetree)->objtype, ((CommentStmt*)parsetree)->@object);
+                break;
+
+            case NodeTag.T_SecLabelStmt:
+                AddTarget(((SecLabelStmt*)parsetree)->objtype, ((SecLabelStmt*)parsetree)->@object);
+                break;
+
+            case NodeTag.T_GrantStmt when ((GrantStmt*)parsetree)->targtype == GrantTargetType.ACL_TARGET_OBJECT:
+                GrantStmt* grant = (GrantStmt*)parsetree;
+                List* objects = grant->objects;
+                for (int i = 0; objects is not null && i < objects->length; i++)
+                {
+                    Node* target = (Node*)objects->elements[i].ptr_value;
+                    if (grant->objtype is ObjectType.OBJECT_FUNCTION or ObjectType.OBJECT_PROCEDURE or ObjectType.OBJECT_ROUTINE)
+                    {
+                        AddTarget(grant->objtype, target);
+                    }
+                    else if (grant->objtype is ObjectType.OBJECT_TYPE or ObjectType.OBJECT_DOMAIN)
+                    {
+                        AddTarget(grant->objtype, (Node*)NativeMethods.makeTypeNameFromNameList((List*)target));
+                    }
+                }
+
+                break;
+
+            default:
+                break;
+        }
+    }
+
+    private static void AddTarget(ObjectType type, Node* target)
+    {
+        RelationData* relation = null;
+        ObjectAddress address = NativeMethods.get_object_address(type, target, &relation, (int)PgLockMode.AccessShare, true);
+        if (relation is not null)
+        {
+            NativeMethods.relation_close(relation, (int)PgLockMode.None);
+        }
+
+        if (address.objectId != 0)
+        {
+            s_changedObjects.Add((address.classId, address.objectId, address.objectSubId));
+        }
+    }
+
+    /// <summary>
+    /// Checks whether an object a DROP names is one of the session's temporary objects, locking it as the DROP will.
+    /// </summary>
+    private static bool IsTemporary(ObjectType type, Node* target)
+    {
+        if (TemporaryNamespace() == 0)
+        {
+            return false;
+        }
+
+        RelationData* relation = null;
+        ObjectAddress address = NativeMethods.get_object_address(type, target, &relation, (int)PgLockMode.AccessExclusive, true);
+        if (relation is not null)
+        {
+            bool temporary = relation->rd_rel->relpersistence == (sbyte)'t';
+            NativeMethods.relation_close(relation, (int)PgLockMode.None);
+            return temporary;
+        }
+
+        uint nspoid = address.objectId == 0 ? 0 : NativeMethods.get_object_namespace(&address);
+        return nspoid != 0 && NativeMethods.isTempNamespace(nspoid);
+    }
+
+    /// <summary>
+    /// Gets the session's temporary namespace, or zero while it has none.
+    /// </summary>
+    private static uint TemporaryNamespace()
+    {
+        uint nspoid;
+        uint toastoid;
+        NativeMethods.GetTempNamespaceState(&nspoid, &toastoid);
+        return nspoid;
     }
 
     /// <summary>
@@ -207,11 +385,19 @@ internal static unsafe partial class DdlReplication
     }
 
     /// <summary>
+    /// Gets whether this session restores a subscription's structure. Only a superuser, or a role granted
+    /// <c>SET</c> on it, may set it, since it turns off DDL replication, the global DDL lock and sequence range checks.
+    /// </summary>
+    [PgGucBool("worf.subscription_schema_restore", false, "Marks a session that restores a subscription's structure.",
+        Context = PgGucContext.SuperuserSet)]
+    internal static partial bool SubscriptionSchemaRestore { get; }
+
+    /// <summary>
     /// Checks whether this session restores a subscription's structure, which DDL replication leaves alone, since the
     /// nodes it would reach already have it.
     /// </summary>
     /// <returns>Whether it does.</returns>
-    internal static bool Restoring() => Setting("worf.subscription_schema_restore") is "true" or "on" or "1";
+    internal static bool Restoring() => SubscriptionSchemaRestore;
 
     private static string Setting(string name)
     {
@@ -252,8 +438,9 @@ internal static unsafe partial class DdlReplication
             return;
         }
 
+        // The replication sets, and the truncate trigger a table joining one gets, are worf's own, whoever runs the DDL.
         bool join = parsetree->type != NodeTag.T_AlterTableStmt || HasCommand((AlterTableStmt*)parsetree, AlterTableType.AT_SetLogged);
-        _ = WithSnapshot(() => Reconcile(reloid, join));
+        _ = WithSnapshot(() => Elevated.Run(() => Reconcile(reloid, join)));
     }
 
     private static bool Reconcile(uint reloid, bool join)
@@ -522,8 +709,18 @@ internal static unsafe partial class DdlReplication
                 return $"DROP {kind}{(stmt->concurrent ? " CONCURRENTLY" : "")}{(stmt->missing_ok ? " IF EXISTS" : "")} " +
                     $"{string.Join(", ", kept)}{(stmt->behavior == DropBehavior.DROP_CASCADE ? " CASCADE" : "")}";
 
+            // Any other object stays on this node when it's temporary.
             default:
-                return command;
+                int temporary = 0;
+                for (int i = 0; i < count; i++)
+                {
+                    temporary += IsTemporary(stmt->removeType, (Node*)objects->elements[i].ptr_value) ? 1 : 0;
+                }
+
+                return temporary == 0 ? command
+                    : temporary == count ? null
+                    : throw new PgException("55000", "temporary objects can't be dropped together with other objects while worf.enable_ddl_replication is on",
+                        hint: "Drop them in a statement of their own.");
         }
     }
 
@@ -548,6 +745,14 @@ internal static unsafe partial class DdlReplication
     /// </summary>
     private static bool NameIs(Node* name, string expected)
         => name is not null && Worf.FromServer(NativeMethods.NameListToString(NativeMethods.lappend(null, name))) == expected;
+
+    /// <summary>
+    /// Checks whether objects of a type are the cluster's, or PostgreSQL's own replication's, rather than the
+    /// database's.
+    /// </summary>
+    private static bool IsClusterObject(ObjectType type)
+        => type is ObjectType.OBJECT_DATABASE or ObjectType.OBJECT_TABLESPACE or ObjectType.OBJECT_ROLE or
+            ObjectType.OBJECT_PARAMETER_ACL or ObjectType.OBJECT_PUBLICATION or ObjectType.OBJECT_SUBSCRIPTION;
 
     private static bool IsWorf(sbyte* name) => name is not null && Worf.FromServer(name) == Worf.ExtensionName;
 

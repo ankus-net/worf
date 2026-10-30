@@ -69,34 +69,40 @@ A replicated `ALTER TABLE ... ADD COLUMN` with a volatile default, such as
 `now()` or `gen_random_uuid()`, fills existing rows with each node's own
 values.
 
-With `worf.global_ddl_lock`, a statement in the same transaction that writes
-rows another node is about to change, before DDL that takes the lock, can
-make the DDL wait until `worf.ddl_lock_timeout`. A node notices within about a
-minute that a node holding back its writes for DDL died before the DDL
-committed.
+With `worf.global_ddl_lock`, DDL that takes the lock fails at once with
+SQLSTATE `55P03` when an earlier statement in its transaction locked or wrote
+to rows that another node's changes, which this node applies first, need, as
+`LOCK TABLE`, `TRUNCATE` or an `UPDATE` of a row another node changed can. Run
+such DDL first in its transaction, or in a transaction of its own. A node
+notices within about a minute that a node holding back its writes for DDL died
+before the DDL committed.
 
-## No replication queue flush
+`worf.replicate_ddl_command` doesn't take the global DDL lock: the DDL it
+queues applies on each node wherever it falls among that node's own writes.
 
-There's no support for freezing transactions on the master and waiting until
-all pending queued xacts are replayed from slots. Support for making the
-upstream read-only for this will be added in a future release.
+DDL that uses the session's temporary objects, such as a temporary function
+in `ALTER TABLE ... USING`, or a temporary type as a column's type, runs on
+its node alone, without a notice.
+
+## Schema changes without the global DDL lock
+
+Without `worf.global_ddl_lock`, there's no support for freezing transactions
+on the provider and waiting until all pending queued transactions are replayed
+from slots.
 
 This means that care must be taken when applying table structure changes. If
 there are committed transactions that aren't yet replicated and the table
 structure of the provider and subscriber are changed at the same time in a way
-that makes the subscriber table incompatible with the queued transactions
+that makes the subscriber table incompatible with the queued transactions,
 replication will stop.
 
-Administrators should either ensure that writes to the master are stopped
+Administrators should either ensure that writes to the provider are stopped
 before making schema changes, or use the `worf.replicate_ddl_command`
 function to queue schema changes so they're replayed at a consistent point
-on the replica.
-
-Once multi-master replication support is added then using
-`worf.replicate_ddl_command` will not be enough, as the subscriber may be
-generating new xacts with the old structure after the schema change is
-committed on the publisher. Users will have to ensure writes are stopped on all
-nodes and all slots are caught up before making schema changes.
+on the subscriber. Where every node writes, that isn't enough, as another node
+may write with the old structure after the change committed: replicate DDL with
+`worf.enable_ddl_replication` and `worf.global_ddl_lock`, or stop writes on all
+nodes and let all slots catch up before making schema changes.
 
 ## FOREIGN KEYS
 

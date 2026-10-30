@@ -17,7 +17,8 @@ description: Replicate DDL and wait for replication.
   Lets local writes and DDL through the fence that `worf.global_ddl_lock` put
   up for DDL from another node, or through every fence in this database when
   `fence_id` is NULL, as when that DDL won't reach this node because its node
-  is gone for good. Returns the number of tables let through.
+  is gone for good, once the transaction commits. Returns the number of tables
+  let through.
 
 - `worf.synchronize_sequence(relation regclass)`
   Push sequence state to all subscribers. Unlike the subscription and table
