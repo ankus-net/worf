@@ -104,7 +104,7 @@ internal static class Sync
                 {
                     PgBackgroundWorker.RunTransaction(() =>
                     {
-                        ushort originid = EnsureReplicationOrigin(sub.SlotName);
+                        ushort originid = EnsureReplicationOrigin(sub);
                         ulong xactLastCommitEnd;
                         unsafe
                         {
@@ -272,7 +272,7 @@ internal static class Sync
                 SequenceRangeSync.JoinBeforeCopy(managedSequences, Spi.ExecuteScalar<uint?>("SELECT to_regclass($1)::oid",
                     SpiParameter.Create(Spi.QuoteQualifiedIdentifier(nspname, relname))) ?? 0);
 
-                ushort originid = EnsureReplicationOrigin(sub.SlotName);
+                ushort originid = EnsureReplicationOrigin(sub);
                 ulong xactLastCommitEnd;
                 unsafe
                 {
@@ -1040,8 +1040,8 @@ internal static class Sync
     /// <summary>
     /// Get or create replication origin for a given slot.
     /// </summary>
-    private static ushort EnsureReplicationOrigin(string slotName)
-        => PgReplicationOrigin.Find(slotName) ?? PgReplicationOrigin.Create(slotName);
+    private static ushort EnsureReplicationOrigin(WorfSubscription sub)
+        => PgReplicationOrigin.Find(sub.SlotName) ?? WorfNode.CreateOrigin(sub.SlotName, sub.Origin.Id);
 
     /// <summary>
     /// Transaction management for COPY.

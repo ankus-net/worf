@@ -421,19 +421,36 @@ internal static class Functions
                 Worker.WorkerKill(guard, apply);
             }
 
-            // Wait for the apply to die.
-            while (true)
+            // Wait for the apply to die. It looks for the request to stop between statements, so an apply that waits on
+            // a row this transaction deleted, as one that is initializing the subscription does, never sees it until
+            // its statement is cancelled. Only an apply this transaction blocks is cancelled: it can't exit before this
+            // transaction ends, so it's still there to cancel. A cancellation is no error of the data, so
+            // exception_behaviour leaves it be.
+            for (int waits = 0; ; waits++)
             {
-                bool running;
+                int pid = 0;
                 using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
                 {
-                    running = guard.Read((in _, workers) =>
-                        Worker.WorkerRunning(workers, Worker.ApplyFind(workers, myDatabaseId, sub.Id)));
+                    int apply = guard.Read((in _, workers) => Worker.ApplyFind(workers, myDatabaseId, sub.Id));
+                    if (apply >= 0 && guard[apply].Proc != 0)
+                    {
+                        unsafe
+                        {
+                            pid = ((PGPROC*)guard[apply].Proc)->pid;
+                        }
+                    }
                 }
 
-                if (!running)
+                if (pid == 0)
                 {
                     break;
+                }
+
+                if (waits > 0)
+                {
+                    _ = Elevated.Run(() => Spi.Execute(
+                        "SELECT pg_catalog.pg_cancel_backend($1) WHERE pg_catalog.pg_backend_pid() = ANY (pg_catalog.pg_blocking_pids($1))",
+                        SpiParameter.Create(pid)));
                 }
 
                 PgInterrupts.Check();

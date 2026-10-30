@@ -196,7 +196,7 @@ rules don't apply to these steps, and each adds multi-server tests.
 
 - [x] **1. Convergence.** Equal commit timestamps resolve by the id of the node that wrote each change, wherever it was relayed from. A warning when `apply_remote` or `keep_local` resolves conflicts between nodes that replicate both ways. Apply waits out a configured maximum clock skew. Proved by [CI run 40826673559](https://github.com/ankus-net/worf/actions/runs/40826673559).
 - [x] **2. Apply errors.** A failing statement or transaction is skipped, or its subscription disabled, and recorded in an exception log, so errors don't stop replication. Proved by [CI run 40843657689](https://github.com/ankus-net/worf/actions/runs/40843657689).
-- [ ] **3. DDL.** Apply tolerates columns one node has dropped or not yet added. DDL is captured and queued automatically, and new tables join replication sets. DDL that can't apply in any order locks every node first.
+- [x] **3. DDL.** Apply tolerates columns one node has dropped or not yet added. DDL is captured and queued automatically, and new tables join replication sets. DDL that can't apply in any order locks every node first. Proved by [CI run 40914761041](https://github.com/ankus-net/worf/actions/runs/40914761041).
 - [ ] **4. Sequences.** Automatic sequence ranges, for schemas that can't change, and Snowflake IDs, for those that can.
 - [ ] **5. Membership.** Joining and leaving a group of nodes, a sync barrier across them, and a lag view.
 - [ ] **6. Delta apply.** Columns that merge as increments rather than overwrite.

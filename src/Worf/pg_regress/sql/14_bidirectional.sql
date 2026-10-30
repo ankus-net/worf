@@ -14,12 +14,15 @@ BEGIN
 	END IF;
 END;$$;
 
+-- The apply workers don't run with the session's setting, so the warning stands.
+SET worf.conflict_resolution = last_update_wins;
 SELECT * FROM worf.create_subscription(
     subscription_name := 'test_bidirectional',
     provider_dsn := (SELECT subscriber_dsn FROM worf_regress_variables()) || ' user=super',
     synchronize_structure := false,
     synchronize_data := false,
     forward_origins := '{}');
+RESET worf.conflict_resolution;
 
 BEGIN;
 SET LOCAL statement_timeout = '180s';
@@ -77,5 +80,16 @@ DROP EXTENSION IF EXISTS worf_origin;
 
 \c :subscriber_dsn
 \a
+-- Wait for the dropped subscription's slot and walsender to go.
+DO $$
+BEGIN
+    FOR i IN 1..300 LOOP
+        IF NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE database = current_database())
+            AND NOT EXISTS (SELECT 1 FROM pg_stat_replication WHERE application_name = 'test_bidirectional') THEN
+            EXIT;
+        END IF;
+        PERFORM pg_sleep(0.1);
+    END LOOP;
+END;$$;
 SELECT slot_name FROM pg_replication_slots WHERE database = current_database();
 SELECT count(*) FROM pg_stat_replication WHERE application_name = 'test_bidirectional';

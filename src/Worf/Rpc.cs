@@ -224,7 +224,7 @@ internal static class Rpc
         IReadOnlyList<string?[]> res;
         try
         {
-            res = conn.Query($"SELECT EXISTS (SELECT 1 FROM worf.subscription WHERE sub_origin = {nodeId.ToString(CultureInfo.InvariantCulture)}), current_setting('worf.conflict_resolution', true)", 2);
+            res = conn.Query($"SELECT EXISTS (SELECT 1 FROM worf.subscription WHERE sub_origin = {nodeId.ToString(CultureInfo.InvariantCulture)}), ({Conflict.WorkerResolutionSql})", 2);
         }
         catch (PgRemoteException error)
         {

@@ -51,13 +51,14 @@ internal static partial class Conflict
     /// Try resolving the conflict resolution.
     /// </summary>
     /// <param name="localOrigin">The origin of the transaction that wrote the local row.</param>
+    /// <param name="localXid">That transaction.</param>
     /// <param name="localTs">When that transaction committed.</param>
     /// <param name="localtuple">The local row.</param>
     /// <param name="remotetuple">The remote row.</param>
     /// <param name="resulttuple">The row to keep.</param>
     /// <param name="resolution">How the conflict was resolved.</param>
     /// <returns>Whether the remote tuple should be applied.</returns>
-    internal static unsafe bool TryResolveConflict(ushort localOrigin, long localTs, HeapTupleData* localtuple,
+    internal static unsafe bool TryResolveConflict(ushort localOrigin, uint localXid, long localTs, HeapTupleData* localtuple,
         HeapTupleData* remotetuple, out HeapTupleData* resulttuple, out WorfConflictResolution resolution)
     {
         bool apply;
@@ -79,12 +80,12 @@ internal static partial class Conflict
                 break;
 
             case WorfResolveOption.LastUpdateWins:
-                apply = ConflictResolveByTimestamp(localOrigin, localTs, Worf.ReploriginSessionOriginTimestamp, true,
+                apply = ConflictResolveByTimestamp(localOrigin, localXid, localTs, Worf.ReploriginSessionOriginTimestamp, true,
                     out resolution);
                 break;
 
             case WorfResolveOption.FirstUpdateWins:
-                apply = ConflictResolveByTimestamp(localOrigin, localTs, Worf.ReploriginSessionOriginTimestamp, false,
+                apply = ConflictResolveByTimestamp(localOrigin, localXid, localTs, Worf.ReploriginSessionOriginTimestamp, false,
                     out resolution);
                 break;
 
@@ -106,16 +107,8 @@ internal static partial class Conflict
     /// <param name="remoteResolution">The other node's <c>worf.conflict_resolution</c>.</param>
     internal static void CheckTwoWayResolution(string localNode, string remoteNode, string remoteResolution)
     {
-        string localResolution = ConflictResolver switch
-        {
-            WorfResolveOption.Error => "error",
-            WorfResolveOption.ApplyRemote => "apply_remote",
-            WorfResolveOption.KeepLocal => "keep_local",
-            WorfResolveOption.LastUpdateWins => "last_update_wins",
-            _ => "first_update_wins",
-        };
-
-        if (localResolution == remoteResolution && localResolution is "error" or "last_update_wins" or "first_update_wins")
+        string localResolution = Spi.ExecuteScalar<string>(WorkerResolutionSql);
+        if (localResolution == remoteResolution && localResolution is "last_update_wins" or "first_update_wins")
         {
             return;
         }
@@ -127,6 +120,24 @@ internal static partial class Conflict
             Hint = "Set worf.conflict_resolution to last_update_wins or first_update_wins on both nodes.",
         });
     }
+
+    /// <summary>
+    /// Gets the query for the <c>worf.conflict_resolution</c> that the apply workers on a node run with, rather than
+    /// the session's: the database's and the workers' role's settings, then the value the session started with,
+    /// which the configuration files and ALTER SYSTEM set.
+    /// </summary>
+    internal const string WorkerResolutionSql = """
+        SELECT coalesce(
+            (SELECT substr(c, length('worf.conflict_resolution=') + 1)
+             FROM pg_catalog.pg_db_role_setting s, unnest(s.setconfig) c
+             WHERE c LIKE 'worf.conflict_resolution=%'
+                AND s.setdatabase IN (0, (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database()))
+                AND s.setrole IN (0, 10)
+             ORDER BY s.setdatabase <> 0 AND s.setrole <> 0 DESC, s.setrole <> 0 DESC, s.setdatabase <> 0 DESC
+             LIMIT 1),
+            (SELECT reset_val FROM pg_catalog.pg_settings WHERE name = 'worf.conflict_resolution'),
+            'apply_remote')
+        """;
 
     /// <summary>
     /// Gets a resolution's name.
@@ -286,7 +297,7 @@ internal static partial class Conflict
     /// <summary>
     /// Resolve conflict based on commit timestamp.
     /// </summary>
-    private static bool ConflictResolveByTimestamp(ushort localOriginId, long localTs, long remoteTs, bool lastUpdateWins,
+    private static bool ConflictResolveByTimestamp(ushort localOriginId, uint localXid, long localTs, long remoteTs, bool lastUpdateWins,
         out WorfConflictResolution resolution)
     {
         int cmp = remoteTs.CompareTo(localTs);
@@ -302,7 +313,7 @@ internal static partial class Conflict
         // written by the node with the higher id wins, whichever node relayed it.
         if (cmp == 0)
         {
-            uint localNodeId = WriterNodeId(localOriginId);
+            uint localNodeId = WriterNodeId(localOriginId, localXid);
             uint remoteNodeId = Apply.WriterNodeId;
             cmp = localNodeId == remoteNodeId ? 1 : remoteNodeId.CompareTo(localNodeId);
         }
@@ -322,18 +333,26 @@ internal static partial class Conflict
     }
 
     /// <summary>
-    /// Gets the node that wrote a local row: the node whose changes its commit's replication origin applies, or this
-    /// node for a row written here or under an origin no subscription owns.
+    /// Gets the node that wrote a local row: the node whose changes its commit's replication origin applied when the
+    /// row's transaction ran, or this node for a row written here. An origin's id is reused once it's dropped, as
+    /// every table sync's is, so the writer comes from what worf recorded for the id as of the row's transaction.
     /// </summary>
     /// <param name="originId">The replication origin of the row's commit.</param>
+    /// <param name="xid">The row's transaction.</param>
     /// <returns>The node's id.</returns>
-    private static unsafe uint WriterNodeId(ushort originId)
+    private static unsafe uint WriterNodeId(ushort originId, uint xid)
     {
         uint localNodeId = Apply.MySubscription!.Target.Id;
+        if (originId == 0)
+        {
+            return localNodeId;
+        }
+
+        uint? recorded = WorfNode.OriginWriter(originId, xid);
         sbyte* name;
-        return originId != 0 && NativeMethods.replorigin_by_oid(originId, true, &name)
+        return recorded ?? (NativeMethods.replorigin_by_oid(originId, true, &name)
             ? WorfNode.GetOriginNodeId(Worf.FromServer(name)) ?? localNodeId
-            : localNodeId;
+            : localNodeId);
     }
 
     /// <summary>

@@ -62,7 +62,7 @@ public sealed class DroppedColumnTests
             ALTER TABLE t ADD COLUMN c text;
             INSERT INTO t VALUES (3, 'a3', 'b3', 'c3');
             """, token);
-        Assert.IsTrue(await PollLogAsync(subscriber, logpos, "unknown column name c", token), "the column the subscriber never had");
+        Assert.IsTrue(await subscriber.PollLogAsync(logpos, "unknown column name c", token), "the column the subscriber never had");
     }
 
     /// <summary>
@@ -169,22 +169,5 @@ public sealed class DroppedColumnTests
         }
 
         return node;
-    }
-
-    private static async Task<bool> PollLogAsync(TestNode node, int logpos, string text, CancellationToken token)
-    {
-        using CancellationTokenSource timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
-        timeout.CancelAfter(TestNode.PollTimeout);
-        while (!node.ReadLog()[logpos..].Contains(text, StringComparison.Ordinal))
-        {
-            if (timeout.IsCancellationRequested)
-            {
-                return false;
-            }
-
-            await Task.Delay(TimeSpan.FromMilliseconds(100), token);
-        }
-
-        return true;
     }
 }
