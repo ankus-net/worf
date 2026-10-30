@@ -517,7 +517,8 @@ internal static unsafe partial class SequenceRanges
             {
                 changed |= GrantOwnBlock(seqoid, info, node, epoch);
             }
-            else
+            else if (!Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range_request WHERE seqoid = $1 AND kind = 'n')",
+                SpiParameter.Create(seqoid)))
             {
                 _ = Spi.Execute("""
                     INSERT INTO worf.sequence_range_request (request_id, seqoid, parent_node, kind, size, created_at)
@@ -1023,19 +1024,28 @@ internal static unsafe partial class SequenceRanges
         SpiParameter line = SpiParameter.Create((long)timeline);
         bool changed = false;
 
-        // Allocator blocks first, so that a node that resets doesn't grant itself from a root it is about to fence.
-        _ = Spi.Execute("UPDATE worf.sequence_range_block SET state = 'abandoned' WHERE kind IN ('r', 'p') AND state IN ('open', 'fenced') AND node_id <> $1", id);
-        SpiResult fenced = Spi.Query(Spi.Sql($"""
-            UPDATE worf.sequence_range_block SET state = 'fenced'
-            WHERE kind IN ('r', 'p') AND state = 'open' AND (sysid <> {(decimal)sysid} OR timeline <> {(long)timeline})
-            RETURNING seqoid::oid
-            """), false, 0);
-        for (int i = 0; i < fenced.Count; i++)
+        // Allocator blocks first, so that a node that resets doesn't grant itself from a root it is about to fence. This
+        // runs on every tick, so it reads first: a write takes a transaction ID even when it changes nothing.
+        if (Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range_block WHERE kind IN ('r', 'p') AND state IN ('open', 'fenced') AND node_id <> $1)", id))
         {
-            uint seqoid = fenced[i].Get<uint>(0);
-            if (Spi.Execute("UPDATE worf.sequence_range SET fenced_at = now() WHERE seqoid = $1 AND fenced_at IS NULL", SpiParameter.Create(seqoid)) > 0)
+            _ = Spi.Execute("UPDATE worf.sequence_range_block SET state = 'abandoned' WHERE kind IN ('r', 'p') AND state IN ('open', 'fenced') AND node_id <> $1", id);
+        }
+
+        if (Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range_block WHERE kind IN ('r', 'p') AND state = 'open' AND (sysid <> $1 OR timeline <> $2))",
+            system, line))
+        {
+            SpiResult fenced = Spi.Query(Spi.Sql($"""
+                UPDATE worf.sequence_range_block SET state = 'fenced'
+                WHERE kind IN ('r', 'p') AND state = 'open' AND (sysid <> {(decimal)sysid} OR timeline <> {(long)timeline})
+                RETURNING seqoid::oid
+                """), false, 0);
+            for (int i = 0; i < fenced.Count; i++)
             {
-                PgLog.Warning($"sequence {GetInfo(seqoid).Name}: this allocator's timeline or system identifier changed, so it grants nothing until every node it granted to reports");
+                uint seqoid = fenced[i].Get<uint>(0);
+                if (Spi.Execute("UPDATE worf.sequence_range SET fenced_at = now() WHERE seqoid = $1 AND fenced_at IS NULL", SpiParameter.Create(seqoid)) > 0)
+                {
+                    PgLog.Warning($"sequence {GetInfo(seqoid).Name}: this allocator's timeline or system identifier changed, so it grants nothing until every node it granted to reports");
+                }
             }
         }
 

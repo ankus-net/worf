@@ -155,7 +155,12 @@ internal static class SequenceRangeExchange
             }
         }
 
-        _ = Spi.Execute("UPDATE worf.sequence_range SET exchanged_at = now()");
+        // A node that manages nothing only asks whether its neighbor does, and writes nothing.
+        if (Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range)"))
+        {
+            _ = Spi.Execute("UPDATE worf.sequence_range SET exchanged_at = now()");
+        }
+
         return changed;
     }
 

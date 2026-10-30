@@ -198,8 +198,13 @@ internal static class SequenceRangeReservations
             }
         }
 
-        // Refusals stay a minute, so that the sessions waiting on them see them.
-        _ = Spi.Execute("DELETE FROM worf.sequence_range_request WHERE state = 'refused' AND created_at < now() - interval '1 minute'");
+        // Refusals stay a minute, so that the sessions waiting on them see them. This runs on every tick, so it reads
+        // first: a write takes a transaction ID even when it changes nothing.
+        if (Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range_request WHERE state = 'refused' AND created_at < now() - interval '1 minute')"))
+        {
+            _ = Spi.Execute("DELETE FROM worf.sequence_range_request WHERE state = 'refused' AND created_at < now() - interval '1 minute'");
+        }
+
         return recorded;
     }
 
