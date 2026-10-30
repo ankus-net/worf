@@ -59,7 +59,8 @@ internal static class SequenceRangeReservations
 
     private static void ReserveRange(uint seqoid, long count, PgInterval timeout)
     {
-        _ = WorfNode.GetLocalNode(true, false);
+        // The node isn't locked while the session waits, since the manager, which starts the range worker, locks it.
+        _ = WorfNode.GetLocalNode(false, false);
         if (count <= 0)
         {
             throw new PgException(PgSqlStates.InvalidParameterValue, "count must be positive");
@@ -133,7 +134,7 @@ internal static class SequenceRangeReservations
 
     private static void ReserveValues(uint seqoid, long lo, long hi, PgInterval timeout)
     {
-        _ = WorfNode.GetLocalNode(true, false);
+        _ = WorfNode.GetLocalNode(false, false);
         if (lo > hi)
         {
             throw new PgException(PgSqlStates.InvalidParameterValue, "lo must not be above hi");
@@ -237,8 +238,8 @@ internal static class SequenceRangeReservations
             }
         }
 
-        // Refusals stay a minute, so that the sessions waiting on them see them. This runs on every tick, so it reads
-        // first: a write takes a transaction ID even when it changes nothing.
+        // Refusals stay a minute, so that the sessions waiting on them see them. They are looked for first, so that a
+        // worker with none writes nothing.
         if (Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range_request WHERE state = 'refused' AND created_at < now() - interval '1 minute')"))
         {
             _ = Spi.Execute("DELETE FROM worf.sequence_range_request WHERE state = 'refused' AND created_at < now() - interval '1 minute'");

@@ -116,7 +116,8 @@ using Ankus.Postgres;
 
     CREATE TABLE worf.sequence_range_link (
         slot_name name PRIMARY KEY,
-        node_id oid NOT NULL
+        node_id oid NOT NULL,
+        role_id oid NOT NULL
     );
 
     CREATE VIEW worf.sequence_ranges AS
@@ -356,9 +357,9 @@ internal static unsafe partial class SequenceRanges
             // The old owner itself starts the next epoch at once: its root, the epoch's only one, stopped when it disabled.
             if (!force && existing[0].Get<uint>(2) != node.Node.Id && Worf.SelectCatalog("""
                 SELECT 1 FROM worf.sequence_range_node
-                WHERE seqoid = $1 AND node_id <> $2 AND epoch = $3 AND state <> 'disabled' AND reported_at > now() - $4::interval
-                """, SpiParameter.Create(seqoid), SpiParameter.Create(node.Node.Id), SpiParameter.Create(current),
-                SpiParameter.Create(LiveReportAge)).Count > 0)
+                WHERE seqoid = $1 AND node_id <> $2 AND epoch = $3 AND state <> 'disabled'
+                    AND worf.sequence_range_heard(node_id, false, reported_at, true) > now() - interval '1 minute'
+                """, SpiParameter.Create(seqoid), SpiParameter.Create(node.Node.Id), SpiParameter.Create(current)).Count > 0)
             {
                 throw new PgException(PgSqlStates.ObjectInUse, $"sequence {info.Name} is still under range management by its owner",
                     hint: "Disable it with worf.disable_sequence_range on its owner first, or pass force := true if the owner is gone for good.");
@@ -533,7 +534,8 @@ internal static unsafe partial class SequenceRanges
 
     /// <summary>
     /// Checks a managed sequence: switches to its next block once the active one runs low, and gets a new next block.
-    /// The range worker calls this in a transaction for each managed sequence.
+    /// The range worker calls this in a transaction for each managed sequence. A check that has nothing to change only
+    /// reads, so that an idle node uses no transaction IDs.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
     /// <param name="node">This node.</param>
@@ -541,10 +543,31 @@ internal static unsafe partial class SequenceRanges
     /// <returns>Whether anything changed, for the guard's caches.</returns>
     internal static bool Check(uint seqoid, WorfLocalNode node, double rate)
     {
+        // The sequence's position is sampled once a check, before the range row is locked.
+        (Guid Block, bool Moved)? backwards = Worf.ReadScalar<int?>("SELECT epoch FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(seqoid))
+            is int sampled && seqoid != SnowflakeIds.NodeSequence() && NodeBlock(seqoid, sampled, "active") is (Guid, long, long) block
+            ? (block.Id, MovedBackwards(seqoid, GetInfo(seqoid), block))
+            : null;
+        return CheckSequence(seqoid, node, rate, backwards, false) && CheckSequence(seqoid, node, rate, backwards, true);
+    }
+
+    /// <summary>
+    /// Finds whether a check has anything to change, or changes it.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    /// <param name="node">This node.</param>
+    /// <param name="rate">The sequence's peak rate in values a second.</param>
+    /// <param name="backwards">The active block sampled, and whether the sequence moved backwards in it.</param>
+    /// <param name="apply">Whether to change it, rather than only read.</param>
+    /// <returns>Whether there is anything to change, or whether anything changed.</returns>
+    private static bool CheckSequence(uint seqoid, WorfLocalNode node, double rate, (Guid Block, bool Moved)? backwards, bool apply)
+    {
         // The range row is locked first, as every change to a sequence's ranges locks it, so that a check and an exchange
         // that both change the sequence take their locks in the same order.
-        SpiResult rows = Spi.Query("SELECT state, epoch, owner_node FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE", false, 1,
-            SpiParameter.Create(seqoid));
+        SpiParameter seq = SpiParameter.Create(seqoid);
+        SpiResult rows = apply
+            ? Spi.Query("SELECT state, epoch, owner_node FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE", false, 1, seq)
+            : Worf.Read("SELECT state, epoch, owner_node FROM worf.sequence_range WHERE seqoid = $1", 1, seq);
         if (rows.Count == 0)
         {
             return false;
@@ -565,10 +588,36 @@ internal static unsafe partial class SequenceRanges
         (Guid Id, long Lo, long Hi, bool Reserved)? next = NextBlock(seqoid, epoch);
         bool changed = false;
 
+        // A Snowflake node number goes when another node holds it too, or once the owner of the numbers hasn't been heard
+        // from for half the time after which it gives the number of a node that stopped reporting to another.
+        if (snowflake && active is not null && SnowflakeNumberLost(seqoid, owner, node, active.Value.Lo) is string lost)
+        {
+            if (!apply)
+            {
+                return true;
+            }
+
+            PgLog.Warning($"Snowflake node number {active.Value.Lo}: {lost}, so this node gives it up and asks for another");
+            GiveUpSnowflakeNumber(seqoid, info, node, epoch);
+            return true;
+        }
+
+        // The owner switches to a block it granted itself only once a neighbor has heard of it, so that a rollback of the
+        // owner can't lose it.
+        if (next is not null && !Confirmed(seqoid, info, next.Value.Id))
+        {
+            next = null;
+        }
+
         if (active is null)
         {
             if (next is not null)
             {
+                if (!apply)
+                {
+                    return true;
+                }
+
                 changed = Switch(seqoid, info, (next.Value.Id, next.Value.Lo, next.Value.Hi));
                 next = null;
             }
@@ -581,17 +630,27 @@ internal static unsafe partial class SequenceRanges
             // smaller than a minute's use still serves most of its values while the next ones grow. A block reserved
             // for a load is switched to at once, and so is any once the sequence moved backwards in its block.
             long margin = Math.Min(Math.Max(size / 20, (long)(rate * 60)), size / 2);
-            bool backwards = MovedBackwards(seqoid, info, active.Value);
-            if (next is not null && (left <= margin || backwards || next.Value.Reserved))
+            bool moved = backwards is (Guid sampled, true) && sampled == active.Value.Id;
+            if (next is not null && (left <= margin || moved || next.Value.Reserved))
             {
+                if (!apply)
+                {
+                    return true;
+                }
+
                 if (Switch(seqoid, info, (next.Value.Id, next.Value.Lo, next.Value.Hi)))
                 {
                     changed = true;
                     next = null;
                 }
             }
-            else if (backwards)
+            else if (moved)
             {
+                if (!apply)
+                {
+                    return true;
+                }
+
                 // With no next block, the sequence stops until one arrives, rather than issue its values again.
                 Quarantine(info);
                 _ = Spi.Execute("UPDATE worf.sequence_range_block SET state = 'retired', retired_at = now() WHERE block_id = $1",
@@ -601,43 +660,62 @@ internal static unsafe partial class SequenceRanges
             }
             else if (left <= 0 && next is null && state != "exhausted")
             {
+                if (!apply)
+                {
+                    return true;
+                }
+
                 _ = Spi.Execute("UPDATE worf.sequence_range SET state = 'exhausted' WHERE seqoid = $1", SpiParameter.Create(seqoid));
                 PgLog.Warning($"sequence {info.Name} has used up its block and has no next block yet");
             }
         }
 
-        // The owner grants its own next block from the root, and its neighbors hear of the new watermark at once, so
-        // that a rollback of the owner can't lose it. Another node requests one from its parent, committed before the
-        // exchange sends it. A Snowflake node number is never used up, so a node that has one needs no next.
+        // The owner grants its own next block from the root, and its neighbors exchange at once to hear of the new
+        // watermark. Another node requests one from its parent, committed before the exchange sends it. A Snowflake node
+        // number is never used up, so a node that has one needs no next.
         if (next is null && !(snowflake && active is not null) && state != "disabled" && NextBlock(seqoid, epoch) is null)
         {
             if (owner == node.Node.Id)
             {
-                if (GrantOwnBlock(seqoid, info, node, epoch))
+                if (!apply)
+                {
+                    if (CanAllocate(seqoid, info, epoch))
+                    {
+                        return true;
+                    }
+                }
+                else if (GrantOwnBlock(seqoid, info, node, epoch))
                 {
                     changed = true;
                     _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () => _ = PgAtomic.Add(ExchangeRequested, 1L));
                 }
             }
-            else if (!Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range_request WHERE seqoid = $1 AND kind = 'n')",
-                SpiParameter.Create(seqoid)))
+            else if (Worf.ReadScalar<bool>("""
+                SELECT r.parent_node IS NOT NULL AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_request q WHERE q.seqoid = r.seqoid AND q.kind = 'n')
+                FROM worf.sequence_range r WHERE r.seqoid = $1
+                """, seq))
             {
+                if (!apply)
+                {
+                    return true;
+                }
+
                 _ = Spi.Execute("""
                     INSERT INTO worf.sequence_range_request (request_id, seqoid, parent_node, kind, size, created_at)
                     SELECT gen_random_uuid(), r.seqoid, r.parent_node, 'n', r.request_size, now()
                     FROM worf.sequence_range r
                     WHERE r.seqoid = $1 AND r.parent_node IS NOT NULL
                         AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_request q WHERE q.seqoid = r.seqoid AND q.kind = 'n')
-                    """, SpiParameter.Create(seqoid));
+                    """, seq);
             }
         }
 
-        if (snowflake && owner == node.Node.Id)
+        if (snowflake && owner == node.Node.Id && ReuseSnowflakeNumbers(seqoid, epoch, apply) && !apply)
         {
-            ReuseSnowflakeNumbers(seqoid, epoch);
+            return true;
         }
 
-        return changed;
+        return apply && changed;
     }
 
     /// <summary>
@@ -664,14 +742,114 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
-    /// Gives the root back, once it has no number left to grant, the Snowflake node numbers no node holds: numbers
-    /// below the start of a root that moved above them, and numbers given up in this epoch. A number is free once every
-    /// node has reported holding numbers in this epoch without it, or has reported nothing for a day; a node reports a
-    /// number it gave up as held for a day, against a copy of it that may still run, and stops using its own number
-    /// after half a day without word from a neighbor. The numbers come back to be used no earlier than the furthest any
-    /// node has reserved its clock, so that no ID of a number's earlier holder can repeat, whatever the clocks.
+    /// Checks whether the next block may be switched to. The owner switches to a block it granted itself only once a
+    /// neighbor in touch, which still exchanges or streams this node's changes, has reported a watermark that covers it,
+    /// or when none is in touch, so that the neighbors know of the values before they can hold rows with them: an owner
+    /// restored to before the grant gives up its free values up to the highest watermark those neighbors report, and
+    /// never issues them again. A Snowflake node number carries its times and needs no such care.
     /// </summary>
-    private static void ReuseSnowflakeNumbers(uint seqoid, int epoch)
+    private static bool Confirmed(uint seqoid, SequenceInfo info, Guid block)
+        => seqoid == SnowflakeIds.NodeSequence() || Worf.ReadScalar<bool>($"""
+            WITH b AS (
+                SELECT b.seqoid, b.lo, b.hi, b.from_node, r.owner_node, r.epoch, l.node_id AS local_id
+                FROM worf.sequence_range_block b JOIN worf.sequence_range r ON r.seqoid = b.seqoid CROSS JOIN worf.local_node l
+                WHERE b.block_id = $1),
+            touching AS (
+                SELECT n.watermark FROM worf.sequence_range_node n JOIN b ON n.seqoid = b.seqoid
+                WHERE n.via_node = n.node_id AND n.node_id <> b.local_id AND n.epoch = b.epoch
+                    AND (worf.sequence_range_heard(n.node_id, true, n.reported_at, true) > now() - $2::interval
+                        OR EXISTS (
+                            SELECT 1 FROM worf.sequence_range_link k JOIN pg_catalog.pg_replication_slots s ON s.slot_name = k.slot_name
+                            WHERE k.node_id = n.node_id AND s.active)))
+            SELECT b.from_node IS DISTINCT FROM b.local_id OR b.owner_node <> b.local_id OR NOT EXISTS (SELECT 1 FROM touching)
+                OR EXISTS (SELECT 1 FROM touching WHERE watermark {(info.Ascending ? ">= b.hi" : "<= b.lo")})
+            FROM b
+            """, SpiParameter.Create(block), SpiParameter.Create(StaleAfter()));
+
+    /// <summary>
+    /// Checks whether the owner's root has a free span for its next block, without locking it.
+    /// </summary>
+    private static bool CanAllocate(uint seqoid, SequenceInfo info, int epoch)
+    {
+        long size = Worf.ReadScalar<long>("SELECT request_size FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(seqoid));
+        return Worf.Read("""
+            SELECT 1 FROM worf.sequence_range_free f JOIN worf.sequence_range_block b ON b.block_id = f.block_id
+            WHERE b.seqoid = $1 AND b.epoch = $2 AND b.kind IN ('r', 'p') AND b.state = 'open' AND b.sysid = $3 AND b.timeline = $4
+                AND f.hi::numeric - f.lo >= $5
+            LIMIT 1
+            """, 1, SpiParameter.Create(seqoid), SpiParameter.Create(epoch), SpiParameter.Create((decimal)NativeMethods.GetSystemIdentifier()),
+            SpiParameter.Create((long)NativeMethods.GetWALInsertionTimeLine()), SpiParameter.Create(((decimal)size - 1) * Math.Abs(info.Increment))).Count > 0;
+    }
+
+    /// <summary>
+    /// Finds why this node must give up its Snowflake node number: another node reports holding it too, or the owner of
+    /// the numbers, which gives the number of a node it hasn't heard from for a day to another, hasn't been heard from for
+    /// half a day. A node that went that long without word stops using the number for good, so that it doesn't take it
+    /// up again once it hears from the owner, which may have given it away.
+    /// </summary>
+    /// <returns>The reason, or null.</returns>
+    private static string? SnowflakeNumberLost(uint seqoid, uint owner, WorfLocalNode node, long number)
+    {
+        SpiParameter seq = SpiParameter.Create(seqoid);
+        SpiParameter reuse = SpiParameter.Create(SnowflakeReuseAfter());
+        if (owner != node.Node.Id && Worf.ReadScalar<bool>("""
+            SELECT EXISTS (
+                SELECT 1 FROM worf.sequence_range_node n
+                WHERE n.seqoid = $1 AND n.node_id = $2 AND worf.sequence_range_heard(n.node_id, false, n.reported_at, false) <= now() - $3::interval / 2)
+            """, seq, SpiParameter.Create(owner), reuse))
+        {
+            return "the owner of the numbers hasn't been heard from for half a day";
+        }
+
+        string? other = Worf.ReadScalar<string?>("""
+            SELECT n.node_name::text FROM worf.sequence_range_node n
+            WHERE n.seqoid = $1 AND n.node_id <> $2 AND $4 = ANY (n.holds)
+                AND worf.sequence_range_heard(n.node_id, false, n.reported_at, false) > now() - $3::interval
+            LIMIT 1
+            """, seq, SpiParameter.Create(node.Node.Id), reuse, SpiParameter.Create(number));
+        return other is null ? null : $"node {other} reports holding it too";
+    }
+
+    /// <summary>
+    /// Gives up this node's Snowflake node number, which it reports holding for a day, and asks for another, or takes one
+    /// from its root as the owner. Its root and pool blocks keep granting.
+    /// </summary>
+    private static void GiveUpSnowflakeNumber(uint seqoid, SequenceInfo info, WorfLocalNode node, int epoch)
+    {
+        SpiParameter seq = SpiParameter.Create(seqoid);
+        _ = Spi.Execute("DELETE FROM worf.sequence_range_request WHERE seqoid = $1", seq);
+        _ = Spi.Execute("""
+            WITH abandoned AS (
+                UPDATE worf.sequence_range_block SET state = 'abandoned', retired_at = now()
+                WHERE seqoid = $1 AND kind = 'n' AND state IN ('next', 'active')
+                RETURNING block_id)
+            UPDATE worf.sequence_range_grant SET state = 'abandoned', abandoned_at = now()
+            WHERE grant_id IN (SELECT block_id FROM abandoned) AND state <> 'abandoned'
+            """, seq);
+        _ = Spi.Execute("UPDATE worf.sequence_range SET state = 'quarantined' WHERE seqoid = $1 AND state NOT IN ('collecting', 'disabled', 'refused')", seq);
+        ChangedOnCommit();
+        if (Worf.ReadScalar<uint>("SELECT owner_node FROM worf.sequence_range WHERE seqoid = $1", seq) == node.Node.Id && GrantOwnBlock(seqoid, info, node, epoch) &&
+            NodeBlock(seqoid, epoch, "next") is (Guid, long, long) next)
+        {
+            _ = Switch(seqoid, info, next);
+        }
+    }
+
+    /// <summary>
+    /// Gives the root back, once it has no number left to grant, the Snowflake node numbers no node holds: numbers
+    /// below the start of a root that moved above them, and numbers given up in this epoch. A number granted to a node
+    /// is free once that node has reported, a day after the grant, without it among the numbers it holds, which it
+    /// reports for a day after giving one up, or has reported nothing for a day, since a node gives up its number after
+    /// half a day without word from the owner. A number is free only once every other node has also reported in this
+    /// epoch without it, or has reported nothing for a day. The numbers come back to be used no earlier than the furthest
+    /// any node has reserved its clock, so that no ID of a number's earlier holder can repeat, whatever the clocks. A
+    /// node that this server hasn't heard from since it started counts as heard when it started.
+    /// </summary>
+    /// <param name="seqoid">The Snowflake sequence.</param>
+    /// <param name="epoch">Its epoch.</param>
+    /// <param name="apply">Whether to free the numbers, rather than only check for any.</param>
+    /// <returns>Whether any number is, or was, free again.</returns>
+    private static bool ReuseSnowflakeNumbers(uint seqoid, int epoch, bool apply)
     {
         SpiParameter seq = SpiParameter.Create(seqoid);
         SpiParameter current = SpiParameter.Create(epoch);
@@ -681,35 +859,56 @@ internal static unsafe partial class SequenceRanges
                 WHERE b.seqoid = $1 AND b.epoch = $2 AND b.kind = 'r' AND b.state = 'open')
             """, seq, current))
         {
-            return;
+            return false;
         }
 
-        long reused = Spi.Execute("""
+        const string Free = """
             WITH root AS (
                 SELECT block_id, lo, hi, received_at FROM worf.sequence_range_block
                 WHERE seqoid = $1 AND epoch = $2 AND kind = 'r' AND state = 'open'),
             floor AS (
-                SELECT greatest((SELECT max(clock) FROM worf.sequence_range_node WHERE seqoid = $1), $4) AS not_before)
-            INSERT INTO worf.sequence_range_free
-            SELECT root.block_id, v, v, floor.not_before
-            FROM root CROSS JOIN floor CROSS JOIN LATERAL generate_series(root.lo, root.hi) v
-            WHERE NOT EXISTS (
-                    SELECT 1 FROM worf.sequence_range_grant g JOIN worf.sequence_range_block b ON b.block_id = g.from_block
-                    WHERE g.seqoid = $1 AND b.epoch = $2 AND g.kind <> 'x' AND g.lo <= v AND v <= g.hi
-                        AND (g.state <> 'abandoned' OR g.abandoned_at > now() - $3::interval))
-                AND NOT EXISTS (
-                    SELECT 1 FROM worf.sequence_range_block o
-                    WHERE o.seqoid = $1 AND o.kind = 'n' AND o.lo = v
-                        AND (o.state IN ('next', 'active') OR o.state = 'abandoned' AND o.retired_at > now() - $3::interval))
-                AND NOT EXISTS (
-                    SELECT 1 FROM worf.sequence_range_node n CROSS JOIN worf.local_node l
-                    WHERE n.seqoid = $1 AND n.node_id <> l.node_id AND n.reported_at > now() - $3::interval
-                        AND (n.epoch IS DISTINCT FROM $2 OR n.reported_at <= root.received_at OR v = ANY (coalesce(n.holds, '{}'))))
-            """, seq, current, SpiParameter.Create(SnowflakeReuseAfter()), SpiParameter.Create(SnowflakeIds.ReservedClock()));
+                SELECT greatest((SELECT max(clock) FROM worf.sequence_range_node WHERE seqoid = $1), $4) AS not_before),
+            free AS (
+                SELECT root.block_id, v, floor.not_before
+                FROM root CROSS JOIN floor CROSS JOIN LATERAL generate_series(root.lo, root.hi) v
+                WHERE NOT EXISTS (
+                        SELECT 1 FROM worf.sequence_range_grant g JOIN worf.sequence_range_block b ON b.block_id = g.from_block
+                            LEFT JOIN worf.sequence_range_node h ON h.seqoid = g.seqoid AND h.node_id = g.grantee_id
+                        WHERE g.seqoid = $1 AND b.epoch = $2 AND g.kind <> 'x' AND g.state <> 'unclaimed' AND g.lo <= v AND v <= g.hi
+                            AND CASE WHEN g.state = 'abandoned' THEN g.abandoned_at > now() - $3::interval
+                                ELSE worf.sequence_range_heard(h.node_id, false, h.reported_at, true) > now() - $3::interval
+                                    AND NOT (g.state = 'acknowledged' AND h.holds IS NOT NULL AND NOT v = ANY (h.holds)
+                                        AND worf.sequence_range_heard(h.node_id, false, h.reported_at, false) > g.granted_at + $3::interval) END)
+                    AND NOT EXISTS (
+                        SELECT 1 FROM worf.sequence_range_block o
+                        WHERE o.seqoid = $1 AND o.kind = 'n' AND o.lo = v
+                            AND (o.state IN ('next', 'active') OR o.state = 'abandoned' AND o.retired_at > now() - $3::interval))
+                    AND NOT EXISTS (
+                        SELECT 1 FROM worf.sequence_range_node n CROSS JOIN worf.local_node l
+                        WHERE n.seqoid = $1 AND n.node_id <> l.node_id AND worf.sequence_range_heard(n.node_id, false, n.reported_at, true) > now() - $3::interval
+                            AND (n.epoch IS DISTINCT FROM $2 OR worf.sequence_range_heard(n.node_id, false, n.reported_at, false) <= root.received_at
+                                OR v = ANY (coalesce(n.holds, '{}')))))
+            """;
+        SpiParameter reuse = SpiParameter.Create(SnowflakeReuseAfter());
+        SpiParameter clock = SpiParameter.Create(SnowflakeIds.ReservedClock());
+        if (!apply)
+        {
+            return Worf.ReadScalar<bool>(Free + "SELECT EXISTS (SELECT 1 FROM free)", seq, current, reuse, clock);
+        }
+
+        // A grant whose number is free again, which never reached its node, is never sent.
+        long reused = Spi.Execute(Free + """
+            , unclaimed AS (
+                UPDATE worf.sequence_range_grant g SET state = 'unclaimed'
+                FROM free WHERE g.seqoid = $1 AND g.state = 'sent' AND g.kind <> 'x' AND g.lo <= free.v AND free.v <= g.hi)
+            INSERT INTO worf.sequence_range_free SELECT block_id, v, v, not_before FROM free
+            """, seq, current, reuse, clock);
         if (reused > 0)
         {
             PgLog.Log($"Snowflake node numbers: {reused} that no node holds are free again");
         }
+
+        return reused > 0;
     }
 
     /// <summary>
@@ -1516,8 +1715,8 @@ internal static unsafe partial class SequenceRanges
         SpiParameter line = SpiParameter.Create((long)timeline);
         bool changed = false;
 
-        // Allocator blocks first, so that a node that resets doesn't grant itself from a root it is about to fence. This
-        // runs on every tick, so it reads first: a write takes a transaction ID even when it changes nothing.
+        // Allocator blocks first, so that a node that resets doesn't grant itself from a root it is about to fence. Each
+        // change is looked for first, so that a node whose identity stays writes nothing.
         if (Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range_block WHERE kind IN ('r', 'p') AND state IN ('open', 'fenced') AND node_id <> $1)", id))
         {
             _ = Spi.Execute("UPDATE worf.sequence_range_block SET state = 'abandoned' WHERE kind IN ('r', 'p') AND state IN ('open', 'fenced') AND node_id <> $1", id);
@@ -1559,8 +1758,8 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
-    /// Lifts an allocator's fence once every node with a grant from its fenced blocks, every neighbor still in touch, and
-    /// on the owner every listed participant, has exchanged since the fence began, unless two grants overlap. The owner's
+    /// Lifts an allocator's fence once every node with a grant from its fenced blocks, every neighbor still in touch or
+    /// streaming this node's changes, and on the owner every listed participant, has exchanged since the fence began, unless two grants overlap. The owner's
     /// root then gives up its free values up to the highest any node has seen granted, which covers the blocks it granted
     /// itself and lost.
     /// </summary>
@@ -1582,6 +1781,7 @@ internal static unsafe partial class SequenceRanges
             FROM worf.sequence_range_grant a JOIN worf.sequence_range_grant b
                 ON b.seqoid = a.seqoid AND a.grant_id < b.grant_id AND a.lo <= b.hi AND b.lo <= a.hi
             WHERE a.seqoid = $1 AND a.kind <> 'x' AND b.kind <> 'x' AND a.state <> 'unclaimed' AND b.state <> 'unclaimed'
+                AND (a.seqoid <> 'worf.snowflake_node'::regclass OR a.state <> 'abandoned' AND b.state <> 'abandoned')
             LIMIT 1
             """, seq);
         if (overlap.Count > 0)
@@ -1602,10 +1802,15 @@ internal static unsafe partial class SequenceRanges
                 SELECT 1 FROM unnest(r.participants) p(name)
                 WHERE NOT EXISTS (SELECT 1 FROM worf.sequence_range_node n
                     WHERE n.seqoid = r.seqoid AND n.node_name = p.name
-                        AND (n.held_at > r.fenced_at OR n.via_node <> n.node_id AND n.reported_at > r.fenced_at))))
+                        AND (n.held_at > r.fenced_at
+                            OR n.via_node <> n.node_id AND worf.sequence_range_heard(n.node_id, false, n.reported_at, false) > r.fenced_at))))
                 OR EXISTS (
                 SELECT 1 FROM worf.sequence_range_node n
-                WHERE n.seqoid = r.seqoid AND n.via_node = n.node_id AND n.node_id <> $2 AND n.reported_at > now() - $3::interval
+                WHERE n.seqoid = r.seqoid AND n.via_node = n.node_id AND n.node_id <> $2
+                    AND (worf.sequence_range_heard(n.node_id, true, n.reported_at, true) > now() - $3::interval
+                        OR EXISTS (
+                            SELECT 1 FROM worf.sequence_range_link k JOIN pg_catalog.pg_replication_slots s ON s.slot_name = k.slot_name
+                            WHERE k.node_id = n.node_id AND s.active))
                     AND (n.held_at IS NULL OR n.held_at <= r.fenced_at))
             FROM worf.sequence_range r WHERE r.seqoid = $1
             """, seq, SpiParameter.Create(node.Node.Id), SpiParameter.Create(StaleAfter())))
@@ -1833,9 +2038,10 @@ internal static unsafe partial class SequenceRanges
             return;
         }
 
+        // Above every watermark too, which covers the blocks of an owner restored to before it activated.
         long? high = Worf.SelectCatalog(info.Ascending
-                ? "SELECT max(high_water) FROM worf.sequence_range_node WHERE seqoid = $1 AND epoch = $2"
-                : "SELECT min(high_water) FROM worf.sequence_range_node WHERE seqoid = $1 AND epoch = $2",
+                ? "SELECT greatest(max(high_water), max(watermark), (SELECT watermark FROM worf.sequence_range WHERE seqoid = $1)) FROM worf.sequence_range_node WHERE seqoid = $1 AND epoch = $2"
+                : "SELECT least(min(high_water), min(watermark), (SELECT watermark FROM worf.sequence_range WHERE seqoid = $1)) FROM worf.sequence_range_node WHERE seqoid = $1 AND epoch = $2",
             SpiParameter.Create(seqoid), SpiParameter.Create(epoch))[0].Get<long?>(0);
 
         long start;
@@ -1873,11 +2079,12 @@ internal static unsafe partial class SequenceRanges
         _ = Spi.Execute("UPDATE worf.sequence_range SET state = 'quarantined', root_start = $2 WHERE seqoid = $1", SpiParameter.Create(seqoid),
             SpiParameter.Create(start));
 
-        // The owner needs no exchange for its own blocks, so it leaves quarantine at once. An owner that keeps the
-        // Snowflake number it held, as when every number is in use, keeps drawing from it.
+        // The owner needs no exchange for its own blocks, so it leaves quarantine as soon as a neighbor has heard of its
+        // first, or at once when none is in touch. An owner that keeps the Snowflake number it held, as when every number
+        // is in use, keeps drawing from it.
         _ = GrantOwnBlock(seqoid, info, node, epoch);
         (Guid Id, long Lo, long Hi)? next = NodeBlock(seqoid, epoch, "next");
-        if (next is not null)
+        if (next is not null && Confirmed(seqoid, info, next.Value.Id))
         {
             _ = Switch(seqoid, info, next.Value);
             _ = GrantOwnBlock(seqoid, info, node, epoch);
@@ -1933,7 +2140,7 @@ internal static unsafe partial class SequenceRanges
         {
             int epoch = range[0].Get<int>(0);
             _ = GrantOwnBlock(seqoid, info, node, epoch);
-            if (NodeBlock(seqoid, epoch, "next") is (Guid, long, long) next)
+            if (NodeBlock(seqoid, epoch, "next") is (Guid, long, long) next && Confirmed(seqoid, info, next.Id))
             {
                 _ = Switch(seqoid, info, next);
                 _ = GrantOwnBlock(seqoid, info, node, epoch);

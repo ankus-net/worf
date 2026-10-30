@@ -29,4 +29,9 @@ internal enum WorfWorkerType
     /// Keeps a database's managed sequences supplied with blocks.
     /// </summary>
     Range,
+
+    /// <summary>
+    /// Exchanges a database's sequence ranges with its neighbors, for its range worker.
+    /// </summary>
+    Exchange,
 }

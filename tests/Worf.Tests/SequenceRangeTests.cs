@@ -299,7 +299,8 @@ public sealed class SequenceRangeTests
     }
 
     /// <summary>
-    /// The range worker switches blocks, and a load's reserved block, while sessions read the ranges' view or have
+    /// A session reserves a block right after the database's first sequence is enabled, as the range worker starts. The
+    /// range worker switches blocks, and a load's reserved block, while sessions read the ranges' view or have
     /// inserted, but not while a transaction that called nextval stays open. It leaves a block when the sequence moves
     /// backwards in it, warns once a root has granted nine tenths of its values, and partitions of a guarded table
     /// keep the guard as they come and go.
@@ -313,6 +314,9 @@ public sealed class SequenceRangeTests
         _ = await node.SafePsqlAsync(Database, """
             CREATE TABLE t (id bigserial PRIMARY KEY, v text);
             SELECT worf.enable_sequence_range('t_id_seq', participants := '{}', range_size := 10);
+            """, token);
+        _ = await node.SafePsqlAsync(Database, "SELECT worf.reserve_sequence_range('t_id_seq', 50, timeout := '20 seconds')", token);
+        _ = await node.SafePsqlAsync(Database, """
             CREATE SEQUENCE small AS smallint MAXVALUE 1000;
             SELECT worf.enable_sequence_range('small', participants := '{}', range_size := 10);
             CREATE TABLE pt (id bigserial PRIMARY KEY, v text) PARTITION BY RANGE (id);
@@ -467,7 +471,8 @@ public sealed class SequenceRangeTests
     /// Two nodes that replicate both ways insert into the same table at once with keys from the same sequence, which the
     /// first node manages: the second learns of it through the exchange, gets blocks from the first, and no key is
     /// written on both nodes. A table on the second node that comes to use the sequence may hold the first's keys.
-    /// Idle, neither takes transaction IDs, except for the exchanges' reports once it manages one.
+    /// Idle, with or without a managed sequence, neither node uses a transaction ID, though they go on checking and
+    /// exchanging.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -486,22 +491,14 @@ public sealed class SequenceRangeTests
 
         await SubscribeAsync(nodeA, "a_from_b", nodeB, token);
         await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
-        await AssertIdleAsync([nodeA, nodeB], "managing nothing", TimeSpan.FromSeconds(2), token);
-        _ = await nodeA.SafePsqlAsync(Database, """
-            SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 1000);
-            SELECT worf.enable_snowflake('{node_b}');
-            """, token);
+        await AssertIdleAsync([nodeA, nodeB], false, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 1000)", token);
         foreach (TestNode node in new[] { nodeA, nodeB })
         {
             Assert.IsTrue(await node.PollQueryUntilAsync(Database,
                 "SELECT count(*) = 2 AND bool_and(state = 'active') AND worf.snowflake_node() IS NOT NULL FROM worf.sequence_ranges", token),
                 $"{node.Name} drawing from blocks, with a Snowflake number");
         }
-
-        // Exchanges, every half second here, write nothing when nothing changed, nor does the range worker reserve the
-        // Snowflake clock, which it did every five seconds, while no session issues IDs.
-        await SettleAsync([nodeA, nodeB], token);
-        await AssertIdleAsync([nodeA, nodeB], "managing sequences", TimeSpan.FromSeconds(6), token);
 
         await Task.WhenAll(InsertAsync(nodeA, "a"), InsertAsync(nodeB, "b"));
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
@@ -512,6 +509,8 @@ public sealed class SequenceRangeTests
                 "SELECT count(*), count(DISTINCT id), count(*) FILTER (WHERE v = 'a'), count(*) FILTER (WHERE v = 'b') FROM t", token),
                 node.Name);
         }
+
+        await AssertIdleAsync([nodeA, nodeB], true, token);
 
         // A table that comes to use the sequence may hold the other node's keys, which the other node has issued.
         _ = await nodeB.SafePsqlAsync(Database, "CREATE TABLE copied AS SELECT id, v FROM t WHERE v = 'a'", token);
@@ -533,7 +532,8 @@ public sealed class SequenceRangeTests
     /// <summary>
     /// A node that gathers from two providers grants their blocks in its own calls. A grant reaches a provider only
     /// once the node committed it, so an exchange that fails after a call, as an injected error here does, loses no
-    /// grant another node holds. A call that names a slot it doesn't stream, or another node's, is refused. Once the
+    /// grant another node holds. A call that names a slot it doesn't stream, or another node's, or another role's that
+    /// nothing streams, is refused. Once the
     /// providers subscribe back, every node exchanges both ways at once, with no deadlock or lock timeout. A provider
     /// whose host never answers holds up nothing else.
     /// </summary>
@@ -565,6 +565,20 @@ public sealed class SequenceRangeTests
                 $"{caller} SELECT worf.sequence_range_exchange('{message}')", token), caller);
             Assert.AreEqual("42501", refused.SqlState, caller);
         }
+
+        // While nothing streams the slot, it stays bound to the role that streamed it, so that another subscriber's role,
+        // with the grants an exchange needs, can't speak for node_a through it.
+        string nodeAId = await nodeA.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
+        _ = await nodeB.SafePsqlAsync(Database,
+            "CREATE ROLE c_user; GRANT USAGE ON SCHEMA worf TO c_user; GRANT EXECUTE ON FUNCTION worf.sequence_range_exchange(text) TO c_user", token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.alter_subscription_disable('a_from_b')", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT NOT active FROM pg_replication_slots", token), "a_from_b's slot idle");
+        string forged = $$"""{"node_id": {{nodeAId}}, "node_name": "node_a", "slot": "{{slot}}", "sysid": "1", "timeline": 1, "wal_lsn": "0/0", "sequences": []}""";
+        PostgresException impersonated = await Assert.ThrowsExactlyAsync<PostgresException>(() => nodeB.SafePsqlAsync(Database,
+            $"SET SESSION AUTHORIZATION c_user; SELECT worf.sequence_range_exchange('{forged}')", token));
+        Assert.AreEqual("42501", impersonated.SqlState);
+        Assert.Contains("is bound to another role", impersonated.MessageText);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.alter_subscription_enable('a_from_b')", token);
 
         // node_a's calls fail once they have taken in the reply, while node_b uses up its blocks and asks for more.
         _ = await nodeA.SafePsqlAsync(Database, """
@@ -621,7 +635,8 @@ public sealed class SequenceRangeTests
     /// In a cascade, a node two links from the owner gets its blocks from its parent's pool block, and a node whose
     /// link to the owner is dropped finds the owner through another neighbor. A late joiner whose values reach into the
     /// root is refused by the pool holder it asks, one sequence's failure leaves the others' exchanges alone, and a
-    /// promoted pool holder fences its pool until its children report.
+    /// pool holder's standby, promoted without the grants its primary made last, fences its pool until its children
+    /// report, and takes the grants it lost back into its ledger.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -687,15 +702,30 @@ public sealed class SequenceRangeTests
             "INSERT INTO late (v) VALUES ('new')", token));
         Assert.AreEqual("2200H", quarantined.SqlState);
 
-        // node_b is promoted, as a standby of itself: it abandons its node blocks and fences its pool until node_c
-        // reports what it holds.
+        // node_b's standby stops at a copy, node_b grants node_c more from its pool and fails, and the standby is
+        // promoted without those grants: it abandons its node blocks and fences its pool until node_c reports what it
+        // holds, which brings the lost grants back into its ledger.
+        using TemporaryDirectory copies = new($"worf-sequence-range-standby-{Guid.NewGuid():N}");
+        string standby = Path.Join(copies.FullName, "node_b");
+        await CopyDataAsync(nodeB, standby, token);
+        const string GrantedToC = "SELECT max(hi) FROM worf.sequence_range_grant WHERE seqoid = 't_id_seq'::regclass AND grantee_name = 'node_c'";
+        string copied = await nodeB.SafePsqlAsync(Database, GrantedToC, token);
+        bool grantedAfterCopy = false;
+        for (int i = 0; i < 30 && !grantedAfterCopy; i++)
+        {
+            await InsertAsync(nodeC, 100, token);
+            grantedAfterCopy = long.Parse(await nodeB.SafePsqlAsync(Database, GrantedToC, token), CultureInfo.InvariantCulture) >
+                long.Parse(copied, CultureInfo.InvariantCulture);
+        }
+
+        Assert.IsTrue(grantedAfterCopy, "node_b granting node_c a block after the copy");
         int logpos = nodeB.ReadLog().Length;
-        await nodeB.StopAsync("fast", token);
-        await File.WriteAllTextAsync(Path.Join(nodeB.Cluster.DataDirectory, "standby.signal"), "", token);
-        await nodeB.StartServerAsync(token);
+        await nodeB.StopAsync("immediate", token);
+        await RestoreDataAsync(nodeB, standby, token, running: false, standby: true);
         (int promoted, string output) = await nodeB.RunProgramAsync("pg_ctl", ["promote", "-w", "-D", nodeB.Cluster.DataDirectory], token);
         Assert.AreEqual(0, promoted, output);
         Assert.IsTrue(await nodeB.PollLogAsync(logpos, "timeline or system identifier changed", token), "node_b fenced its pool");
+        Assert.IsTrue(await nodeB.PollLogAsync(logpos, "which this allocator had no record of; it is back in the ledger", token), "node_b's lost grant");
         Assert.IsTrue(await nodeB.PollLogAsync(logpos, "the allocator's fence lifted", token), "node_b's fence lifted");
         await WaitActiveAsync([nodeB], token);
         foreach (TestNode node in nodes)
@@ -710,7 +740,9 @@ public sealed class SequenceRangeTests
     /// Restoring a node from a copy taken while it was stopped rolls it back on the same timeline. Its neighbor sees
     /// its WAL position move back and tells it to reset: a child drops the request it made before the copy, whose
     /// answer it already used, and asks again, and an owner that only answers calls fences its root until the child
-    /// reports its blocks. Meanwhile a node keeps drawing from its blocks while the owner is down.
+    /// reports its blocks. The owner drew from blocks it granted itself after the copy only once the child had heard of
+    /// them, so it never issues the values of the rows the child copied from it again. Meanwhile a node keeps drawing
+    /// from its blocks while the owner's host accepts connections and never answers them.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -725,22 +757,54 @@ public sealed class SequenceRangeTests
             _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
         }
 
-        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100)", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            SELECT * FROM worf.replication_set_add_table('default', 't');
+            SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100);
+            """, token);
         await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
         await WaitActiveAsync(nodes, token);
 
-        // With the owner down, node_b draws from its blocks until its next block is active and its request waits.
+        // With the owner's host taking connections and never answering, node_b's exchanges give up after
+        // worf.sequence_range_timeout, and it draws from its blocks until its next block is active and its request waits.
+        // Windows has no way to stop a process, so there the owner is shut down.
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT next_lo IS NOT NULL FROM worf.sequence_ranges", token), "node_b's next block");
-        await nodeA.StopAsync("fast", token);
-        await InsertAsync(nodeB, 150, token);
-        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM worf.sequence_range_request WHERE state = 'open')", token),
-            "node_b's request waiting");
-
-        // node_b is copied, gets its request answered and uses the block, then goes back to the copy.
+        int hung = nodeB.ReadLog().Length;
         using TemporaryDirectory copies = new($"worf-sequence-range-copies-{Guid.NewGuid():N}");
         string copyB = Path.Join(copies.FullName, "node_b");
-        await CopyDataAsync(nodeB, copyB, token);
-        await nodeA.StartServerAsync(token);
+        try
+        {
+            if (OperatingSystem.IsWindows())
+            {
+                await nodeA.StopAsync("fast", token);
+            }
+            else
+            {
+                await SuspendAsync(nodeA, true, token);
+            }
+
+            await InsertAsync(nodeB, 150, token);
+            Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM worf.sequence_range_request WHERE state = 'open')", token),
+                "node_b's request waiting");
+            if (!OperatingSystem.IsWindows())
+            {
+                Assert.IsTrue(await nodeB.PollLogAsync(hung, "node node_a didn't answer within 5000 ms", token), "node_b's exchange gave up");
+            }
+
+            // node_b is copied, gets its request answered and uses the block, then goes back to the copy.
+            await CopyDataAsync(nodeB, copyB, token);
+        }
+        finally
+        {
+            if (OperatingSystem.IsWindows())
+            {
+                await nodeA.StartServerAsync(token);
+            }
+            else
+            {
+                await SuspendAsync(nodeA, false, CancellationToken.None);
+            }
+        }
+
         await InsertAsync(nodeB, 150, token);
         string granted = await nodeA.SafePsqlAsync(Database, "SELECT max(hi) FROM worf.sequence_range_grant WHERE grantee_name = 'node_b'", token);
         await RestoreDataAsync(nodeB, copyB, token);
@@ -762,8 +826,22 @@ public sealed class SequenceRangeTests
         }
 
         Assert.IsTrue(grantedAfterCopy, "node_a granting node_b a block after the copy");
+
+        // node_a also draws from blocks it granted itself after the copy, whose rows node_b copies, but only once node_b
+        // has heard of them: while node_b, still streaming node_a's rows, can't exchange with it, they wait, even after
+        // node_b's last exchange has gone stale. Then node_a goes down at once.
+        const string Unheard = "SELECT count(*) FROM t WHERE v = 'node_a' AND id > (SELECT watermark FROM worf.sequence_range)";
+        _ = await nodeA.SafePsqlAsync(Database, "ALTER FUNCTION worf.sequence_range_exchange(text) RENAME TO sequence_range_exchange_paused", token);
+        Task inserting = InsertAsync(nodeA, 600, token);
+        await Task.Delay(TimeSpan.FromSeconds(8), token);
+        Assert.AreEqual("0", await nodeB.SafePsqlAsync(Database, Unheard, token), "node_a issued values node_b hadn't heard of");
+        _ = await nodeA.SafePsqlAsync(Database, "ALTER FUNCTION worf.sequence_range_exchange_paused(text) RENAME TO sequence_range_exchange", token);
+        await inserting;
+        await nodeA.StopAsync("immediate", token);
+        HashSet<string> copiedFromA = [.. (await nodeB.SafePsqlAsync(Database, "SELECT id FROM t WHERE v = 'node_a'", token)).Split('\n')];
         int logpos = nodeA.ReadLog().Length;
-        await RestoreDataAsync(nodeA, copyA, token);
+        await RestoreDataAsync(nodeA, copyA, token, running: false);
+        HashSet<string> restored = [.. (await nodeA.SafePsqlAsync(Database, "SELECT id FROM t", token)).Split('\n')];
         Assert.IsTrue(await nodeA.PollLogAsync(logpos, "this allocator reset", token), "node_a fenced its root");
         Assert.IsTrue(await nodeA.PollLogAsync(logpos, "the allocator's fence lifted", token), "node_a's fence lifted");
         await WaitActiveAsync(nodes, token);
@@ -773,6 +851,10 @@ public sealed class SequenceRangeTests
         }
 
         await AssertNoSharedValuesAsync(nodes, token);
+        foreach (string id in (await nodeA.SafePsqlAsync(Database, "SELECT id FROM t", token)).Split('\n').Where(id => !restored.Contains(id)))
+        {
+            Assert.DoesNotContain(id, copiedFromA, $"node_a issued {id} again, which node_b copied from it before the restore");
+        }
     }
 
     /// <summary>
@@ -1063,40 +1145,6 @@ public sealed class SequenceRangeTests
         }
     }
 
-    /// <summary>
-    /// Waits until each node holds its next blocks, with no request open and no grant unacknowledged, and the neighbors
-    /// have heard so.
-    /// </summary>
-    private static async Task SettleAsync(TestNode[] nodes, CancellationToken token)
-    {
-        foreach (TestNode node in nodes)
-        {
-            Assert.IsTrue(await node.PollQueryUntilAsync(Database, """
-                SELECT bool_and(next_lo IS NOT NULL)
-                    AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_request)
-                    AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_grant WHERE state = 'sent')
-                FROM worf.sequence_ranges
-                """, token), $"{node.Name} holding its next blocks");
-        }
-
-        await Task.Delay(1000, token);
-    }
-
-    /// <summary>
-    /// Asserts that the nodes take no transaction IDs over a while, as their workers tick and exchange.
-    /// </summary>
-    private static async Task AssertIdleAsync(TestNode[] nodes, string phase, TimeSpan span, CancellationToken token)
-    {
-        const string NextXid = "SELECT pg_snapshot_xmax(pg_current_snapshot())";
-        string[] before = await Task.WhenAll(nodes.Select(node => node.SafePsqlAsync(Database, NextXid, token)));
-        await Task.Delay(span, token);
-        for (int i = 0; i < nodes.Length; i++)
-        {
-            Assert.AreEqual(before[i], await nodes[i].SafePsqlAsync(Database, NextXid, token),
-                $"{nodes[i].Name} taking no transaction IDs while idle, {phase}");
-        }
-    }
-
     private static async Task SubscribeAsync(TestNode subscriber, string name, TestNode provider, CancellationToken token,
         string database = Database)
     {
@@ -1113,6 +1161,61 @@ public sealed class SequenceRangeTests
                 SELECT 1 FROM worf.show_subscription_status()
                     WHERE subscription_name = '{name}' AND status = 'replicating')
             """, token), "subscription failed to reach \"replicating\" state");
+    }
+
+    /// <summary>
+    /// Waits for the nodes to settle, with nothing requested or granted and a next block ready, and then checks that
+    /// neither uses a transaction ID for two seconds, which spans twenty checks and four exchanges.
+    /// </summary>
+    private static async Task AssertIdleAsync(TestNode[] nodes, bool managed, CancellationToken token)
+    {
+        foreach (TestNode node in nodes.Where(_ => managed))
+        {
+            Assert.IsTrue(await node.PollQueryUntilAsync(Database, """
+                SELECT NOT EXISTS (SELECT 1 FROM worf.sequence_range_request) AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_grant WHERE state = 'sent')
+                    AND (SELECT bool_and(next_lo IS NOT NULL) FROM worf.sequence_ranges)
+                """, token), $"{node.Name} settled");
+        }
+
+        await Task.Delay(TimeSpan.FromSeconds(1), token);
+        const string Next = "SELECT pg_snapshot_xmax(pg_current_snapshot())";
+        string[] before = await Task.WhenAll(nodes.Select(node => node.SafePsqlAsync(Database, Next, token)));
+        await Task.Delay(TimeSpan.FromSeconds(2), token);
+        string[] after = await Task.WhenAll(nodes.Select(node => node.SafePsqlAsync(Database, Next, token)));
+        for (int i = 0; i < nodes.Length; i++)
+        {
+            Assert.AreEqual(before[i], after[i], $"{nodes[i].Name} used transaction IDs while idle");
+        }
+    }
+
+    /// <summary>
+    /// Stops or resumes every process of a node's server, as a host that accepts connections and never answers them.
+    /// </summary>
+    private static async Task SuspendAsync(TestNode node, bool suspend, CancellationToken token)
+    {
+        // The postmaster stops first, so that it starts no process the others miss, and resumes last. A child may exit
+        // before its signal.
+        string postmaster = File.ReadLines(Path.Join(node.Cluster.DataDirectory, "postmaster.pid")).First().Trim();
+        if (suspend)
+        {
+            await SignalAsync("-STOP", [postmaster], true);
+        }
+
+        (_, string children, _) = await ProcessRunner.RunAsync("pgrep", ["-P", postmaster], token);
+        await SignalAsync(suspend ? "-STOP" : "-CONT", children.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries), false);
+        if (!suspend)
+        {
+            await SignalAsync("-CONT", [postmaster], true);
+        }
+
+        async Task SignalAsync(string signal, string[] pids, bool required)
+        {
+            foreach (string pid in pids)
+            {
+                (int exitCode, _, string error) = await ProcessRunner.RunAsync("kill", [signal, pid], token);
+                Assert.IsTrue(exitCode == 0 || !required, error);
+            }
+        }
     }
 
     private static async Task WaitActiveAsync(IEnumerable<TestNode> nodes, CancellationToken token)
@@ -1196,9 +1299,13 @@ public sealed class SequenceRangeTests
     /// <summary>
     /// Puts a copy of a node's data directory back in place, as a restored backup or snapshot does.
     /// </summary>
-    private static async Task RestoreDataAsync(TestNode node, string source, CancellationToken token)
+    private static async Task RestoreDataAsync(TestNode node, string source, CancellationToken token, bool running = true, bool standby = false)
     {
-        await node.StopAsync("fast", token);
+        if (running)
+        {
+            await node.StopAsync("fast", token);
+        }
+
         DirectoryInfo data = new(node.Cluster.DataDirectory);
         foreach (FileSystemInfo entry in data.EnumerateFileSystemInfos())
         {
@@ -1213,6 +1320,11 @@ public sealed class SequenceRangeTests
         }
 
         CopyDirectory(source, data.FullName);
+        if (standby)
+        {
+            await File.WriteAllTextAsync(Path.Join(data.FullName, "standby.signal"), "", token);
+        }
+
         await node.StartServerAsync(token);
     }
 
@@ -1242,9 +1354,9 @@ public sealed class SequenceRangeTests
             "max_replication_slots = 10",
             "worf.sequence_range_check_interval = 100",
             "worf.sequence_range_exchange_interval = 500",
-            "autovacuum = off",
             "worf.sequence_range_timeout = 5000",
             "max_worker_processes = 16",
+            "autovacuum = off",
         ], token);
         try
         {

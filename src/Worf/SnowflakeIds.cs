@@ -135,8 +135,9 @@ internal static class SnowflakeIds
     }
 
     /// <summary>
-    /// Keeps this database's clock reserved ahead, from the range worker, once less than half the time reserved ahead is
-    /// left.
+    /// Keeps this database's clock reserved ahead, from the range worker, while sessions issue IDs, once less than half the
+    /// time reserved ahead is left. A node that issues none reserves nothing, so that it writes nothing: its first ID
+    /// reserves the clock itself.
     /// </summary>
     internal static void Reserve()
     {
@@ -146,10 +147,11 @@ internal static class SnowflakeIds
         }
 
         uint dboid = DatabaseId();
+        long now = NowMs();
         using (PgLwLockExclusiveGuard<WorfSnowflakeTable, WorfSnowflakeClock> guard = Clocks.Exclusive())
         {
             WorfSnowflakeClock clock = guard[Slot(guard, dboid)];
-            if (clock.Floored && clock.ReservedMs - NowMs() >= ReserveAheadMs / 2)
+            if (!clock.Floored || clock.ReservedMs - now >= ReserveAheadMs / 2 || (clock.LastState >> CounterBits) < now - ReserveAheadMs)
             {
                 return;
             }
@@ -191,6 +193,15 @@ internal static class SnowflakeIds
                 if (target > durable)
                 {
                     _ = Spi.Execute("SELECT pg_catalog.setval('worf.snowflake_clock', $1)", SpiParameter.Create(target));
+
+                    // While this node issues IDs, the tables keep within an hour of when it last heard from the owner of the
+                    // numbers, which shared memory records, so that it can go on issuing after a restart.
+                    _ = Spi.Execute("""
+                        UPDATE worf.sequence_range_node n SET reported_at = worf.sequence_range_heard(n.node_id, false, n.reported_at, false)
+                        FROM worf.sequence_range r
+                        WHERE r.seqoid = 'worf.snowflake_node'::regclass AND n.seqoid = r.seqoid AND n.node_id = r.owner_node
+                            AND worf.sequence_range_heard(n.node_id, false, n.reported_at, false) > n.reported_at + interval '1 hour'
+                        """);
                     unsafe
                     {
                         NativeMethods.XLogFlush(NativeMethods.GetXLogInsertRecPtr());
@@ -296,15 +307,18 @@ internal static class SnowflakeIds
             timeline = NativeMethods.GetWALInsertionTimeLine();
         }
 
-        // A node that hasn't heard from a neighbor for half the time after which the owner gives the number of a node
-        // that stopped reporting to another stops using it, unless it is the owner.
+        // A node that hasn't heard from the owner of the numbers, directly or through its neighbors, for half the time
+        // after which the owner gives the number of a node that stopped reporting to another, stops using it, and its
+        // range worker gives it up.
         long? lo = Elevated.Run(() => Worf.ReadScalar<long?>("""
             SELECT b.lo FROM worf.sequence_range_block b JOIN worf.local_node l ON l.node_id = b.node_id
+                JOIN worf.sequence_range r ON r.seqoid = b.seqoid
             WHERE b.seqoid = 'worf.snowflake_node'::regclass AND b.kind = 'n' AND b.state = 'active'
                 AND b.sysid = $1 AND b.timeline = $2
-                AND (EXISTS (SELECT 1 FROM worf.sequence_range r WHERE r.seqoid = b.seqoid AND r.owner_node = l.node_id)
+                AND (r.owner_node = l.node_id
                     OR EXISTS (SELECT 1 FROM worf.sequence_range_node n
-                        WHERE n.seqoid = b.seqoid AND n.via_node = n.node_id AND n.node_id <> l.node_id AND n.reported_at > now() - $3::interval / 2))
+                        WHERE n.seqoid = b.seqoid AND n.node_id = r.owner_node
+                            AND worf.sequence_range_heard(n.node_id, false, n.reported_at, false) > now() - $3::interval / 2))
             """, SpiParameter.Create((decimal)sysid), SpiParameter.Create((long)timeline),
             SpiParameter.Create(SequenceRanges.SnowflakeReuseAfter())));
         s_node = lo is long value ? (int)value : null;

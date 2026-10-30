@@ -655,6 +655,7 @@ internal static partial class Worf
         DdlLock.ShmemInit();
         SequenceRanges.ShmemInit();
         SequenceRangeReservations.ShmemInit();
+        SequenceRangeHeard.ShmemInit();
         SnowflakeIds.ShmemInit();
 
         // Init executor module

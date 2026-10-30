@@ -133,8 +133,9 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   `PUBLIC` doesn't have. The default is `1min`.
 
 - `worf.sequence_range_timeout`
-  How long a sequence range exchange waits for the other node's host to
-  answer, and for each call to the other node. The default is `10s`.
+  How long a sequence range exchange waits to connect to the other node, and
+  for each call to it, before the range worker cancels it. The default is
+  `10s`.
 
 - `worf.ddl_lock_timeout`
   How long DDL waits for the other nodes to hold back their writes and catch

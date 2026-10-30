@@ -2,8 +2,10 @@ namespace Worf;
 
 /// <summary>
 /// The worker that keeps a database's managed sequences supplied: it switches each to its next block when the active
-/// one runs low and gets new blocks, checking every <c>worf.sequence_range_check_interval</c>. In a database that
-/// manages none, the manager runs it once an exchange interval to ask the providers whether they manage any.
+/// one runs low and gets new blocks, checking every <c>worf.sequence_range_check_interval</c>. Its exchange worker
+/// makes the calls to the neighbors. In a database that manages none, the manager runs it once an exchange interval to
+/// have the exchange worker ask the providers whether they manage any. A tick that changes nothing writes nothing, so
+/// an idle node uses no transaction IDs.
 /// </summary>
 internal static class SequenceRangeWorker
 {
@@ -67,25 +69,23 @@ internal static class SequenceRangeWorker
                     PgLog.Warning($"could not reserve the Snowflake clock: {error.Message}");
                 }
 
-                // Requests are committed before the exchanges send them, including those that sessions handed over.
+                // Requests are committed before the exchange worker sends them, including those that sessions handed over.
                 List<Guid> recorded = PgBackgroundWorker.RunTransaction(() => SequenceRangeReservations.Record(local));
                 SequenceRangeReservations.Forget(recorded);
                 changed |= recorded.Count > 0;
             }
 
-            // A database that manages nothing yet exchanges to hear of the sequences its providers manage.
-            if (managed is not null)
-            {
-                changed |= SequenceRangeExchange.ExchangeAll();
-            }
-
-            // Backends reload their blocks once the change is committed.
+            // Backends reload their blocks once the change is committed, and the exchange worker sends what is waiting.
             if (changed)
             {
                 SequenceRanges.Changed();
+                SequenceRangeExchangeWorker.Wake();
             }
 
-            if (managed is null || PgBackgroundWorker.RunTransaction(Sequences).Count == 0)
+            // The exchange worker runs while the database manages sequences. A database that manages nothing yet runs it
+            // once, to hear of the sequences its providers manage, and this worker waits for it.
+            bool exchanging = managed is (_, List<uint> current) && SequenceRangeExchangeWorker.Watch(current.Count > 0);
+            if (managed is null || (!exchanging && PgBackgroundWorker.RunTransaction(Sequences).Count == 0))
             {
                 if (managedAny)
                 {
