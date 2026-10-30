@@ -261,7 +261,8 @@ internal static unsafe class ApplyHeap
     /// Puts the columns a tuple sends into a row in replication's form. A column it doesn't send, or sends as an
     /// unchanged TOAST value, stays unsent.
     /// </summary>
-    /// <returns>Whether the row holds the tuple; a column in PostgreSQL's internal form has no replication form.</returns>
+    /// <returns>Whether the row holds the tuple; a column in PostgreSQL's internal form, or sent in another type than
+    /// its own, has no replication form.</returns>
     private static bool SetRow(PgReplicatedRow row, WorfTupleData tuple)
     {
         row.Clear();
@@ -270,6 +271,11 @@ internal static unsafe class ApplyHeap
             if (!tuple.Changed[attid])
             {
                 continue;
+            }
+
+            if (tuple.Conversions?[attid] is not null)
+            {
+                return false;
             }
 
             switch (tuple.Kinds[attid])

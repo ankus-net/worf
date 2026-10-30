@@ -30,7 +30,7 @@ internal static partial class Worf
     /// <summary>
     /// The newest protocol version this worf speaks.
     /// </summary>
-    internal const int MaxProtoVersionNum = 1;
+    internal const int MaxProtoVersionNum = 2;
 
     /// <summary>
     /// The name of the extension, its schema and its library.

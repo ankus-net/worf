@@ -11,8 +11,15 @@ You must `CREATE EXTENSION worf` on both.
 Tables on the provider and subscriber must have the same names and be in the
 same schema. Future revisions may add mapping features.
 
-Tables on the provider and subscriber must have the same columns, with the same
-data types in each column. `CHECK` constraints, `NOT NULL` constraints, etc., must
+Tables on the provider and subscriber must have the same columns. A subscriber
+converts the provider's values for a column of another data type as an
+assignment does, as `ALTER COLUMN ... TYPE` without `USING` would. A value with
+no such conversion, or of a type the subscriber lacks or defines differently,
+fails with PostgreSQL's error, which `worf.exception_behaviour` handles. Types
+that aren't PostgreSQL's own match by schema and name, or else the subscriber
+column's own type when it's defined the same. A provider running an older worf
+doesn't send column types, so its columns need the same types on the
+subscriber. `CHECK` constraints, `NOT NULL` constraints, etc., must
 be the same or weaker (more permissive) on the subscriber than the provider.
 A subscriber ignores a column it dropped in rows from a provider that still
 has it.

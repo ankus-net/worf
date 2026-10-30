@@ -55,9 +55,9 @@ internal static partial class RelCache
                     throw new PgException(PgSqlStates.InternalError, $"unknown column name {entry.Attnames[i]}");
                 }
 
-                (entry.DecodeTypes[i], entry.MissingTypes[i]) = entry.Attmap[i] >= 0 && entry.RemoteTypes[i] is WorfRemoteType remote
-                    ? DecodeType(remote, NativeMethods.TupleDescAttr(desc, entry.Attmap[i])->atttypid)
-                    : (0, null);
+                entry.Conversions[i] = entry.Attmap[i] >= 0 && entry.RemoteTypes[i] is WorfRemoteType remote
+                    ? ColumnConversion(entry, remote, NativeMethods.TupleDescAttr(desc, entry.Attmap[i]))
+                    : null;
             }
 
             entry.Reloid = entry.Rel->rd_id;
@@ -123,8 +123,7 @@ internal static partial class RelCache
             Attnames = attnames,
             Attmap = new int[attnames.Length],
             RemoteTypes = types ?? new WorfRemoteType?[attnames.Length],
-            DecodeTypes = new uint[attnames.Length],
-            MissingTypes = new string?[attnames.Length],
+            Conversions = new WorfColumnConversion?[attnames.Length],
             Reloid = 0,
         };
     }
@@ -231,29 +230,72 @@ internal static partial class RelCache
     }
 
     /// <summary>
-    /// Finds the type a remote column's values are decoded with, when it isn't the local column's: PostgreSQL's own
-    /// types by OID, and others by schema and name.
+    /// Finds how a remote column's values convert to the local column's type, when they're sent in another: they're
+    /// read with PostgreSQL's own types by OID, and with others found by schema and name when defined the same here.
+    /// Values of a type found neither way are read as the local column's own type when that's defined the same, as
+    /// the same type under another schema or name.
     /// </summary>
-    /// <returns>The remote type's local OID, or zero when it's the local column's, and the type's name when this node
-    /// lacks it.</returns>
-    private static (uint Oid, string? Missing) DecodeType(WorfRemoteType remote, uint localType)
+    /// <param name="entry">The remote relation.</param>
+    /// <param name="remote">The type the column's values are sent in.</param>
+    /// <param name="att">The local column.</param>
+    /// <returns>The conversion, or null when the values are of the local column's type.</returns>
+    private static unsafe WorfColumnConversion? ColumnConversion(WorfRelation entry, WorfRemoteType remote, FormData_pg_attribute* att)
     {
-        if (remote.Nspname is null || remote.Typname is null)
+        string column = Worf.FromServer((sbyte*)&att->attname);
+        uint local = NativeMethods.getBaseType(att->atttypid);
+        if (remote.Definition is null)
         {
-            return (remote.Oid == localType ? 0 : remote.Oid, null);
+            if (remote.Oid == local)
+            {
+                return null;
+            }
+
+            return NativeMethods.get_typtype(remote.Oid) != 0
+                ? new WorfColumnConversion(column, Worf.FromServer(NativeMethods.format_type_be(remote.Oid)), remote.Oid)
+                : new WorfColumnConversion(PgSqlStates.UndefinedObject,
+                    $"type with OID {remote.Oid} of column {column} of remote table {entry.Nspname}.{entry.Relname} does not exist");
+        }
+
+        string name = $"{remote.Nspname}.{remote.Typname}";
+        string localDefinition = ProtoNative.TypeDefinition(local);
+        if (localDefinition == remote.Definition && TypeName(local) == name)
+        {
+            return null;
         }
 
         SpiResult found = Worf.SelectCatalog("""
             SELECT t.oid FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
             WHERE n.nspname = $1 AND t.typname = $2
             """, SpiParameter.Create(remote.Nspname), SpiParameter.Create(remote.Typname));
-        if (found.Count == 0)
+        if (found.Count != 0 && ProtoNative.TypeDefinition(found[0].Get<uint>(0)) == remote.Definition)
         {
-            return (0, $"{remote.Nspname}.{remote.Typname}");
+            uint readType = NativeMethods.getBaseType(found[0].Get<uint>(0));
+            return readType == local ? null : new WorfColumnConversion(column, name, readType);
         }
 
-        uint oid = found[0].Get<uint>(0);
-        return (oid == localType ? 0 : oid, null);
+        if (localDefinition == remote.Definition)
+        {
+            return null;
+        }
+
+        return found.Count == 0
+            ? new WorfColumnConversion(PgSqlStates.UndefinedObject,
+                $"type {name} of column {column} of remote table {entry.Nspname}.{entry.Relname} does not exist")
+            : new WorfColumnConversion(PgSqlStates.DatatypeMismatch,
+                $"type {name} of column {column} of remote table {entry.Nspname}.{entry.Relname} is defined differently here");
+    }
+
+    /// <summary>
+    /// Gets a type's schema and name.
+    /// </summary>
+    private static unsafe string TypeName(uint typoid)
+    {
+        HeapTupleData* typtup = NativeMethods.typeidType(typoid);
+        FormData_pg_type* typclass = (FormData_pg_type*)NativeMethods.GETSTRUCT(typtup);
+        sbyte* nspname = NativeMethods.get_namespace_name(typclass->typnamespace);
+        string name = $"{(nspname is null ? "" : Worf.FromServer(nspname))}.{Worf.FromServer((sbyte*)&typclass->typname)}";
+        NativeMethods.ReleaseSysCache(typtup);
+        return name;
     }
 
     private static bool ColumnDropped(uint relid, string attname)

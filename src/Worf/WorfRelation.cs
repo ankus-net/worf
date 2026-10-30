@@ -53,16 +53,10 @@ internal sealed unsafe class WorfRelation
     public WorfRemoteType?[] RemoteTypes { get; set; } = [];
 
     /// <summary>
-    /// Gets or sets, for each remote column whose type differs from its local column's, the local OID of the remote
-    /// type, with which its binary and internal values are decoded, or zero. Filled with the local relation.
+    /// Gets or sets how each remote column's values convert to its local column's type, or null for a column whose
+    /// values are of that type. Filled with the local relation.
     /// </summary>
-    public uint[] DecodeTypes { get; set; } = [];
-
-    /// <summary>
-    /// Gets or sets, for each remote column of a type this node lacks, the type's name, or null. Filled with the local
-    /// relation.
-    /// </summary>
-    public string?[] MissingTypes { get; set; } = [];
+    public WorfColumnConversion?[] Conversions { get; set; } = [];
 
     /// <summary>
     /// Gets or sets whether the local relation has row triggers that fire for replicated changes. Only valid as
