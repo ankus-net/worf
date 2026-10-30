@@ -43,9 +43,11 @@ public sealed class GlobalDdlLockTests
                 CREATE TABLE p (id integer PRIMARY KEY, v integer) PARTITION BY RANGE (id);
                 CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (0) TO (100);
                 CREATE TABLE p2 PARTITION OF p FOR VALUES FROM (100) TO (200);
+                CREATE TABLE dupe (id integer PRIMARY KEY, v integer);
                 SELECT * FROM worf.replication_set_add_table('default', 't');
                 SELECT * FROM worf.replication_set_add_table('default', 'p1');
                 SELECT * FROM worf.replication_set_add_table('default', 'p2');
+                SELECT * FROM worf.replication_set_add_table('default', 'dupe');
                 """, token);
         }
 
@@ -185,6 +187,17 @@ public sealed class GlobalDdlLockTests
         _ = await nodeB.SafePsqlAsync(Database, $"ALTER ROLE {SuperUser} RESET idle_session_timeout", token);
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
         _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO t VALUES (7, 7)", token);
+
+        // A unique index built concurrently that fails leaves an invalid index, which stays on this node, as does
+        // dropping it.
+        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO dupe VALUES (1, 1), (2, 1)", token);
+        PostgresException duplicate = await Assert.ThrowsExactlyAsync<PostgresException>(
+            () => nodeA.SafePsqlAsync(Database, "CREATE UNIQUE INDEX CONCURRENTLY dupe_v ON dupe (v)", token));
+        Assert.AreEqual("23505", duplicate.SqlState);
+        _ = await nodeA.SafePsqlAsync(Database, "DROP INDEX dupe_v; INSERT INTO dupe VALUES (3, 3)", token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
+        Assert.AreEqual("0", await nodeA.SafePsqlAsync(Database, "SELECT count(*) FROM worf.queue WHERE message->>'command' LIKE '%dupe_v%'", token));
+        Assert.AreEqual("3", await nodeB.SafePsqlAsync(Database, "SELECT count(*) FROM dupe", token));
     }
 
     /// <summary>
@@ -219,6 +232,8 @@ public sealed class GlobalDdlLockTests
                 CREATE TYPE c AS (x d);
                 CREATE TABLE td (id integer PRIMARY KEY, v d);
                 CREATE TABLE tc (id integer PRIMARY KEY, v c[]);
+                CREATE TABLE inner_t (id integer PRIMARY KEY, v e);
+                CREATE TABLE t_row (id integer PRIMARY KEY, x inner_t);
                 CREATE DOMAIN positive AS integer;
                 CREATE TABLE tp (id integer PRIMARY KEY, v positive);
                 CREATE TABLE parent (id integer PRIMARY KEY);
@@ -226,7 +241,7 @@ public sealed class GlobalDdlLockTests
                 CREATE TABLE q (id integer PRIMARY KEY) PARTITION BY RANGE (id);
                 CREATE TABLE q1 (id integer PRIMARY KEY);
                 SELECT worf.replication_set_add_table('default', oid::regclass)
-                FROM pg_class WHERE relname IN ('t', 'st', 'td', 'tc', 'tp', 'parent', 'child', 'q1');
+                FROM pg_class WHERE relname IN ('t', 'st', 'td', 'tc', 't_row', 'tp', 'parent', 'child', 'q1');
                 """, token);
         }
 
@@ -340,7 +355,7 @@ public sealed class GlobalDdlLockTests
         await HeldBackAsync(nodeA, nodeB, "ALTER TABLE child SET SCHEMA s", ["INSERT INTO child VALUES (6, 6)"], token);
         await HeldBackAsync(nodeA, nodeB, "ALTER DOMAIN positive ADD CHECK (VALUE > 0)", ["INSERT INTO tp VALUES (6, 6)"], token);
         await HeldBackAsync(nodeA, nodeB, "ALTER TYPE e RENAME VALUE 'a' TO 'z'",
-            ["INSERT INTO td VALUES (6, 'a', 0)", "INSERT INTO tc VALUES (6, ARRAY[ROW('a')::c])"], token);
+            ["INSERT INTO td VALUES (6, 'a', 0)", "INSERT INTO tc VALUES (6, ARRAY[ROW('a')::c])", "INSERT INTO t_row VALUES (6, ROW(1, 'a'))"], token);
         await HeldBackAsync(nodeA, nodeB, "ALTER TYPE c ADD ATTRIBUTE y integer CASCADE", ["INSERT INTO tc VALUES (6, NULL)"], token);
         await HeldBackAsync(nodeA, nodeB, "ALTER TABLE q ATTACH PARTITION q1 FOR VALUES FROM (0) TO (100)", ["INSERT INTO q1 VALUES (6)"], token);
         await HeldBackAsync(nodeA, nodeB, "ALTER TABLE child ADD FOREIGN KEY (parent_id) REFERENCES parent",
@@ -455,6 +470,10 @@ public sealed class GlobalDdlLockTests
             await using NpgsqlCommand insert = new("INSERT INTO w VALUES (1)", connection);
             _ = await insert.ExecuteNonQueryAsync(token);
         }
+
+        // worf leaves a statement's transaction without an ID, as DROP INDEX CONCURRENTLY needs.
+        _ = await node.SafePsqlAsync("many0", "CREATE INDEX w_id ON w (id)", token);
+        _ = await node.SafePsqlAsync("many0", "DROP INDEX CONCURRENTLY w_id", token);
     }
 
     /// <summary>
@@ -477,8 +496,10 @@ public sealed class GlobalDdlLockTests
                 CREATE TABLE t2 (id integer PRIMARY KEY, v integer);
                 CREATE TABLE t3 (id integer PRIMARY KEY, v integer);
                 CREATE TABLE busy (id serial PRIMARY KEY);
+                CREATE TABLE cic (id integer PRIMARY KEY, v integer);
+                INSERT INTO cic VALUES (1, 1);
                 SELECT worf.replication_set_add_table('default', oid::regclass)
-                FROM pg_class WHERE relname IN ('t', 't2', 't3', 'busy');
+                FROM pg_class WHERE relname IN ('t', 't2', 't3', 'busy', 'cic');
                 """, token);
         }
 
@@ -486,6 +507,18 @@ public sealed class GlobalDdlLockTests
         _ = await nodeB.SafePsqlAsync(Database, "CREATE VIEW tv AS SELECT v FROM t", token);
         await SubscribeAsync(nodeA, "a_from_b", nodeB, token);
         await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+
+        // A unique index built concurrently waits for a write under way on node_a, all the while node_b lets go of
+        // the other fences below, and its fence holds until the transaction that queues it commits.
+        await using NpgsqlConnection writer = await nodeA.OpenAsync(Database, token);
+        await using NpgsqlTransaction pending = await writer.BeginTransactionAsync(token);
+        await using (NpgsqlCommand insert = new("INSERT INTO cic VALUES (100, 100)", writer, pending))
+        {
+            _ = await insert.ExecuteNonQueryAsync(token);
+        }
+
+        Task<string> building = nodeA.SafePsqlAsync(Database, "CREATE UNIQUE INDEX CONCURRENTLY cic_v ON cic (v)", token);
+        Assert.IsTrue(await PollFailsAsync(nodeB, "UPDATE cic SET v = v WHERE id = 0", token), "the build's fence");
 
         _ = await nodeA.SafePsqlAsync(Database, "ALTER TABLE t ALTER COLUMN v TYPE bigint", token);
         _ = await nodeA.SafePsqlAsync(Database, "BEGIN; ALTER TABLE t2 ALTER COLUMN v TYPE bigint; PREPARE TRANSACTION 'aborted'", token);
@@ -519,7 +552,17 @@ public sealed class GlobalDdlLockTests
             await writing;
         }
 
-        Assert.AreEqual("0", await nodeB.SafePsqlAsync(Database, "SELECT count(*) FROM worf.fence", token));
+        // node_b, which asked node_a about the build's fence meanwhile, keeps it while the build goes on.
+        Assert.AreEqual("1", await nodeB.SafePsqlAsync(Database, "SELECT count(DISTINCT fence_id) FROM worf.fence", token));
+        PostgresException held = await Assert.ThrowsExactlyAsync<PostgresException>(
+            () => nodeB.SafePsqlAsync(Database, "INSERT INTO cic VALUES (2, 1)", token), "a duplicate while the build waits");
+        Assert.AreEqual("55P03", held.SqlState);
+        await pending.CommitAsync(token);
+        _ = await building;
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
+        Assert.AreEqual("cic_v|0", await nodeB.SafePsqlAsync(Database,
+            "SELECT (SELECT indexname FROM pg_indexes WHERE indexname = 'cic_v'), (SELECT count(*) FROM worf.fence)", token));
+        _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO cic VALUES (2, 2)", token);
     }
 
     /// <summary>

@@ -53,6 +53,12 @@ internal static unsafe partial class DdlLock
 
     private const string LockNotAvailable = "55P03";
 
+    // ExclusiveLock from storage/lockdefs.h, LOCKTAG_ADVISORY from storage/lock.h and USER_LOCKMETHOD, which advisory
+    // locks take.
+    private const int ExclusiveLock = 7;
+    private const byte LockTagAdvisory = 10;
+    private const byte UserLockMethod = 2;
+
     private const uint LsnOid = 3220;
 
     // How long a kept fence's DDL may take to arrive before apply asks its origin whether it ever will.
@@ -68,6 +74,12 @@ internal static unsafe partial class DdlLock
 
     // The fences of the DDL this transaction queued, which the other nodes keep until it applies there.
     private static readonly HashSet<ulong> s_queuedFences = [];
+
+    // The fence of a statement that commits on its way, such as CREATE INDEX CONCURRENTLY, which keeps it at its
+    // first commit and holds a lock named for it until the transaction that queues its DDL ends, or the statement
+    // fails, and whether that transaction lets the lock go.
+    private static ulong s_statementLock;
+    private static bool s_statementLockQueued;
 
     // The tables this transaction fenced, which later DDL in it needs no new fence for.
     private static readonly HashSet<uint> s_transactionTables = [];
@@ -527,9 +539,16 @@ internal static unsafe partial class DdlLock
                     long fenceId = kept[i].Get<long>(0);
 
                     // A transaction the origin hasn't reached never ran there, as on an origin restored to an earlier
-                    // point, and one too old for the origin to know of finished long ago.
+                    // point, and one too old for the origin to know of finished long ago. A statement that commits on
+                    // its way holds a lock named for its fence until the transaction that queues its DDL ends.
+                    ulong key = unchecked((ulong)fenceId);
                     string?[] row = conn.Query($"""
-                        SELECT CASE WHEN x >= pg_catalog.pg_snapshot_xmax(pg_catalog.pg_current_snapshot()) THEN 'aborted'
+                        SELECT CASE WHEN EXISTS (SELECT FROM pg_catalog.pg_locks l JOIN pg_catalog.pg_database d ON d.oid = l.database
+                                WHERE l.locktype = 'advisory' AND d.datname = pg_catalog.current_database() AND l.objsubid = 1
+                                    AND l.classid = {(key >> 32).ToString(CultureInfo.InvariantCulture)}
+                                    AND l.objid = {(key & uint.MaxValue).ToString(CultureInfo.InvariantCulture)})
+                            THEN 'in progress'
+                            WHEN x >= pg_catalog.pg_snapshot_xmax(pg_catalog.pg_current_snapshot()) THEN 'aborted'
                             ELSE pg_catalog.pg_xact_status(x) END, pg_catalog.pg_current_wal_insert_lsn()
                         FROM (SELECT '{kept[i].Get<long>(1).ToString(CultureInfo.InvariantCulture)}'::pg_catalog.xid8 AS x) AS fence
                         """, 2)[0];
@@ -619,10 +638,10 @@ internal static unsafe partial class DdlLock
 
             // Apply can't pass a lock this transaction holds, as on a table that an earlier statement in it locked or
             // wrote to.
-            if (polls % 50 == 0 && blocked.Count > 0 && Spi.ExecuteScalar<bool>("""
+            if (polls % 50 == 0 && blocked.Count > 0 && Spi.Select("""
                 SELECT EXISTS (SELECT FROM pg_catalog.unnest($1::pg_catalog.int8[]) AS a (pid)
                     WHERE pg_catalog.pg_backend_pid() = ANY (pg_catalog.pg_blocking_pids(a.pid::pg_catalog.int4)))
-                """, SpiParameter.Create(blocked.ToArray())))
+                """, SpiParameter.Create(blocked.ToArray()))[0].Get<bool>(0))
             {
                 throw new PgException(LockNotAvailable,
                     $"cannot apply node {waiting[0].NodeId}'s changes before DDL while this transaction holds a lock they need",
@@ -1364,7 +1383,7 @@ internal static unsafe partial class DdlLock
 
     /// <summary>
     /// Adds the tables with a column of a type, or of a type built on it: a domain over it, an array, range or
-    /// multirange of it, or a composite type with an attribute of it, however deep.
+    /// multirange of it, or a composite type, or a table's row type, with an attribute of it, however deep.
     /// </summary>
     private static void AddTypeUsers(List<uint> tables, uint typeOid)
     {
@@ -1378,7 +1397,7 @@ internal static unsafe partial class DdlLock
                 SELECT typbasetype, oid FROM pg_catalog.pg_type WHERE typtype = 'd'
                 UNION ALL SELECT oid, typarray FROM pg_catalog.pg_type WHERE typarray <> 0
                 UNION ALL SELECT a.atttypid, c.reltype FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
-                    WHERE c.relkind = 'c' AND a.attnum > 0 AND NOT a.attisdropped
+                    WHERE c.reltype <> 0 AND a.attnum > 0 AND NOT a.attisdropped
                 UNION ALL SELECT rngsubtype, rngtypid FROM pg_catalog.pg_range
                 UNION ALL SELECT rngtypid, rngmultitypid FROM pg_catalog.pg_range
             ), types (oid) AS (
@@ -1469,8 +1488,34 @@ internal static unsafe partial class DdlLock
     }
 
     /// <summary>
-    /// Keeps the fences of the DDL the transaction queued, and of the statement that commits partway now. The other
-    /// fences go with their connections.
+    /// Ends a statement's hold of its lock, if it committed on its way: the transaction that queued its DDL lets it
+    /// go as it ends, and a statement that failed, or ran without queuing its DDL, lets it go now.
+    /// </summary>
+    /// <param name="queued">Whether the statement queued its DDL.</param>
+    internal static void EndStatement(bool queued)
+    {
+        if (s_statementLock == 0 || s_statementLockQueued)
+        {
+            return;
+        }
+
+        if (!queued)
+        {
+            ReleaseStatementLock();
+            return;
+        }
+
+        s_statementLockQueued = true;
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, ReleaseStatementLock);
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, ReleaseStatementLock);
+    }
+
+    /// <summary>
+    /// Keeps the fences of the DDL the transaction queued, under the transaction that queued it, which the other nodes
+    /// ask about if the DDL doesn't arrive. The other fences go with their connections. A statement that commits on
+    /// its way, such as CREATE INDEX CONCURRENTLY, keeps its fence at its first commit, as its connections don't
+    /// outlast it, and holds a lock named for the fence, which tells the other nodes that the DDL may still come, until
+    /// it ends.
     /// </summary>
     private static void KeepHeldFences()
     {
@@ -1479,8 +1524,9 @@ internal static unsafe partial class DdlLock
             throw new PgException(LockNotAvailable, $"lost the hold on node {s_lostNodes.First()}'s writes for this transaction's DDL");
         }
 
+        ulong? statement = DdlReplication.Running ? s_statementFence?.Id : null;
         List<(ulong Id, uint NodeId)> kept = [.. s_heldFences
-            .Where(fence => s_queuedFences.Contains(fence.Id) || (DdlReplication.Running && s_statementFence?.Id == fence.Id))
+            .Where(fence => s_queuedFences.Contains(fence.Id) || fence.Id == statement)
             .Select(fence => (fence.Id, fence.NodeId))
             .Distinct()];
         if (kept.Count == 0)
@@ -1488,13 +1534,49 @@ internal static unsafe partial class DdlLock
             return;
         }
 
+        if (statement is ulong id && s_statementLock == 0)
+        {
+            LOCKTAG tag = StatementLockTag(id);
+            _ = NativeMethods.LockAcquire(&tag, ExclusiveLock, true, false);
+            s_statementLock = id;
+        }
+
         string nodeId = WorfNode.GetLocalNode(false, false)!.Node.Id.ToString(CultureInfo.InvariantCulture);
         string xid = Spi.ExecuteScalar<long>("SELECT pg_catalog.txid_current()").ToString(CultureInfo.InvariantCulture);
-        foreach ((ulong id, uint node) in kept)
+        foreach ((ulong fenceId, uint node) in kept)
         {
-            _ = s_fenceConnections[node].Query($"SELECT worf.keep_fence({unchecked((long)id).ToString(CultureInfo.InvariantCulture)}, {nodeId}, {xid})", 1);
+            _ = s_fenceConnections[node].Query($"SELECT worf.keep_fence({unchecked((long)fenceId).ToString(CultureInfo.InvariantCulture)}, {nodeId}, {xid})", 1);
         }
     }
+
+    /// <summary>
+    /// Lets go of the lock that a statement that commits on its way holds for its fence.
+    /// </summary>
+    private static void ReleaseStatementLock()
+    {
+        if (s_statementLock != 0)
+        {
+            LOCKTAG tag = StatementLockTag(s_statementLock);
+            _ = NativeMethods.LockRelease(&tag, ExclusiveLock, true);
+        }
+
+        s_statementLock = 0;
+        s_statementLockQueued = false;
+    }
+
+    /// <summary>
+    /// Names the advisory lock of a fence, as <c>pg_advisory_lock</c> names one for a bigint key, which shows in
+    /// <c>pg_locks</c> with the key's halves as its class and object.
+    /// </summary>
+    private static LOCKTAG StatementLockTag(ulong fenceId) => new()
+    {
+        locktag_field1 = DatabaseId(),
+        locktag_field2 = (uint)(fenceId >> 32),
+        locktag_field3 = (uint)fenceId,
+        locktag_field4 = 1,
+        locktag_type = LockTagAdvisory,
+        locktag_lockmethodid = UserLockMethod,
+    };
 
     private static void CloseHeldFences()
     {
@@ -1510,7 +1592,7 @@ internal static unsafe partial class DdlLock
         s_queuedFences.Clear();
         s_transactionTables.Clear();
 
-        // A statement that commits partway still queues its DDL with its fence.
+        // A statement that commits on its way still queues its DDL with its fence.
         if (!DdlReplication.Running)
         {
             s_statementFence = null;

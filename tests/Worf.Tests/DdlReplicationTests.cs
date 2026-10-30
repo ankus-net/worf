@@ -172,19 +172,54 @@ public sealed class DdlReplicationTests
             ALTER TABLE pk DROP CONSTRAINT pk_pkey;
             ALTER TABLE parted ADD PRIMARY KEY (id);
             ALTER TABLE ul SET UNLOGGED;
-            CREATE FUNCTION pg_temp.tmp_conv(integer) RETURNS bigint LANGUAGE sql AS 'SELECT $1::bigint';
-            COMMENT ON FUNCTION pg_temp.tmp_conv(integer) IS 'scratch';
-            ALTER FUNCTION pg_temp.tmp_conv(integer) STABLE;
-            GRANT EXECUTE ON FUNCTION pg_temp.tmp_conv(integer) TO PUBLIC;
-            CREATE TYPE pg_temp.tmp_type AS (a integer);
-            COMMENT ON TYPE pg_temp.tmp_type IS 'scratch';
-            CREATE TABLE conv (id integer PRIMARY KEY, v integer);
-            ALTER TABLE conv ALTER COLUMN v TYPE bigint USING pg_temp.tmp_conv(v);
-            ALTER TABLE conv ADD COLUMN w bigint DEFAULT pg_temp.tmp_conv(1);
-            ALTER TABLE conv ADD COLUMN x pg_temp.tmp_type;
-            DROP TYPE pg_temp.tmp_type CASCADE;
-            DROP FUNCTION pg_temp.tmp_conv(integer) CASCADE;
             """, token);
+
+        // The session's temporary functions, types and operators, named with the temporary schema or, for types, without,
+        // keep what uses them on this node. Partitions and inheritance change as ever in a session with temporary
+        // objects, and DROP INDEX CONCURRENTLY can run.
+        await using (NpgsqlConnection session = await nodeA.OpenAsync(Database, token))
+        {
+            foreach (string sql in new[]
+            {
+                "CREATE TABLE conv (id integer PRIMARY KEY, a integer, b integer, c integer, d integer, e integer, f integer, g integer, h integer)",
+                "CREATE FUNCTION pg_temp.tmp_conv(integer) RETURNS bigint LANGUAGE sql AS 'SELECT $1::bigint'",
+                "CREATE FUNCTION pg_temp.tmp_secure(integer) RETURNS bigint LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog AS 'SELECT $1::bigint'",
+                "CREATE DOMAIN pg_temp.tmp_dom AS integer",
+                "CREATE OPERATOR pg_temp.### (LEFTARG = integer, RIGHTARG = integer, FUNCTION = int4pl)",
+                "CREATE TYPE pg_temp.tmp_type AS (a integer)",
+                "COMMENT ON FUNCTION pg_temp.tmp_conv(integer) IS 'scratch'",
+                "ALTER FUNCTION pg_temp.tmp_conv(integer) STABLE",
+                "GRANT EXECUTE ON FUNCTION pg_temp.tmp_conv(integer) TO PUBLIC",
+                "COMMENT ON TYPE tmp_type IS 'scratch'",
+                "ALTER TABLE conv ALTER COLUMN a TYPE bigint USING pg_temp.tmp_conv(a)",
+                "ALTER TABLE conv ALTER COLUMN b TYPE bigint USING pg_temp.tmp_secure(b)",
+                "ALTER TABLE conv ALTER COLUMN c TYPE bigint USING c::pg_temp.tmp_dom",
+                "ALTER TABLE conv ALTER COLUMN d TYPE bigint USING CAST(d AS tmp_dom)",
+                "ALTER TABLE conv ALTER COLUMN e TYPE bigint USING e OPERATOR(pg_temp.###) 1",
+                "ALTER TABLE conv ALTER COLUMN f SET DEFAULT pg_temp.tmp_conv(1)",
+                "ALTER TABLE conv ADD COLUMN x tmp_type",
+                "ALTER TABLE conv ALTER COLUMN g SET DEFAULT tmp_dom '1'",
+                "ALTER TABLE conv ALTER COLUMN h TYPE bigint USING h::tmp_dom",
+                "DROP TYPE pg_temp.tmp_type CASCADE",
+                "DROP FUNCTION pg_temp.tmp_conv(integer) CASCADE",
+                "CREATE TABLE pp (id integer PRIMARY KEY) PARTITION BY RANGE (id)",
+                "CREATE TABLE pp1 PARTITION OF pp FOR VALUES FROM (0) TO (10)",
+                "CREATE TABLE pp2 PARTITION OF pp FOR VALUES FROM (10) TO (20)",
+                "CREATE TABLE ip (id integer)",
+                "CREATE TABLE ic () INHERITS (ip)",
+                "CREATE TABLE io (id integer)",
+                "ALTER TABLE io INHERIT ip",
+                "ALTER TABLE pp DETACH PARTITION pp1",
+                "ALTER TABLE pp DETACH PARTITION pp2 CONCURRENTLY",
+                "CREATE INDEX conv_id ON conv (id)",
+                "DROP INDEX CONCURRENTLY conv_id",
+            })
+            {
+                await using NpgsqlCommand command = new(sql, session);
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+        }
+
         PostgresException together = await Assert.ThrowsExactlyAsync<PostgresException>(() => nodeA.SafePsqlAsync(Database, """
             CREATE FUNCTION pg_temp.tmp_f() RETURNS integer LANGUAGE sql AS 'SELECT 1';
             CREATE FUNCTION kept_f() RETURNS integer LANGUAGE sql AS 'SELECT 1';
@@ -221,10 +256,15 @@ public sealed class DdlReplicationTests
                 (SELECT count(*) FROM worf.replication_set_table WHERE set_reloid IN ('from_temp'::regclass, 'like_temp'::regclass, 'from_prepared'::regclass)),
                 (SELECT count(*) FROM worf.queue WHERE message->>'command' ~ '(ROLE|DATABASE|PUBLICATION|SUBSCRIPTION)')
             """, token), "DDL from a function queued once, and nothing that used the session's objects or was the cluster's");
-        Assert.AreEqual("integer|", await nodeB.SafePsqlAsync(Database, """
-            SELECT format_type(atttypid, atttypmod), (SELECT attname FROM pg_attribute WHERE attrelid = 'conv'::regclass AND attname = 'w')
-            FROM pg_attribute WHERE attrelid = 'conv'::regclass AND attname = 'v'
-            """, token), "what used temporary functions and types stayed on node_a");
+        Assert.AreEqual("id a b c d e f g h|0|ic,io|", await nodeB.SafePsqlAsync(Database, """
+            SELECT (SELECT string_agg(attname, ' ' ORDER BY attnum) FROM pg_attribute
+                    WHERE attrelid = 'conv'::regclass AND attnum > 0 AND NOT attisdropped AND atttypid = 'integer'::regtype),
+                (SELECT count(*) FROM pg_attrdef WHERE adrelid = 'conv'::regclass),
+                (SELECT string_agg(inhrelid::regclass::text, ',' ORDER BY inhrelid::regclass::text) FROM pg_inherits
+                    WHERE inhparent IN ('pp'::regclass, 'ip'::regclass)),
+                to_regclass('conv_id')
+            """, token), "what used temporary functions, types and operators stayed on node_a; partitions, inheritance and indexes changed");
+        Assert.AreEqual("0", await nodeA.SafePsqlAsync(Database, "SELECT count(*) FROM pg_inherits WHERE inhdetachpending", token));
         Assert.AreEqual("s||||'2026-02-01'::date", await nodeB.SafePsqlAsync(Database, """
             SELECT to_regclass('s')::text, to_regclass('orders')::text, to_regclass('from_temp')::text, to_regclass('from_prepared')::text,
                 pg_get_expr(adbin, adrelid)
