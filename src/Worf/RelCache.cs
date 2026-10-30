@@ -54,6 +54,10 @@ internal static partial class RelCache
                 {
                     throw new PgException(PgSqlStates.InternalError, $"unknown column name {entry.Attnames[i]}");
                 }
+
+                (entry.DecodeTypes[i], entry.MissingTypes[i]) = entry.Attmap[i] >= 0 && entry.RemoteTypes[i] is WorfRemoteType remote
+                    ? DecodeType(remote, NativeMethods.TupleDescAttr(desc, entry.Attmap[i])->atttypid)
+                    : (0, null);
             }
 
             entry.Reloid = entry.Rel->rd_id;
@@ -99,7 +103,9 @@ internal static partial class RelCache
     /// <param name="schemaname">The relation's schema.</param>
     /// <param name="relname">The relation's name.</param>
     /// <param name="attnames">The remote columns' names.</param>
-    internal static void RelationCacheUpdate(uint remoteid, string schemaname, string relname, string[] attnames)
+    /// <param name="types">The remote columns' types, or null when the provider didn't say.</param>
+    internal static void RelationCacheUpdate(uint remoteid, string schemaname, string relname, string[] attnames,
+        WorfRemoteType?[]? types = null)
     {
         Dictionary<uint, WorfRelation> hash = s_relationHash ??= RelcacheInit();
 
@@ -116,6 +122,9 @@ internal static partial class RelCache
             Relname = relname,
             Attnames = attnames,
             Attmap = new int[attnames.Length],
+            RemoteTypes = types ?? new WorfRemoteType?[attnames.Length],
+            DecodeTypes = new uint[attnames.Length],
+            MissingTypes = new string?[attnames.Length],
             Reloid = 0,
         };
     }
@@ -219,6 +228,32 @@ internal static partial class RelCache
         }
 
         return -1;
+    }
+
+    /// <summary>
+    /// Finds the type a remote column's values are decoded with, when it isn't the local column's: PostgreSQL's own
+    /// types by OID, and others by schema and name.
+    /// </summary>
+    /// <returns>The remote type's local OID, or zero when it's the local column's, and the type's name when this node
+    /// lacks it.</returns>
+    private static (uint Oid, string? Missing) DecodeType(WorfRemoteType remote, uint localType)
+    {
+        if (remote.Nspname is null || remote.Typname is null)
+        {
+            return (remote.Oid == localType ? 0 : remote.Oid, null);
+        }
+
+        SpiResult found = Worf.SelectCatalog("""
+            SELECT t.oid FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+            WHERE n.nspname = $1 AND t.typname = $2
+            """, SpiParameter.Create(remote.Nspname), SpiParameter.Create(remote.Typname));
+        if (found.Count == 0)
+        {
+            return (0, $"{remote.Nspname}.{remote.Typname}");
+        }
+
+        uint oid = found[0].Get<uint>(0);
+        return (oid == localType ? 0 : oid, null);
     }
 
     private static bool ColumnDropped(uint relid, string attname)
