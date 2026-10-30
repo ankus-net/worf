@@ -148,12 +148,17 @@ public sealed class RelayOriginTests
         await SubscribeAsync(subscriber, "temp", provider, "{all}", token, "cset");
 
         // The workers on both nodes run with their configuration files' settings, keep_local and apply_remote, rather
-        // than the last_update_wins that the connections creating the subscription set.
+        // than the last_update_wins of the role that creates the subscription and connects back.
+        foreach (TestNode node in nodes)
+        {
+            _ = await node.SafePsqlAsync(Database, $"ALTER ROLE {SuperUser} SET worf.conflict_resolution = last_update_wins", token);
+        }
+
         int logpos = provider.ReadLog().Length;
-        await using (NpgsqlConnection connection = await OpenWithLastUpdateWinsAsync(provider, token))
+        await using (NpgsqlConnection connection = await OpenAsSuperUserAsync(provider, token))
         await using (NpgsqlCommand command = new($"""
             SELECT worf.create_subscription(subscription_name := 'back',
-                provider_dsn := '{subscriber.Dsn(Database, SuperUser)} options=''-cworf.conflict_resolution=last_update_wins''',
+                provider_dsn := '{subscriber.Dsn(Database, SuperUser)}',
                 synchronize_structure := false, synchronize_data := false, forward_origins := '{"{}"}')
             """, connection))
         {
@@ -289,9 +294,9 @@ public sealed class RelayOriginTests
     }
 
     /// <summary>
-    /// Opens a connection whose session sets last_update_wins, which the node's workers don't run with.
+    /// Opens a connection as the superuser the test creates, whose role settings the node's workers don't run with.
     /// </summary>
-    private static async Task<NpgsqlConnection> OpenWithLastUpdateWinsAsync(TestNode node, CancellationToken token)
+    private static async Task<NpgsqlConnection> OpenAsSuperUserAsync(TestNode node, CancellationToken token)
     {
         NpgsqlConnectionStringBuilder builder = new()
         {
@@ -299,7 +304,6 @@ public sealed class RelayOriginTests
             Port = node.Cluster.Port,
             Database = Database,
             Username = SuperUser,
-            Options = "-c worf.conflict_resolution=last_update_wins",
             Pooling = false,
             Timeout = 60,
         };

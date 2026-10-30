@@ -748,7 +748,7 @@ internal sealed partial class WorfNode
     /// </summary>
     /// <returns>Whether they are.</returns>
     internal static bool OriginSlotsFull()
-        => Spi.ExecuteScalar<bool>("""
+        => Worf.ReadScalar<bool>("""
             SELECT count(*) >= coalesce(pg_catalog.current_setting('max_active_replication_origins', true),
                 pg_catalog.current_setting('max_replication_slots'))::integer
             FROM pg_catalog.pg_replication_origin_status
