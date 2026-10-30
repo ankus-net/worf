@@ -939,6 +939,23 @@ internal static partial class ReplicationSet
     }
 
     /// <summary>
+    /// Makes the output plugin build every table's replication info again, as when one of its replication sets changes
+    /// what it replicates.
+    /// </summary>
+    internal static void InvalidateTableReplicationInfo()
+    {
+        if (s_repSetTableHash is null)
+        {
+            return;
+        }
+
+        foreach (WorfTableRepInfo entry in s_repSetTableHash.Values)
+        {
+            entry.IsValid = false;
+        }
+    }
+
+    /// <summary>
     /// Reads a replication set from its catalog tuple.
     /// </summary>
     /// <param name="tuple">The tuple.</param>
@@ -1039,10 +1056,7 @@ internal static partial class ReplicationSet
 
         if (reloid == 0)
         {
-            foreach (WorfTableRepInfo entry in s_repSetTableHash.Values)
-            {
-                entry.IsValid = false;
-            }
+            InvalidateTableReplicationInfo();
         }
         else if (s_repSetTableHash.TryGetValue(reloid, out WorfTableRepInfo? entry))
         {

@@ -427,6 +427,12 @@ internal static unsafe partial class OutputPlugin
                     rs.ReplicateDelete = replicatedSet.ReplicateDelete;
                     rs.ReplicateTruncate = replicatedSet.ReplicateTruncate;
 
+                    // The tables' info holds the actions as they were when it was built. Build it again, or a table
+                    // whose changes were decoded before keeps replicating what the set no longer does until its
+                    // relcache entry happens to be invalidated, as a TRUNCATE that commits before the walsender has
+                    // decoded the changes ahead of it does.
+                    ReplicationSet.InvalidateTableReplicationInfo();
+
                     return false;
                 }
             }
