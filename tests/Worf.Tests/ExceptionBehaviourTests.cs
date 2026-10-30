@@ -70,13 +70,16 @@ public sealed class ExceptionBehaviourTests
         await SubscribeAsync(provider, subscriber, token);
 
         // The worker that stops to apply a transaction again change by change restarts at once, rather than after
-        // the usual five seconds.
+        // the usual five seconds, or one on Windows, where the time alone can't tell.
         await SetBehaviourAsync(subscriber, "discard", token);
+        int logpos = subscriber.ReadLog().Length;
         Stopwatch restarting = Stopwatch.StartNew();
         _ = await provider.SafePsqlAsync(Database, "INSERT INTO t VALUES (1, 'good'), (2, 'bad'), (3, 'good')", token);
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM t WHERE id = 3)", token),
             "the discarded change's transaction");
         Assert.IsLessThan(4500, restarting.ElapsedMilliseconds, "the worker restarted at once");
+        Assert.Contains("restarting the apply worker for subscription sub at once", subscriber.ReadLog()[logpos..],
+            "the worker restarted before the restart delay");
         Assert.AreEqual("1\n3", await subscriber.SafePsqlAsync(Database, "SELECT id FROM t ORDER BY id", token));
         Assert.AreEqual("discard|INSERT|public|t|2|bad|23514", await LastLogAsync(subscriber, token));
 
@@ -133,6 +136,24 @@ public sealed class ExceptionBehaviourTests
             SELECT behaviour, operation, schema_name, table_name, remote_new_tuple->>'id', remote_new_tuple->>'v', error_sqlstate
             FROM worf.exception_log WHERE remote_new_tuple->>'id' IN ('11', '12', '13') ORDER BY log_id
             """, token), "every change of the skipped transaction");
+        Assert.AreEqual("1", await subscriber.SafePsqlAsync(Database,
+            "SELECT count(DISTINCT xmin::text) FROM worf.exception_log WHERE remote_new_tuple->>'id' IN ('11', '12', '13')", token),
+            "transactions recording the skipped changes, rather than a subtransaction each");
+
+        // A skipped transaction's queued DDL is recorded as the statement.
+        _ = await provider.SafePsqlAsync(Database, """
+            SELECT worf.replicate_ddl_command('CREATE TABLE public.skipped (id integer PRIMARY KEY)');
+            INSERT INTO t VALUES (15, 'bad');
+            """, token);
+        _ = await provider.SafePsqlAsync(Database, "INSERT INTO t VALUES (16, 'good')", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM t WHERE id = 16)", token),
+            "the transaction after the one with the DDL");
+        Assert.AreEqual("QUEUED_SQL|t,INSERT|15", await subscriber.SafePsqlAsync(Database, """
+            SELECT string_agg(concat_ws('|', operation, remote_new_tuple->>'id', queued_message LIKE '%CREATE TABLE public.skipped%'), ','
+                ORDER BY log_id)
+            FROM worf.exception_log
+            WHERE remote_commit_lsn = (SELECT remote_commit_lsn FROM worf.exception_log ORDER BY log_id DESC LIMIT 1)
+            """, token), "the skipped transaction's changes");
 
         await SetBehaviourAsync(subscriber, "sub_disable", token);
         _ = await provider.SafePsqlAsync(Database, "INSERT INTO t VALUES (21, 'bad')", token);

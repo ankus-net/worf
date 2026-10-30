@@ -113,12 +113,13 @@ decoding:
     max_wal_senders = 10        # one per node needed on provider node
     shared_preload_libraries = 'worf'
 
-On a subscriber, each subscription uses a replication origin, plus one for each
-other node whose changes its provider forwards with `forward_origins` `{all}`.
-They count against `max_active_replication_origins` from PostgreSQL 18, or
-`max_replication_slots` before. When none is free, worf applies a forwarded
-node's changes as its provider's, and breaks timestamp ties for them as if the
-provider wrote them.
+On a subscriber, PostgreSQL tracks each replication origin in use in one of
+`max_active_replication_origins` slots from PostgreSQL 18, or
+`max_replication_slots` before. Each subscription takes one, each table it's
+synchronizing another, and each other node whose changes its provider forwards
+with `forward_origins` `{all}` another. When none is free, a subscription
+gives up the slots of forwarded nodes' origins it no longer needs, which slows
+apply; failing that, its apply or table sync stops with an error and retries.
 
 If you want to handle conflict resolution with last/first update wins (see
 [Conflicts](#conflicts)), you can add this additional option to
@@ -702,8 +703,10 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   Nodes that replicate both ways need the same one of these two settings to
   keep the same rows, and `create_subscription` warns when they don't. It
   compares the settings the apply workers run with, from the configuration
-  files and `ALTER SYSTEM`, `ALTER DATABASE` or `ALTER ROLE`, not a session's
-  `SET`.
+  files, `ALTER SYSTEM`, `ALTER DATABASE`, and `ALTER ROLE` for the bootstrap
+  superuser the workers run as, not a session's `SET` or the settings of the
+  role that runs it. A provider connection's user that can't read
+  `pg_file_settings` reports the value its session started with.
 
   The default value is `apply_remote`.
 
@@ -724,9 +727,9 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   How far ahead of the local clock a remote transaction's commit time can be
   for apply to wait until the local clock passes it, so that local changes
   made afterwards commit later than it, as `last_update_wins` and
-  `first_update_wins` need. Only the apply worker of a subscription whose
-  provider also subscribes to this node waits, and only under those two
-  settings. A remote transaction further ahead applies at once, with a warning
+  `first_update_wins` need. Only apply workers on a node that other nodes
+  subscribe to wait, as their local changes can meet the remote ones there
+  or further on, and only under those two settings. A remote transaction further ahead applies at once, with a warning
   at most once a minute. `-1` never waits. The default is `1s`.
 
 - `worf.exception_behaviour`

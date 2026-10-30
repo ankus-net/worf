@@ -107,7 +107,7 @@ internal static partial class Conflict
     /// <param name="remoteResolution">The other node's <c>worf.conflict_resolution</c>.</param>
     internal static void CheckTwoWayResolution(string localNode, string remoteNode, string remoteResolution)
     {
-        string localResolution = Worf.ReadScalar<string>(WorkerResolutionSql);
+        string localResolution = Elevated.Run(() => Worf.ReadScalar<string>(WorkerResolutionSql(true)));
         if (localResolution == remoteResolution && localResolution is "last_update_wins" or "first_update_wins")
         {
             return;
@@ -123,10 +123,18 @@ internal static partial class Conflict
 
     /// <summary>
     /// Gets the query for the <c>worf.conflict_resolution</c> that the apply workers on a node run with, rather than
-    /// the session's: the database's and the workers' role's settings, then the value the session started with,
-    /// which the configuration files and ALTER SYSTEM set.
+    /// the session's: the database's and the workers' role's settings, then the server's, which the configuration
+    /// files, ALTER SYSTEM and the server's command line set. The session's value is the server's unless the
+    /// session's role, its database or its connection set it; then the configuration files have it, which a role
+    /// without the privileges of <c>pg_read_all_settings</c> can't read, and the value the session started with is
+    /// taken.
     /// </summary>
-    internal const string WorkerResolutionSql = """
+    /// <param name="readFiles">Whether the session can read the configuration files.</param>
+    /// <returns>The query.</returns>
+    internal static string WorkerResolutionSql(bool readFiles)
+        => readFiles ? WorkerResolutionHeadSql + WorkerResolutionFileSql : WorkerResolutionHeadSql + WorkerResolutionResetSql;
+
+    private const string WorkerResolutionHeadSql = """
         SELECT coalesce(
             (SELECT substr(c, length('worf.conflict_resolution=') + 1)
              FROM pg_catalog.pg_db_role_setting s, unnest(s.setconfig) c
@@ -135,6 +143,19 @@ internal static partial class Conflict
                 AND s.setrole IN (0, 10)
              ORDER BY s.setdatabase <> 0 AND s.setrole <> 0 DESC, s.setrole <> 0 DESC, s.setdatabase <> 0 DESC
              LIMIT 1),
+            (SELECT setting FROM pg_catalog.pg_settings WHERE name = 'worf.conflict_resolution'
+                AND source IN ('default', 'environment variable', 'configuration file', 'command line')),
+
+        """;
+
+    private const string WorkerResolutionFileSql = """
+            (SELECT setting FROM pg_catalog.pg_file_settings WHERE name = 'worf.conflict_resolution' AND applied
+             ORDER BY seqno DESC LIMIT 1),
+            (SELECT boot_val FROM pg_catalog.pg_settings WHERE name = 'worf.conflict_resolution'),
+            'apply_remote')
+        """;
+
+    private const string WorkerResolutionResetSql = """
             (SELECT reset_val FROM pg_catalog.pg_settings WHERE name = 'worf.conflict_resolution'),
             'apply_remote')
         """;
@@ -348,7 +369,7 @@ internal static partial class Conflict
             return localNodeId;
         }
 
-        uint? recorded = WorfNode.OriginWriter(originId, xid);
+        uint? recorded = Apply.OriginWriter(originId, xid)?.Writer;
         sbyte* name;
         return recorded ?? (NativeMethods.replorigin_by_oid(originId, true, &name)
             ? WorfNode.GetOriginNodeId(Worf.FromServer(name)) ?? localNodeId

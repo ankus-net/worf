@@ -20,6 +20,11 @@ internal static class Manager
     private static long MinSleep => OperatingSystem.IsWindows() ? 1000 : 5000;
 
     /// <summary>
+    /// Gets how long after an apply or table sync worker fails it's started again, in milliseconds.
+    /// </summary>
+    internal static long RestartDelay => MinSleep;
+
+    /// <summary>
     /// Entry point for manager worker.
     /// </summary>
     /// <param name="mainArg">The worker's slot.</param>
@@ -267,13 +272,18 @@ internal static class Manager
                 {
                     if (applyWorker.CrashedAt != 0)
                     {
-                        long restartTime = applyWorker.CrashedAt + (MinSleep * 1000);
+                        long restartTime = applyWorker.CrashedAt + (RestartDelay * 1000);
 
                         // One that stopped to apply its failed transaction in a new way restarts at once.
-                        if (restartTime > Worker.GetCurrentTimestamp() && !applyWorker.Worker.Apply.ExceptionRestartsAtOnce)
+                        if (restartTime > Worker.GetCurrentTimestamp())
                         {
-                            ret = false;
-                            continue;
+                            if (!applyWorker.Worker.Apply.ExceptionRestartsAtOnce)
+                            {
+                                ret = false;
+                                continue;
+                            }
+
+                            PgLog.Log($"restarting the apply worker for subscription {sub.Name} at once, to apply its failed transaction again under worf.exception_behaviour");
                         }
                     }
                     else
