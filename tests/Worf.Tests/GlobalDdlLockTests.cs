@@ -188,12 +188,13 @@ public sealed class GlobalDdlLockTests
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
         _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO t VALUES (7, 7)", token);
 
-        // A unique index built concurrently that fails leaves an invalid index, which stays on this node, as does
-        // dropping it.
+        // A unique index built concurrently that fails, after the transactions it committed, lets its fence go and
+        // leaves an invalid index, which stays on this node, as does dropping it.
         _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO dupe VALUES (1, 1), (2, 1)", token);
         PostgresException duplicate = await Assert.ThrowsExactlyAsync<PostgresException>(
             () => nodeA.SafePsqlAsync(Database, "CREATE UNIQUE INDEX CONCURRENTLY dupe_v ON dupe (v)", token));
         Assert.AreEqual("23505", duplicate.SqlState);
+        Assert.IsTrue(await PollSucceedsAsync(nodeB, "UPDATE dupe SET v = v WHERE id = 0", token), "the failed build's fence went");
         _ = await nodeA.SafePsqlAsync(Database, "DROP INDEX dupe_v; INSERT INTO dupe VALUES (3, 3)", token);
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
         Assert.AreEqual("0", await nodeA.SafePsqlAsync(Database, "SELECT count(*) FROM worf.queue WHERE message->>'command' LIKE '%dupe_v%'", token));
@@ -552,8 +553,7 @@ public sealed class GlobalDdlLockTests
             await writing;
         }
 
-        // node_b, which asked node_a about the build's fence meanwhile, keeps it while the build goes on.
-        Assert.AreEqual("1", await nodeB.SafePsqlAsync(Database, "SELECT count(DISTINCT fence_id) FROM worf.fence", token));
+        // node_b keeps the build's fence while the build goes on, long past when it asks node_a about kept fences.
         PostgresException held = await Assert.ThrowsExactlyAsync<PostgresException>(
             () => nodeB.SafePsqlAsync(Database, "INSERT INTO cic VALUES (2, 1)", token), "a duplicate while the build waits");
         Assert.AreEqual("55P03", held.SqlState);
