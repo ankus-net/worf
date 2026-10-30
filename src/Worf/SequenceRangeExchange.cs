@@ -84,7 +84,7 @@ internal static class SequenceRangeExchange
 
         // The manager and the range worker exchange one at a time, so that this node's calls carry its WAL position in
         // order.
-        _ = Spi.Execute("SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('worf.sequence_range_exchange'))");
+        _ = Worf.Read("SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('worf.sequence_range_exchange'))", 0);
         bool changed = false;
         Contacted = false;
         NextDueAt = long.MaxValue;
@@ -360,7 +360,7 @@ internal static class SequenceRangeExchange
 
         foreach (JsonElement entry in sequences.EnumerateArray())
         {
-            uint? found = Spi.ExecuteScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(entry.GetProperty("name").GetString()));
+            uint? found = Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(entry.GetProperty("name").GetString()));
             if (found is not uint seqoid)
             {
                 continue;
@@ -488,7 +488,7 @@ internal static class SequenceRangeExchange
             }
 
             // Blocks the neighbor holds from this node. A fenced allocator takes back into its ledger the ones it lost.
-            bool fenced = Spi.ExecuteScalar<bool>("SELECT fenced_at IS NOT NULL FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(seqoid));
+            bool fenced = Worf.ReadScalar<bool>("SELECT fenced_at IS NOT NULL FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(seqoid));
             if (entry.TryGetProperty("held", out JsonElement heldBlocks))
             {
                 foreach (JsonElement block in heldBlocks.EnumerateArray())

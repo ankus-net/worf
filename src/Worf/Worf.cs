@@ -597,6 +597,41 @@ internal static partial class Worf
     }
 
     /// <summary>
+    /// Selects rows with the snapshot a statement of the transaction takes, as SPI's writable helpers do, without
+    /// assigning the transaction an ID as they do even for a SELECT: an idle worker then writes no commit records, and
+    /// a read before DROP INDEX CONCURRENTLY leaves it the first action in its transaction.
+    /// </summary>
+    /// <param name="commandText">The query.</param>
+    /// <param name="limit">The most rows to return, or zero for all.</param>
+    /// <param name="parameters">The query's parameters.</param>
+    /// <returns>The rows.</returns>
+    internal static unsafe SpiResult Read(string commandText, int limit, params ReadOnlySpan<SpiParameter> parameters)
+    {
+        NativeMethods.PushActiveSnapshot(NativeMethods.GetTransactionSnapshot());
+        try
+        {
+            return Spi.Select(commandText, limit, parameters);
+        }
+        finally
+        {
+            NativeMethods.PopActiveSnapshot();
+        }
+    }
+
+    /// <summary>
+    /// Reads the first column of a query's first row as <see cref="Read"/> reads rows.
+    /// </summary>
+    /// <typeparam name="T">The column's managed type.</typeparam>
+    /// <param name="commandText">The query.</param>
+    /// <param name="parameters">The query's parameters.</param>
+    /// <returns>The value, or the type's default when the query returns no rows.</returns>
+    internal static T ReadScalar<[PgConvertible] T>(string commandText, params ReadOnlySpan<SpiParameter> parameters)
+    {
+        SpiResult result = Read(commandText, 1, parameters);
+        return result.Count == 0 ? default! : result[0].Get<T>(0);
+    }
+
+    /// <summary>
     /// Entry point for this module.
     /// </summary>
     [PgModuleLoad]
@@ -670,7 +705,7 @@ internal static partial class Worf
             NativeMethods.LockRelationOid(Dependency.ExtensionRelationId, WorfNode.ShareUpdateExclusiveLock);
         }
 
-        string? extversion = Spi.ExecuteScalar<string?>(
+        string? extversion = ReadScalar<string?>(
             "SELECT extversion FROM pg_catalog.pg_extension WHERE extname = $1", SpiParameter.Create(ExtensionName));
 
         // No extension, nothing to update. Only run the alter if the versions don't match.

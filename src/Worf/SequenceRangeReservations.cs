@@ -255,7 +255,7 @@ internal static class SequenceRangeReservations
     private static uint RequireUsage(PgDatum sequence)
     {
         uint seqoid = SequenceRanges.RequireSequence(sequence);
-        return Spi.ExecuteScalar<bool>("SELECT pg_catalog.has_sequence_privilege($1, 'USAGE')", SpiParameter.Create(seqoid)) ? seqoid
+        return Worf.ReadScalar<bool>("SELECT pg_catalog.has_sequence_privilege($1, 'USAGE')", SpiParameter.Create(seqoid)) ? seqoid
             : throw new PgException("42501", $"permission denied for sequence {SequenceRanges.GetInfo(seqoid).Name}");
     }
 

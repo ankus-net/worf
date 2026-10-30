@@ -35,7 +35,7 @@ internal static class Sequences
                 Worf.FromServer(NativeMethods.get_rel_name(seqoid)));
         }
 
-        return Spi.ExecuteScalar<long>("SELECT last_value FROM " + seqname);
+        return Worf.ReadScalar<long>("SELECT last_value FROM " + seqname);
     }
 
     /// <summary>
@@ -54,19 +54,32 @@ internal static class Sequences
                 return;
             }
 
-            SpiResult states = Spi.Query("SELECT seqoid, cache_size, last_value FROM worf.sequence_state FOR UPDATE", false, 0);
+            // A row lock assigns the transaction an ID, so only the rows to update are locked, and a pass with nothing to
+            // update writes no commit record.
+            SpiResult states = Worf.Read("SELECT seqoid, last_value FROM worf.sequence_state", 0);
 
             foreach (SpiRow oldseq in states)
             {
                 PgInterrupts.Check();
 
                 uint seqoid = oldseq.Get<uint>(0);
-                int cacheSize = oldseq.Get<int>(1);
-                long oldLastValue = oldseq.Get<long>(2);
-
-                long lastValue = SequenceGetLastValue(seqoid);
 
                 // Not enough of the sequence was consumed yet for us to care.
+                if (oldseq.Get<long>(1) >= SequenceGetLastValue(seqoid) + (SequenceReplicationMinCache / 2))
+                {
+                    continue;
+                }
+
+                SpiResult locked = Spi.Query("SELECT cache_size, last_value FROM worf.sequence_state WHERE seqoid = $1 FOR UPDATE",
+                    false, 0, SpiParameter.Create(seqoid));
+                if (locked.Count == 0)
+                {
+                    continue;
+                }
+
+                int cacheSize = locked[0].Get<int>(0);
+                long oldLastValue = locked[0].Get<long>(1);
+                long lastValue = SequenceGetLastValue(seqoid);
                 if (oldLastValue >= lastValue + (SequenceReplicationMinCache / 2))
                 {
                     continue;
@@ -135,7 +148,7 @@ internal static class Sequences
     internal static void CreateSequenceStateRecord(uint seqoid)
     {
         // Check if the state record already exists, and if it doesn't insert it.
-        if (Spi.ExecuteScalar<long>("SELECT count(*) FROM worf.sequence_state WHERE seqoid = $1", SpiParameter.Create(seqoid)) == 0)
+        if (Worf.ReadScalar<long>("SELECT count(*) FROM worf.sequence_state WHERE seqoid = $1", SpiParameter.Create(seqoid)) == 0)
         {
             _ = Spi.Execute("INSERT INTO worf.sequence_state VALUES ($1, $2, $3)",
                 SpiParameter.Create(seqoid), SpiParameter.Create(SequenceReplicationMinCache),
