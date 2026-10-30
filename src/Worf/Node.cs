@@ -30,7 +30,7 @@ using Ankus.Postgres;
     );
 
     COMMENT ON TABLE worf.origin_writer IS
-        'The node whose changes each replication origin worf created applies, and the subscription it applies them for, from the transaction that created it';
+        'The node whose changes each replication origin worf created applies, and the subscription it applies them for, from the transaction that created it, or zeros from the one that dropped it';
 
     CREATE TABLE worf.subscription (
         sub_id oid NOT NULL PRIMARY KEY,
@@ -563,6 +563,9 @@ internal sealed partial class WorfNode
         }
     }
 
+    // The plan that records what a replication origin applies.
+    private static SpiPreparedStatement? s_recordOriginWriter;
+
     private const string SubscriptionQuery =
         "SELECT sub_id, sub_name::text, sub_origin, sub_target, sub_origin_if, sub_target_if, sub_enabled, " +
         "sub_slot_name::text, sub_replication_sets, sub_forward_origins, sub_apply_delay, sub_force_text_transfer " +
@@ -630,15 +633,11 @@ internal sealed partial class WorfNode
     /// <param name="originName">The origin.</param>
     /// <param name="writerNodeId">The node whose changes it applies.</param>
     /// <param name="subId">The subscription it applies them for.</param>
-    /// <returns>The origin's id.</returns>
-    internal static ushort CreateOrigin(string originName, uint writerNodeId, uint subId)
+    /// <returns>The origin's id, and the full id of the transaction that created it.</returns>
+    internal static (ushort Origin, ulong SinceXid) CreateOrigin(string originName, uint writerNodeId, uint subId)
     {
         ushort origin = PgReplicationOrigin.Create(originName);
-        _ = Spi.Execute("""
-            INSERT INTO worf.origin_writer
-            VALUES ($1, $2, $3, coalesce(pg_catalog.pg_current_xact_id_if_assigned(), pg_catalog.pg_snapshot_xmax(pg_catalog.pg_current_snapshot())))
-            ON CONFLICT DO NOTHING
-            """, SpiParameter.Create((uint)origin), SpiParameter.Create(writerNodeId), SpiParameter.Create(subId));
+        ulong sinceXid = RecordOriginWriter(origin, writerNodeId, subId);
 
         // An origin that a rolled back transaction created and used leaves its progress in shared memory, which an
         // origin created with its id would otherwise start from.
@@ -647,7 +646,21 @@ internal sealed partial class WorfNode
             PgReplicationOrigin.Advance(origin, PgLsn.Invalid, PgLsn.Invalid, true, true);
         }
 
-        return origin;
+        return (origin, sinceXid);
+    }
+
+    /// <summary>
+    /// Drops a replication origin that worf created, and records that worf applies nothing under its id from this
+    /// transaction on, as an origin worf doesn't know can take the id next.
+    /// </summary>
+    /// <param name="originName">The origin.</param>
+    internal static void DropOrigin(string originName)
+    {
+        if (PgReplicationOrigin.Find(originName) is ushort origin)
+        {
+            PgReplicationOrigin.Drop(originName, false);
+            _ = RecordOriginWriter(origin, 0, 0);
+        }
     }
 
     /// <summary>
@@ -656,7 +669,8 @@ internal sealed partial class WorfNode
     /// </summary>
     /// <param name="originId">The origin's id.</param>
     /// <param name="xid">The transaction, within the last two billion.</param>
-    /// <returns>The node and the subscription, or null when worf didn't record the origin.</returns>
+    /// <returns>The node and the subscription, zeros when worf had dropped the origin, or null when worf didn't record
+    /// the origin.</returns>
     internal static (uint Writer, uint SubId)? OriginWriter(ushort originId, uint xid)
     {
         SpiResult result = Worf.Read("""
@@ -671,18 +685,19 @@ internal sealed partial class WorfNode
     }
 
     /// <summary>
-    /// Lists the replication origins that apply a subscription's changes now, its apply and table sync workers' own
-    /// origins and their relay origins, with the transaction that created each.
+    /// Lists a worker's own replication origin and its relay origins that apply its subscription's changes now, with the
+    /// transaction that created each. Only the worker drops them while it runs.
     /// </summary>
     /// <param name="subId">The subscription.</param>
+    /// <param name="originName">The worker's origin.</param>
     /// <returns>Each origin's id and the full id of the transaction that created it.</returns>
-    internal static Dictionary<ushort, ulong> SubscriptionOrigins(uint subId)
+    internal static Dictionary<ushort, ulong> WorkerOrigins(uint subId, string originName)
     {
         SpiResult result = Worf.SelectCatalog("""
             SELECT o.roident, w.since_xid::text::bigint FROM pg_catalog.pg_replication_origin o,
                 LATERAL (SELECT sub_id, since_xid FROM worf.origin_writer WHERE roident = o.roident ORDER BY since_xid DESC LIMIT 1) w
-            WHERE w.sub_id = $1
-            """, SpiParameter.Create(subId));
+            WHERE w.sub_id = $1 AND (o.roname = $2 OR starts_with(o.roname, $3))
+            """, SpiParameter.Create(subId), SpiParameter.Create(originName), SpiParameter.Create(originName + RelaySeparator));
         return Enumerable.Range(0, result.Count).ToDictionary(i => (ushort)result[i].Get<uint>(0), i => (ulong)result[i].Get<long>(1));
     }
 
@@ -692,10 +707,10 @@ internal sealed partial class WorfNode
     /// <param name="originName">The worker's origin.</param>
     internal static void DropOrigins(string originName)
     {
-        PgReplicationOrigin.Drop(originName, true);
+        DropOrigin(originName);
         foreach ((_, string relay) in RelayOrigins(originName))
         {
-            PgReplicationOrigin.Drop(relay, true);
+            DropOrigin(relay);
         }
     }
 
@@ -715,31 +730,45 @@ internal sealed partial class WorfNode
     }
 
     /// <summary>
-    /// Lists a worker's own origin and relay origins that hold one of the replication origin slots in shared memory,
-    /// with how far each has applied.
+    /// Records what a replication origin applies from this transaction on: the node whose changes and the subscription
+    /// it applies them for, or zeros for nothing. A record that later ones supersede for every transaction since the
+    /// oldest that any database hasn't frozen is forgotten, as rows older than that carry no commit origin. Apply runs
+    /// this for each relay origin it creates and drops, so the statement is planned once.
     /// </summary>
-    /// <param name="originName">The worker's origin.</param>
-    /// <returns>The origins' names and progress.</returns>
-    internal static List<(string Name, ulong Progress)> TrackedOrigins(string originName)
-    {
-        string prefix = originName + RelaySeparator;
-        SpiResult result = Worf.SelectCatalog("""
-            SELECT o.roname, coalesce(s.remote_lsn, '0/0')::text FROM pg_catalog.pg_replication_origin_status s
-                JOIN pg_catalog.pg_replication_origin o ON o.roident = s.local_id
-            WHERE o.roname = $1 OR starts_with(o.roname, $2)
-            """, SpiParameter.Create(originName), SpiParameter.Create(prefix));
-        List<(string Name, ulong Progress)> tracked = [];
-        for (int i = 0; i < result.Count; i++)
+    /// <returns>The full id of this transaction.</returns>
+    private static ulong RecordOriginWriter(ushort origin, uint writerNodeId, uint subId)
+        => Elevated.Run(() =>
         {
-            string name = result[i].Get<string>(0);
-            if ((name == originName || uint.TryParse(name.AsSpan(prefix.Length), NumberStyles.None, CultureInfo.InvariantCulture, out _)) &&
-                Worf.TryParseLsn(result[i].Get<string>(1), out ulong progress))
-            {
-                tracked.Add((name, progress));
-            }
-        }
+            s_recordOriginWriter ??= Spi.Prepare("""
+                WITH recorded AS (
+                    INSERT INTO worf.origin_writer VALUES ($1, $2, $3, pg_catalog.pg_current_xact_id())
+                    ON CONFLICT (roident, since_xid) DO UPDATE SET writer_node = excluded.writer_node, sub_id = excluded.sub_id
+                    RETURNING since_xid),
+                kept AS (
+                    SELECT since_xid FROM worf.origin_writer
+                    WHERE roident = $1 AND since_xid <= (
+                        SELECT min(CASE WHEN f <= n & 4294967295 THEN n >> 32 << 32 | f ELSE (n >> 32) - 1 << 32 | f END)
+                        FROM (SELECT datfrozenxid::text::bigint AS f, pg_catalog.pg_current_xact_id()::text::bigint AS n
+                              FROM pg_catalog.pg_database) d)::text::xid8
+                    ORDER BY since_xid DESC
+                    LIMIT 1),
+                pruned AS (
+                    DELETE FROM worf.origin_writer w USING kept WHERE w.roident = $1 AND w.since_xid < kept.since_xid)
+                SELECT since_xid::text::bigint FROM recorded
+                """, [typeof(uint), typeof(uint), typeof(uint)]).Keep();
+            return (ulong)s_recordOriginWriter.ExecuteScalar<long>(SpiParameter.Create((uint)origin), SpiParameter.Create(writerNodeId),
+                SpiParameter.Create(subId));
+        });
 
-        return tracked;
+    /// <summary>
+    /// Gets a replication origin's name.
+    /// </summary>
+    /// <param name="originId">The origin's id.</param>
+    /// <returns>The name, or null when no origin has the id.</returns>
+    internal static unsafe string? OriginName(ushort originId)
+    {
+        sbyte* name;
+        return NativeMethods.replorigin_by_oid(originId, true, &name) ? Worf.FromServer(name) : null;
     }
 
     /// <summary>

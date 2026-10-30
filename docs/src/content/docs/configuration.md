@@ -27,11 +27,12 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   changes another node forwarded, so every node keeps the same version.
   Nodes that replicate both ways need the same one of these two settings to
   keep the same rows, and `create_subscription` warns when they don't. It
-  compares the settings the apply workers run with, from the configuration
-  files, `ALTER SYSTEM`, `ALTER DATABASE`, and `ALTER ROLE` for the bootstrap
-  superuser the workers run as, not a session's `SET` or the settings of the
-  role that runs it. A provider connection's user that can't read
-  `pg_file_settings` reports the value its session started with.
+  compares the settings the apply workers run with, from the server's command
+  line, the configuration files, `ALTER SYSTEM`, `ALTER DATABASE`, and
+  `ALTER ROLE` for the bootstrap superuser the workers run as, not a session's
+  `SET` or the settings of the role that runs it. A provider connection's user
+  that can't read `pg_file_settings` reports the value its session started
+  with, and one that can't run `pg_read_file` misses the command line's.
 
   The default value is `apply_remote`.
 

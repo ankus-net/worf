@@ -278,42 +278,35 @@ internal static unsafe partial class OutputPlugin
             SendStartupMessage(ctx, data, false /* can't be last message */);
         }
 
-        // If the record didn't originate locally, send origin info
-        sendReplicationOrigin &= txn->origin_id != 0;
-
+        // If the record didn't originate locally, send origin info. An origin whose name isn't found, as one the
+        // transaction itself created, gets no ORIGIN message, rather than an empty one that the subscriber can't read:
+        // the subscriber then treats the transaction as this node's.
         WorfProtoApi api = data.Api!;
+        sbyte* origin = null;
+        sendReplicationOrigin &= txn->origin_id != 0 && api.WriteOrigin is not null &&
+            NativeMethods.replorigin_by_oid(txn->origin_id, true, &origin);
+
         NativeMethods.OutputPluginPrepareWrite(ctx, !sendReplicationOrigin);
         api.WriteBegin(ctx->@out, data, txn);
 
         if (sendReplicationOrigin)
         {
-            sbyte* origin;
-
             // Message boundary
             NativeMethods.OutputPluginWrite(ctx, false);
             NativeMethods.OutputPluginPrepareWrite(ctx, true);
 
-            // XXX: which behaviour we want here?
-            //
-            // Alternatives:
-            //  - don't send origin message if origin name not found (that's what we do now)
-            //  - throw error - that will break replication, not good
-            //  - send some special "unknown" origin
-            if (api.WriteOrigin is not null && NativeMethods.replorigin_by_oid(txn->origin_id, true, &origin))
+            // Name the node that wrote the transaction, which the subscriber resolves conflicts by. An origin no
+            // subscription owns, it treats as this node's.
+            // An origin's name fixes its node, as the slot name in it names the provider, so the node is looked up
+            // once.
+            string originName = Worf.FromServer(origin);
+            if (!s_originNodeIds.TryGetValue(originName, out uint nodeId))
             {
-                // Name the node that wrote the transaction, which the subscriber resolves conflicts by. An origin no
-                // subscription owns, it treats as this node's.
-                // An origin's name fixes its node, as the slot name in it names the provider, so the node is looked up
-                // once.
-                string originName = Worf.FromServer(origin);
-                if (!s_originNodeIds.TryGetValue(originName, out uint nodeId))
-                {
-                    nodeId = WorfNode.GetOriginNodeId(originName) ?? 0;
-                    s_originNodeIds[originName] = nodeId;
-                }
-
-                api.WriteOrigin(ctx->@out, origin, txn->origin_lsn, nodeId);
+                nodeId = WorfNode.GetOriginNodeId(originName) ?? 0;
+                s_originNodeIds[originName] = nodeId;
             }
+
+            api.WriteOrigin(ctx->@out, origin, txn->origin_lsn, nodeId);
         }
 
         NativeMethods.OutputPluginWrite(ctx, true);

@@ -17,9 +17,10 @@ On a subscriber, PostgreSQL tracks each replication origin in use in one of
 `max_active_replication_origins` slots from PostgreSQL 18, or
 `max_replication_slots` before. Each subscription takes one, each table it's
 synchronizing another, and each other node whose changes its provider forwards
-with `forward_origins` `{all}` another. When none is free, a subscription
-gives up the slots of forwarded nodes' origins it no longer needs, which slows
-apply; failing that, its apply or table sync stops with an error and retries.
+with `forward_origins` `{all}` another. When one that needs a slot finds none
+free, subscriptions give up the slots of forwarded nodes' origins they no longer
+need, which slows apply; failing that within a few seconds, its apply or table
+sync stops with an error and retries.
 
 If you want to handle conflict resolution with last/first update wins (see
 [Conflicts](../../conflicts/)), you can add this additional option to

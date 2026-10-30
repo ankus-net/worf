@@ -128,6 +128,26 @@ internal static class Rpc
     }
 
     /// <summary>
+    /// Stops the process that holds a remote replication slot, as the walsender of a connection that has closed still
+    /// can while it decodes a transaction. A process the connection's role can't signal is left.
+    /// </summary>
+    /// <param name="conn">The provider connection, inside a local transaction.</param>
+    /// <param name="slotName">The slot.</param>
+    internal static void TerminateSlotHolder(PgReplicationConnection conn, string slotName)
+    {
+        try
+        {
+            _ = conn.Query("SELECT pg_catalog.pg_terminate_backend(active_pid) " +
+                "FROM pg_catalog.pg_replication_slots " +
+                "WHERE slot_name = " + Spi.QuoteLiteral(slotName) + " AND active_pid <> pg_catalog.pg_backend_pid()", 1);
+        }
+        catch (PgRemoteException error)
+        {
+            PgLog.Debug1($"could not stop the holder of slot \"{slotName}\": {error.Message}");
+        }
+    }
+
+    /// <summary>
     /// Drops replication slot on remote node that has been used by the local node.
     /// </summary>
     /// <param name="conn">The provider connection, inside a local transaction.</param>
@@ -224,8 +244,11 @@ internal static class Rpc
         IReadOnlyList<string?[]> res;
         try
         {
-            bool readFiles = conn.Query("SELECT pg_catalog.has_table_privilege('pg_catalog.pg_file_settings', 'SELECT')", 1)[0][0] == "t";
-            res = conn.Query($"SELECT EXISTS (SELECT 1 FROM worf.subscription WHERE sub_origin = {nodeId.ToString(CultureInfo.InvariantCulture)}), ({Conflict.WorkerResolutionSql(readFiles)})", 2);
+            string?[] privileges = conn.Query("""
+                SELECT pg_catalog.has_table_privilege('pg_catalog.pg_file_settings', 'SELECT'),
+                    pg_catalog.has_function_privilege('pg_catalog.pg_read_file(text, bigint, bigint, boolean)', 'EXECUTE')
+                """, 2)[0];
+            res = conn.Query($"SELECT EXISTS (SELECT 1 FROM worf.subscription WHERE sub_origin = {nodeId.ToString(CultureInfo.InvariantCulture)}), ({Conflict.WorkerResolutionSql(privileges[0] == "t", privileges[1] == "t")})", 2);
         }
         catch (PgRemoteException error)
         {

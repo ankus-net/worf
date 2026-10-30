@@ -102,7 +102,7 @@ internal static class Sync
 
                 try
                 {
-                    PgBackgroundWorker.RunTransaction(() =>
+                    Apply.RunTakingOriginSlot(() =>
                     {
                         ushort originid = EnsureReplicationOrigin(sub);
                         ulong xactLastCommitEnd;
@@ -266,7 +266,7 @@ internal static class Sync
         // Make sure we cleanup the slot if something goes wrong.
         try
         {
-            PgBackgroundWorker.RunTransaction(() =>
+            Apply.RunTakingOriginSlot(() =>
             {
                 // The table's managed sequences are joined before any rows arrive.
                 SequenceRangeSync.JoinBeforeCopy(managedSequences, Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid",
@@ -398,11 +398,18 @@ internal static class Sync
             // any of the results.
             _ = PgBackgroundWorker.RunTransaction(() => Worf.IdentifySystem(streamConn));
 
-            // The walsender that streamed before can hold the slot a moment longer.
-            long deadline = Worker.GetCurrentTimestamp() + 5000000L;
-            while (!Worker.GotSigterm && Worker.GetCurrentTimestamp() < deadline &&
-                PgBackgroundWorker.RunTransaction(() => Rpc.RemoteSlotActive(streamConn, sub.SlotName)))
+            // The walsender that streamed before holds the slot until it notices the connection closed, which it doesn't
+            // while it's busy decoding, as with a large transaction it sends nothing of. Failing would copy the table
+            // again, so the worker waits for the slot, which is its own, and after a moment stops its holder.
+            long terminateAt = Worker.GetCurrentTimestamp() + 1000000L;
+            while (!Worker.GotSigterm && PgBackgroundWorker.RunTransaction(() => Rpc.RemoteSlotActive(streamConn, sub.SlotName)))
             {
+                if (Worker.GetCurrentTimestamp() >= terminateAt)
+                {
+                    PgBackgroundWorker.RunTransaction(() => Rpc.TerminateSlotHolder(streamConn, sub.SlotName));
+                    terminateAt = Worker.GetCurrentTimestamp() + 1000000L;
+                }
+
                 _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(50));
             }
 
@@ -1053,7 +1060,7 @@ internal static class Sync
     /// Get or create replication origin for a given slot.
     /// </summary>
     private static ushort EnsureReplicationOrigin(WorfSubscription sub)
-        => PgReplicationOrigin.Find(sub.SlotName) ?? WorfNode.CreateOrigin(sub.SlotName, sub.Origin.Id, sub.Id);
+        => PgReplicationOrigin.Find(sub.SlotName) ?? WorfNode.CreateOrigin(sub.SlotName, sub.Origin.Id, sub.Id).Origin;
 
     /// <summary>
     /// Transaction management for COPY.

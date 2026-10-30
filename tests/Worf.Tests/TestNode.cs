@@ -289,9 +289,11 @@ internal sealed class TestNode : IAsyncDisposable
     /// Starts the node's server again after <see cref="StopAsync"/>, with the settings it had.
     /// </summary>
     /// <param name="cancellationToken">Cancels waiting for the server.</param>
+    /// <param name="options">Options for the server's command line, such as <c>-c name=value</c>, or null.</param>
     /// <returns>The work.</returns>
-    public Task StartServerAsync(CancellationToken cancellationToken)
-        => RunPgCtlAsync(["start", "-D", Cluster.DataDirectory, "-l", RestartLogPath, "-w", "-t", "180"], cancellationToken);
+    public Task StartServerAsync(CancellationToken cancellationToken, string? options = null)
+        => RunPgCtlAsync(["start", "-D", Cluster.DataDirectory, "-l", RestartLogPath, "-w", "-t", "180",
+            .. options is null ? Array.Empty<string>() : ["-o", options]], cancellationToken);
 
     /// <summary>
     /// Reads the node's server log, and what the server wrote after <see cref="StartServerAsync"/>.
