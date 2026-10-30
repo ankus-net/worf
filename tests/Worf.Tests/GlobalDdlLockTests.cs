@@ -26,7 +26,8 @@ public sealed class GlobalDdlLockTests
     /// partitioned table's partitions, which writes through the table reach. DDL fails when a node's write under way
     /// outlasts worf.ddl_lock_timeout, which bounds every wait together. Only the session that asked for a fence keeps
     /// it, a TRUNCATE that may not run doesn't queue for its lock, a unique index built concurrently takes the lock,
-    /// a concurrent detach leaves no fence, and the provider role's idle session timeout doesn't end a fence.
+    /// and lets it go as soon as it fails, a concurrent detach leaves no fence and, cancelled and finished later,
+    /// replicates, and the provider role's idle session timeout doesn't end a fence.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -43,10 +44,12 @@ public sealed class GlobalDdlLockTests
                 CREATE TABLE p (id integer PRIMARY KEY, v integer) PARTITION BY RANGE (id);
                 CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (0) TO (100);
                 CREATE TABLE p2 PARTITION OF p FOR VALUES FROM (100) TO (200);
+                CREATE TABLE p3 PARTITION OF p FOR VALUES FROM (200) TO (300);
                 CREATE TABLE dupe (id integer PRIMARY KEY, v integer);
                 SELECT * FROM worf.replication_set_add_table('default', 't');
                 SELECT * FROM worf.replication_set_add_table('default', 'p1');
                 SELECT * FROM worf.replication_set_add_table('default', 'p2');
+                SELECT * FROM worf.replication_set_add_table('default', 'p3');
                 SELECT * FROM worf.replication_set_add_table('default', 'dupe');
                 """, token);
         }
@@ -169,6 +172,34 @@ public sealed class GlobalDdlLockTests
             "SELECT (SELECT count(*) FROM pg_inherits WHERE inhrelid = 'p2'::regclass), (SELECT count(*) FROM worf.fence)", token));
         _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO p1 VALUES (20, 20); INSERT INTO p2 VALUES (120, 120)", token);
 
+        // A concurrent detach cancelled after its first commit, and finished later, detaches the partition on node_b
+        // too, where a later attach then applies.
+        await using (NpgsqlConnection reading = await nodeA.OpenAsync(Database, token))
+        await using (NpgsqlConnection detaching = await nodeA.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction transaction = await reading.BeginTransactionAsync(token);
+            await using (NpgsqlCommand select = new("SELECT count(*) FROM p", reading, transaction))
+            {
+                _ = await select.ExecuteScalarAsync(token);
+            }
+
+            await using (NpgsqlCommand timeout = new("SET statement_timeout = '1s'", detaching))
+            {
+                _ = await timeout.ExecuteNonQueryAsync(token);
+            }
+
+            await using NpgsqlCommand detach = new("ALTER TABLE p DETACH PARTITION p3 CONCURRENTLY", detaching);
+            PostgresException cancelled = await Assert.ThrowsExactlyAsync<PostgresException>(() => detach.ExecuteNonQueryAsync(token));
+            Assert.AreEqual("57014", cancelled.SqlState);
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database, "ALTER TABLE p DETACH PARTITION p3 FINALIZE", token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
+        Assert.AreEqual("0", await nodeB.SafePsqlAsync(Database, "SELECT count(*) FROM pg_inherits WHERE inhrelid = 'p3'::regclass", token));
+        _ = await nodeA.SafePsqlAsync(Database, "ALTER TABLE p ATTACH PARTITION p3 FOR VALUES FROM (200) TO (300)", token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
+        Assert.AreEqual("1", await nodeB.SafePsqlAsync(Database, "SELECT count(*) FROM pg_inherits WHERE inhrelid = 'p3'::regclass", token));
+
         // A fence's session that idles through the provider role's idle_session_timeout keeps holding back writes.
         _ = await nodeB.SafePsqlAsync(Database, $"ALTER ROLE {SuperUser} SET idle_session_timeout = '1s'", token);
         await using (NpgsqlConnection migrating = await nodeA.OpenAsync(Database, token))
@@ -188,17 +219,59 @@ public sealed class GlobalDdlLockTests
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
         _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO t VALUES (7, 7)", token);
 
-        // A unique index built concurrently that fails, after the transactions it committed, lets its fence go and
-        // leaves an invalid index, which stays on this node, as does dropping it.
+        // A unique index built concurrently that fails after the transactions it committed, in its build or once it
+        // has built, lets its fence go as it fails, while its session lasts, and the session's next DDL locks node_b
+        // afresh. It leaves an invalid index, which stays on this node, as does DDL on it, and which REINDEX can't make
+        // valid here alone.
         _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO dupe VALUES (1, 1), (2, 1)", token);
-        PostgresException duplicate = await Assert.ThrowsExactlyAsync<PostgresException>(
-            () => nodeA.SafePsqlAsync(Database, "CREATE UNIQUE INDEX CONCURRENTLY dupe_v ON dupe (v)", token));
-        Assert.AreEqual("23505", duplicate.SqlState);
-        Assert.IsTrue(await PollSucceedsAsync(nodeB, "UPDATE dupe SET v = v WHERE id = 0", token), "the failed build's fence went");
-        _ = await nodeA.SafePsqlAsync(Database, "DROP INDEX dupe_v; INSERT INTO dupe VALUES (3, 3)", token);
+        await using (NpgsqlConnection building = await nodeA.OpenAsync(Database, token))
+        {
+            await using (NpgsqlCommand build = new("CREATE UNIQUE INDEX CONCURRENTLY dupe_v ON dupe (v)", building))
+            {
+                PostgresException duplicate = await Assert.ThrowsExactlyAsync<PostgresException>(() => build.ExecuteNonQueryAsync(token));
+                Assert.AreEqual("23505", duplicate.SqlState);
+            }
+
+            await WritesGoSoonAsync(nodeB, "UPDATE dupe SET v = v WHERE id = 0", "the failed build's fence went", token);
+            await using (NpgsqlConnection locking = await nodeA.OpenAsync(Database, token))
+            {
+                await using NpgsqlTransaction transaction = await locking.BeginTransactionAsync(token);
+                await using (NpgsqlCommand lockQueue = new("LOCK TABLE worf.queue IN ACCESS EXCLUSIVE MODE", locking, transaction))
+                {
+                    _ = await lockQueue.ExecuteNonQueryAsync(token);
+                }
+
+                await using (NpgsqlCommand timeout = new("SET lock_timeout = '1s'", building))
+                {
+                    _ = await timeout.ExecuteNonQueryAsync(token);
+                }
+
+                await using NpgsqlCommand build = new("CREATE UNIQUE INDEX CONCURRENTLY dupe_id ON dupe (id)", building);
+                PostgresException unqueued = await Assert.ThrowsExactlyAsync<PostgresException>(() => build.ExecuteNonQueryAsync(token));
+                Assert.AreEqual("55P03", unqueued.SqlState);
+                await WritesGoSoonAsync(nodeB, "UPDATE dupe SET v = v WHERE id = 0", "the build's fence went as its DDL couldn't be queued", token);
+            }
+
+            foreach (string sql in new[] { "RESET lock_timeout", "COMMENT ON INDEX dupe_v IS 'here'", "ALTER INDEX dupe_id DEPENDS ON EXTENSION plpgsql" })
+            {
+                await using NpgsqlCommand command = new(sql, building);
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+
+            await using (NpgsqlCommand reindex = new("REINDEX INDEX dupe_id", building))
+            {
+                PostgresException invalid = await Assert.ThrowsExactlyAsync<PostgresException>(() => reindex.ExecuteNonQueryAsync(token));
+                Assert.AreEqual("55000", invalid.SqlState);
+            }
+
+            await using NpgsqlCommand change = new("DROP INDEX dupe_v, dupe_id; ALTER TABLE dupe ALTER COLUMN v TYPE bigint", building);
+            _ = await change.ExecuteNonQueryAsync(token);
+        }
+
+        Assert.AreEqual("0", await nodeA.SafePsqlAsync(Database, "SELECT count(*) FROM worf.queue WHERE message->>'command' ~ 'dupe_(v|id)'", token));
+        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO dupe VALUES (3, 3)", token);
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
-        Assert.AreEqual("0", await nodeA.SafePsqlAsync(Database, "SELECT count(*) FROM worf.queue WHERE message->>'command' LIKE '%dupe_v%'", token));
-        Assert.AreEqual("3", await nodeB.SafePsqlAsync(Database, "SELECT count(*) FROM dupe", token));
+        Assert.AreEqual("3|bigint", await nodeB.SafePsqlAsync(Database, "SELECT count(*), pg_typeof(min(v))::text FROM dupe", token));
     }
 
     /// <summary>
@@ -207,9 +280,10 @@ public sealed class GlobalDdlLockTests
     /// from its first statement that locks out writes, through one connection to each node; a savepoint rolled back
     /// lets its fences go while the others hold; DDL after a lock that the transaction took itself fails at once; a
     /// schema's owner takes the lock to drop a table in it; and a fence holds back the other node's DDL but not
-    /// EXPLAIN, across a restart, until released. The lock covers the tables of renamed, dropped and moved tables and
-    /// schemas, of a domain, an enum, a composite type or a range, however deep, a partition attached, and the table a
-    /// new foreign key references.
+    /// EXPLAIN, across a restart, until released, after which a node that is also a template replicates. A unique index
+    /// built concurrently that loses its hold before its first commit fails. The lock covers the tables of renamed,
+    /// dropped and moved tables and schemas, of a domain, an enum, a composite type or a range, however deep, a
+    /// partition attached, and the table a new foreign key references.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -262,6 +336,18 @@ public sealed class GlobalDdlLockTests
             SELECT count(*), format_type(atttypid, atttypmod) FROM t, pg_attribute
             WHERE id = 1 AND attrelid = 't'::regclass AND attname = 'v' GROUP BY 2
             """, token));
+
+        // A unique index built concurrently that loses its hold on node_b's writes before its first commit, as it
+        // waits for node_b's earlier write, fails, and builds nothing.
+        _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO t VALUES (100, 100)", token);
+        Task<string> build = nodeA.SafePsqlAsync(Database, "CREATE UNIQUE INDEX CONCURRENTLY t_id_key ON t (id)", token);
+        Assert.IsTrue(await PollFailsAsync(nodeB, "UPDATE t SET v = v WHERE id = 1", token), "node_b's writes held back");
+        Assert.AreEqual("t", await nodeB.SafePsqlAsync(Database,
+            "SELECT count(*) FILTER (WHERE pg_terminate_backend(pid, 10000)) > 0 FROM pg_stat_activity WHERE application_name = 'worf_ddl_lock'", token));
+        PostgresException lost = await Assert.ThrowsExactlyAsync<PostgresException>(() => build);
+        Assert.AreEqual("55P03", lost.SqlState);
+        Assert.Contains("lost the hold", lost.MessageText);
+        Assert.AreEqual("0", await nodeA.SafePsqlAsync(Database, "SELECT count(*) FROM pg_class WHERE relname = 't_id_key'", token));
 
         // In a transaction block, the first DDL that locks out writes takes the lock, as dropping an index does, so
         // later DDL there needn't wait for node_b's writes. All of it holds node_b back through one connection.
@@ -372,11 +458,16 @@ public sealed class GlobalDdlLockTests
             () => nodeB.SafePsqlAsync(Database, "ALTER TABLE t ALTER COLUMN v TYPE text", token));
         Assert.AreEqual("55P03", ddlHeld.SqlState);
         _ = await nodeB.SafePsqlAsync(Database, "EXPLAIN INSERT INTO t VALUES (7, 7)", token);
+        _ = await nodeB.SafePsqlAsync(Database, "ALTER DATABASE postgres IS_TEMPLATE true", token);
         await nodeB.StopAsync("fast", token);
         await nodeB.StartServerAsync(token);
         Assert.IsFalse(await nodeB.PsqlAsync(Database, "INSERT INTO t VALUES (7, 7)", token), "a write through a kept fence after a restart");
         Assert.AreEqual("1", await nodeB.SafePsqlAsync(Database, "SELECT worf.release_fence(44)", token));
         _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO t VALUES (7, 7)", token);
+
+        // A node that is also a template keeps replicating after the restart.
+        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO t VALUES (8, 8)", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT FROM t WHERE id = 8)", token), "node_a's write on node_b, a template");
     }
 
     /// <summary>
@@ -448,7 +539,7 @@ public sealed class GlobalDdlLockTests
 
     /// <summary>
     /// Every database worf is in reads its kept fences back before its first write, however many databases there are,
-    /// although shared memory notes only some of them as read.
+    /// although shared memory notes only some of them as read, and copying a template with worf works.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -456,9 +547,12 @@ public sealed class GlobalDdlLockTests
     {
         CancellationToken token = TestContext.CancellationToken;
 
-        // Each database is copied from template1 between two checkpoints, which needn't reach the disk.
+        // Each database is copied from template1 between two checkpoints, which needn't reach the disk. template1, which
+        // isn't a node, keeps no manager that would keep it busy, as one starts there with the server.
         await using TestNode node = await StartNodeAsync("node", token, "fsync = off");
         _ = await node.SafePsqlAsync("template1", "CREATE EXTENSION worf; CREATE TABLE w (id integer)", token);
+        await node.StopAsync("fast", token);
+        await node.StartServerAsync(token);
         await using NpgsqlConnection admin = await node.OpenAsync(Database, token);
         for (int i = 0; i < WorfFenceTableDatabases + 6; i++)
         {
@@ -480,7 +574,8 @@ public sealed class GlobalDdlLockTests
     /// <summary>
     /// A kept fence whose DDL a node skips with its transaction, or whose prepared transaction rolls back, goes once
     /// the node has applied past it or learns that it aborted, while its origin keeps writing. A prepared
-    /// transaction's DDL that commits applies and lets its fence go.
+    /// transaction's DDL that commits applies and lets its fence go. A unique index built concurrently keeps its fence
+    /// while it builds, after the connection that asked for it is gone.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -553,7 +648,10 @@ public sealed class GlobalDdlLockTests
             await writing;
         }
 
-        // node_b keeps the build's fence while the build goes on, long past when it asks node_a about kept fences.
+        // node_b keeps the build's fence while the build goes on, long past when it asks node_a about kept fences, and
+        // once the connection that asked for it is gone.
+        Assert.AreEqual("t", await nodeB.SafePsqlAsync(Database,
+            "SELECT count(*) FILTER (WHERE pg_terminate_backend(pid, 10000)) > 0 FROM pg_stat_activity WHERE application_name = 'worf_ddl_lock'", token));
         PostgresException held = await Assert.ThrowsExactlyAsync<PostgresException>(
             () => nodeB.SafePsqlAsync(Database, "INSERT INTO cic VALUES (2, 1)", token), "a duplicate while the build waits");
         Assert.AreEqual("55P03", held.SqlState);
@@ -585,6 +683,16 @@ public sealed class GlobalDdlLockTests
         }
 
         await transaction.RollbackAsync(token);
+    }
+
+    /// <summary>
+    /// Checks that a write gets through a fence soon, before the node would ask the fence's origin about it.
+    /// </summary>
+    private static async Task WritesGoSoonAsync(TestNode node, string sql, string message, CancellationToken token)
+    {
+        Stopwatch elapsed = Stopwatch.StartNew();
+        Assert.IsTrue(await PollSucceedsAsync(node, sql, token), message);
+        Assert.IsLessThan(10, elapsed.Elapsed.TotalSeconds, message);
     }
 
     /// <summary>

@@ -67,10 +67,14 @@ internal static class Manager
             }
         }
 
-        // If the extension is still not installed after retries, exit.
-        if (extoid == 0)
+        // If the extension is still not installed after retries, exit. A template that isn't a node has nothing to
+        // manage, and a manager would keep it busy, while PostgreSQL copies a database only from a template nobody is
+        // connected to.
+        if (extoid == 0 || PgBackgroundWorker.RunTransaction(static () =>
+            Worf.ReadScalar<bool>("SELECT datistemplate FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database()") &&
+            WorfNode.GetLocalNode(false, true) is null))
         {
-            // Mark that we're exiting due to missing extension so the detach handler doesn't wake the supervisor.
+            // Mark that we're exiting with nothing to manage so the detach handler doesn't wake the supervisor.
             // This prevents rapid restart cycles for databases that don't have worf installed.
             using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive();
             WorfWorker me = guard[Worker.MyWorfWorker];

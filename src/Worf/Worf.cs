@@ -1019,9 +1019,8 @@ internal static partial class Worf
 
             PgInterrupts.Check();
 
-            // Can't run workers on databases which don't allow connection. A template's manager would keep it busy, and
-            // PostgreSQL copies a database only from a template nobody is connected to.
-            if (!pgdatabase->datallowconn || pgdatabase->datistemplate)
+            // Can't run workers on databases which don't allow connection.
+            if (!pgdatabase->datallowconn)
             {
                 continue;
             }
