@@ -1043,7 +1043,7 @@ public sealed class SequenceRangeTests
     /// Snowflake IDs carry each node's own number, from the owner of the numbers, so they never collide, and each
     /// node's IDs only grow, across a restart too. A reset of every sequence leaves the node its number. With only three
     /// numbers, the owner moves back and forth without running out: the numbers below a new root's start that no node
-    /// holds come back, and a node that gives up its number takes one of them.
+    /// holds come back, and a node that gives up its number takes one of them. A number two nodes hold is given up.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -1137,12 +1137,22 @@ public sealed class SequenceRangeTests
             await other.SafePsqlAsync(Database, "SELECT worf.snowflake_node()", token), "the numbers after the reset");
         foreach (TestNode node in nodes)
         {
+            Assert.AreEqual("t", await node.SafePsqlAsync(Database, "SELECT worf.snowflake_node() BETWEEN 0 AND 2", token), $"{node.Name}'s number");
             _ = await node.SafePsqlAsync(Database, "INSERT INTO s (n) SELECT g FROM generate_series(10001, 10100) g", token);
             foreach (string id in (await node.SafePsqlAsync(Database, "SELECT id FROM s WHERE n > 10000", token)).Split('\n'))
             {
                 Assert.IsTrue(ids.Add(long.Parse(id, CultureInfo.InvariantCulture)), $"{node.Name}'s ID {id} is another node's too");
             }
         }
+
+        // A number that two nodes hold, as one given out again too soon would be, is given up.
+        int logpos = owner.ReadLog().Length;
+        string shared = await owner.SafePsqlAsync(Database, "SELECT worf.snowflake_node()", token);
+        _ = await other.SafePsqlAsync(Database, $"""
+            UPDATE worf.sequence_range_block SET lo = {shared}, hi = {shared}
+            WHERE seqoid = 'worf.snowflake_node'::regclass AND kind = 'n' AND state = 'active'
+            """, token);
+        Assert.IsTrue(await owner.PollLogAsync(logpos, $"Snowflake node number {shared}: node {other.Name} reports holding it too", token), "the number given up");
     }
 
     private static async Task SubscribeAsync(TestNode subscriber, string name, TestNode provider, CancellationToken token,

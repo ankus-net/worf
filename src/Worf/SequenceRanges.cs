@@ -618,7 +618,9 @@ internal static unsafe partial class SequenceRanges
                     return true;
                 }
 
+                // A Snowflake node number, once switched to, is the node's for good, and it asks for no other.
                 changed = Switch(seqoid, info, (next.Value.Id, next.Value.Lo, next.Value.Hi));
+                active = changed ? (next.Value.Id, next.Value.Lo, next.Value.Hi) : null;
                 next = null;
             }
         }
@@ -862,32 +864,39 @@ internal static unsafe partial class SequenceRanges
             return false;
         }
 
+        // Each node's report and when it was heard from are read once.
         const string Free = """
             WITH root AS (
                 SELECT block_id, lo, hi, received_at FROM worf.sequence_range_block
                 WHERE seqoid = $1 AND epoch = $2 AND kind = 'r' AND state = 'open'),
             floor AS (
                 SELECT greatest((SELECT max(clock) FROM worf.sequence_range_node WHERE seqoid = $1), $4) AS not_before),
+            nodes AS (
+                SELECT n.node_id, n.epoch, n.holds, worf.sequence_range_heard(n.node_id, false, n.reported_at, true) AS assumed,
+                    worf.sequence_range_heard(n.node_id, false, n.reported_at, false) AS heard
+                FROM worf.sequence_range_node n CROSS JOIN worf.local_node l
+                WHERE n.seqoid = $1 AND n.node_id <> l.node_id),
+            granted AS (
+                SELECT g.lo, g.hi, CASE WHEN g.state = 'abandoned' THEN g.abandoned_at > now() - $3::interval
+                        ELSE h.assumed > now() - $3::interval
+                            AND NOT (g.state = 'acknowledged' AND h.holds IS NOT NULL AND h.heard > g.granted_at + $3::interval) END AS held,
+                    CASE WHEN g.state = 'acknowledged' AND h.assumed > now() - $3::interval AND h.holds IS NOT NULL AND h.heard > g.granted_at + $3::interval
+                        THEN h.holds END AS reported
+                FROM worf.sequence_range_grant g JOIN worf.sequence_range_block b ON b.block_id = g.from_block
+                    LEFT JOIN nodes h ON h.node_id = g.grantee_id
+                WHERE g.seqoid = $1 AND b.epoch = $2 AND g.kind <> 'x' AND g.state <> 'unclaimed'),
             free AS (
                 SELECT root.block_id, v, floor.not_before
                 FROM root CROSS JOIN floor CROSS JOIN LATERAL generate_series(root.lo, root.hi) v
-                WHERE NOT EXISTS (
-                        SELECT 1 FROM worf.sequence_range_grant g JOIN worf.sequence_range_block b ON b.block_id = g.from_block
-                            LEFT JOIN worf.sequence_range_node h ON h.seqoid = g.seqoid AND h.node_id = g.grantee_id
-                        WHERE g.seqoid = $1 AND b.epoch = $2 AND g.kind <> 'x' AND g.state <> 'unclaimed' AND g.lo <= v AND v <= g.hi
-                            AND CASE WHEN g.state = 'abandoned' THEN g.abandoned_at > now() - $3::interval
-                                ELSE worf.sequence_range_heard(h.node_id, false, h.reported_at, true) > now() - $3::interval
-                                    AND NOT (g.state = 'acknowledged' AND h.holds IS NOT NULL AND NOT v = ANY (h.holds)
-                                        AND worf.sequence_range_heard(h.node_id, false, h.reported_at, false) > g.granted_at + $3::interval) END)
+                WHERE NOT EXISTS (SELECT 1 FROM granted g WHERE g.lo <= v AND v <= g.hi AND (g.held OR v = ANY (g.reported)))
                     AND NOT EXISTS (
                         SELECT 1 FROM worf.sequence_range_block o
                         WHERE o.seqoid = $1 AND o.kind = 'n' AND o.lo = v
                             AND (o.state IN ('next', 'active') OR o.state = 'abandoned' AND o.retired_at > now() - $3::interval))
                     AND NOT EXISTS (
-                        SELECT 1 FROM worf.sequence_range_node n CROSS JOIN worf.local_node l
-                        WHERE n.seqoid = $1 AND n.node_id <> l.node_id AND worf.sequence_range_heard(n.node_id, false, n.reported_at, true) > now() - $3::interval
-                            AND (n.epoch IS DISTINCT FROM $2 OR worf.sequence_range_heard(n.node_id, false, n.reported_at, false) <= root.received_at
-                                OR v = ANY (coalesce(n.holds, '{}')))))
+                        SELECT 1 FROM nodes n
+                        WHERE n.assumed > now() - $3::interval
+                            AND (n.epoch IS DISTINCT FROM $2 OR n.heard <= root.received_at OR v = ANY (coalesce(n.holds, '{}')))))
             """;
         SpiParameter reuse = SpiParameter.Create(SnowflakeReuseAfter());
         SpiParameter clock = SpiParameter.Create(SnowflakeIds.ReservedClock());
@@ -1759,9 +1768,9 @@ internal static unsafe partial class SequenceRanges
 
     /// <summary>
     /// Lifts an allocator's fence once every node with a grant from its fenced blocks, every neighbor still in touch or
-    /// streaming this node's changes, and on the owner every listed participant, has exchanged since the fence began, unless two grants overlap. The owner's
-    /// root then gives up its free values up to the highest any node has seen granted, which covers the blocks it granted
-    /// itself and lost.
+    /// streaming this node's changes, and on the owner every listed participant, has exchanged since the fence began,
+    /// unless two grants overlap. The owner's root then gives up its free values up to the highest any node has seen
+    /// granted, which covers the blocks it granted itself and lost.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
     /// <param name="node">This node.</param>
@@ -2065,10 +2074,10 @@ internal static unsafe partial class SequenceRanges
             }
         }
 
-        // A Snowflake root spans every node number, since the numbers below its start come back once no node holds
-        // them.
+        // A Snowflake root spans every node number, from zero, since the numbers below its start come back once no node
+        // holds them. The sequence's own bounds are its quarantine's by now.
         (long lo, long hi) = info.Ascending ? (start, end) : (end, start);
-        Guid root = InsertBlock(seqoid, epoch, 'r', snowflake ? info.Min : lo, hi, "open", null, node);
+        Guid root = InsertBlock(seqoid, epoch, 'r', snowflake ? 0 : lo, hi, "open", null, node);
         if (lo <= hi)
         {
             _ = Spi.Execute("INSERT INTO worf.sequence_range_free VALUES ($1, $2, $3)",
@@ -2084,9 +2093,8 @@ internal static unsafe partial class SequenceRanges
         // is in use, keeps drawing from it.
         _ = GrantOwnBlock(seqoid, info, node, epoch);
         (Guid Id, long Lo, long Hi)? next = NodeBlock(seqoid, epoch, "next");
-        if (next is not null && Confirmed(seqoid, info, next.Value.Id))
+        if (next is not null && Confirmed(seqoid, info, next.Value.Id) && Switch(seqoid, info, next.Value) && !snowflake)
         {
-            _ = Switch(seqoid, info, next.Value);
             _ = GrantOwnBlock(seqoid, info, node, epoch);
         }
 
@@ -2140,9 +2148,9 @@ internal static unsafe partial class SequenceRanges
         {
             int epoch = range[0].Get<int>(0);
             _ = GrantOwnBlock(seqoid, info, node, epoch);
-            if (NodeBlock(seqoid, epoch, "next") is (Guid, long, long) next && Confirmed(seqoid, info, next.Id))
+            if (NodeBlock(seqoid, epoch, "next") is (Guid, long, long) next && Confirmed(seqoid, info, next.Id) && Switch(seqoid, info, next) &&
+                seqoid != SnowflakeIds.NodeSequence())
             {
-                _ = Switch(seqoid, info, next);
                 _ = GrantOwnBlock(seqoid, info, node, epoch);
             }
         }
