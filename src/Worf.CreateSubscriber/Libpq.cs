@@ -1,485 +1,205 @@
-using System.Diagnostics;
-using System.Globalization;
-using System.Net;
-using System.Net.Sockets;
-using Npgsql;
+using System.Runtime.InteropServices;
+using System.Text;
 
 namespace Worf.CreateSubscriber;
 
 /// <summary>
-/// Opens Npgsql connections from libpq connection strings, as <c>PQconnectdb</c> and <c>PQping</c> do.
+/// Connects through libpq, as <c>pglogical_create_subscriber</c> does, so that connection strings, service files,
+/// password files, environment variables, timeouts, TLS and GSSAPI work as in every other PostgreSQL program.
 /// </summary>
-internal static class Libpq
+internal static unsafe class Libpq
 {
-    /// <summary>
-    /// The longest connection timeout Npgsql takes, in seconds.
-    /// </summary>
-    private const int NpgsqlTimeoutLimit = 1024;
+    // CONNECTION_OK and PGRES_COMMAND_OK and PGRES_TUPLES_OK from libpq-fe.h.
+    private const int ConnectionOk = 0;
+    private const int CommandOk = 1;
+    private const int TuplesOk = 2;
+
+    private static readonly Lock s_loading = new();
+    private static bool s_loaded;
+    private static delegate* unmanaged<byte*, nint> s_connectdb;
+    private static delegate* unmanaged<nint, int> s_status;
+    private static delegate* unmanaged<nint, byte*> s_errorMessage;
+    private static delegate* unmanaged<nint, byte*, int> s_setClientEncoding;
+    private static delegate* unmanaged<nint, void> s_finish;
+    private static delegate* unmanaged<byte*, int> s_ping;
+    private static delegate* unmanaged<nint, byte*, nint> s_exec;
+    private static delegate* unmanaged<nint, int> s_resultStatus;
+    private static delegate* unmanaged<nint, byte*> s_resultErrorMessage;
+    private static delegate* unmanaged<nint, int> s_ntuples;
+    private static delegate* unmanaged<nint, int> s_nfields;
+    private static delegate* unmanaged<nint, int, int, byte*> s_getvalue;
+    private static delegate* unmanaged<nint, int, int, int> s_getisnull;
+    private static delegate* unmanaged<nint, void> s_clear;
 
     /// <summary>
-    /// The longest one timer waits.
-    /// </summary>
-    private static readonly TimeSpan s_longestTimer = TimeSpan.FromMilliseconds(uint.MaxValue - 1);
-
-    private static readonly string[] s_targetSessionAttrs = ["any", "read-write", "read-only", "primary", "standby", "prefer-standby"];
-
-    /// <summary>
-    /// Opens a connection.
+    /// Opens a connection, as <c>PQconnectdb</c> does.
     /// </summary>
     /// <param name="conninfo">A libpq connection string or URI.</param>
     /// <returns>The open connection.</returns>
-    /// <exception cref="ArgumentException">The connection string is invalid.</exception>
-    /// <exception cref="NpgsqlException">The connection failed.</exception>
-    public static NpgsqlConnection Connect(string conninfo)
-        => TryConnect(conninfo, out _, out NpgsqlException? error) ?? throw error!;
+    /// <exception cref="LibpqException">The connection failed, with libpq's message.</exception>
+    /// <exception cref="DllNotFoundException">There's no libpq to load.</exception>
+    public static LibpqConnection Connect(string conninfo)
+    {
+        Load();
+        nint conn;
+        fixed (byte* cconninfo = CString(conninfo))
+        {
+            conn = s_connectdb(cconninfo);
+        }
+
+        if (conn == 0)
+        {
+            throw new LibpqException("out of memory\n");
+        }
+
+        if (s_status(conn) != ConnectionOk)
+        {
+            string message = String(s_errorMessage(conn));
+            s_finish(conn);
+            throw new LibpqException(message);
+        }
+
+        // Rows and messages come back as UTF-8, whatever the database's encoding.
+        fixed (byte* encoding = CString("UTF8"))
+        {
+            _ = s_setClientEncoding(conn, encoding);
+        }
+
+        return new LibpqConnection(conn);
+    }
 
     /// <summary>
     /// Reports whether a server accepts connections, as <c>PQping</c> does.
     /// </summary>
     /// <param name="conninfo">A libpq connection string or URI.</param>
     /// <returns>The server's status.</returns>
+    /// <exception cref="DllNotFoundException">There's no libpq to load.</exception>
     public static PingStatus Ping(string conninfo)
     {
+        Load();
+        fixed (byte* cconninfo = CString(conninfo))
+        {
+            return (PingStatus)s_ping(cconninfo);
+        }
+    }
+
+    /// <summary>
+    /// Runs a command and reads every row it returns as text.
+    /// </summary>
+    /// <param name="conn">The connection.</param>
+    /// <param name="sql">The command.</param>
+    /// <returns>The rows.</returns>
+    /// <exception cref="LibpqException">The command failed, with libpq's message.</exception>
+    internal static List<string?[]> Exec(nint conn, string sql)
+    {
+        nint result;
+        fixed (byte* query = CString(sql))
+        {
+            result = s_exec(conn, query);
+        }
+
         try
         {
-            using NpgsqlConnection? connection = TryConnect(conninfo, out PingStatus status, out _);
-            return status;
-        }
-        catch (ArgumentException)
-        {
-            return PingStatus.NoAttempt;
-        }
-    }
-
-    /// <summary>
-    /// Converts a libpq connection string or URI to Npgsql's settings for every server, with libpq's environment
-    /// variables and defaults, and lists the servers to try in turn.
-    /// </summary>
-    /// <param name="conninfo">The libpq connection string.</param>
-    /// <param name="servers">The hosts or Unix-domain socket directories, with their ports.</param>
-    /// <param name="connectTimeout">The seconds to wait for each address, or zero to wait indefinitely.</param>
-    /// <param name="targetSessionAttrs">The kind of session to accept.</param>
-    /// <returns>The Npgsql connection string builder.</returns>
-    /// <exception cref="ArgumentException">The connection string is invalid.</exception>
-    public static NpgsqlConnectionStringBuilder ToNpgsql(string conninfo, out List<(string Host, int Port)> servers,
-        out int connectTimeout, out string targetSessionAttrs)
-    {
-        Dictionary<string, string> options = Fe.ConninfoParse(conninfo, out string? errmsg)
-            ?? throw new ArgumentException(errmsg, nameof(conninfo));
-
-        string? Option(string keyword, string? environment = null)
-            => options.TryGetValue(keyword, out string? value) && value.Length > 0
-                ? value
-                : environment is not null && Environment.GetEnvironmentVariable(environment) is { Length: > 0 } fromEnvironment
-                    ? fromEnvironment
-                    : null;
-
-        string user = Option("user", "PGUSER") ?? Environment.UserName;
-        NpgsqlConnectionStringBuilder builder = new()
-        {
-            Username = user,
-            Database = Option("dbname", "PGDATABASE") ?? user,
-            Pooling = false,
-
-            // libpq waits as long as connecting and each command take, where Npgsql gives up after 15 and 30 seconds:
-            // the first connection to a node that has just been promoted can take longer on a busy machine.
-            Timeout = 0,
-            CommandTimeout = 0,
-
-            // The command has no GSSAPI, as a libpq built without it, so it doesn't ask for GSS encryption, which Npgsql
-            // would otherwise try every failed connection again without.
-            GssEncryptionMode = GssEncryptionMode.Disable,
-        };
-
-        // As in libpq, a list of hosts, of addresses, or of both of the same length, with one port for all of them or
-        // one each.
-        string[] hosts = List(Option("host", "PGHOST"));
-        string[] hostaddrs = List(Option("hostaddr", "PGHOSTADDR"));
-        string[] ports = List(Option("port", "PGPORT"));
-        int count = hostaddrs.Length > 0 ? hostaddrs.Length : Math.Max(hosts.Length, 1);
-        if (hosts.Length > 0 && hostaddrs.Length > 0 && hosts.Length != hostaddrs.Length)
-        {
-            throw new ArgumentException($"could not match {hosts.Length} host names to {hostaddrs.Length} hostaddr values", nameof(conninfo));
-        }
-
-        if (ports.Length > 1 && ports.Length != count)
-        {
-            throw new ArgumentException($"could not match {ports.Length} port numbers to {count} hosts", nameof(conninfo));
-        }
-
-        servers = [];
-        for (int i = 0; i < count; i++)
-        {
-            string portText = ports.Length == 0 ? "" : ports[ports.Length == 1 ? 0 : i];
-            int port = portText.Length == 0 ? 5432 : ParseInt(portText, "port");
-            if (port is < 1 or > 65535)
+            if (s_resultStatus(result) is not (CommandOk or TuplesOk))
             {
-                throw new ArgumentException($"invalid port number: \"{portText}\"", nameof(conninfo));
+                throw new LibpqException(String(result == 0 ? s_errorMessage(conn) : s_resultErrorMessage(result)));
             }
 
-            string host = hosts.Length > 0 && hosts[i].Length > 0 ? hosts[i]
-                : hostaddrs.Length > 0 && hostaddrs[i].Length > 0 ? hostaddrs[i]
-                : DefaultHost(port);
-            servers.Add((host, port));
-        }
-
-        if (Option("password", "PGPASSWORD") is { } password)
-        {
-            builder.Password = password;
-        }
-
-        if (Option("passfile", "PGPASSFILE") is { } passfile)
-        {
-            builder.Passfile = passfile;
-        }
-
-        // As in libpq, zero or less waits indefinitely and the shortest timeout is 2 seconds.
-        connectTimeout = 0;
-        if (Option("connect_timeout", "PGCONNECT_TIMEOUT") is { } timeout)
-        {
-            int seconds = ParseInt(timeout, "connect_timeout");
-            connectTimeout = seconds <= 0 ? 0 : Math.Max(seconds, 2);
-        }
-
-        targetSessionAttrs = Option("target_session_attrs", "PGTARGETSESSIONATTRS") ?? "any";
-        if (!s_targetSessionAttrs.Contains(targetSessionAttrs))
-        {
-            throw new ArgumentException($"invalid target_session_attrs value: \"{targetSessionAttrs}\"", nameof(conninfo));
-        }
-
-        if ((Option("application_name", "PGAPPNAME") ?? Option("fallback_application_name")) is { } applicationName)
-        {
-            builder.ApplicationName = applicationName;
-        }
-
-        if (Option("options", "PGOPTIONS") is { } serverOptions)
-        {
-            builder.Options = serverOptions;
-        }
-
-        if (Option("sslmode", "PGSSLMODE") is { } sslmode)
-        {
-            builder.SslMode = sslmode switch
+            int fields = s_nfields(result);
+            List<string?[]> rows = [];
+            for (int i = 0; i < s_ntuples(result); i++)
             {
-                "disable" => SslMode.Disable,
-                "allow" => SslMode.Allow,
-                "prefer" => SslMode.Prefer,
-                "require" => SslMode.Require,
-                "verify-ca" => SslMode.VerifyCA,
-                "verify-full" => SslMode.VerifyFull,
-                _ => throw new ArgumentException($"invalid sslmode value: \"{sslmode}\"", nameof(conninfo)),
-            };
-        }
-
-        if (Option("sslcert", "PGSSLCERT") is { } sslcert)
-        {
-            builder.SslCertificate = sslcert;
-        }
-
-        if (Option("sslkey", "PGSSLKEY") is { } sslkey)
-        {
-            builder.SslKey = sslkey;
-        }
-
-        if (Option("sslpassword") is { } sslpassword)
-        {
-            builder.SslPassword = sslpassword;
-        }
-
-        if (Option("sslrootcert", "PGSSLROOTCERT") is { } sslrootcert)
-        {
-            builder.RootCertificate = sslrootcert;
-        }
-
-        if (Option("keepalives_idle") is { } keepalivesIdle)
-        {
-            builder.TcpKeepAliveTime = ParseInt(keepalivesIdle, "keepalives_idle");
-        }
-
-        if (Option("keepalives_interval") is { } keepalivesInterval)
-        {
-            builder.TcpKeepAliveInterval = ParseInt(keepalivesInterval, "keepalives_interval");
-        }
-
-        return builder;
-    }
-
-    /// <summary>
-    /// Tries each server in turn until one gives a suitable session, as libpq does: connect_timeout bounds each address
-    /// of each server on its own, and one that times out, fails or gives the wrong kind of session leaves the next to
-    /// try.
-    /// </summary>
-    /// <param name="conninfo">A libpq connection string or URI.</param>
-    /// <param name="status">What the last server tried showed of itself, as <c>PQping</c> reports it.</param>
-    /// <param name="error">Why each server failed, when none was suitable.</param>
-    /// <returns>The open connection, or null.</returns>
-    /// <exception cref="ArgumentException">The connection string is invalid.</exception>
-    private static NpgsqlConnection? TryConnect(string conninfo, out PingStatus status, out NpgsqlException? error)
-    {
-        NpgsqlConnectionStringBuilder builder = ToNpgsql(conninfo, out List<(string Host, int Port)> servers,
-            out int connectTimeout, out string targetSessionAttrs);
-
-        // A standby is preferred over any server, so the servers are tried for one before any server will do.
-        string[] passes = targetSessionAttrs == "prefer-standby" ? ["standby", "any"] : [targetSessionAttrs];
-        List<string> failures = [];
-        Exception? last = null;
-        status = PingStatus.NoResponse;
-        foreach (string wanted in passes)
-        {
-            foreach ((string host, int port) in servers)
-            {
-                builder.Host = host;
-                builder.Port = port;
-                NpgsqlConnection? connection;
-                string? reason;
-                try
+                string?[] row = new string?[fields];
+                for (int j = 0; j < fields; j++)
                 {
-                    connection = OpenSuitable(builder, connectTimeout, wanted, out reason);
-                }
-                catch (NpgsqlException failure)
-                {
-                    status = failure switch
-                    {
-                        // The server is starting up, shutting down or in crash recovery.
-                        PostgresException { SqlState: PostgresErrorCodes.CannotConnectNow } => PingStatus.Reject,
-
-                        // The server answered, so it's up even though it refused this connection.
-                        PostgresException => PingStatus.Ok,
-                        _ => PingStatus.NoResponse,
-                    };
-                    failures.Add($"{Server(host, port)} failed: {Reason(failure)}");
-                    last = failure;
-                    continue;
+                    row[j] = s_getisnull(result, i, j) != 0 ? null : String(s_getvalue(result, i, j));
                 }
 
-                status = PingStatus.Ok;
-                if (connection is not null)
+                rows.Add(row);
+            }
+
+            return rows;
+        }
+        finally
+        {
+            s_clear(result);
+        }
+    }
+
+    /// <summary>
+    /// Checks whether a connection is still good.
+    /// </summary>
+    /// <param name="conn">The connection.</param>
+    /// <returns>Whether it is.</returns>
+    internal static bool IsOk(nint conn) => s_status(conn) == ConnectionOk;
+
+    /// <summary>
+    /// Closes a connection.
+    /// </summary>
+    /// <param name="conn">The connection.</param>
+    internal static void Finish(nint conn) => s_finish(conn);
+
+    private static byte[] CString(string value) => Encoding.UTF8.GetBytes(value + '\0');
+
+    private static string String(byte* value) => Marshal.PtrToStringUTF8((nint)value) ?? "";
+
+    /// <summary>
+    /// Loads the libpq of the PostgreSQL installation the command runs from, which PostgreSQL's own programs find
+    /// through the run path built into them: the command's directory holds it on Windows, and on Unix the installation's
+    /// lib directory does, beside the bin directory of the command or of the <c>pg_ctl</c> it runs. A libpq installed
+    /// for the whole system serves when the installation has none of its own, as in Debian's packages.
+    /// </summary>
+    private static void Load()
+    {
+        lock (s_loading)
+        {
+            if (s_loaded)
+            {
+                return;
+            }
+
+            string file = OperatingSystem.IsWindows() ? "libpq.dll" : OperatingSystem.IsMacOS() ? "libpq.5.dylib" : "libpq.so.5";
+            List<string> candidates = [];
+            if (Environment.ProcessPath is { } command)
+            {
+                string[] programs = [command, Path.Join(Path.GetDirectoryName(command), OperatingSystem.IsWindows() ? "pg_ctl.exe" : "pg_ctl")];
+                foreach (string program in programs.Where(File.Exists))
                 {
-                    error = null;
-                    return connection;
+                    string bin = Path.GetDirectoryName(File.ResolveLinkTarget(program, returnFinalTarget: true)?.FullName ?? program)!;
+                    candidates.AddRange([Path.Join(bin, file), Path.Join(bin, "..", "lib", file), Path.Join(bin, "..", "lib", "postgresql", file)]);
                 }
-
-                failures.Add($"{Server(host, port)} failed: {reason}");
-                last = null;
             }
-        }
 
-        error = new NpgsqlException(string.Join('\n', failures), last);
-        return null;
-    }
-
-    /// <summary>
-    /// Connects to one server, keeping the connection if its session is the kind wanted.
-    /// </summary>
-    /// <param name="builder">The connection string, with the server.</param>
-    /// <param name="connectTimeout">The seconds to wait for each of the server's addresses, or zero to wait
-    /// indefinitely.</param>
-    /// <param name="wanted">The kind of session wanted.</param>
-    /// <param name="reason">Why the session isn't the kind wanted, in libpq's words.</param>
-    /// <returns>The open connection, or null when its session isn't the kind wanted.</returns>
-    private static NpgsqlConnection? OpenSuitable(NpgsqlConnectionStringBuilder builder, int connectTimeout, string wanted,
-        out string? reason)
-    {
-        NpgsqlConnection connection = Open(builder, connectTimeout);
-        try
-        {
-            reason = Unsuitable(connection, wanted);
-        }
-        catch
-        {
-            connection.Dispose();
-            throw;
-        }
-
-        if (reason is null)
-        {
-            return connection;
-        }
-
-        connection.Dispose();
-        return null;
-    }
-
-    /// <summary>
-    /// Names a server as libpq's messages do.
-    /// </summary>
-    private static string Server(string host, int port)
-        => IsUnixSocket(host)
-            ? $"connection to server on socket \"{Path.Join(host, $".s.PGSQL.{port.ToString(CultureInfo.InvariantCulture)}")}\""
-            : $"connection to server at \"{host}\", port {port.ToString(CultureInfo.InvariantCulture)}";
-
-    /// <summary>
-    /// Connects to one server.
-    /// </summary>
-    /// <param name="builder">The connection string, with the server.</param>
-    /// <param name="connectTimeout">The seconds to wait for each of the server's addresses, or zero to wait
-    /// indefinitely.</param>
-    /// <returns>The open connection.</returns>
-    private static NpgsqlConnection Open(NpgsqlConnectionStringBuilder builder, int connectTimeout)
-    {
-        // Npgsql shares a server's timeout among its addresses, where libpq gives each its own, so the server gets as
-        // much as all its addresses would. Npgsql takes no timeout longer than its limit, and sets a socket's timeout in
-        // whole milliseconds, which leaves a read with less than one to go waiting forever, so a timer of its own bounds
-        // the wait as well.
-        long seconds = (long)connectTimeout * Addresses(builder.Host!);
-        builder.Timeout = seconds <= NpgsqlTimeoutLimit ? (int)seconds : 0;
-        // The slim builder leaves TLS out unless asked, and then any sslmode but disable, allow and prefer fails.
-        NpgsqlDataSource dataSource = new NpgsqlSlimDataSourceBuilder(builder.ConnectionString).EnableTransportSecurity().Build();
-        try
-        {
-            return seconds == 0
-                ? dataSource.OpenConnection()
-                : OpenAsync(dataSource, TimeSpan.FromSeconds(seconds)).GetAwaiter().GetResult();
-        }
-        catch
-        {
-            dataSource.Dispose();
-            throw;
-        }
-    }
-
-    /// <summary>
-    /// Connects, giving up after a timeout.
-    /// </summary>
-    /// <param name="dataSource">The server's data source.</param>
-    /// <param name="timeout">The timeout.</param>
-    /// <returns>The open connection.</returns>
-    private static async Task<NpgsqlConnection> OpenAsync(NpgsqlDataSource dataSource, TimeSpan timeout)
-    {
-        using CancellationTokenSource expired = new();
-        using CancellationTokenSource opened = new();
-        Task<NpgsqlConnection> open = dataSource.OpenConnectionAsync(expired.Token).AsTask();
-
-        // libpq takes timeouts of up to 68 years, and a timer waits at most 49 days, so a longer one waits again.
-        long start = Stopwatch.GetTimestamp();
-        for (TimeSpan left = timeout; left > TimeSpan.Zero; left = timeout - Stopwatch.GetElapsedTime(start))
-        {
-            if (await Task.WhenAny(open, Task.Delay(left < s_longestTimer ? left : s_longestTimer, opened.Token)) == open)
+            candidates.Add(file);
+            nint library = 0;
+            foreach (string candidate in candidates.Distinct())
             {
-                break;
+                if (NativeLibrary.TryLoad(candidate, out library))
+                {
+                    break;
+                }
             }
-        }
 
-        await opened.CancelAsync();
-        if (!open.IsCompleted)
-        {
-            await expired.CancelAsync();
-        }
-
-        try
-        {
-            return await open;
-        }
-        catch (Exception error) when (expired.IsCancellationRequested && error is OperationCanceledException or NpgsqlException)
-        {
-            throw new NpgsqlException("timeout expired", error);
-        }
-    }
-
-    /// <summary>
-    /// Counts the addresses Npgsql tries for a host: one for a Unix-domain socket or an address, or each its name
-    /// resolves to.
-    /// </summary>
-    private static int Addresses(string host)
-    {
-        if (IsUnixSocket(host) || IPAddress.TryParse(host, out _))
-        {
-            return 1;
-        }
-
-        try
-        {
-            return Math.Max(Dns.GetHostAddresses(host).Length, 1);
-        }
-        catch (SocketException)
-        {
-            // Npgsql reports the failure when it resolves the name itself.
-            return 1;
-        }
-    }
-
-    /// <summary>
-    /// Says why a session isn't the kind wanted, in libpq's words, from the settings the server reports.
-    /// </summary>
-    private static string? Unsuitable(NpgsqlConnection connection, string wanted)
-    {
-        bool hotStandby = Reports(connection, "in_hot_standby");
-        bool readOnly = hotStandby || Reports(connection, "default_transaction_read_only");
-        return wanted switch
-        {
-            "read-write" when readOnly => "session is read-only",
-            "read-only" when !readOnly => "session is not read-only",
-            "primary" when hotStandby => "server is in hot standby mode",
-            "standby" when !hotStandby => "server is not in hot standby mode",
-            _ => null,
-        };
-
-        static bool Reports(NpgsqlConnection connection, string parameter)
-            => connection.PostgresParameters.TryGetValue(parameter, out string? value) && value == "on";
-    }
-
-    /// <summary>
-    /// Says why a connection failed, as libpq does.
-    /// </summary>
-    private static string Reason(NpgsqlException failure)
-    {
-        if (failure is PostgresException postgres)
-        {
-            return $"{postgres.Severity}:  {postgres.MessageText}";
-        }
-
-        for (Exception? cause = failure; cause is not null; cause = cause.InnerException)
-        {
-            switch (cause)
+            if (library == 0)
             {
-                case TimeoutException or OperationCanceledException:
-                    return "timeout expired";
-                case SocketException socket:
-                    return socket.Message;
+                throw new DllNotFoundException($"{file} is in none of {string.Join(", ", candidates.Distinct())}");
             }
+
+            s_connectdb = (delegate* unmanaged<byte*, nint>)NativeLibrary.GetExport(library, "PQconnectdb");
+            s_status = (delegate* unmanaged<nint, int>)NativeLibrary.GetExport(library, "PQstatus");
+            s_errorMessage = (delegate* unmanaged<nint, byte*>)NativeLibrary.GetExport(library, "PQerrorMessage");
+            s_setClientEncoding = (delegate* unmanaged<nint, byte*, int>)NativeLibrary.GetExport(library, "PQsetClientEncoding");
+            s_finish = (delegate* unmanaged<nint, void>)NativeLibrary.GetExport(library, "PQfinish");
+            s_ping = (delegate* unmanaged<byte*, int>)NativeLibrary.GetExport(library, "PQping");
+            s_exec = (delegate* unmanaged<nint, byte*, nint>)NativeLibrary.GetExport(library, "PQexec");
+            s_resultStatus = (delegate* unmanaged<nint, int>)NativeLibrary.GetExport(library, "PQresultStatus");
+            s_resultErrorMessage = (delegate* unmanaged<nint, byte*>)NativeLibrary.GetExport(library, "PQresultErrorMessage");
+            s_ntuples = (delegate* unmanaged<nint, int>)NativeLibrary.GetExport(library, "PQntuples");
+            s_nfields = (delegate* unmanaged<nint, int>)NativeLibrary.GetExport(library, "PQnfields");
+            s_getvalue = (delegate* unmanaged<nint, int, int, byte*>)NativeLibrary.GetExport(library, "PQgetvalue");
+            s_getisnull = (delegate* unmanaged<nint, int, int, int>)NativeLibrary.GetExport(library, "PQgetisnull");
+            s_clear = (delegate* unmanaged<nint, void>)NativeLibrary.GetExport(library, "PQclear");
+            s_loaded = true;
         }
-
-        return failure.Message;
-    }
-
-    /// <summary>
-    /// Parses an integer option as libpq does: with any whitespace around it, failing on anything else or an overflow.
-    /// </summary>
-    private static int ParseInt(string value, string keyword)
-        => int.TryParse(value, NumberStyles.AllowLeadingWhite | NumberStyles.AllowTrailingWhite | NumberStyles.AllowLeadingSign,
-            CultureInfo.InvariantCulture, out int result)
-            ? result
-            : throw new ArgumentException($"invalid integer value \"{value}\" for connection option \"{keyword}\"", nameof(value));
-
-    /// <summary>
-    /// Splits a comma-separated list of hosts, addresses or ports, as libpq does.
-    /// </summary>
-    private static string[] List(string? value) => value is null ? [] : value.Split(',');
-
-    /// <summary>
-    /// Says whether a host is a Unix-domain socket's directory, as libpq does.
-    /// </summary>
-    private static bool IsUnixSocket(string host) => Path.IsPathRooted(host) || host.StartsWith('@');
-
-    /// <summary>
-    /// Chooses the host libpq uses when none is given: a Unix-domain socket where the server's is, or else localhost.
-    /// </summary>
-    private static string DefaultHost(int port)
-    {
-        if (OperatingSystem.IsWindows())
-        {
-            return "localhost";
-        }
-
-        string[] directories = ["/tmp", "/var/run/postgresql"];
-        foreach (string directory in directories)
-        {
-            if (File.Exists(Path.Join(directory, $".s.PGSQL.{port.ToString(CultureInfo.InvariantCulture)}")))
-            {
-                return directory;
-            }
-        }
-
-        return "/tmp";
     }
 }

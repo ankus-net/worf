@@ -100,26 +100,24 @@ runs:
           ${{ steps.postgresql-keys.outputs.ankus }}-
           ${{ steps.postgresql-keys.outputs.prefix }}-
 
-    - name: Install PostgreSQL source build tools (Windows)
-      # EDB publishes no Windows archive for a PostgreSQL release candidate, so ankus init builds it from source, unless
-      # this Ankus version installed it before.
-      if: >-
-        runner.os == 'Windows' && inputs.postgresql == '19' &&
-        !startsWith(steps.postgresql-cache.outputs.cache-matched-key, format('{0}-', steps.postgresql-keys.outputs.ankus))
-      shell: pwsh
-      run: |
-        python -m pip install --quiet meson ninja
-        choco install winflexbison3 --no-progress -y
-        # Git's MSYS Perl, also on the PATH, rewrites the MSVC tools' /options as paths.
-        "C:\Strawberry\perl\bin" >> $env:GITHUB_PATH
-
     - name: Install PostgreSQL
       id: postgresql
       shell: bash
       env:
         ANKUS_KEY: ${{ steps.postgresql-keys.outputs.ankus }}
       run: |
-        dotnet ankus init ${{ inputs.release == 'true' && '--release' || '' }} --pg${{ inputs.postgresql }} download
+        init() { dotnet ankus init ${{ inputs.release == 'true' && '--release' || '' }} --pg${{ inputs.postgresql }} download; }
+        if ! init; then
+          # On Windows, ankus init builds a release from source when EDB publishes no archive of it, as for a release
+          # candidate, or a release EDB hasn't packaged yet, which takes these tools. Whether it must depends on the
+          # newest release, which only ankus init resolves, so they're installed once it has failed without them.
+          [ "$RUNNER_OS" = Windows ] || exit 1
+          python -m pip install --quiet meson ninja
+          choco install winflexbison3 --no-progress -y
+          # Git's MSYS Perl, also on the PATH, rewrites the MSVC tools' /options as paths.
+          export PATH="/c/Strawberry/perl/bin:$PATH"
+          init
+        fi
         installation=$(dotnet ankus info path ${{ inputs.postgresql }} | tr -d '\r')
         installation=${installation%[\\/]}
         echo "directory=${installation##*[\\/]}" >> "$GITHUB_OUTPUT"

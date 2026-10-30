@@ -5,17 +5,12 @@
     <RootNamespace>Worf.CreateSubscriber</RootNamespace>
     <PublishAot>true</PublishAot>
     <InvariantGlobalization>true</InvariantGlobalization>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <DefineConstants>$(DefineConstants);WORF_FRONTEND</DefineConstants>
     <!-- The command keeps pglogical_create_subscriber's name, so its assembly name has underscores. -->
     <NoWarn>$(NoWarn);CA1707</NoWarn>
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="../Worf/Fe.cs" Link="Fe.cs" />
-  </ItemGroup>
-  <ItemGroup>
-    <PackageReference Include="Npgsql" />
-  </ItemGroup>
-  <ItemGroup>
-    <InternalsVisibleTo Include="Worf.Tests" />
   </ItemGroup>
 </Project>

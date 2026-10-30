@@ -10,6 +10,5 @@
     <PackageReference Include="Ankus.Testing" />
     <PackageReference Include="Npgsql" />
     <ProjectReference Include="../../src/Worf/Worf.csproj" />
-    <ProjectReference Include="../../src/Worf.CreateSubscriber/Worf.CreateSubscriber.csproj" />
   </ItemGroup>
 </Project>
