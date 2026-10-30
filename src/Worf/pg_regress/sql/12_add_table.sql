@@ -156,6 +156,7 @@ SELECT * FROM "strange.schema-IS".test_strangeschema;
 
 \c :provider_dsn
 
+-- The walsender already streaming test_diff_repset stops replicating it at once.
 SELECT * FROM worf.alter_replication_set('repset_test', replicate_insert := false, replicate_update := false, replicate_delete := false, replicate_truncate := false);
 
 INSERT INTO "strange.schema-IS".test_diff_repset VALUES(3);

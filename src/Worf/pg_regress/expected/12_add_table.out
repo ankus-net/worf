@@ -348,6 +348,7 @@ SELECT * FROM "strange.schema-IS".test_strangeschema;
 (4 rows)
 
 \c :provider_dsn
+-- The walsender already streaming test_diff_repset stops replicating it at once.
 SELECT * FROM worf.alter_replication_set('repset_test', replicate_insert := false, replicate_update := false, replicate_delete := false, replicate_truncate := false);
  alter_replication_set 
 -----------------------
@@ -369,8 +370,8 @@ SELECT worf.wait_slot_confirm_lsn(NULL, NULL);
 SELECT * FROM "strange.schema-IS".test_diff_repset;
  id | data 
 ----+------
-  3 | data
-  4 | data
+  1 | 
+  2 | 
 (2 rows)
 
 \c :provider_dsn
@@ -392,8 +393,8 @@ SELECT worf.wait_slot_confirm_lsn(NULL, NULL);
 SELECT * FROM "strange.schema-IS".test_diff_repset;
  id | data 
 ----+------
-  3 | data
-  4 | data
+  1 | 
+  2 | 
   5 | 
   6 | 
 (4 rows)
