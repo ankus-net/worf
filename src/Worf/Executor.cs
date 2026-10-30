@@ -387,6 +387,7 @@ internal static unsafe partial class Executor
     private static void WorfExecutorStart(QueryDesc* queryDesc, int eflags)
     {
         DdlLock.CheckWrites(queryDesc, eflags);
+        SequenceRangeGuard.StartStatement(queryDesc);
 
         if (!s_nextExecutorStartHook.IsNull)
         {

@@ -91,8 +91,10 @@ public sealed class SequenceRangeTests
 
     /// <summary>
     /// Range management rejects the DDL and settings that would let values escape it, and its guard checks every row
-    /// of a statement as the row was finally written, but stays silent under session_replication_role replica.
-    /// Ordinary roles keep running DDL, and only a sequence's owner reserves its values.
+    /// of a statement as the row was finally written, but stays silent under session_replication_role replica. Rows
+    /// that DDL brings under the guard are checked too, a partitioned table's guard covers its partitions' own columns,
+    /// and a row an update moves to another partition keeps its value. Ordinary roles keep running DDL, and only a
+    /// sequence's owner reserves its values.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -116,6 +118,10 @@ public sealed class SequenceRangeTests
             CREATE SCHEMA other;
             CREATE SEQUENCE nseq;
             CREATE TABLE n (id numeric PRIMARY KEY DEFAULT nextval('nseq'), v text);
+            CREATE TABLE o (id bigserial, region text, PRIMARY KEY (id, region)) PARTITION BY LIST (region);
+            CREATE TABLE o_us PARTITION OF o FOR VALUES IN ('us');
+            CREATE TABLE o_eu PARTITION OF o FOR VALUES IN ('eu');
+            INSERT INTO o VALUES (5, 'us');
             """, token);
         foreach (string sequence in new[] { "temp_seq", "cycling", "replicated", "textual_seq" })
         {
@@ -128,6 +134,7 @@ public sealed class SequenceRangeTests
             SELECT worf.enable_sequence_range('child_id_seq', participants := '{}', range_size := 100);
             SELECT worf.enable_sequence_range('"a.b".dotted', participants := '{}', range_size := 100);
             SELECT worf.enable_sequence_range('nseq', participants := '{}', range_size := 100);
+            SELECT worf.enable_sequence_range('o_id_seq', participants := '{}', range_size := 100);
             """, token);
         Assert.AreEqual("0", await node.SafePsqlAsync(Database, """
             SELECT count(*) FROM pg_class c, aclexplode(c.relacl) a WHERE c.oid = 't_id_seq'::regclass AND a.privilege_type = 'UPDATE'
@@ -149,10 +156,12 @@ public sealed class SequenceRangeTests
             "ALTER TABLE t ALTER COLUMN id DROP DEFAULT",
             "DROP TRIGGER worf_sequence_range_guard ON t",
             "DROP TRIGGER worf_sequence_range_guard_update ON t",
-            "CREATE OR REPLACE TRIGGER worf_sequence_range_guard AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION worf.sequence_range_guard()",
+            "CREATE OR REPLACE TRIGGER worf_sequence_range_guard AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION suppress_redundant_updates_trigger()",
             "ALTER TABLE t DISABLE TRIGGER worf_sequence_range_guard",
+            "ALTER TABLE t ENABLE REPLICA TRIGGER worf_sequence_range_guard",
             "ALTER TABLE t DISABLE TRIGGER ALL",
             "ALTER TRIGGER worf_sequence_range_guard ON t RENAME TO other",
+            "ALTER TRIGGER worf_sequence_range_guard_update ON t DEPENDS ON EXTENSION worf",
             "TRUNCATE t RESTART IDENTITY",
             "TRUNCATE parent RESTART IDENTITY",
         })
@@ -164,7 +173,6 @@ public sealed class SequenceRangeTests
         foreach (string call in new[]
         {
             "SELECT worf.replication_set_add_sequence('default', 't_id_seq')",
-            "SELECT worf.replication_set_add_all_sequences('default', '{public}')",
             "SELECT worf.synchronize_sequence('t_id_seq')",
             "SELECT worf.alter_sequence_range('t_id_seq', 1, 1)",
             "SELECT worf.alter_sequence_range('worf.snowflake_node', 2)",
@@ -172,6 +180,25 @@ public sealed class SequenceRangeTests
         {
             Assert.IsFalse(await node.PsqlAsync(Database, call, token), call);
         }
+
+        // A dumped guard is skipped, ENABLE ALWAYS and TRUNCATE ONLY leave values alone, and adding a schema's
+        // sequences leaves out the managed ones.
+        _ = await node.SafePsqlAsync(Database, """
+            CREATE TRIGGER worf_sequence_range_guard AFTER INSERT ON t FOR EACH ROW
+                WHEN (worf.sequence_range_check('t_id_seq'::regclass, new.id)) EXECUTE FUNCTION worf.sequence_range_guard();
+            CREATE TABLE dumped (id bigserial PRIMARY KEY);
+            CREATE TRIGGER worf_sequence_range_guard AFTER INSERT ON dumped FOR EACH ROW
+                WHEN (worf.sequence_range_check('dumped_id_seq'::regclass, new.id)) EXECUTE FUNCTION worf.sequence_range_guard('1:1');
+            ALTER TABLE t ENABLE ALWAYS TRIGGER worf_sequence_range_guard;
+            ALTER TABLE t ENABLE TRIGGER worf_sequence_range_guard;
+            TRUNCATE ONLY parent RESTART IDENTITY;
+            SELECT worf.replication_set_add_all_sequences('default', '{public}');
+            """, token);
+        Assert.AreEqual("0|0|t", await node.SafePsqlAsync(Database, """
+            SELECT (SELECT count(*) FROM pg_trigger WHERE tgrelid = 'dumped'::regclass),
+                (SELECT count(*) FROM worf.replication_set_seq s JOIN worf.sequence_range r ON r.seqoid = s.set_seqoid),
+                EXISTS (SELECT 1 FROM worf.replication_set_seq WHERE set_seqoid = 'cycling'::regclass)
+            """, token));
 
         _ = await node.SafePsqlAsync(Database, "GRANT USAGE ON SEQUENCE t_id_seq TO PUBLIC; TRUNCATE t; GRANT ALL ON ALL TABLES IN SCHEMA public TO PUBLIC", token);
 
@@ -208,22 +235,61 @@ public sealed class SequenceRangeTests
         await AssertOutsideAsync(node, "INSERT INTO n (id, v) VALUES (5.5, 'fraction')");
         await AssertOutsideAsync(node, "INSERT INTO n (id, v) VALUES (" + Next(Next(await node.SafePsqlAsync(Database, "SELECT max(id) FROM n", token))) + ", 'ahead')");
 
-        // A role that isn't a superuser runs its own DDL, and only the sequence's owner reserves its values.
+        // An update moves a row to another partition with its value, even one from before range management, but not to
+        // a value of its choosing, and a MERGE that only updates does too.
+        _ = await node.SafePsqlAsync(Database, """
+            UPDATE o SET region = 'eu' WHERE id = 5;
+            MERGE INTO o USING (VALUES (5)) s (k) ON o.id = s.k WHEN MATCHED THEN UPDATE SET region = 'us';
+            """, token);
+        await AssertOutsideAsync(node, "UPDATE o SET region = 'eu', id = 1000000 WHERE id = 5");
+        await AssertOutsideAsync(node, "MERGE INTO o USING (VALUES (5)) s (k) ON o.id = s.k WHEN MATCHED THEN UPDATE SET region = 'eu' WHEN NOT MATCHED THEN INSERT VALUES (s.k, 'eu')");
+
+        // Rows that DDL brings under the guard can't hold values the sequence may still issue, though values from before
+        // range management can stay. A partitioned table's guard checks a column that only a partition's own default
+        // draws from a managed sequence.
+        _ = await node.SafePsqlAsync(Database, """
+            CREATE TABLE legacy (id bigint PRIMARY KEY, v text);
+            INSERT INTO legacy VALUES (424242, 'inside the root');
+            CREATE TABLE pp (id bigint PRIMARY KEY DEFAULT nextval('t_id_seq'), ref bigint) PARTITION BY RANGE (id);
+            CREATE TABLE pp_low PARTITION OF pp (ref DEFAULT nextval('nseq')) FOR VALUES FROM (MINVALUE) TO (1000000);
+            CREATE TABLE pp_high (LIKE pp);
+            INSERT INTO pp_high VALUES (1555555, NULL);
+            """, token);
+        await AssertOutsideAsync(node, "ALTER TABLE legacy ALTER COLUMN id SET DEFAULT nextval('t_id_seq')");
+        await AssertOutsideAsync(node, "ALTER TABLE pp ATTACH PARTITION pp_high FOR VALUES FROM (1000000) TO (MAXVALUE)");
+        await AssertOutsideAsync(node, "INSERT INTO pp_low (ref) VALUES (515151)");
+        _ = await node.SafePsqlAsync(Database, """
+            UPDATE legacy SET id = -1;
+            ALTER TABLE legacy ALTER COLUMN id SET DEFAULT nextval('t_id_seq');
+            INSERT INTO pp_low DEFAULT VALUES;
+            """, token);
+
+        // A role that isn't a superuser runs its own DDL, with the tables it creates joining the default replication
+        // sets, but can't claim to restore a subscription's structure, and only the sequence's owner reserves its values.
         _ = await node.SafePsqlAsync(Database, """
             CREATE ROLE app;
             GRANT USAGE ON SEQUENCE t_id_seq TO app;
+            GRANT USAGE ON SCHEMA worf TO app;
             CREATE SCHEMA app AUTHORIZATION app;
+            SET worf.include_ddl_repset = on;
             SET ROLE app;
             CREATE TABLE app.app_rows (id bigint PRIMARY KEY DEFAULT nextval('public.t_id_seq'), v text);
+            CREATE TABLE app.own_rows (id bigserial PRIMARY KEY);
             ALTER TABLE app.app_rows ADD COLUMN w int;
             GRANT ALL ON ALL TABLES IN SCHEMA app TO PUBLIC;
             INSERT INTO app.app_rows (v) VALUES ('app');
             """, token);
-        Assert.AreEqual("2", await node.SafePsqlAsync(Database,
-            "SELECT count(*) FROM pg_trigger WHERE tgrelid = 'app.app_rows'::regclass AND tgname LIKE 'worf_sequence_range_guard%'", token));
+        Assert.AreEqual("2|2", await node.SafePsqlAsync(Database, """
+            SELECT (SELECT count(*) FROM pg_trigger WHERE tgrelid = 'app.app_rows'::regclass AND tgname LIKE 'worf_sequence_range_guard%'),
+                (SELECT count(*) FROM worf.replication_set_table WHERE set_reloid IN ('app.app_rows'::regclass, 'app.own_rows'::regclass))
+            """, token));
+        PostgresException restore = await Assert.ThrowsExactlyAsync<PostgresException>(() => node.SafePsqlAsync(Database,
+            "SET ROLE app; SET worf.subscription_schema_restore = on; DROP TRIGGER worf_sequence_range_guard ON app.app_rows", token));
+        Assert.AreEqual("42501", restore.SqlState);
         PostgresException reserve = await Assert.ThrowsExactlyAsync<PostgresException>(() => node.SafePsqlAsync(Database,
             "SET ROLE app; SELECT worf.reserve_sequence_values('t_id_seq', 1, 2)", token));
         Assert.AreEqual("42501", reserve.SqlState);
+        Assert.Contains("must be owner", reserve.MessageText);
 
         async Task AssertOutsideAsync(TestNode target, string sql)
         {
@@ -352,7 +418,20 @@ public sealed class SequenceRangeTests
         PostgresException detached = await Assert.ThrowsExactlyAsync<PostgresException>(() => node.SafePsqlAsync(Database,
             "INSERT INTO pt_high (id, v) VALUES (2000000000, 'detached')", token));
         Assert.AreEqual("23514", detached.SqlState);
-        _ = await node.SafePsqlAsync(Database, "ALTER TABLE pt ATTACH PARTITION pt_high FOR VALUES FROM (1000000000) TO (MAXVALUE)", token);
+
+        // Attaching a partition doesn't hold up writers to the rest of the tree.
+        await using (NpgsqlConnection attacher = await node.OpenAsync(Database, token))
+        {
+            await using (NpgsqlCommand attach = new("BEGIN; ALTER TABLE pt ATTACH PARTITION pt_high FOR VALUES FROM (1000000000) TO (MAXVALUE)", attacher))
+            {
+                _ = await attach.ExecuteNonQueryAsync(token);
+            }
+
+            _ = await node.SafePsqlAsync(Database, "SET lock_timeout = '2s'; INSERT INTO pt (v) VALUES ('while attaching')", token);
+            await using NpgsqlCommand commit = new("COMMIT", attacher);
+            _ = await commit.ExecuteNonQueryAsync(token);
+        }
+
         Assert.AreEqual("6", await node.SafePsqlAsync(Database,
             "SELECT count(*) FROM pg_trigger WHERE tgrelid IN ('pt'::regclass, 'pt_low'::regclass, 'pt_high'::regclass) AND tgname LIKE 'worf_sequence_range_guard%'",
             token), "a guard pair on each table");
@@ -387,7 +466,8 @@ public sealed class SequenceRangeTests
     /// <summary>
     /// Two nodes that replicate both ways insert into the same table at once with keys from the same sequence, which the
     /// first node manages: the second learns of it through the exchange, gets blocks from the first, and no key is
-    /// written on both nodes. Idle, neither takes transaction IDs, across exchanges, with Snowflake IDs enabled too.
+    /// written on both nodes. A table on the second node that comes to use the sequence may hold the first's keys.
+    /// Idle, neither takes transaction IDs, except for the exchanges' reports once it manages one.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -432,6 +512,12 @@ public sealed class SequenceRangeTests
                 "SELECT count(*), count(DISTINCT id), count(*) FILTER (WHERE v = 'a'), count(*) FILTER (WHERE v = 'b') FROM t", token),
                 node.Name);
         }
+
+        // A table that comes to use the sequence may hold the other node's keys, which the other node has issued.
+        _ = await nodeB.SafePsqlAsync(Database, "CREATE TABLE copied AS SELECT id, v FROM t WHERE v = 'a'", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
+            "SELECT watermark >= (SELECT max(id) FROM copied) FROM worf.sequence_range", token), "node_a's grants heard of");
+        _ = await nodeB.SafePsqlAsync(Database, "ALTER TABLE copied ALTER COLUMN id SET DEFAULT nextval('t_id_seq')", token);
 
         async Task InsertAsync(TestNode node, string value)
         {

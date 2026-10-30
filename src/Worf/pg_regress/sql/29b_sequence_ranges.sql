@@ -31,7 +31,7 @@ ALTER SEQUENCE t_id_seq RESTART;
 ALTER SEQUENCE t_id_seq RENAME TO renamed;
 ALTER SEQUENCE t_id_seq SET UNLOGGED;
 DROP TRIGGER worf_sequence_range_guard ON t;
-CREATE OR REPLACE TRIGGER worf_sequence_range_guard AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION worf.sequence_range_guard();
+CREATE OR REPLACE TRIGGER worf_sequence_range_guard AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION suppress_redundant_updates_trigger();
 TRUNCATE t RESTART IDENTITY;
 GRANT UPDATE ON SEQUENCE t_id_seq TO PUBLIC;
 SELECT worf.alter_sequence_range('t_id_seq', 1);

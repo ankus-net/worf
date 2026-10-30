@@ -19,7 +19,7 @@ The other nodes learn of the sequence over their subscriptions, so each node nee
 SELECT * FROM worf.sequence_ranges;
 ```
 
-shows each sequence's state, its active and next blocks, and the values left. `worf.sequence_range_grants` lists the blocks this node granted.
+shows each sequence's state, its active and next blocks, and the values left. `worf.sequence_range_grants` lists the blocks this node granted. A role that isn't a superuser needs `USAGE` on schema `worf` to call the functions below, and `SELECT` to read these views.
 
 | Function | Runs on | Does |
 | --- | --- | --- |
@@ -37,7 +37,9 @@ A node's first block has `range_size` values: 100 for `smallint`, 10,000 for `in
 
 The owner holds the root, the values not yet granted. Each node draws from its active block and keeps a next block ready. Each database that manages a sequence runs a range worker, which takes one of `max_worker_processes`; a database that only subscribes runs it briefly every `worf.sequence_range_exchange_interval` to ask its providers whether they manage any. The range worker switches to the next block when the active one runs low, by setting the sequence's `MINVALUE` and `MAXVALUE` to the block, and asks for another. It also switches away at once when a superuser's `setval` moves the sequence back in its block. Nodes reach the owner over their subscriptions: a node asks its neighbor nearest the owner that still exchanges with it, and a node that serves others holds pool blocks to grant from, asking for more before they run out. The owner logs a warning once the root has granted nine tenths of its values.
 
-Two triggers on each table that uses the sequence check every row a local session writes, after any `BEFORE` trigger has changed it: a new row's value, and a value an update changes. A value passes when it is in one of this node's blocks and the sequence has passed it. Any other value fails the statement with SQLSTATE `23514`. Apply and sync workers write other nodes' rows unchecked. The column must be `smallint`, `integer`, `bigint` or `numeric`, in a table or a partitioned table.
+Two triggers on each table that uses the sequence check every row a local session writes, after any `BEFORE` trigger has changed it: a new row's value, and a value an update changes. A value passes when it is in one of this node's blocks and the sequence has passed it. Any other value fails the statement with SQLSTATE `23514`. Apply and sync workers write other nodes' rows unchecked. A partitioned table's triggers check every partition, and every column that uses the sequence in any of them. An `UPDATE`, or a `MERGE` without an `INSERT` action, that moves a row to another partition is checked as an update, so the row keeps its value; a `MERGE` with an `INSERT` action checks the moved row as a new one. The column must be `smallint`, `integer`, `bigint` or `numeric`, in a table or a partitioned table, and its default `nextval` of the sequence itself: a default such as `nextval('s') + 1000000` gives values that always fail.
+
+DDL that brings rows under the triggers, by setting a column's default to the sequence, attaching a partition to a guarded table, or `ALTER SEQUENCE ... OWNED BY`, fails with SQLSTATE `23514` if a row holds a value the sequence may still issue, as far as this node knows: one ahead of this node's sequence in its blocks, or one not yet granted to any node.
 
 A single transaction that needs more values than the active block has left fails at the block's end. Before a large load, reserve enough values, before the transaction calls `nextval` on the sequence:
 
@@ -45,7 +47,7 @@ A single transaction that needs more values than the active block has left fails
 SELECT worf.reserve_sequence_range('inventory_id_seq', 500000);
 ```
 
-To load rows that already carry keys, reserve exactly those keys on the node that loads them. The owner refuses keys that may already be in use. Both reservations need the privileges of the sequence's owner.
+To load rows that already carry keys, or bring them under the triggers, reserve exactly those keys on the node that loads them. The owner refuses keys that may already be in use. Both reservations need the privileges of the sequence's owner.
 
 A transaction that has called `nextval` and stays open holds off the switch to the next block until it ends.
 
@@ -78,13 +80,15 @@ An ID holds the milliseconds since 2025 in its top 41 bits, the node's number in
 
 ## Restrictions
 
-Managed sequences can't cycle, be temporary or unlogged, or be in a replication set. Except when worf runs it, worf rejects:
+Managed sequences can't cycle, be temporary or unlogged, or be in a replication set; `replication_set_add_all_sequences` leaves them out. Except when worf runs it, worf rejects:
 
 - `ALTER SEQUENCE` on them, other than `OWNED BY` and `OWNER TO`, including `RENAME`, `SET SCHEMA` and `SET UNLOGGED`;
 - renaming their schema, and moving or unlogging a table that owns one;
 - `GRANT UPDATE` or `GRANT ALL` on them, directly or through `ALL SEQUENCES IN SCHEMA`;
 - changing the default or identity of a column that uses one;
-- creating, dropping, renaming or disabling the guard triggers;
-- `TRUNCATE ... RESTART IDENTITY` that would restart one, including through inheritance or `CASCADE`.
+- dropping, renaming or disabling the guard triggers, making them depend on an extension, and creating other triggers with their names;
+- `TRUNCATE ... RESTART IDENTITY` that would restart one, including through `CASCADE` or inheritance without `ONLY`.
+
+A `CREATE TRIGGER` of the guard, as a restored dump holds, is skipped, since worf creates the triggers on the tables that need them. Changing the type of a column that uses a managed sequence, or dropping it without `CASCADE`, fails because the triggers depend on it.
 
 Superusers and members of `pg_write_all_data` can still call `setval`, and the range worker then leaves the block.

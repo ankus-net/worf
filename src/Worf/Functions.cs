@@ -1749,7 +1749,8 @@ internal static class Functions
             {
                 uint reloid = reltup.Get<uint>(0);
 
-                if (existingRelations.Contains(reloid))
+                // Each node's own blocks keep a managed sequence's values apart, so its state isn't replicated.
+                if (existingRelations.Contains(reloid) || (relkind == 'S' && SequenceRanges.IsManaged(reloid)))
                 {
                     continue;
                 }

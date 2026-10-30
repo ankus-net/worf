@@ -180,6 +180,8 @@ internal static unsafe partial class SequenceRanges
     private const uint Int8Oid = 20;
     private const uint NumericOid = 1700;
 
+    private static readonly string[] s_guardNames = [GuardName, UpdateGuardName];
+
     private static bool s_changedOnCommit;
 
     // The furthest position each sequence's active block has reached, which the range worker tracks to notice its
@@ -720,16 +722,27 @@ internal static unsafe partial class SequenceRanges
     /// <summary>
     /// Rejects DDL that would let values escape range management, except when worf itself runs it: changing, renaming,
     /// moving or unlogging a managed sequence, granting UPDATE on one, changing the default or identity of a column that
-    /// uses one, creating, dropping, renaming or disabling the guard, and restarting a managed sequence through
-    /// <c>TRUNCATE</c>. A table that becomes a partition of a guarded table gives up its own guard for its parent's.
+    /// uses one, creating, dropping, renaming or disabling the guard or making it depend on an extension, and restarting
+    /// a managed sequence through <c>TRUNCATE</c>. A table that becomes a partition gives up its own guard for its
+    /// tree's.
     /// </summary>
     /// <param name="parsetree">The statement, before it runs.</param>
     internal static void CheckDdl(Node* parsetree)
     {
+        if (InternalDdl)
+        {
+            return;
+        }
+
+        if (parsetree->type == NodeTag.T_AlterTableStmt)
+        {
+            DropAttachedGuards((AlterTableStmt*)parsetree);
+        }
+
         // The restore of a subscription's structure is worf's own.
-        if (InternalDdl || parsetree->type is not (NodeTag.T_AlterSeqStmt or NodeTag.T_GrantStmt or NodeTag.T_AlterTableStmt or
+        if (parsetree->type is not (NodeTag.T_AlterSeqStmt or NodeTag.T_GrantStmt or NodeTag.T_AlterTableStmt or
             NodeTag.T_DropStmt or NodeTag.T_RenameStmt or NodeTag.T_TruncateStmt or NodeTag.T_CreateTrigStmt or
-            NodeTag.T_AlterObjectSchemaStmt) || !AnyManaged() || DdlReplication.Restoring())
+            NodeTag.T_AlterObjectSchemaStmt or NodeTag.T_AlterObjectDependsStmt) || !AnyManaged() || DdlReplication.Restoring())
         {
             return;
         }
@@ -778,8 +791,21 @@ internal static unsafe partial class SequenceRanges
 
                 break;
 
-            case NodeTag.T_CreateTrigStmt when IsGuardName(Worf.FromServer(((CreateTrigStmt*)parsetree)->trigname)):
+            // A dumped guard is skipped, since worf creates the guard itself.
+            case NodeTag.T_CreateTrigStmt when IsGuardName(Worf.FromServer(((CreateTrigStmt*)parsetree)->trigname)) &&
+                !IsGuardFunction(((CreateTrigStmt*)parsetree)->funcname):
                 throw Rejected("creating a trigger with the guard's name", "worf creates the guard itself.");
+
+            // An extension's drop would drop the guard with it.
+            case NodeTag.T_AlterObjectDependsStmt when ((AlterObjectDependsStmt*)parsetree)->objectType == ObjectType.OBJECT_TRIGGER &&
+                !((AlterObjectDependsStmt*)parsetree)->remove:
+                List* trigger = (List*)((AlterObjectDependsStmt*)parsetree)->@object;
+                if (trigger is not null && IsGuardName(NodeName(trigger->elements[trigger->length - 1].ptr_value)))
+                {
+                    throw Rejected("making the guard of a table that uses a managed sequence depend on an extension", "Disable range management first.");
+                }
+
+                break;
 
             case NodeTag.T_TruncateStmt when ((TruncateStmt*)parsetree)->restart_seqs:
                 CheckTruncate((TruncateStmt*)parsetree);
@@ -811,8 +837,7 @@ internal static unsafe partial class SequenceRanges
                 _ when sequence => cmd->subtype != AlterTableType.AT_ChangeOwner,
                 AlterTableType.AT_ColumnDefault or AlterTableType.AT_AddIdentity or AlterTableType.AT_SetIdentity or
                     AlterTableType.AT_DropIdentity => name is not null && ColumnUsesManaged(relid, name),
-                AlterTableType.AT_DisableTrig or AlterTableType.AT_EnableReplicaTrig or AlterTableType.AT_EnableAlwaysTrig =>
-                    name is not null && IsGuardName(name),
+                AlterTableType.AT_DisableTrig or AlterTableType.AT_EnableReplicaTrig => name is not null && IsGuardName(name),
                 AlterTableType.AT_DisableTrigAll or AlterTableType.AT_DisableTrigUser => IsGuarded(relid),
 
                 // A table's sequences follow it to unlogged.
@@ -823,12 +848,22 @@ internal static unsafe partial class SequenceRanges
             {
                 throw Rejected("changing a managed sequence, a column that uses one, or its table's guard", "Disable range management first.");
             }
+        }
+    }
 
-            // PostgreSQL gives a new partition its parent's guard, which can't stand beside one of its own.
-            if (cmd->subtype == AlterTableType.AT_AttachPartition && IsGuarded(relid))
+    /// <summary>
+    /// Drops the guard of a table that becomes a partition. PostgreSQL gives it its tree's guard, which can't stand beside
+    /// one of its own, and which checks its columns too.
+    /// </summary>
+    private static void DropAttachedGuards(AlterTableStmt* alter)
+    {
+        for (int i = 0; alter->cmds is not null && i < alter->cmds->length; i++)
+        {
+            AlterTableCmd* cmd = (AlterTableCmd*)alter->cmds->elements[i].ptr_value;
+            if (cmd->subtype == AlterTableType.AT_AttachPartition)
             {
                 uint partition = Resolve(((PartitionCmd*)cmd->def)->name);
-                foreach (string guard in OwnGuards(partition))
+                foreach (string guard in partition == 0 ? [] : OwnGuards(partition))
                 {
                     RunInternalDdl($"DROP TRIGGER {Spi.QuoteIdentifier(guard)} ON {QualifiedName(partition)}");
                 }
@@ -864,36 +899,43 @@ internal static unsafe partial class SequenceRanges
 
     /// <summary>
     /// Rejects <c>TRUNCATE ... RESTART IDENTITY</c> that would restart a managed sequence: one owned by a table it
-    /// names, by one of their inheritors or partitions, or, with <c>CASCADE</c>, by a table whose foreign keys reach them.
+    /// names, by one of their inheritors or partitions unless it names the table with <c>ONLY</c>, or, with
+    /// <c>CASCADE</c>, by a table whose foreign keys reach them.
     /// </summary>
     private static void CheckTruncate(TruncateStmt* truncate)
     {
-        List<uint> relids = [];
+        List<long> only = [];
+        List<long> inherited = [];
         List* relations = truncate->relations;
         for (int i = 0; relations is not null && i < relations->length; i++)
         {
-            uint relid = Resolve((RangeVar*)relations->elements[i].ptr_value);
+            RangeVar* relation = (RangeVar*)relations->elements[i].ptr_value;
+            uint relid = Resolve(relation);
             if (relid != 0)
             {
-                relids.Add(relid);
+                (relation->inh ? inherited : only).Add(relid);
             }
         }
 
         if (Elevated.Run(() => Worf.ReadScalar<bool>("""
-            WITH RECURSIVE edges (parent, child) AS (
-                SELECT inhparent, inhrelid FROM pg_catalog.pg_inherits
-                UNION ALL
-                SELECT confrelid, conrelid FROM pg_catalog.pg_constraint WHERE contype = 'f' AND $2),
+            WITH RECURSIVE named (relid) AS (
+                SELECT unnest($2::int8[])::oid
+                UNION
+                SELECT i.inhrelid FROM pg_catalog.pg_inherits i JOIN named n ON i.inhparent = n.relid),
             truncated (relid) AS (
                 SELECT unnest($1::int8[])::oid
                 UNION
-                SELECT e.child FROM edges e JOIN truncated t ON e.parent = t.relid)
+                SELECT relid FROM named
+                UNION
+                SELECT c.conrelid FROM pg_catalog.pg_constraint c JOIN truncated t ON c.confrelid = t.relid
+                WHERE c.contype = 'f' AND $3)
             SELECT EXISTS (
                 SELECT 1 FROM truncated t
                     JOIN pg_catalog.pg_depend d ON d.refclassid = 'pg_catalog.pg_class'::regclass AND d.refobjid = t.relid
                         AND d.classid = 'pg_catalog.pg_class'::regclass AND d.deptype IN ('a', 'i')
                     JOIN worf.sequence_range r ON r.seqoid = d.objid)
-            """, SpiParameter.Create(relids.Select(relid => (long)relid).ToArray()), SpiParameter.Create(truncate->behavior == DropBehavior.DROP_CASCADE))))
+            """, SpiParameter.Create(only.ToArray()), SpiParameter.Create(inherited.ToArray()),
+            SpiParameter.Create(truncate->behavior == DropBehavior.DROP_CASCADE))))
         {
             throw Rejected("TRUNCATE ... RESTART IDENTITY of a managed sequence", "Truncate without RESTART IDENTITY.");
         }
@@ -916,18 +958,28 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
-    /// Skips the guard that a provider's dumped structure creates, since the restore installs the guards itself.
+    /// Skips the guard that a dump creates, as a provider's dumped structure or a restored table's does, since worf
+    /// installs the guards itself, on the tables that use a managed sequence here.
     /// </summary>
     /// <param name="parsetree">The statement, before it runs.</param>
     /// <returns>Whether to skip it.</returns>
     internal static bool SkipsDumpedGuard(Node* parsetree)
         => !InternalDdl && parsetree->type == NodeTag.T_CreateTrigStmt && IsGuardName(Worf.FromServer(((CreateTrigStmt*)parsetree)->trigname)) &&
-            DdlReplication.Restoring();
+            IsGuardFunction(((CreateTrigStmt*)parsetree)->funcname);
+
+    /// <summary>
+    /// Checks whether a trigger's function is the guard's.
+    /// </summary>
+    private static bool IsGuardFunction(List* funcname)
+        => funcname is not null && NodeName(funcname->elements[funcname->length - 1].ptr_value) == "sequence_range_guard" &&
+            (funcname->length == 1 || NodeName(funcname->elements[funcname->length - 2].ptr_value) == Worf.ExtensionName);
 
     /// <summary>
     /// Puts managed sequences in place after DDL: the restore of a subscription's structure quarantines and joins the
-    /// provider's managed sequences as it creates them, and a table that comes to use a managed sequence, or a partition
-    /// detached from a guarded table, gets the guard in the same transaction.
+    /// provider's managed sequences as it creates them, and a table or partition tree that comes to use a managed
+    /// sequence, or a partition detached from a guarded tree, gets the guard in the same transaction. The rows that DDL
+    /// brings under the guard, by setting a column's default, attaching a partition or giving a managed sequence an
+    /// owning column, must hold values the guard passes, or values from before the sequence's root.
     /// </summary>
     /// <param name="parsetree">The statement, which has run.</param>
     internal static void AfterDdl(Node* parsetree)
@@ -953,22 +1005,64 @@ internal static unsafe partial class SequenceRanges
                 uint seqoid = Resolve(((AlterSeqStmt*)parsetree)->sequence);
                 if (seqoid != 0 && IsManaged(seqoid))
                 {
+                    // Only OWNED BY changes a managed sequence outside worf's own DDL, and its column brings its rows.
                     InstallGuards(seqoid);
+                    if (Worf.Read("""
+                        SELECT d.refobjid::oid, a.attname::text FROM pg_catalog.pg_depend d
+                            JOIN pg_catalog.pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
+                        WHERE d.classid = 'pg_catalog.pg_class'::regclass AND d.objid = $1 AND d.refclassid = 'pg_catalog.pg_class'::regclass
+                            AND d.deptype = 'a' AND d.refobjsubid > 0
+                        """, 1, SpiParameter.Create(seqoid)) is { Count: 1 } owner)
+                    {
+                        CheckColumnRows(owner[0].Get<uint>(0), owner[0].Get<string>(1), false);
+                    }
                 }
 
                 break;
 
             case NodeTag.T_AlterTableStmt:
                 AlterTableStmt* alter = (AlterTableStmt*)parsetree;
-                InstallGuard(Resolve(alter->relation));
+                uint relid = Resolve(alter->relation);
+                if (relid == 0)
+                {
+                    break;
+                }
 
-                // PostgreSQL drops the guard a detached partition had from its parent.
+                // A partition tree's guard is its root's; an inheritance parent's default reaches its children.
+                if (NativeMethods.get_rel_relkind(relid) == (sbyte)'p')
+                {
+                    InstallGuard(relid);
+                }
+                else
+                {
+                    List* inheritors = NativeMethods.find_all_inheritors(relid, 0, null);
+                    for (int i = 0; inheritors is not null && i < inheritors->length; i++)
+                    {
+                        InstallGuard(inheritors->elements[i].oid_value);
+                    }
+                }
+
                 for (int i = 0; alter->cmds is not null && i < alter->cmds->length; i++)
                 {
                     AlterTableCmd* cmd = (AlterTableCmd*)alter->cmds->elements[i].ptr_value;
-                    if (cmd->subtype is AlterTableType.AT_DetachPartition or AlterTableType.AT_DetachPartitionFinalize)
+                    switch (cmd->subtype)
                     {
-                        InstallGuard(Resolve(((PartitionCmd*)cmd->def)->name));
+                        // PostgreSQL drops the guard a detached partition had from its tree.
+                        case AlterTableType.AT_DetachPartition or AlterTableType.AT_DetachPartitionFinalize:
+                            InstallGuard(Resolve(((PartitionCmd*)cmd->def)->name));
+                            break;
+
+                        case AlterTableType.AT_AttachPartition:
+                            CheckAttachedRows(Resolve(((PartitionCmd*)cmd->def)->name));
+                            break;
+
+                        // A column that uses a managed sequence can't change its default, so one that does now didn't.
+                        case AlterTableType.AT_ColumnDefault when cmd->name is not null:
+                            CheckColumnRows(relid, Worf.FromServer(cmd->name), alter->relation->inh);
+                            break;
+
+                        default:
+                            break;
                     }
                 }
 
@@ -980,6 +1074,40 @@ internal static unsafe partial class SequenceRanges
 
             default:
                 break;
+        }
+    }
+
+    /// <summary>
+    /// Checks the values a table's rows hold in a column that has come under the guard, with its inheritors' and
+    /// partitions' rows when <paramref name="inherited"/> is set or it's partitioned.
+    /// </summary>
+    private static void CheckColumnRows(uint relid, string column, bool inherited)
+    {
+        if (GuardedColumns(TreeRoot(relid)).TryGetValue(column, out (uint TypeOid, List<uint> Sequences) guarded))
+        {
+            SequenceRangeGuard.CheckRows(QualifiedName(relid), inherited || NativeMethods.get_rel_relkind(relid) == (sbyte)'p', column,
+                guarded.TypeOid == NumericOid, guarded.Sequences);
+        }
+    }
+
+    /// <summary>
+    /// Checks the rows of a partition that joined a guarded tree, in each column its tree's guard checks against
+    /// sequences beyond those the partition's own guard did.
+    /// </summary>
+    private static void CheckAttachedRows(uint partition)
+    {
+        if (partition == 0)
+        {
+            return;
+        }
+
+        Dictionary<string, (uint TypeOid, List<uint> Sequences)> own = GuardedColumns(partition);
+        foreach ((string column, (uint typeOid, List<uint> sequences)) in GuardedColumns(TreeRoot(partition)))
+        {
+            if (!own.TryGetValue(column, out (uint TypeOid, List<uint> Sequences) before) || !before.Sequences.TrueForAll(sequences.Contains))
+            {
+                SequenceRangeGuard.CheckRows(QualifiedName(partition), true, column, typeOid == NumericOid, sequences);
+            }
         }
     }
 
@@ -1047,8 +1175,8 @@ internal static unsafe partial class SequenceRanges
     internal static bool IsGuardName(string name) => name is GuardName or UpdateGuardName;
 
     private static bool IsGuarded(uint relid)
-        => relid != 0 && Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid = $1 AND tgname IN ($2, $3))",
-            SpiParameter.Create(relid), SpiParameter.Create(GuardName), SpiParameter.Create(UpdateGuardName));
+        => relid != 0 && Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid = $1 AND tgname = ANY ($2))",
+            SpiParameter.Create(relid), SpiParameter.Create(s_guardNames));
 
     /// <summary>
     /// Lists the guards a table has of its own, rather than from a parent it is a partition of.
@@ -1056,8 +1184,8 @@ internal static unsafe partial class SequenceRanges
     private static List<string> OwnGuards(uint relid)
     {
         SpiResult result = Worf.Read("""
-            SELECT tgname::text FROM pg_catalog.pg_trigger WHERE tgrelid = $1 AND tgname IN ($2, $3) AND tgparentid = 0
-            """, 0, SpiParameter.Create(relid), SpiParameter.Create(GuardName), SpiParameter.Create(UpdateGuardName));
+            SELECT tgname::text FROM pg_catalog.pg_trigger WHERE tgrelid = $1 AND tgname = ANY ($2) AND tgparentid = 0
+            """, 0, SpiParameter.Create(relid), SpiParameter.Create(s_guardNames));
         List<string> guards = [];
         for (int i = 0; i < result.Count; i++)
         {
@@ -2246,54 +2374,125 @@ internal static unsafe partial class SequenceRanges
     /// </summary>
     private static void InstallGuards(uint seqoid)
     {
-        foreach (uint relid in UsingColumns(seqoid).Select(column => column.Relid).Distinct())
+        foreach (uint root in UsingColumns(seqoid).Select(column => TreeRoot(column.Relid)).Distinct())
         {
-            InstallGuard(relid);
+            InstallGuard(root);
         }
     }
 
     /// <summary>
-    /// Puts the guard on a table, checking each of its columns that uses a managed sequence, if it has any. The guard is
-    /// a pair of triggers that run after each row is written, so that they see the row every BEFORE trigger left, and
-    /// whose conditions check the values: those of a new row, and those an update changes. Columns are referenced by
-    /// number, so a renamed column stays checked. A partition takes its parent's guard, which PostgreSQL gives it.
+    /// Puts the guard on a table's partition tree, or on the table itself when it's no partition, checking each column
+    /// that uses a managed sequence anywhere in the tree. The guard is a pair of triggers on the tree's root, which
+    /// PostgreSQL gives every partition, that run after each row is written, so that they see the row every BEFORE
+    /// trigger left, and whose conditions check the values: those of a new row, and those an update changes. A value
+    /// passes under any of the managed sequences its column uses. Columns are referenced by number, so a renamed column
+    /// stays checked, and the triggers' arguments list what they check, so that a guard that checks the same is left
+    /// alone and its tree's writers aren't held up.
     /// </summary>
     private static void InstallGuard(uint relid)
     {
-        if (relid == 0 || Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid = $1 AND tgname = $2 AND tgparentid <> 0)",
-            SpiParameter.Create(relid), SpiParameter.Create(GuardName)))
+        if (relid == 0)
         {
             return;
         }
 
-        List<string> inserted = [];
-        List<string> updated = [];
+        uint root = TreeRoot(relid);
+        Dictionary<string, (uint TypeOid, List<uint> Sequences)> columns = GuardedColumns(root);
+        SpiResult attributes = Worf.Read("SELECT attname::text, attnum FROM pg_catalog.pg_attribute WHERE attrelid = $1 AND attnum > 0 AND NOT attisdropped",
+            0, SpiParameter.Create(root));
+        Dictionary<string, short> attnums = [];
+        for (int i = 0; i < attributes.Count; i++)
+        {
+            attnums[attributes[i].Get<string>(0)] = attributes[i].Get<short>(1);
+        }
+
+        List<(short Attnum, string Name, string Type, List<uint> Sequences)> guarded = [.. columns
+            .Select(column => (attnums[column.Key], Spi.QuoteIdentifier(column.Key), column.Value.TypeOid == NumericOid ? "numeric" : "bigint",
+                column.Value.Sequences))
+            .OrderBy(column => column.Item1)];
+        List<string> arguments = [.. guarded.Select(column => $"{column.Attnum}:{string.Join(",", column.Sequences)}")];
+        string table = QualifiedName(root);
+        SpiResult existing = Worf.Read("""
+            SELECT tgname::text, encode(tgargs, 'escape') FROM pg_catalog.pg_trigger WHERE tgrelid = $1 AND tgname = ANY ($2) AND tgparentid = 0
+            """, 0, SpiParameter.Create(root), SpiParameter.Create(s_guardNames));
+        string encoded = string.Concat(arguments.Select(argument => argument + "\\000"));
+        if (guarded.Count == 0 || (existing.Count == s_guardNames.Length && Enumerable.Range(0, existing.Count).All(i => existing[i].Get<string>(1) == encoded)))
+        {
+            // A tree with no column that uses a managed sequence keeps no guard.
+            for (int i = 0; guarded.Count == 0 && i < existing.Count; i++)
+            {
+                RunInternalDdl($"DROP TRIGGER {Spi.QuoteIdentifier(existing[i].Get<string>(0))} ON {table}");
+            }
+
+            return;
+        }
+
+        // An update's condition checks only a value it changes, as when it moves a row to another partition, which
+        // PostgreSQL checks against the partitioned table's update guard after the row's insert.
+        string Check(string check, string name, string type, List<uint> sequences)
+        {
+            string first = $"{check}({Sequence(sequences[0])}, NEW.{name}::{type})";
+            return sequences.Count == 1
+                ? first
+                : $"(NOT ({string.Join(" OR ", sequences.Select(seq => $"worf.sequence_range_admits({Sequence(seq)}, NEW.{name}::{type})"))}) AND {first})";
+        }
+
+        static string Sequence(uint seqoid) => Spi.QuoteLiteral(GetInfo(seqoid).Name) + "::regclass";
+
+        string function = $"worf.sequence_range_guard({string.Join(", ", arguments.Select(Spi.QuoteLiteral))})";
+        RunInternalDdl($"""
+            CREATE OR REPLACE TRIGGER {GuardName} AFTER INSERT ON {table}
+            FOR EACH ROW WHEN ({string.Join(" OR ", guarded.Select(c => Check("worf.sequence_range_check", c.Name, c.Type, c.Sequences)))})
+            EXECUTE FUNCTION {function}
+            """);
+        RunInternalDdl($"""
+            CREATE OR REPLACE TRIGGER {UpdateGuardName} AFTER UPDATE ON {table}
+            FOR EACH ROW WHEN ({string.Join(" OR ", guarded.Select(c =>
+                $"(OLD.{c.Name} IS DISTINCT FROM NEW.{c.Name} AND {Check("worf.sequence_range_check_update", c.Name, c.Type, c.Sequences)})"))})
+            EXECUTE FUNCTION {function}
+            """);
+    }
+
+    /// <summary>
+    /// Finds the root of a table's partition tree: the table itself when it's no partition.
+    /// </summary>
+    private static uint TreeRoot(uint relid)
+        => relid == 0 ? 0 : Worf.ReadScalar<uint?>("SELECT pg_catalog.pg_partition_root($1::regclass)::oid", SpiParameter.Create(relid)) ?? relid;
+
+    /// <summary>
+    /// Lists, by name, the columns of a table and its partitions that use a managed sequence, with their types and the
+    /// sequences they use.
+    /// </summary>
+    private static Dictionary<string, (uint TypeOid, List<uint> Sequences)> GuardedColumns(uint top)
+    {
+        HashSet<uint> tree = [top];
+        SpiResult partitions = Worf.Read("SELECT relid::oid FROM pg_catalog.pg_partition_tree($1::regclass)", 0, SpiParameter.Create(top));
+        for (int i = 0; i < partitions.Count; i++)
+        {
+            _ = tree.Add(partitions[i].Get<uint>(0));
+        }
+
+        Dictionary<string, (uint TypeOid, List<uint> Sequences)> columns = [];
         SpiResult managed = Elevated.Run(() => Worf.SelectCatalog("SELECT seqoid::oid FROM worf.sequence_range ORDER BY seqoid"));
         for (int i = 0; i < managed.Count; i++)
         {
             uint managedSeq = managed[i].Get<uint>(0);
-            foreach ((_, string column, uint typeOid) in UsingColumns(managedSeq).Where(entry => entry.Relid == relid))
+            foreach ((uint relid, string column, uint typeOid) in UsingColumns(managedSeq).Where(entry => tree.Contains(entry.Relid)))
             {
                 RequireCheckable(relid, column, typeOid, managedSeq);
-                string sequence = Spi.QuoteLiteral(GetInfo(managedSeq).Name) + "::regclass";
-                string type = typeOid == NumericOid ? "numeric" : "bigint";
-                string name = Spi.QuoteIdentifier(column);
-                inserted.Add($"worf.sequence_range_check({sequence}, NEW.{name}::{type})");
-                updated.Add($"worf.sequence_range_check({sequence}, OLD.{name}::{type}, NEW.{name}::{type})");
+                if (!columns.TryGetValue(column, out (uint TypeOid, List<uint> Sequences) entry))
+                {
+                    entry = (typeOid, []);
+                    columns.Add(column, entry);
+                }
+
+                if (!entry.Sequences.Contains(managedSeq))
+                {
+                    entry.Sequences.Add(managedSeq);
+                }
             }
         }
 
-        if (inserted.Count > 0)
-        {
-            string table = QualifiedName(relid);
-            RunInternalDdl($"""
-                CREATE OR REPLACE TRIGGER {GuardName} AFTER INSERT ON {table}
-                FOR EACH ROW WHEN ({string.Join(" OR ", inserted)}) EXECUTE FUNCTION worf.sequence_range_guard()
-                """);
-            RunInternalDdl($"""
-                CREATE OR REPLACE TRIGGER {UpdateGuardName} AFTER UPDATE ON {table}
-                FOR EACH ROW WHEN ({string.Join(" OR ", updated)}) EXECUTE FUNCTION worf.sequence_range_guard()
-                """);
-        }
+        return columns;
     }
 }
