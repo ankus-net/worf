@@ -72,7 +72,8 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   out of resources, are retried as under `error`. Every skipped change,
   including each change of a transaction skipped as a whole, and disabled
   subscriptions are recorded in `worf.exception_log`, with the error, the
-  change's rows or queued DDL, and the transaction it belongs to. The
+  change's rows or queued DDL, and the transaction it belongs to. A value the
+  subscriber can't read is recorded as its bytes in hex. The
   transaction that a subscription applies again, and how, is kept in
   `worf.exception_state` across restarts. Table sync workers catching up
   after a copy handle failures the same way. The default is `error`.

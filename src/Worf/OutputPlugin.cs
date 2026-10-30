@@ -177,6 +177,9 @@ internal static unsafe partial class OutputPlugin
                     $"client sent max_proto_version={data.ClientMaxProtoVersion} but we only support protocol {OutputProto.ProtoMinVersionNum} or higher");
             }
 
+            // An older client reads the layout of the version it knows.
+            data.ProtoVersion = Math.Min(data.ClientMaxProtoVersion, OutputProto.ProtoVersionNum);
+
             // Set correct protocol format.
             //
             // This is the output plugin protocol format, this is different from the individual fields binary vs

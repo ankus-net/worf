@@ -63,20 +63,26 @@ internal static class ExceptionLog
     {
         (string? oldTuple, string? newTuple) = (null, null);
         (string? schemaName, string? tableName) = (change.Relation?.Nspname, change.Relation?.Relname);
-        if (change.Message is not null)
+
+        // A value this node can't read fails the first read of the rows, and the second records its bytes instead.
+        for (int read = 0; change.Message is not null && read < 2; read++)
         {
+            bool unreadableAsHex = read > 0;
             try
             {
                 PgTransaction.RunInSubtransaction(() =>
                 {
-                    (oldTuple, newTuple, string schema, string table) = ReadTuples(change.Message);
+                    (oldTuple, newTuple, string schema, string table) = ReadTuples(change.Message, unreadableAsHex);
                     schemaName ??= schema;
                     tableName ??= table;
                 });
+                break;
             }
             catch (PgException)
             {
-                // The rows stay unrecorded when the change can't be read again, as when its table is missing.
+                // The rows stay unrecorded when the change can't be read again, as when its table is missing. The
+                // rollback released the relation the read opened.
+                RelCache.ForgetOpenRelations();
             }
         }
 
@@ -152,8 +158,11 @@ internal static class ExceptionLog
     /// Reads a change's rows from its message again, as JSON objects of the text of the columns it sent.
     /// </summary>
     /// <param name="message">The INSERT, UPDATE or DELETE message.</param>
+    /// <param name="unreadableAsHex">Whether a value this node can't read is recorded as its bytes rather than failing
+    /// the read, which then reads each value in a subtransaction.</param>
     /// <returns>The key of the row an update or delete changes, and the row an insert or update writes.</returns>
-    private static unsafe (string? OldTuple, string? NewTuple, string Schema, string Table) ReadTuples(byte[] message)
+    private static unsafe (string? OldTuple, string? NewTuple, string Schema, string Table) ReadTuples(byte[] message,
+        bool unreadableAsHex)
     {
         fixed (byte* data = message)
         {
@@ -189,7 +198,8 @@ internal static class ExceptionLog
             try
             {
                 TupleDescData* desc = rel.Rel->rd_att;
-                return (TupleToJson(desc, oldtup), TupleToJson(desc, newtup), rel.Nspname, rel.Relname);
+                return (TupleToJson(desc, oldtup, unreadableAsHex), TupleToJson(desc, newtup, unreadableAsHex), rel.Nspname,
+                    rel.Relname);
             }
             finally
             {
@@ -202,7 +212,7 @@ internal static class ExceptionLog
     /// Converts the columns a remote change sent to a JSON object of their text. Values in the internal format point
     /// into the message, which has to stay pinned.
     /// </summary>
-    private static unsafe string? TupleToJson(TupleDescData* desc, WorfTupleData? tuple)
+    private static unsafe string? TupleToJson(TupleDescData* desc, WorfTupleData? tuple, bool unreadableAsHex)
     {
         if (tuple is null)
         {
@@ -235,12 +245,9 @@ internal static class ExceptionLog
                     Executor.EscapeJson(json, Worf.FromServer(tuple.Data[natt]!));
                     break;
 
-                case 'b':
-                    Executor.EscapeJson(json, ValueToText(attr, BinaryToValue(attr, tuple.Data[natt]!)));
-                    break;
-
                 default:
-                    Executor.EscapeJson(json, ValueToText(attr, tuple.Values[natt]));
+                    Executor.EscapeJson(json, tuple.Converted[natt] ? ValueToText(attr->atttypid, tuple.Values[natt])
+                        : BinaryToText(attr, tuple, natt, unreadableAsHex));
                     break;
             }
         }
@@ -249,29 +256,41 @@ internal static class ExceptionLog
     }
 
     /// <summary>
-    /// Converts a value in its type's binary format to a datum.
+    /// Gets the text of a value sent in binary, or in the internal format of another type than its column's, read
+    /// with the type it was sent in, without the column's domain constraints. A value this node can't read fails, or
+    /// is recorded as its bytes in hex, as bytea shows them.
     /// </summary>
-    private static unsafe ulong BinaryToValue(FormData_pg_attribute* attr, byte[] data)
+    private static unsafe string BinaryToText(FormData_pg_attribute* attr, WorfTupleData tuple, int natt, bool unreadableAsHex)
     {
-        uint typreceive;
-        uint typioparam;
-        NativeMethods.getTypeBinaryInputInfo(attr->atttypid, &typreceive, &typioparam);
-
-        StringInfoData buf;
-        NativeMethods.initStringInfo(&buf);
-        fixed (byte* bytes = data)
+        char kind = tuple.Kinds[natt];
+        byte[] data = tuple.Data[natt]!;
+        uint type = tuple.Conversions?[natt] is { } conversion ? conversion.ReadType : NativeMethods.getBaseType(attr->atttypid);
+        if (type != 0 && !unreadableAsHex)
         {
-            Worf.AppendBinaryStringInfo(&buf, bytes, data.Length);
+            return ValueToText(type, WorfColumnConversion.Read(type, kind, data));
         }
 
-        return NativeMethods.OidReceiveFunctionCall(typreceive, &buf, typioparam, attr->atttypmod);
+        string? text = null;
+        if (type != 0)
+        {
+            try
+            {
+                PgTransaction.RunInSubtransaction(() => text = ValueToText(type, WorfColumnConversion.Read(type, kind, data)));
+            }
+            catch (PgException)
+            {
+                // The bytes are recorded instead.
+            }
+        }
+
+        return text ?? "\\x" + Convert.ToHexStringLower(data);
     }
 
-    private static unsafe string ValueToText(FormData_pg_attribute* attr, ulong value)
+    private static unsafe string ValueToText(uint type, ulong value)
     {
         uint typoutput;
         bool typisvarlena;
-        NativeMethods.getTypeOutputInfo(attr->atttypid, &typoutput, &typisvarlena);
+        NativeMethods.getTypeOutputInfo(type, &typoutput, &typisvarlena);
         return Worf.FromServer(NativeMethods.OidOutputFunctionCall(typoutput, value));
     }
 }
