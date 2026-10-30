@@ -565,7 +565,8 @@ by extensions will go to `default` replication set.
   Lets local writes and DDL through the fence that `worf.global_ddl_lock` put
   up for DDL from another node, or through every fence in this database when
   `fence_id` is NULL, as when that DDL won't reach this node because its node
-  is gone for good. Returns the number of tables let through.
+  is gone for good, once the transaction commits. Returns the number of tables
+  let through.
 
 - `worf.synchronize_sequence(relation regclass)`
   Push sequence state to all subscribers. Unlike the subscription and table
@@ -758,12 +759,25 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   `standard_conforming_strings`, `default_tablespace`,
   `default_table_access_method` and `default_toast_compression`. Statements
   about databases, tablespaces, roles, server settings and PostgreSQL's own
-  publications and subscriptions stay on their node, as do statements that use
-  the session's temporary objects or prepared statements, and what they create.
-  A `DROP` of temporary and other objects drops the others everywhere. worf
-  itself can only be dropped in a statement of its own. Other nodes run
-  concurrent statements, such as `CREATE INDEX CONCURRENTLY`, in their apply
-  transaction. The default is `off`.
+  publications and subscriptions stay on their node, including renaming them,
+  changing their owners, commenting on them and granting on them, as do
+  statements that use the session's temporary objects or prepared statements,
+  and what they create. A statement uses a temporary object when it names one,
+  runs a temporary function, or makes an object depend on one, as a column of a
+  temporary type or a default that calls a temporary function does. A `DROP` of
+  temporary and other tables drops the others everywhere; temporary objects of
+  other kinds, and worf itself, can only be dropped in a statement of their own.
+  Other nodes run concurrent statements, such as `CREATE INDEX CONCURRENTLY`, in
+  their apply transaction. The default is `off`.
+
+- `worf.subscription_schema_restore`
+  Marks the session that restores a subscription's structure, which DDL
+  replication, the global DDL lock and sequence range checks leave alone. worf
+  sets it on the connection to the subscriber's own node. Only a superuser, or
+  a role granted `SET` on it with
+  `GRANT SET ON PARAMETER worf.subscription_schema_restore`, can set it, so the
+  user in the subscriber node's connection string needs one or the other to
+  synchronize structure. The default is `off`.
 
 - `worf.include_ddl_repset`
   Adds the tables DDL creates to the `default` replication set, or to
@@ -780,21 +794,33 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   With `worf.enable_ddl_replication`, locks every node for DDL that can't
   apply in any order: changing a column's type, renaming a table, column or
   schema, moving a table to another schema, adding a constraint, a unique
-  index or a `NOT NULL` column without a default, dropping a table or a schema
-  with `CASCADE`, adding a domain constraint, renaming an enum value, or
-  changing a composite type. It covers a partitioned table's partitions and
-  every table with a column of a changed type. In a transaction block, any
-  DDL takes the lock for its tables, so later DDL there needn't wait. Before
-  the DDL runs, each node this node subscribes to that receives its DDL
-  through `ddl_sql` holds back writes to those tables it replicates, which
-  fail with SQLSTATE `55P03`, and DDL on them, until the DDL has applied
-  there. Every node applies the others' changes up to that point first. A
-  node keeps holding back across a restart, and lets go once the DDL applies
-  or the transaction that ran it aborts. Only the table's, schema's or type's
-  owner takes the lock. `CREATE UNIQUE INDEX CONCURRENTLY`, which commits
-  partway, can't take it. The user in each provider connection string needs
-  `EXECUTE` on `worf.fence_writes` and `worf.keep_fence`, which `PUBLIC`
-  doesn't have. The default is `on`.
+  index or a `NOT NULL` column without a default, adding a foreign key, which
+  locks the table it references too, attaching a partition, dropping a table
+  or a schema with `CASCADE`, adding a domain constraint, renaming an enum
+  value, or changing a composite type. It covers a partitioned table's
+  partitions, and every table with a column of a changed type, or of a
+  domain, array, range or composite type built on it. Detaching a partition
+  applies in any order. In a transaction block, any DDL that locks a table
+  against writes, such as `DROP INDEX` or `CREATE TRIGGER`, takes the lock for
+  it first, so later DDL there needn't wait. Before the DDL runs, each node
+  this node subscribes to that receives its DDL through `ddl_sql` holds back
+  writes to those tables it replicates, including writes through a
+  partitioned table, which fail with SQLSTATE `55P03`, and DDL on them, until
+  the DDL has applied there. Every node applies the others' changes up to
+  that point first. A node keeps holding back across a restart, and lets go
+  once the DDL applies, once it has applied past the transaction that ran it,
+  as when `worf.exception_behaviour` skips that transaction, or once it
+  learns that the transaction aborted. Only a user who may run the DDL takes
+  the lock: the owner of the table, schema or type, a user with the `TRIGGER`
+  privilege for `CREATE TRIGGER`, and for a `DROP`, the owner of the object's
+  schema too. `CREATE UNIQUE INDEX CONCURRENTLY` holds the lock across the
+  transactions it commits. A transaction holds each node back through one
+  connection, whatever the `idle_session_timeout` of its role. The user in
+  each provider connection string needs `USAGE` on schema `worf` and
+  `EXECUTE` on `worf.fence_writes`, `worf.unfence_writes` and
+  `worf.keep_fence`, which `PUBLIC` doesn't have. They let that user hold back
+  writes to any table on the node, across restarts, so grant them only to the
+  role other nodes connect as. The default is `on`.
 
 - `worf.sequence_range_check_interval`
   How often the range worker checks each managed sequence, switching it to
@@ -809,8 +835,8 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   default is `10s`.
 
 - `worf.ddl_lock_timeout`
-  How long DDL waits for the other nodes to hold back their writes and catch
-  up before it fails. The default is `1min`.
+  How long DDL waits in all for the other nodes to hold back their writes and
+  for this node to catch up with them before it fails. The default is `1min`.
 
 - `worf.max_fenced_tables`
   How many tables other nodes' DDL can hold back on this server at once.
@@ -952,34 +978,40 @@ A replicated `ALTER TABLE ... ADD COLUMN` with a volatile default, such as
 `now()` or `gen_random_uuid()`, fills existing rows with each node's own
 values.
 
-With `worf.global_ddl_lock`, a statement in the same transaction that writes
-rows another node is about to change, before DDL that takes the lock, can
-make the DDL wait until `worf.ddl_lock_timeout`. A node notices within about a
-minute that a node holding back its writes for DDL died before the DDL
-committed.
+With `worf.global_ddl_lock`, DDL that takes the lock fails at once with
+SQLSTATE `55P03` when an earlier statement in its transaction locked or wrote
+to rows that another node's changes, which this node applies first, need, as
+`LOCK TABLE`, `TRUNCATE` or an `UPDATE` of a row another node changed can. Run
+such DDL first in its transaction, or in a transaction of its own. A node
+notices within about a minute that a node holding back its writes for DDL died
+before the DDL committed.
 
-### No replication queue flush
+`worf.replicate_ddl_command` doesn't take the global DDL lock: the DDL it
+queues applies on each node wherever it falls among that node's own writes.
 
-There's no support for freezing transactions on the master and waiting until
-all pending queued xacts are replayed from slots. Support for making the
-upstream read-only for this will be added in a future release.
+DDL that uses the session's temporary objects, such as a temporary function
+in `ALTER TABLE ... USING`, or a temporary type as a column's type, runs on
+its node alone, without a notice.
+
+### Schema changes without the global DDL lock
+
+Without `worf.global_ddl_lock`, there's no support for freezing transactions
+on the provider and waiting until all pending queued transactions are replayed
+from slots.
 
 This means that care must be taken when applying table structure changes. If
 there are committed transactions that aren't yet replicated and the table
 structure of the provider and subscriber are changed at the same time in a way
-that makes the subscriber table incompatible with the queued transactions
+that makes the subscriber table incompatible with the queued transactions,
 replication will stop.
 
-Administrators should either ensure that writes to the master are stopped
+Administrators should either ensure that writes to the provider are stopped
 before making schema changes, or use the `worf.replicate_ddl_command`
 function to queue schema changes so they're replayed at a consistent point
-on the replica.
-
-Once multi-master replication support is added then using
-`worf.replicate_ddl_command` will not be enough, as the subscriber may be
-generating new xacts with the old structure after the schema change is
-committed on the publisher. Users will have to ensure writes are stopped on all
-nodes and all slots are caught up before making schema changes.
+on the subscriber. Where every node writes, that isn't enough, as another node
+may write with the old structure after the change committed: replicate DDL with
+`worf.enable_ddl_replication` and `worf.global_ddl_lock`, or stop writes on all
+nodes and let all slots catch up before making schema changes.
 
 ### FOREIGN KEYS
 

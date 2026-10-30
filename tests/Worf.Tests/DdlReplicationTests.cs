@@ -79,6 +79,30 @@ public sealed class DdlReplicationTests
         await WaitAsync(nodeA, token);
         Assert.AreEqual("", await nodeB.SafePsqlAsync(Database, "SELECT to_regclass('app.nopk')", token));
 
+        // A user who logs in and isn't a superuser creates and changes tables, which join and move between the sets on
+        // both nodes, but can't mark a session as restoring a subscription's structure.
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE ROLE developer LOGIN", token);
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database, "GRANT USAGE, CREATE ON SCHEMA app TO developer", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE TABLE app.owned (id integer PRIMARY KEY, v text);
+            INSERT INTO app.owned VALUES (1, 'one');
+            ALTER TABLE app.owned DROP CONSTRAINT owned_pkey;
+            """, token, "developer");
+        await WaitAsync(nodeA, token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            Assert.AreEqual("default_insert_only", await SetsAsync(node, "app.owned", token), $"{node.Name}: a table that lost its primary key");
+        }
+
+        Assert.AreEqual("1|one", await nodeB.SafePsqlAsync(Database, "SELECT * FROM app.owned", token));
+        PostgresException restoring = await Assert.ThrowsExactlyAsync<PostgresException>(
+            () => nodeA.SafePsqlAsync(Database, "SET worf.subscription_schema_restore = on", token, "developer"));
+        Assert.AreEqual("42501", restoring.SqlState);
+
         // worf's own tables stay out of replication sets and the queue, even created from functions, and each node
         // drops worf itself.
         _ = await nodeA.SafePsqlAsync(Database, """
@@ -148,14 +172,59 @@ public sealed class DdlReplicationTests
             ALTER TABLE pk DROP CONSTRAINT pk_pkey;
             ALTER TABLE parted ADD PRIMARY KEY (id);
             ALTER TABLE ul SET UNLOGGED;
+            CREATE FUNCTION pg_temp.tmp_conv(integer) RETURNS bigint LANGUAGE sql AS 'SELECT $1::bigint';
+            COMMENT ON FUNCTION pg_temp.tmp_conv(integer) IS 'scratch';
+            ALTER FUNCTION pg_temp.tmp_conv(integer) STABLE;
+            GRANT EXECUTE ON FUNCTION pg_temp.tmp_conv(integer) TO PUBLIC;
+            CREATE TYPE pg_temp.tmp_type AS (a integer);
+            COMMENT ON TYPE pg_temp.tmp_type IS 'scratch';
+            CREATE TABLE conv (id integer PRIMARY KEY, v integer);
+            ALTER TABLE conv ALTER COLUMN v TYPE bigint USING pg_temp.tmp_conv(v);
+            ALTER TABLE conv ADD COLUMN w bigint DEFAULT pg_temp.tmp_conv(1);
+            ALTER TABLE conv ADD COLUMN x pg_temp.tmp_type;
+            DROP TYPE pg_temp.tmp_type CASCADE;
+            DROP FUNCTION pg_temp.tmp_conv(integer) CASCADE;
+            """, token);
+        PostgresException together = await Assert.ThrowsExactlyAsync<PostgresException>(() => nodeA.SafePsqlAsync(Database, """
+            CREATE FUNCTION pg_temp.tmp_f() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+            CREATE FUNCTION kept_f() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+            DROP FUNCTION pg_temp.tmp_f(), kept_f();
+            """, token));
+        Assert.AreEqual("55000", together.SqlState);
+
+        // Statements about roles, databases, and PostgreSQL's own publications and subscriptions stay on their node.
+        _ = await nodeA.SafePsqlAsync(Database, "CREATE DATABASE other STRATEGY FILE_COPY", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE ROLE r1;
+            ALTER ROLE r1 RENAME TO r2;
+            COMMENT ON ROLE r2 IS 'here';
+            ALTER DATABASE other RENAME TO other2;
+            ALTER DATABASE other2 OWNER TO r2;
+            COMMENT ON DATABASE other2 IS 'here';
+            GRANT CONNECT ON DATABASE other2 TO r2;
+            CREATE PUBLICATION pub;
+            ALTER PUBLICATION pub RENAME TO pub2;
+            ALTER PUBLICATION pub2 OWNER TO r2;
+            COMMENT ON PUBLICATION pub2 IS 'here';
+            CREATE SUBSCRIPTION sub CONNECTION 'host=127.0.0.1 dbname=nowhere' PUBLICATION pub2 WITH (connect = false);
+            ALTER SUBSCRIPTION sub RENAME TO sub2;
+            COMMENT ON SUBSCRIPTION sub2 IS 'here';
+            ALTER SUBSCRIPTION sub2 SET (slot_name = NONE);
+            DROP SUBSCRIPTION sub2;
+            DROP PUBLICATION pub2;
             """, token);
         await WaitAsync(nodeA, token);
 
-        Assert.AreEqual("1|0|0", await nodeA.SafePsqlAsync(Database, """
+        Assert.AreEqual("1|0|0|0", await nodeA.SafePsqlAsync(Database, """
             SELECT (SELECT count(*) FROM worf.queue WHERE message->>'command' LIKE 'CREATE TABLE s %'),
                 (SELECT count(*) FROM worf.queue WHERE message::text LIKE '%tmp%' OR message::text LIKE '%EXECUTE p%'),
-                (SELECT count(*) FROM worf.replication_set_table WHERE set_reloid IN ('from_temp'::regclass, 'like_temp'::regclass, 'from_prepared'::regclass))
-            """, token), "DDL from a function queued once, and nothing that used the session's objects");
+                (SELECT count(*) FROM worf.replication_set_table WHERE set_reloid IN ('from_temp'::regclass, 'like_temp'::regclass, 'from_prepared'::regclass)),
+                (SELECT count(*) FROM worf.queue WHERE message->>'command' ~ '(ROLE|DATABASE|PUBLICATION|SUBSCRIPTION)')
+            """, token), "DDL from a function queued once, and nothing that used the session's objects or was the cluster's");
+        Assert.AreEqual("integer|", await nodeB.SafePsqlAsync(Database, """
+            SELECT format_type(atttypid, atttypmod), (SELECT attname FROM pg_attribute WHERE attrelid = 'conv'::regclass AND attname = 'w')
+            FROM pg_attribute WHERE attrelid = 'conv'::regclass AND attname = 'v'
+            """, token), "what used temporary functions and types stayed on node_a");
         Assert.AreEqual("s||||'2026-02-01'::date", await nodeB.SafePsqlAsync(Database, """
             SELECT to_regclass('s')::text, to_regclass('orders')::text, to_regclass('from_temp')::text, to_regclass('from_prepared')::text,
                 pg_get_expr(adbin, adrelid)

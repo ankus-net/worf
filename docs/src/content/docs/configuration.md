@@ -84,12 +84,25 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   `standard_conforming_strings`, `default_tablespace`,
   `default_table_access_method` and `default_toast_compression`. Statements
   about databases, tablespaces, roles, server settings and PostgreSQL's own
-  publications and subscriptions stay on their node, as do statements that use
-  the session's temporary objects or prepared statements, and what they create.
-  A `DROP` of temporary and other objects drops the others everywhere. worf
-  itself can only be dropped in a statement of its own. Other nodes run
-  concurrent statements, such as `CREATE INDEX CONCURRENTLY`, in their apply
-  transaction. The default is `off`.
+  publications and subscriptions stay on their node, including renaming them,
+  changing their owners, commenting on them and granting on them, as do
+  statements that use the session's temporary objects or prepared statements,
+  and what they create. A statement uses a temporary object when it names one,
+  runs a temporary function, or makes an object depend on one, as a column of a
+  temporary type or a default that calls a temporary function does. A `DROP` of
+  temporary and other tables drops the others everywhere; temporary objects of
+  other kinds, and worf itself, can only be dropped in a statement of their own.
+  Other nodes run concurrent statements, such as `CREATE INDEX CONCURRENTLY`, in
+  their apply transaction. The default is `off`.
+
+- `worf.subscription_schema_restore`
+  Marks the session that restores a subscription's structure, which DDL
+  replication, the global DDL lock and sequence range checks leave alone. worf
+  sets it on the connection to the subscriber's own node. Only a superuser, or
+  a role granted `SET` on it with
+  `GRANT SET ON PARAMETER worf.subscription_schema_restore`, can set it, so the
+  user in the subscriber node's connection string needs one or the other to
+  synchronize structure. The default is `off`.
 
 - `worf.include_ddl_repset`
   Adds the tables DDL creates to the `default` replication set, or to
@@ -106,21 +119,33 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   With `worf.enable_ddl_replication`, locks every node for DDL that can't
   apply in any order: changing a column's type, renaming a table, column or
   schema, moving a table to another schema, adding a constraint, a unique
-  index or a `NOT NULL` column without a default, dropping a table or a schema
-  with `CASCADE`, adding a domain constraint, renaming an enum value, or
-  changing a composite type. It covers a partitioned table's partitions and
-  every table with a column of a changed type. In a transaction block, any
-  DDL takes the lock for its tables, so later DDL there needn't wait. Before
-  the DDL runs, each node this node subscribes to that receives its DDL
-  through `ddl_sql` holds back writes to those tables it replicates, which
-  fail with SQLSTATE `55P03`, and DDL on them, until the DDL has applied
-  there. Every node applies the others' changes up to that point first. A
-  node keeps holding back across a restart, and lets go once the DDL applies
-  or the transaction that ran it aborts. Only the table's, schema's or type's
-  owner takes the lock. `CREATE UNIQUE INDEX CONCURRENTLY`, which commits
-  partway, can't take it. The user in each provider connection string needs
-  `EXECUTE` on `worf.fence_writes` and `worf.keep_fence`, which `PUBLIC`
-  doesn't have. The default is `on`.
+  index or a `NOT NULL` column without a default, adding a foreign key, which
+  locks the table it references too, attaching a partition, dropping a table
+  or a schema with `CASCADE`, adding a domain constraint, renaming an enum
+  value, or changing a composite type. It covers a partitioned table's
+  partitions, and every table with a column of a changed type, or of a
+  domain, array, range or composite type built on it. Detaching a partition
+  applies in any order. In a transaction block, any DDL that locks a table
+  against writes, such as `DROP INDEX` or `CREATE TRIGGER`, takes the lock for
+  it first, so later DDL there needn't wait. Before the DDL runs, each node
+  this node subscribes to that receives its DDL through `ddl_sql` holds back
+  writes to those tables it replicates, including writes through a
+  partitioned table, which fail with SQLSTATE `55P03`, and DDL on them, until
+  the DDL has applied there. Every node applies the others' changes up to
+  that point first. A node keeps holding back across a restart, and lets go
+  once the DDL applies, once it has applied past the transaction that ran it,
+  as when `worf.exception_behaviour` skips that transaction, or once it
+  learns that the transaction aborted. Only a user who may run the DDL takes
+  the lock: the owner of the table, schema or type, a user with the `TRIGGER`
+  privilege for `CREATE TRIGGER`, and for a `DROP`, the owner of the object's
+  schema too. `CREATE UNIQUE INDEX CONCURRENTLY` holds the lock across the
+  transactions it commits. A transaction holds each node back through one
+  connection, whatever the `idle_session_timeout` of its role. The user in
+  each provider connection string needs `USAGE` on schema `worf` and
+  `EXECUTE` on `worf.fence_writes`, `worf.unfence_writes` and
+  `worf.keep_fence`, which `PUBLIC` doesn't have. They let that user hold back
+  writes to any table on the node, across restarts, so grant them only to the
+  role other nodes connect as. The default is `on`.
 
 - `worf.sequence_range_check_interval`
   How often the range worker checks each managed sequence, switching it to
@@ -135,8 +160,8 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   default is `10s`.
 
 - `worf.ddl_lock_timeout`
-  How long DDL waits for the other nodes to hold back their writes and catch
-  up before it fails. The default is `1min`.
+  How long DDL waits in all for the other nodes to hold back their writes and
+  for this node to catch up with them before it fails. The default is `1min`.
 
 - `worf.max_fenced_tables`
   How many tables other nodes' DDL can hold back on this server at once.
