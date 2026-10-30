@@ -357,6 +357,15 @@ internal static partial class ReplicationSet
             SpiParameter.Create(repset.Id), SpiParameter.Create(repset.ReplicateInsert),
             SpiParameter.Create(repset.ReplicateUpdate), SpiParameter.Create(repset.ReplicateDelete),
             SpiParameter.Create(repset.ReplicateTruncate));
+
+        // Output plugins keep each table's sets until its relcache entry is invalidated. Invalidating every table in
+        // the set makes decoding take up the new actions exactly where this transaction commits, rather than whenever
+        // something else happens to invalidate the table.
+        foreach (SpiRow table in Worf.SelectCatalog("SELECT set_reloid::oid FROM worf.replication_set_table WHERE set_id = $1",
+            SpiParameter.Create(repset.Id)))
+        {
+            InvalidateRelcache(table.Get<uint>(0));
+        }
     }
 
     /// <summary>
