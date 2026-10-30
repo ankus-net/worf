@@ -805,6 +805,9 @@ public sealed class SequenceRangeTests
             }
         }
 
+        // node_b writes a few megabytes first, so that its calls show a WAL position the restored copy, which writes as it
+        // starts, stays below.
+        _ = await nodeB.SafePsqlAsync(Database, "CREATE TABLE written AS SELECT g, repeat('x', 100) AS v FROM generate_series(1, 20000) g", token);
         await InsertAsync(nodeB, 150, token);
         string granted = await nodeA.SafePsqlAsync(Database, "SELECT max(hi) FROM worf.sequence_range_grant WHERE grantee_name = 'node_b'", token);
         await RestoreDataAsync(nodeB, copyB, token);
