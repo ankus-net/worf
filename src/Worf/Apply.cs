@@ -642,7 +642,7 @@ internal static unsafe partial class Apply
         if (now - s_replicatedCheckedAt >= 10_000_000)
         {
             s_replicatedCheckedAt = now;
-            s_replicated = PgBackgroundWorker.RunTransaction(static () => Spi.ExecuteScalar<bool>("""
+            s_replicated = PgBackgroundWorker.RunTransaction(static () => Worf.ReadScalar<bool>("""
                 SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_replication_slots
                     WHERE plugin = 'worf' AND database = pg_catalog.current_database())
                 """));
