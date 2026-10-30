@@ -24,11 +24,13 @@ SELECT pg_sleep(0.1);
 SELECT subscription_name, status, provider_node, replication_sets, forward_origins FROM worf.show_subscription_status();
 
 \c :provider_dsn
--- Wait for the walsender to connect as the interface's user, which the subscriber's status doesn't say.
+-- Wait for the slot to be held by a walsender connected as the interface's user, which the subscriber's status
+-- doesn't say, and which a walsender that hasn't started replicating doesn't hold yet.
 DO $$
 BEGIN
     FOR i IN 1..300 LOOP
-        IF EXISTS (SELECT 1 FROM pg_stat_replication WHERE application_name = 'test_subscription' AND usename = 'super2') THEN
+        IF EXISTS (SELECT 1 FROM pg_replication_slots s JOIN pg_stat_replication r ON r.pid = s.active_pid
+                   WHERE r.application_name = 'test_subscription' AND r.usename = 'super2') THEN
             EXIT;
         END IF;
         PERFORM pg_sleep(0.1);
@@ -54,11 +56,13 @@ SELECT pg_sleep(0.1);
 SELECT subscription_name, status, provider_node, replication_sets, forward_origins FROM worf.show_subscription_status();
 
 \c :provider_dsn
--- Wait for the walsender to connect as the interface's user, which the subscriber's status doesn't say.
+-- Wait for the slot to be held by a walsender connected as the interface's user, which the subscriber's status
+-- doesn't say, and which a walsender that hasn't started replicating doesn't hold yet.
 DO $$
 BEGIN
     FOR i IN 1..300 LOOP
-        IF EXISTS (SELECT 1 FROM pg_stat_replication WHERE application_name = 'test_subscription' AND usename = 'super') THEN
+        IF EXISTS (SELECT 1 FROM pg_replication_slots s JOIN pg_stat_replication r ON r.pid = s.active_pid
+                   WHERE r.application_name = 'test_subscription' AND r.usename = 'super') THEN
             EXIT;
         END IF;
         PERFORM pg_sleep(0.1);
