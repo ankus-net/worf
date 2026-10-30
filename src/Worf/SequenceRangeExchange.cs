@@ -629,13 +629,13 @@ internal static class SequenceRangeExchange
                 // The reports the neighbor relays, each as of when its node made it, once taken in.
                 if (entry.TryGetProperty("reports", out JsonElement reports))
                 {
-                    foreach (JsonElement report in reports.EnumerateArray())
+                    uint localId = node.Node.Id;
+                    foreach ((uint reported, long at) in reports.EnumerateArray()
+                        .Select(report => (Node: report.GetProperty("node_id").GetUInt32(), At: ReportedAt(report)))
+                        .Where(report => report.At is not null && report.Node != localId && report.Node != senderId)
+                        .Select(report => (report.Node, report.At!.Value)))
                     {
-                        if (ReportedAt(report) is long at && report.GetProperty("node_id").GetUInt32() is uint reported && reported != node.Node.Id &&
-                            reported != senderId)
-                        {
-                            SequenceRangeHeard.Record(reported, false, Math.Min(at, Worker.GetCurrentTimestamp()));
-                        }
+                        SequenceRangeHeard.Record(reported, false, Math.Min(at, Worker.GetCurrentTimestamp()));
                     }
                 }
             }
