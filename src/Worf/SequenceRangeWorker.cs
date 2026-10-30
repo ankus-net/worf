@@ -83,8 +83,8 @@ internal static class SequenceRangeWorker
             }
 
             // The exchange worker runs while the database manages sequences. A database that manages nothing yet runs it
-            // once, to hear of the sequences its providers manage, and this worker waits for it.
-            bool exchanging = managed is (_, List<uint> current) && SequenceRangeExchangeWorker.Watch(current.Count > 0);
+            // once, to hear of the sequences its providers manage, and this worker watches it until it is done.
+            bool exchanging = managed is not null && SequenceRangeExchangeWorker.Watch();
             if (managed is null || (!exchanging && PgBackgroundWorker.RunTransaction(Sequences).Count == 0))
             {
                 if (managedAny)

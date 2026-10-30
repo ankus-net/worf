@@ -5,18 +5,12 @@ namespace Worf;
 /// <summary>
 /// The worker that makes a database's exchanges with its neighbors, apart from its range worker, so that a neighbor that
 /// never answers holds up none of the range worker's switches and Snowflake clock reservations. libpq keeps no time
-/// limit of its own on a connection a backend waits for, so the range worker starts this worker and cancels any call of
-/// it that outlasts <c>worf.sequence_range_timeout</c>. In a database that manages no sequence, it exchanges once, to
-/// ask the providers whether they manage any, and exits.
+/// limit of its own on a connection a backend waits for, so the range worker cancels any call of it that outlasts
+/// <c>worf.sequence_range_timeout</c>. The manager starts both. In a database that manages no sequence, it exchanges
+/// once, to ask the providers whether they manage any, and exits.
 /// </summary>
 internal static class SequenceRangeExchangeWorker
 {
-    // How long the range worker waits before it starts an exchange worker again that exited with an error.
-    private const long RestartDelay = 5_000_000;
-
-    // When this range worker last started an exchange worker, or zero before it has.
-    private static long s_startedAt;
-
     /// <summary>
     /// Runs the exchange worker.
     /// </summary>
@@ -55,13 +49,11 @@ internal static class SequenceRangeExchangeWorker
     }
 
     /// <summary>
-    /// Keeps the database's exchange worker running, from its range worker, and cancels a call of the exchange worker
-    /// that has run out of time.
+    /// Watches the database's exchange worker, from its range worker, and cancels a call of it that has run out of time.
+    /// The manager starts both.
     /// </summary>
-    /// <param name="managed">Whether the database manages sequences, which keeps the exchange worker running. Otherwise
-    /// it is started once.</param>
-    /// <returns>Whether the exchange worker runs, or is to be started again.</returns>
-    internal static bool Watch(bool managed)
+    /// <returns>Whether the exchange worker runs.</returns>
+    internal static bool Watch()
     {
         uint dboid = Worker.MyWorker.Dboid;
         long now = Worker.GetCurrentTimestamp();
@@ -97,27 +89,7 @@ internal static class SequenceRangeExchangeWorker
             _ = PgBackgroundWorker.RunTransaction(() => Worf.ReadScalar<bool>("SELECT pg_catalog.pg_cancel_backend($1)", SpiParameter.Create(overdue)));
         }
 
-        if (running)
-        {
-            return true;
-        }
-
-        if (s_startedAt != 0 && (!managed || now - s_startedAt < RestartDelay))
-        {
-            return managed;
-        }
-
-        s_startedAt = now;
-        try
-        {
-            _ = Worker.WorkerRegister(new WorfWorker { WorkerType = WorfWorkerType.Exchange, Dboid = dboid });
-        }
-        catch (PgException error)
-        {
-            PgLog.Warning($"could not start the sequence range exchange worker: {error.Message}");
-        }
-
-        return true;
+        return running;
     }
 
     /// <summary>

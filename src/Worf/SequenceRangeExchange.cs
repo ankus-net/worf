@@ -370,21 +370,7 @@ internal static class SequenceRangeExchange
         string reply = SequenceRangeExchangeWorker.Bounded(() => conn.Query("SELECT worf.sequence_range_exchange(" + Spi.QuoteLiteral(message) + ")", 1))[0][0] ?? "{}";
         AcknowledgeRefusals(refusals);
         using JsonDocument document = JsonDocument.Parse(reply);
-        (bool granted, bool received) = Process(node, document.RootElement, sub.Origin.Id, sub.Origin.Name, false);
-
-        // An exchange that changed nothing writes nothing, not even when it happened.
-        uint xid;
-        unsafe
-        {
-            xid = NativeMethods.GetTopTransactionIdIfAny();
-        }
-
-        if (xid != 0)
-        {
-            _ = Spi.Execute("UPDATE worf.sequence_range SET exchanged_at = now()");
-        }
-
-        return (granted, received);
+        return Process(node, document.RootElement, sub.Origin.Id, sub.Origin.Name, false);
     }
 
     /// <summary>
@@ -1073,6 +1059,13 @@ internal static class SequenceRangeExchange
         if (isOwner)
         {
             SequenceRanges.ActivateWhenReported(seqoid, node);
+        }
+
+        // An answer that changed nothing is noted in shared memory alone, and one that did here, under the range row's lock,
+        // which this transaction takes for each sequence in turn, in the order every exchange takes them.
+        if (!call)
+        {
+            _ = Spi.Execute("UPDATE worf.sequence_range SET exchanged_at = now() WHERE seqoid = $1", seq);
         }
 
         return (granted, received, learned);

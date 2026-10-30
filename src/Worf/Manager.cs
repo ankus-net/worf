@@ -129,35 +129,22 @@ internal static class Manager
     }
 
     /// <summary>
-    /// Starts the database's sequence range worker when it has managed sequences and the worker isn't running, or once
-    /// a crashed one's restart delay has passed. Until it manages one, a database with subscriptions runs the worker once
-    /// an exchange interval, or at once when a backend learned of a sequence, to ask the providers of the sequences they
-    /// manage. The worker connects to them, so a provider that can't be reached holds up only the worker.
+    /// Starts the database's sequence range worker and its exchange worker when it has managed sequences and they aren't
+    /// running, or once a crashed one's restart delay has passed. Until it manages one, a database with subscriptions runs
+    /// them once an exchange interval, or at once when a backend learned of a sequence, to ask the providers of the
+    /// sequences they manage. The exchange worker connects to them, so a provider that can't be reached holds up neither
+    /// the manager nor the range worker, which cancels a call that takes too long.
     /// </summary>
     /// <returns>Whether nothing is left to retry.</returns>
     private static bool ManageRangeWorker()
     {
         uint dboid = Worker.MyWorker.Dboid;
-        long crashedAt = -1;
-        using (PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share())
-        {
-            for (int i = 0; i < guard.Length && crashedAt < 0; i++)
-            {
-                if (guard[i].WorkerType == WorfWorkerType.Range && guard[i].Dboid == dboid)
-                {
-                    crashedAt = guard[i].CrashedAt;
-                }
-            }
-        }
-
-        if (crashedAt == 0)
+        long now = Worker.GetCurrentTimestamp();
+        (bool rangeRunning, bool rangeCrashed) = RangeWorkerState(WorfWorkerType.Range, dboid, now);
+        (bool exchangeRunning, bool exchangeCrashed) = RangeWorkerState(WorfWorkerType.Exchange, dboid, now);
+        if (rangeRunning && exchangeRunning)
         {
             return true;
-        }
-
-        if (crashedAt > 0 && crashedAt + (MinSleep * 1000) > Worker.GetCurrentTimestamp())
-        {
-            return false;
         }
 
         (bool managed, bool linked) = PgBackgroundWorker.RunTransaction(static () =>
@@ -172,7 +159,6 @@ internal static class Manager
                 WorfNode.GetNodeSubscriptions(node.Node.Id, false).Exists(sub => sub.Enabled));
         });
 
-        long now = Worker.GetCurrentTimestamp();
         long requested = SequenceRanges.ExchangeRequested.Value;
         if (!managed && !linked)
         {
@@ -181,24 +167,59 @@ internal static class Manager
             return true;
         }
 
+        bool started = true;
         if (managed || now >= s_discoveryAt || requested != s_discoveryRequested)
         {
             s_discoveryRequested = requested;
             s_discoveryAt = now + (SequenceRanges.ExchangeInterval * 1000L);
 
-            // With every worker slot taken, the range worker waits for the next look rather than stop the manager.
-            try
+            // The exchange worker starts first, so that the range worker finds it to watch.
+            started = StartRangeWorker(WorfWorkerType.Exchange, dboid, exchangeRunning || exchangeCrashed) &&
+                StartRangeWorker(WorfWorkerType.Range, dboid, rangeRunning || rangeCrashed);
+        }
+
+        return started && !rangeCrashed && !exchangeCrashed;
+    }
+
+    /// <summary>
+    /// Finds whether one of a database's range workers runs, or crashed too lately to start again.
+    /// </summary>
+    private static (bool Running, bool Crashed) RangeWorkerState(WorfWorkerType type, uint dboid, long now)
+    {
+        using PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share();
+        for (int i = 0; i < guard.Length; i++)
+        {
+            if (guard[i].WorkerType == type && guard[i].Dboid == dboid)
             {
-                _ = Worker.WorkerRegister(new WorfWorker { WorkerType = WorfWorkerType.Range, Dboid = dboid });
-            }
-            catch (PgException error)
-            {
-                PgLog.Warning($"could not start the sequence range worker: {error.Message}");
-                return false;
+                return (guard[i].CrashedAt == 0, guard[i].CrashedAt > 0 && guard[i].CrashedAt + (MinSleep * 1000) > now);
             }
         }
 
-        return true;
+        return (false, false);
+    }
+
+    /// <summary>
+    /// Starts one of a database's range workers. With every worker slot taken, it waits for the next look rather than
+    /// stop the manager.
+    /// </summary>
+    /// <returns>Whether it started, or wasn't to start.</returns>
+    private static bool StartRangeWorker(WorfWorkerType type, uint dboid, bool skip)
+    {
+        if (skip)
+        {
+            return true;
+        }
+
+        try
+        {
+            _ = Worker.WorkerRegister(new WorfWorker { WorkerType = type, Dboid = dboid });
+            return true;
+        }
+        catch (PgException error)
+        {
+            PgLog.Warning($"could not start the sequence {Worker.WorkerTypeName(type)} worker: {error.Message}");
+            return false;
+        }
     }
 
     /// <summary>

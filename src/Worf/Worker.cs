@@ -707,9 +707,9 @@ internal static class Worker
             supervisor = ctx.Supervisor;
         }
 
-        // Likewise wake the manager when an apply, sync or range worker exits: a subscription change that stops a worker
-        // wakes the manager when it commits, and the manager can look before the worker has gone.
-        if (type is WorfWorkerType.Apply or WorfWorkerType.Sync or WorfWorkerType.Range)
+        // Likewise wake the manager when an apply, sync, range or exchange worker exits: a subscription change that stops a
+        // worker wakes the manager when it commits, and the manager can look before the worker has gone.
+        if (type is WorfWorkerType.Apply or WorfWorkerType.Sync or WorfWorkerType.Range or WorfWorkerType.Exchange)
         {
             int managerSlot = guard.Read((in _, workers) => ManagerFind(workers, dboid));
             if (managerSlot >= 0)

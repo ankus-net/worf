@@ -584,8 +584,10 @@ internal static unsafe partial class SequenceRanges
 
         SequenceInfo info = GetInfo(seqoid);
         bool snowflake = seqoid == SnowflakeIds.NodeSequence();
-        (Guid Id, long Lo, long Hi)? active = NodeBlock(seqoid, epoch, "active");
-        (Guid Id, long Lo, long Hi, bool Reserved)? next = NextBlock(seqoid, epoch);
+        (Guid Id, long Lo, long Hi)? active = snowflake ? SnowflakeNumber(seqoid, "active") : NodeBlock(seqoid, epoch, "active");
+        (Guid Id, long Lo, long Hi, bool Reserved)? next = snowflake
+            ? SnowflakeNumber(seqoid, "next") is (Guid Id, long Lo, long Hi) number ? (number.Id, number.Lo, number.Hi, false) : null
+            : NextBlock(seqoid, epoch);
         bool changed = false;
 
         // A Snowflake node number goes when another node holds it too, or once the owner of the numbers hasn't been heard
@@ -675,7 +677,8 @@ internal static unsafe partial class SequenceRanges
         // The owner grants its own next block from the root, and its neighbors exchange at once to hear of the new
         // watermark. Another node requests one from its parent, committed before the exchange sends it. A Snowflake node
         // number is never used up, so a node that has one needs no next.
-        if (next is null && !(snowflake && active is not null) && state != "disabled" && NextBlock(seqoid, epoch) is null)
+        if (next is null && !(snowflake && active is not null) && state != "disabled" &&
+            (snowflake ? SnowflakeNumber(seqoid, "next") : NodeBlock(seqoid, epoch, "next")) is null)
         {
             if (owner == node.Node.Id)
             {
@@ -810,6 +813,21 @@ internal static unsafe partial class SequenceRanges
             LIMIT 1
             """, seq, SpiParameter.Create(node.Node.Id), reuse, SpiParameter.Create(number));
         return other is null ? null : $"node {other} reports holding it too";
+    }
+
+    /// <summary>
+    /// Finds this node's Snowflake node number, or the one it is to switch to, from whichever epoch granted it: a number
+    /// stays this node's alone across epochs, since each new root starts above every number held, so a node that has one
+    /// asks for no other.
+    /// </summary>
+    private static (Guid Id, long Lo, long Hi)? SnowflakeNumber(uint seqoid, string state)
+    {
+        SpiResult result = Worf.SelectCatalog("""
+            SELECT block_id, lo, hi FROM worf.sequence_range_block
+            WHERE seqoid = $1 AND kind = 'n' AND state = $2
+            ORDER BY received_at LIMIT 1
+            """, SpiParameter.Create(seqoid), SpiParameter.Create(state));
+        return result.Count == 0 ? null : (result[0].Get<Guid>(0), result[0].Get<long>(1), result[0].Get<long>(2));
     }
 
     /// <summary>
