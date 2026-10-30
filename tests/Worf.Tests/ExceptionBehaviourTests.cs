@@ -235,7 +235,9 @@ public sealed class ExceptionBehaviourTests
         CancellationToken token = TestContext.CancellationToken;
 
         await using TestNode provider = await StartNodeAsync("provider", token);
-        await using TestNode subscriber = await StartNodeAsync("subscriber", token, "worf.exception_behaviour = discard");
+        // PostgreSQL looks for a deadlock once, when a wait has lasted deadlock_timeout, so the replay's lasts long
+        // enough for the local transaction below to have queued behind it by then.
+        await using TestNode subscriber = await StartNodeAsync("subscriber", token, "worf.exception_behaviour = discard", "deadlock_timeout = 5s");
         _ = await provider.SafePsqlAsync(Database, """
             CREATE TABLE t (id integer PRIMARY KEY, v text);
             CREATE TABLE a (id integer PRIMARY KEY, v text);
