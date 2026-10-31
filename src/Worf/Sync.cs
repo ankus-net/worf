@@ -877,6 +877,38 @@ internal static class Sync
     }
 
     /// <summary>
+    /// Waits while a table's sync worker catches up, which it does up to the position an apply worker gave it.
+    /// </summary>
+    /// <param name="subid">The subscription.</param>
+    /// <param name="nspname">The table's schema.</param>
+    /// <param name="relname">The table's name.</param>
+    internal static void WaitForCatchup(uint subid, string nspname, string relname)
+    {
+        uint myDatabaseId;
+        unsafe
+        {
+            myDatabaseId = NativeGlobals.MyDatabaseId;
+        }
+
+        byte[] serverNspname = Worf.ToServer(nspname);
+        byte[] serverRelname = Worf.ToServer(relname);
+        while (!Worker.GotSigterm &&
+            PgBackgroundWorker.RunTransaction(() => GetTableSyncStatus(subid, nspname, relname, true)?.Status == SyncStatusCatchup))
+        {
+            using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
+            {
+                if (guard.Read((in _, workers) => Worker.SyncFind(workers, myDatabaseId, subid, serverNspname, serverRelname)) < 0)
+                {
+                    return;
+                }
+            }
+
+            _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(1000));
+            PgInterrupts.Check();
+        }
+    }
+
+    /// <summary>
     /// Truncates table if it exists.
     /// </summary>
     /// <param name="nspname">The table's schema.</param>

@@ -227,6 +227,17 @@ internal static unsafe partial class Apply
             return startpos;
         });
 
+        // An apply worker that let a table's sync worker catch up waits for it before going past the position it gave
+        // it. This one starts from no further, so it waits for a catch-up that's still running too, or it would pass
+        // over the table's changes after that position, which the catch-up doesn't apply.
+        foreach (WorfSyncStatus sync in PgBackgroundWorker.RunTransaction(() => Sync.GetUnsyncedTables(sub.Id)))
+        {
+            if (sync.Status == Sync.SyncStatusCatchup)
+            {
+                Sync.WaitForCatchup(sub.Id, sync.Nspname, sync.Relname);
+            }
+        }
+
         // Start the replication.
         using PgReplicationConnection streamConn = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, null);
         string repsets = ReplicationSet.StringlistToIdentifierstr(sub.ReplicationSets);

@@ -344,6 +344,61 @@ public sealed class ExceptionBehaviourTests
         Assert.AreEqual("1\n3", await subscriber.SafePsqlAsync(Database, "SELECT id FROM synced ORDER BY id", token));
         Assert.AreEqual("discard|INSERT|public|synced|2|bad|23514", await LastLogAsync(subscriber, token));
         Assert.AreEqual(1, subscriber.ReadLog().Split("starting sync of table public.synced").Length - 1, "copies of the table");
+
+        // Apply that restarts while the table's sync worker catches up waits for the catch-up, which goes as far as the
+        // worker before it had got, before it applies the table's changes after that. The provider holds the sync
+        // worker back until this transaction holds the copy back, and a slow trigger holds the catch-up. The copy
+        // leaves out the bad row the subscriber's check rejects.
+        _ = await provider.SafePsqlAsync(Database, "DELETE FROM synced WHERE id = 2", token);
+        _ = await subscriber.SafePsqlAsync(Database, """
+            CREATE FUNCTION slow() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                IF NEW.v = 'slow' THEN
+                    PERFORM pg_sleep(3);
+                END IF;
+                RETURN NEW;
+            END $$;
+            CREATE TRIGGER slow BEFORE UPDATE ON synced FOR EACH ROW EXECUTE FUNCTION slow();
+            ALTER TABLE synced ENABLE ALWAYS TRIGGER slow;
+            """, token);
+        await using (NpgsqlConnection held = await provider.OpenAsync(Database, token))
+        await using (NpgsqlConnection local = await subscriber.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction heldTransaction = await held.BeginTransactionAsync(token);
+            await using (NpgsqlCommand command = new("LOCK TABLE worf.sequence_range", held, heldTransaction))
+            {
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+
+            _ = await subscriber.SafePsqlAsync(Database, "SELECT worf.alter_subscription_resynchronize_table('sub', 'synced')", token);
+            Assert.IsTrue(await provider.PollQueryUntilAsync(Database,
+                SyncWorkerHeldSql, token),
+                "the sync worker reading the provider's managed sequences");
+            await using NpgsqlTransaction transaction = await local.BeginTransactionAsync(token);
+            await using (NpgsqlCommand command = new("LOCK TABLE synced IN SHARE MODE", local, transaction))
+            {
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+
+            await heldTransaction.RollbackAsync(token);
+            Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE NOT granted AND relation = 'synced'::regclass)", token), "the copy");
+            _ = await provider.SafePsqlAsync(Database, "UPDATE synced SET v = 'slow' WHERE id = 1", token);
+            await transaction.RollbackAsync(token);
+        }
+
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event = 'PgSleep' AND application_name LIKE '%sync%')", token),
+            "the catch-up in the trigger");
+        _ = await subscriber.SafePsqlAsync(Database,
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name LIKE '%apply%'", token);
+        _ = await provider.SafePsqlAsync(Database, "UPDATE synced SET v = 'after' WHERE id = 3", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+            "SELECT sync_status = 'r' FROM worf.local_sync_status WHERE sync_relname = 'synced'", token), "the table synchronized again");
+        _ = await provider.SafePsqlAsync(Database, "INSERT INTO t VALUES (3, 'last')", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM t WHERE id = 3)", token),
+            "the transaction after the update");
+        Assert.AreEqual("1|slow\n3|after", await subscriber.SafePsqlAsync(Database, "SELECT * FROM synced ORDER BY id", token));
     }
 
     private static async Task<TestNode> StartNodeAsync(string name, CancellationToken token, params string[] settings)
