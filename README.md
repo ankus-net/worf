@@ -636,12 +636,16 @@ rejects values written by hand outside this node's blocks with SQLSTATE
   Stops granting. Each node keeps using its blocks. Enabling it on another
   node then moves the owner.
 - `worf.reset_sequence_range(sequence regclass)`
-  Abandons this node's blocks and requests new ones, as after a restore.
+  Abandons this node's blocks and requests new ones, as after a restore. An
+  owner or pool holder grants nothing until the nodes it granted to report
+  what they hold.
 - `worf.reserve_sequence_range(sequence regclass, count bigint, timeout interval)`
   Returns once the active block has at least `count` values left, before a
-  load that numbers its rows with the sequence.
+  load that numbers its rows with the sequence. Run it before the load's
+  transaction calls `nextval`. It needs the privileges of the sequence's owner.
 - `worf.reserve_sequence_values(sequence regclass, lo bigint, hi bigint, timeout interval)`
   Gives this node exactly `[lo, hi]`, for rows that already carry those keys.
+  It needs the privileges of the sequence's owner.
 
 Where the schema can change, Snowflake IDs need no blocks. Run
 `worf.enable_snowflake(participants text[])` on one node, naming the others,
@@ -802,11 +806,13 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
 
 - `worf.sequence_range_exchange_interval`
   How often each node exchanges sequence range reports with its neighbors
-  when no request, grant or reset is waiting. The default is `1min`.
+  when no request, grant or reset is waiting. The user in each provider
+  connection string needs `EXECUTE` on `worf.sequence_range_exchange`, which
+  `PUBLIC` doesn't have. The default is `1min`.
 
 - `worf.sequence_range_timeout`
-  The connection and statement timeout of a sequence range exchange. The
-  default is `10s`.
+  How long a sequence range exchange waits for the other node's host to
+  answer, and for each call to the other node. The default is `10s`.
 
 - `worf.ddl_lock_timeout`
   How long DDL waits for the other nodes to hold back their writes and catch

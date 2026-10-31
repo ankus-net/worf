@@ -646,7 +646,7 @@ internal sealed partial class WorfNode
     /// <param name="xid">The transaction, within the last two billion.</param>
     /// <returns>The node, or null when worf didn't record the origin.</returns>
     internal static uint? OriginWriter(ushort originId, uint xid)
-        => Spi.ExecuteScalar<uint?>("""
+        => Worf.ReadScalar<uint?>("""
             SELECT w.writer_node FROM worf.origin_writer w,
                 (SELECT pg_catalog.pg_snapshot_xmax(pg_catalog.pg_current_snapshot())::text::bigint AS next) n
             WHERE w.roident = $1 AND w.since_xid::text::bigint <= CASE WHEN $2 <= n.next & 4294967295 THEN n.next >> 32 << 32 | $2

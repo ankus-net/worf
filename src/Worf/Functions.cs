@@ -223,7 +223,7 @@ internal static class Functions
             ("node_id", SpiParameter.Create(node.Node.Id)),
             ("node_name", SpiParameter.Create(node.Node.Name)),
             ("sysid", SpiParameter.Create(sysid.ToString(CultureInfo.InvariantCulture))),
-            ("dbname", SpiParameter.Create(Spi.ExecuteScalar<string>("SELECT pg_catalog.current_database()::text"))),
+            ("dbname", SpiParameter.Create(Worf.ReadScalar<string>("SELECT pg_catalog.current_database()::text"))),
             ("replication_sets", SpiParameter.Create(ReplicationSet.StringlistToIdentifierstr(repsets.Select(static repset => repset.Name)))));
     }
 
@@ -1612,13 +1612,7 @@ internal static class Functions
     /// node's block.
     /// </summary>
     private static void RejectManagedSequence(uint seqoid)
-    {
-        if (SequenceRanges.IsManaged(seqoid))
-        {
-            throw new PgException(PgSqlStates.InvalidParameterValue, "a sequence under range management can't replicate its state",
-                hint: "Range management keeps the nodes' values apart; disable it first.");
-        }
-    }
+        => SequenceRanges.RejectReplicatedState(seqoid);
 
     /// <summary>
     /// Returns a boolean as the oid that pglogical's drop_subscription returns it as.
@@ -1754,9 +1748,15 @@ internal static class Functions
             foreach (SpiRow reltup in relations)
             {
                 uint reloid = reltup.Get<uint>(0);
-
                 if (existingRelations.Contains(reloid))
                 {
+                    continue;
+                }
+
+                // Each node's own blocks keep a managed sequence's values apart, so its state isn't replicated.
+                if (relkind == 'S' && SequenceRanges.IsManaged(reloid))
+                {
+                    PgLog.Notice($"sequence {Spi.QuoteQualifiedIdentifier(nspname, reltup.Get<string>(1))} is left out, since it is under sequence range management");
                     continue;
                 }
 

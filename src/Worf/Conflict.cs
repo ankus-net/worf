@@ -107,7 +107,7 @@ internal static partial class Conflict
     /// <param name="remoteResolution">The other node's <c>worf.conflict_resolution</c>.</param>
     internal static void CheckTwoWayResolution(string localNode, string remoteNode, string remoteResolution)
     {
-        string localResolution = Spi.ExecuteScalar<string>(WorkerResolutionSql);
+        string localResolution = Worf.ReadScalar<string>(WorkerResolutionSql);
         if (localResolution == remoteResolution && localResolution is "last_update_wins" or "first_update_wins")
         {
             return;

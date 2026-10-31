@@ -10,8 +10,13 @@ internal static class Manager
     private const long InitialSleep = 10000;
     private const long MaxSleep = 180000;
 
-    // When the manager next asks this database's providers of the sequences they manage, or long.MaxValue.
-    private static long s_discoveryAt = long.MaxValue;
+    // When the manager next runs the exchange worker to ask this database's providers of the sequences they manage, and
+    // the exchange counter it last saw, which a backend that learned of a sequence raises.
+    private static long s_discoveryAt;
+    private static long s_discoveryRequested;
+
+    // Whether an exchange worker runs with no range worker to cancel a call of it that runs out of time.
+    private static bool s_watching;
 
     /// <summary>
     /// Gets the minimum time the manager sleeps between checking for subscription changes. On Windows, process
@@ -81,7 +86,7 @@ internal static class Manager
         }
 
         PgBackgroundWorker.RunTransaction(static () =>
-            PgLog.Log($"starting worf database manager for database {Spi.ExecuteScalar<string>("SELECT pg_catalog.current_database()::text")}"));
+            PgLog.Log($"starting worf database manager for database {Worf.ReadScalar<string>("SELECT pg_catalog.current_database()::text")}"));
 
         // Brief delay before checking/upgrading extension version. This avoids a race condition where an explicit
         // ALTER EXTENSION UPDATE runs concurrently with our auto-upgrade check on fast systems.
@@ -107,11 +112,18 @@ internal static class Manager
                 ? Math.Min(sleepTimer * 2, MaxSleep)
                 : Math.Max(sleepTimer / 2, MinSleep);
 
-            // A database that subscribes but manages no sequence asks its providers again when the next exchange is due.
+            // A database that subscribes but manages no sequence runs the exchange worker again when the next exchange
+            // is due, even if the last one ran past it.
             long sleep = processedAll ? sleepTimer : MinSleep;
-            if (s_discoveryAt != long.MaxValue)
+            long now = Worker.GetCurrentTimestamp();
+            if (s_discoveryAt != 0)
             {
-                sleep = Math.Clamp((s_discoveryAt - Worker.GetCurrentTimestamp()) / 1000, 1, sleep);
+                sleep = Math.Clamp((s_discoveryAt - now) / 1000, 1, sleep);
+            }
+
+            if (s_watching)
+            {
+                sleep = Math.Min(sleep, SequenceRanges.CheckInterval);
             }
 
             if (!PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(sleep)) &&
@@ -125,75 +137,110 @@ internal static class Manager
     }
 
     /// <summary>
-    /// Starts the database's sequence range worker when it has managed sequences and the worker isn't running, or once
-    /// a crashed one's restart delay has passed. Until it manages one, a database with subscriptions asks their
-    /// providers, at the exchange interval, of the sequences they manage.
+    /// Starts the database's sequence range worker and its exchange worker when it has managed sequences and they
+    /// aren't running, or once a crashed one's restart delay has passed. Until it manages one, a database with
+    /// subscriptions runs the exchange worker once an exchange interval, or at once when a backend learned of a
+    /// sequence, to ask the providers of the sequences they manage. The exchange worker connects to them, so a provider
+    /// that can't be reached holds up neither the manager nor the range worker; whichever of them watches it cancels a
+    /// call that takes too long.
     /// </summary>
-    /// <returns>Whether nothing is left to retry; an exchange to retry sets when the manager wakes.</returns>
+    /// <returns>Whether nothing is left to retry.</returns>
     private static bool ManageRangeWorker()
     {
-        s_discoveryAt = long.MaxValue;
         uint dboid = Worker.MyWorker.Dboid;
-        long crashedAt = -1;
-        using (PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share())
+        long now = Worker.GetCurrentTimestamp();
+        (bool rangeRunning, bool rangeCrashed) = RangeWorkerState(WorfWorkerType.Range, dboid, now);
+        (bool exchangeRunning, bool exchangeCrashed) = RangeWorkerState(WorfWorkerType.Exchange, dboid, now);
+
+        // Without a range worker, as while a database that manages nothing asks its providers, the manager cancels an
+        // exchange call that has run out of time, and looks again soon.
+        s_watching = exchangeRunning && !rangeRunning && SequenceRangeExchangeWorker.Watch();
+        if (rangeRunning && exchangeRunning)
         {
-            for (int i = 0; i < guard.Length && crashedAt < 0; i++)
+            s_discoveryAt = 0;
+            return true;
+        }
+
+        (bool managed, bool linked) = PgBackgroundWorker.RunTransaction(static () =>
+        {
+            if (!Worf.ReadScalar<bool>("SELECT to_regclass('worf.sequence_range') IS NOT NULL") ||
+                WorfNode.GetLocalNode(false, true) is not WorfLocalNode node)
             {
-                if (guard[i].WorkerType == WorfWorkerType.Range && guard[i].Dboid == dboid)
-                {
-                    crashedAt = guard[i].CrashedAt;
-                }
+                return (false, false);
+            }
+
+            return (Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range)"),
+                WorfNode.GetNodeSubscriptions(node.Node.Id, false).Exists(sub => sub.Enabled));
+        });
+
+        long requested = SequenceRanges.ExchangeRequested.Value;
+        if (!managed && !linked)
+        {
+            // A subscription created later asks at once.
+            s_discoveryAt = 0;
+            return true;
+        }
+
+        bool started = true;
+        if (managed)
+        {
+            // The exchange worker starts first, so that the range worker finds it to watch.
+            s_discoveryAt = 0;
+            started = StartRangeWorker(WorfWorkerType.Exchange, dboid, exchangeRunning || exchangeCrashed) &&
+                StartRangeWorker(WorfWorkerType.Range, dboid, rangeRunning || rangeCrashed);
+        }
+        else if (now >= s_discoveryAt || requested != s_discoveryRequested)
+        {
+            // A database that manages nothing needs no range worker, so asking its providers takes one worker slot. The
+            // next round is due an exchange interval after this one starts, however long starting it took.
+            s_discoveryRequested = requested;
+            started = StartRangeWorker(WorfWorkerType.Exchange, dboid, exchangeRunning || exchangeCrashed);
+            s_watching |= started && !exchangeRunning && !exchangeCrashed;
+            s_discoveryAt = Worker.GetCurrentTimestamp() + (SequenceRanges.ExchangeInterval * 1000L);
+        }
+
+        return started && !rangeCrashed && !exchangeCrashed;
+    }
+
+    /// <summary>
+    /// Finds whether one of a database's range workers runs, or crashed too lately to start again.
+    /// </summary>
+    private static (bool Running, bool Crashed) RangeWorkerState(WorfWorkerType type, uint dboid, long now)
+    {
+        using PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share();
+        for (int i = 0; i < guard.Length; i++)
+        {
+            if (guard[i].WorkerType == type && guard[i].Dboid == dboid)
+            {
+                return (guard[i].CrashedAt == 0, guard[i].CrashedAt > 0 && guard[i].CrashedAt + (MinSleep * 1000) > now);
             }
         }
 
-        if (crashedAt == 0)
+        return (false, false);
+    }
+
+    /// <summary>
+    /// Starts one of a database's range workers. With every worker slot taken, it waits for the next look rather than
+    /// stop the manager.
+    /// </summary>
+    /// <returns>Whether it started, or wasn't to start.</returns>
+    private static bool StartRangeWorker(WorfWorkerType type, uint dboid, bool skip)
+    {
+        if (skip)
         {
             return true;
         }
 
-        if (crashedAt > 0 && crashedAt + (MinSleep * 1000) > Worker.GetCurrentTimestamp())
+        try
         {
+            _ = Worker.WorkerRegister(new WorfWorker { WorkerType = type, Dboid = dboid });
+            return true;
+        }
+        catch (PgException error)
+        {
+            PgLog.Warning($"could not start the sequence {Worker.WorkerTypeName(type)} worker: {error.Message}");
             return false;
         }
-
-        bool managed = PgBackgroundWorker.RunTransaction(static () =>
-        {
-            if (!Spi.ExecuteScalar<bool>("SELECT to_regclass('worf.sequence_range') IS NOT NULL") ||
-                WorfNode.GetLocalNode(false, true) is not WorfLocalNode node)
-            {
-                return false;
-            }
-
-            if (!Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range)"))
-            {
-                _ = SequenceRangeExchange.ExchangeAll(node);
-                s_discoveryAt = SequenceRangeExchange.NextDueAt;
-            }
-
-            return Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range)");
-        });
-        if (managed)
-        {
-            _ = Worker.WorkerRegister(new WorfWorker { WorkerType = WorfWorkerType.Range, Dboid = dboid });
-        }
-
-        // The exchange's connection waits on the latch and resets it, which may have been set for the manager, as when
-        // an apply worker exited to apply its transaction again. Set it again so the manager looks again instead of
-        // sleeping through it.
-        if (SequenceRangeExchange.Contacted)
-        {
-            unsafe
-            {
-                NativeMethods.SetLatch(NativeGlobals.MyLatch);
-            }
-        }
-
-        if (managed)
-        {
-            s_discoveryAt = long.MaxValue;
-        }
-
-        return true;
     }
 
     /// <summary>

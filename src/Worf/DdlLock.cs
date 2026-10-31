@@ -906,7 +906,7 @@ internal static unsafe partial class DdlLock
     private static uint NamespaceOid(string name) => NativeMethods.get_namespace_oid(Worf.PStrDup(name), true);
 
     private static uint TypeOid(List* names)
-        => names is null ? 0 : Spi.ExecuteScalar<uint?>("SELECT pg_catalog.to_regtype($1)::oid",
+        => names is null ? 0 : Worf.ReadScalar<uint?>("SELECT pg_catalog.to_regtype($1)::oid",
             SpiParameter.Create(Worf.FromServer(NativeMethods.NameListToQuotedString(names)))) ?? 0;
 
     /// <summary>

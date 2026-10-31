@@ -32,6 +32,7 @@ internal static unsafe partial class Executor
     private static object_access_hook_type s_nextObjectAccessHook;
     private static ProcessUtility_hook_type s_nextProcessUtilityHook;
     private static ExecutorStart_hook_type s_nextExecutorStartHook;
+    private static ExecutorEnd_hook_type s_nextExecutorEndHook;
     private static bool s_installed;
 
     /// <summary>
@@ -47,6 +48,9 @@ internal static unsafe partial class Executor
 
     [PgNativeCallback(nameof(WorfExecutorStart))]
     private static partial ExecutorStart_hook_type ExecutorStartCallback { get; }
+
+    [PgNativeCallback(nameof(WorfExecutorEnd))]
+    private static partial ExecutorEnd_hook_type ExecutorEndCallback { get; }
 
     /// <summary>
     /// Creates the executor state for one relation, as a query that reads or writes it would.
@@ -165,6 +169,10 @@ internal static unsafe partial class Executor
         // Executor start hook, which holds back writes to tables another node changes.
         s_nextExecutorStartHook = NativeGlobals.ExecutorStart_hook;
         NativeGlobals.ExecutorStart_hook = ExecutorStartCallback;
+
+        // Executor end hook, which tells the sequence range guard a statement has ended.
+        s_nextExecutorEndHook = NativeGlobals.ExecutorEnd_hook;
+        NativeGlobals.ExecutorEnd_hook = ExecutorEndCallback;
         s_installed = true;
     }
 
@@ -387,6 +395,7 @@ internal static unsafe partial class Executor
     private static void WorfExecutorStart(QueryDesc* queryDesc, int eflags)
     {
         DdlLock.CheckWrites(queryDesc, eflags);
+        SequenceRangeGuard.StartStatement(queryDesc);
 
         if (!s_nextExecutorStartHook.IsNull)
         {
@@ -395,6 +404,20 @@ internal static unsafe partial class Executor
         else
         {
             NativeMethods.standard_ExecutorStart(queryDesc, eflags);
+        }
+    }
+
+    private static void WorfExecutorEnd(QueryDesc* queryDesc)
+    {
+        SequenceRangeGuard.EndStatement(queryDesc);
+
+        if (!s_nextExecutorEndHook.IsNull)
+        {
+            s_nextExecutorEndHook.Invoke(queryDesc);
+        }
+        else
+        {
+            NativeMethods.standard_ExecutorEnd(queryDesc);
         }
     }
 

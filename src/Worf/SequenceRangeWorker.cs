@@ -1,9 +1,10 @@
-
 namespace Worf;
 
 /// <summary>
 /// The worker that keeps a database's managed sequences supplied: it switches each to its next block when the active
-/// one runs low and gets new blocks, checking every <c>worf.sequence_range_check_interval</c>.
+/// one runs low and gets new blocks, checking every <c>worf.sequence_range_check_interval</c>. Its exchange worker
+/// makes the calls to the neighbors. A tick that changes nothing writes nothing, so an idle node uses no transaction
+/// IDs.
 /// </summary>
 internal static class SequenceRangeWorker
 {
@@ -15,7 +16,8 @@ internal static class SequenceRangeWorker
     internal static void RangeMain(nuint mainArg)
     {
         Worker.WorkerAttach((int)mainArg, WorfWorkerType.Range);
-        PgLog.Log("starting sequence range worker");
+        PgLog.Debug1("starting sequence range worker");
+        bool managedAny = false;
 
         // Each sequence's active block, its last position in it and when it was read, and its peak rate in values a
         // second.
@@ -25,32 +27,29 @@ internal static class SequenceRangeWorker
             PgInterrupts.Check();
             Worker.ProcessConfigReload();
 
-            bool managed = false;
+            // Each sequence is checked in a transaction of its own, so that its locks are held no longer than its check,
+            // which an exchange answered meanwhile may wait for.
+            (WorfLocalNode Node, List<uint> Sequences)? managed = PgBackgroundWorker.RunTransaction(() =>
+                WorfNode.GetLocalNode(false, true) is WorfLocalNode node ? (node, Sequences()) : ((WorfLocalNode, List<uint>)?)null);
             bool changed = false;
-            PgBackgroundWorker.RunTransaction(() =>
+            if (managed is (WorfLocalNode local, List<uint> sequences) && sequences.Count > 0)
             {
-                if (WorfNode.GetLocalNode(false, true) is not WorfLocalNode node)
+                if (!managedAny)
                 {
-                    return;
+                    managedAny = true;
+                    PgLog.Log("sequence range worker managing sequences");
                 }
 
-                SpiResult sequences = Worf.SelectCatalog("SELECT seqoid::oid FROM worf.sequence_range");
-                managed = sequences.Count > 0;
-                if (sequences.Count > 0)
+                changed |= PgBackgroundWorker.RunTransaction(() => SequenceRanges.CheckIdentity(local));
+                foreach (uint seqoid in sequences)
                 {
-                    changed |= SequenceRanges.CheckIdentity(node);
-                }
-
-                for (int i = 0; i < sequences.Count; i++)
-                {
-                    uint seqoid = sequences[i].Get<uint>(0);
-                    double rate = Rate(rates, seqoid);
                     try
                     {
-                        PgTransaction.RunInSubtransaction(() =>
+                        changed |= PgBackgroundWorker.RunTransaction(() =>
                         {
-                            _ = SequenceRanges.LiftFence(seqoid, node, false);
-                            changed |= SequenceRanges.Check(seqoid, node, rate);
+                            double rate = Rate(rates, seqoid);
+                            _ = SequenceRanges.LiftFence(seqoid, local, false);
+                            return SequenceRanges.Check(seqoid, local, rate);
                         });
                     }
                     catch (PgException error)
@@ -59,50 +58,55 @@ internal static class SequenceRangeWorker
                     }
                 }
 
-                // Snowflake IDs never pass the time reserved ahead.
-                if (sequences.Count > 0)
+                // Snowflake IDs never pass the time reserved ahead, which backends see only once it is durable.
+                try
                 {
-                    try
-                    {
-                        PgTransaction.RunInSubtransaction(SnowflakeIds.Reserve);
-                    }
-                    catch (PgException error)
-                    {
-                        PgLog.Warning($"could not reserve the Snowflake clock: {error.Message}");
-                    }
+                    PgBackgroundWorker.RunTransaction(SnowflakeIds.Reserve);
                 }
-            });
+                catch (PgException error)
+                {
+                    PgLog.Warning($"could not reserve the Snowflake clock: {error.Message}");
+                }
 
-            // Requests are committed before the exchanges send them, including those that sessions handed over.
-            if (managed)
-            {
-                List<Guid> recorded = PgBackgroundWorker.RunTransaction(() =>
-                    WorfNode.GetLocalNode(false, true) is WorfLocalNode node ? SequenceRangeReservations.Record(node) : []);
+                // Requests are committed before the exchange worker sends them, including those that sessions handed over.
+                List<Guid> recorded = PgBackgroundWorker.RunTransaction(() => SequenceRangeReservations.Record(local));
                 SequenceRangeReservations.Forget(recorded);
                 changed |= recorded.Count > 0;
-                PgBackgroundWorker.RunTransaction(() =>
-                {
-                    if (WorfNode.GetLocalNode(false, true) is WorfLocalNode node)
-                    {
-                        changed |= SequenceRangeExchange.ExchangeAll(node);
-                    }
-                });
             }
 
-            // Backends reload their blocks once the change is committed.
+            // Backends reload their blocks once the change is committed, and the exchange worker sends what is waiting.
             if (changed)
             {
                 SequenceRanges.Changed();
+                SequenceRangeExchangeWorker.Wake();
             }
 
-            if (!managed)
+            // Once the database manages no sequence, this worker watches the exchange worker until it is done.
+            bool exchanging = managed is not null && SequenceRangeExchangeWorker.Watch();
+            if (managed is null || (!exchanging && PgBackgroundWorker.RunTransaction(Sequences).Count == 0))
             {
-                PgLog.Log("no managed sequences left, sequence range worker exiting");
+                if (managedAny)
+                {
+                    PgLog.Log("no managed sequences left, sequence range worker exiting");
+                }
+
                 return;
             }
 
             _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(SequenceRanges.CheckInterval));
         }
+    }
+
+    private static List<uint> Sequences()
+    {
+        SpiResult rows = Worf.SelectCatalog("SELECT seqoid::oid FROM worf.sequence_range ORDER BY seqoid");
+        List<uint> sequences = [];
+        for (int i = 0; i < rows.Count; i++)
+        {
+            sequences.Add(rows[i].Get<uint>(0));
+        }
+
+        return sequences;
     }
 
     /// <summary>

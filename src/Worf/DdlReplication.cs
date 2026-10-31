@@ -39,6 +39,14 @@ internal static unsafe partial class DdlReplication
     internal static partial bool AllowDdlFromFunctions { get; }
 
     /// <summary>
+    /// Gets whether this session restores a subscription's structure. Only a superuser, or a role granted SET on it,
+    /// can claim that, since such a session's DDL isn't replicated and joins the provider's managed sequences.
+    /// </summary>
+    [PgGucBool("worf.subscription_schema_restore", false, "Marks a session that restores a subscription's structure.",
+        Context = PgGucContext.SuperuserSet, Flags = PgGucOptions.NoShowAll)]
+    internal static partial bool SubscriptionSchemaRestore { get; }
+
+    /// <summary>
     /// Gets or sets whether DDL runs for <c>replicate_ddl_command</c>, which queues it itself.
     /// </summary>
     internal static bool Suppressed { get; set; }
@@ -211,7 +219,7 @@ internal static unsafe partial class DdlReplication
     /// nodes it would reach already have it.
     /// </summary>
     /// <returns>Whether it does.</returns>
-    internal static bool Restoring() => Setting("worf.subscription_schema_restore") is "true" or "on" or "1";
+    internal static bool Restoring() => SubscriptionSchemaRestore;
 
     private static string Setting(string name)
     {
@@ -252,8 +260,10 @@ internal static unsafe partial class DdlReplication
             return;
         }
 
+        // worf keeps the table in its sets for whoever's DDL created or changed it, who may have no rights on worf's
+        // schema.
         bool join = parsetree->type != NodeTag.T_AlterTableStmt || HasCommand((AlterTableStmt*)parsetree, AlterTableType.AT_SetLogged);
-        _ = WithSnapshot(() => Reconcile(reloid, join));
+        _ = WithSnapshot(() => Elevated.Run(() => Reconcile(reloid, join)));
     }
 
     private static bool Reconcile(uint reloid, bool join)
