@@ -87,6 +87,18 @@ public sealed class SequenceRangeTests
         PostgresException appError = await Assert.ThrowsExactlyAsync<PostgresException>(
             () => node.SafePsqlAsync(Database, "SET ROLE app; INSERT INTO t (id, v) VALUES (1, 'app by hand')", token));
         Assert.AreEqual("23514", appError.SqlState);
+
+        // A session that reaches the last twentieth of the active block wakes the range worker, which switches then
+        // rather than at its next check.
+        _ = await node.SafePsqlAsync(Database, "ALTER SYSTEM SET worf.sequence_range_check_interval = '10min'", token);
+        _ = await node.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
+        await Task.Delay(500, token);
+        long[] block = [.. (await node.SafePsqlAsync(Database, "SELECT active_lo, active_hi, values_left FROM worf.sequence_ranges", token))
+            .Split('|').Select(value => long.Parse(value, CultureInfo.InvariantCulture))];
+        _ = await node.SafePsqlAsync(Database, $"INSERT INTO t (v) SELECT 'tail' FROM generate_series(1, {block[2] - ((block[1] - block[0]) / 20)})", token);
+        Stopwatch switching = Stopwatch.StartNew();
+        Assert.IsTrue(await node.PollQueryUntilAsync(Database, $"SELECT active_lo <> {block[0]} FROM worf.sequence_ranges", token), "a switch");
+        Assert.IsLessThan(5000, switching.ElapsedMilliseconds, "a switch as the block ran low");
     }
 
     /// <summary>
@@ -516,12 +528,12 @@ public sealed class SequenceRangeTests
             await ExecuteAsync(load, "INSERT INTO t (v) SELECT 'load' FROM generate_series(1, 5000); COMMIT", token);
         }
 
-        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.reserve_sequence_range('t_id_seq', 5000)", token);
-        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO t (v) SELECT 'load' FROM generate_series(1, 5000)", token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.reserve_sequence_range('t_id_seq', 10000)", token);
+        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO t (v) SELECT 'load' FROM generate_series(1, 10000)", token);
         await SettleAsync([nodeA], token);
         string[] after = (await nodeA.SafePsqlAsync(Database, "SELECT request_size, peak_rate FROM worf.sequence_range", token)).Split('|');
         Assert.AreEqual(before[0], after[0], "the request size");
-        Assert.IsLessThanOrEqualTo(double.Parse(before[1], CultureInfo.InvariantCulture), double.Parse(after[1], CultureInfo.InvariantCulture), "the peak rate");
+        Assert.AreEqual(before[1], after[1], "the peak rate");
 
         // Nor does a load's transaction hold up another session's reservation, whose switch it then finds when it
         // reserves again.
