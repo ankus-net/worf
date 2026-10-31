@@ -546,8 +546,10 @@ public sealed class SequenceRangeTests
             CREATE TABLE app.x2 (id bigint PRIMARY KEY, CHECK (app.imm('check')));
             CREATE INDEX ON app.x2 (id) WHERE app.imm('index');
             ALTER TABLE app.x2 ALTER COLUMN id SET DEFAULT nextval('public.t_id_seq');
-            INSERT INTO app.x2 SELECT FROM generate_series(1, 3);
             """, token);
+
+        // The sequence moves once the table is committed, so that the range worker's read after it sees the table.
+        _ = await node.SafePsqlAsync(Database, "SET ROLE app; INSERT INTO app.x2 SELECT FROM generate_series(1, 3)", token);
         string rangeWorker = await node.SafePsqlAsync(Database, "SELECT pid FROM pg_stat_activity WHERE datname = current_database() AND backend_type LIKE 'worf range%'", token);
         Assert.IsTrue(await node.PollLogAsync(escapes, $"runs as app in {rangeWorker}", token), "the range worker read the table as its owner");
         Assert.AreEqual("f", await node.SafePsqlAsync(Database, "SELECT rolsuper FROM pg_roles WHERE rolname = 'app'", token));
@@ -1753,8 +1755,20 @@ public sealed class SequenceRangeTests
         // A load's transaction holds the sequence from its reservation's switch until it commits, and the range worker
         // leaves the sequence for later rather than wait on it. Neither that load nor one after a reservation of its own,
         // here from several sessions at once, faster than any before, counts toward the sequence's rate, nor do their
-        // switches toward the size of its next blocks.
-        await SettleAsync([nodeA], true, token);
+        // switches toward the size of its next blocks. node_a settles first: it holds its next block, and nothing is asked
+        // for or granted but the refusal, which moves no block.
+        async Task SettleBlocksAsync()
+        {
+            Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, """
+                SELECT next_lo IS NOT NULL
+                    AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_request)
+                    AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_grant WHERE state = 'sent' AND kind <> 'x')
+                FROM worf.sequence_ranges
+                """, token), "node_a holding its next block");
+            await Task.Delay(1000, token);
+        }
+
+        await SettleBlocksAsync();
         string[] before = (await nodeA.SafePsqlAsync(Database, "SELECT request_size, peak_rate FROM worf.sequence_range", token)).Split('|');
         await using (NpgsqlConnection load = await nodeA.OpenAsync(Database, token))
         {
@@ -1770,7 +1784,7 @@ public sealed class SequenceRangeTests
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.reserve_sequence_range('t_id_seq', 10000)", token);
         await Task.WhenAll(Enumerable.Range(0, 4).Select(_ =>
             nodeA.SafePsqlAsync(Database, "INSERT INTO t (v) SELECT 'load' FROM generate_series(1, 2500)", token)));
-        await SettleAsync([nodeA], true, token);
+        await SettleBlocksAsync();
         string[] after = (await nodeA.SafePsqlAsync(Database, "SELECT request_size, peak_rate FROM worf.sequence_range", token)).Split('|');
         Assert.AreEqual(before[0], after[0], "the request size");
         Assert.AreEqual(before[1], after[1], "the peak rate");
@@ -2050,43 +2064,6 @@ public sealed class SequenceRangeTests
     /// </summary>
     private static async Task AssertIdleAsync(TestNode[] nodes, bool managed, CancellationToken token, TimeSpan? span = null)
     {
-        await SettleAsync(nodes, managed, token);
-
-        // Each exchange call is a session of its own. A slot takes no more than a call an exchange interval, and one where
-        // each end of the while cuts an interval, and these queries take two sessions.
-        TimeSpan idle = span ?? TimeSpan.FromSeconds(2);
-        long calls = (long)(idle / TimeSpan.FromMilliseconds(500)) + 1;
-        const string Next = """
-            SELECT pg_snapshot_xmax(pg_current_snapshot()), (SELECT sessions FROM pg_stat_database WHERE datname = current_database()),
-                (SELECT count(*) FROM pg_replication_slots WHERE plugin = 'worf' AND database = current_database()), pg_current_wal_insert_lsn()
-            """;
-        string[][] before = await Task.WhenAll(nodes.Select(async node => (await node.SafePsqlAsync(Database, Next, token)).Split('|')));
-        await Task.Delay(idle, token);
-        string[][] after = await Task.WhenAll(nodes.Select(async node => (await node.SafePsqlAsync(Database, Next, token)).Split('|')));
-        for (int i = 0; i < nodes.Length; i++)
-        {
-            Assert.AreEqual(before[i][0], after[i][0], $"{nodes[i].Name} used transaction IDs while idle");
-            Assert.IsLessThanOrEqualTo((calls * long.Parse(after[i][2], CultureInfo.InvariantCulture)) + 2,
-                long.Parse(after[i][1], CultureInfo.InvariantCulture) - long.Parse(before[i][1], CultureInfo.InvariantCulture), $"{nodes[i].Name}'s exchange calls");
-            if (before[i][3] != after[i][3])
-            {
-                Assert.IsTrue(await nodes[i].PollQueryUntilAsync(Database, $"SELECT pg_current_wal_flush_lsn() >= '{after[i][3]}'", token),
-                    $"{nodes[i].Name} flushing its WAL");
-                Assert.AreEqual("", await nodes[i].SafePsqlAsync(Database, $"""
-                    SELECT string_agg(resource_manager || ' ' || record_type, ', ')
-                    FROM pg_get_wal_records_info('{before[i][3]}', '{after[i][3]}')
-                    WHERE resource_manager <> 'Standby' AND record_type NOT IN ('CHECKPOINT_REDO', 'CHECKPOINT_ONLINE', 'FPI_FOR_HINT')
-                        AND NOT (resource_manager = 'Heap2' AND record_type IN ('PRUNE', 'PRUNE_ON_ACCESS'))
-                    """, token), $"{nodes[i].Name} wrote WAL while idle");
-            }
-        }
-    }
-
-    /// <summary>
-    /// Waits until the nodes have settled, as AssertIdleAsync describes, and a moment more.
-    /// </summary>
-    private static async Task SettleAsync(TestNode[] nodes, bool managed, CancellationToken token)
-    {
         // A node that settles may unsettle one that had, as a request it answers leads to one of the neighbor's, so the
         // nodes are checked until every one of them has settled at once.
         string settled = $"""
@@ -2120,7 +2097,35 @@ public sealed class SequenceRangeTests
             }
         }
 
+        // Each exchange call is a session of its own. A slot takes no more than a call an exchange interval, and one where
+        // each end of the while cuts an interval, and these queries take two sessions.
+        TimeSpan idle = span ?? TimeSpan.FromSeconds(2);
+        long calls = (long)(idle / TimeSpan.FromMilliseconds(500)) + 1;
         await Task.Delay(TimeSpan.FromSeconds(1), token);
+        const string Next = """
+            SELECT pg_snapshot_xmax(pg_current_snapshot()), (SELECT sessions FROM pg_stat_database WHERE datname = current_database()),
+                (SELECT count(*) FROM pg_replication_slots WHERE plugin = 'worf' AND database = current_database()), pg_current_wal_insert_lsn()
+            """;
+        string[][] before = await Task.WhenAll(nodes.Select(async node => (await node.SafePsqlAsync(Database, Next, token)).Split('|')));
+        await Task.Delay(idle, token);
+        string[][] after = await Task.WhenAll(nodes.Select(async node => (await node.SafePsqlAsync(Database, Next, token)).Split('|')));
+        for (int i = 0; i < nodes.Length; i++)
+        {
+            Assert.AreEqual(before[i][0], after[i][0], $"{nodes[i].Name} used transaction IDs while idle");
+            Assert.IsLessThanOrEqualTo((calls * long.Parse(after[i][2], CultureInfo.InvariantCulture)) + 2,
+                long.Parse(after[i][1], CultureInfo.InvariantCulture) - long.Parse(before[i][1], CultureInfo.InvariantCulture), $"{nodes[i].Name}'s exchange calls");
+            if (before[i][3] != after[i][3])
+            {
+                Assert.IsTrue(await nodes[i].PollQueryUntilAsync(Database, $"SELECT pg_current_wal_flush_lsn() >= '{after[i][3]}'", token),
+                    $"{nodes[i].Name} flushing its WAL");
+                Assert.AreEqual("", await nodes[i].SafePsqlAsync(Database, $"""
+                    SELECT string_agg(resource_manager || ' ' || record_type, ', ')
+                    FROM pg_get_wal_records_info('{before[i][3]}', '{after[i][3]}')
+                    WHERE resource_manager <> 'Standby' AND record_type NOT IN ('CHECKPOINT_REDO', 'CHECKPOINT_ONLINE', 'FPI_FOR_HINT')
+                        AND NOT (resource_manager = 'Heap2' AND record_type IN ('PRUNE', 'PRUNE_ON_ACCESS'))
+                    """, token), $"{nodes[i].Name} wrote WAL while idle");
+            }
+        }
     }
 
     private static async Task ExecuteAsync(NpgsqlConnection connection, string sql, CancellationToken token)
