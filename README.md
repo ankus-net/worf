@@ -639,7 +639,9 @@ rejects values written by hand outside this node's blocks with SQLSTATE
   Abandons this node's blocks and requests new ones, as after a restore.
 - `worf.reserve_sequence_range(sequence regclass, count bigint, timeout interval)`
   Returns once the active block has at least `count` values left, before a
-  load that numbers its rows with the sequence.
+  load that numbers its rows with the sequence. A reservation that switches
+  blocks holds the sequence until its transaction commits, so reserve in a
+  transaction of its own.
 - `worf.reserve_sequence_values(sequence regclass, lo bigint, hi bigint, timeout interval)`
   Gives this node exactly `[lo, hi]`, for rows that already carry those keys.
 

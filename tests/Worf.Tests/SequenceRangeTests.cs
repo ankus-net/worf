@@ -546,6 +546,32 @@ public sealed class SequenceRangeTests
         long left = long.Parse(await nodeA.SafePsqlAsync(Database, "SELECT values_left FROM worf.sequence_ranges", token), CultureInfo.InvariantCulture);
         _ = await nodeA.SafePsqlAsync(Database, $"SET statement_timeout = '10s'; SELECT worf.reserve_sequence_range('t_id_seq', {left + 100})", token);
         await ExecuteAsync(batch, "SELECT worf.reserve_sequence_range('t_id_seq', 10); INSERT INTO t (v) SELECT 'batch' FROM generate_series(1, 10); COMMIT", token);
+
+        // A load's transaction on node_b holds its sequence too, which node_b's exchanges with node_a leave for later. Another
+        // sequence there keeps switching meanwhile, to the blocks node_a grants it.
+        foreach (TestNode node in nodes)
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE u (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('u_id_seq', participants := '{node_b}', range_size := 10, max_range_size := 10)", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 'u_id_seq'::regclass",
+            token), "node_b drawing from a block of u_id_seq");
+        await using NpgsqlConnection hold = await nodeB.OpenAsync(Database, token);
+        long heldLeft = long.Parse(await nodeB.SafePsqlAsync(Database, "SELECT values_left FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token),
+            CultureInfo.InvariantCulture);
+        await ExecuteAsync(hold, $"BEGIN; SELECT worf.reserve_sequence_range('t_id_seq', {heldLeft + 1000})", token);
+        for (int i = 0; i < 3; i++)
+        {
+            string active = await nodeB.SafePsqlAsync(Database, "SELECT active_lo FROM worf.sequence_ranges WHERE sequence = 'u_id_seq'::regclass", token);
+            _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO u (v) SELECT 'u' FROM generate_series(1, (SELECT values_left FROM worf.sequence_ranges WHERE sequence = 'u_id_seq'::regclass))",
+                token);
+            Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, $"""
+                SELECT active_lo <> {active} AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 'u_id_seq'::regclass
+                """, token), "node_b switching u_id_seq while t_id_seq is held");
+        }
+
+        await ExecuteAsync(hold, "INSERT INTO t (v) SELECT 'held' FROM generate_series(1, 1000); COMMIT", token);
     }
 
     /// <summary>

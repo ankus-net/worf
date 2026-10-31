@@ -187,8 +187,23 @@ internal static class SequenceRangeReservations
             SpiResult range = Worf.SelectCatalog("SELECT owner_node, epoch FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(reservation.Seqoid));
             if (range.Count > 0 && range[0].Get<uint>(0) == node.Node.Id)
             {
+                // A transaction that switched the sequence holds it and its row until it commits, and the request waits
+                // for a later tick, so that the worker waits on no session.
+                unsafe
+                {
+                    if (!NativeMethods.ConditionalLockRelationOid(reservation.Seqoid, (int)PgLockMode.RowExclusive))
+                    {
+                        continue;
+                    }
+                }
+
                 // An allocation that fails, as for values in use, leaves the session to find no block.
                 Allocate(reservation, range[0].Get<int>(1), node);
+                unsafe
+                {
+                    NativeMethods.UnlockRelationOid(reservation.Seqoid, (int)PgLockMode.RowExclusive);
+                }
+
                 recorded.Add(reservation.RequestId);
                 continue;
             }

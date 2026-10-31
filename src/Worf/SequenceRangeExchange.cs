@@ -160,7 +160,7 @@ internal static class SequenceRangeExchange
 
         // A node that manages nothing only asks whether its neighbor does, and writes nothing. The time of the last exchange
         // is written along with what an exchange changed, which gave its subtransaction an ID, or once it is old, so that
-        // an exchange that changes nothing writes nothing.
+        // an exchange that changes nothing writes nothing. A sequence that a transaction holds, as above, keeps its time.
         bool wrote;
         unsafe
         {
@@ -170,7 +170,7 @@ internal static class SequenceRangeExchange
         if (wrote || Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range WHERE exchanged_at IS NULL OR exchanged_at <= now() - $1::interval / 2)",
             SpiParameter.Create(SequenceRanges.LiveReportAge)))
         {
-            _ = Spi.Execute("UPDATE worf.sequence_range SET exchanged_at = now()");
+            _ = Spi.Execute("UPDATE worf.sequence_range SET exchanged_at = now() WHERE seqoid IN (SELECT seqoid FROM worf.sequence_range FOR NO KEY UPDATE SKIP LOCKED)");
         }
 
         return changed;
@@ -381,6 +381,7 @@ internal static class SequenceRangeExchange
             return (false, false);
         }
 
+        List<uint> locked = [];
         foreach (JsonElement entry in sequences.EnumerateArray())
         {
             uint? found = Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(entry.GetProperty("name").GetString()));
@@ -389,6 +390,18 @@ internal static class SequenceRangeExchange
                 continue;
             }
 
+            // A transaction that switched the sequence, as a reservation does, holds it and its rows until it commits. The
+            // sequence waits for a later exchange, which the neighbor's requests, grants and acknowledgements wait for too,
+            // so that neither end waits on that session, and the other sequences carry on.
+            unsafe
+            {
+                if (!NativeMethods.ConditionalLockRelationOid(seqoid, (int)PgLockMode.RowExclusive))
+                {
+                    continue;
+                }
+            }
+
+            locked.Add(seqoid);
             int epoch = entry.GetProperty("epoch").GetInt32();
             uint owner = entry.GetProperty("owner_id").GetUInt32();
             SpiResult local = Worf.SelectCatalog("SELECT owner_node, epoch, state FROM worf.sequence_range WHERE seqoid = $1",
@@ -617,6 +630,15 @@ internal static class SequenceRangeExchange
             if (isOwner)
             {
                 SequenceRanges.ActivateWhenReported(seqoid, node);
+            }
+        }
+
+        // The locks hold off no switch for the rest of the exchange; an error lets them go with its subtransaction.
+        foreach (uint seqoid in locked)
+        {
+            unsafe
+            {
+                NativeMethods.UnlockRelationOid(seqoid, (int)PgLockMode.RowExclusive);
             }
         }
 

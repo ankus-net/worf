@@ -45,6 +45,8 @@ A single transaction that needs more values than the active block has left fails
 SELECT worf.reserve_sequence_range('inventory_id_seq', 500000);
 ```
 
+When the active block is too short, the reservation switches to a block that holds the load, and its transaction then holds the sequence until it commits: other sessions' `nextval` on the sequence waits, and the range worker leaves that sequence alone meanwhile. Reserve in a transaction of its own, just before the load.
+
 To load rows that already carry keys, reserve exactly those keys on the node that loads them. The owner refuses keys that may already be in use.
 
 ## Moving the owner
