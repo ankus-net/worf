@@ -10,9 +10,9 @@ namespace Worf;
 /// <summary>
 /// Snowflake IDs: 64-bit keys made of the time in milliseconds since 2025, this node's number and a counter, so keys
 /// from different nodes never collide and each node's keys only grow. Node numbers are single values of
-/// <c>worf.snowflake_node</c> under range management, which never grants a value twice. The range worker reserves the
-/// clock ahead in <c>worf.snowflake_clock</c>, so a node never issues a time it may have issued before a restart, even
-/// when its clock went back.
+/// <c>worf.snowflake_node</c> under range management, which never grants a value twice. The clock is reserved ahead in
+/// <c>worf.snowflake_clock</c>, so a node never issues a time it may have issued before a restart, even when its clock
+/// went back.
 /// </summary>
 internal static class SnowflakeIds
 {
@@ -77,7 +77,9 @@ internal static class SnowflakeIds
         while (true)
         {
             long now = NowMs();
-            bool wake;
+            long needed = now;
+            bool writable;
+            bool wake = false;
             using (PgLwLockExclusiveGuard<WorfSnowflakeTable, WorfSnowflakeClock> guard = Clocks.Exclusive())
             {
                 int slot = Slot(guard, dboid);
@@ -100,13 +102,29 @@ internal static class SnowflakeIds
                         guard[slot] = clock;
                         return (ms << (NodeBits + CounterBits)) | ((long)node << CounterBits) | (state & ((1L << CounterBits) - 1));
                     }
+
+                    needed = ms;
                 }
 
-                // The range worker hasn't reserved this far yet, which it does ahead only while sessions issue IDs. The
-                // first session to wait asks it to.
-                wake = !clock.Wanted;
-                clock.Wanted = true;
-                guard[slot] = clock;
+                // The time isn't reserved this far yet: the range worker reserves ahead only while sessions issue IDs. A
+                // session that may write reserves it itself, so that it never waits on the worker, which may be held up
+                // in an exchange; one that may not, as in a read-only transaction, asks the worker to, the first to wait.
+                unsafe
+                {
+                    writable = !NativeGlobals.XactReadOnly;
+                }
+
+                if (!writable)
+                {
+                    wake = !clock.Wanted;
+                    clock.Wanted = true;
+                    guard[slot] = clock;
+                }
+            }
+
+            if (writable && Elevated.Run(() => Advance(dboid, true)) > needed)
+            {
+                continue;
             }
 
             if (wake)
@@ -157,36 +175,71 @@ internal static class SnowflakeIds
             return;
         }
 
-        long durable = Worf.ReadScalar<long>("SELECT last_value FROM worf.snowflake_clock");
-        long target = floored || wanted ? Math.Max(durable, Math.Max(reserved, now + ReserveAheadMs)) : durable;
-        if (target > durable)
-        {
-            _ = Spi.Execute("SELECT pg_catalog.setval('worf.snowflake_clock', $1)", SpiParameter.Create(target));
+        _ = Advance(dboid, floored || wanted);
+    }
 
-            // A waiting session issues IDs up to the time reserved as soon as it sees it, before this commits.
-            unsafe
-            {
-                NativeMethods.XLogFlush(NativeMethods.GetXLogInsertRecPtr());
-            }
+    /// <summary>
+    /// Raises the clock to the time reserved before the server started, and with <paramref name="ahead"/> reserves the
+    /// time ahead durably once less than half of it is left. The range worker and sessions take turns under a lock, so
+    /// that the time written only grows.
+    /// </summary>
+    /// <returns>The time reserved.</returns>
+    private static long Advance(uint dboid, bool ahead)
+    {
+        uint clockOid = Worf.ReadScalar<uint>("SELECT 'worf.snowflake_clock'::regclass::oid");
+        unsafe
+        {
+            NativeMethods.LockRelationOid(clockOid, (int)PgLockMode.ShareUpdateExclusive);
         }
 
-        using (PgLwLockExclusiveGuard<WorfSnowflakeTable, WorfSnowflakeClock> guard = Clocks.Exclusive())
+        try
         {
-            int slot = Slot(guard, dboid);
-            WorfSnowflakeClock clock = guard[slot];
-            if (!clock.Floored)
+            long now = NowMs();
+            long reserved;
+            using (PgLwLockExclusiveGuard<WorfSnowflakeTable, WorfSnowflakeClock> guard = Clocks.Exclusive())
             {
-                clock.LastState = Math.Max(clock.LastState, durable << CounterBits);
-                clock.Floored = true;
+                reserved = guard[Slot(guard, dboid)].ReservedMs;
             }
 
-            clock.ReservedMs = Math.Max(clock.ReservedMs, target);
-            if (wanted)
+            long durable = Worf.ReadScalar<long>("SELECT last_value FROM worf.snowflake_clock");
+            long target = ahead && reserved - now < ReserveAheadMs / 2 ? Math.Max(durable, now + ReserveAheadMs) : durable;
+            if (target > durable)
             {
-                clock.Wanted = false;
+                _ = Spi.Execute("SELECT pg_catalog.setval('worf.snowflake_clock', $1)", SpiParameter.Create(target));
+
+                // IDs up to the time reserved are issued as soon as it is set, before this commits.
+                unsafe
+                {
+                    NativeMethods.XLogFlush(NativeMethods.GetXLogInsertRecPtr());
+                }
             }
 
-            guard[slot] = clock;
+            using (PgLwLockExclusiveGuard<WorfSnowflakeTable, WorfSnowflakeClock> guard = Clocks.Exclusive())
+            {
+                int slot = Slot(guard, dboid);
+                WorfSnowflakeClock clock = guard[slot];
+                if (!clock.Floored)
+                {
+                    clock.LastState = Math.Max(clock.LastState, durable << CounterBits);
+                    clock.Floored = true;
+                }
+
+                clock.ReservedMs = Math.Max(clock.ReservedMs, target);
+                if (ahead)
+                {
+                    clock.Wanted = false;
+                }
+
+                guard[slot] = clock;
+                return clock.ReservedMs;
+            }
+        }
+        finally
+        {
+            unsafe
+            {
+                NativeMethods.UnlockRelationOid(clockOid, (int)PgLockMode.ShareUpdateExclusive);
+            }
         }
     }
 

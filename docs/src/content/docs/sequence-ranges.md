@@ -68,7 +68,7 @@ SELECT worf.enable_snowflake(participants := '{node_beta}');
 CREATE TABLE events (id bigint PRIMARY KEY DEFAULT worf.snowflake_id(), payload jsonb);
 ```
 
-An ID holds the milliseconds since 2025 in its top 41 bits, the node's number in the next 10 and a counter in the last 12, so up to 1,024 nodes each issue up to 4,096 IDs a millisecond, and the IDs sort by time. Node numbers come from the same allocator as sequence ranges, so no number is handed out twice, and `worf.snowflake_node()` shows this node's. Each node's IDs only grow, even when its clock goes back across a restart, since the range worker records how far ahead the clock may run.
+An ID holds the milliseconds since 2025 in its top 41 bits, the node's number in the next 10 and a counter in the last 12, so up to 1,024 nodes each issue up to 4,096 IDs a millisecond, and the IDs sort by time. Node numbers come from the same allocator as sequence ranges, so no number is handed out twice, and `worf.snowflake_node()` shows this node's. Each node's IDs only grow, even when its clock goes back across a restart, since the node records how far ahead the clock may run before it issues IDs that far.
 
 ## Restrictions
 
