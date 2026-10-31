@@ -9,6 +9,18 @@ CREATE TABLE public.test_publicschema(id serial primary key, data text);
 
 \c :subscriber_dsn
 
+-- 11_replication_set's DROP of the table replicates, so wait for it before creating this one.
+DO $$
+BEGIN
+	FOR i IN 1..100 LOOP
+		IF to_regclass('public.test_publicschema') IS NULL THEN
+			RETURN;
+		END IF;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END;
+$$;
+
 CREATE TABLE public.test_publicschema(data text, id serial primary key);
 
 \c :provider_dsn

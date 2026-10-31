@@ -22,6 +22,18 @@ VALUES (5, 'foo', '1 minute'::interval),
        (1, NULL, NULL);
 
 \c :subscriber_dsn
+-- 25_att_list's DROP of the table replicates, so wait for it before creating this one.
+DO $$
+BEGIN
+	FOR i IN 1..100 LOOP
+		IF to_regclass('public.basic_dml') IS NULL THEN
+			RETURN;
+		END IF;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END;
+$$;
+
 -- create table on subscriber to receive replicated filtered data from provider
 -- there are some extra columns too, and we omit 'other' as a non-replicated
 -- table on upstream only.
