@@ -675,9 +675,10 @@ internal static partial class Worf
     /// <param name="connstring">The connection string.</param>
     /// <param name="connname">The name the connection's application name starts with.</param>
     /// <param name="suffix">The application name's suffix, or null.</param>
+    /// <param name="options">Connection options that override the connection string's, or null.</param>
     /// <returns>The connection.</returns>
-    internal static PgReplicationConnection Connect(string connstring, string connname, string? suffix)
-        => ConnectBase(connstring, connname, suffix, false);
+    internal static PgReplicationConnection Connect(string connstring, string connname, string? suffix, string? options = null)
+        => ConnectBase(connstring, connname, suffix, false, options);
 
     /// <summary>
     /// Make replication connection, ERROR on failure.
@@ -687,7 +688,7 @@ internal static partial class Worf
     /// <param name="suffix">The application name's suffix, or null.</param>
     /// <returns>The connection.</returns>
     internal static PgReplicationConnection ConnectReplica(string connstring, string connname, string? suffix)
-        => ConnectBase(connstring, connname, suffix, true);
+        => ConnectBase(connstring, connname, suffix, true, null);
 
     /// <summary>
     /// Make sure the extension is up to date. Called by db manager.
@@ -1049,7 +1050,7 @@ internal static partial class Worf
         NativeMethods.table_close(rel, (int)PgLockMode.AccessShare);
     }
 
-    private static PgReplicationConnection ConnectBase(string connstr, string appname, string? suffix, bool replication)
+    private static PgReplicationConnection ConnectBase(string connstr, string appname, string? suffix, bool replication, string? options)
     {
         string s = ExtraConnectionOptions + " " + connstr;
         string applicationName = appname;
@@ -1069,6 +1070,10 @@ internal static partial class Worf
         conninfo.Append(" application_name=");
         Fe.AppendConnstrValue(conninfo, applicationName);
         conninfo.Append(" connect_timeout=30 keepalives=1 keepalives_idle=20 keepalives_interval=20 keepalives_count=5");
+        if (options is not null)
+        {
+            conninfo.Append(' ').Append(options);
+        }
 
         bool inTransaction;
         unsafe

@@ -246,6 +246,12 @@ internal static unsafe partial class Executor
 
         s_droppingWorfObj = false;
 
+        // Whether DDL on an index replicates depends on the indexes the statements before built.
+        if (context != ProcessUtilityContext.PROCESS_UTILITY_SUBCOMMAND)
+        {
+            LocalIndex.Flush();
+        }
+
         if (parsetree->type == NodeTag.T_TruncateStmt)
         {
             WorfStartTruncate();
@@ -254,6 +260,11 @@ internal static unsafe partial class Executor
         if (parsetree->type == NodeTag.T_DropStmt)
         {
             s_lastDropBehavior = ((DropStmt*)parsetree)->behavior;
+        }
+
+        if (parsetree->type == NodeTag.T_CreatedbStmt)
+        {
+            Manager.WakeTemplate(TemplateOf((CreatedbStmt*)parsetree));
         }
 
         // A COPY into or TRUNCATE of a table another node changes waits for the change, where worf is, which alone
@@ -276,7 +287,11 @@ internal static unsafe partial class Executor
         }
 
         SequenceRanges.CheckDdl(parsetree);
-        DdlReplication.CheckReindex(parsetree);
+        if (parsetree->type != NodeTag.T_TransactionStmt)
+        {
+            DdlLock.UnfencePending();
+        }
+
         if (SequenceRanges.SkipsDumpedGuard(parsetree))
         {
             return;
@@ -296,6 +311,7 @@ internal static unsafe partial class Executor
 
         // A statement that commits on its way, and then fails, lets its fence go as its transaction aborts.
         uint xactFlags = DdlReplication.BeginStatement(ddl is not null);
+        bool tracking = LocalIndex.BeginStatement(parsetree, ddl is not null);
         bool usedTemp;
         try
         {
@@ -310,15 +326,21 @@ internal static unsafe partial class Executor
         }
         finally
         {
+            LocalIndex.EndStatement(tracking);
             usedTemp = DdlReplication.EndStatement(xactFlags, ddl is not null);
         }
 
-        // A DROP leaves out its temporary objects itself, and any other statement that used one stays on this node.
-        bool usedTemporary = usedTemp || (ddl is not null && TemporaryObjectUse.UsedBy(parsetree, ddl));
-        bool local = sessionLocal || (usedTemporary && parsetree->type != NodeTag.T_DropStmt);
+        // A DROP leaves out its temporary objects itself, and any other statement that used one stays on this node, or
+        // fails when it created or changed objects that outlast the session.
+        bool local = sessionLocal || (parsetree->type != NodeTag.T_DropStmt &&
+            (ddl is null ? usedTemp : TemporaryObjectUse.UsedBy(parsetree, ddl, usedTemp)));
         if (ddl is not null && !local)
         {
             DdlReplication.QueueDdl(ddl);
+            if (tracking)
+            {
+                LocalIndex.Queued();
+            }
         }
 
         DdlLock.EndStatement(ddl is not null && !local);
@@ -337,6 +359,24 @@ internal static unsafe partial class Executor
     }
 
     /// <summary>
+    /// Gets the template that CREATE DATABASE copies.
+    /// </summary>
+    private static string TemplateOf(CreatedbStmt* stmt)
+    {
+        List* options = stmt->options;
+        for (int i = 0; options is not null && i < options->length; i++)
+        {
+            DefElem* option = (DefElem*)options->elements[i].ptr_value;
+            if (Worf.FromServer(option->defname) == "template" && option->arg is not null)
+            {
+                return Worf.FromServer(NativeMethods.defGetString(option));
+            }
+        }
+
+        return "template1";
+    }
+
+    /// <summary>
     /// Handle object drop. Calls to dependency tracking code.
     /// </summary>
     private static void WorfObjectAccess(ObjectAccessType access, uint classId, uint objectId, int subId, void* arg)
@@ -347,11 +387,19 @@ internal static unsafe partial class Executor
         }
 
         TemporaryObjectUse.NoteObjectAccess(access, classId, objectId, subId);
+        if (access == ObjectAccessType.OAT_POST_CREATE && classId == Dependency.RelationRelationId && subId == 0)
+        {
+            LocalIndex.NoteCreated(objectId);
+        }
 
         if (access == ObjectAccessType.OAT_DROP)
         {
             // ObjectAccessDrop holds only its dropflags.
             int dropflags = *(int*)arg;
+            if (classId == Dependency.RelationRelationId && subId == 0)
+            {
+                LocalIndex.NoteDropped(objectId, (dropflags & PerformDeletionInternal) != 0);
+            }
 
             // No need to check for internal deletions.
             if ((dropflags & PerformDeletionInternal) != 0)
@@ -419,6 +467,7 @@ internal static unsafe partial class Executor
 
     private static void WorfExecutorStart(QueryDesc* queryDesc, int eflags)
     {
+        DdlLock.UnfencePending();
         DdlLock.CheckWrites(queryDesc, eflags);
 
         if (!s_nextExecutorStartHook.IsNull)

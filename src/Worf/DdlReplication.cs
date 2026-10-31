@@ -39,6 +39,14 @@ internal static unsafe partial class DdlReplication
     internal static partial bool AllowDdlFromFunctions { get; }
 
     /// <summary>
+    /// Gets whether this session restores a subscription's structure. Only a superuser, or a role granted SET on it,
+    /// can claim that, since such a session's DDL isn't replicated and joins the provider's managed sequences.
+    /// </summary>
+    [PgGucBool("worf.subscription_schema_restore", false, "Marks a session that restores a subscription's structure.",
+        Context = PgGucContext.SuperuserSet, Flags = PgGucOptions.NoShowAll)]
+    internal static partial bool SubscriptionSchemaRestore { get; }
+
+    /// <summary>
     /// Gets or sets whether DDL runs for <c>replicate_ddl_command</c>, which queues it itself.
     /// </summary>
     internal static bool Suppressed { get; set; }
@@ -108,9 +116,6 @@ internal static unsafe partial class DdlReplication
             NodeTag.T_SecLabelStmt when IsClusterObject(((SecLabelStmt*)parsetree)->objtype) => false,
             NodeTag.T_GrantStmt when IsClusterObject(((GrantStmt*)parsetree)->objtype) => false,
 
-            // A prepared statement is the session's.
-            NodeTag.T_CreateTableAsStmt when local => false,
-
             // Each node creates, updates and drops worf itself.
             NodeTag.T_CreateExtensionStmt => !IsWorf(((CreateExtensionStmt*)parsetree)->extname),
             NodeTag.T_AlterExtensionStmt => !IsWorf(((AlterExtensionStmt*)parsetree)->extname),
@@ -124,6 +129,13 @@ internal static unsafe partial class DdlReplication
         if (!replicated || !WithSnapshot(() => WorfNode.GetLocalNode(false, true) is not null))
         {
             return null;
+        }
+
+        // A prepared statement is the session's, and a table made from one would be on this node alone.
+        if (local)
+        {
+            throw new PgException("0A000", "cannot create a table from a prepared statement while worf.enable_ddl_replication is on",
+                hint: "The other nodes don't have the prepared statement. Create the table, and insert the statement's rows into it.");
         }
 
         int length = Worf.StrLen(queryString);
@@ -149,6 +161,15 @@ internal static unsafe partial class DdlReplication
 
         return flags;
     }
+
+    /// <summary>
+    /// Checks whether DDL that this session runs now would replicate, as a statement's own kind allows.
+    /// </summary>
+    /// <returns>Whether it would.</returns>
+    internal static bool Replicates()
+        => EnableDdlReplication && !Suppressed && !NativeGlobals.creating_extension &&
+            NativeGlobals.SessionReplicationRole != SessionReplicationRoleReplica && !Restoring() &&
+            WithSnapshot(() => WorfNode.GetLocalNode(false, true) is not null);
 
     /// <summary>
     /// Gets whether DDL being replicated runs now, as when a statement that commits partway, such as
@@ -216,14 +237,6 @@ internal static unsafe partial class DdlReplication
     }
 
     /// <summary>
-    /// Gets whether this session restores a subscription's structure. Only a superuser, or a role granted
-    /// <c>SET</c> on it, may set it, since it turns off DDL replication, the global DDL lock and sequence range checks.
-    /// </summary>
-    [PgGucBool("worf.subscription_schema_restore", false, "Marks a session that restores a subscription's structure.",
-        Context = PgGucContext.SuperuserSet)]
-    internal static partial bool SubscriptionSchemaRestore { get; }
-
-    /// <summary>
     /// Checks whether this session restores a subscription's structure, which DDL replication leaves alone, since the
     /// nodes it would reach already have it.
     /// </summary>
@@ -269,7 +282,8 @@ internal static unsafe partial class DdlReplication
             return;
         }
 
-        // The replication sets, and the truncate trigger a table joining one gets, are worf's own, whoever runs the DDL.
+        // worf keeps the table in its sets for whoever's DDL created or changed it, who may have no rights on worf's
+        // schema.
         bool join = parsetree->type != NodeTag.T_AlterTableStmt || HasCommand((AlterTableStmt*)parsetree, AlterTableType.AT_SetLogged);
         _ = WithSnapshot(() => Elevated.Run(() => Reconcile(reloid, join)));
     }
@@ -382,8 +396,8 @@ internal static unsafe partial class DdlReplication
     }
 
     /// <summary>
-    /// Checks whether a relation is temporary, or one of worf's own, or an index left invalid, which only a concurrent
-    /// build or reindex that failed here leaves, since other nodes build indexes in their apply transaction.
+    /// Checks whether a relation is temporary, or one of worf's own, or an index on this node alone, which a concurrent
+    /// build or reindex that failed here left.
     /// </summary>
     private static bool StaysLocal(RangeVar* relation)
     {
@@ -409,7 +423,7 @@ internal static unsafe partial class DdlReplication
         uint reloid = NativeMethods.RangeVarGetRelidExtended(relation, 0, RangeVarMissingOk, default, null);
         return reloid != 0 &&
             (NativeMethods.get_rel_persistence(reloid) == (sbyte)'t' || NativeMethods.get_rel_namespace(reloid) == WorfNamespace() ||
-                (NativeMethods.get_rel_relkind(reloid) == (sbyte)'i' && !NativeMethods.get_index_isvalid(reloid)));
+                (NativeMethods.get_rel_relkind(reloid) == (sbyte)'i' && LocalIndex.Contains(reloid)));
     }
 
     /// <summary>
@@ -567,57 +581,6 @@ internal static unsafe partial class DdlReplication
                     : temporary == count ? null
                     : throw new PgException("55000", "temporary objects can't be dropped together with other objects while worf.enable_ddl_replication is on",
                         hint: "Drop them in a statement of their own.");
-        }
-    }
-
-    /// <summary>
-    /// Fails a REINDEX that would make valid an index left invalid here, which only a concurrent build or reindex that
-    /// failed here leaves, while DDL replicates: the other nodes don't have the index, so DDL on it stays on this node.
-    /// A concurrent REINDEX of a table, schema or database leaves out invalid indexes itself.
-    /// </summary>
-    /// <param name="parsetree">The statement about to run.</param>
-    internal static void CheckReindex(Node* parsetree)
-    {
-        if (parsetree->type != NodeTag.T_ReindexStmt || !EnableDdlReplication || Suppressed ||
-            NativeGlobals.SessionReplicationRole == SessionReplicationRoleReplica || Restoring())
-        {
-            return;
-        }
-
-        ReindexStmt* stmt = (ReindexStmt*)parsetree;
-        bool concurrently = false;
-        for (int i = 0; stmt->@params is not null && i < stmt->@params->length; i++)
-        {
-            DefElem* option = (DefElem*)stmt->@params->elements[i].ptr_value;
-            concurrently |= Worf.FromServer(option->defname) == "concurrently" && NativeMethods.defGetBoolean(option);
-        }
-
-        (string? scope, uint target) = stmt->kind switch
-        {
-            ReindexObjectType.REINDEX_OBJECT_INDEX => ("index", NativeMethods.RangeVarGetRelidExtended(stmt->relation, 0, RangeVarMissingOk, default, null)),
-            ReindexObjectType.REINDEX_OBJECT_TABLE when !concurrently =>
-                ("table", NativeMethods.RangeVarGetRelidExtended(stmt->relation, 0, RangeVarMissingOk, default, null)),
-            ReindexObjectType.REINDEX_OBJECT_SCHEMA when !concurrently => ("schema", NativeMethods.get_namespace_oid(stmt->name, true)),
-            ReindexObjectType.REINDEX_OBJECT_DATABASE when !concurrently => ("database", 0u),
-            _ => (null, 0u),
-        };
-        if (scope is null || (target == 0 && scope != "database") || !WithSnapshot(() => WorfNode.GetLocalNode(false, true) is not null))
-        {
-            return;
-        }
-
-        string? index = Worf.ReadScalar<string?>("""
-            SELECT c.relname::text FROM pg_catalog.pg_index i
-                JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid JOIN pg_catalog.pg_class t ON t.oid = i.indrelid
-            WHERE NOT i.indisvalid AND c.relkind = 'i' AND c.relpersistence <> 't'
-                AND t.relnamespace NOT IN ($3, 'pg_catalog'::pg_catalog.regnamespace, 'pg_toast'::pg_catalog.regnamespace)
-                AND CASE $1 WHEN 'index' THEN i.indexrelid = $2 WHEN 'table' THEN i.indrelid = $2 WHEN 'schema' THEN t.relnamespace = $2 ELSE true END
-            LIMIT 1
-            """, SpiParameter.Create(scope), SpiParameter.Create(target), SpiParameter.Create(WorfNamespace()));
-        if (index is not null)
-        {
-            throw new PgException("55000", $"index \"{index}\" is invalid on this node alone, so it can't be rebuilt while worf.enable_ddl_replication is on",
-                hint: "Drop it, and create it again to build it on every node.");
         }
     }
 
