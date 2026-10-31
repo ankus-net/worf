@@ -513,8 +513,9 @@ public sealed class SequenceRangeTests
         Assert.HasCount(2110, keys);
 
         // A load's transaction holds the sequence from its reservation's switch until it commits, and the range worker
-        // leaves the sequence for later rather than wait on it. Neither that load nor one after a reservation of its own
-        // counts toward the sequence's rate, nor do their switches toward the size of its next blocks.
+        // leaves the sequence for later rather than wait on it. Neither that load nor one after a reservation of its own,
+        // here from several sessions at once, faster than any before, counts toward the sequence's rate, nor do their
+        // switches toward the size of its next blocks.
         await SettleAsync([nodeA], token);
         string[] before = (await nodeA.SafePsqlAsync(Database, "SELECT request_size, peak_rate FROM worf.sequence_range", token)).Split('|');
         await using (NpgsqlConnection load = await nodeA.OpenAsync(Database, token))
@@ -529,7 +530,8 @@ public sealed class SequenceRangeTests
         }
 
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.reserve_sequence_range('t_id_seq', 10000)", token);
-        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO t (v) SELECT 'load' FROM generate_series(1, 10000)", token);
+        await Task.WhenAll(Enumerable.Range(0, 4).Select(_ =>
+            nodeA.SafePsqlAsync(Database, "INSERT INTO t (v) SELECT 'load' FROM generate_series(1, 2500)", token)));
         await SettleAsync([nodeA], token);
         string[] after = (await nodeA.SafePsqlAsync(Database, "SELECT request_size, peak_rate FROM worf.sequence_range", token)).Split('|');
         Assert.AreEqual(before[0], after[0], "the request size");
