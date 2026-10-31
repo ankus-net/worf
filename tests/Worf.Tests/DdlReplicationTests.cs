@@ -202,6 +202,7 @@ public sealed class DdlReplicationTests
                 "CREATE TABLE conv (id integer PRIMARY KEY, a integer, b integer, c integer, d integer, e integer, f integer, g integer, h integer, i integer, j integer, k integer)",
                 "CREATE FUNCTION pg_temp.tmp_conv(integer) RETURNS bigint LANGUAGE sql AS 'SELECT $1::bigint'",
                 "CREATE FUNCTION pg_temp.tmp_secure(integer) RETURNS bigint LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog AS 'SELECT $1::bigint'",
+                "CREATE FUNCTION pg_temp.tmp_same(integer) RETURNS integer IMMUTABLE LANGUAGE sql AS 'SELECT $1'",
                 "CREATE DOMAIN pg_temp.tmp_dom AS integer",
                 "CREATE OPERATOR pg_temp.### (LEFTARG = integer, RIGHTARG = integer, FUNCTION = int4pl)",
                 "CREATE TYPE pg_temp.tmp_type AS (a integer)",
@@ -235,11 +236,18 @@ public sealed class DdlReplicationTests
                 "CREATE TABLE from_temp AS SELECT * FROM tmp_tt",
                 "CREATE TABLE like_temp (LIKE tmp_tt)",
                 "CREATE TABLE from_prepared AS EXECUTE p",
+                "CREATE INDEX CONCURRENTLY conv_same ON conv (pg_temp.tmp_same(id))",
             })
             {
                 await using NpgsqlCommand command = new(sql, session);
                 PostgresException refused = await Assert.ThrowsExactlyAsync<PostgresException>(() => command.ExecuteNonQueryAsync(token), sql);
                 Assert.AreEqual("0A000", refused.SqlState, sql);
+            }
+
+            // A concurrent build fails before it commits its index, which would last until the session ends.
+            await using (NpgsqlCommand built = new("SELECT count(*) FROM pg_class WHERE relname = 'conv_same'", session))
+            {
+                Assert.AreEqual(0L, await built.ExecuteScalarAsync(token), "the refused concurrent build left nothing");
             }
 
             foreach (string sql in new[]

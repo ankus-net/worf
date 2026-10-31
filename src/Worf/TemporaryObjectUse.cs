@@ -9,7 +9,7 @@ namespace Worf;
 /// itself only as it opens a temporary relation, creates an object in the temporary schema, or drops or locks a
 /// temporary object. Such DDL stays on this node, since the other nodes' sessions don't have the objects.
 /// </summary>
-internal static unsafe class TemporaryObjectUse
+internal static unsafe partial class TemporaryObjectUse
 {
     // The catalogs of relations, attribute defaults, indexes, inheritance, foreign tables and types, from
     // catalog/pg_*_d.h.
@@ -26,6 +26,10 @@ internal static unsafe class TemporaryObjectUse
     // session's temporary functions, noted while the session has temporary objects.
     private static readonly List<(uint ClassId, uint ObjectId, int SubId)> s_changedObjects = [];
     private static bool s_ranTemporaryFunction;
+    private static bool s_callbackRegistered;
+
+    [PgNativeCallback(nameof(TransactionEnding))]
+    private static partial XactCallback TransactionCallback { get; }
 
     /// <summary>
     /// Starts noting what DDL being replicated uses.
@@ -34,6 +38,11 @@ internal static unsafe class TemporaryObjectUse
     {
         s_changedObjects.Clear();
         s_ranTemporaryFunction = false;
+        if (!s_callbackRegistered)
+        {
+            NativeMethods.RegisterXactCallback(TransactionCallback, null);
+            s_callbackRegistered = true;
+        }
     }
 
     /// <summary>
@@ -105,6 +114,43 @@ internal static unsafe class TemporaryObjectUse
             return used;
         }
 
+        (bool depends, bool outlasts) = ReadChanged(schema);
+        used |= depends;
+        if (used && outlasts)
+        {
+            throw OutlastingUse();
+        }
+
+        return used;
+    }
+
+    /// <summary>
+    /// Fails DDL being replicated that commits on its way, at each commit, once what it has created or changed outlasts
+    /// the session and depends on the session's temporary objects: CREATE INDEX CONCURRENTLY, at its first commit, once
+    /// it has created its index and before it builds it, so that it leaves nothing behind.
+    /// </summary>
+    private static void TransactionEnding(XactEvent xactEvent, void* arg)
+    {
+        uint nspoid;
+        if (xactEvent != XactEvent.XACT_EVENT_PRE_COMMIT || !DdlReplication.Running || s_changedObjects.Count == 0 ||
+            (nspoid = TemporaryNamespace()) == 0)
+        {
+            return;
+        }
+
+        (bool depends, bool outlasts) = ReadChanged(Worf.FromServer(NativeMethods.get_namespace_name(nspoid)));
+        if (depends && outlasts)
+        {
+            throw OutlastingUse();
+        }
+    }
+
+    /// <summary>
+    /// Reads whether the objects that the DDL being replicated has created or changed so far depend on the session's
+    /// temporary objects, and whether any outlasts the session.
+    /// </summary>
+    private static (bool Depends, bool Outlasts) ReadChanged(string schema)
+    {
         NativeMethods.CommandCounterIncrement();
         long[] classIds = [.. s_changedObjects.Select(changed => (long)changed.ClassId)];
         long[] objectIds = [.. s_changedObjects.Select(changed => (long)changed.ObjectId)];
@@ -112,7 +158,7 @@ internal static unsafe class TemporaryObjectUse
 
         // An object in a catalog with a schema is checked for its own schema, and every object for what it depends on.
         // An object outlasts the session unless it's in the temporary schema, or is part of a temporary relation.
-        SpiResult result = Elevated.Run(() => Spi.Select("""
+        SpiResult result = Elevated.Run(() => Worf.Read("""
             WITH o AS (
                 SELECT c.classid, coalesce(ad.oid, c.objid) AS objid, CASE WHEN ad.oid IS NULL THEN c.objsubid ELSE 0 END AS objsubid,
                     CASE WHEN c.classid IN ('pg_catalog.pg_class'::pg_catalog.regclass, 'pg_catalog.pg_attrdef'::pg_catalog.regclass) THEN c.objid
@@ -146,16 +192,13 @@ internal static unsafe class TemporaryObjectUse
                         THEN (SELECT relpersistence <> 't' FROM pg_catalog.pg_class WHERE oid = o.relid)
                         ELSE (SELECT i.schema IS DISTINCT FROM $4 FROM pg_catalog.pg_identify_object(o.classid, o.objid, 0) AS i
                             WHERE i.identity IS NOT NULL) END)
-            """, SpiParameter.Create(classIds), SpiParameter.Create(objectIds), SpiParameter.Create(subIds), SpiParameter.Create(schema)));
-        used |= result[0].Get<bool>(0);
-        if (used && result[0].Get<bool>(1))
-        {
-            throw new PgException("0A000", "cannot create or change objects that outlast the session with its temporary objects while worf.enable_ddl_replication is on",
-                hint: "The other nodes don't have the temporary objects. Use permanent ones, or write out what the statement takes from them.");
-        }
-
-        return used;
+            """, 0, SpiParameter.Create(classIds), SpiParameter.Create(objectIds), SpiParameter.Create(subIds), SpiParameter.Create(schema)));
+        return (result[0].Get<bool>(0), result[0].Get<bool>(1));
     }
+
+    private static PgException OutlastingUse()
+        => new("0A000", "cannot create or change objects that outlast the session with its temporary objects while worf.enable_ddl_replication is on",
+            hint: "The other nodes don't have the temporary objects. Use permanent ones, or write out what the statement takes from them.");
 
     /// <summary>
     /// Checks whether an object a DROP names is one of the session's temporary objects, locking it as the DROP will.
