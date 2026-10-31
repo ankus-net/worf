@@ -273,6 +273,15 @@ public sealed class SequenceRangeTests
         // portal does after another's partial execution, so that statement's rows aren't taken for rows it moved.
         Assert.AreEqual("23514", await PartialExecuteAsync("UPDATE t SET v = v RETURNING key", "INSERT INTO t (key, v) VALUES (333333, 'forged')"));
 
+        // An update that an error ends inside an EXCEPTION block leaves with its subtransaction, so the savepoint of a
+        // later transaction in the same simple query, which starts at the same time, isn't taken for it.
+        (int forgedExit, string forged) = await node.RunProgramAsync("psql", ["-X", "-d", Database, "-c", """
+            BEGIN; DO $$BEGIN BEGIN UPDATE t SET v = (1 / (length(v) - length(v)))::text; EXCEPTION WHEN division_by_zero THEN NULL; END; END$$; COMMIT;
+            BEGIN; SAVEPOINT s; INSERT INTO t (key, v) VALUES (777778, 'forged'); COMMIT;
+            """], token);
+        Assert.AreNotEqual(0, forgedExit, forged);
+        Assert.Contains("is not in a sequence range this node holds", forged);
+
         // Rows that DDL brings under the guard can't hold values the sequence may still issue, though values from before
         // range management can stay. A partitioned table's guard checks a column that only a partition's own default
         // draws from a managed sequence.

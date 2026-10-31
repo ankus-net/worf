@@ -40,10 +40,11 @@ internal static class SequenceRangeGuard
     private static nint s_lastValue;
 
     // The running statements whose only inserts are the rows they move to another partition, an UPDATE or a MERGE with
-    // no INSERT action, by the start of their transaction, their subtransaction and their snapshot's command ID. A
-    // statement leaves as it ends; one that an error ends stays behind in a subtransaction that no later statement runs
-    // in, or in an earlier transaction.
-    private static readonly List<(nint QueryDesc, long Started, uint Subxact, uint Cid)> s_moving = [];
+    // no INSERT action, by their subtransaction and their snapshot's command ID. A statement leaves as it ends, and one
+    // that an error ends leaves with the subtransaction it ran in, or with its transaction, so that no later statement,
+    // which a new subtransaction or command ID sets apart from it, is taken for it.
+    private static readonly List<(nint QueryDesc, uint Subxact, uint Cid)> s_moving = [];
+    private static bool s_movingRegistered;
 
     /// <summary>
     /// The guard's trigger function. The triggers' conditions do the checking and are never true, so this never runs.
@@ -174,9 +175,17 @@ internal static class SequenceRangeGuard
 
         if (moves)
         {
-            long started = NativeMethods.GetCurrentTransactionStartTimestamp();
-            _ = s_moving.RemoveAll(statement => statement.Started != started);
-            s_moving.Add(((nint)queryDesc, started, NativeMethods.GetCurrentSubTransactionId(), queryDesc->snapshot->curcid));
+            if (!s_movingRegistered)
+            {
+                s_movingRegistered = true;
+                _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, ForgetMoving);
+                _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, ForgetMoving);
+                _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, ForgetMoving);
+                _ = PgTransaction.RegisterSubtransactionCallback(PgSubtransactionEvent.Abort,
+                    static (aborted, _) => s_moving.RemoveAll(statement => statement.Subxact == aborted.Value));
+            }
+
+            s_moving.Add(((nint)queryDesc, NativeMethods.GetCurrentSubTransactionId(), queryDesc->snapshot->curcid));
         }
     }
 
@@ -194,6 +203,15 @@ internal static class SequenceRangeGuard
     }
 
     /// <summary>
+    /// Forgets the moving statements of a transaction as it ends.
+    /// </summary>
+    private static void ForgetMoving()
+    {
+        s_moving.Clear();
+        s_movingRegistered = false;
+    }
+
+    /// <summary>
     /// Checks whether a new row is one a running statement moves from another partition. PostgreSQL then checks the
     /// partitioned table's update guard against the row's old and new values, so its insert leaves the check to that.
     /// A statement that runs inside it, as a trigger's does, has a later command ID.
@@ -205,11 +223,10 @@ internal static class SequenceRangeGuard
             return false;
         }
 
-        (long started, uint subxact, uint cid) = (NativeMethods.GetCurrentTransactionStartTimestamp(), NativeMethods.GetCurrentSubTransactionId(),
-            NativeMethods.GetActiveSnapshot()->curcid);
-        foreach ((_, long statementStarted, uint statementSubxact, uint statementCid) in s_moving)
+        (uint subxact, uint cid) = (NativeMethods.GetCurrentSubTransactionId(), NativeMethods.GetActiveSnapshot()->curcid);
+        foreach ((_, uint statementSubxact, uint statementCid) in s_moving)
         {
-            if ((statementStarted, statementSubxact, statementCid) == (started, subxact, cid))
+            if ((statementSubxact, statementCid) == (subxact, cid))
             {
                 return true;
             }
