@@ -156,6 +156,10 @@ internal static unsafe partial class OutputPlugin
             // startup message until the first change processed on the stream, in a begin callback.
             s_startupMessageSent = false;
 
+            // A set can be dropped and created again under its name, and so its ID, after a change the walsender
+            // decodes. The sets are found by name no earlier than this snapshot, so a set it saw deleted was another.
+            data.SetsSnapshot = SetsSnapshot();
+
             // Now parse the rest of the params and ERROR if we see any we don't recognise
             int paramsFormat = OutputConfig.ProcessParameters(ReadOptions(ctx->output_plugin_options), data);
 
@@ -278,6 +282,8 @@ internal static unsafe partial class OutputPlugin
             SendStartupMessage(ctx, data, false /* can't be last message */);
         }
 
+        data.Xid = txn->xid;
+
         // If the record didn't originate locally, send origin info
         sendReplicationOrigin &= txn->origin_id != 0;
 
@@ -365,6 +371,27 @@ internal static unsafe partial class OutputPlugin
         data.ActionsSnapshot = actionsSnapshot;
     }
 
+    /// <summary>
+    /// Reads the catalog snapshot that finding the replication sets by name sees no less than.
+    /// </summary>
+    private static (uint Xmin, uint Xmax, HashSet<uint> Running) SetsSnapshot()
+    {
+        SnapshotData* snapshot = NativeMethods.GetCatalogSnapshot(ReplicationSet.GetReplicationSetRelOid());
+        HashSet<uint> running = [];
+        for (uint i = 0; i < snapshot->xcnt; i++)
+        {
+            _ = running.Add(snapshot->xip[i]);
+        }
+
+        return (snapshot->xmin, snapshot->xmax, running);
+    }
+
+    /// <summary>
+    /// Checks whether a snapshot saw a transaction that has committed as committed.
+    /// </summary>
+    private static bool SeenCommitted((uint Xmin, uint Xmax, HashSet<uint> Running) snapshot, uint xid)
+        => (int)(xid - snapshot.Xmin) < 0 || ((int)(xid - snapshot.Xmax) < 0 && !snapshot.Running.Contains(xid));
+
     private static bool WorfChangeFilter(WorfOutputData data, RelationData* relation, ReorderBufferChange* change,
         out HashSet<int>? attList)
     {
@@ -433,7 +460,9 @@ internal static unsafe partial class OutputPlugin
             foreach (WorfRepSet rs in data.ReplicationSets)
             {
                 // Somebody deleted one of our rep sets, bail here and let reconnect logic handle any potential issues.
-                if (rs.Id == replicatedSet.Id)
+                // A set deleted before the walsender found ours by name was another of that name, which ours
+                // replaced; the actions read as of each change follow the sets from one to the other.
+                if (rs.Id == replicatedSet.Id && !SeenCommitted(data.SetsSnapshot, data.Xid))
                 {
                     throw new PgException(PgSqlStates.InternalError,
                         $"replication set \"{rs.Name}\" used by this connection was deleted, existing");
