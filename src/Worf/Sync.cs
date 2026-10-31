@@ -244,13 +244,13 @@ internal static class Sync
                 return (sync.Status, sync.Statuslsn);
             }
 
-            // If previous sync attempt failed, we need to start from beginning. One that failed once its copy had
-            // committed, as while it caught up, left the rows that copying again adds, which go, as resynchronizing does.
+            // One that failed once its copy had committed, as while it caught up, may catch up again.
             if (sync.Status is SyncStatusSyncwait or SyncStatusCatchup)
             {
-                TruncateTable(nspname, relname);
+                return (sync.Status, sync.Statuslsn);
             }
 
+            // If previous sync attempt failed, we need to start from beginning.
             if (sync.Status != SyncStatusInit)
             {
                 SetTableSyncStatus(sub.Id, nspname, relname, SyncStatusInit, 0);
@@ -260,9 +260,24 @@ internal static class Sync
         });
 
         statusLsn = currentLsn;
-        if (currentStatus != SyncStatusNone)
+        if (currentStatus is SyncStatusReady or SyncStatusSyncdone)
         {
             return currentStatus;
+        }
+
+        // The copy's rows, and the changes caught up after them, are kept. The slot and the origin's progress outlive
+        // the worker, so it catches up from where it got to; without them it starts from the beginning again, and the
+        // copy fails on the rows already there, as before.
+        if (currentStatus is SyncStatusSyncwait or SyncStatusCatchup)
+        {
+            if (CatchupStart(sub) is ulong start)
+            {
+                PgLog.Log($"resuming the catch-up of table {nspname}.{relname} from {Worf.FormatLsn(start)}");
+                statusLsn = start;
+                return SyncStatusSyncwait;
+            }
+
+            PgBackgroundWorker.RunTransaction(() => SetTableSyncStatus(sub.Id, nspname, relname, SyncStatusInit, 0));
         }
 
         List<WorfManagedSequence> managedSequences = PgBackgroundWorker.RunTransaction(() => SequenceRangeSync.FetchManaged(sub.OriginIf.Dsn, sub.Name));
@@ -303,6 +318,39 @@ internal static class Sync
         }
 
         return SyncStatusSyncwait;
+    }
+
+    /// <summary>
+    /// Gets where a table sync worker whose copy has committed catches up from: the latest progress of its origin and
+    /// relay origins, as apply starts from, when the slot it streams from is still on the provider.
+    /// </summary>
+    /// <param name="sub">The subscription, with the table's slot name.</param>
+    /// <returns>The position, or null when the slot or the origin is gone.</returns>
+    private static ulong? CatchupStart(WorfSubscription sub)
+    {
+        using (PgReplicationConnection conn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "resume"))
+        {
+            if (!PgBackgroundWorker.RunTransaction(() => Rpc.RemoteSlotExists(conn, sub.SlotName)))
+            {
+                return null;
+            }
+        }
+
+        return PgBackgroundWorker.RunTransaction(() =>
+        {
+            if (PgReplicationOrigin.Find(sub.SlotName) is not ushort origin)
+            {
+                return (ulong?)null;
+            }
+
+            ulong start = PgReplicationOrigin.GetProgress(origin, false).Value;
+            foreach ((ushort relay, _) in WorfNode.RelayOrigins(sub.SlotName))
+            {
+                start = Math.Max(start, PgReplicationOrigin.GetProgress(relay, false).Value);
+            }
+
+            return start;
+        });
     }
 
     /// <summary>
@@ -408,8 +456,8 @@ internal static class Sync
             _ = PgBackgroundWorker.RunTransaction(() => Worf.IdentifySystem(streamConn));
 
             // The walsender that streamed before holds the slot until it notices the connection closed, which it doesn't
-            // while it's busy decoding, as with a large transaction it sends nothing of. Failing would copy the table
-            // again, so the worker waits for the slot, which is its own.
+            // while it's busy decoding, as with a large transaction it sends nothing of. Rather than fail and start
+            // again, the worker waits for the slot, which is its own.
             WaitForCatchupSlot(streamConn, sub.SlotName);
 
             Worf.StartReplication(streamConn, sub.SlotName, startLsn, "all", null, tablename, sub.ForceTextTransfer);
@@ -426,7 +474,7 @@ internal static class Sync
     /// Waits for a table sync worker's slot to be free before it streams from it. After a second, a walsender of an
     /// earlier connection of this worker's, with the same user and application name, is stopped; anything else that
     /// holds the slot, such as a session reading its changes, is waited for, with a warning. After a minute the worker
-    /// fails, and copies the table again when it restarts.
+    /// fails, and catches up again when it restarts.
     /// </summary>
     /// <param name="streamConn">The replication connection the worker streams on.</param>
     /// <param name="slotName">The slot.</param>
@@ -448,7 +496,7 @@ internal static class Sync
             {
                 throw new PgException(PgSqlStates.ObjectInUse,
                     $"replication slot \"{slotName}\" is still active for PID {holder} on the provider", null!,
-                    "Stop the process that holds the slot; the table is copied again.", null!);
+                    "Stop the process that holds the slot; the sync catches up again when it restarts.", null!);
             }
 
             if (now >= checkAt)
@@ -461,7 +509,7 @@ internal static class Sync
                     PgLog.Warning(new PgDiagnostic($"replication slot \"{slotName}\" is active for PID {holder} on the provider, which this table sync waits for")
                     {
                         Detail = notStopped,
-                        Hint = $"The sync fails after {CatchupSlotWait} seconds and copies the table again.",
+                        Hint = $"The sync fails after {CatchupSlotWait} seconds, and catches up again when it restarts.",
                     });
                 }
             }
