@@ -1359,13 +1359,19 @@ internal static unsafe partial class Apply
             throw new PgException(PgSqlStates.InternalError, "missing last_value in sequence message");
         }
 
-        uint nspoid;
         uint reloid;
         fixed (byte* cnspname = Worf.ToServerCString(nspname))
         fixed (byte* crelname = Worf.ToServerCString(relname))
         {
-            nspoid = NativeMethods.get_namespace_oid((sbyte*)cnspname, false);
-            reloid = NativeMethods.get_relname_relid((sbyte*)crelname, nspoid);
+            uint nspoid = NativeMethods.get_namespace_oid((sbyte*)cnspname, true);
+            reloid = nspoid == 0 ? 0 : NativeMethods.get_relname_relid((sbyte*)crelname, nspoid);
+        }
+
+        // There's nothing to set for a sequence that isn't here, as when it was dropped.
+        if (reloid == 0)
+        {
+            PgLog.Warning($"skipping the state of sequence {nspname}.{relname}, which doesn't exist here");
+            return;
         }
 
         // A managed sequence's position is this node's own, and the provider's would fall outside its block.
