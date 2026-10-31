@@ -438,6 +438,29 @@ public sealed class SequenceRangeTests
         Assert.AreEqual("42501", reserve.SqlState);
         Assert.Contains("must be owner", reserve.MessageText);
 
+        // The functions the planner runs for a role's table, from a CHECK constraint or an index predicate, run as the
+        // table's owner when worf reads its rows, on SET DEFAULT and in the range worker, so they can't make it a superuser.
+        int escapes = node.ReadLog().Length;
+        _ = await node.SafePsqlAsync(Database, """
+            SET ROLE app;
+            CREATE FUNCTION app.esc(what text) RETURNS boolean LANGUAGE plpgsql AS $$
+            BEGIN
+                RAISE LOG 'esc(%) runs as % in %', what, current_user, pg_backend_pid();
+                ALTER ROLE app SUPERUSER;
+                RETURN true;
+            EXCEPTION WHEN insufficient_privilege THEN
+                RETURN true;
+            END$$;
+            CREATE FUNCTION app.imm(what text) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$SELECT app.esc(what)$$;
+            CREATE TABLE app.x2 (id bigint PRIMARY KEY, CHECK (app.imm('check')));
+            CREATE INDEX ON app.x2 (id) WHERE app.imm('index');
+            ALTER TABLE app.x2 ALTER COLUMN id SET DEFAULT nextval('public.t_id_seq');
+            INSERT INTO app.x2 SELECT FROM generate_series(1, 3);
+            """, token);
+        string rangeWorker = await node.SafePsqlAsync(Database, "SELECT pid FROM pg_stat_activity WHERE datname = current_database() AND backend_type LIKE 'worf range%'", token);
+        Assert.IsTrue(await node.PollLogAsync(escapes, $"runs as app in {rangeWorker}", token), "the range worker read the table as its owner");
+        Assert.AreEqual("f", await node.SafePsqlAsync(Database, "SELECT rolsuper FROM pg_roles WHERE rolname = 'app'", token));
+
         // Triggers with the guard's names from before worf was installed are replaced as their table comes under the
         // guard, and once it is installed, no trigger takes the guard's names or function, while a restore skips them.
         _ = await node.SafePsqlAsync(Database, "CREATE DATABASE decoys", token);

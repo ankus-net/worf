@@ -345,12 +345,12 @@ internal static class SequenceRangeGuard
     /// check looks for the values that fail by their spans, so that an index on the column, or the table's constraints,
     /// spare it from reading every row.
     /// </summary>
-    /// <param name="table">The table's qualified name.</param>
+    /// <param name="relid">The table.</param>
     /// <param name="inherited">Whether to check its inheritors' and partitions' rows too.</param>
     /// <param name="column">The column.</param>
     /// <param name="numeric">Whether the column is numeric.</param>
     /// <param name="sequences">The managed sequences the column uses.</param>
-    internal static void CheckRows(string table, bool inherited, string column, bool numeric, List<uint> sequences)
+    internal static void CheckRows(uint relid, bool inherited, string column, bool numeric, List<uint> sequences)
     {
         Reload();
         List<(long Lo, long Hi)> refused = [];
@@ -389,8 +389,10 @@ internal static class SequenceRangeGuard
         }
 
         // The table's constraints, as a partition's bound, may rule the spans out, and spare reading its rows, as they spare
-        // PostgreSQL's own check of an attached partition's rows.
-        string? outside = Elevated.Run(() =>
+        // PostgreSQL's own check of an attached partition's rows. The query runs as the table's owner, so that the user's
+        // functions the planner runs, as from its constraints and index predicates, have no rights the owner lacks.
+        string table = SequenceRanges.QualifiedName(relid);
+        string? outside = TableOwner.Run(relid, () =>
         {
             unsafe
             {

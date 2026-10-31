@@ -821,7 +821,8 @@ internal static unsafe partial class SequenceRanges
     /// <summary>
     /// Reads the furthest value the tables hold in a block, from each column that uses the sequence and leads a btree
     /// index, whose table isn't locked against reading, so that the read is quick and waits on no DDL. A partitioned
-    /// table's partitions, which take its column's default, are read on their own.
+    /// table's partitions, which take its column's default, are read on their own. Each table is read as its owner, so
+    /// that the user's functions the planner runs have no rights the owner lacks, and only when the owner may read it.
     /// </summary>
     /// <returns>The value, or null when no row holds one.</returns>
     private static decimal? FurthestStored(SequenceInfo info, (Guid Id, long Lo, long Hi) block)
@@ -835,15 +836,18 @@ internal static unsafe partial class SequenceRanges
                         JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
                         JOIN pg_catalog.pg_am m ON m.oid = c.relam
                         JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
-                    WHERE i.indrelid = $1 AND a.attname = $2 AND m.amname = 'btree' AND i.indisvalid AND i.indpred IS NULL)
+                        JOIN pg_catalog.pg_class t ON t.oid = i.indrelid
+                    WHERE i.indrelid = $1 AND a.attname = $2 AND m.amname = 'btree' AND i.indisvalid AND i.indpred IS NULL
+                        AND pg_catalog.has_table_privilege(t.relowner, t.oid, 'SELECT')
+                        AND pg_catalog.has_schema_privilege(t.relowner, t.relnamespace, 'USAGE'))
                 """, SpiParameter.Create(relid), SpiParameter.Create(column)) ||
                 !NativeMethods.ConditionalLockRelationOid(relid, (int)PgLockMode.AccessShare))
             {
                 continue;
             }
 
-            if (Worf.ReadScalar<decimal?>($"SELECT {(info.Ascending ? "max" : "min")}({Spi.QuoteIdentifier(column)})::numeric FROM {QualifiedName(relid)} WHERE {Spi.QuoteIdentifier(column)} BETWEEN $1 AND $2",
-                SpiParameter.Create(block.Lo), SpiParameter.Create(block.Hi)) is decimal value)
+            string query = $"SELECT {(info.Ascending ? "max" : "min")}({Spi.QuoteIdentifier(column)})::numeric FROM {QualifiedName(relid)} WHERE {Spi.QuoteIdentifier(column)} BETWEEN $1 AND $2";
+            if (TableOwner.Run(relid, () => Worf.ReadScalar<decimal?>(query, SpiParameter.Create(block.Lo), SpiParameter.Create(block.Hi))) is decimal value)
             {
                 furthest = furthest is not decimal f ? value : info.Ascending ? Math.Max(f, value) : Math.Min(f, value);
             }
@@ -1562,7 +1566,7 @@ internal static unsafe partial class SequenceRanges
         {
             if (GuardedColumns(relid).TryGetValue(column, out (uint TypeOid, List<uint> Sequences) guarded))
             {
-                SequenceRangeGuard.CheckRows(QualifiedName(relid), inherited, column, guarded.TypeOid == NumericOid, guarded.Sequences);
+                SequenceRangeGuard.CheckRows(relid, inherited, column, guarded.TypeOid == NumericOid, guarded.Sequences);
             }
 
             return;
@@ -1575,7 +1579,7 @@ internal static unsafe partial class SequenceRanges
             if (leaf && Beneath(partition, relid, tree.Members) &&
                 GuardedColumns(partition, tree).TryGetValue(column, out (uint TypeOid, List<uint> Sequences) guarded))
             {
-                SequenceRangeGuard.CheckRows(QualifiedName(partition), false, column, guarded.TypeOid == NumericOid, guarded.Sequences);
+                SequenceRangeGuard.CheckRows(partition, false, column, guarded.TypeOid == NumericOid, guarded.Sequences);
             }
         }
     }
@@ -1609,7 +1613,7 @@ internal static unsafe partial class SequenceRanges
             {
                 if (!own.TryGetValue(column, out (uint TypeOid, List<uint> Sequences) before) || !sequences.TrueForAll(before.Sequences.Contains))
                 {
-                    SequenceRangeGuard.CheckRows(QualifiedName(leaf), false, column, typeOid == NumericOid, sequences);
+                    SequenceRangeGuard.CheckRows(leaf, false, column, typeOid == NumericOid, sequences);
                 }
             }
         }
@@ -3021,20 +3025,25 @@ internal static unsafe partial class SequenceRanges
         Take(Worf.ReadScalar<long?>("SELECT watermark FROM worf.sequence_range WHERE seqoid = $1", seq));
         Take(Worf.ReadScalar<long?>("SELECT " + pick + "(" + (info.Ascending ? "hi" : "lo") +
             ") FROM worf.sequence_range_block WHERE seqoid = $1 AND kind IN ('n', 'i')", seq));
+        // Each table is read as its owner, so that the user's functions the planner runs have no rights the owner lacks.
         foreach ((uint relid, string column, uint typeOid) in UsingColumns(info.Seqoid))
         {
-            string nspname = Worf.FromServer(NativeMethods.get_namespace_name(NativeMethods.get_rel_namespace(relid)));
-            string relname = Worf.FromServer(NativeMethods.get_rel_name(relid));
-            Take(Worf.ReadScalar<long?>(typeOid == NumericOid
+            string query = typeOid == NumericOid
                 ? "SELECT least(greatest(" + round + "(" + pick + "(" + Spi.QuoteIdentifier(column) +
-                    ")), -9223372036854775808), 9223372036854775807)::bigint FROM " + Spi.QuoteQualifiedIdentifier(nspname, relname)
-                : "SELECT " + pick + "(" + Spi.QuoteIdentifier(column) + ")::bigint FROM " + Spi.QuoteQualifiedIdentifier(nspname, relname)));
+                    ")), -9223372036854775808), 9223372036854775807)::bigint FROM " + QualifiedName(relid)
+                : "SELECT " + pick + "(" + Spi.QuoteIdentifier(column) + ")::bigint FROM " + QualifiedName(relid);
+            Take(TableOwner.Run(relid, () => Worf.ReadScalar<long?>(query)));
         }
 
         return high;
     }
 
-    private static string QualifiedName(uint relid)
+    /// <summary>
+    /// Gets a relation's quoted, schema-qualified name.
+    /// </summary>
+    /// <param name="relid">The relation.</param>
+    /// <returns>The name.</returns>
+    internal static string QualifiedName(uint relid)
         => Spi.QuoteQualifiedIdentifier(Worf.FromServer(NativeMethods.get_namespace_name(NativeMethods.get_rel_namespace(relid))),
             Worf.FromServer(NativeMethods.get_rel_name(relid)));
 
