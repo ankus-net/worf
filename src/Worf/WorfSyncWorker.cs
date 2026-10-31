@@ -23,13 +23,13 @@ internal struct WorfSyncWorker
     public nameData Relname;
 
     /// <summary>
-    /// The position of the copy's snapshot, once the worker waits for the apply worker to reach it, or zero.
+    /// The position the worker waits for the apply worker to reach before it copies the table, or zero.
     /// </summary>
     public ulong CopyLsn;
 
     /// <summary>
-    /// Whether the apply worker has applied everything that committed before the copy's snapshot, so the copy can
-    /// start.
+    /// The position before which the apply worker has applied everything that committed, as it last told the worker
+    /// while it waits.
     /// </summary>
-    public bool CopyAllowed;
+    public ulong AppliedLsn;
 }

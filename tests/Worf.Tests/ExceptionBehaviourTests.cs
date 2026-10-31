@@ -13,6 +13,13 @@ public sealed class ExceptionBehaviourTests
     private const string Database = "postgres";
     private const string SuperUser = "super";
 
+    // The sync worker's connection that reads the provider's managed sequences waits for a lock on them.
+    private const string SyncWorkerHeldSql = """
+        SELECT EXISTS (
+            SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+            WHERE NOT l.granted AND l.relation = 'worf.sequence_range'::regclass AND a.application_name = 'sub_ranges')
+        """;
+
     /// <summary>
     /// Gets or sets the test context.
     /// </summary>
@@ -143,6 +150,38 @@ public sealed class ExceptionBehaviourTests
         _ = await subscriber.SafePsqlAsync(Database, "SELECT worf.alter_subscription_enable('sub')", token);
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM t WHERE id = 21)", token),
             "the transaction that disabled the subscription");
+
+        // A table's copy waits for apply, which fails on a row until the constraint goes, without the snapshot that would
+        // keep the provider from removing dead rows meanwhile. The provider holds the sync worker back until the row is
+        // in.
+        await SetBehaviourAsync(subscriber, "error", token);
+        _ = await subscriber.SafePsqlAsync(Database, "ALTER TABLE t ADD CONSTRAINT not_bad CHECK (v <> 'bad') NOT VALID", token);
+        await using (NpgsqlConnection held = await provider.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction transaction = await held.BeginTransactionAsync(token);
+            await using (NpgsqlCommand command = new("LOCK TABLE worf.sequence_range", held, transaction))
+            {
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+
+            _ = await subscriber.SafePsqlAsync(Database, "SELECT worf.alter_subscription_resynchronize_table('sub', 'parent')", token);
+            Assert.IsTrue(await provider.PollQueryUntilAsync(Database,
+                SyncWorkerHeldSql, token),
+                "the sync worker reading the provider's managed sequences");
+            _ = await provider.SafePsqlAsync(Database, "INSERT INTO t VALUES (31, 'bad')", token);
+            await transaction.RollbackAsync(token);
+        }
+
+        await Task.Delay(TimeSpan.FromSeconds(2), token);
+        _ = await provider.SafePsqlAsync(Database, "CREATE TABLE churn AS SELECT generate_series(1, 1000) AS id", token);
+        _ = await provider.SafePsqlAsync(Database, "DELETE FROM churn", token);
+        _ = await provider.SafePsqlAsync(Database, "VACUUM churn", token);
+        Assert.AreEqual("0", await provider.SafePsqlAsync(Database, "SELECT pg_relation_size('churn')", token),
+            "the pages VACUUM emptied of the dead rows and truncated");
+        _ = await subscriber.SafePsqlAsync(Database, "ALTER TABLE t DROP CONSTRAINT not_bad", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+            "SELECT sync_status = 'r' FROM worf.local_sync_status WHERE sync_relname = 'parent'", token), "the table synchronized");
+        Assert.AreEqual("1", await subscriber.SafePsqlAsync(Database, "SELECT string_agg(id::text, ',') FROM parent", token));
 
         // The rolled back subtransactions released what they held.
         string[] leaks = [.. subscriber.ReadLog().Split('\n').Where(line => line.Contains("leak", StringComparison.Ordinal) || line.Contains("not closed", StringComparison.Ordinal))];

@@ -2429,9 +2429,10 @@ internal static unsafe partial class Apply
     }
 
     /// <summary>
-    /// Lets the subscription's sync workers copy their table once everything that committed before their copy's
-    /// snapshot is applied. Queued SQL that committed before a snapshot changes the table before its copy, as it
-    /// changed the provider's rows before it; run after the copy, it changes the copied rows again.
+    /// Tells the subscription's sync workers that wait to copy their table how far apply has got, so each copies once
+    /// everything that committed before its copy's snapshot is applied. Queued SQL that committed before a snapshot
+    /// changes the table before its copy, as it changed the provider's rows before it; run after the copy, it changes
+    /// the copied rows again.
     /// </summary>
     /// <param name="lsn">The position before which everything that committed is applied.</param>
     private static void AllowCopies(ulong lsn)
@@ -2444,7 +2445,7 @@ internal static unsafe partial class Apply
             WorfWorker me = guard[Worker.MyWorfWorker];
             for (int i = 0; i < guard.Length && me.WorkerType == WorfWorkerType.Apply && !waiting; i++)
             {
-                waiting = WaitsToCopy(guard[i], dboid, me.Worker.Apply.SubId, lsn);
+                waiting = WaitsForApply(guard[i], dboid, me.Worker.Apply.SubId, lsn);
             }
         }
 
@@ -2459,24 +2460,26 @@ internal static unsafe partial class Apply
             for (int i = 0; i < guard.Length; i++)
             {
                 WorfWorker worker = guard[i];
-                if (WaitsToCopy(worker, dboid, subid, lsn))
+                if (WaitsForApply(worker, dboid, subid, lsn))
                 {
-                    worker.Worker.Sync.CopyAllowed = true;
+                    worker.Worker.Sync.AppliedLsn = lsn;
                     guard[i] = worker;
-                    Worker.SetProcLatch(worker.Proc);
+                    if (lsn >= worker.Worker.Sync.CopyLsn)
+                    {
+                        Worker.SetProcLatch(worker.Proc);
+                    }
                 }
             }
         }
     }
 
     /// <summary>
-    /// Checks whether a worker is a sync worker of the subscription that waits for the apply worker to reach its copy's
-    /// snapshot, which it has.
+    /// Checks whether a worker is a sync worker of the subscription that waits for the apply worker, which it hasn't
+    /// heard has got this far.
     /// </summary>
-    private static bool WaitsToCopy(WorfWorker worker, uint dboid, uint subid, ulong lsn)
+    private static bool WaitsForApply(WorfWorker worker, uint dboid, uint subid, ulong lsn)
         => worker.WorkerType == WorfWorkerType.Sync && worker.Proc != 0 && worker.Dboid == dboid &&
-            worker.Worker.Apply.SubId == subid && worker.Worker.Sync.CopyLsn != 0 && worker.Worker.Sync.CopyLsn <= lsn &&
-            !worker.Worker.Sync.CopyAllowed;
+            worker.Worker.Apply.SubId == subid && worker.Worker.Sync.CopyLsn != 0 && worker.Worker.Sync.AppliedLsn < lsn;
 
     private static void StartSyncWorker(string nspname, string relname)
     {

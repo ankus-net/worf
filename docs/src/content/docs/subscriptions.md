@@ -89,6 +89,8 @@ description: Create, alter, synchronize and drop subscriptions.
   foreign key constraints.
   **WARNING: This function will truncate the table immediately, and only then
   begin synchronising it, so it will be empty while being synced**
+  The copy starts once apply has caught up with the provider, so it waits, and
+  logs that it does, while apply fails on a change.
 
   Does not block, use `worf.wait_for_table_sync_complete` to wait for
   completion.
