@@ -28,9 +28,12 @@ public sealed class GlobalDdlLockTests
     /// it, and only the one that kept it lets it go by asking, a TRUNCATE that may not run doesn't queue for its lock,
     /// a unique index built concurrently takes the lock, and lets it go as soon as it fails, a concurrent detach leaves
     /// no fence and, cancelled and finished later, replicates, a detach finishes one under way where it applies, and
-    /// does nothing where the partition is detached already, and the provider role's idle session timeout doesn't end
-    /// a fence. DDL on an index that a cancelled concurrent drop left invalid replicates, while DDL on one that a
-    /// failed build or reindex left stays on its node, however it's built again.
+    /// does nothing where the partition is detached already, or where the node's own detach finishes first, a node that
+    /// lags gets what came before its provider rebuilt its catalog's indexes, and the provider role's idle session
+    /// timeout doesn't end a fence. DDL on an index that a cancelled concurrent drop left invalid replicates, while DDL
+    /// on one that a failed build or reindex left stays on its node, however and from whichever session it's built
+    /// again, DDL that would make other objects use it fails, and DDL from the other node that takes its name renames
+    /// it.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -204,14 +207,16 @@ public sealed class GlobalDdlLockTests
             "node_a's detach finished node_b's");
 
         // Both nodes detaching a partition, one finishing a concurrent detach as PostgreSQL hints, leaves it detached.
+        // node_a's write before it rebuilds its catalog's indexes, as node_b lags, reaches node_b.
         _ = await nodeA.SafePsqlAsync(Database, "ALTER TABLE p ATTACH PARTITION p3 FOR VALUES FROM (200) TO (300)", token);
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
         _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.alter_subscription_disable('b_from_a', true)", token);
         _ = await nodeA.SafePsqlAsync(Database, "ALTER TABLE p DETACH PARTITION p3", token);
+        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO p VALUES (30, 30)", token);
+        _ = await nodeA.SafePsqlAsync(Database, "REINDEX TABLE worf.replication_set_table", token);
         await CancelMidwayAsync(nodeB, "p", "ALTER TABLE p DETACH PARTITION p3 CONCURRENTLY", token);
         _ = await nodeB.SafePsqlAsync(Database, "ALTER TABLE p DETACH PARTITION p3 FINALIZE", token);
         _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.alter_subscription_enable('b_from_a', true)", token);
-        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO p VALUES (30, 30)", token);
         _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO p VALUES (31, 31)", token);
         foreach ((TestNode node, TestNode other) in new[] { (nodeA, nodeB), (nodeB, nodeA) })
         {
@@ -219,6 +224,28 @@ public sealed class GlobalDdlLockTests
                 $"{node.Name}'s write after the detaches");
             Assert.AreEqual("0", await other.SafePsqlAsync(Database, "SELECT count(*) FROM pg_inherits WHERE inhrelid = 'p3'::regclass", token));
         }
+
+        // A detach that reaches node_b while node_b's own waits to commit finds the partition detached once that has.
+        _ = await nodeA.SafePsqlAsync(Database, "ALTER TABLE p ATTACH PARTITION p3 FOR VALUES FROM (200) TO (300)", token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
+        int logStart = nodeB.ReadLog().Length;
+        await using (NpgsqlConnection detaching = await nodeB.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction transaction = await detaching.BeginTransactionAsync(token);
+            await using (NpgsqlCommand detach = new("ALTER TABLE p DETACH PARTITION p3", detaching, transaction))
+            {
+                _ = await detach.ExecuteNonQueryAsync(token);
+            }
+
+            _ = await nodeA.SafePsqlAsync(Database, "ALTER TABLE p DETACH PARTITION p3", token);
+            Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT FROM pg_locks WHERE relation = 'p'::regclass AND NOT granted)", token),
+                "node_a's detach waits on node_b");
+            await transaction.CommitAsync(token);
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
+        _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
+        Assert.DoesNotContain("is not a partition", nodeB.ReadLog()[logStart..], "node_b's apply of node_a's detach");
 
         // A fence's session that idles through the provider role's idle_session_timeout keeps holding back writes.
         _ = await nodeB.SafePsqlAsync(Database, $"ALTER ROLE {SuperUser} SET idle_session_timeout = '1s'", token);
@@ -272,29 +299,53 @@ public sealed class GlobalDdlLockTests
                 await WritesGoSoonAsync(nodeB, "UPDATE dupe SET v = v WHERE id = 0", "the build's fence went as its DDL couldn't be queued", token);
             }
 
-            // An index that REINDEX SCHEMA, or a column's new type, builds again stays here, as does what a concurrent
-            // reindex that failed leaves.
+            // An index that REINDEX SCHEMA, or a column's new type or a concurrent reindex from any session, builds
+            // again stays here, as does what a concurrent reindex that failed leaves, while a primary key's index
+            // that the reindex builds alongside, with the same definition, is on every node. DDL that would make
+            // other objects use one fails.
             await CancelMidwayAsync(nodeA, "dupe", "REINDEX INDEX CONCURRENTLY dupe_pkey", token, write: true);
             foreach (string sql in new[]
             {
                 "RESET lock_timeout", "COMMENT ON INDEX dupe_v IS 'here'", "ALTER INDEX dupe_id DEPENDS ON EXTENSION plpgsql", "DROP INDEX dupe_v",
-                "REINDEX SCHEMA public", "ALTER TABLE dupe ALTER COLUMN id TYPE bigint", "COMMENT ON INDEX dupe_id IS 'here'", "DROP INDEX dupe_id",
-                "DROP INDEX dupe_pkey_ccnew",
+                "REINDEX SCHEMA public", "DROP INDEX dupe_pkey_ccnew",
             })
             {
                 await using NpgsqlCommand command = new(sql, building);
                 _ = await command.ExecuteNonQueryAsync(token);
             }
 
-            await using NpgsqlCommand change = new("ALTER TABLE dupe ALTER COLUMN v TYPE bigint", building);
-            _ = await change.ExecuteNonQueryAsync(token);
+            foreach (string sql in new[]
+            {
+                "ALTER TABLE dupe ALTER COLUMN id TYPE bigint", "REINDEX TABLE CONCURRENTLY dupe", "COMMENT ON INDEX dupe_id IS 'here'",
+                "COMMENT ON INDEX dupe_pkey IS 'key'",
+            })
+            {
+                _ = await nodeA.SafePsqlAsync(Database, sql, token);
+            }
+
+            foreach (string sql in new[]
+            {
+                "ALTER TABLE dupe ADD CONSTRAINT dupe_id_key UNIQUE USING INDEX dupe_id", "ALTER TABLE dupe REPLICA IDENTITY USING INDEX dupe_id",
+                "ALTER TABLE dupe CLUSTER ON dupe_id",
+            })
+            {
+                PostgresException used = await Assert.ThrowsExactlyAsync<PostgresException>(() => nodeA.SafePsqlAsync(Database, sql, token), sql);
+                Assert.AreEqual("55000", used.SqlState, sql);
+            }
+
+            foreach (string sql in new[] { "DROP INDEX dupe_id", "ALTER TABLE dupe ALTER COLUMN v TYPE bigint" })
+            {
+                await using NpgsqlCommand command = new(sql, building);
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
         }
 
-        Assert.AreEqual("0", await nodeA.SafePsqlAsync(Database, "SELECT count(*) FROM worf.queue WHERE message->>'command' ~ 'dupe_(v|id|pkey)'", token));
+        Assert.AreEqual("0", await nodeA.SafePsqlAsync(Database,
+            "SELECT count(*) FROM worf.queue WHERE message->>'command' ~ 'dupe_(v|id)\\M|_cc(new|old)'", token));
         _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO dupe VALUES (3, 3)", token);
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
-        Assert.AreEqual("3|bigint|bigint", await nodeB.SafePsqlAsync(Database,
-            "SELECT count(*), pg_typeof(min(v))::text, pg_typeof(min(id))::text FROM dupe", token));
+        Assert.AreEqual("3|bigint|bigint|key", await nodeB.SafePsqlAsync(Database,
+            "SELECT count(*), pg_typeof(min(v))::text, pg_typeof(min(id))::text, obj_description('dupe_pkey'::regclass, 'pg_class') FROM dupe", token));
 
         // An index that a cancelled concurrent drop left invalid is still on node_b, so DDL on it replicates.
         _ = await nodeA.SafePsqlAsync(Database, "CREATE INDEX dupe_w ON dupe (v)", token);
@@ -311,13 +362,33 @@ public sealed class GlobalDdlLockTests
                 WHERE indexrelid = 'dupe_w'::regclass)
             FROM dupe
             """, token), "node_b dropped and built the index again");
+
+        // Attaching an index on this node alone to one on every node fails too, and DDL from node_b that takes the
+        // name of one renames it.
+        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO p VALUES (50, 0)", token);
+        PostgresException zero = await Assert.ThrowsExactlyAsync<PostgresException>(
+            () => nodeA.SafePsqlAsync(Database, "CREATE INDEX CONCURRENTLY p1_v ON p1 ((1 / v))", token));
+        Assert.AreEqual("22012", zero.SqlState);
+        _ = await nodeA.SafePsqlAsync(Database, "CREATE INDEX p_v ON ONLY p ((1 / v))", token);
+        PostgresException attach = await Assert.ThrowsExactlyAsync<PostgresException>(
+            () => nodeA.SafePsqlAsync(Database, "ALTER INDEX p_v ATTACH PARTITION p1_v", token));
+        Assert.AreEqual("55000", attach.SqlState);
+        _ = await nodeB.SafePsqlAsync(Database, "CREATE INDEX p1_v ON p1 (id)", token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT to_regclass('p1_v_local') IS NOT NULL", token), "node_b's index on node_a");
+        Assert.AreEqual("id|p1_v_local", await nodeA.SafePsqlAsync(Database, """
+            SELECT (SELECT string_agg(attname, ',') FROM pg_index JOIN pg_attribute ON attrelid = indrelid AND attnum = ANY (indkey)
+                    WHERE indexrelid = 'p1_v'::regclass),
+                (SELECT string_agg(indexrelid::regclass::text, ',') FROM worf.local_index)
+            """, token), "node_b's index under its name, and node_a's own under another");
+        Assert.Contains("renamed index \"p1_v\"", nodeA.ReadLog());
     }
 
     /// <summary>
     /// The DDL waits until this node has applied the other node's earlier writes, and the other node's writes fail
     /// while it's in flight. DDL in a transaction block, run by a table owner who logs in directly, holds the lock
     /// from its first statement that locks out writes, through one connection to each node; a savepoint rolled back
-    /// lets its fences go at the next statement while the others hold; DDL after a lock that the transaction took
+    /// lets its fences go at the next statement while the others hold, or fails the commit if their connection is lost
+    /// meanwhile; DDL after a lock that the transaction took
     /// itself fails at once; a schema's owner takes the lock to drop a table in it; and a fence holds back the other
     /// node's DDL but not EXPLAIN, across a restart, until released, after which a node that is also a template
     /// replicates. A unique index
@@ -439,6 +510,27 @@ public sealed class GlobalDdlLockTests
             Assert.IsTrue(await PollSucceedsAsync(nodeB, "INSERT INTO t VALUES (4, 4)", token), "the savepoint's fence went");
             Assert.IsFalse(await nodeB.PsqlAsync(Database, "INSERT INTO child VALUES (4, 4)", token), "the transaction's other fence holds");
             await transaction.CommitAsync(token);
+        }
+
+        // One whose node_b connection is lost by the time it commits fails for the lost hold.
+        await using (NpgsqlConnection migrating = await nodeA.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction transaction = await migrating.BeginTransactionAsync(token);
+            await using (NpgsqlCommand change = new("""
+                ALTER TABLE child ALTER COLUMN parent_id TYPE integer;
+                SAVEPOINT s;
+                ALTER TABLE t ALTER COLUMN v TYPE text;
+                ROLLBACK TO SAVEPOINT s;
+                """, migrating, transaction))
+            {
+                _ = await change.ExecuteNonQueryAsync(token);
+            }
+
+            Assert.AreEqual("t", await nodeB.SafePsqlAsync(Database,
+                "SELECT count(*) FILTER (WHERE pg_terminate_backend(pid, 10000)) > 0 FROM pg_stat_activity WHERE application_name = 'worf_ddl_lock'", token));
+            PostgresException unkept = await Assert.ThrowsExactlyAsync<PostgresException>(() => transaction.CommitAsync(token));
+            Assert.AreEqual("55P03", unkept.SqlState);
+            Assert.Contains("lost the hold", unkept.MessageText);
         }
 
         _ = await nodeA.SafePsqlAsync(Database, """
