@@ -1265,7 +1265,6 @@ internal static class Sync
             PgBackgroundWorker.RunTransaction(() =>
             {
                 StartCopyTargetTx(originName);
-                HoldOffWrites(tables);
                 foreach ((string nspname, string relname) in tables)
                 {
                     WorfRemoteRel remoterel = Rpc.GetRemoteRepsetTable(originConn, nspname, relname, replicationSets);
@@ -1327,31 +1326,6 @@ internal static class Sync
 
             _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(1000));
             PgInterrupts.Check();
-        }
-    }
-
-    /// <summary>
-    /// Locks the tables against writes until their copy commits, and lets the apply worker go on. Queued SQL that it
-    /// runs from now on committed after the copy's snapshot, so it has to change the tables after the copy does.
-    /// </summary>
-    /// <param name="tables">The tables.</param>
-    private static unsafe void HoldOffWrites(List<(string Nspname, string Relname)> tables)
-    {
-        foreach ((string nspname, string relname) in tables)
-        {
-            RangeVar* rv = NativeMethods.makeRangeVar(Worf.PStrDup(nspname), Worf.PStrDup(relname), -1);
-            _ = NativeMethods.RangeVarGetRelidExtended(rv, (int)PgLockMode.Share, 0, default, null);
-        }
-
-        using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive();
-        WorfWorker me = guard[Worker.MyWorfWorker];
-        me.Worker.Sync.CopyLocked = true;
-        guard[Worker.MyWorfWorker] = me;
-
-        int apply = guard.Read((in _, workers) => Worker.ApplyFind(workers, me.Dboid, me.Worker.Apply.SubId));
-        if (apply >= 0 && guard[apply].Proc != 0)
-        {
-            Worker.SetProcLatch(guard[apply].Proc);
         }
     }
 

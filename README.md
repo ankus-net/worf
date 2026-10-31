@@ -316,7 +316,6 @@ Nodes can be added and removed dynamically using the SQL interfaces.
   foreign key constraints.
   **WARNING: This function will truncate the table immediately, and only then
   begin synchronising it, so it will be empty while being synced**
-  Writes to the table wait while its rows are copied.
 
   Does not block, use `worf.wait_for_table_sync_complete` to wait for
   completion.

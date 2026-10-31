@@ -66,9 +66,6 @@ internal static unsafe partial class Apply
     private static ulong s_publishedFlushpos;
     private static bool s_publishesFlushpos;
 
-    // The remote commit position of the latest change to each synchronizing table that wasn't applied.
-    private static readonly Dictionary<(string Nspname, string Relname), ulong> s_skippedChanges = [];
-
     // A failed remote transaction that worf.exception_behaviour applies again, how, and whether the transaction being
     // applied is that one.
     private static ulong s_exceptionLsn;
@@ -513,7 +510,6 @@ internal static unsafe partial class Apply
                     sync.Status != Sync.SyncStatusReady &&
                     !(sync.Status == Sync.SyncStatusSyncdone && sync.Statuslsn <= originLsn))
                 {
-                    s_skippedChanges[(nspname, relname)] = originLsn;
                     return false;
                 }
             }
@@ -2355,13 +2351,8 @@ internal static unsafe partial class Apply
 
                         if (worker >= 0 && guard[worker].Proc != 0 && endLsn >= guard[worker].Worker.Apply.ReplayStopLsn)
                         {
-                            // The copy holds the changes that committed before its snapshot, so the sync worker only
-                            // catches up with those after it that this worker passed over.
                             WorfWorker w = guard[worker];
-                            w.Worker.Apply.ReplayStopLsn =
-                                s_skippedChanges.TryGetValue((sync.Nspname, sync.Relname), out ulong skipped) && skipped > sync.Statuslsn
-                                    ? endLsn
-                                    : sync.Statuslsn;
+                            w.Worker.Apply.ReplayStopLsn = endLsn;
                             guard[worker] = w;
                             sync.Status = Sync.SyncStatusCatchup;
 
@@ -2400,7 +2391,6 @@ internal static unsafe partial class Apply
                 // Ready? Remove it from local cache.
                 if (sync.Status == Sync.SyncStatusReady)
                 {
-                    _ = s_skippedChanges.Remove((sync.Nspname, sync.Relname));
                     s_syncingTables.RemoveAt(index);
                     index--;
                 }
@@ -2440,9 +2430,8 @@ internal static unsafe partial class Apply
 
     /// <summary>
     /// Lets the subscription's sync workers copy their table once everything that committed before their copy's
-    /// snapshot is applied, and waits until each holds off writes to its table until the copy commits. Queued SQL that
-    /// committed before a snapshot changes the table before its copy, as it changed the provider's rows before it, and
-    /// the rest after; otherwise it changes the copied rows again, or its change is copied over.
+    /// snapshot is applied. Queued SQL that committed before a snapshot changes the table before its copy, as it
+    /// changed the provider's rows before it; run after the copy, it changes the copied rows again.
     /// </summary>
     /// <param name="lsn">The position before which everything that committed is applied.</param>
     private static void AllowCopies(ulong lsn)
@@ -2464,7 +2453,6 @@ internal static unsafe partial class Apply
             return;
         }
 
-        List<(int Slot, ushort Generation)> allowed = [];
         using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
         {
             uint subid = guard[Worker.MyWorfWorker].Worker.Apply.SubId;
@@ -2476,36 +2464,6 @@ internal static unsafe partial class Apply
                     worker.Worker.Sync.CopyAllowed = true;
                     guard[i] = worker;
                     Worker.SetProcLatch(worker.Proc);
-                    allowed.Add((i, worker.Generation));
-                }
-            }
-        }
-
-        // The copy takes a moment to start, and a sync worker that fails stops the wait.
-        foreach ((int slot, ushort generation) in allowed)
-        {
-            while (true)
-            {
-                using (PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share())
-                {
-                    WorfWorker worker = guard[slot];
-                    if (worker.Proc == 0 || worker.Generation != generation || worker.Worker.Sync.CopyLocked)
-                    {
-                        break;
-                    }
-                }
-
-                if (Worker.GotSigterm)
-                {
-                    throw new OperationCanceledException("The worf worker is stopping.");
-                }
-
-                _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(1000));
-                PgInterrupts.Check();
-
-                if (s_applyconn is not null)
-                {
-                    _ = SendFeedback(s_applyconn, s_lastReceived, Worker.GetCurrentTimestamp(), false);
                 }
             }
         }
