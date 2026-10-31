@@ -387,14 +387,15 @@ public sealed class ExceptionBehaviourTests
 
         // A sync worker leaves anything but a walsender of its own that holds its slot, here a session reading the
         // slot's changes that waits for the same lock, and waits for it with a warning. One that fails while it catches
-        // up, here as it waits, starts again and copies the table again, into the emptied table, rather than leaving the
-        // apply worker waiting.
+        // up, here as it waits, starts again and catches up from where it got to, rather than leaving the apply worker
+        // waiting, or copying again over the rows it copied and the subscriber's own.
         foreach (TestNode node in new[] { provider, subscriber })
         {
             _ = await node.SafePsqlAsync(Database, "CREATE TABLE synced2 (id integer PRIMARY KEY)", token);
         }
 
         _ = await provider.SafePsqlAsync(Database, "INSERT INTO synced2 VALUES (1)", token);
+        _ = await subscriber.SafePsqlAsync(Database, "INSERT INTO synced2 VALUES (100)", token);
         await using NpgsqlConnection reader = await provider.OpenAsync(Database, token);
         await using NpgsqlCommand peek = reader.CreateCommand();
         await using NpgsqlTransaction moreSubscriptions = await blocker.BeginTransactionAsync(token);
@@ -450,7 +451,10 @@ public sealed class ExceptionBehaviourTests
 
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
             "SELECT sync_status = 'r' FROM worf.local_sync_status WHERE sync_relname = 'synced2'", token), "the second table synchronized");
-        Assert.AreEqual("1\n2", await subscriber.SafePsqlAsync(Database, "SELECT id FROM synced2 ORDER BY id", token));
+        Assert.AreEqual("1\n2\n100", await subscriber.SafePsqlAsync(Database, "SELECT id FROM synced2 ORDER BY id", token));
+        Assert.Contains("resuming the catch-up of table public.synced2", subscriber.ReadLog()[logpos..], "the restarted sync catching up");
+        Assert.AreEqual(1, subscriber.ReadLog().Split("finished synchronization of data for table public.synced2").Length - 1,
+            "copies of the second table");
     }
 
     private static async Task<TestNode> StartNodeAsync(string name, CancellationToken token, params string[] settings)

@@ -128,6 +128,25 @@ internal static class Rpc
     }
 
     /// <summary>
+    /// Checks whether a remote replication slot exists.
+    /// </summary>
+    /// <param name="conn">The provider connection, inside a local transaction.</param>
+    /// <param name="slotName">The slot.</param>
+    /// <returns>Whether it does.</returns>
+    internal static bool RemoteSlotExists(PgReplicationConnection conn, string slotName)
+    {
+        try
+        {
+            return conn.Query("SELECT 1 FROM pg_catalog.pg_replication_slots WHERE slot_name = " + Spi.QuoteLiteral(slotName), 1).Count > 0;
+        }
+        catch (PgRemoteException error)
+        {
+            throw new PgException(PgSqlStates.InternalError, "getting remote slot info failed",
+                detail: $"SELECT FROM pg_catalog.pg_replication_slots failed with: ERROR:  {error.Message}\n");
+        }
+    }
+
+    /// <summary>
     /// Gets the process that holds a remote replication slot.
     /// </summary>
     /// <param name="conn">The provider connection, inside a local transaction.</param>
