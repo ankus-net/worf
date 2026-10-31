@@ -53,7 +53,7 @@ Run `disable_sequence_range` on the old owner, then `enable_sequence_range` on t
 
 ## Restores and failover
 
-A node whose node id, system identifier or timeline changes, as after a promotion, `pg_upgrade` or point-in-time recovery, abandons its blocks and asks for new ones. Its neighbors also notice when its WAL position moves backwards, as after a restore from a snapshot, and tell it to reset. They notice only at their next exchange, so keep writes away from a restored node until `reset_sequence_range` has run on it.
+A node whose node id, system identifier or timeline changes, as after a promotion, `pg_upgrade` or point-in-time recovery, abandons its blocks and asks for new ones. Its neighbors also notice when its WAL position moves backwards, as after a restore from a snapshot, and tell it to reset. They notice only at their next exchange, and may miss a restore to within the node's last 64 kB of WAL, so keep writes away from a restored node until `reset_sequence_range` has run on it.
 
 An owner or pool holder whose timeline changes may have lost grants. It grants nothing until the nodes it granted to report the blocks they hold. A synchronous standby for each of them prevents the loss.
 

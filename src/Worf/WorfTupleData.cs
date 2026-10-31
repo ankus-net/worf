@@ -53,8 +53,26 @@ internal sealed class WorfTupleData
     public bool[] Converted { get; }
 
     /// <summary>
+    /// Gets or sets how each column sent in binary in another type than its own converts, or null when none was.
+    /// </summary>
+    public WorfColumnConversion?[]? Conversions { get; set; }
+
+    /// <summary>
+    /// Converts a column sent in binary in another type than its own to its datum, once.
+    /// </summary>
+    /// <param name="attid">The column, which has a conversion.</param>
+    internal void ConvertFromSentType(int attid)
+    {
+        if (!Converted[attid])
+        {
+            Values[attid] = Conversions![attid]!.Convert(Kinds[attid], Data[attid]!, out Nulls[attid]);
+            Converted[attid] = true;
+        }
+    }
+
+    /// <summary>
     /// Converts every sent column to its datum with the column type's input or receive function, as the native
-    /// protocol's reader does.
+    /// protocol's reader does, or for a value sent in binary in another type, from that type.
     /// </summary>
     /// <param name="desc">The local relation's descriptor.</param>
     internal unsafe void ConvertValues(TupleDescData* desc)
@@ -63,6 +81,12 @@ internal sealed class WorfTupleData
         {
             if (Converted[attid] || Data[attid] is null)
             {
+                continue;
+            }
+
+            if (Conversions?[attid] is not null)
+            {
+                ConvertFromSentType(attid);
                 continue;
             }
 

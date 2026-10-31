@@ -26,9 +26,7 @@ description: Create, alter, synchronize and drop subscriptions.
     skips its own changes when another node forwards them back
   - `apply_delay` - how much to delay replication, default is 0 seconds
   - `force_text_transfer` - force the provider to replicate all columns
-    using a text representation (which is slower, but may be used to
-    change the type of a replicated column on the subscriber), default
-    is false
+    using a text representation (which is slower), default is false
 
   The `subscription_name` is used as `application_name` by the replication
   connection. This means that it's visible in the `pg_stat_replication`

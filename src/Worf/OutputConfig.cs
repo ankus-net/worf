@@ -63,11 +63,11 @@ internal static class OutputConfig
         int pgVersionNum = Worf.ServerVersionNum;
         List<(string Key, string Value)> l =
         [
-            ("max_proto_version", "1"),
-            ("min_proto_version", "1"),
+            ("max_proto_version", Int(OutputProto.ProtoVersionNum)),
+            ("min_proto_version", Int(OutputProto.ProtoMinVersionNum)),
 
-            // We don't support understand column types yet
-            ("coltypes", Bool(false)),
+            // Whether RELATION messages carry the columns' types
+            ("coltypes", Bool(data.ProtoVersion >= OutputProto.ColumnTypesVersionNum)),
 
             // Info about our Pg host
             ("pg_version_num", Int(pgVersionNum)),
@@ -220,8 +220,8 @@ internal static class OutputConfig
                     break;
 
                 case OutputPluginParamKey.BinaryFloat8byval:
-                    data.ClientBinaryFloat4byvalSet = true;
-                    data.ClientBinaryFloat4byval = ParseParamBool(elem);
+                    data.ClientBinaryFloat8byvalSet = true;
+                    data.ClientBinaryFloat8byval = ParseParamBool(elem);
                     break;
 
                 case OutputPluginParamKey.BinaryIntegerDatetimes:

@@ -269,7 +269,7 @@ internal static class Sync
             PgBackgroundWorker.RunTransaction(() =>
             {
                 // The table's managed sequences are joined before any rows arrive.
-                SequenceRangeSync.JoinBeforeCopy(managedSequences, Spi.ExecuteScalar<uint?>("SELECT to_regclass($1)::oid",
+                SequenceRangeSync.JoinBeforeCopy(managedSequences, Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid",
                     SpiParameter.Create(Spi.QuoteQualifiedIdentifier(nspname, relname))) ?? 0);
 
                 ushort originid = EnsureReplicationOrigin(sub);
@@ -931,7 +931,7 @@ internal static class Sync
 
         // Skip the worf_origin if it exists locally.
         bool hasPglOrigin = PgBackgroundWorker.RunTransaction(() =>
-            Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT FROM pg_catalog.pg_namespace WHERE nspname = 'worf_origin')"));
+            Worf.ReadScalar<bool>("SELECT EXISTS (SELECT FROM pg_catalog.pg_namespace WHERE nspname = 'worf_origin')"));
         if (hasPglOrigin)
         {
             cmdargv.Add($"--exclude-schema={"worf_origin"}");

@@ -43,9 +43,24 @@ You must `CREATE EXTENSION worf` on both.
 Tables on the provider and subscriber must have the same names and be in the
 same schema. Future revisions may add mapping features.
 
-Tables on the provider and subscriber must have the same columns, with the same
-data types in each column. `CHECK` constraints, `NOT NULL` constraints, etc., must
-be the same or weaker (more permissive) on the subscriber than the provider.
+Tables on the provider and subscriber must have the same columns. A column may
+have another data type on the subscriber, as while a change of its type is on
+its way. Values sent in binary, as between nodes of the same major version, are
+read with the provider's type and converted as an assignment does, as
+`ALTER COLUMN ... TYPE` without `USING` would, or else, for a string type, by
+the column type's input. Types that aren't PostgreSQL's own are found by schema
+and name, and used when defined the same: of the same kind, with the same input
+and receive functions and length, or the same subtype, element or attribute
+types in order. The column's own type reads the rest, as it always has: values
+sent as text (in the initial copy, with `force_text_transfer`, between major
+versions, and for composites and arrays of types that aren't PostgreSQL's own),
+an enum's labels, and values of a type the subscriber lacks or defines
+differently. A value that converts neither way fails with PostgreSQL's error,
+which `worf.exception_behaviour` handles. An older worf doesn't send or read
+column types, so columns replicated through an older provider, subscriber or
+relay node need the same types. `CHECK` constraints, `NOT NULL` constraints,
+etc., must be the same or weaker (more permissive) on the subscriber than the
+provider.
 A subscriber ignores a column it dropped in rows from a provider that still
 has it.
 
@@ -253,9 +268,7 @@ Nodes can be added and removed dynamically using the SQL interfaces.
     skips its own changes when another node forwards them back
   - `apply_delay` - how much to delay replication, default is 0 seconds
   - `force_text_transfer` - force the provider to replicate all columns
-    using a text representation (which is slower, but may be used to
-    change the type of a replicated column on the subscriber), default
-    is false
+    using a text representation (which is slower), default is false
 
   The `subscription_name` is used as `application_name` by the replication
   connection. This means that it's visible in the `pg_stat_replication`
@@ -746,7 +759,8 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   out of resources, are retried as under `error`. Every skipped change,
   including each change of a transaction skipped as a whole, and disabled
   subscriptions are recorded in `worf.exception_log`, with the error, the
-  change's rows or queued DDL, and the transaction it belongs to. The
+  change's rows or queued DDL, and the transaction it belongs to. A value the
+  subscriber can't read is recorded as its bytes in hex. The
   transaction that a subscription applies again, and how, is kept in
   `worf.exception_state` across restarts. Table sync workers catching up
   after a copy handle failures the same way. The default is `error`.

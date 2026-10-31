@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Runtime.CompilerServices;
 using Ankus.Postgres;
 
@@ -8,7 +9,16 @@ namespace Worf;
 /// </summary>
 internal static unsafe class ProtoNative
 {
+    /// <summary>
+    /// The definition of every enum, whose values are their labels, whatever labels it has.
+    /// </summary>
+    internal const string EnumDefinition = "enum";
+
     private const byte IsReplicaIdentity = 1;
+
+    // A column's flag for its type, which follows its name from protocol version 2, so that a node whose column has
+    // another type reads the column's values with the type they were sent in.
+    private const byte HasType = 2;
 
     // An ORIGIN message's flag for the id of the node that wrote the transaction, which follows the origin's name.
     private const byte OriginFlagNodeId = 1;
@@ -21,7 +31,6 @@ internal static unsafe class ProtoNative
     /// </summary>
     internal static void WriteRel(StringInfoData* @out, WorfOutputData data, RelationData* rel, HashSet<int>? attList)
     {
-        _ = data;
         byte flags = 0;
 
         NativeMethods.pq_sendbyte(@out, (byte)'R');      // sending RELATION
@@ -50,7 +59,7 @@ internal static unsafe class ProtoNative
         Worf.PqSendBytes(@out, relname, relnamelen);
 
         // send the attribute info
-        WriteAttrs(@out, rel, attList);
+        WriteAttrs(@out, rel, attList, data.ProtoVersion >= OutputProto.ColumnTypesVersionNum);
 
         NativeMethods.pfree(nspname);
     }
@@ -383,17 +392,17 @@ internal static unsafe class ProtoNative
         string relname = CString(NativeMethods.pq_getmsgbytes(@in, len), len);
 
         // Get attribute description
-        string[] attrnames = ReadAttrs(@in);
+        string[] attrnames = ReadAttrs(@in, out WorfRemoteType?[] types);
 
-        RelCache.RelationCacheUpdate(relid, schemaname, relname, attrnames);
+        RelCache.RelationCacheUpdate(relid, schemaname, relname, attrnames, types);
 
         return relid;
     }
 
     /// <summary>
-    /// Write relation attributes to the outputstream.
+    /// Write relation attributes to the outputstream, with each one's type for a client that reads them.
     /// </summary>
-    private static void WriteAttrs(StringInfoData* @out, RelationData* rel, HashSet<int>? attList)
+    private static void WriteAttrs(StringInfoData* @out, RelationData* rel, HashSet<int>? attList, bool types)
     {
         TupleDescData* desc = rel->rd_att;
         ushort nliveatts = 0;
@@ -444,6 +453,11 @@ internal static unsafe class ProtoNative
                 flags |= IsReplicaIdentity;
             }
 
+            if (types)
+            {
+                flags |= HasType;
+            }
+
             NativeMethods.pq_sendbyte(@out, (byte)'C');  // column definition follows
             NativeMethods.pq_sendbyte(@out, flags);
 
@@ -452,9 +466,119 @@ internal static unsafe class ProtoNative
             ushort len = (ushort)(Worf.StrLen(attname) + 1);
             NativeMethods.pq_sendint16(@out, len);
             Worf.PqSendBytes(@out, attname, len);  // data
+
+            if (types)
+            {
+                WriteType(@out, att->atttypid);
+            }
         }
 
         NativeMethods.bms_free(idattrs);
+    }
+
+    /// <summary>
+    /// Writes a column's type block: the OID of the type its values are sent in, which for a domain is its base type's,
+    /// and for a type that isn't PostgreSQL's own, whose OID each node assigns itself, its schema, name and
+    /// <see cref="TypeDefinition"/>.
+    /// </summary>
+    private static void WriteType(StringInfoData* @out, uint typoid)
+    {
+        typoid = NativeMethods.getBaseType(typoid);
+        NativeMethods.pq_sendbyte(@out, (byte)'Y');  // column type block follows
+        NativeMethods.pq_sendint32(@out, typoid);
+        if (typoid < FirstNormalObjectId)
+        {
+            return;
+        }
+
+        HeapTupleData* typtup = NativeMethods.typeidType(typoid);
+        FormData_pg_type* typclass = (FormData_pg_type*)NativeMethods.GETSTRUCT(typtup);
+        sbyte* nspname = NativeMethods.get_namespace_name(typclass->typnamespace);
+        if (nspname is null)
+        {
+            throw new PgException(PgSqlStates.InternalError, $"cache lookup failed for namespace {typclass->typnamespace}");
+        }
+
+        sbyte* typname = (sbyte*)&typclass->typname;
+        byte nspnamelen = (byte)(Worf.StrLen(nspname) + 1);
+        byte typnamelen = (byte)(Worf.StrLen(typname) + 1);
+        NativeMethods.pq_sendbyte(@out, nspnamelen);  // type schema length
+        Worf.PqSendBytes(@out, nspname, nspnamelen);
+        NativeMethods.pq_sendbyte(@out, typnamelen);  // type name length
+        Worf.PqSendBytes(@out, typname, typnamelen);
+        NativeMethods.ReleaseSysCache(typtup);
+        NativeMethods.pfree(nspname);
+
+        byte[] definition = Worf.ToServerCString(TypeDefinition(typoid));
+        NativeMethods.pq_sendint32(@out, (uint)definition.Length);  // type definition length
+        fixed (byte* bytes = definition)
+        {
+            Worf.PqSendBytes(@out, bytes, definition.Length);
+        }
+    }
+
+    /// <summary>
+    /// Describes what reading a type's values depends on, the same on every node, so that a node can tell whether its
+    /// type of a name reads another node's values: PostgreSQL's own types by OID, a domain as its base type, and
+    /// others by kind, with the types they're made of, or a base type's input and receive functions and length.
+    /// </summary>
+    /// <param name="typoid">The type.</param>
+    /// <returns>The description.</returns>
+    internal static string TypeDefinition(uint typoid)
+    {
+        typoid = NativeMethods.getBaseType(typoid);
+        if (typoid < FirstNormalObjectId)
+        {
+            return typoid.ToString(CultureInfo.InvariantCulture);
+        }
+
+        uint element = NativeMethods.get_element_type(typoid);
+        if (element != 0)
+        {
+            return $"array({TypeDefinition(element)})";
+        }
+
+        switch ((char)NativeMethods.get_typtype(typoid))
+        {
+            case 'e':
+                return EnumDefinition;
+
+            case 'r':
+                return $"range({TypeDefinition(NativeMethods.get_range_subtype(typoid))})";
+
+            case 'm':
+                return $"multirange({TypeDefinition(NativeMethods.get_multirange_range(typoid))})";
+
+            case 'c':
+            {
+                TupleDescData* desc = NativeMethods.lookup_rowtype_tupdesc(typoid, -1);
+                List<string> attributes = [];
+                for (int i = 0; i < desc->natts; i++)
+                {
+                    FormData_pg_attribute* att = NativeMethods.TupleDescAttr(desc, i);
+                    if (!att->attisdropped)
+                    {
+                        attributes.Add(TypeDefinition(att->atttypid));
+                    }
+                }
+
+                if (desc->tdrefcount >= 0)
+                {
+                    NativeMethods.DecrTupleDescRefCount(desc);
+                }
+
+                return $"composite({string.Join(',', attributes)})";
+            }
+
+            default:
+            {
+                HeapTupleData* typtup = NativeMethods.typeidType(typoid);
+                FormData_pg_type* typclass = (FormData_pg_type*)NativeMethods.GETSTRUCT(typtup);
+                string definition = $"base({FunctionName(typclass->typinput)},{FunctionName(typclass->typreceive)},{typclass->typlen})";
+                NativeMethods.ReleaseSysCache(typtup);
+                return definition;
+            }
+        }
     }
 
     /// <summary>
@@ -705,8 +829,17 @@ internal static unsafe class ProtoNative
                     len = (int)NativeMethods.pq_getmsgint(@in, 4); // read length
                     sbyte* data = NativeMethods.pq_getmsgbytes(@in, len);
 
-                    // and data
-                    tuple.Values[attid] = att->attbyval ? FetchAttByval(data, len) : (ulong)data;
+                    // A value of another type than the column's is kept to convert with the rest of the row.
+                    if (rel.Conversions[i] is { } conversion)
+                    {
+                        tuple.Data[attid] = new ReadOnlySpan<byte>(data, len).ToArray();
+                        (tuple.Conversions ??= new WorfColumnConversion?[desc->natts])[attid] = conversion;
+                        break;
+                    }
+
+                    // and data, which has to fit the column's type
+                    tuple.Values[attid] = WorfColumnConversion.ReadInternal(att->atttypid, att->attlen, att->attbyval,
+                        (byte*)data, len);
                     tuple.Converted[attid] = true;
                     break;
                 }
@@ -720,9 +853,15 @@ internal static unsafe class ProtoNative
                     len = (int)NativeMethods.pq_getmsgint(@in, 4); // read length
                     sbyte* data = NativeMethods.pq_getmsgbytes(@in, len);
 
-                    // Text arrives with its terminating zero.
+                    // Text arrives with its terminating zero. The column's type reads it, and a value sent in binary in
+                    // another type is converted.
                     int datalen = kind == 't' ? Math.Max(len - 1, 0) : len;
                     tuple.Data[attid] = new ReadOnlySpan<byte>(data, datalen).ToArray();
+                    if (kind == 'b' && rel.Conversions[i] is { } conversion)
+                    {
+                        (tuple.Conversions ??= new WorfColumnConversion?[desc->natts])[attid] = conversion;
+                    }
+
                     break;
                 }
 
@@ -737,7 +876,7 @@ internal static unsafe class ProtoNative
     /// <summary>
     /// Read relation attributes from the outputstream.
     /// </summary>
-    private static string[] ReadAttrs(StringInfoData* @in)
+    private static string[] ReadAttrs(StringInfoData* @in, out WorfRemoteType?[] types)
     {
         int blocktype = NativeMethods.pq_getmsgbyte(@in);
         if (blocktype != 'A')
@@ -747,6 +886,7 @@ internal static unsafe class ProtoNative
 
         int nattrs = (int)NativeMethods.pq_getmsgint(@in, 2);
         string[] attrs = new string[nattrs];
+        types = new WorfRemoteType?[nattrs];
 
         // read the attributes
         for (int i = 0; i < nattrs; i++)
@@ -757,8 +897,8 @@ internal static unsafe class ProtoNative
                 throw new PgException(PgSqlStates.InternalError, $"expected COLUMN, got {(char)blocktype}");
             }
 
-            // read flags (we ignore them so far)
-            _ = NativeMethods.pq_getmsgbyte(@in);
+            // read flags, of which only the type's matters here
+            int flags = NativeMethods.pq_getmsgbyte(@in);
 
             blocktype = NativeMethods.pq_getmsgbyte(@in);      // column name block follows
             if (blocktype != 'N')
@@ -771,9 +911,46 @@ internal static unsafe class ProtoNative
 
             // the string is NULL terminated
             attrs[i] = CString(NativeMethods.pq_getmsgbytes(@in, len), len);
+
+            if ((flags & HasType) != 0)
+            {
+                types[i] = ReadType(@in);
+            }
         }
 
         return attrs;
+    }
+
+    /// <summary>
+    /// Reads a column's type block.
+    /// </summary>
+    private static WorfRemoteType ReadType(StringInfoData* @in)
+    {
+        int blocktype = NativeMethods.pq_getmsgbyte(@in);  // column type block follows
+        if (blocktype != 'Y')
+        {
+            throw new PgException(PgSqlStates.InternalError, $"expected TYPE, got {(char)blocktype}");
+        }
+
+        uint typoid = NativeMethods.pq_getmsgint(@in, 4);
+        if (typoid < FirstNormalObjectId)
+        {
+            return new WorfRemoteType(typoid, null, null, null);
+        }
+
+        int len = NativeMethods.pq_getmsgbyte(@in);
+        string nspname = CString(NativeMethods.pq_getmsgbytes(@in, len), len);
+        len = NativeMethods.pq_getmsgbyte(@in);
+        string typname = CString(NativeMethods.pq_getmsgbytes(@in, len), len);
+        len = (int)NativeMethods.pq_getmsgint(@in, 4);
+        string definition = CString(NativeMethods.pq_getmsgbytes(@in, len), len);
+        return new WorfRemoteType(typoid, nspname, typname, definition);
+    }
+
+    private static string FunctionName(uint funcid)
+    {
+        sbyte* name = funcid == 0 ? null : NativeMethods.get_func_name(funcid);
+        return name is null ? "" : Worf.FromServer(name);
     }
 
     private static string CString(sbyte* data, int maxlen)
@@ -787,7 +964,13 @@ internal static unsafe class ProtoNative
         return Worf.FromServer(new ReadOnlySpan<byte>(data, len));
     }
 
-    private static ulong FetchAttByval(sbyte* data, int len) => len switch
+    /// <summary>
+    /// Gets a pass-by-value datum from its bytes in the internal format.
+    /// </summary>
+    /// <param name="data">The bytes.</param>
+    /// <param name="len">How many there are.</param>
+    /// <returns>The datum.</returns>
+    internal static ulong FetchAttByval(sbyte* data, int len) => len switch
     {
         1 => unchecked((ulong)*data),
         2 => unchecked((ulong)Unsafe.ReadUnaligned<short>(data)),

@@ -5,7 +5,7 @@
     "allowPrerelease": false
   },
   "msbuild-sdks": {
-    "Ankus.Sdk": "0.2.15",
+    "Ankus.Sdk": "0.2.18",
     "MSTest.Sdk": "4.5.2"
   },
   "test": {
