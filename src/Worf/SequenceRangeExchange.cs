@@ -583,10 +583,10 @@ internal static class SequenceRangeExchange
         WriteNullable(writer, "root_end", row.Get<long?>(12));
         if (managed is null)
         {
-            WriteNullable(writer, "reset", (string?)null);
-            WriteNullable(writer, "reset_done", (string?)null);
+            writer.WriteNull("reset");
+            writer.WriteNull("reset_done");
             writer.WriteBoolean("held_complete", false);
-            foreach (string name in (ReadOnlySpan<string>)["held", "requests", "reports", "grants", "acks"])
+            foreach (string name in new[] { "held", "requests", "reports", "grants", "acks" })
             {
                 writer.WriteStartArray(name);
                 writer.WriteEndArray();
