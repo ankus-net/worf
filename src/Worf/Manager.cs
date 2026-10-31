@@ -10,10 +10,13 @@ internal static class Manager
     private const long InitialSleep = 10000;
     private const long MaxSleep = 180000;
 
-    // When the manager next runs the range worker to ask this database's providers of the sequences they manage, and
+    // When the manager next runs the exchange worker to ask this database's providers of the sequences they manage, and
     // the exchange counter it last saw, which a backend that learned of a sequence raises.
     private static long s_discoveryAt;
     private static long s_discoveryRequested;
+
+    // Whether an exchange worker runs with no range worker to cancel a call of it that runs out of time.
+    private static bool s_watching;
 
     /// <summary>
     /// Gets the minimum time the manager sleeps between checking for subscription changes. On Windows, process
@@ -109,13 +112,18 @@ internal static class Manager
                 ? Math.Min(sleepTimer * 2, MaxSleep)
                 : Math.Max(sleepTimer / 2, MinSleep);
 
-            // A database that subscribes but manages no sequence runs the range worker again when the next exchange is
-            // due.
+            // A database that subscribes but manages no sequence runs the exchange worker again when the next exchange
+            // is due, even if the last one ran past it.
             long sleep = processedAll ? sleepTimer : MinSleep;
             long now = Worker.GetCurrentTimestamp();
-            if (s_discoveryAt > now)
+            if (s_discoveryAt != 0)
             {
                 sleep = Math.Clamp((s_discoveryAt - now) / 1000, 1, sleep);
+            }
+
+            if (s_watching)
+            {
+                sleep = Math.Min(sleep, SequenceRanges.CheckInterval);
             }
 
             if (!PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(sleep)) &&
@@ -129,11 +137,12 @@ internal static class Manager
     }
 
     /// <summary>
-    /// Starts the database's sequence range worker and its exchange worker when it has managed sequences and they aren't
-    /// running, or once a crashed one's restart delay has passed. Until it manages one, a database with subscriptions runs
-    /// them once an exchange interval, or at once when a backend learned of a sequence, to ask the providers of the
-    /// sequences they manage. The exchange worker connects to them, so a provider that can't be reached holds up neither
-    /// the manager nor the range worker, which cancels a call that takes too long.
+    /// Starts the database's sequence range worker and its exchange worker when it has managed sequences and they
+    /// aren't running, or once a crashed one's restart delay has passed. Until it manages one, a database with
+    /// subscriptions runs the exchange worker once an exchange interval, or at once when a backend learned of a
+    /// sequence, to ask the providers of the sequences they manage. The exchange worker connects to them, so a provider
+    /// that can't be reached holds up neither the manager nor the range worker; whichever of them watches it cancels a
+    /// call that takes too long.
     /// </summary>
     /// <returns>Whether nothing is left to retry.</returns>
     private static bool ManageRangeWorker()
@@ -142,8 +151,13 @@ internal static class Manager
         long now = Worker.GetCurrentTimestamp();
         (bool rangeRunning, bool rangeCrashed) = RangeWorkerState(WorfWorkerType.Range, dboid, now);
         (bool exchangeRunning, bool exchangeCrashed) = RangeWorkerState(WorfWorkerType.Exchange, dboid, now);
+
+        // Without a range worker, as while a database that manages nothing asks its providers, the manager cancels an
+        // exchange call that has run out of time, and looks again soon.
+        s_watching = exchangeRunning && !rangeRunning && SequenceRangeExchangeWorker.Watch();
         if (rangeRunning && exchangeRunning)
         {
+            s_discoveryAt = 0;
             return true;
         }
 
@@ -168,14 +182,21 @@ internal static class Manager
         }
 
         bool started = true;
-        if (managed || now >= s_discoveryAt || requested != s_discoveryRequested)
+        if (managed)
         {
-            s_discoveryRequested = requested;
-            s_discoveryAt = now + (SequenceRanges.ExchangeInterval * 1000L);
-
             // The exchange worker starts first, so that the range worker finds it to watch.
+            s_discoveryAt = 0;
             started = StartRangeWorker(WorfWorkerType.Exchange, dboid, exchangeRunning || exchangeCrashed) &&
                 StartRangeWorker(WorfWorkerType.Range, dboid, rangeRunning || rangeCrashed);
+        }
+        else if (now >= s_discoveryAt || requested != s_discoveryRequested)
+        {
+            // A database that manages nothing needs no range worker, so asking its providers takes one worker slot. The
+            // next round is due an exchange interval after this one starts, however long starting it took.
+            s_discoveryRequested = requested;
+            started = StartRangeWorker(WorfWorkerType.Exchange, dboid, exchangeRunning || exchangeCrashed);
+            s_watching |= started && !exchangeRunning && !exchangeCrashed;
+            s_discoveryAt = Worker.GetCurrentTimestamp() + (SequenceRanges.ExchangeInterval * 1000L);
         }
 
         return started && !rangeCrashed && !exchangeCrashed;

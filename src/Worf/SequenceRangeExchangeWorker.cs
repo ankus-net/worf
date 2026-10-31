@@ -5,9 +5,10 @@ namespace Worf;
 /// <summary>
 /// The worker that makes a database's exchanges with its neighbors, apart from its range worker, so that a neighbor that
 /// never answers holds up none of the range worker's switches and Snowflake clock reservations. libpq keeps no time
-/// limit of its own on a connection a backend waits for, so the range worker cancels any call of it that outlasts
-/// <c>worf.sequence_range_timeout</c>. The manager starts both. In a database that manages no sequence, it exchanges
-/// once, to ask the providers whether they manage any, and exits.
+/// limit of its own on a connection a backend waits for, so the range worker, its watcher, cancels any call of it that
+/// outlasts <c>worf.sequence_range_timeout</c>. The manager starts both. In a database that manages no sequence, the
+/// manager starts it alone, once an exchange interval, and watches it; it exchanges once, to ask the providers whether
+/// they manage any, and exits.
 /// </summary>
 internal static class SequenceRangeExchangeWorker
 {
@@ -43,14 +44,14 @@ internal static class SequenceRangeExchangeWorker
             }
             catch (PgQueryCanceledException)
             {
-                // The range worker cancelled a call just as it ended, and the exchanges go on.
+                // Its watcher cancelled a call just as it ended, and the exchanges go on.
             }
         }
     }
 
     /// <summary>
-    /// Watches the database's exchange worker, from its range worker, and cancels a call of it that has run out of time.
-    /// The manager starts both.
+    /// Watches the database's exchange worker, from its range worker or, without one, its manager, and cancels a call
+    /// of it that has run out of time.
     /// </summary>
     /// <returns>Whether the exchange worker runs.</returns>
     internal static bool Watch()
@@ -109,7 +110,7 @@ internal static class SequenceRangeExchangeWorker
     }
 
     /// <summary>
-    /// Makes a call to a neighbor, from the exchange worker, which the range worker cancels once it has taken longer than
+    /// Makes a call to a neighbor, from the exchange worker, which its watcher cancels once it has taken longer than
     /// <c>worf.sequence_range_timeout</c>.
     /// </summary>
     /// <typeparam name="T">The call's result.</typeparam>

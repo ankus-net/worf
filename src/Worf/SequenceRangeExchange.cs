@@ -87,7 +87,9 @@ internal static class SequenceRangeExchange
         SpiResult link = Worf.SelectCatalog("SELECT node_id, role_id FROM worf.sequence_range_link WHERE slot_name = $1", name);
         if (active ? slots[0].Get<uint?>(1) != role : link.Count == 0 || link[0].Get<uint>(1) != role)
         {
-            throw new PgException("42501", $"replication slot \"{slot}\" is {(active ? "streamed by" : "bound to")} another role than this sequence range exchange's");
+            throw new PgException("42501", active ? $"replication slot \"{slot}\" is streamed by another role than this sequence range exchange's"
+                : link.Count == 0 ? $"replication slot \"{slot}\" isn't streamed yet"
+                : $"replication slot \"{slot}\" is bound to another role than this sequence range exchange's");
         }
 
         if (link.Count > 0)
@@ -179,7 +181,7 @@ internal static class SequenceRangeExchange
             catch (Exception error) when (error is PgException or PgRemoteException or PgQueryCanceledException)
             {
                 // A failed exchange is tried again after a delay that doubles, up to the exchange interval. A call the
-                // range worker cancelled has run out of time.
+                // watcher cancelled has run out of time.
                 long delay = s_retries.TryGetValue(sub.Id, out (long At, long Delay) retry) ? retry.Delay * 2 : 0;
                 delay = Math.Min(Math.Max(delay, SequenceRanges.CheckInterval * 1000L), SequenceRanges.ExchangeInterval * 1000L);
                 s_retries[sub.Id] = (now + delay, delay);
@@ -219,9 +221,9 @@ internal static class SequenceRangeExchange
     }
 
     /// <summary>
-    /// Exchanges with a subscription's provider. The range worker cancels a connection or call that takes longer than
-    /// <c>worf.sequence_range_timeout</c>, and the provider ends a call that runs that long. Each waits in a transaction,
-    /// which the cancellation aborts, so that the worker goes on.
+    /// Exchanges with a subscription's provider. The exchange worker's watcher cancels a connection or call that takes
+    /// longer than <c>worf.sequence_range_timeout</c>, and the provider ends a call that runs that long. Each waits in
+    /// a transaction, which the cancellation aborts, so that the worker goes on.
     /// </summary>
     private static bool ExchangeWith(WorfLocalNode node, WorfSubscription sub)
     {

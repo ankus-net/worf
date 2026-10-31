@@ -3,9 +3,8 @@ namespace Worf;
 /// <summary>
 /// The worker that keeps a database's managed sequences supplied: it switches each to its next block when the active
 /// one runs low and gets new blocks, checking every <c>worf.sequence_range_check_interval</c>. Its exchange worker
-/// makes the calls to the neighbors. In a database that manages none, the manager runs it once an exchange interval to
-/// have the exchange worker ask the providers whether they manage any. A tick that changes nothing writes nothing, so
-/// an idle node uses no transaction IDs.
+/// makes the calls to the neighbors. A tick that changes nothing writes nothing, so an idle node uses no transaction
+/// IDs.
 /// </summary>
 internal static class SequenceRangeWorker
 {
@@ -82,8 +81,7 @@ internal static class SequenceRangeWorker
                 SequenceRangeExchangeWorker.Wake();
             }
 
-            // The exchange worker runs while the database manages sequences. A database that manages nothing yet runs it
-            // once, to hear of the sequences its providers manage, and this worker watches it until it is done.
+            // Once the database manages no sequence, this worker watches the exchange worker until it is done.
             bool exchanging = managed is not null && SequenceRangeExchangeWorker.Watch();
             if (managed is null || (!exchanging && PgBackgroundWorker.RunTransaction(Sequences).Count == 0))
             {

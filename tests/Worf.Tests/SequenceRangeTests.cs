@@ -608,8 +608,8 @@ public sealed class SequenceRangeTests
 
         await AssertNoSharedValuesAsync(nodes, token);
 
-        // A database that only subscribes asks its providers whether they manage any sequence from its range worker, so
-        // a provider whose host never answers holds up neither its manager, which restarts the other subscription's
+        // A database that only subscribes asks its providers whether they manage any sequence from its exchange worker,
+        // so a provider whose host never answers holds up neither its manager, which restarts the other subscription's
         // apply worker as usual, nor the other exchanges, which give up on it after worf.sequence_range_timeout.
         _ = await nodeA.SafePsqlAsync(Database, "CREATE DATABASE other", token);
         _ = await nodeA.SafePsqlAsync("other",
