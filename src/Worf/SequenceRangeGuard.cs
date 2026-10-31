@@ -31,9 +31,11 @@ internal static class SequenceRangeGuard
     // pg_sequence_last_value, which reads a sequence's position without a query.
     private static nint s_lastValue;
 
-    // The last statement to start whose only inserts are the rows it moves to another partition, an UPDATE or a MERGE
-    // with no INSERT action, by the start of its transaction and its snapshot's command ID.
-    private static (long Started, uint Cid) s_update = (0, uint.MaxValue);
+    // The running statements whose only inserts are the rows they move to another partition, an UPDATE or a MERGE with
+    // no INSERT action, by the start of their transaction, their subtransaction and their snapshot's command ID. A
+    // statement leaves as it ends; one that an error ends stays behind in a subtransaction that no later statement runs
+    // in, or in an earlier transaction.
+    private static readonly List<(nint QueryDesc, long Started, uint Subxact, uint Cid)> s_moving = [];
 
     /// <summary>
     /// The guard's trigger function. The triggers' conditions do the checking and are never true, so this never runs.
@@ -164,17 +166,49 @@ internal static class SequenceRangeGuard
 
         if (moves)
         {
-            s_update = (NativeMethods.GetCurrentTransactionStartTimestamp(), queryDesc->snapshot->curcid);
+            long started = NativeMethods.GetCurrentTransactionStartTimestamp();
+            _ = s_moving.RemoveAll(statement => statement.Started != started);
+            s_moving.Add(((nint)queryDesc, started, NativeMethods.GetCurrentSubTransactionId(), queryDesc->snapshot->curcid));
         }
     }
 
     /// <summary>
-    /// Checks whether a new row is one the running statement moves from another partition. PostgreSQL then checks the
+    /// Forgets a statement as it ends, so that a statement that runs later with the same command ID, as one of the
+    /// extended protocol's portals does after another's partial execution, isn't taken for it.
+    /// </summary>
+    /// <param name="queryDesc">The statement.</param>
+    internal static unsafe void EndStatement(QueryDesc* queryDesc)
+    {
+        if (s_moving.Count > 0)
+        {
+            _ = s_moving.RemoveAll(statement => statement.QueryDesc == (nint)queryDesc);
+        }
+    }
+
+    /// <summary>
+    /// Checks whether a new row is one a running statement moves from another partition. PostgreSQL then checks the
     /// partitioned table's update guard against the row's old and new values, so its insert leaves the check to that.
+    /// A statement that runs inside it, as a trigger's does, has a later command ID.
     /// </summary>
     private static unsafe bool Moved()
-        => NativeMethods.ActiveSnapshotSet() &&
-            s_update == (NativeMethods.GetCurrentTransactionStartTimestamp(), NativeMethods.GetActiveSnapshot()->curcid);
+    {
+        if (s_moving.Count == 0 || !NativeMethods.ActiveSnapshotSet())
+        {
+            return false;
+        }
+
+        (long started, uint subxact, uint cid) = (NativeMethods.GetCurrentTransactionStartTimestamp(), NativeMethods.GetCurrentSubTransactionId(),
+            NativeMethods.GetActiveSnapshot()->curcid);
+        foreach ((_, long statementStarted, uint statementSubxact, uint statementCid) in s_moving)
+        {
+            if ((statementStarted, statementSubxact, statementCid) == (started, subxact, cid))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
 
     /// <summary>
     /// Reads a numeric value as a whole number, or null when it has a fraction or is too large for a decimal.

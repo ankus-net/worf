@@ -1,5 +1,8 @@
+using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Globalization;
+using System.Net.Sockets;
+using System.Text;
 using Npgsql;
 using Npgsql.Replication;
 using Npgsql.Replication.Internal;
@@ -246,6 +249,10 @@ public sealed class SequenceRangeTests
         await AssertOutsideAsync(node, "UPDATE o SET region = 'eu', id = 1000000 WHERE id = 5");
         await AssertOutsideAsync(node, "MERGE INTO o USING (VALUES (5)) s (k) ON o.id = s.k WHEN MATCHED THEN UPDATE SET region = 'eu' WHEN NOT MATCHED THEN INSERT VALUES (s.k, 'eu')");
 
+        // An update ends before a statement that runs after it with the same command ID, as an extended protocol
+        // portal does after another's partial execution, so that statement's rows aren't taken for rows it moved.
+        Assert.AreEqual("23514", await PartialExecuteAsync("UPDATE t SET v = v RETURNING key", "INSERT INTO t (key, v) VALUES (333333, 'forged')"));
+
         // Rows that DDL brings under the guard can't hold values the sequence may still issue, though values from before
         // range management can stay. A partitioned table's guard checks a column that only a partition's own default
         // draws from a managed sequence.
@@ -297,6 +304,64 @@ public sealed class SequenceRangeTests
         {
             PostgresException error = await Assert.ThrowsExactlyAsync<PostgresException>(() => target.SafePsqlAsync(Database, sql, token), sql);
             Assert.AreEqual("23514", error.SqlState, sql);
+        }
+
+        // Runs two statements over the extended protocol in one transaction, parsing and binding both before the first
+        // is executed for one row and the second in full, and returns the SQLSTATE of the error they end with, if any.
+        async Task<string?> PartialExecuteAsync(string first, string second)
+        {
+            using TcpClient client = new();
+            await client.ConnectAsync("127.0.0.1", node.Cluster.Port, token);
+            NetworkStream stream = client.GetStream();
+            byte[] startup = [.. new byte[8], .. Text("user"), .. Text("postgres"), .. Text("database"), .. Text(Database), 0];
+            BinaryPrimitives.WriteInt32BigEndian(startup, startup.Length);
+            BinaryPrimitives.WriteInt32BigEndian(startup.AsSpan(4), 3 << 16);
+            await stream.WriteAsync(startup, token);
+            _ = await ReadyAsync();
+            byte[] extended = [
+                .. Message('P', Text("s1"), Text(first), new byte[2]), .. Message('B', Text("p1"), Text("s1"), new byte[6]),
+                .. Message('P', Text("s2"), Text(second), new byte[2]), .. Message('B', Text("p2"), Text("s2"), new byte[6]),
+                .. Message('E', Text("p1"), Rows(1)), .. Message('E', Text("p2"), Rows(0)), .. Message('S')];
+            await stream.WriteAsync(extended, token);
+            return await ReadyAsync();
+
+            static byte[] Text(string value) => [.. Encoding.UTF8.GetBytes(value), 0];
+
+            static byte[] Rows(int rows)
+            {
+                byte[] count = new byte[4];
+                BinaryPrimitives.WriteInt32BigEndian(count, rows);
+                return count;
+            }
+
+            static byte[] Message(char type, params byte[][] parts)
+            {
+                byte[] message = [(byte)type, 0, 0, 0, 0, .. parts.SelectMany(part => part)];
+                BinaryPrimitives.WriteInt32BigEndian(message.AsSpan(1), message.Length - 1);
+                return message;
+            }
+
+            // Reads messages up to the next ReadyForQuery, keeping the SQLSTATE of an ErrorResponse.
+            async Task<string?> ReadyAsync()
+            {
+                string? state = null;
+                byte[] header = new byte[5];
+                while (true)
+                {
+                    await stream.ReadExactlyAsync(header, token);
+                    byte[] body = new byte[BinaryPrimitives.ReadInt32BigEndian(header.AsSpan(1)) - 4];
+                    await stream.ReadExactlyAsync(body, token);
+                    if (header[0] == (byte)'Z')
+                    {
+                        return state;
+                    }
+
+                    if (header[0] == (byte)'E')
+                    {
+                        state ??= Encoding.UTF8.GetString(body).Split('\0').FirstOrDefault(field => field.StartsWith('C'))?[1..];
+                    }
+                }
+            }
         }
     }
 
