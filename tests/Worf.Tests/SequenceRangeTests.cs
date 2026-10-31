@@ -1000,10 +1000,11 @@ public sealed class SequenceRangeTests
 
     /// <summary>
     /// In a cascade, a node two links from the owner gets its blocks from its parent's pool block, and a node whose
-    /// link to the owner is dropped finds the owner through another neighbor, which relays its reports without writing. A late joiner whose values reach into the
-    /// root is refused by the pool holder it asks, one sequence's failure leaves the others' exchanges alone, and a
-    /// pool holder's standby, promoted without the grants its primary made last, fences its pool until its children
-    /// report, and takes the grants it lost back into its ledger.
+    /// link to the owner is dropped finds the owner through another neighbor, which relays its reports without writing.
+    /// A late joiner whose values reach into the root is refused by the pool holder it asks, one sequence's failure
+    /// leaves the others' exchanges alone, and a pool holder's standby, promoted without the grants its primary made
+    /// last, fences its pool until its children report, and takes the grants it lost back into its ledger. A pool
+    /// holder's Snowflake node numbers stay its while it reports.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -1117,6 +1118,29 @@ public sealed class SequenceRangeTests
         }
 
         await AssertNoSharedValuesAsync(nodes, token);
+
+        // With eighteen Snowflake node numbers, node_a and node_b take one each, and node_b a pool block of the other
+        // sixteen, from which node_c takes its own. A day after the pool's grant, the numbers node_b has yet to grant on
+        // stay its, though it reports holding only its own, and the root has none left.
+        _ = await nodeA.SafePsqlAsync(Database, "ALTER SEQUENCE worf.snowflake_node MAXVALUE 17; SELECT worf.enable_snowflake('{node_b,node_c}')", token);
+        foreach (TestNode node in nodes)
+        {
+            Assert.IsTrue(await node.PollQueryUntilAsync(Database, "SELECT worf.snowflake_node() IS NOT NULL", token), $"{node.Name}'s node number");
+        }
+
+        string[] pool = (await nodeA.SafePsqlAsync(Database,
+            "SELECT lo, hi FROM worf.sequence_range_grant WHERE seqoid = 'worf.snowflake_node'::regclass AND kind = 'p'", token)).Split('|');
+        Assert.AreEqual("t", await nodeC.SafePsqlAsync(Database, $"SELECT worf.snowflake_node() BETWEEN {pool[0]} AND {pool[1]}", token), "node_c's number from node_b's pool");
+        int reused = nodeA.ReadLog().Length;
+        _ = await nodeA.SafePsqlAsync(Database,
+            "UPDATE worf.sequence_range_grant SET granted_at = now() - interval '2 days' WHERE seqoid = 'worf.snowflake_node'::regclass AND kind = 'p'", token);
+        await Task.Delay(TimeSpan.FromSeconds(3), token);
+        Assert.DoesNotContain("are free again", nodeA.ReadLog()[reused..], "node_b's pool numbers given back");
+        Assert.AreEqual("0", await nodeA.SafePsqlAsync(Database, $"""
+            SELECT count(*) FROM worf.sequence_range_free f JOIN worf.sequence_range_block b ON b.block_id = f.block_id
+            WHERE b.seqoid = 'worf.snowflake_node'::regclass AND f.lo <= {pool[1]} AND {pool[0]} <= f.hi
+            """, token), "node_b's pool numbers free in the root");
+        Assert.HasCount(3, (await Task.WhenAll(nodes.Select(node => node.SafePsqlAsync(Database, "SELECT worf.snowflake_node()", token)))).Distinct());
     }
 
     /// <summary>

@@ -953,10 +953,12 @@ internal static unsafe partial class SequenceRanges
     /// below the start of a root that moved above them, and numbers given up in this epoch. A number granted to a node
     /// is free once that node has reported, a day after the grant, without it among the numbers it holds, which it
     /// reports for a day after giving one up, or has reported nothing for a day, since a node gives up its number after
-    /// half a day without word from the owner. A number is free only once every other node has also reported in this
-    /// epoch without it, or has reported nothing for a day. The numbers come back to be used no earlier than the furthest
-    /// any node has reserved its clock, so that no ID of a number's earlier holder can repeat, whatever the clocks. A
-    /// node that this server hasn't heard from since it started counts as heard when it started.
+    /// half a day without word from the owner. Numbers granted to a pool holder, which holds them to grant on rather than
+    /// as its own, stay its until it gives the pool block up, or has reported nothing for a day. A number is free only
+    /// once every other node has also reported in this epoch without it, or has reported nothing for a day. The numbers
+    /// come back to be used no earlier than the furthest any node has reserved its clock, so that no ID of a number's
+    /// earlier holder can repeat, whatever the clocks. A node that this server hasn't heard from since it started counts
+    /// as heard when it started.
     /// </summary>
     /// <param name="seqoid">The Snowflake sequence.</param>
     /// <param name="epoch">Its epoch.</param>
@@ -990,8 +992,9 @@ internal static unsafe partial class SequenceRanges
             granted AS (
                 SELECT g.lo, g.hi, CASE WHEN g.state = 'abandoned' THEN g.abandoned_at > now() - $3::interval
                         ELSE h.assumed > now() - $3::interval
-                            AND NOT (g.state = 'acknowledged' AND h.holds IS NOT NULL AND h.heard > g.granted_at + $3::interval) END AS held,
-                    CASE WHEN g.state = 'acknowledged' AND h.assumed > now() - $3::interval AND h.holds IS NOT NULL AND h.heard > g.granted_at + $3::interval
+                            AND NOT (g.kind = 'n' AND g.state = 'acknowledged' AND h.holds IS NOT NULL AND h.heard > g.granted_at + $3::interval) END AS held,
+                    CASE WHEN g.kind = 'n' AND g.state = 'acknowledged' AND h.assumed > now() - $3::interval AND h.holds IS NOT NULL
+                            AND h.heard > g.granted_at + $3::interval
                         THEN h.holds END AS reported
                 FROM worf.sequence_range_grant g JOIN worf.sequence_range_block b ON b.block_id = g.from_block
                     LEFT JOIN nodes h ON h.node_id = g.grantee_id
