@@ -1355,19 +1355,18 @@ internal static unsafe partial class Apply
             throw new PgException(PgSqlStates.InternalError, "missing last_value in sequence message");
         }
 
+        // The state goes to the sequence of the same name. One missing here, as after a rename on either node, stops
+        // apply as a missing table does, rather than leaving the sequence behind the provider's unseen.
         uint reloid;
         fixed (byte* cnspname = Worf.ToServerCString(nspname))
         fixed (byte* crelname = Worf.ToServerCString(relname))
         {
-            uint nspoid = NativeMethods.get_namespace_oid((sbyte*)cnspname, true);
-            reloid = nspoid == 0 ? 0 : NativeMethods.get_relname_relid((sbyte*)crelname, nspoid);
+            reloid = NativeMethods.get_relname_relid((sbyte*)crelname, NativeMethods.get_namespace_oid((sbyte*)cnspname, false));
         }
 
-        // There's nothing to set for a sequence that isn't here, as when it was dropped.
         if (reloid == 0)
         {
-            PgLog.Warning($"skipping the state of sequence {nspname}.{relname}, which doesn't exist here");
-            return;
+            throw new PgException(PgSqlStates.UndefinedTable, $"relation \"{nspname}.{relname}\" does not exist");
         }
 
         // A managed sequence's position is this node's own, and the provider's would fall outside its block.

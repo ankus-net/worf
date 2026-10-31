@@ -96,7 +96,8 @@ INSERT INTO public.test_publicschema VALUES(4, 'd');
 INSERT INTO "strange.schema-IS".test_strangeschema VALUES(3, DEFAULT);
 INSERT INTO "strange.schema-IS".test_strangeschema VALUES(4, DEFAULT);
 
--- The subscriber has no such sequence, and skips its state.
+-- The subscriber has no sequence of this name, as after a rename on either node, so apply stops at its state, as at a
+-- change to a missing table, until there is one.
 CREATE SEQUENCE public.test_provider_only_seq;
 SELECT * FROM worf.replication_set_add_sequence('default', 'test_provider_only_seq');
 
@@ -104,11 +105,32 @@ SELECT worf.synchronize_sequence(c.oid)
   FROM pg_class c, pg_namespace n
  WHERE c.relkind = 'S' AND c.relnamespace = n.oid AND n.nspname IN ('public', 'strange.schema-IS');
 
+\c :subscriber_dsn
+
+DO $$
+BEGIN
+	FOR i IN 1..300 LOOP
+		IF EXISTS (SELECT 1 FROM worf.show_subscription_status() WHERE status = 'down') THEN
+			RETURN;
+		END IF;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+	RAISE EXCEPTION 'apply went on past the state of a sequence it does not have';
+END;
+$$;
+
+CREATE SEQUENCE public.test_renamed_seq;
+ALTER SEQUENCE public.test_renamed_seq RENAME TO test_provider_only_seq;
+
+\c :provider_dsn
+
 SELECT worf.wait_slot_confirm_lsn(NULL, NULL);
 
 DROP SEQUENCE public.test_provider_only_seq CASCADE;
 
 \c :subscriber_dsn
+SELECT last_value > 1000 FROM public.test_provider_only_seq;
+DROP SEQUENCE public.test_provider_only_seq;
 SELECT * FROM public.test_publicschema;
 SELECT * FROM "strange.schema-IS".test_strangeschema;
 
