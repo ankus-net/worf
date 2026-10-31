@@ -323,7 +323,7 @@ internal static partial class ReplicationSet
     /// <param name="repset">The set.</param>
     internal static void AlterReplicationSet(WorfRepSet repset)
     {
-        if (!Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT FROM worf.replication_set WHERE set_id = $1)",
+        if (!Worf.ReadScalar<bool>("SELECT EXISTS (SELECT FROM worf.replication_set WHERE set_id = $1)",
             SpiParameter.Create(repset.Id)))
         {
             throw new PgException(PgSqlStates.InternalError, $"replication set {repset.Id} not found");
@@ -365,7 +365,7 @@ internal static partial class ReplicationSet
     /// <param name="setid">The set.</param>
     internal static void DropReplicationSet(uint setid)
     {
-        uint nodeid = Spi.ExecuteScalar<uint?>("SELECT set_nodeid FROM worf.replication_set WHERE set_id = $1",
+        uint nodeid = Worf.ReadScalar<uint?>("SELECT set_nodeid FROM worf.replication_set WHERE set_id = $1",
             SpiParameter.Create(setid))
             ?? throw new PgException(PgSqlStates.InternalError, $"replication set {setid} not found");
 
@@ -810,7 +810,7 @@ internal static partial class ReplicationSet
     private static bool SequenceHasReplicationSets(uint nodeid, uint seqoid)
     {
         _ = nodeid;
-        return Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT FROM worf.replication_set_seq WHERE set_seqoid = $1)",
+        return Worf.ReadScalar<bool>("SELECT EXISTS (SELECT FROM worf.replication_set_seq WHERE set_seqoid = $1)",
             SpiParameter.Create(seqoid));
     }
 

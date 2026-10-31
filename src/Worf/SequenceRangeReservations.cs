@@ -56,7 +56,9 @@ internal static class SequenceRangeReservations
 
     private static void ReserveRange(uint seqoid, long count, PgInterval timeout)
     {
-        _ = WorfNode.GetLocalNode(true, false);
+        // The node is only looked up, not locked against configuration changes until the load commits, so that a load's
+        // transaction holds up neither the manager nor other reservations.
+        _ = WorfNode.GetLocalNode(false, false);
         if (count <= 0)
         {
             throw new PgException(PgSqlStates.InvalidParameterValue, "count must be positive");
@@ -89,13 +91,21 @@ internal static class SequenceRangeReservations
             if (next.Count > 0 && SequenceRanges.Steps(info, next[0].Get<long>(1), next[0].Get<long>(2)) >= needed)
             {
                 long wait = Math.Max((deadline - Worker.GetCurrentTimestamp()) / 1000, 1);
-                if (!SequenceRanges.Switch(seqoid, info, (next[0].Get<Guid>(0), next[0].Get<long>(1), next[0].Get<long>(2)), (int)Math.Min(wait, int.MaxValue)))
+                Guid block = next[0].Get<Guid>(0);
+                if (SequenceRanges.Switch(seqoid, info, (block, next[0].Get<long>(1), next[0].Get<long>(2)), (int)Math.Min(wait, int.MaxValue), true))
+                {
+                    break;
+                }
+
+                // The range worker may have switched to the block first; its values left are counted again.
+                if (Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range_block WHERE block_id = $1 AND state = 'next'",
+                    SpiParameter.Create(block)).Count > 0)
                 {
                     throw new PgException("55P03", $"could not switch sequence {info.Name} to a block of {needed} values in time",
                         hint: "A transaction that called nextval on it is still open.");
                 }
 
-                break;
+                continue;
             }
 
             if (!requested)
@@ -116,7 +126,7 @@ internal static class SequenceRangeReservations
 
     private static void ReserveValues(uint seqoid, long lo, long hi, PgInterval timeout)
     {
-        _ = WorfNode.GetLocalNode(true, false);
+        _ = WorfNode.GetLocalNode(false, false);
         if (lo > hi)
         {
             throw new PgException(PgSqlStates.InvalidParameterValue, "lo must not be above hi");
@@ -198,8 +208,13 @@ internal static class SequenceRangeReservations
             }
         }
 
-        // Refusals stay a minute, so that the sessions waiting on them see them.
-        _ = Spi.Execute("DELETE FROM worf.sequence_range_request WHERE state = 'refused' AND created_at < now() - interval '1 minute'");
+        // Refusals stay a minute, so that the sessions waiting on them see them. This runs on every tick, so it reads
+        // first: a write takes a transaction ID even when it changes nothing.
+        if (Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range_request WHERE state = 'refused' AND created_at < now() - interval '1 minute')"))
+        {
+            _ = Spi.Execute("DELETE FROM worf.sequence_range_request WHERE state = 'refused' AND created_at < now() - interval '1 minute'");
+        }
+
         return recorded;
     }
 
@@ -255,7 +270,7 @@ internal static class SequenceRangeReservations
     private static uint RequireUsage(PgDatum sequence)
     {
         uint seqoid = SequenceRanges.RequireSequence(sequence);
-        return Spi.ExecuteScalar<bool>("SELECT pg_catalog.has_sequence_privilege($1, 'USAGE')", SpiParameter.Create(seqoid)) ? seqoid
+        return Worf.ReadScalar<bool>("SELECT pg_catalog.has_sequence_privilege($1, 'USAGE')", SpiParameter.Create(seqoid)) ? seqoid
             : throw new PgException("42501", $"permission denied for sequence {SequenceRanges.GetInfo(seqoid).Name}");
     }
 
