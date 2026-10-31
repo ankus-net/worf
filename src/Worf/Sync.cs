@@ -262,6 +262,7 @@ internal static class Sync
         string snapshot = EnsureReplicationSlotSnapshot(sub, originConnRepl, "copy_slot", false, out ulong lsn);
 
         statusLsn = lsn;
+        PublishCopyLsn(lsn);
 
         // Make sure we cleanup the slot if something goes wrong.
         try
@@ -269,7 +270,7 @@ internal static class Sync
             PgBackgroundWorker.RunTransaction(() =>
             {
                 // The table's managed sequences are joined before any rows arrive.
-                SequenceRangeSync.JoinBeforeCopy(managedSequences, Spi.ExecuteScalar<uint?>("SELECT to_regclass($1)::oid",
+                SequenceRangeSync.JoinBeforeCopy(managedSequences, Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid",
                     SpiParameter.Create(Spi.QuoteQualifiedIdentifier(nspname, relname))) ?? 0);
 
                 ushort originid = EnsureReplicationOrigin(sub);
@@ -284,6 +285,8 @@ internal static class Sync
 
                 SetTableSyncStatus(sub.Id, nspname, relname, SyncStatusData, lsn);
             });
+
+            WaitForApply();
 
             // Copy data.
             CopyTablesData(sub.Name, sub.OriginIf.Dsn, snapshot, [(nspname, relname)], sub.ReplicationSets, sub.SlotName);
@@ -931,7 +934,7 @@ internal static class Sync
 
         // Skip the worf_origin if it exists locally.
         bool hasPglOrigin = PgBackgroundWorker.RunTransaction(() =>
-            Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT FROM pg_catalog.pg_namespace WHERE nspname = 'worf_origin')"));
+            Worf.ReadScalar<bool>("SELECT EXISTS (SELECT FROM pg_catalog.pg_namespace WHERE nspname = 'worf_origin')"));
         if (hasPglOrigin)
         {
             cmdargv.Add($"--exclude-schema={"worf_origin"}");
@@ -1279,6 +1282,51 @@ internal static class Sync
 
         // Finish the transactions and disconnect.
         FinishCopyOriginTx(originConn);
+    }
+
+    /// <summary>
+    /// Tells the subscription's apply worker where the copy's snapshot is, as soon as it's known.
+    /// </summary>
+    /// <param name="lsn">The position of the copy's snapshot.</param>
+    private static void PublishCopyLsn(ulong lsn)
+    {
+        using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive();
+        WorfWorker me = guard[Worker.MyWorfWorker];
+        me.Worker.Sync.CopyLsn = lsn;
+        guard[Worker.MyWorfWorker] = me;
+
+        int apply = guard.Read((in _, workers) => Worker.ApplyFind(workers, me.Dboid, me.Worker.Apply.SubId));
+        if (apply >= 0 && guard[apply].Proc != 0)
+        {
+            Worker.SetProcLatch(guard[apply].Proc);
+        }
+    }
+
+    /// <summary>
+    /// Waits for the subscription's apply worker to apply everything that committed before the copy's snapshot. Queued
+    /// SQL among it has to change the table before the copy does, as it changed the provider's rows before the
+    /// snapshot; run after the copy, it changes the copied rows again.
+    /// </summary>
+    private static void WaitForApply()
+    {
+        while (true)
+        {
+            using (PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share())
+            {
+                if (guard[Worker.MyWorfWorker].Worker.Sync.CopyAllowed)
+                {
+                    return;
+                }
+            }
+
+            if (Worker.GotSigterm)
+            {
+                throw new OperationCanceledException("The worf worker is stopping.");
+            }
+
+            _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(1000));
+            PgInterrupts.Check();
+        }
     }
 
     /// <summary>

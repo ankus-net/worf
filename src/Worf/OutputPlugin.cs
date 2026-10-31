@@ -278,6 +278,9 @@ internal static unsafe partial class OutputPlugin
             SendStartupMessage(ctx, data, false /* can't be last message */);
         }
 
+        // Another transaction's snapshot can match the last one's while it doesn't see that transaction's own changes.
+        data.ActionsSnapshot = null;
+
         // If the record didn't originate locally, send origin info
         sendReplicationOrigin &= txn->origin_id != 0;
 
@@ -335,6 +338,31 @@ internal static unsafe partial class OutputPlugin
         RelmetacachePrune();
     }
 
+    /// <summary>
+    /// Reads what the connection's replication sets replicate when the historic snapshot has changed since they were
+    /// last read, so each change gets the actions its sets had when it was made. The catalog as it is now would apply
+    /// actions changed since to the changes a walsender decodes again when it restarts.
+    /// </summary>
+    private static void ReadReplicationSetActions(WorfOutputData data)
+    {
+        // A transaction's snapshot changes when its own catalog changes take effect, at a new command, and when another
+        // transaction's commit changes the catalogs, which grows the set of committed transactions it sees.
+        SnapshotData* snapshot = NativeMethods.GetCatalogSnapshot(ReplicationSet.GetReplicationSetRelOid());
+        (uint, uint, uint, uint) actionsSnapshot = (snapshot->xmin, snapshot->xmax, snapshot->xcnt, snapshot->curcid);
+        if (data.ActionsSnapshot == actionsSnapshot)
+        {
+            return;
+        }
+
+        // The tables' info holds the actions as they were when it was built.
+        if (ReplicationSet.ReadReplicationSetActions(data.ReplicationSets))
+        {
+            ReplicationSet.InvalidateTableReplicationInfo();
+        }
+
+        data.ActionsSnapshot = actionsSnapshot;
+    }
+
     private static bool WorfChangeFilter(WorfOutputData data, RelationData* relation, ReorderBufferChange* change,
         out HashSet<int>? attList)
     {
@@ -370,6 +398,8 @@ internal static unsafe partial class OutputPlugin
                     return true;
                 }
 
+                ReadReplicationSetActions(data);
+
                 foreach (string queueSet in q.ReplicationSets ?? [])
                 {
                     foreach (WorfRepSet rs in data.ReplicationSets)
@@ -390,44 +420,21 @@ internal static unsafe partial class OutputPlugin
         {
             // Special case - replication set table.
             //
-            // We can use this to update our cached replication set info, without having to deal with cache
-            // invalidation callbacks.
-            HeapTupleData* tup;
-
-            if (change->action == ReorderBufferChangeType.REORDER_BUFFER_CHANGE_UPDATE)
-            {
-                tup = NewTuple(change);
-            }
-            else if (change->action == ReorderBufferChangeType.REORDER_BUFFER_CHANGE_DELETE)
-            {
-                tup = OldTuple(change);
-            }
-            else
+            // A change to one of our sets' actions needs nothing here, as the next change reads them under a
+            // historic snapshot that sees it.
+            if (change->action != ReorderBufferChangeType.REORDER_BUFFER_CHANGE_DELETE)
             {
                 return false;
             }
 
-            WorfRepSet replicatedSet = ReplicationSet.ReplicationSetFromTuple(tup, relation->rd_att);
+            WorfRepSet replicatedSet = ReplicationSet.ReplicationSetFromTuple(OldTuple(change), relation->rd_att);
             foreach (WorfRepSet rs in data.ReplicationSets)
             {
-                // Check if the changed repset is used by us.
+                // Somebody deleted one of our rep sets, bail here and let reconnect logic handle any potential issues.
                 if (rs.Id == replicatedSet.Id)
                 {
-                    // In case this was delete, somebody deleted one of our rep sets, bail here and let reconnect logic
-                    // handle any potential issues.
-                    if (change->action == ReorderBufferChangeType.REORDER_BUFFER_CHANGE_DELETE)
-                    {
-                        throw new PgException(PgSqlStates.InternalError,
-                            $"replication set \"{rs.Name}\" used by this connection was deleted, existing");
-                    }
-
-                    // This was update of our repset, update the cache.
-                    rs.ReplicateInsert = replicatedSet.ReplicateInsert;
-                    rs.ReplicateUpdate = replicatedSet.ReplicateUpdate;
-                    rs.ReplicateDelete = replicatedSet.ReplicateDelete;
-                    rs.ReplicateTruncate = replicatedSet.ReplicateTruncate;
-
-                    return false;
+                    throw new PgException(PgSqlStates.InternalError,
+                        $"replication set \"{rs.Name}\" used by this connection was deleted, existing");
                 }
             }
 
@@ -435,6 +442,7 @@ internal static unsafe partial class OutputPlugin
         }
 
         // Normal case - use replication set membership.
+        ReadReplicationSetActions(data);
         WorfTableRepInfo tblinfo = ReplicationSet.GetTableReplicationInfo(data.LocalNodeId, relation, data.ReplicationSets);
 
         // First try filter out by change type.

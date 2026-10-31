@@ -198,8 +198,13 @@ internal static class SequenceRangeReservations
             }
         }
 
-        // Refusals stay a minute, so that the sessions waiting on them see them.
-        _ = Spi.Execute("DELETE FROM worf.sequence_range_request WHERE state = 'refused' AND created_at < now() - interval '1 minute'");
+        // Refusals stay a minute, so that the sessions waiting on them see them. This runs on every tick, so it reads
+        // first: a write takes a transaction ID even when it changes nothing.
+        if (Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range_request WHERE state = 'refused' AND created_at < now() - interval '1 minute')"))
+        {
+            _ = Spi.Execute("DELETE FROM worf.sequence_range_request WHERE state = 'refused' AND created_at < now() - interval '1 minute'");
+        }
+
         return recorded;
     }
 
@@ -255,7 +260,7 @@ internal static class SequenceRangeReservations
     private static uint RequireUsage(PgDatum sequence)
     {
         uint seqoid = SequenceRanges.RequireSequence(sequence);
-        return Spi.ExecuteScalar<bool>("SELECT pg_catalog.has_sequence_privilege($1, 'USAGE')", SpiParameter.Create(seqoid)) ? seqoid
+        return Worf.ReadScalar<bool>("SELECT pg_catalog.has_sequence_privilege($1, 'USAGE')", SpiParameter.Create(seqoid)) ? seqoid
             : throw new PgException("42501", $"permission denied for sequence {SequenceRanges.GetInfo(seqoid).Name}");
     }
 

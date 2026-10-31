@@ -81,7 +81,7 @@ internal static class Manager
         }
 
         PgBackgroundWorker.RunTransaction(static () =>
-            PgLog.Log($"starting worf database manager for database {Spi.ExecuteScalar<string>("SELECT pg_catalog.current_database()::text")}"));
+            PgLog.Log($"starting worf database manager for database {Worf.ReadScalar<string>("SELECT pg_catalog.current_database()::text")}"));
 
         // Brief delay before checking/upgrading extension version. This avoids a race condition where an explicit
         // ALTER EXTENSION UPDATE runs concurrently with our auto-upgrade check on fast systems.
@@ -158,19 +158,19 @@ internal static class Manager
 
         bool managed = PgBackgroundWorker.RunTransaction(static () =>
         {
-            if (!Spi.ExecuteScalar<bool>("SELECT to_regclass('worf.sequence_range') IS NOT NULL") ||
+            if (!Worf.ReadScalar<bool>("SELECT to_regclass('worf.sequence_range') IS NOT NULL") ||
                 WorfNode.GetLocalNode(false, true) is not WorfLocalNode node)
             {
                 return false;
             }
 
-            if (!Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range)"))
+            if (!Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range)"))
             {
                 _ = SequenceRangeExchange.ExchangeAll(node);
                 s_discoveryAt = SequenceRangeExchange.NextDueAt;
             }
 
-            return Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range)");
+            return Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range)");
         });
         if (managed)
         {

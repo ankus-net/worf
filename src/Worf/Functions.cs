@@ -223,7 +223,7 @@ internal static class Functions
             ("node_id", SpiParameter.Create(node.Node.Id)),
             ("node_name", SpiParameter.Create(node.Node.Name)),
             ("sysid", SpiParameter.Create(sysid.ToString(CultureInfo.InvariantCulture))),
-            ("dbname", SpiParameter.Create(Spi.ExecuteScalar<string>("SELECT pg_catalog.current_database()::text"))),
+            ("dbname", SpiParameter.Create(Worf.ReadScalar<string>("SELECT pg_catalog.current_database()::text"))),
             ("replication_sets", SpiParameter.Create(ReplicationSet.StringlistToIdentifierstr(repsets.Select(static repset => repset.Name)))));
     }
 

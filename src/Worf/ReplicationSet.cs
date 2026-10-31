@@ -323,7 +323,7 @@ internal static partial class ReplicationSet
     /// <param name="repset">The set.</param>
     internal static void AlterReplicationSet(WorfRepSet repset)
     {
-        if (!Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT FROM worf.replication_set WHERE set_id = $1)",
+        if (!Worf.ReadScalar<bool>("SELECT EXISTS (SELECT FROM worf.replication_set WHERE set_id = $1)",
             SpiParameter.Create(repset.Id)))
         {
             throw new PgException(PgSqlStates.InternalError, $"replication set {repset.Id} not found");
@@ -365,7 +365,7 @@ internal static partial class ReplicationSet
     /// <param name="setid">The set.</param>
     internal static void DropReplicationSet(uint setid)
     {
-        uint nodeid = Spi.ExecuteScalar<uint?>("SELECT set_nodeid FROM worf.replication_set WHERE set_id = $1",
+        uint nodeid = Worf.ReadScalar<uint?>("SELECT set_nodeid FROM worf.replication_set WHERE set_id = $1",
             SpiParameter.Create(setid))
             ?? throw new PgException(PgSqlStates.InternalError, $"replication set {setid} not found");
 
@@ -810,7 +810,7 @@ internal static partial class ReplicationSet
     private static bool SequenceHasReplicationSets(uint nodeid, uint seqoid)
     {
         _ = nodeid;
-        return Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT FROM worf.replication_set_seq WHERE set_seqoid = $1)",
+        return Worf.ReadScalar<bool>("SELECT EXISTS (SELECT FROM worf.replication_set_seq WHERE set_seqoid = $1)",
             SpiParameter.Create(seqoid));
     }
 
@@ -939,6 +939,64 @@ internal static partial class ReplicationSet
     }
 
     /// <summary>
+    /// Reads what each of the output plugin's replication sets replicates, as the catalog snapshot sees it. While a
+    /// change is decoded, that's the historic snapshot, so the actions are the ones the set had when the change was
+    /// made.
+    /// </summary>
+    /// <param name="replicationSets">The connection's sets, whose actions are updated.</param>
+    /// <returns>Whether any set's actions changed.</returns>
+    internal static unsafe bool ReadReplicationSetActions(List<WorfRepSet> replicationSets)
+    {
+        RelationData* rel = Worf.OpenCatalog(CatalogRepset, (int)PgLockMode.AccessShare);
+        NativeMethods.list_free(NativeMethods.RelationGetIndexList(rel));
+        uint pkindex = rel->rd_pkindex;
+        ScanKeyData key;
+        bool changed = false;
+
+        foreach (WorfRepSet repset in replicationSets)
+        {
+            NativeMethods.ScanKeyInit(&key, AnumRepsetId, BtEqualStrategyNumber, FOideq, repset.Id);
+            SysScanDescData* scan = NativeMethods.systable_beginscan(rel, pkindex, true, null, 1, &key);
+            HeapTupleData* tuple = NativeMethods.systable_getnext(scan);
+
+            // A set created after the change replicated nothing when it was made.
+            WorfRepSet actions = tuple is null ? new WorfRepSet() : ReplicationSetFromTuple(tuple, rel->rd_att);
+            NativeMethods.systable_endscan(scan);
+
+            if (actions.ReplicateInsert != repset.ReplicateInsert || actions.ReplicateUpdate != repset.ReplicateUpdate ||
+                actions.ReplicateDelete != repset.ReplicateDelete || actions.ReplicateTruncate != repset.ReplicateTruncate)
+            {
+                repset.ReplicateInsert = actions.ReplicateInsert;
+                repset.ReplicateUpdate = actions.ReplicateUpdate;
+                repset.ReplicateDelete = actions.ReplicateDelete;
+                repset.ReplicateTruncate = actions.ReplicateTruncate;
+                changed = true;
+            }
+        }
+
+        NativeMethods.table_close(rel, (int)PgLockMode.AccessShare);
+
+        return changed;
+    }
+
+    /// <summary>
+    /// Makes the output plugin build every table's replication info again, as when one of its replication sets changes
+    /// what it replicates.
+    /// </summary>
+    internal static void InvalidateTableReplicationInfo()
+    {
+        if (s_repSetTableHash is null)
+        {
+            return;
+        }
+
+        foreach (WorfTableRepInfo entry in s_repSetTableHash.Values)
+        {
+            entry.IsValid = false;
+        }
+    }
+
+    /// <summary>
     /// Reads a replication set from its catalog tuple.
     /// </summary>
     /// <param name="tuple">The tuple.</param>
@@ -1039,10 +1097,7 @@ internal static partial class ReplicationSet
 
         if (reloid == 0)
         {
-            foreach (WorfTableRepInfo entry in s_repSetTableHash.Values)
-            {
-                entry.IsValid = false;
-            }
+            InvalidateTableReplicationInfo();
         }
         else if (s_repSetTableHash.TryGetValue(reloid, out WorfTableRepInfo? entry))
         {

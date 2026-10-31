@@ -566,6 +566,9 @@ internal static unsafe partial class Apply
 
         ProtoNative.ReadBegin(s, out ulong commitLsn, out long commitTime, out s_remoteXid);
 
+        // Everything that committed before this transaction is applied.
+        AllowCopies(commitLsn);
+
         Worf.ReploriginSessionOriginTimestamp = commitTime;
         Worf.ReploriginSessionOriginLsn = commitLsn;
         s_remoteOriginId = 0;
@@ -1352,13 +1355,19 @@ internal static unsafe partial class Apply
             throw new PgException(PgSqlStates.InternalError, "missing last_value in sequence message");
         }
 
-        uint nspoid;
         uint reloid;
         fixed (byte* cnspname = Worf.ToServerCString(nspname))
         fixed (byte* crelname = Worf.ToServerCString(relname))
         {
-            nspoid = NativeMethods.get_namespace_oid((sbyte*)cnspname, false);
-            reloid = NativeMethods.get_relname_relid((sbyte*)crelname, nspoid);
+            uint nspoid = NativeMethods.get_namespace_oid((sbyte*)cnspname, true);
+            reloid = nspoid == 0 ? 0 : NativeMethods.get_relname_relid((sbyte*)crelname, nspoid);
+        }
+
+        // There's nothing to set for a sequence that isn't here, as when it was dropped.
+        if (reloid == 0)
+        {
+            PgLog.Warning($"skipping the state of sequence {nspname}.{relname}, which doesn't exist here");
+            return;
         }
 
         // A managed sequence's position is this node's own, and the provider's would fall outside its block.
@@ -2292,6 +2301,8 @@ internal static unsafe partial class Apply
         uint subid = myApplyWorker.SubId;
         uint myDatabaseId = NativeGlobals.MyDatabaseId;
 
+        AllowCopies(endLsn);
+
         // First check if we need to update the cached information.
         if (myApplyWorker.SyncPending)
         {
@@ -2416,6 +2427,56 @@ internal static unsafe partial class Apply
             }
         }
     }
+
+    /// <summary>
+    /// Lets the subscription's sync workers copy their table once everything that committed before their copy's
+    /// snapshot is applied. Queued SQL that committed before a snapshot changes the table before its copy, as it
+    /// changed the provider's rows before it; run after the copy, it changes the copied rows again.
+    /// </summary>
+    /// <param name="lsn">The position before which everything that committed is applied.</param>
+    private static void AllowCopies(ulong lsn)
+    {
+        // None waits but while a table synchronizes, so look under the shared lock first.
+        uint dboid = NativeGlobals.MyDatabaseId;
+        bool waiting = false;
+        using (PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share())
+        {
+            WorfWorker me = guard[Worker.MyWorfWorker];
+            for (int i = 0; i < guard.Length && me.WorkerType == WorfWorkerType.Apply && !waiting; i++)
+            {
+                waiting = WaitsToCopy(guard[i], dboid, me.Worker.Apply.SubId, lsn);
+            }
+        }
+
+        if (!waiting)
+        {
+            return;
+        }
+
+        using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
+        {
+            uint subid = guard[Worker.MyWorfWorker].Worker.Apply.SubId;
+            for (int i = 0; i < guard.Length; i++)
+            {
+                WorfWorker worker = guard[i];
+                if (WaitsToCopy(worker, dboid, subid, lsn))
+                {
+                    worker.Worker.Sync.CopyAllowed = true;
+                    guard[i] = worker;
+                    Worker.SetProcLatch(worker.Proc);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Checks whether a worker is a sync worker of the subscription that waits for the apply worker to reach its copy's
+    /// snapshot, which it has.
+    /// </summary>
+    private static bool WaitsToCopy(WorfWorker worker, uint dboid, uint subid, ulong lsn)
+        => worker.WorkerType == WorfWorkerType.Sync && worker.Proc != 0 && worker.Dboid == dboid &&
+            worker.Worker.Apply.SubId == subid && worker.Worker.Sync.CopyLsn != 0 && worker.Worker.Sync.CopyLsn <= lsn &&
+            !worker.Worker.Sync.CopyAllowed;
 
     private static void StartSyncWorker(string nspname, string relname)
     {

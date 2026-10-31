@@ -157,13 +157,13 @@ internal static class SequenceRangeGuard
 
         SpiResult result = Elevated.Run(() => Spi.Select("""
             SELECT r.seqoid::oid, s.seqincrement > 0, b.lo, b.hi, b.state,
-                b.node_id = l.node_id AND b.sysid = $1::numeric AND b.timeline = $2
+                b.node_id = l.node_id AND b.sysid = $1 AND b.timeline = $2
             FROM worf.sequence_range r
                 JOIN pg_catalog.pg_sequence s ON s.seqrelid = r.seqoid
                 CROSS JOIN worf.local_node l
                 LEFT JOIN worf.sequence_range_block b ON b.seqoid = r.seqoid AND b.kind IN ('n', 'i')
                     AND b.state IN ('next', 'active', 'retired', 'imported')
-            """, SpiParameter.Create(sysid.ToString(CultureInfo.InvariantCulture)), SpiParameter.Create((long)timeline)));
+            """, SpiParameter.Create((decimal)sysid), SpiParameter.Create((long)timeline)));
         for (int i = 0; i < result.Count; i++)
         {
             SpiRow row = result[i];

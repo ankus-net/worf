@@ -9,6 +9,18 @@ CREATE TABLE public.test_publicschema(id serial primary key, data text);
 
 \c :subscriber_dsn
 
+-- 11_replication_set's DROP of the table replicates, so wait for it before creating this one.
+DO $$
+BEGIN
+	FOR i IN 1..100 LOOP
+		IF to_regclass('public.test_publicschema') IS NULL THEN
+			RETURN;
+		END IF;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END;
+$$;
+
 CREATE TABLE public.test_publicschema(data text, id serial primary key);
 
 \c :provider_dsn
@@ -84,11 +96,17 @@ INSERT INTO public.test_publicschema VALUES(4, 'd');
 INSERT INTO "strange.schema-IS".test_strangeschema VALUES(3, DEFAULT);
 INSERT INTO "strange.schema-IS".test_strangeschema VALUES(4, DEFAULT);
 
+-- The subscriber has no such sequence, and skips its state.
+CREATE SEQUENCE public.test_provider_only_seq;
+SELECT * FROM worf.replication_set_add_sequence('default', 'test_provider_only_seq');
+
 SELECT worf.synchronize_sequence(c.oid)
   FROM pg_class c, pg_namespace n
  WHERE c.relkind = 'S' AND c.relnamespace = n.oid AND n.nspname IN ('public', 'strange.schema-IS');
 
 SELECT worf.wait_slot_confirm_lsn(NULL, NULL);
+
+DROP SEQUENCE public.test_provider_only_seq CASCADE;
 
 \c :subscriber_dsn
 SELECT * FROM public.test_publicschema;
@@ -156,6 +174,7 @@ SELECT * FROM "strange.schema-IS".test_strangeschema;
 
 \c :provider_dsn
 
+-- The walsender already streaming test_diff_repset stops replicating it at once.
 SELECT * FROM worf.alter_replication_set('repset_test', replicate_insert := false, replicate_update := false, replicate_delete := false, replicate_truncate := false);
 
 INSERT INTO "strange.schema-IS".test_diff_repset VALUES(3);
@@ -188,6 +207,40 @@ SELECT * FROM "strange.schema-IS".test_diff_repset;
 TRUNCATE "strange.schema-IS".test_diff_repset;
 
 SELECT worf.wait_slot_confirm_lsn(NULL, NULL);
+
+\c :subscriber_dsn
+
+SELECT * FROM "strange.schema-IS".test_diff_repset;
+
+-- A walsender that starts after the set stops replicating inserts still replicates the ones made before.
+SELECT worf.alter_subscription_disable('test_subscription', true);
+
+\c :provider_dsn
+
+DO $$
+BEGIN
+	FOR i IN 1..100 LOOP
+		IF NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE active) THEN
+			RETURN;
+		END IF;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END;
+$$;
+
+INSERT INTO "strange.schema-IS".test_diff_repset VALUES(7);
+SELECT * FROM worf.alter_replication_set('repset_test', replicate_insert := false);
+INSERT INTO "strange.schema-IS".test_diff_repset VALUES(8);
+
+\c :subscriber_dsn
+
+SELECT worf.alter_subscription_enable('test_subscription', true);
+
+\c :provider_dsn
+
+SELECT worf.wait_slot_confirm_lsn(NULL, NULL);
+
+SELECT * FROM worf.alter_replication_set('repset_test', replicate_insert := true);
 
 \c :subscriber_dsn
 
