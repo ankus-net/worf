@@ -278,9 +278,6 @@ internal static unsafe partial class OutputPlugin
             SendStartupMessage(ctx, data, false /* can't be last message */);
         }
 
-        // Another transaction's snapshot can match the last one's while it doesn't see that transaction's own changes.
-        data.ActionsSnapshot = null;
-
         // If the record didn't originate locally, send origin info
         sendReplicationOrigin &= txn->origin_id != 0;
 
@@ -346,9 +343,14 @@ internal static unsafe partial class OutputPlugin
     private static void ReadReplicationSetActions(WorfOutputData data)
     {
         // A transaction's snapshot changes when its own catalog changes take effect, at a new command, and when another
-        // transaction's commit changes the catalogs, which grows the set of committed transactions it sees.
+        // transaction's commit changes the catalogs, which grows the set of committed transactions it sees. Only a
+        // transaction that changes the catalogs sees its own changes, through a copy of the snapshot that lists its
+        // transaction IDs, so another transaction's snapshot that matches it otherwise doesn't see them. The snapshot
+        // of every other transaction is the same until a commit changes the catalogs, so the actions are read again
+        // only then.
         SnapshotData* snapshot = NativeMethods.GetCatalogSnapshot(ReplicationSet.GetReplicationSetRelOid());
-        (uint, uint, uint, uint) actionsSnapshot = (snapshot->xmin, snapshot->xmax, snapshot->xcnt, snapshot->curcid);
+        (uint, uint, uint, uint, uint) actionsSnapshot = (snapshot->xmin, snapshot->xmax, snapshot->xcnt, snapshot->curcid,
+            snapshot->subxcnt > 0 ? snapshot->subxip[0] : 0);
         if (data.ActionsSnapshot == actionsSnapshot)
         {
             return;

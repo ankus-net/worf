@@ -157,9 +157,10 @@ internal sealed class WorfOutputData
 
     /// <summary>
     /// Gets or sets the historic snapshot the replication sets' actions were last read under, as its xmin, xmax,
-    /// count of committed transactions and command id, or null to read them at the next change.
+    /// count of committed transactions, command id and the transaction whose own changes it sees, or null to read them
+    /// at the next change.
     /// </summary>
-    public (uint Xmin, uint Xmax, uint Xcnt, uint Curcid)? ActionsSnapshot { get; set; }
+    public (uint Xmin, uint Xmax, uint Xcnt, uint Curcid, uint OwnXid)? ActionsSnapshot { get; set; }
 
     /// <summary>
     /// Gets or sets the only table to replicate, as schema and name, or null.
