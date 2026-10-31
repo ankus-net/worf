@@ -31,6 +31,13 @@ internal static partial class RelCache
     /// </summary>
     private static long s_typesStamp;
 
+    /// <summary>
+    /// Gets or sets how the provider formats money, as <see cref="OutputConfig.MoneyFormat"/> shows it, or null when it
+    /// didn't say. Values sent as money fail when this node formats it differently, under another <c>lc_monetary</c>,
+    /// since they count the provider's currency in its fraction digits.
+    /// </summary>
+    internal static string? ProviderMoneyFormat { get; set; }
+
     [PgNativeCallback(nameof(RelcacheInvalidateCallback))]
 #if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
     private static partial RelcacheCallbackFunction InvalidateCallback { get; }
@@ -318,8 +325,10 @@ internal static partial class RelCache
     /// <summary>
     /// Finds how a remote column's values convert to the local column's type, when they're sent in another: PostgreSQL's
     /// own types are read by OID, and others found by schema and name when defined the same. An enum's values are its
-    /// labels, which an enum column reads and another reads as text. A type the subscriber lacks or defines
-    /// differently can't be read in binary, and the column's own type reads its text.
+    /// labels, which an enum column reads and another reads as text, and a type made of enums is read only for a
+    /// column whose type is made of the same ones, since the provider's labels may be ones they lack. A type the
+    /// subscriber lacks or defines differently, or made of enums the column's type isn't, can't be read in binary, and
+    /// the column's own type reads its text. Values sent as money fail when the provider formats money differently.
     /// </summary>
     /// <param name="remote">The type the column's values are sent in.</param>
     /// <param name="att">The local column.</param>
@@ -329,6 +338,13 @@ internal static partial class RelCache
         uint local = NativeMethods.getBaseType(att->atttypid);
         uint readType = 0;
         string name;
+        if (SendsMoney(remote) && ProviderMoneyFormat is string providerFormat && providerFormat != OutputConfig.MoneyFormat())
+        {
+            string column = Worf.FromServer((sbyte*)&att->attname);
+            return new WorfColumnConversion(column, "money", 0, att->atttypid, att->atttypmod,
+                $"column \"{column}\" gets money, which the provider formats as {providerFormat} and this node as {OutputConfig.MoneyFormat()}, under another lc_monetary");
+        }
+
         if (remote.Definition is null)
         {
             if (remote.Oid == local)
@@ -369,7 +385,8 @@ internal static partial class RelCache
                     WHERE n.nspname = $1 AND t.typname = $2
                     """, SpiParameter.Create(remote.Nspname), SpiParameter.Create(remote.Typname));
                 if (found.Count > 0 && Readable(found[0].Get<uint>(0)) &&
-                    ProtoNative.TypeDefinition(found[0].Get<uint>(0)) == remote.Definition)
+                    ProtoNative.TypeDefinition(found[0].Get<uint>(0)) == remote.Definition &&
+                    MadeOfEnumsOf(att->atttypid, found[0].Get<uint>(0)))
                 {
                     readType = NativeMethods.getBaseType(found[0].Get<uint>(0));
                 }
@@ -378,6 +395,84 @@ internal static partial class RelCache
 
         return new WorfColumnConversion(Worf.FromServer((sbyte*)&att->attname), name, readType, att->atttypid, att->atttypmod);
     }
+
+    /// <summary>
+    /// Checks whether a type is made of only enums another type is made of too.
+    /// </summary>
+    /// <param name="column">The type that has to be made of the enums.</param>
+    /// <param name="type">The type whose enums those are.</param>
+    private static bool MadeOfEnumsOf(uint column, uint type)
+    {
+        HashSet<uint> enums = [];
+        CollectEnums(type, enums);
+        if (enums.Count == 0)
+        {
+            return true;
+        }
+
+        HashSet<uint> columnEnums = [];
+        CollectEnums(column, columnEnums);
+        return enums.IsSubsetOf(columnEnums);
+    }
+
+    /// <summary>
+    /// Collects the enums a type is made of: itself, its base type's, its element's, its subtype's or its attributes'.
+    /// </summary>
+    private static unsafe void CollectEnums(uint typoid, HashSet<uint> enums)
+    {
+        typoid = NativeMethods.getBaseType(typoid);
+        uint element = NativeMethods.get_element_type(typoid);
+        if (element != 0)
+        {
+            CollectEnums(element, enums);
+            return;
+        }
+
+        switch (NativeMethods.get_typtype(typoid))
+        {
+            case EnumType:
+                _ = enums.Add(typoid);
+                break;
+
+            case RangeType:
+                CollectEnums(NativeMethods.get_range_subtype(typoid), enums);
+                break;
+
+            case MultirangeType:
+                CollectEnums(NativeMethods.get_multirange_range(typoid), enums);
+                break;
+
+            case CompositeType:
+            {
+                TupleDescData* desc = NativeMethods.lookup_rowtype_tupdesc(typoid, -1);
+                for (int i = 0; i < desc->natts; i++)
+                {
+                    FormData_pg_attribute* att = NativeMethods.TupleDescAttr(desc, i);
+                    if (!att->attisdropped)
+                    {
+                        CollectEnums(att->atttypid, enums);
+                    }
+                }
+
+                if (desc->tdrefcount >= 0)
+                {
+                    NativeMethods.DecrTupleDescRefCount(desc);
+                }
+
+                break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Checks whether values sent in a type are money or made of it, as the type's OID or definition shows.
+    /// </summary>
+    /// <param name="remote">The type.</param>
+    /// <returns>Whether they are.</returns>
+    internal static bool SendsMoney(WorfRemoteType remote)
+        => remote.Definition is null
+            ? remote.Oid is MoneyOid or MoneyArrayOid
+            : remote.Definition.Split('(', ')', ',').Any(part => part is MoneyOidText or MoneyArrayOidText);
 
     /// <summary>
     /// Checks whether a type exists here and its values can be read, which a shell or pseudo-type's can't.
@@ -401,4 +496,13 @@ internal static partial class RelCache
     private const sbyte TriggerDisabled = (sbyte)'D';
     private const int TriggerTypeRow = 1;
     private const sbyte EnumType = (sbyte)'e';
+    private const sbyte RangeType = (sbyte)'r';
+    private const sbyte MultirangeType = (sbyte)'m';
+    private const sbyte CompositeType = (sbyte)'c';
+
+    // The OIDs of money and its array, also as type definitions write them.
+    private const uint MoneyOid = 790;
+    private const uint MoneyArrayOid = 791;
+    private const string MoneyOidText = "790";
+    private const string MoneyArrayOidText = "791";
 }

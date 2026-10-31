@@ -127,6 +127,23 @@ internal static class Rpc
     }
 
     /// <summary>
+    /// Gets how the provider's session formats money, as <see cref="OutputConfig.MoneyFormat"/> shows it.
+    /// </summary>
+    /// <param name="conn">The provider connection, inside a local transaction.</param>
+    /// <returns>The text.</returns>
+    internal static string GetRemoteMoneyFormat(PgReplicationConnection conn)
+    {
+        try
+        {
+            return conn.Query("SELECT '-1234567'::pg_catalog.money::pg_catalog.text", 1)[0][0]!;
+        }
+        catch (PgRemoteException error)
+        {
+            throw new PgException(PgSqlStates.InternalError, $"could not get how the provider formats money: ERROR:  {error.Message}\n");
+        }
+    }
+
+    /// <summary>
     /// Is the remote slot active?.
     /// </summary>
     /// <param name="conn">The provider connection, inside a local transaction.</param>

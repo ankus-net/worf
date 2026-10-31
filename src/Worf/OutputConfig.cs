@@ -8,6 +8,9 @@ namespace Worf;
 /// </summary>
 internal static class OutputConfig
 {
+    // The OID of money.
+    private const uint MoneyOid = 790;
+
     /// <summary>
     /// Gets whether <c>USE_FLOAT4_BYVAL</c> is defined.
     /// </summary>
@@ -78,6 +81,9 @@ internal static class OutputConfig
             ("forward_changeset_origins", Bool(data.ForwardChangesetOrigins)),
             ("walsender_pid", Int(Environment.ProcessId)),
 
+            // How lc_monetary formats money, whose values count its currency in its fraction digits
+            ("money_format", MoneyFormat()),
+
             // and ourselves
             ("worf_version", Worf.Version),
             ("worf_version_num", Int(Worf.VersionNum)),
@@ -103,6 +109,26 @@ internal static class OutputConfig
         ];
 
         return l;
+    }
+
+    /// <summary>
+    /// Gets how this session's <c>lc_monetary</c> formats money: the text of the amount -1234567, as
+    /// <c>'-1234567'::money::text</c> gives it, which shows the currency, the fraction digits and the separators.
+    /// </summary>
+    /// <returns>The text.</returns>
+    internal static unsafe string MoneyFormat()
+    {
+        uint typinput;
+        uint typioparam;
+        uint typoutput;
+        bool typisvarlena;
+        NativeMethods.getTypeInputInfo(MoneyOid, &typinput, &typioparam);
+        NativeMethods.getTypeOutputInfo(MoneyOid, &typoutput, &typisvarlena);
+        fixed (byte* amount = "-1234567\0"u8)
+        {
+            ulong value = NativeMethods.OidInputFunctionCall(typinput, (sbyte*)amount, typioparam, -1);
+            return Worf.FromServer(NativeMethods.OidOutputFunctionCall(typoutput, value));
+        }
     }
 
     /// <summary>

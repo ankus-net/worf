@@ -61,7 +61,7 @@ internal static class ExceptionLog
     /// <param name="error">The error.</param>
     internal static void Record(WorfFailedChange change, WorfExceptionBehaviour behaviour, PgException error)
     {
-        (string? oldTuple, string? newTuple) = (null, null);
+        (string? oldTuple, string? newTuple) = (null, change.NewTuple);
         (string? schemaName, string? tableName) = (change.Relation?.Nspname, change.Relation?.Relname);
 
         // A value this node can't read fails the first read of the rows, and the second records its bytes instead.

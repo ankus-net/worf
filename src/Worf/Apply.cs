@@ -15,6 +15,10 @@ internal static unsafe partial class Apply
     // Number of tuples inserted after which we switch to multi-insert.
     private const int MinMultiInsertTuples = 5;
 
+    // How many milliseconds a table's sync worker that started before waits to start again, at first and at most.
+    private const long SyncRestartDelay = 5000;
+    private const long MaxSyncRestartDelay = 300_000;
+
     // How worf.exception_behaviour applies a failed transaction again: change by change, as a whole in a subtransaction,
     // or, when its commit fails however it's applied, not at all.
     private const int ExceptionByChange = 1;
@@ -55,6 +59,10 @@ internal static unsafe partial class Apply
     private static long s_applyDelay;
     private static uint s_queueRelid;
     private static List<WorfSyncStatus> s_syncingTables = [];
+
+    // When each table's sync worker last started, and how many times it has, so that one that fails, as on a value
+    // that fails to convert in its copy, starts again only after a delay that doubles each time.
+    private static readonly Dictionary<(string Nspname, string Relname), (long StartedAt, int Starts)> s_syncStarts = [];
     private static PgReplicationConnection? s_applyconn;
     private static ApplyFunctions s_applyApi = ApplyFunctions.Heap;
     private static WorfRelation? s_lastInsertRel;
@@ -1103,7 +1111,8 @@ internal static unsafe partial class Apply
         }
 
         // The startup message consists of null-terminated strings as key/value pairs. The first entry is always the
-        // format identifier.
+        // format identifier. An older provider doesn't say how it formats money.
+        RelCache.ProviderMoneyFormat = null;
         do
         {
             string k = Worf.FromServer(NativeMethods.pq_getmsgstring(s));
@@ -1157,6 +1166,11 @@ internal static unsafe partial class Apply
                 throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState,
                     $"expected encoding={Worf.DatabaseEncodingName} from upstream but got {value}");
             }
+        }
+
+        if (key == "money_format")
+        {
+            RelCache.ProviderMoneyFormat = value;
         }
 
         if (key == "forward_changeset_origins")
@@ -1778,7 +1792,7 @@ internal static unsafe partial class Apply
     /// statement timeout, a cancellation, a shutdown, running out of resources, a lost connection or an I/O error do,
     /// so applying the transaction again can get past it.
     /// </summary>
-    private static bool IsTransient(PgException error)
+    internal static bool IsTransient(PgException error)
     {
         string state = error.SqlState;
         return state is "40000" or "40001" or "40003" or "40P01" or "55P03" or "58030" ||
@@ -2381,6 +2395,7 @@ internal static unsafe partial class Apply
                 if (sync.Status == Sync.SyncStatusReady)
                 {
                     s_syncingTables.RemoveAt(index);
+                    _ = s_syncStarts.Remove((sync.Nspname, sync.Relname));
                     index--;
                 }
             }
@@ -2411,6 +2426,16 @@ internal static unsafe partial class Apply
 
             if (nworkers < 1)
             {
+                // A table whose sync worker started before waits, 5 seconds after its first start and twice as long
+                // after each later one, up to 5 minutes, while another table's starts.
+                long now = Worker.GetCurrentTimestamp();
+                (long startedAt, int starts) = s_syncStarts.GetValueOrDefault((sync.Nspname, sync.Relname));
+                if (starts > 0 && now < startedAt + (Math.Min(SyncRestartDelay << Math.Min(starts - 1, 6), MaxSyncRestartDelay) * 1000))
+                {
+                    continue;
+                }
+
+                s_syncStarts[(sync.Nspname, sync.Relname)] = (now, starts + 1);
                 StartSyncWorker(sync.Nspname, sync.Relname);
                 break;
             }

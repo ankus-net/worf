@@ -885,7 +885,7 @@ internal static unsafe class ProtoNative
                     // except text of a type this node can't read, which the column's type reads.
                     int datalen = kind == 't' ? Math.Max(len - 1, 0) : len;
                     tuple.Data[attid] = new ReadOnlySpan<byte>(data, datalen).ToArray();
-                    if (rel.Conversions[i] is { } conversion && (kind == 'b' || conversion.ReadType != 0))
+                    if (rel.Conversions[i] is { } conversion && conversion.Converts(kind))
                     {
                         (tuple.Conversions ??= new WorfColumnConversion?[desc->natts])[attid] = conversion;
                     }

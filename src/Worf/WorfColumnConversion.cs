@@ -5,9 +5,10 @@ namespace Worf;
 /// <summary>
 /// How a remote column's values, sent in another type than their local column's, convert to it: read with the type
 /// they were sent in, then converted as an assignment would, as <c>ALTER COLUMN TYPE</c> without <c>USING</c> converts
-/// a column's values, or else through text, which the column type's input reads with its type modifier, as it reads
-/// text. A value sent in binary in a type this node lacks or defines differently can't be read. The conversion is
-/// compiled for its first value and kept, in its own memory context, until it's released.
+/// a column's values, or else through text, which the column type's input reads with its type modifier, however the
+/// values are sent. A value sent in binary in a type this node lacks or defines differently can't be read, and a
+/// conversion can fail every value it's given. The conversion is compiled for its first value and kept, in its own
+/// memory context, until it's released.
 /// </summary>
 internal sealed unsafe class WorfColumnConversion
 {
@@ -16,6 +17,14 @@ internal sealed unsafe class WorfColumnConversion
     /// </summary>
     internal const uint TextOid = 25;
 
+    // The OIDs of the integer types, whose text a wider one's input reads.
+    private const uint Int2Oid = 21;
+    private const uint Int4Oid = 23;
+    private const uint Int8Oid = 20;
+
+    // The type category of string types.
+    private const sbyte StringCategory = (sbyte)'S';
+
     // The local column's name and the name of the type the values are sent in, for errors.
     private readonly string _column;
     private readonly string _sourceType;
@@ -23,6 +32,9 @@ internal sealed unsafe class WorfColumnConversion
     // The local column's type and type modifier.
     private readonly uint _targetType;
     private readonly int _targetTypmod;
+
+    // Why every value fails, or null.
+    private readonly string? _failure;
 
     // What the conversion keeps once compiled: its memory context, the read type's length, its receive and input
     // functions and their parameter, the compiled conversion and the context it's evaluated in, or, for values with no
@@ -50,13 +62,16 @@ internal sealed unsafe class WorfColumnConversion
     /// the type or defines it differently.</param>
     /// <param name="targetType">The local column's type.</param>
     /// <param name="targetTypmod">The local column's type modifier.</param>
-    internal WorfColumnConversion(string column, string sourceType, uint readType, uint targetType, int targetTypmod)
+    /// <param name="failure">Why every value fails, or null.</param>
+    internal WorfColumnConversion(string column, string sourceType, uint readType, uint targetType, int targetTypmod,
+        string? failure = null)
     {
         _column = column;
         _sourceType = sourceType;
         ReadType = readType;
         _targetType = targetType;
         _targetTypmod = targetTypmod;
+        _failure = failure;
     }
 
     /// <summary>
@@ -65,17 +80,39 @@ internal sealed unsafe class WorfColumnConversion
     public uint ReadType { get; }
 
     /// <summary>
-    /// Gets whether the values have no assignment cast to the column's type, and go through text. Compiles the
-    /// conversion of values this node reads.
+    /// Gets whether the column type's input reads the text of values in the type they're read with as converting them
+    /// would, and never fails, as for a wider integer or a string type a cast only relabels, so that their text needs
+    /// no conversion.
     /// </summary>
-    public bool ThroughText
+    public bool ReadsTextDirectly
     {
         get
         {
-            Compile();
-            return _state is null;
+            if (_failure is not null || ReadType == 0 || _targetTypmod != -1 || NativeMethods.getBaseType(_targetType) != _targetType)
+            {
+                return false;
+            }
+
+            if (ReadType == _targetType || (ReadType, _targetType) is (Int2Oid, Int4Oid) or (Int2Oid, Int8Oid) or (Int4Oid, Int8Oid))
+            {
+                return true;
+            }
+
+            uint funcid;
+            return NativeMethods.TypeCategory(ReadType) == StringCategory && NativeMethods.TypeCategory(_targetType) == StringCategory &&
+                NativeMethods.find_coercion_pathway(_targetType, ReadType, CoercionContext.COERCION_ASSIGNMENT, &funcid) ==
+                    CoercionPathType.COERCION_PATH_RELABELTYPE;
         }
     }
+
+    /// <summary>
+    /// Checks whether a value sent in a form converts, rather than going to the column type: one sent as text does
+    /// only when this node reads the type it's sent in, or every value fails.
+    /// </summary>
+    /// <param name="kind">The value's form: <c>i</c> for PostgreSQL's internal one, <c>b</c> for binary, <c>t</c> for
+    /// text.</param>
+    /// <returns>Whether it converts.</returns>
+    internal bool Converts(char kind) => kind != 't' || ReadType != 0 || _failure is not null;
 
     /// <summary>
     /// Reads a value sent in binary with a type, without a domain's constraints.
@@ -153,31 +190,18 @@ internal sealed unsafe class WorfColumnConversion
     /// <returns>The datum, in the current memory context.</returns>
     internal ulong Convert(char kind, byte[] data, out bool isnull)
     {
-        if (ReadType == 0)
-        {
-            string targetType = Worf.FromServer(NativeMethods.format_type_be(_targetType));
-            throw new PgException(PgSqlStates.DatatypeMismatch,
-                $"column \"{_column}\" is of type {targetType} but the provider's value is of type {_sourceType}, which this node lacks or defines differently");
-        }
+        CheckReadable();
 
-        Compile();
-
-        ulong value;
         fixed (byte* bytes = data)
         {
             if (kind == 't')
             {
-                // Text with no assignment cast is the text the column type's input reads.
-                sbyte* text = CString(bytes, data.Length);
-                if (_state is null)
-                {
-                    isnull = false;
-                    return NativeMethods.InputFunctionCall(_columnInput, text, _columnTypioparam, _targetTypmod);
-                }
-
-                value = NativeMethods.InputFunctionCall(_input, text, _typioparam, -1);
+                return ConvertText(CString(bytes, data.Length), out isnull);
             }
-            else if (kind == 'i')
+
+            Compile();
+            ulong value;
+            if (kind == 'i')
             {
                 value = ReadInternal(ReadType, _typlen, _typbyval, bytes, data.Length);
             }
@@ -193,18 +217,23 @@ internal sealed unsafe class WorfColumnConversion
                 value = NativeMethods.ReceiveFunctionCall(_receive, &buf, _typioparam, -1);
                 CheckReadToEnd(&buf);
             }
-        }
 
-        if (_state is null)
-        {
-            isnull = false;
-            return NativeMethods.InputFunctionCall(_columnInput, NativeMethods.OutputFunctionCall(_output, value),
-                _columnTypioparam, _targetTypmod);
+            return ConvertRead(value, out isnull);
         }
+    }
 
-        _econtext->caseValue_datum = value;
-        _econtext->caseValue_isNull = false;
-        return Executor.ExecEvalExpr(_state, _econtext, out isnull);
+    /// <summary>
+    /// Converts a value sent as text to the local column's type: read with the type it was sent in, as a value sent
+    /// in binary is, so that both convert alike.
+    /// </summary>
+    /// <param name="text">The text, with its terminating zero.</param>
+    /// <param name="isnull">Whether the result is null.</param>
+    /// <returns>The datum, in the current memory context.</returns>
+    internal ulong ConvertText(sbyte* text, out bool isnull)
+    {
+        CheckReadable();
+        Compile();
+        return ConvertRead(NativeMethods.InputFunctionCall(_input, text, _typioparam, -1), out isnull);
     }
 
     /// <summary>
@@ -261,6 +290,42 @@ internal sealed unsafe class WorfColumnConversion
         FmgrInfo* info = (FmgrInfo*)NativeMethods.palloc0((ulong)sizeof(FmgrInfo));
         NativeMethods.fmgr_info_cxt(function, info, context);
         return info;
+    }
+
+    /// <summary>
+    /// Fails a value when every value fails, or when this node can't read the type it was sent in.
+    /// </summary>
+    private void CheckReadable()
+    {
+        if (_failure is not null)
+        {
+            throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState, _failure);
+        }
+
+        if (ReadType == 0)
+        {
+            string targetType = Worf.FromServer(NativeMethods.format_type_be(_targetType));
+            throw new PgException(PgSqlStates.DatatypeMismatch,
+                $"column \"{_column}\" is of type {targetType} but the provider's value is of type {_sourceType}, which this node lacks or defines differently");
+        }
+    }
+
+    /// <summary>
+    /// Converts a value read with the type it was sent in: cast, or else through text, which this node's settings
+    /// format.
+    /// </summary>
+    private ulong ConvertRead(ulong value, out bool isnull)
+    {
+        if (_state is null)
+        {
+            isnull = false;
+            return NativeMethods.InputFunctionCall(_columnInput, NativeMethods.OutputFunctionCall(_output, value),
+                _columnTypioparam, _targetTypmod);
+        }
+
+        _econtext->caseValue_datum = value;
+        _econtext->caseValue_isNull = false;
+        return Executor.ExecEvalExpr(_state, _econtext, out isnull);
     }
 
     /// <summary>
