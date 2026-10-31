@@ -120,6 +120,11 @@ using Ankus.Postgres;
         role_id oid NOT NULL
     );
 
+    CREATE TABLE worf.sequence_range_role (
+        role_id oid PRIMARY KEY,
+        node_id oid NOT NULL
+    );
+
     CREATE VIEW worf.sequence_ranges AS
         SELECT r.seqoid AS sequence, coalesce(o.node_name, ro.node_name) AS owner, r.epoch, coalesce(p.node_name, rp.node_name) AS parent,
             CASE WHEN r.fenced_at IS NOT NULL THEN 'fenced' ELSE r.state END AS state,

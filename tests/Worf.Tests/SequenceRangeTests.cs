@@ -1011,11 +1011,14 @@ public sealed class SequenceRangeTests
         Assert.AreEqual("42501", impersonated.SqlState);
         Assert.Contains("is bound to another role", impersonated.MessageText);
 
-        // Nor can it by streaming the slot itself, as a role with REPLICATION can, while it speaks for node_c.
+        // Nor can it by streaming the slot itself, as a role with REPLICATION can, while it speaks for node_c, even once
+        // it has dropped its own slot.
         string nodeCId = await nodeC.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
         _ = await nodeB.SafePsqlAsync(Database, "ALTER ROLE c_user LOGIN REPLICATION", token);
         _ = await nodeB.SafePsqlAsync(Database, "SELECT pg_create_logical_replication_slot('c_link', 'worf')", token);
         _ = await nodeB.SafePsqlAsync(Database, $"INSERT INTO worf.sequence_range_link VALUES ('c_link', {nodeCId}, 'c_user'::regrole)", token);
+        string asNodeC = $$"""{"node_id": {{nodeCId}}, "node_name": "node_c", "slot": "c_link", "sysid": "1", "timeline": 1, "wal_lsn": "0/0", "sequences": []}""";
+        _ = await nodeB.SafePsqlAsync(Database, $"SET SESSION AUTHORIZATION c_user; SELECT worf.sequence_range_exchange('{asNodeC}')", token);
         NpgsqlConnectionStringBuilder asCUser = new() { Host = "127.0.0.1", Port = nodeB.Cluster.Port, Database = Database, Username = "c_user" };
         await using (LogicalReplicationConnection replication = new(asCUser.ConnectionString))
         {
@@ -1026,10 +1029,15 @@ public sealed class SequenceRangeTests
                 options: [new("min_proto_version", "1"), new("max_proto_version", "1"), new("startup_params_format", "1")])
                 .GetAsyncEnumerator(streaming.Token);
             Assert.IsTrue(await messages.MoveNextAsync(), "c_user streaming a_from_b's slot");
-            PostgresException takeover = await Assert.ThrowsExactlyAsync<PostgresException>(() => nodeB.SafePsqlAsync(Database,
-                $"SET SESSION AUTHORIZATION c_user; SELECT worf.sequence_range_exchange('{forged}')", token));
-            Assert.AreEqual("42501", takeover.SqlState);
-            Assert.Contains("already speaks for node", takeover.MessageText);
+            foreach (string before in new[] { "SELECT 1", "SELECT pg_drop_replication_slot('c_link')" })
+            {
+                _ = await nodeB.SafePsqlAsync(Database, before, token);
+                PostgresException takeover = await Assert.ThrowsExactlyAsync<PostgresException>(() => nodeB.SafePsqlAsync(Database,
+                    $"SET SESSION AUTHORIZATION c_user; SELECT worf.sequence_range_exchange('{forged}')", token), before);
+                Assert.AreEqual("42501", takeover.SqlState, before);
+                Assert.Contains("already speaks for node", takeover.MessageText, before);
+            }
+
             await streaming.CancelAsync();
         }
 
@@ -1057,10 +1065,7 @@ public sealed class SequenceRangeTests
         Assert.AreEqual("1024", await nodeB.SafePsqlAsync(Database, "SELECT count(*) FROM worf.sequence_range_node WHERE seqoid = 't_id_seq'::regclass", token),
             "the nodes node_b keeps");
         Assert.IsTrue(await nodeB.PollLogAsync(flooded, "beyond the 1024 this node keeps; they are ignored", token), "the ignored reports");
-        _ = await nodeB.SafePsqlAsync(Database, """
-            DELETE FROM worf.sequence_range_node WHERE node_name LIKE 'made_up_%';
-            SELECT pg_drop_replication_slot('c_link');
-            """, token);
+        _ = await nodeB.SafePsqlAsync(Database, "DELETE FROM worf.sequence_range_node WHERE node_name LIKE 'made_up_%'", token);
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.alter_subscription_enable('a_from_b')", token);
 
         // node_a's calls fail once they have taken in the reply, while node_b uses up its blocks and asks for more.

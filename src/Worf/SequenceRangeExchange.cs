@@ -77,8 +77,8 @@ internal static class SequenceRangeExchange
     /// the calling role, or, while nothing streams it, bound to that role. The first call through a slot binds it to the
     /// node that makes it and to the role that streams it, until the slot is dropped, and a call from another role that
     /// streams it binds it to that role. A node speaks through the slots of one role, and a role, unless it is a
-    /// superuser, for one node, so that one subscriber's role can't speak for another node: a provider tells its
-    /// subscribers apart by their roles alone.
+    /// superuser, for one node, the first it calls for, for good, whatever becomes of its slots, so that one
+    /// subscriber's role can't speak for another node: a provider tells its subscribers apart by their roles alone.
     /// </summary>
     private static void Authenticate(string slot, uint senderId)
     {
@@ -113,6 +113,31 @@ internal static class SequenceRangeExchange
             throw new PgException("42501", $"replication slot \"{slot}\" belongs to another node than this sequence range exchange's");
         }
 
+        bool superuser;
+        unsafe
+        {
+            superuser = NativeMethods.superuser_arg(role);
+        }
+
+        // A role speaks for the node it first called for, which a dropped slot's link leaves recorded. A role dropped
+        // since leaves its oid to the next role that takes it.
+        if (!superuser)
+        {
+            SpiResult spoken = Worf.SelectCatalog(
+                "SELECT node_id, pg_catalog.pg_get_userbyid(role_id)::text FROM worf.sequence_range_role WHERE role_id = $1", SpiParameter.Create(role));
+            if (spoken.Count > 0 && spoken[0].Get<uint>(0) != senderId)
+            {
+                throw new PgException("42501", $"role \"{spoken[0].Get<string>(1)}\" already speaks for node {spoken[0].Get<uint>(0)} here",
+                    hint: "Give each subscriber node a role of its own in its provider connection strings.");
+            }
+
+            if (spoken.Count == 0)
+            {
+                _ = Spi.Execute("DELETE FROM worf.sequence_range_role r WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles a WHERE a.oid = r.role_id)");
+                _ = Spi.Execute("INSERT INTO worf.sequence_range_role VALUES ($1, $2)", SpiParameter.Create(role), SpiParameter.Create(senderId));
+            }
+        }
+
         if (link.Count > 0 && link[0].Get<uint>(1) == role)
         {
             return;
@@ -127,12 +152,6 @@ internal static class SequenceRangeExchange
                 DELETE FROM worf.sequence_range_link l
                 WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_replication_slots s WHERE s.slot_name = l.slot_name)
                 """);
-        }
-
-        bool superuser;
-        unsafe
-        {
-            superuser = NativeMethods.superuser_arg(role);
         }
 
         // A slot bound already, whose subscriber's connection string names another role now, takes that role, as long as
