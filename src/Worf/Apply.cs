@@ -1524,7 +1524,8 @@ internal static unsafe partial class Apply
 
     /// <summary>
     /// Checks whether a partition's concurrent detach from a table is under way here, or whether the partition is
-    /// detached from it already.
+    /// detached from it already. The check is made again once the table is locked as the detach will lock it, as a
+    /// plain detach or one that finishes a detach under way, so that a detach here can't finish in between.
     /// </summary>
     /// <returns>Whether a detach is under way, or null when the partition isn't the table's.</returns>
     private static bool? DetachPending(RangeVar* table, RangeVar* partition)
@@ -1536,9 +1537,25 @@ internal static unsafe partial class Apply
             return false;
         }
 
-        return Worf.ReadScalar<bool?>("SELECT inhdetachpending FROM pg_catalog.pg_inherits WHERE inhrelid = $1 AND inhparent = $2",
-            SpiParameter.Create(relid), SpiParameter.Create(parent));
+        bool? pending = InheritsPending(relid, parent);
+        if (pending is null)
+        {
+            return null;
+        }
+
+        NativeMethods.LockRelationOid(parent, (int)(pending.Value ? PgLockMode.ShareUpdateExclusive : PgLockMode.AccessExclusive));
+        bool? locked = InheritsPending(relid, parent);
+        if (locked == false && pending.Value)
+        {
+            NativeMethods.LockRelationOid(parent, (int)PgLockMode.AccessExclusive);
+        }
+
+        return locked;
     }
+
+    private static bool? InheritsPending(uint relid, uint parent)
+        => Worf.ReadScalar<bool?>("SELECT inhdetachpending FROM pg_catalog.pg_inherits WHERE inhrelid = $1 AND inhparent = $2",
+            SpiParameter.Create(relid), SpiParameter.Create(parent));
 
     /// <summary>
     /// Handles messages comming from the queue.
