@@ -68,20 +68,14 @@ internal static class Manager
         }
 
         // If the extension is still not installed after retries, exit.
-        if (extoid == 0)
+        if (extoid == 0 || PgBackgroundWorker.RunTransaction(IsIdleTemplate))
         {
-            // Mark that we're exiting due to missing extension so the detach handler doesn't wake the supervisor.
-            // This prevents rapid restart cycles for databases that don't have worf installed.
-            using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive();
-            WorfWorker me = guard[Worker.MyWorfWorker];
-            me.SkipSupervisorWakeup = true;
-            guard[Worker.MyWorfWorker] = me;
-
+            ExitIdle();
             return;
         }
 
         PgBackgroundWorker.RunTransaction(static () =>
-            PgLog.Log($"starting worf database manager for database {Spi.ExecuteScalar<string>("SELECT pg_catalog.current_database()::text")}"));
+            PgLog.Log($"starting worf database manager for database {Worf.ReadScalar<string>("SELECT pg_catalog.current_database()::text")}"));
 
         // Brief delay before checking/upgrading extension version. This avoids a race condition where an explicit
         // ALTER EXTENSION UPDATE runs concurrently with our auto-upgrade check on fast systems.
@@ -97,6 +91,13 @@ internal static class Manager
         while (!Worker.GotSigterm)
         {
             Worker.ProcessConfigReload();
+
+            // The database may have become a template since, as one is copied once it does.
+            if (PgBackgroundWorker.RunTransaction(IsIdleTemplate))
+            {
+                ExitIdle();
+                return;
+            }
 
             // Launch the apply workers, and the range worker for managed sequences.
             bool processedAll = ManageApplyWorkers();
@@ -122,6 +123,42 @@ internal static class Manager
 
             PgInterrupts.Check();
         }
+    }
+
+    /// <summary>
+    /// Wakes the manager of a database that is about to be copied, so that if it's a template with nothing to manage,
+    /// it exits, as PostgreSQL copies a database only from a template nobody is connected to.
+    /// </summary>
+    /// <param name="template">The database's name.</param>
+    internal static unsafe void WakeTemplate(string template)
+    {
+        uint dboid = NativeMethods.get_database_oid(Worf.PStrDup(template), true);
+        using PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share();
+        int manager = dboid == 0 ? -1 : guard.Read((in _, workers) => Worker.ManagerFind(workers, dboid));
+        if (manager >= 0 && guard[manager].Proc != 0)
+        {
+            Worker.SetProcLatch(guard[manager].Proc);
+        }
+    }
+
+    /// <summary>
+    /// Checks whether this database is a template that isn't a node, which has nothing to manage, and which a manager
+    /// would keep busy, while PostgreSQL copies a database only from a template nobody is connected to.
+    /// </summary>
+    private static bool IsIdleTemplate()
+        => Worf.ReadScalar<bool>("SELECT datistemplate FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database()") &&
+            WorfNode.GetLocalNode(false, true) is null;
+
+    /// <summary>
+    /// Exits with nothing to manage, marking it so that the detach handler doesn't wake the supervisor, which would
+    /// start the manager again at once, as for a database without worf.
+    /// </summary>
+    private static void ExitIdle()
+    {
+        using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive();
+        WorfWorker me = guard[Worker.MyWorfWorker];
+        me.SkipSupervisorWakeup = true;
+        guard[Worker.MyWorfWorker] = me;
     }
 
     /// <summary>
@@ -158,19 +195,19 @@ internal static class Manager
 
         bool managed = PgBackgroundWorker.RunTransaction(static () =>
         {
-            if (!Spi.ExecuteScalar<bool>("SELECT to_regclass('worf.sequence_range') IS NOT NULL") ||
+            if (!Worf.ReadScalar<bool>("SELECT to_regclass('worf.sequence_range') IS NOT NULL") ||
                 WorfNode.GetLocalNode(false, true) is not WorfLocalNode node)
             {
                 return false;
             }
 
-            if (!Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range)"))
+            if (!Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range)"))
             {
                 _ = SequenceRangeExchange.ExchangeAll(node);
                 s_discoveryAt = SequenceRangeExchange.NextDueAt;
             }
 
-            return Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range)");
+            return Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range)");
         });
         if (managed)
         {

@@ -223,7 +223,7 @@ internal static class Functions
             ("node_id", SpiParameter.Create(node.Node.Id)),
             ("node_name", SpiParameter.Create(node.Node.Name)),
             ("sysid", SpiParameter.Create(sysid.ToString(CultureInfo.InvariantCulture))),
-            ("dbname", SpiParameter.Create(Spi.ExecuteScalar<string>("SELECT pg_catalog.current_database()::text"))),
+            ("dbname", SpiParameter.Create(Worf.ReadScalar<string>("SELECT pg_catalog.current_database()::text"))),
             ("replication_sets", SpiParameter.Create(ReplicationSet.StringlistToIdentifierstr(repsets.Select(static repset => repset.Name)))));
     }
 
@@ -401,9 +401,11 @@ internal static class Functions
                 return BoolDatum(true);
             }
 
-            // If the provider node record existed only for the dropped, subscription, it should be dropped as well.
+            // If the provider node record existed only for the dropped, subscription, it should be dropped as well,
+            // along with the fences its DDL kept here, since nothing would bring the DDL.
             if (WorfNode.GetNodeSubscriptions(sub.Origin.Id, true).Count == 0)
             {
+                DdlLock.ForgetOrigin(sub.Origin.Id);
                 WorfNode.DropNodeInterfaces(sub.Origin.Id);
                 WorfNode.DropNode(sub.Origin.Id);
             }

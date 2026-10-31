@@ -19,7 +19,8 @@ public sealed class DdlReplicationTests
 
     /// <summary>
     /// DDL on either of two nodes that replicate both ways reaches the other, with its search path, and the tables it
-    /// creates replicate both ways. Temporary objects stay on their node.
+    /// creates replicate both ways. Temporary objects stay on their node, and dropping a subscription lets go of the
+    /// fences its provider's DDL kept.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -79,6 +80,30 @@ public sealed class DdlReplicationTests
         await WaitAsync(nodeA, token);
         Assert.AreEqual("", await nodeB.SafePsqlAsync(Database, "SELECT to_regclass('app.nopk')", token));
 
+        // A user who logs in and isn't a superuser creates and changes tables, which join and move between the sets on
+        // both nodes, but can't mark a session as restoring a subscription's structure.
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE ROLE developer LOGIN", token);
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database, "GRANT USAGE, CREATE ON SCHEMA app TO developer", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE TABLE app.owned (id integer PRIMARY KEY, v text);
+            INSERT INTO app.owned VALUES (1, 'one');
+            ALTER TABLE app.owned DROP CONSTRAINT owned_pkey;
+            """, token, "developer");
+        await WaitAsync(nodeA, token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            Assert.AreEqual("default_insert_only", await SetsAsync(node, "app.owned", token), $"{node.Name}: a table that lost its primary key");
+        }
+
+        Assert.AreEqual("1|one", await nodeB.SafePsqlAsync(Database, "SELECT * FROM app.owned", token));
+        PostgresException restoring = await Assert.ThrowsExactlyAsync<PostgresException>(
+            () => nodeA.SafePsqlAsync(Database, "SET worf.subscription_schema_restore = on", token, "developer"));
+        Assert.AreEqual("42501", restoring.SqlState);
+
         // worf's own tables stay out of replication sets and the queue, even created from functions, and each node
         // drops worf itself.
         _ = await nodeA.SafePsqlAsync(Database, """
@@ -90,7 +115,23 @@ public sealed class DdlReplicationTests
                     WHERE c.relnamespace = 'worf'::regnamespace),
                 (SELECT count(*) FROM worf.queue WHERE message::text LIKE '%conflict_history%')
             """, token));
-        _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.drop_subscription('b_from_a')", token);
+        // Dropping the subscription from node_a lets go of the fences node_a's DDL kept on node_b, while the session
+        // that kept one lasts.
+        await using (NpgsqlConnection keeping = await nodeB.OpenAsync(Database, token))
+        {
+            await using (NpgsqlCommand keep = new("""
+                SELECT worf.fence_writes(45, (SELECT node_id FROM worf.node WHERE node_name = 'node_a'), ARRAY['app.t'], 1000);
+                SELECT worf.keep_fence(45, (SELECT node_id FROM worf.node WHERE node_name = 'node_a'), 0);
+                """, keeping))
+            {
+                _ = await keep.ExecuteNonQueryAsync(token);
+            }
+
+            Assert.IsFalse(await nodeB.PsqlAsync(Database, "INSERT INTO app.t VALUES (3, 'from b')", token), "a write through a kept fence");
+            _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.drop_subscription('b_from_a')", token);
+            _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO app.t VALUES (3, 'from b')", token);
+        }
+
         PostgresException together = await Assert.ThrowsExactlyAsync<PostgresException>(
             () => nodeB.SafePsqlAsync(Database, "DROP EXTENSION worf, plpgsql CASCADE", token));
         Assert.AreEqual("55000", together.SqlState);
@@ -104,9 +145,10 @@ public sealed class DdlReplicationTests
     }
 
     /// <summary>
-    /// Statements that use the session's own objects stay on their node, DDL from functions is queued once, a DROP of
-    /// local and other tables replicates the others, the settings a statement ran with apply with it, tables follow
-    /// their replica identity between the default sets, and a subscriber's structure sync doesn't queue the schema.
+    /// Statements that use the session's own objects stay on their node, or fail when they'd create or change others,
+    /// DDL from functions is queued once, a DROP of local and other tables replicates the others, the settings a
+    /// statement ran with apply with it, tables follow their replica identity between the default sets, and a
+    /// subscriber's structure sync doesn't queue the schema.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -135,10 +177,8 @@ public sealed class DdlReplicationTests
             ALTER TABLE tmp RENAME TO tmp2;
             COMMENT ON TABLE tmp2 IS 'scratch';
             CREATE VIEW tmp_view AS SELECT * FROM tmp2;
-            CREATE TABLE from_temp AS SELECT * FROM tmp2;
-            CREATE TABLE like_temp (LIKE tmp2);
             PREPARE p AS SELECT 1 AS x;
-            CREATE TABLE from_prepared AS EXECUTE p;
+            CREATE TEMP TABLE tmp_prepared AS EXECUTE p;
             GRANT SELECT ON tmp2 TO PUBLIC;
             CREATE FUNCTION nothing() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
             CREATE TRIGGER tmp_trigger BEFORE INSERT ON tmp2 FOR EACH ROW EXECUTE FUNCTION nothing();
@@ -149,13 +189,126 @@ public sealed class DdlReplicationTests
             ALTER TABLE parted ADD PRIMARY KEY (id);
             ALTER TABLE ul SET UNLOGGED;
             """, token);
+
+        // The session's temporary functions, types and operators, named with the temporary schema, however it's
+        // written, or, for types, without, and its temporary tables and prepared statements, keep what uses them on
+        // this node when what it creates or changes is temporary too, and fail what creates or changes other objects,
+        // which the other nodes couldn't follow. Partitions and inheritance change as ever in a session with temporary
+        // objects, and DROP INDEX CONCURRENTLY can run.
+        await using (NpgsqlConnection session = await nodeA.OpenAsync(Database, token))
+        {
+            foreach (string sql in new[]
+            {
+                "CREATE TABLE conv (id integer PRIMARY KEY, a integer, b integer, c integer, d integer, e integer, f integer, g integer, h integer, i integer, j integer, k integer)",
+                "CREATE FUNCTION pg_temp.tmp_conv(integer) RETURNS bigint LANGUAGE sql AS 'SELECT $1::bigint'",
+                "CREATE FUNCTION pg_temp.tmp_secure(integer) RETURNS bigint LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog AS 'SELECT $1::bigint'",
+                "CREATE DOMAIN pg_temp.tmp_dom AS integer",
+                "CREATE OPERATOR pg_temp.### (LEFTARG = integer, RIGHTARG = integer, FUNCTION = int4pl)",
+                "CREATE TYPE pg_temp.tmp_type AS (a integer)",
+                "COMMENT ON FUNCTION pg_temp.tmp_conv(integer) IS 'scratch'",
+                "ALTER FUNCTION pg_temp.tmp_conv(integer) STABLE",
+                "GRANT EXECUTE ON FUNCTION pg_temp.tmp_conv(integer) TO PUBLIC",
+                "COMMENT ON TYPE tmp_type IS 'scratch'",
+                "CREATE TEMP TABLE tmp_tt (v integer)",
+                "PREPARE p AS SELECT 1 AS x",
+            })
+            {
+                await using NpgsqlCommand command = new(sql, session);
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+
+            foreach (string sql in new[]
+            {
+                "ALTER TABLE conv ALTER COLUMN a TYPE bigint USING pg_temp.tmp_conv(a)",
+                "ALTER TABLE conv ALTER COLUMN b TYPE bigint USING pg_temp.tmp_secure(b)",
+                "ALTER TABLE conv ALTER COLUMN c TYPE bigint USING c::pg_temp.tmp_dom",
+                "ALTER TABLE conv ALTER COLUMN d TYPE bigint USING CAST(d AS tmp_dom)",
+                "ALTER TABLE conv ALTER COLUMN e TYPE bigint USING e OPERATOR(pg_temp.###) 1",
+                "ALTER TABLE conv ALTER COLUMN f SET DEFAULT pg_temp.tmp_conv(1)",
+                "ALTER TABLE conv ADD COLUMN x tmp_type",
+                "ALTER TABLE conv ALTER COLUMN g SET DEFAULT tmp_dom '1'",
+                "ALTER TABLE conv ALTER COLUMN h TYPE bigint USING h::tmp_dom",
+                "ALTER TABLE conv ALTER COLUMN i TYPE bigint USING i::U&\"pg\\005ftemp\".tmp_dom",
+                "ALTER TABLE conv ALTER COLUMN j TYPE bigint USING j::U&\"tmp_dom\"",
+                "ALTER TABLE conv ALTER COLUMN k TYPE bigint USING k::U&\"pg!005ftemp\" UESCAPE '!'.tmp_dom",
+                "CREATE FUNCTION tmp_typed(x tmp_tt.v%TYPE) RETURNS integer LANGUAGE sql AS 'SELECT 1'",
+                "CREATE TABLE from_temp AS SELECT * FROM tmp_tt",
+                "CREATE TABLE like_temp (LIKE tmp_tt)",
+                "CREATE TABLE from_prepared AS EXECUTE p",
+            })
+            {
+                await using NpgsqlCommand command = new(sql, session);
+                PostgresException refused = await Assert.ThrowsExactlyAsync<PostgresException>(() => command.ExecuteNonQueryAsync(token), sql);
+                Assert.AreEqual("0A000", refused.SqlState, sql);
+            }
+
+            foreach (string sql in new[]
+            {
+                "DROP TYPE pg_temp.tmp_type CASCADE",
+                "DROP FUNCTION pg_temp.tmp_conv(integer) CASCADE",
+                "CREATE TABLE pp (id integer PRIMARY KEY) PARTITION BY RANGE (id)",
+                "CREATE TABLE pp1 PARTITION OF pp FOR VALUES FROM (0) TO (10)",
+                "CREATE TABLE pp2 PARTITION OF pp FOR VALUES FROM (10) TO (20)",
+                "CREATE TABLE ip (id integer)",
+                "CREATE TABLE ic () INHERITS (ip)",
+                "CREATE TABLE io (id integer)",
+                "ALTER TABLE io INHERIT ip",
+                "ALTER TABLE pp DETACH PARTITION pp1",
+                "ALTER TABLE pp DETACH PARTITION pp2 CONCURRENTLY",
+                "CREATE INDEX conv_id ON conv (id)",
+                "DROP INDEX CONCURRENTLY conv_id",
+            })
+            {
+                await using NpgsqlCommand command = new(sql, session);
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+        }
+
+        PostgresException together = await Assert.ThrowsExactlyAsync<PostgresException>(() => nodeA.SafePsqlAsync(Database, """
+            CREATE FUNCTION pg_temp.tmp_f() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+            CREATE FUNCTION kept_f() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+            DROP FUNCTION pg_temp.tmp_f(), kept_f();
+            """, token));
+        Assert.AreEqual("55000", together.SqlState);
+
+        // Statements about roles, databases, and PostgreSQL's own publications and subscriptions stay on their node.
+        _ = await nodeA.SafePsqlAsync(Database, "CREATE DATABASE other STRATEGY FILE_COPY", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE ROLE r1;
+            ALTER ROLE r1 RENAME TO r2;
+            COMMENT ON ROLE r2 IS 'here';
+            ALTER DATABASE other RENAME TO other2;
+            ALTER DATABASE other2 OWNER TO r2;
+            COMMENT ON DATABASE other2 IS 'here';
+            GRANT CONNECT ON DATABASE other2 TO r2;
+            CREATE PUBLICATION pub;
+            ALTER PUBLICATION pub RENAME TO pub2;
+            ALTER PUBLICATION pub2 OWNER TO r2;
+            COMMENT ON PUBLICATION pub2 IS 'here';
+            CREATE SUBSCRIPTION sub CONNECTION 'host=127.0.0.1 dbname=nowhere' PUBLICATION pub2 WITH (connect = false);
+            ALTER SUBSCRIPTION sub RENAME TO sub2;
+            COMMENT ON SUBSCRIPTION sub2 IS 'here';
+            ALTER SUBSCRIPTION sub2 SET (slot_name = NONE);
+            DROP SUBSCRIPTION sub2;
+            DROP PUBLICATION pub2;
+            """, token);
         await WaitAsync(nodeA, token);
 
-        Assert.AreEqual("1|0|0", await nodeA.SafePsqlAsync(Database, """
+        Assert.AreEqual("1|0|0|0", await nodeA.SafePsqlAsync(Database, """
             SELECT (SELECT count(*) FROM worf.queue WHERE message->>'command' LIKE 'CREATE TABLE s %'),
                 (SELECT count(*) FROM worf.queue WHERE message::text LIKE '%tmp%' OR message::text LIKE '%EXECUTE p%'),
-                (SELECT count(*) FROM worf.replication_set_table WHERE set_reloid IN ('from_temp'::regclass, 'like_temp'::regclass, 'from_prepared'::regclass))
-            """, token), "DDL from a function queued once, and nothing that used the session's objects");
+                (SELECT count(*) FROM pg_class WHERE relname IN ('from_temp', 'like_temp', 'from_prepared')),
+                (SELECT count(*) FROM worf.queue WHERE message->>'command' ~ '(ROLE|DATABASE|PUBLICATION|SUBSCRIPTION)')
+            """, token), "DDL from a function queued once, and nothing that used the session's objects or was the cluster's");
+        Assert.AreEqual("id a b c d e f g h i j k|0|ic,io|", await nodeB.SafePsqlAsync(Database, """
+            SELECT (SELECT string_agg(attname, ' ' ORDER BY attnum) FROM pg_attribute
+                    WHERE attrelid = 'conv'::regclass AND attnum > 0 AND NOT attisdropped AND atttypid = 'integer'::regtype),
+                (SELECT count(*) FROM pg_attrdef WHERE adrelid = 'conv'::regclass),
+                (SELECT string_agg(inhrelid::regclass::text, ',' ORDER BY inhrelid::regclass::text) FROM pg_inherits
+                    WHERE inhparent IN ('pp'::regclass, 'ip'::regclass)),
+                to_regclass('conv_id')
+            """, token), "what used temporary functions, types and operators stayed on node_a; partitions, inheritance and indexes changed");
+        Assert.AreEqual("0", await nodeA.SafePsqlAsync(Database, "SELECT count(*) FROM pg_inherits WHERE inhdetachpending", token));
         Assert.AreEqual("s||||'2026-02-01'::date", await nodeB.SafePsqlAsync(Database, """
             SELECT to_regclass('s')::text, to_regclass('orders')::text, to_regclass('from_temp')::text, to_regclass('from_prepared')::text,
                 pg_get_expr(adbin, adrelid)

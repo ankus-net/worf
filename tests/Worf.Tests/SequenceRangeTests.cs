@@ -175,7 +175,7 @@ public sealed class SequenceRangeTests
     /// <summary>
     /// Two nodes that replicate both ways insert into the same table at once with keys from the same sequence, which the
     /// first node manages: the second learns of it through the exchange, gets blocks from the first, and no key is
-    /// written on both nodes.
+    /// written on both nodes. Idle, neither takes transaction IDs, across exchanges, with Snowflake IDs enabled too.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -194,12 +194,22 @@ public sealed class SequenceRangeTests
 
         await SubscribeAsync(nodeA, "a_from_b", nodeB, token);
         await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
-        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 1000)", token);
+        await AssertIdleAsync([nodeA, nodeB], "managing nothing", TimeSpan.FromSeconds(2), token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 1000);
+            SELECT worf.enable_snowflake('{node_b}');
+            """, token);
         foreach (TestNode node in new[] { nodeA, nodeB })
         {
-            Assert.IsTrue(await node.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges", token),
-                $"{node.Name} drawing from a block");
+            Assert.IsTrue(await node.PollQueryUntilAsync(Database,
+                "SELECT count(*) = 2 AND bool_and(state = 'active') AND worf.snowflake_node() IS NOT NULL FROM worf.sequence_ranges", token),
+                $"{node.Name} drawing from blocks, with a Snowflake number");
         }
+
+        // Exchanges, every half second here, write nothing when nothing changed, nor does the range worker reserve the
+        // Snowflake clock, which it did every five seconds, while no session issues IDs.
+        await SettleAsync([nodeA, nodeB], token);
+        await AssertIdleAsync([nodeA, nodeB], "managing sequences", TimeSpan.FromSeconds(6), token);
 
         await Task.WhenAll(InsertAsync(nodeA, "a"), InsertAsync(nodeB, "b"));
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
@@ -254,6 +264,10 @@ public sealed class SequenceRangeTests
             "SELECT p.node_name, r.distance FROM worf.sequence_range r JOIN worf.node p ON p.node_id = r.parent_node", token));
         Assert.AreEqual("1", await nodeB.SafePsqlAsync(Database,
             "SELECT count(*) FROM worf.sequence_range_block WHERE kind = 'p'", token), "node_b's pool block");
+
+        // node_b relays each end's reports to the other, and writes nothing when nothing changed.
+        await SettleAsync(nodes, token);
+        await AssertIdleAsync(nodes, "relaying reports", TimeSpan.FromSeconds(2), token);
 
         HashSet<long> keys = [];
         foreach (TestNode node in nodes)
@@ -313,8 +327,10 @@ public sealed class SequenceRangeTests
         Assert.IsTrue(await nodeA.PollLogAsync(logpos, "the allocator's fence lifted", token), "node_a's fence lifted");
         Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges", token), "node_a drawing again");
 
+        // node_b's blocks are read first: node_a, drawing again, may grant it another between the reads.
+        string[] blocks = (await nodeB.SafePsqlAsync(Database, "SELECT lo, hi FROM worf.sequence_range_block", token)).Split('\n');
         string[] grants = (await nodeA.SafePsqlAsync(Database, "SELECT lo, hi FROM worf.sequence_range_grant WHERE grantee_name = 'node_b'", token)).Split('\n');
-        foreach (string block in (await nodeB.SafePsqlAsync(Database, "SELECT lo, hi FROM worf.sequence_range_block", token)).Split('\n'))
+        foreach (string block in blocks)
         {
             Assert.Contains(block, grants, "node_b's block back in node_a's ledger");
         }
@@ -563,6 +579,40 @@ public sealed class SequenceRangeTests
         }
     }
 
+    /// <summary>
+    /// Waits until each node holds its next blocks, with no request open and no grant unacknowledged, and the neighbors
+    /// have heard so.
+    /// </summary>
+    private static async Task SettleAsync(TestNode[] nodes, CancellationToken token)
+    {
+        foreach (TestNode node in nodes)
+        {
+            Assert.IsTrue(await node.PollQueryUntilAsync(Database, """
+                SELECT bool_and(next_lo IS NOT NULL)
+                    AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_request)
+                    AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_grant WHERE state = 'sent')
+                FROM worf.sequence_ranges
+                """, token), $"{node.Name} holding its next blocks");
+        }
+
+        await Task.Delay(1000, token);
+    }
+
+    /// <summary>
+    /// Asserts that the nodes take no transaction IDs over a while, as their workers tick and exchange.
+    /// </summary>
+    private static async Task AssertIdleAsync(TestNode[] nodes, string phase, TimeSpan span, CancellationToken token)
+    {
+        const string NextXid = "SELECT pg_snapshot_xmax(pg_current_snapshot())";
+        string[] before = await Task.WhenAll(nodes.Select(node => node.SafePsqlAsync(Database, NextXid, token)));
+        await Task.Delay(span, token);
+        for (int i = 0; i < nodes.Length; i++)
+        {
+            Assert.AreEqual(before[i], await nodes[i].SafePsqlAsync(Database, NextXid, token),
+                $"{nodes[i].Name} taking no transaction IDs while idle, {phase}");
+        }
+    }
+
     private static async Task SubscribeAsync(TestNode subscriber, string name, TestNode provider, CancellationToken token)
     {
         _ = await subscriber.SafePsqlAsync(Database, $$"""
@@ -592,6 +642,7 @@ public sealed class SequenceRangeTests
             "max_replication_slots = 10",
             "worf.sequence_range_check_interval = 100",
             "worf.sequence_range_exchange_interval = 500",
+            "autovacuum = off",
         ], token);
         try
         {
