@@ -1344,6 +1344,42 @@ internal static class Functions
     }
 
     /// <summary>
+    /// Returns the type each column of a table's values are sent in, as RELATION messages name them, so that a
+    /// subscriber's initial copy converts them as replication does.
+    /// </summary>
+    [PgFunction(SetMode = PgSetMode.Materialize, Sql = """
+        CREATE FUNCTION worf.show_table_column_types(relation regclass, OUT attname text, OUT type_oid oid,
+        	OUT type_nspname text, OUT type_name text, OUT type_definition text)
+        RETURNS SETOF record STRICT STABLE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
+        """)]
+    internal static unsafe IEnumerable<PgHeapTuple?> ShowTableColumnTypes(
+        [PgSqlType("regclass", Schema = "pg_catalog")] PgDatum relation)
+    {
+        RelationData* rel = NativeMethods.table_open(Oid(relation), (int)PgLockMode.AccessShare);
+        TupleDescData* reldesc = rel->rd_att;
+        List<PgHeapTuple?> rows = [];
+        for (int i = 0; i < reldesc->natts; i++)
+        {
+            FormData_pg_attribute* att = NativeMethods.TupleDescAttr(reldesc, i);
+            if (att->attisdropped)
+            {
+                continue;
+            }
+
+            WorfRemoteType type = ProtoNative.ColumnType(att->atttypid);
+            rows.Add(PgHeapTuple.Create(
+                ("attname", SpiParameter.Create(Worf.FromServer((sbyte*)&att->attname))),
+                ("type_oid", SpiParameter.Create(type.Oid)),
+                ("type_nspname", SpiParameter.Create<string?>(type.Nspname)),
+                ("type_name", SpiParameter.Create<string?>(type.Typname)),
+                ("type_definition", SpiParameter.Create<string?>(type.Definition))));
+        }
+
+        NativeMethods.table_close(rel, (int)PgLockMode.None);
+        return rows;
+    }
+
+    /// <summary>
     /// Do sequential table scan and return all rows that pass the row filter(s) defined in speficied replication
     /// set(s) for a table. This is called by downstream sync worker on the upstream to obtain filtered data for
     /// initial COPY.

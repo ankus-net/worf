@@ -12,6 +12,7 @@ namespace Worf.Tests;
 public sealed class ColumnTypeTests
 {
     private const string Database = "postgres";
+    private const string TextDatabase = "textsub";
     private const string SuperUser = "super";
 
     /// <summary>
@@ -20,14 +21,15 @@ public sealed class ColumnTypeTests
     public TestContext TestContext { get; set; } = null!;
 
     /// <summary>
-    /// Values sent in binary are read with the provider's type, PostgreSQL's own by OID, a domain as its base type and
-    /// others by schema and name when defined the same, and converted to the subscriber's as an assignment would, as
-    /// ALTER COLUMN TYPE converts them, or else, for a string type, by the column type's input. The column's own type
-    /// reads values sent as text, an enum's labels, and those of a type the subscriber lacks or defines differently, as
-    /// it always has. A value that converts neither way fails with PostgreSQL's own error, which exception_behaviour
-    /// handles, recording the table and row, without affecting the next change. Conversions follow types the
-    /// subscriber creates and drops. A client of the first protocol version gets RELATION messages without the column
-    /// types, and values in PostgreSQL's internal format only from the second.
+    /// Values are read with the provider's type, PostgreSQL's own by OID, a domain as its base type and others by
+    /// schema and name when defined the same, and converted to the subscriber's as an assignment would, as ALTER COLUMN
+    /// TYPE converts them, or else through text, which the column type's input reads with the column's type modifier.
+    /// An enum's values are its labels. The column's own type reads the text of a type the subscriber lacks or defines
+    /// differently, whose values in binary fail. A value that doesn't convert fails with PostgreSQL's own error, which
+    /// exception_behaviour handles, recording the table and row, without affecting the next change. Conversions follow
+    /// types the subscriber creates and drops. The initial copy converts as replication does, and values convert under
+    /// the subscriber's settings however they're sent. A client of the first protocol version gets RELATION messages
+    /// without the column types, and values in PostgreSQL's internal format only from the second.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -35,8 +37,10 @@ public sealed class ColumnTypeTests
     {
         CancellationToken token = TestContext.CancellationToken;
 
-        await using TestNode provider = await StartNodeAsync("provider", token);
-        await using TestNode subscriber = await StartNodeAsync("subscriber", token, "worf.exception_behaviour = discard");
+        await using TestNode provider = await StartNodeAsync("provider", token, "TimeZone = 'Asia/Tokyo'",
+            "bytea_output = escape");
+        await using TestNode subscriber = await StartNodeAsync("subscriber", token, "worf.exception_behaviour = discard",
+            "TimeZone = 'America/New_York'", "max_worker_processes = 16");
         foreach (TestNode node in new[] { provider, subscriber })
         {
             _ = await node.SafePsqlAsync(Database, """
@@ -46,7 +50,7 @@ public sealed class ColumnTypeTests
         }
 
         // The subscriber's mood lacks a label, its emotion is the provider's app.feeling under another schema and
-        // name, its amount and pair are defined differently, and it lacks gone, citext and, for now, span.
+        // name, its amount, pair and fspan are defined differently, and it lacks gone, st, citext and, for now, span.
         _ = await provider.SafePsqlAsync(Database, """
             CREATE TYPE mood AS ENUM ('sad', 'happy', 'angry');
             CREATE SCHEMA app;
@@ -55,6 +59,8 @@ public sealed class ColumnTypeTests
             CREATE TYPE span AS RANGE (subtype = integer);
             CREATE TYPE pair AS (x integer, y integer);
             CREATE TYPE gone AS ENUM ('x', 'y');
+            CREATE TYPE st AS ENUM ('done', 'complete');
+            CREATE TYPE fspan AS RANGE (subtype = integer);
             CREATE EXTENSION citext;
             """, token);
         _ = await subscriber.SafePsqlAsync(Database, """
@@ -62,28 +68,42 @@ public sealed class ColumnTypeTests
             CREATE TYPE emotion AS ENUM ('calm', 'tense');
             CREATE DOMAIN amount AS real;
             CREATE TYPE pair AS (x bigint, y integer);
+            CREATE TYPE fspan AS RANGE (subtype = real);
+            """, token);
+
+        // A table the initial copy converts, copied before any other change, from a provider whose TimeZone and
+        // bytea_output differ from the subscriber's.
+        _ = await provider.SafePsqlAsync(Database, """
+            CREATE TABLE zt (id integer PRIMARY KEY, n numeric, tz timestamptz, by bytea);
+            SELECT * FROM worf.create_replication_set('zs');
+            SELECT * FROM worf.replication_set_add_table('zs', 'zt');
+            INSERT INTO zt VALUES (1, 3.7, '2024-01-02 03:04:05+00', 'A');
             """, token);
 
         // int4 to int8 and back, int4 to float4, text to int4, int4 to text, an enum to text, a domain to int8,
         // numeric to int4, an enum to its own type under another name, a domain to text, a range to text, a composite
-        // to text, a missing enum and citext to text, composites and their arrays to their own types defined
-        // differently, an enum to its own type, a domain's array, sent as text, to int4[], and boolean to int4.
+        // to text, a missing enum to text, citext to int4, composites and their arrays to their own types defined
+        // differently, an enum to its own type, a domain's array, sent as text, to int4[], boolean to int4, text to
+        // bit(4) and varbit(3), an enum to int4, int8 and timestamp, a range to its own type defined differently, and a
+        // missing range to boolean.
         _ = await provider.SafePsqlAsync(Database, """
             CREATE TABLE t (id integer PRIMARY KEY, a integer, b bigint, c integer, d text, e integer, f mood, g posint,
                 h numeric, i app.feeling, j amount, k span, l pair, m gone, n citext, o pair, p pair[], q mood, r numdom[],
-                s boolean);
+                s boolean, u text, v text, w st, x st, y st, z fspan, za span);
             SELECT * FROM worf.replication_set_add_table('default', 't');
             """, token);
         _ = await provider.SafePsqlAsync(Database, "SELECT * FROM pg_create_logical_replication_slot('column_types', 'worf')", token);
         _ = await subscriber.SafePsqlAsync(Database, """
             CREATE TABLE t (id integer PRIMARY KEY, a bigint, b integer, c real, d integer, e text, f text, g bigint,
-                h integer, i emotion, j text, k text, l text, m text, n text, o pair, p pair[], q mood, r integer[],
-                s integer)
+                h integer, i emotion, j text, k text, l text, m text, n integer, o pair, p pair[], q mood, r integer[],
+                s integer, u bit(4), v varbit(3), w integer, x bigint, y timestamp, z fspan, za boolean);
+            CREATE TABLE zt (id integer PRIMARY KEY, n integer, tz timestamp, by text);
             """, token);
         _ = await subscriber.SafePsqlAsync(Database, $"""
             SELECT worf.create_subscription(
                 subscription_name := 'sub',
                 provider_dsn := '{provider.Dsn(Database, SuperUser)}',
+                replication_sets := ARRAY['default', 'zs'],
                 synchronize_structure := false,
                 synchronize_data := false)
             """, token);
@@ -94,15 +114,17 @@ public sealed class ColumnTypeTests
             """, token), "subscription failed to reach \"replicating\" state");
 
         _ = await provider.SafePsqlAsync(Database, """
-            INSERT INTO t VALUES (1, 1, 2, 3, '40', 5, 'happy', 6, 3.7, 'tense', 5, NULL, '(1,2)', 'x', 'Abc', '(1,2)',
-                '{"(1,2)"}', 'happy', '{1}', NULL);
+            INSERT INTO t VALUES (1, 1, 2, 3, '40', 5, 'happy', 6, 3.7, 'tense', 5, NULL, '(1,2)', 'x', NULL, '(1,2)',
+                '{"(1,2)"}', 'happy', '{1}', NULL, '1010', '101');
             UPDATE t SET a = 2147483647, h = 2.5 WHERE id = 1;
             """, token);
 
         // A value too big for the subscriber's column, text its integer input rejects, a label the subscriber's mood
-        // lacks, a boolean, which has no assignment cast to integer, and a domain's array whose text integer[]'s input
-        // rejects are each discarded with their error, and the changes after them apply. So does a label only its text
-        // column lacks.
+        // lacks, a boolean, whose text integer's input rejects, bits too many or too few for the column, an enum's
+        // labels, which integer, bigint and timestamp reject, and citext, which the subscriber lacks, and ranges it
+        // defines differently or lacks, which it can't read in binary, are each discarded with their error, and the
+        // changes after them apply. So does a label only its text column lacks, and a domain's array, sent as text,
+        // converts.
         _ = await provider.SafePsqlAsync(Database, """
             BEGIN;
             INSERT INTO t VALUES (2, 1, 3000000000, 3, NULL, 5, 'sad', 6, 1, 'calm', 5, NULL, NULL);
@@ -111,7 +133,16 @@ public sealed class ColumnTypeTests
             INSERT INTO t (id, f, q) VALUES (5, 'angry', 'angry');
             INSERT INTO t (id, s) VALUES (6, true);
             INSERT INTO t (id, r) VALUES (8, '{3.7}');
-            INSERT INTO t VALUES (7, 7, 7, 7, NULL, 7, 'happy', 7, -7.5, 'tense', 7, NULL, '(7,7)', 'y', 'XyZ', '(7,7)',
+            INSERT INTO t (id, u) VALUES (12, '10101');
+            INSERT INTO t (id, u) VALUES (13, '101');
+            INSERT INTO t (id, v) VALUES (14, '1111');
+            INSERT INTO t (id, w) VALUES (15, 'done');
+            INSERT INTO t (id, x) VALUES (16, 'complete');
+            INSERT INTO t (id, y) VALUES (17, 'complete');
+            INSERT INTO t (id, n) VALUES (18, '1234');
+            INSERT INTO t (id, z) VALUES (19, '[1,5)');
+            INSERT INTO t (id, za) VALUES (20, 'empty');
+            INSERT INTO t VALUES (7, 7, 7, 7, NULL, 7, 'happy', 7, -7.5, 'tense', 7, NULL, '(7,7)', 'y', NULL, '(7,7)',
                 NULL, 'sad', '{7}', NULL);
             COMMIT;
             """, token);
@@ -119,36 +150,51 @@ public sealed class ColumnTypeTests
         // A client of the first protocol version gets the layout it reads, and one of the second each column's type:
         // a domain's base type, PostgreSQL's own by OID and others by name and definition. Values come in PostgreSQL's
         // internal format, for its own base types, only with the second.
-        Assert.AreEqual("id,a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s", await RelationColumnsAsync(provider, 1, token));
+        Assert.AreEqual("id,a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,u,v,w,x,y,z,za",
+            await RelationColumnsAsync(provider, 1, token));
         Assert.AreEqual(
             "id:23,a:23,b:20,c:23,d:25,e:23,f:public.mood=enum,g:23,h:1700,i:app.feeling=enum,j:23," +
             "k:public.span=range(23),l:public.pair=composite(23,23),m:public.gone=enum," +
             "n:public.citext=base(citextin,citextrecv,-1),o:public.pair=composite(23,23)," +
-            "p:public._pair=array(composite(23,23)),q:public.mood=enum,r:public._numdom=array(1700),s:16",
+            "p:public._pair=array(composite(23,23)),q:public.mood=enum,r:public._numdom=array(1700),s:16,u:25,v:25," +
+            "w:public.st=enum,x:public.st=enum,y:public.st=enum,z:public.fspan=range(23),za:public.span=range(23)",
             await RelationColumnsAsync(provider, 2, token));
-        Assert.AreEqual("bbbbbbbbbbbntbbttbtn", await InsertKindsAsync(provider, 1, token));
-        Assert.AreEqual("iiiiiibbibbntbbttbtn", await InsertKindsAsync(provider, 2, token));
+        Assert.AreEqual("bbbbbbbbbbbntbnttbtnbbnnnnn", await InsertKindsAsync(provider, 1, token));
+        Assert.AreEqual("iiiiiibbibbntbnttbtniinnnnn", await InsertKindsAsync(provider, 2, token));
         _ = await provider.SafePsqlAsync(Database, """
             SELECT pg_drop_replication_slot('column_types');
             SELECT worf.wait_slot_confirm_lsn(NULL, NULL);
             """, token);
 
         Assert.AreEqual(
-            "1|2147483647|2|3|40|5|happy|6|3|tense|5|(1,2)|x|Abc|(1,2)|{\"(1,2)\"}|happy|{1}\n" +
+            "1|2147483647|2|3|40|5|happy|6|3|tense|5|(1,2)|x|(1,2)|{\"(1,2)\"}|happy|{1}|1010|101\n" +
             "3|1|2|3|5|angry|6|1|calm|5\n" +
-            "7|7|7|7|7|happy|7|-8|tense|7|(7,7)|y|XyZ|(7,7)|sad|{7}",
-            await subscriber.SafePsqlAsync(Database,
-                "SELECT concat_ws('|', id, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s) FROM t ORDER BY id", token));
+            "7|7|7|7|7|happy|7|-8|tense|7|(7,7)|y|(7,7)|sad|{7}\n" +
+            "8|{4}",
+            await subscriber.SafePsqlAsync(Database, """
+                SELECT concat_ws('|', id, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, u, v, w, x, y, z, za)
+                FROM t ORDER BY id
+                """, token));
         Assert.AreEqual(
             "INSERT|public|t|22003|2|3000000000|sad\n" +
             "INSERT|public|t|22P02|4|2|x|sad\n" +
             "INSERT|public|t|22P02|5|angry|angry\n" +
-            "INSERT|public|t|42804|6|t\n" +
-            "INSERT|public|t|22P02|8|{3.7}",
+            "INSERT|public|t|22P02|6|t\n" +
+            "INSERT|public|t|22026|12|10101\n" +
+            "INSERT|public|t|22026|13|101\n" +
+            "INSERT|public|t|22001|14|1111\n" +
+            "INSERT|public|t|22P02|15|done\n" +
+            "INSERT|public|t|22P02|16|complete\n" +
+            "INSERT|public|t|22007|17|complete\n" +
+            "INSERT|public|t|42804|18|\\x31323334\n" +
+            "INSERT|public|t|42804|19|\\x0200000004000000010000000400000005\n" +
+            "INSERT|public|t|42804|20|\\x01",
             await subscriber.SafePsqlAsync(Database, """
                 SELECT concat_ws('|', operation, schema_name, table_name, error_sqlstate, remote_new_tuple->>'id',
                     remote_new_tuple->>'b', remote_new_tuple->>'d', remote_new_tuple->>'f', remote_new_tuple->>'q',
-                    remote_new_tuple->>'s', remote_new_tuple->>'r')
+                    remote_new_tuple->>'s', remote_new_tuple->>'u', remote_new_tuple->>'v', remote_new_tuple->>'w',
+                    remote_new_tuple->>'x', remote_new_tuple->>'y', remote_new_tuple->>'n', remote_new_tuple->>'z',
+                    remote_new_tuple->>'za')
                 FROM worf.exception_log ORDER BY log_id
                 """, token));
 
@@ -167,6 +213,42 @@ public sealed class ColumnTypeTests
         Assert.AreEqual("10|[1,5)\n11|[2,6)", await subscriber.SafePsqlAsync(Database,
             "SELECT concat_ws('|', id, k) FROM t WHERE id >= 10 ORDER BY id", token));
         Assert.DoesNotContain("exiting with error", subscriber.ReadLog()[logpos..]);
+
+        // The initial copy converts values as replication does, for a resynchronized table and for a subscription
+        // that gets values as text, and so do the values sent afterwards, in binary and as text, all under the
+        // subscriber's TimeZone and bytea_output.
+        _ = await subscriber.SafePsqlAsync(Database, "SELECT worf.alter_subscription_resynchronize_table('sub', 'zt')", token);
+        _ = await subscriber.SafePsqlAsync(Database, $"CREATE DATABASE {TextDatabase}", token);
+        _ = await subscriber.SafePsqlAsync(TextDatabase, "CREATE EXTENSION worf", token);
+        _ = await subscriber.SafePsqlAsync(TextDatabase, $"""
+            SELECT * FROM worf.create_node(node_name := 'subscriber_text', dsn := '{subscriber.Dsn(TextDatabase, SuperUser)}');
+            CREATE TABLE zt (id integer PRIMARY KEY, n integer, tz timestamp, by text);
+            """, token);
+        _ = await subscriber.SafePsqlAsync(TextDatabase, $"""
+            SELECT worf.create_subscription(
+                subscription_name := 'textsub',
+                provider_dsn := '{provider.Dsn(Database, SuperUser)}',
+                replication_sets := ARRAY['zs'],
+                synchronize_structure := false,
+                synchronize_data := true,
+                force_text_transfer := true)
+            """, token);
+        foreach (string database in new[] { Database, TextDatabase })
+        {
+            Assert.IsTrue(await subscriber.PollQueryUntilAsync(database, """
+                SELECT EXISTS (SELECT 1 FROM zt)
+                    AND NOT EXISTS (SELECT 1 FROM worf.local_sync_status WHERE sync_status <> 'r')
+                """, token), $"zt wasn't copied in {database}");
+        }
+
+        _ = await provider.SafePsqlAsync(Database, "INSERT INTO zt VALUES (2, 3.7, '2024-01-02 03:04:05+00', 'A')", token);
+        foreach (string database in new[] { Database, TextDatabase })
+        {
+            Assert.IsTrue(await subscriber.PollQueryUntilAsync(database, "SELECT count(*) = 2 FROM zt", token),
+                $"zt's row 2 wasn't applied in {database}");
+            Assert.AreEqual("1|4|2024-01-01 22:04:05|\\x41\n2|4|2024-01-01 22:04:05|\\x41",
+                await subscriber.SafePsqlAsync(database, "SELECT concat_ws('|', id, n, tz, by) FROM zt ORDER BY id", token));
+        }
     }
 
     /// <summary>

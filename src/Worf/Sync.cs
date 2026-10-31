@@ -42,6 +42,9 @@ internal static class Sync
     private const string PgdumpBinary = "pg_dump";
     private const string PgrestoreBinary = "pg_restore";
 
+    // The temporary table a copy whose values convert goes through.
+    private const string StagingTable = "pg_temp.worf_copy";
+
     /// <summary>
     /// Whether a kind of synchronization copies data.
     /// </summary>
@@ -1087,11 +1090,20 @@ internal static class Sync
         PgReplicationOrigin.SetupSession(origin);
 
         Spi.Execute("SET LOCAL session_replication_role = 'replica'");
-        Spi.Execute("SET LOCAL DATESTYLE = ISO");
-        Spi.Execute("SET LOCAL INTERVALSTYLE = POSTGRES");
-        Spi.Execute("SET LOCAL extra_float_digits TO 3");
+        SetCopyTargetStyle(false);
         Spi.Execute("SET LOCAL statement_timeout = 0");
         Spi.Execute("SET LOCAL lock_timeout = 0");
+    }
+
+    /// <summary>
+    /// Sets the styles values take in the copy's target transaction: the origin's, or this node's own, which values
+    /// that convert from the provider's type follow, as in replication.
+    /// </summary>
+    private static void SetCopyTargetStyle(bool own)
+    {
+        Spi.Execute($"SET LOCAL DATESTYLE TO {(own ? "DEFAULT" : "ISO")}");
+        Spi.Execute($"SET LOCAL INTERVALSTYLE TO {(own ? "DEFAULT" : "POSTGRES")}");
+        Spi.Execute($"SET LOCAL extra_float_digits TO {(own ? "DEFAULT" : "3")}");
     }
 
     private static void FinishCopyOriginTx(PgReplicationConnection conn)
@@ -1162,14 +1174,52 @@ internal static class Sync
     }
 
     /// <summary>
+    /// Finds the copied columns whose values convert from the provider's type, for which the copy goes through a
+    /// temporary table: the column's own type reads the text of those that go through text, and the others are copied
+    /// in the type their values are read with.
+    /// </summary>
+    /// <returns>The columns copied in the type their values are read with, and its schema and name, or null when no
+    /// column converts.</returns>
+    private static unsafe List<(string Attname, string Nspname, string Typname)>? FindCopyConversions(WorfRelation rel)
+    {
+        List<(string, string, string)> columns = [];
+        bool converts = false;
+        TupleDescData* desc = rel.Rel->rd_att;
+
+        for (int attnum = 0; attnum < desc->natts; attnum++)
+        {
+            int remoteattnum = PhysattInAttmap(rel, attnum);
+            if (NativeMethods.TupleDescAttr(desc, attnum)->attisdropped || remoteattnum < 0 ||
+                rel.Conversions[remoteattnum] is not { ReadType: not 0 } conversion)
+            {
+                continue;
+            }
+
+            converts = true;
+            if (!conversion.ThroughText)
+            {
+                HeapTupleData* typtup = NativeMethods.typeidType(conversion.ReadType);
+                FormData_pg_type* typclass = (FormData_pg_type*)NativeMethods.GETSTRUCT(typtup);
+                string typname = Worf.FromServer((sbyte*)&typclass->typname);
+                uint typnamespace = typclass->typnamespace;
+                NativeMethods.ReleaseSysCache(typtup);
+                columns.Add((rel.Attnames[remoteattnum], Worf.FromServer(NativeMethods.get_namespace_name(typnamespace)), typname));
+            }
+        }
+
+        return converts ? columns : null;
+    }
+
+    /// <summary>
     /// COPY single table over wire. Runs in the target transaction.
     /// </summary>
     private static void CopyTableData(PgReplicationConnection originConn, WorfRemoteRel remoterel, List<string> replicationSets)
     {
-        // Build the relation map.
-        RelCache.RelationCacheUpdater(remoterel);
+        // Build the relation map, with the provider's column types.
+        RelCache.RelationCacheUpdater(remoterel, Rpc.GetRemoteColumnTypes(originConn, remoterel));
         WorfRelation rel = RelCache.RelationOpen(remoterel.Relid, PgLockMode.AccessShare);
         List<string> attnamelist = MakeCopyAttnamelist(rel);
+        List<(string Attname, string Nspname, string Typname)>? converted = attnamelist.Count != 0 ? FindCopyConversions(rel) : null;
         uint reloid = rel.Reloid;
 
         StringBuilder attlist = new();
@@ -1229,6 +1279,35 @@ internal static class Sync
 
         query.Append("TO stdout");
 
+        // A table whose values convert is copied into a temporary table with its copied columns, in the type values
+        // are read with for those that are cast, under this node's own settings, which conversions follow.
+        if (converted is not null)
+        {
+            SetCopyTargetStyle(true);
+            StringBuilder create = new("CREATE TEMPORARY TABLE " + StagingTable + " AS SELECT ");
+            for (int i = 0; i < attnamelist.Count; i++)
+            {
+                create.Append(i > 0 ? ", " : "").Append(Spi.QuoteIdentifier(attnamelist[i]));
+            }
+
+            create.Append(" FROM ").Append(Spi.QuoteQualifiedIdentifier(remoterel.Nspname, remoterel.Relname)).Append(" WITH NO DATA");
+            Spi.Execute(create.ToString());
+            if (converted.Count > 0)
+            {
+                StringBuilder alter = new("ALTER TABLE " + StagingTable);
+                for (int i = 0; i < converted.Count; i++)
+                {
+                    alter.Append(i > 0 ? ", " : " ").Append("ALTER COLUMN ").Append(Spi.QuoteIdentifier(converted[i].Attname))
+                        .Append(" TYPE ").Append(Spi.QuoteQualifiedIdentifier(converted[i].Nspname, converted[i].Typname))
+                        .Append(" USING NULL");
+                }
+
+                Spi.Execute(alter.ToString());
+            }
+
+            reloid = Worf.ReadScalar<uint>("SELECT '" + StagingTable + "'::regclass::oid");
+        }
+
         // Execute COPY TO.
         try
         {
@@ -1241,7 +1320,23 @@ internal static class Sync
         }
 
         // Execute COPY FROM.
-        _ = originConn.CopyInto(reloid, attnamelist.Count != 0 ? attnamelist : null);
+        _ = originConn.CopyInto(reloid, converted is null && attnamelist.Count != 0 ? attnamelist : null);
+
+        // The insert from the temporary table converts the values as replication does.
+        if (converted is not null)
+        {
+            StringBuilder insert = new("INSERT INTO ");
+            insert.Append(Spi.QuoteQualifiedIdentifier(remoterel.Nspname, remoterel.Relname)).Append(" (");
+            for (int i = 0; i < attnamelist.Count; i++)
+            {
+                insert.Append(i > 0 ? ", " : "").Append(Spi.QuoteIdentifier(attnamelist[i]));
+            }
+
+            insert.Append(") OVERRIDING SYSTEM VALUE SELECT * FROM " + StagingTable);
+            Spi.Execute(insert.ToString());
+            Spi.Execute("DROP TABLE " + StagingTable);
+            SetCopyTargetStyle(false);
+        }
 
         PgLog.Info($"finished synchronization of data for table {remoterel.Nspname}.{remoterel.Relname}");
     }
