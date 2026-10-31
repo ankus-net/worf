@@ -148,6 +148,12 @@ internal static unsafe partial class SequenceRanges
     /// </summary>
     internal const string GuardName = "worf_sequence_range_guard";
 
+    /// <summary>
+    /// How recently a node must have reported to count as live. An exchange writes a report that changed nothing again
+    /// only once it is half this old, so that an exchange that changes nothing writes nothing.
+    /// </summary>
+    internal const string LiveReportAge = "10 minutes";
+
     private const string CheckViolation = "23514";
     private const string SequenceLimitExceeded = "2200H";
 
@@ -271,7 +277,7 @@ internal static unsafe partial class SequenceRanges
         }
 
         // Moving the owner starts the next epoch. Two live roots could overlap, so it waits until no neighbor has
-        // reported the old owner's epoch as live within the last minute, unless forced because the old owner is gone.
+        // reported the old owner's epoch as live lately, unless forced because the old owner is gone.
         SpiResult existing = Worf.SelectCatalog(
             "SELECT epoch, state, owner_node, watermark, root_start, root_end FROM worf.sequence_range WHERE seqoid = $1",
             SpiParameter.Create(seqoid));
@@ -291,8 +297,9 @@ internal static unsafe partial class SequenceRanges
 
             if (!force && Worf.SelectCatalog("""
                 SELECT 1 FROM worf.sequence_range_node
-                WHERE seqoid = $1 AND node_id <> $2 AND epoch = $3 AND state <> 'disabled' AND reported_at > now() - interval '1 minute'
-                """, SpiParameter.Create(seqoid), SpiParameter.Create(node.Node.Id), SpiParameter.Create(current)).Count > 0)
+                WHERE seqoid = $1 AND node_id <> $2 AND epoch = $3 AND state <> 'disabled' AND reported_at > now() - $4::interval
+                """, SpiParameter.Create(seqoid), SpiParameter.Create(node.Node.Id), SpiParameter.Create(current),
+                SpiParameter.Create(LiveReportAge)).Count > 0)
             {
                 throw new PgException(PgSqlStates.ObjectInUse, $"sequence {info.Name} is still under range management by its owner",
                     hint: "Disable it with worf.disable_sequence_range on its owner first, or pass force := true if the owner is gone for good.");
@@ -1142,9 +1149,11 @@ internal static unsafe partial class SequenceRanges
     internal static void RecordHeld(uint seqoid, SequenceInfo info, Guid id, char kind, long lo, long hi, bool abandoned, bool fenced,
         uint holderId, string holderName)
     {
-        if (Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range_grant WHERE grant_id = $1", SpiParameter.Create(id)).Count > 0)
+        SpiResult grant = Worf.SelectCatalog("SELECT state FROM worf.sequence_range_grant WHERE grant_id = $1", SpiParameter.Create(id));
+        if (grant.Count > 0)
         {
-            if (abandoned)
+            // The holder reports an abandoned block at each exchange for a while, which changes the grant once.
+            if (abandoned && grant[0].Get<string>(0) != "abandoned")
             {
                 _ = Spi.Execute("UPDATE worf.sequence_range_grant SET state = 'abandoned' WHERE grant_id = $1 AND state <> 'abandoned'",
                     SpiParameter.Create(id));
