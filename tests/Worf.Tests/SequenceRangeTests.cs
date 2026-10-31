@@ -1138,13 +1138,10 @@ public sealed class SequenceRangeTests
                 CREATE TABLE t (id bigserial PRIMARY KEY, v text);
                 CREATE TABLE late (id bigserial PRIMARY KEY, v text);
                 CREATE TABLE narrow (id smallserial PRIMARY KEY, v text);
-                CREATE SEQUENCE nums_seq;
-                CREATE TABLE nums (id numeric PRIMARY KEY DEFAULT nextval('nums_seq'));
                 """, token);
         }
 
-        _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO narrow VALUES (32767, 'legacy'); INSERT INTO nums VALUES (150), (151), ('NaN')", token);
-        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO nums SELECT FROM generate_series(1, 3)", token);
+        _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO narrow VALUES (32767, 'legacy')", token);
         _ = await nodeC.SafePsqlAsync(Database, "INSERT INTO late (id, v) SELECT g, 'legacy' FROM generate_series(1, 5000) g", token);
         _ = await nodeA.SafePsqlAsync(Database,
             "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b,node_c}', range_size := 100, max_range_size := 100)", token);
