@@ -1043,7 +1043,7 @@ internal static unsafe partial class SequenceRanges
         // The restore of a subscription's structure runs under these rules too: it sets a column's default once its
         // sequence owns the column, which a column that uses a managed sequence through its ownership alone may do.
         if (parsetree->type is not (NodeTag.T_AlterSeqStmt or NodeTag.T_GrantStmt or NodeTag.T_AlterTableStmt or
-            NodeTag.T_DropStmt or NodeTag.T_RenameStmt or NodeTag.T_TruncateStmt or
+            NodeTag.T_DropStmt or NodeTag.T_RenameStmt or NodeTag.T_TruncateStmt or NodeTag.T_AlterDomainStmt or
             NodeTag.T_AlterObjectSchemaStmt or NodeTag.T_AlterObjectDependsStmt) || !AnyManaged())
         {
             return;
@@ -1107,6 +1107,11 @@ internal static unsafe partial class SequenceRanges
             case NodeTag.T_TruncateStmt when ((TruncateStmt*)parsetree)->restart_seqs:
                 CheckTruncate((TruncateStmt*)parsetree);
                 break;
+
+            // A domain's default reaches the columns of the domain that have none of their own.
+            case NodeTag.T_AlterDomainStmt when AltersDefault((AlterDomainStmt*)parsetree) &&
+                DomainUsesManaged(((AlterDomainStmt*)parsetree)->typeName):
+                throw Rejected("changing the default of a domain that uses a managed sequence", "Disable range management first.");
 
             default:
                 break;
@@ -1369,7 +1374,8 @@ internal static unsafe partial class SequenceRanges
     /// <param name="parsetree">The statement, which has run.</param>
     internal static void AfterDdl(Node* parsetree)
     {
-        if (InternalDdl || parsetree->type is not (NodeTag.T_CreateSeqStmt or NodeTag.T_AlterSeqStmt or NodeTag.T_AlterTableStmt or NodeTag.T_CreateStmt))
+        if (InternalDdl || parsetree->type is not (NodeTag.T_CreateSeqStmt or NodeTag.T_AlterSeqStmt or NodeTag.T_AlterTableStmt or NodeTag.T_CreateStmt or
+            NodeTag.T_AlterDomainStmt))
         {
             return;
         }
@@ -1468,6 +1474,29 @@ internal static unsafe partial class SequenceRanges
                 InstallGuard(Resolve(((CreateStmt*)parsetree)->relation));
                 break;
 
+            // A domain's default can't change once it uses a managed sequence, so one that does now didn't.
+            case NodeTag.T_AlterDomainStmt when AltersDefault((AlterDomainStmt*)parsetree):
+                uint domain = NativeMethods.typenameTypeId(null, NativeMethods.makeTypeNameFromNameList(((AlterDomainStmt*)parsetree)->typeName));
+                SpiResult columns = Worf.Read("""
+                    WITH RECURSIVE domains (typid) AS (
+                        SELECT $1::oid
+                        UNION
+                        SELECT t.oid FROM pg_catalog.pg_type t JOIN domains d ON t.typbasetype = d.typid
+                        WHERE t.typtype = 'd' AND t.typdefaultbin IS NULL)
+                    SELECT DISTINCT a.attrelid::oid, a.attname::text
+                    FROM domains d
+                        JOIN pg_catalog.pg_attribute a ON a.atttypid = d.typid
+                        JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+                    WHERE c.relkind IN ('r', 'p') AND a.attnum > 0 AND NOT a.attisdropped AND NOT a.atthasdef
+                    """, 0, SpiParameter.Create(domain));
+                for (int i = 0; i < columns.Count; i++)
+                {
+                    InstallGuard(columns[i].Get<uint>(0));
+                    CheckColumnRows(columns[i].Get<uint>(0), columns[i].Get<string>(1), false);
+                }
+
+                break;
+
             default:
                 break;
         }
@@ -1560,6 +1589,29 @@ internal static unsafe partial class SequenceRanges
         }
     }
 
+    /// <summary>
+    /// Checks whether ALTER DOMAIN sets or drops the domain's default.
+    /// </summary>
+    private static bool AltersDefault(AlterDomainStmt* alter)
+#if ANKUS_PG19
+        => alter->subtype == AlterDomainType.AD_AlterDefault;
+#else
+        => alter->subtype == (sbyte)'T';
+#endif
+
+    /// <summary>
+    /// Checks whether a domain's default uses a managed sequence.
+    /// </summary>
+    private static bool DomainUsesManaged(List* typeName)
+    {
+        uint typid = NativeMethods.typenameTypeId(null, NativeMethods.makeTypeNameFromNameList(typeName));
+        return Elevated.Run(() => Worf.ReadScalar<bool>("""
+            SELECT EXISTS (
+                SELECT 1 FROM pg_catalog.pg_depend d JOIN worf.sequence_range r ON r.seqoid = d.refobjid
+                WHERE d.classid = 'pg_catalog.pg_type'::regclass AND d.objid = $1 AND d.refclassid = 'pg_catalog.pg_class'::regclass)
+            """, SpiParameter.Create(typid)));
+    }
+
     private static bool AnyManaged()
         => Worf.CatalogOid("sequence_range") != 0 && Elevated.Run(() => Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range)"));
 
@@ -1631,13 +1683,22 @@ internal static unsafe partial class SequenceRanges
 
     /// <summary>
     /// Lists the columns, with their tables and the types beneath any domains, whose default or identity uses a
-    /// sequence.
+    /// sequence, or which have no default of their own and take their domain's, which does. PostgreSQL records no use
+    /// of a sequence that a default reaches through a function, or through a name it looks up as it runs, as
+    /// <c>nextval('s'::text)</c> does.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
     /// <returns>The columns.</returns>
     internal static List<(uint Relid, string Column, uint TypeOid)> UsingColumns(uint seqoid)
     {
         SpiResult result = Worf.SelectCatalog("""
+            WITH RECURSIVE domains (typid) AS (
+                SELECT d.objid FROM pg_catalog.pg_depend d
+                WHERE d.classid = 'pg_catalog.pg_type'::regclass AND d.refclassid = 'pg_catalog.pg_class'::regclass
+                    AND d.refobjid = $1 AND d.deptype = 'n'
+                UNION
+                SELECT t.oid FROM pg_catalog.pg_type t JOIN domains d ON t.typbasetype = d.typid
+                WHERE t.typtype = 'd' AND t.typdefaultbin IS NULL)
             SELECT DISTINCT a.attrelid, a.attname::text, a.atttypid
             FROM (
                 SELECT d.refobjid AS relid, d.refobjsubid AS attnum
@@ -1649,6 +1710,10 @@ internal static unsafe partial class SequenceRanges
                 FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_attrdef ad ON ad.oid = d.objid
                 WHERE d.classid = 'pg_catalog.pg_attrdef'::regclass AND d.refclassid = 'pg_catalog.pg_class'::regclass
                     AND d.refobjid = $1
+                UNION
+                SELECT a.attrelid, a.attnum
+                FROM domains d JOIN pg_catalog.pg_attribute a ON a.atttypid = d.typid
+                WHERE a.attnum > 0 AND NOT a.atthasdef
             ) u
             JOIN pg_catalog.pg_attribute a ON a.attrelid = u.relid AND a.attnum = u.attnum
             JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
@@ -1687,9 +1752,17 @@ internal static unsafe partial class SequenceRanges
     private static void RequireNextval(uint relid, string column, List<uint> sequences)
     {
         SpiResult result = Worf.Read("""
+            WITH RECURSIVE chain (typid, depth) AS (
+                SELECT a.atttypid, 0 FROM pg_catalog.pg_attribute a WHERE a.attrelid = $1 AND a.attname = $2 AND NOT a.atthasdef
+                UNION ALL
+                SELECT t.typbasetype, c.depth + 1 FROM chain c JOIN pg_catalog.pg_type t ON t.oid = c.typid
+                WHERE t.typtype = 'd' AND t.typdefaultbin IS NULL)
             SELECT d.adbin::text
             FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
             WHERE a.attrelid = $1 AND a.attname = $2 AND a.attidentity = '' AND a.attgenerated = ''
+            UNION ALL
+            (SELECT t.typdefaultbin::text FROM chain c JOIN pg_catalog.pg_type t ON t.oid = c.typid
+            WHERE t.typtype = 'd' AND t.typdefaultbin IS NOT NULL ORDER BY c.depth LIMIT 1)
             """, 1, SpiParameter.Create(relid), SpiParameter.Create(column));
         if (result.Count > 0 && !sequences.Contains(DrawsFrom(result[0].Get<string>(0))))
         {
@@ -1740,13 +1813,17 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
-    /// Checks whether a column has a default of its own.
+    /// Checks whether a column has a default, of its own or from its domain.
     /// </summary>
     private static bool HasDefault(uint relid, string column)
         => Worf.ReadScalar<bool>("""
+            WITH RECURSIVE chain (typid) AS (
+                SELECT a.atttypid FROM pg_catalog.pg_attribute a WHERE a.attrelid = $1 AND a.attname = $2
+                UNION ALL
+                SELECT t.typbasetype FROM chain c JOIN pg_catalog.pg_type t ON t.oid = c.typid WHERE t.typtype = 'd')
             SELECT EXISTS (
-                SELECT 1 FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
-                WHERE a.attrelid = $1 AND a.attname = $2)
+                SELECT 1 FROM pg_catalog.pg_attribute a WHERE a.attrelid = $1 AND a.attname = $2 AND a.atthasdef)
+                OR EXISTS (SELECT 1 FROM chain c JOIN pg_catalog.pg_type t ON t.oid = c.typid WHERE t.typdefaultbin IS NOT NULL)
             """, SpiParameter.Create(relid), SpiParameter.Create(column));
 
     /// <summary>

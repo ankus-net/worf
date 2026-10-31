@@ -299,6 +299,7 @@ public sealed class SequenceRangeTests
             ALTER TABLE owned ALTER COLUMN id SET DEFAULT nextval('owner_seq');
             INSERT INTO owned DEFAULT VALUES;
             CREATE TABLE plus (id bigint);
+            CREATE DOMAIN plus_one AS bigint DEFAULT nextval('t_id_seq') + 1;
             """, token);
         await AssertOutsideAsync(node, "INSERT INTO widen VALUES (1300000)");
         await AssertOutsideAsync(node, "ALTER TABLE widen ALTER COLUMN id TYPE numeric USING id");
@@ -306,10 +307,34 @@ public sealed class SequenceRangeTests
         {
             "CREATE TABLE plus2 (id bigint DEFAULT nextval('t_id_seq') + 1000000)",
             "ALTER TABLE plus ALTER COLUMN id SET DEFAULT nextval('t_id_seq') * 2",
+            "CREATE TABLE plus3 (id plus_one)",
         })
         {
             PostgresException error = await Assert.ThrowsExactlyAsync<PostgresException>(() => node.SafePsqlAsync(Database, ddl, token), ddl);
             Assert.AreEqual("0A000", error.SqlState, ddl);
+        }
+
+        // A column with no default of its own takes its domain's, which guards it as its own would, and which can't change
+        // while it uses a managed sequence. A domain that comes to use one checks its columns' rows.
+        _ = await node.SafePsqlAsync(Database, """
+            CREATE DOMAIN numbered AS bigint DEFAULT nextval('t_id_seq');
+            CREATE TABLE via_domain (id numbered PRIMARY KEY, v text);
+            INSERT INTO via_domain (v) VALUES ('numbered');
+            CREATE DOMAIN later AS bigint;
+            CREATE TABLE via_later (id later PRIMARY KEY);
+            INSERT INTO via_later VALUES (979797);
+            """, token);
+        await AssertOutsideAsync(node, "INSERT INTO via_domain VALUES (979797, 'by hand')");
+        await AssertOutsideAsync(node, "ALTER DOMAIN later SET DEFAULT nextval('t_id_seq')");
+        foreach (string ddl in new[]
+        {
+            "ALTER DOMAIN numbered DROP DEFAULT",
+            "ALTER DOMAIN numbered SET DEFAULT 0",
+            "ALTER TABLE via_domain ALTER COLUMN id SET DEFAULT 0",
+        })
+        {
+            PostgresException error = await Assert.ThrowsExactlyAsync<PostgresException>(() => node.SafePsqlAsync(Database, ddl, token), ddl);
+            Assert.AreEqual("55000", error.SqlState, ddl);
         }
 
         // A role that isn't a superuser runs its own DDL, with the tables it creates joining the default replication
