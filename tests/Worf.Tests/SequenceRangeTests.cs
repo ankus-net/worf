@@ -992,6 +992,12 @@ public sealed class SequenceRangeTests
         await AssertIdleAsync([nodeA, nodeB], true, token, TimeSpan.FromSeconds(6));
         Assert.AreEqual(1, nodeA.ReadLog()[refused..].Split("has no values left above 32767 for a root").Length - 1, "node_a warned once");
 
+        // A session that can't write, here in a read-only transaction, can't reserve the clock after an idle stretch
+        // itself, so the range worker reserves it for the session.
+        Stopwatch readOnly = Stopwatch.StartNew();
+        _ = await nodeA.SafePsqlAsync(Database, "BEGIN READ ONLY; SELECT worf.snowflake_id(); COMMIT", token);
+        Assert.IsLessThan(3000, readOnly.ElapsedMilliseconds, "node_a's Snowflake ID in a read-only transaction");
+
         // A table that comes to use the sequence can't hold the other node's keys, which may be ones it has yet to issue,
         // unless a session that restores rows brings them.
         _ = await nodeB.SafePsqlAsync(Database, "CREATE TABLE copied AS SELECT id, v FROM t WHERE v = 'a'", token);

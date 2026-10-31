@@ -118,6 +118,22 @@ internal static class SnowflakeIds
                 continue;
             }
 
+            // One that can't write asks the range worker to reserve, the first to wait.
+            bool wake;
+            using (PgLwLockExclusiveGuard<WorfSnowflakeTable, WorfSnowflakeClock> guard = Clocks.Exclusive())
+            {
+                int slot = Slot(guard, dboid);
+                WorfSnowflakeClock clock = guard[slot];
+                wake = !clock.Wanted;
+                clock.Wanted = true;
+                guard[slot] = clock;
+            }
+
+            if (wake)
+            {
+                Worker.WakeRangeWorker();
+            }
+
             if (Worker.GetCurrentTimestamp() >= deadline)
             {
                 throw new PgException("55000", "the Snowflake clock isn't reserved this far yet",
@@ -131,8 +147,8 @@ internal static class SnowflakeIds
 
     /// <summary>
     /// Keeps this database's clock reserved ahead, from the range worker, while sessions issue IDs, once less than half the
-    /// time reserved ahead is left. A node that issues none reserves nothing, so that it writes nothing: its first ID
-    /// reserves the clock itself.
+    /// time reserved ahead is left, and reserves it for a session that can't itself. A node that issues none reserves
+    /// nothing, so that it writes nothing: its first ID reserves the clock itself.
     /// </summary>
     internal static void Reserve()
     {
@@ -146,7 +162,8 @@ internal static class SnowflakeIds
         using (PgLwLockExclusiveGuard<WorfSnowflakeTable, WorfSnowflakeClock> guard = Clocks.Exclusive())
         {
             WorfSnowflakeClock clock = guard[Slot(guard, dboid)];
-            if (!clock.Floored || clock.ReservedMs - now >= ReserveAheadMs / 2 || (clock.LastState >> CounterBits) < now - ReserveAheadMs)
+            if (!clock.Wanted &&
+                (!clock.Floored || clock.ReservedMs - now >= ReserveAheadMs / 2 || (clock.LastState >> CounterBits) < now - ReserveAheadMs))
             {
                 return;
             }
@@ -204,6 +221,7 @@ internal static class SnowflakeIds
                 }
 
                 clock.ReservedMs = Math.Max(clock.ReservedMs, target);
+                clock.Wanted = false;
                 published[slot] = clock;
                 return true;
             }));
