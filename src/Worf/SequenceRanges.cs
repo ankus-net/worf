@@ -1645,8 +1645,8 @@ internal static unsafe partial class SequenceRanges
     /// <summary>
     /// Reads the last value a sequence issued, or null before its first, from its row. pg_sequence_last_value locks
     /// the sequence as nextval does, until the transaction ends, and ALTER SEQUENCE waits on that lock, so two
-    /// transactions that each read a sequence that way and then switch it to a block deadlock. Reading the row takes
-    /// a lock that ALTER SEQUENCE doesn't wait on.
+    /// transactions that each read a sequence that way and then switch it to a block deadlock. This read holds that
+    /// lock only while it reads.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
     /// <returns>The last value, or null.</returns>
@@ -1656,8 +1656,22 @@ internal static unsafe partial class SequenceRanges
             SELECT n.nspname::text, c.relname::text FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
             WHERE c.oid = $1
             """, 1, SpiParameter.Create(seqoid));
-        return Worf.ReadScalar<long?>("SELECT CASE WHEN is_called THEN last_value END FROM " +
-            Spi.QuoteQualifiedIdentifier(name[0].Get<string>(0), name[0].Get<string>(1)));
+
+        // A switch's ALTER SEQUENCE writes the sequence to a new file. Its block is visible once it commits, a moment
+        // before other sessions learn of the new file, so a read that takes no lock ALTER SEQUENCE waits on can pair the
+        // new block with the old position, the quarantine's at the start. The read takes the lock nextval takes, which
+        // waits for a switch to finish committing, and lets it go once done, so that it holds off no switch for the rest
+        // of the transaction.
+        NativeMethods.LockRelationOid(seqoid, (int)PgLockMode.RowExclusive);
+        try
+        {
+            return Worf.ReadScalar<long?>("SELECT CASE WHEN is_called THEN last_value END FROM " +
+                Spi.QuoteQualifiedIdentifier(name[0].Get<string>(0), name[0].Get<string>(1)));
+        }
+        finally
+        {
+            NativeMethods.UnlockRelationOid(seqoid, (int)PgLockMode.RowExclusive);
+        }
     });
 
     /// <summary>
