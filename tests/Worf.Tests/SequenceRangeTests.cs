@@ -654,13 +654,14 @@ public sealed class SequenceRangeTests
                     "reset": null, "reset_done": null, "held_complete": false, "held": [], "requests": [], "reports": [{{madeUp}}], "grants": [], "acks": []}]}
             """;
         int flooded = nodeB.ReadLog().Length;
-        Assert.AreEqual("t|t|t", await nodeB.SafePsqlAsync(Database, $"""
+        Assert.AreEqual("t|t", await nodeB.SafePsqlAsync(Database, $"""
             SET SESSION AUTHORIZATION {SuperUser};
             SELECT worf.sequence_range_heard({nodeAId}, true, '-infinity', false) > now() - interval '1 minute',
-                worf.sequence_range_heard({nodeCId}, false, '-infinity', false) > now() - interval '1 minute',
-                (SELECT count(*) FROM worf.sequence_range_node WHERE seqoid = 't_id_seq'::regclass) <= 1024
+                worf.sequence_range_heard({nodeCId}, false, '-infinity', false) > now() - interval '1 minute'
             FROM (SELECT worf.sequence_range_exchange('{flood}')) e
-            """, token), "node_a and node_c heard from, and no more than 1,024 nodes kept");
+            """, token), "node_a and node_c heard from");
+        Assert.AreEqual("1024", await nodeB.SafePsqlAsync(Database, "SELECT count(*) FROM worf.sequence_range_node WHERE seqoid = 't_id_seq'::regclass", token),
+            "the nodes node_b keeps");
         Assert.IsTrue(await nodeB.PollLogAsync(flooded, "beyond the 1024 this node keeps; they are ignored", token), "the ignored reports");
         _ = await nodeB.SafePsqlAsync(Database, """
             DELETE FROM worf.sequence_range_node WHERE node_name LIKE 'made_up_%';
@@ -1250,8 +1251,30 @@ public sealed class SequenceRangeTests
         foreach (TestNode node in nodes)
         {
             Assert.IsTrue(await node.PollQueryUntilAsync(Database, "SELECT worf.snowflake_node() IS NOT NULL", token), $"{node.Name}'s node number");
-
             numbers[node] = await node.SafePsqlAsync(Database, "SELECT worf.snowflake_node()", token);
+        }
+
+        // node_b keeps when it last heard from node_a, the owner of the numbers, recorded within an hour, though it issues
+        // no IDs, so that it keeps its number and issues IDs after a restart while node_a is down. node_a's report stays
+        // as it is meanwhile, since the time its clock is reserved to moves only while it issues IDs.
+        string ownerId = await nodeA.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
+        string ownerRow = $"seqoid = 'worf.snowflake_node'::regclass AND node_id = {ownerId}";
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, $"""
+            SELECT n.watermark = r.watermark AND n.holds = ARRAY[{numbers[nodeA]}]::bigint[]
+            FROM worf.sequence_range_node n JOIN worf.sequence_range r ON r.seqoid = n.seqoid WHERE n.{ownerRow}
+            """, token), "node_b heard node_a's last report");
+        _ = await nodeB.SafePsqlAsync(Database, $"UPDATE worf.sequence_range_node SET reported_at = now() - interval '13 hours' WHERE {ownerRow}", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, $"SELECT reported_at > now() - interval '1 hour' FROM worf.sequence_range_node WHERE {ownerRow}", token),
+            "node_b recorded hearing from node_a");
+        await nodeA.StopAsync("fast", token);
+        await nodeB.StopAsync("fast", token);
+        await nodeB.StartServerAsync(token);
+        Assert.AreEqual($"{numbers[nodeB]}|t", await nodeB.SafePsqlAsync(Database, "SELECT worf.snowflake_node(), worf.snowflake_id() IS NOT NULL", token),
+            "node_b's node number and an ID after a restart");
+        await nodeA.StartServerAsync(token);
+
+        foreach (TestNode node in nodes)
+        {
             _ = await node.SafePsqlAsync(Database, """
                 CREATE TABLE s (n serial PRIMARY KEY, id bigint NOT NULL DEFAULT worf.snowflake_id());
                 CREATE ROLE app;
@@ -1270,19 +1293,8 @@ public sealed class SequenceRangeTests
         _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.reset_sequence_range()", token);
         Assert.AreEqual(numbers[nodeB], await nodeB.SafePsqlAsync(Database, "SELECT worf.snowflake_node()", token));
 
-        // A restart keeps the clock where it was. node_b, which issues no IDs meanwhile, keeps when it last heard from
-        // node_a, the owner of the numbers, recorded within an hour, so that it keeps its number and issues IDs after a
-        // restart while node_a is down.
-        string ownerId = await nodeA.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
-        string heardOwner = $"WHERE seqoid = 'worf.snowflake_node'::regclass AND node_id = {ownerId}";
-        _ = await nodeB.SafePsqlAsync(Database, $"UPDATE worf.sequence_range_node SET reported_at = now() - interval '13 hours' {heardOwner}", token);
-        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, $"SELECT reported_at > now() - interval '1 hour' FROM worf.sequence_range_node {heardOwner}", token),
-            "node_b recorded hearing from node_a");
+        // A restart keeps the clock where it was.
         await nodeA.StopAsync("fast", token);
-        await nodeB.StopAsync("fast", token);
-        await nodeB.StartServerAsync(token);
-        Assert.AreEqual(numbers[nodeB], await nodeB.SafePsqlAsync(Database, "SELECT worf.snowflake_node()", token), "node_b's node number after a restart");
-        _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO s (n) SELECT g FROM generate_series(5001, 5100) g", token);
         await nodeA.StartServerAsync(token);
         Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT worf.snowflake_node() IS NOT NULL", token), "node_a's node number after a restart");
         _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO s (n) SELECT g FROM generate_series(5001, 5100) g", token);
