@@ -973,13 +973,14 @@ internal static partial class ReplicationSet
 
         // pg_class as it is now, as PostgreSQL reads it for a catalog's file.
         RelationData* pgClass = NativeMethods.table_open(PgClassRelationId, AccessShareLock);
+        SnapshotData* snapshot = NativeMethods.RegisterSnapshot(NativeMethods.GetNonHistoricCatalogSnapshot(PgClassRelationId));
         ScanKeyData key;
         NativeMethods.ScanKeyInit(&key, AnumPgClassOid, BtEqualStrategyNumber, FOideq, index->rd_id);
-        SysScanDescData* scan = NativeMethods.systable_beginscan(pgClass, PgClassOidIndexId, true,
-            NativeMethods.GetNonHistoricCatalogSnapshot(PgClassRelationId), 1, &key);
+        SysScanDescData* scan = NativeMethods.systable_beginscan(pgClass, PgClassOidIndexId, true, snapshot, 1, &key);
         HeapTupleData* tuple = NativeMethods.systable_getnext(scan);
         bool current = tuple is not null && ((FormData_pg_class*)NativeMethods.GETSTRUCT(tuple))->relfilenode == index->rd_rel->relfilenode;
         NativeMethods.systable_endscan(scan);
+        NativeMethods.UnregisterSnapshot(snapshot);
         NativeMethods.table_close(pgClass, AccessShareLock);
         return current;
     }
