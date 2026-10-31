@@ -934,8 +934,8 @@ public sealed class SequenceRangeTests
         _ = await nodeA.SafePsqlAsync(Database, """
             INSERT INTO t (v) SELECT 'node_a' FROM generate_series(1, 10);
             INSERT INTO padding SELECT g, repeat(md5(g::text), 4) FROM generate_series(1, 2000) g;
-            SELECT worf.wait_slot_confirm_lsn(NULL, NULL);
             """, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
         HashSet<string> drawnBehind = [.. (await nodeB.SafePsqlAsync(Database, "SELECT id FROM t WHERE v = 'node_a'", token)).Split('\n')];
         await nodeB.StopAsync("fast", token);
         int behind = nodeA.ReadLog().Length;
@@ -951,10 +951,8 @@ public sealed class SequenceRangeTests
         }
 
         // node_a writes past where node_b applied its changes to, so that node_b's subscription streams them again.
-        _ = await nodeA.SafePsqlAsync(Database, """
-            INSERT INTO padding SELECT g, repeat(md5(g::text), 4) FROM generate_series(10001, 14000) g;
-            SELECT worf.wait_slot_confirm_lsn(NULL, NULL);
-            """, token);
+        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO padding SELECT g, repeat(md5(g::text), 4) FROM generate_series(10001, 14000) g", token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
 
         // node_a, which only answers node_b's calls, is copied, grants node_b more, and is recovered from the copy to a
         // point after that. node_b may draw hundreds of values from the blocks it already holds, so it inserts until
