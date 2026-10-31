@@ -126,7 +126,11 @@ behind but does not completely eliminate the possibility.
 A sequence's state goes to the subscriber's sequence of the same schema and
 name. If the subscriber has none, as after the sequence is renamed on only one
 node, apply stops at the state with an error, as it does at a change to a
-missing table, until there is one.
+missing table, until there is one. To go on without it, remove the sequence
+from its replication sets on the provider with
+`worf.replication_set_remove_sequence`: apply skips, with a warning, the state
+of a sequence it doesn't have once the provider replicates none of that name to
+the subscription.
 
 It might be desirable to call `synchronize_sequence` to ensure all subscribers
 have up to date information about given sequence after "big events" in the

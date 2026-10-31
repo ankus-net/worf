@@ -1370,17 +1370,30 @@ internal static unsafe partial class Apply
         }
 
         // The state goes to the sequence of the same name. One missing here, as after a rename on either node, stops
-        // apply as a missing table does, rather than leaving the sequence behind the provider's unseen.
+        // apply as a missing table does, rather than leaving the sequence behind the provider's unseen, until there is
+        // one or the provider no longer replicates a sequence of that name to this subscription.
         uint reloid;
         fixed (byte* cnspname = Worf.ToServerCString(nspname))
         fixed (byte* crelname = Worf.ToServerCString(relname))
         {
-            reloid = NativeMethods.get_relname_relid((sbyte*)crelname, NativeMethods.get_namespace_oid((sbyte*)cnspname, false));
+            uint nspoid = NativeMethods.get_namespace_oid((sbyte*)cnspname, true);
+            reloid = nspoid == 0 ? 0 : NativeMethods.get_relname_relid((sbyte*)crelname, nspoid);
         }
 
         if (reloid == 0)
         {
-            throw new PgException(PgSqlStates.UndefinedTable, $"relation \"{nspname}.{relname}\" does not exist");
+            WorfSubscription sub = MySubscription!;
+            using (PgReplicationConnection conn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "sequence"))
+            {
+                if (!Rpc.RemoteReplicatesSequence(conn, nspname, relname, sub.ReplicationSets))
+                {
+                    PgLog.Warning($"skipping the state of sequence {nspname}.{relname}, which doesn't exist here and which provider {sub.Origin.Name} doesn't replicate");
+                    return;
+                }
+            }
+
+            throw new PgException(PgSqlStates.UndefinedTable, $"relation \"{nspname}.{relname}\" does not exist",
+                hint: $"Create the sequence, or remove it from its replication set on provider {sub.Origin.Name}.");
         }
 
         // A managed sequence's position is this node's own, and the provider's would fall outside its block.

@@ -96,10 +96,12 @@ INSERT INTO public.test_publicschema VALUES(4, 'd');
 INSERT INTO "strange.schema-IS".test_strangeschema VALUES(3, DEFAULT);
 INSERT INTO "strange.schema-IS".test_strangeschema VALUES(4, DEFAULT);
 
--- The subscriber has no sequence of this name, as after a rename on either node, so apply stops at its state, as at a
--- change to a missing table, until there is one.
+-- The subscriber has no sequences of these names, as after a rename on either node, so apply stops at their states, as
+-- at a change to a missing table, until there is one, or until the provider no longer replicates one of the name.
 CREATE SEQUENCE public.test_provider_only_seq;
 SELECT * FROM worf.replication_set_add_sequence('default', 'test_provider_only_seq');
+CREATE SEQUENCE public.test_removed_seq;
+SELECT * FROM worf.replication_set_add_sequence('default', 'test_removed_seq');
 
 SELECT worf.synchronize_sequence(c.oid)
   FROM pg_class c, pg_namespace n
@@ -124,9 +126,15 @@ ALTER SEQUENCE public.test_renamed_seq RENAME TO test_provider_only_seq;
 
 \c :provider_dsn
 
+SELECT * FROM worf.replication_set_remove_sequence('default', 'test_removed_seq');
+
+BEGIN;
+SET LOCAL statement_timeout = '60s';
 SELECT worf.wait_slot_confirm_lsn(NULL, NULL);
+COMMIT;
 
 DROP SEQUENCE public.test_provider_only_seq CASCADE;
+DROP SEQUENCE public.test_removed_seq;
 
 \c :subscriber_dsn
 SELECT last_value > 1000 FROM public.test_provider_only_seq;
