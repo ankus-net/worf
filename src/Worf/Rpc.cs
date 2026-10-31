@@ -128,22 +128,28 @@ internal static class Rpc
     }
 
     /// <summary>
-    /// Checks whether a remote replication slot exists.
+    /// Checks whether a remote replication slot can stream: it exists, and PostgreSQL hasn't invalidated it, as for
+    /// <c>max_slot_wal_keep_size</c>, which every version from 15 shows as a lost WAL status.
     /// </summary>
     /// <param name="conn">The provider connection, inside a local transaction.</param>
     /// <param name="slotName">The slot.</param>
-    /// <returns>Whether it does.</returns>
-    internal static bool RemoteSlotExists(PgReplicationConnection conn, string slotName)
+    /// <returns>Why it can't stream, or null when it can.</returns>
+    internal static string? RemoteSlotLost(PgReplicationConnection conn, string slotName)
     {
+        IReadOnlyList<string?[]> res;
         try
         {
-            return conn.Query("SELECT 1 FROM pg_catalog.pg_replication_slots WHERE slot_name = " + Spi.QuoteLiteral(slotName), 1).Count > 0;
+            res = conn.Query("SELECT wal_status FROM pg_catalog.pg_replication_slots WHERE slot_name = " + Spi.QuoteLiteral(slotName), 1);
         }
         catch (PgRemoteException error)
         {
             throw new PgException(PgSqlStates.InternalError, "getting remote slot info failed",
                 detail: $"SELECT FROM pg_catalog.pg_replication_slots failed with: ERROR:  {error.Message}\n");
         }
+
+        return res.Count == 0 ? $"Replication slot \"{slotName}\" does not exist on the provider."
+            : res[0][0] == "lost" ? $"Replication slot \"{slotName}\" on the provider was invalidated."
+            : null;
     }
 
     /// <summary>
@@ -170,15 +176,15 @@ internal static class Rpc
     }
 
     /// <summary>
-    /// Stops the process that holds a remote replication slot when it's a walsender of an earlier connection like this
-    /// one, with the same user and application name, as one whose connection has closed still is while it decodes a
-    /// transaction.
+    /// Stops the process that holds a remote replication slot when it's a walsender of an earlier connection with this
+    /// one's user and an application name, as one whose connection has closed still is while it decodes a transaction.
     /// </summary>
     /// <param name="conn">The provider connection, inside a local transaction.</param>
     /// <param name="slotName">The slot.</param>
     /// <param name="holder">The process that held the slot.</param>
+    /// <param name="applicationName">The application name of the connections whose walsenders are stopped.</param>
     /// <returns>Why the process wasn't stopped, or null when it was.</returns>
-    internal static string? TerminateSlotHolder(PgReplicationConnection conn, string slotName, int holder)
+    internal static string? TerminateSlotHolder(PgReplicationConnection conn, string slotName, int holder, string applicationName)
     {
         try
         {
@@ -188,7 +194,7 @@ internal static class Rpc
                     JOIN pg_catalog.pg_replication_slots s ON s.active_pid = a.pid
                 WHERE s.slot_name = {Spi.QuoteLiteral(slotName)} AND a.pid = {holder.ToString(CultureInfo.InvariantCulture)}
                     AND a.pid <> pg_catalog.pg_backend_pid() AND a.backend_type = 'walsender' AND a.usename = session_user
-                    AND a.application_name = pg_catalog.current_setting('application_name')
+                    AND a.application_name = {Spi.QuoteLiteral(applicationName)}
                 """, 1);
             return res.Count == 0 ? "It isn't a walsender of this table sync's earlier connections, which the sync stops."
                 : res[0][0] == "t" ? null

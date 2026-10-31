@@ -83,9 +83,13 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   after a copy handle failures the same way, streaming from their slot again.
   When a walsender of their earlier connection, with the same user and
   application name, still holds the slot after a second, they stop it; they
-  wait for anything else with a warning, and fail after a minute. One that
-  fails after its copy catches up again from where it got to when it restarts,
-  while its slot remains, rather than copying again. The default is `error`.
+  wait for anything else with a warning, and fail after a minute. Their
+  cleanup, which drops the slot, does the same, and leaves a slot that
+  something else still holds after a minute, with a warning. One that stops
+  after its copy has committed catches up again from where it got to when it
+  restarts, rather than copying again; when its slot is gone or invalidated,
+  or its origin has no progress, it truncates the table and copies it again.
+  The default is `error`.
 
 - `worf.enable_ddl_replication`
   Replicates DDL as it runs, through the `ddl_sql` replication set as

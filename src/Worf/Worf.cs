@@ -1106,19 +1106,28 @@ internal static partial class Worf
         NativeMethods.table_close(rel, (int)PgLockMode.AccessShare);
     }
 
+    /// <summary>
+    /// Gets the application name a connection made with <see cref="Connect"/> or <see cref="ConnectReplica"/> has.
+    /// </summary>
+    /// <param name="connname">The name the connection's application name starts with.</param>
+    /// <param name="suffix">The application name's suffix, or null.</param>
+    /// <returns>The application name.</returns>
+    internal static string ApplicationName(string connname, string? suffix)
+    {
+        if (suffix is null)
+        {
+            return connname;
+        }
+
+        string applicationName = $"{ShortenHash(connname, Worker.NameDataLen - ToServer(suffix).Length - 2)}_{suffix}";
+        byte[] bytes = ToServer(applicationName);
+        return bytes.Length > Worker.NameDataLen - 1 ? FromServer(bytes.AsSpan(0, Worker.NameDataLen - 1)) : applicationName;
+    }
+
     private static PgReplicationConnection ConnectBase(string connstr, string appname, string? suffix, bool replication)
     {
         string s = ExtraConnectionOptions + " " + connstr;
-        string applicationName = appname;
-        if (suffix is not null)
-        {
-            applicationName = $"{ShortenHash(appname, Worker.NameDataLen - ToServer(suffix).Length - 2)}_{suffix}";
-            byte[] bytes = ToServer(applicationName);
-            if (bytes.Length > Worker.NameDataLen - 1)
-            {
-                applicationName = FromServer(bytes.AsSpan(0, Worker.NameDataLen - 1));
-            }
-        }
+        string applicationName = ApplicationName(appname, suffix);
 
         // We use the connection string as the base and pass some extra options after it, which override the ones it
         // names, as libpq's expand_dbname does.

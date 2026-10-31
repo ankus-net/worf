@@ -2726,6 +2726,15 @@ internal static unsafe partial class Apply
                 // Relay origins this worker no longer needs give their slots up to the sync worker's origin.
                 ReclaimRelayOrigins();
 
+                // One that stopped while it asked this worker to stop for its catch-up left the request, which the
+                // new one would find answered before it's ready. It asks again once it is.
+                if (sync.Status == Sync.SyncStatusSyncwait)
+                {
+                    sync.Status = Sync.SyncStatusCatchup;
+                    PgBackgroundWorker.RunTransaction(() =>
+                        Sync.SetTableSyncStatus(subid, sync.Nspname, sync.Relname, sync.Status, sync.Statuslsn));
+                }
+
                 StartSyncWorker(sync.Nspname, sync.Relname);
                 break;
             }
