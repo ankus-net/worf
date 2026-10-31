@@ -194,6 +194,40 @@ SELECT worf.wait_slot_confirm_lsn(NULL, NULL);
 
 SELECT * FROM "strange.schema-IS".test_diff_repset;
 
+-- A walsender that starts after the set stops replicating inserts still replicates the ones made before.
+SELECT worf.alter_subscription_disable('test_subscription', true);
+
+\c :provider_dsn
+
+DO $$
+BEGIN
+	FOR i IN 1..100 LOOP
+		IF NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE active) THEN
+			RETURN;
+		END IF;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END;
+$$;
+
+INSERT INTO "strange.schema-IS".test_diff_repset VALUES(7);
+SELECT * FROM worf.alter_replication_set('repset_test', replicate_insert := false);
+INSERT INTO "strange.schema-IS".test_diff_repset VALUES(8);
+
+\c :subscriber_dsn
+
+SELECT worf.alter_subscription_enable('test_subscription', true);
+
+\c :provider_dsn
+
+SELECT worf.wait_slot_confirm_lsn(NULL, NULL);
+
+SELECT * FROM worf.alter_replication_set('repset_test', replicate_insert := true);
+
+\c :subscriber_dsn
+
+SELECT * FROM "strange.schema-IS".test_diff_repset;
+
 SELECT * FROM worf.alter_subscription_add_replication_set('test_subscription', 'default');
 
 DO $$

@@ -156,6 +156,12 @@ internal sealed class WorfOutputData
     public List<WorfRepSet> ReplicationSets { get; set; } = [];
 
     /// <summary>
+    /// Gets or sets the historic snapshot the replication sets' actions were last read under, as its xmin, xmax,
+    /// count of committed transactions and command id, or null to read them at the next change.
+    /// </summary>
+    public (uint Xmin, uint Xmax, uint Xcnt, uint Curcid)? ActionsSnapshot { get; set; }
+
+    /// <summary>
     /// Gets or sets the only table to replicate, as schema and name, or null.
     /// </summary>
     public (string Schemaname, string Relname)? ReplicateOnlyTable { get; set; }
