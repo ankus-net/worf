@@ -197,8 +197,8 @@ internal static class SequenceRangeExchange
 
                 // An exchange that changed nothing while something waits makes the next one wait longer, up to the
                 // exchange interval, since the neighbor may not answer it for long, as when a root can't start or a
-                // fence waits on a node that is down, though no more than ten check intervals while the provider's
-                // fence holds.
+                // fence waits on a node that is down, though no more than ten check intervals while the fence of the
+                // provider, or of an allocator behind it, holds.
                 if (received || granted || waiting is null)
                 {
                     _ = s_waits.Remove(sub.Id);
@@ -459,15 +459,17 @@ internal static class SequenceRangeExchange
 
     /// <summary>
     /// Lists what this node waits on with a neighbor: its requests open with the neighbor, its grants the neighbor
-    /// hasn't acknowledged, and resets to ask of it or acknowledge, and whether either is a fenced allocator, which
-    /// waits on its neighbors' reports.
+    /// hasn't acknowledged, and resets to ask of it or acknowledge, and whether a fenced allocator, which waits on its
+    /// neighbors' reports, holds it up: the neighbor, or one that a request open with the neighbor waits on in turn, as
+    /// the owner behind a pool holder.
     /// </summary>
-    /// <returns>What waits, or null when nothing does, and whether the neighbor is a fenced allocator.</returns>
+    /// <returns>What waits, or null when nothing does, and whether a fenced allocator holds it up.</returns>
     private static (string? What, bool Fenced) Waiting(uint neighbor)
     {
         SpiResult waiting = Worf.Read("""
             SELECT string_agg(what, ' ' ORDER BY what), coalesce(bool_or(fenced), false) FROM (
-                SELECT request_id::text, false FROM worf.sequence_range_request WHERE parent_node = $1 AND state = 'open'
+                SELECT q.request_id::text, EXISTS (SELECT 1 FROM worf.sequence_range_node n WHERE n.seqoid = q.seqoid AND n.state = 'fenced')
+                FROM worf.sequence_range_request q WHERE q.parent_node = $1 AND q.state = 'open'
                 UNION ALL
                 SELECT grant_id::text, false FROM worf.sequence_range_grant WHERE grantee_id = $1 AND state = 'sent'
                 UNION ALL
