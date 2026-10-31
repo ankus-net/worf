@@ -1003,7 +1003,7 @@ internal static unsafe partial class Apply
 
     /// <summary>
     /// Has this worker give up the slots of relay origins it no longer needs when a worker found none free since it
-    /// last looked, or, every ten seconds, when another user of origins has none.
+    /// last looked, or, every ten seconds, when an enabled PostgreSQL subscription's origin has none.
     /// </summary>
     private static void ReclaimRelayOriginsIfWanted()
     {

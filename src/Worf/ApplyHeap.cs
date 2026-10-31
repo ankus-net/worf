@@ -75,13 +75,14 @@ internal static unsafe class ApplyHeap
         RelationData* relation = rel.Rel;
         HeapTupleData* localtuple = LocalTuple(local);
         HeapTupleData* remotetuple = FormTuple(relation, newtup);
-        long localTs = local.CommitTime?.MicrosecondsSinceEpoch ?? 0;
+        (PgTimestampTz? commitTime, ushort commitOrigin) = CommitInfo(relation, local);
+        long localTs = commitTime?.MicrosecondsSinceEpoch ?? 0;
 
-        bool apply = Conflict.TryResolveConflict(local.CommitOrigin, local.TransactionId, localTs, localtuple, remotetuple,
+        bool apply = Conflict.TryResolveConflict(commitOrigin, local.TransactionId, localTs, localtuple, remotetuple,
             out HeapTupleData* applytuple, out WorfConflictResolution resolution);
 
         Conflict.ReportConflict(WorfConflictType.InsertInsert, rel, localtuple, null, remotetuple, applytuple, resolution,
-            local.TransactionId, local.CommitTime is not null, local.CommitOrigin, localTs, local.IndexOid,
+            local.TransactionId, commitTime is not null, commitOrigin, localTs, local.IndexOid,
             relation->trigdesc is not null && relation->trigdesc->trig_insert_before_row);
 
         if (apply)
@@ -121,24 +122,25 @@ internal static unsafe class ApplyHeap
         }
 
         bool apply = true;
-        long localTs = local.CommitTime?.MicrosecondsSinceEpoch ?? 0;
+        (PgTimestampTz? commitTime, ushort commitOrigin) = CommitInfo(relation, local);
+        long localTs = commitTime?.MicrosecondsSinceEpoch ?? 0;
         HeapTupleData* localtuple = null;
 
         // If the local tuple was previously updated by different transaction on different server, consider this to be
         // conflict and resolve it. One that came through this subscription, from any node its provider relays, came
         // in order.
-        if (local.CommitTime is not null &&
+        if (commitTime is not null &&
             local.TransactionId != NativeMethods.GetTopTransactionId() &&
-            !Apply.IsOwnStream(local.CommitOrigin, local.TransactionId))
+            !Apply.IsOwnStream(commitOrigin, local.TransactionId))
         {
             localtuple = LocalTuple(local);
             HeapTupleData* remotetuple = ModifyTuple(localtuple, relation, newtup);
 
-            apply = Conflict.TryResolveConflict(local.CommitOrigin, local.TransactionId, localTs, localtuple, remotetuple,
+            apply = Conflict.TryResolveConflict(commitOrigin, local.TransactionId, localTs, localtuple, remotetuple,
                 out HeapTupleData* applytuple, out WorfConflictResolution resolution);
 
             Conflict.ReportConflict(WorfConflictType.UpdateUpdate, rel, localtuple, oldtup, remotetuple, applytuple,
-                resolution, local.TransactionId, true, local.CommitOrigin, localTs, local.IndexOid,
+                resolution, local.TransactionId, true, commitOrigin, localTs, local.IndexOid,
                 relation->trigdesc is not null && relation->trigdesc->trig_update_before_row);
         }
 
@@ -301,6 +303,20 @@ internal static unsafe class ApplyHeap
 
     private static HeapTupleData* LocalTuple(PgFoundRow local)
         => (HeapTupleData*)local.Row.DangerousToNative(PgMemoryContext.Current);
+
+    /// <summary>
+    /// Gets when a local row's transaction committed and its replication origin, which a row older than its table's
+    /// <c>relfrozenxid</c>, frozen by vacuum, has neither of, as PostgreSQL treats it, though PostgreSQL can still keep
+    /// them: worf forgets which node and subscription an origin applied for in transactions that old.
+    /// </summary>
+    /// <param name="relation">The row's table.</param>
+    /// <param name="local">The row.</param>
+    /// <returns>The commit time and origin, or null and zero.</returns>
+    private static (PgTimestampTz? Time, ushort Origin) CommitInfo(RelationData* relation, PgFoundRow local)
+        => local.CommitTime is null ||
+            Worf.FullTransactionId(local.TransactionId) < Worf.FullTransactionId(relation->rd_rel->relfrozenxid)
+            ? (null, 0)
+            : (local.CommitTime, local.CommitOrigin);
 
     private static HeapTupleData* FormTuple(RelationData* relation, WorfTupleData tuple)
     {

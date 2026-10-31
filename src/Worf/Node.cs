@@ -776,9 +776,10 @@ internal sealed partial class WorfNode
     /// them for, or zeros for nothing. The record starts at the next transaction id to be given, rather than this
     /// transaction's, which can be older than another transaction's that dropped or created an origin with the id
     /// since; the caller holds the lock on the catalog that creating or dropping it took, which keeps others from
-    /// changing the id until it commits. A record that a later one supersedes for every transaction whose commit
-    /// timestamp PostgreSQL still keeps is forgotten, as only those rows carry their commit's origin. Apply runs this for
-    /// relay origins it creates and drops, so the statement is planned once.
+    /// changing the id until it commits. A record of any origin that a later one supersedes for every transaction since
+    /// this database's <c>datfrozenxid</c> is forgotten, as apply treats the rows of older transactions, which vacuum has
+    /// frozen, as having no commit origin, or since the oldest commit timestamp PostgreSQL keeps, when that's later.
+    /// Apply runs this for relay origins it creates and drops, so the statement is planned once.
     /// </summary>
     /// <returns>The full transaction id the record starts from.</returns>
     internal static ulong RecordOriginWriter(ushort origin, uint writerNodeId, uint subId)
@@ -789,15 +790,15 @@ internal sealed partial class WorfNode
                     INSERT INTO worf.origin_writer VALUES ($1, $2, $3, $4::text::xid8)
                     ON CONFLICT (roident, since_xid) DO UPDATE SET writer_node = excluded.writer_node, sub_id = excluded.sub_id),
                 kept AS (
-                    SELECT since_xid FROM worf.origin_writer
-                    WHERE roident = $1 AND since_xid <= $5::text::xid8
-                    ORDER BY since_xid DESC
-                    LIMIT 1)
-                DELETE FROM worf.origin_writer w USING kept WHERE w.roident = $1 AND w.since_xid < kept.since_xid
+                    SELECT roident, max(since_xid) AS since_xid FROM worf.origin_writer
+                    WHERE since_xid <= $5::text::xid8
+                    GROUP BY roident)
+                DELETE FROM worf.origin_writer w USING kept WHERE w.roident = kept.roident AND w.since_xid < kept.since_xid
                 """, [typeof(uint), typeof(uint), typeof(uint), typeof(long), typeof(long)]).Keep();
             ulong sinceXid = Worf.NextFullTransactionId;
+            ulong forgetBefore = Math.Max(Worf.DatabaseFrozenFullTransactionId, Worf.OldestCommitTsFullTransactionId);
             _ = s_recordOriginWriter.Execute(SpiParameter.Create((uint)origin), SpiParameter.Create(writerNodeId), SpiParameter.Create(subId),
-                SpiParameter.Create((long)sinceXid), SpiParameter.Create((long)Worf.OldestCommitTsFullTransactionId));
+                SpiParameter.Create((long)sinceXid), SpiParameter.Create((long)forgetBefore));
             return sinceXid;
         });
 
@@ -825,17 +826,21 @@ internal sealed partial class WorfNode
             """);
 
     /// <summary>
-    /// Checks whether every replication origin slot in shared memory is taken while an origin has none, as one that
-    /// another user of origins, such as a PostgreSQL subscription, can't set up has. Unlike worf's workers, those don't
-    /// say when they find no slot free.
+    /// Checks whether every replication origin slot in shared memory is taken while the origin of an enabled PostgreSQL
+    /// subscription, or of one of its table syncs, has none, as one its workers can't set up has. Unlike worf's
+    /// workers, those don't say when they find no slot free. An origin that nothing sets up, such as a disabled
+    /// subscription's or one a user created, has none too, and doesn't count.
     /// </summary>
     /// <returns>Whether one is.</returns>
     internal static bool OriginSlotWantedElsewhere()
         => Worf.ReadScalar<bool>("""
             SELECT count(*) >= coalesce(pg_catalog.current_setting('max_active_replication_origins', true),
                     pg_catalog.current_setting('max_replication_slots'))::integer AND
-                EXISTS (SELECT 1 FROM pg_catalog.pg_replication_origin o
-                    WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_replication_origin_status s WHERE s.local_id = o.roident))
+                EXISTS (SELECT 1 FROM pg_catalog.pg_subscription s
+                    JOIN pg_catalog.pg_replication_origin o
+                        ON o.roname = 'pg_' || s.oid OR starts_with(o.roname, 'pg_' || s.oid || '_')
+                    WHERE s.subenabled AND
+                        NOT EXISTS (SELECT 1 FROM pg_catalog.pg_replication_origin_status st WHERE st.local_id = o.roident))
             FROM pg_catalog.pg_replication_origin_status
             """);
 

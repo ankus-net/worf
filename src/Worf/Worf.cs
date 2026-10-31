@@ -259,6 +259,14 @@ internal static partial class Worf
     }
 
     /// <summary>
+    /// Gets the full id of this database's <c>datfrozenxid</c>, before which vacuum has frozen every row in its tables.
+    /// Vacuum moves it on as it freezes them.
+    /// </summary>
+    internal static ulong DatabaseFrozenFullTransactionId
+        => FullTransactionId((uint)ReadScalar<long>(
+            "SELECT datfrozenxid::text::bigint FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database()"));
+
+    /// <summary>
     /// Gets the replication origin of this session, <c>replorigin_session_origin</c>.
     /// </summary>
     internal static ushort ReploriginSessionOrigin

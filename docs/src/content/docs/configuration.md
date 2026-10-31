@@ -37,7 +37,9 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   The default value is `apply_remote`.
 
   The `keep_local`, `last_update_wins` and `first_update_wins` settings
-  require `track_commit_timestamp` PostgreSQL setting to be enabled.
+  require `track_commit_timestamp` PostgreSQL setting to be enabled. A row
+  older than its table's `relfrozenxid`, which vacuum has frozen, has no commit
+  timestamp or origin here, as in PostgreSQL, so changes to it don't conflict.
 
 - `worf.conflict_log_level`
   Sets the log level for reporting detected conflicts when the
