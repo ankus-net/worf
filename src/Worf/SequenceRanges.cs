@@ -2528,11 +2528,12 @@ internal static unsafe partial class SequenceRanges
             WHERE c.oid = $1
             """, 1, SpiParameter.Create(seqoid));
 
-        // A switch's ALTER SEQUENCE writes the sequence to a new file. Its block is visible once it commits, a moment
-        // before other sessions learn of the new file, so a read that takes no lock ALTER SEQUENCE waits on can pair the
-        // new block with the old position, the quarantine's at the start. The read takes the lock nextval takes, which
-        // waits for a switch to finish committing, and lets it go once done, so that it holds off no switch for the rest
-        // of the transaction.
+        // A switch's ALTER SEQUENCE writes the sequence to a new file and empties the old one as it commits, under a
+        // lock that a read doesn't wait on, so a read that opened the old file just before could find it empty. Its
+        // block is also visible a moment before other sessions learn of the new file, so such a read could pair the new
+        // block with the old position, the quarantine's at the start. The read takes the lock nextval takes, which
+        // waits for a switch to finish committing, and lets it go once done, so that it holds off no switch for the
+        // rest of the transaction.
         NativeMethods.LockRelationOid(seqoid, (int)PgLockMode.RowExclusive);
         try
         {
