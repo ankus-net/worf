@@ -734,9 +734,11 @@ public sealed class SequenceRangeTests
         await nodeB.StopAsync("immediate", token);
         await RestoreDataAsync(nodeB, standby, token, running: false, standby: true);
 
-        // Until it is promoted, the standby refuses node_c's calls whole and has no Snowflake number of its own, while
-        // its view still reads.
+        // Until it is promoted, the standby refuses node_c's calls whole and reservations at once, and has no Snowflake
+        // number of its own, while its view still reads.
         Assert.IsTrue(await nodeB.PollLogAsync(logpos, "cannot exchange sequence ranges during recovery", token), "the standby refused node_c");
+        Assert.AreEqual("25006", (await Assert.ThrowsExactlyAsync<PostgresException>(() => nodeB.SafePsqlAsync(Database,
+            "SELECT worf.reserve_sequence_range('t_id_seq', 10, '5s')", token))).SqlState);
         Assert.AreEqual("", await nodeB.SafePsqlAsync(Database, "SELECT worf.snowflake_node()", token));
         Assert.AreEqual("t", await nodeB.SafePsqlAsync(Database, "SELECT count(values_left) > 0 FROM worf.sequence_ranges", token));
         (int promoted, string output) = await nodeB.RunProgramAsync("pg_ctl", ["promote", "-w", "-D", nodeB.Cluster.DataDirectory], token);
