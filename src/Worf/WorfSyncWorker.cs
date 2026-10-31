@@ -32,9 +32,4 @@ internal struct WorfSyncWorker
     /// start.
     /// </summary>
     public bool CopyAllowed;
-
-    /// <summary>
-    /// Whether the worker holds off writes to the table until its copy commits, so the apply worker can go on.
-    /// </summary>
-    public bool CopyLocked;
 }

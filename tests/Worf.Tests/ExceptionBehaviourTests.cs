@@ -205,7 +205,8 @@ public sealed class ExceptionBehaviourTests
     /// <summary>
     /// A change that deadlocks with a local transaction while discard applies its transaction again is applied
     /// again with it once the deadlock clears, rather than skipped as if its data were at fault. A table sync worker
-    /// catching up after its copy discards a failed change as the apply worker does, rather than copying again.
+    /// catching up after its copy applies the changes the apply worker passed over, though that worker restarted since,
+    /// and discards a failed change as the apply worker does, rather than copying again.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -270,7 +271,9 @@ public sealed class ExceptionBehaviourTests
             FROM worf.exception_log
             """, token));
 
-        // The sync worker's copy waits on a lock here until a change it applies after the copy has committed.
+        // The sync worker's copy waits here on a row a local transaction inserts, while apply passes over changes to
+        // the table that commit after the copy's snapshot, and then restarts on a failed change elsewhere. The copy's
+        // catch-up applies the changes all the same, and discards the failed one as apply does.
         foreach (TestNode node in new[] { provider, subscriber })
         {
             _ = await node.SafePsqlAsync(Database, "CREATE TABLE synced (id integer PRIMARY KEY, v text CHECK (v <> 'bad'))", token);
@@ -280,7 +283,7 @@ public sealed class ExceptionBehaviourTests
         await using (NpgsqlConnection local = await subscriber.OpenAsync(Database, token))
         {
             await using NpgsqlTransaction transaction = await local.BeginTransactionAsync(token);
-            await using (NpgsqlCommand command = new("LOCK TABLE synced", local, transaction))
+            await using (NpgsqlCommand command = new("INSERT INTO synced VALUES (1, 'local')", local, transaction))
             {
                 _ = await command.ExecuteNonQueryAsync(token);
             }
@@ -290,6 +293,10 @@ public sealed class ExceptionBehaviourTests
             Assert.IsTrue(await provider.PollQueryUntilAsync(Database,
                 "SELECT count(*) = 2 FROM pg_replication_slots WHERE slot_name LIKE 'worf%'", token), "the sync worker's slot");
             _ = await provider.SafePsqlAsync(Database, "INSERT INTO synced VALUES (2, 'bad'), (3, 'good')", token);
+            _ = await provider.SafePsqlAsync(Database, "INSERT INTO t VALUES (2, 'bad')", token);
+            Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+                "SELECT EXISTS (SELECT 1 FROM worf.exception_log WHERE table_name = 't' AND remote_new_tuple->>'id' = '2')", token),
+                "apply restarted past the changes to synced");
             await transaction.RollbackAsync(token);
         }
 
