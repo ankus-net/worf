@@ -30,6 +30,10 @@ internal static unsafe partial class LocalIndex
     // The indexes the running statement built, with their names then, which a reindex swaps with those they replace.
     private static readonly List<(uint Oid, string Name)> s_built = [];
 
+    // The indexes of the tables a concurrent reindex builds indexes for, by their names before it swaps them, as each
+    // index built takes the name of the one it replaces.
+    private static readonly Dictionary<(uint Table, string Name), uint> s_namedBefore = [];
+
     // The tables and names of the local indexes dropped to be built again, as ALTER TABLE drops an index to build it
     // again for a column's new type.
     private static readonly List<(uint Table, string Name)> s_rebuilding = [];
@@ -52,13 +56,9 @@ internal static unsafe partial class LocalIndex
             return false;
         }
 
-        if (!s_callbackRegistered)
-        {
-            NativeMethods.RegisterXactCallback(TransactionCallback, null);
-            s_callbackRegistered = true;
-        }
-
+        RegisterCallback();
         s_built.Clear();
+        s_namedBefore.Clear();
         s_tracking = true;
         s_reindexing = reindexing;
         return true;
@@ -116,8 +116,11 @@ internal static unsafe partial class LocalIndex
             return;
         }
 
+        // The index built again is tracked as the transaction commits, if not at the transaction's next statement, so
+        // that other sessions find it on this node alone too.
         if (internalDrop)
         {
+            RegisterCallback();
             s_rebuilding.Add((NativeMethods.IndexGetRelation(relid, false), Worf.FromServer(NativeMethods.get_rel_name(relid))));
         }
 
@@ -169,7 +172,151 @@ internal static unsafe partial class LocalIndex
             }
         }
 
+        if (s_reindexing && local.Count > 0)
+        {
+            NoteNames([.. local.Select(relid => NativeMethods.IndexGetRelation(relid, false)).Distinct()]);
+        }
+
         Track(local);
+    }
+
+    /// <summary>
+    /// Notes the names of the indexes of tables that a concurrent reindex builds indexes for, before it swaps them.
+    /// </summary>
+    private static void NoteNames(List<uint> tables)
+    {
+        SpiResult result = Worf.Read("""
+            SELECT i.indrelid, i.indexrelid, c.relname::pg_catalog.text FROM pg_catalog.pg_index i
+                JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
+            WHERE i.indrelid = ANY ($1::pg_catalog.int8[]::pg_catalog.oid[])
+            """, 0, SpiParameter.Create(tables.Select(table => (long)table).ToArray()));
+        foreach (SpiRow row in result)
+        {
+            s_namedBefore[(row.Get<uint>(0), row.Get<string>(2))] = row.Get<uint>(1);
+        }
+    }
+
+    /// <summary>
+    /// Reads how the indexes on this node alone are tied to other objects, before DDL that replicates and may tie one
+    /// to them: as a partition of another index, its table's replica identity or clustering index, or by what depends
+    /// on it, or it on other than its table's columns, as a constraint that it becomes the index of, or a foreign key
+    /// that references its table by it.
+    /// </summary>
+    /// <param name="parsetree">The DDL.</param>
+    /// <returns>The ties, for <see cref="CheckTies"/>, or null when the DDL can't tie any.</returns>
+    internal static Dictionary<uint, (string Name, bool Partition, bool Identity, bool Clustered, long Dependencies)>? Ties(Node* parsetree)
+        => (parsetree->type is NodeTag.T_AlterTableStmt or NodeTag.T_CreateStmt ||
+                (parsetree->type == NodeTag.T_IndexStmt && !((IndexStmt*)parsetree)->concurrent)) && Worf.CatalogOid("local_index") != 0
+            ? ReadTies()
+            : null;
+
+    /// <summary>
+    /// Fails DDL that replicates and has tied an index on this node alone to more objects than before it ran, which
+    /// the other nodes, without the index, couldn't follow. DDL that changes the index alone stays on this node.
+    /// </summary>
+    /// <param name="before">The ties before the DDL ran.</param>
+    internal static void CheckTies(Dictionary<uint, (string Name, bool Partition, bool Identity, bool Clustered, long Dependencies)>? before)
+    {
+        if (before is null || before.Count == 0)
+        {
+            return;
+        }
+
+        NativeMethods.CommandCounterIncrement();
+        foreach ((uint relid, (string Name, bool Partition, bool Identity, bool Clustered, long Dependencies) after) in ReadTies())
+        {
+            if (before.TryGetValue(relid, out (string Name, bool Partition, bool Identity, bool Clustered, long Dependencies) tie) &&
+                ((after.Partition && !tie.Partition) || (after.Identity && !tie.Identity) || (after.Clustered && !tie.Clustered) ||
+                    after.Dependencies > tie.Dependencies))
+            {
+                throw new PgException("55000",
+                    $"cannot make objects on every node use index \"{tie.Name}\", which is on this node alone, while worf.enable_ddl_replication is on",
+                    hint: "A concurrent build or reindex that failed on this node left the index. Drop it, and build it again so that every node has it.");
+            }
+        }
+    }
+
+    private static Dictionary<uint, (string Name, bool Partition, bool Identity, bool Clustered, long Dependencies)> ReadTies()
+    {
+        Dictionary<uint, (string Name, bool Partition, bool Identity, bool Clustered, long Dependencies)> ties = [];
+        SpiResult result = Elevated.Run(() => Worf.Read("""
+            SELECT l.indexrelid, c.relname::pg_catalog.text, c.relispartition, i.indisreplident, i.indisclustered,
+                (SELECT pg_catalog.count(*) FROM pg_catalog.pg_depend d
+                    WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.objid = l.indexrelid
+                        AND (d.refclassid, d.refobjid) <> ('pg_catalog.pg_class'::pg_catalog.regclass, i.indrelid)) +
+                (SELECT pg_catalog.count(*) FROM pg_catalog.pg_depend d
+                    WHERE d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.refobjid = l.indexrelid)
+            FROM worf.local_index l
+                JOIN pg_catalog.pg_class c ON c.oid = l.indexrelid
+                JOIN pg_catalog.pg_index i ON i.indexrelid = l.indexrelid
+            """, 0));
+        foreach (SpiRow row in result)
+        {
+            ties[row.Get<uint>(0)] = (row.Get<string>(1), row.Get<bool>(2), row.Get<bool>(3), row.Get<bool>(4), row.Get<long>(5));
+        }
+
+        return ties;
+    }
+
+    /// <summary>
+    /// Moves the indexes on this node alone out of the way of DDL from another node, which, without them, may create
+    /// objects under their names, or choose names for its own that would otherwise differ from the other nodes'.
+    /// </summary>
+    /// <returns>The indexes moved, by their schemas, names and names meanwhile, for <see cref="MoveBack"/>.</returns>
+    internal static List<(uint Namespace, string Name, string Aside)> MoveAside()
+    {
+        List<(uint Namespace, string Name, string Aside)> moved = [];
+        if (Worf.CatalogOid("local_index") == 0)
+        {
+            return moved;
+        }
+
+        SpiResult result = Elevated.Run(() => Worf.Read("SELECT indexrelid FROM worf.local_index", 0));
+        foreach (SpiRow row in result)
+        {
+            uint relid = row.Get<uint>(0);
+            sbyte* name = NativeMethods.get_rel_name(relid);
+            if (name is null)
+            {
+                continue;
+            }
+
+            uint nspoid = NativeMethods.get_rel_namespace(relid);
+            sbyte* aside = NativeMethods.ChooseRelationName(name, null, Worf.PStrDup("worf_aside"), nspoid, false);
+            moved.Add((nspoid, Worf.FromServer(name), Worf.FromServer(aside)));
+            NativeMethods.RenameRelationInternal(relid, aside, true, true);
+            NativeMethods.CommandCounterIncrement();
+        }
+
+        return moved;
+    }
+
+    /// <summary>
+    /// Gives the indexes on this node alone that DDL from another node ran without their names back, or where the DDL
+    /// took one, a new name, with a warning.
+    /// </summary>
+    /// <param name="moved">The indexes moved.</param>
+    /// <param name="origin">The node the DDL came from.</param>
+    internal static void MoveBack(List<(uint Namespace, string Name, string Aside)> moved, string origin)
+    {
+        foreach ((uint nspoid, string name, string aside) in moved)
+        {
+            uint relid = NativeMethods.get_relname_relid(Worf.PStrDup(aside), nspoid);
+            if (relid == 0)
+            {
+                continue;
+            }
+
+            sbyte* target = Worf.PStrDup(name);
+            if (NativeMethods.get_relname_relid(target, nspoid) != 0)
+            {
+                target = NativeMethods.ChooseRelationName(target, null, Worf.PStrDup("local"), nspoid, false);
+                PgLog.Warning($"renamed index \"{name}\", which is on this node alone, to \"{Worf.FromServer(target)}\", as DDL from node {origin} took its name");
+            }
+
+            NativeMethods.RenameRelationInternal(relid, target, true, true);
+            NativeMethods.CommandCounterIncrement();
+        }
     }
 
     private static void Track(List<uint> relids)
@@ -204,6 +351,7 @@ internal static unsafe partial class LocalIndex
         {
             s_created.Clear();
             s_rebuilding.Clear();
+            s_namedBefore.Clear();
             s_tracking = false;
             s_reindexing = false;
             return;
@@ -237,17 +385,8 @@ internal static unsafe partial class LocalIndex
             }
 
             _ = s_built.Remove((relid, name));
-            uint replaced = Elevated.Run(() => Worf.ReadScalar<uint?>("""
-                SELECT o.indexrelid FROM pg_catalog.pg_index n
-                    JOIN pg_catalog.pg_index o ON o.indrelid = n.indrelid AND o.indexrelid <> n.indexrelid
-                WHERE n.indexrelid = $1 AND NOT o.indisvalid
-                    AND o.xmin::text::bigint = pg_catalog.pg_current_xact_id_if_assigned()::text::bigint % 4294967296
-                    AND o.indkey::text = n.indkey::text AND o.indclass::text = n.indclass::text
-                    AND o.indcollation::text = n.indcollation::text AND o.indoption::text = n.indoption::text
-                    AND pg_catalog.pg_get_expr(o.indexprs, o.indrelid) IS NOT DISTINCT FROM pg_catalog.pg_get_expr(n.indexprs, n.indrelid)
-                    AND pg_catalog.pg_get_expr(o.indpred, o.indrelid) IS NOT DISTINCT FROM pg_catalog.pg_get_expr(n.indpred, n.indrelid)
-                ORDER BY o.indexrelid LIMIT 1
-                """, SpiParameter.Create(relid)) ?? 0);
+            uint replaced = s_namedBefore.TryGetValue((NativeMethods.IndexGetRelation(relid, false), Worf.FromServer(current)), out uint before) &&
+                before != relid ? before : 0;
             if (replaced == 0 || !Contains(replaced))
             {
                 Write("DELETE FROM worf.local_index WHERE indexrelid = $1", SpiParameter.Create(relid));
@@ -257,6 +396,15 @@ internal static unsafe partial class LocalIndex
             {
                 Track([replaced]);
             }
+        }
+    }
+
+    private static void RegisterCallback()
+    {
+        if (!s_callbackRegistered)
+        {
+            NativeMethods.RegisterXactCallback(TransactionCallback, null);
+            s_callbackRegistered = true;
         }
     }
 

@@ -1454,8 +1454,11 @@ internal static unsafe partial class Apply
         }
 
         // A statement that runs concurrently commits along the way, which apply's transaction can't, so it runs
-        // in that transaction instead.
+        // in that transaction instead. The indexes on this node alone, which the origin doesn't have, are out of its
+        // way.
+        List<(uint Namespace, string Name, string Aside)> moved = LocalIndex.MoveAside();
         ExecuteSqlCommand(command.GetString()!, queuedMessage.Role, false, true);
+        LocalIndex.MoveBack(moved, MySubscription!.Origin.Name);
 
         NativeMethods.AtEOXact_GUC(true, saveNestlevel);
     }

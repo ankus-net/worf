@@ -153,12 +153,15 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   from its first commit, a node keeps holding back if its connection is lost,
   until it learns that the statement has ended. An index that such a build, or
   a concurrent `REINDEX`, leaves when it fails is on its node alone, as are
-  statements on it, however it's built again since. Drop it: until then a
-  unique one still rejects duplicates, so apply on its node stops at a row the
-  other nodes wrote that it rejects. A transaction holds each node back
-  through one connection, whatever the `idle_session_timeout` of its role. The
-  user in each provider connection string needs `USAGE` on schema `worf` and
-  `EXECUTE` on `worf.fence_writes`, `worf.unfence_writes` and
+  statements on it, however it's built again since. DDL that would make other
+  objects use it, as a constraint's, the replica identity, the clustering
+  index, a partition of another index, or for a foreign key, fails, and DDL
+  from another node that takes its name renames it, with a warning. Drop it:
+  until then a unique one still rejects duplicates, so apply on its node stops
+  at a row the other nodes wrote that it rejects. A transaction holds each
+  node back through one connection, whatever the `idle_session_timeout` of its
+  role. The user in each provider connection string needs `USAGE` on schema
+  `worf` and `EXECUTE` on `worf.fence_writes`, `worf.unfence_writes` and
   `worf.keep_fence`, which `PUBLIC` doesn't have. They let that user hold back
   writes to any table on the node, across restarts, and let go only of what
   the same session held back, so grant them only to the role other nodes
