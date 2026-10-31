@@ -1041,8 +1041,9 @@ public sealed class SequenceRangeTests
             _ = await node.SafePsqlAsync(Database, $"INSERT INTO mv (v) SELECT '{node.Name}' FROM generate_series(1, 20)", token);
         }
 
-        _ = await nodeA.SafePsqlAsync(Database, "DELETE FROM worf.sequence_range_grant WHERE seqoid = 'mv_id_seq'::regclass AND grantee_name = 'node_b'", token);
+        // node_b stops first, so that no report of its can bring the grants back before node_a resets.
         await nodeB.StopAsync("fast", token);
+        _ = await nodeA.SafePsqlAsync(Database, "DELETE FROM worf.sequence_range_grant WHERE seqoid = 'mv_id_seq'::regclass AND grantee_name = 'node_b'", token);
         int lost = nodeA.ReadLog().Length;
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.reset_sequence_range('mv_id_seq')", token);
         await Task.Delay(TimeSpan.FromSeconds(8), token);
@@ -2312,6 +2313,21 @@ public sealed class SequenceRangeTests
         }
 
         await node.StartServerAsync(token);
+
+        // A server that recovers refuses connections until it is consistent.
+        Stopwatch starting = Stopwatch.StartNew();
+        while (true)
+        {
+            try
+            {
+                _ = await node.SafePsqlAsync(Database, "SELECT 1", token);
+                break;
+            }
+            catch (PostgresException error) when (error.SqlState == "57P03" && starting.Elapsed < TestNode.PollTimeout)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(100), token);
+            }
+        }
     }
 
     private static void CopyDirectory(string source, string target)
