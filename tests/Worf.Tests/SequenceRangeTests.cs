@@ -666,19 +666,30 @@ public sealed class SequenceRangeTests
     }
 
     /// <summary>
-    /// Waits until each node holds its next blocks, with no request open and no grant unacknowledged, and the neighbors
-    /// have heard so.
+    /// Waits until every node at once holds its next blocks, with no request open and no grant unacknowledged, and the
+    /// neighbors have heard so.
     /// </summary>
     private static async Task SettleAsync(TestNode[] nodes, CancellationToken token)
     {
-        foreach (TestNode node in nodes)
+        const string Settled = """
+            SELECT bool_and(next_lo IS NOT NULL)
+                AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_request)
+                AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_grant WHERE state = 'sent')
+            FROM worf.sequence_ranges
+            """;
+
+        // A node that settles may unsettle one that had, as a request it relays leads to a grant from the owner, so the
+        // nodes are checked until every one of them has settled at once.
+        bool waited = true;
+        while (waited)
         {
-            Assert.IsTrue(await node.PollQueryUntilAsync(Database, """
-                SELECT bool_and(next_lo IS NOT NULL)
-                    AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_request)
-                    AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_grant WHERE state = 'sent')
-                FROM worf.sequence_ranges
-                """, token), $"{node.Name} holding its next blocks");
+            string[] states = await Task.WhenAll(nodes.Select(node => node.SafePsqlAsync(Database, Settled, token)));
+            waited = false;
+            foreach (TestNode node in nodes.Where((_, i) => states[i] != "t"))
+            {
+                waited = true;
+                Assert.IsTrue(await node.PollQueryUntilAsync(Database, Settled, token), $"{node.Name} holding its next blocks");
+            }
         }
 
         await Task.Delay(1000, token);
