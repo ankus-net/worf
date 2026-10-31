@@ -118,6 +118,8 @@ internal static class SequenceRangeWorker
 
             _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(SequenceRanges.CheckInterval));
         }
+
+        _ = SequenceRangeExchangeWorker.Watch(true);
     }
 
     private static List<uint> Sequences()

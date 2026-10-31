@@ -134,6 +134,11 @@ internal static class Manager
 
             PgInterrupts.Check();
         }
+
+        if (s_watching)
+        {
+            _ = SequenceRangeExchangeWorker.Watch(true);
+        }
     }
 
     /// <summary>

@@ -51,10 +51,12 @@ internal static class SequenceRangeExchangeWorker
 
     /// <summary>
     /// Watches the database's exchange worker, from its range worker or, without one, its manager, and cancels a call
-    /// of it that has run out of time.
+    /// of it that has run out of time, or any call as the watcher stops. A call that waits on a neighbor that never
+    /// answers doesn't see the exchange worker's own stop request, so it would hold up a server's shutdown.
     /// </summary>
+    /// <param name="stopping">Whether the watcher stops.</param>
     /// <returns>Whether the exchange worker runs.</returns>
-    internal static bool Watch()
+    internal static bool Watch(bool stopping = false)
     {
         uint dboid = Worker.MyWorker.Dboid;
         long now = Worker.GetCurrentTimestamp();
@@ -71,7 +73,7 @@ internal static class SequenceRangeExchangeWorker
                 }
 
                 running = true;
-                if (worker.Proc != 0 && worker.Worker.Exchange.Deadline != 0 && now >= worker.Worker.Exchange.Deadline)
+                if (worker.Proc != 0 && worker.Worker.Exchange.Deadline != 0 && (stopping || now >= worker.Worker.Exchange.Deadline))
                 {
                     unsafe
                     {
@@ -118,6 +120,12 @@ internal static class SequenceRangeExchangeWorker
     /// <returns>Its result.</returns>
     internal static T Bounded<T>(Func<T> call)
     {
+        // A worker asked to stop makes no new call, which its stop request might not reach.
+        if (Worker.GotSigterm)
+        {
+            throw new PgException("57P01", "the sequence range exchange worker is stopping");
+        }
+
         SetDeadline(Worker.GetCurrentTimestamp() + (SequenceRanges.ExchangeTimeout * 1000L));
         try
         {

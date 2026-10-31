@@ -206,6 +206,12 @@ internal static class SequenceRangeExchange
         bool changed = false;
         foreach ((WorfSubscription sub, string? waiting, bool fenced) in due)
         {
+            // A worker asked to stop makes no more calls.
+            if (Worker.GotSigterm)
+            {
+                break;
+            }
+
             long now = Worker.GetCurrentTimestamp();
             try
             {
@@ -237,6 +243,12 @@ internal static class SequenceRangeExchange
             }
             catch (Exception error) when (error is PgException or PgRemoteException or PgQueryCanceledException)
             {
+                // A call the watcher cancelled as the worker stops didn't fail.
+                if (Worker.GotSigterm)
+                {
+                    break;
+                }
+
                 // A failed exchange is tried again after a delay that doubles, up to the exchange interval. A call the
                 // watcher cancelled has run out of time.
                 long delay = s_retries.TryGetValue(sub.Id, out (long At, long Delay) retry) ? retry.Delay * 2 : 0;
