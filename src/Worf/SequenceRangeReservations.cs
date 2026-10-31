@@ -30,8 +30,9 @@ internal static class SequenceRangeReservations
     internal static void ShmemInit() => PgSharedMemory.Initialize(Reservations, MaxReservations, static () => default, static _ => default);
 
     /// <summary>
-    /// Returns once the sequence's active block has at least <paramref name="count"/> values left after the margin,
-    /// once the range worker has switched to a block that large if needed.
+    /// Returns once the sequence's active block has at least <paramref name="count"/> values left, and a twentieth more
+    /// for other sessions, once the range worker has switched to a block that large if needed: the next block, when it
+    /// is, or one granted for the reservation.
     /// </summary>
     [PgFunction(Sql = """
         CREATE FUNCTION worf.reserve_sequence_range(sequence regclass, count bigint, timeout interval DEFAULT '1 minute')
@@ -66,11 +67,12 @@ internal static class SequenceRangeReservations
             throw new PgException(PgSqlStates.InvalidParameterValue, "count must be positive");
         }
 
-        (int epoch, double rate) = RequireUsable(seqoid);
+        int epoch = RequireUsable(seqoid);
         SequenceInfo info = SequenceRanges.GetInfo(seqoid);
 
-        // Sessions inserting at the same time can't run the load short.
-        long needed = (long)Math.Min(count + Math.Ceiling(Math.Max(count / 20m, (decimal)rate * 60)), MaxNeeded);
+        // Sessions inserting at the same time have a twentieth more. The sequence's peak rate, which a load drives up,
+        // would size the block to a minute of loads, and leave the next block unused.
+        long needed = (long)Math.Min(count + Math.Ceiling(count / 20m), MaxNeeded);
         long deadline = Worker.GetCurrentTimestamp() + (long)Int128.Min(timeout.ToComparisonMicroseconds(), long.MaxValue / 2);
         Guid requestId = Guid.NewGuid();
         bool requested = false;
@@ -313,19 +315,18 @@ internal static class SequenceRangeReservations
     }
 
     /// <summary>
-    /// Checks the sequence's state and returns its epoch and peak insert rate.
+    /// Checks the sequence's state and returns its epoch.
     /// </summary>
-    private static (int Epoch, double Rate) RequireUsable(uint seqoid)
+    private static int RequireUsable(uint seqoid)
     {
-        SpiResult range = Worf.SelectCatalog("SELECT epoch, owner_node, peak_rate, state, fenced_at IS NOT NULL FROM worf.sequence_range WHERE seqoid = $1",
-            SpiParameter.Create(seqoid));
-        string? state = range.Count == 0 ? null : range[0].Get<string>(3);
+        SpiResult range = Worf.SelectCatalog("SELECT epoch, state FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(seqoid));
+        string? state = range.Count == 0 ? null : range[0].Get<string>(1);
         if (state is null or "collecting" or "refused" or "disabled" or "no_route")
         {
             throw new PgException("55000", $"sequence {SequenceRanges.GetInfo(seqoid).Name} can't draw new blocks while it is {state ?? "not under range management"}");
         }
 
-        return (range[0].Get<int>(0), range[0].Get<double>(2));
+        return range[0].Get<int>(0);
     }
 
     /// <summary>

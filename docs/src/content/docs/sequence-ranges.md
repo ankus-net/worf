@@ -28,7 +28,7 @@ shows each sequence's state, its active and next blocks, and the values left. `w
 | `worf.alter_sequence_range(sequence regclass, range_size bigint DEFAULT NULL, max_range_size bigint DEFAULT NULL)` | Owner | Changes the block sizes, each at least 2 |
 | `worf.disable_sequence_range(sequence regclass)` | Owner | Stops granting. Each node keeps using the blocks it holds |
 | `worf.reset_sequence_range(sequence regclass DEFAULT NULL)` | Any node | Abandons this node's blocks and requests new ones. An owner or pool holder grants nothing until the nodes it granted to report what they hold |
-| `worf.reserve_sequence_range(sequence regclass, count bigint, timeout interval DEFAULT '1 minute')` | Any node | Returns once the active block has at least `count` values left |
+| `worf.reserve_sequence_range(sequence regclass, count bigint, timeout interval DEFAULT '1 minute')` | Any node | Returns once the active block has at least `count` values left, and a twentieth more for other sessions, switching to the next block when that holds them |
 | `worf.reserve_sequence_values(sequence regclass, lo bigint, hi bigint, timeout interval DEFAULT '1 minute')` | Any node | Gives this node exactly `[lo, hi]`, for rows that already carry those keys |
 
 A node's first block has `range_size` values: 100 for `smallint`, 10,000 for `integer` and 1,000,000 for `bigint`. A node whose block lasted under an hour asks for twice as many next time, up to `max_range_size`, and one whose block lasted over a day asks for half.

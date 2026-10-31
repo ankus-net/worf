@@ -780,6 +780,21 @@ public sealed class SequenceRangeTests
             "a switch away from the block behind the rows");
         _ = await node.SafePsqlAsync(Database, "INSERT INTO t (v) SELECT 'after' FROM generate_series(1, 5)", token);
 
+        // A reservation the next block holds switches to it, though a load just ran fast, rather than taking a block sized
+        // to a minute at that rate.
+        _ = await node.SafePsqlAsync(Database, """
+            CREATE TABLE bulk (id bigserial PRIMARY KEY);
+            SELECT worf.enable_sequence_range('bulk_id_seq', participants := '{}', range_size := 100000, max_range_size := 100000);
+            INSERT INTO bulk SELECT FROM generate_series(1, 50000);
+            """, token);
+        Assert.IsTrue(await node.PollQueryUntilAsync(Database, "SELECT peak_rate > 5000 FROM worf.sequence_range WHERE seqoid = 'bulk_id_seq'::regclass", token),
+            "the load's rate");
+        Assert.AreEqual("100001|100000", await node.SafePsqlAsync(Database, """
+            SELECT worf.reserve_sequence_range('bulk_id_seq', 60000);
+            SELECT r.active_lo, (SELECT max(hi - lo + 1) FROM worf.sequence_range_grant WHERE seqoid = 'bulk_id_seq'::regclass)
+            FROM worf.sequence_ranges r WHERE r.sequence = 'bulk_id_seq'::regclass
+            """, token));
+
         // A reservation that takes most of a root warns.
         logpos = node.ReadLog().Length;
         _ = await node.SafePsqlAsync(Database, "SELECT worf.reserve_sequence_range('small', 850)", token);
