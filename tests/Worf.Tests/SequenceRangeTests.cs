@@ -966,9 +966,9 @@ public sealed class SequenceRangeTests
             "SELECT count(*) = 300 FROM shared WHERE EXISTS (SELECT 1 FROM pg_attrdef WHERE adrelid = 'shared'::regclass)", token),
             "node_a's rows and default on node_b");
 
-        // Dropping a managed sequence on its owner ends its epoch, which node_b, keeping its blocks, hears of as disabled.
-        // A dump of its table restores there, the sequence unmanaged, and enabling it again starts a new epoch above the
-        // values node_b holds.
+        // node_b joins a sequence late. node_a loses its grants to node_b, as a recovery to before them would, and resets:
+        // its fence waits for node_b, though node_b is down for longer than a neighbor counts as in touch, and takes them
+        // back into its ledger once node_b reports.
         foreach (TestNode node in new[] { nodeA, nodeB })
         {
             _ = await node.SafePsqlAsync(Database, "CREATE TABLE mv (id bigserial PRIMARY KEY, v text)", token);
@@ -982,7 +982,24 @@ public sealed class SequenceRangeTests
             _ = await node.SafePsqlAsync(Database, $"INSERT INTO mv (v) SELECT '{node.Name}' FROM generate_series(1, 20)", token);
         }
 
+        _ = await nodeA.SafePsqlAsync(Database, "DELETE FROM worf.sequence_range_grant WHERE seqoid = 'mv_id_seq'::regclass AND grantee_name = 'node_b'", token);
+        await nodeB.StopAsync("fast", token);
+        int lost = nodeA.ReadLog().Length;
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.reset_sequence_range('mv_id_seq')", token);
+        await Task.Delay(TimeSpan.FromSeconds(8), token);
+        Assert.AreEqual("t", await nodeA.SafePsqlAsync(Database, "SELECT fenced_at IS NOT NULL FROM worf.sequence_range WHERE seqoid = 'mv_id_seq'::regclass", token),
+            "node_a's fence waiting for node_b");
+        await nodeB.StartServerAsync(token);
+        Assert.IsTrue(await nodeA.PollLogAsync(lost, "which this allocator had no record of; it is back in the ledger", token), "node_b's grants back in the ledger");
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            Assert.IsTrue(await node.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges WHERE sequence = 'mv_id_seq'::regclass", token),
+                $"{node.Name} drawing from mv_id_seq's blocks again");
+        }
 
+        // Dropping a managed sequence on its owner ends its epoch, which node_b, keeping its blocks, hears of as disabled.
+        // A dump of its table restores there, the sequence unmanaged, and enabling it again starts a new epoch above the
+        // values node_b holds.
         using TemporaryDirectory dumps = new($"worf-sequence-range-dump-{Guid.NewGuid():N}");
         string dump = Path.Join(dumps.FullName, "mv.dump");
         (int dumped, string dumpOutput) = await nodeA.RunProgramAsync("pg_dump", ["-Fc", "-t", "mv", "-f", dump, "-d", Database], token);

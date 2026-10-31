@@ -2601,10 +2601,11 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
-    /// Lifts an allocator's fence once every node with a grant from its fenced blocks, every neighbor still in touch or
-    /// streaming this node's changes, and on the owner every listed participant, has exchanged since the fence began,
-    /// unless two grants overlap. The owner's root then gives up its free values up to the highest any node has seen
-    /// granted, which covers the blocks it granted itself and lost. Since a neighbor's report of that may be made up, it
+    /// Lifts an allocator's fence once every node with a grant from its fenced blocks, every neighbor, even one that is
+    /// down, since it may hold a grant the allocator lost, as a node that joined late its first, and on the owner every
+    /// listed participant, has exchanged since the fence began, unless two grants overlap. The owner's root then gives
+    /// up its free values up to the highest any node has seen granted, which covers the blocks it granted itself and
+    /// lost. Since a neighbor's report of that may be made up, it
     /// does so on its own only up to two of its largest blocks beyond the last grant its ledger holds, as many as it
     /// draws from at once, and further only on <c>activate_sequence_range</c>.
     /// </summary>
@@ -2652,13 +2653,9 @@ internal static unsafe partial class SequenceRanges
                 OR EXISTS (
                 SELECT 1 FROM worf.sequence_range_node n
                 WHERE n.seqoid = r.seqoid AND n.via_node = n.node_id AND n.node_id <> $2
-                    AND (worf.sequence_range_heard(n.node_id, true, n.reported_at, true) > now() - $3::interval
-                        OR EXISTS (
-                            SELECT 1 FROM worf.sequence_range_link k JOIN pg_catalog.pg_replication_slots s ON s.slot_name = k.slot_name
-                            WHERE k.node_id = n.node_id AND s.active))
                     AND (n.held_at IS NULL OR n.held_at <= r.fenced_at))
             FROM worf.sequence_range r WHERE r.seqoid = $1
-            """, seq, SpiParameter.Create(node.Node.Id), SpiParameter.Create(StaleAfter())))
+            """, seq, SpiParameter.Create(node.Node.Id)))
         {
             return false;
         }
