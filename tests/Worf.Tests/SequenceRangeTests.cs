@@ -1004,7 +1004,8 @@ public sealed class SequenceRangeTests
     /// A late joiner whose values reach into the root is refused by the pool holder it asks, one sequence's failure
     /// leaves the others' exchanges alone, and a pool holder's standby, promoted without the grants its primary made
     /// last, fences its pool until its children report, and takes the grants it lost back into its ledger. A pool
-    /// holder's Snowflake node numbers stay its while it reports.
+    /// holder's Snowflake node numbers stay its while it reports, and it grants none of them once it hasn't heard from
+    /// the owner for half a day.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -1141,6 +1142,34 @@ public sealed class SequenceRangeTests
             WHERE b.seqoid = 'worf.snowflake_node'::regclass AND f.lo <= {pool[1]} AND {pool[0]} <= f.hi
             """, token), "node_b's pool numbers free in the root");
         Assert.HasCount(3, (await Task.WhenAll(nodes.Select(node => node.SafePsqlAsync(Database, "SELECT worf.snowflake_node()", token)))).Distinct());
+
+        // node_a goes down, and node_b and node_c restart, having last heard from it half a day ago as far as they know.
+        // node_c gives up its number and asks node_b for another, which grants none from its pool, whose numbers node_a
+        // may give out again a day after it last heard from node_b, until it hears from node_a again.
+        string ownerId = await nodeA.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
+        string ownerNumber = await nodeA.SafePsqlAsync(Database, "SELECT worf.snowflake_node()", token);
+        _ = await nodeC.SafePsqlAsync(Database, "SELECT worf.alter_subscription_disable('c_from_b')", token);
+        await nodeA.StopAsync("fast", token);
+        foreach (TestNode node in new[] { nodeB, nodeC })
+        {
+            await node.StopAsync("fast", token);
+            await node.StartServerAsync(token);
+            _ = await node.SafePsqlAsync(Database, $"UPDATE worf.sequence_range_node SET reported_at = now() - interval '13 hours' WHERE node_id = {ownerId}", token);
+        }
+
+        // Stale routes between node_b and node_c, which count upward for a while, still carry node_c's requests.
+        string restarted = await nodeB.SafePsqlAsync(Database, "SELECT now()::text", token);
+        _ = await nodeC.SafePsqlAsync(Database, "SELECT worf.alter_subscription_enable('c_from_b')", token);
+        Assert.IsTrue(await nodeC.PollQueryUntilAsync(Database,
+            "SELECT EXISTS (SELECT 1 FROM worf.sequence_range_request WHERE seqoid = 'worf.snowflake_node'::regclass)", token), "node_c asking for a number");
+        await Task.Delay(TimeSpan.FromSeconds(3), token);
+        Assert.AreEqual("0", await nodeB.SafePsqlAsync(Database, $"""
+            SELECT count(*) FROM worf.sequence_range_grant
+            WHERE seqoid = 'worf.snowflake_node'::regclass AND grantee_name = 'node_c' AND granted_at > '{restarted}'
+            """, token), "numbers for node_c from node_b's pool");
+        await nodeA.StartServerAsync(token);
+        Assert.IsTrue(await nodeC.PollQueryUntilAsync(Database, "SELECT worf.snowflake_node() IS NOT NULL", token), "node_c's number once node_b hears from node_a");
+        Assert.AreNotEqual(ownerNumber, await nodeC.SafePsqlAsync(Database, "SELECT worf.snowflake_node()", token), "node_c's number and node_a's");
     }
 
     /// <summary>

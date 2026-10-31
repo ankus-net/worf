@@ -884,9 +884,9 @@ internal static class SequenceRangeExchange
 
     /// <summary>
     /// Checks, only reading, whether this node would leave a neighbor's requests for blocks as they are, as while the
-    /// root has run out, or, on a node between it and the owner, can't start: none was answered before, no free span of
-    /// this node's root or pool blocks holds the smallest, and this node, unless it is the owner, has asked its parent
-    /// for a pool block already.
+    /// root has run out, or, on a node between it and the owner, can't start: none was answered before, and no free
+    /// span of this node's root or pool blocks holds the smallest, while this node, unless it is the owner, has asked its
+    /// parent for a pool block already, or this node, a Snowflake pool holder, hasn't heard from the owner lately.
     /// </summary>
     private static bool Unanswerable(uint seqoid, SequenceInfo info, int epoch, JsonElement requests, bool isOwner)
     {
@@ -909,16 +909,17 @@ internal static class SequenceRangeExchange
             sysid = NativeMethods.GetSystemIdentifier();
         }
 
+        bool silent = !isOwner && seqoid == SnowflakeIds.NodeSequence() && !SequenceRanges.SnowflakeOwnerHeard(seqoid);
         return Worf.ReadScalar<bool>("""
             SELECT NOT EXISTS (SELECT 1 FROM worf.sequence_range_grant WHERE request_id = ANY ($2))
-                AND NOT EXISTS (
-                    SELECT 1 FROM worf.sequence_range_free f JOIN worf.sequence_range_block b ON b.block_id = f.block_id
-                    WHERE b.seqoid = $1 AND b.epoch = $3 AND b.kind IN ('r', 'p') AND b.state = 'open' AND b.sysid = $4 AND b.timeline = $5
-                        AND f.hi::numeric - f.lo >= $6)
-                AND ($7 OR EXISTS (SELECT 1 FROM worf.sequence_range_request WHERE seqoid = $1 AND kind = 'p' AND state = 'open'))
+                AND ($8 OR NOT EXISTS (
+                        SELECT 1 FROM worf.sequence_range_free f JOIN worf.sequence_range_block b ON b.block_id = f.block_id
+                        WHERE b.seqoid = $1 AND b.epoch = $3 AND b.kind IN ('r', 'p') AND b.state = 'open' AND b.sysid = $4 AND b.timeline = $5
+                            AND f.hi::numeric - f.lo >= $6)
+                    AND ($7 OR EXISTS (SELECT 1 FROM worf.sequence_range_request WHERE seqoid = $1 AND kind = 'p' AND state = 'open')))
             """, SpiParameter.Create(seqoid), SpiParameter.Create(ids.ToArray()), SpiParameter.Create(epoch),
             SpiParameter.Create((decimal)sysid), SpiParameter.Create((long)SequenceRanges.Timeline()),
-            SpiParameter.Create(((decimal)smallest - 1) * Math.Abs(info.Increment)), SpiParameter.Create(isOwner));
+            SpiParameter.Create(((decimal)smallest - 1) * Math.Abs(info.Increment)), SpiParameter.Create(isOwner), SpiParameter.Create(silent));
     }
 
     /// <summary>
@@ -1271,6 +1272,13 @@ internal static class SequenceRangeExchange
                 SpiParameter.Create(granteeName), SpiParameter.Create(h));
             PgLog.Warning($"sequence {info.Name}: node {granteeName} joined with values up to {h}, which reach into the root; it is refused");
             return null;
+        }
+
+        // A Snowflake pool holder grants its pool's numbers only while the owner, which may give them out again a day
+        // after it last heard from the pool holder, has been heard from within half a day.
+        if (!isOwner && seqoid == SnowflakeIds.NodeSequence() && !SequenceRanges.SnowflakeOwnerHeard(seqoid))
+        {
+            return false;
         }
 
         string kind = request.TryGetProperty("kind", out JsonElement value) ? value.GetString() ?? "n" : "n";

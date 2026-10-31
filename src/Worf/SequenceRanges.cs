@@ -880,6 +880,20 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
+    /// Checks whether this node has heard from the owner of the Snowflake node numbers, directly or through its
+    /// neighbors, within half the time after which the owner may give the numbers of a node it hasn't heard from to
+    /// another. A pool holder that hasn't grants none of its pool's numbers, as a node stops using its own then.
+    /// </summary>
+    /// <param name="seqoid">The Snowflake sequence.</param>
+    /// <returns>Whether it has.</returns>
+    internal static bool SnowflakeOwnerHeard(uint seqoid)
+        => Worf.ReadScalar<bool>("""
+            SELECT EXISTS (
+                SELECT 1 FROM worf.sequence_range r JOIN worf.sequence_range_node n ON n.seqoid = r.seqoid AND n.node_id = r.owner_node
+                WHERE r.seqoid = $1 AND worf.sequence_range_heard(n.node_id, false, n.reported_at, false) > now() - $2::interval / 2)
+            """, SpiParameter.Create(seqoid), SpiParameter.Create(SnowflakeReuseAfter()));
+
+    /// <summary>
     /// Finds why this node must give up its Snowflake node number: another node reports holding it too, or the owner of
     /// the numbers, which gives the number of a node it hasn't heard from for a day to another, hasn't been heard from for
     /// half a day. A node that went that long without word stops using the number for good, so that it doesn't take it
