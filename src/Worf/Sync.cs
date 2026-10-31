@@ -262,6 +262,7 @@ internal static class Sync
         string snapshot = EnsureReplicationSlotSnapshot(sub, originConnRepl, "copy_slot", false, out ulong lsn);
 
         statusLsn = lsn;
+        PublishCopyLsn(lsn);
 
         // Make sure we cleanup the slot if something goes wrong.
         try
@@ -284,6 +285,8 @@ internal static class Sync
 
                 SetTableSyncStatus(sub.Id, nspname, relname, SyncStatusData, lsn);
             });
+
+            WaitForApply();
 
             // Copy data.
             CopyTablesData(sub.Name, sub.OriginIf.Dsn, snapshot, [(nspname, relname)], sub.ReplicationSets, sub.SlotName);
@@ -1262,6 +1265,7 @@ internal static class Sync
             PgBackgroundWorker.RunTransaction(() =>
             {
                 StartCopyTargetTx(originName);
+                HoldOffWrites(tables);
                 foreach ((string nspname, string relname) in tables)
                 {
                     WorfRemoteRel remoterel = Rpc.GetRemoteRepsetTable(originConn, nspname, relname, replicationSets);
@@ -1279,6 +1283,76 @@ internal static class Sync
 
         // Finish the transactions and disconnect.
         FinishCopyOriginTx(originConn);
+    }
+
+    /// <summary>
+    /// Tells the subscription's apply worker where the copy's snapshot is, as soon as it's known.
+    /// </summary>
+    /// <param name="lsn">The position of the copy's snapshot.</param>
+    private static void PublishCopyLsn(ulong lsn)
+    {
+        using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive();
+        WorfWorker me = guard[Worker.MyWorfWorker];
+        me.Worker.Sync.CopyLsn = lsn;
+        guard[Worker.MyWorfWorker] = me;
+
+        int apply = guard.Read((in _, workers) => Worker.ApplyFind(workers, me.Dboid, me.Worker.Apply.SubId));
+        if (apply >= 0 && guard[apply].Proc != 0)
+        {
+            Worker.SetProcLatch(guard[apply].Proc);
+        }
+    }
+
+    /// <summary>
+    /// Waits for the subscription's apply worker to apply everything that committed before the copy's snapshot. Queued
+    /// SQL among it has to change the table before the copy does, as it changed the provider's rows before the
+    /// snapshot; run after the copy, it changes the copied rows again.
+    /// </summary>
+    private static void WaitForApply()
+    {
+        while (true)
+        {
+            using (PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share())
+            {
+                if (guard[Worker.MyWorfWorker].Worker.Sync.CopyAllowed)
+                {
+                    return;
+                }
+            }
+
+            if (Worker.GotSigterm)
+            {
+                throw new OperationCanceledException("The worf worker is stopping.");
+            }
+
+            _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(1000));
+            PgInterrupts.Check();
+        }
+    }
+
+    /// <summary>
+    /// Locks the tables against writes until their copy commits, and lets the apply worker go on. Queued SQL that it
+    /// runs from now on committed after the copy's snapshot, so it has to change the tables after the copy does.
+    /// </summary>
+    /// <param name="tables">The tables.</param>
+    private static unsafe void HoldOffWrites(List<(string Nspname, string Relname)> tables)
+    {
+        foreach ((string nspname, string relname) in tables)
+        {
+            RangeVar* rv = NativeMethods.makeRangeVar(Worf.PStrDup(nspname), Worf.PStrDup(relname), -1);
+            _ = NativeMethods.RangeVarGetRelidExtended(rv, (int)PgLockMode.Share, 0, default, null);
+        }
+
+        using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive();
+        WorfWorker me = guard[Worker.MyWorfWorker];
+        me.Worker.Sync.CopyLocked = true;
+        guard[Worker.MyWorfWorker] = me;
+
+        int apply = guard.Read((in _, workers) => Worker.ApplyFind(workers, me.Dboid, me.Worker.Apply.SubId));
+        if (apply >= 0 && guard[apply].Proc != 0)
+        {
+            Worker.SetProcLatch(guard[apply].Proc);
+        }
     }
 
     /// <summary>

@@ -66,6 +66,9 @@ internal static unsafe partial class Apply
     private static ulong s_publishedFlushpos;
     private static bool s_publishesFlushpos;
 
+    // The remote commit position of the latest change to each synchronizing table that wasn't applied.
+    private static readonly Dictionary<(string Nspname, string Relname), ulong> s_skippedChanges = [];
+
     // A failed remote transaction that worf.exception_behaviour applies again, how, and whether the transaction being
     // applied is that one.
     private static ulong s_exceptionLsn;
@@ -510,6 +513,7 @@ internal static unsafe partial class Apply
                     sync.Status != Sync.SyncStatusReady &&
                     !(sync.Status == Sync.SyncStatusSyncdone && sync.Statuslsn <= originLsn))
                 {
+                    s_skippedChanges[(nspname, relname)] = originLsn;
                     return false;
                 }
             }
@@ -565,6 +569,9 @@ internal static unsafe partial class Apply
         s_actionName = "BEGIN";
 
         ProtoNative.ReadBegin(s, out ulong commitLsn, out long commitTime, out s_remoteXid);
+
+        // Everything that committed before this transaction is applied.
+        AllowCopies(commitLsn);
 
         Worf.ReploriginSessionOriginTimestamp = commitTime;
         Worf.ReploriginSessionOriginLsn = commitLsn;
@@ -2292,6 +2299,8 @@ internal static unsafe partial class Apply
         uint subid = myApplyWorker.SubId;
         uint myDatabaseId = NativeGlobals.MyDatabaseId;
 
+        AllowCopies(endLsn);
+
         // First check if we need to update the cached information.
         if (myApplyWorker.SyncPending)
         {
@@ -2340,8 +2349,13 @@ internal static unsafe partial class Apply
 
                         if (worker >= 0 && guard[worker].Proc != 0 && endLsn >= guard[worker].Worker.Apply.ReplayStopLsn)
                         {
+                            // The copy holds the changes that committed before its snapshot, so the sync worker only
+                            // catches up with those after it that this worker passed over.
                             WorfWorker w = guard[worker];
-                            w.Worker.Apply.ReplayStopLsn = endLsn;
+                            w.Worker.Apply.ReplayStopLsn =
+                                s_skippedChanges.TryGetValue((sync.Nspname, sync.Relname), out ulong skipped) && skipped > sync.Statuslsn
+                                    ? endLsn
+                                    : sync.Statuslsn;
                             guard[worker] = w;
                             sync.Status = Sync.SyncStatusCatchup;
 
@@ -2380,6 +2394,7 @@ internal static unsafe partial class Apply
                 // Ready? Remove it from local cache.
                 if (sync.Status == Sync.SyncStatusReady)
                 {
+                    _ = s_skippedChanges.Remove((sync.Nspname, sync.Relname));
                     s_syncingTables.RemoveAt(index);
                     index--;
                 }
@@ -2416,6 +2431,88 @@ internal static unsafe partial class Apply
             }
         }
     }
+
+    /// <summary>
+    /// Lets the subscription's sync workers copy their table once everything that committed before their copy's
+    /// snapshot is applied, and waits until each holds off writes to its table until the copy commits. Queued SQL that
+    /// committed before a snapshot changes the table before its copy, as it changed the provider's rows before it, and
+    /// the rest after; otherwise it changes the copied rows again, or its change is copied over.
+    /// </summary>
+    /// <param name="lsn">The position before which everything that committed is applied.</param>
+    private static void AllowCopies(ulong lsn)
+    {
+        // None waits but while a table synchronizes, so look under the shared lock first.
+        uint dboid = NativeGlobals.MyDatabaseId;
+        bool waiting = false;
+        using (PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share())
+        {
+            WorfWorker me = guard[Worker.MyWorfWorker];
+            for (int i = 0; i < guard.Length && me.WorkerType == WorfWorkerType.Apply && !waiting; i++)
+            {
+                waiting = WaitsToCopy(guard[i], dboid, me.Worker.Apply.SubId, lsn);
+            }
+        }
+
+        if (!waiting)
+        {
+            return;
+        }
+
+        List<(int Slot, ushort Generation)> allowed = [];
+        using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
+        {
+            uint subid = guard[Worker.MyWorfWorker].Worker.Apply.SubId;
+            for (int i = 0; i < guard.Length; i++)
+            {
+                WorfWorker worker = guard[i];
+                if (WaitsToCopy(worker, dboid, subid, lsn))
+                {
+                    worker.Worker.Sync.CopyAllowed = true;
+                    guard[i] = worker;
+                    Worker.SetProcLatch(worker.Proc);
+                    allowed.Add((i, worker.Generation));
+                }
+            }
+        }
+
+        // The copy takes a moment to start, and a sync worker that fails stops the wait.
+        foreach ((int slot, ushort generation) in allowed)
+        {
+            while (true)
+            {
+                using (PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share())
+                {
+                    WorfWorker worker = guard[slot];
+                    if (worker.Proc == 0 || worker.Generation != generation || worker.Worker.Sync.CopyLocked)
+                    {
+                        break;
+                    }
+                }
+
+                if (Worker.GotSigterm)
+                {
+                    throw new OperationCanceledException("The worf worker is stopping.");
+                }
+
+                _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(1000));
+                PgInterrupts.Check();
+
+                if (s_applyconn is not null)
+                {
+                    _ = SendFeedback(s_applyconn, s_lastReceived, Worker.GetCurrentTimestamp(), false);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Checks whether a worker is a sync worker of the subscription that waits for the apply worker to reach its copy's
+    /// snapshot, which it has.
+    /// </summary>
+    private static bool WaitsToCopy(WorfWorker worker, uint dboid, uint subid, ulong lsn)
+        => worker.WorkerType == WorfWorkerType.Sync && worker.Proc != 0 && worker.Dboid == dboid &&
+            worker.Worker.Apply.SubId == subid && worker.Worker.Sync.CopyLsn != 0 && worker.Worker.Sync.CopyLsn <= lsn &&
+            !worker.Worker.Sync.CopyAllowed;
 
     private static void StartSyncWorker(string nspname, string relname)
     {
