@@ -705,7 +705,7 @@ internal static class SequenceRangeExchange
 
         // The neighbor is heard from now, in shared memory, which an exchange that changes nothing else is all it writes to,
         // unless shared memory has no room for it, and then its report is written to the tables.
-        bool heard = SequenceRangeHeard.Record(senderId, true, Worker.GetCurrentTimestamp());
+        bool heard = SequenceRangeHeard.Record(senderId, senderId, Worker.GetCurrentTimestamp());
         if (!root.TryGetProperty("sequences", out JsonElement sequences))
         {
             return (false, false);
@@ -735,7 +735,7 @@ internal static class SequenceRangeExchange
                         .Where(report => report.At is not null && report.Node != localId && report.Node != senderId)
                         .Select(report => (report.Node, report.At!.Value)))
                     {
-                        _ = SequenceRangeHeard.Record(reported, false, Math.Min(at, Worker.GetCurrentTimestamp()));
+                        _ = SequenceRangeHeard.Record(reported, senderId, Math.Min(at, Worker.GetCurrentTimestamp()));
                     }
                 }
             }
@@ -824,7 +824,7 @@ internal static class SequenceRangeExchange
             WHERE seqoid = $1 AND node_id = $2 AND via_node = node_id AND node_name = $3 AND sysid = $4::numeric AND timeline = $5
                 AND epoch IS NOT DISTINCT FROM $7 AND state IS NOT DISTINCT FROM $8 AND distance IS NOT DISTINCT FROM $9
                 AND high_water IS NOT DISTINCT FROM $10 AND watermark IS NOT DISTINCT FROM $11 AND holds IS NOT DISTINCT FROM $12
-                AND clock IS NOT DISTINCT FROM $13 AND ($14::pg_lsn IS NULL OR reset_done = $14::pg_lsn)
+                AND (clock IS NOT DISTINCT FROM $13 OR clock >= $13) AND ($14::pg_lsn IS NULL OR reset_done = $14::pg_lsn)
                 AND ($15::pg_lsn IS NULL OR reset_lsn IS DISTINCT FROM $15::pg_lsn)
             """, 1, seq, sender, SpiParameter.Create(root.GetProperty("node_name").GetString()), SpiParameter.Create(sysid),
             SpiParameter.Create(timeline), SpiParameter.Create(call), SpiParameter.Create(epoch), SpiParameter.Create(state),
@@ -840,8 +840,8 @@ internal static class SequenceRangeExchange
             return false;
         }
 
-        // Each relayed report is older than what this node has, or relayed instead of a live report, or says the same, or
-        // is of a node this node has no room to take in.
+        // Each relayed report is older than what this node has, or relayed instead of a live report, or says the same and
+        // is of a node shared memory holds, which notes when it was made, or is of a node this node has no room to take in.
         if (entry.TryGetProperty("reports", out JsonElement reports))
         {
             bool? full = null;
@@ -853,23 +853,23 @@ internal static class SequenceRangeExchange
                     continue;
                 }
 
-                bool? same = Worf.ReadScalar<bool?>("""
+                SpiResult known = Worf.Read("""
                     SELECT CASE
-                        WHEN least(coalesce(pg_catalog.to_timestamp($3), now()), now()) <= worf.sequence_range_heard(n.node_id, false, n.reported_at, false) THEN true
-                        WHEN n.via_node = n.node_id THEN worf.sequence_range_heard(n.node_id, true, n.reported_at, false) >= now() - $4::interval
-                        ELSE n.node_name = $5 AND n.high_water IS NOT DISTINCT FROM $6 AND n.watermark IS NOT DISTINCT FROM $7
+                            WHEN least(coalesce(pg_catalog.to_timestamp($3), now()), now()) <= worf.sequence_range_heard(n.node_id, false, n.reported_at, false) THEN true
+                            WHEN n.via_node = n.node_id THEN worf.sequence_range_heard(n.node_id, true, n.reported_at, false) >= now() - $4::interval END,
+                        n.node_name = $5 AND n.high_water IS NOT DISTINCT FROM $6 AND n.watermark IS NOT DISTINCT FROM $7
                             AND n.epoch IS NOT DISTINCT FROM $8 AND n.state IS NOT DISTINCT FROM $9 AND n.holds IS NOT DISTINCT FROM $10
-                            AND n.clock IS NOT DISTINCT FROM $11 END
+                            AND (n.clock IS NOT DISTINCT FROM $11 OR n.clock >= $11)
                     FROM worf.sequence_range_node n WHERE n.seqoid = $1 AND n.node_id = $2
-                    """, seq, SpiParameter.Create(reported),
+                    """, 1, seq, SpiParameter.Create(reported),
                     SpiParameter.Create(report.TryGetProperty("reported_at", out JsonElement at) && at.ValueKind == JsonValueKind.Number ? at.GetDouble() : (double?)null),
                     SpiParameter.Create(SequenceRanges.StaleAfter()), SpiParameter.Create(report.GetProperty("node_name").GetString()),
                     SpiParameter.Create(Nullable(report, "high_water")), SpiParameter.Create(Nullable(report, "watermark")),
                     SpiParameter.Create(Nullable32(report, "epoch")), SpiParameter.Create(Text(report, "state")), SpiParameter.Create(Holds(report)),
                     SpiParameter.Create(Nullable(report, "clock")));
-                if (same is null
+                if (known.Count == 0
                     ? !(full ??= Worf.ReadScalar<long>("SELECT count(*) FROM worf.sequence_range_node WHERE seqoid = $1", seq) >= SequenceRangeHeard.MaxNodes)
-                    : same == false)
+                    : known[0].Get<bool?>(0) is bool skip ? !skip : !known[0].Get<bool>(1) || !SequenceRangeHeard.Holds(reported))
                 {
                     return false;
                 }
@@ -1069,7 +1069,7 @@ internal static class SequenceRangeExchange
                 wal_lsn = CASE WHEN $12 THEN excluded.wal_lsn ELSE sequence_range_node.wal_lsn END,
                 reply_lsn = CASE WHEN NOT $12 THEN excluded.reply_lsn ELSE sequence_range_node.reply_lsn END, epoch = excluded.epoch,
                 state = excluded.state, distance = excluded.distance, high_water = excluded.high_water, watermark = excluded.watermark,
-                reported_at = excluded.reported_at, holds = excluded.holds, clock = excluded.clock
+                reported_at = excluded.reported_at, holds = excluded.holds, clock = greatest(sequence_range_node.clock, excluded.clock)
             """, seq, sender, SpiParameter.Create(senderName),
             SpiParameter.Create(sysid), SpiParameter.Create(timeline), SpiParameter.Create(walLsn), SpiParameter.Create(epoch),
             SpiParameter.Create(entry.GetProperty("state").GetString()), SpiParameter.Create(Nullable32(entry, "distance")),
@@ -1117,7 +1117,7 @@ internal static class SequenceRangeExchange
         // Reports of other nodes, relayed toward the owner, each as old as its node made it. A fresher report replaces a
         // relayed one, and the neighbor's own report replaces one it relayed only once that has gone stale. Reports of new
         // nodes are taken in only while this node knows of fewer nodes than shared memory holds, so that a neighbor can't
-        // fill the tables, and every message, with made-up nodes.
+        // fill the tables, and every message, with made-up nodes. A node's Snowflake clock never goes back on a report.
         if (entry.TryGetProperty("reports", out JsonElement reports))
         {
             long known = Worf.ReadScalar<long>("SELECT count(*) FROM worf.sequence_range_node WHERE seqoid = $1", seq);
@@ -1149,7 +1149,7 @@ internal static class SequenceRangeExchange
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, least(coalesce(pg_catalog.to_timestamp($9), now()), now()), $11, $12)
                     ON CONFLICT (seqoid, node_id) DO UPDATE SET node_name = excluded.node_name, via_node = excluded.via_node,
                         high_water = excluded.high_water, watermark = excluded.watermark, epoch = excluded.epoch, state = excluded.state,
-                        reported_at = excluded.reported_at, holds = excluded.holds, clock = excluded.clock
+                        reported_at = excluded.reported_at, holds = excluded.holds, clock = greatest(sequence_range_node.clock, excluded.clock)
                     WHERE excluded.reported_at > worf.sequence_range_heard(sequence_range_node.node_id, false, sequence_range_node.reported_at, false)
                         AND (sequence_range_node.via_node <> sequence_range_node.node_id
                             OR worf.sequence_range_heard(sequence_range_node.node_id, true, sequence_range_node.reported_at, false) < now() - $10::interval)

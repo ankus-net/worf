@@ -989,14 +989,15 @@ internal static unsafe partial class SequenceRanges
     /// <summary>
     /// Gives the root back, once it has no number left to grant, the Snowflake node numbers no node holds: numbers
     /// below the start of a root that moved above them, and numbers given up in this epoch. A number granted to a node
-    /// is free once that node has reported, a day after the grant, without it among the numbers it holds, which it
-    /// reports for a day after giving one up, or has reported nothing for a day, since a node gives up its number after
-    /// half a day without word from the owner. Numbers granted to a pool holder, which holds them to grant on rather than
-    /// as its own, stay its until it gives the pool block up, or has reported nothing for a day. A number is free only
-    /// once every other node has also reported in this epoch without it, or has reported nothing for a day. The numbers
-    /// come back to be used no earlier than the furthest any node has reserved its clock, so that no ID of a number's
-    /// earlier holder can repeat, whatever the clocks. A node that this server hasn't heard from since it started counts
-    /// as heard when it started.
+    /// is free once that node has reported to this node itself, a day after the grant, without it among the numbers it
+    /// holds, which it reports for a day after giving one up, or has reported nothing for a day, since a node gives up its
+    /// number after half a day without word from the owner. Numbers granted to a pool holder, which holds them to grant
+    /// on rather than as its own, stay its until it gives the pool block up, or has reported nothing for a day. A number
+    /// is free only once every other node has also reported to this node itself in this epoch without it, or has reported
+    /// nothing for a day. No report a neighbor relays, which this node can't check, frees a number. The numbers come back
+    /// to be used no earlier than the furthest any node has reserved its clock, up to a day ahead of this node's, so that
+    /// no ID of a number's earlier holder can repeat, and a made-up clock holds a number up for a day at most. A node that
+    /// this server hasn't heard from since it started counts as heard when it started.
     /// </summary>
     /// <param name="seqoid">The Snowflake sequence.</param>
     /// <param name="epoch">Its epoch.</param>
@@ -1021,18 +1022,21 @@ internal static unsafe partial class SequenceRanges
                 SELECT block_id, lo, hi, received_at FROM worf.sequence_range_block
                 WHERE seqoid = $1 AND epoch = $2 AND kind = 'r' AND state = 'open'),
             floor AS (
-                SELECT greatest((SELECT max(clock) FROM worf.sequence_range_node WHERE seqoid = $1), $4) AS not_before),
+                SELECT greatest(least((SELECT max(clock) FROM worf.sequence_range_node WHERE seqoid = $1), $5), $4) AS not_before),
             nodes AS (
-                SELECT n.node_id, n.epoch, n.holds, worf.sequence_range_heard(n.node_id, false, n.reported_at, true) AS assumed,
-                    worf.sequence_range_heard(n.node_id, false, n.reported_at, false) AS heard
+                SELECT n.node_id, n.epoch, n.holds, n.via_node = n.node_id AS direct,
+                    worf.sequence_range_heard(n.node_id, false, n.reported_at, true) AS assumed,
+                    worf.sequence_range_heard(n.node_id, false, n.reported_at, false) AS heard,
+                    worf.sequence_range_heard(n.node_id, true, n.reported_at, false) AS heard_directly
                 FROM worf.sequence_range_node n CROSS JOIN worf.local_node l
                 WHERE n.seqoid = $1 AND n.node_id <> l.node_id),
             granted AS (
                 SELECT g.lo, g.hi, CASE WHEN g.state = 'abandoned' THEN g.abandoned_at > now() - $3::interval
                         ELSE h.assumed > now() - $3::interval
-                            AND NOT (g.kind = 'n' AND g.state = 'acknowledged' AND h.holds IS NOT NULL AND h.heard > g.granted_at + $3::interval) END AS held,
-                    CASE WHEN g.kind = 'n' AND g.state = 'acknowledged' AND h.assumed > now() - $3::interval AND h.holds IS NOT NULL
-                            AND h.heard > g.granted_at + $3::interval
+                            AND NOT (g.kind = 'n' AND g.state = 'acknowledged' AND h.direct AND h.holds IS NOT NULL
+                                AND h.heard_directly > g.granted_at + $3::interval) END AS held,
+                    CASE WHEN g.kind = 'n' AND g.state = 'acknowledged' AND h.assumed > now() - $3::interval AND h.direct AND h.holds IS NOT NULL
+                            AND h.heard_directly > g.granted_at + $3::interval
                         THEN h.holds END AS reported
                 FROM worf.sequence_range_grant g JOIN worf.sequence_range_block b ON b.block_id = g.from_block
                     LEFT JOIN nodes h ON h.node_id = g.grantee_id
@@ -1048,13 +1052,15 @@ internal static unsafe partial class SequenceRanges
                     AND NOT EXISTS (
                         SELECT 1 FROM nodes n
                         WHERE n.assumed > now() - $3::interval
-                            AND (n.epoch IS DISTINCT FROM $2 OR n.heard <= root.received_at OR v = ANY (coalesce(n.holds, '{}')))))
+                            AND (NOT n.direct OR n.epoch IS DISTINCT FROM $2 OR n.heard_directly <= root.received_at
+                                OR v = ANY (coalesce(n.holds, '{}')))))
             """;
         SpiParameter reuse = SpiParameter.Create(SnowflakeReuseAfter());
         SpiParameter clock = SpiParameter.Create(SnowflakeIds.ReservedClock());
+        SpiParameter ahead = SpiParameter.Create(SnowflakeIds.NowMs() + (long)s_snowflakeReuseAfter.TotalMilliseconds);
         if (!apply)
         {
-            return Worf.ReadScalar<bool>(Free + "SELECT EXISTS (SELECT 1 FROM free)", seq, current, reuse, clock);
+            return Worf.ReadScalar<bool>(Free + "SELECT EXISTS (SELECT 1 FROM free)", seq, current, reuse, clock, ahead);
         }
 
         // A grant whose number is free again, which never reached its node, is never sent.
@@ -1063,7 +1069,7 @@ internal static unsafe partial class SequenceRanges
                 UPDATE worf.sequence_range_grant g SET state = 'unclaimed'
                 FROM free WHERE g.seqoid = $1 AND g.state = 'sent' AND g.kind <> 'x' AND g.lo <= free.v AND free.v <= g.hi)
             INSERT INTO worf.sequence_range_free SELECT block_id, v, v, not_before FROM free
-            """, seq, current, reuse, clock);
+            """, seq, current, reuse, clock, ahead);
         if (reused > 0)
         {
             PgLog.Log($"Snowflake node numbers: {reused} that no node holds are free again");
@@ -2560,7 +2566,9 @@ internal static unsafe partial class SequenceRanges
     /// Lifts an allocator's fence once every node with a grant from its fenced blocks, every neighbor still in touch or
     /// streaming this node's changes, and on the owner every listed participant, has exchanged since the fence began,
     /// unless two grants overlap. The owner's root then gives up its free values up to the highest any node has seen
-    /// granted, which covers the blocks it granted itself and lost.
+    /// granted, which covers the blocks it granted itself and lost. Since a neighbor's report of that may be made up, it
+    /// does so on its own only up to two of its largest blocks beyond the last grant its ledger holds, as many as it
+    /// draws from at once, and further only on <c>activate_sequence_range</c>.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
     /// <param name="node">This node.</param>
@@ -2617,13 +2625,23 @@ internal static unsafe partial class SequenceRanges
             return false;
         }
 
+        SequenceInfo info = GetInfo(seqoid);
+        if (!force && range[0].Get<uint>(1) == node.Node.Id && BeyondLedger(seqoid, info) is string beyond)
+        {
+            if (Spi.Execute("UPDATE worf.sequence_range SET detail = $2 WHERE seqoid = $1 AND detail IS DISTINCT FROM $2", seq, SpiParameter.Create(beyond)) > 0)
+            {
+                PgLog.Warning(beyond);
+            }
+
+            return false;
+        }
+
         _ = Spi.Execute("""
             UPDATE worf.sequence_range_block SET state = 'open', sysid = $2, timeline = $3
             WHERE seqoid = $1 AND state = 'fenced'
             """, seq, SpiParameter.Create((decimal)NativeMethods.GetSystemIdentifier()),
             SpiParameter.Create((long)Timeline()));
         _ = Spi.Execute("UPDATE worf.sequence_range SET fenced_at = NULL, detail = NULL WHERE seqoid = $1", seq);
-        SequenceInfo info = GetInfo(seqoid);
         if (range[0].Get<uint>(1) == node.Node.Id)
         {
             LockLedger(seqoid);
@@ -2649,6 +2667,32 @@ internal static unsafe partial class SequenceRanges
 
         PgLog.Log($"sequence {info.Name}: the allocator's fence lifted");
         return true;
+    }
+
+    /// <summary>
+    /// Finds whether the watermark lies further beyond the last grant of the owner's ledger than two of its largest
+    /// blocks.
+    /// </summary>
+    /// <returns>Why the fence holds, or null.</returns>
+    private static string? BeyondLedger(uint seqoid, SequenceInfo info)
+    {
+        SpiResult ledger = Worf.SelectCatalog($"""
+            SELECT r.watermark, coalesce({(info.Ascending ? "max(g.hi)" : "min(g.lo)")}, r.root_start), r.max_range_size
+            FROM worf.sequence_range r
+                LEFT JOIN worf.sequence_range_block b ON b.seqoid = r.seqoid AND b.epoch = r.epoch AND b.kind = 'r'
+                LEFT JOIN worf.sequence_range_grant g ON g.from_block = b.block_id AND g.kind <> 'x'
+            WHERE r.seqoid = $1
+            GROUP BY r.watermark, r.root_start, r.max_range_size
+            """, SpiParameter.Create(seqoid));
+        if (ledger.Count == 0 || ledger[0].Get<long?>(0) is not long watermark || ledger[0].Get<long?>(1) is not long last)
+        {
+            return null;
+        }
+
+        decimal beyond = info.Ascending ? (decimal)watermark - last : (decimal)last - watermark;
+        return beyond > 2m * ledger[0].Get<long>(2) * Math.Abs(info.Increment)
+            ? $"sequence {info.Name}: nodes report grants up to {watermark}, more than two of its largest blocks beyond the last grant its ledger holds, at {last}; run worf.activate_sequence_range on it to give up its values up to there"
+            : null;
     }
 
     /// <summary>

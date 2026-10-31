@@ -1064,6 +1064,9 @@ public sealed class SequenceRangeTests
             """, token), "node_a and node_c heard from");
         Assert.AreEqual("1024", await nodeB.SafePsqlAsync(Database, "SELECT count(*) FROM worf.sequence_range_node WHERE seqoid = 't_id_seq'::regclass", token),
             "the nodes node_b keeps");
+        Assert.AreEqual("t", await nodeB.SafePsqlAsync(Database, """
+            SELECT count(*) <= 256 FROM generate_series(1000001, 1001100) g WHERE worf.sequence_range_heard(g::oid, false, '-infinity', false) > '-infinity'
+            """, token), "the made-up nodes node_b notes in memory");
         Assert.IsTrue(await nodeB.PollLogAsync(flooded, "beyond the 1024 this node keeps; they are ignored", token), "the ignored reports");
         _ = await nodeB.SafePsqlAsync(Database, "DELETE FROM worf.sequence_range_node WHERE node_name LIKE 'made_up_%'", token);
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.alter_subscription_enable('a_from_b')", token);
@@ -1117,6 +1120,28 @@ public sealed class SequenceRangeTests
         Assert.IsTrue(await nodeA.PollQueryUntilAsync("other",
             "SELECT status = 'replicating' FROM worf.show_subscription_status() WHERE subscription_name = 'x_from_b'", token), "x_from_b restarted");
         Assert.IsLessThan(30.0, restarted.Elapsed.TotalSeconds, "the manager restarted x_from_b without waiting on the unreachable host");
+
+        // A watermark node_b makes up in its own report fences node_a, which gives up its values up to it only on
+        // activate_sequence_range, rather than as the fence lifts.
+        string nodeBId = await nodeB.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
+        string bSlot = await nodeA.SafePsqlAsync(Database, $"SELECT slot_name FROM worf.sequence_range_link WHERE node_id = {nodeBId}", token);
+        string[] owned = (await nodeA.SafePsqlAsync(Database,
+            "SELECT epoch, range_size, max_range_size, root_start, root_end FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass", token)).Split('|');
+        string madeUpWatermark = $$"""
+            {"node_id": {{nodeBId}}, "node_name": "node_b", "slot": "{{bSlot}}", "sysid": "1", "timeline": 1, "wal_lsn": "0/0", "sequences": [
+                {"name": "public.t_id_seq", "owner_id": {{nodeAId}}, "epoch": {{owned[0]}}, "range_size": {{owned[1]}}, "max_range_size": {{owned[2]}},
+                    "distance": 1, "high_water": null, "watermark": 9000000000000000000, "state": "active", "root_start": {{owned[3]}}, "root_end": {{owned[4]}},
+                    "reset": null, "reset_done": null, "held_complete": false, "held": [], "requests": [], "reports": [], "grants": [], "acks": []}]}
+            """;
+        _ = await nodeA.SafePsqlAsync(Database, $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{madeUpWatermark}')", token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database,
+            "SELECT detail LIKE '%run worf.activate_sequence_range on it%' FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass", token), "node_a's fence held");
+        Assert.AreEqual("t", await nodeA.SafePsqlAsync(Database, """
+            SELECT r.fenced_at IS NOT NULL AND EXISTS (
+                SELECT 1 FROM worf.sequence_range_free f JOIN worf.sequence_range_block b ON b.block_id = f.block_id
+                WHERE b.seqoid = r.seqoid AND b.kind = 'r' AND f.lo < 9000000000000000000)
+            FROM worf.sequence_range r WHERE r.seqoid = 't_id_seq'::regclass
+            """, token), "node_a's root kept below the made-up watermark");
     }
 
     /// <summary>
@@ -1253,15 +1278,26 @@ public sealed class SequenceRangeTests
         string[] pool = (await nodeA.SafePsqlAsync(Database,
             "SELECT lo, hi FROM worf.sequence_range_grant WHERE seqoid = 'worf.snowflake_node'::regclass AND kind = 'p'", token)).Split('|');
         Assert.AreEqual("t", await nodeC.SafePsqlAsync(Database, $"SELECT worf.snowflake_node() BETWEEN {pool[0]} AND {pool[1]}", token), "node_c's number from node_b's pool");
+        // Nor does node_b's own number, a day after its grant, come back on a report of node_b that lists no number and
+        // that another node relays, as one it made up would be, while node_b doesn't report itself.
+        string nodeBNumber = await nodeB.SafePsqlAsync(Database, "SELECT worf.snowflake_node()", token);
+        string nodeCId = await nodeC.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
+        _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.alter_subscription_disable('b_from_a')", token);
+        await Task.Delay(TimeSpan.FromSeconds(1), token);
         int reused = nodeA.ReadLog().Length;
-        _ = await nodeA.SafePsqlAsync(Database,
-            "UPDATE worf.sequence_range_grant SET granted_at = now() - interval '2 days' WHERE seqoid = 'worf.snowflake_node'::regclass AND kind = 'p'", token);
+        _ = await nodeA.SafePsqlAsync(Database, $"""
+            UPDATE worf.sequence_range_grant SET granted_at = now() - interval '2 days'
+            WHERE seqoid = 'worf.snowflake_node'::regclass AND (kind = 'p' OR grantee_id = {nodeBId});
+            UPDATE worf.sequence_range_node SET via_node = {nodeCId}, holds = ARRAY[]::bigint[], reported_at = now()
+            WHERE seqoid = 'worf.snowflake_node'::regclass AND node_id = {nodeBId};
+            """, token);
         await Task.Delay(TimeSpan.FromSeconds(3), token);
-        Assert.DoesNotContain("are free again", nodeA.ReadLog()[reused..], "node_b's pool numbers given back");
+        Assert.DoesNotContain("are free again", nodeA.ReadLog()[reused..], "node_b's numbers given back");
         Assert.AreEqual("0", await nodeA.SafePsqlAsync(Database, $"""
             SELECT count(*) FROM worf.sequence_range_free f JOIN worf.sequence_range_block b ON b.block_id = f.block_id
-            WHERE b.seqoid = 'worf.snowflake_node'::regclass AND f.lo <= {pool[1]} AND {pool[0]} <= f.hi
-            """, token), "node_b's pool numbers free in the root");
+            WHERE b.seqoid = 'worf.snowflake_node'::regclass AND (f.lo <= {pool[1]} AND {pool[0]} <= f.hi OR f.lo <= {nodeBNumber} AND {nodeBNumber} <= f.hi)
+            """, token), "node_b's numbers free in the root");
+        _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.alter_subscription_enable('b_from_a')", token);
         Assert.HasCount(3, (await Task.WhenAll(nodes.Select(node => node.SafePsqlAsync(Database, "SELECT worf.snowflake_node()", token)))).Distinct());
 
         // node_a goes down, and node_b and node_c restart, having last heard from it half a day ago as far as they know.

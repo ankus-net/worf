@@ -7,7 +7,9 @@ namespace Worf;
 /// that brings no change writes nothing and an idle node uses no transaction IDs. The tables record a node's report when
 /// it changes. Each query that asks how recently a node reported takes the later of the two, and a node that this server
 /// hasn't heard from since it started counts, for the checks that wait on it, as heard when it started. A node the table
-/// has no room for has its reports written to the tables instead.
+/// has no room for has its reports written to the tables instead. Each neighbor's relayed reports claim a quarter of the
+/// table at most, so that made-up reports can't fill it, and a node heard from directly takes the entry of one only ever
+/// relayed when it finds no other.
 /// </summary>
 internal static class SequenceRangeHeard
 {
@@ -15,6 +17,9 @@ internal static class SequenceRangeHeard
     /// The most nodes the table holds, for every database of the server.
     /// </summary>
     internal const int MaxNodes = 1024;
+
+    // The most entries the reports one neighbor relays claim.
+    private const int MaxRelayed = MaxNodes / 4;
 
     // How long an entry stays once its node is no longer heard from: as long as anything waits on hearing from a node,
     // the day after which a Snowflake node number a node stopped reporting comes back.
@@ -35,13 +40,14 @@ internal static class SequenceRangeHeard
     /// Records a report from a node of this database, made at a time.
     /// </summary>
     /// <param name="nodeId">The node.</param>
-    /// <param name="direct">Whether the node exchanged with this server, rather than a neighbor relaying its report.</param>
+    /// <param name="via">The node that exchanged with this server, itself unless it relayed the report.</param>
     /// <param name="at">The time, in microseconds since 2000.</param>
     /// <returns>Whether the table recorded it, which it doesn't when it has no room for the node.</returns>
-    internal static bool Record(uint nodeId, bool direct, long at)
+    internal static bool Record(uint nodeId, uint via, long at)
     {
+        bool direct = via == nodeId;
         using PgLwLockExclusiveGuard<WorfHeardTable, WorfHeard> guard = Nodes.Exclusive();
-        int slot = Find(guard, nodeId);
+        int slot = Find(guard, nodeId, via);
         if (slot < 0)
         {
             return false;
@@ -71,7 +77,7 @@ internal static class SequenceRangeHeard
     internal static void RecordLsn(uint nodeId, ulong sysid, long timeline, bool call, ulong lsn)
     {
         using PgLwLockExclusiveGuard<WorfHeardTable, WorfHeard> guard = Nodes.Exclusive();
-        int slot = Find(guard, nodeId);
+        int slot = Find(guard, nodeId, nodeId);
         if (slot < 0)
         {
             return;
@@ -120,19 +126,33 @@ internal static class SequenceRangeHeard
 
     /// <summary>
     /// Finds a node's entry, or claims one: a free one, or else the one heard from least recently, if no node has been
-    /// heard from through it for a day. An entry a node is heard from through is never given up, so that reports of
-    /// other nodes, however many, can't make the node look silent, or drop the WAL position it was last at.
+    /// heard from through it for a day. A node heard from directly that finds none takes the entry of the node heard
+    /// from least recently of those only ever relayed. An entry a node is heard from through is otherwise never given
+    /// up, so that reports of other nodes, however many, can't make the node look silent, or drop the WAL position it
+    /// was last at, and a neighbor's relayed reports claim no more than their share.
     /// </summary>
     /// <returns>The entry, or -1 when the table has no room.</returns>
-    private static int Find(PgLwLockExclusiveGuard<WorfHeardTable, WorfHeard> guard, uint nodeId)
+    private static int Find(PgLwLockExclusiveGuard<WorfHeardTable, WorfHeard> guard, uint nodeId, uint via)
     {
         uint dboid = DatabaseId();
+        int relayed = 0;
         for (int i = 0; i < guard.Length; i++)
         {
             if (guard[i].Dboid == dboid && guard[i].NodeId == nodeId)
             {
                 return i;
             }
+
+            if (guard[i].Dboid == dboid && guard[i].DirectAt == 0 && guard[i].Via == via)
+            {
+                relayed++;
+            }
+        }
+
+        bool direct = via == nodeId;
+        if (!direct && relayed >= MaxRelayed)
+        {
+            return -1;
         }
 
         long forgotten = Worker.GetCurrentTimestamp() - KeepFor;
@@ -146,12 +166,43 @@ internal static class SequenceRangeHeard
             }
         }
 
+        if (direct && slot < 0)
+        {
+            for (int i = 0; i < guard.Length; i++)
+            {
+                if (guard[i].DirectAt == 0 && (slot < 0 || guard[i].ReportedAt < guard[slot].ReportedAt))
+                {
+                    slot = i;
+                }
+            }
+        }
+
         if (slot >= 0)
         {
-            guard[slot] = new WorfHeard { Dboid = dboid, NodeId = nodeId };
+            guard[slot] = new WorfHeard { Dboid = dboid, NodeId = nodeId, Via = direct ? 0 : via };
         }
 
         return slot;
+    }
+
+    /// <summary>
+    /// Checks whether the table holds a node's entry.
+    /// </summary>
+    /// <param name="nodeId">The node.</param>
+    /// <returns>Whether it does.</returns>
+    internal static bool Holds(uint nodeId)
+    {
+        uint dboid = DatabaseId();
+        using PgLwLockShareGuard<WorfHeardTable, WorfHeard> guard = Nodes.Share();
+        for (int i = 0; i < guard.Length; i++)
+        {
+            if (guard[i].Dboid == dboid && guard[i].NodeId == nodeId)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>

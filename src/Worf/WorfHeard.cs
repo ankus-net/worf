@@ -16,6 +16,11 @@ internal struct WorfHeard
     public uint NodeId;
 
     /// <summary>
+    /// The neighbor whose relayed report claimed the entry, while the node hasn't exchanged with this server.
+    /// </summary>
+    public uint Via;
+
+    /// <summary>
     /// When the node last exchanged with this server, or zero.
     /// </summary>
     public long DirectAt;
