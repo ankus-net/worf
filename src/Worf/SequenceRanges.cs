@@ -125,6 +125,17 @@ using Ankus.Postgres;
         node_id oid NOT NULL
     );
 
+    CREATE TABLE worf.sequence_range_dropped (
+        name text PRIMARY KEY,
+        owner_node oid NOT NULL,
+        epoch integer NOT NULL,
+        range_size bigint NOT NULL,
+        max_range_size bigint NOT NULL,
+        watermark bigint,
+        root_start bigint,
+        root_end bigint NOT NULL
+    );
+
     CREATE VIEW worf.sequence_ranges AS
         SELECT r.seqoid AS sequence, coalesce(o.node_name, ro.node_name) AS owner, r.epoch, coalesce(p.node_name, rp.node_name) AS parent,
             CASE WHEN r.fenced_at IS NOT NULL THEN 'fenced' ELSE r.state END AS state,
@@ -384,6 +395,18 @@ internal static unsafe partial class SequenceRanges
         long? watermark = null;
         long? rootStart = info.Ascending ? info.Min : info.Max;
         long end = RootEnd(info);
+        // A sequence of the name this node owned and dropped starts the next epoch, above the dropped one's grants.
+        if (existing.Count == 0 &&
+            Worf.SelectCatalog("SELECT epoch, watermark, root_start, root_end FROM worf.sequence_range_dropped WHERE name = $1", SpiParameter.Create(info.Name))
+            is { Count: > 0 } dropped)
+        {
+            epoch = dropped[0].Get<int>(0) + 1;
+            watermark = dropped[0].Get<long?>(1);
+            rootStart = dropped[0].Get<long?>(2);
+            end = dropped[0].Get<long>(3);
+            _ = Spi.Execute("DELETE FROM worf.sequence_range_dropped WHERE name = $1", SpiParameter.Create(info.Name));
+        }
+
         if (existing.Count > 0)
         {
             int current = existing[0].Get<int>(0);
@@ -528,7 +551,10 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
-    /// Removes a dropped sequence's range state.
+    /// Removes a dropped sequence's range state. A sequence its owner drops ends its epoch there: the owner keeps the
+    /// epoch, which it tells its neighbors is disabled, so that they keep drawing from their blocks and ask it for no
+    /// more, takes no report of it as one to join, and starts the next epoch above it once a sequence of the same name
+    /// comes under range management again.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
     internal static void Forget(uint seqoid)
@@ -539,6 +565,18 @@ internal static unsafe partial class SequenceRanges
         }
 
         SpiParameter seq = SpiParameter.Create(seqoid);
+        _ = Spi.Execute("""
+            INSERT INTO worf.sequence_range_dropped
+            SELECT pg_catalog.quote_ident(n.nspname) || '.' || pg_catalog.quote_ident(c.relname), r.owner_node, r.epoch, r.range_size, r.max_range_size,
+                r.watermark, r.root_start, r.root_end
+            FROM worf.sequence_range r
+                JOIN pg_catalog.pg_class c ON c.oid = r.seqoid
+                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                JOIN worf.local_node l ON l.node_id = r.owner_node
+            WHERE r.seqoid = $1
+            ON CONFLICT (name) DO UPDATE SET owner_node = excluded.owner_node, epoch = excluded.epoch, range_size = excluded.range_size,
+                max_range_size = excluded.max_range_size, watermark = excluded.watermark, root_start = excluded.root_start, root_end = excluded.root_end
+            """, seq);
         _ = Spi.Execute("DELETE FROM worf.sequence_range_free WHERE block_id IN (SELECT block_id FROM worf.sequence_range_block WHERE seqoid = $1)", seq);
         _ = Spi.Execute("DELETE FROM worf.sequence_range_grant WHERE seqoid = $1", seq);
         _ = Spi.Execute("DELETE FROM worf.sequence_range_block WHERE seqoid = $1", seq);

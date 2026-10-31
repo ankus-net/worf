@@ -533,14 +533,20 @@ internal static class SequenceRangeExchange
             }
 
             writer.WriteStartArray("sequences");
+            // An epoch this node owned of a sequence it dropped goes out as disabled, with nothing else.
             SpiResult sequences = Worf.SelectCatalog("""
-                SELECT r.seqoid::oid, pg_catalog.quote_ident(n.nspname) || '.' || pg_catalog.quote_ident(c.relname), r.owner_node,
-                    r.epoch, r.range_size, r.max_range_size, r.distance, r.high_water, r.watermark, r.parent_node,
-                    CASE WHEN r.fenced_at IS NOT NULL THEN 'fenced' ELSE r.state END, r.root_start, r.root_end
-                FROM worf.sequence_range r
-                    JOIN pg_catalog.pg_class c ON c.oid = r.seqoid
-                    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-                ORDER BY (pg_catalog.quote_ident(n.nspname) || '.' || pg_catalog.quote_ident(c.relname)) COLLATE "C"
+                SELECT * FROM (
+                    SELECT r.seqoid::oid, pg_catalog.quote_ident(n.nspname) || '.' || pg_catalog.quote_ident(c.relname) AS name, r.owner_node,
+                        r.epoch, r.range_size, r.max_range_size, r.distance, r.high_water, r.watermark, r.parent_node,
+                        CASE WHEN r.fenced_at IS NOT NULL THEN 'fenced' ELSE r.state END, r.root_start, r.root_end
+                    FROM worf.sequence_range r
+                        JOIN pg_catalog.pg_class c ON c.oid = r.seqoid
+                        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                    UNION ALL
+                    SELECT NULL, d.name, d.owner_node, d.epoch, d.range_size, d.max_range_size, 0, NULL, d.watermark, NULL, 'disabled', d.root_start, d.root_end
+                    FROM worf.sequence_range_dropped d
+                    WHERE NOT EXISTS (SELECT 1 FROM worf.sequence_range r WHERE r.seqoid = pg_catalog.to_regclass(d.name))) s
+                ORDER BY name COLLATE "C"
                 """);
             for (int i = 0; i < sequences.Count; i++)
             {
@@ -559,7 +565,8 @@ internal static class SequenceRangeExchange
     /// </summary>
     private static void WriteSequence(Utf8JsonWriter writer, SpiRow row, uint neighbor, List<Guid> refusals)
     {
-        uint seqoid = row.Get<uint>(0);
+        uint? managed = row.Get<uint?>(0);
+        uint seqoid = managed ?? 0;
         SpiParameter seq = SpiParameter.Create(seqoid);
         SpiParameter peer = SpiParameter.Create(neighbor);
         writer.WriteStartObject();
@@ -574,6 +581,21 @@ internal static class SequenceRangeExchange
         writer.WriteString("state", row.Get<string>(10));
         WriteNullable(writer, "root_start", row.Get<long?>(11));
         WriteNullable(writer, "root_end", row.Get<long?>(12));
+        if (managed is null)
+        {
+            WriteNullable(writer, "reset", (string?)null);
+            WriteNullable(writer, "reset_done", (string?)null);
+            writer.WriteBoolean("held_complete", false);
+            foreach (string name in (ReadOnlySpan<string>)["held", "requests", "reports", "grants", "acks"])
+            {
+                writer.WriteStartArray(name);
+                writer.WriteEndArray();
+            }
+
+            writer.WriteEndObject();
+            return;
+        }
+
         bool snowflake = seqoid == SnowflakeIds.NodeSequence();
         if (snowflake)
         {
@@ -649,7 +671,7 @@ internal static class SequenceRangeExchange
             writer.WriteEndObject();
         });
 
-        // Grants for the neighbor that it hasn't acknowledged, and acknowledgements of its grants.
+        // Grants for the neighbor that it hasn't acknowledged.
         WriteArray(writer, "grants", Worf.SelectCatalog(
             "SELECT grant_id, request_id, lo, hi, kind::text, not_before FROM worf.sequence_range_grant WHERE seqoid = $1 AND grantee_id = $2 AND state = 'sent'",
             seq, peer), grant =>
@@ -668,9 +690,12 @@ internal static class SequenceRangeExchange
             }
         });
 
-        WriteArray(writer, "acks", Worf.SelectCatalog(
-            "SELECT block_id FROM worf.sequence_range_block WHERE seqoid = $1 AND from_node = $2 AND kind IN ('n', 'p', 'i') AND state IN ('next', 'active', 'open', 'imported')",
-            seq, peer), received => writer.WriteStringValue(received.Get<Guid>(0)));
+        // The blocks this node holds of the epoch, which the neighbor's ledger has a record of unless it went back, while
+        // an earlier epoch's root, as one whose sequence its owner dropped, may have none.
+        WriteArray(writer, "acks", Worf.SelectCatalog("""
+            SELECT block_id FROM worf.sequence_range_block
+            WHERE seqoid = $1 AND from_node = $2 AND kind IN ('n', 'p', 'i') AND state IN ('next', 'active', 'open', 'imported') AND epoch = $3
+            """, seq, peer, SpiParameter.Create(row.Get<int>(3))), received => writer.WriteStringValue(received.Get<Guid>(0)));
         writer.WriteEndObject();
     }
 
@@ -790,7 +815,7 @@ internal static class SequenceRangeExchange
         string? state = Text(entry, "state");
         if (local.Count == 0)
         {
-            return state == "disabled";
+            return state == "disabled" || entry.GetProperty("owner_id").GetUInt32() == node.Node.Id;
         }
 
         if (local[0].Get<int>(0) != epoch)
@@ -968,7 +993,8 @@ internal static class SequenceRangeExchange
             SpiParameter.Create(seqoid));
         if (local.Count == 0)
         {
-            if (entry.GetProperty("state").GetString() == "disabled")
+            // An epoch this node owns and no longer manages, as after it dropped the sequence, is no epoch to join.
+            if (entry.GetProperty("state").GetString() == "disabled" || owner == node.Node.Id)
             {
                 return (false, false, false);
             }
@@ -1195,9 +1221,11 @@ internal static class SequenceRangeExchange
         Guid[] acks = [.. entry.GetProperty("acks").EnumerateArray().Select(ack => ack.GetGuid())];
         _ = Spi.Execute("UPDATE worf.sequence_range_grant SET state = 'acknowledged' WHERE grant_id = ANY ($1) AND grantee_id = $2 AND state = 'sent'",
             SpiParameter.Create(acks), sender);
-        if (!fenced && !wentBack && Worf.ReadScalar<long>(
-            "SELECT count(*) FROM unnest($1::uuid[]) a(id) WHERE NOT EXISTS (SELECT 1 FROM worf.sequence_range_grant g WHERE g.grant_id = a.id)",
-            SpiParameter.Create(acks)) is long unknown and > 0)
+        if (!fenced && !wentBack && Worf.ReadScalar<long>("""
+            SELECT count(*) FROM unnest($1::uuid[]) a(id)
+            WHERE NOT EXISTS (SELECT 1 FROM worf.sequence_range_grant g WHERE g.grant_id = a.id)
+                AND EXISTS (SELECT 1 FROM worf.sequence_range_block b WHERE b.seqoid = $2 AND b.kind IN ('r', 'p') AND b.state = 'open')
+            """, SpiParameter.Create(acks), seq) is long unknown and > 0)
         {
             PgLog.Warning($"sequence {info.Name}: node {senderName} holds {unknown} blocks this node granted and has no record of, so this node went back; it resets");
             SequenceRanges.Reset(seqoid, node, false);

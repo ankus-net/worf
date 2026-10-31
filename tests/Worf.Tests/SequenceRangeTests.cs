@@ -966,6 +966,46 @@ public sealed class SequenceRangeTests
             "SELECT count(*) = 300 FROM shared WHERE EXISTS (SELECT 1 FROM pg_attrdef WHERE adrelid = 'shared'::regclass)", token),
             "node_a's rows and default on node_b");
 
+        // Dropping a managed sequence on its owner ends its epoch, which node_b, keeping its blocks, hears of as disabled.
+        // A dump of its table restores there, the sequence unmanaged, and enabling it again starts a new epoch above the
+        // values node_b holds.
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE mv (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('mv_id_seq', participants := '{}', range_size := 100)", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            Assert.IsTrue(await node.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges WHERE sequence = 'mv_id_seq'::regclass", token),
+                $"{node.Name} drawing from mv_id_seq's blocks");
+            _ = await node.SafePsqlAsync(Database, $"INSERT INTO mv (v) SELECT '{node.Name}' FROM generate_series(1, 20)", token);
+        }
+
+
+        using TemporaryDirectory dumps = new($"worf-sequence-range-dump-{Guid.NewGuid():N}");
+        string dump = Path.Join(dumps.FullName, "mv.dump");
+        (int dumped, string dumpOutput) = await nodeA.RunProgramAsync("pg_dump", ["-Fc", "-t", "mv", "-f", dump, "-d", Database], token);
+        Assert.AreEqual(0, dumped, dumpOutput);
+        int dropped = nodeA.ReadLog().Length;
+        _ = await nodeA.SafePsqlAsync(Database, "DROP TABLE mv", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'disabled' FROM worf.sequence_ranges WHERE sequence = 'mv_id_seq'::regclass", token),
+            "node_b heard mv_id_seq's epoch end");
+        (int restored, string restoreOutput) = await nodeA.RunProgramAsync("pg_restore",
+            ["-d", $"dbname={Database} options='-c worf.sequence_range_restore=on'", dump], token);
+        Assert.AreEqual(0, restored, restoreOutput);
+        await Task.Delay(TimeSpan.FromSeconds(2), token);
+        Assert.AreEqual("20|f", await nodeA.SafePsqlAsync(Database,
+            "SELECT count(*), EXISTS (SELECT 1 FROM worf.sequence_range WHERE seqoid = 'mv_id_seq'::regclass) FROM mv", token));
+        Assert.DoesNotContain("it resets", nodeA.ReadLog()[dropped..]);
+        string heldByB = await nodeB.SafePsqlAsync(Database, "SELECT max(hi) FROM worf.sequence_range_block WHERE seqoid = 'mv_id_seq'::regclass AND kind = 'n'", token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('mv_id_seq', participants := '{node_b}', range_size := 100)", token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database,
+            $"SELECT state = 'active' AND epoch = 2 AND root_start > {heldByB} FROM worf.sequence_range WHERE seqoid = 'mv_id_seq'::regclass", token),
+            "mv_id_seq's second epoch above node_b's blocks");
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT epoch = 2 FROM worf.sequence_range WHERE seqoid = 'mv_id_seq'::regclass", token),
+            "node_b in mv_id_seq's second epoch");
+
         async Task InsertAsync(TestNode node, string value)
         {
             await using NpgsqlConnection connection = await node.OpenAsync(Database, token);
