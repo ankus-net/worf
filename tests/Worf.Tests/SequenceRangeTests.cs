@@ -2049,11 +2049,6 @@ public sealed class SequenceRangeTests
     /// </summary>
     private static async Task AssertIdleAsync(TestNode[] nodes, bool managed, CancellationToken token, TimeSpan? span = null)
     {
-        foreach (TestNode node in nodes)
-        {
-            _ = await node.SafePsqlAsync(Database, "CREATE EXTENSION IF NOT EXISTS pg_walinspect", token);
-        }
-
         await SettleAsync(nodes, managed, token);
 
         // Each exchange call is a session of its own. A slot takes no more than a call an exchange interval, and one where
@@ -2353,6 +2348,9 @@ public sealed class SequenceRangeTests
         {
             _ = await node.SafePsqlAsync(Database, $"CREATE USER {SuperUser} SUPERUSER", token);
             _ = await node.SafePsqlAsync(Database, "CREATE EXTENSION worf", token);
+
+            // For the idle checks, which read the WAL; created now, before the DDL can replicate.
+            _ = await node.SafePsqlAsync(Database, "CREATE EXTENSION pg_walinspect", token);
             _ = await node.SafePsqlAsync(Database,
                 $"SELECT * FROM worf.create_node(node_name := '{name}', dsn := '{node.Dsn(Database, SuperUser)}')", token);
         }
