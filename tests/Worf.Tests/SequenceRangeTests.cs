@@ -307,7 +307,7 @@ public sealed class SequenceRangeTests
         // the failing values out, without reading every row.
         _ = await node.SafePsqlAsync(Database, """
             CREATE TABLE odd (id numeric);
-            INSERT INTO odd VALUES ('NaN'), (1e30), (5.5);
+            INSERT INTO odd VALUES ('NaN'), (1e30), (5.5), ('Infinity'), ('-Infinity');
             ALTER TABLE odd ALTER COLUMN id SET DEFAULT nextval('nseq');
             CREATE TABLE indexed (id bigint PRIMARY KEY);
             INSERT INTO indexed SELECT -g FROM generate_series(1, 20000) g;
@@ -324,6 +324,30 @@ public sealed class SequenceRangeTests
             SELECT pg_stat_force_next_flush();
             """, token);
         Assert.AreEqual(scans, await node.SafePsqlAsync(Database, Scans, token), "no sequential scan");
+
+        // A root starts above the whole values within bigint that the tables hold, which NaN, the infinities and values
+        // past bigint don't move, as when the sequence is enabled again, with a column that took its default afterwards.
+        _ = await node.SafePsqlAsync(Database, """
+            CREATE SEQUENCE nan_seq;
+            CREATE TABLE nan_rows (id numeric DEFAULT nextval('nan_seq'));
+            INSERT INTO nan_rows SELECT FROM generate_series(1, 50);
+            INSERT INTO nan_rows VALUES ('NaN'), ('Infinity'), ('-Infinity'), (1e30);
+            SELECT worf.enable_sequence_range('nan_seq', participants := '{}', range_size := 100);
+            """, token);
+        Assert.AreEqual("51|50|51", await node.SafePsqlAsync(Database, """
+            WITH i AS (INSERT INTO nan_rows DEFAULT VALUES RETURNING id)
+            SELECT r.root_start, r.high_water, (SELECT id FROM i) FROM worf.sequence_range r WHERE r.seqoid = 'nan_seq'::regclass
+            """, token));
+        _ = await node.SafePsqlAsync(Database, """
+            CREATE TABLE nan_set (id numeric);
+            INSERT INTO nan_set VALUES ('Infinity'), ('NaN');
+            ALTER TABLE nan_set ALTER COLUMN id SET DEFAULT nextval('nan_seq');
+            SELECT worf.disable_sequence_range('nan_seq');
+            SELECT worf.enable_sequence_range('nan_seq', participants := '{}', range_size := 100);
+            INSERT INTO nan_set DEFAULT VALUES;
+            """, token);
+        Assert.AreEqual("2|t", await node.SafePsqlAsync(Database,
+            "SELECT epoch, root_start BETWEEN 152 AND 1000000 FROM worf.sequence_range WHERE seqoid = 'nan_seq'::regclass", token));
 
         // A partition whose own default draws from a managed sequence has the column guarded on its own, so attaching one
         // holds up no writers to the tree, and the tree's other partitions write any value in the column.
@@ -847,10 +871,13 @@ public sealed class SequenceRangeTests
                 CREATE TABLE t (id bigserial PRIMARY KEY, v text);
                 SELECT * FROM worf.replication_set_add_table('default', 't');
                 CREATE TABLE narrow (id smallserial PRIMARY KEY, v text);
+                CREATE SEQUENCE nums_seq;
+                CREATE TABLE nums (id numeric PRIMARY KEY DEFAULT nextval('nums_seq'));
                 """, token);
         }
 
-        _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO narrow VALUES (32767, 'legacy')", token);
+        _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO narrow VALUES (32767, 'legacy'); INSERT INTO nums VALUES (150), (151), ('NaN')", token);
+        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO nums SELECT FROM generate_series(1, 3)", token);
         await SubscribeAsync(nodeA, "a_from_b", nodeB, token);
         await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
         await AssertIdleAsync([nodeA, nodeB], false, token);
@@ -874,6 +901,15 @@ public sealed class SequenceRangeTests
                 "SELECT count(*), count(DISTINCT id), count(*) FILTER (WHERE v = 'a'), count(*) FILTER (WHERE v = 'b') FROM t", token),
                 node.Name);
         }
+
+        // A root starts above the values both nodes hold, which a NaN doesn't move.
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('nums_seq', participants := '{node_b}', range_size := 100)", token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database,
+            "SELECT state = 'active' FROM worf.sequence_ranges WHERE sequence = 'nums_seq'::regclass", token), "nums_seq's root started");
+        Assert.AreEqual("152|152", await nodeA.SafePsqlAsync(Database, """
+            WITH i AS (INSERT INTO nums DEFAULT VALUES RETURNING id)
+            SELECT r.root_start, (SELECT id FROM i) FROM worf.sequence_range r WHERE r.seqoid = 'nums_seq'::regclass
+            """, token));
 
         // A root with no values left above node_b's can't start. The owner notes why and warns once, and takes in
         // node_b's report and request, which stay as they are, without writing, while node_b asks less often.
@@ -1102,10 +1138,13 @@ public sealed class SequenceRangeTests
                 CREATE TABLE t (id bigserial PRIMARY KEY, v text);
                 CREATE TABLE late (id bigserial PRIMARY KEY, v text);
                 CREATE TABLE narrow (id smallserial PRIMARY KEY, v text);
+                CREATE SEQUENCE nums_seq;
+                CREATE TABLE nums (id numeric PRIMARY KEY DEFAULT nextval('nums_seq'));
                 """, token);
         }
 
-        _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO narrow VALUES (32767, 'legacy')", token);
+        _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO narrow VALUES (32767, 'legacy'); INSERT INTO nums VALUES (150), (151), ('NaN')", token);
+        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO nums SELECT FROM generate_series(1, 3)", token);
         _ = await nodeC.SafePsqlAsync(Database, "INSERT INTO late (id, v) SELECT g, 'legacy' FROM generate_series(1, 5000) g", token);
         _ = await nodeA.SafePsqlAsync(Database,
             "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b,node_c}', range_size := 100, max_range_size := 100)", token);

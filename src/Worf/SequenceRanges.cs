@@ -2869,11 +2869,12 @@ internal static unsafe partial class SequenceRanges
                 : "SELECT least(min(high_water), min(watermark), (SELECT watermark FROM worf.sequence_range WHERE seqoid = $1)) FROM worf.sequence_range_node WHERE seqoid = $1 AND epoch = $2",
             SpiParameter.Create(seqoid), SpiParameter.Create(epoch))[0].Get<long?>(0);
 
-        long start;
+        // The start is worked out in numeric, so that a node's values at the end of bigint don't wrap it around.
+        decimal start;
         bool snowflake = seqoid == SnowflakeIds.NodeSequence();
         if (info.Ascending)
         {
-            start = Math.Max(Math.Max(poolStart ?? info.QuarantineEdge + 1, high is long h ? h + 1 : info.QuarantineEdge + 1),
+            start = Math.Max(Math.Max(poolStart ?? info.QuarantineEdge + 1, high is long h ? (decimal)h + 1 : info.QuarantineEdge + 1),
                 info.QuarantineEdge + 1);
             if (start > end && !snowflake)
             {
@@ -2882,7 +2883,7 @@ internal static unsafe partial class SequenceRanges
         }
         else
         {
-            start = Math.Min(Math.Min(poolStart ?? info.QuarantineEdge - 1, high is long h ? h - 1 : info.QuarantineEdge - 1),
+            start = Math.Min(Math.Min(poolStart ?? info.QuarantineEdge - 1, high is long h ? (decimal)h - 1 : info.QuarantineEdge - 1),
                 info.QuarantineEdge - 1);
             if (start < end)
             {
@@ -2892,7 +2893,7 @@ internal static unsafe partial class SequenceRanges
 
         // A Snowflake root spans every node number, from zero, since the numbers below its start come back once no node
         // holds them. The sequence's own bounds are its quarantine's by now.
-        (long lo, long hi) = info.Ascending ? (start, end) : (end, start);
+        (long lo, long hi) = info.Ascending ? ((long)start, end) : (end, (long)start);
         Guid root = InsertBlock(seqoid, epoch, 'r', snowflake ? 0 : lo, hi, "open", null, node);
         if (lo <= hi)
         {
@@ -2902,7 +2903,7 @@ internal static unsafe partial class SequenceRanges
         // The root's start goes to the other nodes, so that each allocator refuses a node that joins later with values
         // that reach into it.
         _ = Spi.Execute("UPDATE worf.sequence_range SET state = 'quarantined', root_start = $2, detail = NULL WHERE seqoid = $1", SpiParameter.Create(seqoid),
-            SpiParameter.Create(start));
+            SpiParameter.Create(info.Ascending ? lo : hi));
 
         // The owner needs no exchange for its own blocks, so it leaves quarantine as soon as a neighbor has heard of its
         // first, or at once when none is in touch. An owner that keeps the Snowflake number it held, as when every number
@@ -3361,7 +3362,9 @@ internal static unsafe partial class SequenceRanges
 
     /// <summary>
     /// Computes the highest value, or lowest for a descending sequence, that the sequence may have issued or its
-    /// tables hold. A numeric column's values are rounded away from the root's start and kept within bigint.
+    /// tables hold. Only a stored value that the root could grant counts, since no other can meet one of its values:
+    /// NaN, an infinity, or a value past the root's end or past bigint, counts for nothing. A numeric column's values are
+    /// rounded away from the root's start.
     /// </summary>
     /// <param name="info">The sequence.</param>
     /// <param name="issued">The last value the sequence issued before a quarantine moved it, if one did.</param>
@@ -3388,12 +3391,16 @@ internal static unsafe partial class SequenceRanges
         Take(Worf.ReadScalar<long?>("SELECT " + pick + "(" + (info.Ascending ? "hi" : "lo") +
             ") FROM worf.sequence_range_block WHERE seqoid = $1 AND kind IN ('n', 'i')", seq));
         // Each table is read as its owner, so that the user's functions the planner runs have no rights the owner lacks.
+        long end = Worf.ReadScalar<long?>("SELECT root_end FROM worf.sequence_range WHERE seqoid = $1", seq) ?? RootEnd(info);
         foreach ((uint relid, string column, uint typeOid) in UsingColumns(info.Seqoid))
         {
-            string query = typeOid == NumericOid
-                ? "SELECT least(greatest(" + round + "(" + pick + "(" + Spi.QuoteIdentifier(column) +
-                    ")), -9223372036854775808), 9223372036854775807)::bigint FROM " + QualifiedName(relid)
-                : "SELECT " + pick + "(" + Spi.QuoteIdentifier(column) + ")::bigint FROM " + QualifiedName(relid);
+            string value = Spi.QuoteIdentifier(column);
+            string within = typeOid != NumericOid
+                ? string.Create(CultureInfo.InvariantCulture, $"{value} {(info.Ascending ? "<=" : ">=")} {end}")
+                : info.Ascending
+                    ? string.Create(CultureInfo.InvariantCulture, $"{value} BETWEEN {long.MinValue}::numeric AND {end}::numeric")
+                    : string.Create(CultureInfo.InvariantCulture, $"{value} BETWEEN {end}::numeric AND {long.MaxValue}::numeric");
+            string query = $"SELECT {round}({pick}({value}))::bigint FROM {QualifiedName(relid)} WHERE {within}";
             Take(TableOwner.Run(relid, () => Worf.ReadScalar<long?>(query)));
         }
 
