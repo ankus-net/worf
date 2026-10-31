@@ -1376,53 +1376,48 @@ internal static class Sync
     private static bool WaitForApply(WorfSubscription sub, string nspname, string relname, ulong lsn, bool untilStalled)
     {
         PublishCopyLsn(lsn);
-        try
+        long started = Stopwatch.GetTimestamp();
+        long progressed = started;
+        TimeSpan logAfter = ApplyWaitLogAfter;
+        ulong applied = 0;
+        while (true)
         {
-            long started = Stopwatch.GetTimestamp();
-            long progressed = started;
-            TimeSpan logAfter = ApplyWaitLogAfter;
-            ulong applied = 0;
-            while (true)
+            ulong reported;
+            using (PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share())
             {
-                ulong reported;
-                using (PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share())
-                {
-                    reported = guard[Worker.MyWorfWorker].Worker.Sync.AppliedLsn;
-                }
-
-                if (reported >= lsn)
-                {
-                    return true;
-                }
-
-                if (reported != applied)
-                {
-                    applied = reported;
-                    progressed = Stopwatch.GetTimestamp();
-                }
-                else if (untilStalled && Stopwatch.GetElapsedTime(progressed) >= ApplyStallTimeout)
-                {
-                    return false;
-                }
-
-                if (Stopwatch.GetElapsedTime(started) >= logAfter)
-                {
-                    PgLog.Log($"table {nspname}.{relname} waits to copy until subscription {sub.Name} applies up to {Worf.FormatLsn(lsn)}, and it's at {Worf.FormatLsn(applied)}");
-                    logAfter += ApplyWaitLogInterval;
-                }
-
-                if (Worker.GotSigterm)
-                {
-                    throw new OperationCanceledException("The worf worker is stopping.");
-                }
-
-                _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(1000));
-                PgInterrupts.Check();
+                reported = guard[Worker.MyWorfWorker].Worker.Sync.AppliedLsn;
             }
-        }
-        finally
-        {
-            PublishCopyLsn(0);
+
+            if (reported >= lsn)
+            {
+                PublishCopyLsn(0);
+                return true;
+            }
+
+            if (reported != applied)
+            {
+                applied = reported;
+                progressed = Stopwatch.GetTimestamp();
+            }
+            else if (untilStalled && Stopwatch.GetElapsedTime(progressed) >= ApplyStallTimeout)
+            {
+                PublishCopyLsn(0);
+                return false;
+            }
+
+            if (Stopwatch.GetElapsedTime(started) >= logAfter)
+            {
+                PgLog.Log($"table {nspname}.{relname} waits to copy until subscription {sub.Name} applies up to {Worf.FormatLsn(lsn)}, and it's at {Worf.FormatLsn(applied)}");
+                logAfter += ApplyWaitLogInterval;
+            }
+
+            if (Worker.GotSigterm)
+            {
+                throw new OperationCanceledException("The worf worker is stopping.");
+            }
+
+            _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(1000));
+            PgInterrupts.Check();
         }
     }
 
