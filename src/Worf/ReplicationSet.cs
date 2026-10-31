@@ -21,10 +21,21 @@ using Ankus.Postgres;
         PRIMARY KEY(set_id, set_reloid)
     ) WITH (user_catalog_table=true);
 
-    -- Decoding reads the table with a historic snapshot, under which PostgreSQL reads its TOAST table in the files
-    -- that it had then, which REINDEX, VACUUM FULL or CLUSTER since replaces, so values stay in the row while they fit.
-    ALTER TABLE worf.replication_set_table ALTER COLUMN set_att_list SET STORAGE MAIN,
-        ALTER COLUMN set_row_filter SET STORAGE MAIN;
+    -- The column lists and row filters of replication_set_table, in parts that are never compressed or kept out of
+    -- line, which decoding reads. Decoding reads worf's catalogs with a historic snapshot, under which PostgreSQL
+    -- reads a TOAST table in the file it had then, which REINDEX, VACUUM FULL or CLUSTER since replaces, while it
+    -- finds a table declared a catalog in its current file. The parts' column is added with its storage, so that the
+    -- table has no TOAST table.
+    CREATE TABLE worf.replication_set_table_part (
+        set_id oid NOT NULL,
+        set_reloid oid NOT NULL,
+        part_attnum smallint NOT NULL,
+        part_no integer NOT NULL,
+        PRIMARY KEY(set_id, set_reloid, part_attnum, part_no)
+    ) WITH (user_catalog_table=true);
+
+    ALTER TABLE worf.replication_set_table_part ADD COLUMN part_data bytea NOT NULL,
+        ALTER COLUMN part_data SET STORAGE PLAIN;
 
     CREATE TABLE worf.replication_set_seq (
         set_id oid NOT NULL,
@@ -500,9 +511,10 @@ internal static partial class ReplicationSet
             nulls[AnumRepsetTableAttList - 1] = true;
         }
 
-        if (rowFilter is not null)
+        sbyte* rowFilterText = rowFilter is null ? null : NativeMethods.nodeToString(rowFilter);
+        if (rowFilterText is not null)
         {
-            values[AnumRepsetTableRowFilter - 1] = (ulong)NativeMethods.cstring_to_text(NativeMethods.nodeToString(rowFilter));
+            values[AnumRepsetTableRowFilter - 1] = (ulong)NativeMethods.cstring_to_text(rowFilterText);
         }
         else
         {
@@ -511,8 +523,18 @@ internal static partial class ReplicationSet
 
         HeapTupleData* tup = NativeMethods.heap_form_tuple(tupDesc, values, nulls);
 
-        // Insert the tuple to the catalog.
+        // Insert the tuple to the catalog, and the column list and row filter in the parts that decoding reads, each
+        // column's name terminated.
         NativeMethods.CatalogTupleInsert(rel, tup);
+        if (attList.Count > 0)
+        {
+            WriteParts(repset.Id, reloid, AnumRepsetTableAttList, [.. attList.SelectMany(Worf.ToServerCString)]);
+        }
+
+        if (rowFilterText is not null)
+        {
+            WriteParts(repset.Id, reloid, AnumRepsetTableRowFilter, new ReadOnlySpan<byte>(rowFilterText, Worf.StrLen(rowFilterText)).ToArray());
+        }
 
         // Cleanup.
         InvalidateRelcache(reloid);
@@ -596,6 +618,7 @@ internal static partial class ReplicationSet
         if (tuple is not null)
         {
             NativeMethods.simple_heap_delete(rel, &tuple->t_self);
+            DeleteParts(setid, reloid);
         }
         else if (!fromDrop)
         {
@@ -777,6 +800,7 @@ internal static partial class ReplicationSet
 
             // Remove the tuple.
             Spi.Execute("DELETE FROM worf.replication_set_table WHERE ctid = $1", SpiParameter.Create(row.Get<PgItemPointer>(0)));
+            DeleteParts(setid, reloid);
             InvalidateRelcache(reloid);
 
             // Dependency cleanup.
@@ -913,27 +937,32 @@ internal static partial class ReplicationSet
                     entry.ReplicateDelete = true;
                 }
 
-                // Update replicated column map.
-                ulong d = NativeMethods.heap_getattr(tuple, AnumRepsetTableAttList, repsetRelDesc, &isnull);
+                // Update replicated column map, from the parts that hold it, as the row's own value may be out of line.
+                _ = NativeMethods.heap_getattr(tuple, AnumRepsetTableAttList, repsetRelDesc, &isnull);
                 if (!isnull)
                 {
-                    string?[] attList = PgDatum.DangerousCreate((nuint)d, (uint)PgBuiltInOid.TextArrayOid, PgMemoryContext.Current).Read<string?[]>();
+                    byte[] attList = ReadParts(repset.Id, reloid, AnumRepsetTableAttList);
                     entry.AttList ??= [];
-                    foreach (string? attname in attList)
+                    for (int start = 0, end; start < attList.Length; start = end + 1)
                     {
-                        entry.AttList.Add(GetAttNumByName(tableDesc, attname!));
+                        end = Array.IndexOf(attList, (byte)0, start);
+                        entry.AttList.Add(GetAttNumByName(tableDesc, Worf.FromServer(attList.AsSpan(start, end - start))));
                     }
                 }
 
                 // Add row filter if any.
-                d = NativeMethods.heap_getattr(tuple, AnumRepsetTableRowFilter, repsetRelDesc, &isnull);
+                _ = NativeMethods.heap_getattr(tuple, AnumRepsetTableRowFilter, repsetRelDesc, &isnull);
                 if (!isnull)
                 {
+                    byte[] rowFilter = ReadParts(repset.Id, reloid, AnumRepsetTableRowFilter);
                     MemoryContextData* olctx = NativeGlobals.CurrentMemoryContext;
                     NativeGlobals.CurrentMemoryContext = NativeGlobals.CacheMemoryContext;
                     try
                     {
-                        entry.RowFilter.Add((nint)NativeMethods.stringToNode(NativeMethods.text_to_cstring((varlena*)d)));
+                        fixed (byte* text = (byte[])[.. rowFilter, 0])
+                        {
+                            entry.RowFilter.Add((nint)NativeMethods.stringToNode((sbyte*)text));
+                        }
                     }
                     finally
                     {
@@ -954,6 +983,65 @@ internal static partial class ReplicationSet
         entry.IsValid = true;
 
         return entry;
+    }
+
+    /// <summary>
+    /// Writes a table's column list or row filter in the parts that decoding reads, each small enough to stay in its
+    /// row.
+    /// </summary>
+    private static void WriteParts(uint setid, uint reloid, short attnum, byte[] value)
+        => Elevated.Run(() => _ = Spi.Execute($$"""
+            INSERT INTO worf.replication_set_table_part
+                SELECT $1, $2, $3, n, pg_catalog.substring($4, (n - 1) * {{PartSize}} + 1, {{PartSize}})
+                FROM pg_catalog.generate_series(1, (pg_catalog.length($4) + {{PartSize - 1}}) / {{PartSize}}) n
+            """, SpiParameter.Create(setid), SpiParameter.Create(reloid), SpiParameter.Create(attnum), SpiParameter.Create(value)));
+
+    /// <summary>
+    /// Deletes the parts of a table's column list and row filter in a replication set.
+    /// </summary>
+    private static void DeleteParts(uint setid, uint reloid)
+        => Elevated.Run(() => _ = Spi.Execute("DELETE FROM worf.replication_set_table_part WHERE set_id = $1 AND set_reloid = $2",
+            SpiParameter.Create(setid), SpiParameter.Create(reloid)));
+
+    /// <summary>
+    /// Reads a table's column list or row filter in a replication set from its parts, which, unlike the value in the
+    /// catalog's row, decoding can read once the catalog is rebuilt. The parts' key is used only while it's in its
+    /// current file.
+    /// </summary>
+    private static unsafe byte[] ReadParts(uint setid, uint reloid, short attnum)
+    {
+        RelationData* rel = Worf.OpenCatalog(CatalogRepsetTablePart, AccessShareLock);
+        NativeMethods.list_free(NativeMethods.RelationGetIndexList(rel));
+        RelationData* pkindex = rel->rd_pkindex == 0 ? null : NativeMethods.index_open(rel->rd_pkindex, AccessShareLock);
+        if (pkindex is not null && !InCurrentFile(pkindex))
+        {
+            NativeMethods.index_close(pkindex, AccessShareLock);
+            pkindex = null;
+        }
+
+        ScanKeyData* key = stackalloc ScanKeyData[3];
+        NativeMethods.ScanKeyInit(&key[0], AnumRepsetTablePartSetid, BtEqualStrategyNumber, FOideq, setid);
+        NativeMethods.ScanKeyInit(&key[1], AnumRepsetTablePartReloid, BtEqualStrategyNumber, FOideq, reloid);
+        NativeMethods.ScanKeyInit(&key[2], AnumRepsetTablePartAttnum, BtEqualStrategyNumber, FInt2eq, (ulong)attnum);
+        SysScanDescData* scan = NativeMethods.systable_beginscan(rel, pkindex is null ? 0 : pkindex->rd_id, pkindex is not null, null, 3, key);
+        SortedList<int, byte[]> parts = [];
+        HeapTupleData* tuple;
+        while ((tuple = NativeMethods.systable_getnext(scan)) is not null)
+        {
+            bool isnull;
+            int partNo = (int)NativeMethods.heap_getattr(tuple, AnumRepsetTablePartNo, rel->rd_att, &isnull);
+            ulong data = NativeMethods.heap_getattr(tuple, AnumRepsetTablePartData, rel->rd_att, &isnull);
+            parts.Add(partNo, PgDatum.DangerousCreate((nuint)data, (uint)PgBuiltInOid.ByteaOid, PgMemoryContext.Current).Read<byte[]>());
+        }
+
+        NativeMethods.systable_endscan(scan);
+        if (pkindex is not null)
+        {
+            NativeMethods.index_close(pkindex, AccessShareLock);
+        }
+
+        NativeMethods.table_close(rel, AccessShareLock);
+        return [.. parts.Values.SelectMany(part => part)];
     }
 
     /// <summary>
@@ -1041,6 +1129,7 @@ internal static partial class ReplicationSet
     private const string CatalogRepset = "replication_set";
     private const string CatalogRepsetSeq = "replication_set_seq";
     private const string CatalogRepsetTable = "replication_set_table";
+    private const string CatalogRepsetTablePart = "replication_set_table_part";
 
     private const short AnumRepsetId = 1;
     private const short AnumRepsetNodeid = 2;
@@ -1065,6 +1154,15 @@ internal static partial class ReplicationSet
     private const short AnumRepsetTableAttList = 3;
     private const short AnumRepsetTableRowFilter = 4;
     private const int NattsRepsetTable = 4;
+
+    // Columns of worf.replication_set_table_part, and how many bytes each part holds at most.
+    private const short AnumRepsetTablePartSetid = 1;
+    private const short AnumRepsetTablePartReloid = 2;
+    private const short AnumRepsetTablePartAttnum = 3;
+    private const short AnumRepsetTablePartNo = 4;
+    private const short AnumRepsetTablePartData = 5;
+    private const int PartSize = 1800;
+    private const uint FInt2eq = 63;
     private const ushort BtEqualStrategyNumber = 3;
     private const uint FOideq = 184;
 
