@@ -298,7 +298,7 @@ internal static unsafe partial class SequenceRanges
                     hint: "Disable it with worf.disable_sequence_range on its owner first, or pass force := true if the owner is gone for good.");
             }
 
-            epoch = Math.Max(current, Spi.ExecuteScalar<int?>("SELECT max(epoch) FROM worf.sequence_range_node WHERE seqoid = $1",
+            epoch = Math.Max(current, Worf.ReadScalar<int?>("SELECT max(epoch) FROM worf.sequence_range_node WHERE seqoid = $1",
                 SpiParameter.Create(seqoid)) ?? 0) + 1;
             watermark = existing[0].Get<long?>(3);
 
@@ -424,7 +424,7 @@ internal static unsafe partial class SequenceRanges
     /// <param name="seqoid">The sequence.</param>
     internal static void Forget(uint seqoid)
     {
-        if (!Spi.ExecuteScalar<bool>("SELECT to_regclass('worf.sequence_range') IS NOT NULL"))
+        if (!Worf.ReadScalar<bool>("SELECT to_regclass('worf.sequence_range') IS NOT NULL"))
         {
             return;
         }
@@ -725,7 +725,7 @@ internal static unsafe partial class SequenceRanges
         {
             // A schema name is a list of one name, which NameListToString joins with dots.
             string[] schemas = Worf.FromServer(NativeMethods.NameListToString(objects)).Split('.');
-            managed = Spi.ExecuteScalar<bool>("""
+            managed = Worf.ReadScalar<bool>("""
                 SELECT EXISTS (
                     SELECT 1 FROM worf.sequence_range r
                         JOIN pg_catalog.pg_class c ON c.oid = r.seqoid
@@ -741,10 +741,10 @@ internal static unsafe partial class SequenceRanges
     }
 
     private static bool AnyManaged()
-        => Worf.CatalogOid("sequence_range") != 0 && Elevated.Run(() => Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range)"));
+        => Worf.CatalogOid("sequence_range") != 0 && Elevated.Run(() => Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range)"));
 
     private static bool IsGuarded(uint relid)
-        => relid != 0 && Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid = $1 AND tgname = $2)",
+        => relid != 0 && Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid = $1 AND tgname = $2)",
             SpiParameter.Create(relid), SpiParameter.Create(GuardName));
 
     private static bool ColumnUsesManaged(uint relid, string column)
@@ -1019,7 +1019,7 @@ internal static unsafe partial class SequenceRanges
         ulong sysid = NativeMethods.GetSystemIdentifier();
         uint timeline = NativeMethods.GetWALInsertionTimeLine();
         SpiParameter id = SpiParameter.Create(node.Node.Id);
-        SpiParameter system = SpiParameter.Create(sysid.ToString(CultureInfo.InvariantCulture));
+        SpiParameter system = SpiParameter.Create((decimal)sysid);
         SpiParameter line = SpiParameter.Create((long)timeline);
         bool changed = false;
 
@@ -1027,7 +1027,7 @@ internal static unsafe partial class SequenceRanges
         _ = Spi.Execute("UPDATE worf.sequence_range_block SET state = 'abandoned' WHERE kind IN ('r', 'p') AND state IN ('open', 'fenced') AND node_id <> $1", id);
         SpiResult fenced = Spi.Query(Spi.Sql($"""
             UPDATE worf.sequence_range_block SET state = 'fenced'
-            WHERE kind IN ('r', 'p') AND state = 'open' AND (sysid <> {sysid.ToString(CultureInfo.InvariantCulture)}::numeric OR timeline <> {(long)timeline})
+            WHERE kind IN ('r', 'p') AND state = 'open' AND (sysid <> {(decimal)sysid} OR timeline <> {(long)timeline})
             RETURNING seqoid::oid
             """), false, 0);
         for (int i = 0; i < fenced.Count; i++)
@@ -1042,7 +1042,7 @@ internal static unsafe partial class SequenceRanges
         SpiResult moved = Worf.SelectCatalog("""
             SELECT DISTINCT seqoid::oid FROM worf.sequence_range_block
             WHERE kind IN ('n', 'i') AND state IN ('next', 'active', 'imported')
-                AND (node_id <> $1 OR sysid <> $2::numeric OR timeline <> $3)
+                AND (node_id <> $1 OR sysid <> $2 OR timeline <> $3)
             """, id, system, line);
         for (int i = 0; i < moved.Count; i++)
         {
@@ -1087,7 +1087,7 @@ internal static unsafe partial class SequenceRanges
             return false;
         }
 
-        if (!force && Spi.ExecuteScalar<bool>("""
+        if (!force && Worf.ReadScalar<bool>("""
             SELECT EXISTS (
                 SELECT 1 FROM worf.sequence_range_grant g JOIN worf.sequence_range_block b ON b.block_id = g.from_block
                 WHERE g.seqoid = $1 AND b.state = 'fenced' AND g.grantee_id <> $2 AND g.state <> 'abandoned'
@@ -1105,9 +1105,9 @@ internal static unsafe partial class SequenceRanges
         }
 
         _ = Spi.Execute("""
-            UPDATE worf.sequence_range_block SET state = 'open', sysid = $2::numeric, timeline = $3
+            UPDATE worf.sequence_range_block SET state = 'open', sysid = $2, timeline = $3
             WHERE seqoid = $1 AND state = 'fenced'
-            """, seq, SpiParameter.Create(NativeMethods.GetSystemIdentifier().ToString(CultureInfo.InvariantCulture)),
+            """, seq, SpiParameter.Create((decimal)NativeMethods.GetSystemIdentifier()),
             SpiParameter.Create((long)NativeMethods.GetWALInsertionTimeLine()));
         _ = Spi.Execute("UPDATE worf.sequence_range SET fenced_at = NULL, detail = NULL WHERE seqoid = $1", seq);
         PgLog.Log($"sequence {GetInfo(seqoid).Name}: the allocator's fence lifted");
@@ -1256,7 +1256,7 @@ internal static unsafe partial class SequenceRanges
     /// <param name="node">This node, its owner.</param>
     internal static void ActivateWhenReported(uint seqoid, WorfLocalNode node)
     {
-        bool ready = Spi.ExecuteScalar<bool>("""
+        bool ready = Worf.ReadScalar<bool>("""
             SELECT r.state = 'collecting' AND r.participants IS NOT NULL AND NOT EXISTS (
                 SELECT 1 FROM unnest(r.participants) p(name)
                 WHERE NOT EXISTS (SELECT 1 FROM worf.sequence_range_node n WHERE n.seqoid = r.seqoid AND n.node_name = p.name AND n.epoch = r.epoch))
@@ -1479,7 +1479,7 @@ internal static unsafe partial class SequenceRanges
             SELECT f.block_id, f.lo, f.hi
             FROM worf.sequence_range_free f JOIN worf.sequence_range_block b ON b.block_id = f.block_id
             WHERE b.seqoid = {seqoid}::oid AND b.epoch = {epoch} AND b.kind IN ('r', 'p') AND b.state = 'open'
-                AND b.sysid = {NativeMethods.GetSystemIdentifier().ToString(CultureInfo.InvariantCulture)}::numeric AND b.timeline = {(long)NativeMethods.GetWALInsertionTimeLine()}
+                AND b.sysid = {(decimal)NativeMethods.GetSystemIdentifier()} AND b.timeline = {(long)NativeMethods.GetWALInsertionTimeLine()}
                 AND f.hi::numeric - f.lo >= {span}
             ORDER BY CASE WHEN {ascending} THEN f.lo END, CASE WHEN NOT {ascending} THEN f.hi END DESC
             LIMIT 1
@@ -1553,7 +1553,7 @@ internal static unsafe partial class SequenceRanges
             SELECT f.block_id, f.lo, f.hi
             FROM worf.sequence_range_free f JOIN worf.sequence_range_block b ON b.block_id = f.block_id
             WHERE b.seqoid = {seqoid}::oid AND b.epoch = {epoch} AND b.kind IN ('r', 'p') AND b.state = 'open'
-                AND b.sysid = {NativeMethods.GetSystemIdentifier().ToString(CultureInfo.InvariantCulture)}::numeric AND b.timeline = {(long)NativeMethods.GetWALInsertionTimeLine()}
+                AND b.sysid = {(decimal)NativeMethods.GetSystemIdentifier()} AND b.timeline = {(long)NativeMethods.GetWALInsertionTimeLine()}
                 AND f.lo <= {lo} AND {hi} <= f.hi
             LIMIT 1
             FOR UPDATE OF f
@@ -1599,10 +1599,10 @@ internal static unsafe partial class SequenceRanges
         _ = Spi.Execute("""
             INSERT INTO worf.sequence_range_block
                 (block_id, seqoid, epoch, kind, lo, hi, state, from_node, node_id, sysid, timeline, received_at)
-            VALUES ($1, $2, $3, $4::"char", $5, $6, $7, $8, $9, $10::numeric, $11, now())
+            VALUES ($1, $2, $3, $4::"char", $5, $6, $7, $8, $9, $10, $11, now())
             """, SpiParameter.Create(block), SpiParameter.Create(seqoid), SpiParameter.Create(epoch),
             SpiParameter.Create(kind.ToString()), SpiParameter.Create(lo), SpiParameter.Create(hi), SpiParameter.Create(state),
-            SpiParameter.Create(fromNode), SpiParameter.Create(node.Node.Id), SpiParameter.Create(sysid.ToString(CultureInfo.InvariantCulture)),
+            SpiParameter.Create(fromNode), SpiParameter.Create(node.Node.Id), SpiParameter.Create((decimal)sysid),
             SpiParameter.Create((long)timeline));
         return block;
     }
@@ -1633,11 +1633,11 @@ internal static unsafe partial class SequenceRanges
     /// <returns>The last value, or null.</returns>
     internal static long? LastValue(uint seqoid) => Elevated.Run(() =>
     {
-        SpiResult name = Spi.Query("""
+        SpiResult name = Worf.Read("""
             SELECT n.nspname::text, c.relname::text FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
             WHERE c.oid = $1
-            """, false, 1, SpiParameter.Create(seqoid));
-        return Spi.ExecuteScalar<long?>("SELECT CASE WHEN is_called THEN last_value END FROM " +
+            """, 1, SpiParameter.Create(seqoid));
+        return Worf.ReadScalar<long?>("SELECT CASE WHEN is_called THEN last_value END FROM " +
             Spi.QuoteQualifiedIdentifier(name[0].Get<string>(0), name[0].Get<string>(1)));
     });
 
@@ -1676,13 +1676,13 @@ internal static unsafe partial class SequenceRanges
         // The value a quarantine reserves is never issued.
         long? last = LastValue(info.Seqoid);
         Take(last == info.QuarantineEdge ? null : last);
-        Take(Spi.ExecuteScalar<long?>("SELECT last_value FROM worf.sequence_state WHERE seqoid = $1", seq));
-        Take(Spi.ExecuteScalar<long?>("SELECT watermark FROM worf.sequence_range WHERE seqoid = $1", seq));
-        Take(Spi.ExecuteScalar<long?>("SELECT " + pick + "(" + (info.Ascending ? "hi" : "lo") +
+        Take(Worf.ReadScalar<long?>("SELECT last_value FROM worf.sequence_state WHERE seqoid = $1", seq));
+        Take(Worf.ReadScalar<long?>("SELECT watermark FROM worf.sequence_range WHERE seqoid = $1", seq));
+        Take(Worf.ReadScalar<long?>("SELECT " + pick + "(" + (info.Ascending ? "hi" : "lo") +
             ") FROM worf.sequence_range_block WHERE seqoid = $1 AND kind IN ('n', 'i')", seq));
         foreach ((uint relid, string column, _) in UsingColumns(info.Seqoid))
         {
-            Take(Spi.ExecuteScalar<long?>("SELECT " + pick + "(" + Spi.QuoteIdentifier(column) + ")::bigint FROM " +
+            Take(Worf.ReadScalar<long?>("SELECT " + pick + "(" + Spi.QuoteIdentifier(column) + ")::bigint FROM " +
                 Spi.QuoteQualifiedIdentifier(Worf.FromServer(NativeMethods.get_namespace_name(NativeMethods.get_rel_namespace(relid))),
                     Worf.FromServer(NativeMethods.get_rel_name(relid)))));
         }

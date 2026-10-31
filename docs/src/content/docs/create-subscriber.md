@@ -6,7 +6,9 @@ description: Create a subscriber from a base backup of the provider with worf_cr
 In addition to the SQL-level node and subscription creation, worf also
 supports creating a subscriber by cloning the provider with `pg_basebackup` and
 starting it up as a worf subscriber. This is done with the
-`worf_create_subscriber` tool; see the `--help` output.
+`worf_create_subscriber` tool; see the `--help` output. It connects through
+the installation's libpq, so connection strings, service files, password files
+and `PG*` environment variables work as in `psql`.
 
 Unlike `worf.create_subscription`'s data sync options, this clone ignores
 replication sets and copies all tables on all databases. However, it's often

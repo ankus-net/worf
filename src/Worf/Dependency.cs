@@ -1306,7 +1306,7 @@ internal static class Dependency
 
     private static void AddIfExists(string catalog, uint classId, uint objoid, List<ObjectAddress> addrs)
     {
-        if (Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT FROM pg_catalog." + Spi.QuoteIdentifier(catalog) + " WHERE oid = $1)",
+        if (Worf.ReadScalar<bool>("SELECT EXISTS (SELECT FROM pg_catalog." + Spi.QuoteIdentifier(catalog) + " WHERE oid = $1)",
             SpiParameter.Create(objoid)))
         {
             addrs.Add(Address(classId, objoid, 0));

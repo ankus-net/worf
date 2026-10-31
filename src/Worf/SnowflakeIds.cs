@@ -1,4 +1,3 @@
-using System.Globalization;
 using Ankus.Postgres;
 
 [assembly: PgSql("snowflake", """
@@ -49,7 +48,7 @@ internal static class SnowflakeIds
         RETURNS void CALLED ON NULL INPUT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
         """)]
     internal static void EnableSnowflake(string?[]? participants)
-        => SequenceRanges.Enable(Spi.ExecuteScalar<uint>("SELECT 'worf.snowflake_node'::regclass::oid"), participants, 1, 1, null, false);
+        => SequenceRanges.Enable(Worf.ReadScalar<uint>("SELECT 'worf.snowflake_node'::regclass::oid"), participants, 1, 1, null, false);
 
     /// <summary>
     /// Returns this node's Snowflake node number.
@@ -137,7 +136,7 @@ internal static class SnowflakeIds
             reserved = clock.ReservedMs;
         }
 
-        long durable = Spi.ExecuteScalar<long>("SELECT last_value FROM worf.snowflake_clock");
+        long durable = Worf.ReadScalar<long>("SELECT last_value FROM worf.snowflake_clock");
         long target = Math.Max(durable, Math.Max(reserved, now + ReserveAheadMs));
         if (floored && reserved - now >= ReserveAheadMs / 2)
         {
@@ -217,11 +216,11 @@ internal static class SnowflakeIds
             timeline = NativeMethods.GetWALInsertionTimeLine();
         }
 
-        long? lo = Elevated.Run(() => Spi.ExecuteScalar<long?>("""
+        long? lo = Elevated.Run(() => Worf.ReadScalar<long?>("""
             SELECT b.lo FROM worf.sequence_range_block b JOIN worf.local_node l ON l.node_id = b.node_id
             WHERE b.seqoid = 'worf.snowflake_node'::regclass AND b.kind = 'n' AND b.state = 'active'
-                AND b.sysid = $1::numeric AND b.timeline = $2
-            """, SpiParameter.Create(sysid.ToString(CultureInfo.InvariantCulture)), SpiParameter.Create((long)timeline)));
+                AND b.sysid = $1 AND b.timeline = $2
+            """, SpiParameter.Create((decimal)sysid), SpiParameter.Create((long)timeline)));
         s_node = lo is long value ? (int)value : null;
         s_nodeVersion = version;
         return s_node;

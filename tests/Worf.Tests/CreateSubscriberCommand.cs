@@ -92,7 +92,8 @@ internal static class CreateSubscriberCommand
     /// <summary>
     /// Finds a TCP port nothing listens on, for a server the command starts long after. Other tests' clusters and every
     /// outgoing connection take ports the operating system assigns, from 32768 up on Linux and 49152 up on macOS and
-    /// Windows, so the port comes from below those, and no other test here gets it.
+    /// Windows, and the regression suite, which runs beside these tests in CI, takes Ankus's development port, 28800
+    /// plus the PostgreSQL major version, so the port comes from below those, and no other test here gets it.
     /// </summary>
     /// <returns>The port.</returns>
     public static int FreePort()
@@ -101,7 +102,7 @@ internal static class CreateSubscriberCommand
         {
             while (true)
             {
-                int port = Random.Shared.Next(20000, 30000);
+                int port = Random.Shared.Next(20000, 28800);
                 if (!s_ports.Add(port))
                 {
                     continue;

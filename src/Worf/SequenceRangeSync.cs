@@ -76,7 +76,7 @@ internal static class SequenceRangeSync
         }
 
         foreach ((WorfManagedSequence sequence, uint seqoid) in managed
-            .Select(sequence => (sequence, Spi.ExecuteScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(sequence.Name)) ?? 0))
+            .Select(sequence => (sequence, Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(sequence.Name)) ?? 0))
             .Where(found => found.Item2 != 0 && !SequenceRanges.IsManaged(found.Item2) &&
                 (relid == 0 || SequenceRanges.UsingColumns(found.Item2).Exists(column => column.Relid == relid))))
         {
@@ -103,7 +103,7 @@ internal static class SequenceRangeSync
         for (int i = 0; i < listed.Count; i++)
         {
             SpiRow row = listed[i];
-            if (Spi.ExecuteScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(row.Get<string>(0))) is uint seqoid &&
+            if (Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(row.Get<string>(0))) is uint seqoid &&
                 !SequenceRanges.IsManaged(seqoid))
             {
                 SequenceRanges.JoinFromNeighbor(seqoid, row.Get<uint>(1), row.Get<int>(2), row.Get<long>(3), row.Get<long>(4), row.Get<long?>(5),
