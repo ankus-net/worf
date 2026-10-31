@@ -359,8 +359,8 @@ internal static class SequenceRangeGuard
     /// where range management of the column's sequences started; in a session that restores rows, as an apply worker
     /// does for DDL from another node, a value also passes unless one of the sequences may still issue it, as far as
     /// this node knows. A numeric value that isn't a whole number within bigint, as NaN, is none of a sequence's. The
-    /// check looks for the values that fail by their spans, so that an index on the column, or the table's constraints,
-    /// spare it from reading every row.
+    /// check looks for the values that fail by their spans, so that an index on the column, or a constraint on the column
+    /// that rules the spans out, spares it from reading every row; otherwise it reads them all.
     /// </summary>
     /// <param name="relid">The table.</param>
     /// <param name="inherited">Whether to check its inheritors' and partitions' rows too.</param>
