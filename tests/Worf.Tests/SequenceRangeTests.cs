@@ -1177,16 +1177,27 @@ public sealed class SequenceRangeTests
     }
 
     /// <summary>
-    /// Waits for the nodes to settle, with nothing requested or granted and a next block ready, and then checks that
-    /// neither uses a transaction ID for two seconds, which spans twenty checks and four exchanges.
+    /// Waits for the nodes to settle, and then checks that neither uses a transaction ID for two seconds, which spans
+    /// twenty checks and four exchanges. A node has settled once the first call through each slot on it has bound the
+    /// slot, and, with sequences managed, once nothing is requested or granted, a next block is ready and its neighbors
+    /// report the watermark it has.
     /// </summary>
     private static async Task AssertIdleAsync(TestNode[] nodes, bool managed, CancellationToken token)
     {
-        foreach (TestNode node in nodes.Where(_ => managed))
+        foreach (TestNode node in nodes)
         {
             Assert.IsTrue(await node.PollQueryUntilAsync(Database, """
+                SELECT NOT EXISTS (
+                    SELECT 1 FROM pg_replication_slots s
+                    WHERE s.plugin = 'worf' AND s.database = current_database()
+                        AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_link l WHERE l.slot_name = s.slot_name))
+                """, token), $"{node.Name}'s slots bound");
+            Assert.IsTrue(!managed || await node.PollQueryUntilAsync(Database, """
                 SELECT NOT EXISTS (SELECT 1 FROM worf.sequence_range_request) AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_grant WHERE state = 'sent')
                     AND (SELECT bool_and(next_lo IS NOT NULL) FROM worf.sequence_ranges)
+                    AND NOT EXISTS (
+                        SELECT 1 FROM worf.sequence_range r JOIN worf.sequence_range_node n ON n.seqoid = r.seqoid CROSS JOIN worf.local_node l
+                        WHERE n.via_node = n.node_id AND n.node_id <> l.node_id AND n.watermark IS DISTINCT FROM r.watermark)
                 """, token), $"{node.Name} settled");
         }
 
