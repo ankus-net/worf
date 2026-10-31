@@ -1430,8 +1430,8 @@ internal static unsafe partial class SequenceRanges
                     _ = Spi.Execute("SELECT pg_catalog.set_config('lock_timeout', $1, true)", SpiParameter.Create(
                         Math.Max(lockTimeout, 1).ToString(CultureInfo.InvariantCulture)));
 
-                    // A switch that took the block while this one read or waited leaves it alone, since restarting the
-                    // sequence at its start would issue its values again.
+                    // Another switch may have taken the block while this one read it or waited for the lock. Restarting
+                    // the sequence at the block's start would then issue its values again, so this one leaves it.
                     NativeMethods.LockRelationOid(seqoid, (int)PgLockMode.ShareRowExclusive);
                     next = Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range_block WHERE block_id = $1 AND state = 'next'",
                         SpiParameter.Create(block.Id)).Count > 0;
