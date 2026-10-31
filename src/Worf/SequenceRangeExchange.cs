@@ -31,6 +31,10 @@ internal static class SequenceRangeExchange
     private static readonly HashSet<uint> s_acksWaiting = [];
     private static long s_requested;
 
+    // What each link waited on at its last exchange that changed nothing, when it next asks for that, and the delay
+    // before that, which doubles from the check interval up to the exchange interval while nothing changes.
+    private static readonly Dictionary<uint, (string What, long At, long Delay)> s_waits = [];
+
     /// <summary>
     /// Answers a neighbor's exchange on the provider end of its subscription.
     /// </summary>
@@ -154,9 +158,9 @@ internal static class SequenceRangeExchange
 
     /// <summary>
     /// Exchanges with the provider of each enabled subscription whose turn has come, or with which something is
-    /// waiting: a request, a grant or an acknowledgement. Each call is a transaction of its own, committed before the
-    /// next call, so that a block this node grants or receives is never sent on, or acknowledged, before it is
-    /// committed, and no row this node locks waits on another node.
+    /// waiting: a request, a grant or an acknowledgement, less often while those exchanges change nothing. Each call is
+    /// a transaction of its own, committed before the next call, so that a block this node grants or receives is never
+    /// sent on, or acknowledged, before it is committed, and no row this node locks waits on another node.
     /// </summary>
     /// <returns>Whether this node's blocks changed.</returns>
     internal static bool ExchangeAll()
@@ -167,23 +171,39 @@ internal static class SequenceRangeExchange
         {
             s_requested = requested;
             s_exchangedAt.Clear();
+            s_waits.Clear();
         }
 
-        (WorfLocalNode Node, List<WorfSubscription> Due)? links = PgBackgroundWorker.RunTransaction(DueLinks);
-        if (links is not (WorfLocalNode node, List<WorfSubscription> due))
+        (WorfLocalNode Node, List<(WorfSubscription Sub, string? Waiting)> Due)? links = PgBackgroundWorker.RunTransaction(DueLinks);
+        if (links is not (WorfLocalNode node, List<(WorfSubscription Sub, string? Waiting)> due))
         {
             return false;
         }
 
         bool changed = false;
-        foreach (WorfSubscription sub in due)
+        foreach ((WorfSubscription sub, string? waiting) in due)
         {
             long now = Worker.GetCurrentTimestamp();
             try
             {
-                changed |= ExchangeWith(node, sub);
+                (bool received, bool granted) = ExchangeWith(node, sub);
+                changed |= received;
                 s_exchangedAt[sub.Id] = now;
                 _ = s_retries.Remove(sub.Id);
+
+                // An exchange that changed nothing while something waits makes the next one wait longer, up to the
+                // exchange interval, since the neighbor may not answer it for long, as when a root can't start or a
+                // fence waits on a node that is down.
+                if (received || granted || waiting is null)
+                {
+                    _ = s_waits.Remove(sub.Id);
+                }
+                else
+                {
+                    long delay = s_waits.TryGetValue(sub.Id, out (string What, long At, long Delay) wait) && wait.What == waiting ? wait.Delay * 2 : 0;
+                    delay = Math.Min(Math.Max(delay, SequenceRanges.CheckInterval * 1000L), SequenceRanges.ExchangeInterval * 1000L);
+                    s_waits[sub.Id] = (waiting, now + delay, delay);
+                }
             }
             catch (Exception error) when (error is PgException or PgRemoteException or PgQueryCanceledException)
             {
@@ -203,24 +223,27 @@ internal static class SequenceRangeExchange
     }
 
     /// <summary>
-    /// Lists the links whose turn has come.
+    /// Lists the links whose turn has come, with what each waits on.
     /// </summary>
-    private static (WorfLocalNode Node, List<WorfSubscription> Due)? DueLinks()
+    private static (WorfLocalNode Node, List<(WorfSubscription Sub, string? Waiting)> Due)? DueLinks()
     {
         if (WorfNode.GetLocalNode(false, true) is not WorfLocalNode node)
         {
             return null;
         }
 
-        List<WorfSubscription> due = [];
+        List<(WorfSubscription Sub, string? Waiting)> due = [];
         long now = Worker.GetCurrentTimestamp();
         foreach (WorfSubscription sub in WorfNode.GetNodeSubscriptions(node.Node.Id, false).Where(sub => sub.Enabled))
         {
             bool retrying = s_retries.TryGetValue(sub.Id, out (long At, long Delay) retry) && now < retry.At;
+            string? waiting = Waiting(sub.Origin.Id);
+            bool asks = waiting is not null &&
+                (!s_waits.TryGetValue(sub.Id, out (string What, long At, long Delay) wait) || wait.What != waiting || now >= wait.At);
             if (!retrying && (!s_exchangedAt.TryGetValue(sub.Id, out long at) || now - at >= SequenceRanges.ExchangeInterval * 1000L ||
-                s_acksWaiting.Contains(sub.Id) || Waiting(sub.Origin.Id)))
+                s_acksWaiting.Contains(sub.Id) || asks))
             {
-                due.Add(sub);
+                due.Add((sub, waiting));
             }
         }
 
@@ -232,7 +255,8 @@ internal static class SequenceRangeExchange
     /// longer than <c>worf.sequence_range_timeout</c>, and the provider ends a call that runs that long. Each waits in
     /// a transaction, which the cancellation aborts, so that the worker goes on.
     /// </summary>
-    private static bool ExchangeWith(WorfLocalNode node, WorfSubscription sub)
+    /// <returns>Whether this node received a block, and whether it granted one.</returns>
+    private static (bool Received, bool Granted) ExchangeWith(WorfLocalNode node, WorfSubscription sub)
     {
         RequireReachable(sub.OriginIf.Dsn, sub.Origin.Name);
         using PgReplicationConnection conn = PgBackgroundWorker.RunTransaction(() => SequenceRangeExchangeWorker.Bounded(() =>
@@ -251,16 +275,18 @@ internal static class SequenceRangeExchange
         }));
         if (!PgBackgroundWorker.RunTransaction(() => SequenceRangeExchangeWorker.Bounded(() => Rpc.RemoteFunctionExists(conn, "worf", "sequence_range_exchange", 1, null))))
         {
-            return false;
+            return (false, false);
         }
 
         bool changed = false;
+        bool gave = false;
 
         // A grant this node makes from the provider's request goes back in a second call, after this node commits it.
         for (int call = 0; call < 2; call++)
         {
             (bool granted, bool received) = PgBackgroundWorker.RunTransaction(() => Call(node, sub, conn));
             changed |= received;
+            gave |= granted;
             if (received)
             {
                 _ = s_acksWaiting.Add(sub.Id);
@@ -276,7 +302,7 @@ internal static class SequenceRangeExchange
             }
         }
 
-        return changed;
+        return (changed, gave);
     }
 
     /// <summary>
@@ -396,20 +422,23 @@ internal static class SequenceRangeExchange
     }
 
     /// <summary>
-    /// Checks whether this node has a request open with a neighbor, a grant the neighbor hasn't acknowledged, or a
-    /// reset to ask of it or acknowledge, or whether either is a fenced allocator, which waits on its neighbors' reports.
+    /// Lists what this node waits on with a neighbor: its requests open with the neighbor, its grants the neighbor
+    /// hasn't acknowledged, and resets to ask of it or acknowledge, and whether either is a fenced allocator, which
+    /// waits on its neighbors' reports.
     /// </summary>
-    private static bool Waiting(uint neighbor)
-        => Worf.SelectCatalog("""
-            SELECT 1 FROM worf.sequence_range_request WHERE parent_node = $1 AND state = 'open'
-            UNION ALL
-            SELECT 1 FROM worf.sequence_range_grant WHERE grantee_id = $1 AND state = 'sent'
-            UNION ALL
-            SELECT 1 FROM worf.sequence_range_node WHERE node_id = $1 AND (state = 'fenced' OR reset_lsn IS NOT NULL)
-            UNION ALL
-            SELECT 1 FROM worf.sequence_range WHERE fenced_at IS NOT NULL
-            LIMIT 1
-            """, SpiParameter.Create(neighbor)).Count > 0;
+    /// <returns>What waits, or null when nothing does.</returns>
+    private static string? Waiting(uint neighbor)
+        => Worf.ReadScalar<string?>("""
+            SELECT string_agg(what, ' ' ORDER BY what) FROM (
+                SELECT request_id::text FROM worf.sequence_range_request WHERE parent_node = $1 AND state = 'open'
+                UNION ALL
+                SELECT grant_id::text FROM worf.sequence_range_grant WHERE grantee_id = $1 AND state = 'sent'
+                UNION ALL
+                SELECT seqoid::oid::text || ' ' || coalesce(state, '') || ' ' || coalesce(reset_lsn::text, '') FROM worf.sequence_range_node
+                WHERE node_id = $1 AND (state = 'fenced' OR reset_lsn IS NOT NULL)
+                UNION ALL
+                SELECT seqoid::oid::text || ' fenced ' || fenced_at::text FROM worf.sequence_range WHERE fenced_at IS NOT NULL) w(what)
+            """, SpiParameter.Create(neighbor));
 
     /// <summary>
     /// Builds this node's message to a neighbor, with its sequences in the order of their names, which each node
@@ -676,10 +705,12 @@ internal static class SequenceRangeExchange
     }
 
     /// <summary>
-    /// Checks, only reading, whether one sequence of a neighbor's message would change nothing here: the neighbor reports
-    /// what it reported before, relays nothing new, asks for, grants and gives up nothing, acknowledges nothing new, and
-    /// leaves this node's route as it is, while neither node is fenced or collecting. Such a message is only noted in
-    /// shared memory, so that exchanges between idle nodes write nothing and use no transaction IDs.
+    /// Checks, only reading, whether one sequence of a neighbor's message would change nothing here: the neighbor
+    /// reports what it reported before, relays nothing new, asks for nothing, unless this node is an owner still
+    /// collecting reports, which grants nothing until they change, grants and gives up nothing, acknowledges nothing
+    /// new, and leaves this node's route as it is, while neither node is fenced. Such a message is only noted in shared
+    /// memory, so that exchanges between idle nodes, or with an owner whose root can't start, write nothing and use no
+    /// transaction IDs.
     /// </summary>
     private static bool Unchanged(WorfLocalNode node, JsonElement root, JsonElement entry, uint senderId, bool call)
     {
@@ -705,8 +736,9 @@ internal static class SequenceRangeExchange
             return local[0].Get<int>(0) > epoch;
         }
 
-        if (local[0].Get<string>(1) == "collecting" || local[0].Get<bool>(2) || state == "fenced" || (state == "disabled" && local[0].Get<string>(1) != "disabled") ||
-            entry.GetProperty("requests").GetArrayLength() > 0 || entry.GetProperty("grants").GetArrayLength() > 0)
+        if (local[0].Get<bool>(2) || state == "fenced" || (state == "disabled" && local[0].Get<string>(1) != "disabled") ||
+            (entry.GetProperty("requests").GetArrayLength() > 0 && local[0].Get<string>(1) != "collecting") ||
+            entry.GetProperty("grants").GetArrayLength() > 0)
         {
             return false;
         }

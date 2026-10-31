@@ -2043,7 +2043,9 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
-    /// Starts the root once every listed participant has reported.
+    /// Starts the root once every listed participant has reported. A root that can't start, as when a node's values
+    /// reach the end of the sequence, is noted in the range's detail, with a warning when that changes, and the owner
+    /// tries again when a report changes.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
     /// <param name="node">This node, its owner.</param>
@@ -2055,9 +2057,23 @@ internal static unsafe partial class SequenceRanges
                 WHERE NOT EXISTS (SELECT 1 FROM worf.sequence_range_node n WHERE n.seqoid = r.seqoid AND n.node_name = p.name AND n.epoch = r.epoch))
             FROM worf.sequence_range r WHERE r.seqoid = $1
             """, SpiParameter.Create(seqoid));
-        if (ready)
+        if (!ready)
+        {
+            return;
+        }
+
+        try
         {
             Activate(seqoid, node);
+        }
+        catch (PgException error) when (error.SqlState == SequenceLimitExceeded)
+        {
+            SpiParameter seq = SpiParameter.Create(seqoid);
+            if (Worf.ReadScalar<string?>("SELECT detail FROM worf.sequence_range WHERE seqoid = $1", seq) != error.Message)
+            {
+                _ = Spi.Execute("UPDATE worf.sequence_range SET detail = $2 WHERE seqoid = $1", seq, SpiParameter.Create(error.Message));
+                PgLog.Warning(error.Message);
+            }
         }
     }
 
@@ -2118,7 +2134,7 @@ internal static unsafe partial class SequenceRanges
         }
         // The root's start goes to the other nodes, so that each allocator refuses a node that joins later with values
         // that reach into it.
-        _ = Spi.Execute("UPDATE worf.sequence_range SET state = 'quarantined', root_start = $2 WHERE seqoid = $1", SpiParameter.Create(seqoid),
+        _ = Spi.Execute("UPDATE worf.sequence_range SET state = 'quarantined', root_start = $2, detail = NULL WHERE seqoid = $1", SpiParameter.Create(seqoid),
             SpiParameter.Create(start));
 
         // The owner needs no exchange for its own blocks, so it leaves quarantine as soon as a neighbor has heard of its
