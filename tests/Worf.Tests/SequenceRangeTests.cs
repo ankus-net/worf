@@ -734,11 +734,6 @@ public sealed class SequenceRangeTests
     private static async Task AssertIdleAsync(TestNode[] nodes, string phase, TimeSpan span, CancellationToken token)
     {
         const string Position = "SELECT pg_snapshot_xmax(pg_current_snapshot()), pg_current_wal_insert_lsn()";
-        foreach (TestNode node in nodes)
-        {
-            _ = await node.SafePsqlAsync(Database, "CREATE EXTENSION IF NOT EXISTS pg_walinspect", token);
-        }
-
         string[] before = await Task.WhenAll(nodes.Select(node => node.SafePsqlAsync(Database, Position, token)));
         await Task.Delay(span, token);
         for (int i = 0; i < nodes.Length; i++)
@@ -795,6 +790,9 @@ public sealed class SequenceRangeTests
         {
             _ = await node.SafePsqlAsync(Database, $"CREATE USER {SuperUser} SUPERUSER", token);
             _ = await node.SafePsqlAsync(Database, "CREATE EXTENSION worf", token);
+
+            // For the idle checks, which read the WAL; created now, before the DDL can replicate.
+            _ = await node.SafePsqlAsync(Database, "CREATE EXTENSION pg_walinspect", token);
             _ = await node.SafePsqlAsync(Database,
                 $"SELECT * FROM worf.create_node(node_name := '{name}', dsn := '{node.Dsn(Database, SuperUser)}')", token);
         }
