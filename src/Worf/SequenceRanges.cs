@@ -522,7 +522,7 @@ internal static unsafe partial class SequenceRanges
         {
             // The next block holds at least two minutes of inserts at the peak rate, up to the largest size, so that a
             // minute's margin leaves the one after it time to arrive.
-            long forRate = (long)Math.Min(Math.Ceiling(rate * 120), long.MaxValue / 2);
+            long forRate = (long)Math.Ceiling(Math.Min(rate * 120, long.MaxValue / 2.0));
             if (owner == node.Node.Id)
             {
                 changed |= GrantOwnBlock(seqoid, info, node, epoch, forRate);

@@ -223,7 +223,7 @@ public sealed class SequenceRangeTests
         // range worker, held up here in an exchange that waits on node_b's table.
         _ = await nodeA.SafePsqlAsync(Database, "ALTER SYSTEM SET worf.sequence_range_timeout = '4s'", token);
         _ = await nodeA.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
-        await using (NpgsqlConnection hold = await HoldExchangesAsync(nodeB, token))
+        await using (await HoldExchangesAsync(nodeB, token))
         {
             Stopwatch elapsed = Stopwatch.StartNew();
             _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.snowflake_id()", token);
@@ -251,7 +251,7 @@ public sealed class SequenceRangeTests
             token)).Split('|');
         int held = int.Parse(active[1], CultureInfo.InvariantCulture) - 10;
         await using (NpgsqlConnection writer = await nodeA.OpenAsync(Database, token))
-        await using (NpgsqlConnection hold = await HoldExchangesAsync(nodeB, token))
+        await using (await HoldExchangesAsync(nodeB, token))
         {
             await ExecuteAsync(writer, $"INSERT INTO t (v) SELECT 'held' FROM generate_series(1, {held})", token);
 
