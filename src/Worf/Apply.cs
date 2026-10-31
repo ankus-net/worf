@@ -63,6 +63,11 @@ internal static unsafe partial class Apply
     private static long s_clockSkewReportedAt;
     private static ulong s_remoteCommitLsn;
     private static long s_remoteCommitTime;
+
+    // The position of the last message received in the stream, and when apply last told copies waiting for it how far
+    // it has got into a remote transaction.
+    private static ulong s_messageLsn;
+    private static long s_copiesToldAt;
     private static ulong s_publishedFlushpos;
     private static bool s_publishesFlushpos;
 
@@ -576,7 +581,7 @@ internal static unsafe partial class Apply
         ProtoNative.ReadBegin(s, out ulong commitLsn, out long commitTime, out s_remoteXid);
 
         // Everything that committed before this transaction is applied.
-        AllowCopies(commitLsn);
+        AllowCopies(commitLsn, 0);
 
         Worf.ReploriginSessionOriginTimestamp = commitTime;
         Worf.ReploriginSessionOriginLsn = commitLsn;
@@ -1597,6 +1602,7 @@ internal static unsafe partial class Apply
                 ulong startLsn = unchecked((ulong)NativeMethods.pq_getmsgint64(&s));
                 ulong endLsn = unchecked((ulong)NativeMethods.pq_getmsgint64(&s));
                 _ = NativeMethods.pq_getmsgint64(&s); // sendTime
+                s_messageLsn = startLsn;
 
                 if (s_lastReceived < startLsn)
                 {
@@ -2139,6 +2145,14 @@ internal static unsafe partial class Apply
                     break;
                 }
 
+                // A transaction that takes a while to apply tells the copies that wait for apply how far into it apply
+                // has got, so that they keep their snapshots while it moves.
+                if (Stopwatch.GetElapsedTime(s_copiesToldAt) >= TimeSpan.FromSeconds(1))
+                {
+                    AllowCopies(s_remoteCommitLsn, s_messageLsn);
+                    s_copiesToldAt = Stopwatch.GetTimestamp();
+                }
+
                 // The walsender drops a connection it hears nothing from for wal_sender_timeout, and the keepalive it
                 // sends to ask for a reply waits behind everything already sent, which a large transaction can take
                 // longer than that to apply. So report progress meanwhile.
@@ -2309,7 +2323,7 @@ internal static unsafe partial class Apply
         uint subid = myApplyWorker.SubId;
         uint myDatabaseId = NativeGlobals.MyDatabaseId;
 
-        AllowCopies(endLsn);
+        AllowCopies(endLsn, 0);
 
         // First check if we need to update the cached information.
         if (myApplyWorker.SyncPending)
@@ -2443,7 +2457,10 @@ internal static unsafe partial class Apply
     /// the copied rows again.
     /// </summary>
     /// <param name="lsn">The position before which everything that committed is applied.</param>
-    private static void AllowCopies(ulong lsn)
+    /// <param name="changeLsn">The position of the last change applied of the transaction that commits at
+    /// <paramref name="lsn"/>, which tells a copy that apply moves through a transaction that takes a while, or zero.
+    /// </param>
+    private static void AllowCopies(ulong lsn, ulong changeLsn)
     {
         // None waits but while a table synchronizes, so look under the shared lock first.
         uint dboid = NativeGlobals.MyDatabaseId;
@@ -2453,7 +2470,7 @@ internal static unsafe partial class Apply
             WorfWorker me = guard[Worker.MyWorfWorker];
             for (int i = 0; i < guard.Length && me.WorkerType == WorfWorkerType.Apply && !waiting; i++)
             {
-                waiting = WaitsForApply(guard[i], dboid, me.Worker.Apply.SubId, lsn);
+                waiting = WaitsForApply(guard[i], dboid, me.Worker.Apply.SubId, lsn, changeLsn);
             }
         }
 
@@ -2468,9 +2485,10 @@ internal static unsafe partial class Apply
             for (int i = 0; i < guard.Length; i++)
             {
                 WorfWorker worker = guard[i];
-                if (WaitsForApply(worker, dboid, subid, lsn))
+                if (WaitsForApply(worker, dboid, subid, lsn, changeLsn))
                 {
                     worker.Worker.Sync.AppliedLsn = lsn;
+                    worker.Worker.Sync.ChangeLsn = changeLsn;
                     guard[i] = worker;
                     if (lsn >= worker.Worker.Sync.CopyLsn)
                     {
@@ -2483,11 +2501,12 @@ internal static unsafe partial class Apply
 
     /// <summary>
     /// Checks whether a worker is a sync worker of the subscription that waits for the apply worker, which it hasn't
-    /// heard has got this far.
+    /// heard has got this far. A transaction applied again, as after a restart, isn't further than it got before.
     /// </summary>
-    private static bool WaitsForApply(WorfWorker worker, uint dboid, uint subid, ulong lsn)
+    private static bool WaitsForApply(WorfWorker worker, uint dboid, uint subid, ulong lsn, ulong changeLsn)
         => worker.WorkerType == WorfWorkerType.Sync && worker.Proc != 0 && worker.Dboid == dboid &&
-            worker.Worker.Apply.SubId == subid && worker.Worker.Sync.CopyLsn != 0 && worker.Worker.Sync.AppliedLsn < lsn;
+            worker.Worker.Apply.SubId == subid && worker.Worker.Sync.CopyLsn != 0 &&
+            (worker.Worker.Sync.AppliedLsn < lsn || (worker.Worker.Sync.AppliedLsn == lsn && worker.Worker.Sync.ChangeLsn < changeLsn));
 
     private static void StartSyncWorker(string nspname, string relname)
     {

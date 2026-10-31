@@ -43,7 +43,7 @@ internal static class Sync
     private const string PgdumpBinary = "pg_dump";
     private const string PgrestoreBinary = "pg_restore";
 
-    // How long apply may get no further before a table's copy lets its snapshot go, and how long a copy waits for
+    // How long apply may get no further before a table's copy first lets its snapshot go, and how long a copy waits for
     // apply before saying so, and then how often.
     private static TimeSpan ApplyStallTimeout => TimeSpan.FromSeconds(10);
     private static TimeSpan ApplyWaitLogAfter => TimeSpan.FromSeconds(10);
@@ -272,22 +272,27 @@ internal static class Sync
             // The copy waits for apply to reach its snapshot, which keeps the provider from removing dead rows
             // meanwhile. So apply is waited for without one first, up to where the provider is now.
             ulong target = ProviderPosition(sub);
+            long waitingSince = Stopwatch.GetTimestamp();
+            TimeSpan stallTimeout = ApplyStallTimeout;
             string snapshot;
             ulong lsn;
             while (true)
             {
-                _ = WaitForApply(sub, nspname, relname, target, false);
+                _ = WaitForApply(sub, nspname, relname, target, TimeSpan.MaxValue, waitingSince);
                 snapshot = EnsureReplicationSlotSnapshot(sub, originConnRepl, "copy_slot", false, out lsn);
-                if (WaitForApply(sub, nspname, relname, lsn, true))
+                if (WaitForApply(sub, nspname, relname, lsn, stallTimeout, waitingSince))
                 {
                     break;
                 }
 
                 // Apply stopped short of the snapshot, as on a change that fails. Its slot is dropped to let the
-                // snapshot go until apply gets there.
-                PgLog.Log($"dropping the snapshot for table {nspname}.{relname} until subscription {sub.Name} applies up to {Worf.FormatLsn(lsn)}");
+                // snapshot go until apply gets there. Apply may get no further for twice as long each time after, so
+                // that the copy starts in the end while changes keep coming that each take long to apply.
+                PgLog.Log($"dropping the snapshot for table {nspname}.{relname} until subscription {sub.Name} applies up to {Worf.FormatLsn(lsn)}, " +
+                    $"since it got no further for {stallTimeout.TotalSeconds:0} s");
                 PgBackgroundWorker.RunTransaction(() => originConnRepl.Execute($"DROP_REPLICATION_SLOT \"{sub.SlotName}\""));
                 target = lsn;
+                stallTimeout *= 2;
             }
 
             statusLsn = lsn;
@@ -1370,45 +1375,51 @@ internal static class Sync
     /// <param name="nspname">The table's schema.</param>
     /// <param name="relname">The table's name.</param>
     /// <param name="lsn">The position.</param>
-    /// <param name="untilStalled">Whether to stop waiting once apply gets no further for a while, as when it fails on a
-    /// change.</param>
+    /// <param name="stallTimeout">How long apply may get no further, as when it fails on a change, before the wait
+    /// stops.</param>
+    /// <param name="waitingSince">When the copy started to wait for apply. Once it has waited a while, each wait says
+    /// so as it starts, and then now and again.</param>
     /// <returns>Whether apply reached the position.</returns>
-    private static bool WaitForApply(WorfSubscription sub, string nspname, string relname, ulong lsn, bool untilStalled)
+    private static bool WaitForApply(WorfSubscription sub, string nspname, string relname, ulong lsn, TimeSpan stallTimeout,
+        long waitingSince)
     {
         PublishCopyLsn(lsn);
-        long started = Stopwatch.GetTimestamp();
-        long progressed = started;
+        long progressed = Stopwatch.GetTimestamp();
         TimeSpan logAfter = ApplyWaitLogAfter;
         ulong applied = 0;
+        ulong change = 0;
         while (true)
         {
-            ulong reported;
+            WorfSyncWorker reported;
             using (PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share())
             {
-                reported = guard[Worker.MyWorfWorker].Worker.Sync.AppliedLsn;
+                reported = guard[Worker.MyWorfWorker].Worker.Sync;
             }
 
-            if (reported >= lsn)
+            if (reported.AppliedLsn >= lsn)
             {
                 PublishCopyLsn(0);
                 return true;
             }
 
-            if (reported != applied)
+            // Apply gets further with each transaction, and with each change of one that takes a while.
+            if (reported.AppliedLsn != applied || reported.ChangeLsn != change)
             {
-                applied = reported;
+                applied = reported.AppliedLsn;
+                change = reported.ChangeLsn;
                 progressed = Stopwatch.GetTimestamp();
             }
-            else if (untilStalled && Stopwatch.GetElapsedTime(progressed) >= ApplyStallTimeout)
+            else if (Stopwatch.GetElapsedTime(progressed) >= stallTimeout)
             {
                 PublishCopyLsn(0);
                 return false;
             }
 
-            if (Stopwatch.GetElapsedTime(started) >= logAfter)
+            if (Stopwatch.GetElapsedTime(waitingSince) >= logAfter)
             {
-                PgLog.Log($"table {nspname}.{relname} waits to copy until subscription {sub.Name} applies up to {Worf.FormatLsn(lsn)}, and it's at {Worf.FormatLsn(applied)}");
-                logAfter += ApplyWaitLogInterval;
+                PgLog.Log($"table {nspname}.{relname} waits to copy until subscription {sub.Name} applies up to {Worf.FormatLsn(lsn)}, " +
+                    (applied == 0 ? "and it hasn't said how far it is" : $"and it's at {Worf.FormatLsn(applied)}"));
+                logAfter = Stopwatch.GetElapsedTime(waitingSince) + ApplyWaitLogInterval;
             }
 
             if (Worker.GotSigterm)
@@ -1423,6 +1434,8 @@ internal static class Sync
 
     /// <summary>
     /// Tells the subscription's apply worker the position the worker waits for it to reach, or zero once it doesn't.
+    /// The worker keeps how far it heard apply has got, which apply only adds to, and starts from the position the apply
+    /// worker last reported to the provider if that's further, as when apply hasn't got further since.
     /// </summary>
     /// <param name="lsn">The position.</param>
     private static void PublishCopyLsn(ulong lsn)
@@ -1430,14 +1443,20 @@ internal static class Sync
         using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive();
         WorfWorker me = guard[Worker.MyWorfWorker];
         me.Worker.Sync.CopyLsn = lsn;
-        me.Worker.Sync.AppliedLsn = 0;
-        guard[Worker.MyWorfWorker] = me;
 
         int apply = guard.Read((in _, workers) => Worker.ApplyFind(workers, me.Dboid, me.Worker.Apply.SubId));
         if (lsn != 0 && apply >= 0 && guard[apply].Proc != 0)
         {
+            if (guard[apply].Worker.Apply.FlushLsn > me.Worker.Sync.AppliedLsn)
+            {
+                me.Worker.Sync.AppliedLsn = guard[apply].Worker.Apply.FlushLsn;
+                me.Worker.Sync.ChangeLsn = 0;
+            }
+
             Worker.SetProcLatch(guard[apply].Proc);
         }
+
+        guard[Worker.MyWorfWorker] = me;
     }
 
     /// <summary>

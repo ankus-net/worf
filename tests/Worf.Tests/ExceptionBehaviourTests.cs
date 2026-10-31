@@ -1,6 +1,7 @@
 using Npgsql;
 
 using System.Diagnostics;
+using System.Text.RegularExpressions;
 
 namespace Worf.Tests;
 
@@ -8,7 +9,7 @@ namespace Worf.Tests;
 /// <c>worf.exception_behaviour</c> keeps a remote transaction that fails from stopping replication, and records it.
 /// </summary>
 [TestClass]
-public sealed class ExceptionBehaviourTests
+public sealed partial class ExceptionBehaviourTests
 {
     private const string Database = "postgres";
     private const string SuperUser = "super";
@@ -18,6 +19,13 @@ public sealed class ExceptionBehaviourTests
         SELECT EXISTS (
             SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
             WHERE NOT l.granted AND l.relation = 'worf.sequence_range'::regclass AND a.application_name = 'sub_ranges')
+        """;
+
+    // A table's copy creates its slot, which waits for the provider's open transactions.
+    private const string CopySlotSql = """
+        SELECT EXISTS (
+            SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+            WHERE NOT l.granted AND l.locktype = 'transactionid' AND a.backend_type = 'walsender')
         """;
 
     /// <summary>
@@ -182,6 +190,67 @@ public sealed class ExceptionBehaviourTests
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
             "SELECT sync_status = 'r' FROM worf.local_sync_status WHERE sync_relname = 'parent'", token), "the table synchronized");
         Assert.AreEqual("1", await subscriber.SafePsqlAsync(Database, "SELECT string_agg(id::text, ',') FROM parent", token));
+
+        // The copy lets its snapshot go when apply gets no further, here on a row a local transaction holds, and says
+        // how far apply has got. Apply may then get no further for twice as long, and moves on with each change of a
+        // transaction that takes a while: nine slow rows and one slower one don't let the next snapshot go. The
+        // provider's open transactions hold the copy's slot until they commit.
+        _ = await subscriber.SafePsqlAsync(Database, """
+            CREATE FUNCTION slow() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                PERFORM pg_sleep(CASE NEW.v WHEN 'slow' THEN 1 WHEN 'slower' THEN 14 ELSE 0 END);
+                RETURN NEW;
+            END $$;
+            CREATE TRIGGER slow BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION slow();
+            ALTER TABLE t ENABLE ALWAYS TRIGGER slow;
+            """, token);
+        string before = await provider.SafePsqlAsync(Database, "SELECT pg_current_wal_lsn()", token);
+        _ = await provider.SafePsqlAsync(Database, $"SELECT worf.wait_slot_confirm_lsn(NULL, '{before}')", token);
+        int copypos = subscriber.ReadLog().Length;
+        await using (NpgsqlConnection local = await subscriber.OpenAsync(Database, token))
+        await using (NpgsqlConnection held = await provider.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction localTransaction = await local.BeginTransactionAsync(token);
+            await using (NpgsqlCommand command = new("INSERT INTO t VALUES (41, 'local')", local, localTransaction))
+            {
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+
+            await using (NpgsqlTransaction transaction = await held.BeginTransactionAsync(token))
+            {
+                await using (NpgsqlCommand command = new("INSERT INTO t VALUES (41, 'held')", held, transaction))
+                {
+                    _ = await command.ExecuteNonQueryAsync(token);
+                }
+
+                _ = await subscriber.SafePsqlAsync(Database, "SELECT worf.alter_subscription_resynchronize_table('sub', 'parent')", token);
+                Assert.IsTrue(await provider.PollQueryUntilAsync(Database, CopySlotSql, token), "the copy's slot");
+                await transaction.CommitAsync(token);
+            }
+
+            Assert.IsTrue(await subscriber.PollLogAsync(copypos, "dropping the snapshot for table public.parent", token), "the snapshot let go");
+            int droppos = subscriber.ReadLog().IndexOf("dropping the snapshot for table public.parent", copypos, StringComparison.Ordinal);
+            Assert.IsTrue(await subscriber.PollLogAsync(droppos, "table public.parent waits to copy", token), "the wait without the snapshot");
+            string at = AppliedPosition().Match(subscriber.ReadLog()[droppos..]).Groups[1].Value;
+            Assert.AreEqual("t", await provider.SafePsqlAsync(Database, $"SELECT '{at}'::pg_lsn >= '{before}'::pg_lsn", token),
+                $"apply at {at}, past {before}");
+
+            await using NpgsqlTransaction slowTransaction = await held.BeginTransactionAsync(token);
+            await using (NpgsqlCommand command = new("INSERT INTO t SELECT g, 'slow' FROM generate_series(42, 50) g; INSERT INTO t VALUES (51, 'slower')",
+                held, slowTransaction))
+            {
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+
+            await localTransaction.RollbackAsync(token);
+            Assert.IsTrue(await provider.PollQueryUntilAsync(Database, CopySlotSql, token), "the copy's next slot");
+            await slowTransaction.CommitAsync(token);
+        }
+
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+            "SELECT sync_status = 'r' FROM worf.local_sync_status WHERE sync_relname = 'parent'", token), "the table synchronized again");
+        Assert.AreEqual(1, subscriber.ReadLog()[copypos..].Split("dropping the snapshot").Length - 1, "snapshots let go");
+        Assert.AreEqual("11", await subscriber.SafePsqlAsync(Database, "SELECT count(*) FROM t WHERE id > 40", token));
 
         // The rolled back subtransactions released what they held.
         string[] leaks = [.. subscriber.ReadLog().Split('\n').Where(line => line.Contains("leak", StringComparison.Ordinal) || line.Contains("not closed", StringComparison.Ordinal))];
@@ -463,4 +532,8 @@ public sealed class ExceptionBehaviourTests
                 error_sqlstate
             FROM worf.exception_log ORDER BY log_id DESC LIMIT 1
             """, token);
+
+    // How far a table's copy says apply has got.
+    [GeneratedRegex("waits to copy until subscription sub applies up to [0-9A-F/]+, and it's at ([0-9A-F]+/[0-9A-F]+)")]
+    private static partial Regex AppliedPosition();
 }
