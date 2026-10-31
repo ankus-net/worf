@@ -86,9 +86,9 @@ Managed sequences can't cycle, be temporary or unlogged, or be in a replication 
 - renaming their schema, and moving or unlogging a table that owns one;
 - `GRANT UPDATE` or `GRANT ALL` on them, directly or through `ALL SEQUENCES IN SCHEMA`;
 - changing the default or identity of a column that uses one;
-- dropping, renaming or disabling the guard triggers, making them depend on an extension, and creating other triggers with their names;
+- dropping, renaming or disabling the guard triggers and making them depend on an extension, and, wherever worf is installed, creating other triggers with their names or function or renaming a trigger to or from them;
 - `TRUNCATE ... RESTART IDENTITY` that would restart one, including through `CASCADE` or inheritance without `ONLY`.
 
-A `CREATE TRIGGER` of the guard, as a restored dump holds, is skipped, since worf creates the triggers on the tables that need them. Changing the type of a column that uses a managed sequence, or dropping it without `CASCADE`, fails because the triggers depend on it.
+A `CREATE TRIGGER` of the guard, as a restored dump holds, is skipped, since worf creates the triggers on the tables that need them, and replaces any triggers with their names that predate it. Changing the type of a column that uses a managed sequence, or dropping it without `CASCADE`, fails because the triggers depend on it.
 
 Superusers and members of `pg_write_all_data` can still call `setval`. The range worker leaves the block only when it finds the sequence behind where it was at its last check or behind a row, as above, so a `setval` back to a value past both makes the sequence issue again the values beyond it that it issued before.

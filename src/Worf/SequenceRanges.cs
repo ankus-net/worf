@@ -1030,9 +1030,11 @@ internal static unsafe partial class SequenceRanges
             DropAttachedGuards((AlterTableStmt*)parsetree);
         }
 
+        CheckGuardNames(parsetree);
+
         // The restore of a subscription's structure is worf's own.
         if (parsetree->type is not (NodeTag.T_AlterSeqStmt or NodeTag.T_GrantStmt or NodeTag.T_AlterTableStmt or
-            NodeTag.T_DropStmt or NodeTag.T_RenameStmt or NodeTag.T_TruncateStmt or NodeTag.T_CreateTrigStmt or
+            NodeTag.T_DropStmt or NodeTag.T_RenameStmt or NodeTag.T_TruncateStmt or
             NodeTag.T_AlterObjectSchemaStmt or NodeTag.T_AlterObjectDependsStmt) || !AnyManaged() || DdlReplication.Restoring())
         {
             return;
@@ -1082,11 +1084,6 @@ internal static unsafe partial class SequenceRanges
 
                 break;
 
-            // A dumped guard is skipped, since worf creates the guard itself.
-            case NodeTag.T_CreateTrigStmt when IsGuardName(Worf.FromServer(((CreateTrigStmt*)parsetree)->trigname)) &&
-                !IsGuardFunction(((CreateTrigStmt*)parsetree)->funcname):
-                throw Rejected("creating a trigger with the guard's name", "worf creates the guard itself.");
-
             // An extension's drop would drop the guard with it.
             case NodeTag.T_AlterObjectDependsStmt when ((AlterObjectDependsStmt*)parsetree)->objectType == ObjectType.OBJECT_TRIGGER &&
                 !((AlterObjectDependsStmt*)parsetree)->remove:
@@ -1104,6 +1101,35 @@ internal static unsafe partial class SequenceRanges
 
             default:
                 break;
+        }
+    }
+
+    /// <summary>
+    /// Keeps the guard's names and function worf's own wherever worf is installed, whether or not it manages a sequence
+    /// yet, so that a trigger that bears them is the guard: it rejects creating a trigger with either unless the trigger
+    /// is a dumped guard, which is skipped, and renaming a trigger to or from a guard's name.
+    /// </summary>
+    private static void CheckGuardNames(Node* parsetree)
+    {
+        if (parsetree->type == NodeTag.T_CreateTrigStmt)
+        {
+            CreateTrigStmt* trigger = (CreateTrigStmt*)parsetree;
+            bool name = IsGuardName(Worf.FromServer(trigger->trigname));
+            if (!name && IsGuardFunction(trigger->funcname))
+            {
+                throw Rejected("creating a trigger with the guard's function", "worf creates the guard itself.");
+            }
+
+            if (name && !SkipsDumpedGuard(parsetree) && GuardFunction() != 0)
+            {
+                throw Rejected("creating a trigger with the guard's name", "worf creates the guard itself.");
+            }
+        }
+        else if (parsetree->type == NodeTag.T_RenameStmt && ((RenameStmt*)parsetree)->renameType == ObjectType.OBJECT_TRIGGER &&
+            (IsGuardName(Worf.FromServer(((RenameStmt*)parsetree)->subname)) || IsGuardName(Worf.FromServer(((RenameStmt*)parsetree)->newname))) &&
+            GuardFunction() != 0)
+        {
+            throw Rejected("renaming a trigger to or from the guard's name", "worf creates the guard itself.");
         }
     }
 
@@ -1166,9 +1192,6 @@ internal static unsafe partial class SequenceRanges
     {
         switch (rename->renameType)
         {
-            case ObjectType.OBJECT_TRIGGER when IsGuardName(Worf.FromServer(rename->subname)) || IsGuardName(Worf.FromServer(rename->newname)):
-                throw Rejected("renaming the guard of a table that uses a managed sequence", "Disable range management first.");
-
             // Other nodes find a managed sequence by its schema and name.
             case ObjectType.OBJECT_SEQUENCE or ObjectType.OBJECT_TABLE or ObjectType.OBJECT_VIEW or ObjectType.OBJECT_MATVIEW or
                 ObjectType.OBJECT_FOREIGN_TABLE or ObjectType.OBJECT_INDEX when rename->relation is not null && IsManaged(Resolve(rename->relation)):
@@ -1250,20 +1273,33 @@ internal static unsafe partial class SequenceRanges
 
     /// <summary>
     /// Skips the guard that a dump creates, as a provider's dumped structure or a restored table's does, since worf
-    /// installs the guards itself, on the tables that use a managed sequence here.
+    /// installs the guards itself, on the tables that use a managed sequence here. The restore of a subscription's
+    /// structure skips any trigger with a guard's name, as one a provider had before worf was installed there.
     /// </summary>
     /// <param name="parsetree">The statement, before it runs.</param>
     /// <returns>Whether to skip it.</returns>
     internal static bool SkipsDumpedGuard(Node* parsetree)
         => !InternalDdl && parsetree->type == NodeTag.T_CreateTrigStmt && IsGuardName(Worf.FromServer(((CreateTrigStmt*)parsetree)->trigname)) &&
-            IsGuardFunction(((CreateTrigStmt*)parsetree)->funcname);
+            (DdlReplication.Restoring() || IsGuardFunction(((CreateTrigStmt*)parsetree)->funcname));
 
     /// <summary>
     /// Checks whether a trigger's function is the guard's.
     /// </summary>
     private static bool IsGuardFunction(List* funcname)
-        => funcname is not null && NodeName(funcname->elements[funcname->length - 1].ptr_value) == "sequence_range_guard" &&
-            (funcname->length == 1 || NodeName(funcname->elements[funcname->length - 2].ptr_value) == Worf.ExtensionName);
+    {
+        uint guard = GuardFunction();
+        return guard != 0 && funcname is not null && NativeMethods.LookupFuncName(funcname, 0, null, true) == guard;
+    }
+
+    /// <summary>
+    /// Finds the guard's trigger function, or 0 where worf isn't installed. It reads the catalog, so that a role without
+    /// USAGE on worf's schema finds it too.
+    /// </summary>
+    private static uint GuardFunction()
+        => Worf.ReadScalar<uint?>("""
+            SELECT p.oid FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+            WHERE n.nspname = 'worf' AND p.proname = 'sequence_range_guard' AND p.pronargs = 0
+            """) ?? 0;
 
     /// <summary>
     /// Puts managed sequences in place after DDL: the restore of a subscription's structure quarantines and joins the
@@ -2750,11 +2786,16 @@ internal static unsafe partial class SequenceRanges
             .OrderBy(column => column.Item1)];
         List<string> arguments = [.. guarded.Select(column => $"{column.Attnum}:{string.Join(",", column.Sequences)}")];
         string table = QualifiedName(root);
+
+        // Only worf creates a trigger with the guard's function, so one with another, as a trigger with the guard's name
+        // that predates worf has, or one that doesn't fire, is no guard.
         SpiResult existing = Worf.Read("""
-            SELECT tgname::text, encode(tgargs, 'escape') FROM pg_catalog.pg_trigger WHERE tgrelid = $1 AND tgname = ANY ($2) AND tgparentid = 0
-            """, 0, SpiParameter.Create(root), SpiParameter.Create(s_guardNames));
+            SELECT tgname::text, encode(tgargs, 'escape'), tgfoid = $3 AND tgenabled IN ('O', 'A')
+            FROM pg_catalog.pg_trigger WHERE tgrelid = $1 AND tgname = ANY ($2) AND tgparentid = 0
+            """, 0, SpiParameter.Create(root), SpiParameter.Create(s_guardNames), SpiParameter.Create(GuardFunction()));
         string encoded = string.Concat(arguments.Select(argument => argument + "\\000"));
-        if (guarded.Count == 0 || (existing.Count == s_guardNames.Length && Enumerable.Range(0, existing.Count).All(i => existing[i].Get<string>(1) == encoded)))
+        if (guarded.Count == 0 || (existing.Count == s_guardNames.Length &&
+            Enumerable.Range(0, existing.Count).All(i => existing[i].Get<string>(1) == encoded && existing[i].Get<bool>(2))))
         {
             // A tree with no column that uses a managed sequence keeps no guard.
             for (int i = 0; guarded.Count == 0 && i < existing.Count; i++)
@@ -2763,6 +2804,14 @@ internal static unsafe partial class SequenceRanges
             }
 
             return;
+        }
+
+        for (int i = 0; i < existing.Count; i++)
+        {
+            if (!existing[i].Get<bool>(2))
+            {
+                RunInternalDdl($"DROP TRIGGER {Spi.QuoteIdentifier(existing[i].Get<string>(0))} ON {table}");
+            }
         }
 
         // An update's condition checks only a value it changes, as when it moves a row to another partition, which

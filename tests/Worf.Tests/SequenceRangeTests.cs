@@ -300,6 +300,61 @@ public sealed class SequenceRangeTests
         Assert.AreEqual("42501", reserve.SqlState);
         Assert.Contains("must be owner", reserve.MessageText);
 
+        // Triggers with the guard's names from before worf was installed are replaced as their table comes under the
+        // guard, and once it is installed, no trigger takes the guard's names or function, while a restore skips them.
+        _ = await node.SafePsqlAsync(Database, "CREATE DATABASE decoys", token);
+        _ = await node.SafePsqlAsync("decoys", """
+            CREATE TABLE d (id bigserial PRIMARY KEY);
+            CREATE TABLE fresh (id bigint);
+            CREATE FUNCTION sequence_range_guard() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NULL; END$$;
+            CREATE TRIGGER other AFTER INSERT ON fresh FOR EACH ROW EXECUTE FUNCTION sequence_range_guard();
+            DO $$
+            BEGIN
+                EXECUTE format('CREATE TRIGGER worf_sequence_range_guard AFTER INSERT ON d FOR EACH ROW WHEN (false)
+                    EXECUTE FUNCTION public.sequence_range_guard(%L)', '1:' || 'd_id_seq'::regclass::oid);
+                EXECUTE format('CREATE TRIGGER worf_sequence_range_guard_update AFTER UPDATE ON d FOR EACH ROW WHEN (false)
+                    EXECUTE FUNCTION public.sequence_range_guard(%L)', '1:' || 'd_id_seq'::regclass::oid);
+            END
+            $$;
+            CREATE EXTENSION worf;
+            """, token);
+        _ = await node.SafePsqlAsync("decoys", $"SELECT * FROM worf.create_node(node_name := 'decoys', dsn := '{node.Dsn("decoys", SuperUser)}')", token);
+        foreach (string ddl in new[]
+        {
+            "CREATE TRIGGER worf_sequence_range_guard AFTER INSERT ON fresh FOR EACH ROW WHEN (false) EXECUTE FUNCTION public.sequence_range_guard()",
+            "CREATE TRIGGER copy AFTER INSERT ON fresh FOR EACH ROW WHEN (false) EXECUTE FUNCTION worf.sequence_range_guard('1:1')",
+            "ALTER TRIGGER other ON fresh RENAME TO worf_sequence_range_guard",
+        })
+        {
+            PostgresException error = await Assert.ThrowsExactlyAsync<PostgresException>(() => node.SafePsqlAsync("decoys", ddl, token), ddl);
+            Assert.AreEqual("55000", error.SqlState, ddl);
+        }
+
+        _ = await node.SafePsqlAsync("decoys", """
+            SET worf.subscription_schema_restore = on;
+            CREATE TRIGGER worf_sequence_range_guard AFTER INSERT ON fresh FOR EACH ROW WHEN (false) EXECUTE FUNCTION public.sequence_range_guard();
+            RESET worf.subscription_schema_restore;
+            SELECT worf.enable_sequence_range('d_id_seq', participants := '{}', range_size := 100);
+            INSERT INTO d DEFAULT VALUES;
+            """, token);
+        Assert.AreEqual("other", await node.SafePsqlAsync("decoys", "SELECT string_agg(tgname, ',') FROM pg_trigger WHERE tgrelid = 'fresh'::regclass", token));
+
+        // A role without USAGE on worf's schema creates triggers, and tables that come under the guard.
+        _ = await node.SafePsqlAsync("decoys", """
+            CREATE ROLE plain;
+            CREATE SCHEMA plain AUTHORIZATION plain;
+            GRANT USAGE ON SEQUENCE d_id_seq TO plain;
+            SET ROLE plain;
+            CREATE TABLE plain.numbered (id bigint PRIMARY KEY DEFAULT nextval('public.d_id_seq'));
+            CREATE FUNCTION plain.noop() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;
+            CREATE TRIGGER noop BEFORE INSERT ON plain.numbered FOR EACH ROW EXECUTE FUNCTION plain.noop();
+            """, token);
+        foreach (string write in new[] { "INSERT INTO d VALUES (987654)", "UPDATE d SET id = 987655", "INSERT INTO plain.numbered VALUES (987656)" })
+        {
+            PostgresException error = await Assert.ThrowsExactlyAsync<PostgresException>(() => node.SafePsqlAsync("decoys", write, token), write);
+            Assert.AreEqual("23514", error.SqlState, write);
+        }
+
         async Task AssertOutsideAsync(TestNode target, string sql)
         {
             PostgresException error = await Assert.ThrowsExactlyAsync<PostgresException>(() => target.SafePsqlAsync(Database, sql, token), sql);
