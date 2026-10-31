@@ -868,16 +868,24 @@ internal static partial class ReplicationSet
         TupleDescData* tableDesc = table->rd_att;
 
         // Look the table up in each of the connection's sets with the catalog's primary key, as a scan of every
-        // membership for each table makes a transaction that touches many tables quadratic.
+        // membership for each table makes a transaction that touches many tables quadratic, unless the key is in a
+        // file that's no longer its, which the scan of the catalog avoids. The key stays locked, so that it can't be
+        // built again meanwhile.
         NativeMethods.list_free(NativeMethods.RelationGetIndexList(repsetRel));
-        uint pkindex = repsetRel->rd_pkindex;
+        RelationData* pkindex = repsetRel->rd_pkindex == 0 ? null : NativeMethods.index_open(repsetRel->rd_pkindex, AccessShareLock);
+        if (pkindex is not null && !InCurrentFile(pkindex))
+        {
+            NativeMethods.index_close(pkindex, AccessShareLock);
+            pkindex = null;
+        }
+
         ScanKeyData* key = stackalloc ScanKeyData[2];
 
         foreach (WorfRepSet repset in subsReplicationSets)
         {
             NativeMethods.ScanKeyInit(&key[0], AnumRepsetTableSetid, BtEqualStrategyNumber, FOideq, repset.Id);
             NativeMethods.ScanKeyInit(&key[1], AnumRepsetTableReloid, BtEqualStrategyNumber, FOideq, reloid);
-            SysScanDescData* scan = NativeMethods.systable_beginscan(repsetRel, pkindex, true, null, 2, key);
+            SysScanDescData* scan = NativeMethods.systable_beginscan(repsetRel, pkindex is null ? 0 : pkindex->rd_id, pkindex is not null, null, 2, key);
 
             HeapTupleData* tuple;
             while ((tuple = NativeMethods.systable_getnext(scan)) is not null)
@@ -932,10 +940,43 @@ internal static partial class ReplicationSet
             NativeMethods.systable_endscan(scan);
         }
 
+        if (pkindex is not null)
+        {
+            NativeMethods.index_close(pkindex, AccessShareLock);
+        }
+
         NativeMethods.table_close(repsetRel, (int)PgLockMode.RowExclusive);
         entry.IsValid = true;
 
         return entry;
+    }
+
+    /// <summary>
+    /// Checks whether an index of one of worf's catalogs is read in its current file. Decoding reads with a historic
+    /// snapshot, under which PostgreSQL finds the current file of a catalog, and of a table declared one, but not of an
+    /// index of such a table, which it reads in the file that it had then. Once REINDEX, VACUUM FULL or CLUSTER has
+    /// built the index again in a new file, the old one is truncated, and gone after the next checkpoint.
+    /// </summary>
+    /// <param name="index">The index, open.</param>
+    /// <returns>Whether it is.</returns>
+    private static unsafe bool InCurrentFile(RelationData* index)
+    {
+        if (!NativeMethods.HistoricSnapshotActive())
+        {
+            return true;
+        }
+
+        // pg_class as it is now, as PostgreSQL reads it for a catalog's file.
+        RelationData* pgClass = NativeMethods.table_open(PgClassRelationId, AccessShareLock);
+        ScanKeyData key;
+        NativeMethods.ScanKeyInit(&key, AnumPgClassOid, BtEqualStrategyNumber, FOideq, index->rd_id);
+        SysScanDescData* scan = NativeMethods.systable_beginscan(pgClass, PgClassOidIndexId, true,
+            NativeMethods.GetNonHistoricCatalogSnapshot(PgClassRelationId), 1, &key);
+        HeapTupleData* tuple = NativeMethods.systable_getnext(scan);
+        bool current = tuple is not null && ((FormData_pg_class*)NativeMethods.GETSTRUCT(tuple))->relfilenode == index->rd_rel->relfilenode;
+        NativeMethods.systable_endscan(scan);
+        NativeMethods.table_close(pgClass, AccessShareLock);
+        return current;
     }
 
     /// <summary>
@@ -1003,7 +1044,13 @@ internal static partial class ReplicationSet
     private const short AnumRepsetSeqSeqoid = 2;
 
     private const int NoLock = 0;
+    private const int AccessShareLock = 1;
     private const int RowExclusiveLock = 3;
+
+    // pg_class, its oid column and the index on it, from catalog/pg_class_d.h.
+    private const uint PgClassRelationId = 1259;
+    private const short AnumPgClassOid = 1;
+    private const uint PgClassOidIndexId = 2662;
     private const uint FNameeq = 62;
 
     // Columns of worf.replication_set_table, and the scan key for its relation.
