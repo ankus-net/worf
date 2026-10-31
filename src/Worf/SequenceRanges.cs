@@ -1108,8 +1108,17 @@ internal static unsafe partial class SequenceRanges
         switch (parsetree->type)
         {
             case NodeTag.T_AlterSeqStmt:
-                if (!OnlyOwnedBy(((AlterSeqStmt*)parsetree)->options) && IsManaged(Resolve(((AlterSeqStmt*)parsetree)->sequence)))
+                AlterSeqStmt* alterSeq = (AlterSeqStmt*)parsetree;
+                uint altered = Resolve(alterSeq->sequence);
+                if (!OnlyOwnedBy(alterSeq->options) && IsManaged(altered))
                 {
+                    // An identity column's type change changes its sequence's type too.
+                    if (RetypedIdentity(alterSeq) is uint typeOid)
+                    {
+                        Retype(altered, typeOid);
+                        break;
+                    }
+
                     throw Rejected("ALTER SEQUENCE on a managed sequence", "Use worf.alter_sequence_range, or disable range management first.");
                 }
 
@@ -1375,6 +1384,86 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
+    /// Finds the type an identity column's type change gives its sequence, through the ALTER SEQUENCE ... AS that
+    /// PostgreSQL runs for it.
+    /// </summary>
+    /// <returns>The type, or null when the statement is no such change.</returns>
+    private static uint? RetypedIdentity(AlterSeqStmt* alter)
+    {
+        List* options = alter->options;
+        return alter->for_identity && options is not null && options->length == 1 &&
+            Worf.FromServer(((DefElem*)options->elements[0].ptr_value)->defname) == "as"
+            ? NativeMethods.typenameTypeId(null, (TypeName*)((DefElem*)options->elements[0].ptr_value)->arg)
+            : null;
+    }
+
+    /// <summary>
+    /// Gets a managed sequence ready for its identity column's type change: it refuses a type that can't hold the
+    /// blocks this node draws from, and a quarantined sequence takes the new type's quarantine bounds, which the old type
+    /// holds too, since PostgreSQL refuses a type that can't hold the sequence's bounds.
+    /// </summary>
+    private static void Retype(uint seqoid, uint typeOid)
+    {
+        (long min, long max) = TypeRange(typeOid);
+        if (Worf.ReadScalar<bool>("""
+            SELECT EXISTS (SELECT 1 FROM worf.sequence_range_block WHERE seqoid = $1 AND kind = 'n' AND state IN ('next', 'active') AND (lo < $2 OR hi > $3))
+            """, SpiParameter.Create(seqoid), SpiParameter.Create(min), SpiParameter.Create(max)))
+        {
+            throw Rejected("changing the type of a managed sequence to one that can't hold its blocks", "Disable range management first.");
+        }
+
+        SequenceInfo info = GetInfo(seqoid);
+        (long oldMin, long oldMax) = TypeRange(info.TypeOid);
+        if (min >= oldMin && max <= oldMax && ActiveBlock(seqoid) is null)
+        {
+            Quarantine(new SequenceInfo(seqoid, info.Name, typeOid, info.Increment, info.Min, info.Max, info.Cycle, info.Persistence));
+        }
+    }
+
+    /// <summary>
+    /// Keeps a managed sequence within its active block, or quarantined, once its identity column's type change has
+    /// changed its type, which may move bounds that were the old type's limits to the new type's. A narrower type ends
+    /// this node's root and pool blocks where it does.
+    /// </summary>
+    private static void Retyped(uint seqoid)
+    {
+        SequenceInfo info = GetInfo(seqoid);
+        if (ActiveBlock(seqoid) is (long lo, long hi))
+        {
+            RunInternalDdl($"ALTER SEQUENCE {info.Name} MINVALUE {lo.ToString(CultureInfo.InvariantCulture)} MAXVALUE {hi.ToString(CultureInfo.InvariantCulture)}");
+        }
+        else
+        {
+            Quarantine(info);
+        }
+
+        (long min, long max) = TypeRange(info.TypeOid);
+        SpiParameter seq = SpiParameter.Create(seqoid);
+        SpiParameter low = SpiParameter.Create(min);
+        SpiParameter high = SpiParameter.Create(max);
+        _ = Spi.Execute("UPDATE worf.sequence_range SET root_end = least(greatest(root_end, $2), $3) WHERE seqoid = $1 AND root_end NOT BETWEEN $2 AND $3",
+            seq, low, high);
+        _ = Spi.Execute("""
+            DELETE FROM worf.sequence_range_free f USING worf.sequence_range_block b
+            WHERE f.block_id = b.block_id AND b.seqoid = $1 AND (f.hi < $2 OR f.lo > $3)
+            """, seq, low, high);
+        _ = Spi.Execute("""
+            UPDATE worf.sequence_range_free f SET lo = greatest(f.lo, $2), hi = least(f.hi, $3) FROM worf.sequence_range_block b
+            WHERE f.block_id = b.block_id AND b.seqoid = $1 AND (f.lo < $2 OR f.hi > $3)
+            """, seq, low, high);
+    }
+
+    /// <summary>
+    /// Finds the block a managed sequence draws from, of whichever epoch.
+    /// </summary>
+    private static (long Lo, long Hi)? ActiveBlock(uint seqoid)
+    {
+        SpiResult active = Worf.SelectCatalog("SELECT lo, hi FROM worf.sequence_range_block WHERE seqoid = $1 AND kind = 'n' AND state = 'active'",
+            SpiParameter.Create(seqoid));
+        return active.Count == 0 ? null : (active[0].Get<long>(0), active[0].Get<long>(1));
+    }
+
+    /// <summary>
     /// Checks whether ALTER SEQUENCE only changes the column that owns the sequence, which leaves its values alone.
     /// </summary>
     private static bool OnlyOwnedBy(List* options)
@@ -1486,7 +1575,16 @@ internal static unsafe partial class SequenceRanges
                 uint seqoid = Resolve(((AlterSeqStmt*)parsetree)->sequence);
                 if (seqoid != 0 && IsManaged(seqoid))
                 {
-                    // Only OWNED BY changes a managed sequence outside worf's own DDL, and its column brings its rows.
+                    // An identity column's type change changes its sequence's type before its column's, and the guard
+                    // comes back once the column has changed.
+                    if (RetypedIdentity((AlterSeqStmt*)parsetree) is not null)
+                    {
+                        Retyped(seqoid);
+                        break;
+                    }
+
+                    // Only OWNED BY changes a managed sequence outside worf's own DDL otherwise, and its column brings its
+                    // rows.
                     InstallGuards(seqoid);
                     if (Worf.Read("""
                         SELECT d.refobjid::oid, a.attname::text FROM pg_catalog.pg_depend d
