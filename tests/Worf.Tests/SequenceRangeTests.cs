@@ -494,8 +494,8 @@ public sealed class SequenceRangeTests
     /// Two nodes that replicate both ways insert into the same table at once with keys from the same sequence, which the
     /// first node manages: the second learns of it through the exchange, gets blocks from the first, and no key is
     /// written on both nodes. A table on the second node that comes to use the sequence may hold the first's keys.
-    /// Idle, with or without a managed sequence, and with a sequence whose root can't start, neither node uses a
-    /// transaction ID, though they go on checking and exchanging.
+    /// Idle, with or without managed sequences and Snowflake IDs, and with a sequence whose root can't start, neither
+    /// node uses a transaction ID, though they go on checking and exchanging.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -517,7 +517,10 @@ public sealed class SequenceRangeTests
         await SubscribeAsync(nodeA, "a_from_b", nodeB, token);
         await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
         await AssertIdleAsync([nodeA, nodeB], false, token);
-        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 1000)", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 1000);
+            SELECT worf.enable_snowflake('{node_b}');
+            """, token);
         foreach (TestNode node in new[] { nodeA, nodeB })
         {
             Assert.IsTrue(await node.PollQueryUntilAsync(Database,
@@ -543,7 +546,7 @@ public sealed class SequenceRangeTests
             SELECT detail = 'sequence public.narrow_id_seq has no values left above 32767 for a root' FROM worf.sequence_ranges
             WHERE sequence = 'narrow_id_seq'::regclass
             """, token), "narrow_id_seq's root can't start");
-        await AssertIdleAsync([nodeA, nodeB], true, token);
+        await AssertIdleAsync([nodeA, nodeB], true, token, TimeSpan.FromSeconds(6));
         Assert.AreEqual(1, nodeA.ReadLog()[refused..].Split("has no values left above 32767 for a root").Length - 1, "node_a warned once");
 
         // A table that comes to use the sequence may hold the other node's keys, which the other node has issued.
@@ -718,7 +721,7 @@ public sealed class SequenceRangeTests
 
     /// <summary>
     /// In a cascade, a node two links from the owner gets its blocks from its parent's pool block, and a node whose
-    /// link to the owner is dropped finds the owner through another neighbor. A late joiner whose values reach into the
+    /// link to the owner is dropped finds the owner through another neighbor, which relays its reports without writing. A late joiner whose values reach into the
     /// root is refused by the pool holder it asks, one sequence's failure leaves the others' exchanges alone, and a
     /// pool holder's standby, promoted without the grants its primary made last, fences its pool until its children
     /// report, and takes the grants it lost back into its ledger.
@@ -764,6 +767,12 @@ public sealed class SequenceRangeTests
         await InsertAsync(nodeC, 1500, token);
         Assert.AreNotEqual("0", await nodeB.SafePsqlAsync(Database,
             "SELECT count(*) FROM worf.sequence_range_block WHERE kind = 'p' AND seqoid = 't_id_seq'::regclass", token), "node_b's pool block");
+
+        // node_b relays each end's reports to the other, once node_a no longer hears from node_c, and none of them writes
+        // anything while nothing changes.
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database,
+            "SELECT bool_and(via_node <> node_id) FROM worf.sequence_range_node WHERE node_name = 'node_c'", token), "node_c's reports relayed");
+        await AssertIdleAsync(nodes, true, token);
 
         // node_b asks for another pool block once its pool blocks can't serve two more of node_c's last requests.
         string last = await nodeB.SafePsqlAsync(Database, """
@@ -1365,51 +1374,66 @@ public sealed class SequenceRangeTests
     }
 
     /// <summary>
-    /// Waits for the nodes to settle, and then checks that neither uses a transaction ID for two seconds, which spans
-    /// twenty checks and four exchanges, nor takes more than one call an exchange interval through each slot on it. A
-    /// node has settled once the first call through each slot on it has bound the slot, and, with sequences managed,
-    /// once nothing is requested or granted for a sequence whose root started, each such sequence has a next block
-    /// ready, and its neighbors report the watermark it has.
+    /// Waits for the nodes to settle, all at once, and then checks that none uses a transaction ID for a while, two seconds unless
+    /// given, which span twenty checks and four exchanges, nor takes more than one call an exchange interval through each
+    /// slot on it. A node has settled once the first call through each slot on it has bound the slot, and, with
+    /// sequences managed, once nothing is requested or granted for a sequence whose root started, each such sequence
+    /// but the Snowflake node numbers has a next block ready, and every node it has heard of reports the watermark it
+    /// has.
     /// </summary>
-    private static async Task AssertIdleAsync(TestNode[] nodes, bool managed, CancellationToken token)
+    private static async Task AssertIdleAsync(TestNode[] nodes, bool managed, CancellationToken token, TimeSpan? span = null)
     {
-        foreach (TestNode node in nodes)
-        {
-            Assert.IsTrue(await node.PollQueryUntilAsync(Database, """
-                SELECT NOT EXISTS (
+        // A node that settles may unsettle one that had, as a request it answers leads to one of the neighbor's, so the
+        // nodes are checked until every one of them has settled at once.
+        string settled = $"""
+            SELECT NOT EXISTS (
                     SELECT 1 FROM pg_replication_slots s
                     WHERE s.plugin = 'worf' AND s.database = current_database()
                         AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_link l WHERE l.slot_name = s.slot_name))
-                """, token), $"{node.Name}'s slots bound");
-            Assert.IsTrue(!managed || await node.PollQueryUntilAsync(Database, """
-                WITH started AS (
-                    SELECT r.seqoid, r.watermark FROM worf.sequence_range r
-                    WHERE r.state <> 'collecting' AND NOT EXISTS (
-                        SELECT 1 FROM worf.sequence_range_node o CROSS JOIN worf.local_node l
-                        WHERE o.seqoid = r.seqoid AND o.node_id = r.owner_node AND o.node_id <> l.node_id AND o.state = 'collecting'))
-                SELECT NOT EXISTS (SELECT 1 FROM worf.sequence_range_request q JOIN started r ON r.seqoid = q.seqoid)
-                    AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_grant WHERE state = 'sent')
-                    AND (SELECT bool_and(s.next_lo IS NOT NULL) FROM worf.sequence_ranges s JOIN started r ON r.seqoid = s.sequence)
-                    AND NOT EXISTS (
-                        SELECT 1 FROM started r JOIN worf.sequence_range_node n ON n.seqoid = r.seqoid CROSS JOIN worf.local_node l
-                        WHERE n.via_node = n.node_id AND n.node_id <> l.node_id AND n.watermark IS DISTINCT FROM r.watermark)
-                """, token), $"{node.Name} settled");
+                AND (NOT {managed} OR (
+                    WITH started AS (
+                        SELECT r.seqoid, r.watermark FROM worf.sequence_range r
+                        WHERE r.state <> 'collecting' AND NOT EXISTS (
+                            SELECT 1 FROM worf.sequence_range_node o CROSS JOIN worf.local_node l
+                            WHERE o.seqoid = r.seqoid AND o.node_id = r.owner_node AND o.node_id <> l.node_id AND o.state = 'collecting'))
+                    SELECT NOT EXISTS (SELECT 1 FROM worf.sequence_range_request q JOIN started r ON r.seqoid = q.seqoid)
+                        AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_grant WHERE state = 'sent')
+                        AND coalesce((SELECT bool_and(s.next_lo IS NOT NULL) FROM worf.sequence_ranges s JOIN started r ON r.seqoid = s.sequence
+                            WHERE s.sequence <> 'worf.snowflake_node'::regclass), true)
+                        AND NOT EXISTS (
+                            SELECT 1 FROM started r JOIN worf.sequence_range_node n ON n.seqoid = r.seqoid CROSS JOIN worf.local_node l
+                            WHERE n.node_id <> l.node_id AND n.watermark IS DISTINCT FROM r.watermark)))
+            """;
+        bool waited = true;
+        while (waited)
+        {
+            waited = false;
+            foreach (TestNode node in nodes)
+            {
+                if (await node.SafePsqlAsync(Database, settled, token) != "t")
+                {
+                    waited = true;
+                    Assert.IsTrue(await node.PollQueryUntilAsync(Database, settled, token), $"{node.Name} settled");
+                }
+            }
         }
 
-        // Each exchange call is a session of its own. Two seconds hold four exchange intervals, so a slot takes no more
-        // than five calls, one where each end cuts an interval, and these queries take two sessions.
+        // Each exchange call is a session of its own. A slot takes no more than a call an exchange interval, and one where
+        // each end of the while cuts an interval, and these queries take two sessions.
+        TimeSpan idle = span ?? TimeSpan.FromSeconds(2);
+        long calls = (long)(idle / TimeSpan.FromMilliseconds(500)) + 1;
         await Task.Delay(TimeSpan.FromSeconds(1), token);
         const string Next = """
             SELECT pg_snapshot_xmax(pg_current_snapshot()), (SELECT sessions FROM pg_stat_database WHERE datname = current_database()),
                 (SELECT count(*) FROM pg_replication_slots WHERE plugin = 'worf' AND database = current_database())
             """;
         string[][] before = await Task.WhenAll(nodes.Select(async node => (await node.SafePsqlAsync(Database, Next, token)).Split('|')));
-        await Task.Delay(TimeSpan.FromSeconds(2), token);
+        await Task.Delay(idle, token);
         string[][] after = await Task.WhenAll(nodes.Select(async node => (await node.SafePsqlAsync(Database, Next, token)).Split('|')));
         for (int i = 0; i < nodes.Length; i++)
         {
             Assert.AreEqual(before[i][0], after[i][0], $"{nodes[i].Name} used transaction IDs while idle");
-            Assert.IsLessThanOrEqualTo((5 * long.Parse(after[i][2], CultureInfo.InvariantCulture)) + 2,
+            Assert.IsLessThanOrEqualTo((calls * long.Parse(after[i][2], CultureInfo.InvariantCulture)) + 2,
                 long.Parse(after[i][1], CultureInfo.InvariantCulture) - long.Parse(before[i][1], CultureInfo.InvariantCulture), $"{nodes[i].Name}'s exchange calls");
         }
     }

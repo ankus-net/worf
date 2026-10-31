@@ -429,27 +429,6 @@ internal static class Worker
     }
 
     /// <summary>
-    /// Wakes this database's sequence range worker, if it runs.
-    /// </summary>
-    internal static void WakeRangeWorker()
-    {
-        uint dboid;
-        unsafe
-        {
-            dboid = NativeGlobals.MyDatabaseId;
-        }
-
-        using PgLwLockShareGuard<WorfContext, WorfWorker> guard = WorfCtx.Share();
-        for (int i = 0; i < guard.Length; i++)
-        {
-            if (guard[i].WorkerType == WorfWorkerType.Range && guard[i].Dboid == dboid && guard[i].Proc != 0)
-            {
-                SetProcLatch(guard[i].Proc);
-            }
-        }
-    }
-
-    /// <summary>
     /// Enqueue signal for supervisor/manager at COMMIT.
     /// </summary>
     /// <param name="subid">The subscription whose apply worker to signal, or zero.</param>

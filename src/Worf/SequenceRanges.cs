@@ -336,7 +336,7 @@ internal static unsafe partial class SequenceRanges
         }
 
         // Moving the owner starts the next epoch. Two live roots could overlap, so it waits until no neighbor has
-        // reported the old owner's epoch as live lately, unless forced because the old owner is gone.
+        // reported the old owner's epoch as live within the last minute, unless forced because the old owner is gone.
         SpiResult existing = Worf.SelectCatalog(
             "SELECT epoch, state, owner_node, watermark, root_start, root_end FROM worf.sequence_range WHERE seqoid = $1",
             SpiParameter.Create(seqoid));

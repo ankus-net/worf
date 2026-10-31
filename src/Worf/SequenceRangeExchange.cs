@@ -634,7 +634,6 @@ internal static class SequenceRangeExchange
         });
 
         // Grants for the neighbor that it hasn't acknowledged, and acknowledgements of its grants.
-        bool refused = false;
         WriteArray(writer, "grants", Worf.SelectCatalog(
             "SELECT grant_id, request_id, lo, hi, kind::text, not_before FROM worf.sequence_range_grant WHERE seqoid = $1 AND grantee_id = $2 AND state = 'sent'",
             seq, peer), grant =>
@@ -753,11 +752,11 @@ internal static class SequenceRangeExchange
 
     /// <summary>
     /// Checks, only reading, whether one sequence of a neighbor's message would change nothing here: the neighbor
-    /// reports what it reported before, relays nothing new, asks for nothing, unless this node is an owner still
-    /// collecting reports, which grants nothing until they change, grants and gives up nothing, acknowledges nothing
-    /// new, and leaves this node's route as it is, while neither node is fenced. Such a message is only noted in shared
-    /// memory, so that exchanges between idle nodes, or with an owner whose root can't start, write nothing and use no
-    /// transaction IDs.
+    /// reports what it reported before, relays nothing new, asks for nothing that this node can answer yet, as an
+    /// owner still collecting reports can't, grants and gives up nothing, acknowledges nothing new, and leaves this
+    /// node's route as it is, while neither node is fenced. Such a message is only noted in shared memory, so that
+    /// exchanges between idle nodes, or toward an owner whose root can't start, write nothing and use no transaction
+    /// IDs.
     /// </summary>
     private static bool Unchanged(WorfLocalNode node, JsonElement root, JsonElement entry, uint senderId, bool call, ulong applied)
     {
@@ -783,14 +782,15 @@ internal static class SequenceRangeExchange
             return local[0].Get<int>(0) > epoch;
         }
 
+        SequenceInfo info = SequenceRanges.GetInfo(seqoid);
         if (local[0].Get<bool>(2) || state == "fenced" || (state == "disabled" && local[0].Get<string>(1) != "disabled") ||
-            (entry.GetProperty("requests").GetArrayLength() > 0 && local[0].Get<string>(1) != "collecting") ||
+            (entry.GetProperty("requests").GetArrayLength() > 0 && local[0].Get<string>(1) != "collecting" &&
+                !Unanswerable(seqoid, info, epoch, entry.GetProperty("requests"), local[0].Get<uint>(5) == node.Node.Id)) ||
             entry.GetProperty("grants").GetArrayLength() > 0)
         {
             return false;
         }
 
-        SequenceInfo info = SequenceRanges.GetInfo(seqoid);
         bool covers(long? have, long? value) => value is not long v || (have is long h && (info.Ascending ? h >= v : h <= v));
         if (!covers(local[0].Get<long?>(3), Nullable(entry, "root_start")) || !covers(local[0].Get<long?>(4), Nullable(entry, "watermark")))
         {
@@ -885,6 +885,45 @@ internal static class SequenceRangeExchange
         return parent == local[0].Get<uint?>(6) && distance == local[0].Get<int?>(7) && routed == local[0].Get<string>(1) &&
             (parent is null || !Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range_request WHERE seqoid = $1 AND parent_node <> $2)",
                 seq, SpiParameter.Create(parent.Value)));
+    }
+
+    /// <summary>
+    /// Checks, only reading, whether this node would leave a neighbor's requests for blocks as they are, as while the
+    /// root has run out, or, on a node between it and the owner, can't start: none was answered before, no free span of
+    /// this node's root or pool blocks holds the smallest, and this node, unless it is the owner, has asked its parent
+    /// for a pool block already.
+    /// </summary>
+    private static bool Unanswerable(uint seqoid, SequenceInfo info, int epoch, JsonElement requests, bool isOwner)
+    {
+        List<Guid> ids = [];
+        long smallest = long.MaxValue;
+        foreach (JsonElement request in requests.EnumerateArray())
+        {
+            if (Text(request, "kind") is not (null or "n" or "p"))
+            {
+                return false;
+            }
+
+            ids.Add(request.GetProperty("id").GetGuid());
+            smallest = Math.Min(smallest, request.GetProperty("size").GetInt64());
+        }
+
+        ulong sysid;
+        unsafe
+        {
+            sysid = NativeMethods.GetSystemIdentifier();
+        }
+
+        return Worf.ReadScalar<bool>("""
+            SELECT NOT EXISTS (SELECT 1 FROM worf.sequence_range_grant WHERE request_id = ANY ($2))
+                AND NOT EXISTS (
+                    SELECT 1 FROM worf.sequence_range_free f JOIN worf.sequence_range_block b ON b.block_id = f.block_id
+                    WHERE b.seqoid = $1 AND b.epoch = $3 AND b.kind IN ('r', 'p') AND b.state = 'open' AND b.sysid = $4 AND b.timeline = $5
+                        AND f.hi::numeric - f.lo >= $6)
+                AND ($7 OR EXISTS (SELECT 1 FROM worf.sequence_range_request WHERE seqoid = $1 AND kind = 'p' AND state = 'open'))
+            """, SpiParameter.Create(seqoid), SpiParameter.Create(ids.ToArray()), SpiParameter.Create(epoch),
+            SpiParameter.Create((decimal)sysid), SpiParameter.Create((long)SequenceRanges.Timeline()),
+            SpiParameter.Create(((decimal)smallest - 1) * Math.Abs(info.Increment)), SpiParameter.Create(isOwner));
     }
 
     /// <summary>

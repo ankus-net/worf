@@ -85,7 +85,6 @@ internal static class SnowflakeIds
         while (true)
         {
             long now = NowMs();
-            bool wake;
             using (PgLwLockExclusiveGuard<WorfSnowflakeTable, WorfSnowflakeClock> guard = Clocks.Exclusive())
             {
                 int slot = Slot(guard, dboid);
@@ -109,17 +108,6 @@ internal static class SnowflakeIds
                         return (ms << (NodeBits + CounterBits)) | ((long)node << CounterBits) | (state & ((1L << CounterBits) - 1));
                     }
                 }
-
-                // The range worker hasn't reserved this far yet, which it does ahead only while sessions issue IDs. The
-                // first session to wait asks it to.
-                wake = !clock.Wanted;
-                clock.Wanted = true;
-                guard[slot] = clock;
-            }
-
-            if (wake)
-            {
-                Worker.WakeRangeWorker();
             }
 
             // The range worker hasn't reserved this far yet, as just after a restart, before its first pass, or while it
