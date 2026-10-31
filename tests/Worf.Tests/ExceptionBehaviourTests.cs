@@ -231,7 +231,9 @@ public sealed partial class ExceptionBehaviourTests
             Assert.IsTrue(await subscriber.PollLogAsync(copypos, "dropping the snapshot for table public.parent", token), "the snapshot let go");
             int droppos = subscriber.ReadLog().IndexOf("dropping the snapshot for table public.parent", copypos, StringComparison.Ordinal);
             Assert.IsTrue(await subscriber.PollLogAsync(droppos, "table public.parent waits to copy", token), "the wait without the snapshot");
-            string at = AppliedPosition().Match(subscriber.ReadLog()[droppos..]).Groups[1].Value;
+            Match wait = AppliedPosition().Match(subscriber.ReadLog()[droppos..]);
+            Assert.IsTrue(wait.Success, "the wait says how far apply is");
+            string at = wait.Groups[1].Value;
             Assert.AreEqual("t", await provider.SafePsqlAsync(Database, $"SELECT '{at}'::pg_lsn >= '{before}'::pg_lsn", token),
                 $"apply at {at}, past {before}");
 
