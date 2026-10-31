@@ -124,7 +124,8 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
 
 - `worf.sequence_range_check_interval`
   How often the range worker checks each managed sequence, switching it to
-  its next block when the active one runs low. The default is `1s`.
+  its next block when the active one runs low. A session that reaches the last
+  twentieth of a block wakes it at once. The default is `1s`.
 
 - `worf.sequence_range_exchange_interval`
   How often each node exchanges sequence range reports with its neighbors

@@ -1,3 +1,5 @@
+using Ankus.Postgres;
+
 namespace Worf;
 
 /// <summary>
@@ -47,9 +49,30 @@ internal static class SequenceRangeWorker
                     {
                         changed |= PgBackgroundWorker.RunTransaction(() =>
                         {
-                            double rate = Rate(rates, seqoid);
-                            _ = SequenceRanges.LiftFence(seqoid, local, false);
-                            return SequenceRanges.Check(seqoid, local, rate);
+                            // The lock nextval takes keeps a switch from committing between the reads of the sequence's
+                            // blocks and of its position. A sequence that a transaction holds against it waits for a later
+                            // tick, so that the worker waits on no session.
+                            unsafe
+                            {
+                                if (!NativeMethods.ConditionalLockRelationOid(seqoid, (int)PgLockMode.RowExclusive))
+                                {
+                                    return false;
+                                }
+                            }
+
+                            try
+                            {
+                                double rate = Rate(rates, seqoid);
+                                _ = SequenceRanges.LiftFence(seqoid, local, false);
+                                return SequenceRanges.Check(seqoid, local, rate);
+                            }
+                            finally
+                            {
+                                unsafe
+                                {
+                                    NativeMethods.UnlockRelationOid(seqoid, (int)PgLockMode.RowExclusive);
+                                }
+                            }
                         });
                     }
                     catch (PgException error)
@@ -111,19 +134,29 @@ internal static class SequenceRangeWorker
 
     /// <summary>
     /// Tracks a sequence's insert rate within its active block and returns its peak, which decays while the sequence is
-    /// idle. A switch moves the position by more than the sequence issued, so it starts a new sample.
+    /// idle. A switch moves the position by more than the sequence issued, so it starts a new sample. A block that a
+    /// reservation switched to, which carries no activation time, serves a load rather than the usual inserts, and isn't
+    /// sampled.
     /// </summary>
     private static double Rate(Dictionary<uint, (long Block, long Position, long At, double Peak)> rates, uint seqoid)
     {
         long now = Worker.GetCurrentTimestamp();
         SpiResult state = Worf.SelectCatalog("""
-            SELECT s.seqincrement, (SELECT lo FROM worf.sequence_range_block WHERE seqoid = $1 AND kind = 'n' AND state = 'active')
+            SELECT s.seqincrement,
+                (SELECT lo FROM worf.sequence_range_block WHERE seqoid = $1 AND kind = 'n' AND state = 'active' AND activated_at IS NOT NULL)
             FROM pg_catalog.pg_sequence s WHERE s.seqrelid = $1
             """, SpiParameter.Create(seqoid));
         bool known = rates.TryGetValue(seqoid, out (long Block, long Position, long At, double Peak) previous);
         if (state.Count == 0 || SequenceRanges.LastValue(seqoid) is not long position || state[0].Get<long?>(1) is not long block)
         {
             return known ? previous.Peak : 0;
+        }
+
+        // A tick that comes early, as when a session wakes the worker, leaves the sample running, so that a burst isn't
+        // taken over a moment as a higher rate.
+        if (known && previous.Block == block && now - previous.At < SequenceRanges.CheckInterval * 1000L)
+        {
+            return previous.Peak;
         }
 
         double peak = known ? previous.Peak : 0;

@@ -720,7 +720,7 @@ internal static unsafe partial class SequenceRanges
                     return true;
                 }
 
-                if (Switch(seqoid, info, (next.Value.Id, next.Value.Lo, next.Value.Hi)))
+                if (Switch(seqoid, info, (next.Value.Id, next.Value.Lo, next.Value.Hi), next.Value.Reserved))
                 {
                     changed = true;
                     next = null;
@@ -758,6 +758,9 @@ internal static unsafe partial class SequenceRanges
         if (next is null && !(snowflake && active is not null) && state != "disabled" &&
             (snowflake ? SnowflakeNumber(seqoid, "next") : NodeBlock(seqoid, epoch, "next")) is null)
         {
+            // The next block holds at least two minutes of inserts at the peak rate, up to the largest size, so that a
+            // minute's margin leaves the one after it time to arrive.
+            long forRate = (long)Math.Ceiling(Math.Min(rate * 120, long.MaxValue / 2.0));
             if (owner == node.Node.Id)
             {
                 if (!apply)
@@ -767,7 +770,7 @@ internal static unsafe partial class SequenceRanges
                         return true;
                     }
                 }
-                else if (GrantOwnBlock(seqoid, info, node, epoch))
+                else if (GrantOwnBlock(seqoid, info, node, epoch, forRate))
                 {
                     changed = true;
                     _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () => _ = PgAtomic.Add(ExchangeRequested, 1L));
@@ -785,11 +788,11 @@ internal static unsafe partial class SequenceRanges
 
                 _ = Spi.Execute("""
                     INSERT INTO worf.sequence_range_request (request_id, seqoid, parent_node, kind, size, created_at)
-                    SELECT gen_random_uuid(), r.seqoid, r.parent_node, 'n', r.request_size, now()
+                    SELECT gen_random_uuid(), r.seqoid, r.parent_node, 'n', greatest(r.request_size, least($2, r.max_range_size)), now()
                     FROM worf.sequence_range r
                     WHERE r.seqoid = $1 AND r.parent_node IS NOT NULL
                         AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_request q WHERE q.seqoid = r.seqoid AND q.kind = 'n')
-                    """, seq);
+                    """, seq, SpiParameter.Create(forRate));
             }
         }
 
@@ -3089,8 +3092,10 @@ internal static unsafe partial class SequenceRanges
     /// <param name="seqoid">The sequence.</param>
     /// <param name="info">The sequence's details.</param>
     /// <param name="block">The block.</param>
-    /// <returns>Whether it switched; it doesn't when a transaction that called nextval holds the sequence for 200 ms.</returns>
-    internal static bool Switch(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) block)
+    /// <param name="forLoad">Whether the block was reserved for a load.</param>
+    /// <returns>Whether it switched; it doesn't when a transaction that called nextval holds the sequence for 200 ms, or
+    /// another switch took the block first.</returns>
+    internal static bool Switch(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) block, bool forLoad = false)
     {
         LockLedger(seqoid);
         if (Worf.ReadScalar<long?>("SELECT not_before FROM worf.sequence_range_block WHERE block_id = $1", SpiParameter.Create(block.Id)) is long notBefore &&
@@ -3107,12 +3112,27 @@ internal static unsafe partial class SequenceRanges
         // quarantined and the block only marks the value as this node's.
         if (block.Lo != block.Hi)
         {
+            bool next = true;
             try
             {
                 PgTransaction.RunInSubtransaction(() =>
                 {
                     _ = Spi.Execute("SET LOCAL lock_timeout = 200");
-                    RunInternalDdl($"ALTER SEQUENCE {info.Name} NO CYCLE CACHE 1 MINVALUE {lo} MAXVALUE {hi} START WITH {start} RESTART WITH {start}");
+
+                    // Another switch may have taken the block while this one read it or waited for the lock. Restarting
+                    // the sequence at the block's start would then issue its values again, so this one leaves it.
+                    NativeMethods.LockRelationOid(seqoid, (int)PgLockMode.ShareRowExclusive);
+                    next = Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range_block WHERE block_id = $1 AND state = 'next'",
+                        SpiParameter.Create(block.Id)).Count > 0;
+                    if (next)
+                    {
+                        RunInternalDdl($"ALTER SEQUENCE {info.Name} NO CYCLE CACHE 1 MINVALUE {lo} MAXVALUE {hi} START WITH {start} RESTART WITH {start}");
+                    }
+                    else
+                    {
+                        NativeMethods.UnlockRelationOid(seqoid, (int)PgLockMode.ShareRowExclusive);
+                    }
+
                     _ = Spi.Execute("SET LOCAL lock_timeout = 0");
                 });
             }
@@ -3120,16 +3140,22 @@ internal static unsafe partial class SequenceRanges
             {
                 return false;
             }
+
+            if (!next)
+            {
+                return false;
+            }
         }
 
         // A block that lasted less than an hour makes the next request bigger, and one that lasted more than a day
-        // smaller.
+        // smaller. A reservation's switch, which retires a block early, and its block, sized for a load, say nothing of
+        // how fast the sequence draws, so neither counts.
         double? lasted = Spi.ExecuteScalar<double?>("""
             UPDATE worf.sequence_range_block SET state = 'retired', retired_at = now()
             WHERE seqoid = $1 AND kind = 'n' AND state = 'active'
             RETURNING extract(epoch FROM now() - activated_at)::float8
             """, SpiParameter.Create(seqoid));
-        if (lasted is double seconds)
+        if (!forLoad && lasted is double seconds)
         {
             string resize = seconds < s_growBelow.TotalSeconds ? "least(request_size * 2, max_range_size)"
                 : seconds > s_shrinkAbove.TotalSeconds ? "greatest(request_size / 2, range_size)"
@@ -3137,8 +3163,8 @@ internal static unsafe partial class SequenceRanges
             _ = Spi.Execute($"UPDATE worf.sequence_range SET request_size = {resize} WHERE seqoid = $1", SpiParameter.Create(seqoid));
         }
 
-        _ = Spi.Execute("UPDATE worf.sequence_range_block SET state = 'active', activated_at = now() WHERE block_id = $1",
-            SpiParameter.Create(block.Id));
+        _ = Spi.Execute("UPDATE worf.sequence_range_block SET state = 'active', activated_at = CASE WHEN $2 THEN now() END WHERE block_id = $1",
+            SpiParameter.Create(block.Id), SpiParameter.Create(!forLoad));
         _ = Spi.Execute("UPDATE worf.sequence_range SET state = 'active', switched_at = now() WHERE seqoid = $1",
             SpiParameter.Create(seqoid));
         // Sessions' guards reload before any nextval reaches the block, which waits for the switch's lock until then.
@@ -3149,11 +3175,12 @@ internal static unsafe partial class SequenceRanges
 
     /// <summary>
     /// Grants the owner a next block from the start of the root's lowest free span that holds it, under a row lock,
-    /// committed with synchronous_commit on.
+    /// committed with synchronous_commit on: the size requested, or <paramref name="forRate"/> up to the largest size.
     /// </summary>
-    private static bool GrantOwnBlock(uint seqoid, SequenceInfo info, WorfLocalNode node, int epoch)
+    private static bool GrantOwnBlock(uint seqoid, SequenceInfo info, WorfLocalNode node, int epoch, long forRate = 0)
     {
-        long size = Worf.SelectCatalog("SELECT request_size FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(seqoid))[0].Get<long>(0);
+        long size = Worf.SelectCatalog("SELECT greatest(request_size, least($2, max_range_size)) FROM worf.sequence_range WHERE seqoid = $1",
+            SpiParameter.Create(seqoid), SpiParameter.Create(forRate))[0].Get<long>(0);
         if (Allocate(seqoid, info, epoch, size, node.Node.Id, node.Node.Name, Guid.NewGuid()) is not (Guid grant, long lo, long hi))
         {
             return false;
