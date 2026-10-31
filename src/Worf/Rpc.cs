@@ -128,6 +128,79 @@ internal static class Rpc
     }
 
     /// <summary>
+    /// Checks whether a remote replication slot exists.
+    /// </summary>
+    /// <param name="conn">The provider connection, inside a local transaction.</param>
+    /// <param name="slotName">The slot.</param>
+    /// <returns>Whether it does.</returns>
+    internal static bool RemoteSlotExists(PgReplicationConnection conn, string slotName)
+    {
+        try
+        {
+            return conn.Query("SELECT 1 FROM pg_catalog.pg_replication_slots WHERE slot_name = " + Spi.QuoteLiteral(slotName), 1).Count > 0;
+        }
+        catch (PgRemoteException error)
+        {
+            throw new PgException(PgSqlStates.InternalError, "getting remote slot info failed",
+                detail: $"SELECT FROM pg_catalog.pg_replication_slots failed with: ERROR:  {error.Message}\n");
+        }
+    }
+
+    /// <summary>
+    /// Gets the process that holds a remote replication slot.
+    /// </summary>
+    /// <param name="conn">The provider connection, inside a local transaction.</param>
+    /// <param name="slotName">The slot.</param>
+    /// <returns>The process's id, or zero when nothing holds the slot.</returns>
+    internal static int RemoteSlotHolder(PgReplicationConnection conn, string slotName)
+    {
+        IReadOnlyList<string?[]> res;
+        try
+        {
+            res = conn.Query("SELECT active_pid FROM pg_catalog.pg_replication_slots " +
+                "WHERE slot_name = " + Spi.QuoteLiteral(slotName) + " AND active", 1);
+        }
+        catch (PgRemoteException error)
+        {
+            throw new PgException(PgSqlStates.InternalError, "getting remote slot info failed",
+                detail: $"SELECT FROM pg_catalog.pg_replication_slots failed with: ERROR:  {error.Message}\n");
+        }
+
+        return res.Count == 0 || res[0][0] is null ? 0 : int.Parse(res[0][0]!, CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>
+    /// Stops the process that holds a remote replication slot when it's a walsender of an earlier connection like this
+    /// one, with the same user and application name, as one whose connection has closed still is while it decodes a
+    /// transaction.
+    /// </summary>
+    /// <param name="conn">The provider connection, inside a local transaction.</param>
+    /// <param name="slotName">The slot.</param>
+    /// <param name="holder">The process that held the slot.</param>
+    /// <returns>Why the process wasn't stopped, or null when it was.</returns>
+    internal static string? TerminateSlotHolder(PgReplicationConnection conn, string slotName, int holder)
+    {
+        try
+        {
+            IReadOnlyList<string?[]> res = conn.Query($"""
+                SELECT pg_catalog.pg_terminate_backend(a.pid)
+                FROM pg_catalog.pg_stat_activity a
+                    JOIN pg_catalog.pg_replication_slots s ON s.active_pid = a.pid
+                WHERE s.slot_name = {Spi.QuoteLiteral(slotName)} AND a.pid = {holder.ToString(CultureInfo.InvariantCulture)}
+                    AND a.pid <> pg_catalog.pg_backend_pid() AND a.backend_type = 'walsender' AND a.usename = session_user
+                    AND a.application_name = pg_catalog.current_setting('application_name')
+                """, 1);
+            return res.Count == 0 ? "It isn't a walsender of this table sync's earlier connections, which the sync stops."
+                : res[0][0] == "t" ? null
+                : "It couldn't be signaled.";
+        }
+        catch (PgRemoteException error)
+        {
+            return $"Stopping it failed: {error.Message}";
+        }
+    }
+
+    /// <summary>
     /// Drops replication slot on remote node that has been used by the local node.
     /// </summary>
     /// <param name="conn">The provider connection, inside a local transaction.</param>
@@ -224,7 +297,11 @@ internal static class Rpc
         IReadOnlyList<string?[]> res;
         try
         {
-            res = conn.Query($"SELECT EXISTS (SELECT 1 FROM worf.subscription WHERE sub_origin = {nodeId.ToString(CultureInfo.InvariantCulture)}), ({Conflict.WorkerResolutionSql})", 2);
+            string?[] privileges = conn.Query("""
+                SELECT pg_catalog.has_table_privilege('pg_catalog.pg_file_settings', 'SELECT'),
+                    pg_catalog.has_function_privilege('pg_catalog.pg_read_file(text, bigint, bigint, boolean)', 'EXECUTE')
+                """, 2)[0];
+            res = conn.Query($"SELECT EXISTS (SELECT 1 FROM worf.subscription WHERE sub_origin = {nodeId.ToString(CultureInfo.InvariantCulture)}), ({Conflict.WorkerResolutionSql(privileges[0] == "t", privileges[1] == "t")})", 2);
         }
         catch (PgRemoteException error)
         {

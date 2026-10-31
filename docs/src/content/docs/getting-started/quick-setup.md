@@ -13,12 +13,16 @@ decoding:
     max_wal_senders = 10        # one per node needed on provider node
     shared_preload_libraries = 'worf'
 
-On a subscriber, each subscription uses a replication origin, plus one for each
-other node whose changes its provider forwards with `forward_origins` `{all}`.
-They count against `max_active_replication_origins` from PostgreSQL 18, or
-`max_replication_slots` before. When none is free, worf applies a forwarded
-node's changes as its provider's, and breaks timestamp ties for them as if the
-provider wrote them.
+On a subscriber, PostgreSQL tracks each replication origin in use in one of
+`max_active_replication_origins` slots from PostgreSQL 18, or
+`max_replication_slots` before. Each subscription takes one, each table it's
+synchronizing another, and each other node whose changes its provider forwards
+with `forward_origins` `{all}` another. When one that needs a slot finds none
+free, subscriptions give up the slots of forwarded nodes' origins they no longer
+need, which slows apply; failing that within 10 seconds, its apply or table
+sync stops with an error and retries. They also give them up, within 10
+seconds, to another user of origins, such as a PostgreSQL subscription, whose
+origin has none.
 
 If you want to handle conflict resolution with last/first update wins (see
 [Conflicts](../../conflicts/)), you can add this additional option to

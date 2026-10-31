@@ -129,7 +129,7 @@ internal static unsafe class ApplyHeap
         // in order.
         if (local.CommitTime is not null &&
             local.TransactionId != NativeMethods.GetTopTransactionId() &&
-            !Apply.IsOwnStream(local.CommitOrigin))
+            !Apply.IsOwnStream(local.CommitOrigin, local.TransactionId))
         {
             localtuple = LocalTuple(local);
             HeapTupleData* remotetuple = ModifyTuple(localtuple, relation, newtup);
