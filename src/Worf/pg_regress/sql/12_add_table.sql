@@ -84,11 +84,17 @@ INSERT INTO public.test_publicschema VALUES(4, 'd');
 INSERT INTO "strange.schema-IS".test_strangeschema VALUES(3, DEFAULT);
 INSERT INTO "strange.schema-IS".test_strangeschema VALUES(4, DEFAULT);
 
+-- The subscriber has no such sequence, and skips its state.
+CREATE SEQUENCE public.test_provider_only_seq;
+SELECT * FROM worf.replication_set_add_sequence('default', 'test_provider_only_seq');
+
 SELECT worf.synchronize_sequence(c.oid)
   FROM pg_class c, pg_namespace n
  WHERE c.relkind = 'S' AND c.relnamespace = n.oid AND n.nspname IN ('public', 'strange.schema-IS');
 
 SELECT worf.wait_slot_confirm_lsn(NULL, NULL);
+
+DROP SEQUENCE public.test_provider_only_seq CASCADE;
 
 \c :subscriber_dsn
 SELECT * FROM public.test_publicschema;
