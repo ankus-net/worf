@@ -21,6 +21,11 @@ using Ankus.Postgres;
         PRIMARY KEY(set_id, set_reloid)
     ) WITH (user_catalog_table=true);
 
+    -- Decoding reads the table with a historic snapshot, under which PostgreSQL reads its TOAST table in the files
+    -- that it had then, which REINDEX, VACUUM FULL or CLUSTER since replaces, so values stay in the row while they fit.
+    ALTER TABLE worf.replication_set_table ALTER COLUMN set_att_list SET STORAGE MAIN,
+        ALTER COLUMN set_row_filter SET STORAGE MAIN;
+
     CREATE TABLE worf.replication_set_seq (
         set_id oid NOT NULL,
         set_seqoid regclass NOT NULL,

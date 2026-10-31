@@ -1118,3 +1118,12 @@ encoding. We recommend using `UTF-8` encoding in all replicated databases.
 
 PostgreSQL's logical decoding facility does not support decoding changes
 to large objects, so worf cannot replicate large objects.
+
+### Very large row filters and column lists
+
+A row filter or column list that stays over about 8 kB once compressed is
+kept out of line, in a TOAST table that logical decoding reads in the files
+it had when the change was made. Once `REINDEX`, `VACUUM FULL` or `CLUSTER`
+has rebuilt `worf.replication_set_table`, a subscriber that is still behind
+can't receive the earlier changes to such a table, and its subscription
+can't get past them.

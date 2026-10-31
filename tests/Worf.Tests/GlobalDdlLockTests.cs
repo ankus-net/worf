@@ -52,6 +52,7 @@ public sealed class GlobalDdlLockTests
                 CREATE TABLE p2 PARTITION OF p FOR VALUES FROM (100) TO (200);
                 CREATE TABLE p3 PARTITION OF p FOR VALUES FROM (200) TO (300);
                 CREATE TABLE dupe (id integer PRIMARY KEY, v integer);
+                CREATE TABLE rf (id integer PRIMARY KEY);
                 SELECT * FROM worf.replication_set_add_table('default', 't');
                 SELECT * FROM worf.replication_set_add_table('default', 'p1');
                 SELECT * FROM worf.replication_set_add_table('default', 'p2');
@@ -60,6 +61,12 @@ public sealed class GlobalDdlLockTests
                 """, token);
         }
 
+        // A row filter of several kilobytes, which doesn't compress.
+        _ = await nodeA.SafePsqlAsync(Database, """
+            SELECT setseed(0.5);
+            SELECT * FROM worf.replication_set_add_table('default', 'rf',
+                row_filter := (SELECT 'id NOT IN (' || string_agg((random() * 2000000000)::integer::text, ',') || ')' FROM generate_series(1, 300)));
+            """, token);
         await SubscribeAsync(nodeA, "a_from_b", nodeB, token);
         await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
 
@@ -207,12 +214,13 @@ public sealed class GlobalDdlLockTests
             "node_a's detach finished node_b's");
 
         // Both nodes detaching a partition, one finishing a concurrent detach as PostgreSQL hints, leaves it detached.
-        // node_a's write before it rebuilds its catalog's indexes, as node_b lags, reaches node_b.
+        // node_a's writes before it rebuilds its catalog's indexes, as node_b lags, reach node_b, through a row
+        // filter too.
         _ = await nodeA.SafePsqlAsync(Database, "ALTER TABLE p ATTACH PARTITION p3 FOR VALUES FROM (200) TO (300)", token);
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
         _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.alter_subscription_disable('b_from_a', true)", token);
         _ = await nodeA.SafePsqlAsync(Database, "ALTER TABLE p DETACH PARTITION p3", token);
-        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO p VALUES (30, 30)", token);
+        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO p VALUES (30, 30); INSERT INTO rf VALUES (1)", token);
         _ = await nodeA.SafePsqlAsync(Database, "REINDEX TABLE worf.replication_set_table", token);
         await CancelMidwayAsync(nodeB, "p", "ALTER TABLE p DETACH PARTITION p3 CONCURRENTLY", token);
         _ = await nodeB.SafePsqlAsync(Database, "ALTER TABLE p DETACH PARTITION p3 FINALIZE", token);
@@ -224,6 +232,8 @@ public sealed class GlobalDdlLockTests
                 $"{node.Name}'s write after the detaches");
             Assert.AreEqual("0", await other.SafePsqlAsync(Database, "SELECT count(*) FROM pg_inherits WHERE inhrelid = 'p3'::regclass", token));
         }
+
+        Assert.AreEqual("1", await nodeB.SafePsqlAsync(Database, "SELECT count(*) FROM rf", token), "node_a's write through the row filter");
 
         // A detach that reaches node_b while node_b's own waits to commit finds the partition detached once that has.
         _ = await nodeA.SafePsqlAsync(Database, "ALTER TABLE p ATTACH PARTITION p3 FOR VALUES FROM (200) TO (300)", token);
