@@ -148,6 +148,13 @@ internal static class SequenceRangeWorker
             return known ? previous.Peak : 0;
         }
 
+        // A tick that comes early, as when a session wakes the worker, leaves the sample running, so that a burst isn't
+        // taken over a moment as a higher rate.
+        if (known && previous.Block == block && now - previous.At < SequenceRanges.CheckInterval * 1000L)
+        {
+            return previous.Peak;
+        }
+
         double peak = known ? previous.Peak : 0;
         if (known && previous.Block == block && now > previous.At)
         {
