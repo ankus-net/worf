@@ -220,8 +220,8 @@ internal static class OutputConfig
                     break;
 
                 case OutputPluginParamKey.BinaryFloat8byval:
-                    data.ClientBinaryFloat4byvalSet = true;
-                    data.ClientBinaryFloat4byval = ParseParamBool(elem);
+                    data.ClientBinaryFloat8byvalSet = true;
+                    data.ClientBinaryFloat8byval = ParseParamBool(elem);
                     break;
 
                 case OutputPluginParamKey.BinaryIntegerDatetimes:

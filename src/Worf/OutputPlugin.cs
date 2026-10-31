@@ -242,8 +242,10 @@ internal static unsafe partial class OutputPlugin
                 data.FieldDatumEncoding = wantedEncoding;
             }
 
-            // It's obviously not possible to send binary representation of data unless we use the binary output.
-            if (opt->output_type == OutputPluginOutputType.OUTPUT_PLUGIN_BINARY_OUTPUT && data.ClientWantInternalBasetypes)
+            // It's obviously not possible to send binary representation of data unless we use the binary output. A
+            // client reads values in the internal format only with their types, which it gets from protocol version 2.
+            if (opt->output_type == OutputPluginOutputType.OUTPUT_PLUGIN_BINARY_OUTPUT && data.ClientWantInternalBasetypes &&
+                data.ProtoVersion >= OutputProto.ColumnTypesVersionNum)
             {
                 data.AllowInternalBasetypes = CheckBinaryCompatibility(data);
             }

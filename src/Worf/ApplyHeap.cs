@@ -261,8 +261,8 @@ internal static unsafe class ApplyHeap
     /// Puts the columns a tuple sends into a row in replication's form. A column it doesn't send, or sends as an
     /// unchanged TOAST value, stays unsent.
     /// </summary>
-    /// <returns>Whether the row holds the tuple; a column in PostgreSQL's internal form, or sent in another type than
-    /// its own, has no replication form.</returns>
+    /// <returns>Whether the row holds the tuple; a column in PostgreSQL's internal form, or converted to a type with
+    /// no binary form, has no replication form.</returns>
     private static bool SetRow(PgReplicatedRow row, WorfTupleData tuple)
     {
         row.Clear();
@@ -273,9 +273,25 @@ internal static unsafe class ApplyHeap
                 continue;
             }
 
-            if (tuple.Conversions?[attid] is not null)
+            // A value sent in another type is converted, and goes in the column type's binary form.
+            if (tuple.Conversions?[attid] is { } conversion)
             {
-                return false;
+                tuple.ConvertFromSentType(attid);
+                if (tuple.Nulls[attid])
+                {
+                    row.SetNull(attid);
+                    continue;
+                }
+
+                varlena* bytes = conversion.Send(tuple.Values[attid]);
+                if (bytes is null)
+                {
+                    return false;
+                }
+
+                row.SetBinary(attid, new ReadOnlySpan<byte>((byte*)bytes + Varlena.Hdrsz, Varlena.Size((byte*)bytes) - Varlena.Hdrsz));
+                NativeMethods.pfree(bytes);
+                continue;
             }
 
             switch (tuple.Kinds[attid])
