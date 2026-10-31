@@ -429,18 +429,13 @@ internal static class SequenceRangeExchange
     /// </summary>
     /// <returns>The position, or zero.</returns>
     private static ulong Applied(WorfSubscription sub)
-    {
-        ulong applied = 0;
-        foreach (ushort origin in WorfNode.RelayOrigins(sub.SlotName).Select(relay => relay.Id).Append(PgReplicationOrigin.Find(sub.SlotName) ?? 0))
-        {
-            if (origin != 0 && PgReplicationOrigin.GetProgress(origin, false) is { IsValid: true } progress)
-            {
-                applied = Math.Max(applied, progress.Value);
-            }
-        }
-
-        return applied;
-    }
+        => WorfNode.RelayOrigins(sub.SlotName).Select(relay => relay.Id).Append(PgReplicationOrigin.Find(sub.SlotName) ?? 0)
+            .Where(origin => origin != 0)
+            .Select(origin => PgReplicationOrigin.GetProgress(origin, false))
+            .Where(progress => progress.IsValid)
+            .Select(progress => progress.Value)
+            .DefaultIfEmpty()
+            .Max();
 
     /// <summary>
     /// Gets the WAL position a neighbor's answer can't be behind of: how far this node applied its changes, unless the

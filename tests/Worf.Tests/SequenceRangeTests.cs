@@ -1417,14 +1417,12 @@ public sealed class SequenceRangeTests
         bool waited = true;
         while (waited)
         {
+            string[] states = await Task.WhenAll(nodes.Select(node => node.SafePsqlAsync(Database, settled, token)));
             waited = false;
-            foreach (TestNode node in nodes)
+            foreach (TestNode node in nodes.Where((_, i) => states[i] != "t"))
             {
-                if (await node.SafePsqlAsync(Database, settled, token) != "t")
-                {
-                    waited = true;
-                    Assert.IsTrue(await node.PollQueryUntilAsync(Database, settled, token), $"{node.Name} settled");
-                }
+                waited = true;
+                Assert.IsTrue(await node.PollQueryUntilAsync(Database, settled, token), $"{node.Name} settled");
             }
         }
 
