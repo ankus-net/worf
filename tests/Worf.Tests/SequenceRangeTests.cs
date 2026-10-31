@@ -175,7 +175,7 @@ public sealed class SequenceRangeTests
     /// <summary>
     /// Two nodes that replicate both ways insert into the same table at once with keys from the same sequence, which the
     /// first node manages: the second learns of it through the exchange, gets blocks from the first, and no key is
-    /// written on both nodes. Idle, neither takes transaction IDs, across exchanges too.
+    /// written on both nodes. Idle, neither takes transaction IDs, across exchanges, with Snowflake IDs enabled too.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -195,16 +195,21 @@ public sealed class SequenceRangeTests
         await SubscribeAsync(nodeA, "a_from_b", nodeB, token);
         await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
         await AssertIdleAsync([nodeA, nodeB], "managing nothing", TimeSpan.FromSeconds(2), token);
-        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 1000)", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 1000);
+            SELECT worf.enable_snowflake('{node_b}');
+            """, token);
         foreach (TestNode node in new[] { nodeA, nodeB })
         {
-            Assert.IsTrue(await node.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges", token),
-                $"{node.Name} drawing from a block");
+            Assert.IsTrue(await node.PollQueryUntilAsync(Database,
+                "SELECT count(*) = 2 AND bool_and(state = 'active') AND worf.snowflake_node() IS NOT NULL FROM worf.sequence_ranges", token),
+                $"{node.Name} drawing from blocks, with a Snowflake number");
         }
 
-        // Exchanges, every half second here, write nothing when nothing changed.
+        // Exchanges, every half second here, write nothing when nothing changed, nor does the range worker reserve the
+        // Snowflake clock, which it did every five seconds, while no session issues IDs.
         await SettleAsync([nodeA, nodeB], token);
-        await AssertIdleAsync([nodeA, nodeB], "managing a sequence", TimeSpan.FromSeconds(2), token);
+        await AssertIdleAsync([nodeA, nodeB], "managing sequences", TimeSpan.FromSeconds(6), token);
 
         await Task.WhenAll(InsertAsync(nodeA, "a"), InsertAsync(nodeB, "b"));
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
