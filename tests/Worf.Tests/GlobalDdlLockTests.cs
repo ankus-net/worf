@@ -300,9 +300,9 @@ public sealed class GlobalDdlLockTests
             }
 
             // An index that REINDEX SCHEMA, or a column's new type or a concurrent reindex from any session, builds
-            // again stays here, as does what a concurrent reindex that failed leaves, while a primary key's index
-            // that the reindex builds alongside, with the same definition, is on every node. DDL that would make
-            // other objects use one fails.
+            // again stays here, as does what a concurrent reindex that failed leaves, while indexes on every node
+            // that the reindex builds alongside, with the same definition, stay there. DDL that would make other
+            // objects use one fails.
             await CancelMidwayAsync(nodeA, "dupe", "REINDEX INDEX CONCURRENTLY dupe_pkey", token, write: true);
             foreach (string sql in new[]
             {
@@ -316,8 +316,8 @@ public sealed class GlobalDdlLockTests
 
             foreach (string sql in new[]
             {
-                "ALTER TABLE dupe ALTER COLUMN id TYPE bigint", "REINDEX TABLE CONCURRENTLY dupe", "COMMENT ON INDEX dupe_id IS 'here'",
-                "COMMENT ON INDEX dupe_pkey IS 'key'",
+                "ALTER TABLE dupe ALTER COLUMN id TYPE bigint", "CREATE UNIQUE INDEX dupe_key ON dupe (id)", "REINDEX TABLE CONCURRENTLY dupe",
+                "COMMENT ON INDEX dupe_id IS 'here'", "COMMENT ON INDEX dupe_key IS 'key'",
             })
             {
                 _ = await nodeA.SafePsqlAsync(Database, sql, token);
@@ -345,7 +345,7 @@ public sealed class GlobalDdlLockTests
         _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO dupe VALUES (3, 3)", token);
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
         Assert.AreEqual("3|bigint|bigint|key", await nodeB.SafePsqlAsync(Database,
-            "SELECT count(*), pg_typeof(min(v))::text, pg_typeof(min(id))::text, obj_description('dupe_pkey'::regclass, 'pg_class') FROM dupe", token));
+            "SELECT count(*), pg_typeof(min(v))::text, pg_typeof(min(id))::text, obj_description('dupe_key'::regclass, 'pg_class') FROM dupe", token));
 
         // An index that a cancelled concurrent drop left invalid is still on node_b, so DDL on it replicates.
         _ = await nodeA.SafePsqlAsync(Database, "CREATE INDEX dupe_w ON dupe (v)", token);
