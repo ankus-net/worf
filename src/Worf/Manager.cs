@@ -98,6 +98,20 @@ internal static class Manager
         {
             Worker.ProcessConfigReload();
 
+            // A session that can't reserve the Snowflake clock itself, as in a read-only transaction, asks the manager as
+            // well as the range worker, which an exchange with a neighbor may hold up for its whole timeout.
+            if (SnowflakeIds.Wanted())
+            {
+                try
+                {
+                    PgBackgroundWorker.RunTransaction(SnowflakeIds.Reserve);
+                }
+                catch (PgException error)
+                {
+                    PgLog.Warning($"could not reserve the Snowflake clock: {error.Message}");
+                }
+            }
+
             // Launch the apply workers, and the range worker for managed sequences.
             bool processedAll = ManageApplyWorkers();
             processedAll &= ManageRangeWorker();

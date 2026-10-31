@@ -250,9 +250,19 @@ public sealed class SequenceRangeTests
         string[] active = (await nodeA.SafePsqlAsync(Database, "SELECT active_lo, values_left FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass",
             token)).Split('|');
         int held = int.Parse(active[1], CultureInfo.InvariantCulture) - 10;
+
+        // A session that can't write, as in a read-only transaction, can't reserve the Snowflake clock itself once the last
+        // reservation has run out. The range worker is held up in the exchange, so the manager reserves it.
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, """
+            SELECT last_value < extract(epoch FROM clock_timestamp() - timestamptz '2025-01-01 00:00:00+00') * 1000 FROM worf.snowflake_clock
+            """, token), "node_a's Snowflake reservation running out");
         await using (NpgsqlConnection writer = await nodeA.OpenAsync(Database, token))
         await using (await HoldExchangesAsync(nodeB, token))
         {
+            Stopwatch readOnly = Stopwatch.StartNew();
+            _ = await nodeA.SafePsqlAsync(Database, "BEGIN READ ONLY; SELECT worf.snowflake_id(); COMMIT", token);
+            Assert.IsLessThan(3000, readOnly.ElapsedMilliseconds, "node_a's Snowflake ID in a read-only transaction while an exchange hangs");
+
             await ExecuteAsync(writer, $"INSERT INTO t (v) SELECT 'held' FROM generate_series(1, {held})", token);
 
             Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database,

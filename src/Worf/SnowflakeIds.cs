@@ -108,7 +108,8 @@ internal static class SnowflakeIds
 
                 // The time isn't reserved this far yet: the range worker reserves ahead only while sessions issue IDs. A
                 // session that may write reserves it itself, so that it never waits on the worker, which may be held up
-                // in an exchange; one that may not, as in a read-only transaction, asks the worker to, the first to wait.
+                // in an exchange; one that may not, as in a read-only transaction, asks the worker and the database's
+                // manager to, the first to wait, and whichever comes first reserves.
                 unsafe
                 {
                     writable = !NativeGlobals.XactReadOnly;
@@ -130,6 +131,7 @@ internal static class SnowflakeIds
             if (wake)
             {
                 Worker.WakeRangeWorker();
+                Worker.WakeManager();
             }
 
             if (Worker.GetCurrentTimestamp() >= deadline)
@@ -144,9 +146,29 @@ internal static class SnowflakeIds
     }
 
     /// <summary>
+    /// Checks whether a session waits for this database's clock to be reserved, which it can't do itself.
+    /// </summary>
+    /// <returns>Whether one waits.</returns>
+    internal static bool Wanted()
+    {
+        uint dboid = DatabaseId();
+        using PgLwLockShareGuard<WorfSnowflakeTable, WorfSnowflakeClock> guard = Clocks.Share();
+        for (int i = 0; i < MaxDatabases; i++)
+        {
+            if (guard[i].Dboid == dboid)
+            {
+                return guard[i].Wanted;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
     /// Keeps this database's clock reserved ahead, from the range worker, while sessions issue IDs or one waits, once
-    /// less than half the time reserved ahead is left. A node that issues none reserves nothing, so that it writes
-    /// nothing. After a restart, it first raises the clock to the time reserved before, and IDs wait for that.
+    /// less than half the time reserved ahead is left, and from the manager while one waits. A node that issues none
+    /// reserves nothing, so that it writes nothing. After a restart, it first raises the clock to the time reserved
+    /// before, and IDs wait for that.
     /// </summary>
     internal static void Reserve()
     {
