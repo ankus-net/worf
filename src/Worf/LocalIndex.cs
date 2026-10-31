@@ -204,18 +204,18 @@ internal static unsafe partial class LocalIndex
     /// </summary>
     /// <param name="parsetree">The DDL.</param>
     /// <returns>The ties, for <see cref="CheckTies"/>, or null when the DDL can't tie any.</returns>
-    internal static Dictionary<uint, (string Name, bool Partition, bool Identity, bool Clustered, long Dependencies)>? Ties(Node* parsetree)
+    internal static Dictionary<uint, (string Name, string?[] Ties)>? Ties(Node* parsetree)
         => (parsetree->type is NodeTag.T_AlterTableStmt or NodeTag.T_CreateStmt ||
                 (parsetree->type == NodeTag.T_IndexStmt && !((IndexStmt*)parsetree)->concurrent)) && Worf.CatalogOid("local_index") != 0
             ? ReadTies()
             : null;
 
     /// <summary>
-    /// Fails DDL that replicates and has tied an index on this node alone to more objects than before it ran, which
-    /// the other nodes, without the index, couldn't follow. DDL that changes the index alone stays on this node.
+    /// Fails DDL that replicates and has tied an index on this node alone to objects it wasn't tied to before it ran,
+    /// which the other nodes, without the index, couldn't follow. DDL that changes the index alone stays on this node.
     /// </summary>
     /// <param name="before">The ties before the DDL ran.</param>
-    internal static void CheckTies(Dictionary<uint, (string Name, bool Partition, bool Identity, bool Clustered, long Dependencies)>? before)
+    internal static void CheckTies(Dictionary<uint, (string Name, string?[] Ties)>? before)
     {
         if (before is null || before.Count == 0)
         {
@@ -223,28 +223,29 @@ internal static unsafe partial class LocalIndex
         }
 
         NativeMethods.CommandCounterIncrement();
-        foreach ((uint relid, (string Name, bool Partition, bool Identity, bool Clustered, long Dependencies) after) in ReadTies())
+        foreach ((uint relid, (string Name, string?[] Ties) after) in ReadTies())
         {
-            if (before.TryGetValue(relid, out (string Name, bool Partition, bool Identity, bool Clustered, long Dependencies) tie) &&
-                ((after.Partition && !tie.Partition) || (after.Identity && !tie.Identity) || (after.Clustered && !tie.Clustered) ||
-                    after.Dependencies > tie.Dependencies))
+            if (before.TryGetValue(relid, out (string Name, string?[] Ties) tied) && after.Ties.Except(tied.Ties).Any())
             {
                 throw new PgException("55000",
-                    $"cannot make objects on every node use index \"{tie.Name}\", which is on this node alone, while worf.enable_ddl_replication is on",
+                    $"cannot make objects on every node use index \"{tied.Name}\", which is on this node alone, while worf.enable_ddl_replication is on",
                     hint: "A concurrent build or reindex that failed on this node left the index. Drop it, and build it again so that every node has it.");
             }
         }
     }
 
-    private static Dictionary<uint, (string Name, bool Partition, bool Identity, bool Clustered, long Dependencies)> ReadTies()
+    private static Dictionary<uint, (string Name, string?[] Ties)> ReadTies()
     {
-        Dictionary<uint, (string Name, bool Partition, bool Identity, bool Clustered, long Dependencies)> ties = [];
+        Dictionary<uint, (string Name, string?[] Ties)> ties = [];
         SpiResult result = Elevated.Run(() => Worf.Read("""
-            SELECT l.indexrelid, c.relname::pg_catalog.text, c.relispartition, i.indisreplident, i.indisclustered,
-                (SELECT pg_catalog.count(*) FROM pg_catalog.pg_depend d
+            SELECT l.indexrelid, c.relname::pg_catalog.text, ARRAY(
+                SELECT 'partition' WHERE c.relispartition
+                UNION ALL SELECT 'replica identity' WHERE i.indisreplident
+                UNION ALL SELECT 'clustering' WHERE i.indisclustered
+                UNION ALL SELECT pg_catalog.concat_ws(' ', 'on', d.refclassid, d.refobjid, d.refobjsubid) FROM pg_catalog.pg_depend d
                     WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.objid = l.indexrelid
-                        AND (d.refclassid, d.refobjid) <> ('pg_catalog.pg_class'::pg_catalog.regclass, i.indrelid)) +
-                (SELECT pg_catalog.count(*) FROM pg_catalog.pg_depend d
+                        AND (d.refclassid, d.refobjid) <> ('pg_catalog.pg_class'::pg_catalog.regclass, i.indrelid)
+                UNION ALL SELECT pg_catalog.concat_ws(' ', 'of', d.classid, d.objid, d.objsubid) FROM pg_catalog.pg_depend d
                     WHERE d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.refobjid = l.indexrelid)
             FROM worf.local_index l
                 JOIN pg_catalog.pg_class c ON c.oid = l.indexrelid
@@ -252,7 +253,7 @@ internal static unsafe partial class LocalIndex
             """, 0));
         foreach (SpiRow row in result)
         {
-            ties[row.Get<uint>(0)] = (row.Get<string>(1), row.Get<bool>(2), row.Get<bool>(3), row.Get<bool>(4), row.Get<long>(5));
+            ties[row.Get<uint>(0)] = (row.Get<string>(1), row.Get<string?[]>(2));
         }
 
         return ties;
@@ -272,9 +273,8 @@ internal static unsafe partial class LocalIndex
         }
 
         SpiResult result = Elevated.Run(() => Worf.Read("SELECT indexrelid FROM worf.local_index", 0));
-        foreach (SpiRow row in result)
+        foreach (uint relid in result.Select(row => row.Get<uint>(0)))
         {
-            uint relid = row.Get<uint>(0);
             sbyte* name = NativeMethods.get_rel_name(relid);
             if (name is null)
             {

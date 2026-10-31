@@ -310,8 +310,7 @@ internal static unsafe partial class Executor
         }
 
         // DDL that replicates can't make other objects use an index on this node alone.
-        Dictionary<uint, (string Name, bool Partition, bool Identity, bool Clustered, long Dependencies)>? ties =
-            ddl is null ? null : LocalIndex.Ties(parsetree);
+        Dictionary<uint, (string Name, string?[] Ties)>? ties = ddl is null ? null : LocalIndex.Ties(parsetree);
 
         // A statement that commits on its way, and then fails, lets its fence go as its transaction aborts.
         uint xactFlags = DdlReplication.BeginStatement(ddl is not null);
