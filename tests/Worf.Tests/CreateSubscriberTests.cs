@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 
 namespace Worf.Tests;
@@ -52,7 +53,7 @@ public sealed class CreateSubscriberTests
 
     /// <summary>
     /// The command turns a base backup of the provider into a subscriber that keeps the provider's data and receives
-    /// its new changes.
+    /// its new changes, and rows the subscription applied take its later changes in order, rather than as conflicts.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -71,6 +72,9 @@ public sealed class CreateSubscriberTests
             "log_line_prefix = '[%m] [%p] [%d] '",
             "log_statement = 'all'",
             "worf.synchronous_commit = true",
+
+            // The subscriber takes the provider's settings, and keeps a row its subscription's changes conflict with.
+            "worf.conflict_resolution = keep_local",
         ], token);
         int providerPort = provider.Cluster.Port;
         int pgport = CreateSubscriberCommand.FreePort();
@@ -149,6 +153,21 @@ public sealed class CreateSubscriberTests
             await AssertPsqlOkAsync(provider, pgport, ["-c", "\\d"], "replication check 1 ", token);
             await AssertPsqlOkAsync(provider, pgport, ["-c", "SELECT * from basic_dml"], "replication check 2 ", token);
             await AssertPsqlOkAsync(provider, pgport, ["-c", "SELECT * from public.basic_dml"], "replication check 3 ", token);
+
+            // The tool creates the subscription's origin without worf.
+            _ = await provider.SafePsqlAsync(Database, "UPDATE basic_dml SET data = 'updated' WHERE other = 5", token);
+            Stopwatch elapsed = Stopwatch.StartNew();
+            string updated = "";
+            while (updated != "updated" && elapsed.Elapsed < TimeSpan.FromSeconds(60))
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(100), token);
+                (_, updated) = await provider.RunProgramAsync("psql",
+                    ["-X", "-At", "-p", pgport.ToString(CultureInfo.InvariantCulture), "-d", Database, "-c", "SELECT data FROM basic_dml WHERE other = 5"],
+                    token);
+                updated = updated.Trim();
+            }
+
+            Assert.AreEqual("updated", updated, "the update of a row the subscription applied");
         }
         finally
         {

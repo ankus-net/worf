@@ -42,6 +42,9 @@ internal static class Sync
     private const string PgdumpBinary = "pg_dump";
     private const string PgrestoreBinary = "pg_restore";
 
+    // How many seconds a table sync worker catching up waits for its slot, held by another process, before it fails.
+    private const int CatchupSlotWait = 60;
+
     /// <summary>
     /// Whether a kind of synchronization copies data.
     /// </summary>
@@ -241,7 +244,13 @@ internal static class Sync
                 return (sync.Status, sync.Statuslsn);
             }
 
-            // If previous sync attempt failed, we need to start from beginning.
+            // If previous sync attempt failed, we need to start from beginning. One that failed once its copy had
+            // committed, as while it caught up, left the rows that copying again adds, which go, as resynchronizing does.
+            if (sync.Status is SyncStatusSyncwait or SyncStatusCatchup)
+            {
+                TruncateTable(nspname, relname);
+            }
+
             if (sync.Status != SyncStatusInit)
             {
                 SetTableSyncStatus(sub.Id, nspname, relname, SyncStatusInit, 0);
@@ -400,18 +409,8 @@ internal static class Sync
 
             // The walsender that streamed before holds the slot until it notices the connection closed, which it doesn't
             // while it's busy decoding, as with a large transaction it sends nothing of. Failing would copy the table
-            // again, so the worker waits for the slot, which is its own, and after a moment stops its holder.
-            long terminateAt = Worker.GetCurrentTimestamp() + 1000000L;
-            while (!Worker.GotSigterm && PgBackgroundWorker.RunTransaction(() => Rpc.RemoteSlotActive(streamConn, sub.SlotName)))
-            {
-                if (Worker.GetCurrentTimestamp() >= terminateAt)
-                {
-                    PgBackgroundWorker.RunTransaction(() => Rpc.TerminateSlotHolder(streamConn, sub.SlotName));
-                    terminateAt = Worker.GetCurrentTimestamp() + 1000000L;
-                }
-
-                _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(50));
-            }
+            // again, so the worker waits for the slot, which is its own.
+            WaitForCatchupSlot(streamConn, sub.SlotName);
 
             Worf.StartReplication(streamConn, sub.SlotName, startLsn, "all", null, tablename, sub.ForceTextTransfer);
 
@@ -421,6 +420,54 @@ internal static class Sync
 
         // We should only get here if we received sigTERM, which in case of sync worker is not expected.
         Worker.ProcExit(1);
+    }
+
+    /// <summary>
+    /// Waits for a table sync worker's slot to be free before it streams from it. After a second, a walsender of an
+    /// earlier connection of this worker's, with the same user and application name, is stopped; anything else that
+    /// holds the slot, such as a session reading its changes, is waited for, with a warning. After a minute the worker
+    /// fails, and copies the table again when it restarts.
+    /// </summary>
+    /// <param name="streamConn">The replication connection the worker streams on.</param>
+    /// <param name="slotName">The slot.</param>
+    private static void WaitForCatchupSlot(PgReplicationConnection streamConn, string slotName)
+    {
+        long start = Worker.GetCurrentTimestamp();
+        long checkAt = start + 1000000L;
+        int warned = 0;
+        while (!Worker.GotSigterm)
+        {
+            int holder = PgBackgroundWorker.RunTransaction(() => Rpc.RemoteSlotHolder(streamConn, slotName));
+            if (holder == 0)
+            {
+                return;
+            }
+
+            long now = Worker.GetCurrentTimestamp();
+            if (now - start >= CatchupSlotWait * 1000000L)
+            {
+                throw new PgException(PgSqlStates.ObjectInUse,
+                    $"replication slot \"{slotName}\" is still active for PID {holder} on the provider", null!,
+                    "Stop the process that holds the slot; the table is copied again.", null!);
+            }
+
+            if (now >= checkAt)
+            {
+                checkAt = now + 1000000L;
+                string? notStopped = PgBackgroundWorker.RunTransaction(() => Rpc.TerminateSlotHolder(streamConn, slotName, holder));
+                if (notStopped is not null && warned != holder)
+                {
+                    warned = holder;
+                    PgLog.Warning(new PgDiagnostic($"replication slot \"{slotName}\" is active for PID {holder} on the provider, which this table sync waits for")
+                    {
+                        Detail = notStopped,
+                        Hint = $"The sync fails after {CatchupSlotWait} seconds and copies the table again.",
+                    });
+                }
+            }
+
+            _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(50));
+        }
     }
 
     /// <summary>
@@ -838,17 +885,18 @@ internal static class Sync
                 break;
             }
 
-            // Check if the worker is still alive - no point waiting if it died.
-            int worker;
+            // Check if the worker is still alive - no point waiting if it died. One that failed keeps its slot, for
+            // the restart delay, but has no process.
+            bool running;
             byte[] serverNspname = Worf.ToServer(nspname);
             byte[] serverRelname = Worf.ToServer(relname);
             using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
             {
-                worker = guard.Read((in _, workers) =>
-                    Worker.SyncFind(workers, myDatabaseId, subid, serverNspname, serverRelname));
+                running = guard.Read((in _, workers) =>
+                    Worker.WorkerRunning(workers, Worker.SyncFind(workers, myDatabaseId, subid, serverNspname, serverRelname)));
             }
 
-            if (worker < 0)
+            if (!running)
             {
                 break;
             }
@@ -1059,8 +1107,7 @@ internal static class Sync
     /// <summary>
     /// Get or create replication origin for a given slot.
     /// </summary>
-    private static ushort EnsureReplicationOrigin(WorfSubscription sub)
-        => PgReplicationOrigin.Find(sub.SlotName) ?? WorfNode.CreateOrigin(sub.SlotName, sub.Origin.Id, sub.Id).Origin;
+    private static ushort EnsureReplicationOrigin(WorfSubscription sub) => WorfNode.EnsureOrigin(sub.SlotName, sub.Origin.Id, sub.Id);
 
     /// <summary>
     /// Transaction management for COPY.
