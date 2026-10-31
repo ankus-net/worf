@@ -21,6 +21,9 @@ internal static class SequenceRangeGuard
     // The furthest position each sequence is known to have reached, which only moves forward within a block.
     private static readonly Dictionary<uint, long> s_reached = [];
 
+    // The active blocks, by sequence and start, whose end this backend has woken the range worker for.
+    private static readonly HashSet<(uint Seqoid, long Lo)> s_woken = [];
+
     /// <summary>
     /// Checks the values a local session writes into columns that use managed sequences.
     /// </summary>
@@ -100,6 +103,7 @@ internal static class SequenceRangeGuard
                     return true;
 
                 case "active":
+                    WakeNearEnd(seqoid, sequence.Ascending, lo, hi, value);
                     if (s_reached.TryGetValue(seqoid, out long reached) && (sequence.Ascending ? reached >= value : reached <= value))
                     {
                         return true;
@@ -120,6 +124,19 @@ internal static class SequenceRangeGuard
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Wakes the range worker once a sequence reaches the last twentieth of its active block, the least it leaves before
+    /// switching, so that a sequence that runs through a block faster than the worker checks switches in time.
+    /// </summary>
+    private static void WakeNearEnd(uint seqoid, bool ascending, long lo, long hi, long value)
+    {
+        long tail = (long)(((decimal)hi - lo) / 20);
+        if ((ascending ? value >= hi - tail : value <= lo + tail) && s_woken.Add((seqoid, lo)))
+        {
+            Worker.WakeRangeWorker();
+        }
     }
 
     /// <summary>
@@ -147,6 +164,7 @@ internal static class SequenceRangeGuard
         s_sequences.Clear();
         s_moved.Clear();
         s_reached.Clear();
+        s_woken.Clear();
         ulong sysid;
         uint timeline;
         unsafe
@@ -155,7 +173,9 @@ internal static class SequenceRangeGuard
             timeline = NativeMethods.GetWALInsertionTimeLine();
         }
 
-        SpiResult result = Elevated.Run(() => Spi.Select("""
+        // The blocks as last committed, since a switch that committed after this statement's snapshot may already
+        // have given the sequence its new block.
+        SpiResult result = Elevated.Run(() => Worf.SelectCatalog("""
             SELECT r.seqoid::oid, s.seqincrement > 0, b.lo, b.hi, b.state,
                 b.node_id = l.node_id AND b.sysid = $1 AND b.timeline = $2
             FROM worf.sequence_range r

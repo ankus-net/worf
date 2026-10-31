@@ -1,3 +1,4 @@
+using Ankus.Postgres;
 
 namespace Worf;
 
@@ -44,13 +45,35 @@ internal static class SequenceRangeWorker
                 for (int i = 0; i < sequences.Count; i++)
                 {
                     uint seqoid = sequences[i].Get<uint>(0);
-                    double rate = Rate(rates, seqoid);
                     try
                     {
                         PgTransaction.RunInSubtransaction(() =>
                         {
-                            _ = SequenceRanges.LiftFence(seqoid, node, false);
-                            changed |= SequenceRanges.Check(seqoid, node, rate);
+                            // The lock nextval takes keeps a switch from committing between the reads of the sequence's
+                            // blocks and of its position. A sequence that a transaction holds against it, as a
+                            // reservation's switch does until it commits, waits for a later tick, so that the worker
+                            // waits on no session.
+                            unsafe
+                            {
+                                if (!NativeMethods.ConditionalLockRelationOid(seqoid, (int)PgLockMode.RowExclusive))
+                                {
+                                    return;
+                                }
+                            }
+
+                            try
+                            {
+                                double rate = Rate(rates, seqoid);
+                                _ = SequenceRanges.LiftFence(seqoid, node, false);
+                                changed |= SequenceRanges.Check(seqoid, node, rate);
+                            }
+                            finally
+                            {
+                                unsafe
+                                {
+                                    NativeMethods.UnlockRelationOid(seqoid, (int)PgLockMode.RowExclusive);
+                                }
+                            }
                         });
                     }
                     catch (PgException error)

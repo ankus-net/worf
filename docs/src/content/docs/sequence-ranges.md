@@ -31,7 +31,7 @@ shows each sequence's state, its active and next blocks, and the values left. `w
 | `worf.reserve_sequence_range(sequence regclass, count bigint, timeout interval DEFAULT '1 minute')` | Any node | Returns once the active block has at least `count` values left |
 | `worf.reserve_sequence_values(sequence regclass, lo bigint, hi bigint, timeout interval DEFAULT '1 minute')` | Any node | Gives this node exactly `[lo, hi]`, for rows that already carry those keys |
 
-A node's first block has `range_size` values: 100 for `smallint`, 10,000 for `integer` and 1,000,000 for `bigint`. A node whose block lasted under an hour asks for twice as many next time, up to `max_range_size`, and one whose block lasted over a day asks for half.
+A node's first block has `range_size` values: 100 for `smallint`, 10,000 for `integer` and 1,000,000 for `bigint`. A node whose block lasted under an hour asks for twice as many next time, up to `max_range_size`, and one whose block lasted over a day asks for half. A node also asks for at least two minutes of values at its peak insert rate, up to `max_range_size`. A switch for `reserve_sequence_range` leaves the size asked for as it is.
 
 ## How it works
 
