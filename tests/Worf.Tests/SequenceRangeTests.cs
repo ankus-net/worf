@@ -197,8 +197,16 @@ public sealed class SequenceRangeTests
             ALTER TABLE t ENABLE ALWAYS TRIGGER worf_sequence_range_guard;
             ALTER TABLE t ENABLE TRIGGER worf_sequence_range_guard;
             TRUNCATE ONLY parent RESTART IDENTITY;
-            SELECT worf.replication_set_add_all_sequences('default', '{public}');
             """, token);
+        await using (NpgsqlConnection connection = await node.OpenAsync(Database, token))
+        {
+            List<string> notices = [];
+            connection.Notice += (_, e) => notices.Add(e.Notice.MessageText);
+            await using NpgsqlCommand add = new("SELECT worf.replication_set_add_all_sequences('default', '{public}')", connection);
+            _ = await add.ExecuteScalarAsync(token);
+            Assert.IsTrue(notices.Exists(notice => notice.Contains("public.t_id_seq is left out")), "a notice of the managed sequence left out");
+        }
+
         Assert.AreEqual("0|0|t", await node.SafePsqlAsync(Database, """
             SELECT (SELECT count(*) FROM pg_trigger WHERE tgrelid = 'dumped'::regclass),
                 (SELECT count(*) FROM worf.replication_set_seq s JOIN worf.sequence_range r ON r.seqoid = s.set_seqoid),
@@ -326,6 +334,7 @@ public sealed class SequenceRangeTests
         PostgresException restore = await Assert.ThrowsExactlyAsync<PostgresException>(() => node.SafePsqlAsync(Database,
             "SET ROLE app; SET worf.subscription_schema_restore = on; DROP TRIGGER worf_sequence_range_guard ON app.app_rows", token));
         Assert.AreEqual("42501", restore.SqlState);
+
         // A role granted SET on it restores structure under range management's rules all the same.
         _ = await node.SafePsqlAsync(Database, "GRANT SET ON PARAMETER worf.subscription_schema_restore TO app", token);
         foreach (string ddl in new[] { "DROP TRIGGER worf_sequence_range_guard ON app.app_rows", "ALTER TABLE app.app_rows ALTER COLUMN id SET DEFAULT 0" })

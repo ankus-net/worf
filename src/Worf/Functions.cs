@@ -1748,10 +1748,15 @@ internal static class Functions
             foreach (SpiRow reltup in relations)
             {
                 uint reloid = reltup.Get<uint>(0);
+                if (existingRelations.Contains(reloid))
+                {
+                    continue;
+                }
 
                 // Each node's own blocks keep a managed sequence's values apart, so its state isn't replicated.
-                if (existingRelations.Contains(reloid) || (relkind == 'S' && SequenceRanges.IsManaged(reloid)))
+                if (relkind == 'S' && SequenceRanges.IsManaged(reloid))
                 {
+                    PgLog.Notice($"sequence {Spi.QuoteQualifiedIdentifier(nspname, reltup.Get<string>(1))} is left out, since it is under sequence range management");
                     continue;
                 }
 

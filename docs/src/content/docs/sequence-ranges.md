@@ -49,7 +49,7 @@ SELECT worf.reserve_sequence_range('inventory_id_seq', 500000);
 
 To load rows that already carry keys, or bring them under the triggers, reserve exactly those keys on the node that loads them. The owner refuses keys that may already be in use. Both reservations need the privileges of the sequence's owner.
 
-A transaction that has called `nextval` and stays open holds off the switch to the next block until it ends.
+A transaction that has called `nextval`, or written a value the guard checked against the active block, and stays open holds off the switch to the next block until it ends.
 
 ## Moving the owner
 
