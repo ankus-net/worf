@@ -130,13 +130,16 @@ internal static class SequenceRangeWorker
 
     /// <summary>
     /// Tracks a sequence's insert rate within its active block and returns its peak, which decays while the sequence is
-    /// idle. A switch moves the position by more than the sequence issued, so it starts a new sample.
+    /// idle. A switch moves the position by more than the sequence issued, so it starts a new sample. A block that a
+    /// reservation switched to, which carries no activation time, serves a load rather than the usual inserts, and isn't
+    /// sampled.
     /// </summary>
     private static double Rate(Dictionary<uint, (long Block, long Position, long At, double Peak)> rates, uint seqoid)
     {
         long now = Worker.GetCurrentTimestamp();
         SpiResult state = Worf.SelectCatalog("""
-            SELECT s.seqincrement, (SELECT lo FROM worf.sequence_range_block WHERE seqoid = $1 AND kind = 'n' AND state = 'active')
+            SELECT s.seqincrement,
+                (SELECT lo FROM worf.sequence_range_block WHERE seqoid = $1 AND kind = 'n' AND state = 'active' AND activated_at IS NOT NULL)
             FROM pg_catalog.pg_sequence s WHERE s.seqrelid = $1
             """, SpiParameter.Create(seqoid));
         bool known = rates.TryGetValue(seqoid, out (long Block, long Position, long At, double Peak) previous);
