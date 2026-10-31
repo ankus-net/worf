@@ -1672,6 +1672,8 @@ internal static unsafe partial class DdlLock
     /// </summary>
     private static void KeepHeldFences()
     {
+        // The fences of savepoints rolled back go first, and a node whose connection fails to let go of them is lost.
+        UnfencePending();
         if (s_lostNodes.Count > 0)
         {
             throw new PgException(LockNotAvailable, $"lost the hold on node {s_lostNodes.First()}'s writes for this transaction's DDL");
@@ -1730,13 +1732,19 @@ internal static unsafe partial class DdlLock
             return;
         }
 
+        // The transaction's ID, as txid_current() gives it, which the other nodes ask about.
         string nodeId = WorfNode.GetLocalNode(false, false)!.Node.Id.ToString(CultureInfo.InvariantCulture);
-        string xid = Spi.ExecuteScalar<long>("SELECT pg_catalog.txid_current()").ToString(CultureInfo.InvariantCulture);
+        string xid = unchecked((long)NativeMethods.GetTopFullTransactionId().value).ToString(CultureInfo.InvariantCulture);
         foreach ((ulong fenceId, uint node) in fences)
         {
+            if (!s_fenceConnections.TryGetValue(node, out PgReplicationConnection? conn))
+            {
+                throw new PgException(LockNotAvailable, $"lost the hold on node {node}'s writes for this transaction's DDL");
+            }
+
             try
             {
-                _ = s_fenceConnections[node].Query($"SELECT worf.keep_fence({unchecked((long)fenceId).ToString(CultureInfo.InvariantCulture)}, {nodeId}, {xid})", 1);
+                _ = conn.Query($"SELECT worf.keep_fence({unchecked((long)fenceId).ToString(CultureInfo.InvariantCulture)}, {nodeId}, {xid})", 1);
             }
             catch (Exception error) when (error is PgException or PgRemoteException)
             {
