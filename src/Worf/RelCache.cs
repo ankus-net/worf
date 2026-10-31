@@ -44,13 +44,13 @@ internal static partial class RelCache
         if (entry.IsValid && entry.Rel is null)
         {
             entry.Rel = NativeMethods.try_table_open(entry.Reloid, (int)lockmode);
-            if (entry.Rel is not null && !entry.IsValid)
-            {
-                NativeMethods.table_close(entry.Rel, (int)lockmode);
-                entry.Rel = null;
-            }
+            entry.IsValid &= entry.Rel is not null;
+        }
 
-            entry.IsValid = entry.Rel is not null;
+        if (entry.Rel is not null && !entry.IsValid)
+        {
+            NativeMethods.table_close(entry.Rel, (int)lockmode);
+            entry.Rel = null;
         }
 
         // Need to update the local cache?
