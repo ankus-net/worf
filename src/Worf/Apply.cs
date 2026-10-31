@@ -1455,10 +1455,35 @@ internal static unsafe partial class Apply
 
         // A statement that runs concurrently commits along the way, which apply's transaction can't, so it runs
         // in that transaction instead. The indexes on this node alone, which the origin doesn't have, are out of its
-        // way.
-        List<(uint Namespace, string Name, string Aside)> moved = LocalIndex.MoveAside();
-        ExecuteSqlCommand(command.GetString()!, queuedMessage.Role, false, true);
-        LocalIndex.MoveBack(moved, MySubscription!.Origin.Name);
+        // way, and one that it can't build again is dropped, so that it applies.
+        string origin = MySubscription!.Origin.Name;
+        List<(uint Index, string Name)> moved = LocalIndex.MoveAside();
+        LocalIndex.Applying = true;
+        try
+        {
+            while (true)
+            {
+                try
+                {
+                    PgTransaction.RunInSubtransaction(() => ExecuteSqlCommand(command.GetString()!, queuedMessage.Role, false, true),
+                        PgSubtransactionMode.Atomic);
+                    break;
+                }
+                catch (PgException error)
+                {
+                    if (!LocalIndex.DropUnbuilt(error, moved, origin))
+                    {
+                        throw;
+                    }
+                }
+            }
+        }
+        finally
+        {
+            LocalIndex.Applying = false;
+        }
+
+        LocalIndex.MoveBack(moved, origin);
 
         NativeMethods.AtEOXact_GUC(true, saveNestlevel);
     }

@@ -153,12 +153,20 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   from its first commit, a node keeps holding back if its connection is lost,
   until it learns that the statement has ended. An index that such a build, or
   a concurrent `REINDEX`, leaves when it fails is on its node alone, as are
-  statements on it, however it's built again since. DDL that would make other
-  objects use it, as a constraint's, the replica identity, the clustering
-  index, a partition of another index, or for a foreign key, fails, and DDL
-  from another node that takes its name renames it, with a warning. Drop it:
-  until then a unique one still rejects duplicates, so apply on its node stops
-  at a row the other nodes wrote that it rejects. A transaction holds each
+  statements on it, however it's built again since, and
+  `DROP INDEX CONCURRENTLY` drops it there. DDL that would make other objects
+  use it, as a constraint's, the replica identity, the clustering index, a
+  partition of another index, or for a foreign key, fails. `CREATE TABLE`,
+  `CREATE INDEX`, and `ALTER TABLE` that only attaches partitions or adds
+  constraints pass over it on every node: they don't copy it with `LIKE`,
+  attach it to a partitioned index or have a foreign key use it, but build
+  what the other nodes build. Names PostgreSQL chooses for new objects are the
+  same on every node, and DDL that takes its name renames it, with a warning.
+  DDL from another node that can't build it again, as a unique one that finds
+  duplicate keys when a table is rewritten, drops it, with a warning that
+  gives its definition. Drop it: until then a unique one still rejects
+  duplicates, so apply on its node stops at a row the other nodes wrote that
+  it rejects. A transaction holds each
   node back through one connection, whatever the `idle_session_timeout` of its
   role. The user in each provider connection string needs `USAGE` on schema
   `worf` and `EXECUTE` on `worf.fence_writes`, `worf.unfence_writes` and

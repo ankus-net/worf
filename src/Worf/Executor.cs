@@ -21,8 +21,9 @@ namespace Worf;
 /// </summary>
 internal static unsafe partial class Executor
 {
-    // PERFORM_DELETION_INTERNAL from catalog/dependency.h.
+    // PERFORM_DELETION_INTERNAL and PERFORM_DELETION_CONCURRENTLY from catalog/dependency.h.
     private const int PerformDeletionInternal = 0x0001;
+    private const int PerformDeletionConcurrently = 0x0002;
 
     // SESSION_REPLICATION_ROLE_REPLICA from commands/trigger.h.
     private const int SessionReplicationRoleReplica = 1;
@@ -309,8 +310,10 @@ internal static unsafe partial class Executor
             });
         }
 
-        // DDL that replicates can't make other objects use an index on this node alone.
+        // DDL that replicates can't make other objects use an index on this node alone, and neither it nor DDL from
+        // another node chooses names or finds indexes to use by those indexes, which the other nodes don't have.
         Dictionary<uint, (string Name, string?[] Ties)>? ties = ddl is null ? null : LocalIndex.Ties(parsetree);
+        (List<(uint Index, string Name)> Moved, List<uint> Hidden)? isolated = LocalIndex.Isolate(parsetree, ddl is not null);
 
         // A statement that commits on its way, and then fails, lets its fence go as its transaction aborts.
         uint xactFlags = DdlReplication.BeginStatement(ddl is not null);
@@ -330,8 +333,11 @@ internal static unsafe partial class Executor
         finally
         {
             LocalIndex.EndStatement(tracking);
+            LocalIndex.EndIsolation(isolated is not null);
             usedTemp = DdlReplication.EndStatement(xactFlags, ddl is not null);
         }
+
+        LocalIndex.Restore(isolated);
 
         // A DROP leaves out its temporary objects itself, and any other statement that used one stays on this node, or
         // fails when it created or changed objects that outlast the session.
@@ -340,6 +346,11 @@ internal static unsafe partial class Executor
         if (ddl is not null && !local)
         {
             LocalIndex.CheckTies(ties);
+            if (tracking)
+            {
+                ddl = LocalIndex.NameBuilt(parsetree, ddl);
+            }
+
             DdlReplication.QueueDdl(ddl);
             if (tracking)
             {
@@ -402,7 +413,7 @@ internal static unsafe partial class Executor
             int dropflags = *(int*)arg;
             if (classId == Dependency.RelationRelationId && subId == 0)
             {
-                LocalIndex.NoteDropped(objectId, (dropflags & PerformDeletionInternal) != 0);
+                LocalIndex.NoteDropped(objectId, (dropflags & PerformDeletionInternal) != 0, (dropflags & PerformDeletionConcurrently) != 0);
             }
 
             // No need to check for internal deletions.
