@@ -552,7 +552,34 @@ public sealed class SequenceRangeTests
         _ = await node.SafePsqlAsync(Database, "SET ROLE app; INSERT INTO app.x2 SELECT FROM generate_series(1, 3)", token);
         string rangeWorker = await node.SafePsqlAsync(Database, "SELECT pid FROM pg_stat_activity WHERE datname = current_database() AND backend_type LIKE 'worf range%'", token);
         Assert.IsTrue(await node.PollLogAsync(escapes, $"runs as app in {rangeWorker}", token), "the range worker read the table as its owner");
-        Assert.AreEqual("f", await node.SafePsqlAsync(Database, "SELECT rolsuper FROM pg_roles WHERE rolname = 'app'", token));
+
+        // worf creates the guard's triggers as the table's owner too, so the functions a partition key runs as its tree is
+        // read can't make it a superuser, and runs no event trigger for them, which would find the role's temporary
+        // table of the name the event trigger writes to first.
+        _ = await node.SafePsqlAsync(Database, """
+            SET ROLE app;
+            CREATE FUNCTION app.immi(what text) RETURNS bigint LANGUAGE sql IMMUTABLE AS $$SELECT CASE WHEN app.esc(what) THEN 0::bigint END$$;
+            CREATE TABLE app.pk (id bigint, v text) PARTITION BY RANGE ((id + app.immi('pk')));
+            CREATE TABLE app.pk_all PARTITION OF app.pk FOR VALUES FROM (MINVALUE) TO (MAXVALUE);
+            CREATE FUNCTION app.audited() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM app.esc('audit'); RETURN NEW; END$$;
+            CREATE TABLE app.audited (id bigint);
+            """, token);
+        _ = await node.SafePsqlAsync(Database, "SET ROLE app; ALTER TABLE app.pk ALTER COLUMN id SET DEFAULT nextval('public.t_id_seq')", token);
+        _ = await node.SafePsqlAsync(Database, """
+            CREATE TABLE ddl_audit (tag text);
+            GRANT INSERT ON ddl_audit TO PUBLIC;
+            CREATE FUNCTION audit() RETURNS event_trigger LANGUAGE plpgsql AS $$BEGIN INSERT INTO ddl_audit VALUES (tg_tag); END$$;
+            CREATE EVENT TRIGGER audit ON ddl_command_end EXECUTE FUNCTION audit();
+            SET ROLE app;
+            CREATE TEMP TABLE ddl_audit (tag text);
+            CREATE TRIGGER audited BEFORE INSERT ON ddl_audit FOR EACH ROW EXECUTE FUNCTION app.audited();
+            ALTER TABLE app.audited ALTER COLUMN id SET DEFAULT nextval('public.t_id_seq');
+            """, token);
+        Assert.AreEqual("f|6", await node.SafePsqlAsync(Database, """
+            SELECT rolsuper, (SELECT count(*) FROM pg_trigger WHERE tgrelid IN ('app.pk'::regclass, 'app.pk_all'::regclass, 'app.audited'::regclass))
+            FROM pg_roles WHERE rolname = 'app';
+            DROP EVENT TRIGGER audit;
+            """, token));
 
         // Triggers with the guard's names from before worf was installed are replaced as their table comes under the
         // guard, and once it is installed, no trigger takes the guard's names or function, while a restore skips them.

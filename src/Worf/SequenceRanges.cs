@@ -214,7 +214,14 @@ internal static unsafe partial class SequenceRanges
     private const uint RegclassOid = 2205;
     private const uint TextOid = 25;
 
+    // TriggerRelationId from catalog/pg_trigger_d.h, and PERFORM_DELETION_INTERNAL from catalog/dependency.h.
+    private const uint TriggerRelationId = 2620;
+    private const int PerformDeletionInternal = 0x0001;
+
     private static readonly string[] s_guardNames = [GuardName, UpdateGuardName, PartitionGuardName, PartitionUpdateGuardName];
+
+    // The names a trigger's condition gives the row before and after it is written, in the order PostgreSQL adds them.
+    private static readonly string[] s_triggerAliases = ["old", "new"];
 
     private static bool s_changedOnCommit;
 
@@ -269,11 +276,6 @@ internal static unsafe partial class SequenceRanges
     [PgGucInt("worf.sequence_range_exchange_interval", 60000, "Sets how often each node exchanges sequence ranges with its neighbors.",
         Minimum = 100, Maximum = int.MaxValue, Unit = PgGucUnit.Milliseconds, Context = PgGucContext.Sighup)]
     internal static partial int ExchangeInterval { get; }
-
-    /// <summary>
-    /// Gets or sets whether worf itself runs the DDL that managed sequences otherwise reject.
-    /// </summary>
-    internal static bool InternalDdl { get; set; }
 
     /// <summary>
     /// Gets the counter that tells backends to reload the blocks they cache for the guard.
@@ -1136,11 +1138,6 @@ internal static unsafe partial class SequenceRanges
     /// <param name="parsetree">The statement, before it runs.</param>
     internal static void CheckDdl(Node* parsetree)
     {
-        if (InternalDdl)
-        {
-            return;
-        }
-
         if (parsetree->type == NodeTag.T_AlterTableStmt)
         {
             DropAttachedGuards((AlterTableStmt*)parsetree);
@@ -1344,7 +1341,7 @@ internal static unsafe partial class SequenceRanges
 
         for (int i = 0; i < guards.Count; i++)
         {
-            RunInternalDdl($"DROP TRIGGER {Spi.QuoteIdentifier(guards[i].Get<string>(1))} ON {QualifiedName(guards[i].Get<uint>(0))}");
+            DropGuardTrigger(guards[i].Get<uint>(0), guards[i].Get<string>(1));
         }
     }
 
@@ -1362,7 +1359,7 @@ internal static unsafe partial class SequenceRanges
                 uint partition = Resolve(((PartitionCmd*)cmd->def)->name);
                 foreach (string guard in partition == 0 ? [] : OwnGuards(partition))
                 {
-                    RunInternalDdl($"DROP TRIGGER {Spi.QuoteIdentifier(guard)} ON {QualifiedName(partition)}");
+                    DropGuardTrigger(partition, guard);
                 }
             }
         }
@@ -1539,7 +1536,7 @@ internal static unsafe partial class SequenceRanges
     /// <param name="parsetree">The statement, before it runs.</param>
     /// <returns>Whether to skip it.</returns>
     internal static bool SkipsDumpedGuard(Node* parsetree)
-        => !InternalDdl && parsetree->type == NodeTag.T_CreateTrigStmt && IsGuardName(Worf.FromServer(((CreateTrigStmt*)parsetree)->trigname)) &&
+        => parsetree->type == NodeTag.T_CreateTrigStmt && IsGuardName(Worf.FromServer(((CreateTrigStmt*)parsetree)->trigname)) &&
             (DdlReplication.Restoring() || IsGuardFunction(((CreateTrigStmt*)parsetree)->funcname));
 
     /// <summary>
@@ -1571,7 +1568,7 @@ internal static unsafe partial class SequenceRanges
     /// <param name="parsetree">The statement, which has run.</param>
     internal static void AfterDdl(Node* parsetree)
     {
-        if (InternalDdl || parsetree->type is not (NodeTag.T_CreateSeqStmt or NodeTag.T_AlterSeqStmt or NodeTag.T_AlterTableStmt or NodeTag.T_CreateStmt or
+        if (parsetree->type is not (NodeTag.T_CreateSeqStmt or NodeTag.T_AlterSeqStmt or NodeTag.T_AlterTableStmt or NodeTag.T_CreateStmt or
             NodeTag.T_AlterDomainStmt or NodeTag.T_CreateDomainStmt))
         {
             return;
@@ -2322,25 +2319,90 @@ internal static unsafe partial class SequenceRanges
             """, SpiParameter.Create(relid), SpiParameter.Create(column));
 
     /// <summary>
-    /// Runs DDL that managed sequences otherwise reject, and that isn't replicated.
+    /// Runs DDL that managed sequences otherwise reject, and that isn't replicated, on a sequence: a change of its bounds
+    /// or a revoke of UPDATE on it. It calls the command itself, as PostgreSQL does for the triggers it creates for its
+    /// own ends, so that no event trigger or other hook runs anything for it, and as worf's own, since a sequence runs
+    /// none of the user's functions.
     /// </summary>
-    /// <param name="sql">The DDL.</param>
-    internal static void RunInternalDdl(string sql)
+    /// <param name="sql">The ALTER SEQUENCE or REVOKE.</param>
+    internal static void RunInternalDdl(string sql) => Elevated.Run(() =>
     {
-        bool internalDdl = InternalDdl;
-        bool suppressed = DdlReplication.Suppressed;
-        InternalDdl = true;
-        DdlReplication.Suppressed = true;
-        try
+        sbyte* text = Worf.PStrDup(sql);
+        Node* statement = ((RawStmt*)NativeMethods.raw_parser(text, RawParseMode.RAW_PARSE_DEFAULT)->elements[0].ptr_value)->stmt;
+        switch (statement->type)
         {
-            // worf runs it for whoever's statement needs it, as when a table comes to use a managed sequence.
-            Elevated.Run(() => _ = Spi.Execute(sql));
+            case NodeTag.T_AlterSeqStmt:
+                ParseState* pstate = NativeMethods.make_parsestate(null);
+                pstate->p_sourcetext = text;
+                _ = NativeMethods.AlterSequence(pstate, (AlterSeqStmt*)statement);
+                break;
+
+            case NodeTag.T_GrantStmt:
+                NativeMethods.ExecuteGrantStmt((GrantStmt*)statement);
+                break;
+
+            default:
+                throw new PgException(PgSqlStates.InternalError, $"worf runs no internal DDL such as: {sql}");
         }
-        finally
+
+        NativeMethods.CommandCounterIncrement();
+    });
+
+    /// <summary>
+    /// Creates or replaces a guard trigger on a table as the table's owner, in a security-restricted operation, so that
+    /// the user's functions PostgreSQL runs for the table, as its partition key's, run as if the owner had created the
+    /// trigger, with no rights the owner lacks. It calls the command itself, so that no event trigger runs for it. The
+    /// trigger's condition, which calls worf's functions, is parsed first as worf's own, which runs nothing of the
+    /// user's, so that the owner needs no rights on worf's schema, and the trigger depends on what the condition uses,
+    /// as one whose condition PostgreSQL parses does.
+    /// </summary>
+    private static void CreateGuardTrigger(uint relid, string sql)
+    {
+        sbyte* text = Worf.PStrDup(sql);
+        CreateTrigStmt* trigger = (CreateTrigStmt*)((RawStmt*)NativeMethods.raw_parser(text, RawParseMode.RAW_PARSE_DEFAULT)->elements[0].ptr_value)->stmt;
+        (nint when, nint rtable) = Elevated.Run(() =>
         {
-            InternalDdl = internalDdl;
-            DdlReplication.Suppressed = suppressed;
+            // The lock CREATE TRIGGER takes, taken first.
+            RelationData* rel = NativeMethods.table_open(relid, (int)PgLockMode.ShareRowExclusive);
+            ParseState* pstate = NativeMethods.make_parsestate(null);
+            pstate->p_sourcetext = text;
+            foreach (string alias in s_triggerAliases)
+            {
+                ParseNamespaceItem* item = NativeMethods.addRangeTableEntryForRelation(pstate, rel, (int)PgLockMode.AccessShare,
+                    NativeMethods.makeAlias(Worf.PStrDup(alias), null), false, false);
+                NativeMethods.addNSItemToQuery(pstate, item, false, true, true);
+            }
+
+            Node* condition = NativeMethods.transformWhereClause(pstate, (Node*)NativeMethods.copyObjectImpl(trigger->whenClause),
+                ParseExprKind.EXPR_KIND_TRIGGER_WHEN, Worf.PStrDup("WHEN"));
+            NativeMethods.assign_expr_collations(pstate, condition);
+            NativeMethods.table_close(rel, (int)PgLockMode.None);
+            return ((nint)condition, (nint)pstate->p_rtable);
+        });
+        uint function = GuardFunction();
+        ObjectAddress created = TableOwner.Run(relid, () => NativeMethods.CreateTrigger(trigger, text, relid, 0, 0, 0, function, 0, (Node*)when, false, false));
+        NativeMethods.recordDependencyOnExpr(&created, (Node*)when, (List*)rtable, DependencyType.DEPENDENCY_NORMAL);
+        NativeMethods.CommandCounterIncrement();
+    }
+
+    /// <summary>
+    /// Drops a guard trigger from a table as the table's owner, as <see cref="CreateGuardTrigger"/> creates one.
+    /// </summary>
+    private static void DropGuardTrigger(uint relid, string name)
+    {
+        uint trigoid = NativeMethods.get_trigger_oid(relid, Worf.PStrDup(name), true);
+        if (trigoid == 0)
+        {
+            return;
         }
+
+        _ = TableOwner.Run(relid, () =>
+        {
+            ObjectAddress trigger = Dependency.Address(TriggerRelationId, trigoid, 0);
+            NativeMethods.performDeletion(&trigger, DropBehavior.DROP_RESTRICT, PerformDeletionInternal);
+            return true;
+        });
+        NativeMethods.CommandCounterIncrement();
     }
 
     /// <summary>
@@ -3618,7 +3680,7 @@ internal static unsafe partial class SequenceRanges
             // A table with no column to check keeps no pair.
             foreach ((_, string name, _, _) in guarded.Count == 0 ? existing : [])
             {
-                RunInternalDdl($"DROP TRIGGER {Spi.QuoteIdentifier(name)} ON {table}");
+                DropGuardTrigger(relid, name);
             }
 
             return;
@@ -3628,7 +3690,7 @@ internal static unsafe partial class SequenceRanges
         {
             if (!ours)
             {
-                RunInternalDdl($"DROP TRIGGER {Spi.QuoteIdentifier(name)} ON {table}");
+                DropGuardTrigger(relid, name);
             }
         }
 
@@ -3642,15 +3704,16 @@ internal static unsafe partial class SequenceRanges
                 : $"(NOT ({string.Join(" OR ", sequences.Select(seq => $"worf.sequence_range_admits({Sequence(seq)}, NEW.{name}::{type})"))}) AND ({each}))";
         }
 
-        static string Sequence(uint seqoid) => Spi.QuoteLiteral(GetInfo(seqoid).Name) + "::regclass";
+        // A sequence is named by its oid, which looks up nothing.
+        static string Sequence(uint seqoid) => Spi.QuoteLiteral(seqoid.ToString(CultureInfo.InvariantCulture)) + "::regclass";
 
         string function = $"worf.sequence_range_guard({string.Join(", ", arguments.Select(Spi.QuoteLiteral))})";
-        RunInternalDdl($"""
+        CreateGuardTrigger(relid, $"""
             CREATE OR REPLACE TRIGGER {insertName} AFTER INSERT ON {table}
             FOR EACH ROW WHEN ({string.Join(" OR ", guarded.Select(c => Check(insertCheck, c.Name, c.Type, c.Sequences)))})
             EXECUTE FUNCTION {function}
             """);
-        RunInternalDdl($"""
+        CreateGuardTrigger(relid, $"""
             CREATE OR REPLACE TRIGGER {updateName} AFTER UPDATE ON {table}
             FOR EACH ROW WHEN ({string.Join(" OR ", guarded.Select(c =>
                 $"(OLD.{c.Name} IS DISTINCT FROM NEW.{c.Name} AND {Check("worf.sequence_range_check_update", c.Name, c.Type, c.Sequences)})"))})

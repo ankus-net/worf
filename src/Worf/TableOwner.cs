@@ -3,11 +3,11 @@ using Ankus.Postgres;
 namespace Worf;
 
 /// <summary>
-/// Runs worf's queries over a user's table as the table's owner, in a security-restricted operation with the search
-/// path set to <c>pg_catalog, pg_temp</c>, as VACUUM and ANALYZE do, and with the owner's own row-level security
-/// lifted, as a foreign key check does. The functions the planner and executor run for the table, as from its
-/// constraints and index predicates, then run with its owner's rights alone and can't change the session. Settings
-/// changed inside are undone when it returns.
+/// Runs worf's work over a user's table as the table's owner, in a security-restricted operation with the search path
+/// set to <c>pg_catalog, pg_temp</c>, as VACUUM and ANALYZE do, and with the owner's own row-level security lifted, as a
+/// foreign key check does: its queries over the table and its guard triggers' DDL. The functions PostgreSQL runs for the
+/// table, as from its constraints, index predicates and partition key, then run with its owner's rights alone, as if
+/// the owner ran the work, and can't change the session. Settings changed inside are undone when it returns.
 /// </summary>
 internal static unsafe class TableOwner
 {
