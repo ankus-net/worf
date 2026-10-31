@@ -192,9 +192,11 @@ internal static unsafe partial class SequenceRanges
     private const uint Int8Oid = 20;
     private const uint NumericOid = 1700;
 
-    // nextval(regclass) from utils/fmgroids.h, and regclass.
+    // nextval(regclass) and regclass(text) from utils/fmgroids.h, regclass and text.
     private const uint NextvalOid = 1574;
+    private const uint TextRegclassOid = 1079;
     private const uint RegclassOid = 2205;
+    private const uint TextOid = 25;
 
     private static readonly string[] s_guardNames = [GuardName, UpdateGuardName, PartitionGuardName, PartitionUpdateGuardName];
 
@@ -1429,7 +1431,7 @@ internal static unsafe partial class SequenceRanges
     internal static void AfterDdl(Node* parsetree)
     {
         if (InternalDdl || parsetree->type is not (NodeTag.T_CreateSeqStmt or NodeTag.T_AlterSeqStmt or NodeTag.T_AlterTableStmt or NodeTag.T_CreateStmt or
-            NodeTag.T_AlterDomainStmt))
+            NodeTag.T_AlterDomainStmt or NodeTag.T_CreateDomainStmt))
         {
             return;
         }
@@ -1437,6 +1439,40 @@ internal static unsafe partial class SequenceRanges
         if (parsetree->type is NodeTag.T_CreateSeqStmt or NodeTag.T_AlterTableStmt && DdlReplication.Restoring())
         {
             Elevated.Run(SequenceRangeSync.JoinRestored);
+        }
+
+        // The sequences that new defaults name as constant strings are recorded wherever worf is installed, so that a
+        // sequence that comes under range management later finds their columns.
+        if (Worf.CatalogOid("sequence_range") != 0)
+        {
+            switch (parsetree->type)
+            {
+                case NodeTag.T_CreateStmt:
+                    RecordNamedSequences([Resolve(((CreateStmt*)parsetree)->relation)], 0);
+                    break;
+
+                case NodeTag.T_AlterTableStmt when Resolve(((AlterTableStmt*)parsetree)->relation) is uint altered and not 0:
+                    List<long> tables = [];
+                    List* inheritors = NativeMethods.find_all_inheritors(altered, 0, null);
+                    for (int i = 0; inheritors is not null && i < inheritors->length; i++)
+                    {
+                        tables.Add(inheritors->elements[i].oid_value);
+                    }
+
+                    RecordNamedSequences([.. tables], 0);
+                    break;
+
+                case NodeTag.T_CreateDomainStmt:
+                    RecordNamedSequences([], NativeMethods.typenameTypeId(null, NativeMethods.makeTypeNameFromNameList(((CreateDomainStmt*)parsetree)->domainname)));
+                    break;
+
+                case NodeTag.T_AlterDomainStmt when AltersDefault((AlterDomainStmt*)parsetree):
+                    RecordNamedSequences([], NativeMethods.typenameTypeId(null, NativeMethods.makeTypeNameFromNameList(((AlterDomainStmt*)parsetree)->typeName)));
+                    break;
+
+                default:
+                    break;
+            }
         }
 
         if (!AnyManaged())
@@ -1766,35 +1802,36 @@ internal static unsafe partial class SequenceRanges
 
     /// <summary>
     /// Lists the columns, with their tables and the types beneath any domains, whose default or identity uses a
-    /// sequence, or which have no default of their own and take their domain's, which does. PostgreSQL records no use
-    /// of a sequence that a default reaches through a function, or through a name it looks up as it runs, as
-    /// <c>nextval('s'::text)</c> does.
+    /// sequence, or which have no default of their own and take their domain's, which does. A default uses it when it may
+    /// call nextval of it, rather than only read it, as <c>currval('s')</c> does. PostgreSQL records no use of a sequence
+    /// that a default reaches through a function, and worf records the one a default names as a constant string, as
+    /// <c>nextval('s'::text)</c> does, as the DDL that sets it runs.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
     /// <returns>The columns.</returns>
     internal static List<(uint Relid, string Column, uint TypeOid)> UsingColumns(uint seqoid)
     {
         SpiResult result = Worf.SelectCatalog("""
-            WITH RECURSIVE domains (typid) AS (
-                SELECT d.objid FROM pg_catalog.pg_depend d
+            WITH RECURSIVE domains (typid, expr) AS (
+                SELECT d.objid, t.typdefaultbin::text FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_type t ON t.oid = d.objid
                 WHERE d.classid = 'pg_catalog.pg_type'::regclass AND d.refclassid = 'pg_catalog.pg_class'::regclass
                     AND d.refobjid = $1 AND d.deptype = 'n'
                 UNION
-                SELECT t.oid FROM pg_catalog.pg_type t JOIN domains d ON t.typbasetype = d.typid
+                SELECT t.oid, d.expr FROM pg_catalog.pg_type t JOIN domains d ON t.typbasetype = d.typid
                 WHERE t.typtype = 'd' AND t.typdefaultbin IS NULL)
-            SELECT DISTINCT a.attrelid, a.attname::text, a.atttypid
+            SELECT DISTINCT a.attrelid, a.attname::text, a.atttypid, u.expr
             FROM (
-                SELECT d.refobjid AS relid, d.refobjsubid AS attnum
+                SELECT d.refobjid AS relid, d.refobjsubid AS attnum, NULL::text AS expr
                 FROM pg_catalog.pg_depend d
                 WHERE d.classid = 'pg_catalog.pg_class'::regclass AND d.objid = $1
                     AND d.refclassid = 'pg_catalog.pg_class'::regclass AND d.deptype IN ('a', 'i') AND d.refobjsubid > 0
                 UNION
-                SELECT ad.adrelid, ad.adnum
+                SELECT ad.adrelid, ad.adnum, ad.adbin::text
                 FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_attrdef ad ON ad.oid = d.objid
                 WHERE d.classid = 'pg_catalog.pg_attrdef'::regclass AND d.refclassid = 'pg_catalog.pg_class'::regclass
                     AND d.refobjid = $1
                 UNION
-                SELECT a.attrelid, a.attnum
+                SELECT a.attrelid, a.attnum, d.expr
                 FROM domains d JOIN pg_catalog.pg_attribute a ON a.atttypid = d.typid
                 WHERE a.attnum > 0 AND NOT a.atthasdef
             ) u
@@ -1805,10 +1842,228 @@ internal static unsafe partial class SequenceRanges
         List<(uint Relid, string Column, uint TypeOid)> columns = [];
         for (int i = 0; i < result.Count; i++)
         {
-            columns.Add((result[i].Get<uint>(0), result[i].Get<string>(1), NativeMethods.getBaseType(result[i].Get<uint>(2))));
+            (uint Relid, string Column, uint TypeOid) column = (result[i].Get<uint>(0), result[i].Get<string>(1), NativeMethods.getBaseType(result[i].Get<uint>(2)));
+            if (!columns.Contains(column) &&
+                (result[i].Get<string?>(3) is not string expression || MayDrawFrom((Node*)NativeMethods.stringToNode(Worf.PStrDup(expression)), seqoid)))
+            {
+                columns.Add(column);
+            }
         }
 
         return columns;
+    }
+
+    /// <summary>
+    /// Checks whether an expression may call nextval of a sequence: it calls nextval of it, or of a sequence it doesn't
+    /// name as a regclass constant, or holds a kind of node this check doesn't look into.
+    /// </summary>
+    private static bool MayDrawFrom(Node* node, uint seqoid)
+    {
+        if (node is null)
+        {
+            return false;
+        }
+
+        if (node->type == NodeTag.T_FuncExpr && ((FuncExpr*)node)->funcid == NextvalOid)
+        {
+            List* args = ((FuncExpr*)node)->args;
+            Node* argument = args is not null && args->length == 1 ? (Node*)args->elements[0].ptr_value : null;
+            return argument is null || argument->type != NodeTag.T_Const || ((Const*)argument)->constisnull ||
+                (uint)((Const*)argument)->constvalue == seqoid;
+        }
+
+        List<nint> children = [];
+        return !Children(node, children) || children.Exists(child => MayDrawFrom((Node*)child, seqoid));
+    }
+
+    /// <summary>
+    /// Lists the names that an expression's calls of nextval give as constant strings, as <c>nextval('s'::text)</c> does.
+    /// </summary>
+    private static void NamedSequences(Node* node, List<string> names)
+    {
+        if (node is null)
+        {
+            return;
+        }
+
+        if (node->type == NodeTag.T_FuncExpr && ((FuncExpr*)node)->funcid == NextvalOid)
+        {
+            if (Named((FuncExpr*)node) is string name)
+            {
+                names.Add(name);
+            }
+
+            return;
+        }
+
+        List<nint> children = [];
+        if (Children(node, children))
+        {
+            foreach (nint child in children)
+            {
+                NamedSequences((Node*)child, names);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Reads the name a call of nextval gives as a constant string, cast to regclass as it runs.
+    /// </summary>
+    /// <returns>The name, or null when it gives none.</returns>
+    private static string? Named(FuncExpr* call)
+    {
+        Node* argument = call->args is not null && call->args->length == 1 ? (Node*)call->args->elements[0].ptr_value : null;
+        while (argument is not null && argument->type == NodeTag.T_RelabelType)
+        {
+            argument = (Node*)((RelabelType*)argument)->arg;
+        }
+
+        if (argument is null || argument->type != NodeTag.T_FuncExpr || ((FuncExpr*)argument)->funcid != TextRegclassOid ||
+            ((FuncExpr*)argument)->args is null || ((FuncExpr*)argument)->args->length != 1)
+        {
+            return null;
+        }
+
+        Node* text = (Node*)((FuncExpr*)argument)->args->elements[0].ptr_value;
+        while (text->type == NodeTag.T_RelabelType)
+        {
+            text = (Node*)((RelabelType*)text)->arg;
+        }
+
+        return text->type == NodeTag.T_Const && !((Const*)text)->constisnull && ((Const*)text)->consttype == TextOid
+            ? Worf.FromServer(NativeMethods.text_to_cstring((varlena*)((Const*)text)->constvalue))
+            : null;
+    }
+
+    /// <summary>
+    /// Lists an expression node's children, for the kinds of node a column default holds.
+    /// </summary>
+    /// <returns>Whether this is such a kind of node.</returns>
+    private static bool Children(Node* node, List<nint> children)
+    {
+        void Add(void* child) => children.Add((nint)child);
+        void AddAll(List* list)
+        {
+            for (int i = 0; list is not null && i < list->length; i++)
+            {
+                children.Add((nint)list->elements[i].ptr_value);
+            }
+        }
+
+        switch (node->type)
+        {
+            case NodeTag.T_List:
+                AddAll((List*)node);
+                return true;
+
+            case NodeTag.T_FuncExpr:
+                AddAll(((FuncExpr*)node)->args);
+                return true;
+
+            // A DistinctExpr and a NullIfExpr are OpExprs.
+            case NodeTag.T_OpExpr or NodeTag.T_DistinctExpr or NodeTag.T_NullIfExpr:
+                AddAll(((OpExpr*)node)->args);
+                return true;
+
+            case NodeTag.T_ScalarArrayOpExpr:
+                AddAll(((ScalarArrayOpExpr*)node)->args);
+                return true;
+
+            case NodeTag.T_BoolExpr:
+                AddAll(((BoolExpr*)node)->args);
+                return true;
+
+            case NodeTag.T_CoalesceExpr:
+                AddAll(((CoalesceExpr*)node)->args);
+                return true;
+
+            case NodeTag.T_MinMaxExpr:
+                AddAll(((MinMaxExpr*)node)->args);
+                return true;
+
+            case NodeTag.T_CaseExpr:
+                Add(((CaseExpr*)node)->arg);
+                AddAll(((CaseExpr*)node)->args);
+                Add(((CaseExpr*)node)->defresult);
+                return true;
+
+            case NodeTag.T_CaseWhen:
+                Add(((CaseWhen*)node)->expr);
+                Add(((CaseWhen*)node)->result);
+                return true;
+
+            case NodeTag.T_RelabelType:
+                Add(((RelabelType*)node)->arg);
+                return true;
+
+            case NodeTag.T_CoerceViaIO:
+                Add(((CoerceViaIO*)node)->arg);
+                return true;
+
+            case NodeTag.T_CoerceToDomain:
+                Add(((CoerceToDomain*)node)->arg);
+                return true;
+
+            case NodeTag.T_NullTest:
+                Add(((NullTest*)node)->arg);
+                return true;
+
+            case NodeTag.T_Const or NodeTag.T_SQLValueFunction:
+                return true;
+
+            default:
+                return false;
+        }
+    }
+
+    /// <summary>
+    /// Records the sequences that column and domain defaults name as constant strings, as <c>nextval('s'::text)</c>
+    /// does, which PostgreSQL looks up as the default runs and records no use of, as the dependency it records for
+    /// <c>nextval('s')</c>, with each name looked up now, as a regclass constant's is. Range management then finds the
+    /// column, and guards it, as any other that uses the sequence.
+    /// </summary>
+    /// <param name="relids">The tables whose column defaults to look at, or null for every table and domain.</param>
+    /// <param name="domain">A domain whose default to look at, or 0.</param>
+    private static void RecordNamedSequences(long[]? relids, uint domain)
+    {
+        SpiResult defaults = Worf.Read("""
+            SELECT 'pg_catalog.pg_attrdef'::regclass::oid, ad.oid, ad.adbin::text FROM pg_catalog.pg_attrdef ad
+            WHERE ($1::oid[] IS NULL OR ad.adrelid = ANY ($1::oid[])) AND ad.adbin::text LIKE '%:funcid 1574 %:funcid 1079 %'
+            UNION ALL
+            SELECT 'pg_catalog.pg_type'::regclass::oid, t.oid, t.typdefaultbin::text FROM pg_catalog.pg_type t
+            WHERE ($1::oid[] IS NULL OR t.oid = $2) AND t.typtype = 'd' AND t.typdefaultbin::text LIKE '%:funcid 1574 %:funcid 1079 %'
+            """, 0, SpiParameter.Create(relids), SpiParameter.Create(domain));
+        bool recorded = false;
+        for (int i = 0; i < defaults.Count; i++)
+        {
+            List<string> names = [];
+            NamedSequences((Node*)NativeMethods.stringToNode(Worf.PStrDup(defaults[i].Get<string>(2))), names);
+            foreach (string name in names.Distinct())
+            {
+                ObjectAddress depender = default;
+                depender.classId = defaults[i].Get<uint>(0);
+                depender.objectId = defaults[i].Get<uint>(1);
+                ObjectAddress referenced = default;
+                referenced.classId = Dependency.RelationRelationId;
+                referenced.objectId = Worf.ReadScalar<uint?>("""
+                    SELECT c.oid FROM pg_catalog.pg_class c
+                    WHERE c.oid = pg_catalog.to_regclass($1) AND c.relkind = 'S'
+                        AND NOT EXISTS (
+                            SELECT 1 FROM pg_catalog.pg_depend d
+                            WHERE d.classid = $2 AND d.objid = $3 AND d.refclassid = 'pg_catalog.pg_class'::regclass AND d.refobjid = c.oid)
+                    """, SpiParameter.Create(name), SpiParameter.Create(depender.classId), SpiParameter.Create(depender.objectId)) ?? 0;
+                if (referenced.objectId != 0)
+                {
+                    NativeMethods.recordDependencyOn(&depender, &referenced, DependencyType.DEPENDENCY_NORMAL);
+                    recorded = true;
+                }
+            }
+        }
+
+        if (recorded)
+        {
+            NativeMethods.CommandCounterIncrement();
+        }
     }
 
     /// <summary>
@@ -1830,7 +2085,8 @@ internal static unsafe partial class SequenceRanges
     /// <summary>
     /// Checks that a column that uses managed sequences draws its values from one of them: that its default, if it has
     /// one, is nextval of one of them, alone or cast to an integer or numeric type, as a serial column's is. A default
-    /// such as <c>nextval('s') + 1000000</c> gives values the guard always refuses.
+    /// such as <c>nextval('s') + 1000000</c> gives values the guard always refuses. A sequence that the default names as
+    /// a constant string is the one worf recorded it to use.
     /// </summary>
     private static void RequireNextval(uint relid, string column, List<uint> sequences)
     {
@@ -1840,14 +2096,20 @@ internal static unsafe partial class SequenceRanges
                 UNION ALL
                 SELECT t.typbasetype, c.depth + 1 FROM chain c JOIN pg_catalog.pg_type t ON t.oid = c.typid
                 WHERE t.typtype = 'd' AND t.typdefaultbin IS NULL)
-            SELECT d.adbin::text
+            SELECT d.adbin::text, ARRAY(
+                SELECT p.refobjid::int8 FROM pg_catalog.pg_depend p
+                WHERE p.classid = 'pg_catalog.pg_attrdef'::regclass AND p.objid = d.oid AND p.refclassid = 'pg_catalog.pg_class'::regclass)
             FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
             WHERE a.attrelid = $1 AND a.attname = $2 AND a.attidentity = '' AND a.attgenerated = ''
             UNION ALL
-            (SELECT t.typdefaultbin::text FROM chain c JOIN pg_catalog.pg_type t ON t.oid = c.typid
+            (SELECT t.typdefaultbin::text, ARRAY(
+                SELECT p.refobjid::int8 FROM pg_catalog.pg_depend p
+                WHERE p.classid = 'pg_catalog.pg_type'::regclass AND p.objid = t.oid AND p.refclassid = 'pg_catalog.pg_class'::regclass)
+            FROM chain c JOIN pg_catalog.pg_type t ON t.oid = c.typid
             WHERE t.typtype = 'd' AND t.typdefaultbin IS NOT NULL ORDER BY c.depth LIMIT 1)
             """, 1, SpiParameter.Create(relid), SpiParameter.Create(column));
-        if (result.Count > 0 && !sequences.Contains(DrawsFrom(result[0].Get<string>(0))))
+        if (result.Count > 0 && DrawsFrom(result[0].Get<string>(0)) is (uint drawn, bool named) &&
+            !(named ? Array.Exists(result[0].Get<long[]>(1), depended => sequences.Contains((uint)depended)) : sequences.Contains(drawn)))
         {
             throw new PgException(FeatureNotSupported,
                 $"column \"{column}\" of table {QualifiedName(relid)} uses sequence {GetInfo(sequences[0]).Name} but its default isn't nextval of it",
@@ -1857,9 +2119,9 @@ internal static unsafe partial class SequenceRanges
 
     /// <summary>
     /// Finds the sequence an expression draws from when it is nextval of a sequence, alone or cast to an integer or
-    /// numeric type.
+    /// numeric type, or whether it names the sequence as a constant string.
     /// </summary>
-    private static uint DrawsFrom(string expression)
+    private static (uint Sequence, bool Named) DrawsFrom(string expression)
     {
         Node* node = (Node*)NativeMethods.stringToNode(Worf.PStrDup(expression));
         while (true)
@@ -1884,13 +2146,13 @@ internal static unsafe partial class SequenceRanges
                         break;
                     }
 
-                    return call->funcid == NextvalOid && argument->type == NodeTag.T_Const && ((Const*)argument)->consttype == RegclassOid &&
-                        !((Const*)argument)->constisnull
-                        ? (uint)((Const*)argument)->constvalue
-                        : 0;
+                    return call->funcid != NextvalOid ? (0, false)
+                        : argument->type == NodeTag.T_Const && ((Const*)argument)->consttype == RegclassOid && !((Const*)argument)->constisnull
+                            ? ((uint)((Const*)argument)->constvalue, false)
+                            : (0, Named(call) is not null);
 
                 default:
-                    return 0;
+                    return (0, false);
             }
         }
     }
@@ -2061,7 +2323,9 @@ internal static unsafe partial class SequenceRanges
         // The guard's and the quarantine's locks hold off writers and nextval, so the high-water mark sees every value. A
         // node that draws from a block of an earlier epoch keeps drawing from it, since the mark covers the block. The
         // last value the sequence issued is read before the quarantine moves it, under a lock that waits for the
-        // transactions that called nextval and holds off the rest.
+        // transactions that called nextval and holds off the rest. Defaults set before worf was installed that name a
+        // sequence as a constant string are recorded first.
+        RecordNamedSequences(null, 0);
         InstallGuards(seqoid);
         SequenceInfo info = GetInfo(seqoid);
         long? issued = null;

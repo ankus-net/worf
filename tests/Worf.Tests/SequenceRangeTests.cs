@@ -372,6 +372,26 @@ public sealed class SequenceRangeTests
             """, token);
         await AssertOutsideAsync(node, "INSERT INTO widen VALUES (1300000)");
         await AssertOutsideAsync(node, "ALTER TABLE widen ALTER COLUMN id TYPE numeric USING id");
+
+        // A default of currval issues nothing, so its column takes any value and enabling its sequence is no trouble. A
+        // default that names a sequence as a constant string, looked up as it runs, guards its column as nextval of the
+        // sequence does.
+        _ = await node.SafePsqlAsync(Database, """
+            CREATE TABLE cv (id bigint DEFAULT nextval('t_id_seq'), parent bigint DEFAULT currval('t_id_seq'));
+            INSERT INTO cv DEFAULT VALUES;
+            INSERT INTO cv (parent) VALUES (5);
+            CREATE SEQUENCE cvseq;
+            CREATE TABLE cv2 (id bigint DEFAULT nextval('t_id_seq'), ref bigint DEFAULT currval('cvseq'));
+            SELECT worf.enable_sequence_range('cvseq', participants := '{}', range_size := 100);
+            CREATE TABLE named (id bigint PRIMARY KEY DEFAULT nextval('t_id_seq'::text));
+            CREATE DOMAIN named_domain AS bigint DEFAULT nextval('public.t_id_seq'::text);
+            CREATE TABLE named2 (id named_domain);
+            INSERT INTO named DEFAULT VALUES;
+            INSERT INTO named2 DEFAULT VALUES;
+            """, token);
+        Assert.AreEqual("1", await node.SafePsqlAsync(Database, "SELECT count(*) FROM cv WHERE id = parent", token));
+        await AssertOutsideAsync(node, "INSERT INTO named VALUES (999999999)");
+        await AssertOutsideAsync(node, "INSERT INTO named2 VALUES (999999999)");
         foreach (string ddl in new[]
         {
             "CREATE TABLE plus2 (id bigint DEFAULT nextval('t_id_seq') + 1000000)",
@@ -475,6 +495,7 @@ public sealed class SequenceRangeTests
         _ = await node.SafePsqlAsync(Database, "CREATE DATABASE decoys", token);
         _ = await node.SafePsqlAsync("decoys", """
             CREATE TABLE d (id bigserial PRIMARY KEY);
+            CREATE TABLE pre (id bigint DEFAULT nextval('d_id_seq'::text));
             CREATE TABLE fresh (id bigint);
             CREATE FUNCTION sequence_range_guard() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NULL; END$$;
             CREATE TRIGGER other AFTER INSERT ON fresh FOR EACH ROW EXECUTE FUNCTION sequence_range_guard();
@@ -519,7 +540,7 @@ public sealed class SequenceRangeTests
             CREATE FUNCTION plain.noop() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;
             CREATE TRIGGER noop BEFORE INSERT ON plain.numbered FOR EACH ROW EXECUTE FUNCTION plain.noop();
             """, token);
-        foreach (string write in new[] { "INSERT INTO d VALUES (987654)", "UPDATE d SET id = 987655", "INSERT INTO plain.numbered VALUES (987656)" })
+        foreach (string write in new[] { "INSERT INTO d VALUES (987654)", "UPDATE d SET id = 987655", "INSERT INTO plain.numbered VALUES (987656)", "INSERT INTO pre VALUES (987657)" })
         {
             PostgresException error = await Assert.ThrowsExactlyAsync<PostgresException>(() => node.SafePsqlAsync("decoys", write, token), write);
             Assert.AreEqual("23514", error.SqlState, write);
