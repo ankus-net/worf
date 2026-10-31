@@ -538,7 +538,9 @@ public sealed class SequenceRangeTests
         Assert.AreEqual(before[1], after[1], "the peak rate");
 
         // Nor does a load's transaction hold up another session's reservation, whose switch it then finds when it
-        // reserves again.
+        // reserves again. The same reservation committed first leaves the load's own nothing to switch, which would hold
+        // the sequence until the load commits.
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.reserve_sequence_range('t_id_seq', 10)", token);
         await using NpgsqlConnection batch = await nodeA.OpenAsync(Database, token);
         await ExecuteAsync(batch, "BEGIN; SELECT worf.reserve_sequence_range('t_id_seq', 10)", token);
         long left = long.Parse(await nodeA.SafePsqlAsync(Database, "SELECT values_left FROM worf.sequence_ranges", token), CultureInfo.InvariantCulture);
