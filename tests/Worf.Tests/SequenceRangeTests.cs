@@ -315,6 +315,31 @@ public sealed class SequenceRangeTests
             """, token);
         Assert.AreEqual(scans, await node.SafePsqlAsync(Database, Scans, token), "no sequential scan");
 
+        // A partition whose own default draws from a managed sequence has the column guarded on its own, so attaching one
+        // holds up no writers to the tree, and the tree's other partitions write any value in the column.
+        _ = await node.SafePsqlAsync(Database, """
+            CREATE TABLE pq (id bigint DEFAULT nextval('t_id_seq'), ref bigint, extra bigint, k text, PRIMARY KEY (id, k)) PARTITION BY LIST (k);
+            CREATE TABLE pq_a PARTITION OF pq (ref DEFAULT nextval('nseq')) FOR VALUES IN ('a');
+            CREATE TABLE pq_b PARTITION OF pq FOR VALUES IN ('b');
+            CREATE TABLE pq_c (id bigint NOT NULL, ref bigint, extra bigint DEFAULT nextval('nseq'), k text NOT NULL CHECK (k = 'c'), PRIMARY KEY (id, k));
+            INSERT INTO pq (ref, extra, k) VALUES (42, 42, 'b');
+            """, token);
+        await AssertOutsideAsync(node, "INSERT INTO pq (ref, k) VALUES (42, 'a')");
+        await using (NpgsqlConnection attacher = await node.OpenAsync(Database, token))
+        {
+            await using (NpgsqlCommand attach = new("BEGIN; ALTER TABLE pq ATTACH PARTITION pq_c FOR VALUES IN ('c')", attacher))
+            {
+                _ = await attach.ExecuteNonQueryAsync(token);
+            }
+
+            _ = await node.SafePsqlAsync(Database, "SET lock_timeout = '2s'; INSERT INTO pq (k) VALUES ('b')", token);
+            await using NpgsqlCommand commit = new("COMMIT", attacher);
+            _ = await commit.ExecuteNonQueryAsync(token);
+        }
+
+        await AssertOutsideAsync(node, "INSERT INTO pq (extra, k) VALUES (42, 'c')");
+        _ = await node.SafePsqlAsync(Database, "INSERT INTO pq (extra, k) VALUES (42, 'a')", token);
+
         // A guarded column changes its type, unchecked when its values stay, as from one integer type to another without
         // USING, and drops without CASCADE. A default other than nextval of the sequence, alone or cast, is refused, and
         // a column the sequence owns takes one that is.

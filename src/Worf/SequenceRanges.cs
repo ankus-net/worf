@@ -172,6 +172,17 @@ internal static unsafe partial class SequenceRanges
     /// </summary>
     internal const string UpdateGuardName = "worf_sequence_range_guard_update";
 
+    /// <summary>
+    /// The name of a partition's own trigger that checks the values new rows hold in the columns its tree's root doesn't
+    /// number from a managed sequence.
+    /// </summary>
+    internal const string PartitionGuardName = "worf_sequence_range_partition_guard";
+
+    /// <summary>
+    /// The name of a partition's own trigger that checks the values updates write in those columns.
+    /// </summary>
+    internal const string PartitionUpdateGuardName = "worf_sequence_range_partition_guard_update";
+
     private const string SequenceLimitExceeded = "2200H";
     private const string FeatureNotSupported = "0A000";
 
@@ -185,7 +196,7 @@ internal static unsafe partial class SequenceRanges
     private const uint NextvalOid = 1574;
     private const uint RegclassOid = 2205;
 
-    private static readonly string[] s_guardNames = [GuardName, UpdateGuardName];
+    private static readonly string[] s_guardNames = [GuardName, UpdateGuardName, PartitionGuardName, PartitionUpdateGuardName];
 
     private static bool s_changedOnCommit;
 
@@ -1517,10 +1528,25 @@ internal static unsafe partial class SequenceRanges
     /// </summary>
     private static void CheckColumnRows(uint relid, string column, bool inherited)
     {
-        if (GuardedColumns(TreeRoot(relid)).TryGetValue(column, out (uint TypeOid, List<uint> Sequences) guarded))
+        if (NativeMethods.get_rel_relkind(relid) != (sbyte)'p')
         {
-            SequenceRangeGuard.CheckRows(QualifiedName(relid), inherited || NativeMethods.get_rel_relkind(relid) == (sbyte)'p', column,
-                guarded.TypeOid == NumericOid, guarded.Sequences);
+            if (GuardedColumns(relid).TryGetValue(column, out (uint TypeOid, List<uint> Sequences) guarded))
+            {
+                SequenceRangeGuard.CheckRows(QualifiedName(relid), inherited, column, guarded.TypeOid == NumericOid, guarded.Sequences);
+            }
+
+            return;
+        }
+
+        (Dictionary<string, (uint TypeOid, List<uint> Sequences)> Root, Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences)>> Partitions,
+            Dictionary<uint, (uint Parent, bool Leaf)> Members) tree = TreeColumns(TreeRoot(relid));
+        foreach ((uint partition, (_, bool leaf)) in tree.Members)
+        {
+            if (leaf && Beneath(partition, relid, tree.Members) &&
+                GuardedColumns(partition, tree).TryGetValue(column, out (uint TypeOid, List<uint> Sequences) guarded))
+            {
+                SequenceRangeGuard.CheckRows(QualifiedName(partition), false, column, guarded.TypeOid == NumericOid, guarded.Sequences);
+            }
         }
     }
 
@@ -1535,12 +1561,26 @@ internal static unsafe partial class SequenceRanges
             return;
         }
 
-        Dictionary<string, (uint TypeOid, List<uint> Sequences)> own = GuardedColumns(partition);
-        foreach ((string column, (uint typeOid, List<uint> sequences)) in GuardedColumns(TreeRoot(partition)))
+        (Dictionary<string, (uint TypeOid, List<uint> Sequences)> ownRoot,
+            Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences)>> ownPartitions,
+            Dictionary<uint, (uint Parent, bool Leaf)> members) = TreeColumns(partition);
+        (Dictionary<string, (uint TypeOid, List<uint> Sequences)> Root, Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences)>> Partitions,
+            Dictionary<uint, (uint Parent, bool Leaf)> Members) tree = TreeColumns(TreeRoot(partition));
+        foreach ((uint leaf, (_, bool isLeaf)) in members)
         {
-            if (!own.TryGetValue(column, out (uint TypeOid, List<uint> Sequences) before) || !before.Sequences.TrueForAll(sequences.Contains))
+            if (!isLeaf)
             {
-                SequenceRangeGuard.CheckRows(QualifiedName(partition), true, column, typeOid == NumericOid, sequences);
+                continue;
+            }
+
+            Dictionary<string, (uint TypeOid, List<uint> Sequences)> own = Merge(ownRoot,
+                ownPartitions.TryGetValue(leaf, out Dictionary<string, (uint TypeOid, List<uint> Sequences)>? columns) ? columns : []);
+            foreach ((string column, (uint typeOid, List<uint> sequences)) in GuardedColumns(leaf, tree))
+            {
+                if (!own.TryGetValue(column, out (uint TypeOid, List<uint> Sequences) before) || !sequences.TrueForAll(before.Sequences.Contains))
+                {
+                    SequenceRangeGuard.CheckRows(QualifiedName(leaf), false, column, typeOid == NumericOid, sequences);
+                }
             }
         }
     }
@@ -1629,7 +1669,7 @@ internal static unsafe partial class SequenceRanges
     /// </summary>
     /// <param name="name">The name.</param>
     /// <returns>Whether it is.</returns>
-    internal static bool IsGuardName(string name) => name is GuardName or UpdateGuardName;
+    internal static bool IsGuardName(string name) => name is GuardName or UpdateGuardName or PartitionGuardName or PartitionUpdateGuardName;
 
     private static bool IsGuarded(uint relid)
         => relid != 0 && Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid = $1 AND tgname = ANY ($2))",
@@ -2980,13 +3020,14 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
-    /// Puts the guard on a table's partition tree, or on the table itself when it's no partition, checking each column
-    /// that uses a managed sequence anywhere in the tree. The guard is a pair of triggers on the tree's root, which
-    /// PostgreSQL gives every partition, that run after each row is written, so that they see the row every BEFORE
-    /// trigger left, and whose conditions check the values: those of a new row, and those an update changes. A value
-    /// passes under any of the managed sequences its column uses. Columns are referenced by number, so a renamed column
-    /// stays checked, and the triggers' arguments list what they check, so that a guard that checks the same is left
-    /// alone and its tree's writers aren't held up.
+    /// Puts the guard on a table's partition tree, or on the table itself when it's no partition. The guard is pairs of
+    /// triggers that run after each row is written, so that they see the row every BEFORE trigger left, and whose
+    /// conditions check the values: those of a new row, and those an update changes. The tree's root has a pair, which
+    /// PostgreSQL gives every partition, for the columns the root numbers from a managed sequence, and a partition has a
+    /// pair of its own for any other column that it, or a partitioned table between it and the root, numbers from one,
+    /// so that attaching it changes no other table's triggers. A value passes under any of the managed sequences its
+    /// column uses. Columns are referenced by number, so a renamed column stays checked, and the triggers' arguments
+    /// list what they check, so that a pair that checks the same is left alone and its writers aren't held up.
     /// </summary>
     private static void InstallGuard(uint relid)
     {
@@ -2996,9 +3037,51 @@ internal static unsafe partial class SequenceRanges
         }
 
         uint root = TreeRoot(relid);
-        Dictionary<string, (uint TypeOid, List<uint> Sequences)> columns = GuardedColumns(root);
+        (Dictionary<string, (uint TypeOid, List<uint> Sequences)> rootColumns,
+            Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences)>> partitions,
+            Dictionary<uint, (uint Parent, bool Leaf)> members) = TreeColumns(root);
+
+        // Only worf creates a trigger with the guard's function, so one with another, as a trigger with the guard's name
+        // that predates worf has, or one that doesn't fire, is no guard.
+        SpiResult existing = Worf.Read("""
+            SELECT tgrelid::oid, tgname::text, encode(tgargs, 'escape'), tgfoid = $3 AND tgenabled IN ('O', 'A')
+            FROM pg_catalog.pg_trigger WHERE tgrelid = ANY ($1::oid[]) AND tgname = ANY ($2) AND tgparentid = 0
+            """, 0, SpiParameter.Create(members.Keys.Select(member => (long)member).ToArray()), SpiParameter.Create(s_guardNames),
+            SpiParameter.Create(GuardFunction()));
+        List<(uint Relid, string Name, string Arguments, bool Ours)> triggers = [];
+        for (int i = 0; i < existing.Count; i++)
+        {
+            triggers.Add((existing[i].Get<uint>(0), existing[i].Get<string>(1), existing[i].Get<string>(2), existing[i].Get<bool>(3)));
+        }
+
+        // A moved row's insert into a partition leaves the check of the root's columns to the root's update guard, which
+        // compares the row's old and new values, but a partition's own columns are checked as a new row's.
+        InstallPair(root, GuardName, UpdateGuardName, "worf.sequence_range_check", rootColumns, triggers);
+        foreach (uint member in members.Keys)
+        {
+            InstallPair(member, PartitionGuardName, PartitionUpdateGuardName, "worf.sequence_range_check_update",
+                member != root && partitions.TryGetValue(member, out Dictionary<string, (uint TypeOid, List<uint> Sequences)>? columns) ? columns : [],
+                triggers);
+        }
+    }
+
+    /// <summary>
+    /// Puts a pair of guard triggers on a table that check columns, replacing a pair that checks others, or drops the
+    /// pair when there are none.
+    /// </summary>
+    private static void InstallPair(uint relid, string insertName, string updateName, string insertCheck,
+        Dictionary<string, (uint TypeOid, List<uint> Sequences)> columns, List<(uint Relid, string Name, string Arguments, bool Ours)> triggers)
+    {
+        List<(uint Relid, string Name, string Arguments, bool Ours)> existing = triggers.FindAll(trigger =>
+            trigger.Relid == relid && (trigger.Name == insertName || trigger.Name == updateName));
+        if (columns.Count == 0 && existing.Count == 0)
+        {
+            return;
+        }
+
+        string table = QualifiedName(relid);
         SpiResult attributes = Worf.Read("SELECT attname::text, attnum FROM pg_catalog.pg_attribute WHERE attrelid = $1 AND attnum > 0 AND NOT attisdropped",
-            0, SpiParameter.Create(root));
+            0, SpiParameter.Create(relid));
         Dictionary<string, short> attnums = [];
         for (int i = 0; i < attributes.Count; i++)
         {
@@ -3010,38 +3093,28 @@ internal static unsafe partial class SequenceRanges
                 column.Value.Sequences))
             .OrderBy(column => column.Item1)];
         List<string> arguments = [.. guarded.Select(column => $"{column.Attnum}:{string.Join(",", column.Sequences)}")];
-        string table = QualifiedName(root);
-
-        // Only worf creates a trigger with the guard's function, so one with another, as a trigger with the guard's name
-        // that predates worf has, or one that doesn't fire, is no guard.
-        SpiResult existing = Worf.Read("""
-            SELECT tgname::text, encode(tgargs, 'escape'), tgfoid = $3 AND tgenabled IN ('O', 'A')
-            FROM pg_catalog.pg_trigger WHERE tgrelid = $1 AND tgname = ANY ($2) AND tgparentid = 0
-            """, 0, SpiParameter.Create(root), SpiParameter.Create(s_guardNames), SpiParameter.Create(GuardFunction()));
         string encoded = string.Concat(arguments.Select(argument => argument + "\\000"));
-        if (guarded.Count == 0 || (existing.Count == s_guardNames.Length &&
-            Enumerable.Range(0, existing.Count).All(i => existing[i].Get<string>(1) == encoded && existing[i].Get<bool>(2))))
+        if (guarded.Count == 0 || (existing.Count == 2 && existing.TrueForAll(trigger => trigger.Arguments == encoded && trigger.Ours)))
         {
-            // A tree with no column that uses a managed sequence keeps no guard.
-            for (int i = 0; guarded.Count == 0 && i < existing.Count; i++)
+            // A table with no column to check keeps no pair.
+            foreach ((_, string name, _, _) in guarded.Count == 0 ? existing : [])
             {
-                RunInternalDdl($"DROP TRIGGER {Spi.QuoteIdentifier(existing[i].Get<string>(0))} ON {table}");
+                RunInternalDdl($"DROP TRIGGER {Spi.QuoteIdentifier(name)} ON {table}");
             }
 
             return;
         }
 
-        for (int i = 0; i < existing.Count; i++)
+        foreach ((_, string name, _, bool ours) in existing)
         {
-            if (!existing[i].Get<bool>(2))
+            if (!ours)
             {
-                RunInternalDdl($"DROP TRIGGER {Spi.QuoteIdentifier(existing[i].Get<string>(0))} ON {table}");
+                RunInternalDdl($"DROP TRIGGER {Spi.QuoteIdentifier(name)} ON {table}");
             }
         }
 
-        // An update's condition checks only a value it changes, as when it moves a row to another partition, which
-        // PostgreSQL checks against the partitioned table's update guard after the row's insert. A value that none of a
-        // column's sequences admits is checked under each, as a restore needs every one of them to say it can't issue it.
+        // An update's condition checks only a value it changes. A value that none of a column's sequences admits is
+        // checked under each, so that every one of them has its say.
         string Check(string check, string name, string type, List<uint> sequences)
         {
             string each = string.Join(" OR ", sequences.Select(seq => $"{check}({Sequence(seq)}, NEW.{name}::{type})"));
@@ -3054,12 +3127,12 @@ internal static unsafe partial class SequenceRanges
 
         string function = $"worf.sequence_range_guard({string.Join(", ", arguments.Select(Spi.QuoteLiteral))})";
         RunInternalDdl($"""
-            CREATE OR REPLACE TRIGGER {GuardName} AFTER INSERT ON {table}
-            FOR EACH ROW WHEN ({string.Join(" OR ", guarded.Select(c => Check("worf.sequence_range_check", c.Name, c.Type, c.Sequences)))})
+            CREATE OR REPLACE TRIGGER {insertName} AFTER INSERT ON {table}
+            FOR EACH ROW WHEN ({string.Join(" OR ", guarded.Select(c => Check(insertCheck, c.Name, c.Type, c.Sequences)))})
             EXECUTE FUNCTION {function}
             """);
         RunInternalDdl($"""
-            CREATE OR REPLACE TRIGGER {UpdateGuardName} AFTER UPDATE ON {table}
+            CREATE OR REPLACE TRIGGER {updateName} AFTER UPDATE ON {table}
             FOR EACH ROW WHEN ({string.Join(" OR ", guarded.Select(c =>
                 $"(OLD.{c.Name} IS DISTINCT FROM NEW.{c.Name} AND {Check("worf.sequence_range_check_update", c.Name, c.Type, c.Sequences)})"))})
             EXECUTE FUNCTION {function}
@@ -3073,52 +3146,156 @@ internal static unsafe partial class SequenceRanges
         => relid == 0 ? 0 : Worf.ReadScalar<uint?>("SELECT pg_catalog.pg_partition_root($1::regclass)::oid", SpiParameter.Create(relid)) ?? relid;
 
     /// <summary>
-    /// Lists, by name, the columns of a table and its partitions that use a managed sequence, with their types and the
-    /// sequences they use.
+    /// Lists, by name, the columns a table's rows are checked in, with their types and the managed sequences they use:
+    /// for a partitioned table, those of every partition beneath it.
     /// </summary>
-    private static Dictionary<string, (uint TypeOid, List<uint> Sequences)> GuardedColumns(uint top)
+    private static Dictionary<string, (uint TypeOid, List<uint> Sequences)> GuardedColumns(uint relid)
+        => GuardedColumns(relid, TreeColumns(TreeRoot(relid)));
+
+    /// <summary>
+    /// Lists, by name, the columns a table's rows are checked in, from the columns of its tree.
+    /// </summary>
+    private static Dictionary<string, (uint TypeOid, List<uint> Sequences)> GuardedColumns(uint relid,
+        (Dictionary<string, (uint TypeOid, List<uint> Sequences)> Root, Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences)>> Partitions,
+            Dictionary<uint, (uint Parent, bool Leaf)> Members) tree)
     {
-        HashSet<uint> tree = [top];
-        SpiResult partitions = Worf.Read("SELECT relid::oid FROM pg_catalog.pg_partition_tree($1::regclass)", 0, SpiParameter.Create(top));
-        for (int i = 0; i < partitions.Count; i++)
+        Dictionary<string, (uint TypeOid, List<uint> Sequences)> columns = Merge(tree.Root, []);
+        foreach ((uint partition, Dictionary<string, (uint TypeOid, List<uint> Sequences)> own) in tree.Partitions)
         {
-            _ = tree.Add(partitions[i].Get<uint>(0));
+            if (Beneath(partition, relid, tree.Members))
+            {
+                columns = Merge(columns, own);
+            }
         }
 
-        Dictionary<string, (uint TypeOid, List<uint> Sequences)> columns = [];
-        Dictionary<(uint Relid, string Column), List<uint>> uses = [];
+        return columns;
+    }
+
+    /// <summary>
+    /// Lists, by name, the columns of a partition tree, or of a table that is no partition, that use a managed sequence,
+    /// with their types and the sequences they use: those the root numbers from one, each with every sequence it uses
+    /// anywhere in the tree, and for each partition beneath, the other columns that it, or a partitioned table between
+    /// it and the root, numbers from one. It also lists the tree's tables, with their parents and whether they hold
+    /// rows.
+    /// </summary>
+    private static (Dictionary<string, (uint TypeOid, List<uint> Sequences)> Root,
+        Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences)>> Partitions,
+        Dictionary<uint, (uint Parent, bool Leaf)> Members) TreeColumns(uint root)
+    {
+        // An inheritance child is a tree of its own.
+        Dictionary<uint, (uint Parent, bool Leaf)> members = [];
+        SpiResult tree = Worf.Read("""
+            SELECT relid::oid, parentrelid::oid, isleaf FROM pg_catalog.pg_partition_tree($1::regclass) WHERE relid = $1 OR parentrelid IS NOT NULL
+            """, 0, SpiParameter.Create(root));
+        for (int i = 0; i < tree.Count; i++)
+        {
+            members[tree[i].Get<uint>(0)] = (tree[i].Get<uint?>(1) ?? 0, tree[i].Get<bool>(2));
+        }
+
+        if (!members.ContainsKey(root))
+        {
+            members[root] = (0, true);
+        }
+
+        Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences)>> uses = [];
         SpiResult managed = Elevated.Run(() => Worf.SelectCatalog("SELECT seqoid::oid FROM worf.sequence_range ORDER BY seqoid"));
         for (int i = 0; i < managed.Count; i++)
         {
             uint managedSeq = managed[i].Get<uint>(0);
-            foreach ((uint relid, string column, uint typeOid) in UsingColumns(managedSeq).Where(entry => tree.Contains(entry.Relid)))
+            foreach ((uint relid, string column, uint typeOid) in UsingColumns(managedSeq).Where(entry => members.ContainsKey(entry.Relid)))
             {
                 RequireCheckable(relid, column, typeOid, managedSeq);
-                if (!columns.TryGetValue(column, out (uint TypeOid, List<uint> Sequences) entry))
+                if (!uses.TryGetValue(relid, out Dictionary<string, (uint TypeOid, List<uint> Sequences)>? columns))
                 {
-                    entry = (typeOid, []);
-                    columns.Add(column, entry);
+                    uses.Add(relid, columns = []);
                 }
 
-                if (!entry.Sequences.Contains(managedSeq))
-                {
-                    entry.Sequences.Add(managedSeq);
-                }
-
-                if (!uses.TryGetValue((relid, column), out List<uint>? sequences))
-                {
-                    uses.Add((relid, column), sequences = []);
-                }
-
-                sequences.Add(managedSeq);
+                uses[relid] = Merge(columns, new() { [column] = (typeOid, [managedSeq]) });
             }
         }
 
-        foreach (((uint relid, string column), List<uint> sequences) in uses)
+        foreach ((uint relid, Dictionary<string, (uint TypeOid, List<uint> Sequences)> columns) in uses)
         {
-            RequireNextval(relid, column, sequences);
+            foreach ((string column, (_, List<uint> sequences)) in columns)
+            {
+                RequireNextval(relid, column, sequences);
+            }
         }
 
-        return columns;
+        // The root's columns take every sequence they use anywhere in the tree, since every partition has the root's
+        // guard.
+        Dictionary<string, (uint TypeOid, List<uint> Sequences)> rootColumns = [];
+        IEnumerable<string> numbered = uses.TryGetValue(root, out Dictionary<string, (uint TypeOid, List<uint> Sequences)>? numberedByRoot)
+            ? numberedByRoot.Keys
+            : [];
+        foreach (string column in numbered)
+        {
+            foreach (Dictionary<string, (uint TypeOid, List<uint> Sequences)> columns in uses.Values.Where(columns => columns.ContainsKey(column)))
+            {
+                rootColumns = Merge(rootColumns, new() { [column] = columns[column] });
+            }
+        }
+
+        Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences)>> partitions = [];
+        foreach ((uint relid, (_, bool leaf)) in members)
+        {
+            if (relid == root || !leaf)
+            {
+                continue;
+            }
+
+            Dictionary<string, (uint TypeOid, List<uint> Sequences)> columns = [];
+            for (uint member = relid; member != root && members.TryGetValue(member, out (uint Parent, bool Leaf) entry); member = entry.Parent)
+            {
+                foreach ((string column, (uint TypeOid, List<uint> Sequences) use) in
+                    uses.TryGetValue(member, out Dictionary<string, (uint TypeOid, List<uint> Sequences)>? own) ? own : [])
+                {
+                    if (!rootColumns.ContainsKey(column))
+                    {
+                        columns = Merge(columns, new() { [column] = use });
+                    }
+                }
+            }
+
+            if (columns.Count > 0)
+            {
+                partitions.Add(relid, columns);
+            }
+        }
+
+        return (rootColumns, partitions, members);
+    }
+
+    /// <summary>
+    /// Joins two sets of columns, each with the sequences it uses in either.
+    /// </summary>
+    private static Dictionary<string, (uint TypeOid, List<uint> Sequences)> Merge(Dictionary<string, (uint TypeOid, List<uint> Sequences)> first,
+        Dictionary<string, (uint TypeOid, List<uint> Sequences)> second)
+    {
+        Dictionary<string, (uint TypeOid, List<uint> Sequences)> merged = [];
+        foreach ((string column, (uint typeOid, List<uint> sequences)) in first.Concat(second))
+        {
+            merged[column] = merged.TryGetValue(column, out (uint TypeOid, List<uint> Sequences) known)
+                ? (known.TypeOid, [.. known.Sequences.Union(sequences)])
+                : (typeOid, [.. sequences]);
+        }
+
+        return merged;
+    }
+
+    /// <summary>
+    /// Checks whether a table of a partition tree is another, or lies beneath it.
+    /// </summary>
+    private static bool Beneath(uint relid, uint ancestor, Dictionary<uint, (uint Parent, bool Leaf)> members)
+    {
+        for (uint member = relid; member != 0; member = members.TryGetValue(member, out (uint Parent, bool Leaf) entry) ? entry.Parent : 0)
+        {
+            if (member == ancestor)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 }
