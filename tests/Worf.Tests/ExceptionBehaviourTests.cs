@@ -254,7 +254,9 @@ public sealed class ExceptionBehaviourTests
             INSERT INTO a VALUES (1, 'initial');
             INSERT INTO b VALUES (1, 'initial');
             """, token);
-        await SubscribeAsync(provider, subscriber, token);
+
+        // The subscription forwards no other node's changes, as the table sync below relies on.
+        await SubscribeAsync(provider, subscriber, token, "{}");
 
         // This transaction holds b. The remote transaction updates a, then fails on its bad row before it updates b,
         // so discard applies it again, and the replay updates a and waits for b. This transaction then waits for a,
@@ -294,8 +296,11 @@ public sealed class ExceptionBehaviourTests
             FROM worf.exception_log
             """, token));
 
-        // The sync worker's copy waits on a lock here until a change it applies after the copy has committed. Its apply
-        // of the bad row waits on an advisory lock, so that it fails only once its walsender holds its slot.
+        // A table sync worker catches up from its own slot, with every origin's changes. Its copy waits on a lock
+        // here, so that the bad row, inserted once the copy has its snapshot, comes in its catch-up. Its apply of the
+        // bad row waits on an advisory lock until its walsender has gone on to a transaction from another origin and
+        // waits for a lock to name it, holding the slot. The apply worker's walsender skips that transaction, so the
+        // apply worker, between transactions, starts the catch-up.
         await using NpgsqlConnection holder = await subscriber.OpenAsync(Database, token);
         await using NpgsqlConnection blocker = await provider.OpenAsync(Database, token);
         foreach (TestNode node in new[] { provider, subscriber })
@@ -315,7 +320,12 @@ public sealed class ExceptionBehaviourTests
             CREATE TRIGGER hold_bad BEFORE INSERT ON synced FOR EACH ROW EXECUTE FUNCTION hold_bad();
             ALTER TABLE synced ENABLE ALWAYS TRIGGER hold_bad;
             """, token);
-        _ = await provider.SafePsqlAsync(Database, "ALTER TABLE synced DROP CONSTRAINT synced_v_check; INSERT INTO synced VALUES (1, 'copied')", token);
+        _ = await provider.SafePsqlAsync(Database, """
+            ALTER TABLE synced DROP CONSTRAINT synced_v_check;
+            INSERT INTO synced VALUES (1, 'copied');
+            CREATE TABLE elsewhere (id integer);
+            SELECT pg_replication_origin_create('elsewhere');
+            """, token);
         await using (NpgsqlCommand command = new("SELECT pg_advisory_lock(4242)", holder))
         {
             _ = await command.ExecuteNonQueryAsync(token);
@@ -331,21 +341,21 @@ public sealed class ExceptionBehaviourTests
 
             _ = await provider.SafePsqlAsync(Database,
                 "SELECT * FROM worf.replication_set_add_table('default', 'synced', synchronize_data := true)", token);
-            Assert.IsTrue(await provider.PollQueryUntilAsync(Database,
-                "SELECT count(*) = 2 FROM pg_replication_slots WHERE slot_name LIKE 'worf%'", token), "the sync worker's slot");
+            Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE relation = 'synced'::regclass AND NOT granted)", token), "the copy waiting");
             _ = await provider.SafePsqlAsync(Database, "INSERT INTO synced VALUES (2, 'bad'), (3, 'good')", token);
-
-            // Having sent the bad row, the walsender waits for this lock to name the origin of the next transaction
-            // from the provider's subscriptions, and holds the sync worker's slot meanwhile.
             await using NpgsqlTransaction subscriptions = await blocker.BeginTransactionAsync(token);
             await using (NpgsqlCommand command = new("LOCK TABLE worf.subscription", blocker, subscriptions))
             {
                 _ = await command.ExecuteNonQueryAsync(token);
             }
 
-            _ = await provider.SafePsqlAsync(Database, "SELECT pg_replication_origin_create('elsewhere')", token);
             _ = await provider.SafePsqlAsync(Database,
-                "SELECT pg_replication_origin_session_setup('elsewhere'); INSERT INTO synced VALUES (4, 'elsewhere')", token);
+                "SELECT pg_replication_origin_session_setup('elsewhere'); INSERT INTO elsewhere VALUES (1)", token);
+
+            // The apply worker waits here too, with the bad row's transaction, so its catch-up stops past it.
+            Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+                "SELECT count(*) = 2 FROM pg_locks WHERE relation = 'synced'::regclass AND NOT granted", token), "the apply worker waiting");
             await transaction.RollbackAsync(token);
 
             string slot = await subscriber.SafePsqlAsync(Database, "SELECT sub_slot_name FROM worf.subscription", token);
@@ -370,9 +380,7 @@ public sealed class ExceptionBehaviourTests
 
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
             "SELECT sync_status = 'r' FROM worf.local_sync_status WHERE sync_relname = 'synced'", token), "the table synchronized");
-        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM synced WHERE id = 4)", token),
-            "the row after the bad one");
-        Assert.AreEqual("1\n3\n4", await subscriber.SafePsqlAsync(Database, "SELECT id FROM synced ORDER BY id", token));
+        Assert.AreEqual("1\n3", await subscriber.SafePsqlAsync(Database, "SELECT id FROM synced ORDER BY id", token));
         Assert.AreEqual("discard|INSERT|public|synced|2|bad|23514", await LastLogAsync(subscriber, token));
         Assert.AreEqual(1, subscriber.ReadLog().Split("starting sync of table public.synced").Length - 1, "copies of the table");
     }
@@ -403,14 +411,16 @@ public sealed class ExceptionBehaviourTests
         return node;
     }
 
-    private static async Task SubscribeAsync(TestNode provider, TestNode subscriber, CancellationToken token)
+    private static async Task SubscribeAsync(TestNode provider, TestNode subscriber, CancellationToken token,
+        string forwardOrigins = "{all}")
     {
         _ = await subscriber.SafePsqlAsync(Database, $"""
             SELECT worf.create_subscription(
                 subscription_name := 'sub',
                 provider_dsn := '{provider.Dsn(Database, SuperUser)}',
                 synchronize_structure := false,
-                synchronize_data := false)
+                synchronize_data := false,
+                forward_origins := '{forwardOrigins}')
             """, token);
         await WaitForStatusAsync(subscriber, "replicating", token);
     }
