@@ -181,9 +181,17 @@ internal static unsafe partial class SequenceRanges
     private const uint Int8Oid = 20;
     private const uint NumericOid = 1700;
 
+    // nextval(regclass) from utils/fmgroids.h, and regclass.
+    private const uint NextvalOid = 1574;
+    private const uint RegclassOid = 2205;
+
     private static readonly string[] s_guardNames = [GuardName, UpdateGuardName];
 
     private static bool s_changedOnCommit;
+
+    // The columns whose type the running ALTER TABLE changes, by table and name, with the managed sequences that checked
+    // them when the change keeps their values, as from one integer type to another without USING.
+    private static readonly Dictionary<(uint Relid, string Column), List<uint>?> s_retyped = [];
 
     // The furthest position each sequence's active block has reached, which the range worker tracks to notice its
     // last value moving backwards.
@@ -1032,10 +1040,11 @@ internal static unsafe partial class SequenceRanges
 
         CheckGuardNames(parsetree);
 
-        // The restore of a subscription's structure is worf's own.
+        // The restore of a subscription's structure runs under these rules too: it sets a column's default once its
+        // sequence owns the column, which a column that uses a managed sequence through its ownership alone may do.
         if (parsetree->type is not (NodeTag.T_AlterSeqStmt or NodeTag.T_GrantStmt or NodeTag.T_AlterTableStmt or
             NodeTag.T_DropStmt or NodeTag.T_RenameStmt or NodeTag.T_TruncateStmt or
-            NodeTag.T_AlterObjectSchemaStmt or NodeTag.T_AlterObjectDependsStmt) || !AnyManaged() || DdlReplication.Restoring())
+            NodeTag.T_AlterObjectSchemaStmt or NodeTag.T_AlterObjectDependsStmt) || !AnyManaged())
         {
             return;
         }
@@ -1149,11 +1158,20 @@ internal static unsafe partial class SequenceRanges
         {
             AlterTableCmd* cmd = (AlterTableCmd*)cmds->elements[i].ptr_value;
             string? name = cmd->name is null ? null : Worf.FromServer(cmd->name);
+            if (!sequence && name is not null && cmd->subtype is AlterTableType.AT_AlterColumnType or AlterTableType.AT_DropColumn)
+            {
+                DropColumnGuards(relid, name, cmd->subtype == AlterTableType.AT_AlterColumnType ? (ColumnDef*)cmd->def : null);
+            }
+
             bool rejected = cmd->subtype switch
             {
                 _ when sequence => cmd->subtype != AlterTableType.AT_ChangeOwner,
-                AlterTableType.AT_ColumnDefault or AlterTableType.AT_AddIdentity or AlterTableType.AT_SetIdentity or
-                    AlterTableType.AT_DropIdentity => name is not null && ColumnUsesManaged(relid, name),
+
+                // A column that uses a managed sequence through its ownership alone may take a default, which must be
+                // nextval of one.
+                AlterTableType.AT_ColumnDefault => name is not null && ColumnUsesManaged(relid, name) && (cmd->def is null || HasDefault(relid, name)),
+                AlterTableType.AT_AddIdentity or AlterTableType.AT_SetIdentity or AlterTableType.AT_DropIdentity =>
+                    name is not null && ColumnUsesManaged(relid, name),
                 AlterTableType.AT_DisableTrig or AlterTableType.AT_EnableReplicaTrig => name is not null && IsGuardName(name),
                 AlterTableType.AT_DisableTrigAll or AlterTableType.AT_DisableTrigUser => IsGuarded(relid),
 
@@ -1165,6 +1183,46 @@ internal static unsafe partial class SequenceRanges
             {
                 throw Rejected("changing a managed sequence, a column that uses one, or its table's guard", "Disable range management first.");
             }
+        }
+    }
+
+    /// <summary>
+    /// Drops the guards that check a column whose type changes or that is dropped, on a table and its inheritors and
+    /// partitions, since PostgreSQL refuses either while a trigger uses the column. The statement's end puts the guards
+    /// back for the columns that still use a managed sequence. A type change that keeps the values, as from one integer
+    /// type to another without <c>USING</c>, leaves the column's rows unchecked.
+    /// </summary>
+    private static void DropColumnGuards(uint relid, string column, ColumnDef* retype)
+    {
+        List<long> tables = [];
+        List* inheritors = NativeMethods.find_all_inheritors(relid, 0, null);
+        for (int i = 0; inheritors is not null && i < inheritors->length; i++)
+        {
+            tables.Add(inheritors->elements[i].oid_value);
+        }
+
+        SpiResult guards = Worf.Read("""
+            SELECT DISTINCT t.tgrelid::oid, t.tgname::text
+            FROM pg_catalog.pg_trigger t
+                JOIN pg_catalog.pg_depend d ON d.classid = 'pg_catalog.pg_trigger'::regclass AND d.objid = t.oid
+                    AND d.refclassid = 'pg_catalog.pg_class'::regclass
+                JOIN pg_catalog.pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
+            WHERE t.tgrelid = ANY ($1::oid[]) AND t.tgname = ANY ($2) AND t.tgparentid = 0 AND a.attname = $3
+            """, 0, SpiParameter.Create(tables.ToArray()), SpiParameter.Create(s_guardNames), SpiParameter.Create(column));
+        if (retype is not null)
+        {
+            s_retyped[(relid, column)] = null;
+            if (guards.Count > 0 && retype->raw_default is null &&
+                GuardedColumns(TreeRoot(relid)).TryGetValue(column, out (uint TypeOid, List<uint> Sequences) guarded) &&
+                guarded.TypeOid is Int2Oid or Int4Oid or Int8Oid)
+            {
+                s_retyped[(relid, column)] = guarded.Sequences;
+            }
+        }
+
+        for (int i = 0; i < guards.Count; i++)
+        {
+            RunInternalDdl($"DROP TRIGGER {Spi.QuoteIdentifier(guards[i].Get<string>(1))} ON {QualifiedName(guards[i].Get<uint>(0))}");
         }
     }
 
@@ -1388,6 +1446,17 @@ internal static unsafe partial class SequenceRanges
                             CheckColumnRows(relid, Worf.FromServer(cmd->name), alter->relation->inh);
                             break;
 
+                        case AlterTableType.AT_AlterColumnType when cmd->name is not null:
+                            string column = Worf.FromServer(cmd->name);
+                            if (!s_retyped.Remove((relid, column), out List<uint>? kept) || kept is null ||
+                                !GuardedColumns(TreeRoot(relid)).TryGetValue(column, out (uint TypeOid, List<uint> Sequences) retyped) ||
+                                !retyped.Sequences.TrueForAll(kept.Contains))
+                            {
+                                CheckColumnRows(relid, column, alter->relation->inh);
+                            }
+
+                            break;
+
                         default:
                             break;
                     }
@@ -1609,6 +1678,76 @@ internal static unsafe partial class SequenceRanges
     }
 
     private static bool Checkable(uint typeOid) => typeOid is Int2Oid or Int4Oid or Int8Oid or NumericOid;
+
+    /// <summary>
+    /// Checks that a column that uses managed sequences draws its values from one of them: that its default, if it has
+    /// one, is nextval of one of them, alone or cast to an integer or numeric type, as a serial column's is. A default
+    /// such as <c>nextval('s') + 1000000</c> gives values the guard always refuses.
+    /// </summary>
+    private static void RequireNextval(uint relid, string column, List<uint> sequences)
+    {
+        SpiResult result = Worf.Read("""
+            SELECT d.adbin::text
+            FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+            WHERE a.attrelid = $1 AND a.attname = $2 AND a.attidentity = '' AND a.attgenerated = ''
+            """, 1, SpiParameter.Create(relid), SpiParameter.Create(column));
+        if (result.Count > 0 && !sequences.Contains(DrawsFrom(result[0].Get<string>(0))))
+        {
+            throw new PgException(FeatureNotSupported,
+                $"column \"{column}\" of table {QualifiedName(relid)} uses sequence {GetInfo(sequences[0]).Name} but its default isn't nextval of it",
+                hint: "Range management checks the values of columns whose default is nextval of the sequence, alone or cast to the column's type.");
+        }
+    }
+
+    /// <summary>
+    /// Finds the sequence an expression draws from when it is nextval of a sequence, alone or cast to an integer or
+    /// numeric type.
+    /// </summary>
+    private static uint DrawsFrom(string expression)
+    {
+        Node* node = (Node*)NativeMethods.stringToNode(Worf.PStrDup(expression));
+        while (true)
+        {
+            switch (node->type)
+            {
+                case NodeTag.T_RelabelType:
+                    node = (Node*)((RelabelType*)node)->arg;
+                    break;
+
+                case NodeTag.T_CoerceToDomain:
+                    node = (Node*)((CoerceToDomain*)node)->arg;
+                    break;
+
+                case NodeTag.T_FuncExpr when ((FuncExpr*)node)->args is not null && ((FuncExpr*)node)->args->length == 1:
+                    FuncExpr* call = (FuncExpr*)node;
+                    Node* argument = (Node*)call->args->elements[0].ptr_value;
+                    if (call->funcformat is CoercionForm.COERCE_IMPLICIT_CAST or CoercionForm.COERCE_EXPLICIT_CAST &&
+                        Checkable(NativeMethods.getBaseType(call->funcresulttype)))
+                    {
+                        node = argument;
+                        break;
+                    }
+
+                    return call->funcid == NextvalOid && argument->type == NodeTag.T_Const && ((Const*)argument)->consttype == RegclassOid &&
+                        !((Const*)argument)->constisnull
+                        ? (uint)((Const*)argument)->constvalue
+                        : 0;
+
+                default:
+                    return 0;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Checks whether a column has a default of its own.
+    /// </summary>
+    private static bool HasDefault(uint relid, string column)
+        => Worf.ReadScalar<bool>("""
+            SELECT EXISTS (
+                SELECT 1 FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+                WHERE a.attrelid = $1 AND a.attname = $2)
+            """, SpiParameter.Create(relid), SpiParameter.Create(column));
 
     /// <summary>
     /// Runs DDL that managed sequences otherwise reject, and that isn't replicated.
@@ -2860,6 +2999,7 @@ internal static unsafe partial class SequenceRanges
         }
 
         Dictionary<string, (uint TypeOid, List<uint> Sequences)> columns = [];
+        Dictionary<(uint Relid, string Column), List<uint>> uses = [];
         SpiResult managed = Elevated.Run(() => Worf.SelectCatalog("SELECT seqoid::oid FROM worf.sequence_range ORDER BY seqoid"));
         for (int i = 0; i < managed.Count; i++)
         {
@@ -2877,7 +3017,19 @@ internal static unsafe partial class SequenceRanges
                 {
                     entry.Sequences.Add(managedSeq);
                 }
+
+                if (!uses.TryGetValue((relid, column), out List<uint>? sequences))
+                {
+                    uses.Add((relid, column), sequences = []);
+                }
+
+                sequences.Add(managedSeq);
             }
+        }
+
+        foreach (((uint relid, string column), List<uint> sequences) in uses)
+        {
+            RequireNextval(relid, column, sequences);
         }
 
         return columns;

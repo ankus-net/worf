@@ -273,6 +273,37 @@ public sealed class SequenceRangeTests
             INSERT INTO pp_low DEFAULT VALUES;
             """, token);
 
+        // A guarded column changes its type, unchecked when its values stay, as from one integer type to another without
+        // USING, and drops without CASCADE. A default other than nextval of the sequence, alone or cast, is refused, and
+        // a column the sequence owns takes one that is.
+        _ = await node.SafePsqlAsync(Database, """
+            CREATE TABLE widen (id int PRIMARY KEY DEFAULT nextval('t_id_seq'), extra bigint DEFAULT nextval('t_id_seq'));
+            INSERT INTO widen DEFAULT VALUES;
+            SET session_replication_role = replica;
+            INSERT INTO widen VALUES (1200000, 1200000);
+            RESET session_replication_role;
+            ALTER TABLE widen ALTER COLUMN id TYPE bigint;
+            ALTER TABLE widen DROP COLUMN extra;
+            CREATE SEQUENCE owner_seq;
+            SELECT worf.enable_sequence_range('owner_seq', participants := '{}', range_size := 100);
+            CREATE TABLE owned (id bigint PRIMARY KEY);
+            ALTER SEQUENCE owner_seq OWNED BY owned.id;
+            ALTER TABLE owned ALTER COLUMN id SET DEFAULT nextval('owner_seq');
+            INSERT INTO owned DEFAULT VALUES;
+            CREATE TABLE plus (id bigint);
+            """, token);
+        await AssertOutsideAsync(node, "INSERT INTO widen VALUES (1300000)");
+        await AssertOutsideAsync(node, "ALTER TABLE widen ALTER COLUMN id TYPE numeric USING id");
+        foreach (string ddl in new[]
+        {
+            "CREATE TABLE plus2 (id bigint DEFAULT nextval('t_id_seq') + 1000000)",
+            "ALTER TABLE plus ALTER COLUMN id SET DEFAULT nextval('t_id_seq') * 2",
+        })
+        {
+            PostgresException error = await Assert.ThrowsExactlyAsync<PostgresException>(() => node.SafePsqlAsync(Database, ddl, token), ddl);
+            Assert.AreEqual("0A000", error.SqlState, ddl);
+        }
+
         // A role that isn't a superuser runs its own DDL, with the tables it creates joining the default replication
         // sets, but can't claim to restore a subscription's structure, and only the sequence's owner reserves its values.
         _ = await node.SafePsqlAsync(Database, """
@@ -295,6 +326,15 @@ public sealed class SequenceRangeTests
         PostgresException restore = await Assert.ThrowsExactlyAsync<PostgresException>(() => node.SafePsqlAsync(Database,
             "SET ROLE app; SET worf.subscription_schema_restore = on; DROP TRIGGER worf_sequence_range_guard ON app.app_rows", token));
         Assert.AreEqual("42501", restore.SqlState);
+        // A role granted SET on it restores structure under range management's rules all the same.
+        _ = await node.SafePsqlAsync(Database, "GRANT SET ON PARAMETER worf.subscription_schema_restore TO app", token);
+        foreach (string ddl in new[] { "DROP TRIGGER worf_sequence_range_guard ON app.app_rows", "ALTER TABLE app.app_rows ALTER COLUMN id SET DEFAULT 0" })
+        {
+            PostgresException error = await Assert.ThrowsExactlyAsync<PostgresException>(() => node.SafePsqlAsync(Database,
+                $"SET ROLE app; SET worf.subscription_schema_restore = on; {ddl}", token), ddl);
+            Assert.AreEqual("55000", error.SqlState, ddl);
+        }
+
         PostgresException reserve = await Assert.ThrowsExactlyAsync<PostgresException>(() => node.SafePsqlAsync(Database,
             "SET ROLE app; SELECT worf.reserve_sequence_values('t_id_seq', 1, 2)", token));
         Assert.AreEqual("42501", reserve.SqlState);

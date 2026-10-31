@@ -40,7 +40,7 @@ internal static unsafe partial class DdlReplication
 
     /// <summary>
     /// Gets whether this session restores a subscription's structure. Only a superuser, or a role granted SET on it,
-    /// can claim that, since such a session runs DDL that range management otherwise rejects.
+    /// can claim that, since such a session's DDL isn't replicated and joins the provider's managed sequences.
     /// </summary>
     [PgGucBool("worf.subscription_schema_restore", false, "Marks a session that restores a subscription's structure.",
         Context = PgGucContext.SuperuserSet, Flags = PgGucOptions.NoShowAll)]
