@@ -208,6 +208,11 @@ internal static unsafe partial class SequenceRanges
     // last value moving backwards.
     private static readonly Dictionary<uint, (Guid Block, long Position)> s_positions = [];
 
+    // When the range worker last read each sequence's tables for the furthest value they hold in its active block, and
+    // where the sequence was then: it reads them again once the sequence has moved, at most once a second, so that a
+    // check stays quick while sessions draw from the block.
+    private static readonly Dictionary<uint, (Guid Block, long Position, long At)> s_readStored = [];
+
     // An allocator gives a Snowflake node number that a node gave up back for use once a day has passed, so the old
     // holder's IDs, which carry their times, can't meet the new holder's.
     private static readonly TimeSpan s_snowflakeReuseAfter = TimeSpan.FromDays(1);
@@ -775,9 +780,9 @@ internal static unsafe partial class SequenceRanges
     /// Checks whether a sequence's last value moved backwards in its active block, as a <c>setval</c> by a superuser or a
     /// member of <c>pg_write_all_data</c> moves it, so that it would issue its values again: behind where it was at the
     /// last check, or behind a value a row holds in the block. Since the check went by, the sequence may have issued
-    /// values beyond where it was then, so once it has moved, the tables are read for the furthest value they hold in
-    /// the block, through an index on each column that uses the sequence, and the sequence then, which has passed every
-    /// value a committed row holds unless it moved backwards.
+    /// values beyond where it was then, so once it has moved, the tables are read, at most once a second, for the
+    /// furthest value they hold in the block, through an index on each column that uses the sequence, and the sequence
+    /// then, which has passed every value a committed row holds unless it moved backwards.
     /// </summary>
     private static bool MovedBackwards(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) active)
     {
@@ -794,7 +799,15 @@ internal static unsafe partial class SequenceRanges
         }
 
         // A sequence's bounds are its block's, so a last value outside the block was a switch or a quarantine.
-        if ((!sampled || position != seen.Position) && FurthestStored(info, active) is decimal furthest && LastValue(seqoid) is long now &&
+        long at = Worker.GetCurrentTimestamp();
+        bool read = !s_readStored.TryGetValue(seqoid, out (Guid Block, long Position, long At) last) || last.Block != active.Id ||
+            (position != last.Position && at - last.At >= 1_000_000);
+        if (read)
+        {
+            s_readStored[seqoid] = (active.Id, position, at);
+        }
+
+        if (read && FurthestStored(info, active) is decimal furthest && LastValue(seqoid) is long now &&
             now >= active.Lo && now <= active.Hi && (info.Ascending ? now < furthest : now > furthest))
         {
             PgLog.Warning($"sequence {info.Name}'s last value moved back to {now}, behind the value {furthest} a row holds in its block [{active.Lo}, {active.Hi}], so it leaves the block");

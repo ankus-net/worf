@@ -52,7 +52,8 @@ public sealed class SequenceRangeTests
             "SELECT state, active_lo, active_hi, next_lo, next_hi FROM worf.sequence_ranges", token));
         Assert.AreEqual("501", await node.SafePsqlAsync(Database, "INSERT INTO t (v) VALUES ('first') RETURNING id", token));
 
-        // The range worker switches as the block runs low.
+        // The range worker, once the manager has started it, switches as the block runs low.
+        Assert.IsTrue(await node.PollLogAsync(0, "sequence range worker managing sequences", token), "the range worker started");
         for (int i = 0; i < 25; i++)
         {
             _ = await node.SafePsqlAsync(Database, "INSERT INTO t (v) VALUES ('more')", token);
