@@ -53,8 +53,8 @@ internal sealed unsafe class WorfRelation
     public WorfRemoteType?[] RemoteTypes { get; set; } = [];
 
     /// <summary>
-    /// Gets or sets how each remote column's values sent in binary convert to its local column's type, or null for a
-    /// column whose type reads them. Filled with the local relation.
+    /// Gets or sets how each remote column's values convert to its local column's type, or null for a column whose
+    /// type reads them. Filled with the local relation.
     /// </summary>
     public WorfColumnConversion?[] Conversions { get; set; } = [];
 

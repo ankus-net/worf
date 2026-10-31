@@ -1,3 +1,4 @@
+using System.Globalization;
 using Ankus.Postgres;
 
 namespace Worf;
@@ -159,8 +160,9 @@ internal static partial class RelCache
     /// Records a remote relation's description from the information function.
     /// </summary>
     /// <param name="remoterel">The remote relation.</param>
-    internal static void RelationCacheUpdater(WorfRemoteRel remoterel)
-        => RelationCacheUpdate(remoterel.Relid, remoterel.Nspname, remoterel.Relname, [.. remoterel.Attnames]);
+    /// <param name="types">The remote columns' types, or null when the provider didn't say.</param>
+    internal static void RelationCacheUpdater(WorfRemoteRel remoterel, WorfRemoteType?[]? types)
+        => RelationCacheUpdate(remoterel.Relid, remoterel.Nspname, remoterel.Relname, [.. remoterel.Attnames], types);
 
     /// <summary>
     /// Closes the local relation. <see cref="PgLockMode.None"/> keeps the lock its open took until the transaction
@@ -279,8 +281,8 @@ internal static partial class RelCache
     }
 
     /// <summary>
-    /// Finds how each remote column's values sent in binary convert to its local column's type, and releases the
-    /// conversions found before.
+    /// Finds how each remote column's values convert to its local column's type, and releases the conversions found
+    /// before.
     /// </summary>
     private static unsafe void FindConversions(WorfRelation entry)
     {
@@ -314,10 +316,10 @@ internal static partial class RelCache
     }
 
     /// <summary>
-    /// Finds how a remote column's values sent in binary convert to the local column's type, when they're sent in
-    /// another this node reads them with: PostgreSQL's own types by OID, and others found by schema and name when
-    /// defined the same here. The local column's own type reads the rest as it always has: its own values, an enum's,
-    /// which are its labels, and those of a type this node lacks, defines differently or can't read values of.
+    /// Finds how a remote column's values convert to the local column's type, when they're sent in another: PostgreSQL's
+    /// own types are read by OID, and others found by schema and name when defined the same. An enum's values are its
+    /// labels, which an enum column reads and another reads as text. A type the subscriber lacks or defines
+    /// differently can't be read in binary, and the column's own type reads its text.
     /// </summary>
     /// <param name="remote">The type the column's values are sent in.</param>
     /// <param name="att">The local column.</param>
@@ -325,40 +327,52 @@ internal static partial class RelCache
     private static unsafe WorfColumnConversion? ColumnConversion(WorfRemoteType remote, FormData_pg_attribute* att)
     {
         uint local = NativeMethods.getBaseType(att->atttypid);
-        uint readType;
+        uint readType = 0;
         string name;
         if (remote.Definition is null)
         {
-            readType = remote.Oid;
-            if (readType == local || !Readable(readType))
+            if (remote.Oid == local)
             {
                 return null;
             }
 
-            name = Worf.FromServer(NativeMethods.format_type_be(readType));
+            if (Readable(remote.Oid))
+            {
+                readType = remote.Oid;
+                name = Worf.FromServer(NativeMethods.format_type_be(readType));
+            }
+            else
+            {
+                name = remote.Oid.ToString(CultureInfo.InvariantCulture);
+            }
         }
         else
         {
             name = $"{remote.Nspname}.{remote.Typname}";
-            if (remote.Definition == ProtoNative.EnumDefinition || TypeName(local) == name)
+            if (remote.Definition == ProtoNative.EnumDefinition)
+            {
+                if (NativeMethods.get_typtype(local) == EnumType)
+                {
+                    return null;
+                }
+
+                readType = WorfColumnConversion.TextOid;
+            }
+            else if (ProtoNative.TypeDefinition(local) == remote.Definition)
             {
                 return null;
             }
-
-            SpiResult found = Worf.SelectCatalog("""
-                SELECT t.oid FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
-                WHERE n.nspname = $1 AND t.typname = $2
-                """, SpiParameter.Create(remote.Nspname), SpiParameter.Create(remote.Typname));
-            if (found.Count == 0 || !Readable(found[0].Get<uint>(0)) ||
-                ProtoNative.TypeDefinition(found[0].Get<uint>(0)) != remote.Definition)
+            else
             {
-                return null;
-            }
-
-            readType = NativeMethods.getBaseType(found[0].Get<uint>(0));
-            if (readType == local)
-            {
-                return null;
+                SpiResult found = Worf.SelectCatalog("""
+                    SELECT t.oid FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+                    WHERE n.nspname = $1 AND t.typname = $2
+                    """, SpiParameter.Create(remote.Nspname), SpiParameter.Create(remote.Typname));
+                if (found.Count > 0 && Readable(found[0].Get<uint>(0)) &&
+                    ProtoNative.TypeDefinition(found[0].Get<uint>(0)) == remote.Definition)
+                {
+                    readType = NativeMethods.getBaseType(found[0].Get<uint>(0));
+                }
             }
         }
 
@@ -376,19 +390,6 @@ internal static partial class RelCache
         }
     }
 
-    /// <summary>
-    /// Gets a type's schema and name.
-    /// </summary>
-    private static unsafe string TypeName(uint typoid)
-    {
-        HeapTupleData* typtup = NativeMethods.typeidType(typoid);
-        FormData_pg_type* typclass = (FormData_pg_type*)NativeMethods.GETSTRUCT(typtup);
-        sbyte* nspname = NativeMethods.get_namespace_name(typclass->typnamespace);
-        string name = $"{(nspname is null ? "" : Worf.FromServer(nspname))}.{Worf.FromServer((sbyte*)&typclass->typname)}";
-        NativeMethods.ReleaseSysCache(typtup);
-        return name;
-    }
-
     private static bool ColumnDropped(uint relid, string attname)
         => Worf.SelectCatalog("""
             SELECT 1 FROM worf.dropped_column d
@@ -399,4 +400,5 @@ internal static partial class RelCache
     private const sbyte TriggerFiresOnOrigin = (sbyte)'O';
     private const sbyte TriggerDisabled = (sbyte)'D';
     private const int TriggerTypeRow = 1;
+    private const sbyte EnumType = (sbyte)'e';
 }

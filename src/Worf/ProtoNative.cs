@@ -518,6 +518,34 @@ internal static unsafe class ProtoNative
     }
 
     /// <summary>
+    /// Gets the type a column's values are sent in, as its type block names it.
+    /// </summary>
+    /// <param name="typoid">The column's type.</param>
+    /// <returns>The type, which for a domain is its base type.</returns>
+    internal static WorfRemoteType ColumnType(uint typoid)
+    {
+        typoid = NativeMethods.getBaseType(typoid);
+        if (typoid < FirstNormalObjectId)
+        {
+            return new WorfRemoteType(typoid, null, null, null);
+        }
+
+        HeapTupleData* typtup = NativeMethods.typeidType(typoid);
+        FormData_pg_type* typclass = (FormData_pg_type*)NativeMethods.GETSTRUCT(typtup);
+        sbyte* nspname = NativeMethods.get_namespace_name(typclass->typnamespace);
+        string? schema = nspname is null ? null : Worf.FromServer(nspname);
+        string typname = Worf.FromServer((sbyte*)&typclass->typname);
+        uint typnamespace = typclass->typnamespace;
+        NativeMethods.ReleaseSysCache(typtup);
+        if (schema is null)
+        {
+            throw new PgException(PgSqlStates.InternalError, $"cache lookup failed for namespace {typnamespace}");
+        }
+
+        return new WorfRemoteType(typoid, schema, typname, TypeDefinition(typoid));
+    }
+
+    /// <summary>
     /// Describes what reading a type's values depends on, the same on every node, so that a node can tell whether its
     /// type of a name reads another node's values: PostgreSQL's own types by OID, a domain as its base type, and
     /// others by kind, with the types they're made of, or a base type's input and receive functions and length.
@@ -853,11 +881,11 @@ internal static unsafe class ProtoNative
                     len = (int)NativeMethods.pq_getmsgint(@in, 4); // read length
                     sbyte* data = NativeMethods.pq_getmsgbytes(@in, len);
 
-                    // Text arrives with its terminating zero. The column's type reads it, and a value sent in binary in
-                    // another type is converted.
+                    // Text arrives with its terminating zero. A value of another type than the column's is converted,
+                    // except text of a type this node can't read, which the column's type reads.
                     int datalen = kind == 't' ? Math.Max(len - 1, 0) : len;
                     tuple.Data[attid] = new ReadOnlySpan<byte>(data, datalen).ToArray();
-                    if (kind == 'b' && rel.Conversions[i] is { } conversion)
+                    if (rel.Conversions[i] is { } conversion && (kind == 'b' || conversion.ReadType != 0))
                     {
                         (tuple.Conversions ??= new WorfColumnConversion?[desc->natts])[attid] = conversion;
                     }

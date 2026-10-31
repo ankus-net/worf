@@ -3,16 +3,18 @@ using Ankus.Postgres;
 namespace Worf;
 
 /// <summary>
-/// How a remote column's values, sent in binary in another type than their local column's, convert to it: read with
-/// the type they were sent in, then converted as an assignment would, as <c>ALTER COLUMN TYPE</c> without <c>USING</c>
-/// converts a column's values. A value of a string type with no such conversion goes through the column type's input,
-/// as text does. The conversion is compiled for its first value and kept, in its own memory context, until it's
-/// released.
+/// How a remote column's values, sent in another type than their local column's, convert to it: read with the type
+/// they were sent in, then converted as an assignment would, as <c>ALTER COLUMN TYPE</c> without <c>USING</c> converts
+/// a column's values, or else through text, which the column type's input reads with its type modifier, as it reads
+/// text. A value sent in binary in a type this node lacks or defines differently can't be read. The conversion is
+/// compiled for its first value and kept, in its own memory context, until it's released.
 /// </summary>
 internal sealed unsafe class WorfColumnConversion
 {
-    // The type category of string types.
-    private const sbyte StringCategory = (sbyte)'S';
+    /// <summary>
+    /// The OID of text, whose values an enum's labels are read as.
+    /// </summary>
+    internal const uint TextOid = 25;
 
     // The local column's name and the name of the type the values are sent in, for errors.
     private readonly string _column;
@@ -22,16 +24,21 @@ internal sealed unsafe class WorfColumnConversion
     private readonly uint _targetType;
     private readonly int _targetTypmod;
 
-    // What the conversion keeps once compiled: its memory context, the read type's length and receive function, the
-    // compiled conversion, the context it's evaluated in, and the column type's send function, or null when it has
-    // none.
+    // What the conversion keeps once compiled: its memory context, the read type's length, its receive and input
+    // functions and their parameter, the compiled conversion and the context it's evaluated in, or, for values with no
+    // assignment cast, the read type's output function and the column type's input function and its parameter, and
+    // the column type's send function, or null when it has none.
     private MemoryContextData* _context;
     private short _typlen;
     private bool _typbyval;
     private FmgrInfo* _receive;
+    private FmgrInfo* _input;
     private uint _typioparam;
     private ExprState* _state;
     private ExprContext* _econtext;
+    private FmgrInfo* _output;
+    private FmgrInfo* _columnInput;
+    private uint _columnTypioparam;
     private FmgrInfo* _send;
 
     /// <summary>
@@ -39,7 +46,8 @@ internal sealed unsafe class WorfColumnConversion
     /// </summary>
     /// <param name="column">The local column's name.</param>
     /// <param name="sourceType">The name of the type the values are sent in.</param>
-    /// <param name="readType">The local type they're read with, which isn't a domain.</param>
+    /// <param name="readType">The local type they're read with, which isn't a domain, or zero when this node lacks
+    /// the type or defines it differently.</param>
     /// <param name="targetType">The local column's type.</param>
     /// <param name="targetTypmod">The local column's type modifier.</param>
     internal WorfColumnConversion(string column, string sourceType, uint readType, uint targetType, int targetTypmod)
@@ -52,9 +60,22 @@ internal sealed unsafe class WorfColumnConversion
     }
 
     /// <summary>
-    /// Gets the local type the values are read with.
+    /// Gets the local type the values are read with, or zero when this node can't read them in binary.
     /// </summary>
     public uint ReadType { get; }
+
+    /// <summary>
+    /// Gets whether the values have no assignment cast to the column's type, and go through text. Compiles the
+    /// conversion of values this node reads.
+    /// </summary>
+    public bool ThroughText
+    {
+        get
+        {
+            Compile();
+            return _state is null;
+        }
+    }
 
     /// <summary>
     /// Reads a value sent in binary with a type, without a domain's constraints.
@@ -125,18 +146,38 @@ internal sealed unsafe class WorfColumnConversion
     /// <summary>
     /// Converts a value to the local column's type.
     /// </summary>
-    /// <param name="kind">The value's form, as <see cref="Read"/> takes it.</param>
-    /// <param name="data">Its bytes.</param>
+    /// <param name="kind">The value's form: <c>i</c> for PostgreSQL's internal one, <c>b</c> for binary, <c>t</c> for
+    /// text.</param>
+    /// <param name="data">Its bytes, without the text's terminating zero.</param>
     /// <param name="isnull">Whether the result is null.</param>
     /// <returns>The datum, in the current memory context.</returns>
     internal ulong Convert(char kind, byte[] data, out bool isnull)
     {
+        if (ReadType == 0)
+        {
+            string targetType = Worf.FromServer(NativeMethods.format_type_be(_targetType));
+            throw new PgException(PgSqlStates.DatatypeMismatch,
+                $"column \"{_column}\" is of type {targetType} but the provider's value is of type {_sourceType}, which this node lacks or defines differently");
+        }
+
         Compile();
 
         ulong value;
         fixed (byte* bytes = data)
         {
-            if (kind == 'i')
+            if (kind == 't')
+            {
+                // Text with no assignment cast is the text the column type's input reads.
+                sbyte* text = CString(bytes, data.Length);
+                if (_state is null)
+                {
+                    isnull = false;
+                    return NativeMethods.InputFunctionCall(_columnInput, text, _columnTypioparam, _targetTypmod);
+                }
+
+                value = NativeMethods.InputFunctionCall(_input, text, _typioparam, -1);
+            }
+            else if (kind == 'i')
             {
                 value = ReadInternal(ReadType, _typlen, _typbyval, bytes, data.Length);
             }
@@ -152,6 +193,13 @@ internal sealed unsafe class WorfColumnConversion
                 value = NativeMethods.ReceiveFunctionCall(_receive, &buf, _typioparam, -1);
                 CheckReadToEnd(&buf);
             }
+        }
+
+        if (_state is null)
+        {
+            isnull = false;
+            return NativeMethods.InputFunctionCall(_columnInput, NativeMethods.OutputFunctionCall(_output, value),
+                _columnTypioparam, _targetTypmod);
         }
 
         _econtext->caseValue_datum = value;
@@ -178,8 +226,11 @@ internal sealed unsafe class WorfColumnConversion
 
         _context = null;
         _receive = null;
+        _input = null;
         _state = null;
         _econtext = null;
+        _output = null;
+        _columnInput = null;
         _send = null;
     }
 
@@ -192,13 +243,34 @@ internal sealed unsafe class WorfColumnConversion
     }
 
     /// <summary>
+    /// Copies text into the current memory context with its terminating zero.
+    /// </summary>
+    private static sbyte* CString(byte* data, int len)
+    {
+        byte* text = (byte*)NativeMethods.palloc((ulong)len + 1);
+        new ReadOnlySpan<byte>(data, len).CopyTo(new Span<byte>(text, len));
+        text[len] = 0;
+        return (sbyte*)text;
+    }
+
+    /// <summary>
+    /// Gets a function's call information, kept in a memory context.
+    /// </summary>
+    private static FmgrInfo* FunctionInfo(uint function, MemoryContextData* context)
+    {
+        FmgrInfo* info = (FmgrInfo*)NativeMethods.palloc0((ulong)sizeof(FmgrInfo));
+        NativeMethods.fmgr_info_cxt(function, info, context);
+        return info;
+    }
+
+    /// <summary>
     /// Compiles the conversion once: the coercion <c>ALTER COLUMN TYPE</c> builds, over a placeholder for the value
-    /// read, planned and initialized, with the functions that read and send values. A conversion with no coercion
-    /// fails each time, so that one created later is found.
+    /// read, planned and initialized, or, when there's none, the functions that take the value through text, with the
+    /// functions that read and send values.
     /// </summary>
     private void Compile()
     {
-        if (_state is not null)
+        if (_context is not null)
         {
             return;
         }
@@ -219,19 +291,14 @@ internal sealed unsafe class WorfColumnConversion
             FormData_pg_type* typclass = (FormData_pg_type*)NativeMethods.GETSTRUCT(typtup);
             _typlen = typclass->typlen;
             _typbyval = typclass->typbyval;
-            bool hasReceive = typclass->typreceive != 0;
+            uint typreceive = typclass->typreceive;
             NativeMethods.ReleaseSysCache(typtup);
 
-            FmgrInfo* receive = null;
-            if (hasReceive)
-            {
-                uint typreceive;
-                uint typioparam;
-                NativeMethods.getTypeBinaryInputInfo(ReadType, &typreceive, &typioparam);
-                receive = (FmgrInfo*)NativeMethods.palloc0((ulong)sizeof(FmgrInfo));
-                NativeMethods.fmgr_info_cxt(typreceive, receive, context);
-                _typioparam = typioparam;
-            }
+            uint typinput;
+            uint typioparam;
+            NativeMethods.getTypeInputInfo(ReadType, &typinput, &typioparam);
+            FmgrInfo* receive = typreceive == 0 ? null : FunctionInfo(typreceive, context);
+            FmgrInfo* input = FunctionInfo(typinput, context);
 
             CaseTestExpr* source = (CaseTestExpr*)NativeMethods.palloc0((ulong)sizeof(CaseTestExpr));
             source->xpr.type = NodeTag.T_CaseTestExpr;
@@ -239,36 +306,43 @@ internal sealed unsafe class WorfColumnConversion
             source->typeMod = -1;
             source->collation = NativeMethods.get_typcollation(ReadType);
 
-            Node* coerced = Coerce((Node*)source, CoercionContext.COERCION_ASSIGNMENT);
-            if (coerced is null && NativeMethods.TypeCategory(ReadType) == StringCategory)
+            Node* coerced = Coerce((Node*)source);
+            ExprState* state = null;
+            ExprContext* econtext = null;
+            FmgrInfo* output = null;
+            FmgrInfo* columnInput = null;
+            uint columnTypioparam = 0;
+            if (coerced is not null)
             {
-                coerced = Coerce((Node*)source, CoercionContext.COERCION_EXPLICIT);
+                state = NativeMethods.ExecInitExpr(NativeMethods.expression_planner((Expr*)coerced), null);
+                econtext = NativeMethods.CreateStandaloneExprContext();
             }
-
-            if (coerced is null)
+            else
             {
-                string targetType = Worf.FromServer(NativeMethods.format_type_be(_targetType));
-                throw new PgException(PgSqlStates.DatatypeMismatch,
-                    $"column \"{_column}\" is of type {targetType} but the provider's value is of type {_sourceType}");
-            }
+                uint typoutput;
+                bool typisvarlena;
+                NativeMethods.getTypeOutputInfo(ReadType, &typoutput, &typisvarlena);
+                output = FunctionInfo(typoutput, context);
 
-            ExprState* state = NativeMethods.ExecInitExpr(NativeMethods.expression_planner((Expr*)coerced), null);
-            ExprContext* econtext = NativeMethods.CreateStandaloneExprContext();
+                uint columnTypinput;
+                NativeMethods.getTypeInputInfo(_targetType, &columnTypinput, &columnTypioparam);
+                columnInput = FunctionInfo(columnTypinput, context);
+            }
 
             typtup = NativeMethods.typeidType(_targetType);
             uint typsend = ((FormData_pg_type*)NativeMethods.GETSTRUCT(typtup))->typsend;
             NativeMethods.ReleaseSysCache(typtup);
-            FmgrInfo* send = null;
-            if (typsend != 0)
-            {
-                send = (FmgrInfo*)NativeMethods.palloc0((ulong)sizeof(FmgrInfo));
-                NativeMethods.fmgr_info_cxt(typsend, send, context);
-            }
+            FmgrInfo* send = typsend == 0 ? null : FunctionInfo(typsend, context);
 
             _context = context;
             _receive = receive;
+            _input = input;
+            _typioparam = typioparam;
             _state = state;
             _econtext = econtext;
+            _output = output;
+            _columnInput = columnInput;
+            _columnTypioparam = columnTypioparam;
             _send = send;
             compiled = true;
         }
@@ -283,13 +357,14 @@ internal sealed unsafe class WorfColumnConversion
     }
 
     /// <summary>
-    /// Builds the coercion of a value of the read type to the local column's type, with its collations.
+    /// Builds the assignment coercion of a value of the read type to the local column's type, with its collations, or
+    /// null when there's none.
     /// </summary>
-    private Node* Coerce(Node* source, CoercionContext ccontext)
+    private Node* Coerce(Node* source)
     {
         ParseState* pstate = NativeMethods.make_parsestate(null);
-        Node* coerced = NativeMethods.coerce_to_target_type(pstate, source, ReadType, _targetType, _targetTypmod, ccontext,
-            CoercionForm.COERCE_IMPLICIT_CAST, -1);
+        Node* coerced = NativeMethods.coerce_to_target_type(pstate, source, ReadType, _targetType, _targetTypmod,
+            CoercionContext.COERCION_ASSIGNMENT, CoercionForm.COERCE_IMPLICIT_CAST, -1);
         if (coerced is not null)
         {
             NativeMethods.assign_expr_collations(pstate, coerced);
