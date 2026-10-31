@@ -9,6 +9,11 @@ namespace Worf;
 /// </summary>
 internal static unsafe class ProtoNative
 {
+    /// <summary>
+    /// The definition of every enum, whose values are their labels, whatever labels it has.
+    /// </summary>
+    internal const string EnumDefinition = "enum";
+
     private const byte IsReplicaIdentity = 1;
 
     // A column's flag for its type, which follows its name from protocol version 2, so that a node whose column has
@@ -536,7 +541,7 @@ internal static unsafe class ProtoNative
         switch ((char)NativeMethods.get_typtype(typoid))
         {
             case 'e':
-                return "enum";
+                return EnumDefinition;
 
             case 'r':
                 return $"range({TypeDefinition(NativeMethods.get_range_subtype(typoid))})";
@@ -832,8 +837,9 @@ internal static unsafe class ProtoNative
                         break;
                     }
 
-                    // and data
-                    tuple.Values[attid] = att->attbyval ? FetchAttByval(data, len) : (ulong)data;
+                    // and data, which has to fit the column's type
+                    tuple.Values[attid] = WorfColumnConversion.ReadInternal(att->atttypid, att->attlen, att->attbyval,
+                        (byte*)data, len);
                     tuple.Converted[attid] = true;
                     break;
                 }
@@ -847,10 +853,11 @@ internal static unsafe class ProtoNative
                     len = (int)NativeMethods.pq_getmsgint(@in, 4); // read length
                     sbyte* data = NativeMethods.pq_getmsgbytes(@in, len);
 
-                    // Text arrives with its terminating zero.
+                    // Text arrives with its terminating zero. The column's type reads it, and a value sent in binary in
+                    // another type is converted.
                     int datalen = kind == 't' ? Math.Max(len - 1, 0) : len;
                     tuple.Data[attid] = new ReadOnlySpan<byte>(data, datalen).ToArray();
-                    if (rel.Conversions[i] is { } conversion)
+                    if (kind == 'b' && rel.Conversions[i] is { } conversion)
                     {
                         (tuple.Conversions ??= new WorfColumnConversion?[desc->natts])[attid] = conversion;
                     }

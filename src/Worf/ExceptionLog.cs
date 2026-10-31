@@ -197,8 +197,7 @@ internal static class ExceptionLog
 
             try
             {
-                TupleDescData* desc = rel.Rel->rd_att;
-                return (TupleToJson(desc, oldtup, unreadableAsHex), TupleToJson(desc, newtup, unreadableAsHex), rel.Nspname,
+                return (TupleToJson(rel, oldtup, unreadableAsHex), TupleToJson(rel, newtup, unreadableAsHex), rel.Nspname,
                     rel.Relname);
             }
             finally
@@ -209,16 +208,16 @@ internal static class ExceptionLog
     }
 
     /// <summary>
-    /// Converts the columns a remote change sent to a JSON object of their text. Values in the internal format point
-    /// into the message, which has to stay pinned.
+    /// Converts the columns a remote change sent to a JSON object of their text.
     /// </summary>
-    private static unsafe string? TupleToJson(TupleDescData* desc, WorfTupleData? tuple, bool unreadableAsHex)
+    private static unsafe string? TupleToJson(WorfRelation rel, WorfTupleData? tuple, bool unreadableAsHex)
     {
         if (tuple is null)
         {
             return null;
         }
 
+        TupleDescData* desc = rel.Rel->rd_att;
         StringBuilder json = new("{");
         for (int natt = 0; natt < desc->natts && natt < tuple.Kinds.Length; natt++)
         {
@@ -241,7 +240,9 @@ internal static class ExceptionLog
                     json.Append("null");
                     break;
 
+                // Text is recorded as it came, and so is an enum's value in binary, its label, which is also its text.
                 case 't':
+                case 'b' when rel.RemoteType(natt)?.Definition == ProtoNative.EnumDefinition:
                     Executor.EscapeJson(json, Worf.FromServer(tuple.Data[natt]!));
                     break;
 
@@ -257,8 +258,8 @@ internal static class ExceptionLog
 
     /// <summary>
     /// Gets the text of a value sent in binary, or in the internal format of another type than its column's, read
-    /// with the type it was sent in, without the column's domain constraints. A value this node can't read fails, or
-    /// is recorded as its bytes in hex, as bytea shows them.
+    /// with the type it converts from, or else the column's own, without the column's domain constraints. A value this
+    /// node can't read fails, or is recorded as its bytes in hex, as bytea shows them.
     /// </summary>
     private static unsafe string BinaryToText(FormData_pg_attribute* attr, WorfTupleData tuple, int natt, bool unreadableAsHex)
     {

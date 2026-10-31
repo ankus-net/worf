@@ -783,8 +783,9 @@ internal static partial class Worf
         command.Append(CultureInfo.InvariantCulture, $", max_proto_version '{MaxProtoVersionNum}'");
         command.Append(", startup_params_format '1'");
 
-        // Binary protocol compatibility.
-        command.Append(CultureInfo.InvariantCulture, $", \"binary.want_internal_basetypes\" '{wantBinary}'");
+        // Binary protocol compatibility. Values in PostgreSQL's internal format can't take the writer's replicated rows,
+        // which read text and binary, so they would apply more slowly than binary.
+        command.Append(", \"binary.want_internal_basetypes\" '0'");
         command.Append(CultureInfo.InvariantCulture, $", \"binary.want_binary_basetypes\" '{wantBinary}'");
         command.Append(CultureInfo.InvariantCulture, $", \"binary.basetypes_major_version\" '{pgVersionNum / 100}'");
         command.Append(CultureInfo.InvariantCulture, $", \"binary.sizeof_datum\" '{SizeofDatum}'");

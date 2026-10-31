@@ -15,12 +15,30 @@ internal static partial class RelCache
     /// </summary>
     private static readonly Dictionary<uint, List<WorfRelation>> s_relationsByReloid = [];
 
+#if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
+    // TYPEOID and PROCOID, the ids of the catalog caches of types and functions, which only PostgreSQL 19's bindings
+    // name.
+    private const int TypeCacheId = 80;
+    private const int ProcCacheId = 45;
+#elif ANKUS_PG18
+    private const int TypeCacheId = 82;
+    private const int ProcCacheId = 47;
+#endif
+
+    /// <summary>
+    /// Counts the changes to types and functions this backend has seen, which the column conversions depend on.
+    /// </summary>
+    private static long s_typesStamp;
+
     [PgNativeCallback(nameof(RelcacheInvalidateCallback))]
 #if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
     private static partial RelcacheCallbackFunction InvalidateCallback { get; }
 #else
     private static partial RelSyncCallbackFunction InvalidateCallback { get; }
 #endif
+
+    [PgNativeCallback(nameof(TypeInvalidateCallback))]
+    private static partial SyscacheCallbackFunction TypeCallback { get; }
 
     /// <summary>
     /// Opens the local relation a remote relation maps to.
@@ -39,7 +57,8 @@ internal static partial class RelCache
         }
 
         // Need to update the local cache?
-        if (entry.Reloid == 0)
+        bool mapped = entry.Reloid == 0;
+        if (mapped)
         {
             RangeVar* rv = NativeMethods.makeRangeVar(Worf.PStrDup(entry.Nspname), Worf.PStrDup(entry.Relname), -1);
             entry.Rel = NativeMethods.table_openrv(rv, (int)lockmode);
@@ -54,10 +73,6 @@ internal static partial class RelCache
                 {
                     throw new PgException(PgSqlStates.InternalError, $"unknown column name {entry.Attnames[i]}");
                 }
-
-                entry.Conversions[i] = entry.Attmap[i] >= 0 && entry.RemoteTypes[i] is WorfRemoteType remote
-                    ? ColumnConversion(entry, remote, NativeMethods.TupleDescAttr(desc, entry.Attmap[i]))
-                    : null;
             }
 
             entry.Reloid = entry.Rel->rd_id;
@@ -93,6 +108,13 @@ internal static partial class RelCache
             entry.Rel = NativeMethods.table_open(entry.Reloid, (int)lockmode);
         }
 
+        // The conversions are found again for the local columns, and after a change to the types and functions they
+        // depend on.
+        if (mapped || (entry.ConversionsDependOnTypes && entry.ConversionsStamp != s_typesStamp))
+        {
+            FindConversions(entry);
+        }
+
         return entry;
     }
 
@@ -109,9 +131,14 @@ internal static partial class RelCache
     {
         Dictionary<uint, WorfRelation> hash = s_relationHash ??= RelcacheInit();
 
-        if (hash.TryGetValue(remoteid, out WorfRelation? old) && s_relationsByReloid.TryGetValue(old.Reloid, out List<WorfRelation>? entries))
+        if (hash.TryGetValue(remoteid, out WorfRelation? old))
         {
-            _ = entries.Remove(old);
+            if (s_relationsByReloid.TryGetValue(old.Reloid, out List<WorfRelation>? entries))
+            {
+                _ = entries.Remove(old);
+            }
+
+            ReleaseConversions(old);
         }
 
         // Make cached copy of the data
@@ -200,12 +227,34 @@ internal static partial class RelCache
         }
     }
 
+    /// <summary>
+    /// Notes a change to a type or function, after which the conversions that depend on them are found again.
+    /// </summary>
+#if ANKUS_PG19
+    private static void TypeInvalidateCallback(ulong arg, SysCacheIdentifier cacheid, uint hashvalue)
+#else
+    private static void TypeInvalidateCallback(ulong arg, int cacheid, uint hashvalue)
+#endif
+    {
+        _ = arg;
+        _ = cacheid;
+        _ = hashvalue;
+        s_typesStamp++;
+    }
+
     private static Dictionary<uint, WorfRelation> RelcacheInit()
     {
         // Watch for invalidation events.
         unsafe
         {
             NativeMethods.CacheRegisterRelcacheCallback(InvalidateCallback, 0);
+#if ANKUS_PG19
+            NativeMethods.CacheRegisterSyscacheCallback(SysCacheIdentifier.TYPEOID, TypeCallback, 0);
+            NativeMethods.CacheRegisterSyscacheCallback(SysCacheIdentifier.PROCOID, TypeCallback, 0);
+#else
+            NativeMethods.CacheRegisterSyscacheCallback(TypeCacheId, TypeCallback, 0);
+            NativeMethods.CacheRegisterSyscacheCallback(ProcCacheId, TypeCallback, 0);
+#endif
         }
 
         return [];
@@ -230,59 +279,101 @@ internal static partial class RelCache
     }
 
     /// <summary>
-    /// Finds how a remote column's values convert to the local column's type, when they're sent in another: they're
-    /// read with PostgreSQL's own types by OID, and with others found by schema and name when defined the same here.
-    /// Values of a type found neither way are read as the local column's own type when that's defined the same, as
-    /// the same type under another schema or name.
+    /// Finds how each remote column's values sent in binary convert to its local column's type, and releases the
+    /// conversions found before.
     /// </summary>
-    /// <param name="entry">The remote relation.</param>
+    private static unsafe void FindConversions(WorfRelation entry)
+    {
+        // Conversions left half found by an error are found again on the next open.
+        long stamp = s_typesStamp;
+        bool dependOnTypes = false;
+        entry.ConversionsDependOnTypes = true;
+        entry.ConversionsStamp = -1;
+        TupleDescData* desc = entry.Rel->rd_att;
+        for (int i = 0; i < entry.Natts; i++)
+        {
+            entry.Conversions[i]?.Release();
+            entry.Conversions[i] = null;
+            if (entry.Attmap[i] >= 0 && entry.RemoteTypes[i] is WorfRemoteType remote)
+            {
+                entry.Conversions[i] = ColumnConversion(remote, NativeMethods.TupleDescAttr(desc, entry.Attmap[i]));
+                dependOnTypes |= remote.Definition is not null || entry.Conversions[i] is not null;
+            }
+        }
+
+        entry.ConversionsDependOnTypes = dependOnTypes;
+        entry.ConversionsStamp = stamp;
+    }
+
+    private static void ReleaseConversions(WorfRelation entry)
+    {
+        foreach (WorfColumnConversion? conversion in entry.Conversions)
+        {
+            conversion?.Release();
+        }
+    }
+
+    /// <summary>
+    /// Finds how a remote column's values sent in binary convert to the local column's type, when they're sent in
+    /// another this node reads them with: PostgreSQL's own types by OID, and others found by schema and name when
+    /// defined the same here. The local column's own type reads the rest as it always has: its own values, an enum's,
+    /// which are its labels, and those of a type this node lacks, defines differently or can't read values of.
+    /// </summary>
     /// <param name="remote">The type the column's values are sent in.</param>
     /// <param name="att">The local column.</param>
-    /// <returns>The conversion, or null when the values are of the local column's type.</returns>
-    private static unsafe WorfColumnConversion? ColumnConversion(WorfRelation entry, WorfRemoteType remote, FormData_pg_attribute* att)
+    /// <returns>The conversion, or null when the local column's type reads the values.</returns>
+    private static unsafe WorfColumnConversion? ColumnConversion(WorfRemoteType remote, FormData_pg_attribute* att)
     {
-        string column = Worf.FromServer((sbyte*)&att->attname);
         uint local = NativeMethods.getBaseType(att->atttypid);
+        uint readType;
+        string name;
         if (remote.Definition is null)
         {
-            if (remote.Oid == local)
+            readType = remote.Oid;
+            if (readType == local || !Readable(readType))
             {
                 return null;
             }
 
-            return NativeMethods.get_typtype(remote.Oid) != 0
-                ? new WorfColumnConversion(column, Worf.FromServer(NativeMethods.format_type_be(remote.Oid)), remote.Oid)
-                : new WorfColumnConversion(PgSqlStates.UndefinedObject,
-                    $"type with OID {remote.Oid} of column {column} of remote table {entry.Nspname}.{entry.Relname} does not exist");
+            name = Worf.FromServer(NativeMethods.format_type_be(readType));
         }
-
-        string name = $"{remote.Nspname}.{remote.Typname}";
-        string localDefinition = ProtoNative.TypeDefinition(local);
-        if (localDefinition == remote.Definition && TypeName(local) == name)
+        else
         {
-            return null;
+            name = $"{remote.Nspname}.{remote.Typname}";
+            if (remote.Definition == ProtoNative.EnumDefinition || TypeName(local) == name)
+            {
+                return null;
+            }
+
+            SpiResult found = Worf.SelectCatalog("""
+                SELECT t.oid FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+                WHERE n.nspname = $1 AND t.typname = $2
+                """, SpiParameter.Create(remote.Nspname), SpiParameter.Create(remote.Typname));
+            if (found.Count == 0 || !Readable(found[0].Get<uint>(0)) ||
+                ProtoNative.TypeDefinition(found[0].Get<uint>(0)) != remote.Definition)
+            {
+                return null;
+            }
+
+            readType = NativeMethods.getBaseType(found[0].Get<uint>(0));
+            if (readType == local)
+            {
+                return null;
+            }
         }
 
-        SpiResult found = Worf.SelectCatalog("""
-            SELECT t.oid FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
-            WHERE n.nspname = $1 AND t.typname = $2
-            """, SpiParameter.Create(remote.Nspname), SpiParameter.Create(remote.Typname));
-        if (found.Count != 0 && ProtoNative.TypeDefinition(found[0].Get<uint>(0)) == remote.Definition)
+        return new WorfColumnConversion(Worf.FromServer((sbyte*)&att->attname), name, readType, att->atttypid, att->atttypmod);
+    }
+
+    /// <summary>
+    /// Checks whether a type exists here and its values can be read, which a shell or pseudo-type's can't.
+    /// </summary>
+    private static bool Readable(uint typoid)
+    {
+        unsafe
         {
-            uint readType = NativeMethods.getBaseType(found[0].Get<uint>(0));
-            return readType == local ? null : new WorfColumnConversion(column, name, readType);
+            return NativeMethods.get_typisdefined(typoid) && NativeMethods.get_typtype(typoid) != (sbyte)'p';
         }
-
-        if (localDefinition == remote.Definition)
-        {
-            return null;
-        }
-
-        return found.Count == 0
-            ? new WorfColumnConversion(PgSqlStates.UndefinedObject,
-                $"type {name} of column {column} of remote table {entry.Nspname}.{entry.Relname} does not exist")
-            : new WorfColumnConversion(PgSqlStates.DatatypeMismatch,
-                $"type {name} of column {column} of remote table {entry.Nspname}.{entry.Relname} is defined differently here");
     }
 
     /// <summary>

@@ -11,16 +11,24 @@ You must `CREATE EXTENSION worf` on both.
 Tables on the provider and subscriber must have the same names and be in the
 same schema. Future revisions may add mapping features.
 
-Tables on the provider and subscriber must have the same columns. A subscriber
-converts the provider's values for a column of another data type as an
-assignment does, as `ALTER COLUMN ... TYPE` without `USING` would. A value with
-no such conversion, or of a type the subscriber lacks or defines differently,
-fails with PostgreSQL's error, which `worf.exception_behaviour` handles. Types
-that aren't PostgreSQL's own match by schema and name, or else the subscriber
-column's own type when it's defined the same. A provider running an older worf
-doesn't send column types, so its columns need the same types on the
-subscriber. `CHECK` constraints, `NOT NULL` constraints, etc., must
-be the same or weaker (more permissive) on the subscriber than the provider.
+Tables on the provider and subscriber must have the same columns. A column may
+have another data type on the subscriber, as while a change of its type is on
+its way. Values sent in binary, as between nodes of the same major version, are
+read with the provider's type and converted as an assignment does, as
+`ALTER COLUMN ... TYPE` without `USING` would, or else, for a string type, by
+the column type's input. Types that aren't PostgreSQL's own are found by schema
+and name, and used when defined the same: of the same kind, with the same input
+and receive functions and length, or the same subtype, element or attribute
+types in order. The column's own type reads the rest, as it always has: values
+sent as text (in the initial copy, with `force_text_transfer`, between major
+versions, and for composites and arrays of types that aren't PostgreSQL's own),
+an enum's labels, and values of a type the subscriber lacks or defines
+differently. A value that converts neither way fails with PostgreSQL's error,
+which `worf.exception_behaviour` handles. An older worf doesn't send or read
+column types, so columns replicated through an older provider, subscriber or
+relay node need the same types. `CHECK` constraints, `NOT NULL` constraints,
+etc., must be the same or weaker (more permissive) on the subscriber than the
+provider.
 A subscriber ignores a column it dropped in rows from a provider that still
 has it.
 

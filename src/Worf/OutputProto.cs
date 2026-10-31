@@ -16,7 +16,8 @@ internal static unsafe class OutputProto
     internal const int ProtoMinVersionNum = 1;
 
     /// <summary>
-    /// The protocol version from which a RELATION message carries each column's type.
+    /// The protocol version from which a RELATION message carries each column's type, which a client that asks for
+    /// values in PostgreSQL's internal format needs to read them.
     /// </summary>
     internal const int ColumnTypesVersionNum = 2;
 
