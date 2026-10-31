@@ -200,15 +200,6 @@ internal static class SnowflakeIds
                 if (target > durable)
                 {
                     _ = Spi.Execute("SELECT pg_catalog.setval('worf.snowflake_clock', $1)", SpiParameter.Create(target));
-
-                    // While this node issues IDs, the tables keep within an hour of when it last heard from the owner of the
-                    // numbers, which shared memory records, so that it can go on issuing after a restart.
-                    _ = Spi.Execute("""
-                        UPDATE worf.sequence_range_node n SET reported_at = worf.sequence_range_heard(n.node_id, false, n.reported_at, false)
-                        FROM worf.sequence_range r
-                        WHERE r.seqoid = 'worf.snowflake_node'::regclass AND n.seqoid = r.seqoid AND n.node_id = r.owner_node
-                            AND worf.sequence_range_heard(n.node_id, false, n.reported_at, false) > n.reported_at + interval '1 hour'
-                        """);
                     unsafe
                     {
                         NativeMethods.XLogFlush(NativeMethods.GetXLogInsertRecPtr());

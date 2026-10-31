@@ -130,7 +130,8 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   How often each node exchanges sequence range reports with its neighbors
   when no request, grant or reset is waiting. While one waits, a node asks
   every check interval, then less often, up to this interval, while nothing
-  changes. The user in each provider
+  changes, and while it waits on a neighbor's fence, up to ten check
+  intervals. The user in each provider
   connection string needs `EXECUTE` on `worf.sequence_range_exchange`, which
   `PUBLIC` doesn't have. The default is `1min`.
 

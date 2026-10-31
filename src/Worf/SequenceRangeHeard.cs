@@ -6,11 +6,19 @@ namespace Worf;
 /// When this server last heard from each node of a database's sequence ranges, in shared memory, so that an exchange
 /// that brings no change writes nothing and an idle node uses no transaction IDs. The tables record a node's report when
 /// it changes. Each query that asks how recently a node reported takes the later of the two, and a node that this server
-/// hasn't heard from since it started counts, for the checks that wait on it, as heard when it started.
+/// hasn't heard from since it started counts, for the checks that wait on it, as heard when it started. A node the table
+/// has no room for has its reports written to the tables instead.
 /// </summary>
 internal static class SequenceRangeHeard
 {
-    private const int MaxNodes = 1024;
+    /// <summary>
+    /// The most nodes the table holds, for every database of the server.
+    /// </summary>
+    internal const int MaxNodes = 1024;
+
+    // How long an entry stays once its node is no longer heard from: as long as anything waits on hearing from a node,
+    // the day after which a Snowflake node number a node stopped reporting comes back.
+    private const long KeepFor = 86_400_000_000;
 
     /// <summary>
     /// Gets the shared table of when this server last heard from each node.
@@ -29,10 +37,16 @@ internal static class SequenceRangeHeard
     /// <param name="nodeId">The node.</param>
     /// <param name="direct">Whether the node exchanged with this server, rather than a neighbor relaying its report.</param>
     /// <param name="at">The time, in microseconds since 2000.</param>
-    internal static void Record(uint nodeId, bool direct, long at)
+    /// <returns>Whether the table recorded it, which it doesn't when it has no room for the node.</returns>
+    internal static bool Record(uint nodeId, bool direct, long at)
     {
         using PgLwLockExclusiveGuard<WorfHeardTable, WorfHeard> guard = Nodes.Exclusive();
         int slot = Find(guard, nodeId);
+        if (slot < 0)
+        {
+            return false;
+        }
+
         WorfHeard heard = guard[slot];
         heard.ReportedAt = Math.Max(heard.ReportedAt, at);
         if (direct)
@@ -41,6 +55,7 @@ internal static class SequenceRangeHeard
         }
 
         guard[slot] = heard;
+        return true;
     }
 
     /// <summary>
@@ -57,6 +72,11 @@ internal static class SequenceRangeHeard
     {
         using PgLwLockExclusiveGuard<WorfHeardTable, WorfHeard> guard = Nodes.Exclusive();
         int slot = Find(guard, nodeId);
+        if (slot < 0)
+        {
+            return;
+        }
+
         WorfHeard heard = guard[slot];
         if (heard.Sysid != sysid || heard.Timeline != timeline)
         {
@@ -99,31 +119,35 @@ internal static class SequenceRangeHeard
     }
 
     /// <summary>
-    /// Finds a node's entry, or claims one.
+    /// Finds a node's entry, or claims one: a free one, or else the one heard from least recently, if no node has been
+    /// heard from through it for a day. An entry a node is heard from through is never given up, so that reports of
+    /// other nodes, however many, can't make the node look silent, or drop the WAL position it was last at.
     /// </summary>
+    /// <returns>The entry, or -1 when the table has no room.</returns>
     private static int Find(PgLwLockExclusiveGuard<WorfHeardTable, WorfHeard> guard, uint nodeId)
     {
         uint dboid = DatabaseId();
-        int slot = -1;
-        for (int i = 0; i < guard.Length && slot < 0; i++)
+        for (int i = 0; i < guard.Length; i++)
         {
             if (guard[i].Dboid == dboid && guard[i].NodeId == nodeId)
+            {
+                return i;
+            }
+        }
+
+        long forgotten = Worker.GetCurrentTimestamp() - KeepFor;
+        int slot = -1;
+        for (int i = 0; i < guard.Length && (slot < 0 || guard[slot].Dboid != 0); i++)
+        {
+            long heard = Math.Max(guard[i].ReportedAt, guard[i].DirectAt);
+            if (guard[i].Dboid == 0 || (heard < forgotten && (slot < 0 || heard < Math.Max(guard[slot].ReportedAt, guard[slot].DirectAt))))
             {
                 slot = i;
             }
         }
 
-        // A full table gives up the entry heard from least recently, which then counts as heard when the table was set up.
-        if (slot < 0)
+        if (slot >= 0)
         {
-            for (int i = 0; i < guard.Length; i++)
-            {
-                if (slot < 0 || guard[i].Dboid == 0 || (guard[slot].Dboid != 0 && guard[i].ReportedAt < guard[slot].ReportedAt))
-                {
-                    slot = i;
-                }
-            }
-
             guard[slot] = new WorfHeard { Dboid = dboid, NodeId = nodeId };
         }
 

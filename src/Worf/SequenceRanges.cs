@@ -715,6 +715,26 @@ internal static unsafe partial class SequenceRanges
             }
         }
 
+        // A node that holds a Snowflake node number keeps when the tables record it last heard from the owner of the
+        // numbers within an hour of when shared memory does, even while it issues no IDs, so that a restart, which
+        // empties shared memory, doesn't make the owner look silent for long enough that the node gives the number up.
+        if (snowflake && active is not null && owner != node.Node.Id && Worf.ReadScalar<bool>("""
+            SELECT EXISTS (
+                SELECT 1 FROM worf.sequence_range_node n
+                WHERE n.seqoid = $1 AND n.node_id = $2 AND worf.sequence_range_heard(n.node_id, false, n.reported_at, false) > n.reported_at + interval '1 hour')
+            """, seq, SpiParameter.Create(owner)))
+        {
+            if (!apply)
+            {
+                return true;
+            }
+
+            _ = Spi.Execute("""
+                UPDATE worf.sequence_range_node n SET reported_at = worf.sequence_range_heard(n.node_id, false, n.reported_at, false)
+                WHERE n.seqoid = $1 AND n.node_id = $2 AND worf.sequence_range_heard(n.node_id, false, n.reported_at, false) > n.reported_at + interval '1 hour'
+                """, seq, SpiParameter.Create(owner));
+        }
+
         if (snowflake && owner == node.Node.Id && ReuseSnowflakeNumbers(seqoid, epoch, apply) && !apply)
         {
             return true;
@@ -724,9 +744,12 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
-    /// Checks whether a sequence's last value moved backwards in its active block since the last check, as a
-    /// <c>setval</c> by a superuser or a member of <c>pg_write_all_data</c> moves it, so that it would issue its values
-    /// again.
+    /// Checks whether a sequence's last value moved backwards in its active block, as a <c>setval</c> by a superuser or a
+    /// member of <c>pg_write_all_data</c> moves it, so that it would issue its values again: behind where it was at the
+    /// last check, or behind a value a row holds in the block. Since the check went by, the sequence may have issued
+    /// values beyond where it was then, so once it has moved, the tables are read for the furthest value they hold in
+    /// the block, through an index on each column that uses the sequence, and the sequence then, which has passed every
+    /// value a committed row holds unless it moved backwards.
     /// </summary>
     private static bool MovedBackwards(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) active)
     {
@@ -735,15 +758,57 @@ internal static unsafe partial class SequenceRanges
             return false;
         }
 
-        if (s_positions.TryGetValue(seqoid, out (Guid Block, long Position) seen) && seen.Block == active.Id &&
-            (info.Ascending ? position < seen.Position : position > seen.Position))
+        bool sampled = s_positions.TryGetValue(seqoid, out (Guid Block, long Position) seen) && seen.Block == active.Id;
+        if (sampled && (info.Ascending ? position < seen.Position : position > seen.Position))
         {
             PgLog.Warning($"sequence {info.Name}'s last value moved back from {seen.Position} to {position} in its block [{active.Lo}, {active.Hi}], so it leaves the block");
             return true;
         }
 
+        // A sequence's bounds are its block's, so a last value outside the block was a switch or a quarantine.
+        if ((!sampled || position != seen.Position) && FurthestStored(info, active) is decimal furthest && LastValue(seqoid) is long now &&
+            now >= active.Lo && now <= active.Hi && (info.Ascending ? now < furthest : now > furthest))
+        {
+            PgLog.Warning($"sequence {info.Name}'s last value moved back to {now}, behind the value {furthest} a row holds in its block [{active.Lo}, {active.Hi}], so it leaves the block");
+            return true;
+        }
+
         s_positions[seqoid] = (active.Id, position);
         return false;
+    }
+
+    /// <summary>
+    /// Reads the furthest value the tables hold in a block, from each column that uses the sequence and leads a btree
+    /// index, whose table isn't locked against reading, so that the read is quick and waits on no DDL. A partitioned
+    /// table's partitions, which take its column's default, are read on their own.
+    /// </summary>
+    /// <returns>The value, or null when no row holds one.</returns>
+    private static decimal? FurthestStored(SequenceInfo info, (Guid Id, long Lo, long Hi) block)
+    {
+        decimal? furthest = null;
+        foreach ((uint relid, string column, _) in UsingColumns(info.Seqoid).Where(column => NativeMethods.get_rel_relkind(column.Relid) != (sbyte)'p'))
+        {
+            if (!Worf.ReadScalar<bool>("""
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_index i
+                        JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
+                        JOIN pg_catalog.pg_am m ON m.oid = c.relam
+                        JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
+                    WHERE i.indrelid = $1 AND a.attname = $2 AND m.amname = 'btree' AND i.indisvalid AND i.indpred IS NULL)
+                """, SpiParameter.Create(relid), SpiParameter.Create(column)) ||
+                !NativeMethods.ConditionalLockRelationOid(relid, (int)PgLockMode.AccessShare))
+            {
+                continue;
+            }
+
+            if (Worf.ReadScalar<decimal?>($"SELECT {(info.Ascending ? "max" : "min")}({Spi.QuoteIdentifier(column)})::numeric FROM {QualifiedName(relid)} WHERE {Spi.QuoteIdentifier(column)} BETWEEN $1 AND $2",
+                SpiParameter.Create(block.Lo), SpiParameter.Create(block.Hi)) is decimal value)
+            {
+                furthest = furthest is not decimal f ? value : info.Ascending ? Math.Max(f, value) : Math.Min(f, value);
+            }
+        }
+
+        return furthest;
     }
 
     /// <summary>
@@ -1659,24 +1724,29 @@ internal static unsafe partial class SequenceRanges
     private static void Join(uint seqoid, WorfLocalNode node)
     {
         // The guard's and the quarantine's locks hold off writers and nextval, so the high-water mark sees every value. A
-        // node that draws from a block of an earlier epoch keeps drawing from it, since the mark covers the block.
+        // node that draws from a block of an earlier epoch keeps drawing from it, since the mark covers the block. The
+        // last value the sequence issued is read before the quarantine moves it, under a lock that waits for the
+        // transactions that called nextval and holds off the rest.
         InstallGuards(seqoid);
         SequenceInfo info = GetInfo(seqoid);
+        long? issued = null;
         if (Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range_block WHERE seqoid = $1 AND kind = 'n' AND state = 'active'",
             SpiParameter.Create(seqoid)).Count == 0)
         {
+            NativeMethods.LockRelationOid(seqoid, (int)PgLockMode.Share);
+            issued = LastValue(seqoid);
             Quarantine(info);
         }
 
-        Report(seqoid, info, node);
+        Report(seqoid, info, node, issued);
     }
 
     /// <summary>
     /// Records this node's high-water mark, its own report, under the sequence's epoch.
     /// </summary>
-    private static void Report(uint seqoid, SequenceInfo info, WorfLocalNode node)
+    private static void Report(uint seqoid, SequenceInfo info, WorfLocalNode node, long? issued = null)
     {
-        long? high = HighWater(info);
+        long? high = HighWater(info, issued);
         _ = Spi.Execute("UPDATE worf.sequence_range SET high_water = $2 WHERE seqoid = $1", SpiParameter.Create(seqoid), SpiParameter.Create(high));
         _ = Spi.Execute("""
             INSERT INTO worf.sequence_range_node (seqoid, node_id, node_name, via_node, distance, high_water, epoch, state, reported_at)
@@ -2596,7 +2666,9 @@ internal static unsafe partial class SequenceRanges
     /// Computes the highest value, or lowest for a descending sequence, that the sequence may have issued or its
     /// tables hold. A numeric column's values are rounded away from the root's start and kept within bigint.
     /// </summary>
-    private static long? HighWater(SequenceInfo info)
+    /// <param name="info">The sequence.</param>
+    /// <param name="issued">The last value the sequence issued before a quarantine moved it, if one did.</param>
+    private static long? HighWater(SequenceInfo info, long? issued)
     {
         long? high = null;
         void Take(long? value)
@@ -2613,6 +2685,7 @@ internal static unsafe partial class SequenceRanges
         // The value a quarantine reserves is never issued.
         long? last = LastValue(info.Seqoid);
         Take(last == info.QuarantineEdge ? null : last);
+        Take(issued == info.QuarantineEdge ? null : issued);
         Take(Worf.ReadScalar<long?>("SELECT last_value FROM worf.sequence_state WHERE seqoid = $1", seq));
         Take(Worf.ReadScalar<long?>("SELECT watermark FROM worf.sequence_range WHERE seqoid = $1", seq));
         Take(Worf.ReadScalar<long?>("SELECT " + pick + "(" + (info.Ascending ? "hi" : "lo") +
