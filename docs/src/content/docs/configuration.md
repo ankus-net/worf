@@ -135,6 +135,13 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   connection string needs `EXECUTE` on `worf.sequence_range_exchange`, which
   `PUBLIC` doesn't have. The default is `1min`.
 
+- `worf.sequence_range_restore`
+  Lets the session write rows whose values no managed sequence may still
+  issue as far as this node knows, as a restore of other nodes' rows, or of
+  rows from before range management, needs. See
+  [Sequence ranges](../sequence-ranges/). Only superusers and roles granted
+  `SET` on it can set it. The default is `off`.
+
 - `worf.sequence_range_timeout`
   How long a sequence range exchange waits to connect to the other node, and
   for each call to it, before the range worker cancels it. The default is

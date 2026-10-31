@@ -14,6 +14,9 @@ internal static class SequenceRangeGuard
 {
     private const string CheckViolation = "23514";
 
+    // SESSION_REPLICATION_ROLE_REPLICA from commands/trigger.h.
+    private const int SessionReplicationRoleReplica = 1;
+
     // BOOTSTRAP_SUPERUSERID from catalog/pg_authid_d.h and SECURITY_LOCAL_USERID_CHANGE from miscadmin.h.
     private const uint BootstrapSuperuserId = 10;
     private const int SecurityLocalUseridChange = 0x0001;
@@ -27,6 +30,11 @@ internal static class SequenceRangeGuard
 
     // The furthest position each sequence is known to have reached, which only moves forward within a block.
     private static readonly Dictionary<uint, long> s_reached = [];
+
+    // The spans each sequence may still issue, for a session that restores rows, as of the start of the statement they
+    // were read for.
+    private static readonly Dictionary<uint, List<(long Lo, long Hi)>> s_issuable = [];
+    private static long s_issuableAt;
 
     // pg_sequence_last_value, which reads a sequence's position without a query.
     private static nint s_lastValue;
@@ -226,7 +234,7 @@ internal static class SequenceRangeGuard
         // A value too large for a decimal, or not finite, doesn't parse, and is no bigint either.
         if (Whole(value) is not decimal exact || exact is < long.MinValue or > long.MaxValue)
         {
-            if (inserted && Moved())
+            if ((inserted && Moved()) || Restoring())
             {
                 return false;
             }
@@ -257,12 +265,24 @@ internal static class SequenceRangeGuard
                 hint: "The range worker abandons them and requests new blocks; try again once it has.");
         }
 
-        if (!Admits(seqoid, value))
+        if (!Admits(seqoid, value) && (!Restoring() || MayIssue(seqoid, value)))
         {
             throw Outside(seqoid, value.ToString(CultureInfo.InvariantCulture));
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Checks whether this session writes rows as a restore does: it sets worf.sequence_range_restore, or it runs with
+    /// session_replication_role replica, as apply and sync workers do, whose rows and DDL come from other nodes.
+    /// </summary>
+    private static bool Restoring()
+    {
+        unsafe
+        {
+            return SequenceRanges.Restore || NativeGlobals.SessionReplicationRole == SessionReplicationRoleReplica;
+        }
     }
 
     private static PgException Outside(uint seqoid, string value)
@@ -318,11 +338,12 @@ internal static class SequenceRangeGuard
 
     /// <summary>
     /// Checks the values a table's rows hold in a column that DDL brings under the guard, as when it sets the column's
-    /// default or attaches the table as a partition. A value fails when one of the managed sequences the column uses
-    /// may still issue it, as far as this node knows: when it lies ahead of this node's sequence in one of its blocks,
-    /// in a span its root or pool blocks have yet to grant, or past every value granted so far. A value the guard would
-    /// pass passes, and so does one before where range management started or in another node's block, as other nodes'
-    /// rows are.
+    /// default or attaches the table as a partition. A value passes when the guard would pass it or it lies before
+    /// where range management of the column's sequences started; in a session that restores rows, as an apply worker
+    /// does for DDL from another node, a value also passes unless one of the sequences may still issue it, as far as
+    /// this node knows. A numeric value that isn't a whole number within bigint, as NaN, is none of a sequence's. The
+    /// check looks for the values that fail by their spans, so that an index on the column, or the table's constraints,
+    /// spare it from reading every row.
     /// </summary>
     /// <param name="table">The table's qualified name.</param>
     /// <param name="inherited">Whether to check its inheritors' and partitions' rows too.</param>
@@ -332,10 +353,8 @@ internal static class SequenceRangeGuard
     internal static void CheckRows(string table, bool inherited, string column, bool numeric, List<uint> sequences)
     {
         Reload();
-        string value = Spi.QuoteIdentifier(column);
-        string Span(long lo, long hi) => string.Create(CultureInfo.InvariantCulture, $"{value} BETWEEN {lo} AND {hi}");
-        List<string> admitted = [];
-        List<string> issuable = [];
+        List<(long Lo, long Hi)> refused = [];
+        List<(long Lo, long Hi)> passed = [];
         foreach (uint seqoid in sequences)
         {
             // A sequence no longer under range management doesn't restrict its column.
@@ -344,67 +363,201 @@ internal static class SequenceRangeGuard
                 return;
             }
 
-            List<string> ahead = [];
-            foreach ((long lo, long hi, string state) in sequence.Blocks)
+            (List<(long Lo, long Hi)> admitted, (long Lo, long Hi) managed, List<(long Lo, long Hi)> issuable) = Spans(seqoid, sequence);
+            passed.AddRange(admitted);
+            if (Restoring())
             {
-                long? position = state == "active" ? Position(seqoid) : null;
-                switch (state)
-                {
-                    case "retired" or "imported":
-                        admitted.Add(Span(lo, hi));
-                        break;
-
-                    // The active block's values the sequence has passed, and those it has yet to issue.
-                    case "active" when position is long p && (sequence.Ascending ? p >= lo : p <= hi):
-                        admitted.Add(sequence.Ascending ? Span(lo, Math.Min(p, hi)) : Span(Math.Max(p, lo), hi));
-                        if (sequence.Ascending ? p < hi : p > lo)
-                        {
-                            ahead.Add(sequence.Ascending ? Span(p + 1, hi) : Span(lo, p - 1));
-                        }
-
-                        break;
-
-                    default:
-                        ahead.Add(Span(lo, hi));
-                        break;
-                }
+                refused.AddRange(issuable);
             }
-
-            SpiResult range = Elevated.Run(() => Worf.Read("""
-                SELECT r.root_start, r.watermark, f.lo, f.hi
-                FROM worf.sequence_range r
-                    LEFT JOIN worf.sequence_range_block b ON b.seqoid = r.seqoid AND b.kind IN ('r', 'p') AND b.state = 'open'
-                    LEFT JOIN worf.sequence_range_free f ON f.block_id = b.block_id
-                WHERE r.seqoid = $1
-                """, 0, SpiParameter.Create(seqoid)));
-            for (int i = 0; i < range.Count; i++)
+            else
             {
-                if (range[i].Get<long?>(2) is long lo)
-                {
-                    ahead.Add(Span(lo, range[i].Get<long>(3)));
-                }
+                refused.Add(managed);
             }
-
-            string before = range.Count > 0 && range[0].Get<long?>(0) is long start
-                ? string.Create(CultureInfo.InvariantCulture, $"{value} {(sequence.Ascending ? "<" : ">")} {start}")
-                : "false";
-            string granted = range.Count > 0 && range[0].Get<long?>(1) is long watermark
-                ? string.Create(CultureInfo.InvariantCulture, $"{value} {(sequence.Ascending ? "<=" : ">=")} {watermark}")
-                : "false";
-            issuable.Add($"NOT ({before} OR ({granted} AND NOT ({(ahead.Count == 0 ? "false" : string.Join(" OR ", ahead))})))");
         }
 
-        // A numeric value with a fraction is none of a sequence's.
-        string pass = $"{(admitted.Count == 0 ? "false" : string.Join(" OR ", admitted))}{(numeric ? $" OR {value} <> trunc({value})" : "")}";
-        string? outside = Elevated.Run(() => Worf.ReadScalar<string?>(
-            $"SELECT {value}::text FROM {(inherited ? "" : "ONLY ")}{table} WHERE NOT ({pass}) AND ({string.Join(" OR ", issuable)}) LIMIT 1"));
+        List<(long Lo, long Hi)> spans = Subtract(refused, passed);
+        if (spans.Count == 0)
+        {
+            return;
+        }
+
+        string value = Spi.QuoteIdentifier(column);
+        string condition = string.Join(" OR ", spans.Select(span => Within(value, span, numeric)));
+        if (numeric)
+        {
+            condition = $"({condition}) AND {value} = trunc({value})";
+        }
+
+        // The table's constraints, as a partition's bound, may rule the spans out, and spare reading its rows, as they spare
+        // PostgreSQL's own check of an attached partition's rows.
+        string? outside = Elevated.Run(() =>
+        {
+            unsafe
+            {
+                fixed (byte* name = Worf.ToServerCString("constraint_exclusion"))
+                fixed (byte* on = Worf.ToServerCString("on"))
+                {
+                    _ = NativeMethods.set_config_option((sbyte*)name, (sbyte*)on, GucContext.PGC_USERSET, GucSource.PGC_S_SESSION,
+                        GucAction.GUC_ACTION_SAVE, true, 0, false);
+                }
+            }
+
+            return Worf.ReadScalar<string?>($"SELECT {value}::text FROM {(inherited ? "" : "ONLY ")}{table} WHERE {condition} LIMIT 1");
+        });
         if (outside is not null)
         {
             throw new PgException(CheckViolation,
-                $"value {outside} in column \"{column}\" of table {table}, which uses sequence {SequenceRanges.GetInfo(sequences[0]).Name}, may still be issued",
-                detail: "The rows of a column that comes to use a managed sequence can't hold values its sequence may still issue on this node or another.",
-                hint: "Reserve the values first with worf.reserve_sequence_values, or change them.");
+                $"value {outside} in column \"{column}\" of table {table}, which uses sequence {SequenceRanges.GetInfo(sequences[0]).Name}, isn't one this node may write",
+                detail: "The rows of a column that comes to use a managed sequence can hold values the guard passes, or values from before range management started.",
+                hint: "Reserve the values first with worf.reserve_sequence_values, or change them. For other nodes' rows, set worf.sequence_range_restore.");
         }
+    }
+
+    /// <summary>
+    /// Finds the spans of a sequence's values, as far as this node knows: the values the guard passes, which this
+    /// node's blocks hold and its sequence has passed; the values from where range management started on; and those
+    /// the sequence may still issue, on this node or another: ahead of this node's sequence in its blocks, in a span its
+    /// root or pool blocks have yet to grant, or past every value granted so far.
+    /// </summary>
+    private static (List<(long Lo, long Hi)> Passed, (long Lo, long Hi) Managed, List<(long Lo, long Hi)> Issuable) Spans(uint seqoid,
+        (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) sequence)
+    {
+        bool ascending = sequence.Ascending;
+        List<(long Lo, long Hi)> passed = [];
+        List<(long Lo, long Hi)> issuable = [];
+        foreach ((long lo, long hi, string state) in sequence.Blocks)
+        {
+            long? position = state == "active" ? Position(seqoid) : null;
+            switch (state)
+            {
+                case "retired" or "imported":
+                    passed.Add((lo, hi));
+                    break;
+
+                // The active block's values the sequence has passed, and those it has yet to issue.
+                case "active" when position is long p && (ascending ? p >= lo : p <= hi):
+                    passed.Add(ascending ? (lo, Math.Min(p, hi)) : (Math.Max(p, lo), hi));
+                    if (ascending ? p < hi : p > lo)
+                    {
+                        issuable.Add(ascending ? (p + 1, hi) : (lo, p - 1));
+                    }
+
+                    break;
+
+                default:
+                    issuable.Add((lo, hi));
+                    break;
+            }
+        }
+
+        SpiResult range = Elevated.Run(() => Worf.Read("""
+            SELECT r.root_start, r.watermark, f.lo, f.hi
+            FROM worf.sequence_range r
+                LEFT JOIN worf.sequence_range_block b ON b.seqoid = r.seqoid AND b.kind IN ('r', 'p') AND b.state = 'open'
+                LEFT JOIN worf.sequence_range_free f ON f.block_id = b.block_id
+            WHERE r.seqoid = $1
+            """, 0, SpiParameter.Create(seqoid)));
+        for (int i = 0; i < range.Count; i++)
+        {
+            if (range[i].Get<long?>(2) is long lo)
+            {
+                issuable.Add((lo, range[i].Get<long>(3)));
+            }
+        }
+
+        // Before the root has a start, any value may be the sequence's.
+        (long Lo, long Hi) managed = range.Count > 0 && range[0].Get<long?>(0) is long start
+            ? (ascending ? (start, long.MaxValue) : (long.MinValue, start))
+            : (long.MinValue, long.MaxValue);
+        if (range.Count == 0 || range[0].Get<long?>(1) is not long watermark)
+        {
+            issuable.Add(managed);
+        }
+        else if (ascending ? watermark < long.MaxValue : watermark > long.MinValue)
+        {
+            issuable.Add(ascending ? (watermark + 1, long.MaxValue) : (long.MinValue, watermark - 1));
+        }
+
+        return (passed, managed, [.. issuable
+            .Select(span => (Math.Max(span.Lo, managed.Lo), Math.Min(span.Hi, managed.Hi)))
+            .Where(span => span.Item1 <= span.Item2)]);
+    }
+
+    /// <summary>
+    /// Removes spans of values from others.
+    /// </summary>
+    private static List<(long Lo, long Hi)> Subtract(List<(long Lo, long Hi)> spans, List<(long Lo, long Hi)> removed)
+    {
+        List<(long Lo, long Hi)> left = [.. spans.Distinct()];
+        foreach ((long lo, long hi) in removed)
+        {
+            List<(long Lo, long Hi)> next = [];
+            foreach ((long Lo, long Hi) span in left)
+            {
+                if (hi < span.Lo || lo > span.Hi)
+                {
+                    next.Add(span);
+                    continue;
+                }
+
+                if (lo > span.Lo)
+                {
+                    next.Add((span.Lo, lo - 1));
+                }
+
+                if (hi < span.Hi)
+                {
+                    next.Add((hi + 1, span.Hi));
+                }
+            }
+
+            left = next;
+        }
+
+        return left;
+    }
+
+    /// <summary>
+    /// Writes the condition that a value lies in a span. An integer column's span is open where it reaches bigint's
+    /// limit, which its values can't pass, while a numeric column's is closed, since NaN and values beyond bigint's
+    /// limits lie past it.
+    /// </summary>
+    private static string Within(string value, (long Lo, long Hi) span, bool numeric) => span switch
+    {
+        _ when numeric => string.Create(CultureInfo.InvariantCulture, $"{value} BETWEEN {span.Lo}::numeric AND {span.Hi}::numeric"),
+        (long.MinValue, long.MaxValue) => $"{value} IS NOT NULL",
+        (long.MinValue, long hi) => string.Create(CultureInfo.InvariantCulture, $"{value} <= {hi}"),
+        (long lo, long.MaxValue) => string.Create(CultureInfo.InvariantCulture, $"{value} >= {lo}"),
+        (long lo, long hi) => string.Create(CultureInfo.InvariantCulture, $"{value} BETWEEN {lo} AND {hi}"),
+    };
+
+    /// <summary>
+    /// Checks whether a sequence may still issue a value, for a session that restores rows, as of the statement the
+    /// sequence's spans were read for.
+    /// </summary>
+    private static bool MayIssue(uint seqoid, long value)
+    {
+        long statement;
+        unsafe
+        {
+            statement = NativeMethods.GetCurrentStatementStartTimestamp();
+        }
+
+        if (statement != s_issuableAt)
+        {
+            s_issuable.Clear();
+            s_issuableAt = statement;
+        }
+
+        if (!s_issuable.TryGetValue(seqoid, out List<(long Lo, long Hi)>? spans))
+        {
+            spans = s_sequences.TryGetValue(seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) sequence)
+                ? Spans(seqoid, sequence).Issuable
+                : [];
+            s_issuable.Add(seqoid, spans);
+        }
+
+        return spans.Exists(span => value >= span.Lo && value <= span.Hi);
     }
 
     /// <summary>
@@ -455,6 +608,7 @@ internal static class SequenceRangeGuard
         s_sequences.Clear();
         s_moved.Clear();
         s_reached.Clear();
+        s_issuable.Clear();
         ulong sysid;
         uint timeline;
         unsafe

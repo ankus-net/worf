@@ -221,6 +221,15 @@ internal static unsafe partial class SequenceRanges
     internal static partial int ExchangeTimeout { get; }
 
     /// <summary>
+    /// Gets whether this session restores rows, as other nodes wrote them or as they were before range management, so
+    /// that the guard passes any value that no managed sequence may still issue as far as this node knows. Only a
+    /// superuser, or a role granted SET on it, can claim that.
+    /// </summary>
+    [PgGucBool("worf.sequence_range_restore", false, "Lets this session write rows with values no node may still issue, as a restore of other nodes' rows needs.",
+        Context = PgGucContext.SuperuserSet)]
+    internal static partial bool Restore { get; }
+
+    /// <summary>
     /// Gets how often each node exchanges with its neighbors when nothing is waiting.
     /// </summary>
     [PgGucInt("worf.sequence_range_exchange_interval", 60000, "Sets how often each node exchanges sequence ranges with its neighbors.",
@@ -3031,13 +3040,14 @@ internal static unsafe partial class SequenceRanges
         }
 
         // An update's condition checks only a value it changes, as when it moves a row to another partition, which
-        // PostgreSQL checks against the partitioned table's update guard after the row's insert.
+        // PostgreSQL checks against the partitioned table's update guard after the row's insert. A value that none of a
+        // column's sequences admits is checked under each, as a restore needs every one of them to say it can't issue it.
         string Check(string check, string name, string type, List<uint> sequences)
         {
-            string first = $"{check}({Sequence(sequences[0])}, NEW.{name}::{type})";
+            string each = string.Join(" OR ", sequences.Select(seq => $"{check}({Sequence(seq)}, NEW.{name}::{type})"));
             return sequences.Count == 1
-                ? first
-                : $"(NOT ({string.Join(" OR ", sequences.Select(seq => $"worf.sequence_range_admits({Sequence(seq)}, NEW.{name}::{type})"))}) AND {first})";
+                ? each
+                : $"(NOT ({string.Join(" OR ", sequences.Select(seq => $"worf.sequence_range_admits({Sequence(seq)}, NEW.{name}::{type})"))}) AND ({each}))";
         }
 
         static string Sequence(uint seqoid) => Spi.QuoteLiteral(GetInfo(seqoid).Name) + "::regclass";

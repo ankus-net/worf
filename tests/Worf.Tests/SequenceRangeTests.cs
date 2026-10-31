@@ -248,6 +248,17 @@ public sealed class SequenceRangeTests
         await AssertOutsideAsync(node, "INSERT INTO n (id, v) VALUES (5.5, 'fraction')");
         await AssertOutsideAsync(node, "INSERT INTO n (id, v) VALUES (" + Next(Next(await node.SafePsqlAsync(Database, "SELECT max(id) FROM n", token))) + ", 'ahead')");
 
+        // A session that restores rows writes values from before range management, though not values the sequence may
+        // still issue: ahead of it in its block, or past every value granted.
+        _ = await node.SafePsqlAsync(Database, "SET worf.sequence_range_restore = on; INSERT INTO t (key, v) VALUES (0, 'restored'), (-5, 'restored')", token);
+        await AssertOutsideAsync(node, "INSERT INTO t (key, v) VALUES (-6, 'not restored')");
+        string restoredAhead = Next(Next(await node.SafePsqlAsync(Database, "SELECT max(key) FROM t", token)));
+        string pastGrants = Next(await node.SafePsqlAsync(Database, "SELECT watermark FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass", token));
+        foreach (string restored in new[] { restoredAhead, pastGrants })
+        {
+            await AssertOutsideAsync(node, $"SET worf.sequence_range_restore = on; INSERT INTO t (key, v) VALUES ({restored}, 'restored')");
+        }
+
         // An update moves a row to another partition with its value, even one from before range management, but not to
         // a value of its choosing, and a MERGE that only updates does too.
         _ = await node.SafePsqlAsync(Database, """
@@ -280,6 +291,29 @@ public sealed class SequenceRangeTests
             ALTER TABLE legacy ALTER COLUMN id SET DEFAULT nextval('t_id_seq');
             INSERT INTO pp_low DEFAULT VALUES;
             """, token);
+
+        // A numeric value that is no bigint, as NaN, passes the checks of existing rows. They find a value that fails
+        // through an index on the column, and skip a partition whose bound, which spares PostgreSQL's own check, rules
+        // the failing values out, without reading every row.
+        _ = await node.SafePsqlAsync(Database, """
+            CREATE TABLE odd (id numeric);
+            INSERT INTO odd VALUES ('NaN'), (1e30), (5.5);
+            ALTER TABLE odd ALTER COLUMN id SET DEFAULT nextval('nseq');
+            CREATE TABLE indexed (id bigint PRIMARY KEY);
+            INSERT INTO indexed SELECT -g FROM generate_series(1, 20000) g;
+            CREATE TABLE ip (id bigint DEFAULT nextval('t_id_seq'), v text) PARTITION BY RANGE (id);
+            CREATE TABLE ip_old (id bigint NOT NULL CHECK (id < 1), v text);
+            INSERT INTO ip_old SELECT -g, 'old' FROM generate_series(1, 20000) g;
+            ANALYZE indexed, ip_old;
+            """, token);
+        const string Scans = "SELECT sum(seq_scan) FROM pg_stat_user_tables WHERE relid IN ('indexed'::regclass, 'ip_old'::regclass)";
+        string scans = await node.SafePsqlAsync(Database, Scans, token);
+        _ = await node.SafePsqlAsync(Database, """
+            ALTER TABLE indexed ALTER COLUMN id SET DEFAULT nextval('t_id_seq');
+            ALTER TABLE ip ATTACH PARTITION ip_old FOR VALUES FROM (MINVALUE) TO (1);
+            SELECT pg_stat_force_next_flush();
+            """, token);
+        Assert.AreEqual(scans, await node.SafePsqlAsync(Database, Scans, token), "no sequential scan");
 
         // A guarded column changes its type, unchecked when its values stay, as from one integer type to another without
         // USING, and drops without CASCADE. A default other than nextval of the sequence, alone or cast, is refused, and
@@ -359,6 +393,10 @@ public sealed class SequenceRangeTests
         PostgresException restore = await Assert.ThrowsExactlyAsync<PostgresException>(() => node.SafePsqlAsync(Database,
             "SET ROLE app; SET worf.subscription_schema_restore = on; DROP TRIGGER worf_sequence_range_guard ON app.app_rows", token));
         Assert.AreEqual("42501", restore.SqlState);
+
+        PostgresException restoreRows = await Assert.ThrowsExactlyAsync<PostgresException>(() => node.SafePsqlAsync(Database,
+            "SET ROLE app; SET worf.sequence_range_restore = on", token));
+        Assert.AreEqual("42501", restoreRows.SqlState);
 
         // A role granted SET on it restores structure under range management's rules all the same.
         _ = await node.SafePsqlAsync(Database, "GRANT SET ON PARAMETER worf.subscription_schema_restore TO app", token);
@@ -743,11 +781,32 @@ public sealed class SequenceRangeTests
         await AssertIdleAsync([nodeA, nodeB], true, token, TimeSpan.FromSeconds(6));
         Assert.AreEqual(1, nodeA.ReadLog()[refused..].Split("has no values left above 32767 for a root").Length - 1, "node_a warned once");
 
-        // A table that comes to use the sequence may hold the other node's keys, which the other node has issued.
+        // A table that comes to use the sequence can't hold the other node's keys, which may be ones it has yet to issue,
+        // unless a session that restores rows brings them.
         _ = await nodeB.SafePsqlAsync(Database, "CREATE TABLE copied AS SELECT id, v FROM t WHERE v = 'a'", token);
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
             "SELECT watermark >= (SELECT max(id) FROM copied) FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass", token), "node_a's grants heard of");
-        _ = await nodeB.SafePsqlAsync(Database, "ALTER TABLE copied ALTER COLUMN id SET DEFAULT nextval('t_id_seq')", token);
+        PostgresException copied = await Assert.ThrowsExactlyAsync<PostgresException>(() => nodeB.SafePsqlAsync(Database,
+            "ALTER TABLE copied ALTER COLUMN id SET DEFAULT nextval('t_id_seq')", token));
+        Assert.AreEqual("23514", copied.SqlState);
+        _ = await nodeB.SafePsqlAsync(Database,
+            "SET worf.sequence_range_restore = on; ALTER TABLE copied ALTER COLUMN id SET DEFAULT nextval('t_id_seq')", token);
+
+        // DDL from the other node, which its apply worker runs, checks rows as a restore does, since they hold that node's
+        // keys.
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE shared (id bigint PRIMARY KEY)", token);
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database, """
+            SELECT * FROM worf.replication_set_add_table('default', 'shared');
+            INSERT INTO shared SELECT id FROM t WHERE v = 'a';
+            SELECT worf.replicate_ddl_command('ALTER TABLE public.shared ALTER COLUMN id SET DEFAULT nextval(''public.t_id_seq'')');
+            """, token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
+            "SELECT count(*) = 300 FROM shared WHERE EXISTS (SELECT 1 FROM pg_attrdef WHERE adrelid = 'shared'::regclass)", token),
+            "node_a's rows and default on node_b");
 
         async Task InsertAsync(TestNode node, string value)
         {
