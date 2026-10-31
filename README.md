@@ -119,8 +119,10 @@ On a subscriber, PostgreSQL tracks each replication origin in use in one of
 synchronizing another, and each other node whose changes its provider forwards
 with `forward_origins` `{all}` another. When one that needs a slot finds none
 free, subscriptions give up the slots of forwarded nodes' origins they no longer
-need, which slows apply; failing that within a few seconds, its apply or table
-sync stops with an error and retries.
+need, which slows apply; failing that within 10 seconds, its apply or table
+sync stops with an error and retries. They also give them up, within 10
+seconds, to another user of origins, such as a PostgreSQL subscription, whose
+origin has none.
 
 If you want to handle conflict resolution with last/first update wins (see
 [Conflicts](#conflicts)), you can add this additional option to
@@ -754,7 +756,11 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   change's rows or queued DDL, and the transaction it belongs to. The
   transaction that a subscription applies again, and how, is kept in
   `worf.exception_state` across restarts. Table sync workers catching up
-  after a copy handle failures the same way. The default is `error`.
+  after a copy handle failures the same way, streaming from their slot again.
+  When a walsender of their earlier connection, with the same user and
+  application name, still holds the slot after a second, they stop it; they
+  wait for anything else with a warning, and after a minute fail and copy the
+  table again. The default is `error`.
 
 - `worf.enable_ddl_replication`
   Replicates DDL as it runs, through the `ddl_sql` replication set as

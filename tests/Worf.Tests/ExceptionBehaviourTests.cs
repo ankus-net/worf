@@ -227,7 +227,8 @@ public sealed class ExceptionBehaviourTests
     /// A change that deadlocks with a local transaction while discard applies its transaction again is applied
     /// again with it once the deadlock clears, rather than skipped as if its data were at fault. A table sync worker
     /// catching up after its copy discards a failed change as the apply worker does, rather than copying again, though
-    /// the walsender it streamed from holds its slot.
+    /// the walsender it streamed from holds its slot. It leaves anything else that holds its slot, with a warning, and
+    /// one that fails while catching up starts again.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -382,7 +383,74 @@ public sealed class ExceptionBehaviourTests
             "SELECT sync_status = 'r' FROM worf.local_sync_status WHERE sync_relname = 'synced'", token), "the table synchronized");
         Assert.AreEqual("1\n3", await subscriber.SafePsqlAsync(Database, "SELECT id FROM synced ORDER BY id", token));
         Assert.AreEqual("discard|INSERT|public|synced|2|bad|23514", await LastLogAsync(subscriber, token));
-        Assert.AreEqual(1, subscriber.ReadLog().Split("starting sync of table public.synced").Length - 1, "copies of the table");
+        Assert.AreEqual(1, subscriber.ReadLog().Split("starting sync of table public.synced ").Length - 1, "copies of the table");
+
+        // A sync worker leaves anything but a walsender of its own that holds its slot, here a session reading the
+        // slot's changes that waits for the same lock, and waits for it with a warning. One that fails while it catches
+        // up, here as it waits, starts again and copies the table again, into the emptied table, rather than leaving the
+        // apply worker waiting.
+        foreach (TestNode node in new[] { provider, subscriber })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE synced2 (id integer PRIMARY KEY)", token);
+        }
+
+        _ = await provider.SafePsqlAsync(Database, "INSERT INTO synced2 VALUES (1)", token);
+        await using NpgsqlConnection reader = await provider.OpenAsync(Database, token);
+        await using NpgsqlCommand peek = reader.CreateCommand();
+        await using NpgsqlTransaction moreSubscriptions = await blocker.BeginTransactionAsync(token);
+        Task<object?> reading;
+        await using (NpgsqlConnection local = await subscriber.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction transaction = await local.BeginTransactionAsync(token);
+            await using (NpgsqlCommand command = new("LOCK TABLE synced2", local, transaction))
+            {
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+
+            _ = await provider.SafePsqlAsync(Database,
+                "SELECT * FROM worf.replication_set_add_table('default', 'synced2', synchronize_data := true)", token);
+            Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE relation = 'synced2'::regclass AND NOT granted)", token), "the second copy waiting");
+            _ = await provider.SafePsqlAsync(Database, "INSERT INTO synced2 VALUES (2)", token);
+            await using (NpgsqlCommand command = new("LOCK TABLE worf.subscription", blocker, moreSubscriptions))
+            {
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+
+            _ = await provider.SafePsqlAsync(Database,
+                "SELECT pg_replication_origin_session_setup('elsewhere'); INSERT INTO elsewhere VALUES (2)", token);
+            Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+                "SELECT count(*) = 2 FROM pg_locks WHERE relation = 'synced2'::regclass AND NOT granted", token), "the apply worker waiting again");
+
+            string slot = await subscriber.SafePsqlAsync(Database, "SELECT sub_slot_name FROM worf.subscription", token);
+            string syncSlot = await provider.SafePsqlAsync(Database,
+                $"SELECT slot_name FROM pg_replication_slots WHERE starts_with(slot_name, '{slot}_')", token);
+            peek.CommandText = $"""
+                SELECT count(*) FROM pg_logical_slot_peek_binary_changes('{syncSlot}', NULL, NULL, 'startup_params_format', '1',
+                    'min_proto_version', '1', 'max_proto_version', '1', 'worf.forward_origins', 'all')
+                """;
+            reading = peek.ExecuteScalarAsync(token);
+            Assert.IsTrue(await provider.PollQueryUntilAsync(Database, $"""
+                SELECT EXISTS (SELECT 1 FROM pg_replication_slots s JOIN pg_stat_activity a ON a.pid = s.active_pid
+                    WHERE s.slot_name = '{syncSlot}' AND a.pid = {reader.ProcessID} AND a.wait_event_type = 'Lock')
+                """, token), "the session reading the slot waiting");
+            logpos = subscriber.ReadLog().Length;
+            await transaction.RollbackAsync(token);
+        }
+
+        Assert.IsTrue(await subscriber.PollLogAsync(logpos, "which this table sync waits for", token), "the warning");
+        Assert.IsFalse(reading.IsCompleted, "the session reading the slot stopped");
+        Assert.AreEqual("u", await subscriber.SafePsqlAsync(Database,
+            "SELECT sync_status FROM worf.local_sync_status WHERE sync_relname = 'synced2'", token), "the sync catching up");
+        _ = await subscriber.SafePsqlAsync(Database,
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE backend_type LIKE 'worf sync%'", token);
+        _ = await provider.SafePsqlAsync(Database, $"SELECT pg_cancel_backend({reader.ProcessID})", token);
+        _ = await Assert.ThrowsExactlyAsync<PostgresException>(() => reading);
+        await moreSubscriptions.CommitAsync(token);
+
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+            "SELECT sync_status = 'r' FROM worf.local_sync_status WHERE sync_relname = 'synced2'", token), "the second table synchronized");
+        Assert.AreEqual("1\n2", await subscriber.SafePsqlAsync(Database, "SELECT id FROM synced2 ORDER BY id", token));
     }
 
     private static async Task<TestNode> StartNodeAsync(string name, CancellationToken token, params string[] settings)

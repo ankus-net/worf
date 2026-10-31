@@ -128,22 +128,56 @@ internal static class Rpc
     }
 
     /// <summary>
-    /// Stops the process that holds a remote replication slot, as the walsender of a connection that has closed still
-    /// can while it decodes a transaction. A process the connection's role can't signal is left.
+    /// Gets the process that holds a remote replication slot.
     /// </summary>
     /// <param name="conn">The provider connection, inside a local transaction.</param>
     /// <param name="slotName">The slot.</param>
-    internal static void TerminateSlotHolder(PgReplicationConnection conn, string slotName)
+    /// <returns>The process's id, or zero when nothing holds the slot.</returns>
+    internal static int RemoteSlotHolder(PgReplicationConnection conn, string slotName)
     {
+        IReadOnlyList<string?[]> res;
         try
         {
-            _ = conn.Query("SELECT pg_catalog.pg_terminate_backend(active_pid) " +
-                "FROM pg_catalog.pg_replication_slots " +
-                "WHERE slot_name = " + Spi.QuoteLiteral(slotName) + " AND active_pid <> pg_catalog.pg_backend_pid()", 1);
+            res = conn.Query("SELECT active_pid FROM pg_catalog.pg_replication_slots " +
+                "WHERE slot_name = " + Spi.QuoteLiteral(slotName) + " AND active", 1);
         }
         catch (PgRemoteException error)
         {
-            PgLog.Debug1($"could not stop the holder of slot \"{slotName}\": {error.Message}");
+            throw new PgException(PgSqlStates.InternalError, "getting remote slot info failed",
+                detail: $"SELECT FROM pg_catalog.pg_replication_slots failed with: ERROR:  {error.Message}\n");
+        }
+
+        return res.Count == 0 || res[0][0] is null ? 0 : int.Parse(res[0][0]!, CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>
+    /// Stops the process that holds a remote replication slot when it's a walsender of an earlier connection like this
+    /// one, with the same user and application name, as one whose connection has closed still is while it decodes a
+    /// transaction.
+    /// </summary>
+    /// <param name="conn">The provider connection, inside a local transaction.</param>
+    /// <param name="slotName">The slot.</param>
+    /// <param name="holder">The process that held the slot.</param>
+    /// <returns>Why the process wasn't stopped, or null when it was.</returns>
+    internal static string? TerminateSlotHolder(PgReplicationConnection conn, string slotName, int holder)
+    {
+        try
+        {
+            IReadOnlyList<string?[]> res = conn.Query($"""
+                SELECT pg_catalog.pg_terminate_backend(a.pid)
+                FROM pg_catalog.pg_stat_activity a
+                    JOIN pg_catalog.pg_replication_slots s ON s.active_pid = a.pid
+                WHERE s.slot_name = {Spi.QuoteLiteral(slotName)} AND a.pid = {holder.ToString(CultureInfo.InvariantCulture)}
+                    AND a.pid <> pg_catalog.pg_backend_pid() AND a.backend_type = 'walsender' AND a.usename = session_user
+                    AND a.application_name = pg_catalog.current_setting('application_name')
+                """, 1);
+            return res.Count == 0 ? "It isn't a walsender of this table sync's earlier connections, which the sync stops."
+                : res[0][0] == "t" ? null
+                : "It couldn't be signaled.";
+        }
+        catch (PgRemoteException error)
+        {
+            return $"Stopping it failed: {error.Message}";
         }
     }
 

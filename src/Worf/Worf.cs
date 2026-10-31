@@ -216,14 +216,46 @@ internal static partial class Worf
     /// <returns>The full transaction id.</returns>
     internal static ulong FullTransactionId(uint xid)
     {
-        ulong next;
-        unsafe
-        {
-            next = NativeMethods.ReadNextFullTransactionId().value;
-        }
-
+        ulong next = NextFullTransactionId;
         ulong epoch = next >> 32;
         return ((xid <= (uint)next || epoch == 0 ? epoch : epoch - 1) << 32) | xid;
+    }
+
+    /// <summary>
+    /// Gets the full id that the next transaction to need one is given, above every id given so far.
+    /// </summary>
+    internal static ulong NextFullTransactionId
+    {
+        get
+        {
+            unsafe
+            {
+                return NativeMethods.ReadNextFullTransactionId().value;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Gets the full id of the oldest transaction whose commit timestamp and origin PostgreSQL still keeps, or the next
+    /// transaction's when it keeps none, as with <c>track_commit_timestamp</c> off. Vacuum moves it on as it truncates
+    /// <c>pg_commit_ts</c>, which can be well after the transactions are frozen.
+    /// </summary>
+    internal static ulong OldestCommitTsFullTransactionId
+    {
+        get
+        {
+            uint oldest;
+            unsafe
+            {
+#if ANKUS_PG15 || ANKUS_PG16
+                oldest = NativeGlobals.ShmemVariableCache->oldestCommitTsXid;
+#else
+                oldest = NativeGlobals.TransamVariables->oldestCommitTsXid;
+#endif
+            }
+
+            return oldest == 0 ? NextFullTransactionId : FullTransactionId(oldest);
+        }
     }
 
     /// <summary>
