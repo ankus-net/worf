@@ -401,9 +401,11 @@ internal static class Functions
                 return BoolDatum(true);
             }
 
-            // If the provider node record existed only for the dropped, subscription, it should be dropped as well.
+            // If the provider node record existed only for the dropped, subscription, it should be dropped as well,
+            // along with the fences its DDL kept here, since nothing would bring the DDL.
             if (WorfNode.GetNodeSubscriptions(sub.Origin.Id, true).Count == 0)
             {
+                DdlLock.ForgetOrigin(sub.Origin.Id);
                 WorfNode.DropNodeInterfaces(sub.Origin.Id);
                 WorfNode.DropNode(sub.Origin.Id);
             }

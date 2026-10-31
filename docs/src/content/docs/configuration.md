@@ -86,19 +86,21 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   about databases, tablespaces, roles, server settings and PostgreSQL's own
   publications and subscriptions stay on their node, including renaming them,
   changing their owners, commenting on them and granting on them, as do
-  statements that use the session's temporary objects or prepared statements,
-  and what they create. A statement uses a temporary object when it opens a
-  temporary table, view or sequence; creates, changes, drops, comments on,
-  labels or grants on a temporary object; names any object with the temporary
-  schema, as `pg_temp` or by its own name; names a temporary type without a
-  schema in a cast written with `::`, `CAST` or `TREAT`; runs or inlines a
-  temporary function; or makes what it creates or changes depend on a temporary
-  object, as a column of a temporary type or a default that calls a temporary
-  function does. A `DROP` of
-  temporary and other tables drops the others everywhere; temporary objects of
-  other kinds, and worf itself, can only be dropped in a statement of their own.
-  Other nodes run concurrent statements, such as `CREATE INDEX CONCURRENTLY`, in
-  their apply transaction. The default is `off`.
+  statements that use the session's temporary objects or prepared statements
+  and create or change only temporary objects. Those that would create or
+  change other objects with them fail, since the other nodes don't have them.
+  A statement uses a temporary object when it opens a temporary table, view
+  or sequence; creates, changes, drops, comments on, labels or grants on a
+  temporary object; names any object with the temporary schema, as `pg_temp`
+  or by its own name; names a temporary type without a schema in a cast
+  written with `::`, `CAST` or `TREAT`; runs or inlines a temporary function;
+  or makes what it creates or changes depend on a temporary object, as a
+  column of a temporary type or a default that calls a temporary function
+  does. A `DROP` of temporary and other tables drops the others everywhere;
+  temporary objects of other kinds, and worf itself, can only be dropped in a
+  statement of their own. Other nodes run concurrent statements, such as
+  `CREATE INDEX CONCURRENTLY`, in their apply transaction. The default is
+  `off`.
 
 - `worf.subscription_schema_restore`
   Marks the session that restores a subscription's structure, which DDL
@@ -128,35 +130,39 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   locks the table it references too, attaching a partition, dropping a table
   or a schema with `CASCADE`, adding a domain constraint, renaming an enum
   value, or changing a composite type. It covers a partitioned table's
-  partitions, and every table with a column of a changed type, or of a
-  domain, array, range, composite type or table row type built on it.
-  Detaching a partition applies in any order. In a transaction block, any DDL
-  that locks a table against writes, such as `DROP INDEX` or `CREATE TRIGGER`,
-  takes the lock for it first, so later DDL there needn't wait. Before the DDL
-  runs, each node this node subscribes to that receives its DDL through
-  `ddl_sql` holds back writes to those tables it replicates, including writes
-  through a
+  partitions, and every table with a column of a changed type, or of a domain,
+  array, range, composite type or table row type built on it. Detaching a
+  partition applies in any order. In a transaction block, any DDL that locks a
+  table against writes, such as `DROP INDEX` or `CREATE TRIGGER`, takes the
+  lock for it first, so later DDL there needn't wait. Before the DDL runs,
+  each node this node subscribes to that receives its DDL through `ddl_sql`
+  holds back writes to those tables it replicates, including writes through a
   partitioned table, which fail with SQLSTATE `55P03`, and DDL on them, until
-  the DDL has applied there. Every node applies the others' changes up to
-  that point first. A node keeps holding back across a restart, and lets go
-  once the DDL applies, once it has applied past the transaction that ran it,
-  as when `worf.exception_behaviour` skips that transaction, or once it
-  learns that the transaction aborted. Only a user who may run the DDL takes
-  the lock: the owner of the table, schema or type, a user with the `TRIGGER`
+  the DDL has applied there. Every node applies the others' changes up to that
+  point first. A savepoint rolled back lets go of its tables at the
+  transaction's next statement. A node keeps holding back across a restart,
+  and while it can't reach the node that ran the DDL, until the DDL applies,
+  until it has applied past the transaction that ran it, as when
+  `worf.exception_behaviour` skips that transaction, or until that node says
+  the transaction aborted. Dropping its last subscription to that node, or
+  `worf.release_fence`, lets go too. Only a user who may run the DDL takes the
+  lock: the owner of the table, schema or type, a user with the `TRIGGER`
   privilege for `CREATE TRIGGER`, and for a `DROP`, the owner of the object's
   schema too. `CREATE UNIQUE INDEX CONCURRENTLY` holds the lock across the
   transactions it commits, until the last commits or the statement fails, and
-  from its first commit, a node keeps holding back if its connection is lost.
-  An index such a build leaves invalid when it fails stays on its node, as do
-  statements on it, and `REINDEX` can't make it valid there alone. Drop it:
-  until then it still rejects duplicates, so apply on its node stops at a row
-  the other nodes wrote that it rejects. A transaction holds each node back
-  through one connection, whatever the `idle_session_timeout` of its role. The user in each provider connection
-  string needs `USAGE` on schema `worf` and
+  from its first commit, a node keeps holding back if its connection is lost,
+  until it learns that the statement has ended. An index that such a build, or
+  a concurrent `REINDEX`, leaves when it fails is on its node alone, as are
+  statements on it, however it's built again since. Drop it: until then a
+  unique one still rejects duplicates, so apply on its node stops at a row the
+  other nodes wrote that it rejects. A transaction holds each node back
+  through one connection, whatever the `idle_session_timeout` of its role. The
+  user in each provider connection string needs `USAGE` on schema `worf` and
   `EXECUTE` on `worf.fence_writes`, `worf.unfence_writes` and
   `worf.keep_fence`, which `PUBLIC` doesn't have. They let that user hold back
-  writes to any table on the node, across restarts, so grant them only to the
-  role other nodes connect as. The default is `on`.
+  writes to any table on the node, across restarts, and let go only of what
+  the same session held back, so grant them only to the role other nodes
+  connect as. The default is `on`.
 
 - `worf.sequence_range_check_interval`
   How often the range worker checks each managed sequence, switching it to

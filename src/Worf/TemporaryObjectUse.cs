@@ -78,32 +78,31 @@ internal static unsafe class TemporaryObjectUse
     }
 
     /// <summary>
-    /// Checks whether DDL being replicated that has run used the session's temporary objects: names one with the
-    /// temporary schema, names a temporary type without one in a cast, ran or inlined a temporary function, changed a
-    /// temporary object, made an object depend on one, or commented on, labeled or granted on one. A DROP leaves out
+    /// Checks whether DDL being replicated that has run used the session's temporary objects: opened one, names one
+    /// with the temporary schema, names a temporary type without one in a cast, ran or inlined a temporary function,
+    /// changed a temporary object, made an object depend on one, or commented on, labeled or granted on one. Such DDL
+    /// stays on this node when it created or changed only temporary objects, and fails when it created or changed
+    /// others, which the other nodes couldn't follow, and on which later DDL would then fail there. A DROP leaves out
     /// its temporary objects itself.
     /// </summary>
     /// <param name="parsetree">The DDL.</param>
     /// <param name="command">Its text.</param>
+    /// <param name="openedTemporary">Whether it opened a temporary relation, as PostgreSQL notes.</param>
     /// <returns>Whether it did.</returns>
-    internal static bool UsedBy(Node* parsetree, string command)
+    internal static bool UsedBy(Node* parsetree, string command, bool openedTemporary)
     {
         uint nspoid = TemporaryNamespace();
         if (nspoid == 0 || parsetree->type == NodeTag.T_DropStmt)
         {
-            return false;
+            return openedTemporary && parsetree->type != NodeTag.T_DropStmt;
         }
 
         string schema = Worf.FromServer(NativeMethods.get_namespace_name(nspoid));
-        if (s_ranTemporaryFunction || NamesTemporaryObjects(command, schema))
-        {
-            return true;
-        }
-
+        bool used = openedTemporary || s_ranTemporaryFunction || NamesTemporaryObjects(command, schema);
         AddTargets(parsetree);
         if (s_changedObjects.Count == 0)
         {
-            return false;
+            return used;
         }
 
         NativeMethods.CommandCounterIncrement();
@@ -112,27 +111,50 @@ internal static unsafe class TemporaryObjectUse
         long[] subIds = [.. s_changedObjects.Select(changed => (long)changed.SubId)];
 
         // An object in a catalog with a schema is checked for its own schema, and every object for what it depends on.
-        return Elevated.Run(() => Spi.Select("""
-            SELECT EXISTS (
-                SELECT FROM ROWS FROM (pg_catalog.unnest($1::pg_catalog.oid[]), pg_catalog.unnest($2::pg_catalog.oid[]),
+        // An object outlasts the session unless it's in the temporary schema, or is part of a temporary relation.
+        SpiResult result = Elevated.Run(() => Spi.Select("""
+            WITH o AS (
+                SELECT c.classid, coalesce(ad.oid, c.objid) AS objid, CASE WHEN ad.oid IS NULL THEN c.objsubid ELSE 0 END AS objsubid,
+                    CASE WHEN c.classid IN ('pg_catalog.pg_class'::pg_catalog.regclass, 'pg_catalog.pg_attrdef'::pg_catalog.regclass) THEN c.objid
+                        WHEN c.classid = 'pg_catalog.pg_trigger'::pg_catalog.regclass THEN (SELECT tgrelid FROM pg_catalog.pg_trigger WHERE oid = c.objid)
+                        WHEN c.classid = 'pg_catalog.pg_rewrite'::pg_catalog.regclass THEN (SELECT ev_class FROM pg_catalog.pg_rewrite WHERE oid = c.objid)
+                        WHEN c.classid = 'pg_catalog.pg_policy'::pg_catalog.regclass THEN (SELECT polrelid FROM pg_catalog.pg_policy WHERE oid = c.objid)
+                    END AS relid
+                FROM ROWS FROM (pg_catalog.unnest($1::pg_catalog.oid[]), pg_catalog.unnest($2::pg_catalog.oid[]),
                     pg_catalog.unnest($3::pg_catalog.int4[])) AS c (classid, objid, objsubid)
                 LEFT JOIN pg_catalog.pg_attrdef ad
                     ON c.classid = 'pg_catalog.pg_attrdef'::pg_catalog.regclass AND ad.adrelid = c.objid AND ad.adnum = c.objsubid
-                CROSS JOIN LATERAL (SELECT c.classid, coalesce(ad.oid, c.objid) AS objid,
-                    CASE WHEN ad.oid IS NULL THEN c.objsubid ELSE 0 END AS objsubid) AS o
-                WHERE (o.classid IN ('pg_catalog.pg_class'::pg_catalog.regclass, 'pg_catalog.pg_type'::pg_catalog.regclass,
-                        'pg_catalog.pg_proc'::pg_catalog.regclass, 'pg_catalog.pg_operator'::pg_catalog.regclass,
-                        'pg_catalog.pg_collation'::pg_catalog.regclass, 'pg_catalog.pg_conversion'::pg_catalog.regclass,
-                        'pg_catalog.pg_constraint'::pg_catalog.regclass, 'pg_catalog.pg_opclass'::pg_catalog.regclass,
-                        'pg_catalog.pg_opfamily'::pg_catalog.regclass, 'pg_catalog.pg_statistic_ext'::pg_catalog.regclass,
-                        'pg_catalog.pg_ts_parser'::pg_catalog.regclass, 'pg_catalog.pg_ts_dict'::pg_catalog.regclass,
-                        'pg_catalog.pg_ts_template'::pg_catalog.regclass, 'pg_catalog.pg_ts_config'::pg_catalog.regclass)
-                        AND (pg_catalog.pg_identify_object(o.classid, o.objid, 0)).schema = $4)
-                    OR EXISTS (
-                        SELECT FROM pg_catalog.pg_depend d
-                        WHERE d.classid = o.classid AND d.objid = o.objid AND (o.objsubid = 0 OR d.objsubid IN (0, o.objsubid))
-                            AND (pg_catalog.pg_identify_object(d.refclassid, d.refobjid, 0)).schema = $4))
-            """, SpiParameter.Create(classIds), SpiParameter.Create(objectIds), SpiParameter.Create(subIds), SpiParameter.Create(schema))[0].Get<bool>(0));
+            )
+            SELECT
+                EXISTS (
+                    SELECT FROM o
+                    WHERE (o.classid IN ('pg_catalog.pg_class'::pg_catalog.regclass, 'pg_catalog.pg_type'::pg_catalog.regclass,
+                            'pg_catalog.pg_proc'::pg_catalog.regclass, 'pg_catalog.pg_operator'::pg_catalog.regclass,
+                            'pg_catalog.pg_collation'::pg_catalog.regclass, 'pg_catalog.pg_conversion'::pg_catalog.regclass,
+                            'pg_catalog.pg_constraint'::pg_catalog.regclass, 'pg_catalog.pg_opclass'::pg_catalog.regclass,
+                            'pg_catalog.pg_opfamily'::pg_catalog.regclass, 'pg_catalog.pg_statistic_ext'::pg_catalog.regclass,
+                            'pg_catalog.pg_ts_parser'::pg_catalog.regclass, 'pg_catalog.pg_ts_dict'::pg_catalog.regclass,
+                            'pg_catalog.pg_ts_template'::pg_catalog.regclass, 'pg_catalog.pg_ts_config'::pg_catalog.regclass)
+                            AND (pg_catalog.pg_identify_object(o.classid, o.objid, 0)).schema = $4)
+                        OR EXISTS (
+                            SELECT FROM pg_catalog.pg_depend d
+                            WHERE d.classid = o.classid AND d.objid = o.objid AND (o.objsubid = 0 OR d.objsubid IN (0, o.objsubid))
+                                AND (pg_catalog.pg_identify_object(d.refclassid, d.refobjid, 0)).schema = $4)),
+                EXISTS (
+                    SELECT FROM o
+                    WHERE CASE WHEN o.relid IS NOT NULL
+                        THEN (SELECT relpersistence <> 't' FROM pg_catalog.pg_class WHERE oid = o.relid)
+                        ELSE (SELECT i.schema IS DISTINCT FROM $4 FROM pg_catalog.pg_identify_object(o.classid, o.objid, 0) AS i
+                            WHERE i.identity IS NOT NULL) END)
+            """, SpiParameter.Create(classIds), SpiParameter.Create(objectIds), SpiParameter.Create(subIds), SpiParameter.Create(schema)));
+        used |= result[0].Get<bool>(0);
+        if (used && result[0].Get<bool>(1))
+        {
+            throw new PgException("0A000", "cannot create or change objects that outlast the session with its temporary objects while worf.enable_ddl_replication is on",
+                hint: "The other nodes don't have the temporary objects. Use permanent ones, or write out what the statement takes from them.");
+        }
+
+        return used;
     }
 
     /// <summary>

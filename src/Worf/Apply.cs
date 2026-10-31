@@ -372,9 +372,9 @@ internal static unsafe partial class Apply
         for (int i = 0; commands is not null && i < commands->length; i++)
         {
             RawStmt* command = (RawStmt*)commands->elements[i].ptr_value;
-            if (withoutConcurrently)
+            if (withoutConcurrently && !RemoveConcurrently(command->stmt))
             {
-                RemoveConcurrently(command->stmt);
+                continue;
             }
 
             // temporarily push snapshot for parse analysis/planning
@@ -1472,10 +1472,12 @@ internal static unsafe partial class Apply
 
     /// <summary>
     /// Makes a statement that would build or drop an index or detach a partition concurrently do it in its
-    /// transaction, and one that finishes a concurrent detach detach the partition at once where none is under way,
-    /// since a concurrent detach replicates only once it has finished.
+    /// transaction. A concurrent detach replicates only once it has finished, so a detach, or one that finishes a
+    /// concurrent detach, finishes the concurrent detach under way here, detaches the partition at once where none is,
+    /// and does nothing where the partition is detached already, as when two nodes detached it.
     /// </summary>
-    private static void RemoveConcurrently(Node* stmt)
+    /// <returns>Whether the statement has anything to do.</returns>
+    private static bool RemoveConcurrently(Node* stmt)
     {
         switch (stmt->type)
         {
@@ -1492,14 +1494,20 @@ internal static unsafe partial class Apply
                 for (int i = 0; cmds is not null && i < cmds->length; i++)
                 {
                     AlterTableCmd* cmd = (AlterTableCmd*)cmds->elements[i].ptr_value;
-                    if (cmd->subtype == AlterTableType.AT_DetachPartition)
+                    if (cmd->subtype is not (AlterTableType.AT_DetachPartition or AlterTableType.AT_DetachPartitionFinalize))
                     {
-                        ((PartitionCmd*)cmd->def)->concurrent = false;
+                        continue;
                     }
-                    else if (cmd->subtype == AlterTableType.AT_DetachPartitionFinalize && !DetachPending(((PartitionCmd*)cmd->def)->name))
+
+                    PartitionCmd* partition = (PartitionCmd*)cmd->def;
+                    partition->concurrent = false;
+                    bool? pending = DetachPending(((AlterTableStmt*)stmt)->relation, partition->name);
+                    if (pending is null)
                     {
-                        cmd->subtype = AlterTableType.AT_DetachPartition;
+                        return false;
                     }
+
+                    cmd->subtype = pending.Value ? AlterTableType.AT_DetachPartitionFinalize : AlterTableType.AT_DetachPartition;
                 }
 
                 break;
@@ -1507,16 +1515,26 @@ internal static unsafe partial class Apply
             default:
                 break;
         }
+
+        return true;
     }
 
     /// <summary>
-    /// Checks whether a partition's concurrent detach is under way here.
+    /// Checks whether a partition's concurrent detach from a table is under way here, or whether the partition is
+    /// detached from it already.
     /// </summary>
-    private static bool DetachPending(RangeVar* partition)
+    /// <returns>Whether a detach is under way, or null when the partition isn't the table's.</returns>
+    private static bool? DetachPending(RangeVar* table, RangeVar* partition)
     {
+        uint parent = NativeMethods.RangeVarGetRelidExtended(table, 0, RangeVarMissingOk, default, null);
         uint relid = NativeMethods.RangeVarGetRelidExtended(partition, 0, RangeVarMissingOk, default, null);
-        return relid != 0 && Worf.ReadScalar<bool>("SELECT EXISTS (SELECT FROM pg_catalog.pg_inherits WHERE inhrelid = $1 AND inhdetachpending)",
-            SpiParameter.Create(relid));
+        if (parent == 0 || relid == 0)
+        {
+            return false;
+        }
+
+        return Worf.ReadScalar<bool?>("SELECT inhdetachpending FROM pg_catalog.pg_inherits WHERE inhrelid = $1 AND inhparent = $2",
+            SpiParameter.Create(relid), SpiParameter.Create(parent));
     }
 
     /// <summary>

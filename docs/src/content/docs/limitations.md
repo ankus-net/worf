@@ -82,10 +82,11 @@ queues applies on each node wherever it falls among that node's own writes.
 
 DDL that uses the session's temporary objects, as
 `worf.enable_ddl_replication` describes, runs on its node alone, without a
-notice. A temporary type named without a schema before a string constant, as
-in `tmp_type '1'`, in an expression the statement doesn't keep, such as in
-`ALTER TABLE ... USING`, isn't noticed, and the statement replicates; qualify
-the type with `pg_temp`, or write the cast with `::`.
+notice, or fails when it creates or changes other objects. A temporary type
+named without a schema before a string constant, as in `tmp_type '1'`, in an
+expression the statement doesn't keep, such as in `ALTER TABLE ... USING`,
+isn't noticed, and the statement replicates; qualify the type with `pg_temp`,
+or write the cast with `::`.
 
 ## Schema changes without the global DDL lock
 
