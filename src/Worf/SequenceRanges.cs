@@ -783,7 +783,7 @@ internal static unsafe partial class SequenceRanges
                 AND f.hi::numeric - f.lo >= $5
             LIMIT 1
             """, 1, SpiParameter.Create(seqoid), SpiParameter.Create(epoch), SpiParameter.Create((decimal)NativeMethods.GetSystemIdentifier()),
-            SpiParameter.Create((long)NativeMethods.GetWALInsertionTimeLine()), SpiParameter.Create(((decimal)size - 1) * Math.Abs(info.Increment))).Count > 0;
+            SpiParameter.Create((long)Timeline()), SpiParameter.Create(((decimal)size - 1) * Math.Abs(info.Increment))).Count > 0;
     }
 
     /// <summary>
@@ -1736,7 +1736,7 @@ internal static unsafe partial class SequenceRanges
     internal static bool CheckIdentity(WorfLocalNode node)
     {
         ulong sysid = NativeMethods.GetSystemIdentifier();
-        uint timeline = NativeMethods.GetWALInsertionTimeLine();
+        uint timeline = Timeline();
         SpiParameter id = SpiParameter.Create(node.Node.Id);
         SpiParameter system = SpiParameter.Create((decimal)sysid);
         SpiParameter line = SpiParameter.Create((long)timeline);
@@ -1849,7 +1849,7 @@ internal static unsafe partial class SequenceRanges
             UPDATE worf.sequence_range_block SET state = 'open', sysid = $2, timeline = $3
             WHERE seqoid = $1 AND state = 'fenced'
             """, seq, SpiParameter.Create((decimal)NativeMethods.GetSystemIdentifier()),
-            SpiParameter.Create((long)NativeMethods.GetWALInsertionTimeLine()));
+            SpiParameter.Create((long)Timeline()));
         _ = Spi.Execute("UPDATE worf.sequence_range SET fenced_at = NULL, detail = NULL WHERE seqoid = $1", seq);
         SequenceInfo info = GetInfo(seqoid);
         if (range[0].Get<uint>(1) == node.Node.Id)
@@ -1878,6 +1878,21 @@ internal static unsafe partial class SequenceRanges
         PgLog.Log($"sequence {info.Name}: the allocator's fence lifted");
         return true;
     }
+
+    /// <summary>
+    /// Gets the timeline this node writes on, which its blocks record. A standby, or a node still finishing its
+    /// promotion, writes on none yet, so nothing that records or compares blocks runs there.
+    /// </summary>
+    /// <returns>The timeline.</returns>
+    internal static uint Timeline() => Recovering()
+        ? throw new PgException("25006", "cannot manage sequence ranges during recovery")
+        : NativeMethods.GetWALInsertionTimeLine();
+
+    /// <summary>
+    /// Gets whether this node is a standby, or still finishing its promotion.
+    /// </summary>
+    /// <returns>Whether recovery is in progress.</returns>
+    internal static bool Recovering() => NativeMethods.RecoveryInProgress();
 
     /// <summary>
     /// Gets how long a neighbor's report counts as current: a link exchanges at least once an exchange interval, so one
@@ -2310,7 +2325,7 @@ internal static unsafe partial class SequenceRanges
             SELECT f.block_id, f.lo, f.hi, f.not_before
             FROM worf.sequence_range_free f JOIN worf.sequence_range_block b ON b.block_id = f.block_id
             WHERE b.seqoid = {seqoid}::oid AND b.epoch = {epoch} AND b.kind IN ('r', 'p') AND b.state = 'open'
-                AND b.sysid = {(decimal)NativeMethods.GetSystemIdentifier()} AND b.timeline = {(long)NativeMethods.GetWALInsertionTimeLine()}
+                AND b.sysid = {(decimal)NativeMethods.GetSystemIdentifier()} AND b.timeline = {(long)Timeline()}
                 AND f.hi::numeric - f.lo >= {span}
             ORDER BY CASE WHEN {ascending} THEN f.lo END, CASE WHEN NOT {ascending} THEN f.hi END DESC
             LIMIT 1
@@ -2402,7 +2417,7 @@ internal static unsafe partial class SequenceRanges
             SELECT f.block_id, f.lo, f.hi
             FROM worf.sequence_range_free f JOIN worf.sequence_range_block b ON b.block_id = f.block_id
             WHERE b.seqoid = {seqoid}::oid AND b.epoch = {epoch} AND b.kind IN ('r', 'p') AND b.state = 'open'
-                AND b.sysid = {(decimal)NativeMethods.GetSystemIdentifier()} AND b.timeline = {(long)NativeMethods.GetWALInsertionTimeLine()}
+                AND b.sysid = {(decimal)NativeMethods.GetSystemIdentifier()} AND b.timeline = {(long)Timeline()}
                 AND f.lo <= {lo} AND {hi} <= f.hi
             LIMIT 1
             FOR UPDATE OF f
@@ -2444,7 +2459,7 @@ internal static unsafe partial class SequenceRanges
         Guid? id = null, bool reserved = false, long? notBefore = null)
     {
         ulong sysid = NativeMethods.GetSystemIdentifier();
-        uint timeline = NativeMethods.GetWALInsertionTimeLine();
+        uint timeline = Timeline();
         Guid block = id ?? Guid.NewGuid();
         _ = Spi.Execute("""
             INSERT INTO worf.sequence_range_block

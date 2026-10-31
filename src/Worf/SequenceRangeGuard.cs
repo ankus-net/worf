@@ -426,7 +426,7 @@ internal static class SequenceRangeGuard
         unsafe
         {
             sysid = NativeMethods.GetSystemIdentifier();
-            timeline = NativeMethods.GetWALInsertionTimeLine();
+            timeline = SequenceRanges.Timeline();
         }
 
         SpiResult result = Elevated.Run(() => Spi.Select("""

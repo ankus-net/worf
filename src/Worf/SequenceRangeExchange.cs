@@ -43,6 +43,13 @@ internal static class SequenceRangeExchange
         """)]
     internal static string Exchange(string message)
     {
+        // A standby, or a node still finishing its promotion, can write nothing and has no timeline to report, so it
+        // takes in no sequence of the call.
+        if (SequenceRanges.Recovering())
+        {
+            throw new PgException("25006", "cannot exchange sequence ranges during recovery");
+        }
+
         WorfLocalNode node = WorfNode.GetLocalNode(false, false)!;
         using JsonDocument document = JsonDocument.Parse(message);
         JsonElement root = document.RootElement;
@@ -421,7 +428,7 @@ internal static class SequenceRangeExchange
             unsafe
             {
                 sysid = NativeMethods.GetSystemIdentifier();
-                timeline = NativeMethods.GetWALInsertionTimeLine();
+                timeline = SequenceRanges.Timeline();
                 insert = NativeMethods.GetXLogInsertRecPtr();
             }
 

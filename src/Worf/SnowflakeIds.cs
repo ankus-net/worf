@@ -52,14 +52,15 @@ internal static class SnowflakeIds
         => SequenceRanges.Enable(Worf.ReadScalar<uint>("SELECT 'worf.snowflake_node'::regclass::oid"), participants, 1, 1, null, false);
 
     /// <summary>
-    /// Returns this node's Snowflake node number.
+    /// Returns this node's Snowflake node number. A standby has none of its own: the number its blocks show is its
+    /// primary's.
     /// </summary>
     /// <returns>The number, or null until the node has one.</returns>
     [PgFunction(Sql = """
         CREATE FUNCTION worf.snowflake_node()
         RETURNS integer VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
         """)]
-    internal static int? SnowflakeNode() => NodeNumber();
+    internal static int? SnowflakeNode() => SequenceRanges.Recovering() ? null : NodeNumber();
 
     /// <summary>
     /// Returns a new Snowflake ID.
@@ -71,6 +72,12 @@ internal static class SnowflakeIds
         """)]
     internal static long SnowflakeId()
     {
+        // A standby would issue its primary's IDs.
+        if (SequenceRanges.Recovering())
+        {
+            throw new PgException("25006", "cannot issue Snowflake IDs during recovery");
+        }
+
         int node = NodeNumber() ?? throw new PgException("55000", "this node has no Snowflake node number yet",
             hint: "Run worf.enable_snowflake on one node; the others get their numbers over their subscriptions.");
         uint dboid = DatabaseId();
@@ -304,7 +311,7 @@ internal static class SnowflakeIds
         unsafe
         {
             sysid = NativeMethods.GetSystemIdentifier();
-            timeline = NativeMethods.GetWALInsertionTimeLine();
+            timeline = SequenceRanges.Timeline();
         }
 
         // A node that hasn't heard from the owner of the numbers, directly or through its neighbors, for half the time

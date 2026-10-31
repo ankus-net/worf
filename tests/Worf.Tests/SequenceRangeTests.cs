@@ -722,6 +722,12 @@ public sealed class SequenceRangeTests
         int logpos = nodeB.ReadLog().Length;
         await nodeB.StopAsync("immediate", token);
         await RestoreDataAsync(nodeB, standby, token, running: false, standby: true);
+
+        // Until it is promoted, the standby refuses node_c's calls whole and has no Snowflake number of its own, while
+        // its view still reads.
+        Assert.IsTrue(await nodeB.PollLogAsync(logpos, "cannot exchange sequence ranges during recovery", token), "the standby refused node_c");
+        Assert.AreEqual("", await nodeB.SafePsqlAsync(Database, "SELECT worf.snowflake_node()", token));
+        Assert.AreEqual("t", await nodeB.SafePsqlAsync(Database, "SELECT count(values_left) > 0 FROM worf.sequence_ranges", token));
         (int promoted, string output) = await nodeB.RunProgramAsync("pg_ctl", ["promote", "-w", "-D", nodeB.Cluster.DataDirectory], token);
         Assert.AreEqual(0, promoted, output);
         // node_b fences its pool when its range worker sees the new timeline, or first when node_c's report shows a
