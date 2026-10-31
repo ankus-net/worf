@@ -724,7 +724,9 @@ public sealed class SequenceRangeTests
         await RestoreDataAsync(nodeB, standby, token, running: false, standby: true);
         (int promoted, string output) = await nodeB.RunProgramAsync("pg_ctl", ["promote", "-w", "-D", nodeB.Cluster.DataDirectory], token);
         Assert.AreEqual(0, promoted, output);
-        Assert.IsTrue(await nodeB.PollLogAsync(logpos, "timeline or system identifier changed", token), "node_b fenced its pool");
+        // node_b fences its pool when its range worker sees the new timeline, or first when node_c's report shows a
+        // grant node_b has no record of.
+        Assert.IsTrue(await nodeB.PollLogAsync(logpos, "so it grants nothing until every node it granted to reports", token), "node_b fenced its pool");
         Assert.IsTrue(await nodeB.PollLogAsync(logpos, "which this allocator had no record of; it is back in the ledger", token), "node_b's lost grant");
         Assert.IsTrue(await nodeB.PollLogAsync(logpos, "the allocator's fence lifted", token), "node_b's fence lifted");
         await WaitActiveAsync([nodeB], token);
