@@ -38,8 +38,23 @@ internal static partial class RelCache
             throw new PgException(PgSqlStates.InternalError, $"cache lookup failed for remote relation {remoteid}");
         }
 
+        // Locking the relation takes the invalidations sent since it was last open, which can leave the mapping stale,
+        // as when the table was changed, renamed or dropped. It's then let go and looked up by name again. Its
+        // invalidation can also come while a change uses it, so it keeps its OID until then.
+        if (entry.IsValid && entry.Rel is null)
+        {
+            entry.Rel = NativeMethods.try_table_open(entry.Reloid, (int)lockmode);
+            if (entry.Rel is not null && !entry.IsValid)
+            {
+                NativeMethods.table_close(entry.Rel, (int)lockmode);
+                entry.Rel = null;
+            }
+
+            entry.IsValid = entry.Rel is not null;
+        }
+
         // Need to update the local cache?
-        if (entry.Reloid == 0)
+        if (!entry.IsValid)
         {
             RangeVar* rv = NativeMethods.makeRangeVar(Worf.PStrDup(entry.Nspname), Worf.PStrDup(entry.Relname), -1);
             entry.Rel = NativeMethods.table_openrv(rv, (int)lockmode);
@@ -57,6 +72,7 @@ internal static partial class RelCache
             }
 
             entry.Reloid = entry.Rel->rd_id;
+            entry.IsValid = true;
             if (!s_relationsByReloid.TryGetValue(entry.Reloid, out List<WorfRelation>? entries))
             {
                 entries = [];
@@ -83,10 +99,6 @@ internal static partial class RelCache
                     }
                 }
             }
-        }
-        else if (entry.Rel is null)
-        {
-            entry.Rel = NativeMethods.table_open(entry.Reloid, (int)lockmode);
         }
 
         return entry;
@@ -176,7 +188,7 @@ internal static partial class RelCache
             {
                 foreach (WorfRelation entry in entries)
                 {
-                    entry.Reloid = 0;
+                    entry.IsValid = false;
                 }
             }
         }
@@ -185,7 +197,7 @@ internal static partial class RelCache
             // invalidate all cache entries
             foreach (WorfRelation entry in s_relationHash.Values)
             {
-                entry.Reloid = 0;
+                entry.IsValid = false;
             }
 
             s_relationsByReloid.Clear();

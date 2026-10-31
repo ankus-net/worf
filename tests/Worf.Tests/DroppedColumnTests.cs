@@ -15,8 +15,8 @@ public sealed class DroppedColumnTests
     public TestContext TestContext { get; set; } = null!;
 
     /// <summary>
-    /// Rows keep replicating after the subscriber drops a column the provider still has, and a column the subscriber
-    /// never had still stops apply.
+    /// Rows keep replicating after the subscriber drops a column the provider still has, also while apply is in a
+    /// transaction that writes to the table later, and a column the subscriber never had still stops apply.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -28,9 +28,25 @@ public sealed class DroppedColumnTests
         await using TestNode subscriber = await StartNodeAsync("subscriber", token);
         _ = await provider.SafePsqlAsync(Database, """
             CREATE TABLE t (id integer PRIMARY KEY, a text, b text);
+            CREATE TABLE u (id integer PRIMARY KEY, a text, b text);
             SELECT * FROM worf.replication_set_add_table('default', 't');
+            SELECT * FROM worf.replication_set_add_table('default', 'u');
             """, token);
-        _ = await subscriber.SafePsqlAsync(Database, "CREATE TABLE t (id integer PRIMARY KEY, a text, b text)", token);
+
+        // Apply takes a while over a row of t's with a slow trigger.
+        _ = await subscriber.SafePsqlAsync(Database, """
+            CREATE TABLE t (id integer PRIMARY KEY, a text, b text);
+            CREATE TABLE u (id integer PRIMARY KEY, a text, b text);
+            CREATE FUNCTION slow() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                IF NEW.a = 'slow' THEN
+                    PERFORM pg_sleep(2);
+                END IF;
+                RETURN NEW;
+            END $$;
+            CREATE TRIGGER slow BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION slow();
+            ALTER TABLE t ENABLE ALWAYS TRIGGER slow;
+            """, token);
         _ = await subscriber.SafePsqlAsync(Database, $"""
             SELECT worf.create_subscription(
                 subscription_name := 'sub',
@@ -44,9 +60,9 @@ public sealed class DroppedColumnTests
                     WHERE subscription_name = 'sub' AND status = 'replicating')
             """, token), "subscription failed to reach \"replicating\" state");
 
-        _ = await provider.SafePsqlAsync(Database, "INSERT INTO t VALUES (1, 'a1', 'b1')", token);
-        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM t WHERE id = 1)", token),
-            "the row before the drop");
+        _ = await provider.SafePsqlAsync(Database, "INSERT INTO t VALUES (1, 'a1', 'b1'); INSERT INTO u VALUES (1, 'a1', 'b1')", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM u WHERE id = 1)", token),
+            "the rows before the drop");
 
         _ = await subscriber.SafePsqlAsync(Database, "ALTER TABLE t DROP COLUMN b", token);
         _ = await provider.SafePsqlAsync(Database, """
@@ -57,10 +73,23 @@ public sealed class DroppedColumnTests
             "the rows after the drop");
         Assert.AreEqual("1|a1 again\n2|a2", await subscriber.SafePsqlAsync(Database, "SELECT * FROM t ORDER BY id", token));
 
+        // The drop of u's column commits while apply is in the trigger, and apply takes it in as it opens u, which it
+        // then looks up again rather than losing its OID.
+        int droppos = subscriber.ReadLog().Length;
+        _ = await provider.SafePsqlAsync(Database, "INSERT INTO t VALUES (3, 'slow'); INSERT INTO u VALUES (2, 'a2', 'b2')", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event = 'PgSleep' AND backend_type <> 'client backend')", token),
+            "apply in the trigger");
+        _ = await subscriber.SafePsqlAsync(Database, "ALTER TABLE u DROP COLUMN b", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM u WHERE id = 2)", token),
+            "the row after the drop");
+        Assert.AreEqual("1|a1\n2|a2", await subscriber.SafePsqlAsync(Database, "SELECT * FROM u ORDER BY id", token));
+        Assert.DoesNotContain("exiting with error", subscriber.ReadLog()[droppos..], "apply kept going");
+
         int logpos = subscriber.ReadLog().Length;
         _ = await provider.SafePsqlAsync(Database, """
             ALTER TABLE t ADD COLUMN c text;
-            INSERT INTO t VALUES (3, 'a3', 'b3', 'c3');
+            INSERT INTO t VALUES (4, 'a4', 'b4', 'c4');
             """, token);
         Assert.IsTrue(await subscriber.PollLogAsync(logpos, "unknown column name c", token), "the column the subscriber never had");
     }

@@ -38,6 +38,12 @@ internal sealed unsafe class WorfRelation
     public uint Reloid { get; set; }
 
     /// <summary>
+    /// Gets or sets whether the local relation and the mapping to it are up to date. An invalidation of the local
+    /// relation clears it, so the relation is looked up by name again the next time it's opened.
+    /// </summary>
+    public bool IsValid { get; set; }
+
+    /// <summary>
     /// Gets or sets the open local relation.
     /// </summary>
     public RelationData* Rel { get; set; }
