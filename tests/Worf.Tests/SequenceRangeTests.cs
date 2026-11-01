@@ -576,6 +576,17 @@ public sealed class SequenceRangeTests
         Assert.AreEqual("42501", reserve.SqlState);
         Assert.Contains("must be owner", reserve.MessageText);
 
+        // With USAGE on worf's schema, a role manages the range of a sequence it owns, though not of one it doesn't.
+        _ = await node.SafePsqlAsync(Database, """
+            SET ROLE app;
+            SELECT worf.enable_sequence_range('app.own_rows_id_seq', participants := '{}', range_size := 100);
+            SELECT worf.alter_sequence_range('app.own_rows_id_seq', range_size := 200);
+            INSERT INTO app.own_rows DEFAULT VALUES;
+            """, token);
+        PostgresException notOwned = await Assert.ThrowsExactlyAsync<PostgresException>(() => node.SafePsqlAsync(Database,
+            "SET ROLE app; SELECT worf.disable_sequence_range('t_id_seq')", token));
+        Assert.AreEqual("42501", notOwned.SqlState);
+
         // worf reads a role's table with PostgreSQL's own scans, on SET DEFAULT and in the range worker, which run none of
         // the functions that its CHECK constraint and index predicate call, so they can't make it a superuser.
         int escapes = node.ReadLog().Length;

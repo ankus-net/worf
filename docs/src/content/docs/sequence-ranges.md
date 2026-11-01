@@ -19,7 +19,7 @@ The other nodes learn of the sequence over their subscriptions, so each node nee
 SELECT * FROM worf.sequence_ranges;
 ```
 
-shows each sequence's state, its active and next blocks, and the values left. `worf.sequence_range_grants` lists the blocks this node granted. A role that isn't a superuser needs `USAGE` on schema `worf` to call the functions below, and `SELECT` to read these views.
+shows each sequence's state, its active and next blocks, and the values left. `worf.sequence_range_grants` lists the blocks this node granted. A role that isn't a superuser needs `USAGE` on schema `worf` to call the functions below, and the privileges of the sequence's owner, as `ALTER SEQUENCE` does, or of every managed sequence's for `reset_sequence_range()` without one, and `SELECT` to read these views. `enable_snowflake` needs the privileges of `worf.snowflake_node`'s owner.
 
 | Function | Runs on | Does |
 | --- | --- | --- |

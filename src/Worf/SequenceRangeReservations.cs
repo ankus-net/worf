@@ -308,10 +308,7 @@ internal static class SequenceRangeReservations
             throw new PgException("25006", "cannot reserve sequence values during recovery");
         }
 
-        uint seqoid = SequenceRanges.RequireSequence(sequence);
-        return Worf.ReadScalar<bool>("SELECT pg_catalog.pg_has_role(relowner, 'USAGE') FROM pg_catalog.pg_class WHERE oid = $1",
-            SpiParameter.Create(seqoid)) ? seqoid
-            : throw new PgException("42501", $"must be owner of sequence {SequenceRanges.GetInfo(seqoid).Name}");
+        return SequenceRanges.RequireOwnedSequence(sequence);
     }
 
     /// <summary>

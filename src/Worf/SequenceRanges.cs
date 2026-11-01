@@ -322,9 +322,9 @@ internal static unsafe partial class SequenceRanges
     internal static void EnableSequenceRange([PgSqlType("regclass", Schema = "pg_catalog")] PgDatum? sequence,
         string?[]? participants, long? rangeSize, long? maxRangeSize, long? poolStart, bool? force)
     {
-        uint seqoid = RequireSequence(sequence);
+        uint seqoid = RequireOwnedSequence(sequence);
         CheckSizes(seqoid, rangeSize, maxRangeSize);
-        Enable(seqoid, participants, rangeSize, maxRangeSize, poolStart, force == true);
+        Elevated.Run(() => Enable(seqoid, participants, rangeSize, maxRangeSize, poolStart, force == true));
     }
 
     /// <summary>
@@ -480,7 +480,15 @@ internal static unsafe partial class SequenceRanges
         """)]
     internal static void ActivateSequenceRange([PgSqlType("regclass", Schema = "pg_catalog")] PgDatum sequence)
     {
-        uint seqoid = RequireSequence(sequence);
+        uint seqoid = RequireOwnedSequence(sequence);
+        Elevated.Run(() => ActivateOrLift(seqoid));
+    }
+
+    /// <summary>
+    /// Lifts a sequence's fence, or else starts granting its values with the nodes that have reported so far.
+    /// </summary>
+    private static void ActivateOrLift(uint seqoid)
+    {
         WorfLocalNode node = WorfNode.GetLocalNode(true, false)!;
         RequireOwner(seqoid, node);
         if (!LiftFence(seqoid, node, true))
@@ -502,18 +510,16 @@ internal static unsafe partial class SequenceRanges
     internal static void AlterSequenceRange([PgSqlType("regclass", Schema = "pg_catalog")] PgDatum? sequence, long? rangeSize,
         long? maxRangeSize)
     {
-        uint seqoid = RequireSequence(sequence);
-        WorfLocalNode node = WorfNode.GetLocalNode(true, false)!;
-        RequireOwner(seqoid, node);
+        uint seqoid = RequireOwnedSequence(sequence);
         CheckSizes(seqoid, rangeSize, maxRangeSize);
-
-        _ = Spi.Execute("""
+        Elevated.Run(() => RequireOwner(seqoid, WorfNode.GetLocalNode(true, false)!));
+        Elevated.Run(() => _ = Spi.Execute("""
             UPDATE worf.sequence_range
             SET range_size = coalesce($2, range_size),
                 max_range_size = greatest(coalesce($3, max_range_size), coalesce($2, range_size)),
                 request_size = least(greatest(request_size, coalesce($2, range_size)), greatest(coalesce($3, max_range_size), coalesce($2, range_size)))
             WHERE seqoid = $1
-            """, SpiParameter.Create(seqoid), SpiParameter.Create(rangeSize), SpiParameter.Create(maxRangeSize));
+            """, SpiParameter.Create(seqoid), SpiParameter.Create(rangeSize), SpiParameter.Create(maxRangeSize)));
     }
 
     /// <summary>
@@ -526,10 +532,12 @@ internal static unsafe partial class SequenceRanges
         """)]
     internal static void DisableSequenceRange([PgSqlType("regclass", Schema = "pg_catalog")] PgDatum sequence)
     {
-        uint seqoid = RequireSequence(sequence);
-        WorfLocalNode node = WorfNode.GetLocalNode(true, false)!;
-        RequireOwner(seqoid, node);
-        Disable(seqoid);
+        uint seqoid = RequireOwnedSequence(sequence);
+        Elevated.Run(() =>
+        {
+            RequireOwner(seqoid, WorfNode.GetLocalNode(true, false)!);
+            Disable(seqoid);
+        });
         ChangedOnCommit();
     }
 
@@ -544,18 +552,26 @@ internal static unsafe partial class SequenceRanges
         """)]
     internal static void ResetSequenceRange([PgSqlType("regclass", Schema = "pg_catalog")] PgDatum? sequence)
     {
-        WorfLocalNode node = WorfNode.GetLocalNode(true, false)!;
         bool all = sequence is null || sequence.IsNull;
-        SpiResult managed = all
+        uint named = all ? 0 : RequireOwnedSequence(sequence);
+        SpiResult managed = Elevated.Run(() => all
             ? Worf.SelectCatalog("SELECT seqoid::oid FROM worf.sequence_range ORDER BY seqoid")
-            : Worf.SelectCatalog("SELECT seqoid::oid FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(RequireSequence(sequence)));
-        for (int i = 0; i < managed.Count; i++)
+            : Worf.SelectCatalog("SELECT seqoid::oid FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(named)));
+        List<uint> sequences = [.. Enumerable.Range(0, managed.Count).Select(i => managed[i].Get<uint>(0))];
+        foreach (uint seqoid in all ? sequences : [])
         {
-            uint seqoid = managed[i].Get<uint>(0);
-            LockLedger(seqoid);
-            Reset(seqoid, node, !all || seqoid != SnowflakeIds.NodeSequence());
+            RequireOwnedSequence(seqoid);
         }
 
+        Elevated.Run(() =>
+        {
+            WorfLocalNode node = WorfNode.GetLocalNode(true, false)!;
+            foreach (uint seqoid in sequences)
+            {
+                LockLedger(seqoid);
+                Reset(seqoid, node, !all || seqoid != SnowflakeIds.NodeSequence());
+            }
+        });
         ChangedOnCommit();
     }
 
@@ -2624,6 +2640,24 @@ internal static unsafe partial class SequenceRanges
 
         return seqoid;
     }
+
+    /// <summary>
+    /// Checks that a function's argument is a sequence, and that the caller has the privileges of its owner, as
+    /// <c>ALTER SEQUENCE</c> needs. The functions that change its range management then do so as worf's own.
+    /// </summary>
+    /// <param name="sequence">The argument.</param>
+    /// <returns>The sequence.</returns>
+    internal static uint RequireOwnedSequence(PgDatum? sequence) => RequireOwnedSequence(RequireSequence(sequence));
+
+    /// <summary>
+    /// Checks that the caller has the privileges of a sequence's owner.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    /// <returns>The sequence.</returns>
+    internal static uint RequireOwnedSequence(uint seqoid)
+        => Worf.ReadScalar<bool>("SELECT pg_catalog.pg_has_role(relowner, 'USAGE') FROM pg_catalog.pg_class WHERE oid = $1", SpiParameter.Create(seqoid))
+            ? seqoid
+            : throw new PgException("42501", $"must be owner of sequence {GetInfo(seqoid).Name}");
 
     private static void RequireOwner(uint seqoid, WorfLocalNode node)
     {

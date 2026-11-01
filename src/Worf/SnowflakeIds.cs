@@ -49,7 +49,10 @@ internal static class SnowflakeIds
         RETURNS void CALLED ON NULL INPUT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
         """)]
     internal static void EnableSnowflake(string?[]? participants)
-        => SequenceRanges.Enable(Worf.ReadScalar<uint>("SELECT 'worf.snowflake_node'::regclass::oid"), participants, 1, 1, null, false);
+    {
+        uint seqoid = SequenceRanges.RequireOwnedSequence(NodeSequence());
+        Elevated.Run(() => SequenceRanges.Enable(seqoid, participants, 1, 1, null, false));
+    }
 
     /// <summary>
     /// Returns this node's Snowflake node number. A standby has none of its own: the number its blocks show is its
