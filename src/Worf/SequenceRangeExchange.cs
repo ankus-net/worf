@@ -823,19 +823,9 @@ internal static class SequenceRangeExchange
         HashSet<uint> absent = [.. Enumerable.Range(0, fencedOn.Count).Select(i => fencedOn[i].Get<uint>(0))];
         foreach (JsonElement entry in sequences.EnumerateArray())
         {
-            uint? carried = Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(entry.GetProperty("name").GetString()));
-            if (carried is uint seqoid)
+            if (absent.Count > 0 && Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(entry.GetProperty("name").GetString())) is uint carried)
             {
-                _ = absent.Remove(seqoid);
-
-                // A sequence's lock comes before its rows, for the rest of the transaction, as it does for the range
-                // worker, so that a DROP of the sequence, which holds the lock as it deletes the rows, never waits on
-                // this exchange while this exchange waits on its rows. A sequence that a transaction holds against
-                // the lock waits for a later exchange.
-                if (!Lock(seqoid))
-                {
-                    continue;
-                }
+                _ = absent.Remove(carried);
             }
 
             try
@@ -870,7 +860,7 @@ internal static class SequenceRangeExchange
             }
         }
 
-        foreach (uint seqoid in absent.Where(Lock))
+        foreach (uint seqoid in absent)
         {
             _ = Spi.Execute("""
                 INSERT INTO worf.sequence_range_absent VALUES ($1, $2, now()) ON CONFLICT (seqoid, node_id) DO UPDATE SET absent_at = excluded.absent_at
@@ -896,18 +886,6 @@ internal static class SequenceRangeExchange
         }
 
         return (granted, received);
-    }
-
-    /// <summary>
-    /// Takes a sequence's lock for the rest of the transaction, unless another transaction holds it against the lock.
-    /// </summary>
-    /// <returns>Whether it took the lock.</returns>
-    private static bool Lock(uint seqoid)
-    {
-        unsafe
-        {
-            return NativeMethods.ConditionalLockRelationOid(seqoid, (int)PgLockMode.RowExclusive);
-        }
     }
 
     /// <summary>
