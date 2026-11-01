@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.ComponentModel;
 using System.Globalization;
 using System.Text;
 using Npgsql;
@@ -41,6 +42,8 @@ public sealed class ColumnTypeTests
     {
         CancellationToken token = TestContext.CancellationToken;
 
+        // Locales generated for the provider, when the host has none that formats money otherwise.
+        using TemporaryDirectory locales = new($"worf-locales-{Guid.NewGuid():N}");
         await using TestNode provider = await StartNodeAsync("provider", token, "TimeZone = 'Asia/Tokyo'",
             "bytea_output = escape");
         await using TestNode subscriber = await StartNodeAsync("subscriber", token, "worf.exception_behaviour = discard",
@@ -77,8 +80,8 @@ public sealed class ColumnTypeTests
             CREATE TYPE fspan AS RANGE (subtype = real);
             """, token);
 
-        // Money is formatted another way on the provider when this host has a locale that does.
-        bool moneyDiffers = await FormatMoneyDifferentlyAsync(provider, subscriber, token);
+        // Money is formatted another way on the provider, under a locale the host has or, on Linux, one generated.
+        bool moneyDiffers = await FormatMoneyDifferentlyAsync(provider, subscriber, locales.FullName, token);
 
         // Tables the initial copy converts, copied before any other change, from a provider whose TimeZone and
         // bytea_output differ from the subscriber's: an enum's array and a composite made of it going into text, a
@@ -308,40 +311,93 @@ public sealed class ColumnTypeTests
     }
 
     /// <summary>
-    /// Sets the provider's lc_monetary to a locale this host has that formats money otherwise than the subscriber's,
-    /// if there is one.
+    /// Sets the provider's lc_monetary to a locale that formats money otherwise than the subscriber's: one the host
+    /// has, as macOS and Windows have ja_JP and en_GB, or else, on Linux, one generated with localedef, which the
+    /// provider is started again to find. Says so when there's neither, and money then replicates as it is.
     /// </summary>
-    /// <returns>Whether there was.</returns>
-    private static async Task<bool> FormatMoneyDifferentlyAsync(TestNode provider, TestNode subscriber, CancellationToken token)
+    /// <returns>Whether there was one.</returns>
+    private async Task<bool> FormatMoneyDifferentlyAsync(TestNode provider, TestNode subscriber, string locales,
+        CancellationToken token)
     {
         const string Format = "SELECT '-1234567'::money::text";
         string format = await subscriber.SafePsqlAsync(Database, Format, token);
-        await using NpgsqlConnection connection = await provider.OpenAsync(Database, token);
-        foreach (string locale in new[] { "ja_JP.UTF-8", "ja_JP.utf8", "ja-JP", "en_GB.UTF-8", "en_GB.utf8", "en-GB" })
+        string? locale = await MoneyLocaleAsync(provider, format, token);
+        if (locale is null && OperatingSystem.IsLinux() && await GenerateLocalesAsync(locales, token))
+        {
+            await provider.StopAsync("fast", token);
+            await provider.StartServerAsync(token, new Dictionary<string, string> { ["LOCPATH"] = locales });
+            locale = await MoneyLocaleAsync(provider, format, token);
+        }
+
+        if (locale is null)
+        {
+            TestContext.WriteLine("No locale formats money otherwise than the subscriber's here, so the test skips money that fails.");
+            return false;
+        }
+
+        _ = await provider.SafePsqlAsync(Database, $"ALTER SYSTEM SET lc_monetary = '{locale}'", token);
+        _ = await provider.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
+        Assert.IsTrue(await provider.PollQueryUntilAsync(Database, $"SELECT '-1234567'::money::text <> '{format}'", token),
+            "lc_monetary didn't take effect");
+        return true;
+
+        static async Task<string?> MoneyLocaleAsync(TestNode provider, string format, CancellationToken token)
+        {
+            await using NpgsqlConnection connection = await provider.OpenAsync(Database, token);
+            foreach (string locale in new[] { "ja_JP.UTF-8", "ja_JP.utf8", "ja-JP", "en_GB.UTF-8", "en_GB.utf8", "en-GB" })
+            {
+                if (await MoneyFormatAsync(connection, locale, token) is string localeFormat && localeFormat != format)
+                {
+                    return locale;
+                }
+            }
+
+            return null;
+        }
+
+        static async Task<string?> MoneyFormatAsync(NpgsqlConnection connection, string locale, CancellationToken token)
         {
             try
             {
                 await using NpgsqlCommand set = new($"SET lc_monetary = '{locale}'", connection);
                 _ = await set.ExecuteNonQueryAsync(token);
                 await using NpgsqlCommand query = new(Format, connection);
-                if ((string?)await query.ExecuteScalarAsync(token) == format)
-                {
-                    continue;
-                }
+                return (string?)await query.ExecuteScalarAsync(token);
             }
             catch (PostgresException)
             {
-                continue;
+                // The host lacks the locale.
+                return null;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Generates the Japanese locale, and the C.UTF-8 locale the nodes start under, for a server that looks for
+    /// locales only in the directory, as LOCPATH makes it.
+    /// </summary>
+    /// <returns>Whether localedef made them.</returns>
+    private static async Task<bool> GenerateLocalesAsync(string locales, CancellationToken token)
+    {
+        foreach ((string input, string name) in new[] { ("ja_JP", "ja_JP.utf8"), ("C", "C.utf8") })
+        {
+            try
+            {
+                _ = await ProcessRunner.RunAsync("localedef", ["-i", input, "-f", "UTF-8", Path.Join(locales, name)], token);
+            }
+            catch (Win32Exception)
+            {
+                // The host has no localedef.
+                return false;
             }
 
-            _ = await provider.SafePsqlAsync(Database, $"ALTER SYSTEM SET lc_monetary = '{locale}'", token);
-            _ = await provider.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
-            Assert.IsTrue(await provider.PollQueryUntilAsync(Database, $"SELECT '-1234567'::money::text <> '{format}'", token),
-                "lc_monetary didn't take effect");
-            return true;
+            if (!File.Exists(Path.Join(locales, name, "LC_MONETARY")))
+            {
+                return false;
+            }
         }
 
-        return false;
+        return true;
     }
 
     private static int CountOccurrences(string text, string value)
