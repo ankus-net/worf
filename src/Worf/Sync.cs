@@ -1571,13 +1571,10 @@ internal static class Sync
 
             insert.Append(columns.Count == key.Count ? ") DO NOTHING" : ") DO UPDATE SET ");
             bool first = true;
-            foreach (string column in columns)
+            foreach (string column in columns.Where(column => !key.Contains(column)))
             {
-                if (!key.Contains(column))
-                {
-                    insert.Append(first ? "" : ", ").Append(Spi.QuoteIdentifier(column)).Append(" = excluded.").Append(Spi.QuoteIdentifier(column));
-                    first = false;
-                }
+                insert.Append(first ? "" : ", ").Append(Spi.QuoteIdentifier(column)).Append(" = excluded.").Append(Spi.QuoteIdentifier(column));
+                first = false;
             }
         }
 
@@ -1865,9 +1862,10 @@ internal static class Sync
         }
 
         using PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share();
-        foreach (int worker in guard.Read((in _, workers) => Worker.SyncFindAll(workers, dboid, sub.Id)))
+        List<int> syncs = guard.Read((in _, workers) => Worker.SyncFindAll(workers, dboid, sub.Id));
+        for (int i = 0; i < syncs.Count; i++)
         {
-            WorfWorker w = guard[worker];
+            WorfWorker w = guard[syncs[i]];
             if (w.Proc != 0)
             {
                 _ = kept.Add(SyncSlotName(sub.SlotName, Worker.NameStr(w.Worker.Sync.Nspname), Worker.NameStr(w.Worker.Sync.Relname)));

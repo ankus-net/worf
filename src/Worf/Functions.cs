@@ -417,7 +417,7 @@ internal static class Functions
             // Kill the apply and table sync workers to unlock the resources.
             using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
             {
-                foreach (int worker in SubscriptionWorkers(guard, myDatabaseId, sub.Id))
+                foreach (int worker in RunningSubscriptionWorkers(guard, myDatabaseId, sub.Id))
                 {
                     Worker.WorkerKill(guard, worker);
                 }
@@ -434,14 +434,11 @@ internal static class Functions
                 List<(int Pid, bool Sync)> pids = [];
                 using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
                 {
-                    foreach (int worker in SubscriptionWorkers(guard, myDatabaseId, sub.Id))
+                    foreach (int worker in RunningSubscriptionWorkers(guard, myDatabaseId, sub.Id))
                     {
-                        if (guard[worker].Proc != 0)
+                        unsafe
                         {
-                            unsafe
-                            {
-                                pids.Add((((PGPROC*)guard[worker].Proc)->pid, guard[worker].WorkerType == WorfWorkerType.Sync));
-                            }
+                            pids.Add((((PGPROC*)guard[worker].Proc)->pid, guard[worker].WorkerType == WorfWorkerType.Sync));
                         }
                     }
                 }
@@ -515,19 +512,23 @@ internal static class Functions
     }
 
     /// <summary>
-    /// Lists a subscription's apply and table sync workers. The caller holds the lock exclusively.
+    /// Lists a subscription's apply and table sync workers that have a process. The caller holds the lock exclusively.
     /// </summary>
-    private static List<int> SubscriptionWorkers(PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard, uint dboid, uint subId)
+    private static List<int> RunningSubscriptionWorkers(PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard, uint dboid, uint subId)
         => guard.Read((in _, workers) =>
         {
             List<int> found = Worker.SyncFindAll(workers, dboid, subId);
-            int apply = Worker.ApplyFind(workers, dboid, subId);
-            if (apply >= 0)
+            found.Add(Worker.ApplyFind(workers, dboid, subId));
+            List<int> running = [];
+            for (int i = 0; i < found.Count; i++)
             {
-                found.Add(apply);
+                if (found[i] >= 0 && workers[found[i]].Proc != 0)
+                {
+                    running.Add(found[i]);
+                }
             }
 
-            return found;
+            return running;
         });
 
     /// <summary>
