@@ -222,6 +222,9 @@ internal static unsafe partial class SequenceRanges
     private const uint TriggerRelationId = 2620;
     private const int PerformDeletionInternal = 0x0001;
 
+    // TRIGGER_TYPE_ROW, TRIGGER_TYPE_BEFORE and TRIGGER_TYPE_UPDATE from catalog/pg_trigger.h.
+    private const int BeforeUpdateRow = 1 | 2 | 16;
+
     private static readonly string[] s_guardNames = [GuardName, UpdateGuardName, PartitionGuardName, PartitionUpdateGuardName];
 
     // The names a trigger's condition gives the row before and after it is written, in the order PostgreSQL adds them.
@@ -1557,7 +1560,7 @@ internal static unsafe partial class SequenceRanges
     internal static void AfterDdl(Node* parsetree)
     {
         if (parsetree->type is not (NodeTag.T_CreateSeqStmt or NodeTag.T_AlterSeqStmt or NodeTag.T_AlterTableStmt or NodeTag.T_CreateStmt or
-            NodeTag.T_AlterDomainStmt or NodeTag.T_CreateDomainStmt))
+            NodeTag.T_AlterDomainStmt or NodeTag.T_CreateDomainStmt or NodeTag.T_CreateTrigStmt or NodeTag.T_DropStmt))
         {
             return;
         }
@@ -1663,6 +1666,21 @@ internal static unsafe partial class SequenceRanges
 
             case NodeTag.T_CreateStmt:
                 InstallGuard(Resolve(((CreateStmt*)parsetree)->relation));
+                break;
+
+            // A row trigger that runs before an update, or the last one gone, changes which updates the update guard fires on.
+            case NodeTag.T_CreateTrigStmt when ((CreateTrigStmt*)parsetree)->row:
+                InstallGuard(Resolve(((CreateTrigStmt*)parsetree)->relation));
+                break;
+
+            case NodeTag.T_DropStmt when ((DropStmt*)parsetree)->removeType == ObjectType.OBJECT_TRIGGER:
+                List* objects = ((DropStmt*)parsetree)->objects;
+                for (int i = 0; objects is not null && i < objects->length; i++)
+                {
+                    List* name = (List*)NativeMethods.copyObjectImpl(objects->elements[i].ptr_value);
+                    InstallGuard(Resolve(NativeMethods.makeRangeVarFromNameList(NativeMethods.list_truncate(name, name->length - 1))));
+                }
+
                 break;
 
             // A domain's default can't change once it uses a managed sequence, so one that does now didn't.
@@ -3725,23 +3743,33 @@ internal static unsafe partial class SequenceRanges
             triggers.Add((existing[i].Get<uint>(0), existing[i].Get<string>(1), existing[i].Get<string>(2), existing[i].Get<bool>(3)));
         }
 
+        // A row trigger that runs before an update may change any column, so the update guard of a table that has one, or
+        // the root's when any table of the tree does, fires on every update, and otherwise only on one that sets a column it
+        // checks.
+        SpiResult before = Worf.Read("""
+            SELECT DISTINCT tgrelid::oid FROM pg_catalog.pg_trigger WHERE tgrelid = ANY ($1::oid[]) AND (tgtype & $2) = $2
+            """, 0, SpiParameter.Create(members.Keys.Select(member => (long)member).ToArray()), SpiParameter.Create(BeforeUpdateRow));
+        HashSet<uint> changing = [.. Enumerable.Range(0, before.Count).Select(i => before[i].Get<uint>(0))];
+
         // A moved row's insert into a partition leaves the check of the root's columns to the root's update guard, which
         // compares the row's old and new values, but a partition's own columns are checked as a new row's.
-        InstallPair(root, GuardName, UpdateGuardName, "worf.sequence_range_check", rootColumns, triggers);
+        InstallPair(root, GuardName, UpdateGuardName, "worf.sequence_range_check", rootColumns, changing.Count > 0, triggers);
         foreach (uint member in members.Keys)
         {
             InstallPair(member, PartitionGuardName, PartitionUpdateGuardName, "worf.sequence_range_check_update",
                 member != root && partitions.TryGetValue(member, out Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>? columns) ? columns : [],
-                triggers);
+                changing.Contains(member), triggers);
         }
     }
 
     /// <summary>
     /// Puts a pair of guard triggers on a table that check columns, replacing a pair that checks others, or drops the
-    /// pair when there are none.
+    /// pair when there are none. The update guard fires on every update when <paramref name="everyUpdate"/> says that a
+    /// row trigger before it may change the columns, and otherwise only on an update that sets one of them.
     /// </summary>
     private static void InstallPair(uint relid, string insertName, string updateName, string insertCheck,
-        Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> columns, List<(uint Relid, string Name, string Arguments, bool Ours)> triggers)
+        Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> columns, bool everyUpdate,
+        List<(uint Relid, string Name, string Arguments, bool Ours)> triggers)
     {
         List<(uint Relid, string Name, string Arguments, bool Ours)> existing = triggers.FindAll(trigger =>
             trigger.Relid == relid && (trigger.Name == insertName || trigger.Name == updateName));
@@ -3769,7 +3797,8 @@ internal static unsafe partial class SequenceRanges
             .OrderBy(column => column.Item1)];
         List<string> arguments = [.. columns
             .OrderBy(column => attnums[column.Key])
-            .Select(column => $"{attnums[column.Key]}:{string.Join(",", [.. column.Value.Sequences.Select(seq => seq.ToString(CultureInfo.InvariantCulture)), .. column.Value.Names])}")];
+            .Select(column => $"{attnums[column.Key]}:{string.Join(",", [.. column.Value.Sequences.Select(seq => seq.ToString(CultureInfo.InvariantCulture)), .. column.Value.Names])}"),
+            .. everyUpdate ? ["every update"] : Array.Empty<string>()];
         string encoded = Convert.ToHexStringLower(Encoding.UTF8.GetBytes(string.Concat(arguments.Select(argument => argument + "\0"))));
         if (guarded.Count == 0 || (existing.Count == 2 && existing.TrueForAll(trigger => trigger.Arguments == encoded && trigger.Ours)))
         {
@@ -3807,7 +3836,7 @@ internal static unsafe partial class SequenceRanges
             EXECUTE FUNCTION {function}
             """);
         CreateGuardTrigger(relid, $"""
-            CREATE OR REPLACE TRIGGER {updateName} AFTER UPDATE ON {table}
+            CREATE OR REPLACE TRIGGER {updateName} AFTER UPDATE{(everyUpdate ? "" : $" OF {string.Join(", ", guarded.Select(c => c.Name))}")} ON {table}
             FOR EACH ROW WHEN ({string.Join(" OR ", guarded.Select(c =>
                 $"(OLD.{c.Name} IS DISTINCT FROM NEW.{c.Name} AND {Check("worf.sequence_range_check_update", c.Name, c.Type, c.Sequences)})"))})
             EXECUTE FUNCTION {function}

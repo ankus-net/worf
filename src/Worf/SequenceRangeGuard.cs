@@ -150,7 +150,8 @@ internal static class SequenceRangeGuard
 
     /// <summary>
     /// Notes a statement as it starts, so that the guard knows one whose only inserts are rows it moves to another
-    /// partition: an UPDATE, or a MERGE with no INSERT action, without a data-modifying WITH.
+    /// partition: an UPDATE, or a MERGE with no INSERT action, of a partitioned table, without a data-modifying WITH. A
+    /// transaction takes on the callbacks that forget them only with the first such statement.
     /// </summary>
     /// <param name="queryDesc">The statement.</param>
     internal static unsafe void StartStatement(QueryDesc* queryDesc)
@@ -161,8 +162,14 @@ internal static class SequenceRangeGuard
             return;
         }
 
+        // Only a statement whose target is partitioned can move a row to another partition.
+        if (statement->planTree is null || statement->planTree->type != NodeTag.T_ModifyTable || ((ModifyTable*)statement->planTree)->rootRelation == 0)
+        {
+            return;
+        }
+
         bool moves = queryDesc->operation == CmdType.CMD_UPDATE;
-        if (queryDesc->operation == CmdType.CMD_MERGE && statement->planTree is not null && statement->planTree->type == NodeTag.T_ModifyTable)
+        if (queryDesc->operation == CmdType.CMD_MERGE)
         {
             moves = true;
             List* lists = ((ModifyTable*)statement->planTree)->mergeActionLists;

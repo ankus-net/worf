@@ -251,6 +251,11 @@ public sealed class SequenceRangeTests
         await AssertOutsideAsync(node, "INSERT INTO t (v) VALUES ('bumped')");
         await AssertOutsideAsync(node, "UPDATE t SET v = 'bumped' WHERE id = " + behind);
         _ = await node.SafePsqlAsync(Database, "DROP TRIGGER zzz ON t; UPDATE t SET v = 'updated' WHERE id = " + behind, token);
+
+        // Without a row trigger before an update, which could change the key, the update guard fires only on an update
+        // that sets the key.
+        Assert.Contains(" AFTER UPDATE OF id ON ", await node.SafePsqlAsync(Database,
+            "SELECT pg_get_triggerdef(oid) FROM pg_trigger WHERE tgrelid = 't'::regclass AND tgname = 'worf_sequence_range_guard_update'", token));
         await AssertOutsideAsync(node, "INSERT INTO tenants VALUES (1200, 2)");
         _ = await node.SafePsqlAsync(Database, "INSERT INTO tenants (tenant) VALUES (2)", token);
 
