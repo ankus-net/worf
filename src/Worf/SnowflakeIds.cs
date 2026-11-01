@@ -229,10 +229,11 @@ internal static class SnowflakeIds
             {
                 _ = Spi.Execute("SELECT pg_catalog.setval('worf.snowflake_clock', $1)", SpiParameter.Create(target));
 
-                // IDs up to the time reserved are issued as soon as it is set, before this commits.
+                // IDs up to the time reserved are issued as soon as it is set, before this commits. The flush goes to the
+                // end of setval's record, as the insert position may lie past a page header not yet written.
                 unsafe
                 {
-                    NativeMethods.XLogFlush(NativeMethods.GetXLogInsertRecPtr());
+                    NativeMethods.XLogFlush(NativeGlobals.XactLastRecEnd);
                 }
             }
 
