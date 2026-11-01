@@ -425,7 +425,7 @@ public sealed class GlobalDdlLockTests
                 _ = await lockQueue.ExecuteNonQueryAsync(token);
             }
 
-            await using (NpgsqlCommand timeout = new("SET lock_timeout = '100ms'", building))
+            await using (NpgsqlCommand timeout = new("SET lock_timeout = '300ms'", building))
             {
                 _ = await timeout.ExecuteNonQueryAsync(token);
             }
