@@ -317,10 +317,14 @@ internal static class SequenceRangeExchange
                     break;
                 }
 
-                // A failed exchange is tried again after a delay that doubles, up to the exchange interval. A call the
-                // watcher cancelled has run out of time.
+                // A failed exchange is tried again after a delay that doubles, up to the exchange interval, or half the
+                // exchange timeout while this node waits on the neighbor, as for a block, so that inserts waiting at a
+                // block's end, up to twice the timeout, get it soon after the neighbor is back. A call the watcher
+                // cancelled has run out of time.
+                long most = waiting is not null ? Math.Min(SequenceRanges.ExchangeInterval * 1000L, SequenceRanges.ExchangeTimeout * 500L)
+                    : SequenceRanges.ExchangeInterval * 1000L;
                 long delay = s_retries.TryGetValue(sub.Id, out (long At, long Delay) retry) ? retry.Delay * 2 : 0;
-                delay = Math.Min(Math.Max(delay, SequenceRanges.CheckInterval * 1000L), SequenceRanges.ExchangeInterval * 1000L);
+                delay = Math.Min(Math.Max(delay, SequenceRanges.CheckInterval * 1000L), Math.Max(most, SequenceRanges.CheckInterval * 1000L));
                 s_retries[sub.Id] = (now + delay, delay);
                 string failure = error is PgQueryCanceledException
                     ? $"node {sub.Origin.Name} didn't answer within {SequenceRanges.ExchangeTimeout.ToString(CultureInfo.InvariantCulture)} ms"
@@ -349,6 +353,12 @@ internal static class SequenceRangeExchange
         long now = Worker.GetCurrentTimestamp();
         foreach (WorfSubscription sub in WorfNode.GetNodeSubscriptions(node.Node.Id, false).Where(sub => sub.Enabled))
         {
+            // The neighbor ties each exchange to the subscription's slot, which a new subscription makes as it starts.
+            if (Sync.GetSubscriptionSyncStatus(sub.Id, true) is not WorfSyncStatus sync || sync.Status == Sync.SyncStatusInit)
+            {
+                continue;
+            }
+
             bool retrying = s_retries.TryGetValue(sub.Id, out (long At, long Delay) retry) && now < retry.At;
             (string? waiting, bool fenced) = Waiting(sub.Origin.Id);
             bool asks = waiting is not null &&

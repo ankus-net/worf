@@ -132,7 +132,9 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   when no request, grant or reset is waiting. While one waits, a node asks
   every check interval, then less often, up to this interval, while nothing
   changes, and while it waits on a neighbor's fence, or on a pool holder,
-  up to ten check intervals. The user in each provider
+  up to ten check intervals. A failed exchange is retried after a delay that
+  doubles up to this, or up to half `worf.sequence_range_timeout` while
+  something waits on that neighbor. The user in each provider
   connection string needs `EXECUTE` on `worf.sequence_range_exchange`, which
   `PUBLIC` doesn't have. The default is `1min`.
 
@@ -145,8 +147,9 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
 
 - `worf.sequence_range_timeout`
   How long a sequence range exchange waits to connect to the other node, and
-  for each call to it, before the range worker cancels it. An insert near the
-  end of a block waits up to twice this for the switch. The default is `10s`.
+  for each call to it, before the range worker cancels it. Inserts near the end
+  of a block wait up to twice this in all for the switch, which then waits up
+  to this for the transactions drawing from the block. The default is `10s`.
 
 - `worf.ddl_lock_timeout`
   How long DDL waits for the other nodes to hold back their writes and catch

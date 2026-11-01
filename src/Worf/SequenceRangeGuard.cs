@@ -49,8 +49,8 @@ internal static class SequenceRangeGuard
     // The points in each sequence's active block, by sequence and value, at which this backend has woken the range worker.
     private static readonly HashSet<(uint Seqoid, long Mark)> s_woken = [];
 
-    // The active blocks, by sequence and start, whose switch this backend has waited for.
-    private static readonly HashSet<(uint Seqoid, long Lo)> s_waited = [];
+    // The active blocks, by sequence and start, whose switch this backend has waited for, and until when it may.
+    private static readonly Dictionary<(uint Seqoid, long Lo), long> s_waited = [];
 
     /// <summary>
     /// The guard's trigger function. The triggers' conditions do the checking and are never true, so this never runs.
@@ -374,7 +374,7 @@ internal static class SequenceRangeGuard
                 case "active":
                     if (WakeNearEnd(seqoid, sequence.Ascending, lo, hi, value))
                     {
-                        WaitForSwitch(seqoid, lo, sequence.Blocks.Exists(block => block.State == "next"));
+                        WaitForSwitch(seqoid, lo);
                     }
 
                     if (s_reached.TryGetValue(seqoid, out long reached) && (sequence.Ascending ? reached >= value : reached <= value))
@@ -426,39 +426,55 @@ internal static class SequenceRangeGuard
     /// Waits, once a sequence reaches the last twentieth of its active block, until the range worker starts the switch,
     /// which takes the sequence's lock as nextval leaves it held and so waits for this transaction, or the block is
     /// switched, so that inserts wait for the worker to wake and switch, or for a next block on its way from the exchange
-    /// worker, rather than run the block out. A backend waits once per block, up to twice the exchange timeout, which
-    /// covers an exchange that hangs and the check after it, and only while the worker can switch: a next block is ready
-    /// or requested, and no transaction holds the sequence against the switch, as DDL on it does.
+    /// worker, rather than run the block out. A backend waits up to twice the exchange timeout for each block in all,
+    /// which covers an exchange that hangs and the check after it, and waits again in a later insert when the switch gave
+    /// up on the lock. It waits only while the worker can switch: the sequence draws from blocks, and no transaction holds
+    /// the sequence against the switch, as the worker's own request for the lock does, or DDL on it.
     /// </summary>
-    private static void WaitForSwitch(uint seqoid, long lo, bool ready)
+    private static void WaitForSwitch(uint seqoid, long lo)
     {
         SpiParameter seq = SpiParameter.Create(seqoid);
         SpiParameter database = SpiParameter.Create(DatabaseId());
-        if (!s_waited.Add((seqoid, lo)) || !Elevated.Run(() => Worf.SelectCatalog("""
-            SELECT ($3 OR EXISTS (SELECT 1 FROM worf.sequence_range_request WHERE seqoid = $1 AND kind = 'n' AND state = 'open'))
-                AND NOT EXISTS (
-                    SELECT 1 FROM pg_catalog.pg_locks
-                    WHERE locktype = 'relation' AND database = $2 AND relation = $1
-                        AND mode IN ('ShareLock', 'ShareRowExclusiveLock', 'ExclusiveLock', 'AccessExclusiveLock'))
-            """, seq, database, SpiParameter.Create(ready))[0].Get<bool>(0)))
+        long now = Worker.GetCurrentTimestamp();
+        if (!s_waited.TryGetValue((seqoid, lo), out long deadline))
         {
-            return;
+            deadline = now + (SequenceRanges.ExchangeTimeout * 2000L);
+            s_waited.Add((seqoid, lo), deadline);
         }
 
-        long deadline = Worker.GetCurrentTimestamp() + (SequenceRanges.ExchangeTimeout * 2000L);
-        while (Worker.GetCurrentTimestamp() < deadline)
+        long woken = 0;
+        while (now < deadline)
         {
+            if (!Elevated.Run(() => Worf.SelectCatalog("""
+                SELECT EXISTS (SELECT 1 FROM worf.sequence_range WHERE seqoid = $1 AND state = 'active')
+                    AND NOT EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_locks
+                        WHERE locktype = 'relation' AND database = $2 AND relation = $1
+                            AND mode IN ('ShareLock', 'ShareRowExclusiveLock', 'ExclusiveLock', 'AccessExclusiveLock'))
+                """, seq, database)[0].Get<bool>(0)))
+            {
+                return;
+            }
+
+            // The worker tries the switch again soon after one that gave up on the lock, and requests a block the
+            // moment it can.
+            if (now - woken >= 100_000)
+            {
+                woken = now;
+                _ = PgAtomic.Add(SequenceRanges.CheckRequested, 1L);
+                Worker.WakeRangeWorker();
+            }
+
             PgInterrupts.Check();
             Worker.WaitLatch(10);
             Reload();
             if (!s_sequences.TryGetValue(seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) sequence) ||
-                !sequence.Blocks.Exists(block => block.State == "active" && block.Lo == lo) ||
-                Elevated.Run(() => Worf.SelectCatalog(
-                    "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_locks WHERE locktype = 'relation' AND database = $2 AND relation = $1 AND NOT granted)",
-                    seq, database)[0].Get<bool>(0)))
+                !sequence.Blocks.Exists(block => block.State == "active" && block.Lo == lo))
             {
                 return;
             }
+
+            now = Worker.GetCurrentTimestamp();
         }
     }
 
@@ -756,8 +772,13 @@ internal static class SequenceRangeGuard
             }
         }
 
-        s_waited.RemoveWhere(waited => !s_sequences.TryGetValue(waited.Seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) sequence) ||
-            !sequence.Blocks.Exists(block => block.State == "active" && block.Lo == waited.Lo));
+        foreach ((uint Seqoid, long Lo) waited in s_waited.Keys.Where(waited =>
+            !s_sequences.TryGetValue(waited.Seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) sequence) ||
+            !sequence.Blocks.Exists(block => block.State == "active" && block.Lo == waited.Lo)).ToList())
+        {
+            _ = s_waited.Remove(waited);
+        }
+
         s_version = version;
         s_localVersion = localVersion;
     }

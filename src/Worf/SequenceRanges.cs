@@ -258,6 +258,9 @@ internal static unsafe partial class SequenceRanges
     // holder's IDs, which carry their times, can't meet the new holder's.
     private static readonly TimeSpan s_snowflakeReuseAfter = TimeSpan.FromDays(1);
 
+    // The range worker's lock timeout for the next try of each sequence's switch, by the block it switches to.
+    private static readonly Dictionary<uint, (Guid Block, int Timeout)> s_switchTimeouts = [];
+
     // When a block that lasted less than an hour is followed by a bigger request, and one that lasted more than a day by
     // a smaller one.
     private static readonly TimeSpan s_growBelow = TimeSpan.FromHours(1);
@@ -806,7 +809,7 @@ internal static unsafe partial class SequenceRanges
                     return true;
                 }
 
-                if (Switch(seqoid, info, (next.Value.Id, next.Value.Lo, next.Value.Hi), next.Value.Reserved))
+                if (SwitchBeforeEnd(seqoid, info, (next.Value.Id, next.Value.Lo, next.Value.Hi), next.Value.Reserved, !moved && left <= size / 20))
                 {
                     changed = true;
                     next = null;
@@ -3398,9 +3401,10 @@ internal static unsafe partial class SequenceRanges
     /// <param name="info">The sequence's details.</param>
     /// <param name="block">The block.</param>
     /// <param name="forLoad">Whether the block was reserved for a load.</param>
-    /// <returns>Whether it switched; it doesn't when a transaction that called nextval holds the sequence for 200 ms, or
+    /// <param name="lockTimeout">How long to wait for transactions that called nextval, in milliseconds.</param>
+    /// <returns>Whether it switched; it doesn't when a transaction that called nextval holds the sequence that long, or
     /// another switch took the block first.</returns>
-    internal static bool Switch(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) block, bool forLoad = false)
+    internal static bool Switch(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) block, bool forLoad = false, int lockTimeout = 200)
     {
         LockLedger(seqoid);
         if (Worf.ReadScalar<long?>("SELECT not_before FROM worf.sequence_range_block WHERE block_id = $1", SpiParameter.Create(block.Id)) is long notBefore &&
@@ -3422,7 +3426,8 @@ internal static unsafe partial class SequenceRanges
             {
                 PgTransaction.RunInSubtransaction(() =>
                 {
-                    _ = Spi.Execute("SET LOCAL lock_timeout = 200");
+                    _ = Spi.Execute("SELECT pg_catalog.set_config('lock_timeout', $1, true)", SpiParameter.Create(
+                        Math.Max(lockTimeout, 1).ToString(CultureInfo.InvariantCulture)));
 
                     // Another switch may have taken the block while this one read it or waited for the lock. Restarting
                     // the sequence at the block's start would then issue its values again, so this one leaves it.
@@ -3476,6 +3481,25 @@ internal static unsafe partial class SequenceRanges
         ChangedOnCommit();
         PgLog.Log($"sequence {info.Name} switched to its block [{lo}, {hi}]");
         return true;
+    }
+
+    /// <summary>
+    /// Switches a sequence to its next block as its active one runs low. A switch waits 200 ms for the transactions that
+    /// called nextval, and once the block reaches its last twentieth, where inserts wait for the switch, each try that
+    /// gives up waits twice as long as the last, up to the exchange timeout, so that the transactions drawing from the
+    /// block can't keep the switch from its lock until they run the block out.
+    /// </summary>
+    private static bool SwitchBeforeEnd(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) next, bool forLoad, bool atEnd)
+    {
+        int timeout = atEnd && s_switchTimeouts.TryGetValue(seqoid, out (Guid Block, int Timeout) last) && last.Block == next.Id ? last.Timeout : 200;
+        if (Switch(seqoid, info, next, forLoad, timeout))
+        {
+            _ = s_switchTimeouts.Remove(seqoid);
+            return true;
+        }
+
+        s_switchTimeouts[seqoid] = (next.Id, atEnd ? Math.Min(timeout * 2, Math.Max(ExchangeTimeout, 200)) : 200);
+        return false;
     }
 
     /// <summary>

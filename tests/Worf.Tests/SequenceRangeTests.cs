@@ -2130,6 +2130,49 @@ public sealed class SequenceRangeTests
     }
 
     /// <summary>
+    /// Many sessions on a node that asks the owner for each of its 1,000-value blocks run through them at the default
+    /// intervals, and none fails at a block's end. The node's exchanges start once its subscription has made its slot,
+    /// which ties them to it.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task ConcurrentInsertsOnANonOwnerOutlastSmallBlocks()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, """
+                ALTER SYSTEM RESET worf.sequence_range_check_interval;
+                ALTER SYSTEM RESET worf.sequence_range_exchange_interval;
+                SELECT pg_reload_conf();
+                CREATE TABLE t (id bigserial PRIMARY KEY, v int);
+                """, token);
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database,
+            "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 1000, max_range_size := 1000)", token);
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges", token), "node_b drawing from a block");
+        Assert.DoesNotContain("carries this sequence range exchange", nodeA.ReadLog(), "node_a's log");
+
+        const int Sessions = 32;
+        const int Inserts = 1000;
+        await Task.WhenAll(Enumerable.Range(0, Sessions).Select(async session =>
+        {
+            await using NpgsqlConnection connection = await nodeB.OpenAsync(Database, token);
+            await using NpgsqlCommand insert = new($"INSERT INTO t (v) VALUES ({session})", connection);
+            for (int i = 0; i < Inserts; i++)
+            {
+                _ = await insert.ExecuteNonQueryAsync(token);
+            }
+        }));
+
+        Assert.AreEqual($"{Sessions * Inserts}|{Sessions * Inserts}", await nodeB.SafePsqlAsync(Database, "SELECT count(*), count(DISTINCT id) FROM t", token));
+    }
+
+    /// <summary>
     /// A subscriber whose structure comes from the provider gets the provider's managed sequences quarantined as they
     /// are created and joins them before rows are copied, so the copied rows don't count against it, and then draws from
     /// blocks of its own.

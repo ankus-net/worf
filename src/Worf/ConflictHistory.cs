@@ -348,6 +348,10 @@ internal static partial class ConflictHistory
             return;
         }
 
+        RelationData* relation = rel.Rel;
+        string schema = Worf.FromServer(NativeMethods.get_namespace_name(relation->rd_rel->relnamespace));
+        string table = Worf.FromServer((sbyte*)&relation->rd_rel->relname);
+
         // The record is one atomic scope: its statements share its subtransaction, so that one that fails, as DDL
         // creating the partition may, rolls the whole record back, which then goes unrecorded.
         try
@@ -360,7 +364,6 @@ internal static partial class ConflictHistory
                 EnsurePartitionExists(recordedAt);
 
                 // Get tuple descriptor for JSONB conversion
-                RelationData* relation = rel.Rel;
                 TupleDescData* tupdesc = relation->rd_att;
 
                 // Get index name if available
@@ -376,8 +379,8 @@ internal static partial class ConflictHistory
                     SpiParameter.Create(sub.Name),
                     SpiParameter.Create(ConflictTypeToString(conflictType)),
                     SpiParameter.Create(ResolutionToString(resolution)),
-                    SpiParameter.Create(Worf.FromServer(NativeMethods.get_namespace_name(relation->rd_rel->relnamespace))),
-                    SpiParameter.Create(Worf.FromServer((sbyte*)&relation->rd_rel->relname)),
+                    SpiParameter.Create(schema),
+                    SpiParameter.Create(table),
                     SpiParameter.Create<string?>(idxname),
                     SpiParameter.Create<string?>(localtuple is not null && StoreTuples ? TupleToJson(tupdesc, localtuple, MaxTupleSize) : null),
                     SpiParameter.Create<string?>(localTupleXid != 0 ? localTupleXid.ToString(CultureInfo.InvariantCulture) : null),
@@ -389,12 +392,32 @@ internal static partial class ConflictHistory
                     Worf.LsnParameter(Worf.ReploriginSessionOriginLsn),
                     SpiParameter.Create(hasBeforeTriggers),
                     SpiParameter.Create(recordedAt));
+
+                // A deferrable constraint on the history fires here rather than as the apply transaction commits,
+                // where its failure would stop apply.
+                SpiResult deferrable = Worf.Read("""
+                    SELECT DISTINCT n.nspname::text, c.conname::text
+                    FROM pg_catalog.pg_partition_tree('worf.conflict_history'::regclass) p
+                        JOIN pg_catalog.pg_constraint c ON c.conrelid = p.relid
+                        JOIN pg_catalog.pg_namespace n ON n.oid = c.connamespace
+                    WHERE c.condeferrable
+                    """, 0);
+                for (int i = 0; i < deferrable.Count; i++)
+                {
+                    _ = Spi.Execute("SET CONSTRAINTS " + Spi.QuoteQualifiedIdentifier(deferrable[i].Get<string>(0), deferrable[i].Get<string>(1)) +
+                        " IMMEDIATE");
+                }
             }, PgSubtransactionMode.Atomic);
         }
-        catch (PgException)
+        catch (PgException error)
         {
-            // Log the error and continue - don't abort the apply transaction
-            PgLog.Warning("conflict_history: recording failed, continuing without recording");
+            // Recording is only observational, so apply goes on without the record.
+            PgLog.Warning(new PgDiagnostic($"conflict_history: recording failed for the {ConflictTypeToString(conflictType)} conflict on table " +
+                $"{schema}.{table}, continuing without recording it: {error.Message} (SQLSTATE {error.SqlState})")
+            {
+                Detail = error.Detail,
+                Hint = error.Hint,
+            });
         }
     }
 
