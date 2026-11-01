@@ -624,7 +624,9 @@ SELECT worf.enable_sequence_range('inventory_id_seq', participants := '{node_bet
 The other nodes learn of the sequence over their subscriptions. `nextval`
 fails with SQLSTATE `2200H` until a node has its first block, and a trigger
 rejects values written by hand outside this node's blocks with SQLSTATE
-`23514`. `worf.sequence_ranges` shows each sequence's state and blocks.
+`23514`. `worf.sequence_ranges` shows each sequence's state and blocks. A role
+that isn't a superuser needs `USAGE` on schema `worf` and the privileges of the
+sequence's owner to call these functions.
 
 - `worf.enable_sequence_range(sequence regclass, participants text[], range_size bigint, max_range_size bigint, pool_start bigint, force boolean)`
   Puts a sequence under range management, owned by this node.
@@ -637,8 +639,8 @@ rejects values written by hand outside this node's blocks with SQLSTATE
   node then moves the owner.
 - `worf.reset_sequence_range(sequence regclass)`
   Abandons this node's blocks and requests new ones, as after a restore. An
-  owner or pool holder grants nothing until the nodes it granted to report
-  what they hold.
+  owner or pool holder grants nothing until every node it exchanges with
+  reports what it holds.
 - `worf.reserve_sequence_range(sequence regclass, count bigint, timeout interval)`
   Returns once the active block has at least `count` values left, before a
   load that numbers its rows with the sequence. Run it before the load's
