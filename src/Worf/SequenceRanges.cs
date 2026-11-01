@@ -2199,6 +2199,7 @@ internal static unsafe partial class SequenceRanges
     private static List<string> QualifiedNameParts(string name)
     {
         List<string> parts = [];
+        StringBuilder part = new();
         int i = 0;
         while (true)
         {
@@ -2207,7 +2208,7 @@ internal static unsafe partial class SequenceRanges
                 i++;
             }
 
-            StringBuilder part = new();
+            _ = part.Clear();
             if (i < name.Length && name[i] == '"')
             {
                 for (i++; ; i++)
@@ -3865,8 +3866,8 @@ internal static unsafe partial class SequenceRanges
         // from, if that is managed.
         List<(short Attnum, string Name, string Type, List<string> Sequences)> guarded = [.. columns
             .Select(column => (attnums[column.Key], Spi.QuoteIdentifier(column.Key), column.Value.TypeOid == NumericOid ? "numeric" : "bigint",
-                (List<string>)[.. column.Value.Sequences.Select(seq => Spi.QuoteLiteral(seq.ToString(CultureInfo.InvariantCulture)) + "::regclass"),
-                    .. column.Value.Names.Select(name => $"pg_catalog.to_regclass({Spi.QuoteLiteral(name)})")]))
+                column.Value.Sequences.Select(seq => Spi.QuoteLiteral(seq.ToString(CultureInfo.InvariantCulture)) + "::regclass")
+                    .Concat(column.Value.Names.Select(name => $"pg_catalog.to_regclass({Spi.QuoteLiteral(name)})")).ToList()))
             .OrderBy(column => column.Item1)];
         List<string> arguments = [.. columns
             .OrderBy(column => attnums[column.Key])
