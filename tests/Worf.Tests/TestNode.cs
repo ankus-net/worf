@@ -292,10 +292,12 @@ internal sealed class TestNode : IAsyncDisposable
     /// </summary>
     /// <param name="cancellationToken">Cancels waiting for the server.</param>
     /// <param name="options">Options for the server's command line, such as <c>-c name=value</c>, or null.</param>
+    /// <param name="environment">Environment variables the server gets besides this process's, or null.</param>
     /// <returns>The work.</returns>
-    public Task StartServerAsync(CancellationToken cancellationToken, string? options = null)
+    public Task StartServerAsync(CancellationToken cancellationToken, string? options = null,
+        IReadOnlyDictionary<string, string>? environment = null)
         => RunPgCtlAsync(["start", "-D", Cluster.DataDirectory, "-l", RestartLogPath, "-w", "-t", "180",
-            .. options is null ? Array.Empty<string>() : ["-o", options]], cancellationToken);
+            .. options is null ? Array.Empty<string>() : ["-o", options]], cancellationToken, environment);
 
     /// <summary>
     /// Reads the node's server log, and what the server wrote after <see cref="StartServerAsync"/>.
@@ -350,9 +352,11 @@ internal sealed class TestNode : IAsyncDisposable
         }
     }
 
-    private async Task RunPgCtlAsync(IReadOnlyList<string> arguments, CancellationToken cancellationToken)
+    private async Task RunPgCtlAsync(IReadOnlyList<string> arguments, CancellationToken cancellationToken,
+        IReadOnlyDictionary<string, string>? environment = null)
     {
-        (int exitCode, string stdout, string stderr) = await ProcessRunner.RunAsync(Installation.PgCtlPath, arguments, cancellationToken);
+        (int exitCode, string stdout, string stderr) = await ProcessRunner.RunAsync(Installation.PgCtlPath, arguments,
+            cancellationToken, environment: environment);
         if (exitCode != 0)
         {
             throw new InvalidOperationException($"pg_ctl {arguments[0]} failed: {stdout}{stderr}");

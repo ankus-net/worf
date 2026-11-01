@@ -177,6 +177,9 @@ internal static unsafe partial class OutputPlugin
                     $"client sent max_proto_version={data.ClientMaxProtoVersion} but we only support protocol {OutputProto.ProtoMinVersionNum} or higher");
             }
 
+            // An older client reads the layout of the version it knows.
+            data.ProtoVersion = Math.Min(data.ClientMaxProtoVersion, OutputProto.ProtoVersionNum);
+
             // Set correct protocol format.
             //
             // This is the output plugin protocol format, this is different from the individual fields binary vs
@@ -239,8 +242,10 @@ internal static unsafe partial class OutputPlugin
                 data.FieldDatumEncoding = wantedEncoding;
             }
 
-            // It's obviously not possible to send binary representation of data unless we use the binary output.
-            if (opt->output_type == OutputPluginOutputType.OUTPUT_PLUGIN_BINARY_OUTPUT && data.ClientWantInternalBasetypes)
+            // It's obviously not possible to send binary representation of data unless we use the binary output. A
+            // client reads values in the internal format only with their types, which it gets from protocol version 2.
+            if (opt->output_type == OutputPluginOutputType.OUTPUT_PLUGIN_BINARY_OUTPUT && data.ClientWantInternalBasetypes &&
+                data.ProtoVersion >= OutputProto.ColumnTypesVersionNum)
             {
                 data.AllowInternalBasetypes = CheckBinaryCompatibility(data);
             }
@@ -276,6 +281,15 @@ internal static unsafe partial class OutputPlugin
         if (!s_startupMessageSent)
         {
             SendStartupMessage(ctx, data, false /* can't be last message */);
+        }
+
+        // A reload that changed lc_monetary since the startup message ends the stream, so that the subscriber hears how
+        // money is formatted again as it reconnects, rather than read its values as it was formatted before.
+        if (OutputConfig.AnnouncedMoneyFormat is string announced && OutputConfig.MoneyFormat() != announced)
+        {
+            throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState,
+                $"lc_monetary formats money as \"{OutputConfig.MoneyFormat()}\" where this walsender told the subscriber \"{announced}\"",
+                hint: "The subscriber reconnects and hears the new format.");
         }
 
         // If the record didn't originate locally, send origin info. An origin whose name isn't found, as one the

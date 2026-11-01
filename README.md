@@ -43,9 +43,38 @@ You must `CREATE EXTENSION worf` on both.
 Tables on the provider and subscriber must have the same names and be in the
 same schema. Future revisions may add mapping features.
 
-Tables on the provider and subscriber must have the same columns, with the same
-data types in each column. `CHECK` constraints, `NOT NULL` constraints, etc., must
-be the same or weaker (more permissive) on the subscriber than the provider.
+Tables on the provider and subscriber must have the same columns. A column may
+have another data type on the subscriber, as while a change of its type is on
+its way. Its values, in the initial copy too, are read with the provider's type
+and converted as an assignment does, as `ALTER COLUMN ... TYPE` without `USING`
+would, or else through text, which the column type's input reads with the
+column's type modifier. An enum's values are its labels. Types that aren't
+PostgreSQL's own are found by schema and name, and used when defined the same:
+of the same kind, with the same input and receive functions and length, or the
+same subtype, element or attribute types in order. A type made of enums, such
+as an enum's array, is used only for a column made of the same enums, since the
+provider's labels may be ones they lack. Values of a type the subscriber lacks,
+defines differently or doesn't use are read by the column type's input when
+sent as text (in the initial copy, with `force_text_transfer`, between major
+versions, for composites and arrays of types that aren't PostgreSQL's own, and
+for domains and ranges of anything but PostgreSQL's own plain types),
+and fail with error 42804 when sent in binary. Values convert under the
+subscriber's settings, such as `TimeZone` and `bytea_output`, however they're
+sent. The initial copy passes the text of a value that needs no conversion,
+such as an integer going into a wider one or `varchar` into `text`, straight to
+the column. A value that doesn't convert fails with PostgreSQL's error, which
+`worf.exception_behaviour` handles, in the initial copy too. Values of `money`,
+or made of it, going into a column that holds money, fail with error 55000 when
+the provider's `lc_monetary` counts other fraction digits than the subscriber's,
+since the stored amounts then differ, or formats money in text that the
+subscriber's reads as another amount. A provider whose `lc_monetary` changes
+ends its stream at the next transaction, so that the subscriber reconnects and
+checks again. An older worf
+doesn't send or read column types, or say how it formats money, so columns
+replicated through an older provider, subscriber or relay node need the same
+types, and money the same `lc_monetary`. `CHECK` constraints, `NOT NULL`
+constraints, etc., must be the same or weaker (more permissive) on the
+subscriber than the provider.
 A subscriber ignores a column it dropped in rows from a provider that still
 has it.
 
@@ -269,9 +298,7 @@ Nodes can be added and removed dynamically using the SQL interfaces.
     skips its own changes when another node forwards them back
   - `apply_delay` - how much to delay replication, default is 0 seconds
   - `force_text_transfer` - force the provider to replicate all columns
-    using a text representation (which is slower, but may be used to
-    change the type of a replicated column on the subscriber), default
-    is false
+    using a text representation (which is slower), default is false
 
   The `subscription_name` is used as `application_name` by the replication
   connection. This means that it's visible in the `pg_stat_replication`
@@ -777,13 +804,14 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   out of resources, are retried as under `error`. Every skipped change,
   including each change of a transaction skipped as a whole, and disabled
   subscriptions are recorded in `worf.exception_log`, with the error, the
-  change's rows or queued DDL, and the transaction it belongs to. The
+  change's rows or queued DDL, and the transaction it belongs to. A value the
+  subscriber can't read is recorded as its bytes in hex. The
   transaction that a subscription applies again, and how, is kept in
   `worf.exception_state` across restarts. Table sync workers catching up
   after a copy handle failures the same way, streaming from their slot again.
   When a walsender of their earlier connection, with the same user and
-  application name, still holds the slot after a second, they stop it; they
-  wait for anything else with a warning, and fail after a minute. Their cleanup,
+  application name, still holds the slot after a second, they stop it; they wait
+  for anything else with a warning, and fail after a minute. Their cleanup,
   which drops the slot, waits five seconds instead, or none when it can't reach
   the provider, then leaves the slot, with a warning, to the subscription's
   apply worker, which drops it, as it does any slot its table syncs left when it
@@ -798,7 +826,18 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   deleted while the sync couldn't catch up stays here; resynchronizing the table
   empties it and copies it again. Writers go on meanwhile, and readers see the
   rows as they were until it commits. A table with neither key fails instead,
-  and retries, until it is resynchronized. The default is `error`.
+  and retries, until it is resynchronized. In a table's initial copy, a row that
+  fails, whether its value doesn't convert to its column's type, the column's
+  input refuses it or a constraint does, is skipped under `discard` and
+  `transdiscard` and disables the subscription under `sub_disable`, and is
+  recorded as a `COPY` with its text, its number in the copy as the action
+  counter and the copy's position. A row that fails other than to convert has
+  the table copied again a row at a time, each in its own subtransaction. Under
+  `error` the copy stops, naming the row, column and value, and starts again
+  after a delay of 5 seconds that doubles each time, up to 5 minutes, from the
+  start of a table's last copy or the failure of a subscription's first;
+  `worf.alter_subscription_resynchronize_table` starts it again at once. The
+  default is `error`.
 
 - `worf.enable_ddl_replication`
   Replicates DDL as it runs, through the `ddl_sql` replication set as

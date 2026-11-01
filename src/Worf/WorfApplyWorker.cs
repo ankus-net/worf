@@ -52,4 +52,10 @@ internal struct WorfApplyWorker
     /// Whether a table sync worker of the subscription left its slot on the provider, which the apply worker drops.
     /// </summary>
     public bool SyncSlotsLeft;
+
+    /// <summary>
+    /// How many times in a row the subscription's initial synchronization failed, after which the next apply worker
+    /// starts later each time.
+    /// </summary>
+    public int SyncFailures;
 }

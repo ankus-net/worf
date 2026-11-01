@@ -83,8 +83,9 @@ internal static class Sync
             case SyncStatusReady:
                 return false;
 
-            // We can recover from crashes during these.
+            // We can recover from crashes during these. A data copy that failed rolled back, and starts again.
             case SyncStatusInit:
+            case SyncStatusData:
             case SyncStatusCatchup:
                 break;
 
@@ -93,7 +94,7 @@ internal static class Sync
                     $"subscriber {sub.Name} initialization failed during nonrecoverable step ({status}), please try the setup again");
         }
 
-        if (status == SyncStatusInit)
+        if (status is SyncStatusInit or SyncStatusData)
         {
             const bool useFailoverSlot = false;
 
@@ -125,21 +126,28 @@ internal static class Sync
                         PgReplicationOrigin.Advance(originid, new PgLsn(lsn), new PgLsn(xactLastCommitEnd), true, true);
                     });
 
+                    // A data copy that starts again finds the structure restored, and dumps it for its constraints.
                     if (SyncKindStructureCopy(sync.Kind))
                     {
-                        PgLog.Info("synchronizing structure");
-
-                        PgBackgroundWorker.RunTransaction(() =>
+                        if (status == SyncStatusInit)
                         {
-                            SetSubscriptionSyncStatus(sub.Id, SyncStatusStructure);
-                            SequenceRangeSync.RecordForRestore(managedSequences);
-                        });
+                            PgLog.Info("synchronizing structure");
+
+                            PgBackgroundWorker.RunTransaction(() =>
+                            {
+                                SetSubscriptionSyncStatus(sub.Id, SyncStatusStructure);
+                                SequenceRangeSync.RecordForRestore(managedSequences);
+                            });
+                        }
 
                         // Dump structure to temp storage.
                         DumpStructure(sub, tmpfile, snapshot);
 
                         // Restore base pre-data structure (types, tables, etc).
-                        RestoreStructure(sub, tmpfile, "pre-data");
+                        if (status == SyncStatusInit)
+                        {
+                            RestoreStructure(sub, tmpfile, "pre-data");
+                        }
                     }
 
                     // Copy data.
@@ -153,33 +161,34 @@ internal static class Sync
                             SequenceRangeSync.JoinBeforeCopy(managedSequences, 0);
                         });
 
-                        List<WorfRemoteRel> tables = CopyReplicationSetsData(sub.Name, sub.OriginIf.Dsn, snapshot,
-                            sub.ReplicationSets, sub.SlotName);
-
-                        // Store info about all the synchronized tables.
-                        PgBackgroundWorker.RunTransaction(() =>
-                        {
-                            foreach (WorfRemoteRel remoterel in tables)
+                        // The tables' statuses are stored, and the subscription's moves past the copy, as the copy
+                        // commits, so that a copy that fails starts again.
+                        CopyReplicationSetsData(sub.Name, sub.OriginIf.Dsn, snapshot, sub.ReplicationSets, sub.SlotName, lsn,
+                            tables =>
                             {
-                                WorfSyncStatus? oldsync = GetTableSyncStatus(sub.Id, remoterel.Nspname, remoterel.Relname, true);
-                                if (oldsync is not null)
+                                foreach (WorfRemoteRel remoterel in tables)
                                 {
-                                    SetTableSyncStatus(sub.Id, remoterel.Nspname, remoterel.Relname, SyncStatusReady, lsn);
-                                }
-                                else
-                                {
-                                    CreateLocalSyncStatus(new WorfSyncStatus
+                                    WorfSyncStatus? oldsync = GetTableSyncStatus(sub.Id, remoterel.Nspname, remoterel.Relname, true);
+                                    if (oldsync is not null)
                                     {
-                                        Kind = SyncKindFull,
-                                        Subid = sub.Id,
-                                        Nspname = remoterel.Nspname,
-                                        Relname = remoterel.Relname,
-                                        Status = SyncStatusReady,
-                                        Statuslsn = lsn,
-                                    });
+                                        SetTableSyncStatus(sub.Id, remoterel.Nspname, remoterel.Relname, SyncStatusReady, lsn);
+                                    }
+                                    else
+                                    {
+                                        CreateLocalSyncStatus(new WorfSyncStatus
+                                        {
+                                            Kind = SyncKindFull,
+                                            Subid = sub.Id,
+                                            Nspname = remoterel.Nspname,
+                                            Relname = remoterel.Relname,
+                                            Status = SyncStatusReady,
+                                            Statuslsn = lsn,
+                                        });
+                                    }
                                 }
-                            }
-                        });
+
+                                SetSubscriptionSyncStatus(sub.Id, SyncKindStructureCopy(sync.Kind) ? SyncStatusConstraints : SyncStatusCatchup);
+                            });
                     }
 
                     // Restore post-data structure (indexes, constraints, etc).
@@ -198,12 +207,22 @@ internal static class Sync
                     SyncTmpfileCleanup(tmpfile);
                 }
             }
+            catch (PgException)
+            {
+                // A row that failed to convert under sub_disable disables the subscription, once the copy rolled back.
+                // The next worker starts later each time the synchronization fails.
+                CleanupAfterError(sub);
+                CopyConversion.DisableAfterFailure();
+                CountSyncFailures(true);
+                throw;
+            }
             catch (Exception)
             {
                 CleanupAfterError(sub);
                 throw;
             }
 
+            CountSyncFailures(false);
             status = SyncStatusCatchup;
             PgBackgroundWorker.RunTransaction(() => SetSubscriptionSyncStatus(sub.Id, SyncStatusCatchup));
         }
@@ -337,7 +356,14 @@ internal static class Sync
             // Copy data. The status that says the copy has committed changes in the copy's transaction, so that a
             // worker that stops after it catches up rather than copying again. A merge's commit advances the origin too.
             CopyTablesData(sub.Name, sub.OriginIf.Dsn, snapshot, [(nspname, relname)], sub.ReplicationSets, sub.SlotName,
-                merge ? lsn : null, () => SetTableSyncStatus(sub.Id, nspname, relname, SyncStatusCatchup, lsn));
+                lsn, merge, () => SetTableSyncStatus(sub.Id, nspname, relname, SyncStatusCatchup, lsn));
+        }
+        catch (PgException)
+        {
+            // A row that failed to convert under sub_disable disables the subscription, once the copy rolled back.
+            CleanupAfterError(sub);
+            CopyConversion.DisableAfterFailure();
+            throw;
         }
         catch (Exception)
         {
@@ -1265,11 +1291,20 @@ internal static class Sync
         PgReplicationOrigin.SetupSession(origin);
 
         Spi.Execute("SET LOCAL session_replication_role = 'replica'");
-        Spi.Execute("SET LOCAL DATESTYLE = ISO");
-        Spi.Execute("SET LOCAL INTERVALSTYLE = POSTGRES");
-        Spi.Execute("SET LOCAL extra_float_digits TO 3");
+        SetCopyTargetStyle(false);
         Spi.Execute("SET LOCAL statement_timeout = 0");
         Spi.Execute("SET LOCAL lock_timeout = 0");
+    }
+
+    /// <summary>
+    /// Sets the styles values take in the copy's target transaction: the origin's, or this node's own, which values
+    /// that convert from the provider's type follow, as in replication.
+    /// </summary>
+    private static void SetCopyTargetStyle(bool own)
+    {
+        Spi.Execute($"SET LOCAL DATESTYLE TO {(own ? "DEFAULT" : "ISO")}");
+        Spi.Execute($"SET LOCAL INTERVALSTYLE TO {(own ? "DEFAULT" : "POSTGRES")}");
+        Spi.Execute($"SET LOCAL extra_float_digits TO {(own ? "DEFAULT" : "3")}");
     }
 
     private static void FinishCopyOriginTx(PgReplicationConnection conn)
@@ -1342,16 +1377,50 @@ internal static class Sync
     }
 
     /// <summary>
-    /// Builds the COPY TO that reads a table's rows on the provider, for the columns the table has here.
+    /// Finds the copied columns whose values convert from the provider's type, other than those whose text the
+    /// column type's input reads as converting it would.
     /// </summary>
-    /// <returns>The local table, the columns that receive the copy's, or none for all of them, and the query.</returns>
-    private static (uint Reloid, List<string> Columns, string Query) CopyQuery(WorfRemoteRel remoterel, List<string> replicationSets)
+    /// <returns>Each local column's conversion, by its number less one, or null when no column converts.</returns>
+    private static unsafe WorfColumnConversion?[]? FindCopyConversions(WorfRelation rel)
     {
-        // Build the relation map.
-        RelCache.RelationCacheUpdater(remoterel);
+        TupleDescData* desc = rel.Rel->rd_att;
+        WorfColumnConversion?[] conversions = new WorfColumnConversion?[desc->natts];
+        bool converts = false;
+
+        for (int attnum = 0; attnum < desc->natts; attnum++)
+        {
+            int remoteattnum = PhysattInAttmap(rel, attnum);
+            if (!NativeMethods.TupleDescAttr(desc, attnum)->attisdropped && remoteattnum >= 0 &&
+                rel.Conversions[remoteattnum] is { } conversion && conversion.Converts('t') && !conversion.ReadsTextDirectly)
+            {
+                conversions[attnum] = conversion;
+                converts = true;
+            }
+        }
+
+        return converts ? conversions : null;
+    }
+
+    /// <summary>
+    /// Builds the COPY TO that reads a table's rows on the provider, for the columns the table has here, with the
+    /// provider's column types.
+    /// </summary>
+    /// <returns>The local table, the columns that receive the copy's, or none for all of them, each local column's
+    /// conversion, by its number less one, or null when no column converts, and the query.</returns>
+    private static (WorfRelation Rel, List<string> Columns, WorfColumnConversion?[]? Conversions, string Query) CopyQuery(
+        PgReplicationConnection originConn, WorfRemoteRel remoterel, List<string> replicationSets)
+    {
+        // Build the relation map, with the provider's column types and, for money, how it formats it.
+        WorfRemoteType?[]? types = Rpc.GetRemoteColumnTypes(originConn, remoterel);
+        if (types is not null && types.Any(type => type is WorfRemoteType remote && RelCache.SendsMoney(remote)))
+        {
+            RelCache.ProviderMoneyFormat = Rpc.GetRemoteMoneyFormat(originConn);
+        }
+
+        RelCache.RelationCacheUpdater(remoterel, types);
         WorfRelation rel = RelCache.RelationOpen(remoterel.Relid, PgLockMode.AccessShare);
         List<string> attnamelist = MakeCopyAttnamelist(rel);
-        uint reloid = rel.Reloid;
+        WorfColumnConversion?[]? converted = attnamelist.Count != 0 ? FindCopyConversions(rel) : null;
 
         StringBuilder attlist = new();
         bool first = true;
@@ -1410,7 +1479,7 @@ internal static class Sync
 
         query.Append("TO stdout");
 
-        return (reloid, attnamelist, query.ToString());
+        return (rel, attnamelist, converted, query.ToString());
     }
 
     /// <summary>
@@ -1430,15 +1499,45 @@ internal static class Sync
     }
 
     /// <summary>
-    /// COPY single table over wire. Runs in the target transaction.
+    /// Starts a COPY TO on the provider and copies its rows into a table: the local one, or the one a merge reads.
     /// </summary>
-    private static void CopyTableData(PgReplicationConnection originConn, WorfRemoteRel remoterel, List<string> replicationSets)
+    /// <param name="originConn">The provider connection, in the copy's transaction.</param>
+    /// <param name="rel">The local table.</param>
+    /// <param name="into">The table the rows go into.</param>
+    /// <param name="attnamelist">The columns that receive the copy's, or none for all of them.</param>
+    /// <param name="converted">Each local column's conversion, by its number less one, or null when no column
+    /// converts.</param>
+    /// <param name="query">The COPY TO.</param>
+    /// <param name="lsn">The position the copy is consistent with.</param>
+    private static void CopyRows(PgReplicationConnection originConn, WorfRelation rel, uint into, List<string> attnamelist,
+        WorfColumnConversion?[]? converted, string query, ulong lsn)
     {
-        (uint reloid, List<string> attnamelist, string query) = CopyQuery(remoterel, replicationSets);
         StartCopy(originConn, query);
 
-        // Execute COPY FROM.
-        _ = originConn.CopyInto(reloid, attnamelist.Count != 0 ? attnamelist : null);
+        // Execute COPY FROM. A table whose values convert is copied with their conversions, under this node's own
+        // settings, which conversions follow, as in replication, and so is any table under worf.exception_behaviour
+        // other than error, which skips or records the rows that fail.
+        if (converted is null && (Apply.ExceptionBehaviour == WorfExceptionBehaviour.Error || attnamelist.Count == 0))
+        {
+            _ = originConn.CopyInto(into, attnamelist.Count != 0 ? attnamelist : null);
+        }
+        else
+        {
+            SetCopyTargetStyle(converted is not null);
+            _ = CopyConversion.Copy(originConn, rel, into, attnamelist, converted, lsn, () => StartCopy(originConn, query));
+            SetCopyTargetStyle(false);
+        }
+    }
+
+    /// <summary>
+    /// COPY single table over wire. Runs in the target transaction.
+    /// </summary>
+    private static void CopyTableData(PgReplicationConnection originConn, WorfRemoteRel remoterel, List<string> replicationSets,
+        ulong lsn)
+    {
+        (WorfRelation rel, List<string> attnamelist, WorfColumnConversion?[]? converted, string query) =
+            CopyQuery(originConn, remoterel, replicationSets);
+        CopyRows(originConn, rel, rel.Reloid, attnamelist, converted, query, lsn);
 
         PgLog.Info($"finished synchronization of data for table {remoterel.Nspname}.{remoterel.Relname}");
     }
@@ -1454,9 +1553,13 @@ internal static class Sync
     /// <param name="originConn">The provider connection, in the copy's transaction.</param>
     /// <param name="remoterel">The table.</param>
     /// <param name="replicationSets">The replication sets, whose row filters apply.</param>
-    private static void MergeTableData(PgReplicationConnection originConn, WorfRemoteRel remoterel, List<string> replicationSets)
+    /// <param name="lsn">The position the copy is consistent with.</param>
+    private static void MergeTableData(PgReplicationConnection originConn, WorfRemoteRel remoterel, List<string> replicationSets,
+        ulong lsn)
     {
-        (uint reloid, List<string> attnamelist, string query) = CopyQuery(remoterel, replicationSets);
+        (WorfRelation rel, List<string> attnamelist, WorfColumnConversion?[]? converted, string query) =
+            CopyQuery(originConn, remoterel, replicationSets);
+        uint reloid = rel.Reloid;
         string table = Spi.QuoteQualifiedIdentifier(remoterel.Nspname, remoterel.Relname);
         (bool partitioned, List<string> key) = TableKey(reloid);
         string only = partitioned ? "" : "ONLY ";
@@ -1484,8 +1587,7 @@ internal static class Sync
             throw Unmergeable(remoterel.Nspname, remoterel.Relname);
         }
 
-        StartCopy(originConn, query);
-        _ = originConn.CopyInto(copyOid, null);
+        CopyRows(originConn, rel, copyOid, attnamelist, converted, query, lsn);
         _ = Spi.Execute($"ANALYZE {MergeCopy}");
 
         // The copy's rows replace the table's with the same key, or join them. A MERGE needs no arbiter index, which a
@@ -1580,12 +1682,13 @@ internal static class Sync
     /// <param name="tables">The tables.</param>
     /// <param name="replicationSets">The replication sets, whose row filters apply.</param>
     /// <param name="originName">The replication origin the copy commits under.</param>
-    /// <param name="merge">The position the copy's commit advances the origin to, for a copy merged into tables that have
-    /// rows, or null for a copy into empty tables.</param>
+    /// <param name="lsn">The position the copy is consistent with.</param>
+    /// <param name="merge">Whether the copy merges into tables that have rows, whose commit advances the origin to
+    /// <paramref name="lsn"/>, rather than going into empty tables.</param>
     /// <param name="copied">Runs in the copy's transaction once the tables are copied.</param>
     private static void CopyTablesData(string subName, string originDsn, string originSnapshot,
-        List<(string Nspname, string Relname)> tables, List<string> replicationSets, string originName,
-        ulong? merge, Action copied)
+        List<(string Nspname, string Relname)> tables, List<string> replicationSets, string originName, ulong lsn,
+        bool merge, Action copied)
     {
         // Connect to origin node.
         PgReplicationConnection originConn = Worf.Connect(originDsn, subName, "copy");
@@ -1597,7 +1700,7 @@ internal static class Sync
             PgBackgroundWorker.RunTransaction(() =>
             {
                 StartCopyTargetTx(originName);
-                if (merge is ulong lsn)
+                if (merge)
                 {
                     Worf.ReploriginSessionOriginLsn = lsn;
                 }
@@ -1606,13 +1709,13 @@ internal static class Sync
                 {
                     WorfRemoteRel remoterel = Rpc.GetRemoteRepsetTable(originConn, nspname, relname, replicationSets);
 
-                    if (merge is not null)
+                    if (merge)
                     {
-                        MergeTableData(originConn, remoterel, replicationSets);
+                        MergeTableData(originConn, remoterel, replicationSets, lsn);
                     }
                     else
                     {
-                        CopyTableData(originConn, remoterel, replicationSets);
+                        CopyTableData(originConn, remoterel, replicationSets, lsn);
                     }
 
                     PgInterrupts.Check();
@@ -1635,30 +1738,30 @@ internal static class Sync
     /// <see cref="CopyTablesData"/>, but it can't be easily merged to single function because we need to get list of
     /// tables here after the transaction is bound to a snapshot.
     /// </summary>
-    private static List<WorfRemoteRel> CopyReplicationSetsData(string subName, string originDsn, string originSnapshot,
-        List<string> replicationSets, string originName)
+    private static void CopyReplicationSetsData(string subName, string originDsn, string originSnapshot,
+        List<string> replicationSets, string originName, ulong lsn, Action<List<WorfRemoteRel>> copied)
     {
         // Connect to origin node.
         PgReplicationConnection originConn = Worf.Connect(originDsn, subName, "copy");
         StartCopyOriginTx(originConn, originSnapshot);
 
-        // Get tables to copy from origin node, and copy every table in the target transaction.
-        List<WorfRemoteRel> tables;
+        // Get tables to copy from origin node, and copy every table in the target transaction, which records what
+        // it copied.
         try
         {
-            tables = PgBackgroundWorker.RunTransaction(() =>
+            PgBackgroundWorker.RunTransaction(() =>
             {
                 List<WorfRemoteRel> tables = Rpc.GetRemoteRepsetTables(originConn, replicationSets);
 
                 StartCopyTargetTx(originName);
                 foreach (WorfRemoteRel remoterel in tables)
                 {
-                    CopyTableData(originConn, remoterel, replicationSets);
+                    CopyTableData(originConn, remoterel, replicationSets, lsn);
 
                     PgInterrupts.Check();
                 }
 
-                return tables;
+                copied(tables);
             });
         }
         finally
@@ -1668,8 +1771,6 @@ internal static class Sync
 
         // Finish the transactions and disconnect.
         FinishCopyOriginTx(originConn);
-
-        return tables;
     }
 
     /// <summary>
@@ -1713,6 +1814,18 @@ internal static class Sync
                 WorfNode.DropOrigins(sub.SlotName);
             });
         }
+    }
+
+    /// <summary>
+    /// Counts one more failure of the subscription's initial synchronization in the apply worker's slot, or none
+    /// once it succeeds.
+    /// </summary>
+    private static void CountSyncFailures(bool failed)
+    {
+        using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive();
+        WorfWorker worker = guard[Worker.MyWorfWorker];
+        worker.Worker.Apply.SyncFailures = failed ? worker.Worker.Apply.SyncFailures + 1 : 0;
+        guard[Worker.MyWorfWorker] = worker;
     }
 
     /// <summary>

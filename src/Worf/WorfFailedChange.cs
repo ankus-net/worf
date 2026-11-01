@@ -54,4 +54,10 @@ internal sealed class WorfFailedChange
     /// Gets the queued message, such as DDL, that the change carries, or null.
     /// </summary>
     public string? QueuedMessage { get; init; }
+
+    /// <summary>
+    /// Gets the change's new row as the exception log records it, for a change no message carries, such as a row of a
+    /// table's initial copy, or null.
+    /// </summary>
+    public string? NewTuple { get; init; }
 }

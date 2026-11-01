@@ -51,6 +51,11 @@ internal sealed class WorfOutputData
     public uint ClientMinProtoVersion { get; set; }
 
     /// <summary>
+    /// Gets or sets the protocol version the plugin writes: the newest both it and the client support.
+    /// </summary>
+    public uint ProtoVersion { get; set; }
+
+    /// <summary>
     /// Gets or sets the encoding the client expects.
     /// </summary>
     public string? ClientExpectedEncoding { get; set; }

@@ -774,9 +774,11 @@ internal static class Functions
             WorfSyncStatus? oldsync = Sync.GetTableSyncStatus(sub.Id, nspname, relname, true);
             if (oldsync is not null)
             {
+                // A sync that keeps failing, whose worker waits to start again, starts over at once.
                 if (oldsync.Status != Sync.SyncStatusReady &&
                     oldsync.Status != Sync.SyncStatusSyncdone &&
-                    oldsync.Status != Sync.SyncStatusNone)
+                    oldsync.Status != Sync.SyncStatusNone &&
+                    SyncWorkerRuns(sub.Id, nspname, relname))
                 {
                     throw new PgException(PgSqlStates.InternalError, $"table {nspname}.{relname} is already being synchronized");
                 }
@@ -811,6 +813,24 @@ internal static class Functions
         Worker.SubscriptionChanged(sub.Id, false);
 
         return true;
+    }
+
+    /// <summary>
+    /// Checks whether a table's sync worker runs.
+    /// </summary>
+    private static bool SyncWorkerRuns(uint subId, string nspname, string relname)
+    {
+        uint dboid;
+        unsafe
+        {
+            dboid = NativeGlobals.MyDatabaseId;
+        }
+
+        byte[] serverNspname = Worf.ToServer(nspname);
+        byte[] serverRelname = Worf.ToServer(relname);
+        using PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share();
+        int worker = guard.Read((in _, workers) => Worker.SyncFind(workers, dboid, subId, serverNspname, serverRelname));
+        return worker >= 0 && guard[worker].Proc != 0;
     }
 
     /// <summary>
@@ -1386,6 +1406,42 @@ internal static class Functions
         NativeMethods.table_close(rel, (int)PgLockMode.None);
 
         return result;
+    }
+
+    /// <summary>
+    /// Returns the type each column of a table's values are sent in, as RELATION messages name them, so that a
+    /// subscriber's initial copy converts them as replication does.
+    /// </summary>
+    [PgFunction(SetMode = PgSetMode.Materialize, Sql = """
+        CREATE FUNCTION worf.show_table_column_types(relation regclass, OUT attname text, OUT type_oid oid,
+        	OUT type_nspname text, OUT type_name text, OUT type_definition text)
+        RETURNS SETOF record STRICT STABLE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
+        """)]
+    internal static unsafe IEnumerable<PgHeapTuple?> ShowTableColumnTypes(
+        [PgSqlType("regclass", Schema = "pg_catalog")] PgDatum relation)
+    {
+        RelationData* rel = NativeMethods.table_open(Oid(relation), (int)PgLockMode.AccessShare);
+        TupleDescData* reldesc = rel->rd_att;
+        List<PgHeapTuple?> rows = [];
+        for (int i = 0; i < reldesc->natts; i++)
+        {
+            FormData_pg_attribute* att = NativeMethods.TupleDescAttr(reldesc, i);
+            if (att->attisdropped)
+            {
+                continue;
+            }
+
+            WorfRemoteType type = ProtoNative.ColumnType(att->atttypid);
+            rows.Add(PgHeapTuple.Create(
+                ("attname", SpiParameter.Create(Worf.FromServer((sbyte*)&att->attname))),
+                ("type_oid", SpiParameter.Create(type.Oid)),
+                ("type_nspname", SpiParameter.Create<string?>(type.Nspname)),
+                ("type_name", SpiParameter.Create<string?>(type.Typname)),
+                ("type_definition", SpiParameter.Create<string?>(type.Definition))));
+        }
+
+        NativeMethods.table_close(rel, (int)PgLockMode.None);
+        return rows;
     }
 
     /// <summary>

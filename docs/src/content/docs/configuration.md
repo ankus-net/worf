@@ -79,13 +79,14 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   out of resources, are retried as under `error`. Every skipped change,
   including each change of a transaction skipped as a whole, and disabled
   subscriptions are recorded in `worf.exception_log`, with the error, the
-  change's rows or queued DDL, and the transaction it belongs to. The
+  change's rows or queued DDL, and the transaction it belongs to. A value the
+  subscriber can't read is recorded as its bytes in hex. The
   transaction that a subscription applies again, and how, is kept in
   `worf.exception_state` across restarts. Table sync workers catching up
   after a copy handle failures the same way, streaming from their slot again.
   When a walsender of their earlier connection, with the same user and
-  application name, still holds the slot after a second, they stop it; they
-  wait for anything else with a warning, and fail after a minute. Their cleanup,
+  application name, still holds the slot after a second, they stop it; they wait
+  for anything else with a warning, and fail after a minute. Their cleanup,
   which drops the slot, waits five seconds instead, or none when it can't reach
   the provider, then leaves the slot, with a warning, to the subscription's
   apply worker, which drops it, as it does any slot its table syncs left when it
@@ -100,7 +101,18 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   deleted while the sync couldn't catch up stays here; resynchronizing the table
   empties it and copies it again. Writers go on meanwhile, and readers see the
   rows as they were until it commits. A table with neither key fails instead,
-  and retries, until it is resynchronized. The default is `error`.
+  and retries, until it is resynchronized. In a table's initial copy, a row that
+  fails, whether its value doesn't convert to its column's type, the column's
+  input refuses it or a constraint does, is skipped under `discard` and
+  `transdiscard` and disables the subscription under `sub_disable`, and is
+  recorded as a `COPY` with its text, its number in the copy as the action
+  counter and the copy's position. A row that fails other than to convert has
+  the table copied again a row at a time, each in its own subtransaction. Under
+  `error` the copy stops, naming the row, column and value, and starts again
+  after a delay of 5 seconds that doubles each time, up to 5 minutes, from the
+  start of a table's last copy or the failure of a subscription's first;
+  `worf.alter_subscription_resynchronize_table` starts it again at once. The
+  default is `error`.
 
 - `worf.enable_ddl_replication`
   Replicates DDL as it runs, through the `ddl_sql` replication set as

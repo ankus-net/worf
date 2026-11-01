@@ -87,6 +87,65 @@ internal static class Rpc
     }
 
     /// <summary>
+    /// Gets the type each column of a remote table's values are sent in, as RELATION messages name them.
+    /// </summary>
+    /// <param name="conn">The provider connection, inside a local transaction.</param>
+    /// <param name="remoterel">The table.</param>
+    /// <returns>Each of its replicated columns' types, or null when the provider doesn't tell them.</returns>
+    internal static WorfRemoteType?[]? GetRemoteColumnTypes(PgReplicationConnection conn, WorfRemoteRel remoterel)
+    {
+        if (!RemoteFunctionExists(conn, Worf.ExtensionName, "show_table_column_types", 1, null))
+        {
+            return null;
+        }
+
+        string qualified = Spi.QuoteQualifiedIdentifier(remoterel.Nspname, remoterel.Relname);
+        IReadOnlyList<string?[]> res;
+        try
+        {
+            res = conn.Query("SELECT attname, type_oid, type_nspname, type_name, type_definition" +
+                "  FROM worf.show_table_column_types(" + Spi.QuoteLiteral(qualified) + "::regclass)", 5);
+        }
+        catch (PgRemoteException error)
+        {
+            throw new PgException(PgSqlStates.InternalError, $"could not get column types: ERROR:  {error.Message}\n");
+        }
+
+        Dictionary<string, WorfRemoteType> types = [];
+        foreach (string?[] row in res)
+        {
+            types[row[0]!] = new WorfRemoteType(Atooid(row[1]), row[2], row[3], row[4]);
+        }
+
+        WorfRemoteType?[] columns = new WorfRemoteType?[remoterel.Attnames.Count];
+        for (int i = 0; i < columns.Length; i++)
+        {
+            columns[i] = types.TryGetValue(remoterel.Attnames[i], out WorfRemoteType type) ? type : null;
+        }
+
+        return columns;
+    }
+
+    /// <summary>
+    /// Gets how the provider's session formats money, as <see cref="OutputConfig.MoneyFormat"/> shows it.
+    /// </summary>
+    /// <param name="conn">The provider connection, inside a local transaction.</param>
+    /// <returns>The text.</returns>
+    internal static string GetRemoteMoneyFormat(PgReplicationConnection conn)
+    {
+        try
+        {
+            return conn.Query("""
+                SELECT '-1234567'::pg_catalog.money::pg_catalog.text || ' = ' || '-1234567'::pg_catalog.money::pg_catalog.numeric::pg_catalog.text
+                """, 1)[0][0]!;
+        }
+        catch (PgRemoteException error)
+        {
+            throw new PgException(PgSqlStates.InternalError, $"could not get how the provider formats money: ERROR:  {error.Message}\n");
+        }
+    }
+
+    /// <summary>
     /// Is the remote slot active?.
     /// </summary>
     /// <param name="conn">The provider connection, inside a local transaction.</param>

@@ -8,6 +8,13 @@ namespace Worf;
 /// </summary>
 internal static class OutputConfig
 {
+    // The OID of money.
+    private const uint MoneyOid = 790;
+
+    // cash_numeric and numeric_out, from catalog/pg_proc.dat.
+    private const uint CashNumericOid = 3823;
+    private const uint NumericOutOid = 1702;
+
     /// <summary>
     /// Gets whether <c>USE_FLOAT4_BYVAL</c> is defined.
     /// </summary>
@@ -63,11 +70,11 @@ internal static class OutputConfig
         int pgVersionNum = Worf.ServerVersionNum;
         List<(string Key, string Value)> l =
         [
-            ("max_proto_version", "1"),
-            ("min_proto_version", "1"),
+            ("max_proto_version", Int(OutputProto.ProtoVersionNum)),
+            ("min_proto_version", Int(OutputProto.ProtoMinVersionNum)),
 
-            // We don't support understand column types yet
-            ("coltypes", Bool(false)),
+            // Whether RELATION messages carry the columns' types
+            ("coltypes", Bool(data.ProtoVersion >= OutputProto.ColumnTypesVersionNum)),
 
             // Info about our Pg host
             ("pg_version_num", Int(pgVersionNum)),
@@ -77,6 +84,9 @@ internal static class OutputConfig
             ("encoding", EncodingToChar(data.FieldDatumEncoding)),
             ("forward_changeset_origins", Bool(data.ForwardChangesetOrigins)),
             ("walsender_pid", Int(Environment.ProcessId)),
+
+            // How lc_monetary formats money, whose values count its currency in its fraction digits
+            ("money_format", AnnouncedMoneyFormat = MoneyFormat()),
 
             // and ourselves
             ("worf_version", Worf.Version),
@@ -104,6 +114,51 @@ internal static class OutputConfig
 
         return l;
     }
+
+    /// <summary>
+    /// Gets or sets how the startup message told the subscriber this walsender formats money.
+    /// </summary>
+    internal static string? AnnouncedMoneyFormat { get; set; }
+
+    /// <summary>
+    /// Gets how this session's <c>lc_monetary</c> formats money: the text of the amount -1234567, as
+    /// <c>'-1234567'::money::text</c> gives it, which shows the currency, the fraction digits and the separators, and
+    /// the amount that stands for, as <c>'-1234567'::money::numeric</c> gives it, which depends on the fraction digits
+    /// alone, as in "-$12,345.67 = -12345.67".
+    /// </summary>
+    /// <returns>The text.</returns>
+    internal static unsafe string MoneyFormat()
+    {
+        uint typinput;
+        uint typioparam;
+        uint typoutput;
+        bool typisvarlena;
+        NativeMethods.getTypeInputInfo(MoneyOid, &typinput, &typioparam);
+        NativeMethods.getTypeOutputInfo(MoneyOid, &typoutput, &typisvarlena);
+        fixed (byte* amount = "-1234567\0"u8)
+        {
+            ulong value = NativeMethods.OidInputFunctionCall(typinput, (sbyte*)amount, typioparam, -1);
+            return Worf.FromServer(NativeMethods.OidOutputFunctionCall(typoutput, value)) + " = " +
+                Worf.FromServer(NativeMethods.OidOutputFunctionCall(NumericOutOid, NativeMethods.OidFunctionCall1Coll(CashNumericOid, 0, value)));
+        }
+    }
+
+    /// <summary>
+    /// Gets the amount a money format, as <see cref="MoneyFormat"/> gives it, stands for, or the whole format when it
+    /// gives none, as an older node's.
+    /// </summary>
+    /// <param name="format">The format.</param>
+    /// <returns>The amount.</returns>
+    internal static string MoneyAmount(string format)
+        => format.LastIndexOf(" = ", StringComparison.Ordinal) is int at and >= 0 ? format[(at + 3)..] : format;
+
+    /// <summary>
+    /// Gets the text a money format, as <see cref="MoneyFormat"/> gives it, writes the amount -1234567 as.
+    /// </summary>
+    /// <param name="format">The format.</param>
+    /// <returns>The text.</returns>
+    internal static string MoneyText(string format)
+        => format.LastIndexOf(" = ", StringComparison.Ordinal) is int at and >= 0 ? format[..at] : format;
 
     /// <summary>
     /// Gets the name of an encoding, as <c>pg_encoding_to_char</c> returns it.
@@ -220,8 +275,8 @@ internal static class OutputConfig
                     break;
 
                 case OutputPluginParamKey.BinaryFloat8byval:
-                    data.ClientBinaryFloat4byvalSet = true;
-                    data.ClientBinaryFloat4byval = ParseParamBool(elem);
+                    data.ClientBinaryFloat8byvalSet = true;
+                    data.ClientBinaryFloat8byval = ParseParamBool(elem);
                     break;
 
                 case OutputPluginParamKey.BinaryIntegerDatetimes:
