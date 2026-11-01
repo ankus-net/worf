@@ -204,10 +204,13 @@ internal static class Sync
             catch (PgException)
             {
                 // A row that failed to convert under sub_disable disables the subscription, once the copy rolled back.
+                // The next worker starts later each time the synchronization fails.
                 CopyConversion.DisableAfterFailure();
+                CountSyncFailures(true);
                 throw;
             }
 
+            CountSyncFailures(false);
             status = SyncStatusCatchup;
             PgBackgroundWorker.RunTransaction(() => SetSubscriptionSyncStatus(sub.Id, SyncStatusCatchup));
         }
@@ -1421,6 +1424,18 @@ internal static class Sync
             PgReplicationOrigin.ResetSession();
             WorfNode.DropOrigins(sub.SlotName);
         }
+    }
+
+    /// <summary>
+    /// Counts one more failure of the subscription's initial synchronization in the apply worker's slot, or none
+    /// once it succeeds.
+    /// </summary>
+    private static void CountSyncFailures(bool failed)
+    {
+        using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive();
+        WorfWorker worker = guard[Worker.MyWorfWorker];
+        worker.Worker.Apply.SyncFailures = failed ? worker.Worker.Apply.SyncFailures + 1 : 0;
+        guard[Worker.MyWorfWorker] = worker;
     }
 
     /// <summary>

@@ -281,7 +281,10 @@ internal static class Manager
                 {
                     if (applyWorker.CrashedAt != 0)
                     {
-                        long restartTime = applyWorker.CrashedAt + (MinSleep * 1000);
+                        // One whose initial synchronization failed waits longer each time it failed.
+                        int syncFailures = applyWorker.Worker.Apply.SyncFailures;
+                        long restartTime = applyWorker.CrashedAt +
+                            ((syncFailures > 0 ? Apply.SyncRestartDelayAfter(syncFailures) : MinSleep) * 1000);
 
                         // One that stopped to apply its failed transaction in a new way restarts at once.
                         if (restartTime > Worker.GetCurrentTimestamp() && !applyWorker.Worker.Apply.ExceptionRestartsAtOnce)
@@ -312,6 +315,7 @@ internal static class Manager
                 // A crashed worker's failed transaction is applied again under worf.exception_behaviour.
                 apply.Worker.Apply.ExceptionLsn = crashed.ExceptionLsn;
                 apply.Worker.Apply.ExceptionLevel = crashed.ExceptionLevel;
+                apply.Worker.Apply.SyncFailures = crashed.SyncFailures;
 
                 _ = Worker.WorkerRegister(apply);
             }

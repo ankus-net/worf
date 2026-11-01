@@ -81,9 +81,9 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   and `transdiscard` and disables the subscription under `sub_disable`, and is
   recorded as a `COPY` with its text, its number in the copy as the action
   counter and the copy's position. Under `error` the copy stops, naming the
-  row, column and value, and starts again once its worker restarts; a table
-  synchronized on its own waits 5 seconds after its last start, and twice as
-  long each time after, up to 5 minutes. The default is `error`.
+  row, column and value, and starts again after a delay of 5 seconds that
+  doubles each time, up to 5 minutes, from the start of a table's last copy or
+  the failure of a subscription's first. The default is `error`.
 
 - `worf.enable_ddl_replication`
   Replicates DDL as it runs, through the `ddl_sql` replication set as

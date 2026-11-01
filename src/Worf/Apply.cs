@@ -15,7 +15,7 @@ internal static unsafe partial class Apply
     // Number of tuples inserted after which we switch to multi-insert.
     private const int MinMultiInsertTuples = 5;
 
-    // How many milliseconds a table's sync worker that started before waits to start again, at first and at most.
+    // How many milliseconds a synchronization that failed waits to start again, at first and at most.
     private const long SyncRestartDelay = 5000;
     private const long MaxSyncRestartDelay = 300_000;
 
@@ -2430,7 +2430,7 @@ internal static unsafe partial class Apply
                 // after each later one, up to 5 minutes, while another table's starts.
                 long now = Worker.GetCurrentTimestamp();
                 (long startedAt, int starts) = s_syncStarts.GetValueOrDefault((sync.Nspname, sync.Relname));
-                if (starts > 0 && now < startedAt + (Math.Min(SyncRestartDelay << Math.Min(starts - 1, 6), MaxSyncRestartDelay) * 1000))
+                if (starts > 0 && now < startedAt + (SyncRestartDelayAfter(starts) * 1000))
                 {
                     continue;
                 }
@@ -2441,6 +2441,14 @@ internal static unsafe partial class Apply
             }
         }
     }
+
+    /// <summary>
+    /// Gets how long a synchronization that failed, or started, a number of times waits to start again: 5 seconds,
+    /// and twice as long each time after, up to 5 minutes.
+    /// </summary>
+    /// <param name="times">How many times, at least one.</param>
+    /// <returns>The delay in milliseconds.</returns>
+    internal static long SyncRestartDelayAfter(int times) => Math.Min(SyncRestartDelay << Math.Min(times - 1, 6), MaxSyncRestartDelay);
 
     private static void StartSyncWorker(string nspname, string relname)
     {

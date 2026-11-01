@@ -47,4 +47,10 @@ internal struct WorfApplyWorker
     /// delay before restarting a worker that failed.
     /// </summary>
     public bool ExceptionRestartsAtOnce;
+
+    /// <summary>
+    /// How many times in a row the subscription's initial synchronization failed, after which the next apply worker
+    /// starts later each time.
+    /// </summary>
+    public int SyncFailures;
 }
