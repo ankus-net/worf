@@ -162,9 +162,10 @@ internal static class SequenceRangeWorker
     /// for a rate kept up for the two minutes a block is sized for: a sample keeps running until it has run that long, and
     /// then starts again. A switch moves the position by more than the sequence issued, so a new block starts a new
     /// sample, from its start as it became active, so that a block that runs low before the next check still shows the
-    /// values it gave. A tick that comes early, as when a session wakes the worker, leaves the peak as it was, though the
-    /// rate so far counts for that check. A block that a reservation switched to, which carries no activation time,
-    /// serves a load rather than the usual inserts, and isn't sampled.
+    /// values it gave, and the peak keeps them though the check switches away from the block. A tick that comes early, as
+    /// when a session wakes the worker, takes the rate as any other, since the ten seconds keep a burst from counting for
+    /// more than it gave. A block that a reservation switched to, which carries no activation time, serves a load rather
+    /// than the usual inserts, and isn't sampled.
     /// </summary>
     private static double Rate(Dictionary<uint, (long Block, long Position, long At, double Peak, long PeakAt)> rates, uint seqoid)
     {
@@ -196,11 +197,6 @@ internal static class SequenceRangeWorker
 
         double seconds = Math.Max(now - previous.At, 0) / 1e6;
         double rate = Math.Max(((double)position - previous.Position) / increment, 0) / Math.Max(seconds, RateSample / 1e6);
-        if (now - previous.PeakAt < SequenceRanges.CheckInterval * 1000L)
-        {
-            return Math.Max(previous.Peak, rate);
-        }
-
         double peak = Math.Max(rate, previous.Peak * Math.Pow(0.99, (now - previous.PeakAt) / 1e6));
         if (Math.Abs(peak - previous.Peak) > Math.Max(previous.Peak * 0.1, 1))
         {
