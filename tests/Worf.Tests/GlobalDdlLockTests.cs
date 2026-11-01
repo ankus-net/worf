@@ -456,9 +456,9 @@ public sealed class GlobalDdlLockTests
         Assert.AreEqual("23505", duplicates.SqlState);
 
         // node_a's DDL that builds node_b's own again, attaches a partition, builds an index on a partitioned table,
-        // copies a table's indexes or adds a foreign key beside a column's new type leaves them as they were and does
-        // what it does on node_a, and its DDL that rewrites a table drops the one that can't be built again, with its
-        // definition.
+        // copies a table's indexes or adds a foreign key beside a column's new type, even one that references a table
+        // whose own it builds again, leaves them as they were and does what it does on node_a, and its DDL that
+        // rewrites a table drops the one that can't be built again, with its definition.
         logStart = nodeB.ReadLog().Length;
         foreach (string sql in new[]
         {
@@ -474,16 +474,24 @@ public sealed class GlobalDdlLockTests
             Assert.IsTrue(await PollSucceedsAsync(nodeA, sql, token), $"the failed build's fence went: {sql}");
         }
 
-        _ = await nodeA.SafePsqlAsync(Database, "ALTER TABLE lfk ADD COLUMN x integer REFERENCES lr (v), ALTER COLUMN y TYPE bigint", token);
+        foreach (string sql in new[]
+        {
+            "ALTER TABLE lfk ADD COLUMN x integer REFERENCES lr (v), ALTER COLUMN y TYPE bigint",
+            "ALTER TABLE lr ALTER COLUMN v TYPE bigint, ADD COLUMN r bigint REFERENCES lr (v)",
+        })
+        {
+            _ = await nodeA.SafePsqlAsync(Database, sql, token);
+        }
+
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
-        Assert.AreEqual("lp1_w,lp2_v,lr_v,lt_v,lt_v_idx,lt_w_idx,lt_w_key|f||bigint|built|lr_v_key", await nodeB.SafePsqlAsync(Database, """
+        Assert.AreEqual("lp1_w,lp2_v,lr_v,lt_v,lt_v_idx,lt_w_idx,lt_w_key|f||bigint|built|lr_v_key,lr_v_key", await nodeB.SafePsqlAsync(Database, """
             SELECT (SELECT string_agg(c.relname, ',' ORDER BY c.relname) FROM worf.local_index l JOIN pg_class c ON c.oid = l.indexrelid),
                 (SELECT bool_or(c.relispartition) FROM worf.local_index l JOIN pg_class c ON c.oid = l.indexrelid),
                 (SELECT string_agg(i.indexrelid::regclass::text, ',') FROM worf.local_index l JOIN pg_index i ON i.indexrelid = l.indexrelid
                     WHERE NOT (i.indisvalid AND i.indislive)),
                 (SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'ld'::regclass AND attname = 'w'),
                 obj_description('lp2_v_idx'::regclass, 'pg_class'),
-                (SELECT conindid::regclass::text FROM pg_constraint WHERE conrelid = 'lfk'::regclass AND contype = 'f')
+                (SELECT string_agg(conindid::regclass::text, ',') FROM pg_constraint WHERE confrelid = 'lr'::regclass AND contype = 'f')
             """, token), "node_b's own indexes after node_a's DDL");
         string log = nodeB.ReadLog()[logStart..];
         Assert.Contains("dropped index \"ld_v\"", log);

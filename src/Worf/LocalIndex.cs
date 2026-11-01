@@ -46,8 +46,10 @@ internal static unsafe partial class LocalIndex
     // transaction can't write.
     private static readonly List<uint> s_droppingConcurrently = [];
 
-    // Whether the indexes on this node alone are out of a statement's way, and those moved aside and hidden from it.
+    // Whether the indexes on this node alone are out of a statement's way, and those moved aside and hidden from it,
+    // and whether those it builds again are hidden too.
     private static bool s_isolating;
+    private static bool s_hidingRebuilt;
     private static List<(uint Index, string Name)> s_moved = [];
     private static List<(uint Index, uint Table, bool Unlive, uint Filenode)> s_hidden = [];
 
@@ -124,6 +126,45 @@ internal static unsafe partial class LocalIndex
         if (s_tracking || s_rebuilding.Count > 0)
         {
             s_created.Add(relid);
+        }
+
+        if (s_isolating && s_hidingRebuilt && s_rebuilding.Count > 0)
+        {
+            HideRebuilt(relid);
+        }
+    }
+
+    /// <summary>
+    /// Hides an index that ALTER TABLE builds again in place of a local index it dropped, as not valid, as soon as it's
+    /// created, so that no foreign key that the statement adds, or builds again for a column's new type, uses it:
+    /// PostgreSQL builds indexes again before it adds constraints. The relation is told from its relcache entry, as its
+    /// catalog rows can't be read yet, and once it's one, they're made visible a step before <c>index_create</c> makes
+    /// them visible itself, so that they can be changed.
+    /// </summary>
+    private static void HideRebuilt(uint relid)
+    {
+        RelationData* rel = NativeMethods.RelationIdGetRelation(relid);
+        if (rel is null)
+        {
+            return;
+        }
+
+        bool index = rel->rd_rel->relkind == (sbyte)'i';
+        string name = Worf.FromServer((sbyte*)&rel->rd_rel->relname);
+        uint nspoid = rel->rd_rel->relnamespace;
+        NativeMethods.RelationClose(rel);
+        if (!index || !s_rebuilding.Exists(dropped => dropped.Name == name && NativeMethods.get_rel_namespace(dropped.Table) == nspoid))
+        {
+            return;
+        }
+
+        NativeMethods.CommandCounterIncrement();
+        SpiResult result = Elevated.Run(() => Spi.Query(
+            "UPDATE pg_catalog.pg_index SET indisvalid = false WHERE indexrelid = $1 AND indisvalid RETURNING indrelid", SpiParameter.Create(relid)));
+        foreach (SpiRow row in result)
+        {
+            s_hidden.Add((relid, row.Get<uint>(0), false, 0));
+            NativeMethods.CacheInvalidateRelcacheByRelid(row.Get<uint>(0));
         }
     }
 
@@ -381,7 +422,8 @@ internal static unsafe partial class LocalIndex
     /// indexes the partitions of or references are hidden: those a foreign key or an attached partition would use are
     /// marked not valid, which they're still kept up to date and built again as, and those that a copy or a
     /// partitioned index would take, which only indexes that aren't live escape, are marked not live, while nothing may
-    /// write to or rewrite their tables.
+    /// write to or rewrite their tables. ALTER TABLE that names no index hides those it builds again as not valid as it
+    /// creates them.
     /// </summary>
     /// <param name="parsetree">The statement.</param>
     /// <param name="replicated">Whether it's DDL to replicate.</param>
@@ -389,6 +431,7 @@ internal static unsafe partial class LocalIndex
     internal static bool Isolate(Node* parsetree, bool replicated)
     {
         bool rename = replicated && ChoosesNames(parsetree);
+        bool hidingRebuilt = parsetree->type == NodeTag.T_AlterTableStmt && (Applying || rename);
         List<uint> unlive = [];
         List<uint> invalid = [];
         if (replicated || Applying)
@@ -396,7 +439,7 @@ internal static unsafe partial class LocalIndex
             UsedTables(parsetree, unlive, invalid);
         }
 
-        if (s_isolating || !(rename || unlive.Count > 0 || invalid.Count > 0) || Worf.CatalogOid("local_index") == 0 ||
+        if (s_isolating || !(rename || hidingRebuilt || unlive.Count > 0 || invalid.Count > 0) || Worf.CatalogOid("local_index") == 0 ||
             !Elevated.Run(() => Worf.ReadScalar<bool>("SELECT EXISTS (SELECT FROM worf.local_index)")))
         {
             return false;
@@ -406,6 +449,7 @@ internal static unsafe partial class LocalIndex
         s_hidden = [];
         Hide(unlive, true);
         Hide(invalid, false);
+        s_hidingRebuilt = hidingRebuilt;
         s_isolating = true;
         return true;
     }
@@ -420,6 +464,7 @@ internal static unsafe partial class LocalIndex
         if (isolated)
         {
             s_isolating = false;
+            s_hidingRebuilt = false;
             s_unliveTables.Clear();
         }
     }
@@ -902,6 +947,7 @@ internal static unsafe partial class LocalIndex
             s_tracking = false;
             s_reindexing = false;
             s_isolating = false;
+            s_hidingRebuilt = false;
             return;
         }
 
