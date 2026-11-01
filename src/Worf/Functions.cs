@@ -408,6 +408,9 @@ internal static class Functions
                 WorfNode.DropNode(sub.Origin.Id);
             }
 
+            // Sequence range fences no longer wait on the provider, unless it still calls this node.
+            SequenceRanges.ForgetNeighbor(sub.Origin.Id);
+
             uint myDatabaseId;
             unsafe
             {
@@ -478,6 +481,7 @@ internal static class Functions
                         Worker.WaitLatch(50);
                     }
 
+                    SequenceRangeExchange.Leave(originConn, node, sub);
                     Rpc.DropRemoteSlot(originConn, sub.SlotName);
                 });
             }

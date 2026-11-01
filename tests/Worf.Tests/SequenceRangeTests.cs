@@ -1115,9 +1115,10 @@ public sealed class SequenceRangeTests
             "SELECT count(*) = 300 FROM shared WHERE EXISTS (SELECT 1 FROM pg_attrdef WHERE adrelid = 'shared'::regclass)", token),
             "node_a's rows and default on node_b");
 
-        // node_b joins a sequence late. node_a loses its grants to node_b, as a recovery to before them would, and resets:
-        // its fence waits for node_b, though node_b is down for longer than a neighbor counts as in touch, and takes them
-        // back into its ledger once node_b reports.
+        // node_b joins a sequence late. node_a loses its grants to node_b, and its record of node_b's reports, as a recovery
+        // to before them would, after exchanges that carried none of the sequence, and resets: its fence waits for node_b,
+        // which it names, though node_b is down for longer than a neighbor counts as in touch, and takes the grants back
+        // into its ledger once node_b reports.
         foreach (TestNode node in new[] { nodeA, nodeB })
         {
             _ = await node.SafePsqlAsync(Database, "CREATE TABLE mv (id bigserial PRIMARY KEY, v text)", token);
@@ -1133,11 +1134,15 @@ public sealed class SequenceRangeTests
 
         // node_b stops first, so that no report of its can bring the grants back before node_a resets.
         await nodeB.StopAsync("fast", token);
-        _ = await nodeA.SafePsqlAsync(Database, "DELETE FROM worf.sequence_range_grant WHERE seqoid = 'mv_id_seq'::regclass AND grantee_name = 'node_b'", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            DELETE FROM worf.sequence_range_grant WHERE seqoid = 'mv_id_seq'::regclass AND grantee_name = 'node_b';
+            DELETE FROM worf.sequence_range_node WHERE seqoid = 'mv_id_seq'::regclass AND node_name = 'node_b';
+            """, token);
         int lost = nodeA.ReadLog().Length;
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.reset_sequence_range('mv_id_seq')", token);
         await Task.Delay(TimeSpan.FromSeconds(8), token);
-        Assert.AreEqual("t", await nodeA.SafePsqlAsync(Database, "SELECT fenced_at IS NOT NULL FROM worf.sequence_range WHERE seqoid = 'mv_id_seq'::regclass", token),
+        Assert.AreEqual("t|t", await nodeA.SafePsqlAsync(Database,
+            "SELECT fenced_at IS NOT NULL, detail LIKE 'fenced until node node_b reports%' FROM worf.sequence_range WHERE seqoid = 'mv_id_seq'::regclass", token),
             "node_a's fence waiting for node_b");
         await nodeB.StartServerAsync(token);
         Assert.IsTrue(await nodeA.PollLogAsync(lost, "which this allocator had no record of; it is back in the ledger", token), "node_b's grants back in the ledger");
@@ -1366,6 +1371,39 @@ public sealed class SequenceRangeTests
                 WHERE b.seqoid = r.seqoid AND b.kind = 'r' AND f.lo < 9000000000000000000)
             FROM worf.sequence_range r WHERE r.seqoid = 't_id_seq'::regclass
             """, token), "node_a's root kept below the made-up watermark");
+
+        // node_a waits for node_c's own report after a reset while node_c is down, though node_b relays a fresh report of
+        // node_c after node_a has lost its record of node_c's grants and reports, as a recovery to before them would, and
+        // takes node_c's grants back into its ledger once node_c reports.
+        string nodeCSlot = await nodeA.SafePsqlAsync(Database, $"SELECT slot_name FROM worf.sequence_range_link WHERE node_id = {nodeCId}", token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.activate_sequence_range('t_id_seq')", token);
+        await nodeC.StopAsync("fast", token);
+        int downC = nodeA.ReadLog().Length;
+        _ = await nodeA.SafePsqlAsync(Database, $"""
+            DELETE FROM worf.sequence_range_grant WHERE seqoid = 't_id_seq'::regclass AND grantee_id = {nodeCId};
+            DELETE FROM worf.sequence_range_node WHERE seqoid = 't_id_seq'::regclass AND node_id = {nodeCId};
+            SELECT worf.reset_sequence_range('t_id_seq');
+            INSERT INTO worf.sequence_range_node (seqoid, node_id, node_name, via_node, epoch, state, reported_at)
+            SELECT seqoid, {nodeCId}, 'node_c', {nodeBId}, epoch, 'active', now() + interval '1 hour' FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass;
+            """, token);
+        await Task.Delay(TimeSpan.FromSeconds(3), token);
+        Assert.AreEqual("t|t", await nodeA.SafePsqlAsync(Database,
+            "SELECT fenced_at IS NOT NULL, detail LIKE 'fenced until node node_c reports%' FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass", token),
+            "node_a's fence waiting for node_c");
+        await nodeC.StartServerAsync(token);
+        Assert.IsTrue(await nodeA.PollLogAsync(downC, "node node_c holds block", token), "node_c's grants back in node_a's ledger");
+        Assert.IsTrue(await nodeA.PollLogAsync(downC, "the allocator's fence lifted", token), "node_a's fence lifted once node_c reported");
+
+        // Once the subscriptions between node_a and node_c are dropped, node_c leaving its slot as it drops its own, node_a
+        // forgets node_c, and a fence no longer waits for it while it is down.
+        _ = await nodeC.SafePsqlAsync(Database, "SELECT worf.drop_subscription('c_from_a')", token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.drop_subscription('a_from_c')", token);
+        Assert.AreEqual("f", await nodeA.SafePsqlAsync(Database,
+            $"SELECT EXISTS (SELECT 1 FROM worf.sequence_range_link WHERE slot_name = '{nodeCSlot}' OR node_id = {nodeCId})", token), "node_c's slot left");
+        await nodeC.StopAsync("fast", token);
+        int forgotten = nodeA.ReadLog().Length;
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.reset_sequence_range('t_id_seq')", token);
+        Assert.IsTrue(await nodeA.PollLogAsync(forgotten, "the allocator's fence lifted", token), "node_a's fence lifted without node_c");
     }
 
     /// <summary>

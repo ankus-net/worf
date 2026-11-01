@@ -121,6 +121,13 @@ using Ankus.Postgres;
         role_id oid NOT NULL
     );
 
+    CREATE TABLE worf.sequence_range_absent (
+        seqoid regclass NOT NULL,
+        node_id oid NOT NULL,
+        absent_at timestamptz NOT NULL,
+        PRIMARY KEY (seqoid, node_id)
+    );
+
     CREATE TABLE worf.sequence_range_role (
         role_id oid PRIMARY KEY,
         node_id oid NOT NULL
@@ -607,10 +614,31 @@ internal static unsafe partial class SequenceRanges
         _ = Spi.Execute("DELETE FROM worf.sequence_range_block WHERE seqoid = $1", seq);
         _ = Spi.Execute("DELETE FROM worf.sequence_range_request WHERE seqoid = $1", seq);
         _ = Spi.Execute("DELETE FROM worf.sequence_range_node WHERE seqoid = $1", seq);
+        _ = Spi.Execute("DELETE FROM worf.sequence_range_absent WHERE seqoid = $1", seq);
         if (Spi.Execute("DELETE FROM worf.sequence_range WHERE seqoid = $1", seq) > 0)
         {
             ChangedOnCommit();
         }
+    }
+
+    /// <summary>
+    /// Forgets a node this node no longer exchanges with, as once a subscription between them is dropped, unless one
+    /// is left: its own reports and those it relayed, which other neighbors relay again if they still hear of it, and
+    /// what it said it doesn't manage, so that no fence waits on it.
+    /// </summary>
+    /// <param name="nodeId">The node.</param>
+    internal static void ForgetNeighbor(uint nodeId)
+    {
+        if (Worf.CatalogOid("sequence_range_absent") == 0 || Worf.ReadScalar<bool>("""
+            SELECT EXISTS (SELECT 1 FROM worf.sequence_range_link WHERE node_id = $1)
+                OR EXISTS (SELECT 1 FROM worf.subscription s JOIN worf.local_node l ON l.node_id = s.sub_target WHERE s.sub_origin = $1)
+            """, SpiParameter.Create(nodeId)))
+        {
+            return;
+        }
+
+        _ = Spi.Execute("DELETE FROM worf.sequence_range_node WHERE via_node = $1", SpiParameter.Create(nodeId));
+        _ = Spi.Execute("DELETE FROM worf.sequence_range_absent WHERE node_id = $1", SpiParameter.Create(nodeId));
     }
 
     /// <summary>
@@ -2812,13 +2840,13 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
-    /// Lifts an allocator's fence once every node with a grant from its fenced blocks, every neighbor, even one that is
-    /// down, since it may hold a grant the allocator lost, as a node that joined late its first, and on the owner every
-    /// listed participant, has exchanged since the fence began, unless two grants overlap. The owner's root then gives
-    /// up its free values up to the highest any node has seen granted, which covers the blocks it granted itself and
-    /// lost. Since a neighbor's report of that may be made up, it
-    /// does so on its own only up to two of its largest blocks beyond the last grant its ledger holds, as many as it
-    /// draws from at once, and further only on <c>activate_sequence_range</c>.
+    /// Lifts an allocator's fence once every node it exchanges with has reported the blocks it holds since the fence
+    /// began, or that it doesn't manage the sequence, unless two grants overlap: every node a slot of this node was used
+    /// by, and every provider this node subscribes to, even one that is down, and one whose earlier exchanges carried no
+    /// sequence, since it may hold a grant the allocator lost, as a node that joined late its first. Only a node's own
+    /// report counts, never one a neighbor relays. A node stops counting once its subscription is dropped, or a node
+    /// that takes its subscription's name over its slot calls. The owner's root then gives up its free values up to
+    /// the highest any node has seen granted, which covers the blocks it granted itself and lost.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
     /// <param name="node">This node.</param>
@@ -2827,7 +2855,7 @@ internal static unsafe partial class SequenceRanges
     internal static bool LiftFence(uint seqoid, WorfLocalNode node, bool force)
     {
         SpiParameter seq = SpiParameter.Create(seqoid);
-        SpiResult range = Worf.SelectCatalog("SELECT fenced_at IS NOT NULL, owner_node, participants FROM worf.sequence_range WHERE seqoid = $1", seq);
+        SpiResult range = Worf.SelectCatalog("SELECT fenced_at IS NOT NULL, owner_node FROM worf.sequence_range WHERE seqoid = $1", seq);
         if (range.Count == 0 || !range[0].Get<bool>(0))
         {
             return false;
@@ -2849,25 +2877,32 @@ internal static unsafe partial class SequenceRanges
             return false;
         }
 
-        if (!force && Worf.ReadScalar<bool>("""
-            SELECT EXISTS (
-                SELECT 1 FROM worf.sequence_range_grant g JOIN worf.sequence_range_block b ON b.block_id = g.from_block
-                WHERE g.seqoid = $1 AND b.state = 'fenced' AND g.grantee_id <> $2 AND g.state NOT IN ('abandoned', 'unclaimed')
-                    AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_node n
-                        WHERE n.seqoid = g.seqoid AND n.node_id = g.grantee_id AND n.held_at > r.fenced_at))
-                OR (r.owner_node = $2 AND EXISTS (
-                SELECT 1 FROM unnest(r.participants) p(name)
-                WHERE NOT EXISTS (SELECT 1 FROM worf.sequence_range_node n
-                    WHERE n.seqoid = r.seqoid AND n.node_name = p.name
-                        AND (n.held_at > r.fenced_at
-                            OR n.via_node <> n.node_id AND worf.sequence_range_heard(n.node_id, false, n.reported_at, false) > r.fenced_at))))
-                OR EXISTS (
-                SELECT 1 FROM worf.sequence_range_node n
-                WHERE n.seqoid = r.seqoid AND n.via_node = n.node_id AND n.node_id <> $2
-                    AND (n.held_at IS NULL OR n.held_at <= r.fenced_at))
-            FROM worf.sequence_range r WHERE r.seqoid = $1
-            """, seq, SpiParameter.Create(node.Node.Id)))
+        SpiResult? waiting = force ? null : Worf.SelectCatalog("""
+            WITH neighbors (node_id) AS (
+                SELECT node_id FROM worf.sequence_range_link
+                UNION
+                SELECT s.sub_origin FROM worf.subscription s JOIN worf.local_node l ON l.node_id = s.sub_target)
+            SELECT coalesce(o.node_name::text, (SELECT max(n.node_name::text) FROM worf.sequence_range_node n WHERE n.node_id = w.node_id),
+                w.node_id::text)
+            FROM neighbors w
+                CROSS JOIN worf.sequence_range r
+                CROSS JOIN worf.local_node l
+                LEFT JOIN worf.node o ON o.node_id = w.node_id
+            WHERE r.seqoid = $1 AND w.node_id <> l.node_id
+                AND NOT EXISTS (
+                    SELECT 1 FROM worf.sequence_range_node n
+                    WHERE n.seqoid = r.seqoid AND n.node_id = w.node_id AND n.via_node = n.node_id AND n.held_at > r.fenced_at)
+                AND NOT EXISTS (
+                    SELECT 1 FROM worf.sequence_range_absent a WHERE a.seqoid = r.seqoid AND a.node_id = w.node_id AND a.absent_at > r.fenced_at)
+            ORDER BY 1
+            """, seq);
+        if (waiting is { Count: > 0 })
         {
+            string detail = $"fenced until {string.Join(", ", Enumerable.Range(0, waiting.Count).Select(i => "node " + waiting[i].Get<string>(0)))} " +
+                (waiting.Count == 1 ? "reports the blocks it holds" : "report the blocks they hold") +
+                "; a node that is gone for good holds the fence until the subscriptions between it and this node are dropped, or its rows in " +
+                "worf.sequence_range_link are deleted, or worf.activate_sequence_range lifts it";
+            _ = Spi.Execute("UPDATE worf.sequence_range SET detail = $2 WHERE seqoid = $1 AND detail IS DISTINCT FROM $2", seq, SpiParameter.Create(detail));
             return false;
         }
 

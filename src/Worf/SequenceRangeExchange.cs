@@ -62,7 +62,16 @@ internal static class SequenceRangeExchange
         using JsonDocument document = JsonDocument.Parse(message);
         JsonElement root = document.RootElement;
         uint senderId = root.GetProperty("node_id").GetUInt32();
-        Authenticate(root.GetProperty("slot").GetString() ?? "", senderId);
+        string slot = root.GetProperty("slot").GetString() ?? "";
+        Authenticate(slot, senderId);
+
+        // A subscriber that drops its subscription leaves the slot, and this node's fences no longer wait on it.
+        if (root.TryGetProperty("leave", out JsonElement leave) && leave.ValueKind == JsonValueKind.True)
+        {
+            _ = Spi.Execute("DELETE FROM worf.sequence_range_link WHERE slot_name = $1", SpiParameter.Create(slot));
+            SequenceRanges.ForgetNeighbor(senderId);
+            return "{}";
+        }
 
         // Backends reload their blocks, which an activation or a grant may have changed, once this commits.
         _ = Process(node, root, senderId, root.GetProperty("node_name").GetString() ?? "", true);
@@ -177,6 +186,44 @@ internal static class SequenceRangeExchange
         _ = link.Count > 0
             ? Spi.Execute("UPDATE worf.sequence_range_link SET role_id = $2 WHERE slot_name = $1", name, SpiParameter.Create(role))
             : Spi.Execute("INSERT INTO worf.sequence_range_link VALUES ($1, $2, $3)", name, SpiParameter.Create(senderId), SpiParameter.Create(role));
+    }
+
+    /// <summary>
+    /// Tells a subscription's provider, as the subscription is dropped, that this node leaves the subscription's slot, so
+    /// that the provider's sequence range fences no longer wait on it. A provider that can't be told, or manages no
+    /// sequence, is left as it is.
+    /// </summary>
+    /// <param name="conn">A connection to the provider.</param>
+    /// <param name="node">This node.</param>
+    /// <param name="sub">The subscription.</param>
+    internal static void Leave(PgReplicationConnection conn, WorfLocalNode node, WorfSubscription sub)
+    {
+        try
+        {
+            if (!Rpc.RemoteFunctionExists(conn, "worf", "sequence_range_exchange", 1, null))
+            {
+                return;
+            }
+
+            using MemoryStream stream = new();
+            using (Utf8JsonWriter writer = new(stream))
+            {
+                writer.WriteStartObject();
+                writer.WriteNumber("node_id", node.Node.Id);
+                writer.WriteString("node_name", node.Node.Name);
+                writer.WriteString("slot", sub.SlotName);
+                writer.WriteBoolean("leave", true);
+                writer.WriteEndObject();
+            }
+
+            conn.Execute($"SET statement_timeout = {SequenceRanges.ExchangeTimeout.ToString(CultureInfo.InvariantCulture)}");
+            _ = conn.Query("SELECT worf.sequence_range_exchange(" + Spi.QuoteLiteral(Encoding.UTF8.GetString(stream.ToArray())) + ")", 1);
+            conn.Execute("SET statement_timeout = 0");
+        }
+        catch (Exception error) when (error is PgException or PgRemoteException)
+        {
+            PgLog.Warning($"could not tell node {sub.Origin.Name} that this node leaves slot \"{sub.SlotName}\", so its sequence range fences may wait on this node: {error.Message}");
+        }
     }
 
     /// <summary>
@@ -748,8 +795,16 @@ internal static class SequenceRangeExchange
             return (false, false);
         }
 
+        // A sequence this node is fenced on that the neighbor's message doesn't carry has no block on the neighbor.
+        SpiResult fencedOn = Worf.Read("SELECT seqoid::oid FROM worf.sequence_range WHERE fenced_at IS NOT NULL", 0);
+        HashSet<uint> absent = [.. Enumerable.Range(0, fencedOn.Count).Select(i => fencedOn[i].Get<uint>(0))];
         foreach (JsonElement entry in sequences.EnumerateArray())
         {
+            if (absent.Count > 0 && Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(entry.GetProperty("name").GetString())) is uint carried)
+            {
+                _ = absent.Remove(carried);
+            }
+
             try
             {
                 if (!heard || !Unchanged(node, root, entry, senderId, call, applied))
@@ -780,6 +835,13 @@ internal static class SequenceRangeExchange
             {
                 PgLog.Warning($"sequence range exchange with node {senderName} skipped sequence {entry.GetProperty("name").GetString()}: {error.Message}");
             }
+        }
+
+        foreach (uint seqoid in absent)
+        {
+            _ = Spi.Execute("""
+                INSERT INTO worf.sequence_range_absent VALUES ($1, $2, now()) ON CONFLICT (seqoid, node_id) DO UPDATE SET absent_at = excluded.absent_at
+                """, SpiParameter.Create(seqoid), SpiParameter.Create(senderId));
         }
 
         // The neighbor's WAL position, once compared with the last one.
