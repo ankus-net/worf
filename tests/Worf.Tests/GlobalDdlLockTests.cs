@@ -495,7 +495,30 @@ public sealed class GlobalDdlLockTests
             """, token), "node_b's own indexes after node_a's DDL");
         string log = nodeB.ReadLog()[logStart..];
         Assert.Contains("dropped index \"ld_v\"", log);
+        Assert.Contains("could not create unique index \"ld_v\"", log);
+        Assert.DoesNotContain("worf_aside", log);
         Assert.Contains("CREATE UNIQUE INDEX ld_v ON public.ld USING btree (v)", log);
+
+        // node_b's own DDL that builds a foreign key again for a column's new type uses none of node_b's own indexes on
+        // the table it references, and DDL that names relations in another schema, or none, leaves them be.
+        _ = await nodeB.SafePsqlAsync(Database, "ALTER TABLE lfk ALTER COLUMN x TYPE integer", token);
+        _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            Assert.AreEqual("lr_v_key", await node.SafePsqlAsync(Database,
+                "SELECT string_agg(conindid::regclass::text, ',') FROM pg_constraint WHERE conrelid = 'lfk'::regclass AND contype = 'f'", token), node.Name);
+        }
+
+        Assert.AreEqual("0\n0", await nodeB.SafePsqlAsync(Database, """
+            BEGIN;
+            CREATE TABLE ls.named (id integer PRIMARY KEY, v integer UNIQUE);
+            SELECT count(*) FROM pg_locks WHERE pid = pg_backend_pid() AND relation IN (SELECT indexrelid FROM worf.local_index);
+            COMMIT;
+            BEGIN;
+            DROP TABLE ls.named;
+            SELECT count(*) FROM pg_locks WHERE pid = pg_backend_pid() AND relation IN (SELECT indexrelid FROM worf.local_index);
+            COMMIT;
+            """, token), "node_b's own indexes locked");
 
         // node_b's DDL that would build one again and cluster on it fails, its DDL chooses the names node_a's would,
         // renaming its own where it takes their names, or tells node_a the name it chose for a concurrent build, and

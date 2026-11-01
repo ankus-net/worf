@@ -1457,7 +1457,7 @@ internal static unsafe partial class Apply
         // in that transaction instead. The indexes on this node alone, which the origin doesn't have, are out of its
         // way, and one that it can't build again is dropped, so that it applies.
         string origin = MySubscription!.Origin.Name;
-        List<(uint Index, string Name)> moved = LocalIndex.MoveAside();
+        List<(uint Index, string Name)> moved = LocalIndex.MoveAside(command.GetString()!);
         LocalIndex.Applying = true;
         try
         {
