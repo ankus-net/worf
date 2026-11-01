@@ -36,8 +36,9 @@ money otherwise than the subscriber's, as in another currency or with other
 fraction digits, since they count the provider's currency. An older worf
 doesn't send or read column types, or say how it formats money, so columns
 replicated through an older provider, subscriber or relay node need the same
-types. `CHECK` constraints, `NOT NULL` constraints, etc., must be the same or
-weaker (more permissive) on the subscriber than the provider.
+types, and money the same `lc_monetary`. `CHECK` constraints, `NOT NULL`
+constraints, etc., must be the same or weaker (more permissive) on the
+subscriber than the provider.
 A subscriber ignores a column it dropped in rows from a provider that still
 has it.
 
