@@ -1036,9 +1036,19 @@ public sealed class GlobalDdlLockTests
                 _ = await rollback.ExecuteNonQueryAsync(token).WaitAsync(TimeSpan.FromSeconds(10), token);
             }
 
-            Assert.AreEqual("0", await nodeA.SafePsqlAsync(Database, """
-                SELECT count(*) FROM pg_locks WHERE (relation = 'cic'::regclass AND mode = 'ShareUpdateExclusiveLock') OR locktype = 'advisory'
-                """, token), "the build's locks");
+            // The build's own locks, which go as its transaction aborts, just after the client hears of the error. The
+            // range worker's exchange holds an advisory lock of its own while it waits on node_b.
+            string locks = $"""
+                SELECT count(*) = 0 FROM pg_locks
+                WHERE (relation = 'cic'::regclass AND mode = 'ShareUpdateExclusiveLock') OR (locktype = 'advisory' AND pid = {rebuilding.ProcessID})
+                """;
+            Stopwatch released = Stopwatch.StartNew();
+            while (await nodeA.SafePsqlAsync(Database, locks, token) != "t" && released.Elapsed < TimeSpan.FromSeconds(2))
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(100), token);
+            }
+
+            Assert.AreEqual("t", await nodeA.SafePsqlAsync(Database, locks, token), "the build's locks gone");
         }
         finally
         {
