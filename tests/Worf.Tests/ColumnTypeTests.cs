@@ -336,7 +336,7 @@ public sealed class ColumnTypeTests
 
             _ = await provider.SafePsqlAsync(Database, $"ALTER SYSTEM SET lc_monetary = '{locale}'", token);
             _ = await provider.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
-            Assert.IsTrue(await provider.PollQueryUntilAsync(Database, $"SELECT current_setting('lc_monetary') = '{locale}'", token),
+            Assert.IsTrue(await provider.PollQueryUntilAsync(Database, $"SELECT '-1234567'::money::text <> '{format}'", token),
                 "lc_monetary didn't take effect");
             return true;
         }
