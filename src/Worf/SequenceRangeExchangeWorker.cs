@@ -12,6 +12,18 @@ namespace Worf;
 /// </summary>
 internal static class SequenceRangeExchangeWorker
 {
+    // The deadline a watcher that stops leaves, which tells the exchange worker to make no more calls and stop too, since
+    // none would cancel a call that never ends.
+    private const long Stopped = -1;
+
+    // Whether this exchange worker's watcher stopped.
+    private static bool s_unwatched;
+
+    /// <summary>
+    /// Gets whether this exchange worker's watcher stopped, so that it makes no more calls.
+    /// </summary>
+    internal static bool Unwatched => s_unwatched;
+
     /// <summary>
     /// Runs the exchange worker.
     /// </summary>
@@ -21,7 +33,7 @@ internal static class SequenceRangeExchangeWorker
     {
         Worker.WorkerAttach((int)mainArg, WorfWorkerType.Exchange);
         PgLog.Debug1("starting sequence range exchange worker");
-        while (!Worker.GotSigterm)
+        while (!Worker.GotSigterm && !s_unwatched)
         {
             try
             {
@@ -51,8 +63,10 @@ internal static class SequenceRangeExchangeWorker
 
     /// <summary>
     /// Watches the database's exchange worker, from its range worker or, without one, its manager, and cancels a call
-    /// of it that has run out of time, or any call as the watcher stops. A call that waits on a neighbor that never
-    /// answers doesn't see the exchange worker's own stop request, so it would hold up a server's shutdown.
+    /// of it that has run out of time, or any call as the watcher stops, which also tells the exchange worker to make no
+    /// more, in one step with the call's start, so that none starts after the watcher's last look. A call that waits on a
+    /// neighbor that never answers doesn't see the exchange worker's own stop request, so it would hold up a server's
+    /// shutdown.
     /// </summary>
     /// <param name="stopping">Whether the watcher stops.</param>
     /// <returns>Whether the exchange worker runs.</returns>
@@ -73,14 +87,18 @@ internal static class SequenceRangeExchangeWorker
                 }
 
                 running = true;
-                if (worker.Proc != 0 && worker.Worker.Exchange.Deadline != 0 && (stopping || now >= worker.Worker.Exchange.Deadline))
+                long deadline = worker.Worker.Exchange.Deadline;
+                if (worker.Proc != 0 && deadline > 0 && (stopping || now >= deadline))
                 {
                     unsafe
                     {
                         overdue = ((PGPROC*)worker.Proc)->pid;
                     }
+                }
 
-                    worker.Worker.Exchange.Deadline = 0;
+                if (stopping || (deadline > 0 && now >= deadline))
+                {
+                    worker.Worker.Exchange.Deadline = stopping ? Stopped : 0;
                     guard[i] = worker;
                 }
             }
@@ -137,6 +155,10 @@ internal static class SequenceRangeExchangeWorker
         }
     }
 
+    /// <summary>
+    /// Sets the deadline of the call about to start, or clears it as the call ends, unless the watcher has stopped: a
+    /// call doesn't start then.
+    /// </summary>
     private static void SetDeadline(long deadline)
     {
         if (Worker.MyWorfWorker < 0)
@@ -146,6 +168,17 @@ internal static class SequenceRangeExchangeWorker
 
         using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive();
         WorfWorker worker = guard[Worker.MyWorfWorker];
+        if (worker.Worker.Exchange.Deadline == Stopped)
+        {
+            s_unwatched = true;
+            if (deadline != 0)
+            {
+                throw new PgException("57P01", "the sequence range exchange worker is stopping, since its watcher stopped");
+            }
+
+            return;
+        }
+
         worker.Worker.Exchange.Deadline = deadline;
         guard[Worker.MyWorfWorker] = worker;
     }

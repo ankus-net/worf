@@ -10,6 +10,9 @@ namespace Worf;
 /// </summary>
 internal static class SequenceRangeWorker
 {
+    // The shortest stretch, in microseconds, that a sequence's insert rate is taken over.
+    private const long RateSample = 10_000_000;
+
     /// <summary>
     /// Runs the range worker.
     /// </summary>
@@ -21,9 +24,9 @@ internal static class SequenceRangeWorker
         PgLog.Debug1("starting sequence range worker");
         bool managedAny = false;
 
-        // Each sequence's active block, its last position in it and when it was read, and its peak rate in values a
-        // second.
-        Dictionary<uint, (long Block, long Position, long At, double Peak)> rates = [];
+        // Each sequence's active block, its position in it and when that was read as its rate's sample began, and its peak
+        // rate in values a second, and when that was worked out.
+        Dictionary<uint, (long Block, long Position, long At, double Peak, long PeakAt)> rates = [];
         while (!Worker.GotSigterm)
         {
             PgInterrupts.Check();
@@ -136,11 +139,13 @@ internal static class SequenceRangeWorker
 
     /// <summary>
     /// Tracks a sequence's insert rate within its active block and returns its peak, which decays while the sequence is
-    /// idle. A switch moves the position by more than the sequence issued, so it starts a new sample. A block that a
-    /// reservation switched to, which carries no activation time, serves a load rather than the usual inserts, and isn't
-    /// sampled.
+    /// idle. The rate is the values issued since the sample began, over ten seconds at least, so that a burst isn't taken
+    /// for a rate kept up for the two minutes a block is sized for: a sample keeps running until it has run that long, and
+    /// then starts again. A switch moves the position by more than the sequence issued, so it starts a new sample. A
+    /// block that a reservation switched to, which carries no activation time, serves a load rather than the usual
+    /// inserts, and isn't sampled.
     /// </summary>
-    private static double Rate(Dictionary<uint, (long Block, long Position, long At, double Peak)> rates, uint seqoid)
+    private static double Rate(Dictionary<uint, (long Block, long Position, long At, double Peak, long PeakAt)> rates, uint seqoid)
     {
         long now = Worker.GetCurrentTimestamp();
         SpiResult state = Worf.SelectCatalog("""
@@ -148,25 +153,32 @@ internal static class SequenceRangeWorker
                 (SELECT lo FROM worf.sequence_range_block WHERE seqoid = $1 AND kind = 'n' AND state = 'active' AND activated_at IS NOT NULL)
             FROM pg_catalog.pg_sequence s WHERE s.seqrelid = $1
             """, SpiParameter.Create(seqoid));
-        bool known = rates.TryGetValue(seqoid, out (long Block, long Position, long At, double Peak) previous);
+        bool known = rates.TryGetValue(seqoid, out (long Block, long Position, long At, double Peak, long PeakAt) previous);
         if (state.Count == 0 || SequenceRanges.LastValue(seqoid) is not long position || state[0].Get<long?>(1) is not long block)
         {
             return known ? previous.Peak : 0;
         }
 
-        // A tick that comes early, as when a session wakes the worker, leaves the sample running, so that a burst isn't
-        // taken over a moment as a higher rate.
-        if (known && previous.Block == block && now - previous.At < SequenceRanges.CheckInterval * 1000L)
+        // A tick that comes before a check interval has passed, as when a session wakes the worker, leaves the peak as it
+        // was.
+        bool sampling = known && previous.Block == block;
+        if (sampling && now - previous.PeakAt < SequenceRanges.CheckInterval * 1000L)
         {
             return previous.Peak;
         }
 
-        double peak = known ? previous.Peak : 0;
-        if (known && previous.Block == block && now > previous.At)
+        double peak = known ? previous.Peak * Math.Pow(0.99, Math.Max(now - previous.PeakAt, 0) / 1e6) : 0;
+        (long start, long startAt) = (position, now);
+        if (sampling && now > previous.At)
         {
             double seconds = (now - previous.At) / 1e6;
-            double rate = Math.Max(((double)position - previous.Position) / state[0].Get<long>(0), 0) / seconds;
-            peak = Math.Max(rate, previous.Peak * Math.Pow(0.99, seconds));
+            double rate = Math.Max(((double)position - previous.Position) / state[0].Get<long>(0), 0) / Math.Max(seconds, RateSample / 1e6);
+            peak = Math.Max(rate, peak);
+            if (seconds < RateSample / 1e6)
+            {
+                (start, startAt) = (previous.Position, previous.At);
+            }
+
             if (Math.Abs(peak - previous.Peak) > Math.Max(previous.Peak * 0.1, 1))
             {
                 _ = Spi.Execute("UPDATE worf.sequence_range SET peak_rate = $2 WHERE seqoid = $1", SpiParameter.Create(seqoid),
@@ -174,7 +186,7 @@ internal static class SequenceRangeWorker
             }
         }
 
-        rates[seqoid] = (block, position, now, peak);
+        rates[seqoid] = (block, start, startAt, peak, now);
         return peak;
     }
 }

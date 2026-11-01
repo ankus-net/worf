@@ -637,6 +637,9 @@ public sealed class SequenceRangeTests
             """, token));
         string rangeWorker = await node.SafePsqlAsync(Database, "SELECT pid FROM pg_stat_activity WHERE datname = current_database() AND backend_type LIKE 'worf range%'", token);
 
+        // A few rows inserted at once are no rate kept up for minutes, which would size its blocks far beyond range_size.
+        _ = await node.SafePsqlAsync(Database, "SET ROLE app; INSERT INTO app.own_rows SELECT FROM generate_series(1, 5)", token);
+
         // Triggers with the guard's names from before worf was installed are replaced as their table comes under the
         // guard, and once it is installed, no trigger takes the guard's names or function, while a restore skips them.
         _ = await node.SafePsqlAsync(Database, "CREATE DATABASE decoys", token);
@@ -694,6 +697,8 @@ public sealed class SequenceRangeTests
         }
 
         // By now the range worker has read the role's table many times, and nothing ran the role's functions but the role.
+        Assert.AreEqual("t", await node.SafePsqlAsync(Database, "SELECT peak_rate < 1 FROM worf.sequence_range WHERE seqoid = 'app.own_rows_id_seq'::regclass", token),
+            "the rate of a few rows inserted at once");
         string escaped = node.ReadLog()[escapes..];
         Assert.DoesNotContain("runs as postgres", escaped);
         Assert.DoesNotContain($"in {rangeWorker}", escaped);
@@ -891,7 +896,7 @@ public sealed class SequenceRangeTests
             """, token);
         await Task.Delay(TimeSpan.FromMilliseconds(500), token);
         _ = await node.SafePsqlAsync(Database, "INSERT INTO bulk SELECT FROM generate_series(1, 50000)", token);
-        Assert.IsTrue(await node.PollQueryUntilAsync(Database, "SELECT peak_rate > 5000 FROM worf.sequence_range WHERE seqoid = 'bulk_id_seq'::regclass", token),
+        Assert.IsTrue(await node.PollQueryUntilAsync(Database, "SELECT peak_rate > 4000 FROM worf.sequence_range WHERE seqoid = 'bulk_id_seq'::regclass", token),
             "the load's rate");
         Assert.AreEqual("100001|100000", await node.SafePsqlAsync(Database, """
             SELECT worf.reserve_sequence_range('bulk_id_seq', 60000);
