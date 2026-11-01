@@ -95,7 +95,7 @@ internal static class SequenceRangeWorker
                     catch (PgException error)
                     {
                         // A sequence dropped since the tick began goes with the next tick.
-                        if (SequenceRanges.SequenceExists(seqoid))
+                        if (PgBackgroundWorker.RunTransaction(() => SequenceRanges.SequenceExists(seqoid)))
                         {
                             PgLog.Warning($"could not check managed sequence {seqoid}: {error.Message}");
                         }
