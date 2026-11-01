@@ -2931,8 +2931,7 @@ internal static unsafe partial class SequenceRanges
 
         SpiResult? waiting = force ? null : Worf.SelectCatalog("""
             WITH neighbors (node_id) AS (
-                SELECT k.node_id FROM worf.sequence_range_link k
-                WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_replication_slots s WHERE s.slot_name = k.slot_name)
+                SELECT node_id FROM worf.sequence_range_link
                 UNION
                 SELECT s.sub_origin FROM worf.subscription s JOIN worf.local_node l ON l.node_id = s.sub_target)
             SELECT coalesce(o.node_name::text, (SELECT max(n.node_name::text) FROM worf.sequence_range_node n WHERE n.node_id = w.node_id),
@@ -2953,8 +2952,8 @@ internal static unsafe partial class SequenceRanges
         {
             string detail = $"fenced until {string.Join(", ", Enumerable.Range(0, waiting.Count).Select(i => "node " + waiting[i].Get<string>(0)))} " +
                 (waiting.Count == 1 ? "reports the blocks it holds" : "report the blocks they hold") +
-                "; a node that is gone for good holds the fence until the subscriptions between it and this node are dropped, or the slots it " +
-                "used here, or its rows in worf.sequence_range_link are deleted, or worf.activate_sequence_range lifts it";
+                "; a node that is gone for good holds the fence until the subscriptions between it and this node are dropped, or its rows in " +
+                "worf.sequence_range_link are deleted, or worf.activate_sequence_range lifts it";
             _ = Spi.Execute("UPDATE worf.sequence_range SET detail = $2 WHERE seqoid = $1 AND detail IS DISTINCT FROM $2", seq, SpiParameter.Create(detail));
             return false;
         }

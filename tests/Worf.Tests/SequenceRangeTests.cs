@@ -2096,7 +2096,7 @@ public sealed class SequenceRangeTests
         // node_b asks for a block. With an exchange interval of ten minutes, node_b still asks node_a every ten checks,
         // and draws from a block beyond that watermark soon after the fence lifts.
         _ = await nodeB.SafePsqlAsync(Database, "ALTER SYSTEM SET worf.sequence_range_exchange_interval = '10min'; SELECT pg_reload_conf()", token);
-        _ = await nodeA.SafePsqlAsync(Database, "SELECT pg_create_physical_replication_slot('ghost'); INSERT INTO worf.sequence_range_link VALUES ('ghost', 4242, 10)", token);
+        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO worf.sequence_range_link VALUES ('ghost', 4242, 10)", token);
         string beyond = await nodeB.SafePsqlAsync(Database, "UPDATE worf.sequence_range SET watermark = watermark + 1000000 WHERE seqoid = 't_id_seq'::regclass RETURNING watermark", token);
         int logpos = nodeA.ReadLog().Length;
         _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.reset_sequence_range('t_id_seq')", token);
@@ -2118,9 +2118,7 @@ public sealed class SequenceRangeTests
             await Task.Delay(TimeSpan.FromMilliseconds(20), token);
         }
 
-        // Dropping the slot a node that is gone used, as drop_subscription asks when it can't reach the provider, lifts the
-        // fence as deleting its link would.
-        _ = await nodeA.SafePsqlAsync(Database, "SELECT pg_drop_replication_slot('ghost')", token);
+        _ = await nodeA.SafePsqlAsync(Database, "DELETE FROM worf.sequence_range_link WHERE node_id = 4242", token);
         Stopwatch lifted = Stopwatch.StartNew();
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, $"SELECT state = 'active' AND active_lo > {beyond} FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token),
             "node_b drawing from a block beyond the watermark it heard of");
