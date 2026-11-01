@@ -1414,10 +1414,9 @@ public sealed class SequenceRangeTests
             INSERT INTO worf.sequence_range_node (seqoid, node_id, node_name, via_node, epoch, state, reported_at)
             SELECT seqoid, {nodeCId}, 'node_c', {nodeBId}, epoch, 'active', now() + interval '1 hour' FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass;
             """, token);
-        await Task.Delay(TimeSpan.FromSeconds(3), token);
-        Assert.AreEqual("t|t", await nodeA.SafePsqlAsync(Database,
-            "SELECT fenced_at IS NOT NULL, detail LIKE 'fenced until node node_c reports%' FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass", token),
-            "node_a's fence waiting for node_c");
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database,
+            "SELECT fenced_at IS NOT NULL AND detail LIKE 'fenced until node node_c reports%' FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass", token),
+            "node_a's fence waiting for node_c alone, once node_b has reported");
         await nodeC.StartServerAsync(token);
         Assert.IsTrue(await nodeA.PollLogAsync(downC, "node node_c holds block", token), "node_c's grants back in node_a's ledger");
         Assert.IsTrue(await nodeA.PollLogAsync(downC, "the allocator's fence lifted", token), "node_a's fence lifted once node_c reported");
