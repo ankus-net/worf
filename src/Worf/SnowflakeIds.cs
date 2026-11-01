@@ -208,9 +208,12 @@ internal static class SnowflakeIds
                 if (target > durable)
                 {
                     _ = Spi.Execute("SELECT pg_catalog.setval('worf.snowflake_clock', $1)", SpiParameter.Create(target));
+
+                    // The flush goes to the end of setval's record, as the insert position may lie past a page header not
+                    // yet written.
                     unsafe
                     {
-                        NativeMethods.XLogFlush(NativeMethods.GetXLogInsertRecPtr());
+                        NativeMethods.XLogFlush(NativeGlobals.XactLastRecEnd);
                     }
                 }
 
