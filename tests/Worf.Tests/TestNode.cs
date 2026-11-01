@@ -103,19 +103,20 @@ internal sealed class TestNode : IAsyncDisposable
         => user is null ? $"{ConnStr} dbname={dbname}" : $"{ConnStr} dbname={dbname} user={user}";
 
     /// <summary>
-    /// Opens a connection to a database on this node as the cluster's superuser.
+    /// Opens a connection to a database on this node, as the cluster's superuser or a role that logs in itself.
     /// </summary>
     /// <param name="dbname">The database.</param>
     /// <param name="cancellationToken">Cancels connecting.</param>
+    /// <param name="user">The role.</param>
     /// <returns>The open connection.</returns>
-    public async Task<NpgsqlConnection> OpenAsync(string dbname, CancellationToken cancellationToken)
+    public async Task<NpgsqlConnection> OpenAsync(string dbname, CancellationToken cancellationToken, string user = "postgres")
     {
         NpgsqlConnectionStringBuilder builder = new()
         {
             Host = "127.0.0.1",
             Port = Cluster.Port,
             Database = dbname,
-            Username = "postgres",
+            Username = user,
             Pooling = false,
             Timeout = 60,
         };
@@ -131,10 +132,11 @@ internal sealed class TestNode : IAsyncDisposable
     /// <param name="dbname">The database.</param>
     /// <param name="sql">The SQL.</param>
     /// <param name="cancellationToken">Cancels the query.</param>
+    /// <param name="user">The role that runs it.</param>
     /// <returns>The output.</returns>
-    public async Task<string> SafePsqlAsync(string dbname, string sql, CancellationToken cancellationToken)
+    public async Task<string> SafePsqlAsync(string dbname, string sql, CancellationToken cancellationToken, string user = "postgres")
     {
-        await using NpgsqlConnection connection = await OpenAsync(dbname, cancellationToken);
+        await using NpgsqlConnection connection = await OpenAsync(dbname, cancellationToken, user);
         await using NpgsqlCommand command = new(sql, connection) { CommandTimeout = 0 };
         await using NpgsqlDataReader reader = await command.ExecuteReaderAsync(cancellationToken);
 

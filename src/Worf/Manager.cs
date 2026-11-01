@@ -73,15 +73,9 @@ internal static class Manager
         }
 
         // If the extension is still not installed after retries, exit.
-        if (extoid == 0)
+        if (extoid == 0 || PgBackgroundWorker.RunTransaction(IsIdleTemplate))
         {
-            // Mark that we're exiting due to missing extension so the detach handler doesn't wake the supervisor.
-            // This prevents rapid restart cycles for databases that don't have worf installed.
-            using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive();
-            WorfWorker me = guard[Worker.MyWorfWorker];
-            me.SkipSupervisorWakeup = true;
-            guard[Worker.MyWorfWorker] = me;
-
+            ExitIdle();
             return;
         }
 
@@ -102,6 +96,13 @@ internal static class Manager
         while (!Worker.GotSigterm)
         {
             Worker.ProcessConfigReload();
+
+            // The database may have become a template since, as one is copied once it does.
+            if (PgBackgroundWorker.RunTransaction(IsIdleTemplate))
+            {
+                ExitIdle();
+                return;
+            }
 
             // Launch the apply workers, and the range worker for managed sequences.
             bool processedAll = ManageApplyWorkers();
@@ -139,6 +140,42 @@ internal static class Manager
         {
             _ = SequenceRangeExchangeWorker.Watch(true);
         }
+    }
+
+    /// <summary>
+    /// Wakes the manager of a database that is about to be copied, so that if it's a template with nothing to manage,
+    /// it exits, as PostgreSQL copies a database only from a template nobody is connected to.
+    /// </summary>
+    /// <param name="template">The database's name.</param>
+    internal static unsafe void WakeTemplate(string template)
+    {
+        uint dboid = NativeMethods.get_database_oid(Worf.PStrDup(template), true);
+        using PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share();
+        int manager = dboid == 0 ? -1 : guard.Read((in _, workers) => Worker.ManagerFind(workers, dboid));
+        if (manager >= 0 && guard[manager].Proc != 0)
+        {
+            Worker.SetProcLatch(guard[manager].Proc);
+        }
+    }
+
+    /// <summary>
+    /// Checks whether this database is a template that isn't a node, which has nothing to manage, and which a manager
+    /// would keep busy, while PostgreSQL copies a database only from a template nobody is connected to.
+    /// </summary>
+    private static bool IsIdleTemplate()
+        => Worf.ReadScalar<bool>("SELECT datistemplate FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database()") &&
+            WorfNode.GetLocalNode(false, true) is null;
+
+    /// <summary>
+    /// Exits with nothing to manage, marking it so that the detach handler doesn't wake the supervisor, which would
+    /// start the manager again at once, as for a database without worf.
+    /// </summary>
+    private static void ExitIdle()
+    {
+        using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive();
+        WorfWorker me = guard[Worker.MyWorfWorker];
+        me.SkipSupervisorWakeup = true;
+        guard[Worker.MyWorfWorker] = me;
     }
 
     /// <summary>

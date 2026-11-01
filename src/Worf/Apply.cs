@@ -15,6 +15,9 @@ internal static unsafe partial class Apply
     // Number of tuples inserted after which we switch to multi-insert.
     private const int MinMultiInsertTuples = 5;
 
+    // RVR_MISSING_OK from catalog/namespace.h.
+    private const uint RangeVarMissingOk = 1;
+
     // How worf.exception_behaviour applies a failed transaction again: change by change, as a whole in a subtransaction,
     // or, when its commit fails however it's applied, not at all.
     private const int ExceptionByChange = 1;
@@ -369,9 +372,9 @@ internal static unsafe partial class Apply
         for (int i = 0; commands is not null && i < commands->length; i++)
         {
             RawStmt* command = (RawStmt*)commands->elements[i].ptr_value;
-            if (withoutConcurrently)
+            if (withoutConcurrently && !RemoveConcurrently(command->stmt))
             {
-                RemoveConcurrently(command->stmt);
+                continue;
             }
 
             // temporarily push snapshot for parse analysis/planning
@@ -1451,8 +1454,36 @@ internal static unsafe partial class Apply
         }
 
         // A statement that runs concurrently commits along the way, which apply's transaction can't, so it runs
-        // in that transaction instead.
-        ExecuteSqlCommand(command.GetString()!, queuedMessage.Role, false, true);
+        // in that transaction instead. The indexes on this node alone, which the origin doesn't have, are out of its
+        // way, and one that it can't build again is dropped, so that it applies.
+        string origin = MySubscription!.Origin.Name;
+        List<(uint Index, string Name)> moved = LocalIndex.MoveAside(command.GetString()!);
+        LocalIndex.Applying = true;
+        try
+        {
+            while (true)
+            {
+                try
+                {
+                    PgTransaction.RunInSubtransaction(() => ExecuteSqlCommand(command.GetString()!, queuedMessage.Role, false, true),
+                        PgSubtransactionMode.Atomic);
+                    break;
+                }
+                catch (PgException error)
+                {
+                    if (!LocalIndex.DropUnbuilt(error, moved, origin))
+                    {
+                        throw;
+                    }
+                }
+            }
+        }
+        finally
+        {
+            LocalIndex.Applying = false;
+        }
+
+        LocalIndex.MoveBack(moved, origin);
 
         NativeMethods.AtEOXact_GUC(true, saveNestlevel);
     }
@@ -1469,9 +1500,12 @@ internal static unsafe partial class Apply
 
     /// <summary>
     /// Makes a statement that would build or drop an index or detach a partition concurrently do it in its
-    /// transaction.
+    /// transaction. A concurrent detach replicates only once it has finished, so a detach, or one that finishes a
+    /// concurrent detach, finishes the concurrent detach under way here, detaches the partition at once where none is,
+    /// and does nothing where the partition is detached already, as when two nodes detached it.
     /// </summary>
-    private static void RemoveConcurrently(Node* stmt)
+    /// <returns>Whether the statement has anything to do.</returns>
+    private static bool RemoveConcurrently(Node* stmt)
     {
         switch (stmt->type)
         {
@@ -1488,10 +1522,20 @@ internal static unsafe partial class Apply
                 for (int i = 0; cmds is not null && i < cmds->length; i++)
                 {
                     AlterTableCmd* cmd = (AlterTableCmd*)cmds->elements[i].ptr_value;
-                    if (cmd->subtype == AlterTableType.AT_DetachPartition)
+                    if (cmd->subtype is not (AlterTableType.AT_DetachPartition or AlterTableType.AT_DetachPartitionFinalize))
                     {
-                        ((PartitionCmd*)cmd->def)->concurrent = false;
+                        continue;
                     }
+
+                    PartitionCmd* partition = (PartitionCmd*)cmd->def;
+                    partition->concurrent = false;
+                    bool? pending = DetachPending(((AlterTableStmt*)stmt)->relation, partition->name);
+                    if (pending is null)
+                    {
+                        return false;
+                    }
+
+                    cmd->subtype = pending.Value ? AlterTableType.AT_DetachPartitionFinalize : AlterTableType.AT_DetachPartition;
                 }
 
                 break;
@@ -1499,7 +1543,44 @@ internal static unsafe partial class Apply
             default:
                 break;
         }
+
+        return true;
     }
+
+    /// <summary>
+    /// Checks whether a partition's concurrent detach from a table is under way here, or whether the partition is
+    /// detached from it already. The check is made again once the table is locked as the detach will lock it, as a
+    /// plain detach or one that finishes a detach under way, so that a detach here can't finish in between.
+    /// </summary>
+    /// <returns>Whether a detach is under way, or null when the partition isn't the table's.</returns>
+    private static bool? DetachPending(RangeVar* table, RangeVar* partition)
+    {
+        uint parent = NativeMethods.RangeVarGetRelidExtended(table, 0, RangeVarMissingOk, default, null);
+        uint relid = NativeMethods.RangeVarGetRelidExtended(partition, 0, RangeVarMissingOk, default, null);
+        if (parent == 0 || relid == 0)
+        {
+            return false;
+        }
+
+        bool? pending = InheritsPending(relid, parent);
+        if (pending is null)
+        {
+            return null;
+        }
+
+        NativeMethods.LockRelationOid(parent, (int)(pending.Value ? PgLockMode.ShareUpdateExclusive : PgLockMode.AccessExclusive));
+        bool? locked = InheritsPending(relid, parent);
+        if (locked == false && pending.Value)
+        {
+            NativeMethods.LockRelationOid(parent, (int)PgLockMode.AccessExclusive);
+        }
+
+        return locked;
+    }
+
+    private static bool? InheritsPending(uint relid, uint parent)
+        => Worf.ReadScalar<bool?>("SELECT inhdetachpending FROM pg_catalog.pg_inherits WHERE inhrelid = $1 AND inhparent = $2",
+            SpiParameter.Create(relid), SpiParameter.Create(parent));
 
     /// <summary>
     /// Handles messages comming from the queue.
