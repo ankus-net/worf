@@ -128,9 +128,10 @@ users of origins need the limit raised. `worf.origin_writer` records the node
 and subscription each origin worf creates applies for, a row each time one is
 created or dropped, and forgets a row once a later one has superseded it for
 `vacuum_freeze_min_age` transactions, as vacuum would freeze rows written before
-then, so it holds a row per origin and those of that many transactions. A
-conflict on a row written before then, whose record is forgotten, takes the row
-to be from what its origin applies for now, as pglogical takes every row.
+then, so it holds a row for each origin id and for each creation or drop in that
+many transactions. A conflict on a row written before then, whose record is
+forgotten, takes the row to be from what its origin applies for now, as
+pglogical takes every row.
 
 If you want to handle conflict resolution with last/first update wins (see
 [Conflicts](#conflicts)), you can add this additional option to
@@ -775,22 +776,23 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   When a walsender of their earlier connection, with the same user and
   application name, still holds the slot after a second, they stop it; they
   wait for anything else with a warning, and fail after a minute. Their cleanup,
-  which drops the slot, waits five seconds instead, then leaves the slot, with a
-  warning, to the subscription's apply worker, which drops it, as it does any
-  slot its table syncs left when it starts, and tries again every five seconds
-  while one stays; dropping the subscription drops them too. One that stops
-  after its copy has committed catches up again from where it got to when it
-  restarts, rather than copying again. When its slot is gone or invalidated, or
-  its origin has no progress, it copies the table again and merges the copy in,
-  in one transaction that keeps writers, but not readers, waiting: the
-  provider's rows replace those with the same key, or join them, and a row the
-  copy lacks is deleted when the subscription wrote it, as its commit origin
-  shows. One whose writer can't be told, as with `track_commit_timestamp` off, a
-  frozen row, or an origin whose record is forgotten, is deleted too, unless
-  another subscription, a PostgreSQL subscription of the table or this node's
-  replication sets could have written it, or another row the copy lacks came
-  from elsewhere; then the sync fails, and retries, until the row is deleted or
-  the table emptied. The default is `error`.
+  which drops the slot, waits five seconds instead, or none when it can't reach
+  the provider, then leaves the slot, with a warning, to the subscription's
+  apply worker, which drops it, as it does any slot its table syncs left when it
+  starts, and tries again every five seconds while one stays; dropping the
+  subscription drops them too. One that stops after its copy has committed
+  catches up again from where it got to when it restarts, rather than copying
+  again. When its slot is gone or invalidated, or its origin has no progress, it
+  copies the table again and merges the copy in, in one transaction that keeps
+  writers, but not readers, waiting: the provider's rows replace those with the
+  same key, or join them, and a row the copy lacks is deleted when the
+  subscription wrote it, as its commit origin shows. One whose writer can't be
+  told, as with `track_commit_timestamp` off, a frozen row, or an origin whose
+  record is forgotten, is deleted too, unless another subscription, a PostgreSQL
+  subscription of the table or this node's replication sets could have written
+  it, or another row the copy lacks came from elsewhere; then the sync fails,
+  and retries, until the row is deleted or the table emptied. The default is
+  `error`.
 
 - `worf.enable_ddl_replication`
   Replicates DDL as it runs, through the `ddl_sql` replication set as

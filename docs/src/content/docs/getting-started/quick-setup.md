@@ -28,9 +28,10 @@ users of origins need the limit raised. `worf.origin_writer` records the node
 and subscription each origin worf creates applies for, a row each time one is
 created or dropped, and forgets a row once a later one has superseded it for
 `vacuum_freeze_min_age` transactions, as vacuum would freeze rows written before
-then, so it holds a row per origin and those of that many transactions. A
-conflict on a row written before then, whose record is forgotten, takes the row
-to be from what its origin applies for now, as pglogical takes every row.
+then, so it holds a row for each origin id and for each creation or drop in that
+many transactions. A conflict on a row written before then, whose record is
+forgotten, takes the row to be from what its origin applies for now, as
+pglogical takes every row.
 
 If you want to handle conflict resolution with last/first update wins (see
 [Conflicts](../../conflicts/)), you can add this additional option to
