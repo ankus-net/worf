@@ -344,6 +344,7 @@ internal static unsafe partial class CopyConversion
             {
                 s_disabling = (change, error);
                 WriteRow(s_message.AsSpan(0, length));
+                s_disabling = null;
                 return true;
             }
 
