@@ -446,7 +446,7 @@ public sealed partial class ExceptionBehaviourTests
         await using (NpgsqlConnection local = await subscriber.OpenAsync(Database, token))
         {
             await using NpgsqlTransaction transaction = await local.BeginTransactionAsync(token);
-            await using (NpgsqlCommand command = new("INSERT INTO synced VALUES (1, 'local')", local, transaction))
+            await using (NpgsqlCommand command = new("LOCK TABLE synced", local, transaction))
             {
                 _ = await command.ExecuteNonQueryAsync(token);
             }
