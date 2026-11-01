@@ -2453,11 +2453,17 @@ public sealed class SequenceRangeTests
                 long.Parse(after[i][1], CultureInfo.InvariantCulture) - long.Parse(before[i][1], CultureInfo.InvariantCulture), $"{nodes[i].Name}'s exchange calls");
             if (before[i][3] != after[i][3])
             {
-                Assert.IsTrue(await nodes[i].PollQueryUntilAsync(Database, $"SELECT pg_current_wal_flush_lsn() >= '{after[i][3]}'", token),
+                // An insert position at a page's start lies past the page's header, which is written only with the page's
+                // first record, so the WAL is flushed once it reaches the page's start.
+                string flushed = $"""
+                    CASE WHEN ('{after[i][3]}'::pg_lsn - '0/0') % 8192 <= 40 THEN '{after[i][3]}'::pg_lsn - ('{after[i][3]}'::pg_lsn - '0/0') % 8192
+                        ELSE '{after[i][3]}'::pg_lsn END
+                    """;
+                Assert.IsTrue(await nodes[i].PollQueryUntilAsync(Database, $"SELECT pg_current_wal_flush_lsn() >= {flushed}", token),
                     $"{nodes[i].Name} flushing its WAL");
                 Assert.AreEqual("", await nodes[i].SafePsqlAsync(Database, $"""
                     SELECT string_agg(resource_manager || ' ' || record_type, ', ')
-                    FROM pg_get_wal_records_info('{before[i][3]}', '{after[i][3]}')
+                    FROM pg_get_wal_records_info('{before[i][3]}', greatest('{before[i][3]}'::pg_lsn + 1, least('{after[i][3]}'::pg_lsn, pg_current_wal_flush_lsn())))
                     WHERE resource_manager <> 'Standby' AND record_type NOT IN ('CHECKPOINT_REDO', 'CHECKPOINT_ONLINE', 'FPI_FOR_HINT')
                         AND NOT (resource_manager = 'Heap2' AND record_type IN ('PRUNE', 'PRUNE_ON_ACCESS'))
                     """, token), $"{nodes[i].Name} wrote WAL while idle");
