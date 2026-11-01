@@ -387,7 +387,8 @@ internal static class Functions
         {
             WorfLocalNode node = WorfNode.GetLocalNode(true, false)!;
 
-            // First drop the status.
+            // First drop the status, after noting the slots its tables' syncs create, which may be left on the provider.
+            List<string> syncSlotNames = Sync.SyncSlotNames(sub);
             Sync.DropSubscriptionSyncStatus(sub.Id);
 
             // Drop the actual subscription.
@@ -419,43 +420,48 @@ internal static class Functions
                 myDatabaseId = NativeGlobals.MyDatabaseId;
             }
 
-            // Kill the apply to unlock the resources.
+            // Kill the apply and table sync workers to unlock the resources.
             using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
             {
-                int apply = guard.Read((in _, workers) => Worker.ApplyFind(workers, myDatabaseId, sub.Id));
-                Worker.WorkerKill(guard, apply);
+                foreach (int worker in RunningSubscriptionWorkers(guard, myDatabaseId, sub.Id))
+                {
+                    Worker.WorkerKill(guard, worker);
+                }
             }
 
-            // Wait for the apply to die. It looks for the request to stop between statements, so an apply that waits on
-            // a row this transaction deleted, as one that is initializing the subscription does, never sees it until
-            // its statement is cancelled. Only an apply this transaction blocks is cancelled: it can't exit before this
-            // transaction ends, so it's still there to cancel. A cancellation is no error of the data, so
-            // exception_behaviour leaves it be.
+            // Wait for them to die. They look for the request to stop between statements, so an apply that waits on a
+            // row this transaction deleted, as one that is initializing the subscription does, never sees it until its
+            // statement is cancelled. Only an apply this transaction blocks is cancelled: it can't exit before this
+            // transaction ends, so it's still there to cancel. A table sync, whose copy can wait on any session's lock,
+            // is cancelled whatever it waits for, and its cleanup drops its slot. A cancellation is no error of the
+            // data, so exception_behaviour leaves it be.
             for (int waits = 0; ; waits++)
             {
-                int pid = 0;
+                List<(int Pid, bool Sync)> pids = [];
                 using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
                 {
-                    int apply = guard.Read((in _, workers) => Worker.ApplyFind(workers, myDatabaseId, sub.Id));
-                    if (apply >= 0 && guard[apply].Proc != 0)
+                    foreach (int worker in RunningSubscriptionWorkers(guard, myDatabaseId, sub.Id))
                     {
                         unsafe
                         {
-                            pid = ((PGPROC*)guard[apply].Proc)->pid;
+                            pids.Add((((PGPROC*)guard[worker].Proc)->pid, guard[worker].WorkerType == WorfWorkerType.Sync));
                         }
                     }
                 }
 
-                if (pid == 0)
+                if (pids.Count == 0)
                 {
                     break;
                 }
 
                 if (waits > 0)
                 {
-                    _ = Elevated.Run(() => Spi.Execute(
-                        "SELECT pg_catalog.pg_cancel_backend($1) WHERE pg_catalog.pg_backend_pid() = ANY (pg_catalog.pg_blocking_pids($1))",
-                        SpiParameter.Create(pid)));
+                    foreach ((int pid, bool sync) in pids)
+                    {
+                        _ = Elevated.Run(() => Spi.Execute(
+                            "SELECT pg_catalog.pg_cancel_backend($1) WHERE $2 OR pg_catalog.pg_backend_pid() = ANY (pg_catalog.pg_blocking_pids($1))",
+                            SpiParameter.Create(pid), SpiParameter.Create(sync)));
+                    }
                 }
 
                 PgInterrupts.Check();
@@ -465,7 +471,7 @@ internal static class Functions
                 Worker.WaitLatch(OperatingSystem.IsWindows() ? 200 : 1000);
             }
 
-            // Drop the slot on remote side.
+            // Drop the slot on remote side, and those its table syncs left.
             //
             // Note, we can't fail here since we can't assume that the remote node is still reachable or even alive.
             try
@@ -474,9 +480,22 @@ internal static class Functions
                 {
                     using PgReplicationConnection originConn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "cleanup");
 
-                    // The walsender of the apply that just exited can hold the slot a moment longer, as when it is
-                    // still finishing a large transaction. Wait for it, as the apply does when it starts.
+                    // The walsenders of the workers that just exited can hold the slots a moment longer, as when one is
+                    // still finishing a large transaction. Wait for them, as the apply does when it starts.
                     long deadline = Worker.GetCurrentTimestamp() + 5000000L;
+                    List<string> syncSlots;
+                    while ((syncSlots = Sync.DropSyncSlots(originConn, syncSlotNames, new HashSet<string>())).Count > 0 &&
+                        Worker.GetCurrentTimestamp() < deadline)
+                    {
+                        PgInterrupts.Check();
+                        Worker.WaitLatch(50);
+                    }
+
+                    if (syncSlots.Count > 0)
+                    {
+                        PgLog.Warning($"could not drop slots {string.Join(", ", syncSlots.Select(slot => $"\"{slot}\""))} on provider, you will probably have to drop them manually");
+                    }
+
                     while (Worker.GetCurrentTimestamp() < deadline && Rpc.RemoteSlotActive(originConn, sub.SlotName))
                     {
                         PgInterrupts.Check();
@@ -498,6 +517,26 @@ internal static class Functions
 
         return BoolDatum(sub is not null);
     }
+
+    /// <summary>
+    /// Lists a subscription's apply and table sync workers that have a process. The caller holds the lock exclusively.
+    /// </summary>
+    private static List<int> RunningSubscriptionWorkers(PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard, uint dboid, uint subId)
+        => guard.Read((in _, workers) =>
+        {
+            List<int> found = Worker.SyncFindAll(workers, dboid, subId);
+            found.Add(Worker.ApplyFind(workers, dboid, subId));
+            List<int> running = [];
+            for (int i = 0; i < found.Count; i++)
+            {
+                if (found[i] >= 0 && workers[found[i]].Proc != 0)
+                {
+                    running.Add(found[i]);
+                }
+            }
+
+            return running;
+        });
 
     /// <summary>
     /// Disable subscription.
@@ -1547,9 +1586,10 @@ internal static class Functions
 
     /// <summary>
     /// Generate slot name (used also for origin identifier). The current format is
-    /// <c>worf_&lt;subscriber database name&gt;_&lt;provider node name&gt;_&lt;subscription name&gt;</c>. Note that
-    /// we want to leave enough free space for 8 bytes of suffix which in practice means 9 bytes including the
-    /// underscore.
+    /// <c>worf_&lt;subscriber database name&gt;_&lt;provider node name&gt;_&lt;subscription name&gt;</c>, at most 54
+    /// bytes, which leaves room in a 63-byte name for a table sync's suffix of an underscore and 8 hex digits. The
+    /// <c>worf_</c> prefix is a byte longer than pglogical's <c>pgl_</c>, so the database's name takes 15 bytes at
+    /// most, rather than 16.
     /// </summary>
     /// <param name="dbname">The subscriber's database.</param>
     /// <param name="providerNode">The provider node's name.</param>
@@ -1558,15 +1598,11 @@ internal static class Functions
     internal static string GenSlotName(string dbname, string providerNode, string subscriptionName)
     {
         List<byte> name = [.. "worf_"u8];
-        name.AddRange(Worf.ShortenHash(Worf.ToServer(dbname), 16));
+        name.AddRange(Worf.ShortenHash(Worf.ToServer(dbname), 15));
         name.Add((byte)'_');
         name.AddRange(Worf.ShortenHash(Worf.ToServer(providerNode), 16));
         name.Add((byte)'_');
         name.AddRange(Worf.ShortenHash(Worf.ToServer(subscriptionName), 16));
-        if (name.Count > 63)
-        {
-            name.RemoveRange(63, name.Count - 63);
-        }
 
         // Replace all the invalid characters in slot name with underscore.
         char[] slot = new char[name.Count];

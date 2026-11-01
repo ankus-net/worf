@@ -27,14 +27,21 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   changes another node forwarded, so every node keeps the same version.
   Nodes that replicate both ways need the same one of these two settings to
   keep the same rows, and `create_subscription` warns when they don't. It
-  compares the settings the apply workers run with, from the configuration
-  files and `ALTER SYSTEM`, `ALTER DATABASE` or `ALTER ROLE`, not a session's
-  `SET`.
+  compares the settings the apply workers run with, from the server's command
+  line, the configuration files, `ALTER SYSTEM`, `ALTER DATABASE`, and
+  `ALTER ROLE` for the bootstrap superuser the workers run as, not a session's
+  `SET` or the settings of the role that runs it. A provider connection's user
+  that can't read `pg_file_settings` reports the value its session started
+  with, and one that can't run `pg_read_file` misses the command line's.
 
   The default value is `apply_remote`.
 
   The `keep_local`, `last_update_wins` and `first_update_wins` settings
-  require `track_commit_timestamp` PostgreSQL setting to be enabled.
+  require `track_commit_timestamp` PostgreSQL setting to be enabled. A row whose
+  tuple header says it's frozen, as vacuum or `COPY FREEZE` leaves it, has no
+  commit timestamp or origin here, as in pglogical, though PostgreSQL may still
+  keep both: an update to it doesn't conflict, and an insert that finds it
+  resolves against a row with no commit timestamp.
 
 - `worf.conflict_log_level`
   Sets the log level for reporting detected conflicts when the
@@ -50,9 +57,9 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   How far ahead of the local clock a remote transaction's commit time can be
   for apply to wait until the local clock passes it, so that local changes
   made afterwards commit later than it, as `last_update_wins` and
-  `first_update_wins` need. Only the apply worker of a subscription whose
-  provider also subscribes to this node waits, and only under those two
-  settings. A remote transaction further ahead applies at once, with a warning
+  `first_update_wins` need. Only apply workers on a node that other nodes
+  subscribe to wait, as their local changes can meet the remote ones there
+  or further on, and only under those two settings. A remote transaction further ahead applies at once, with a warning
   at most once a minute. `-1` never waits. The default is `1s`.
 
 - `worf.exception_behaviour`
@@ -75,7 +82,25 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   change's rows or queued DDL, and the transaction it belongs to. The
   transaction that a subscription applies again, and how, is kept in
   `worf.exception_state` across restarts. Table sync workers catching up
-  after a copy handle failures the same way. The default is `error`.
+  after a copy handle failures the same way, streaming from their slot again.
+  When a walsender of their earlier connection, with the same user and
+  application name, still holds the slot after a second, they stop it; they
+  wait for anything else with a warning, and fail after a minute. Their cleanup,
+  which drops the slot, waits five seconds instead, or none when it can't reach
+  the provider, then leaves the slot, with a warning, to the subscription's
+  apply worker, which drops it, as it does any slot its table syncs left when it
+  starts, and tries again every five seconds while one stays; dropping the
+  subscription drops them too. One that stops after its copy has committed
+  catches up again from where it got to when it restarts, rather than copying
+  again. When its slot is gone or invalidated, or its origin has no progress, it
+  copies the table again and merges the copy in, in one transaction: the
+  provider's rows replace those with the same replica identity or primary key,
+  or join them, and the table's other rows stay, as in pglogical, since whether
+  the subscription wrote one can't be told in general. So a row the provider
+  deleted while the sync couldn't catch up stays here; resynchronizing the table
+  empties it and copies it again. Writers go on meanwhile, and readers see the
+  rows as they were until it commits. A table with neither key fails instead,
+  and retries, until it is resynchronized. The default is `error`.
 
 - `worf.enable_ddl_replication`
   Replicates DDL as it runs, through the `ddl_sql` replication set as

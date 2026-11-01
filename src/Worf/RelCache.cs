@@ -23,6 +23,14 @@ internal static partial class RelCache
 #endif
 
     /// <summary>
+    /// Gets the schema and name of a remote relation, without opening the local relation it maps to.
+    /// </summary>
+    /// <param name="remoteid">The remote relation's id.</param>
+    /// <returns>The schema and the name, or nulls when the provider hasn't described the relation.</returns>
+    internal static (string? Nspname, string? Relname) RemoteName(uint remoteid)
+        => s_relationHash is not null && s_relationHash.TryGetValue(remoteid, out WorfRelation? entry) ? (entry.Nspname, entry.Relname) : (null, null);
+
+    /// <summary>
     /// Opens the local relation a remote relation maps to.
     /// </summary>
     /// <param name="remoteid">The remote relation's id.</param>
@@ -36,6 +44,11 @@ internal static partial class RelCache
         if (!hash.TryGetValue(remoteid, out WorfRelation? entry))
         {
             throw new PgException(PgSqlStates.InternalError, $"cache lookup failed for remote relation {remoteid}");
+        }
+
+        if (entry.Reloid != 0 && entry.Rel is null && OpenKnown(entry, lockmode))
+        {
+            return entry;
         }
 
         // Need to update the local cache?
@@ -84,12 +97,26 @@ internal static partial class RelCache
                 }
             }
         }
-        else if (entry.Rel is null)
-        {
-            entry.Rel = NativeMethods.table_open(entry.Reloid, (int)lockmode);
-        }
 
         return entry;
+    }
+
+    /// <summary>
+    /// Opens the local relation an entry knows. The lock taken to open it processes invalidations, which may reset the
+    /// entry, as for DDL on the table that committed meanwhile; the entry is then looked up again, under the lock.
+    /// </summary>
+    /// <returns>Whether the entry still knows the relation, opened.</returns>
+    private static unsafe bool OpenKnown(WorfRelation entry, PgLockMode lockmode)
+    {
+        entry.Rel = NativeMethods.table_open(entry.Reloid, (int)lockmode);
+        if (entry.Reloid != 0)
+        {
+            return true;
+        }
+
+        NativeMethods.table_close(entry.Rel, (int)PgLockMode.None);
+        entry.Rel = null;
+        return false;
     }
 
     /// <summary>

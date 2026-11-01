@@ -11,6 +11,20 @@ internal static unsafe class ApplyHeap
     // latest few open, as pglogical keeps one.
     private const int MaxWriters = 64;
 
+    // The transaction id pglogical reads a frozen row's as, FrozenTransactionId.
+    private const uint FrozenTransactionId = 2;
+
+    // HEAP_XMIN_FROZEN, the infomask bits of a tuple header that say its xmin is frozen: HEAP_XMIN_COMMITTED and
+    // HEAP_XMIN_INVALID together.
+    private const ushort HeapXminFrozen = 0x0300;
+
+    // SK_ISNULL and SK_SEARCHNULL, the flags of a scan key that finds NULLs.
+    private const int ScanKeyIsNull = 0x0001;
+    private const int ScanKeySearchNull = 0x0040;
+
+    private const int AccessShareLock = 1;
+    private const ushort BtEqualStrategyNumber = 3;
+
     // The writers of the remote transaction being applied, by table, with a row for its changes, one for their keys
     // and the table's replica identity index.
     private static readonly Dictionary<uint, (PgRelationWriter Writer, PgReplicatedRow Row, PgReplicatedRow Key, uint ReplicaIndex)> s_writers = [];
@@ -71,17 +85,21 @@ internal static unsafe class ApplyHeap
             return;
         }
 
-        // Tuple already exists, try resolving conflict.
+        // Tuple already exists, try resolving conflict. A frozen one has no commit timestamp or origin.
         RelationData* relation = rel.Rel;
         HeapTupleData* localtuple = LocalTuple(local);
         HeapTupleData* remotetuple = FormTuple(relation, newtup);
-        long localTs = local.CommitTime?.MicrosecondsSinceEpoch ?? 0;
+        bool frozen = local.CommitTime is not null && IsFrozen(relation, local.IndexOid, localtuple);
+        PgTimestampTz? commitTime = frozen ? null : local.CommitTime;
+        ushort commitOrigin = frozen ? (ushort)0 : local.CommitOrigin;
+        uint localXid = frozen ? FrozenTransactionId : local.TransactionId;
+        long localTs = commitTime?.MicrosecondsSinceEpoch ?? 0;
 
-        bool apply = Conflict.TryResolveConflict(local.CommitOrigin, local.TransactionId, localTs, localtuple, remotetuple,
+        bool apply = Conflict.TryResolveConflict(commitOrigin, localXid, localTs, localtuple, remotetuple,
             out HeapTupleData* applytuple, out WorfConflictResolution resolution);
 
         Conflict.ReportConflict(WorfConflictType.InsertInsert, rel, localtuple, null, remotetuple, applytuple, resolution,
-            local.TransactionId, local.CommitTime is not null, local.CommitOrigin, localTs, local.IndexOid,
+            localXid, commitTime is not null, commitOrigin, localTs, local.IndexOid,
             relation->trigdesc is not null && relation->trigdesc->trig_insert_before_row);
 
         if (apply)
@@ -121,25 +139,28 @@ internal static unsafe class ApplyHeap
         }
 
         bool apply = true;
-        long localTs = local.CommitTime?.MicrosecondsSinceEpoch ?? 0;
         HeapTupleData* localtuple = null;
 
         // If the local tuple was previously updated by different transaction on different server, consider this to be
         // conflict and resolve it. One that came through this subscription, from any node its provider relays, came
-        // in order.
-        if (local.CommitTime is not null &&
+        // in order, and a frozen one has no commit timestamp or origin, as in pglogical.
+        if (local.CommitTime is PgTimestampTz commitTime &&
             local.TransactionId != NativeMethods.GetTopTransactionId() &&
-            !Apply.IsOwnStream(local.CommitOrigin))
+            !Apply.IsOwnStream(local.CommitOrigin, local.TransactionId))
         {
             localtuple = LocalTuple(local);
-            HeapTupleData* remotetuple = ModifyTuple(localtuple, relation, newtup);
+            if (!IsFrozen(relation, local.IndexOid, localtuple))
+            {
+                long localTs = commitTime.MicrosecondsSinceEpoch;
+                HeapTupleData* remotetuple = ModifyTuple(localtuple, relation, newtup);
 
-            apply = Conflict.TryResolveConflict(local.CommitOrigin, local.TransactionId, localTs, localtuple, remotetuple,
-                out HeapTupleData* applytuple, out WorfConflictResolution resolution);
+                apply = Conflict.TryResolveConflict(local.CommitOrigin, local.TransactionId, localTs, localtuple, remotetuple,
+                    out HeapTupleData* applytuple, out WorfConflictResolution resolution);
 
-            Conflict.ReportConflict(WorfConflictType.UpdateUpdate, rel, localtuple, oldtup, remotetuple, applytuple,
-                resolution, local.TransactionId, true, local.CommitOrigin, localTs, local.IndexOid,
-                relation->trigdesc is not null && relation->trigdesc->trig_update_before_row);
+                Conflict.ReportConflict(WorfConflictType.UpdateUpdate, rel, localtuple, oldtup, remotetuple, applytuple,
+                    resolution, local.TransactionId, true, local.CommitOrigin, localTs, local.IndexOid,
+                    relation->trigdesc is not null && relation->trigdesc->trig_update_before_row);
+            }
         }
 
         if (!apply)
@@ -301,6 +322,78 @@ internal static unsafe class ApplyHeap
 
     private static HeapTupleData* LocalTuple(PgFoundRow local)
         => (HeapTupleData*)local.Row.DangerousToNative(PgMemoryContext.Current);
+
+    /// <summary>
+    /// Checks whether a local row is frozen, as its tuple header says once vacuum or <c>COPY FREEZE</c> has frozen it,
+    /// which pglogical reads as <c>FrozenTransactionId</c>, with no commit timestamp or origin: the transaction id the
+    /// header keeps can be older than PostgreSQL keeps either for. The row found has its values but not its header, so
+    /// it's found again through the index it was found through, under a snapshot that sees it, as it's locked.
+    /// </summary>
+    /// <param name="relation">The row's table.</param>
+    /// <param name="indexOid">The unique index the row was found through.</param>
+    /// <param name="localtuple">The row's values.</param>
+    /// <returns>Whether it's frozen.</returns>
+    private static bool IsFrozen(RelationData* relation, uint indexOid, HeapTupleData* localtuple)
+    {
+        // Rows are found through an index, the table's key for a change's old row or a unique index for a new row.
+        if (indexOid == 0)
+        {
+            return false;
+        }
+
+        RelationData* index = NativeMethods.index_open(indexOid, AccessShareLock);
+        int nkeys = index->rd_index->indnkeyatts;
+        short* indkey = (short*)(&index->rd_index->indkey + 1);
+        ScanKeyData* keys = stackalloc ScanKeyData[nkeys];
+        bool usable = true;
+        for (int i = 0; i < nkeys; i++)
+        {
+            // Lookups skip indexes on expressions.
+            short attno = indkey[i];
+            if (attno <= 0)
+            {
+                usable = false;
+                break;
+            }
+
+            bool isnull;
+            ulong value = NativeMethods.heap_getattr(localtuple, attno, relation->rd_att, &isnull);
+            if (isnull)
+            {
+                // Only an index whose NULLs aren't distinct finds a row by a NULL.
+                NativeMethods.ScanKeyEntryInitialize(&keys[i], ScanKeyIsNull | ScanKeySearchNull, attno, 0, 0, 0, 0, 0);
+            }
+            else
+            {
+                uint opcintype = index->rd_opcintype[i];
+                uint op = NativeMethods.get_opfamily_member(index->rd_opfamily[i], opcintype, opcintype, (short)BtEqualStrategyNumber);
+                NativeMethods.ScanKeyInit(&keys[i], attno, BtEqualStrategyNumber, NativeMethods.get_opcode(op), value);
+                keys[i].sk_collation = index->rd_indcollation[i];
+            }
+        }
+
+        NativeMethods.index_close(index, AccessShareLock);
+        if (!usable)
+        {
+            return false;
+        }
+
+        // PostgreSQL 18 checks that a scan's snapshot is registered.
+        SnapshotData* snapshot = NativeMethods.RegisterSnapshot(NativeMethods.GetLatestSnapshot());
+        SysScanDescData* scan = NativeMethods.systable_beginscan(relation, indexOid, true, snapshot, nkeys, keys);
+        HeapTupleData* tuple = NativeMethods.systable_getnext(scan);
+        bool frozen = tuple is not null && XminFrozen(tuple->t_data);
+        NativeMethods.systable_endscan(scan);
+        NativeMethods.UnregisterSnapshot(snapshot);
+        return frozen;
+    }
+
+    /// <summary>
+    /// Checks whether a tuple header says its row is frozen, as <c>HeapTupleHeaderXminFrozen</c> does.
+    /// </summary>
+    /// <param name="header">The header.</param>
+    /// <returns>Whether it does.</returns>
+    internal static bool XminFrozen(HeapTupleHeaderData* header) => (header->t_infomask & HeapXminFrozen) == HeapXminFrozen;
 
     private static HeapTupleData* FormTuple(RelationData* relation, WorfTupleData tuple)
     {

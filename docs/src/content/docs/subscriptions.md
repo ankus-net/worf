@@ -41,7 +41,8 @@ description: Create, alter, synchronize and drop subscriptions.
   schema and/or data sync.
 
 - `worf.drop_subscription(subscription_name name, ifexists bool)`
-  Disconnects the subscription and removes it from the catalog.
+  Disconnects the subscription, drops its slot on the provider and those its
+  table syncs left there, and removes it from the catalog.
 
   Parameters:
   - `subscription_name` - name of the existing subscription

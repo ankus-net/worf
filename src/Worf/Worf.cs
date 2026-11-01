@@ -210,6 +210,63 @@ internal static partial class Worf
     }
 
     /// <summary>
+    /// Widens a transaction id from the last two billion to its full, 64-bit id.
+    /// </summary>
+    /// <param name="xid">The transaction id.</param>
+    /// <returns>The full transaction id.</returns>
+    internal static ulong FullTransactionId(uint xid)
+    {
+        ulong next = NextFullTransactionId;
+        ulong epoch = next >> 32;
+        return ((xid <= (uint)next || epoch == 0 ? epoch : epoch - 1) << 32) | xid;
+    }
+
+    /// <summary>
+    /// Gets the full id that the next transaction to need one is given, above every id given so far.
+    /// </summary>
+    internal static ulong NextFullTransactionId
+    {
+        get
+        {
+            unsafe
+            {
+                return NativeMethods.ReadNextFullTransactionId().value;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Gets the full id of the oldest transaction whose commit timestamp and origin PostgreSQL still keeps, or the next
+    /// transaction's when it keeps none, as with <c>track_commit_timestamp</c> off. Vacuum moves it on as it truncates
+    /// <c>pg_commit_ts</c>, which can be well after the transactions are frozen.
+    /// </summary>
+    internal static ulong OldestCommitTsFullTransactionId
+    {
+        get
+        {
+            uint oldest;
+            unsafe
+            {
+#if ANKUS_PG15 || ANKUS_PG16
+                oldest = NativeGlobals.ShmemVariableCache->oldestCommitTsXid;
+#else
+                oldest = NativeGlobals.TransamVariables->oldestCommitTsXid;
+#endif
+            }
+
+            return oldest == 0 ? NextFullTransactionId : FullTransactionId(oldest);
+        }
+    }
+
+    /// <summary>
+    /// Gets the full id of this database's <c>datfrozenxid</c>, before which vacuum has frozen every row in its tables.
+    /// Vacuum moves it on as it freezes them.
+    /// </summary>
+    internal static ulong DatabaseFrozenFullTransactionId
+        => FullTransactionId((uint)ReadScalar<long>(
+            "SELECT datfrozenxid::text::bigint FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database()"));
+
+    /// <summary>
     /// Gets the replication origin of this session, <c>replorigin_session_origin</c>.
     /// </summary>
     internal static ushort ReploriginSessionOrigin
@@ -1074,19 +1131,28 @@ internal static partial class Worf
         NativeMethods.table_close(rel, (int)PgLockMode.AccessShare);
     }
 
+    /// <summary>
+    /// Gets the application name a connection made with <see cref="Connect"/> or <see cref="ConnectReplica"/> has.
+    /// </summary>
+    /// <param name="connname">The name the connection's application name starts with.</param>
+    /// <param name="suffix">The application name's suffix, or null.</param>
+    /// <returns>The application name.</returns>
+    internal static string ApplicationName(string connname, string? suffix)
+    {
+        if (suffix is null)
+        {
+            return connname;
+        }
+
+        string applicationName = $"{ShortenHash(connname, Worker.NameDataLen - ToServer(suffix).Length - 2)}_{suffix}";
+        byte[] bytes = ToServer(applicationName);
+        return bytes.Length > Worker.NameDataLen - 1 ? FromServer(bytes.AsSpan(0, Worker.NameDataLen - 1)) : applicationName;
+    }
+
     private static PgReplicationConnection ConnectBase(string connstr, string appname, string? suffix, bool replication, string? options)
     {
         string s = ExtraConnectionOptions + " " + connstr;
-        string applicationName = appname;
-        if (suffix is not null)
-        {
-            applicationName = $"{ShortenHash(appname, Worker.NameDataLen - ToServer(suffix).Length - 2)}_{suffix}";
-            byte[] bytes = ToServer(applicationName);
-            if (bytes.Length > Worker.NameDataLen - 1)
-            {
-                applicationName = FromServer(bytes.AsSpan(0, Worker.NameDataLen - 1));
-            }
-        }
+        string applicationName = ApplicationName(appname, suffix);
 
         // We use the connection string as the base and pass some extra options after it, which override the ones it
         // names, as libpq's expand_dbname does.
