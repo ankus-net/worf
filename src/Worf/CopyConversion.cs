@@ -6,9 +6,9 @@ namespace Worf;
 
 /// <summary>
 /// Copies a table whose values convert from the provider's types through PostgreSQL's own <c>COPY FROM</c>, as the
-/// other tables are copied, with each converted column's input function replaced by its conversion, so that values
-/// convert as replication converts them sent as text, and an error names the row and column as COPY's do. Under
-/// <c>worf.exception_behaviour</c> other than <c>error</c>, each row's conversions are tried first, and a row whose
+/// other tables are copied. Each row's converted values are converted as replication converts a value sent as text,
+/// and written as the column type's output writes them, which COPY's input reads back, and a value that fails names
+/// its row and column as COPY's errors do. Under <c>worf.exception_behaviour</c> other than <c>error</c>, a row whose
 /// value fails to convert is skipped and recorded in <c>worf.exception_log</c>, or disables the subscription once the
 /// copy rolls back.
 /// </summary>
@@ -17,33 +17,39 @@ internal static unsafe partial class CopyConversion
     // The operation the exception log records a row of the copy as.
     private const string Operation = "COPY";
 
-    // The copy in progress: the connection its rows come from, the row being passed to COPY and how much of it is
-    // left, each converted column's conversion and own input function by its number, and the copy's state.
+    // The copy in progress: the connection its rows come from and whether they ended, the number of the last row
+    // read, a row still to pass to COPY, how much of it is left and its number, and COPY's state.
     private static PgReplicationConnection? s_conn;
+    private static bool s_ended;
+    private static ulong s_line;
     private static byte[] s_row = new byte[8192];
     private static int s_rowStart;
     private static int s_rowEnd;
-    private static WorfColumnConversion?[] s_conversions = [];
-    private static FmgrInfo* s_inputs;
+    private static ulong s_rowLine;
     private static CopyFromStateData* s_cstate;
 
-    // How the rows are checked when worf.exception_behaviour skips or records them: the conversions of the copied
-    // columns in order, the columns' names, the behaviour, what the exception log records with each row, and the
-    // number of rows read so far.
-    private static WorfColumnConversion?[]? s_checks;
-    private static List<string> s_columns = [];
-    private static WorfExceptionBehaviour s_behaviour;
+    // Each copied column's conversion, or null, a converted column's name and its type's output function, the memory
+    // context a row converts in, a value's text, and the row as converted.
+    private static WorfColumnConversion?[] s_conversions = [];
+    private static sbyte** s_names;
+    private static FmgrInfo* s_outputs;
+    private static MemoryContextData* s_context;
+    private static byte[] s_text = new byte[256];
+    private static byte[] s_converted = new byte[8192];
+    private static int s_convertedLength;
+
+    // When worf.exception_behaviour skips or records rows: what the exception log records with each, or null, the
+    // behaviour, the copied columns' names, and the row as received.
     private static WorfFailedChange? s_change;
-    private static ulong s_line;
+    private static WorfExceptionBehaviour s_behaviour;
+    private static List<string> s_columns = [];
+    private static byte[] s_message = new byte[8192];
 
     // A row that failed under sub_disable, which disables the subscription once the copy rolls back.
     private static (WorfFailedChange Change, PgException Error)? s_disabling;
 
-    [PgNativeCallback(nameof(ReadRow))]
+    [PgNativeCallback(nameof(ReadRows))]
     private static partial copy_data_source_cb DataSource { get; }
-
-    [PgNativeCallback(nameof(InputConverted))]
-    private static partial PGFunction ConvertedInput { get; }
 
     /// <summary>
     /// Copies the rows of a <c>COPY ... TO STDOUT</c> started on the connection into a local table, converting the
@@ -60,45 +66,54 @@ internal static unsafe partial class CopyConversion
         WorfColumnConversion?[] conversions, ulong commitLsn)
     {
         RelationData* relation = NativeMethods.table_open(rel.Reloid, RowExclusiveLock);
+        MemoryContextData* context;
+        fixed (byte* name = "worf copy conversion\0"u8)
+        {
+            // The name is static, as a memory context's has to be.
+            context = NativeMethods.AllocSetContextCreateInternal(NativeGlobals.CurrentMemoryContext, (sbyte*)name, 0,
+                8 * 1024, 8 * 1024 * 1024);
+        }
+
         try
         {
             ParseState* pstate = NativeMethods.make_parsestate(null);
             _ = NativeMethods.addRangeTableEntryForRelation(pstate, relation, AccessShareLock, null, false, false);
             List* attnamelist = null;
-            foreach (string attname in attnames)
+            s_conversions = new WorfColumnConversion?[attnames.Count];
+            s_names = (sbyte**)NativeMethods.palloc0((ulong)(sizeof(sbyte*) * attnames.Count));
+            s_outputs = (FmgrInfo*)NativeMethods.palloc0((ulong)(sizeof(FmgrInfo) * attnames.Count));
+            for (int i = 0; i < attnames.Count; i++)
             {
-                attnamelist = NativeMethods.lappend(attnamelist, NativeMethods.makeString(Worf.PStrDup(attname)));
-            }
-
-            s_conn = conn;
-            s_rowStart = s_rowEnd = 0;
-            s_conversions = conversions;
-            s_checks = null;
-            s_line = 0;
-            CopyFromStateData* cstate = NativeMethods.BeginCopyFrom(pstate, relation, null, null, false, DataSource, attnamelist, null);
-            s_cstate = cstate;
-
-            // The converted columns' input functions convert, and keep the column type's own for nulls, which a
-            // domain's input checks.
-            s_inputs = (FmgrInfo*)NativeMethods.palloc0((ulong)(sizeof(FmgrInfo) * Math.Max(conversions.Length, 1)));
-            for (int i = 0; i < conversions.Length; i++)
-            {
-                if (conversions[i] is not null)
+                sbyte* attname = Worf.PStrDup(attnames[i]);
+                attnamelist = NativeMethods.lappend(attnamelist, NativeMethods.makeString(attname));
+                int attnum = NativeMethods.attnameAttNum(relation, attname, false);
+                if (attnum > 0 && conversions[attnum - 1] is { } conversion)
                 {
-                    FmgrInfo* input = &cstate->in_functions[i];
-                    s_inputs[i] = *input;
-                    input->fn_addr = ConvertedInput;
-                    input->fn_extra = (void*)(nint)i;
+                    uint typoutput;
+                    bool typisvarlena;
+                    NativeMethods.getTypeOutputInfo(NativeMethods.TupleDescAttr(relation->rd_att, attnum - 1)->atttypid, &typoutput,
+                        &typisvarlena);
+                    NativeMethods.fmgr_info(typoutput, &s_outputs[i]);
+                    s_conversions[i] = conversion;
+                    s_names[i] = attname;
                 }
             }
 
-            // Unless worf.exception_behaviour stops at a failure, each row's conversions are tried before it's copied.
+            s_conn = conn;
+            s_ended = false;
+            s_line = 0;
+            s_rowStart = s_rowEnd = 0;
+            s_context = context;
+            s_change = null;
+            CopyFromStateData* cstate = NativeMethods.BeginCopyFrom(pstate, relation, null, null, false, DataSource, attnamelist, null);
+            s_cstate = cstate;
+
+            // Unless worf.exception_behaviour stops at a failure, each row converts in its own subtransaction.
             if (Apply.ExceptionBehaviour != WorfExceptionBehaviour.Error)
             {
                 WorfSubscription sub = Apply.MySubscription!;
-                s_checks = [.. attnames.Select(attname => conversions[NativeMethods.attnameAttNum(relation, Worf.PStrDup(attname), false) - 1])];
-                s_columns = attnames;
                 s_behaviour = Apply.ExceptionBehaviour;
+                s_columns = attnames;
                 s_change = new WorfFailedChange
                 {
                     Subscription = sub,
@@ -110,19 +125,39 @@ internal static unsafe partial class CopyConversion
                 };
             }
 
-            NativeMethods.PushActiveSnapshot(NativeMethods.GetTransactionSnapshot());
+            bool snapshot = !NativeMethods.ActiveSnapshotSet();
+            if (snapshot)
+            {
+                NativeMethods.PushActiveSnapshot(NativeMethods.GetTransactionSnapshot());
+            }
+
             ulong copied = NativeMethods.CopyFrom(cstate);
-            NativeMethods.PopActiveSnapshot();
             NativeMethods.EndCopyFrom(cstate);
+
+            // Text COPY can stop at an end-of-data line, and data after it would leave the connection mid-copy.
+            byte extra;
+            if (ReadRows(&extra, 1, 1) != 0)
+            {
+                throw new PgException(PgSqlStates.ProtocolViolation, "the copy sent data after its end-of-data marker");
+            }
+
+            if (snapshot)
+            {
+                NativeMethods.PopActiveSnapshot();
+            }
+
+            NativeMethods.free_parsestate(pstate);
+            NativeMethods.MemoryContextDelete(context);
             return copied;
         }
         finally
         {
             s_conn = null;
             s_cstate = null;
-            s_inputs = null;
             s_conversions = [];
-            s_checks = null;
+            s_names = null;
+            s_outputs = null;
+            s_context = null;
             s_change = null;
             NativeMethods.table_close(relation, NoLock);
         }
@@ -151,103 +186,158 @@ internal static unsafe partial class CopyConversion
     }
 
     /// <summary>
-    /// COPY's data source: passes it the provider's rows one at a time, so that its line numbers count the
-    /// provider's rows, and skips those whose values fail to convert when worf.exception_behaviour says so.
+    /// COPY's data source: passes it the provider's rows that have arrived, converted, whole unless one is longer
+    /// than COPY reads at once, and skips those whose values fail to convert when worf.exception_behaviour says so,
+    /// keeping COPY's line numbers those of the provider's rows.
     /// </summary>
-    private static int ReadRow(void* outbuf, int minread, int maxread)
+    private static int ReadRows(void* outbuf, int minread, int maxread)
     {
         _ = minread;
-        while (s_rowStart == s_rowEnd)
+        Span<byte> output = new(outbuf, maxread);
+        int written = 0;
+        while (true)
         {
-            PgReplicationReceiveStatus status = s_conn!.Receive(TimeSpan.FromSeconds(1), out ReadOnlySpan<byte> message);
+            // A row that didn't fit after others, or the rest of one longer than COPY reads at once.
+            if (s_rowStart < s_rowEnd)
+            {
+                int len = s_rowEnd - s_rowStart;
+                if (len > maxread - written)
+                {
+                    if (written > 0)
+                    {
+                        return written;
+                    }
+
+                    len = maxread;
+                }
+
+                if (written == 0 && s_rowStart == 0)
+                {
+                    StartRow(s_rowLine);
+                }
+
+                s_row.AsSpan(s_rowStart, len).CopyTo(output[written..]);
+                s_rowStart += len;
+                written += len;
+                if (s_rowStart < s_rowEnd)
+                {
+                    return written;
+                }
+
+                continue;
+            }
+
+            if (s_ended)
+            {
+                return written;
+            }
+
+            PgReplicationReceiveStatus status = s_conn!.Receive(written == 0 ? TimeSpan.FromSeconds(1) : TimeSpan.Zero,
+                out ReadOnlySpan<byte> message);
             if (status == PgReplicationReceiveStatus.Ended)
             {
-                return 0;
+                s_ended = true;
+                return written;
             }
 
             if (status != PgReplicationReceiveStatus.Message)
             {
+                if (written > 0)
+                {
+                    return written;
+                }
+
                 PgInterrupts.Check();
                 continue;
             }
 
-            if (s_row.Length < message.Length)
+            // Each message is a row, which ends with its newline.
+            s_line++;
+            if (!ConvertRow(message))
             {
-                s_row = new byte[Math.Max(message.Length, s_row.Length * 2)];
+                continue;
             }
 
-            message.CopyTo(s_row);
-            s_rowStart = 0;
-            s_rowEnd = message.Length;
-
-            // A row ends with its newline, which a message carries.
-            if (message.Length > 0 && message[^1] == (byte)'\n')
+            ReadOnlySpan<byte> row = s_converted.AsSpan(0, s_convertedLength);
+            if (row.Length <= maxread - written)
             {
-                s_line++;
-                if (s_checks is not null && !CheckRow(new ReadOnlySpan<byte>(s_row, 0, s_rowEnd - 1)))
+                if (written == 0)
                 {
-                    s_rowStart = s_rowEnd = 0;
-                    continue;
+                    StartRow(s_line);
                 }
 
-                // COPY counts the rows it reads, and those skipped too.
-                s_cstate->cur_lineno = s_line;
+                row.CopyTo(output[written..]);
+                written += row.Length;
+                continue;
             }
-        }
 
-        int len = Math.Min(maxread, s_rowEnd - s_rowStart);
-        new ReadOnlySpan<byte>(s_row, s_rowStart, len).CopyTo(new Span<byte>(outbuf, len));
-        s_rowStart += len;
-        return len;
+            if (s_row.Length < row.Length)
+            {
+                s_row = new byte[Math.Max(row.Length, s_row.Length * 2)];
+            }
+
+            row.CopyTo(s_row);
+            s_rowStart = 0;
+            s_rowEnd = row.Length;
+            s_rowLine = s_line;
+        }
     }
 
     /// <summary>
-    /// Tries a row's conversions, and records a row whose value fails: skipped, or kept to disable the subscription
-    /// once the copy fails on it and rolls back.
+    /// Numbers the row COPY reads next as the provider's row it is, once rows before it were skipped.
+    /// </summary>
+    private static void StartRow(ulong line)
+    {
+        if (s_change is not null)
+        {
+            s_cstate->cur_lineno = line;
+        }
+    }
+
+    /// <summary>
+    /// Converts a row, in its own subtransaction when worf.exception_behaviour skips or records rows, and records a
+    /// row whose value fails: skipped, or kept to disable the subscription as it fails the copy.
     /// </summary>
     /// <returns>Whether the row goes on to COPY.</returns>
-    private static bool CheckRow(ReadOnlySpan<byte> row)
+    private static bool ConvertRow(ReadOnlySpan<byte> message)
     {
-        List<byte[]?> fields = ReadFields(row);
-        if (fields.Count != s_checks!.Length)
+        if (s_change is null)
         {
+            WriteRow(message);
             return true;
         }
 
+        if (s_message.Length < message.Length)
+        {
+            s_message = new byte[Math.Max(message.Length, s_message.Length * 2)];
+        }
+
+        message.CopyTo(s_message);
+        int length = message.Length;
         try
         {
-            PgTransaction.RunInSubtransaction(() =>
-            {
-                for (int i = 0; i < fields.Count; i++)
-                {
-                    if (s_checks[i] is { } conversion && fields[i] is byte[] field)
-                    {
-                        fixed (byte* text = field)
-                        {
-                            _ = conversion.ConvertText((sbyte*)text, out _);
-                        }
-                    }
-                }
-            }, PgSubtransactionMode.Atomic);
+            PgTransaction.RunInSubtransaction(() => WriteRow(s_message.AsSpan(0, length)), PgSubtransactionMode.Atomic);
             return true;
         }
         catch (PgException error) when (!Apply.IsTransient(error))
         {
             WorfFailedChange change = new()
             {
-                Subscription = s_change!.Subscription,
+                Subscription = s_change.Subscription,
                 WriterNodeId = s_change.WriterNodeId,
                 CommitTime = s_change.CommitTime,
                 CommitLsn = s_change.CommitLsn,
                 ActionCounter = (uint)s_line,
                 Operation = Operation,
                 Relation = s_change.Relation,
-                NewTuple = RowJson(fields),
+                NewTuple = RowJson(s_message.AsSpan(0, length)),
             };
-            // Under sub_disable, the row goes on to fail in COPY, which names it and its column.
+
+            // Under sub_disable, the row converts again to fail the copy, naming its row and column.
             if (s_behaviour == WorfExceptionBehaviour.SubDisable)
             {
                 s_disabling = (change, error);
+                WriteRow(s_message.AsSpan(0, length));
                 return true;
             }
 
@@ -257,130 +347,228 @@ internal static unsafe partial class CopyConversion
     }
 
     /// <summary>
-    /// Reads a row's fields as COPY's text format writes them, each with its terminating zero, or null.
+    /// Writes a row as COPY reads it, with its converted values converted and written as their type's output writes
+    /// them, while COPY's errors name the row, and the column and value being converted.
     /// </summary>
-    private static List<byte[]?> ReadFields(ReadOnlySpan<byte> row)
+    private static void WriteRow(ReadOnlySpan<byte> message)
     {
-        List<byte[]?> fields = [];
-        List<byte> field = [];
-        int start = 0;
-        for (int i = 0; i <= row.Length; i++)
+        s_convertedLength = 0;
+        ulong lineno = s_cstate->cur_lineno;
+        MemoryContextData* oldcontext = Worf.MemoryContextSwitchTo(s_context);
+        try
         {
-            if (i < row.Length && row[i] != (byte)'\t')
+            NativeMethods.MemoryContextReset(s_context);
+            bool newline = message.Length > 0 && message[^1] == (byte)'\n';
+            ReadOnlySpan<byte> row = newline ? message[..^1] : message;
+            int field = 0;
+            int start = 0;
+            for (int i = 0; i <= row.Length; i++)
             {
-                if (row[i] != (byte)'\\' || i + 1 == row.Length)
+                if (i < row.Length && row[i] != (byte)'\t')
                 {
-                    field.Add(row[i]);
                     continue;
                 }
 
-                byte c = row[++i];
-                switch (c)
+                ReadOnlySpan<byte> raw = row[start..i];
+                if (field < s_conversions.Length && s_conversions[field] is { } conversion && !raw.SequenceEqual("\\N"u8))
                 {
-                    case (byte)'b': field.Add(8); break;
-                    case (byte)'f': field.Add(12); break;
-                    case (byte)'n': field.Add(10); break;
-                    case (byte)'r': field.Add(13); break;
-                    case (byte)'t': field.Add(9); break;
-                    case (byte)'v': field.Add(11); break;
-                    case >= (byte)'0' and <= (byte)'7':
+                    _ = Unescape(raw, ref s_text);
+                    fixed (byte* text = s_text)
                     {
-                        int value = c - '0';
-                        for (int n = 1; n < 3 && i + 1 < row.Length && row[i + 1] is >= (byte)'0' and <= (byte)'7'; n++)
+                        s_cstate->cur_lineno = s_line;
+                        s_cstate->cur_attname = s_names[field];
+                        s_cstate->cur_attval = (sbyte*)text;
+                        ulong value = conversion.ConvertText((sbyte*)text, out bool isnull);
+                        if (isnull)
                         {
-                            value = (value << 3) + (row[++i] - '0');
+                            Append("\\N"u8);
+                        }
+                        else
+                        {
+                            sbyte* output = NativeMethods.OutputFunctionCall(&s_outputs[field], value);
+                            AppendEscaped(new ReadOnlySpan<byte>(output, Worf.StrLen(output)));
                         }
 
-                        field.Add((byte)value);
-                        break;
+                        s_cstate->cur_attname = null;
+                        s_cstate->cur_attval = null;
                     }
-
-                    case (byte)'x' when i + 1 < row.Length && char.IsAsciiHexDigit((char)row[i + 1]):
-                    {
-                        int value = HexValue(row[++i]);
-                        if (i + 1 < row.Length && char.IsAsciiHexDigit((char)row[i + 1]))
-                        {
-                            value = (value << 4) + HexValue(row[++i]);
-                        }
-
-                        field.Add((byte)value);
-                        break;
-                    }
-
-                    default: field.Add(c); break;
+                }
+                else
+                {
+                    Append(raw);
                 }
 
+                if (i < row.Length)
+                {
+                    Append("\t"u8);
+                }
+
+                field++;
+                start = i + 1;
+            }
+
+            if (newline)
+            {
+                Append("\n"u8);
+            }
+        }
+        finally
+        {
+            s_cstate->cur_lineno = lineno;
+            s_cstate->cur_attname = null;
+            s_cstate->cur_attval = null;
+            _ = Worf.MemoryContextSwitchTo(oldcontext);
+        }
+    }
+
+    /// <summary>
+    /// Reads a field as COPY's text format writes it, with its terminating zero.
+    /// </summary>
+    /// <returns>Its length.</returns>
+    private static int Unescape(ReadOnlySpan<byte> raw, ref byte[] text)
+    {
+        if (text.Length <= raw.Length)
+        {
+            text = new byte[Math.Max(raw.Length + 1, text.Length * 2)];
+        }
+
+        int n = 0;
+        for (int i = 0; i < raw.Length; i++)
+        {
+            byte c = raw[i];
+            if (c != (byte)'\\' || i + 1 == raw.Length)
+            {
+                text[n++] = c;
                 continue;
             }
 
-            // A field that's exactly \N is null.
-            if (row[start..i].SequenceEqual("\\N"u8))
+            c = raw[++i];
+            switch (c)
             {
-                fields.Add(null);
-            }
-            else
-            {
-                field.Add(0);
-                fields.Add([.. field]);
-            }
+                case (byte)'b': text[n++] = 8; break;
+                case (byte)'f': text[n++] = 12; break;
+                case (byte)'n': text[n++] = 10; break;
+                case (byte)'r': text[n++] = 13; break;
+                case (byte)'t': text[n++] = 9; break;
+                case (byte)'v': text[n++] = 11; break;
+                case >= (byte)'0' and <= (byte)'7':
+                {
+                    int value = c - '0';
+                    for (int digits = 1; digits < 3 && i + 1 < raw.Length && raw[i + 1] is >= (byte)'0' and <= (byte)'7'; digits++)
+                    {
+                        value = (value << 3) + (raw[++i] - '0');
+                    }
 
-            field.Clear();
-            start = i + 1;
+                    text[n++] = (byte)value;
+                    break;
+                }
+
+                case (byte)'x' when i + 1 < raw.Length && char.IsAsciiHexDigit((char)raw[i + 1]):
+                {
+                    int value = HexValue(raw[++i]);
+                    if (i + 1 < raw.Length && char.IsAsciiHexDigit((char)raw[i + 1]))
+                    {
+                        value = (value << 4) + HexValue(raw[++i]);
+                    }
+
+                    text[n++] = (byte)value;
+                    break;
+                }
+
+                default: text[n++] = c; break;
+            }
         }
 
-        return fields;
+        text[n] = 0;
+        return n;
     }
 
     private static int HexValue(byte digit) => digit <= (byte)'9' ? digit - '0' : (digit | 0x20) - 'a' + 10;
 
     /// <summary>
-    /// Writes a row's fields as the exception log records a row: a JSON object of the columns' text.
+    /// Adds bytes to the converted row.
     /// </summary>
-    private static string RowJson(List<byte[]?> fields)
+    private static void Append(ReadOnlySpan<byte> bytes)
     {
+        if (s_converted.Length < s_convertedLength + bytes.Length)
+        {
+            Array.Resize(ref s_converted, Math.Max(s_convertedLength + bytes.Length, s_converted.Length * 2));
+        }
+
+        bytes.CopyTo(s_converted.AsSpan(s_convertedLength));
+        s_convertedLength += bytes.Length;
+    }
+
+    /// <summary>
+    /// Adds a value to the converted row as COPY's text format writes it, with its backslashes and control characters
+    /// escaped.
+    /// </summary>
+    private static void AppendEscaped(ReadOnlySpan<byte> value)
+    {
+        int start = 0;
+        for (int i = 0; i < value.Length; i++)
+        {
+            byte escape = value[i] switch
+            {
+                (byte)'\\' => (byte)'\\',
+                8 => (byte)'b',
+                9 => (byte)'t',
+                10 => (byte)'n',
+                11 => (byte)'v',
+                12 => (byte)'f',
+                13 => (byte)'r',
+                _ => 0,
+            };
+            if (escape != 0)
+            {
+                Append(value[start..i]);
+                Append([(byte)'\\', escape]);
+                start = i + 1;
+            }
+        }
+
+        Append(value[start..]);
+    }
+
+    /// <summary>
+    /// Writes a row as the exception log records a row: a JSON object of the columns' text.
+    /// </summary>
+    private static string RowJson(ReadOnlySpan<byte> message)
+    {
+        ReadOnlySpan<byte> row = message.Length > 0 && message[^1] == (byte)'\n' ? message[..^1] : message;
         using MemoryStream stream = new();
         using (Utf8JsonWriter writer = new(stream))
         {
             writer.WriteStartObject();
-            for (int i = 0; i < fields.Count; i++)
+            int field = 0;
+            int start = 0;
+            byte[] text = new byte[row.Length + 1];
+            for (int i = 0; i <= row.Length && field < s_columns.Count; i++)
             {
-                if (fields[i] is byte[] field)
+                if (i < row.Length && row[i] != (byte)'\t')
                 {
-                    writer.WriteString(s_columns[i], Worf.FromServer(field.AsSpan(0, field.Length - 1)));
+                    continue;
+                }
+
+                ReadOnlySpan<byte> raw = row[start..i];
+                if (raw.SequenceEqual("\\N"u8))
+                {
+                    writer.WriteNull(s_columns[field]);
                 }
                 else
                 {
-                    writer.WriteNull(s_columns[i]);
+                    int len = Unescape(raw, ref text);
+                    writer.WriteString(s_columns[field], Worf.FromServer(text.AsSpan(0, len)));
                 }
+
+                field++;
+                start = i + 1;
             }
 
             writer.WriteEndObject();
         }
 
         return Encoding.UTF8.GetString(stream.ToArray());
-    }
-
-    /// <summary>
-    /// A converted column's input function in the copy: converts the provider's text as replication does, and gives
-    /// a null to the column type's own input.
-    /// </summary>
-    private static ulong InputConverted(FunctionCallInfoBaseData* fcinfo)
-    {
-        Span<NullableDatum> args = FunctionCallInfoBaseData.Dangerous_args(fcinfo, 3);
-        int i = (int)(nint)fcinfo->flinfo->fn_extra;
-        if (args[0].isnull || args[0].value == 0)
-        {
-            fcinfo->isnull = true;
-            return NativeMethods.InputFunctionCall(&s_inputs[i], null, (uint)args[1].value, (int)args[2].value);
-        }
-
-        ulong value = s_conversions[i]!.ConvertText((sbyte*)args[0].value, out bool isnull);
-        if (isnull)
-        {
-            throw new PgException(PgSqlStates.NotNullViolation, "a converted value is null");
-        }
-
-        return value;
     }
 
     private const int AccessShareLock = 1;
