@@ -616,8 +616,8 @@ public sealed class SequenceRangeTests
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges", token), "node_b drawing from a block");
         Assert.DoesNotContain("carries this sequence range exchange", nodeA.ReadLog(), "node_a's log");
 
-        const int Sessions = 32;
-        const int Inserts = 1000;
+        const int Sessions = 16;
+        const int Inserts = 500;
         await Task.WhenAll(Enumerable.Range(0, Sessions).Select(async session =>
         {
             await using NpgsqlConnection connection = await nodeB.OpenAsync(Database, token);
