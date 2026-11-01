@@ -451,12 +451,12 @@ public sealed class GlobalDdlLockTests
         {
             "ALTER TABLE lt ALTER COLUMN v TYPE bigint", "ALTER TABLE lp ATTACH PARTITION lp2 FOR VALUES FROM (100) TO (200)",
             "CREATE INDEX lp_w ON lp (w)", "COMMENT ON INDEX lp2_v_idx IS 'built'", "CREATE TABLE lk_a (LIKE lt INCLUDING ALL)",
-            "ALTER TABLE ld ALTER COLUMN w TYPE bigint",
         })
         {
             _ = await nodeA.SafePsqlAsync(Database, sql, token);
         }
 
+        Assert.IsTrue(await PollSucceedsAsync(nodeA, "ALTER TABLE ld ALTER COLUMN w TYPE bigint", token), "the failed build's fence went");
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
         Assert.AreEqual("lp1_w,lp2_v,lt_v,lt_v_idx,lt_w_idx,lt_w_key|f|bigint|built", await nodeB.SafePsqlAsync(Database, """
             SELECT (SELECT string_agg(c.relname, ',' ORDER BY c.relname) FROM worf.local_index l JOIN pg_class c ON c.oid = l.indexrelid),
