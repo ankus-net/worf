@@ -1146,7 +1146,10 @@ public sealed class SequenceRangeTests
 
         // node_b stops first, so that no report of its can bring the grants back before node_a resets.
         await nodeB.StopAsync("fast", token);
+        // Edits by hand lock the range row first, as every change to a sequence's ranges does, so that none deadlocks with an
+        // exchange.
         _ = await nodeA.SafePsqlAsync(Database, """
+            SELECT 1 FROM worf.sequence_range WHERE seqoid = 'mv_id_seq'::regclass FOR NO KEY UPDATE;
             DELETE FROM worf.sequence_range_grant WHERE seqoid = 'mv_id_seq'::regclass AND grantee_name = 'node_b';
             DELETE FROM worf.sequence_range_node WHERE seqoid = 'mv_id_seq'::regclass AND node_name = 'node_b';
             """, token);
@@ -1408,6 +1411,7 @@ public sealed class SequenceRangeTests
         await nodeC.StopAsync("fast", token);
         int downC = nodeA.ReadLog().Length;
         _ = await nodeA.SafePsqlAsync(Database, $"""
+            SELECT 1 FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass FOR NO KEY UPDATE;
             DELETE FROM worf.sequence_range_grant WHERE seqoid = 't_id_seq'::regclass AND grantee_id = {nodeCId};
             DELETE FROM worf.sequence_range_node WHERE seqoid = 't_id_seq'::regclass AND node_id = {nodeCId};
             SELECT worf.reset_sequence_range('t_id_seq');
@@ -1575,6 +1579,7 @@ public sealed class SequenceRangeTests
         await Task.Delay(TimeSpan.FromSeconds(1), token);
         int reused = nodeA.ReadLog().Length;
         _ = await nodeA.SafePsqlAsync(Database, $"""
+            SELECT 1 FROM worf.sequence_range WHERE seqoid = 'worf.snowflake_node'::regclass FOR NO KEY UPDATE;
             UPDATE worf.sequence_range_grant SET granted_at = now() - interval '2 days'
             WHERE seqoid = 'worf.snowflake_node'::regclass AND (kind = 'p' OR grantee_id = {nodeBId});
             UPDATE worf.sequence_range_node SET via_node = {nodeCId}, holds = ARRAY[]::bigint[], reported_at = now()
