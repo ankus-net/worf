@@ -954,12 +954,12 @@ internal static partial class ReplicationSet
                 _ = NativeMethods.heap_getattr(tuple, AnumRepsetTableRowFilter, repsetRelDesc, &isnull);
                 if (!isnull)
                 {
-                    byte[] rowFilter = ReadParts(repset.Id, reloid, AnumRepsetTableRowFilter);
+                    byte[] rowFilter = [.. ReadParts(repset.Id, reloid, AnumRepsetTableRowFilter), 0];
                     MemoryContextData* olctx = NativeGlobals.CurrentMemoryContext;
                     NativeGlobals.CurrentMemoryContext = NativeGlobals.CacheMemoryContext;
                     try
                     {
-                        fixed (byte* text = (byte[])[.. rowFilter, 0])
+                        fixed (byte* text = rowFilter)
                         {
                             entry.RowFilter.Add((nint)NativeMethods.stringToNode((sbyte*)text));
                         }
