@@ -342,7 +342,7 @@ internal static partial class RelCache
         {
             string column = Worf.FromServer((sbyte*)&att->attname);
             return new WorfColumnConversion(column, "money", 0, att->atttypid, att->atttypmod,
-                $"column \"{column}\" gets money, which the provider formats as {providerFormat} and this node as {OutputConfig.MoneyFormat()}, under another lc_monetary");
+                $"column \"{column}\" gets money from a provider whose lc_monetary formats it as \"{providerFormat}\" where this node's formats it as \"{OutputConfig.MoneyFormat()}\"");
         }
 
         if (remote.Definition is null)

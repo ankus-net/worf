@@ -29,12 +29,13 @@ internal static unsafe partial class CopyConversion
     private static CopyFromStateData* s_cstate;
 
     // Each copied column's conversion, or null, a converted column's name and its type's output function, the memory
-    // context a row converts in, a value's text, and the row as converted.
+    // context a row converts in, a value's text, which COPY's errors show, and the row as converted.
     private static WorfColumnConversion?[] s_conversions = [];
     private static sbyte** s_names;
     private static FmgrInfo* s_outputs;
     private static MemoryContextData* s_context;
-    private static byte[] s_text = new byte[256];
+    private static byte* s_text;
+    private static int s_textSize;
     private static byte[] s_converted = new byte[8192];
     private static int s_convertedLength;
 
@@ -99,6 +100,8 @@ internal static unsafe partial class CopyConversion
                 }
             }
 
+            s_textSize = 256;
+            s_text = (byte*)NativeMethods.palloc((ulong)s_textSize);
             s_conn = conn;
             s_ended = false;
             s_line = 0;
@@ -158,6 +161,7 @@ internal static unsafe partial class CopyConversion
             s_names = null;
             s_outputs = null;
             s_context = null;
+            s_text = null;
             s_change = null;
             NativeMethods.table_close(relation, NoLock);
         }
@@ -314,6 +318,7 @@ internal static unsafe partial class CopyConversion
 
         message.CopyTo(s_message);
         int length = message.Length;
+        ulong lineno = s_cstate->cur_lineno;
         try
         {
             PgTransaction.RunInSubtransaction(() => WriteRow(s_message.AsSpan(0, length)), PgSubtransactionMode.Atomic);
@@ -321,6 +326,7 @@ internal static unsafe partial class CopyConversion
         }
         catch (PgException error) when (!Apply.IsTransient(error))
         {
+            ForgetValue(lineno);
             WorfFailedChange change = new()
             {
                 Subscription = s_change.Subscription,
@@ -348,7 +354,7 @@ internal static unsafe partial class CopyConversion
 
     /// <summary>
     /// Writes a row as COPY reads it, with its converted values converted and written as their type's output writes
-    /// them, while COPY's errors name the row, and the column and value being converted.
+    /// them. While a value converts, COPY's errors name its row, column and text, which a failure leaves them naming.
     /// </summary>
     private static void WriteRow(ReadOnlySpan<byte> message)
     {
@@ -372,26 +378,22 @@ internal static unsafe partial class CopyConversion
                 ReadOnlySpan<byte> raw = row[start..i];
                 if (field < s_conversions.Length && s_conversions[field] is { } conversion && !raw.SequenceEqual("\\N"u8))
                 {
-                    _ = Unescape(raw, ref s_text);
-                    fixed (byte* text = s_text)
+                    _ = Unescape(raw);
+                    s_cstate->cur_lineno = s_line;
+                    s_cstate->cur_attname = s_names[field];
+                    s_cstate->cur_attval = (sbyte*)s_text;
+                    ulong value = conversion.ConvertText((sbyte*)s_text, out bool isnull);
+                    if (isnull)
                     {
-                        s_cstate->cur_lineno = s_line;
-                        s_cstate->cur_attname = s_names[field];
-                        s_cstate->cur_attval = (sbyte*)text;
-                        ulong value = conversion.ConvertText((sbyte*)text, out bool isnull);
-                        if (isnull)
-                        {
-                            Append("\\N"u8);
-                        }
-                        else
-                        {
-                            sbyte* output = NativeMethods.OutputFunctionCall(&s_outputs[field], value);
-                            AppendEscaped(new ReadOnlySpan<byte>(output, Worf.StrLen(output)));
-                        }
-
-                        s_cstate->cur_attname = null;
-                        s_cstate->cur_attval = null;
+                        Append("\\N"u8);
                     }
+                    else
+                    {
+                        sbyte* output = NativeMethods.OutputFunctionCall(&s_outputs[field], value);
+                        AppendEscaped(new ReadOnlySpan<byte>(output, Worf.StrLen(output)));
+                    }
+
+                    ForgetValue(lineno);
                 }
                 else
                 {
@@ -414,22 +416,30 @@ internal static unsafe partial class CopyConversion
         }
         finally
         {
-            s_cstate->cur_lineno = lineno;
-            s_cstate->cur_attname = null;
-            s_cstate->cur_attval = null;
             _ = Worf.MemoryContextSwitchTo(oldcontext);
         }
     }
 
     /// <summary>
-    /// Reads a field as COPY's text format writes it, with its terminating zero.
+    /// Stops COPY's errors naming the value that converted, and gives them the line COPY is reading back.
+    /// </summary>
+    private static void ForgetValue(ulong lineno)
+    {
+        s_cstate->cur_lineno = lineno;
+        s_cstate->cur_attname = null;
+        s_cstate->cur_attval = null;
+    }
+
+    /// <summary>
+    /// Reads a field as COPY's text format writes it into the value's text, with its terminating zero.
     /// </summary>
     /// <returns>Its length.</returns>
-    private static int Unescape(ReadOnlySpan<byte> raw, ref byte[] text)
+    private static int Unescape(ReadOnlySpan<byte> raw)
     {
-        if (text.Length <= raw.Length)
+        if (s_textSize <= raw.Length)
         {
-            text = new byte[Math.Max(raw.Length + 1, text.Length * 2)];
+            s_textSize = Math.Max(raw.Length + 1, s_textSize * 2);
+            s_text = (byte*)NativeMethods.repalloc(s_text, (ulong)s_textSize);
         }
 
         int n = 0;
@@ -438,19 +448,19 @@ internal static unsafe partial class CopyConversion
             byte c = raw[i];
             if (c != (byte)'\\' || i + 1 == raw.Length)
             {
-                text[n++] = c;
+                s_text[n++] = c;
                 continue;
             }
 
             c = raw[++i];
             switch (c)
             {
-                case (byte)'b': text[n++] = 8; break;
-                case (byte)'f': text[n++] = 12; break;
-                case (byte)'n': text[n++] = 10; break;
-                case (byte)'r': text[n++] = 13; break;
-                case (byte)'t': text[n++] = 9; break;
-                case (byte)'v': text[n++] = 11; break;
+                case (byte)'b': s_text[n++] = 8; break;
+                case (byte)'f': s_text[n++] = 12; break;
+                case (byte)'n': s_text[n++] = 10; break;
+                case (byte)'r': s_text[n++] = 13; break;
+                case (byte)'t': s_text[n++] = 9; break;
+                case (byte)'v': s_text[n++] = 11; break;
                 case >= (byte)'0' and <= (byte)'7':
                 {
                     int value = c - '0';
@@ -459,7 +469,7 @@ internal static unsafe partial class CopyConversion
                         value = (value << 3) + (raw[++i] - '0');
                     }
 
-                    text[n++] = (byte)value;
+                    s_text[n++] = (byte)value;
                     break;
                 }
 
@@ -471,15 +481,15 @@ internal static unsafe partial class CopyConversion
                         value = (value << 4) + HexValue(raw[++i]);
                     }
 
-                    text[n++] = (byte)value;
+                    s_text[n++] = (byte)value;
                     break;
                 }
 
-                default: text[n++] = c; break;
+                default: s_text[n++] = c; break;
             }
         }
 
-        text[n] = 0;
+        s_text[n] = 0;
         return n;
     }
 
@@ -542,7 +552,6 @@ internal static unsafe partial class CopyConversion
             writer.WriteStartObject();
             int field = 0;
             int start = 0;
-            byte[] text = new byte[row.Length + 1];
             for (int i = 0; i <= row.Length && field < s_columns.Count; i++)
             {
                 if (i < row.Length && row[i] != (byte)'\t')
@@ -557,8 +566,7 @@ internal static unsafe partial class CopyConversion
                 }
                 else
                 {
-                    int len = Unescape(raw, ref text);
-                    writer.WriteString(s_columns[field], Worf.FromServer(text.AsSpan(0, len)));
+                    writer.WriteString(s_columns[field], Worf.FromServer(new ReadOnlySpan<byte>(s_text, Unescape(raw))));
                 }
 
                 field++;
