@@ -1300,13 +1300,18 @@ public sealed class SequenceRangeTests
                 worf.sequence_range_heard({nodeCId}, false, '-infinity', false) > now() - interval '1 minute'
             FROM (SELECT worf.sequence_range_exchange('{flood}')) e
             """, token), "node_a and node_c heard from");
-        Assert.AreEqual("1024", await nodeB.SafePsqlAsync(Database, "SELECT count(*) FROM worf.sequence_range_node WHERE seqoid = 't_id_seq'::regclass", token),
-            "the nodes node_b keeps");
+        const string MadeUpKept = "SELECT count(*) FROM worf.sequence_range_node WHERE seqoid = 't_id_seq'::regclass AND node_name LIKE 'made_up_%'";
+        Assert.AreEqual("t", await nodeB.SafePsqlAsync(Database,
+            $"SELECT count(*) BETWEEN 200 AND 256 FROM worf.sequence_range_node WHERE seqoid = 't_id_seq'::regclass AND via_node = {nodeAId} AND node_id <> via_node",
+            token), "the nodes node_b keeps from node_a's relays");
         Assert.AreEqual("t", await nodeB.SafePsqlAsync(Database, """
             SELECT count(*) <= 256 FROM generate_series(1000001, 1001100) g WHERE worf.sequence_range_heard(g::oid, false, '-infinity', false) > '-infinity'
             """, token), "the made-up nodes node_b notes in memory");
-        Assert.IsTrue(await nodeB.PollLogAsync(flooded, "beyond the 1024 this node keeps; they are ignored", token), "the ignored reports");
-        _ = await nodeB.SafePsqlAsync(Database, "DELETE FROM worf.sequence_range_node WHERE node_name LIKE 'made_up_%'", token);
+        Assert.IsTrue(await nodeB.PollLogAsync(flooded, "or the 256 it keeps from one neighbor; they are ignored", token), "the ignored reports");
+
+        // A call that relays them no more leaves none of them.
+        _ = await nodeB.SafePsqlAsync(Database, $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{flood.Replace(madeUp, "")}')", token);
+        Assert.AreEqual("0", await nodeB.SafePsqlAsync(Database, MadeUpKept, token), "the made-up nodes node_b forgets");
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.alter_subscription_enable('a_from_b')", token);
 
         // node_a's calls fail once they have taken in the reply, while node_b uses up its blocks and asks for more.
@@ -1359,8 +1364,8 @@ public sealed class SequenceRangeTests
             "SELECT status = 'replicating' FROM worf.show_subscription_status() WHERE subscription_name = 'x_from_b'", token), "x_from_b restarted");
         Assert.IsLessThan(30.0, restarted.Elapsed.TotalSeconds, "the manager restarted x_from_b without waiting on the unreachable host");
 
-        // A watermark node_b makes up in its own report fences node_a, which gives up its values up to it only on
-        // activate_sequence_range, rather than as the fence lifts.
+        // A watermark node_b makes up in its own report, beyond any a node could have heard of, node_a takes only two of
+        // its largest blocks beyond its own, with a warning, so that the fence it brings on gives up no more as it lifts.
         string nodeBId = await nodeB.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
         string bSlot = await nodeA.SafePsqlAsync(Database, $"SELECT slot_name FROM worf.sequence_range_link WHERE node_id = {nodeBId}", token);
         string[] owned = (await nodeA.SafePsqlAsync(Database,
@@ -1371,15 +1376,17 @@ public sealed class SequenceRangeTests
                     "distance": 1, "high_water": null, "watermark": 9000000000000000000, "state": "active", "root_start": {{owned[3]}}, "root_end": {{owned[4]}},
                     "reset": null, "reset_done": null, "held_complete": false, "held": [], "requests": [], "reports": [], "grants": [], "acks": []}]}
             """;
+        int forgedAt = nodeA.ReadLog().Length;
         _ = await nodeA.SafePsqlAsync(Database, $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{madeUpWatermark}')", token);
-        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database,
-            "SELECT detail LIKE '%run worf.activate_sequence_range on it%' FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass", token), "node_a's fence held");
+        Assert.IsTrue(await nodeA.PollLogAsync(forgedAt, "node node_b reports grants up to 9000000000000000000, beyond any a node could have heard of", token),
+            "node_a's warning of the made-up watermark");
+        Assert.IsTrue(await nodeA.PollLogAsync(forgedAt, "the allocator's fence lifted", token), "node_a's fence lifted");
         Assert.AreEqual("t", await nodeA.SafePsqlAsync(Database, """
-            SELECT r.fenced_at IS NOT NULL AND EXISTS (
+            SELECT r.watermark < 9000000000000000000 AND EXISTS (
                 SELECT 1 FROM worf.sequence_range_free f JOIN worf.sequence_range_block b ON b.block_id = f.block_id
-                WHERE b.seqoid = r.seqoid AND b.kind = 'r' AND f.lo < 9000000000000000000)
+                WHERE b.seqoid = r.seqoid AND b.kind = 'r' AND f.lo <= r.watermark + 1)
             FROM worf.sequence_range r WHERE r.seqoid = 't_id_seq'::regclass
-            """, token), "node_a's root kept below the made-up watermark");
+            """, token), "node_a's root kept above its bound on the made-up watermark");
 
         // node_a waits for node_c's own report after a reset while node_c is down, though node_b relays a fresh report of
         // node_c after node_a has lost its record of node_c's grants and reports, as a recovery to before them would, and

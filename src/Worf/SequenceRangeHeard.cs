@@ -19,7 +19,7 @@ internal static class SequenceRangeHeard
     internal const int MaxNodes = 1024;
 
     // The most entries the reports one neighbor relays claim.
-    private const int MaxRelayed = MaxNodes / 4;
+    internal const int MaxRelayed = MaxNodes / 4;
 
     // How long an entry stays once its node is no longer heard from: as long as anything waits on hearing from a node,
     // the day after which a Snowflake node number a node stopped reporting comes back.

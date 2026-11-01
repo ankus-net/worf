@@ -921,7 +921,8 @@ internal static class SequenceRangeExchange
         }
 
         bool covers(long? have, long? value) => value is not long v || (have is long h && (info.Ascending ? h >= v : h <= v));
-        if (!covers(local[0].Get<long?>(3), Nullable(entry, "root_start")) || !covers(local[0].Get<long?>(4), Nullable(entry, "watermark")))
+        long? watermark = Bounded(seqoid, info, entry);
+        if (!covers(local[0].Get<long?>(3), Nullable(entry, "root_start")) || !covers(local[0].Get<long?>(4), watermark))
         {
             return false;
         }
@@ -942,7 +943,7 @@ internal static class SequenceRangeExchange
             """, 1, seq, sender, SpiParameter.Create(root.GetProperty("node_name").GetString()), SpiParameter.Create(sysid),
             SpiParameter.Create(timeline), SpiParameter.Create(call), SpiParameter.Create(epoch), SpiParameter.Create(state),
             SpiParameter.Create(Nullable32(entry, "distance")), SpiParameter.Create(Nullable(entry, "high_water")),
-            SpiParameter.Create(Nullable(entry, "watermark")), SpiParameter.Create(Holds(entry)), SpiParameter.Create(Nullable(entry, "clock")),
+            SpiParameter.Create(watermark), SpiParameter.Create(Holds(entry)), SpiParameter.Create(Nullable(entry, "clock")),
             SpiParameter.Create(Text(entry, "reset")), SpiParameter.Create(Text(entry, "reset_done")));
         if (own.Count == 0 || !Worf.TryParseLsn(own[0].Get<string?>(0) ?? "", out ulong recorded) ||
             !Worf.TryParseLsn(root.GetProperty("wal_lsn").GetString() ?? "", out ulong position) ||
@@ -954,10 +955,12 @@ internal static class SequenceRangeExchange
         }
 
         // Each relayed report is older than what this node has, or relayed instead of a live report, or says the same and
-        // is of a node shared memory holds, which notes when it was made, or is of a node this node has no room to take in.
+        // is of a node shared memory holds, which notes when it was made, or is of a node this node has no room to take in,
+        // and the neighbor still relays every report it relayed before.
         if (entry.TryGetProperty("reports", out JsonElement reports))
         {
             bool? full = null;
+            List<long> still = [];
             foreach (JsonElement report in reports.EnumerateArray())
             {
                 uint reported = report.GetProperty("node_id").GetUInt32();
@@ -965,6 +968,8 @@ internal static class SequenceRangeExchange
                 {
                     continue;
                 }
+
+                still.Add(reported);
 
                 SpiResult known = Worf.Read("""
                     SELECT CASE
@@ -977,15 +982,25 @@ internal static class SequenceRangeExchange
                     """, 1, seq, SpiParameter.Create(reported),
                     SpiParameter.Create(report.TryGetProperty("reported_at", out JsonElement at) && at.ValueKind == JsonValueKind.Number ? at.GetDouble() : (double?)null),
                     SpiParameter.Create(SequenceRanges.StaleAfter()), SpiParameter.Create(report.GetProperty("node_name").GetString()),
-                    SpiParameter.Create(Nullable(report, "high_water")), SpiParameter.Create(Nullable(report, "watermark")),
+                    SpiParameter.Create(Nullable(report, "high_water")), SpiParameter.Create(Bounded(seqoid, info, report)),
                     SpiParameter.Create(Nullable32(report, "epoch")), SpiParameter.Create(Text(report, "state")), SpiParameter.Create(Holds(report)),
                     SpiParameter.Create(Nullable(report, "clock")));
                 if (known.Count == 0
-                    ? !(full ??= Worf.ReadScalar<long>("SELECT count(*) FROM worf.sequence_range_node WHERE seqoid = $1", seq) >= SequenceRangeHeard.MaxNodes)
+                    ? !(full ??= Worf.ReadScalar<bool>("""
+                        SELECT count(*) >= $2 OR count(*) FILTER (WHERE via_node = $3 AND node_id <> via_node) >= $4
+                        FROM worf.sequence_range_node WHERE seqoid = $1
+                        """, seq, SpiParameter.Create(SequenceRangeHeard.MaxNodes), sender, SpiParameter.Create(SequenceRangeHeard.MaxRelayed)))
                     : known[0].Get<bool?>(0) is bool skip ? !skip : !known[0].Get<bool>(1) || !SequenceRangeHeard.Holds(reported))
                 {
                     return false;
                 }
+            }
+
+            if (Worf.ReadScalar<bool>("""
+                SELECT EXISTS (SELECT 1 FROM worf.sequence_range_node WHERE seqoid = $1 AND via_node = $2 AND node_id <> via_node AND NOT node_id = ANY ($3::oid[]))
+                """, seq, sender, SpiParameter.Create(still.ToArray())))
+            {
+                return false;
             }
         }
 
@@ -1113,6 +1128,12 @@ internal static class SequenceRangeExchange
         learned |= local.Count == 0 || Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2", seq, sender).Count == 0;
         long? high = Nullable(entry, "high_water");
         long? watermark = Nullable(entry, "watermark");
+        if (watermark is long claimed && SequenceRanges.BoundWatermark(seqoid, info, claimed) is (long bounded, true))
+        {
+            PgLog.Warning($"sequence {info.Name}: node {senderName} reports grants up to {claimed}, beyond any a node could have heard of, so this node takes them only up to {bounded}");
+            watermark = bounded;
+        }
+
         string sysid = root.GetProperty("sysid").GetString() ?? "";
         long timeline = root.GetProperty("timeline").GetInt64();
         string walLsn = root.GetProperty("wal_lsn").GetString() ?? "0/0";
@@ -1230,12 +1251,17 @@ internal static class SequenceRangeExchange
 
         // Reports of other nodes, relayed toward the owner, each as old as its node made it. A fresher report replaces a
         // relayed one, and the neighbor's own report replaces one it relayed only once that has gone stale. Reports of new
-        // nodes are taken in only while this node knows of fewer nodes than shared memory holds, so that a neighbor can't
-        // fill the tables, and every message, with made-up nodes. A node's Snowflake clock never goes back on a report.
+        // nodes are taken in only while this node knows of fewer nodes than shared memory holds, and of fewer that this
+        // neighbor relays than shared memory notes from one neighbor, and a report the neighbor no longer relays goes,
+        // so that a neighbor can't fill the tables, and every message, with made-up nodes. A node's Snowflake clock never
+        // goes back on a report.
         if (entry.TryGetProperty("reports", out JsonElement reports))
         {
             long known = Worf.ReadScalar<long>("SELECT count(*) FROM worf.sequence_range_node WHERE seqoid = $1", seq);
+            long relayed = Worf.ReadScalar<long>(
+                "SELECT count(*) FROM worf.sequence_range_node WHERE seqoid = $1 AND via_node = $2 AND node_id <> via_node", seq, sender);
             int ignored = 0;
+            List<long> still = [];
             foreach (JsonElement report in reports.EnumerateArray())
             {
                 // The neighbor's own entry, above, is its live report.
@@ -1247,15 +1273,18 @@ internal static class SequenceRangeExchange
 
                 if (Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2", seq, SpiParameter.Create(reported)).Count == 0)
                 {
-                    if (known >= SequenceRangeHeard.MaxNodes)
+                    if (known >= SequenceRangeHeard.MaxNodes || relayed >= SequenceRangeHeard.MaxRelayed)
                     {
                         ignored++;
                         continue;
                     }
 
                     known++;
+                    relayed++;
                     learned = true;
                 }
+
+                still.Add(reported);
 
                 _ = Spi.Execute("""
                     INSERT INTO worf.sequence_range_node (seqoid, node_id, node_name, via_node, high_water, watermark, epoch, state, reported_at,
@@ -1268,15 +1297,18 @@ internal static class SequenceRangeExchange
                         AND (sequence_range_node.via_node <> sequence_range_node.node_id
                             OR worf.sequence_range_heard(sequence_range_node.node_id, true, sequence_range_node.reported_at, false) < now() - $10::interval)
                     """, seq, SpiParameter.Create(reported), SpiParameter.Create(report.GetProperty("node_name").GetString()),
-                    sender, SpiParameter.Create(Nullable(report, "high_water")), SpiParameter.Create(Nullable(report, "watermark")),
+                    sender, SpiParameter.Create(Nullable(report, "high_water")), SpiParameter.Create(Bounded(seqoid, info, report)),
                     SpiParameter.Create(Nullable32(report, "epoch")), SpiParameter.Create(Text(report, "state")),
                     SpiParameter.Create(report.TryGetProperty("reported_at", out JsonElement at) && at.ValueKind == JsonValueKind.Number ? at.GetDouble() : (double?)null),
                     SpiParameter.Create(SequenceRanges.StaleAfter()), SpiParameter.Create(Holds(report)), SpiParameter.Create(Nullable(report, "clock")));
             }
 
+            _ = Spi.Execute("""
+                DELETE FROM worf.sequence_range_node WHERE seqoid = $1 AND via_node = $2 AND node_id <> via_node AND NOT node_id = ANY ($3::oid[])
+                """, seq, sender, SpiParameter.Create(still.ToArray()));
             if (ignored > 0)
             {
-                PgLog.Warning($"sequence {info.Name}: node {senderName} relayed reports of {ignored} nodes beyond the {SequenceRangeHeard.MaxNodes} this node keeps; they are ignored");
+                PgLog.Warning($"sequence {info.Name}: node {senderName} relayed reports of {ignored} nodes beyond the {SequenceRangeHeard.MaxNodes} this node keeps, or the {SequenceRangeHeard.MaxRelayed} it keeps from one neighbor; they are ignored");
             }
         }
 
@@ -1722,6 +1754,12 @@ internal static class SequenceRangeExchange
         => report.TryGetProperty("reported_at", out JsonElement at) && at.ValueKind == JsonValueKind.Number
             ? (long)((at.GetDouble() - UnixToPostgres) * 1e6)
             : null;
+
+    /// <summary>
+    /// Reads the watermark a report gives, bounded as <see cref="SequenceRanges.BoundWatermark"/> bounds it.
+    /// </summary>
+    private static long? Bounded(uint seqoid, SequenceInfo info, JsonElement report)
+        => Nullable(report, "watermark") is long reported ? SequenceRanges.BoundWatermark(seqoid, info, reported).Mark : null;
 
     private static string? Text(JsonElement entry, string name)
         => entry.TryGetProperty(name, out JsonElement value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;

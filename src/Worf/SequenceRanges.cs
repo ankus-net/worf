@@ -2907,16 +2907,6 @@ internal static unsafe partial class SequenceRanges
         }
 
         SequenceInfo info = GetInfo(seqoid);
-        if (!force && range[0].Get<uint>(1) == node.Node.Id && BeyondLedger(seqoid, info) is string beyond)
-        {
-            if (Spi.Execute("UPDATE worf.sequence_range SET detail = $2 WHERE seqoid = $1 AND detail IS DISTINCT FROM $2", seq, SpiParameter.Create(beyond)) > 0)
-            {
-                PgLog.Warning(beyond);
-            }
-
-            return false;
-        }
-
         _ = Spi.Execute("""
             UPDATE worf.sequence_range_block SET state = 'open', sysid = $2, timeline = $3
             WHERE seqoid = $1 AND state = 'fenced'
@@ -2951,29 +2941,43 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
-    /// Finds whether the watermark lies further beyond the last grant of the owner's ledger than two of its largest
-    /// blocks.
+    /// Bounds a watermark a neighbor reports, of its own or another node's, by what any node could have heard of
+    /// granted: no further than the root's end, and on the owner, once its root has started, no further than two of
+    /// its largest blocks beyond both its own watermark and the furthest grant its ledger holds. Only the owner's
+    /// own blocks, two at most at once, can lie beyond that, since every other grant's holder reports it to its
+    /// allocator. A made-up watermark is taken only that far, so that a fence that lifts gives up no more of the
+    /// root's values.
     /// </summary>
-    /// <returns>Why the fence holds, or null.</returns>
-    private static string? BeyondLedger(uint seqoid, SequenceInfo info)
+    /// <param name="seqoid">The sequence.</param>
+    /// <param name="info">The sequence's details.</param>
+    /// <param name="mark">The watermark the neighbor reports.</param>
+    /// <returns>The watermark this node takes, and whether that is less than the neighbor reports.</returns>
+    internal static (long Mark, bool Bounded) BoundWatermark(uint seqoid, SequenceInfo info, long mark)
     {
-        SpiResult ledger = Worf.SelectCatalog($"""
-            SELECT r.watermark, coalesce({(info.Ascending ? "max(g.hi)" : "min(g.lo)")}, r.root_start), r.max_range_size
+        SpiResult range = Worf.SelectCatalog($"""
+            SELECT r.root_end, r.max_range_size, r.owner_node = l.node_id AND r.root_start IS NOT NULL, r.watermark,
+                {(info.Ascending ? "max(g.hi)" : "min(g.lo)")}
             FROM worf.sequence_range r
+                CROSS JOIN worf.local_node l
                 LEFT JOIN worf.sequence_range_block b ON b.seqoid = r.seqoid AND b.epoch = r.epoch AND b.kind = 'r'
                 LEFT JOIN worf.sequence_range_grant g ON g.from_block = b.block_id AND g.kind <> 'x'
             WHERE r.seqoid = $1
-            GROUP BY r.watermark, r.root_start, r.max_range_size
+            GROUP BY r.root_end, r.max_range_size, r.owner_node, l.node_id, r.root_start, r.watermark
             """, SpiParameter.Create(seqoid));
-        if (ledger.Count == 0 || ledger[0].Get<long?>(0) is not long watermark || ledger[0].Get<long?>(1) is not long last)
+        if (range.Count == 0)
         {
-            return null;
+            return (mark, false);
         }
 
-        decimal beyond = info.Ascending ? (decimal)watermark - last : (decimal)last - watermark;
-        return beyond > 2m * ledger[0].Get<long>(2) * Math.Abs(info.Increment)
-            ? $"sequence {info.Name}: nodes report grants up to {watermark}, more than two of its largest blocks beyond the last grant its ledger holds, at {last}; run worf.activate_sequence_range on it to give up its values up to there"
-            : null;
+        decimal limit = range[0].Get<long>(0);
+        List<decimal> known = [.. new[] { range[0].Get<long?>(3), range[0].Get<long?>(4) }.OfType<long>().Select(value => (decimal)value)];
+        if (range[0].Get<bool>(2) && known.Count > 0)
+        {
+            decimal reach = 2m * range[0].Get<long>(1) * Math.Abs(info.Increment);
+            limit = info.Ascending ? Math.Min(limit, known.Max() + reach) : Math.Max(limit, known.Min() - reach);
+        }
+
+        return (info.Ascending ? mark > limit : mark < limit) ? ((long)limit, true) : (mark, false);
     }
 
     /// <summary>
