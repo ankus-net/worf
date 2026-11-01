@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Globalization;
 using System.Text;
+using Npgsql;
 
 namespace Worf.Tests;
 
@@ -24,12 +25,15 @@ public sealed class ColumnTypeTests
     /// Values are read with the provider's type, PostgreSQL's own by OID, a domain as its base type and others by
     /// schema and name when defined the same, and converted to the subscriber's as an assignment would, as ALTER COLUMN
     /// TYPE converts them, or else through text, which the column type's input reads with the column's type modifier.
-    /// An enum's values are its labels. The column's own type reads the text of a type the subscriber lacks or defines
-    /// differently, whose values in binary fail. A value that doesn't convert fails with PostgreSQL's own error, which
-    /// exception_behaviour handles, recording the table and row, without affecting the next change. Conversions follow
-    /// types the subscriber creates and drops. The initial copy converts as replication does, and values convert under
-    /// the subscriber's settings however they're sent. A client of the first protocol version gets RELATION messages
-    /// without the column types, and values in PostgreSQL's internal format only from the second.
+    /// An enum's values are its labels, and a type made of enums is read only for a column made of them. The column's
+    /// own type reads the text of a type the subscriber lacks or defines differently, whose values in binary fail. A
+    /// value that doesn't convert fails with PostgreSQL's own error, which exception_behaviour handles, recording the
+    /// table and row, without affecting the next change. Conversions follow types the subscriber creates and drops.
+    /// The initial copy converts as replication does, and values convert under the subscriber's settings however
+    /// they're sent. In the copy, exception_behaviour skips and records a row that fails, and under error the copy
+    /// stops naming the row, column and value, and starts again only after a delay. Money fails when the provider
+    /// formats it differently. A client of the first protocol version gets RELATION messages without the column
+    /// types, and values in PostgreSQL's internal format only from the second.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -53,6 +57,7 @@ public sealed class ColumnTypeTests
         // name, its amount, pair and fspan are defined differently, and it lacks gone, st, citext and, for now, span.
         _ = await provider.SafePsqlAsync(Database, """
             CREATE TYPE mood AS ENUM ('sad', 'happy', 'angry');
+            CREATE TYPE mpair AS (m mood, n integer);
             CREATE SCHEMA app;
             CREATE TYPE app.feeling AS ENUM ('calm', 'tense');
             CREATE DOMAIN amount AS integer;
@@ -65,19 +70,28 @@ public sealed class ColumnTypeTests
             """, token);
         _ = await subscriber.SafePsqlAsync(Database, """
             CREATE TYPE mood AS ENUM ('sad', 'happy');
+            CREATE TYPE mpair AS (m mood, n integer);
             CREATE TYPE emotion AS ENUM ('calm', 'tense');
             CREATE DOMAIN amount AS real;
             CREATE TYPE pair AS (x bigint, y integer);
             CREATE TYPE fspan AS RANGE (subtype = real);
             """, token);
 
-        // A table the initial copy converts, copied before any other change, from a provider whose TimeZone and
-        // bytea_output differ from the subscriber's.
+        // Money is formatted another way on the provider when this host has a locale that does.
+        bool moneyDiffers = await FormatMoneyDifferentlyAsync(provider, subscriber, token);
+
+        // Tables the initial copy converts, copied before any other change, from a provider whose TimeZone and
+        // bytea_output differ from the subscriber's: an enum's array and a composite made of it going into text, a
+        // range with no assignment cast to the subscriber's, and a value too big for the subscriber's column.
         _ = await provider.SafePsqlAsync(Database, """
-            CREATE TABLE zt (id integer PRIMARY KEY, n numeric, tz timestamptz, by bytea);
+            CREATE TABLE zt (id integer PRIMARY KEY, n numeric, tz timestamptz, by bytea, e mood[], p mpair, r tstzrange);
+            CREATE TABLE mt (id integer PRIMARY KEY, m money);
             SELECT * FROM worf.create_replication_set('zs');
             SELECT * FROM worf.replication_set_add_table('zs', 'zt');
-            INSERT INTO zt VALUES (1, 3.7, '2024-01-02 03:04:05+00', 'A');
+            SELECT * FROM worf.replication_set_add_table('zs', 'mt');
+            INSERT INTO zt VALUES (1, 3.7, '2024-01-02 03:04:05+00', 'A', '{angry}', '(angry,1)',
+                '[2024-01-02 03:04:05+00,2024-01-03 03:04:05+00)'), (3, 1e10, NULL, NULL, NULL, NULL, NULL);
+            INSERT INTO mt VALUES (1, '12.35');
             """, token);
 
         // int4 to int8 and back, int4 to float4, text to int4, int4 to text, an enum to text, a domain to int8,
@@ -97,7 +111,8 @@ public sealed class ColumnTypeTests
             CREATE TABLE t (id integer PRIMARY KEY, a bigint, b integer, c real, d integer, e text, f text, g bigint,
                 h integer, i emotion, j text, k text, l text, m text, n integer, o pair, p pair[], q mood, r integer[],
                 s integer, u bit(4), v varbit(3), w integer, x bigint, y timestamp, z fspan, za boolean);
-            CREATE TABLE zt (id integer PRIMARY KEY, n integer, tz timestamp, by text);
+            CREATE TABLE zt (id integer PRIMARY KEY, n integer, tz timestamp, by text, e text[], p text, r tsrange);
+            CREATE TABLE mt (id integer PRIMARY KEY, m money);
             """, token);
         _ = await subscriber.SafePsqlAsync(Database, $"""
             SELECT worf.create_subscription(
@@ -216,13 +231,19 @@ public sealed class ColumnTypeTests
 
         // The initial copy converts values as replication does, for a resynchronized table and for a subscription
         // that gets values as text, and so do the values sent afterwards, in binary and as text, all under the
-        // subscriber's TimeZone and bytea_output.
-        _ = await subscriber.SafePsqlAsync(Database, "SELECT worf.alter_subscription_resynchronize_table('sub', 'zt')", token);
+        // subscriber's TimeZone and bytea_output. The row whose value is too big is skipped and recorded.
+        _ = await subscriber.SafePsqlAsync(Database, """
+            SELECT worf.alter_subscription_resynchronize_table('sub', 'zt');
+            SELECT worf.alter_subscription_resynchronize_table('sub', 'mt');
+            """, token);
         _ = await subscriber.SafePsqlAsync(Database, $"CREATE DATABASE {TextDatabase}", token);
         _ = await subscriber.SafePsqlAsync(TextDatabase, "CREATE EXTENSION worf", token);
         _ = await subscriber.SafePsqlAsync(TextDatabase, $"""
             SELECT * FROM worf.create_node(node_name := 'subscriber_text', dsn := '{subscriber.Dsn(TextDatabase, SuperUser)}');
-            CREATE TABLE zt (id integer PRIMARY KEY, n integer, tz timestamp, by text);
+            CREATE TYPE mood AS ENUM ('sad', 'happy');
+            CREATE TYPE mpair AS (m mood, n integer);
+            CREATE TABLE zt (id integer PRIMARY KEY, n integer, tz timestamp, by text, e text[], p text, r tsrange);
+            CREATE TABLE mt (id integer PRIMARY KEY, m money);
             """, token);
         _ = await subscriber.SafePsqlAsync(TextDatabase, $"""
             SELECT worf.create_subscription(
@@ -241,14 +262,97 @@ public sealed class ColumnTypeTests
                 """, token), $"zt wasn't copied in {database}");
         }
 
-        _ = await provider.SafePsqlAsync(Database, "INSERT INTO zt VALUES (2, 3.7, '2024-01-02 03:04:05+00', 'A')", token);
+        _ = await provider.SafePsqlAsync(Database, """
+            INSERT INTO zt VALUES (2, 3.7, '2024-01-02 03:04:05+00', 'A', '{angry}', '(angry,1)',
+                '[2024-01-02 03:04:05+00,2024-01-03 03:04:05+00)');
+            INSERT INTO mt VALUES (2, '12.35');
+            """, token);
         foreach (string database in new[] { Database, TextDatabase })
         {
-            Assert.IsTrue(await subscriber.PollQueryUntilAsync(database, "SELECT count(*) = 2 FROM zt", token),
-                $"zt's row 2 wasn't applied in {database}");
-            Assert.AreEqual("1|4|2024-01-01 22:04:05|\\x41\n2|4|2024-01-01 22:04:05|\\x41",
-                await subscriber.SafePsqlAsync(database, "SELECT concat_ws('|', id, n, tz, by) FROM zt ORDER BY id", token));
+            Assert.IsTrue(await subscriber.PollQueryUntilAsync(database, """
+                SELECT (SELECT count(*) FROM zt) = 2
+                    AND (SELECT count(*) FROM mt) + (SELECT count(*) FROM worf.exception_log WHERE table_name = 'mt') = 2
+                """, token), $"zt's and mt's row 2 weren't applied in {database}");
+            Assert.AreEqual(
+                "1|4|2024-01-01 22:04:05|\\x41|{angry}|(angry,1)|[\"2024-01-01 22:04:05\",\"2024-01-02 22:04:05\")\n" +
+                "2|4|2024-01-01 22:04:05|\\x41|{angry}|(angry,1)|[\"2024-01-01 22:04:05\",\"2024-01-02 22:04:05\")",
+                await subscriber.SafePsqlAsync(database, "SELECT concat_ws('|', id, n, tz, by, e, p, r) FROM zt ORDER BY id", token));
+            Assert.AreEqual("COPY|zt|discard|22003|2|3|10000000000", await subscriber.SafePsqlAsync(database, """
+                SELECT concat_ws('|', operation, table_name, behaviour, error_sqlstate, action_counter,
+                    remote_new_tuple->>'id', remote_new_tuple->>'n')
+                FROM worf.exception_log WHERE table_name = 'zt'
+                """, token));
+            Assert.AreEqual(moneyDiffers ? "" : "1|$12.35\n2|$12.35",
+                await subscriber.SafePsqlAsync(database, "SELECT concat_ws('|', id, m) FROM mt ORDER BY id", token));
+            Assert.AreEqual(moneyDiffers ? "COPY|55000|1\nINSERT|55000|2" : "", await subscriber.SafePsqlAsync(database, """
+                SELECT concat_ws('|', operation, error_sqlstate, remote_new_tuple->>'id')
+                FROM worf.exception_log WHERE table_name = 'mt' ORDER BY log_id
+                """, token));
         }
+
+        // Under error, a copy whose value fails to convert stops, naming the row, column and value as COPY does, and
+        // starts again only after a delay.
+        logpos = subscriber.ReadLog().Length;
+        _ = await subscriber.SafePsqlAsync(Database, "ALTER SYSTEM SET worf.exception_behaviour = error", token);
+        _ = await subscriber.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
+        _ = await subscriber.SafePsqlAsync(Database, "CREATE TABLE ft (id integer PRIMARY KEY, n integer)", token);
+        _ = await provider.SafePsqlAsync(Database, """
+            CREATE TABLE ft (id integer PRIMARY KEY, n numeric);
+            INSERT INTO ft VALUES (1, 1e10);
+            SELECT * FROM worf.replication_set_add_table('default', 'ft', synchronize_data := true);
+            """, token);
+        Assert.IsTrue(await subscriber.PollLogAsync(logpos, "COPY ft, line 1, column n: \"10000000000\"", token),
+            "ft's copy didn't fail");
+        await Task.Delay(TimeSpan.FromSeconds(2), token);
+        Assert.AreEqual(1, CountOccurrences(subscriber.ReadLog()[logpos..], "starting sync of table public.ft"));
+    }
+
+    /// <summary>
+    /// Sets the provider's lc_monetary to a locale this host has that formats money otherwise than the subscriber's,
+    /// if there is one.
+    /// </summary>
+    /// <returns>Whether there was.</returns>
+    private static async Task<bool> FormatMoneyDifferentlyAsync(TestNode provider, TestNode subscriber, CancellationToken token)
+    {
+        const string Format = "SELECT '-1234567'::money::text";
+        string format = await subscriber.SafePsqlAsync(Database, Format, token);
+        await using NpgsqlConnection connection = await provider.OpenAsync(Database, token);
+        foreach (string locale in new[] { "ja_JP.UTF-8", "ja_JP.utf8", "ja-JP", "en_GB.UTF-8", "en_GB.utf8", "en-GB" })
+        {
+            try
+            {
+                await using NpgsqlCommand set = new($"SET lc_monetary = '{locale}'", connection);
+                _ = await set.ExecuteNonQueryAsync(token);
+                await using NpgsqlCommand query = new(Format, connection);
+                if ((string?)await query.ExecuteScalarAsync(token) == format)
+                {
+                    continue;
+                }
+            }
+            catch (PostgresException)
+            {
+                continue;
+            }
+
+            _ = await provider.SafePsqlAsync(Database, $"ALTER SYSTEM SET lc_monetary = '{locale}'", token);
+            _ = await provider.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
+            Assert.IsTrue(await provider.PollQueryUntilAsync(Database, $"SELECT current_setting('lc_monetary') = '{locale}'", token),
+                "lc_monetary didn't take effect");
+            return true;
+        }
+
+        return false;
+    }
+
+    private static int CountOccurrences(string text, string value)
+    {
+        int count = 0;
+        for (int i = text.IndexOf(value, StringComparison.Ordinal); i >= 0; i = text.IndexOf(value, i + value.Length, StringComparison.Ordinal))
+        {
+            count++;
+        }
+
+        return count;
     }
 
     /// <summary>

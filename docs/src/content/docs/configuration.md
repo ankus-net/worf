@@ -76,7 +76,14 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   subscriber can't read is recorded as its bytes in hex. The
   transaction that a subscription applies again, and how, is kept in
   `worf.exception_state` across restarts. Table sync workers catching up
-  after a copy handle failures the same way. The default is `error`.
+  after a copy handle failures the same way. In a table's initial copy, a row
+  whose value doesn't convert to its column's type is skipped under `discard`
+  and `transdiscard` and disables the subscription under `sub_disable`, and is
+  recorded as a `COPY` with its text, its number in the copy as the action
+  counter and the copy's position. Under `error` the copy stops, naming the
+  row, column and value, and starts again once its worker restarts; a table
+  synchronized on its own waits 5 seconds after its last start, and twice as
+  long each time after, up to 5 minutes. The default is `error`.
 
 - `worf.enable_ddl_replication`
   Replicates DDL as it runs, through the `ddl_sql` replication set as

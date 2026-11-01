@@ -51,20 +51,25 @@ would, or else through text, which the column type's input reads with the
 column's type modifier. An enum's values are its labels. Types that aren't
 PostgreSQL's own are found by schema and name, and used when defined the same:
 of the same kind, with the same input and receive functions and length, or the
-same subtype, element or attribute types in order. Values of a type the
-subscriber lacks or defines differently are read by the column type's input
-when sent as text (in the initial copy, with `force_text_transfer`, between
-major versions, and for composites and arrays of types that aren't PostgreSQL's
-own), and fail with error 42804 when sent in binary. Values convert under the
+same subtype, element or attribute types in order. A type made of enums, such
+as an enum's array, is used only for a column made of the same enums, since the
+provider's labels may be ones they lack. Values of a type the subscriber lacks,
+defines differently or doesn't use are read by the column type's input when
+sent as text (in the initial copy, with `force_text_transfer`, between major
+versions, and for composites and arrays of types that aren't PostgreSQL's own),
+and fail with error 42804 when sent in binary. Values convert under the
 subscriber's settings, such as `TimeZone` and `bytea_output`, however they're
-sent, though one that goes through text keeps the provider's text when sent as
-text. A value that doesn't convert fails with PostgreSQL's error, which
-`worf.exception_behaviour` handles, except in the initial copy, which it fails.
-An older worf doesn't send or read column types, so columns replicated through
-an older provider, subscriber or relay node need the same types. `CHECK`
-constraints, `NOT NULL` constraints,
-etc., must be the same or weaker (more permissive) on the subscriber than the
-provider.
+sent. The initial copy passes the text of a value that needs no conversion,
+such as an integer going into a wider one or `varchar` into `text`, straight to
+the column. A value that doesn't convert fails with PostgreSQL's error, which
+`worf.exception_behaviour` handles, in the initial copy too. Values of `money`,
+or made of it, fail with error 55000 when the provider's `lc_monetary` formats
+money otherwise than the subscriber's, as in another currency or with other
+fraction digits, since they count the provider's currency. An older worf
+doesn't send or read column types, or say how it formats money, so columns
+replicated through an older provider, subscriber or relay node need the same
+types. `CHECK` constraints, `NOT NULL` constraints, etc., must be the same or
+weaker (more permissive) on the subscriber than the provider.
 A subscriber ignores a column it dropped in rows from a provider that still
 has it.
 
@@ -769,7 +774,14 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   subscriber can't read is recorded as its bytes in hex. The
   transaction that a subscription applies again, and how, is kept in
   `worf.exception_state` across restarts. Table sync workers catching up
-  after a copy handle failures the same way. The default is `error`.
+  after a copy handle failures the same way. In a table's initial copy, a row
+  whose value doesn't convert to its column's type is skipped under `discard`
+  and `transdiscard` and disables the subscription under `sub_disable`, and is
+  recorded as a `COPY` with its text, its number in the copy as the action
+  counter and the copy's position. Under `error` the copy stops, naming the
+  row, column and value, and starts again once its worker restarts; a table
+  synchronized on its own waits 5 seconds after its last start, and twice as
+  long each time after, up to 5 minutes. The default is `error`.
 
 - `worf.enable_ddl_replication`
   Replicates DDL as it runs, through the `ddl_sql` replication set as
