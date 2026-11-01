@@ -882,7 +882,8 @@ internal static unsafe class ProtoNative
                     sbyte* data = NativeMethods.pq_getmsgbytes(@in, len);
 
                     // Text arrives with its terminating zero. A value of another type than the column's is converted,
-                    // except text of a type this node can't read, which the column's type reads.
+                    // except text of a type this node can't read, which the column's type reads unless every value of
+                    // the column fails.
                     int datalen = kind == 't' ? Math.Max(len - 1, 0) : len;
                     tuple.Data[attid] = new ReadOnlySpan<byte>(data, datalen).ToArray();
                     if (rel.Conversions[i] is { } conversion && conversion.Converts(kind))
