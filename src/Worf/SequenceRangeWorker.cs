@@ -172,7 +172,8 @@ internal static class SequenceRangeWorker
         long now = Worker.GetCurrentTimestamp();
         SpiResult state = Worf.SelectCatalog("""
             SELECT s.seqincrement, b.lo, CASE WHEN s.seqincrement > 0 THEN b.lo ELSE b.hi END,
-                extract(epoch FROM clock_timestamp() - b.activated_at)::float8
+                extract(epoch FROM clock_timestamp() - b.activated_at)::float8,
+                (SELECT r.peak_rate FROM worf.sequence_range r WHERE r.seqoid = s.seqrelid)
             FROM pg_catalog.pg_sequence s
                 LEFT JOIN worf.sequence_range_block b
                     ON b.seqoid = s.seqrelid AND b.kind = 'n' AND b.state = 'active' AND b.activated_at IS NOT NULL
@@ -197,8 +198,11 @@ internal static class SequenceRangeWorker
 
         double seconds = Math.Max(now - previous.At, 0) / 1e6;
         double rate = Math.Max(((double)position - previous.Position) / increment, 0) / Math.Max(seconds, RateSample / 1e6);
+        // The peak is written once it rises a tenth above the one the range row holds, however small each check's step,
+        // and not as it decays, so that an idle sequence writes nothing.
         double peak = Math.Max(rate, previous.Peak * Math.Pow(0.99, (now - previous.PeakAt) / 1e6));
-        if (Math.Abs(peak - previous.Peak) > Math.Max(previous.Peak * 0.1, 1))
+        double written = state[0].Get<double?>(4) ?? 0;
+        if (peak - written > Math.Max(written * 0.1, 1))
         {
             _ = Spi.Execute("UPDATE worf.sequence_range SET peak_rate = $2 WHERE seqoid = $1", SpiParameter.Create(seqoid),
                 SpiParameter.Create(peak));

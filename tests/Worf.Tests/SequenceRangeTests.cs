@@ -896,8 +896,9 @@ public sealed class SequenceRangeTests
             """, token);
         await Task.Delay(TimeSpan.FromMilliseconds(500), token);
         _ = await node.SafePsqlAsync(Database, "INSERT INTO bulk SELECT FROM generate_series(1, 50000)", token);
-        Assert.IsTrue(await node.PollQueryUntilAsync(Database, "SELECT peak_rate > 4000 FROM worf.sequence_range WHERE seqoid = 'bulk_id_seq'::regclass", token),
-            "the load's rate");
+        Assert.IsTrue(await node.PollQueryUntilAsync(Database,
+            "SELECT peak_rate * 120 >= max_range_size FROM worf.sequence_range WHERE seqoid = 'bulk_id_seq'::regclass", token),
+            "the load's rate, at which two minutes take the largest block");
         Assert.AreEqual("100001|100000", await node.SafePsqlAsync(Database, """
             SELECT worf.reserve_sequence_range('bulk_id_seq', 60000);
             SELECT r.active_lo, (SELECT max(hi - lo + 1) FROM worf.sequence_range_grant WHERE seqoid = 'bulk_id_seq'::regclass)
