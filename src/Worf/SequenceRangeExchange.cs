@@ -342,6 +342,12 @@ internal static class SequenceRangeExchange
     /// <summary>
     /// Lists the links whose turn has come, with what each waits on, and whether the provider is fenced.
     /// </summary>
+    /// <summary>
+    /// Gets whether a subscription was still making its slot at the last look at the links due, so that its first
+    /// exchange waits a check interval rather than an exchange interval.
+    /// </summary>
+    internal static bool Starting { get; private set; }
+
     private static (WorfLocalNode Node, List<(WorfSubscription Sub, string? Waiting, bool Fenced)> Due)? DueLinks()
     {
         if (WorfNode.GetLocalNode(false, true) is not WorfLocalNode node)
@@ -351,11 +357,13 @@ internal static class SequenceRangeExchange
 
         List<(WorfSubscription Sub, string? Waiting, bool Fenced)> due = [];
         long now = Worker.GetCurrentTimestamp();
+        Starting = false;
         foreach (WorfSubscription sub in WorfNode.GetNodeSubscriptions(node.Node.Id, false).Where(sub => sub.Enabled))
         {
             // The neighbor ties each exchange to the subscription's slot, which a new subscription makes as it starts.
             if (Sync.GetSubscriptionSyncStatus(sub.Id, true) is not WorfSyncStatus sync || sync.Status == Sync.SyncStatusInit)
             {
+                Starting = true;
                 continue;
             }
 

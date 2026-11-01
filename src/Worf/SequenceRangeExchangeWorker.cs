@@ -49,8 +49,9 @@ internal static class SequenceRangeExchangeWorker
                     Worker.WakeRangeWorker();
                 }
 
-                // A database that manages nothing has asked its providers, and the manager looks again later.
-                if (!PgBackgroundWorker.RunTransaction(Managed))
+                // A database that manages nothing has asked its providers, and the manager looks again later, unless a
+                // subscription is still making its slot.
+                if (!SequenceRangeExchange.Starting && !PgBackgroundWorker.RunTransaction(Managed))
                 {
                     return;
                 }
