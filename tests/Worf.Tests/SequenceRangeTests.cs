@@ -244,9 +244,10 @@ public sealed class SequenceRangeTests
 
         await AssertIdleAsync([nodeA, nodeB], "managing sequences, after the last Snowflake ID", TimeSpan.FromSeconds(6), token);
 
-        // A switch reaches the backends that cached the blocks as it commits, rather than once the range worker's
-        // exchanges are done, which may hang as here. The block runs low while an exchange hangs, so the switch comes
-        // just before the next one.
+        // The block runs out while an exchange hangs, which holds up the range worker, and an insert that reaches its last
+        // twentieth waits for the worker to switch, rather than the inserts after it failing at the block's end. The
+        // switch reaches the backends that cached the blocks as it commits, rather than once the worker's exchanges are
+        // done.
         string[] active = (await nodeA.SafePsqlAsync(Database, "SELECT active_lo, values_left FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass",
             token)).Split('|');
         int held = int.Parse(active[1], CultureInfo.InvariantCulture) - 10;
@@ -264,10 +265,13 @@ public sealed class SequenceRangeTests
             Assert.IsLessThan(3000, readOnly.ElapsedMilliseconds, "node_a's Snowflake ID in a read-only transaction while an exchange hangs");
 
             await ExecuteAsync(writer, $"INSERT INTO t (v) SELECT 'held' FROM generate_series(1, {held})", token);
+            for (int i = 0; i < 20; i++)
+            {
+                await ExecuteAsync(writer, "INSERT INTO t (v) VALUES ('held')", token);
+            }
 
-            Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database,
+            Assert.AreEqual("t", await nodeA.SafePsqlAsync(Database,
                 $"SELECT active_lo <> {active[0]} FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token), "node_a switching");
-            await ExecuteAsync(writer, "INSERT INTO t (v) VALUES ('held')", token);
         }
 
         _ = await nodeA.SafePsqlAsync(Database, "ALTER SYSTEM RESET worf.sequence_range_timeout", token);
@@ -276,7 +280,7 @@ public sealed class SequenceRangeTests
         await Task.WhenAll(InsertAsync(nodeA, "a"), InsertAsync(nodeB, "b"));
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
         _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
-        string total = (600 + held + 1).ToString(CultureInfo.InvariantCulture);
+        string total = (600 + held + 20).ToString(CultureInfo.InvariantCulture);
         foreach (TestNode node in new[] { nodeA, nodeB })
         {
             Assert.AreEqual($"{total}|{total}|300|300", await node.SafePsqlAsync(Database,

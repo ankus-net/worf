@@ -124,16 +124,17 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
 
 - `worf.sequence_range_check_interval`
   How often the range worker checks each managed sequence, switching it to
-  its next block when the active one runs low. A session that reaches the last
-  twentieth of a block wakes it at once. The default is `1s`.
+  its next block when the active one runs low. A session that passes half a
+  block, or reaches its last twentieth, wakes it at once. The default is `1s`.
 
 - `worf.sequence_range_exchange_interval`
   How often each node exchanges sequence range reports with its neighbors
   when no request, grant or reset is waiting. The default is `1min`.
 
 - `worf.sequence_range_timeout`
-  The connection and statement timeout of a sequence range exchange. The
-  default is `10s`.
+  The connection and statement timeout of a sequence range exchange. An insert
+  near the end of a block waits up to twice this for the switch. The default is
+  `10s`.
 
 - `worf.ddl_lock_timeout`
   How long DDL waits for the other nodes to hold back their writes and catch
