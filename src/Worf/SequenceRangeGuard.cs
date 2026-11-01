@@ -24,8 +24,10 @@ internal static class SequenceRangeGuard
     // The points in each sequence's active block, by sequence and value, at which this backend has woken the range worker.
     private static readonly HashSet<(uint Seqoid, long Mark)> s_woken = [];
 
-    // The active blocks, by sequence and start, whose switch this backend has waited for, and until when it may.
+    // The active blocks, by sequence and start, whose switch this backend has waited for, and until when it may, and
+    // those this transaction has.
     private static readonly Dictionary<(uint Seqoid, long Lo), long> s_waited = [];
+    private static readonly HashSet<(uint Seqoid, long Lo)> s_waitedInTransaction = [];
 
     /// <summary>
     /// Checks the values a local session writes into columns that use managed sequences.
@@ -161,12 +163,25 @@ internal static class SequenceRangeGuard
     /// which then waits for this transaction's lock on the sequence, or the block is switched, so that inserts wait for a
     /// worker that is busy, as in an exchange, or for a next block on its way, rather than run the block out. A backend
     /// waits up to twice the exchange timeout for each block in all, which covers an exchange that hangs and the check
-    /// after it, and waits again in a later insert when the switch gave up on the lock. It waits only while the worker
+    /// after it, and waits again in a later transaction when the switch gave up on the lock. It waits only while the worker
     /// can switch: the sequence draws from blocks, and no transaction holds the sequence against the switch, as the
     /// worker's own request for the lock does, or a reservation's switch until it commits.
     /// </summary>
     private static void WaitForSwitch(uint seqoid, long lo)
     {
+        // A transaction waits at most once for each block: it holds the sequence from then, as nextval leaves it held,
+        // so the switch can't finish before it ends, and a later row of it only slows it.
+        if (!s_waitedInTransaction.Add((seqoid, lo)))
+        {
+            return;
+        }
+
+        if (s_waitedInTransaction.Count == 1)
+        {
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () => s_waitedInTransaction.Clear());
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, static () => s_waitedInTransaction.Clear());
+        }
+
         SpiParameter seq = SpiParameter.Create(seqoid);
         SpiParameter database = SpiParameter.Create(DatabaseId());
         long now = Worker.GetCurrentTimestamp();
