@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using Ankus.Postgres;
 
 [assembly: PgSql("sequence-range-tables", """
@@ -212,7 +213,10 @@ internal static unsafe partial class SequenceRanges
     private const uint NextvalOid = 1574;
     private const uint TextRegclassOid = 1079;
     private const uint RegclassOid = 2205;
-    private const uint TextOid = 25;
+
+    // FirstNormalObjectId from access/transam.h, below which PostgreSQL's own objects lie, and NAMEDATALEN.
+    private const uint FirstNormalObjectId = 16384;
+    private const int NameDataLength = 64;
 
     // TriggerRelationId from catalog/pg_trigger_d.h, and PERFORM_DELETION_INTERNAL from catalog/dependency.h.
     private const uint TriggerRelationId = 2620;
@@ -1316,10 +1320,10 @@ internal static unsafe partial class SequenceRanges
         {
             s_retyped[(relid, column)] = null;
             if (guards.Count > 0 && retype->raw_default is null &&
-                GuardedColumns(TreeRoot(relid)).TryGetValue(column, out (uint TypeOid, List<uint> Sequences) guarded) &&
+                GuardedColumns(TreeRoot(relid)).TryGetValue(column, out (uint TypeOid, List<uint> Sequences, List<string> Names) guarded) &&
                 guarded.TypeOid is Int2Oid or Int4Oid or Int8Oid)
             {
-                s_retyped[(relid, column)] = guarded.Sequences;
+                s_retyped[(relid, column)] = Effective(guarded);
             }
         }
 
@@ -1563,40 +1567,6 @@ internal static unsafe partial class SequenceRanges
             Elevated.Run(SequenceRangeSync.JoinRestored);
         }
 
-        // The sequences that new defaults name as constant strings are recorded wherever worf is installed, so that a
-        // sequence that comes under range management later finds their columns.
-        if (Worf.CatalogOid("sequence_range") != 0)
-        {
-            switch (parsetree->type)
-            {
-                case NodeTag.T_CreateStmt:
-                    RecordNamedSequences([Resolve(((CreateStmt*)parsetree)->relation)], 0);
-                    break;
-
-                case NodeTag.T_AlterTableStmt when Resolve(((AlterTableStmt*)parsetree)->relation) is uint altered and not 0:
-                    List<long> tables = [];
-                    List* inheritors = NativeMethods.find_all_inheritors(altered, 0, null);
-                    for (int i = 0; inheritors is not null && i < inheritors->length; i++)
-                    {
-                        tables.Add(inheritors->elements[i].oid_value);
-                    }
-
-                    RecordNamedSequences([.. tables], 0);
-                    break;
-
-                case NodeTag.T_CreateDomainStmt:
-                    RecordNamedSequences([], NativeMethods.typenameTypeId(null, NativeMethods.makeTypeNameFromNameList(((CreateDomainStmt*)parsetree)->domainname)));
-                    break;
-
-                case NodeTag.T_AlterDomainStmt when AltersDefault((AlterDomainStmt*)parsetree):
-                    RecordNamedSequences([], NativeMethods.typenameTypeId(null, NativeMethods.makeTypeNameFromNameList(((AlterDomainStmt*)parsetree)->typeName)));
-                    break;
-
-                default:
-                    break;
-            }
-        }
-
         if (!AnyManaged())
         {
             return;
@@ -1676,8 +1646,8 @@ internal static unsafe partial class SequenceRanges
                         case AlterTableType.AT_AlterColumnType when cmd->name is not null:
                             string column = Worf.FromServer(cmd->name);
                             if (!s_retyped.Remove((relid, column), out List<uint>? kept) || kept is null ||
-                                !GuardedColumns(TreeRoot(relid)).TryGetValue(column, out (uint TypeOid, List<uint> Sequences) retyped) ||
-                                !retyped.Sequences.TrueForAll(kept.Contains))
+                                !GuardedColumns(TreeRoot(relid)).TryGetValue(column, out (uint TypeOid, List<uint> Sequences, List<string> Names) retyped) ||
+                                !Effective(retyped).TrueForAll(kept.Contains))
                             {
                                 CheckColumnRows(relid, column, alter->relation->inh);
                             }
@@ -1731,22 +1701,22 @@ internal static unsafe partial class SequenceRanges
     {
         if (NativeMethods.get_rel_relkind(relid) != (sbyte)'p')
         {
-            if (GuardedColumns(relid).TryGetValue(column, out (uint TypeOid, List<uint> Sequences) guarded))
+            if (GuardedColumns(relid).TryGetValue(column, out (uint TypeOid, List<uint> Sequences, List<string> Names) guarded))
             {
-                SequenceRangeGuard.CheckRows(relid, inherited, column, guarded.Sequences);
+                SequenceRangeGuard.CheckRows(relid, inherited, column, Effective(guarded));
             }
 
             return;
         }
 
-        (Dictionary<string, (uint TypeOid, List<uint> Sequences)> Root, Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences)>> Partitions,
+        (Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> Root, Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>> Partitions,
             Dictionary<uint, (uint Parent, bool Leaf)> Members) tree = TreeColumns(TreeRoot(relid));
         foreach ((uint partition, (_, bool leaf)) in tree.Members)
         {
             if (leaf && Beneath(partition, relid, tree.Members) &&
-                GuardedColumns(partition, tree).TryGetValue(column, out (uint TypeOid, List<uint> Sequences) guarded))
+                GuardedColumns(partition, tree).TryGetValue(column, out (uint TypeOid, List<uint> Sequences, List<string> Names) guarded))
             {
-                SequenceRangeGuard.CheckRows(partition, false, column, guarded.Sequences);
+                SequenceRangeGuard.CheckRows(partition, false, column, Effective(guarded));
             }
         }
     }
@@ -1762,10 +1732,10 @@ internal static unsafe partial class SequenceRanges
             return;
         }
 
-        (Dictionary<string, (uint TypeOid, List<uint> Sequences)> ownRoot,
-            Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences)>> ownPartitions,
+        (Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> ownRoot,
+            Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>> ownPartitions,
             Dictionary<uint, (uint Parent, bool Leaf)> members) = TreeColumns(partition);
-        (Dictionary<string, (uint TypeOid, List<uint> Sequences)> Root, Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences)>> Partitions,
+        (Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> Root, Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>> Partitions,
             Dictionary<uint, (uint Parent, bool Leaf)> Members) tree = TreeColumns(TreeRoot(partition));
         foreach ((uint leaf, (_, bool isLeaf)) in members)
         {
@@ -1774,11 +1744,12 @@ internal static unsafe partial class SequenceRanges
                 continue;
             }
 
-            Dictionary<string, (uint TypeOid, List<uint> Sequences)> own = Merge(ownRoot,
-                ownPartitions.TryGetValue(leaf, out Dictionary<string, (uint TypeOid, List<uint> Sequences)>? columns) ? columns : []);
-            foreach ((string column, (uint typeOid, List<uint> sequences)) in GuardedColumns(leaf, tree))
+            Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> own = Merge(ownRoot,
+                ownPartitions.TryGetValue(leaf, out Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>? columns) ? columns : []);
+            foreach ((string column, (uint TypeOid, List<uint> Sequences, List<string> Names) use) in GuardedColumns(leaf, tree))
             {
-                if (!own.TryGetValue(column, out (uint TypeOid, List<uint> Sequences) before) || !sequences.TrueForAll(before.Sequences.Contains))
+                List<uint> sequences = Effective(use);
+                if (!own.TryGetValue(column, out (uint TypeOid, List<uint> Sequences, List<string> Names) before) || !sequences.TrueForAll(Effective(before).Contains))
                 {
                     SequenceRangeGuard.CheckRows(leaf, false, column, sequences);
                 }
@@ -1855,11 +1826,9 @@ internal static unsafe partial class SequenceRanges
     private static bool DomainUsesManaged(List* typeName)
     {
         uint typid = NativeMethods.typenameTypeId(null, NativeMethods.makeTypeNameFromNameList(typeName));
-        return Elevated.Run(() => Worf.ReadScalar<bool>("""
-            SELECT EXISTS (
-                SELECT 1 FROM pg_catalog.pg_depend d JOIN worf.sequence_range r ON r.seqoid = d.refobjid
-                WHERE d.classid = 'pg_catalog.pg_type'::regclass AND d.objid = $1 AND d.refclassid = 'pg_catalog.pg_class'::regclass)
-            """, SpiParameter.Create(typid)));
+        SpiResult managed = Elevated.Run(() => Worf.SelectCatalog("SELECT seqoid::oid FROM worf.sequence_range"));
+        return Worf.ReadScalar<string?>("SELECT typdefaultbin::text FROM pg_catalog.pg_type WHERE oid = $1", SpiParameter.Create(typid)) is string expression &&
+            Enumerable.Range(0, managed.Count).Any(i => MayDrawFrom((Node*)NativeMethods.stringToNode(Worf.PStrDup(expression)), managed[i].Get<uint>(0)).Draws);
     }
 
     private static bool AnyManaged()
@@ -1935,18 +1904,29 @@ internal static unsafe partial class SequenceRanges
     /// Lists the columns, with their tables and the types beneath any domains, whose default or identity uses a
     /// sequence, or which have no default of their own and take their domain's, which does. A default uses it when it may
     /// call nextval of it, rather than only read it, as <c>currval('s')</c> does. PostgreSQL records no use of a sequence
-    /// that a default reaches through a function, and worf records the one a default names as a constant string, as
-    /// <c>nextval('s'::text)</c> does, as the DDL that sets it runs.
+    /// that a default reaches through a function, or names as text, as <c>nextval('s'::text)</c> does, which it looks up
+    /// as the default runs: worf takes a default that names the sequence's relation, under any search path, as using it,
+    /// and one whose name it can't tell as using every sequence.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
     /// <returns>The columns.</returns>
     internal static List<(uint Relid, string Column, uint TypeOid)> UsingColumns(uint seqoid)
+        => [.. UsingColumnsNamed(seqoid).Select(column => (column.Relid, column.Column, column.TypeOid)).Distinct()];
+
+    /// <summary>
+    /// Lists the columns that use a sequence, as <see cref="UsingColumns"/> does, each with the name its default gives the
+    /// sequence, when it names it as text.
+    /// </summary>
+    private static List<(uint Relid, string Column, uint TypeOid, string? Name)> UsingColumnsNamed(uint seqoid)
     {
         SpiResult result = Worf.SelectCatalog("""
             WITH RECURSIVE domains (typid, expr) AS (
                 SELECT d.objid, t.typdefaultbin::text FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_type t ON t.oid = d.objid
                 WHERE d.classid = 'pg_catalog.pg_type'::regclass AND d.refclassid = 'pg_catalog.pg_class'::regclass
                     AND d.refobjid = $1 AND d.deptype = 'n'
+                UNION
+                SELECT t.oid, t.typdefaultbin::text FROM pg_catalog.pg_type t
+                WHERE t.typtype = 'd' AND t.typdefaultbin::text LIKE '%:funcid 1574 %'
                 UNION
                 SELECT t.oid, d.expr FROM pg_catalog.pg_type t JOIN domains d ON t.typbasetype = d.typid
                 WHERE t.typtype = 'd' AND t.typdefaultbin IS NULL)
@@ -1962,6 +1942,9 @@ internal static unsafe partial class SequenceRanges
                 WHERE d.classid = 'pg_catalog.pg_attrdef'::regclass AND d.refclassid = 'pg_catalog.pg_class'::regclass
                     AND d.refobjid = $1
                 UNION
+                SELECT ad.adrelid, ad.adnum, ad.adbin::text
+                FROM pg_catalog.pg_attrdef ad WHERE ad.adbin::text LIKE '%:funcid 1574 %'
+                UNION
                 SELECT a.attrelid, a.attnum, d.expr
                 FROM domains d JOIN pg_catalog.pg_attribute a ON a.atttypid = d.typid
                 WHERE a.attnum > 0 AND NOT a.atthasdef
@@ -1970,12 +1953,15 @@ internal static unsafe partial class SequenceRanges
             JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
             WHERE c.relkind IN ('r', 'p') AND NOT a.attisdropped
             """, SpiParameter.Create(seqoid));
-        List<(uint Relid, string Column, uint TypeOid)> columns = [];
+        List<(uint Relid, string Column, uint TypeOid, string? Name)> columns = [];
         for (int i = 0; i < result.Count; i++)
         {
-            (uint Relid, string Column, uint TypeOid) column = (result[i].Get<uint>(0), result[i].Get<string>(1), NativeMethods.getBaseType(result[i].Get<uint>(2)));
-            if (!columns.Contains(column) &&
-                (result[i].Get<string?>(3) is not string expression || MayDrawFrom((Node*)NativeMethods.stringToNode(Worf.PStrDup(expression)), seqoid)))
+            (bool draws, string? name) = result[i].Get<string?>(3) is string expression
+                ? MayDrawFrom((Node*)NativeMethods.stringToNode(Worf.PStrDup(expression)), seqoid)
+                : (true, null);
+            (uint Relid, string Column, uint TypeOid, string? Name) column = (result[i].Get<uint>(0), result[i].Get<string>(1),
+                NativeMethods.getBaseType(result[i].Get<uint>(2)), name);
+            if (draws && !columns.Contains(column))
             {
                 columns.Add(column);
             }
@@ -1985,63 +1971,49 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
-    /// Checks whether an expression may call nextval of a sequence: it calls nextval of it, or of a sequence it doesn't
-    /// name as a regclass constant, or holds a kind of node this check doesn't look into.
+    /// Checks whether an expression may call nextval of a sequence: it calls nextval of it as a regclass constant, or of a
+    /// name that may resolve to it, or of a sequence it names in a way this check can't tell, or holds a kind of node
+    /// this check doesn't look into.
     /// </summary>
-    private static bool MayDrawFrom(Node* node, uint seqoid)
+    /// <returns>Whether it may, and the name it gives the sequence as text, if it does.</returns>
+    private static (bool Draws, string? Name) MayDrawFrom(Node* node, uint seqoid)
     {
         if (node is null)
         {
-            return false;
+            return (false, null);
         }
 
         if (node->type == NodeTag.T_FuncExpr && ((FuncExpr*)node)->funcid == NextvalOid)
         {
-            List* args = ((FuncExpr*)node)->args;
-            Node* argument = args is not null && args->length == 1 ? (Node*)args->elements[0].ptr_value : null;
-            return argument is null || argument->type != NodeTag.T_Const || ((Const*)argument)->constisnull ||
-                (uint)((Const*)argument)->constvalue == seqoid;
+            (uint oid, string? name) = NextvalTarget((FuncExpr*)node);
+            return name is not null ? (NameMatches(name, seqoid), name) : (oid == 0 || oid == seqoid, null);
         }
 
         List<nint> children = [];
-        return !Children(node, children) || children.Exists(child => MayDrawFrom((Node*)child, seqoid));
+        if (!Children(node, children))
+        {
+            return (true, null);
+        }
+
+        foreach (nint child in children)
+        {
+            (bool draws, string? name) = MayDrawFrom((Node*)child, seqoid);
+            if (draws)
+            {
+                return (true, name);
+            }
+        }
+
+        return (false, null);
     }
 
     /// <summary>
-    /// Lists the names that an expression's calls of nextval give as constant strings, as <c>nextval('s'::text)</c> does.
+    /// Reads the sequence a call of nextval names: its oid when it names it as a regclass constant, or the name it gives
+    /// as text, as a cast, a conversion or a concatenation of constant strings gives it, folded to a constant where the
+    /// expression calls only PostgreSQL's own immutable functions, which run nothing of the user's.
     /// </summary>
-    private static void NamedSequences(Node* node, List<string> names)
-    {
-        if (node is null)
-        {
-            return;
-        }
-
-        if (node->type == NodeTag.T_FuncExpr && ((FuncExpr*)node)->funcid == NextvalOid)
-        {
-            if (Named((FuncExpr*)node) is string name)
-            {
-                names.Add(name);
-            }
-
-            return;
-        }
-
-        List<nint> children = [];
-        if (Children(node, children))
-        {
-            foreach (nint child in children)
-            {
-                NamedSequences((Node*)child, names);
-            }
-        }
-    }
-
-    /// <summary>
-    /// Reads the name a call of nextval gives as a constant string, cast to regclass as it runs.
-    /// </summary>
-    /// <returns>The name, or null when it gives none.</returns>
-    private static string? Named(FuncExpr* call)
+    /// <returns>The oid or the name, or neither when the call names its sequence some other way.</returns>
+    private static (uint Oid, string? Name) NextvalTarget(FuncExpr* call)
     {
         Node* argument = call->args is not null && call->args->length == 1 ? (Node*)call->args->elements[0].ptr_value : null;
         while (argument is not null && argument->type == NodeTag.T_RelabelType)
@@ -2049,21 +2021,200 @@ internal static unsafe partial class SequenceRanges
             argument = (Node*)((RelabelType*)argument)->arg;
         }
 
-        if (argument is null || argument->type != NodeTag.T_FuncExpr || ((FuncExpr*)argument)->funcid != TextRegclassOid ||
-            ((FuncExpr*)argument)->args is null || ((FuncExpr*)argument)->args->length != 1)
+        if (argument is null)
+        {
+            return (0, null);
+        }
+
+        if (argument->type == NodeTag.T_Const && ((Const*)argument)->consttype == RegclassOid)
+        {
+            return ((Const*)argument)->constisnull ? (0, null) : ((uint)((Const*)argument)->constvalue, null);
+        }
+
+        // text's cast to regclass looks up the name, and an input conversion takes digits as an oid, as regclass does.
+        if (argument->type == NodeTag.T_FuncExpr && ((FuncExpr*)argument)->funcid == TextRegclassOid && ((FuncExpr*)argument)->args is not null &&
+            ((FuncExpr*)argument)->args->length == 1)
+        {
+            return (0, Fold((Node*)((FuncExpr*)argument)->args->elements[0].ptr_value));
+        }
+
+        if (argument->type == NodeTag.T_CoerceViaIO && ((CoerceViaIO*)argument)->resulttype == RegclassOid &&
+            Fold((Node*)((CoerceViaIO*)argument)->arg) is string text)
+        {
+            return text.Length > 0 && text.All(char.IsAsciiDigit) && uint.TryParse(text, CultureInfo.InvariantCulture, out uint oid) ? (oid, null) : (0, text);
+        }
+
+        return (0, null);
+    }
+
+    /// <summary>
+    /// Folds an expression of PostgreSQL's own types and immutable functions to a constant, and reads it as text.
+    /// </summary>
+    /// <returns>The text, or null when the expression isn't such, or is null.</returns>
+    private static string? Fold(Node* expression)
+    {
+        if (!Foldable(expression))
         {
             return null;
         }
 
-        Node* text = (Node*)((FuncExpr*)argument)->args->elements[0].ptr_value;
-        while (text->type == NodeTag.T_RelabelType)
+        Node* folded = NativeMethods.eval_const_expressions(null, (Node*)NativeMethods.copyObjectImpl(expression));
+        if (folded->type != NodeTag.T_Const || ((Const*)folded)->constisnull)
         {
-            text = (Node*)((RelabelType*)text)->arg;
+            return null;
         }
 
-        return text->type == NodeTag.T_Const && !((Const*)text)->constisnull && ((Const*)text)->consttype == TextOid
-            ? Worf.FromServer(NativeMethods.text_to_cstring((varlena*)((Const*)text)->constvalue))
-            : null;
+        uint output;
+        bool varlena;
+        NativeMethods.getTypeOutputInfo(((Const*)folded)->consttype, &output, &varlena);
+        return Worf.FromServer(NativeMethods.OidOutputFunctionCall(output, ((Const*)folded)->constvalue));
+    }
+
+    /// <summary>
+    /// Checks whether an expression holds only constants, casts and calls of PostgreSQL's own types and immutable
+    /// functions.
+    /// </summary>
+    private static bool Foldable(Node* node) => node->type switch
+    {
+        NodeTag.T_Const => ((Const*)node)->consttype < FirstNormalObjectId,
+        NodeTag.T_RelabelType => ((RelabelType*)node)->resulttype < FirstNormalObjectId && Foldable((Node*)((RelabelType*)node)->arg),
+        NodeTag.T_CollateExpr => Foldable((Node*)((CollateExpr*)node)->arg),
+        NodeTag.T_CoerceViaIO => ((CoerceViaIO*)node)->resulttype < FirstNormalObjectId &&
+            NativeMethods.exprType((Node*)((CoerceViaIO*)node)->arg) < FirstNormalObjectId && Foldable((Node*)((CoerceViaIO*)node)->arg),
+        NodeTag.T_FuncExpr => Immutable(((FuncExpr*)node)->funcid) && AllFoldable(((FuncExpr*)node)->args),
+        NodeTag.T_OpExpr => Immutable(((OpExpr*)node)->opfuncid != 0 ? ((OpExpr*)node)->opfuncid : NativeMethods.get_opcode(((OpExpr*)node)->opno)) &&
+            AllFoldable(((OpExpr*)node)->args),
+        _ => false,
+    };
+
+    private static bool AllFoldable(List* nodes)
+    {
+        for (int i = 0; nodes is not null && i < nodes->length; i++)
+        {
+            if (!Foldable((Node*)nodes->elements[i].ptr_value))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool Immutable(uint funcid) => funcid != 0 && funcid < FirstNormalObjectId && NativeMethods.func_volatile(funcid) == (sbyte)'i';
+
+    /// <summary>
+    /// Checks whether a name, as nextval looks it up, may resolve to a sequence under some search path: it names the
+    /// sequence's relation, and its schema, if it names one.
+    /// </summary>
+    private static bool NameMatches(string name, uint seqoid)
+        => QualifiedNameParts(name) is { Count: > 0 } parts && parts[^1] == Worf.FromServer(NativeMethods.get_rel_name(seqoid)) &&
+            (parts.Count == 1 || parts[^2] == Worf.FromServer(NativeMethods.get_namespace_name(NativeMethods.get_rel_namespace(seqoid))));
+
+    /// <summary>
+    /// Finds the managed sequences a name may resolve to under some search path.
+    /// </summary>
+    private static List<uint> Matching(string name)
+    {
+        SpiResult managed = Elevated.Run(() => Worf.SelectCatalog("SELECT seqoid::oid FROM worf.sequence_range ORDER BY seqoid"));
+        List<uint> matching = [];
+        for (int i = 0; i < managed.Count; i++)
+        {
+            if (NameMatches(name, managed[i].Get<uint>(0)))
+            {
+                matching.Add(managed[i].Get<uint>(0));
+            }
+        }
+
+        return matching;
+    }
+
+    /// <summary>
+    /// Splits a qualified name into its parts as PostgreSQL does for text it casts to regclass: at dots outside double
+    /// quotes, with a quoted part's doubled quotes made single and an unquoted part's ASCII letters made lower case, each
+    /// cut to the longest name.
+    /// </summary>
+    /// <returns>The parts, or none when the name isn't one.</returns>
+    private static List<string> QualifiedNameParts(string name)
+    {
+        List<string> parts = [];
+        int i = 0;
+        while (true)
+        {
+            while (i < name.Length && char.IsWhiteSpace(name[i]))
+            {
+                i++;
+            }
+
+            StringBuilder part = new();
+            if (i < name.Length && name[i] == '"')
+            {
+                for (i++; ; i++)
+                {
+                    if (i >= name.Length)
+                    {
+                        return [];
+                    }
+
+                    if (name[i] == '"')
+                    {
+                        if (i + 1 < name.Length && name[i + 1] == '"')
+                        {
+                            i++;
+                        }
+                        else
+                        {
+                            i++;
+                            break;
+                        }
+                    }
+
+                    _ = part.Append(name[i]);
+                }
+            }
+            else
+            {
+                for (; i < name.Length && name[i] != '.' && !char.IsWhiteSpace(name[i]); i++)
+                {
+                    _ = part.Append(char.IsAsciiLetterUpper(name[i]) ? char.ToLowerInvariant(name[i]) : name[i]);
+                }
+
+                if (part.Length == 0)
+                {
+                    return [];
+                }
+            }
+
+            parts.Add(Truncated(part.ToString()));
+            while (i < name.Length && char.IsWhiteSpace(name[i]))
+            {
+                i++;
+            }
+
+            if (i == name.Length)
+            {
+                return parts;
+            }
+
+            if (name[i] != '.')
+            {
+                return [];
+            }
+
+            i++;
+        }
+    }
+
+    /// <summary>
+    /// Cuts a name to the longest PostgreSQL keeps, at a whole character.
+    /// </summary>
+    private static string Truncated(string name)
+    {
+        while (Encoding.UTF8.GetByteCount(name) > NameDataLength - 1)
+        {
+            name = name[..^1];
+        }
+
+        return name;
     }
 
     /// <summary>
@@ -2148,56 +2299,6 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
-    /// Records the sequences that column and domain defaults name as constant strings, as <c>nextval('s'::text)</c>
-    /// does, which PostgreSQL looks up as the default runs and records no use of, as the dependency it records for
-    /// <c>nextval('s')</c>, with each name looked up now, as a regclass constant's is. Range management then finds the
-    /// column, and guards it, as any other that uses the sequence.
-    /// </summary>
-    /// <param name="relids">The tables whose column defaults to look at, or null for every table and domain.</param>
-    /// <param name="domain">A domain whose default to look at, or 0.</param>
-    private static void RecordNamedSequences(long[]? relids, uint domain)
-    {
-        SpiResult defaults = Worf.Read("""
-            SELECT 'pg_catalog.pg_attrdef'::regclass::oid, ad.oid, ad.adbin::text FROM pg_catalog.pg_attrdef ad
-            WHERE ($1::oid[] IS NULL OR ad.adrelid = ANY ($1::oid[])) AND ad.adbin::text LIKE '%:funcid 1574 %:funcid 1079 %'
-            UNION ALL
-            SELECT 'pg_catalog.pg_type'::regclass::oid, t.oid, t.typdefaultbin::text FROM pg_catalog.pg_type t
-            WHERE ($1::oid[] IS NULL OR t.oid = $2) AND t.typtype = 'd' AND t.typdefaultbin::text LIKE '%:funcid 1574 %:funcid 1079 %'
-            """, 0, SpiParameter.Create(relids), SpiParameter.Create(domain));
-        bool recorded = false;
-        for (int i = 0; i < defaults.Count; i++)
-        {
-            List<string> names = [];
-            NamedSequences((Node*)NativeMethods.stringToNode(Worf.PStrDup(defaults[i].Get<string>(2))), names);
-            foreach (string name in names.Distinct())
-            {
-                ObjectAddress depender = default;
-                depender.classId = defaults[i].Get<uint>(0);
-                depender.objectId = defaults[i].Get<uint>(1);
-                ObjectAddress referenced = default;
-                referenced.classId = Dependency.RelationRelationId;
-                referenced.objectId = Worf.ReadScalar<uint?>("""
-                    SELECT c.oid FROM pg_catalog.pg_class c
-                    WHERE c.oid = pg_catalog.to_regclass($1) AND c.relkind = 'S'
-                        AND NOT EXISTS (
-                            SELECT 1 FROM pg_catalog.pg_depend d
-                            WHERE d.classid = $2 AND d.objid = $3 AND d.refclassid = 'pg_catalog.pg_class'::regclass AND d.refobjid = c.oid)
-                    """, SpiParameter.Create(name), SpiParameter.Create(depender.classId), SpiParameter.Create(depender.objectId)) ?? 0;
-                if (referenced.objectId != 0)
-                {
-                    NativeMethods.recordDependencyOn(&depender, &referenced, DependencyType.DEPENDENCY_NORMAL);
-                    recorded = true;
-                }
-            }
-        }
-
-        if (recorded)
-        {
-            NativeMethods.CommandCounterIncrement();
-        }
-    }
-
-    /// <summary>
     /// Checks that the guard can read a column's values: an integer or numeric column. A column whose default only
     /// uses the sequence, as in <c>'INV-' || nextval(...)</c>, holds values the guard can't check.
     /// </summary>
@@ -2215,11 +2316,11 @@ internal static unsafe partial class SequenceRanges
 
     /// <summary>
     /// Checks that a column that uses managed sequences draws its values from one of them: that its default, if it has
-    /// one, is nextval of one of them, alone or cast to an integer or numeric type, as a serial column's is. A default
-    /// such as <c>nextval('s') + 1000000</c> gives values the guard always refuses. A sequence that the default names as
-    /// a constant string is the one worf recorded it to use.
+    /// one, is nextval of one of them, alone or cast to an integer or numeric type, as a serial column's is, named as a
+    /// regclass constant, or as text that may resolve to one. A default such as <c>nextval('s') + 1000000</c> gives
+    /// values the guard always refuses, and one whose sequence worf can't tell from its text may draw from any.
     /// </summary>
-    private static void RequireNextval(uint relid, string column, List<uint> sequences)
+    private static void RequireNextval(uint relid, string column, List<uint> sequences, List<string> names)
     {
         SpiResult result = Worf.Read("""
             WITH RECURSIVE chain (typid, depth) AS (
@@ -2227,32 +2328,41 @@ internal static unsafe partial class SequenceRanges
                 UNION ALL
                 SELECT t.typbasetype, c.depth + 1 FROM chain c JOIN pg_catalog.pg_type t ON t.oid = c.typid
                 WHERE t.typtype = 'd' AND t.typdefaultbin IS NULL)
-            SELECT d.adbin::text, ARRAY(
-                SELECT p.refobjid::int8 FROM pg_catalog.pg_depend p
-                WHERE p.classid = 'pg_catalog.pg_attrdef'::regclass AND p.objid = d.oid AND p.refclassid = 'pg_catalog.pg_class'::regclass)
+            SELECT d.adbin::text
             FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
             WHERE a.attrelid = $1 AND a.attname = $2 AND a.attidentity = '' AND a.attgenerated = ''
             UNION ALL
-            (SELECT t.typdefaultbin::text, ARRAY(
-                SELECT p.refobjid::int8 FROM pg_catalog.pg_depend p
-                WHERE p.classid = 'pg_catalog.pg_type'::regclass AND p.objid = t.oid AND p.refclassid = 'pg_catalog.pg_class'::regclass)
+            (SELECT t.typdefaultbin::text
             FROM chain c JOIN pg_catalog.pg_type t ON t.oid = c.typid
             WHERE t.typtype = 'd' AND t.typdefaultbin IS NOT NULL ORDER BY c.depth LIMIT 1)
             """, 1, SpiParameter.Create(relid), SpiParameter.Create(column));
-        if (result.Count > 0 && DrawsFrom(result[0].Get<string>(0)) is (uint drawn, bool named) &&
-            !(named ? Array.Exists(result[0].Get<long[]>(1), depended => sequences.Contains((uint)depended)) : sequences.Contains(drawn)))
+        if (result.Count == 0)
+        {
+            return;
+        }
+
+        (bool nextval, uint drawn, string? name) = DrawsFrom(result[0].Get<string>(0));
+        if (nextval && drawn == 0 && name is null)
         {
             throw new PgException(FeatureNotSupported,
-                $"column \"{column}\" of table {QualifiedName(relid)} uses sequence {GetInfo(sequences[0]).Name} but its default isn't nextval of it",
+                $"column \"{column}\" of table {QualifiedName(relid)} calls nextval of a sequence worf can't tell from its default, which may be a managed one",
+                hint: "Name the sequence as a regclass constant, as nextval('s') does, or as a constant string.");
+        }
+
+        if (name is not null ? !names.Contains(name) : !sequences.Contains(drawn))
+        {
+            throw new PgException(FeatureNotSupported,
+                $"column \"{column}\" of table {QualifiedName(relid)} uses sequence {(sequences.Count > 0 ? GetInfo(sequences[0]).Name : names[0])} but its default isn't nextval of it",
                 hint: "Range management checks the values of columns whose default is nextval of the sequence, alone or cast to the column's type.");
         }
     }
 
     /// <summary>
     /// Finds the sequence an expression draws from when it is nextval of a sequence, alone or cast to an integer or
-    /// numeric type, or whether it names the sequence as a constant string.
+    /// numeric type, as <see cref="NextvalTarget"/> reads it.
     /// </summary>
-    private static (uint Sequence, bool Named) DrawsFrom(string expression)
+    /// <returns>Whether it is nextval of a sequence, and the sequence's oid or the name it gives it.</returns>
+    private static (bool Nextval, uint Sequence, string? Name) DrawsFrom(string expression)
     {
         Node* node = (Node*)NativeMethods.stringToNode(Worf.PStrDup(expression));
         while (true)
@@ -2269,21 +2379,23 @@ internal static unsafe partial class SequenceRanges
 
                 case NodeTag.T_FuncExpr when ((FuncExpr*)node)->args is not null && ((FuncExpr*)node)->args->length == 1:
                     FuncExpr* call = (FuncExpr*)node;
-                    Node* argument = (Node*)call->args->elements[0].ptr_value;
                     if (call->funcformat is CoercionForm.COERCE_IMPLICIT_CAST or CoercionForm.COERCE_EXPLICIT_CAST &&
                         Checkable(NativeMethods.getBaseType(call->funcresulttype)))
                     {
-                        node = argument;
+                        node = (Node*)call->args->elements[0].ptr_value;
                         break;
                     }
 
-                    return call->funcid != NextvalOid ? (0, false)
-                        : argument->type == NodeTag.T_Const && ((Const*)argument)->consttype == RegclassOid && !((Const*)argument)->constisnull
-                            ? ((uint)((Const*)argument)->constvalue, false)
-                            : (0, Named(call) is not null);
+                    if (call->funcid != NextvalOid)
+                    {
+                        return (false, 0, null);
+                    }
+
+                    (uint oid, string? name) = NextvalTarget(call);
+                    return (true, oid, name);
 
                 default:
-                    return (0, false);
+                    return (false, 0, null);
             }
         }
     }
@@ -2519,9 +2631,7 @@ internal static unsafe partial class SequenceRanges
         // The guard's and the quarantine's locks hold off writers and nextval, so the high-water mark sees every value. A
         // node that draws from a block of an earlier epoch keeps drawing from it, since the mark covers the block. The
         // last value the sequence issued is read before the quarantine moves it, under a lock that waits for the
-        // transactions that called nextval and holds off the rest. Defaults set before worf was installed that name a
-        // sequence as a constant string are recorded first.
-        RecordNamedSequences(null, 0);
+        // transactions that called nextval and holds off the rest.
         InstallGuards(seqoid);
         SequenceInfo info = GetInfo(seqoid);
         long? issued = null;
@@ -3598,14 +3708,14 @@ internal static unsafe partial class SequenceRanges
         }
 
         uint root = TreeRoot(relid);
-        (Dictionary<string, (uint TypeOid, List<uint> Sequences)> rootColumns,
-            Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences)>> partitions,
+        (Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> rootColumns,
+            Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>> partitions,
             Dictionary<uint, (uint Parent, bool Leaf)> members) = TreeColumns(root);
 
         // Only worf creates a trigger with the guard's function, so one with another, as a trigger with the guard's name
         // that predates worf has, or one that doesn't fire, is no guard.
         SpiResult existing = Worf.Read("""
-            SELECT tgrelid::oid, tgname::text, encode(tgargs, 'escape'), tgfoid = $3 AND tgenabled IN ('O', 'A')
+            SELECT tgrelid::oid, tgname::text, encode(tgargs, 'hex'), tgfoid = $3 AND tgenabled IN ('O', 'A')
             FROM pg_catalog.pg_trigger WHERE tgrelid = ANY ($1::oid[]) AND tgname = ANY ($2) AND tgparentid = 0
             """, 0, SpiParameter.Create(members.Keys.Select(member => (long)member).ToArray()), SpiParameter.Create(s_guardNames),
             SpiParameter.Create(GuardFunction()));
@@ -3621,7 +3731,7 @@ internal static unsafe partial class SequenceRanges
         foreach (uint member in members.Keys)
         {
             InstallPair(member, PartitionGuardName, PartitionUpdateGuardName, "worf.sequence_range_check_update",
-                member != root && partitions.TryGetValue(member, out Dictionary<string, (uint TypeOid, List<uint> Sequences)>? columns) ? columns : [],
+                member != root && partitions.TryGetValue(member, out Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>? columns) ? columns : [],
                 triggers);
         }
     }
@@ -3631,7 +3741,7 @@ internal static unsafe partial class SequenceRanges
     /// pair when there are none.
     /// </summary>
     private static void InstallPair(uint relid, string insertName, string updateName, string insertCheck,
-        Dictionary<string, (uint TypeOid, List<uint> Sequences)> columns, List<(uint Relid, string Name, string Arguments, bool Ours)> triggers)
+        Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> columns, List<(uint Relid, string Name, string Arguments, bool Ours)> triggers)
     {
         List<(uint Relid, string Name, string Arguments, bool Ours)> existing = triggers.FindAll(trigger =>
             trigger.Relid == relid && (trigger.Name == insertName || trigger.Name == updateName));
@@ -3649,12 +3759,18 @@ internal static unsafe partial class SequenceRanges
             attnums[attributes[i].Get<string>(0)] = attributes[i].Get<short>(1);
         }
 
-        List<(short Attnum, string Name, string Type, List<uint> Sequences)> guarded = [.. columns
+        // A sequence is named by its oid, which looks up nothing, and one that a default names as text by that text, looked
+        // up as the row is written, as the default looks it up, so that the value is checked under the sequence it came
+        // from, if that is managed.
+        List<(short Attnum, string Name, string Type, List<string> Sequences)> guarded = [.. columns
             .Select(column => (attnums[column.Key], Spi.QuoteIdentifier(column.Key), column.Value.TypeOid == NumericOid ? "numeric" : "bigint",
-                column.Value.Sequences))
+                (List<string>)[.. column.Value.Sequences.Select(seq => Spi.QuoteLiteral(seq.ToString(CultureInfo.InvariantCulture)) + "::regclass"),
+                    .. column.Value.Names.Select(name => $"pg_catalog.to_regclass({Spi.QuoteLiteral(name)})")]))
             .OrderBy(column => column.Item1)];
-        List<string> arguments = [.. guarded.Select(column => $"{column.Attnum}:{string.Join(",", column.Sequences)}")];
-        string encoded = string.Concat(arguments.Select(argument => argument + "\\000"));
+        List<string> arguments = [.. columns
+            .OrderBy(column => attnums[column.Key])
+            .Select(column => $"{attnums[column.Key]}:{string.Join(",", [.. column.Value.Sequences.Select(seq => seq.ToString(CultureInfo.InvariantCulture)), .. column.Value.Names])}")];
+        string encoded = Convert.ToHexStringLower(Encoding.UTF8.GetBytes(string.Concat(arguments.Select(argument => argument + "\0"))));
         if (guarded.Count == 0 || (existing.Count == 2 && existing.TrueForAll(trigger => trigger.Arguments == encoded && trigger.Ours)))
         {
             // A table with no column to check keeps no pair.
@@ -3676,16 +3792,13 @@ internal static unsafe partial class SequenceRanges
 
         // An update's condition checks only a value it changes. A value that none of a column's sequences admits is
         // checked under each, so that every one of them has its say.
-        string Check(string check, string name, string type, List<uint> sequences)
+        static string Check(string check, string name, string type, List<string> sequences)
         {
-            string each = string.Join(" OR ", sequences.Select(seq => $"{check}({Sequence(seq)}, NEW.{name}::{type})"));
+            string each = string.Join(" OR ", sequences.Select(seq => $"{check}({seq}, NEW.{name}::{type})"));
             return sequences.Count == 1
                 ? each
-                : $"(NOT ({string.Join(" OR ", sequences.Select(seq => $"worf.sequence_range_admits({Sequence(seq)}, NEW.{name}::{type})"))}) AND ({each}))";
+                : $"(NOT ({string.Join(" OR ", sequences.Select(seq => $"worf.sequence_range_admits({seq}, NEW.{name}::{type})"))}) AND ({each}))";
         }
-
-        // A sequence is named by its oid, which looks up nothing.
-        static string Sequence(uint seqoid) => Spi.QuoteLiteral(seqoid.ToString(CultureInfo.InvariantCulture)) + "::regclass";
 
         string function = $"worf.sequence_range_guard({string.Join(", ", arguments.Select(Spi.QuoteLiteral))})";
         CreateGuardTrigger(relid, $"""
@@ -3702,6 +3815,13 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
+    /// Lists the managed sequences a column uses: those its defaults name by oid, and those a name a default gives as
+    /// text may resolve to.
+    /// </summary>
+    private static List<uint> Effective((uint TypeOid, List<uint> Sequences, List<string> Names) use)
+        => [.. use.Sequences.Union(use.Names.SelectMany(Matching))];
+
+    /// <summary>
     /// Finds the root of a table's partition tree: the table itself when it's no partition.
     /// </summary>
     private static uint TreeRoot(uint relid)
@@ -3711,18 +3831,18 @@ internal static unsafe partial class SequenceRanges
     /// Lists, by name, the columns a table's rows are checked in, with their types and the managed sequences they use:
     /// for a partitioned table, those of every partition beneath it.
     /// </summary>
-    private static Dictionary<string, (uint TypeOid, List<uint> Sequences)> GuardedColumns(uint relid)
+    private static Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> GuardedColumns(uint relid)
         => GuardedColumns(relid, TreeColumns(TreeRoot(relid)));
 
     /// <summary>
     /// Lists, by name, the columns a table's rows are checked in, from the columns of its tree.
     /// </summary>
-    private static Dictionary<string, (uint TypeOid, List<uint> Sequences)> GuardedColumns(uint relid,
-        (Dictionary<string, (uint TypeOid, List<uint> Sequences)> Root, Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences)>> Partitions,
+    private static Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> GuardedColumns(uint relid,
+        (Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> Root, Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>> Partitions,
             Dictionary<uint, (uint Parent, bool Leaf)> Members) tree)
     {
-        Dictionary<string, (uint TypeOid, List<uint> Sequences)> columns = Merge(tree.Root, []);
-        foreach ((uint partition, Dictionary<string, (uint TypeOid, List<uint> Sequences)> own) in tree.Partitions)
+        Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> columns = Merge(tree.Root, []);
+        foreach ((uint partition, Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> own) in tree.Partitions)
         {
             if (Beneath(partition, relid, tree.Members))
             {
@@ -3740,8 +3860,8 @@ internal static unsafe partial class SequenceRanges
     /// it and the root, numbers from one. It also lists the tree's tables, with their parents and whether they hold
     /// rows.
     /// </summary>
-    private static (Dictionary<string, (uint TypeOid, List<uint> Sequences)> Root,
-        Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences)>> Partitions,
+    private static (Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> Root,
+        Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>> Partitions,
         Dictionary<uint, (uint Parent, bool Leaf)> Members) TreeColumns(uint root)
     {
         // An inheritance child is a tree of its own.
@@ -3759,46 +3879,46 @@ internal static unsafe partial class SequenceRanges
             members[root] = (0, true);
         }
 
-        Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences)>> uses = [];
+        Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>> uses = [];
         SpiResult managed = Elevated.Run(() => Worf.SelectCatalog("SELECT seqoid::oid FROM worf.sequence_range ORDER BY seqoid"));
         for (int i = 0; i < managed.Count; i++)
         {
             uint managedSeq = managed[i].Get<uint>(0);
-            foreach ((uint relid, string column, uint typeOid) in UsingColumns(managedSeq).Where(entry => members.ContainsKey(entry.Relid)))
+            foreach ((uint relid, string column, uint typeOid, string? name) in UsingColumnsNamed(managedSeq).Where(entry => members.ContainsKey(entry.Relid)))
             {
                 RequireCheckable(relid, column, typeOid, managedSeq);
-                if (!uses.TryGetValue(relid, out Dictionary<string, (uint TypeOid, List<uint> Sequences)>? columns))
+                if (!uses.TryGetValue(relid, out Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>? columns))
                 {
                     uses.Add(relid, columns = []);
                 }
 
-                uses[relid] = Merge(columns, new() { [column] = (typeOid, [managedSeq]) });
+                uses[relid] = Merge(columns, new() { [column] = name is null ? (typeOid, [managedSeq], []) : (typeOid, [], [name]) });
             }
         }
 
-        foreach ((uint relid, Dictionary<string, (uint TypeOid, List<uint> Sequences)> columns) in uses)
+        foreach ((uint relid, Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> columns) in uses)
         {
-            foreach ((string column, (_, List<uint> sequences)) in columns)
+            foreach ((string column, (_, List<uint> sequences, List<string> names)) in columns)
             {
-                RequireNextval(relid, column, sequences);
+                RequireNextval(relid, column, sequences, names);
             }
         }
 
         // The root's columns take every sequence they use anywhere in the tree, since every partition has the root's
         // guard.
-        Dictionary<string, (uint TypeOid, List<uint> Sequences)> rootColumns = [];
-        IEnumerable<string> numbered = uses.TryGetValue(root, out Dictionary<string, (uint TypeOid, List<uint> Sequences)>? numberedByRoot)
+        Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> rootColumns = [];
+        IEnumerable<string> numbered = uses.TryGetValue(root, out Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>? numberedByRoot)
             ? numberedByRoot.Keys
             : [];
         foreach (string column in numbered)
         {
-            foreach (Dictionary<string, (uint TypeOid, List<uint> Sequences)> columns in uses.Values.Where(columns => columns.ContainsKey(column)))
+            foreach (Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> columns in uses.Values.Where(columns => columns.ContainsKey(column)))
             {
                 rootColumns = Merge(rootColumns, new() { [column] = columns[column] });
             }
         }
 
-        Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences)>> partitions = [];
+        Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>> partitions = [];
         foreach ((uint relid, (_, bool leaf)) in members)
         {
             if (relid == root || !leaf)
@@ -3806,11 +3926,11 @@ internal static unsafe partial class SequenceRanges
                 continue;
             }
 
-            Dictionary<string, (uint TypeOid, List<uint> Sequences)> columns = [];
+            Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> columns = [];
             for (uint member = relid; member != root && members.TryGetValue(member, out (uint Parent, bool Leaf) entry); member = entry.Parent)
             {
-                foreach ((string column, (uint TypeOid, List<uint> Sequences) use) in
-                    uses.TryGetValue(member, out Dictionary<string, (uint TypeOid, List<uint> Sequences)>? own) ? own : [])
+                foreach ((string column, (uint TypeOid, List<uint> Sequences, List<string> Names) use) in
+                    uses.TryGetValue(member, out Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>? own) ? own : [])
                 {
                     if (!rootColumns.ContainsKey(column))
                     {
@@ -3831,15 +3951,15 @@ internal static unsafe partial class SequenceRanges
     /// <summary>
     /// Joins two sets of columns, each with the sequences it uses in either.
     /// </summary>
-    private static Dictionary<string, (uint TypeOid, List<uint> Sequences)> Merge(Dictionary<string, (uint TypeOid, List<uint> Sequences)> first,
-        Dictionary<string, (uint TypeOid, List<uint> Sequences)> second)
+    private static Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> Merge(Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> first,
+        Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> second)
     {
-        Dictionary<string, (uint TypeOid, List<uint> Sequences)> merged = [];
-        foreach ((string column, (uint typeOid, List<uint> sequences)) in first.Concat(second))
+        Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> merged = [];
+        foreach ((string column, (uint typeOid, List<uint> sequences, List<string> names)) in first.Concat(second))
         {
-            merged[column] = merged.TryGetValue(column, out (uint TypeOid, List<uint> Sequences) known)
-                ? (known.TypeOid, [.. known.Sequences.Union(sequences)])
-                : (typeOid, [.. sequences]);
+            merged[column] = merged.TryGetValue(column, out (uint TypeOid, List<uint> Sequences, List<string> Names) known)
+                ? (known.TypeOid, [.. known.Sequences.Union(sequences)], [.. known.Names.Union(names)])
+                : (typeOid, [.. sequences], [.. names]);
         }
 
         return merged;

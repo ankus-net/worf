@@ -471,6 +471,31 @@ public sealed class SequenceRangeTests
         Assert.AreEqual("1", await node.SafePsqlAsync(Database, "SELECT count(*) FROM cv WHERE id = parent", token));
         await AssertOutsideAsync(node, "INSERT INTO named VALUES (999999999)");
         await AssertOutsideAsync(node, "INSERT INTO named2 VALUES (999999999)");
+
+        // The text may be cast or put together in any way that folds to a constant, as a dump restored with an empty
+        // search path writes it, and is looked up as the row is written, under the search path the default draws under,
+        // rather than the DDL's.
+        _ = await node.SafePsqlAsync(Database, """
+            CREATE TABLE named_varchar (id bigint DEFAULT nextval('t_id_seq'::varchar));
+            CREATE TABLE named_name (id bigint DEFAULT nextval('t_id_seq'::name::text));
+            CREATE TABLE named_concat (id bigint DEFAULT nextval('t_id' || '_seq'));
+            SET search_path = '';
+            CREATE TABLE public.named_dump (id bigint DEFAULT nextval(('t_id_seq'::text)::regclass));
+            CREATE SEQUENCE other.t_id_seq;
+            SET search_path = other;
+            CREATE TABLE public.named_other (id bigint DEFAULT nextval('t_id_seq'::text));
+            """, token);
+        foreach (string table in new[] { "named_varchar", "named_name", "named_concat", "named_dump", "named_other" })
+        {
+            _ = await node.SafePsqlAsync(Database, $"INSERT INTO {table} DEFAULT VALUES", token);
+            await AssertOutsideAsync(node, $"INSERT INTO {table} VALUES (888888)");
+        }
+
+        _ = await node.SafePsqlAsync(Database, "SET search_path = other; INSERT INTO public.named_other DEFAULT VALUES; INSERT INTO public.named_other VALUES (888888)", token);
+        PostgresException unknown = await Assert.ThrowsExactlyAsync<PostgresException>(() => node.SafePsqlAsync(Database,
+            "CREATE TABLE named_unknown (id bigint DEFAULT nextval(current_setting('application_name')))", token));
+        Assert.AreEqual("0A000", unknown.SqlState);
+        Assert.Contains("regclass constant", unknown.Hint ?? "");
         foreach (string ddl in new[]
         {
             "CREATE TABLE plus2 (id bigint DEFAULT nextval('t_id_seq') + 1000000)",
