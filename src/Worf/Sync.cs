@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -51,6 +52,12 @@ internal static class Sync
 
     // The suffix of the application name of a table sync worker's connection that catches up.
     private const string CatchupConnection = "catchup";
+
+    // How long apply may get no further before a table's copy first lets its snapshot go, and how long a copy waits for
+    // apply before saying so, and then how often.
+    private static TimeSpan ApplyStallTimeout => TimeSpan.FromSeconds(10);
+    private static TimeSpan ApplyWaitLogAfter => TimeSpan.FromSeconds(10);
+    private static TimeSpan ApplyWaitLogInterval => TimeSpan.FromSeconds(60);
 
     /// <summary>
     /// Whether a kind of synchronization copies data.
@@ -322,13 +329,37 @@ internal static class Sync
         List<WorfManagedSequence> managedSequences = PgBackgroundWorker.RunTransaction(() => SequenceRangeSync.FetchManaged(sub.OriginIf.Dsn, sub.Name));
         using PgReplicationConnection originConnRepl = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, "copy");
 
-        string snapshot = EnsureReplicationSlotSnapshot(sub, originConnRepl, "copy_slot", false, out ulong lsn);
-
-        statusLsn = lsn;
-
         // Make sure we cleanup the slot if something goes wrong.
         try
         {
+            // The copy waits for apply to reach its snapshot, which keeps the provider from removing dead rows
+            // meanwhile. So apply is waited for without one first, up to where the provider is now.
+            ulong target = ProviderPosition(sub);
+            long waitingSince = Stopwatch.GetTimestamp();
+            TimeSpan stallTimeout = ApplyStallTimeout;
+            string snapshot;
+            ulong lsn;
+            while (true)
+            {
+                _ = WaitForApply(sub, nspname, relname, target, TimeSpan.MaxValue, waitingSince);
+                snapshot = EnsureReplicationSlotSnapshot(sub, originConnRepl, "copy_slot", false, out lsn);
+                if (WaitForApply(sub, nspname, relname, lsn, stallTimeout, waitingSince))
+                {
+                    break;
+                }
+
+                // Apply stopped short of the snapshot, as on a change that fails. Its slot is dropped to let the
+                // snapshot go until apply gets there. Apply may get no further for twice as long each time after, so
+                // that the copy starts in the end while changes keep coming that each take long to apply.
+                PgLog.Log($"dropping the snapshot for table {nspname}.{relname} until subscription {sub.Name} applies up to {Worf.FormatLsn(lsn)}, " +
+                    $"since it got no further for {stallTimeout.TotalSeconds:0} s");
+                PgBackgroundWorker.RunTransaction(() => originConnRepl.Execute($"DROP_REPLICATION_SLOT \"{sub.SlotName}\""));
+                target = lsn;
+                stallTimeout *= 2;
+            }
+
+            statusLsn = lsn;
+
             Apply.RunTakingOriginSlot(() =>
             {
                 // The table's managed sequences are joined before any rows arrive.
@@ -1056,6 +1087,38 @@ internal static class Sync
     }
 
     /// <summary>
+    /// Waits while a table's sync worker catches up, which it does up to the position an apply worker gave it.
+    /// </summary>
+    /// <param name="subid">The subscription.</param>
+    /// <param name="nspname">The table's schema.</param>
+    /// <param name="relname">The table's name.</param>
+    internal static void WaitForCatchup(uint subid, string nspname, string relname)
+    {
+        uint myDatabaseId;
+        unsafe
+        {
+            myDatabaseId = NativeGlobals.MyDatabaseId;
+        }
+
+        byte[] serverNspname = Worf.ToServer(nspname);
+        byte[] serverRelname = Worf.ToServer(relname);
+        while (!Worker.GotSigterm &&
+            PgBackgroundWorker.RunTransaction(() => GetTableSyncStatus(subid, nspname, relname, true)?.Status == SyncStatusCatchup))
+        {
+            using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
+            {
+                if (guard.Read((in _, workers) => Worker.SyncFind(workers, myDatabaseId, subid, serverNspname, serverRelname)) < 0)
+                {
+                    return;
+                }
+            }
+
+            _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(1000));
+            PgInterrupts.Check();
+        }
+    }
+
+    /// <summary>
     /// Truncates table if it exists.
     /// </summary>
     /// <param name="nspname">The table's schema.</param>
@@ -1731,6 +1794,121 @@ internal static class Sync
 
         // Finish the transactions and disconnect.
         FinishCopyOriginTx(originConn);
+    }
+
+    /// <summary>
+    /// Reads the provider's current WAL position.
+    /// </summary>
+    private static ulong ProviderPosition(WorfSubscription sub)
+    {
+        using PgReplicationConnection conn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "copy_position");
+        string? position = PgBackgroundWorker.RunTransaction(() =>
+        {
+            try
+            {
+                return conn.Query("SELECT pg_catalog.pg_current_wal_lsn()", 1)[0][0];
+            }
+            catch (PgRemoteException error)
+            {
+                throw new PgException(PgSqlStates.InternalError, $"could not read the provider's WAL position: ERROR:  {error.Message}\n");
+            }
+        });
+
+        return Worf.TryParseLsn(position ?? "", out ulong lsn) ? lsn
+            : throw new PgException(PgSqlStates.InvalidTextRepresentation, $"invalid input syntax for type pg_lsn: \"{position}\"");
+    }
+
+    /// <summary>
+    /// Waits for the subscription's apply worker to apply everything that committed before a position. Queued SQL that
+    /// committed before the copy's snapshot has to change the table before the copy does, as it changed the provider's
+    /// rows before the snapshot; run after the copy, it changes the copied rows again.
+    /// </summary>
+    /// <param name="sub">The subscription.</param>
+    /// <param name="nspname">The table's schema.</param>
+    /// <param name="relname">The table's name.</param>
+    /// <param name="lsn">The position.</param>
+    /// <param name="stallTimeout">How long apply may get no further, as when it fails on a change, before the wait
+    /// stops.</param>
+    /// <param name="waitingSince">When the copy started to wait for apply. Once it has waited a while, each wait says
+    /// so as it starts, and then now and again.</param>
+    /// <returns>Whether apply reached the position.</returns>
+    private static bool WaitForApply(WorfSubscription sub, string nspname, string relname, ulong lsn, TimeSpan stallTimeout,
+        long waitingSince)
+    {
+        PublishCopyLsn(lsn);
+        long progressed = Stopwatch.GetTimestamp();
+        TimeSpan logAfter = ApplyWaitLogAfter;
+        ulong applied = 0;
+        ulong change = 0;
+        while (true)
+        {
+            WorfSyncWorker reported;
+            using (PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share())
+            {
+                reported = guard[Worker.MyWorfWorker].Worker.Sync;
+            }
+
+            if (reported.AppliedLsn >= lsn)
+            {
+                PublishCopyLsn(0);
+                return true;
+            }
+
+            // Apply gets further with each transaction, and with each change of one that takes a while.
+            if (reported.AppliedLsn != applied || reported.ChangeLsn != change)
+            {
+                applied = reported.AppliedLsn;
+                change = reported.ChangeLsn;
+                progressed = Stopwatch.GetTimestamp();
+            }
+            else if (Stopwatch.GetElapsedTime(progressed) >= stallTimeout)
+            {
+                PublishCopyLsn(0);
+                return false;
+            }
+
+            if (Stopwatch.GetElapsedTime(waitingSince) >= logAfter)
+            {
+                PgLog.Log($"table {nspname}.{relname} waits to copy until subscription {sub.Name} applies up to {Worf.FormatLsn(lsn)}, " +
+                    (applied == 0 ? "and it hasn't said how far it is" : $"and it's at {Worf.FormatLsn(applied)}"));
+                logAfter = Stopwatch.GetElapsedTime(waitingSince) + ApplyWaitLogInterval;
+            }
+
+            if (Worker.GotSigterm)
+            {
+                throw new OperationCanceledException("The worf worker is stopping.");
+            }
+
+            _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(1000));
+            PgInterrupts.Check();
+        }
+    }
+
+    /// <summary>
+    /// Tells the subscription's apply worker the position the worker waits for it to reach, or zero once it doesn't.
+    /// The worker keeps how far it heard apply has got, which apply only adds to, and starts from the position the apply
+    /// worker last reported to the provider if that's further, as when apply hasn't got further since.
+    /// </summary>
+    /// <param name="lsn">The position.</param>
+    private static void PublishCopyLsn(ulong lsn)
+    {
+        using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive();
+        WorfWorker me = guard[Worker.MyWorfWorker];
+        me.Worker.Sync.CopyLsn = lsn;
+
+        int apply = guard.Read((in _, workers) => Worker.ApplyFind(workers, me.Dboid, me.Worker.Apply.SubId));
+        if (lsn != 0 && apply >= 0 && guard[apply].Proc != 0)
+        {
+            if (guard[apply].Worker.Apply.FlushLsn > me.Worker.Sync.AppliedLsn)
+            {
+                me.Worker.Sync.AppliedLsn = guard[apply].Worker.Apply.FlushLsn;
+                me.Worker.Sync.ChangeLsn = 0;
+            }
+
+            Worker.SetProcLatch(guard[apply].Proc);
+        }
+
+        guard[Worker.MyWorfWorker] = me;
     }
 
     /// <summary>

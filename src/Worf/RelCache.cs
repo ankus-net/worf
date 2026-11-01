@@ -72,13 +72,23 @@ internal static partial class RelCache
             throw new PgException(PgSqlStates.InternalError, $"cache lookup failed for remote relation {remoteid}");
         }
 
-        if (entry.Reloid != 0 && entry.Rel is null && OpenKnown(entry, lockmode))
+        // Locking the relation takes the invalidations sent since it was last open, which can leave the mapping stale,
+        // as when the table was changed, renamed or dropped. It's then let go and looked up by name again. Its
+        // invalidation can also come while a change uses it, so it keeps its OID until then.
+        if (entry.IsValid && entry.Rel is null)
         {
-            return entry;
+            entry.Rel = NativeMethods.try_table_open(entry.Reloid, (int)lockmode);
+            entry.IsValid &= entry.Rel is not null;
+        }
+
+        if (entry.Rel is not null && !entry.IsValid)
+        {
+            NativeMethods.table_close(entry.Rel, (int)lockmode);
+            entry.Rel = null;
         }
 
         // Need to update the local cache?
-        bool mapped = entry.Reloid == 0;
+        bool mapped = !entry.IsValid;
         if (mapped)
         {
             RangeVar* rv = NativeMethods.makeRangeVar(Worf.PStrDup(entry.Nspname), Worf.PStrDup(entry.Relname), -1);
@@ -97,6 +107,7 @@ internal static partial class RelCache
             }
 
             entry.Reloid = entry.Rel->rd_id;
+            entry.IsValid = true;
             if (!s_relationsByReloid.TryGetValue(entry.Reloid, out List<WorfRelation>? entries))
             {
                 entries = [];
@@ -133,24 +144,6 @@ internal static partial class RelCache
         }
 
         return entry;
-    }
-
-    /// <summary>
-    /// Opens the local relation an entry knows. The lock taken to open it processes invalidations, which may reset the
-    /// entry, as for DDL on the table that committed meanwhile; the entry is then looked up again, under the lock.
-    /// </summary>
-    /// <returns>Whether the entry still knows the relation, opened.</returns>
-    private static unsafe bool OpenKnown(WorfRelation entry, PgLockMode lockmode)
-    {
-        entry.Rel = NativeMethods.table_open(entry.Reloid, (int)lockmode);
-        if (entry.Reloid != 0)
-        {
-            return true;
-        }
-
-        NativeMethods.table_close(entry.Rel, (int)PgLockMode.None);
-        entry.Rel = null;
-        return false;
     }
 
     /// <summary>
@@ -247,7 +240,7 @@ internal static partial class RelCache
             {
                 foreach (WorfRelation entry in entries)
                 {
-                    entry.Reloid = 0;
+                    entry.IsValid = false;
                 }
             }
         }
@@ -256,7 +249,7 @@ internal static partial class RelCache
             // invalidate all cache entries
             foreach (WorfRelation entry in s_relationHash.Values)
             {
-                entry.Reloid = 0;
+                entry.IsValid = false;
             }
 
             s_relationsByReloid.Clear();

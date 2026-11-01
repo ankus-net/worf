@@ -1076,6 +1076,76 @@ internal static partial class ReplicationSet
     }
 
     /// <summary>
+    /// Reads what each of the output plugin's replication sets replicates, as the catalog snapshot sees it. While a
+    /// change is decoded, that's the historic snapshot, so the actions are the ones the set had when the change was
+    /// made.
+    /// </summary>
+    /// <param name="replicationSets">The connection's sets, whose actions are updated.</param>
+    /// <returns>Whether any set's actions changed.</returns>
+    internal static unsafe bool ReadReplicationSetActions(List<WorfRepSet> replicationSets)
+    {
+        // The catalog's key is used only while it's in its current file, as for a table's sets.
+        RelationData* rel = Worf.OpenCatalog(CatalogRepset, (int)PgLockMode.AccessShare);
+        NativeMethods.list_free(NativeMethods.RelationGetIndexList(rel));
+        RelationData* pkindex = rel->rd_pkindex == 0 ? null : NativeMethods.index_open(rel->rd_pkindex, AccessShareLock);
+        if (pkindex is not null && !InCurrentFile(pkindex))
+        {
+            NativeMethods.index_close(pkindex, AccessShareLock);
+            pkindex = null;
+        }
+
+        ScanKeyData key;
+        bool changed = false;
+
+        foreach (WorfRepSet repset in replicationSets)
+        {
+            NativeMethods.ScanKeyInit(&key, AnumRepsetId, BtEqualStrategyNumber, FOideq, repset.Id);
+            SysScanDescData* scan = NativeMethods.systable_beginscan(rel, pkindex is null ? 0 : pkindex->rd_id, pkindex is not null, null, 1, &key);
+            HeapTupleData* tuple = NativeMethods.systable_getnext(scan);
+
+            // A set created after the change replicated nothing when it was made.
+            WorfRepSet actions = tuple is null ? new WorfRepSet() : ReplicationSetFromTuple(tuple, rel->rd_att);
+            NativeMethods.systable_endscan(scan);
+
+            if (actions.ReplicateInsert != repset.ReplicateInsert || actions.ReplicateUpdate != repset.ReplicateUpdate ||
+                actions.ReplicateDelete != repset.ReplicateDelete || actions.ReplicateTruncate != repset.ReplicateTruncate)
+            {
+                repset.ReplicateInsert = actions.ReplicateInsert;
+                repset.ReplicateUpdate = actions.ReplicateUpdate;
+                repset.ReplicateDelete = actions.ReplicateDelete;
+                repset.ReplicateTruncate = actions.ReplicateTruncate;
+                changed = true;
+            }
+        }
+
+        if (pkindex is not null)
+        {
+            NativeMethods.index_close(pkindex, AccessShareLock);
+        }
+
+        NativeMethods.table_close(rel, (int)PgLockMode.AccessShare);
+
+        return changed;
+    }
+
+    /// <summary>
+    /// Makes the output plugin build every table's replication info again, as when one of its replication sets changes
+    /// what it replicates.
+    /// </summary>
+    internal static void InvalidateTableReplicationInfo()
+    {
+        if (s_repSetTableHash is null)
+        {
+            return;
+        }
+
+        foreach (WorfTableRepInfo entry in s_repSetTableHash.Values)
+        {
+            entry.IsValid = false;
+        }
+    }
+
+    /// <summary>
     /// Reads a replication set from its catalog tuple.
     /// </summary>
     /// <param name="tuple">The tuple.</param>
@@ -1192,10 +1262,7 @@ internal static partial class ReplicationSet
 
         if (reloid == 0)
         {
-            foreach (WorfTableRepInfo entry in s_repSetTableHash.Values)
-            {
-                entry.IsValid = false;
-            }
+            InvalidateTableReplicationInfo();
         }
         else if (s_repSetTableHash.TryGetValue(reloid, out WorfTableRepInfo? entry))
         {

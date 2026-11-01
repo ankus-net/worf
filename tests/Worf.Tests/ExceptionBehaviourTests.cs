@@ -1,6 +1,7 @@
 using Npgsql;
 
 using System.Diagnostics;
+using System.Text.RegularExpressions;
 
 namespace Worf.Tests;
 
@@ -8,10 +9,24 @@ namespace Worf.Tests;
 /// <c>worf.exception_behaviour</c> keeps a remote transaction that fails from stopping replication, and records it.
 /// </summary>
 [TestClass]
-public sealed class ExceptionBehaviourTests
+public sealed partial class ExceptionBehaviourTests
 {
     private const string Database = "postgres";
     private const string SuperUser = "super";
+
+    // The sync worker's connection that reads the provider's managed sequences waits for a lock on them.
+    private const string SyncWorkerHeldSql = """
+        SELECT EXISTS (
+            SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+            WHERE NOT l.granted AND l.relation = 'worf.sequence_range'::regclass AND a.application_name = 'sub_ranges')
+        """;
+
+    // A table's copy creates its slot, which waits for the provider's open transactions.
+    private const string CopySlotSql = """
+        SELECT EXISTS (
+            SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+            WHERE NOT l.granted AND l.locktype = 'transactionid' AND a.backend_type = 'walsender')
+        """;
 
     /// <summary>
     /// Gets or sets the test context.
@@ -165,6 +180,101 @@ public sealed class ExceptionBehaviourTests
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM t WHERE id = 21)", token),
             "the transaction that disabled the subscription");
 
+        // A table's copy waits for apply, which fails on a row until the constraint goes, without the snapshot that would
+        // keep the provider from removing dead rows meanwhile. The provider holds the sync worker back until the row is
+        // in.
+        await SetBehaviourAsync(subscriber, "error", token);
+        _ = await subscriber.SafePsqlAsync(Database, "ALTER TABLE t ADD CONSTRAINT not_bad CHECK (v <> 'bad') NOT VALID", token);
+        await using (NpgsqlConnection held = await provider.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction transaction = await held.BeginTransactionAsync(token);
+            await using (NpgsqlCommand command = new("LOCK TABLE worf.sequence_range", held, transaction))
+            {
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+
+            _ = await subscriber.SafePsqlAsync(Database, "SELECT worf.alter_subscription_resynchronize_table('sub', 'parent')", token);
+            Assert.IsTrue(await provider.PollQueryUntilAsync(Database,
+                SyncWorkerHeldSql, token),
+                "the sync worker reading the provider's managed sequences");
+            _ = await provider.SafePsqlAsync(Database, "INSERT INTO t VALUES (31, 'bad')", token);
+            await transaction.RollbackAsync(token);
+        }
+
+        await Task.Delay(TimeSpan.FromSeconds(2), token);
+        _ = await provider.SafePsqlAsync(Database, "CREATE TABLE churn AS SELECT generate_series(1, 1000) AS id", token);
+        _ = await provider.SafePsqlAsync(Database, "DELETE FROM churn", token);
+        _ = await provider.SafePsqlAsync(Database, "VACUUM churn", token);
+        Assert.AreEqual("0", await provider.SafePsqlAsync(Database, "SELECT pg_relation_size('churn')", token),
+            "the pages VACUUM emptied of the dead rows and truncated");
+        _ = await subscriber.SafePsqlAsync(Database, "ALTER TABLE t DROP CONSTRAINT not_bad", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+            "SELECT sync_status = 'r' FROM worf.local_sync_status WHERE sync_relname = 'parent'", token), "the table synchronized");
+        Assert.AreEqual("1", await subscriber.SafePsqlAsync(Database, "SELECT string_agg(id::text, ',') FROM parent", token));
+
+        // The copy lets its snapshot go when apply gets no further, here on a row a local transaction holds, and says
+        // how far apply has got. Apply may then get no further for twice as long, and moves on with each change of a
+        // transaction that takes a while: nine slow rows and one slower one don't let the next snapshot go. The
+        // provider's open transactions hold the copy's slot until they commit.
+        _ = await subscriber.SafePsqlAsync(Database, """
+            CREATE FUNCTION slow() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                PERFORM pg_sleep(CASE NEW.v WHEN 'slow' THEN 1 WHEN 'slower' THEN 14 ELSE 0 END);
+                RETURN NEW;
+            END $$;
+            CREATE TRIGGER slow BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION slow();
+            ALTER TABLE t ENABLE ALWAYS TRIGGER slow;
+            """, token);
+        string before = await provider.SafePsqlAsync(Database, "SELECT pg_current_wal_lsn()", token);
+        _ = await provider.SafePsqlAsync(Database, $"SELECT worf.wait_slot_confirm_lsn(NULL, '{before}')", token);
+        int copypos = subscriber.ReadLog().Length;
+        await using (NpgsqlConnection local = await subscriber.OpenAsync(Database, token))
+        await using (NpgsqlConnection held = await provider.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction localTransaction = await local.BeginTransactionAsync(token);
+            await using (NpgsqlCommand command = new("INSERT INTO t VALUES (41, 'local')", local, localTransaction))
+            {
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+
+            await using (NpgsqlTransaction transaction = await held.BeginTransactionAsync(token))
+            {
+                await using (NpgsqlCommand command = new("INSERT INTO t VALUES (41, 'held')", held, transaction))
+                {
+                    _ = await command.ExecuteNonQueryAsync(token);
+                }
+
+                _ = await subscriber.SafePsqlAsync(Database, "SELECT worf.alter_subscription_resynchronize_table('sub', 'parent')", token);
+                Assert.IsTrue(await provider.PollQueryUntilAsync(Database, CopySlotSql, token), "the copy's slot");
+                await transaction.CommitAsync(token);
+            }
+
+            Assert.IsTrue(await subscriber.PollLogAsync(copypos, "dropping the snapshot for table public.parent", token), "the snapshot let go");
+            int droppos = subscriber.ReadLog().IndexOf("dropping the snapshot for table public.parent", copypos, StringComparison.Ordinal);
+            Assert.IsTrue(await subscriber.PollLogAsync(droppos, "table public.parent waits to copy", token), "the wait without the snapshot");
+            Match wait = AppliedPosition().Match(subscriber.ReadLog()[droppos..]);
+            Assert.IsTrue(wait.Success, "the wait says how far apply is");
+            string at = wait.Groups[1].Value;
+            Assert.AreEqual("t", await provider.SafePsqlAsync(Database, $"SELECT '{at}'::pg_lsn >= '{before}'::pg_lsn", token),
+                $"apply at {at}, past {before}");
+
+            await using NpgsqlTransaction slowTransaction = await held.BeginTransactionAsync(token);
+            await using (NpgsqlCommand command = new("INSERT INTO t SELECT g, 'slow' FROM generate_series(42, 50) g; INSERT INTO t VALUES (51, 'slower')",
+                held, slowTransaction))
+            {
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+
+            await localTransaction.RollbackAsync(token);
+            Assert.IsTrue(await provider.PollQueryUntilAsync(Database, CopySlotSql, token), "the copy's next slot");
+            await slowTransaction.CommitAsync(token);
+        }
+
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+            "SELECT sync_status = 'r' FROM worf.local_sync_status WHERE sync_relname = 'parent'", token), "the table synchronized again");
+        Assert.AreEqual(1, subscriber.ReadLog()[copypos..].Split("dropping the snapshot").Length - 1, "snapshots let go");
+        Assert.AreEqual("11", await subscriber.SafePsqlAsync(Database, "SELECT count(*) FROM t WHERE id > 40", token));
+
         // The rolled back subtransactions released what they held.
         string[] leaks = [.. subscriber.ReadLog().Split('\n').Where(line => line.Contains("leak", StringComparison.Ordinal) || line.Contains("not closed", StringComparison.Ordinal))];
         Assert.IsEmpty(leaks, string.Join('\n', leaks));
@@ -226,9 +336,10 @@ public sealed class ExceptionBehaviourTests
     /// <summary>
     /// A change that deadlocks with a local transaction while discard applies its transaction again is applied
     /// again with it once the deadlock clears, rather than skipped as if its data were at fault. A table sync worker
-    /// catching up after its copy discards a failed change as the apply worker does, rather than copying again, though
-    /// the walsender it streamed from holds its slot. It leaves anything else that holds its slot, with a warning, and
-    /// one that fails while catching up starts again.
+    /// catching up after its copy applies the changes the apply worker passed over, though that worker restarted since,
+    /// and discards a failed change as the apply worker does, rather than copying again, though the walsender it
+    /// streamed from holds its slot. It leaves anything else that holds its slot, with a warning, and one that fails
+    /// while catching up starts again.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -335,7 +446,7 @@ public sealed class ExceptionBehaviourTests
         await using (NpgsqlConnection local = await subscriber.OpenAsync(Database, token))
         {
             await using NpgsqlTransaction transaction = await local.BeginTransactionAsync(token);
-            await using (NpgsqlCommand command = new("LOCK TABLE synced", local, transaction))
+            await using (NpgsqlCommand command = new("INSERT INTO synced VALUES (1, 'local')", local, transaction))
             {
                 _ = await command.ExecuteNonQueryAsync(token);
             }
@@ -455,6 +566,95 @@ public sealed class ExceptionBehaviourTests
         Assert.Contains("resuming the catch-up of table public.synced2", subscriber.ReadLog()[logpos..], "the restarted sync catching up");
         Assert.AreEqual(1, subscriber.ReadLog().Split("finished synchronization of data for table public.synced2").Length - 1,
             "copies of the second table");
+
+        // The sync worker's copy waits here on a row a local transaction inserts, while apply passes over changes to
+        // the table that commit after the copy's snapshot, and then restarts on a failed change elsewhere. The copy's
+        // catch-up applies the changes all the same, and discards the failed one as apply does.
+        foreach (TestNode node in new[] { provider, subscriber })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE synced3 (id integer PRIMARY KEY, v text CHECK (v <> 'bad'))", token);
+        }
+
+        _ = await provider.SafePsqlAsync(Database, "ALTER TABLE synced3 DROP CONSTRAINT synced3_v_check; INSERT INTO synced3 VALUES (1, 'copied')", token);
+        await using (NpgsqlConnection local = await subscriber.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction transaction = await local.BeginTransactionAsync(token);
+            await using (NpgsqlCommand command = new("INSERT INTO synced3 VALUES (1, 'local')", local, transaction))
+            {
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+
+            _ = await provider.SafePsqlAsync(Database,
+                "SELECT * FROM worf.replication_set_add_table('default', 'synced3', synchronize_data := true)", token);
+            Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'transactionid' AND NOT granted)", token), "the copy waiting");
+            _ = await provider.SafePsqlAsync(Database, "INSERT INTO synced3 VALUES (2, 'bad'), (3, 'good')", token);
+            _ = await provider.SafePsqlAsync(Database, "INSERT INTO t VALUES (2, 'bad')", token);
+            Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+                "SELECT EXISTS (SELECT 1 FROM worf.exception_log WHERE table_name = 't' AND remote_new_tuple->>'id' = '2')", token),
+                "apply restarted past the changes to synced3");
+            await transaction.RollbackAsync(token);
+        }
+
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+            "SELECT sync_status = 'r' FROM worf.local_sync_status WHERE sync_relname = 'synced3'", token), "the third table synchronized");
+        Assert.AreEqual("1\n3", await subscriber.SafePsqlAsync(Database, "SELECT id FROM synced3 ORDER BY id", token));
+        Assert.AreEqual("discard|INSERT|public|synced3|2|bad|23514", await LastLogAsync(subscriber, token));
+
+        // Apply that restarts while the table's sync worker catches up waits for the catch-up, which goes as far as the
+        // worker before it had got, before it applies the table's changes after that. The provider holds the sync
+        // worker back until this transaction holds the copy back, and a slow trigger holds the catch-up. The copy
+        // leaves out the bad row the subscriber's check rejects.
+        _ = await provider.SafePsqlAsync(Database, "DELETE FROM synced WHERE id = 2", token);
+        _ = await subscriber.SafePsqlAsync(Database, """
+            CREATE FUNCTION slow() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                IF NEW.v = 'slow' THEN
+                    PERFORM pg_sleep(3);
+                END IF;
+                RETURN NEW;
+            END $$;
+            CREATE TRIGGER slow BEFORE UPDATE ON synced FOR EACH ROW EXECUTE FUNCTION slow();
+            ALTER TABLE synced ENABLE ALWAYS TRIGGER slow;
+            """, token);
+        await using (NpgsqlConnection held = await provider.OpenAsync(Database, token))
+        await using (NpgsqlConnection local = await subscriber.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction heldTransaction = await held.BeginTransactionAsync(token);
+            await using (NpgsqlCommand command = new("LOCK TABLE worf.sequence_range", held, heldTransaction))
+            {
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+
+            _ = await subscriber.SafePsqlAsync(Database, "SELECT worf.alter_subscription_resynchronize_table('sub', 'synced')", token);
+            Assert.IsTrue(await provider.PollQueryUntilAsync(Database,
+                SyncWorkerHeldSql, token),
+                "the sync worker reading the provider's managed sequences");
+            await using NpgsqlTransaction transaction = await local.BeginTransactionAsync(token);
+            await using (NpgsqlCommand command = new("LOCK TABLE synced IN SHARE MODE", local, transaction))
+            {
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+
+            await heldTransaction.RollbackAsync(token);
+            Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE NOT granted AND relation = 'synced'::regclass)", token), "the copy");
+            _ = await provider.SafePsqlAsync(Database, "UPDATE synced SET v = 'slow' WHERE id = 1", token);
+            await transaction.RollbackAsync(token);
+        }
+
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event = 'PgSleep' AND application_name LIKE '%sync%')", token),
+            "the catch-up in the trigger");
+        _ = await subscriber.SafePsqlAsync(Database,
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name LIKE '%apply%'", token);
+        _ = await provider.SafePsqlAsync(Database, "UPDATE synced SET v = 'after' WHERE id = 3", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+            "SELECT sync_status = 'r' FROM worf.local_sync_status WHERE sync_relname = 'synced'", token), "the table synchronized again");
+        _ = await provider.SafePsqlAsync(Database, "INSERT INTO t VALUES (3, 'last')", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM t WHERE id = 3)", token),
+            "the transaction after the update");
+        Assert.AreEqual("1|slow\n3|after", await subscriber.SafePsqlAsync(Database, "SELECT * FROM synced ORDER BY id", token));
     }
 
     /// <summary>
@@ -840,4 +1040,8 @@ public sealed class ExceptionBehaviourTests
                 error_sqlstate
             FROM worf.exception_log ORDER BY log_id DESC LIMIT 1
             """, token);
+
+    // How far a table's copy says apply has got.
+    [GeneratedRegex("waits to copy until subscription sub applies up to [0-9A-F/]+, and it's at ([0-9A-F]+/[0-9A-F]+)")]
+    private static partial Regex AppliedPosition();
 }

@@ -409,6 +409,35 @@ internal static class Rpc
     }
 
     /// <summary>
+    /// Checks whether the remote node replicates a sequence of a name in any of the replication sets.
+    /// </summary>
+    /// <param name="conn">The provider connection, inside a local transaction.</param>
+    /// <param name="nspname">The sequence's schema.</param>
+    /// <param name="relname">The sequence's name.</param>
+    /// <param name="replicationSets">The replication sets.</param>
+    /// <returns>Whether one of the sets has the sequence.</returns>
+    internal static bool RemoteReplicatesSequence(PgReplicationConnection conn, string nspname, string relname, List<string> replicationSets)
+    {
+        string query = "SELECT 1" +
+            "  FROM worf.replication_set_seq q, worf.replication_set s, worf.local_node l, pg_catalog.pg_class c, pg_catalog.pg_namespace n" +
+            " WHERE s.set_id = q.set_id AND s.set_nodeid = l.node_id AND c.oid = q.set_seqoid AND n.oid = c.relnamespace" +
+            "   AND n.nspname = " + Spi.QuoteLiteral(nspname) + " AND c.relname = " + Spi.QuoteLiteral(relname) +
+            "   AND s.set_name = ANY(ARRAY[" + RepsetArray(replicationSets) + "]::name[])";
+
+        IReadOnlyList<string?[]> res;
+        try
+        {
+            res = conn.Query(query, 1);
+        }
+        catch (PgRemoteException error)
+        {
+            throw new PgException(PgSqlStates.InternalError, $"could not fetch remote sequence info: ERROR:  {error.Message}\n\n");
+        }
+
+        return res.Count > 0;
+    }
+
+    /// <summary>
     /// Checks whether a function exists on the remote node.
     /// </summary>
     /// <param name="conn">The provider connection, inside a local transaction.</param>
