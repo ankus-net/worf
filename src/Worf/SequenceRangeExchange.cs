@@ -93,13 +93,15 @@ internal static class SequenceRangeExchange
         NextDueAt = long.MaxValue;
         foreach (WorfSubscription sub in WorfNode.GetNodeSubscriptions(node.Node.Id, false).Where(sub => sub.Enabled))
         {
-            // The neighbor ties each exchange to the subscription's slot, which a new subscription makes as it starts.
+            // The neighbor ties each exchange to the subscription's slot, which a new subscription makes as it starts,
+            // so the exchange waits a check interval for it.
+            long now = Worker.GetCurrentTimestamp();
             if (Sync.GetSubscriptionSyncStatus(sub.Id, true) is not WorfSyncStatus sync || sync.Status == Sync.SyncStatusInit)
             {
+                NextDueAt = Math.Min(NextDueAt, now + (SequenceRanges.CheckInterval * 1000L));
                 continue;
             }
 
-            long now = Worker.GetCurrentTimestamp();
             bool retrying = s_retries.TryGetValue(sub.Id, out (long At, long Delay) retry) && now < retry.At;
             bool due = !s_exchangedAt.TryGetValue(sub.Id, out long at) || now - at >= SequenceRanges.ExchangeInterval * 1000L ||
                 s_acksWaiting.Contains(sub.Id) || Waiting(sub.Origin.Id);
