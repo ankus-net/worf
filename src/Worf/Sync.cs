@@ -297,6 +297,7 @@ internal static class Sync
             Apply.RunTakingOriginSlot(() =>
                 PgReplicationOrigin.Advance(EnsureReplicationOrigin(sub), PgLsn.Invalid, PgLsn.Invalid, true, true));
             merge = true;
+            PgBackgroundWorker.RunTransaction(() => RequireMergeable(nspname, relname));
         }
 
         List<WorfManagedSequence> managedSequences = PgBackgroundWorker.RunTransaction(() => SequenceRangeSync.FetchManaged(sub.OriginIf.Dsn, sub.Name));
@@ -336,7 +337,7 @@ internal static class Sync
             // Copy data. The status that says the copy has committed changes in the copy's transaction, so that a
             // worker that stops after it catches up rather than copying again. A merge's commit advances the origin too.
             CopyTablesData(sub.Name, sub.OriginIf.Dsn, snapshot, [(nspname, relname)], sub.ReplicationSets, sub.SlotName,
-                merge ? (sub.Id, lsn) : null, () => SetTableSyncStatus(sub.Id, nspname, relname, SyncStatusCatchup, lsn));
+                merge ? lsn : null, () => SetTableSyncStatus(sub.Id, nspname, relname, SyncStatusCatchup, lsn));
         }
         catch (Exception)
         {
@@ -1445,26 +1446,20 @@ internal static class Sync
     /// <summary>
     /// Copies a table that has rows again, in the target transaction, and merges the copy into them, as a table sync
     /// does that can't catch up from its first copy. The provider's rows replace the table's with the same key, or join
-    /// them, and a row the copy lacks is deleted when this subscription wrote it, as its commit origin shows. The table
-    /// is locked against writes, though not reads, until the transaction commits, so it's never seen empty or half
-    /// merged, and session_replication_role replica keeps foreign keys from being checked, as for apply. A row the copy
-    /// lacks whose writer can't be told, as with track_commit_timestamp off, is deleted too when nothing else writes the
-    /// table: no other subscription, no PostgreSQL subscription of the table, and no replication set of this node has
-    /// it, and no row the copy lacks came from elsewhere. Otherwise the sync stops with an error.
+    /// them, and the table's other rows stay, as pglogical keeps them: whether this subscription wrote a row can't be
+    /// told in general, as without commit timestamps or once it's frozen. A row the copy leaves as it was isn't written
+    /// again. Writers go on meanwhile, readers see the rows as they were until the merge commits, and
+    /// session_replication_role replica keeps foreign keys from being checked, as for apply.
     /// </summary>
     /// <param name="originConn">The provider connection, in the copy's transaction.</param>
     /// <param name="remoterel">The table.</param>
     /// <param name="replicationSets">The replication sets, whose row filters apply.</param>
-    /// <param name="subId">The subscription.</param>
-    private static void MergeTableData(PgReplicationConnection originConn, WorfRemoteRel remoterel, List<string> replicationSets, uint subId)
+    private static void MergeTableData(PgReplicationConnection originConn, WorfRemoteRel remoterel, List<string> replicationSets)
     {
         (uint reloid, List<string> attnamelist, string query) = CopyQuery(remoterel, replicationSets);
         string table = Spi.QuoteQualifiedIdentifier(remoterel.Nspname, remoterel.Relname);
         (bool partitioned, List<string> key) = TableKey(reloid);
         string only = partitioned ? "" : "ONLY ";
-
-        // Writers wait for the merge, and readers see the rows as they were until it commits.
-        _ = Spi.Execute($"LOCK TABLE {table} IN EXCLUSIVE MODE");
 
         // The provider's rows go into a table of the copy's columns first.
         StringBuilder create = new("CREATE TEMPORARY TABLE worf_sync_copy ON COMMIT DROP AS SELECT ");
@@ -1476,113 +1471,64 @@ internal static class Sync
         create.Append(attnamelist.Count == 0 ? "*" : "").Append(" FROM ONLY ").Append(table).Append(" WITH NO DATA");
         ExecuteQuoted(create.ToString());
         uint copyOid = Worf.ReadScalar<uint>($"SELECT '{MergeCopy}'::regclass::oid");
-        SpiResult attributes = Worf.Read(
-            "SELECT attname::text FROM pg_catalog.pg_attribute WHERE attrelid = $1 AND attnum > 0 AND NOT attisdropped ORDER BY attnum",
-            0, SpiParameter.Create(copyOid));
+
+        // The columns the merge writes: the copy's, but those the table generates.
+        SpiResult attributes = Worf.Read("""
+            SELECT c.attname::text FROM pg_catalog.pg_attribute c
+                JOIN pg_catalog.pg_attribute t ON t.attrelid = $2 AND t.attname = c.attname AND t.attgenerated = ''
+            WHERE c.attrelid = $1 AND c.attnum > 0 AND NOT c.attisdropped ORDER BY c.attnum
+            """, 0, SpiParameter.Create(copyOid), SpiParameter.Create(reloid));
         List<string> columns = [.. Enumerable.Range(0, attributes.Count).Select(i => attributes[i].Get<string>(0))];
+        if (key.Count == 0 || !key.TrueForAll(columns.Contains))
+        {
+            throw Unmergeable(remoterel.Nspname, remoterel.Relname);
+        }
+
         StartCopy(originConn, query);
         _ = originConn.CopyInto(copyOid, null);
         _ = Spi.Execute($"ANALYZE {MergeCopy}");
 
-        // The table's key matches the copy's rows with its own, when the copy has the key's columns. Without one, every
-        // row is the copy's to replace.
-        if (!key.TrueForAll(columns.Contains))
+        // The copy's rows replace the table's with the same key, or join them. A MERGE needs no arbiter index, which a
+        // deferrable key can't be, and an identity column takes the copy's value.
+        string[] quoted = [.. columns.Select(Spi.QuoteIdentifier)];
+        string[] rest = [.. columns.Where(column => !key.Contains(column)).Select(Spi.QuoteIdentifier)];
+        StringBuilder merge = new("MERGE INTO ");
+        merge.Append(only).Append(table).Append(" t USING ").Append(MergeCopy).Append(" c ON ")
+            .Append(string.Join(" AND ", key.Select(Spi.QuoteIdentifier).Select(column => $"t.{column} = c.{column}")));
+        if (rest.Length > 0)
         {
-            key = [];
+            merge.Append(" WHEN MATCHED AND ROW(").Append(string.Join(", ", rest.Select(column => $"t.{column}"))).Append(")::text IS DISTINCT FROM ROW(")
+                .Append(string.Join(", ", rest.Select(column => $"c.{column}"))).Append(")::text THEN UPDATE SET ")
+                .Append(string.Join(", ", rest.Select(column => $"{column} = c.{column}")));
         }
 
-        string lacking = key.Count == 0 ? ""
-            : $" WHERE NOT EXISTS (SELECT 1 FROM {MergeCopy} c WHERE {string.Join(" AND ", key.Select(k => $"c.{Spi.QuoteIdentifier(k)} = t.{Spi.QuoteIdentifier(k)}"))})";
-        SpiResult rows = Worf.Read($"""
-            SELECT t.tableoid::oid, (t.ctid::text::point)[0]::bigint, (t.ctid::text::point)[1]::integer, t.xmin::text::bigint
-            FROM {only}{table} t{lacking}
-            """, 0);
-
-        Dictionary<uint, List<string>> deleted = [];
-        List<(uint Relid, string Tid)> unknown = [];
-        bool elsewhere = false;
-        using (RowWriters writers = new(subId))
-        {
-            for (int i = 0; i < rows.Count; i++)
-            {
-                uint relid = rows[i].Get<uint>(0);
-                uint block = (uint)rows[i].Get<long>(1);
-                ushort offset = (ushort)rows[i].Get<int>(2);
-                string tid = string.Create(CultureInfo.InvariantCulture, $"({block},{offset})");
-                switch (writers.WrittenBy(relid, block, offset, (uint)rows[i].Get<long>(3)))
-                {
-                    case true:
-                        Deleted(deleted, relid).Add(tid);
-                        break;
-                    case false:
-                        elsewhere = true;
-                        break;
-                    default:
-                        unknown.Add((relid, tid));
-                        break;
-                }
-            }
-        }
-
-        if (unknown.Count > 0)
-        {
-            if (elsewhere || WrittenElsewhere(reloid, subId))
-            {
-                throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState,
-                    $"could not tell whether this subscription wrote the rows of table {remoterel.Nspname}.{remoterel.Relname} that the provider's copy lacks",
-                    detail: $"{unknown.Count.ToString(CultureInfo.InvariantCulture)} such rows are frozen, have no commit timestamp, or came through an origin whose record is forgotten, and something else writes the table too.",
-                    hint: "Delete the rows the provider lacks, or empty the table, and the sync copies it again.");
-            }
-
-            foreach ((uint relid, string tid) in unknown)
-            {
-                Deleted(deleted, relid).Add(tid);
-            }
-        }
-
-        foreach ((uint relid, List<string> tids) in deleted)
-        {
-            _ = Spi.Execute($"DELETE FROM {only}{table} t WHERE t.tableoid = $1 AND t.ctid = ANY ($2::text::tid[])",
-                SpiParameter.Create(relid), SpiParameter.Create($"{{{string.Join(',', tids.Select(tid => $"\"{tid}\""))}}}"));
-        }
-
-        // The copy's rows replace the table's with the same key, or join them.
-        StringBuilder insert = new("INSERT INTO ");
-        insert.Append(table).Append(" (");
-        for (int i = 0; i < columns.Count; i++)
-        {
-            insert.Append(i == 0 ? "" : ", ").Append(Spi.QuoteIdentifier(columns[i]));
-        }
-
-        insert.Append(") SELECT ");
-        for (int i = 0; i < columns.Count; i++)
-        {
-            insert.Append(i == 0 ? "" : ", ").Append(Spi.QuoteIdentifier(columns[i]));
-        }
-
-        insert.Append(" FROM ").Append(MergeCopy);
-        if (key.Count > 0)
-        {
-            insert.Append(" ON CONFLICT (");
-            for (int i = 0; i < key.Count; i++)
-            {
-                insert.Append(i == 0 ? "" : ", ").Append(Spi.QuoteIdentifier(key[i]));
-            }
-
-            insert.Append(columns.Count == key.Count ? ") DO NOTHING" : ") DO UPDATE SET ");
-            bool first = true;
-            foreach (string column in columns.Where(column => !key.Contains(column)))
-            {
-                insert.Append(first ? "" : ", ").Append(Spi.QuoteIdentifier(column)).Append(" = excluded.").Append(Spi.QuoteIdentifier(column));
-                first = false;
-            }
-        }
-
-        ExecuteQuoted(insert.ToString());
+        merge.Append(" WHEN NOT MATCHED THEN INSERT (").Append(string.Join(", ", quoted)).Append(") OVERRIDING SYSTEM VALUE VALUES (")
+            .Append(string.Join(", ", quoted.Select(column => $"c.{column}"))).Append(')');
+        ExecuteQuoted(merge.ToString());
         _ = Spi.Execute($"DROP TABLE {MergeCopy}");
 
         PgLog.Info($"finished synchronization of data for table {remoterel.Nspname}.{remoterel.Relname}");
     }
+
+    /// <summary>
+    /// Fails a sync that would copy a table again into the rows it has, as one that can't catch up from its first copy
+    /// does, when the table has no key to match the copy's rows with its own by.
+    /// </summary>
+    /// <param name="nspname">The table's schema.</param>
+    /// <param name="relname">The table's name.</param>
+    internal static void RequireMergeable(string nspname, string relname)
+    {
+        if (Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(Spi.QuoteQualifiedIdentifier(nspname, relname))) is uint reloid &&
+            TableKey(reloid).Key.Count == 0)
+        {
+            throw Unmergeable(nspname, relname);
+        }
+    }
+
+    private static PgException Unmergeable(string nspname, string relname)
+        => new(PgSqlStates.ObjectNotInPrerequisiteState,
+            $"could not copy table {nspname}.{relname} again into the rows it has, as it has no replica identity index or primary key that the copy has",
+            hint: "Resynchronize the table with worf.alter_subscription_resynchronize_table, which empties it and copies it again.");
 
     /// <summary>
     /// Runs a statement a merge composes, whose every name the merge quotes with <see cref="Spi.QuoteIdentifier"/> and
@@ -1590,20 +1536,9 @@ internal static class Sync
     /// </summary>
     private static void ExecuteQuoted(string sql) => _ = Spi.Execute(sql);
 
-    private static List<string> Deleted(Dictionary<uint, List<string>> deleted, uint relid)
-    {
-        if (!deleted.TryGetValue(relid, out List<string>? tids))
-        {
-            tids = [];
-            deleted.Add(relid, tids);
-        }
-
-        return tids;
-    }
-
     /// <summary>
     /// Gets whether a table is partitioned, and its key's columns: those of its replica identity index or else its
-    /// primary key, or none.
+    /// primary key, even a deferrable one, which PostgreSQL doesn't take as the replica identity, or none.
     /// </summary>
     private static unsafe (bool Partitioned, List<string> Key) TableKey(uint reloid)
     {
@@ -1616,6 +1551,12 @@ internal static class Sync
         }
 
         NativeMethods.table_close(rel, NoLock);
+        if (index == 0)
+        {
+            index = Worf.ReadScalar<uint?>("SELECT indexrelid FROM pg_catalog.pg_index WHERE indrelid = $1 AND indisprimary",
+                SpiParameter.Create(reloid)) ?? 0;
+        }
+
         if (index == 0)
         {
             return (partitioned, []);
@@ -1631,27 +1572,6 @@ internal static class Sync
     }
 
     /// <summary>
-    /// Checks whether something other than a subscription may write a table: another subscription of this node's,
-    /// which may apply the table, a PostgreSQL subscription of it, or this node itself, which writes the tables its
-    /// replication sets have.
-    /// </summary>
-    private static bool WrittenElsewhere(uint reloid, uint subId)
-    {
-        if (Worf.ReadScalar<bool>("""
-            SELECT EXISTS (SELECT 1 FROM worf.subscription WHERE sub_id <> $1) OR
-                EXISTS (SELECT 1 FROM pg_catalog.pg_subscription_rel
-                    WHERE srrelid IN (SELECT relid FROM pg_catalog.pg_partition_tree($2::regclass)
-                        UNION SELECT relid FROM pg_catalog.pg_partition_ancestors($2::regclass)))
-            """, SpiParameter.Create(subId), SpiParameter.Create(reloid)))
-        {
-            return true;
-        }
-
-        WorfLocalNode? node = WorfNode.GetLocalNode(false, true);
-        return node is not null && ReplicationSet.GetTableReplicationSets(node.Node.Id, reloid).Count > 0;
-    }
-
-    /// <summary>
     /// Copy data from origin node to target node. Creates new connection to origin.
     /// </summary>
     /// <param name="subName">The subscription's name.</param>
@@ -1660,12 +1580,12 @@ internal static class Sync
     /// <param name="tables">The tables.</param>
     /// <param name="replicationSets">The replication sets, whose row filters apply.</param>
     /// <param name="originName">The replication origin the copy commits under.</param>
-    /// <param name="merge">The subscription whose rows a copy into tables that have rows replaces, and the position
-    /// the copy's commit advances the origin to, or null for a copy into empty tables.</param>
+    /// <param name="merge">The position the copy's commit advances the origin to, for a copy merged into tables that have
+    /// rows, or null for a copy into empty tables.</param>
     /// <param name="copied">Runs in the copy's transaction once the tables are copied.</param>
     private static void CopyTablesData(string subName, string originDsn, string originSnapshot,
         List<(string Nspname, string Relname)> tables, List<string> replicationSets, string originName,
-        (uint SubId, ulong Lsn)? merge, Action copied)
+        ulong? merge, Action copied)
     {
         // Connect to origin node.
         PgReplicationConnection originConn = Worf.Connect(originDsn, subName, "copy");
@@ -1677,7 +1597,7 @@ internal static class Sync
             PgBackgroundWorker.RunTransaction(() =>
             {
                 StartCopyTargetTx(originName);
-                if (merge is (_, ulong lsn))
+                if (merge is ulong lsn)
                 {
                     Worf.ReploriginSessionOriginLsn = lsn;
                 }
@@ -1686,9 +1606,9 @@ internal static class Sync
                 {
                     WorfRemoteRel remoterel = Rpc.GetRemoteRepsetTable(originConn, nspname, relname, replicationSets);
 
-                    if (merge is (uint mergeSubId, _))
+                    if (merge is not null)
                     {
-                        MergeTableData(originConn, remoterel, replicationSets, mergeSubId);
+                        MergeTableData(originConn, remoterel, replicationSets);
                     }
                     else
                     {
@@ -1844,6 +1764,14 @@ internal static class Sync
         => $"{slotName}_{Worf.HashAny(Spi.QuoteQualifiedIdentifier(nspname, relname)):x8}";
 
     /// <summary>
+    /// Gets the names of the slots the table syncs of a subscription's tables create on the provider.
+    /// </summary>
+    /// <param name="sub">The subscription.</param>
+    /// <returns>The slots' names.</returns>
+    internal static List<string> SyncSlotNames(WorfSubscription sub)
+        => [.. GetSubscriptionTables(sub.Id).Select(sync => SyncSlotName(sub.SlotName, sync.Nspname, sync.Relname)).Distinct()];
+
+    /// <summary>
     /// Gets the slots on the provider that a subscription's table syncs still stream from or drop themselves: those of
     /// tables that are synchronizing, or whose sync worker runs.
     /// </summary>
@@ -1876,17 +1804,17 @@ internal static class Sync
     }
 
     /// <summary>
-    /// Drops the slots on the provider that a subscription's table syncs left, as their names show, but those kept.
-    /// One that something holds stays.
+    /// Drops the slots on the provider that a subscription's table syncs left, but those kept. One that something holds
+    /// stays.
     /// </summary>
     /// <param name="conn">The provider connection, inside a local transaction.</param>
-    /// <param name="slotName">The subscription's slot name.</param>
+    /// <param name="names">The names of the slots the subscription's table syncs create, from <see cref="SyncSlotNames"/>.</param>
     /// <param name="kept">The slots that stay, as those of tables still synchronizing.</param>
     /// <returns>The slots that couldn't be dropped.</returns>
-    internal static List<string> DropSyncSlots(PgReplicationConnection conn, string slotName, IReadOnlySet<string> kept)
+    internal static List<string> DropSyncSlots(PgReplicationConnection conn, IReadOnlyCollection<string> names, IReadOnlySet<string> kept)
     {
         List<string> left = [];
-        foreach ((string name, bool active) in Rpc.RemoteSyncSlots(conn, slotName))
+        foreach ((string name, bool active) in Rpc.RemoteSyncSlots(conn, names))
         {
             if (kept.Contains(name))
             {

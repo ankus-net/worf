@@ -123,8 +123,11 @@ need, which slows apply; failing that within 10 seconds, its apply or table sync
 stops with an error and retries. They also give them up, within 10 seconds, to
 an enabled PostgreSQL subscription whose origin, or a table sync's, has none
 while a worker of it runs or can start: its owner can log in, its database
-allows connections, and `max_logical_replication_workers` leaves room. Other
-users of origins need the limit raised. `worf.origin_writer` records the node
+allows connections, and `max_logical_replication_workers` leaves room. One that
+still has none 10 seconds after they gave theirs up, as while its provider can't
+be reached, isn't waiting for one, and they don't give theirs up for it again for
+10 minutes, then for twice as long each time, up to a day. Other users of
+origins need the limit raised. `worf.origin_writer` records the node
 and subscription each origin worf creates applies for, a row each time one is
 created or dropped, and forgets a row once a later one has superseded it for
 `vacuum_freeze_min_age` transactions, as vacuum would freeze rows written before
@@ -783,16 +786,14 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   subscription drops them too. One that stops after its copy has committed
   catches up again from where it got to when it restarts, rather than copying
   again. When its slot is gone or invalidated, or its origin has no progress, it
-  copies the table again and merges the copy in, in one transaction that keeps
-  writers, but not readers, waiting: the provider's rows replace those with the
-  same key, or join them, and a row the copy lacks is deleted when the
-  subscription wrote it, as its commit origin shows. One whose writer can't be
-  told, as with `track_commit_timestamp` off, a frozen row, or an origin whose
-  record is forgotten, is deleted too, unless another subscription, a PostgreSQL
-  subscription of the table or this node's replication sets could have written
-  it, or another row the copy lacks came from elsewhere; then the sync fails,
-  and retries, until the row is deleted or the table emptied. The default is
-  `error`.
+  copies the table again and merges the copy in, in one transaction: the
+  provider's rows replace those with the same replica identity or primary key,
+  or join them, and the table's other rows stay, as in pglogical, since whether
+  the subscription wrote one can't be told in general. So a row the provider
+  deleted while the sync couldn't catch up stays here; resynchronizing the table
+  empties it and copies it again. Writers go on meanwhile, and readers see the
+  rows as they were until it commits. A table with neither key fails instead,
+  and retries, until it is resynchronized. The default is `error`.
 
 - `worf.enable_ddl_replication`
   Replicates DDL as it runs, through the `ddl_sql` replication set as

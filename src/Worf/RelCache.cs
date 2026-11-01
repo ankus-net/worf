@@ -46,6 +46,11 @@ internal static partial class RelCache
             throw new PgException(PgSqlStates.InternalError, $"cache lookup failed for remote relation {remoteid}");
         }
 
+        if (entry.Reloid != 0 && entry.Rel is null && OpenKnown(entry, lockmode))
+        {
+            return entry;
+        }
+
         // Need to update the local cache?
         if (entry.Reloid == 0)
         {
@@ -92,12 +97,26 @@ internal static partial class RelCache
                 }
             }
         }
-        else if (entry.Rel is null)
-        {
-            entry.Rel = NativeMethods.table_open(entry.Reloid, (int)lockmode);
-        }
 
         return entry;
+    }
+
+    /// <summary>
+    /// Opens the local relation an entry knows. The lock taken to open it processes invalidations, which may reset the
+    /// entry, as for DDL on the table that committed meanwhile; the entry is then looked up again, under the lock.
+    /// </summary>
+    /// <returns>Whether the entry still knows the relation, opened.</returns>
+    private static unsafe bool OpenKnown(WorfRelation entry, PgLockMode lockmode)
+    {
+        entry.Rel = NativeMethods.table_open(entry.Reloid, (int)lockmode);
+        if (entry.Reloid != 0)
+        {
+            return true;
+        }
+
+        NativeMethods.table_close(entry.Rel, (int)PgLockMode.None);
+        entry.Rel = null;
+        return false;
     }
 
     /// <summary>

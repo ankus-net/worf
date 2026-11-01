@@ -66,6 +66,11 @@ internal static unsafe partial class Apply
     private static long s_reclaimCheckedAt;
     private static long s_elsewhereCheckedAt;
 
+    // The origins of PostgreSQL subscriptions this worker last gave slots up for, and those it found waiting for none,
+    // with when it gives slots up for them again and the delay before that.
+    private static readonly HashSet<string> s_gaveUpFor = [];
+    private static readonly Dictionary<string, (long Until, long Delay)> s_notWaiting = [];
+
     // When this worker next tries to drop the slots that table syncs left on the provider, or zero.
     private static long s_syncSlotsRetryAt;
     private static bool s_skipRemoteTransaction;
@@ -267,7 +272,7 @@ internal static unsafe partial class Apply
         // Slots that the subscription's table syncs left on the provider are dropped, now and while one stays.
         SetSyncSlotsLeft(false);
         s_syncSlotsRetryAt = PgBackgroundWorker.RunTransaction(() =>
-            Sync.DropSyncSlots(streamConn, sub.SlotName, Sync.KeptSyncSlots(sub)).Count == 0)
+            Sync.DropSyncSlots(streamConn, Sync.SyncSlotNames(sub), Sync.KeptSyncSlots(sub)).Count == 0)
             ? 0 : Worker.GetCurrentTimestamp() + SyncSlotsRetryInterval;
 
         Worf.StartReplication(streamConn, sub.SlotName, originStartpos, origins, repsets, null, sub.ForceTextTransfer);
@@ -1032,8 +1037,32 @@ internal static unsafe partial class Apply
         else if (s_streamOrigins.Count > 1 && now - s_elsewhereCheckedAt >= 10_000_000)
         {
             s_elsewhereCheckedAt = now;
-            if (PgBackgroundWorker.RunTransaction(WorfNode.OriginSlotWantedElsewhere))
+
+            // An origin still without a slot since this worker gave slots up for it, which left one free, isn't waiting
+            // for one, as when its subscription's provider can't be reached, so slots aren't given up for it again for a
+            // while that doubles, from ten minutes up to a day, so that the relay origins aren't made again and again.
+            if (s_gaveUpFor.Count > 0)
             {
+                List<string> still = PgBackgroundWorker.RunTransaction(() => WorfNode.OriginsWithoutSlots(s_gaveUpFor));
+                foreach (string origin in still)
+                {
+                    long delay = s_notWaiting.TryGetValue(origin, out (long Until, long Delay) last) ? Math.Min(last.Delay * 2, 86_400_000_000L) : 600_000_000L;
+                    s_notWaiting[origin] = (now + delay, delay);
+                }
+
+                foreach (string origin in s_gaveUpFor.Except(still))
+                {
+                    _ = s_notWaiting.Remove(origin);
+                }
+
+                s_gaveUpFor.Clear();
+            }
+
+            List<string> wanting = PgBackgroundWorker.RunTransaction(WorfNode.OriginsWantingSlots)
+                .FindAll(origin => !s_notWaiting.TryGetValue(origin, out (long Until, long Delay) notWaiting) || now >= notWaiting.Until);
+            if (wanting.Count > 0)
+            {
+                s_gaveUpFor.UnionWith(wanting);
                 ReclaimRelayOrigins();
             }
         }
@@ -1060,7 +1089,7 @@ internal static unsafe partial class Apply
             dropped = PgBackgroundWorker.RunTransaction(() =>
             {
                 using PgReplicationConnection conn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "cleanup");
-                return Sync.DropSyncSlots(conn, sub.SlotName, Sync.KeptSyncSlots(sub)).Count == 0;
+                return Sync.DropSyncSlots(conn, Sync.SyncSlotNames(sub), Sync.KeptSyncSlots(sub)).Count == 0;
             });
         }
         catch (PgException error)

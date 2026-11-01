@@ -93,16 +93,14 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   subscription drops them too. One that stops after its copy has committed
   catches up again from where it got to when it restarts, rather than copying
   again. When its slot is gone or invalidated, or its origin has no progress, it
-  copies the table again and merges the copy in, in one transaction that keeps
-  writers, but not readers, waiting: the provider's rows replace those with the
-  same key, or join them, and a row the copy lacks is deleted when the
-  subscription wrote it, as its commit origin shows. One whose writer can't be
-  told, as with `track_commit_timestamp` off, a frozen row, or an origin whose
-  record is forgotten, is deleted too, unless another subscription, a PostgreSQL
-  subscription of the table or this node's replication sets could have written
-  it, or another row the copy lacks came from elsewhere; then the sync fails,
-  and retries, until the row is deleted or the table emptied. The default is
-  `error`.
+  copies the table again and merges the copy in, in one transaction: the
+  provider's rows replace those with the same replica identity or primary key,
+  or join them, and the table's other rows stay, as in pglogical, since whether
+  the subscription wrote one can't be told in general. So a row the provider
+  deleted while the sync couldn't catch up stays here; resynchronizing the table
+  empties it and copies it again. Writers go on meanwhile, and readers see the
+  rows as they were until it commits. A table with neither key fails instead,
+  and retries, until it is resynchronized. The default is `error`.
 
 - `worf.enable_ddl_replication`
   Replicates DDL as it runs, through the `ddl_sql` replication set as

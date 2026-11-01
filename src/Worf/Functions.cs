@@ -387,7 +387,8 @@ internal static class Functions
         {
             WorfLocalNode node = WorfNode.GetLocalNode(true, false)!;
 
-            // First drop the status.
+            // First drop the status, after noting the slots its tables' syncs create, which may be left on the provider.
+            List<string> syncSlotNames = Sync.SyncSlotNames(sub);
             Sync.DropSubscriptionSyncStatus(sub.Id);
 
             // Drop the actual subscription.
@@ -478,7 +479,7 @@ internal static class Functions
                     // still finishing a large transaction. Wait for them, as the apply does when it starts.
                     long deadline = Worker.GetCurrentTimestamp() + 5000000L;
                     List<string> syncSlots;
-                    while ((syncSlots = Sync.DropSyncSlots(originConn, sub.SlotName, new HashSet<string>())).Count > 0 &&
+                    while ((syncSlots = Sync.DropSyncSlots(originConn, syncSlotNames, new HashSet<string>())).Count > 0 &&
                         Worker.GetCurrentTimestamp() < deadline)
                     {
                         PgInterrupts.Check();

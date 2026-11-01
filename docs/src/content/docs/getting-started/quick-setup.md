@@ -23,8 +23,11 @@ need, which slows apply; failing that within 10 seconds, its apply or table sync
 stops with an error and retries. They also give them up, within 10 seconds, to
 an enabled PostgreSQL subscription whose origin, or a table sync's, has none
 while a worker of it runs or can start: its owner can log in, its database
-allows connections, and `max_logical_replication_workers` leaves room. Other
-users of origins need the limit raised. `worf.origin_writer` records the node
+allows connections, and `max_logical_replication_workers` leaves room. One that
+still has none 10 seconds after they gave theirs up, as while its provider can't
+be reached, isn't waiting for one, and they don't give theirs up for it again for
+10 minutes, then for twice as long each time, up to a day. Other users of
+origins need the limit raised. `worf.origin_writer` records the node
 and subscription each origin worf creates applies for, a row each time one is
 created or dropped, and forgets a row once a later one has superseded it for
 `vacuum_freeze_min_age` transactions, as vacuum would freeze rows written before

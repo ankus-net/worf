@@ -600,9 +600,12 @@ internal sealed partial class WorfNode
             relayed = originName[..relay];
         }
 
+        // A subscription's own origin, whose name is its slot's, comes before a table sync's of another subscription,
+        // whose slot's name followed by a table's hash may look the same.
         RelationData* rel = OpenCatalog(CatalogSubscription, AccessShareLock);
         SysScanDescData* scan = NativeMethods.systable_beginscan(rel, 0, false, null, 0, null);
         uint? result = null;
+        bool exact = false;
         HeapTupleData* tuple;
         while ((tuple = NativeMethods.systable_getnext(scan)) is not null)
         {
@@ -611,12 +614,15 @@ internal sealed partial class WorfNode
             if (IsWorkerOrigin(originName, slotName))
             {
                 result = (uint)NativeMethods.heap_getattr(tuple, AnumSubOrigin, rel->rd_att, &isnull);
-                break;
+                if (originName == slotName)
+                {
+                    break;
+                }
             }
-
-            if (relayed is not null && IsWorkerOrigin(relayed, slotName))
+            else if (relayed is not null && !exact && IsWorkerOrigin(relayed, slotName))
             {
                 result = writer;
+                exact = relayed == slotName;
             }
         }
 
@@ -711,14 +717,13 @@ internal sealed partial class WorfNode
     /// Gets the node whose changes a replication origin applied when a transaction ran, and the subscription it applied
     /// them for, from what worf recorded. For a transaction older than <see cref="OriginWriterKeptSince"/>, whose record
     /// can be forgotten, it's what the origin applies for now when worf recorded nothing older, as pglogical takes every
-    /// row's origin to be, unless asked for only what worf recorded.
+    /// row's origin to be.
     /// </summary>
     /// <param name="originId">The origin's id.</param>
     /// <param name="xid">The transaction, within the last two billion.</param>
-    /// <param name="recordedOnly">Whether to take only what worf recorded as of the transaction.</param>
     /// <returns>The node and the subscription, zeros when worf had dropped the origin, or null when worf didn't record
     /// the origin.</returns>
-    internal static (uint Writer, uint SubId)? OriginWriter(ushort originId, uint xid, bool recordedOnly = false)
+    internal static (uint Writer, uint SubId)? OriginWriter(ushort originId, uint xid)
     {
         SpiResult result = Worf.Read("""
             SELECT writer_node, sub_id FROM worf.origin_writer
@@ -726,7 +731,7 @@ internal sealed partial class WorfNode
             ORDER BY since_xid <= $2::text::xid8 DESC, since_xid DESC
             LIMIT 1
             """, 1, SpiParameter.Create((uint)originId), SpiParameter.Create((long)Worf.FullTransactionId(xid)),
-            SpiParameter.Create(recordedOnly ? 0L : (long)OriginWriterKeptSince));
+            SpiParameter.Create((long)OriginWriterKeptSince));
         return result.Count == 0 ? null : (result[0].Get<uint>(0), result[0].Get<uint>(1));
     }
 
@@ -852,31 +857,48 @@ internal sealed partial class WorfNode
             """);
 
     /// <summary>
-    /// Checks whether every replication origin slot in shared memory is taken while the origin of an enabled PostgreSQL
-    /// subscription, or of one of its table syncs, has none, and a worker of the subscription runs or can start: its
-    /// owner can log in, its database allows connections, and <c>max_logical_replication_workers</c> leaves room. Unlike
+    /// Lists the origins of enabled PostgreSQL subscriptions, and of their table syncs, that have no replication origin
+    /// slot in shared memory while every one is taken, and a worker of whose subscription runs or can start: its owner
+    /// can log in, its database allows connections, and <c>max_logical_replication_workers</c> leaves room. Unlike
     /// worf's workers, those don't say when they find no slot free, and exit at once when they do. An origin that nothing
     /// sets up, such as a disabled subscription's, one whose worker can't start, or one a user created, has none too,
-    /// and doesn't count.
+    /// and isn't listed.
     /// </summary>
-    /// <returns>Whether one is.</returns>
-    internal static bool OriginSlotWantedElsewhere()
-        => Worf.ReadScalar<bool>("""
-            SELECT count(*) >= coalesce(pg_catalog.current_setting('max_active_replication_origins', true),
+    /// <returns>The origins' names.</returns>
+    internal static List<string> OriginsWantingSlots()
+    {
+        SpiResult wanting = Worf.Read("""
+            SELECT o.roname::text FROM pg_catalog.pg_subscription s
+                JOIN pg_catalog.pg_replication_origin o
+                    ON o.roname = 'pg_' || s.oid OR starts_with(o.roname, 'pg_' || s.oid || '_')
+                JOIN pg_catalog.pg_roles r ON r.oid = s.subowner
+                JOIN pg_catalog.pg_database d ON d.oid = s.subdbid
+            WHERE s.subenabled AND
+                (SELECT count(*) FROM pg_catalog.pg_replication_origin_status) >= coalesce(
+                    pg_catalog.current_setting('max_active_replication_origins', true),
                     pg_catalog.current_setting('max_replication_slots'))::integer AND
-                EXISTS (SELECT 1 FROM pg_catalog.pg_subscription s
-                    JOIN pg_catalog.pg_replication_origin o
-                        ON o.roname = 'pg_' || s.oid OR starts_with(o.roname, 'pg_' || s.oid || '_')
-                    JOIN pg_catalog.pg_roles r ON r.oid = s.subowner
-                    JOIN pg_catalog.pg_database d ON d.oid = s.subdbid
-                    WHERE s.subenabled AND
-                        NOT EXISTS (SELECT 1 FROM pg_catalog.pg_replication_origin_status st WHERE st.local_id = o.roident) AND
-                        (EXISTS (SELECT 1 FROM pg_catalog.pg_stat_subscription w WHERE w.subid = s.oid AND w.pid IS NOT NULL) OR
-                            (r.rolcanlogin AND d.datallowconn AND
-                                (SELECT count(*) FROM pg_catalog.pg_stat_subscription w WHERE w.pid IS NOT NULL) <
-                                    pg_catalog.current_setting('max_logical_replication_workers')::integer)))
-            FROM pg_catalog.pg_replication_origin_status
-            """);
+                NOT EXISTS (SELECT 1 FROM pg_catalog.pg_replication_origin_status st WHERE st.local_id = o.roident) AND
+                (EXISTS (SELECT 1 FROM pg_catalog.pg_stat_subscription w WHERE w.subid = s.oid AND w.pid IS NOT NULL) OR
+                    (r.rolcanlogin AND d.datallowconn AND
+                        (SELECT count(*) FROM pg_catalog.pg_stat_subscription w WHERE w.pid IS NOT NULL) <
+                            pg_catalog.current_setting('max_logical_replication_workers')::integer))
+            """, 0);
+        return [.. Enumerable.Range(0, wanting.Count).Select(i => wanting[i].Get<string>(0))];
+    }
+
+    /// <summary>
+    /// Lists those of some replication origins that have no slot in shared memory.
+    /// </summary>
+    /// <param name="names">The origins' names.</param>
+    /// <returns>The names of those that have none.</returns>
+    internal static List<string> OriginsWithoutSlots(IReadOnlyCollection<string> names)
+    {
+        SpiResult without = Worf.Read("""
+            SELECT o.roname::text FROM pg_catalog.pg_replication_origin o
+            WHERE o.roname = ANY ($1) AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_replication_origin_status st WHERE st.local_id = o.roident)
+            """, 0, SpiParameter.Create(names.ToArray()));
+        return [.. Enumerable.Range(0, without.Count).Select(i => without[i].Get<string>(0))];
+    }
 
     /// <summary>
     /// Checks whether an origin is the apply or a table sync worker's own origin for a subscription: the slot's name,

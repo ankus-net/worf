@@ -207,21 +207,26 @@ internal static class Rpc
     }
 
     /// <summary>
-    /// Lists the slots in the provider's database that a subscription's table syncs create: the subscription's slot
-    /// name followed by a table's hash.
+    /// Lists which of the slots a subscription's table syncs create are in the provider's database. The names are those
+    /// of the subscription's tables, rather than any that look like one, which another subscription's own slot may.
     /// </summary>
     /// <param name="conn">The provider connection, inside a local transaction.</param>
-    /// <param name="slotName">The subscription's slot name.</param>
+    /// <param name="names">The names of the slots the subscription's table syncs create.</param>
     /// <returns>Each slot's name, and whether a process holds it.</returns>
-    internal static List<(string Name, bool Active)> RemoteSyncSlots(PgReplicationConnection conn, string slotName)
+    internal static List<(string Name, bool Active)> RemoteSyncSlots(PgReplicationConnection conn, IReadOnlyCollection<string> names)
     {
+        if (names.Count == 0)
+        {
+            return [];
+        }
+
         IReadOnlyList<string?[]> res;
         try
         {
             res = conn.Query($"""
                 SELECT slot_name, active FROM pg_catalog.pg_replication_slots
                 WHERE database = pg_catalog.current_database() AND plugin = {Spi.QuoteLiteral(Worf.ExtensionName)}
-                    AND slot_name ~ {Spi.QuoteLiteral($"^{slotName}_[0-9a-f]{{8}}$")}
+                    AND slot_name OPERATOR(pg_catalog.=) ANY (ARRAY[{string.Join(", ", names.Select(Spi.QuoteLiteral))}]::pg_catalog.name[])
                 """, 2);
         }
         catch (PgRemoteException error)

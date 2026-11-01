@@ -462,8 +462,9 @@ public sealed class ExceptionBehaviourTests
     /// a lock with changes to the table from after the copy skipped, catches up from its copy when it starts again, with
     /// those changes, and leaves its slot to the apply worker when its cleanup can't reach the provider. When its slot is
     /// gone or invalidated, or its origin has no progress, it copies the table again and merges the copy in, in one
-    /// transaction, so the table is never seen empty: rows it wrote that the provider has since deleted go, though a key
-    /// references the table, and rows written here or under another origin stay. One cancelled before its copy commits
+    /// transaction, so the table is never seen empty, though a key references the table, its own key is an identity or
+    /// deferrable: the provider's rows replace those with the same key, and the table's other rows stay, those written
+    /// here or under another origin, and those the provider has since deleted. One cancelled before its copy commits
     /// copies a table without a key once, and the cleanup after it waits for a session that holds its slot, with a
     /// warning, rather than for ever. Dropping the subscription drops the slots its syncs left.
     /// </summary>
@@ -490,16 +491,41 @@ public sealed class ExceptionBehaviourTests
         string slot = await subscriber.SafePsqlAsync(Database, "SELECT sub_slot_name FROM worf.subscription", token);
         const string SyncWorkers = "SELECT pid FROM pg_stat_activity WHERE backend_type LIKE 'worf sync%'";
 
+        // DDL on a table that commits while the apply worker waits for its lock to open it leaves the worker to look the
+        // table up again.
+        _ = await provider.SafePsqlAsync(Database, "INSERT INTO x DEFAULT VALUES; SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
+        await using (NpgsqlConnection altering = await subscriber.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction alter = await altering.BeginTransactionAsync(token);
+            await using (NpgsqlCommand command = new("LOCK TABLE x; ALTER TABLE x SET (fillfactor = 90)", altering, alter))
+            {
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+
+            _ = await provider.SafePsqlAsync(Database, "INSERT INTO x DEFAULT VALUES", token);
+            Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE relation = 'x'::regclass AND NOT granted)", token), "the apply worker waiting");
+            await alter.CommitAsync(token);
+        }
+
+        _ = await provider.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
+        Assert.AreEqual("2", await subscriber.SafePsqlAsync(Database, "SELECT count(*) FROM x", token), "x's rows");
+        Assert.DoesNotContain("with OID 0", subscriber.ReadLog(), "the subscriber's log");
+
         foreach (string stop in new[] { "resume", "drop", "zero", "lost" })
         {
             string table = $"stopped_{stop}";
-            foreach (TestNode node in new[] { provider, subscriber })
+            _ = await provider.SafePsqlAsync(Database, $"CREATE TABLE {table} (id integer PRIMARY KEY, v text)", token);
+            string key = stop switch
             {
-                _ = await node.SafePsqlAsync(Database, $"CREATE TABLE {table} (id integer PRIMARY KEY, v text)", token);
-            }
+                "zero" => "integer PRIMARY KEY DEFERRABLE UNIQUE",
+                "lost" => "integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY",
+                _ => "integer PRIMARY KEY",
+            };
+            _ = await subscriber.SafePsqlAsync(Database, $"CREATE TABLE {table} (id {key}, v text)", token);
 
             // A key on the subscriber references the table.
-            _ = await subscriber.SafePsqlAsync(Database, $"CREATE TABLE {table}_ref (id integer REFERENCES {table})", token);
+            _ = await subscriber.SafePsqlAsync(Database, $"CREATE TABLE {table}_ref (id integer REFERENCES {table} (id))", token);
 
             _ = await provider.SafePsqlAsync(Database, $"INSERT INTO {table} SELECT g, 'copied' FROM generate_series(1, 1000) g", token);
             int logpos = subscriber.ReadLog().Length;
@@ -548,9 +574,9 @@ public sealed class ExceptionBehaviourTests
 
                 // Rows written here and under another origin, and one that references the table.
                 _ = await subscriber.SafePsqlAsync(Database, $"""
-                    INSERT INTO {table} VALUES (900001, 'here');
+                    INSERT INTO {table} OVERRIDING SYSTEM VALUE VALUES (900001, 'here');
                     SELECT pg_replication_origin_session_setup('elsewhere');
-                    INSERT INTO {table} VALUES (900002, 'elsewhere');
+                    INSERT INTO {table} OVERRIDING SYSTEM VALUE VALUES (900002, 'elsewhere');
                     INSERT INTO {table}_ref VALUES (1);
                     """, token);
 
@@ -611,7 +637,8 @@ public sealed class ExceptionBehaviourTests
                 $"SELECT sync_status = 'r' FROM worf.local_sync_status WHERE sync_relname = '{table}'", token), $"the table synchronized after {stop}");
             await counting.CancelAsync();
             Assert.IsGreaterThanOrEqualTo(1000L, await fewest, $"the fewest rows seen during the sync after {stop}");
-            Assert.AreEqual("1000|500500|updated|f|t|here|elsewhere|1", await subscriber.SafePsqlAsync(Database, $"""
+            Assert.AreEqual(stop == "resume" ? "1000|500500|updated|f|t|here|elsewhere|1" : "1001|501100|updated|t|t|here|elsewhere|1",
+                await subscriber.SafePsqlAsync(Database, $"""
                 SELECT count(*), sum(id) - 700000 + 600, (SELECT v FROM {table} WHERE id = 500),
                     EXISTS (SELECT 1 FROM {table} WHERE id = 600), EXISTS (SELECT 1 FROM {table} WHERE id = 700000),
                     (SELECT v FROM {table} WHERE id = 900001), (SELECT v FROM {table} WHERE id = 900002),
@@ -694,11 +721,15 @@ public sealed class ExceptionBehaviourTests
         Assert.AreEqual("0", await provider.SafePsqlAsync(Database,
             $"SELECT count(*) FROM pg_replication_slots WHERE starts_with(slot_name, '{slot}_')", token), "the syncs' slots left");
 
-        // Dropping the subscription drops the slots its table syncs left, as one stopped before it caught up leaves.
-        _ = await provider.SafePsqlAsync(Database, $"SELECT pg_create_logical_replication_slot('{slot}_0badf00d', 'worf')", token);
+        // Dropping the subscription drops the slots its table syncs left, as one stopped before it caught up leaves, but
+        // not another subscription's own, whose name may look like one, as that of a subscription named sub_20261101 does.
+        _ = await provider.SafePsqlAsync(Database, $"""
+            SELECT pg_create_logical_replication_slot('{slot}_' || lpad(to_hex(hashtext('public.nokey')), 8, '0'), 'worf');
+            SELECT pg_create_logical_replication_slot('{slot}_20261101', 'worf');
+            """, token);
         _ = await subscriber.SafePsqlAsync(Database, "SELECT worf.drop_subscription('sub')", token);
-        Assert.AreEqual("0", await provider.SafePsqlAsync(Database,
-            $"SELECT count(*) FROM pg_replication_slots WHERE starts_with(slot_name, '{slot}')", token), "the slots left after the drop");
+        Assert.AreEqual($"{slot}_20261101", await provider.SafePsqlAsync(Database,
+            $"SELECT string_agg(slot_name, ',') FROM pg_replication_slots WHERE starts_with(slot_name, '{slot}')", token), "the slots left after the drop");
     }
 
     /// <summary>
