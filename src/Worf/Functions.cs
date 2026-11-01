@@ -729,9 +729,11 @@ internal static class Functions
             WorfSyncStatus? oldsync = Sync.GetTableSyncStatus(sub.Id, nspname, relname, true);
             if (oldsync is not null)
             {
+                // A sync that keeps failing, whose worker waits to start again, starts over at once.
                 if (oldsync.Status != Sync.SyncStatusReady &&
                     oldsync.Status != Sync.SyncStatusSyncdone &&
-                    oldsync.Status != Sync.SyncStatusNone)
+                    oldsync.Status != Sync.SyncStatusNone &&
+                    SyncWorkerRuns(sub.Id, nspname, relname))
                 {
                     throw new PgException(PgSqlStates.InternalError, $"table {nspname}.{relname} is already being synchronized");
                 }
@@ -766,6 +768,24 @@ internal static class Functions
         Worker.SubscriptionChanged(sub.Id, false);
 
         return true;
+    }
+
+    /// <summary>
+    /// Checks whether a table's sync worker runs.
+    /// </summary>
+    private static bool SyncWorkerRuns(uint subId, string nspname, string relname)
+    {
+        uint dboid;
+        unsafe
+        {
+            dboid = NativeGlobals.MyDatabaseId;
+        }
+
+        byte[] serverNspname = Worf.ToServer(nspname);
+        byte[] serverRelname = Worf.ToServer(relname);
+        using PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share();
+        int worker = guard.Read((in _, workers) => Worker.SyncFind(workers, dboid, subId, serverNspname, serverRelname));
+        return worker >= 0 && guard[worker].Proc != 0;
     }
 
     /// <summary>

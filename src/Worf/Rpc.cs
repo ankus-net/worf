@@ -135,7 +135,9 @@ internal static class Rpc
     {
         try
         {
-            return conn.Query("SELECT '-1234567'::pg_catalog.money::pg_catalog.text", 1)[0][0]!;
+            return conn.Query("""
+                SELECT '-1234567'::pg_catalog.money::pg_catalog.text || ' = ' || '-1234567'::pg_catalog.money::pg_catalog.numeric::pg_catalog.text
+                """, 1)[0][0]!;
         }
         catch (PgRemoteException error)
         {

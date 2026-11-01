@@ -77,13 +77,17 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   transaction that a subscription applies again, and how, is kept in
   `worf.exception_state` across restarts. Table sync workers catching up
   after a copy handle failures the same way. In a table's initial copy, a row
-  whose value doesn't convert to its column's type is skipped under `discard`
+  that fails, whether its value doesn't convert to its column's type, the
+  column's input refuses it or a constraint does, is skipped under `discard`
   and `transdiscard` and disables the subscription under `sub_disable`, and is
   recorded as a `COPY` with its text, its number in the copy as the action
-  counter and the copy's position. Under `error` the copy stops, naming the
-  row, column and value, and starts again after a delay of 5 seconds that
-  doubles each time, up to 5 minutes, from the start of a table's last copy or
-  the failure of a subscription's first. The default is `error`.
+  counter and the copy's position. A row that fails other than to convert has
+  the table copied again a row at a time, each in its own subtransaction. Under
+  `error` the copy stops, naming the row, column and value, and starts again
+  after a delay of 5 seconds that doubles each time, up to 5 minutes, from the
+  start of a table's last copy or the failure of a subscription's first;
+  `worf.alter_subscription_resynchronize_table` starts it again at once. The
+  default is `error`.
 
 - `worf.enable_ddl_replication`
   Replicates DDL as it runs, through the `ddl_sql` replication set as

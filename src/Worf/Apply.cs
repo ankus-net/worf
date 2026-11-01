@@ -2298,7 +2298,18 @@ internal static unsafe partial class Apply
     /// <summary>
     /// Load list of tables currently pending sync. Must be inside transaction.
     /// </summary>
-    private static void RereadUnsyncedTables(uint subid) => s_syncingTables = Sync.GetUnsyncedTables(subid);
+    private static void RereadUnsyncedTables(uint subid)
+    {
+        List<WorfSyncStatus> before = s_syncingTables;
+        s_syncingTables = Sync.GetUnsyncedTables(subid);
+
+        // A table whose sync starts over, as a resynchronization asks, starts without waiting for its earlier starts.
+        foreach (WorfSyncStatus sync in s_syncingTables.Where(sync => sync.Status == Sync.SyncStatusInit && sync.Statuslsn == 0 &&
+            !before.Exists(old => old.Nspname == sync.Nspname && old.Relname == sync.Relname && old.Status == Sync.SyncStatusInit && old.Statuslsn == 0)))
+        {
+            _ = s_syncStarts.Remove((sync.Nspname, sync.Relname));
+        }
+    }
 
     private static void ProcessSyncingTables(ulong endLsn)
     {

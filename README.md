@@ -56,16 +56,20 @@ as an enum's array, is used only for a column made of the same enums, since the
 provider's labels may be ones they lack. Values of a type the subscriber lacks,
 defines differently or doesn't use are read by the column type's input when
 sent as text (in the initial copy, with `force_text_transfer`, between major
-versions, and for composites and arrays of types that aren't PostgreSQL's own),
+versions, for composites and arrays of types that aren't PostgreSQL's own, and
+for domains and ranges of anything but PostgreSQL's own plain types),
 and fail with error 42804 when sent in binary. Values convert under the
 subscriber's settings, such as `TimeZone` and `bytea_output`, however they're
 sent. The initial copy passes the text of a value that needs no conversion,
 such as an integer going into a wider one or `varchar` into `text`, straight to
 the column. A value that doesn't convert fails with PostgreSQL's error, which
 `worf.exception_behaviour` handles, in the initial copy too. Values of `money`,
-or made of it, fail with error 55000 when the provider's `lc_monetary` formats
-money otherwise than the subscriber's, as in another currency or with other
-fraction digits, since they count the provider's currency. An older worf
+or made of it, going into a column that holds money, fail with error 55000 when
+the provider's `lc_monetary` counts other fraction digits than the subscriber's,
+since the stored amounts then differ, or formats money in text that the
+subscriber's reads as another amount. A provider whose `lc_monetary` changes
+ends its stream at the next transaction, so that the subscriber reconnects and
+checks again. An older worf
 doesn't send or read column types, or say how it formats money, so columns
 replicated through an older provider, subscriber or relay node need the same
 types, and money the same `lc_monetary`. `CHECK` constraints, `NOT NULL`
@@ -776,13 +780,17 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   transaction that a subscription applies again, and how, is kept in
   `worf.exception_state` across restarts. Table sync workers catching up
   after a copy handle failures the same way. In a table's initial copy, a row
-  whose value doesn't convert to its column's type is skipped under `discard`
+  that fails, whether its value doesn't convert to its column's type, the
+  column's input refuses it or a constraint does, is skipped under `discard`
   and `transdiscard` and disables the subscription under `sub_disable`, and is
   recorded as a `COPY` with its text, its number in the copy as the action
-  counter and the copy's position. Under `error` the copy stops, naming the
-  row, column and value, and starts again after a delay of 5 seconds that
-  doubles each time, up to 5 minutes, from the start of a table's last copy or
-  the failure of a subscription's first. The default is `error`.
+  counter and the copy's position. A row that fails other than to convert has
+  the table copied again a row at a time, each in its own subtransaction. Under
+  `error` the copy stops, naming the row, column and value, and starts again
+  after a delay of 5 seconds that doubles each time, up to 5 minutes, from the
+  start of a table's last copy or the failure of a subscription's first;
+  `worf.alter_subscription_resynchronize_table` starts it again at once. The
+  default is `error`.
 
 - `worf.enable_ddl_replication`
   Replicates DDL as it runs, through the `ddl_sql` replication set as

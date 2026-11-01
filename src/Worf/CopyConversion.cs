@@ -8,9 +8,11 @@ namespace Worf;
 /// Copies a table whose values convert from the provider's types through PostgreSQL's own <c>COPY FROM</c>, as the
 /// other tables are copied. Each row's converted values are converted as replication converts a value sent as text,
 /// and written as the column type's output writes them, which COPY's input reads back, and a value that fails names
-/// its row and column as COPY's errors do. Under <c>worf.exception_behaviour</c> other than <c>error</c>, a row whose
-/// value fails to convert is skipped and recorded in <c>worf.exception_log</c>, or disables the subscription once the
-/// copy rolls back.
+/// its row and column as COPY's errors do. Under <c>worf.exception_behaviour</c> other than <c>error</c>, which copies
+/// every table this way, a row that fails, whether a value fails to convert, its column's input refuses it or a
+/// constraint does, is skipped and recorded in <c>worf.exception_log</c>, or disables the subscription once the copy
+/// rolls back. A row whose value fails to convert is skipped as it's read; any other failure has the table copied
+/// again a row at a time, each in its own <c>COPY</c> and subtransaction.
 /// </summary>
 internal static unsafe partial class CopyConversion
 {
@@ -49,8 +51,15 @@ internal static unsafe partial class CopyConversion
     // A row that failed under sub_disable, which disables the subscription once the copy rolls back.
     private static (WorfFailedChange Change, PgException Error)? s_disabling;
 
+    // The row a copy of one row passes to COPY, its length, and how much of it COPY has read.
+    private static int s_oneLength;
+    private static int s_oneRead;
+
     [PgNativeCallback(nameof(ReadRows))]
     private static partial copy_data_source_cb DataSource { get; }
+
+    [PgNativeCallback(nameof(ReadOneRow))]
+    private static partial copy_data_source_cb OneRowSource { get; }
 
     /// <summary>
     /// Copies the rows of a <c>COPY ... TO STDOUT</c> started on the connection into a local table, converting the
@@ -62,9 +71,10 @@ internal static unsafe partial class CopyConversion
     /// <param name="conversions">Each local column's conversion, by its number less one, or null where the column's
     /// own input reads the provider's text.</param>
     /// <param name="commitLsn">The position the copy is consistent with, which the exception log records.</param>
+    /// <param name="restart">Starts the provider's copy again, for a copy a row at a time.</param>
     /// <returns>The number of rows copied.</returns>
     internal static ulong Copy(PgReplicationConnection conn, WorfRelation rel, List<string> attnames,
-        WorfColumnConversion?[] conversions, ulong commitLsn)
+        WorfColumnConversion?[] conversions, ulong commitLsn, Action restart)
     {
         RelationData* relation = NativeMethods.table_open(rel.Reloid, RowExclusiveLock);
         MemoryContextData* context;
@@ -108,8 +118,6 @@ internal static unsafe partial class CopyConversion
             s_rowStart = s_rowEnd = 0;
             s_context = context;
             s_change = null;
-            CopyFromStateData* cstate = NativeMethods.BeginCopyFrom(pstate, relation, null, null, false, DataSource, attnamelist, null);
-            s_cstate = cstate;
 
             // Unless worf.exception_behaviour stops at a failure, each row converts in its own subtransaction.
             if (Apply.ExceptionBehaviour != WorfExceptionBehaviour.Error)
@@ -134,14 +142,35 @@ internal static unsafe partial class CopyConversion
                 NativeMethods.PushActiveSnapshot(NativeMethods.GetTransactionSnapshot());
             }
 
-            ulong copied = NativeMethods.CopyFrom(cstate);
-            NativeMethods.EndCopyFrom(cstate);
-
-            // Text COPY can stop at an end-of-data line, and data after it would leave the connection mid-copy.
-            byte extra;
-            if (ReadRows(&extra, 1, 1) != 0)
+            ulong copied;
+            if (s_change is null)
             {
-                throw new PgException(PgSqlStates.ProtocolViolation, "the copy sent data after its end-of-data marker");
+                copied = CopyAll(pstate, relation, attnamelist);
+            }
+            else
+            {
+                try
+                {
+                    copied = PgTransaction.RunInSubtransaction(() => CopyAll(pstate, relation, attnamelist), PgSubtransactionMode.Atomic);
+                }
+                catch (PgException error) when (!Apply.IsTransient(error) && s_disabling is null)
+                {
+                    // The rest of the provider's rows are read and passed over, and the copy starts again a row at a
+                    // time.
+                    PgLog.Log($"copying table {rel.Nspname}.{rel.Relname} again a row at a time, as a row failed: {error.Message}");
+                    while (!s_ended)
+                    {
+                        s_rowStart = s_rowEnd = 0;
+                        PgInterrupts.Check();
+                        if (s_conn!.Receive(TimeSpan.FromSeconds(1), out _) == PgReplicationReceiveStatus.Ended)
+                        {
+                            s_ended = true;
+                        }
+                    }
+
+                    restart();
+                    copied = CopyEachRow(pstate, relation, attnamelist);
+                }
             }
 
             if (snapshot)
@@ -166,6 +195,118 @@ internal static unsafe partial class CopyConversion
             NativeMethods.table_close(relation, NoLock);
         }
     }
+
+    /// <summary>
+    /// Copies the provider's rows in one COPY.
+    /// </summary>
+    private static ulong CopyAll(ParseState* pstate, RelationData* relation, List* attnamelist)
+    {
+        CopyFromStateData* cstate = NativeMethods.BeginCopyFrom(pstate, relation, null, null, false, DataSource, attnamelist, null);
+        s_cstate = cstate;
+        ulong copied = NativeMethods.CopyFrom(cstate);
+        NativeMethods.EndCopyFrom(cstate);
+
+        // Text COPY can stop at an end-of-data line, and data after it would leave the connection mid-copy.
+        byte extra;
+        if (ReadRows(&extra, 1, 1) != 0)
+        {
+            throw new PgException(PgSqlStates.ProtocolViolation, "the copy sent data after its end-of-data marker");
+        }
+
+        return copied;
+    }
+
+    /// <summary>
+    /// Copies the provider's rows a row at a time, each in its own COPY and subtransaction, and records a row that
+    /// fails: skipped, or kept to disable the subscription as it fails the copy.
+    /// </summary>
+    private static ulong CopyEachRow(ParseState* pstate, RelationData* relation, List* attnamelist)
+    {
+        s_ended = false;
+        s_line = 0;
+        ulong copied = 0;
+        while (true)
+        {
+            PgInterrupts.Check();
+            PgReplicationReceiveStatus status = s_conn!.Receive(TimeSpan.FromSeconds(1), out ReadOnlySpan<byte> message);
+            if (status == PgReplicationReceiveStatus.Ended)
+            {
+                s_ended = true;
+                return copied;
+            }
+
+            if (status != PgReplicationReceiveStatus.Message)
+            {
+                continue;
+            }
+
+            s_line++;
+            if (s_message.Length < message.Length)
+            {
+                s_message = new byte[Math.Max(message.Length, s_message.Length * 2)];
+            }
+
+            message.CopyTo(s_message);
+            s_oneLength = message.Length;
+            try
+            {
+                copied += PgTransaction.RunInSubtransaction(() =>
+                {
+                    s_oneRead = -1;
+                    CopyFromStateData* cstate = NativeMethods.BeginCopyFrom(pstate, relation, null, null, false, OneRowSource, attnamelist, null);
+                    s_cstate = cstate;
+                    ulong one = NativeMethods.CopyFrom(cstate);
+                    NativeMethods.EndCopyFrom(cstate);
+                    return one;
+                }, PgSubtransactionMode.Atomic);
+            }
+            catch (PgException error) when (!Apply.IsTransient(error))
+            {
+                WorfFailedChange change = Failed(s_message.AsSpan(0, s_oneLength));
+                if (s_behaviour == WorfExceptionBehaviour.SubDisable)
+                {
+                    s_disabling = (change, error);
+                    throw;
+                }
+
+                ExceptionLog.Record(change, WorfExceptionBehaviour.Discard, error);
+            }
+        }
+    }
+
+    /// <summary>
+    /// COPY's data source for a copy of one row: the row, converted, numbered as the provider's row it is.
+    /// </summary>
+    private static int ReadOneRow(void* outbuf, int minread, int maxread)
+    {
+        _ = minread;
+        if (s_oneRead < 0)
+        {
+            WriteRow(s_message.AsSpan(0, s_oneLength));
+            s_cstate->cur_lineno = s_line;
+            s_oneRead = 0;
+        }
+
+        int len = Math.Min(s_convertedLength - s_oneRead, maxread);
+        s_converted.AsSpan(s_oneRead, len).CopyTo(new Span<byte>(outbuf, maxread));
+        s_oneRead += len;
+        return len;
+    }
+
+    /// <summary>
+    /// Describes a row of the copy that failed, as the exception log records it.
+    /// </summary>
+    private static WorfFailedChange Failed(ReadOnlySpan<byte> message) => new()
+    {
+        Subscription = s_change!.Subscription,
+        WriterNodeId = s_change.WriterNodeId,
+        CommitTime = s_change.CommitTime,
+        CommitLsn = s_change.CommitLsn,
+        ActionCounter = (uint)s_line,
+        Operation = Operation,
+        Relation = s_change.Relation,
+        NewTuple = RowJson(message),
+    };
 
     /// <summary>
     /// Disables the subscription after a row of its copy failed under <c>sub_disable</c>, once the copy rolled back,
@@ -272,6 +413,14 @@ internal static unsafe partial class CopyConversion
 
                 row.CopyTo(output[written..]);
                 written += row.Length;
+
+                // COPY numbers the rows it reads in one call one after another, so where rows may be skipped, each
+                // comes in a call of its own, numbered as the provider's row it is.
+                if (s_change is not null)
+                {
+                    return written;
+                }
+
                 continue;
             }
 
@@ -327,17 +476,7 @@ internal static unsafe partial class CopyConversion
         catch (PgException error) when (!Apply.IsTransient(error))
         {
             ForgetValue(lineno);
-            WorfFailedChange change = new()
-            {
-                Subscription = s_change.Subscription,
-                WriterNodeId = s_change.WriterNodeId,
-                CommitTime = s_change.CommitTime,
-                CommitLsn = s_change.CommitLsn,
-                ActionCounter = (uint)s_line,
-                Operation = Operation,
-                Relation = s_change.Relation,
-                NewTuple = RowJson(s_message.AsSpan(0, length)),
-            };
+            WorfFailedChange change = Failed(s_message.AsSpan(0, length));
 
             // Under sub_disable, the row converts again to fail the copy, naming its row and column.
             if (s_behaviour == WorfExceptionBehaviour.SubDisable)

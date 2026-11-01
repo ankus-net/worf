@@ -283,6 +283,15 @@ internal static unsafe partial class OutputPlugin
             SendStartupMessage(ctx, data, false /* can't be last message */);
         }
 
+        // A reload that changed lc_monetary since the startup message ends the stream, so that the subscriber hears how
+        // money is formatted again as it reconnects, rather than read its values as it was formatted before.
+        if (OutputConfig.AnnouncedMoneyFormat is string announced && OutputConfig.MoneyFormat() != announced)
+        {
+            throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState,
+                $"lc_monetary formats money as \"{OutputConfig.MoneyFormat()}\" where this walsender told the subscriber \"{announced}\"",
+                hint: "The subscriber reconnects and hears the new format.");
+        }
+
         // If the record didn't originate locally, send origin info
         sendReplicationOrigin &= txn->origin_id != 0;
 

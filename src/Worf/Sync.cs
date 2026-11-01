@@ -1237,6 +1237,11 @@ internal static class Sync
         List<string> attnamelist = MakeCopyAttnamelist(rel);
         WorfColumnConversion?[]? converted = attnamelist.Count != 0 ? FindCopyConversions(rel) : null;
         uint reloid = rel.Reloid;
+        int natts;
+        unsafe
+        {
+            natts = rel.Rel->rd_att->natts;
+        }
 
         StringBuilder attlist = new();
         bool first = true;
@@ -1296,26 +1301,32 @@ internal static class Sync
         query.Append("TO stdout");
 
         // Execute COPY TO.
-        try
+        void Start()
         {
-            originConn.StartCopy(query.ToString());
-        }
-        catch (PgRemoteException error)
-        {
-            throw new PgException(PgSqlStates.InternalError, "table copy failed",
-                detail: $"Query '{query}': ERROR:  {error.Message}\n");
+            try
+            {
+                originConn.StartCopy(query.ToString());
+            }
+            catch (PgRemoteException error)
+            {
+                throw new PgException(PgSqlStates.InternalError, "table copy failed",
+                    detail: $"Query '{query}': ERROR:  {error.Message}\n");
+            }
         }
 
+        Start();
+
         // Execute COPY FROM. A table whose values convert is copied with their conversions, under this node's own
-        // settings, which conversions follow, as in replication.
-        if (converted is null)
+        // settings, which conversions follow, as in replication, and so is any table under worf.exception_behaviour
+        // other than error, which skips or records the rows that fail.
+        if (converted is null && (Apply.ExceptionBehaviour == WorfExceptionBehaviour.Error || attnamelist.Count == 0))
         {
             _ = originConn.CopyInto(reloid, attnamelist.Count != 0 ? attnamelist : null);
         }
         else
         {
-            SetCopyTargetStyle(true);
-            _ = CopyConversion.Copy(originConn, rel, attnamelist, converted, lsn);
+            SetCopyTargetStyle(converted is not null);
+            _ = CopyConversion.Copy(originConn, rel, attnamelist, converted ?? new WorfColumnConversion?[natts], lsn, Start);
             SetCopyTargetStyle(false);
         }
 

@@ -338,7 +338,7 @@ internal static partial class RelCache
         uint local = NativeMethods.getBaseType(att->atttypid);
         uint readType = 0;
         string name;
-        if (SendsMoney(remote) && ProviderMoneyFormat is string providerFormat && providerFormat != OutputConfig.MoneyFormat())
+        if (SendsMoney(remote) && ProviderMoneyFormat is string providerFormat && HoldsMoney(att->atttypid) && !MoneyReadsAlike(providerFormat))
         {
             string column = Worf.FromServer((sbyte*)&att->attname);
             return new WorfColumnConversion(column, "money", 0, att->atttypid, att->atttypmod,
@@ -473,6 +473,69 @@ internal static partial class RelCache
         => remote.Definition is null
             ? remote.Oid is MoneyOid or MoneyArrayOid
             : remote.Definition.Split('(', ')', ',').Any(part => part is MoneyOidText or MoneyArrayOidText);
+
+    /// <summary>
+    /// Checks whether money the provider formats one way means here what it means there: its values count the same
+    /// fraction digits, so that its stored amounts agree, and its text, which a value sent as text is, reads here as
+    /// the same amount, or fails to read at all, rather than as another.
+    /// </summary>
+    /// <param name="providerFormat">How the provider formats money, as <see cref="OutputConfig.MoneyFormat"/> shows it.</param>
+    /// <returns>Whether it does.</returns>
+    internal static bool MoneyReadsAlike(string providerFormat)
+    {
+        string local = OutputConfig.MoneyFormat();
+        if (providerFormat == local)
+        {
+            return true;
+        }
+
+        if (OutputConfig.MoneyAmount(providerFormat) != OutputConfig.MoneyAmount(local))
+        {
+            return false;
+        }
+
+        try
+        {
+            return PgTransaction.RunInSubtransaction(() => Worf.ReadScalar<bool>(
+                "SELECT $1::pg_catalog.money OPERATOR(pg_catalog.=) '-1234567'::pg_catalog.money",
+                SpiParameter.Create(OutputConfig.MoneyText(providerFormat))), PgSubtransactionMode.Atomic);
+        }
+        catch (PgException)
+        {
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Checks whether a type's values hold money: it's money, or an array, domain or composite type of it.
+    /// </summary>
+    private static bool HoldsMoney(uint typid)
+    {
+        unsafe
+        {
+            uint basetype = NativeMethods.getBaseType(typid);
+            if (basetype is MoneyOid or MoneyArrayOid)
+            {
+                return true;
+            }
+
+            uint element = NativeMethods.get_element_type(basetype);
+            if (element != 0)
+            {
+                return HoldsMoney(element);
+            }
+
+            uint relid = NativeMethods.get_typ_typrelid(basetype);
+            if (relid == 0)
+            {
+                return false;
+            }
+
+            SpiResult attributes = Worf.Read(
+                "SELECT atttypid FROM pg_catalog.pg_attribute WHERE attrelid = $1 AND attnum > 0 AND NOT attisdropped", 0, SpiParameter.Create(relid));
+            return Enumerable.Range(0, attributes.Count).Any(i => HoldsMoney(attributes[i].Get<uint>(0)));
+        }
+    }
 
     /// <summary>
     /// Checks whether a type exists here and its values can be read, which a shell or pseudo-type's can't.

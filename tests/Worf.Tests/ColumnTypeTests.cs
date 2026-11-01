@@ -108,6 +108,11 @@ public sealed class ColumnTypeTests
                 h numeric, i app.feeling, j amount, k span, l pair, m gone, n citext, o pair, p pair[], q mood, r numdom[],
                 s boolean, u text, v text, w st, x st, y st, z fspan, za span);
             SELECT * FROM worf.replication_set_add_table('default', 't');
+            CREATE DOMAIN moods AS mood[];
+            CREATE DOMAIN mpd AS mpair;
+            CREATE TYPE moodrange AS RANGE (subtype = mood);
+            CREATE TABLE ut (id integer PRIMARY KEY, a moods, c mpd, r moodrange);
+            SELECT * FROM worf.replication_set_add_table('default', 'ut');
             """, token);
         _ = await provider.SafePsqlAsync(Database, "SELECT * FROM pg_create_logical_replication_slot('column_types', 'worf')", token);
         _ = await subscriber.SafePsqlAsync(Database, """
@@ -116,6 +121,7 @@ public sealed class ColumnTypeTests
                 s integer, u bit(4), v varbit(3), w integer, x bigint, y timestamp, z fspan, za boolean);
             CREATE TABLE zt (id integer PRIMARY KEY, n integer, tz timestamp, by text, e text[], p text, r tsrange);
             CREATE TABLE mt (id integer PRIMARY KEY, m money);
+            CREATE TABLE ut (id integer PRIMARY KEY, a text, c text, r text);
             """, token);
         _ = await subscriber.SafePsqlAsync(Database, $"""
             SELECT worf.create_subscription(
@@ -184,6 +190,11 @@ public sealed class ColumnTypeTests
             SELECT worf.wait_slot_confirm_lsn(NULL, NULL);
             """, token);
 
+        // Domains over an enum's array and over a composite, and a range of an enum, go into text, in binary streaming.
+        _ = await provider.SafePsqlAsync(Database, "INSERT INTO ut VALUES (1, '{happy}', '(happy,1)', '[sad,happy)')", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM ut)", token), "ut's row");
+        Assert.AreEqual("{happy}|(happy,1)|[sad,happy)", await subscriber.SafePsqlAsync(Database, "SELECT concat_ws('|', a, c, r) FROM ut", token));
+
         Assert.AreEqual(
             "1|2147483647|2|3|40|5|happy|6|3|tense|5|(1,2)|x|(1,2)|{\"(1,2)\"}|happy|{1}|1010|101\n" +
             "3|1|2|3|5|angry|6|1|calm|5\n" +
@@ -239,6 +250,14 @@ public sealed class ColumnTypeTests
             SELECT worf.alter_subscription_resynchronize_table('sub', 'zt');
             SELECT worf.alter_subscription_resynchronize_table('sub', 'mt');
             """, token);
+        // A table whose types are the same on both nodes but whose rows the subscriber's own constraints refuse: a
+        // shorter varchar, a domain only it has, and an enum that lacks a label.
+        _ = await provider.SafePsqlAsync(Database, """
+            CREATE TABLE ct (id integer PRIMARY KEY, v varchar(10), d integer, m mood);
+            INSERT INTO ct VALUES (1, 'ok', 1, 'sad'), (2, 'too long', 1, 'sad'), (3, 'ok', 500, 'sad'), (4, 'ok', 1, 'angry'),
+                (5, 'ok', 1, 'happy');
+            SELECT * FROM worf.replication_set_add_table('zs', 'ct');
+            """, token);
         _ = await subscriber.SafePsqlAsync(Database, $"CREATE DATABASE {TextDatabase}", token);
         _ = await subscriber.SafePsqlAsync(TextDatabase, "CREATE EXTENSION worf", token);
         _ = await subscriber.SafePsqlAsync(TextDatabase, $"""
@@ -247,6 +266,8 @@ public sealed class ColumnTypeTests
             CREATE TYPE mpair AS (m mood, n integer);
             CREATE TABLE zt (id integer PRIMARY KEY, n integer, tz timestamp, by text, e text[], p text, r tsrange);
             CREATE TABLE mt (id integer PRIMARY KEY, m money);
+            CREATE DOMAIN small AS integer CHECK (VALUE < 100);
+            CREATE TABLE ct (id integer PRIMARY KEY, v varchar(3), d small, m mood);
             """, token);
         _ = await subscriber.SafePsqlAsync(TextDatabase, $"""
             SELECT worf.create_subscription(
@@ -292,6 +313,13 @@ public sealed class ColumnTypeTests
                 FROM worf.exception_log WHERE table_name = 'mt' ORDER BY log_id
                 """, token));
         }
+
+        // Each row the copy can't write is skipped and recorded under discard, numbered as the provider's row it is.
+        Assert.AreEqual("1\n5", await subscriber.SafePsqlAsync(TextDatabase, "SELECT id FROM ct ORDER BY id", token));
+        Assert.AreEqual("COPY|2|22001|2\nCOPY|3|23514|3\nCOPY|4|22P02|4", await subscriber.SafePsqlAsync(TextDatabase, """
+            SELECT concat_ws('|', operation, action_counter, error_sqlstate, remote_new_tuple->>'id')
+            FROM worf.exception_log WHERE table_name = 'ct' ORDER BY action_counter
+            """, token));
 
         // Under error, a copy whose value fails to convert stops, naming the row, column and value as COPY does, and
         // starts again only after a delay.

@@ -24,16 +24,20 @@ as an enum's array, is used only for a column made of the same enums, since the
 provider's labels may be ones they lack. Values of a type the subscriber lacks,
 defines differently or doesn't use are read by the column type's input when
 sent as text (in the initial copy, with `force_text_transfer`, between major
-versions, and for composites and arrays of types that aren't PostgreSQL's own),
+versions, for composites and arrays of types that aren't PostgreSQL's own, and
+for domains and ranges of anything but PostgreSQL's own plain types),
 and fail with error 42804 when sent in binary. Values convert under the
 subscriber's settings, such as `TimeZone` and `bytea_output`, however they're
 sent. The initial copy passes the text of a value that needs no conversion,
 such as an integer going into a wider one or `varchar` into `text`, straight to
 the column. A value that doesn't convert fails with PostgreSQL's error, which
 `worf.exception_behaviour` handles, in the initial copy too. Values of `money`,
-or made of it, fail with error 55000 when the provider's `lc_monetary` formats
-money otherwise than the subscriber's, as in another currency or with other
-fraction digits, since they count the provider's currency. An older worf
+or made of it, going into a column that holds money, fail with error 55000 when
+the provider's `lc_monetary` counts other fraction digits than the subscriber's,
+since the stored amounts then differ, or formats money in text that the
+subscriber's reads as another amount. A provider whose `lc_monetary` changes
+ends its stream at the next transaction, so that the subscriber reconnects and
+checks again. An older worf
 doesn't send or read column types, or say how it formats money, so columns
 replicated through an older provider, subscriber or relay node need the same
 types, and money the same `lc_monetary`. `CHECK` constraints, `NOT NULL`

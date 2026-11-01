@@ -774,15 +774,39 @@ internal static unsafe class ProtoNative
         // Use send/recv, if allowed, if the type is plain or builtin.
         //
         // XXX: we can't use send/recv for array or composite types for now due to the embedded oids.
-        else if (allowBinaryBasetypes &&
-                 typclass->typreceive != 0 &&
-                 (att->atttypid < FirstNormalObjectId || typclass->typtype != 'c') &&
-                 (att->atttypid < FirstNormalObjectId || typclass->typelem == 0))
+        else if (allowBinaryBasetypes && typclass->typreceive != 0 && (att->atttypid < FirstNormalObjectId || UserBinary(att->atttypid, typclass)))
         {
             return 'b';
         }
 
         return 't';
+    }
+
+    /// <summary>
+    /// Checks whether a user type's values can go in its binary format: it's neither a composite nor an array, and a
+    /// domain or range is of a plain built-in type.
+    /// </summary>
+    private static bool UserBinary(uint typid, FormData_pg_type* typclass)
+        => typclass->typtype != 'c' && typclass->typelem == 0 && PlainUnderneath(typid, typclass->typtype);
+
+    /// <summary>
+    /// Checks whether a user domain's or range's values are a plain built-in type's underneath, whose binary format
+    /// carries no OIDs and reads alike on every node. A domain over an array or a composite, or a range of an enum, goes
+    /// as text, which a subscriber reads into any column, as into text, where its binary format names types the
+    /// subscriber may lack or number otherwise.
+    /// </summary>
+    private static bool PlainUnderneath(uint typid, sbyte typtype)
+    {
+        uint underneath = typtype switch
+        {
+            (sbyte)'d' => NativeMethods.getBaseType(typid),
+            (sbyte)'r' => NativeMethods.get_range_subtype(typid),
+            (sbyte)'m' => NativeMethods.get_range_subtype(NativeMethods.get_multirange_range(typid)),
+            _ => 0,
+        };
+        return typtype is not ((sbyte)'d' or (sbyte)'r' or (sbyte)'m') ||
+            (underneath != 0 && underneath < FirstNormalObjectId && NativeMethods.get_element_type(underneath) == 0 &&
+                NativeMethods.get_typtype(underneath) == (sbyte)'b');
     }
 
     /// <summary>
