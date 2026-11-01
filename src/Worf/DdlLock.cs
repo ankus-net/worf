@@ -621,7 +621,9 @@ internal static unsafe partial class DdlLock
                     long fenceId = kept[i].Get<long>(0);
 
                     // A transaction the origin hasn't reached never ran there, as on an origin restored to an earlier
-                    // point, and one too old for the origin to know of finished long ago. A statement that commits on
+                    // point, and one too old for the origin to know of finished long ago. Reached means below the next
+                    // transaction ID, which age() counts from, and not a snapshot's xmax, which a transaction still in
+                    // progress or prepared can be at or above while none after it has ended. A statement that commits on
                     // its way holds a lock named for its fence until the transaction that queues its DDL ends.
                     ulong key = unchecked((ulong)fenceId);
                     string?[] row = conn.Query($"""
@@ -630,7 +632,7 @@ internal static unsafe partial class DdlLock
                                     AND l.classid = {(key >> 32).ToString(CultureInfo.InvariantCulture)}
                                     AND l.objid = {(key & uint.MaxValue).ToString(CultureInfo.InvariantCulture)})
                             THEN 'in progress'
-                            WHEN x >= pg_catalog.pg_snapshot_xmax(pg_catalog.pg_current_snapshot()) THEN 'aborted'
+                            WHEN pg_catalog.age(pg_catalog.xid(x)) <= 0 THEN 'aborted'
                             ELSE pg_catalog.pg_xact_status(x) END, pg_catalog.pg_current_wal_insert_lsn()
                         FROM (SELECT '{kept[i].Get<long>(1).ToString(CultureInfo.InvariantCulture)}'::pg_catalog.xid8 AS x) AS fence
                         """, 2)[0];

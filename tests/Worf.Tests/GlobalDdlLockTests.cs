@@ -942,6 +942,10 @@ public sealed class GlobalDdlLockTests
 
         _ = await nodeA.SafePsqlAsync(Database, "ALTER TABLE t ALTER COLUMN v TYPE bigint", token);
         _ = await nodeA.SafePsqlAsync(Database, "BEGIN; ALTER TABLE t2 ALTER COLUMN v TYPE bigint; PREPARE TRANSACTION 'aborted'", token);
+
+        // node_b asks node_a about the fence a second after the session that kept it ends, as at PREPARE, and the prepared
+        // transaction is still in progress there, though no transaction after it has ended.
+        await Task.Delay(TimeSpan.FromSeconds(3), token);
         Assert.IsFalse(await nodeB.PsqlAsync(Database, "INSERT INTO t2 VALUES (1, 1)", token), "a write through a prepared transaction's fence");
         _ = await nodeA.SafePsqlAsync(Database, "ROLLBACK PREPARED 'aborted'", token);
         _ = await nodeA.SafePsqlAsync(Database, "BEGIN; ALTER TABLE t3 ALTER COLUMN v TYPE bigint; PREPARE TRANSACTION 'committed'", token);
