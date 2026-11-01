@@ -734,7 +734,21 @@ public sealed class SequenceRangeTests
             }
         }
 
-        await Task.Delay(1000, token);
+        // Reports relayed between nodes that aren't neighbors may still be on their way, an exchange behind, so the nodes
+        // are waited for until none takes a transaction ID over a while.
+        const string Position = "SELECT pg_snapshot_xmax(pg_current_snapshot())";
+        string[] before = await Task.WhenAll(nodes.Select(node => node.SafePsqlAsync(Database, Position, token)));
+        while (true)
+        {
+            await Task.Delay(1500, token);
+            string[] after = await Task.WhenAll(nodes.Select(node => node.SafePsqlAsync(Database, Position, token)));
+            if (after.SequenceEqual(before))
+            {
+                break;
+            }
+
+            before = after;
+        }
     }
 
     private static async Task ExecuteAsync(NpgsqlConnection connection, string sql, CancellationToken token)
