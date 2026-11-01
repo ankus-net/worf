@@ -84,10 +84,13 @@ internal static class SequenceRangeExchange
     /// <summary>
     /// Ties a call to the subscription whose slot it names. The slot must be worf's, in this database, and streamed by
     /// the calling role, or, while nothing streams it, bound to that role. The first call through a slot binds it to the
-    /// node that makes it and to the role that streams it, until the slot is dropped, and a call from another role that
-    /// streams it binds it to that role. A node speaks through the slots of one role, and a role, unless it is a
-    /// superuser, for one node, the first it calls for, for good, whatever becomes of its slots, so that one
-    /// subscriber's role can't speak for another node: a provider tells its subscribers apart by their roles alone.
+    /// node that makes it and to the role that streams it, and a call from another role that streams it binds it to
+    /// that role. A node speaks through the slots of one role, and a role, unless it is a superuser, for one node, the
+    /// first it calls for, for good, whatever becomes of its slots, until its row in <c>worf.sequence_range_role</c> is
+    /// deleted, so that one subscriber's role can't speak for another node: a provider tells its subscribers apart by
+    /// their roles alone. A node re-created under another name, with the same subscription name and role, takes over
+    /// the slot its old node was bound to once the role may speak for it, or, for a superuser, once the old node has
+    /// been silent for as long as a neighbor counts as in touch, and the old node is forgotten.
     /// </summary>
     private static void Authenticate(string slot, uint senderId)
     {
@@ -117,11 +120,6 @@ internal static class SequenceRangeExchange
                 : $"replication slot \"{slot}\" is bound to another role than this sequence range exchange's");
         }
 
-        if (link.Count > 0 && link[0].Get<uint>(0) != senderId)
-        {
-            throw new PgException("42501", $"replication slot \"{slot}\" belongs to another node than this sequence range exchange's");
-        }
-
         bool superuser;
         unsafe
         {
@@ -147,20 +145,25 @@ internal static class SequenceRangeExchange
             }
         }
 
-        if (link.Count > 0 && link[0].Get<uint>(1) == role)
+        // A slot bound to another node passes to this one, as a node re-created under another name takes its old node's
+        // subscription name: once the role may speak for this node, or for a superuser, once the old node is silent.
+        if (link.Count > 0 && link[0].Get<uint>(0) != senderId)
         {
+            uint old = link[0].Get<uint>(0);
+            if (link[0].Get<uint>(1) != role || (superuser && !Silent(old)))
+            {
+                throw new PgException("42501", $"replication slot \"{slot}\" belongs to another node than this sequence range exchange's");
+            }
+
+            _ = Spi.Execute("UPDATE worf.sequence_range_link SET node_id = $2 WHERE slot_name = $1", name, SpiParameter.Create(senderId));
+            SequenceRanges.ForgetNeighbor(old);
+            PgLog.Log($"node {senderId} takes over replication slot \"{slot}\" from node {old}, which this node forgets");
             return;
         }
 
-        // A dropped slot frees its name for the next subscription that takes it.
-        if (Worf.ReadScalar<bool>("""
-            SELECT EXISTS (SELECT 1 FROM worf.sequence_range_link l WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_replication_slots s WHERE s.slot_name = l.slot_name))
-            """))
+        if (link.Count > 0 && link[0].Get<uint>(1) == role)
         {
-            _ = Spi.Execute("""
-                DELETE FROM worf.sequence_range_link l
-                WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_replication_slots s WHERE s.slot_name = l.slot_name)
-                """);
+            return;
         }
 
         // A slot bound already, whose subscriber's connection string names another role now, takes that role, as long as
@@ -187,6 +190,17 @@ internal static class SequenceRangeExchange
             ? Spi.Execute("UPDATE worf.sequence_range_link SET role_id = $2 WHERE slot_name = $1", name, SpiParameter.Create(role))
             : Spi.Execute("INSERT INTO worf.sequence_range_link VALUES ($1, $2, $3)", name, SpiParameter.Create(senderId), SpiParameter.Create(role));
     }
+
+    /// <summary>
+    /// Checks whether a node has been silent here for as long as a neighbor counts as in touch: neither its calls nor its
+    /// answers, nor its reports that others relay, reached this node.
+    /// </summary>
+    private static bool Silent(uint nodeId)
+        => Worf.ReadScalar<bool>("""
+            SELECT coalesce(max(worf.sequence_range_heard(node_id, false, reported_at, false)), worf.sequence_range_heard($1, false, '-infinity', false))
+                < now() - $2::interval
+            FROM worf.sequence_range_node WHERE node_id = $1
+            """, SpiParameter.Create(nodeId), SpiParameter.Create(SequenceRanges.StaleAfter()));
 
     /// <summary>
     /// Tells a subscription's provider, as the subscription is dropped, that this node leaves the subscription's slot, so

@@ -1270,6 +1270,15 @@ public sealed class SequenceRangeTests
             await streaming.CancelAsync();
         }
 
+        // A node re-created under another name, with the same subscription name and role, takes over its old node's slot
+        // once the role's row is deleted, rather than being locked out by the slot's link.
+        _ = await nodeB.SafePsqlAsync(Database, "DELETE FROM worf.sequence_range_role WHERE role_id = 'c_user'::regrole", token);
+        _ = await nodeB.SafePsqlAsync(Database, "SELECT pg_create_logical_replication_slot('c_link', 'worf')", token);
+        string recreated = $$"""{"node_id": 2000001, "node_name": "node_c_again", "slot": "c_link", "sysid": "1", "timeline": 1, "wal_lsn": "0/0", "sequences": []}""";
+        _ = await nodeB.SafePsqlAsync(Database, $"SET SESSION AUTHORIZATION c_user; SELECT worf.sequence_range_exchange('{recreated}')", token);
+        Assert.AreEqual("2000001", await nodeB.SafePsqlAsync(Database, "SELECT node_id FROM worf.sequence_range_link WHERE slot_name = 'c_link'", token));
+        _ = await nodeB.SafePsqlAsync(Database, "SELECT pg_drop_replication_slot('c_link')", token);
+
         // A call relays reports of no more nodes than node_b keeps, and node_b goes on counting node_a and node_c as heard
         // from however many it is told of.
         string[] range = (await nodeB.SafePsqlAsync(Database,
