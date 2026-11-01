@@ -113,14 +113,15 @@ using Ankus.Postgres;
     -- ============================================================================
 
     CREATE OR REPLACE FUNCTION worf.conflict_history_ensure_partition(
-        target_date DATE DEFAULT CURRENT_DATE
+        target_date DATE DEFAULT (now() AT TIME ZONE 'UTC')::DATE
     ) RETURNS VOID AS $$
     DECLARE
         partition_name TEXT;
         start_date DATE;
         end_date DATE;
     BEGIN
-        -- Calculate month boundaries
+        -- Calculate month boundaries. A partition holds a month in UTC, whatever the session's time zone, so that every
+        -- session agrees on where months start.
         start_date := date_trunc('month', target_date)::DATE;
         end_date := (date_trunc('month', target_date) + interval '1 month')::DATE;
 
@@ -138,14 +139,15 @@ using Ankus.Postgres;
             EXECUTE format(
                 'CREATE TABLE worf.%I PARTITION OF worf.conflict_history
                  FOR VALUES FROM (%L) TO (%L)',
-                partition_name, start_date, end_date
+                partition_name, to_char(start_date, 'YYYY-MM-DD') || ' 00:00:00+00',
+                to_char(end_date, 'YYYY-MM-DD') || ' 00:00:00+00'
             );
         END IF;
     END;
     $$ LANGUAGE plpgsql;
 
     COMMENT ON FUNCTION worf.conflict_history_ensure_partition(DATE) IS
-        'Ensures a partition exists for the specified date. Creates the partition if it does not exist.';
+        'Ensures a partition exists for the month, in UTC, of the specified date. Creates the partition if it does not exist.';
 
     CREATE OR REPLACE FUNCTION worf.conflict_history_cleanup(
         retention_days INTEGER DEFAULT 30
@@ -157,7 +159,7 @@ using Ankus.Postgres;
         partition_end_date DATE;
     BEGIN
         -- Calculate cutoff date
-        cutoff_date := CURRENT_DATE - retention_days;
+        cutoff_date := (now() AT TIME ZONE 'UTC')::DATE - retention_days;
 
         -- Find and drop old partitions
         FOR partition_rec IN
@@ -194,7 +196,7 @@ using Ankus.Postgres;
     -- Create Initial Partition for Current Month
     -- ============================================================================
 
-    SELECT worf.conflict_history_ensure_partition(CURRENT_DATE);
+    SELECT worf.conflict_history_ensure_partition();
 
     -- ============================================================================
     -- Views
@@ -311,13 +313,13 @@ internal static partial class ConflictHistory
         "schema_name, table_name, index_name, " +
         "local_tuple, local_xid, local_origin, local_commit_ts, " +
         "remote_tuple, remote_origin, remote_commit_ts, remote_commit_lsn, " +
-        "has_before_triggers" +
+        "has_before_triggers, recorded_at" +
         ") VALUES (" +
         "$1, $2::name, $3, $4, " +
         "$5::name, $6::name, $7::name, " +
         "$8::jsonb, $9::text::xid, $10, $11, " +
         "$12::jsonb, $13, $14, $15, " +
-        "$16" +
+        "$16, $17" +
         ")";
 
     /// <summary>
@@ -346,12 +348,16 @@ internal static partial class ConflictHistory
             return;
         }
 
+        // The record is one atomic scope: its statements share its subtransaction, so that one that fails, as DDL
+        // creating the partition may, rolls the whole record back, which then goes unrecorded.
         try
         {
             PgTransaction.RunInSubtransaction(() =>
             {
-                // Ensure partition exists for current date
-                EnsurePartitionExists();
+                // Ensure the partition exists for the time recorded, which the row takes from here, so that the two
+                // agree even across midnight.
+                PgTimestampTz recordedAt = new(Worker.GetCurrentTimestamp());
+                EnsurePartitionExists(recordedAt);
 
                 // Get tuple descriptor for JSONB conversion
                 RelationData* relation = rel.Rel;
@@ -381,8 +387,9 @@ internal static partial class ConflictHistory
                     SpiParameter.Create((int)Worf.ReploriginSessionOrigin),
                     SpiParameter.Create(new PgTimestampTz(Worf.ReploriginSessionOriginTimestamp)),
                     Worf.LsnParameter(Worf.ReploriginSessionOriginLsn),
-                    SpiParameter.Create(hasBeforeTriggers));
-            });
+                    SpiParameter.Create(hasBeforeTriggers),
+                    SpiParameter.Create(recordedAt));
+            }, PgSubtransactionMode.Atomic);
         }
         catch (PgException)
         {
@@ -474,7 +481,8 @@ internal static partial class ConflictHistory
     }
 
     /// <summary>
-    /// Ensure that a partition exists for the current date.
+    /// Ensure that a partition exists for a time, which partitions hold by its month in UTC.
     /// </summary>
-    private static void EnsurePartitionExists() => _ = Spi.Execute("SELECT worf.conflict_history_ensure_partition(CURRENT_DATE)");
+    private static void EnsurePartitionExists(PgTimestampTz time)
+        => _ = Spi.Execute("SELECT worf.conflict_history_ensure_partition(($1 AT TIME ZONE 'UTC')::date)", SpiParameter.Create(time));
 }
