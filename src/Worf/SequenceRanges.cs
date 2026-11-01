@@ -3122,7 +3122,24 @@ internal static unsafe partial class SequenceRanges
     /// that two allocations don't wait on each other.
     /// </summary>
     private static void LockLedger(uint seqoid)
-        => _ = Spi.Execute("SELECT 1 FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE", SpiParameter.Create(seqoid));
+    {
+        if (!LedgerNoWait)
+        {
+            _ = Spi.Execute("SELECT 1 FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE", SpiParameter.Create(seqoid));
+        }
+        else if (Spi.Query("SELECT 1 FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE SKIP LOCKED", false, 1,
+            SpiParameter.Create(seqoid)).Count == 0 && IsManaged(seqoid))
+        {
+            throw new PgException("55P03", $"the range of sequence {seqoid} is locked");
+        }
+    }
+
+    /// <summary>
+    /// Gets or sets whether a sequence's range row is taken only when no transaction holds it, as in the range worker's
+    /// check, which holds the lock nextval takes on the sequence. A reset holds the row and waits for that lock, so the
+    /// check leaves the sequence for a later tick rather than wait.
+    /// </summary>
+    internal static bool LedgerNoWait { get; set; }
 
     /// <summary>
     /// Removes values from a block's free spans. Each span shrinks in place, or is deleted once empty, so that a

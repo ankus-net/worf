@@ -79,12 +79,14 @@ internal static class SequenceRangeWorker
 
                             try
                             {
+                                SequenceRanges.LedgerNoWait = true;
                                 double rate = Rate(rates, seqoid);
                                 _ = SequenceRanges.LiftFence(seqoid, local, false);
                                 return SequenceRanges.Check(seqoid, local, rate);
                             }
                             finally
                             {
+                                SequenceRanges.LedgerNoWait = false;
                                 unsafe
                                 {
                                     NativeMethods.UnlockRelationOid(seqoid, (int)PgLockMode.RowExclusive);
@@ -94,8 +96,9 @@ internal static class SequenceRangeWorker
                     }
                     catch (PgException error)
                     {
-                        // A sequence dropped since the tick began goes with the next tick.
-                        if (PgBackgroundWorker.RunTransaction(() => SequenceRanges.SequenceExists(seqoid)))
+                        // A sequence dropped since the tick began, or whose range a transaction holds, goes with the next
+                        // tick.
+                        if (error.SqlState != "55P03" && PgBackgroundWorker.RunTransaction(() => SequenceRanges.SequenceExists(seqoid)))
                         {
                             PgLog.Warning($"could not check managed sequence {seqoid}: {error.Message}");
                         }
