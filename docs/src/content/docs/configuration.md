@@ -129,12 +129,16 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
 
 - `worf.sequence_range_exchange_interval`
   How often each node exchanges sequence range reports with its neighbors
-  when no request, grant or reset is waiting. The default is `1min`.
+  when no request, grant or reset is waiting. A failed exchange is retried
+  after a delay that doubles up to this, or up to half
+  `worf.sequence_range_timeout` while something waits on that neighbor. The
+  default is `1min`.
 
 - `worf.sequence_range_timeout`
-  The connection and statement timeout of a sequence range exchange. An insert
-  near the end of a block waits up to twice this for the switch. The default is
-  `10s`.
+  The connection and statement timeout of a sequence range exchange. Inserts
+  near the end of a block wait up to twice this in all for the switch, which
+  then waits up to this for the transactions drawing from the block. The default
+  is `10s`.
 
 - `worf.ddl_lock_timeout`
   How long DDL waits for the other nodes to hold back their writes and catch

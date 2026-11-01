@@ -159,6 +159,9 @@ internal static unsafe partial class SequenceRanges
 
     private static bool s_changedOnCommit;
 
+    // The range worker's lock timeout for the next try of each sequence's switch, by the block it switches to.
+    private static readonly Dictionary<uint, (Guid Block, int Timeout)> s_switchTimeouts = [];
+
     // When a block that lasted less than an hour is followed by a bigger request, and one that lasted more than a day by
     // a smaller one.
     private static readonly TimeSpan s_growBelow = TimeSpan.FromHours(1);
@@ -511,7 +514,7 @@ internal static unsafe partial class SequenceRanges
             long margin = Math.Min(Math.Max(size / 20, (long)(rate * 60)), size / 2);
             if (left <= margin && next is not null)
             {
-                changed = Switch(seqoid, info, next.Value);
+                changed = SwitchBeforeEnd(seqoid, info, next.Value, left <= size / 20);
                 next = null;
             }
             else if (left <= 0 && next is null && state != "exhausted")
@@ -1491,6 +1494,25 @@ internal static unsafe partial class SequenceRanges
         // guard admits its values at once.
         ChangedOnCommit();
         return true;
+    }
+
+    /// <summary>
+    /// Switches a sequence to its next block as its active one runs low. A switch waits 200 ms for the transactions that
+    /// called nextval, and once the block reaches its last twentieth, where inserts wait for the switch, each try that
+    /// gives up waits twice as long as the last, up to the exchange timeout, so that the transactions drawing from the
+    /// block can't keep the switch from its lock until they run the block out.
+    /// </summary>
+    private static bool SwitchBeforeEnd(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) next, bool atEnd)
+    {
+        int timeout = atEnd && s_switchTimeouts.TryGetValue(seqoid, out (Guid Block, int Timeout) last) && last.Block == next.Id ? last.Timeout : 200;
+        if (Switch(seqoid, info, next, timeout))
+        {
+            _ = s_switchTimeouts.Remove(seqoid);
+            return true;
+        }
+
+        s_switchTimeouts[seqoid] = (next.Id, atEnd ? Math.Min(timeout * 2, Math.Max(ExchangeTimeout, 200)) : 200);
+        return false;
     }
 
     /// <summary>

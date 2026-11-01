@@ -93,6 +93,12 @@ internal static class SequenceRangeExchange
         NextDueAt = long.MaxValue;
         foreach (WorfSubscription sub in WorfNode.GetNodeSubscriptions(node.Node.Id, false).Where(sub => sub.Enabled))
         {
+            // The neighbor ties each exchange to the subscription's slot, which a new subscription makes as it starts.
+            if (Sync.GetSubscriptionSyncStatus(sub.Id, true) is not WorfSyncStatus sync || sync.Status == Sync.SyncStatusInit)
+            {
+                continue;
+            }
+
             long now = Worker.GetCurrentTimestamp();
             bool retrying = s_retries.TryGetValue(sub.Id, out (long At, long Delay) retry) && now < retry.At;
             bool due = !s_exchangedAt.TryGetValue(sub.Id, out long at) || now - at >= SequenceRanges.ExchangeInterval * 1000L ||
@@ -113,8 +119,16 @@ internal static class SequenceRangeExchange
             }
             catch (Exception error) when (error is PgException or PgRemoteException)
             {
-                // A failed exchange is tried again after a delay that doubles, up to the exchange interval.
-                long delay = Math.Min(Math.Max(retry.Delay * 2, SequenceRanges.CheckInterval * 1000L), SequenceRanges.ExchangeInterval * 1000L);
+                // A failed exchange is tried again after a delay that doubles, up to the exchange interval, or half the
+                // exchange timeout while this node waits on the neighbor, as for a block, so that inserts waiting at a
+                // block's end, up to twice the timeout, get it soon after the neighbor is back.
+                long most = SequenceRanges.ExchangeInterval * 1000L;
+                if (Waiting(sub.Origin.Id))
+                {
+                    most = Math.Min(most, SequenceRanges.ExchangeTimeout * 500L);
+                }
+
+                long delay = Math.Min(Math.Max(retry.Delay * 2, SequenceRanges.CheckInterval * 1000L), Math.Max(most, SequenceRanges.CheckInterval * 1000L));
                 s_retries[sub.Id] = (now + delay, delay);
                 NextDueAt = Math.Min(NextDueAt, now + delay);
                 PgLog.Warning($"sequence range exchange with node {sub.Origin.Name} failed: {error.Message}");

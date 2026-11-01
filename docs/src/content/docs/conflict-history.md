@@ -227,4 +227,4 @@ The cleanup function returns the number of partitions dropped.
 - Conflict history is recorded on the **subscriber** side only (where conflicts are detected during apply)
 - Very large tuple values are truncated based on `worf.conflict_history_max_tuple_size`
 - External TOAST values are stored as `"(unchanged-toast-datum)"` rather than the actual value
-- Recording failures do not abort replication - they are logged as warnings and replication continues
+- Recording failures do not abort replication - they are logged as warnings, with the error and its SQLSTATE, and replication continues. A deferrable constraint on the history is checked as the conflict is recorded, rather than when the apply transaction commits
