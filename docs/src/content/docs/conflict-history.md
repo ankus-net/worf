@@ -157,7 +157,7 @@ The `worf.conflict_history` table contains:
 
 ## Partition Management
 
-The `conflict_history` table is partitioned by month for efficient data management.
+The `conflict_history` table is partitioned by month, in UTC whatever the session's time zone, for efficient data management.
 
 ### Partitions are Created Automatically
 
