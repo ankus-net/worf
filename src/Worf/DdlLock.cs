@@ -395,14 +395,20 @@ internal static unsafe partial class DdlLock
     internal static void CheckWrite(List<uint> relids) => Check(relids, false);
 
     /// <summary>
-    /// Checks the result relations of a statement about to run, unless it's only explained.
+    /// Lists the result relations of a statement about to run, none when it's only explained.
     /// </summary>
     /// <param name="queryDesc">The statement.</param>
     /// <param name="eflags">The executor's flags.</param>
-    internal static void CheckWrites(QueryDesc* queryDesc, int eflags)
+    /// <returns>The tables it writes to.</returns>
+    internal static List<uint> WrittenTables(QueryDesc* queryDesc, int eflags)
     {
         PlannedStmt* plan = queryDesc->plannedstmt;
         List<uint> relids = [];
+        if ((eflags & ExplainOnly) != 0)
+        {
+            return relids;
+        }
+
 #if ANKUS_PG19
         Bitmapset* results = plan->resultRelationRelids;
         for (int rti = NativeMethods.bms_next_member(results, -1); rti >= 0; rti = NativeMethods.bms_next_member(results, rti))
@@ -416,10 +422,7 @@ internal static unsafe partial class DdlLock
             relids.Add(((RangeTblEntry*)NativeMethods.list_nth(plan->rtable, results->elements[i].int_value - 1))->relid);
         }
 #endif
-        if (relids.Count > 0 && (eflags & ExplainOnly) == 0)
-        {
-            Check(relids, false);
-        }
+        return relids;
     }
 
     /// <summary>

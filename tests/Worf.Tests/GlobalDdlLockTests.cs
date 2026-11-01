@@ -34,9 +34,10 @@ public sealed class GlobalDdlLockTests
     /// concurrent drop left invalid replicates, while DDL on one that a failed build or reindex left stays on its node,
     /// however and from whichever session it's built again, and a concurrent drop drops it there. DDL that would make
     /// other objects use it fails, even as it builds the index again, and DDL from either node that takes its name
-    /// renames it, while either node's DDL neither copies nor attaches it, chooses the names the other node does, and
-    /// leaves its name and mark as they were, however the DDL builds it again or moves its table. DDL from the other
-    /// node that can't build it again drops it, and concurrent reindexes of worf's catalogs leave no mark behind.
+    /// renames it, while either node's DDL neither copies nor attaches it nor has a foreign key use it, chooses the
+    /// names the other node does, and leaves its name and mark as they were, however the DDL builds it again or moves
+    /// its table, and DDL whose event trigger would write to its table without it fails. DDL from the other node that
+    /// can't build it again drops it, and concurrent reindexes of worf's catalogs leave no mark behind.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -404,8 +405,8 @@ public sealed class GlobalDdlLockTests
             """, token), "node_b's index under its name, and node_a's own under another");
         Assert.Contains("renamed index \"p1_v\"", nodeA.ReadLog());
 
-        // Valid indexes on node_b alone, which builds whose DDL couldn't be queued left, and an invalid unique one over
-        // duplicate keys that node_a doesn't have.
+        // Valid indexes on node_b alone, which builds whose DDL couldn't be queued left, built again there in case a
+        // build failed before it finished, and an invalid unique one over duplicate keys that node_a doesn't have.
         _ = await nodeA.SafePsqlAsync(Database, """
             CREATE TABLE lt (id integer PRIMARY KEY, v integer, w integer);
             CREATE TABLE lp (id integer PRIMARY KEY, v integer, w integer) PARTITION BY RANGE (id);
@@ -413,6 +414,8 @@ public sealed class GlobalDdlLockTests
             CREATE TABLE lp2 (id integer PRIMARY KEY, v integer, w integer);
             CREATE INDEX lp_v ON lp (v);
             CREATE TABLE ld (id integer PRIMARY KEY, v integer, w integer);
+            CREATE TABLE lr (id integer PRIMARY KEY, v integer);
+            CREATE TABLE lfk (id integer PRIMARY KEY, y integer);
             CREATE SCHEMA ls;
             """, token);
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
@@ -430,22 +433,32 @@ public sealed class GlobalDdlLockTests
                 _ = await timeout.ExecuteNonQueryAsync(token);
             }
 
-            foreach (string index in new[] { "lt_v ON lt (v)", "lt_v_idx ON lt (v)", "lt_w_key ON lt (w)", "lt_w_idx ON lt (w)", "lp2_v ON lp2 (v)", "lp1_w ON lp1 (w)" })
+            foreach (string index in new[]
             {
-                await using NpgsqlCommand build = new($"CREATE INDEX CONCURRENTLY {index}", building);
+                "INDEX CONCURRENTLY lt_v ON lt (v)", "INDEX CONCURRENTLY lt_v_idx ON lt (v)", "INDEX CONCURRENTLY lt_w_key ON lt (w)",
+                "INDEX CONCURRENTLY lt_w_idx ON lt (w)", "INDEX CONCURRENTLY lp2_v ON lp2 (v)", "INDEX CONCURRENTLY lp1_w ON lp1 (w)",
+                "UNIQUE INDEX CONCURRENTLY lr_v ON lr (v)",
+            })
+            {
+                await using NpgsqlCommand build = new($"CREATE {index}", building);
                 PostgresException unqueued = await Assert.ThrowsExactlyAsync<PostgresException>(() => build.ExecuteNonQueryAsync(token), index);
                 Assert.AreEqual("55P03", unqueued.SqlState, index);
             }
         }
 
+        Assert.AreEqual("7", await nodeB.SafePsqlAsync(Database, """
+            REINDEX TABLE lt; REINDEX TABLE lp1; REINDEX TABLE lp2; REINDEX TABLE lr;
+            SELECT count(*) FROM worf.local_index l JOIN pg_index i ON i.indexrelid = l.indexrelid WHERE i.indisvalid
+            """, token), "node_b's own indexes, valid");
         _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO ld VALUES (1, 1, 1), (2, 1, 1)", token);
         PostgresException duplicates = await Assert.ThrowsExactlyAsync<PostgresException>(
             () => nodeB.SafePsqlAsync(Database, "CREATE UNIQUE INDEX CONCURRENTLY ld_v ON ld (v)", token));
         Assert.AreEqual("23505", duplicates.SqlState);
 
-        // node_a's DDL that builds node_b's own again, attaches a partition, builds an index on a partitioned table or
-        // copies a table's indexes leaves them as they were and builds what node_a builds, and its DDL that rewrites a
-        // table drops the one that can't be built again, with its definition.
+        // node_a's DDL that builds node_b's own again, attaches a partition, builds an index on a partitioned table,
+        // copies a table's indexes or adds a foreign key beside a column's new type leaves them as they were and does
+        // what it does on node_a, and its DDL that rewrites a table drops the one that can't be built again, with its
+        // definition.
         logStart = nodeB.ReadLog().Length;
         foreach (string sql in new[]
         {
@@ -456,13 +469,21 @@ public sealed class GlobalDdlLockTests
             _ = await nodeA.SafePsqlAsync(Database, sql, token);
         }
 
-        Assert.IsTrue(await PollSucceedsAsync(nodeA, "ALTER TABLE ld ALTER COLUMN w TYPE bigint", token), "the failed build's fence went");
+        foreach (string sql in new[] { "ALTER TABLE ld ALTER COLUMN w TYPE bigint", "CREATE UNIQUE INDEX lr_v_key ON lr (v)" })
+        {
+            Assert.IsTrue(await PollSucceedsAsync(nodeA, sql, token), $"the failed build's fence went: {sql}");
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database, "ALTER TABLE lfk ADD COLUMN x integer REFERENCES lr (v), ALTER COLUMN y TYPE bigint", token);
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
-        Assert.AreEqual("lp1_w,lp2_v,lt_v,lt_v_idx,lt_w_idx,lt_w_key|f|bigint|built", await nodeB.SafePsqlAsync(Database, """
+        Assert.AreEqual("lp1_w,lp2_v,lr_v,lt_v,lt_v_idx,lt_w_idx,lt_w_key|f||bigint|built|lr_v_key", await nodeB.SafePsqlAsync(Database, """
             SELECT (SELECT string_agg(c.relname, ',' ORDER BY c.relname) FROM worf.local_index l JOIN pg_class c ON c.oid = l.indexrelid),
                 (SELECT bool_or(c.relispartition) FROM worf.local_index l JOIN pg_class c ON c.oid = l.indexrelid),
+                (SELECT string_agg(i.indexrelid::regclass::text, ',') FROM worf.local_index l JOIN pg_index i ON i.indexrelid = l.indexrelid
+                    WHERE NOT (i.indisvalid AND i.indislive)),
                 (SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'ld'::regclass AND attname = 'w'),
-                obj_description('lp2_v_idx'::regclass, 'pg_class')
+                obj_description('lp2_v_idx'::regclass, 'pg_class'),
+                (SELECT conindid::regclass::text FROM pg_constraint WHERE conrelid = 'lfk'::regclass AND contype = 'f')
             """, token), "node_b's own indexes after node_a's DDL");
         string log = nodeB.ReadLog()[logStart..];
         Assert.Contains("dropped index \"ld_v\"", log);
@@ -470,14 +491,28 @@ public sealed class GlobalDdlLockTests
 
         // node_b's DDL that would build one again and cluster on it fails, its DDL chooses the names node_a's would,
         // renaming its own where it takes their names, or tells node_a the name it chose for a concurrent build, and
-        // neither copies nor keeps its own, which it drops concurrently. Concurrent reindexes of worf's catalogs leave
-        // no mark on them, nor one for an index that no longer exists.
+        // neither copies nor keeps its own, which it drops concurrently. DDL whose event trigger writes to a table it
+        // copies the indexes of fails, rather than leave the copied table's own indexes without the row. Concurrent
+        // reindexes of worf's catalogs leave no mark on them, nor one for an index that no longer exists.
         PostgresException clustered = await Assert.ThrowsExactlyAsync<PostgresException>(
             () => nodeB.SafePsqlAsync(Database, "ALTER TABLE lt ALTER COLUMN v TYPE integer, CLUSTER ON lt_v", token));
         Assert.AreEqual("55000", clustered.SqlState);
+        foreach (string sql in new[] { "CREATE INDEX ON lt (v)", "ALTER TABLE lt ADD UNIQUE (w)", "CREATE INDEX CONCURRENTLY ON lt (w)" })
+        {
+            _ = await nodeB.SafePsqlAsync(Database, sql, token);
+        }
+
+        _ = await nodeB.SafePsqlAsync(Database, """
+            SET worf.enable_ddl_replication = off;
+            CREATE FUNCTION audit() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO lt VALUES (100, 100, 100); END $$;
+            CREATE EVENT TRIGGER audit ON ddl_command_end WHEN TAG IN ('CREATE TABLE') EXECUTE FUNCTION audit();
+            """, token);
+        PostgresException audited = await Assert.ThrowsExactlyAsync<PostgresException>(
+            () => nodeB.SafePsqlAsync(Database, "CREATE TABLE lk_b (LIKE lt INCLUDING INDEXES)", token));
+        Assert.AreEqual("55000", audited.SqlState);
         foreach (string sql in new[]
         {
-            "CREATE INDEX ON lt (v)", "ALTER TABLE lt ADD UNIQUE (w)", "CREATE INDEX CONCURRENTLY ON lt (w)", "CREATE TABLE lk_b (LIKE lt INCLUDING INDEXES)",
+            "SET worf.enable_ddl_replication = off; DROP EVENT TRIGGER audit; DROP FUNCTION audit()", "CREATE TABLE lk_b (LIKE lt INCLUDING INDEXES)",
             "DROP INDEX CONCURRENTLY lt_w_idx", "REINDEX SCHEMA CONCURRENTLY worf",
         })
         {
@@ -496,7 +531,7 @@ public sealed class GlobalDdlLockTests
         Assert.AreEqual("lk_a_pkey,lk_b_pkey,lk_b_v_idx,lk_b_w_idx,lk_b_w_key,lp1_pkey,lp1_v_idx,lp1_w_idx,lp2_pkey,lp2_v_idx,lp2_w_idx,lt_pkey,lt_v_idx,lt_w_idx1,lt_w_key",
             indexes);
         Assert.AreEqual(indexes, await nodeB.SafePsqlAsync(Database, Indexes, token), "node_b's indexes on every node");
-        Assert.AreEqual("lp1_w,lp2_v,ls.lt_v,ls.lt_v_idx_local,ls.lt_w_key_local|0", await nodeB.SafePsqlAsync(Database, """
+        Assert.AreEqual("lp1_w,lp2_v,lr_v,ls.lt_v,ls.lt_v_idx_local,ls.lt_w_key_local|0", await nodeB.SafePsqlAsync(Database, """
             SELECT string_agg(indexrelid::regclass::text, ',' ORDER BY indexrelid::regclass::text COLLATE "C"),
                 count(*) FILTER (WHERE NOT EXISTS (SELECT FROM pg_class c WHERE c.oid = indexrelid AND c.relnamespace <> 'worf'::regnamespace))
             FROM worf.local_index

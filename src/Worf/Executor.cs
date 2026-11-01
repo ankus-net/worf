@@ -287,6 +287,9 @@ internal static unsafe partial class Executor
             }
         }
 
+        // Nor may one write to a table whose indexes on this node alone a statement under way hides.
+        LocalIndex.CheckWrite(parsetree);
+
         SequenceRanges.CheckDdl(parsetree);
         if (parsetree->type != NodeTag.T_TransactionStmt)
         {
@@ -313,7 +316,7 @@ internal static unsafe partial class Executor
         // DDL that replicates can't make other objects use an index on this node alone, and neither it nor DDL from
         // another node chooses names or finds indexes to use by those indexes, which the other nodes don't have.
         Dictionary<uint, (string Name, string?[] Ties)>? ties = ddl is null ? null : LocalIndex.Ties(parsetree);
-        (List<(uint Index, string Name)> Moved, List<uint> Hidden)? isolated = LocalIndex.Isolate(parsetree, ddl is not null);
+        bool isolated = LocalIndex.Isolate(parsetree, ddl is not null);
 
         // A statement that commits on its way, and then fails, lets its fence go as its transaction aborts.
         uint xactFlags = DdlReplication.BeginStatement(ddl is not null);
@@ -333,7 +336,7 @@ internal static unsafe partial class Executor
         finally
         {
             LocalIndex.EndStatement(tracking);
-            LocalIndex.EndIsolation(isolated is not null);
+            LocalIndex.EndIsolation(isolated);
             usedTemp = DdlReplication.EndStatement(xactFlags, ddl is not null);
         }
 
@@ -483,7 +486,12 @@ internal static unsafe partial class Executor
     private static void WorfExecutorStart(QueryDesc* queryDesc, int eflags)
     {
         DdlLock.UnfencePending();
-        DdlLock.CheckWrites(queryDesc, eflags);
+        List<uint> written = DdlLock.WrittenTables(queryDesc, eflags);
+        if (written.Count > 0)
+        {
+            DdlLock.CheckWrite(written);
+            LocalIndex.CheckWrites(written);
+        }
 
         if (!s_nextExecutorStartHook.IsNull)
         {

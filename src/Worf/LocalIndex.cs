@@ -46,8 +46,17 @@ internal static unsafe partial class LocalIndex
     // transaction can't write.
     private static readonly List<uint> s_droppingConcurrently = [];
 
-    // Whether the indexes on this node alone are out of a statement's way.
+    // Whether the indexes on this node alone are out of a statement's way, and those moved aside and hidden from it.
     private static bool s_isolating;
+    private static List<(uint Index, string Name)> s_moved = [];
+    private static List<(uint Index, uint Table, bool Unlive, uint Filenode)> s_hidden = [];
+
+    // The tables whose indexes on this node alone a statement hides as not live, which nothing may write to meanwhile.
+    private static readonly HashSet<uint> s_unliveTables = [];
+
+    // RVR_MISSING_OK from catalog/namespace.h, and CREATE_TABLE_LIKE_INDEXES from nodes/parsenodes.h.
+    private const uint RangeVarMissingOk = 1;
+    private const uint CreateTableLikeIndexes = 1 << 6;
 
     [PgNativeCallback(nameof(TransactionEnding))]
     private static partial XactCallback TransactionCallback { get; }
@@ -368,46 +377,42 @@ internal static unsafe partial class LocalIndex
     /// out of the way of the names that PostgreSQL chooses for the objects that DDL that replicates creates, so that
     /// every node chooses the same, as <see cref="MoveAside"/> does for apply; and out of sight of DDL that replicates,
     /// or DDL from another node, that would copy them, attach them to a partitioned index, or have a foreign key use
-    /// them, none of which the other nodes can. Such DDL, which can't build an index again, finds them not live.
+    /// them, none of which the other nodes can. Only the indexes of the tables the statement copies, attaches,
+    /// indexes the partitions of or references are hidden: those a foreign key or an attached partition would use are
+    /// marked not valid, which they're still kept up to date and built again as, and those that a copy or a
+    /// partitioned index would take, which only indexes that aren't live escape, are marked not live, while nothing may
+    /// write to or rewrite their tables.
     /// </summary>
     /// <param name="parsetree">The statement.</param>
     /// <param name="replicated">Whether it's DDL to replicate.</param>
-    /// <returns>The indexes moved and those hidden, for <see cref="Restore"/>, or null when none are.</returns>
-    internal static (List<(uint Index, string Name)> Moved, List<uint> Hidden)? Isolate(Node* parsetree, bool replicated)
+    /// <returns>Whether any are out of its way, for <see cref="EndIsolation"/> and <see cref="Restore"/>.</returns>
+    internal static bool Isolate(Node* parsetree, bool replicated)
     {
         bool rename = replicated && ChoosesNames(parsetree);
-        bool hide = (replicated || Applying) && UsesIndexes(parsetree);
-        if (s_isolating || !(rename || hide) || Worf.CatalogOid("local_index") == 0 ||
+        List<uint> unlive = [];
+        List<uint> invalid = [];
+        if (replicated || Applying)
+        {
+            UsedTables(parsetree, unlive, invalid);
+        }
+
+        if (s_isolating || !(rename || unlive.Count > 0 || invalid.Count > 0) || Worf.CatalogOid("local_index") == 0 ||
             !Elevated.Run(() => Worf.ReadScalar<bool>("SELECT EXISTS (SELECT FROM worf.local_index)")))
         {
-            return null;
+            return false;
         }
 
-        List<(uint Index, string Name)> moved = rename ? MoveAside() : [];
-        List<uint> hidden = [];
-        if (hide)
-        {
-            SpiResult result = Elevated.Run(() => Spi.Query("""
-                UPDATE pg_catalog.pg_index i SET indislive = false FROM worf.local_index l
-                WHERE i.indexrelid = l.indexrelid AND i.indislive
-                RETURNING i.indexrelid, i.indrelid
-                """));
-            foreach (SpiRow row in result)
-            {
-                hidden.Add(row.Get<uint>(0));
-                NativeMethods.CacheInvalidateRelcacheByRelid(row.Get<uint>(1));
-            }
-
-            NativeMethods.CommandCounterIncrement();
-        }
-
+        s_moved = rename ? MoveAside() : [];
+        s_hidden = [];
+        Hide(unlive, true);
+        Hide(invalid, false);
         s_isolating = true;
-        return (moved, hidden);
+        return true;
     }
 
     /// <summary>
     /// Ends a statement that <see cref="Isolate"/> ran out of the way of the indexes on this node alone, whether it ran
-    /// or failed, which rolls their changes back.
+    /// or failed, which rolls their changes back, so that their tables can be written to again.
     /// </summary>
     /// <param name="isolated">Whether they were out of its way.</param>
     internal static void EndIsolation(bool isolated)
@@ -415,36 +420,115 @@ internal static unsafe partial class LocalIndex
         if (isolated)
         {
             s_isolating = false;
+            s_unliveTables.Clear();
         }
     }
 
     /// <summary>
     /// Brings the indexes on this node alone back once a statement that <see cref="Isolate"/> ran out of their way has
-    /// run: live again, and under their names, as <see cref="MoveBack"/> gives them.
+    /// run: live and valid again, and under their names, as <see cref="MoveBack"/> gives them. A statement that
+    /// rewrote a table whose indexes weren't live, which left them unbuilt, fails.
     /// </summary>
-    /// <param name="isolated">The indexes moved and those hidden.</param>
-    internal static void Restore((List<(uint Index, string Name)> Moved, List<uint> Hidden)? isolated)
+    /// <param name="isolated">Whether they were out of its way.</param>
+    internal static void Restore(bool isolated)
     {
-        if (isolated is not (List<(uint Index, string Name)> moved, List<uint> hidden))
+        if (!isolated)
         {
             return;
         }
 
-        if (hidden.Count > 0)
+        List<(uint Index, uint Table, bool Unlive, uint Filenode)> hidden = s_hidden;
+        List<(uint Index, string Name)> moved = s_moved;
+        s_hidden = [];
+        s_moved = [];
+        foreach ((uint _, uint table, bool _, uint filenode) in hidden.Where(index => index.Unlive))
         {
-            SpiResult result = Elevated.Run(() => Spi.Query("""
-                UPDATE pg_catalog.pg_index SET indislive = true WHERE indexrelid = ANY ($1::pg_catalog.int8[]::pg_catalog.oid[])
-                RETURNING indrelid
-                """, SpiParameter.Create(hidden.Select(relid => (long)relid).ToArray())));
+            if (Elevated.Run(() => Worf.ReadScalar<uint>("SELECT relfilenode FROM pg_catalog.pg_class WHERE oid = $1", SpiParameter.Create(table))) != filenode)
+            {
+                throw new PgException("55000",
+                    $"cannot rewrite table \"{Worf.FromServer(NativeMethods.get_rel_name(table))}\" while DDL runs that its indexes on this node alone are hidden from",
+                    hint: "The indexes wouldn't be built again. Rewrite the table before or after the DDL, not from an event trigger or a function that it runs.");
+            }
+        }
+
+        foreach (bool unlive in new[] { true, false })
+        {
+            long[] relids = [.. hidden.Where(index => index.Unlive == unlive).Select(index => (long)index.Index)];
+            if (relids.Length == 0)
+            {
+                continue;
+            }
+
+            SpiResult result = Elevated.Run(() => Spi.Query(unlive
+                ? "UPDATE pg_catalog.pg_index SET indislive = true WHERE indexrelid = ANY ($1::pg_catalog.int8[]::pg_catalog.oid[]) RETURNING indrelid"
+                : "UPDATE pg_catalog.pg_index SET indisvalid = true WHERE indexrelid = ANY ($1::pg_catalog.int8[]::pg_catalog.oid[]) RETURNING indrelid",
+                SpiParameter.Create(relids)));
             foreach (SpiRow row in result)
             {
                 NativeMethods.CacheInvalidateRelcacheByRelid(row.Get<uint>(0));
             }
-
-            NativeMethods.CommandCounterIncrement();
         }
 
+        NativeMethods.CommandCounterIncrement();
         MoveBack(moved, null);
+    }
+
+    /// <summary>
+    /// Fails a write to a table whose indexes on this node alone a statement has hidden as not live, as from an event
+    /// trigger or a function that the statement runs, since the indexes wouldn't get its rows. A write to a
+    /// partitioned table checks the partitions it can reach.
+    /// </summary>
+    /// <param name="relids">The tables written to.</param>
+    internal static void CheckWrites(List<uint> relids)
+    {
+        if (s_unliveTables.Count == 0)
+        {
+            return;
+        }
+
+        foreach (uint relid in relids)
+        {
+            List* tables = NativeMethods.find_all_inheritors(relid, (int)PgLockMode.None, null);
+            for (int i = 0; tables is not null && i < tables->length; i++)
+            {
+                uint table = tables->elements[i].oid_value;
+                if (s_unliveTables.Contains(table))
+                {
+                    throw new PgException("55000",
+                        $"cannot write to table \"{Worf.FromServer(NativeMethods.get_rel_name(table))}\" while DDL runs that its indexes on this node alone are hidden from",
+                        hint: "The indexes wouldn't get the rows. Write to the table before or after the DDL, not from an event trigger or a function that it runs.");
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Fails a <c>COPY FROM</c> or <c>TRUNCATE</c> of a table whose indexes on this node alone a statement has hidden as
+    /// not live, as <see cref="CheckWrites"/> does.
+    /// </summary>
+    /// <param name="parsetree">The statement.</param>
+    internal static void CheckWrite(Node* parsetree)
+    {
+        if (s_unliveTables.Count == 0)
+        {
+            return;
+        }
+
+        List<uint> relids = [];
+        if (parsetree->type == NodeTag.T_CopyStmt && ((CopyStmt*)parsetree)->is_from)
+        {
+            AddTable(relids, ((CopyStmt*)parsetree)->relation);
+        }
+        else if (parsetree->type == NodeTag.T_TruncateStmt)
+        {
+            List* relations = ((TruncateStmt*)parsetree)->relations;
+            for (int i = 0; relations is not null && i < relations->length; i++)
+            {
+                AddTable(relids, (RangeVar*)relations->elements[i].ptr_value);
+            }
+        }
+
+        CheckWrites(relids);
     }
 
     /// <summary>
@@ -606,35 +690,167 @@ internal static unsafe partial class LocalIndex
     }
 
     /// <summary>
-    /// Checks whether a statement may copy existing indexes, attach them to a partitioned index, or have a foreign key
-    /// use one, without building any index again: CREATE TABLE, CREATE INDEX, and ALTER TABLE that only attaches
-    /// partitions or adds constraints, other than with an existing index.
+    /// Finds the tables whose existing indexes a statement may copy, attach to a partitioned index, or have a foreign
+    /// key use: the tables that <c>CREATE TABLE ... LIKE</c> copies the indexes of, the partitions of a partitioned
+    /// table indexed, which the index may take its partitions from, and those of a partition attached, and the tables
+    /// that a partition attached is, or that foreign keys reference, which take only valid indexes.
     /// </summary>
-    private static bool UsesIndexes(Node* parsetree)
+    /// <param name="parsetree">The statement.</param>
+    /// <param name="unlive">The tables whose indexes are to be hidden as not live.</param>
+    /// <param name="invalid">The tables whose indexes are to be hidden as not valid.</param>
+    private static void UsedTables(Node* parsetree, List<uint> unlive, List<uint> invalid)
     {
         switch (parsetree->type)
         {
-            case NodeTag.T_IndexStmt:
-                return !((IndexStmt*)parsetree)->concurrent;
             case NodeTag.T_CreateStmt:
-                return true;
+                List* elements = ((CreateStmt*)parsetree)->tableElts;
+                for (int i = 0; elements is not null && i < elements->length; i++)
+                {
+                    Node* element = (Node*)elements->elements[i].ptr_value;
+                    if (element->type == NodeTag.T_TableLikeClause && (((TableLikeClause*)element)->options & CreateTableLikeIndexes) != 0)
+                    {
+                        AddTable(unlive, ((TableLikeClause*)element)->relation);
+                    }
+                    else
+                    {
+                        AddReferenced(invalid, element);
+                    }
+                }
+
+                break;
+
+            case NodeTag.T_IndexStmt when !((IndexStmt*)parsetree)->concurrent && ((IndexStmt*)parsetree)->relation->inh:
+                uint indexed = NativeMethods.RangeVarGetRelidExtended(((IndexStmt*)parsetree)->relation, 0, RangeVarMissingOk, default, null);
+                if (indexed != 0 && NativeMethods.get_rel_relkind(indexed) == (sbyte)'p')
+                {
+                    AddPartitions(unlive, indexed);
+                }
+
+                break;
+
             case NodeTag.T_AlterTableStmt when ((AlterTableStmt*)parsetree)->objtype == ObjectType.OBJECT_TABLE:
                 List* cmds = ((AlterTableStmt*)parsetree)->cmds;
                 for (int i = 0; cmds is not null && i < cmds->length; i++)
                 {
                     AlterTableCmd* cmd = (AlterTableCmd*)cmds->elements[i].ptr_value;
-                    if (!(cmd->subtype == AlterTableType.AT_AttachPartition ||
-                        (cmd->subtype == AlterTableType.AT_AddConstraint && cmd->def is not null && cmd->def->type == NodeTag.T_Constraint &&
-                            ((Constraint*)cmd->def)->indexname is null)))
+                    if (cmd->subtype == AlterTableType.AT_AttachPartition && cmd->def is not null)
                     {
-                        return false;
+                        uint attached = AddTable(invalid, ((PartitionCmd*)cmd->def)->name);
+                        if (attached != 0)
+                        {
+                            AddPartitions(unlive, attached);
+                        }
+                    }
+                    else if (cmd->subtype is AlterTableType.AT_AddConstraint or AlterTableType.AT_AddColumn && cmd->def is not null)
+                    {
+                        AddReferenced(invalid, cmd->def);
                     }
                 }
 
-                return cmds is not null;
+                break;
+
             default:
-                return false;
+                break;
         }
+    }
+
+    /// <summary>
+    /// Adds the tables that the foreign keys of a constraint, or of a column's constraints, reference.
+    /// </summary>
+    private static void AddReferenced(List<uint> tables, Node* node)
+    {
+        if (node->type == NodeTag.T_Constraint && ((Constraint*)node)->contype == ConstrType.CONSTR_FOREIGN)
+        {
+            _ = AddTable(tables, ((Constraint*)node)->pktable);
+        }
+        else if (node->type == NodeTag.T_ColumnDef)
+        {
+            List* constraints = ((ColumnDef*)node)->constraints;
+            for (int i = 0; constraints is not null && i < constraints->length; i++)
+            {
+                AddReferenced(tables, (Node*)constraints->elements[i].ptr_value);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Adds the partitions under a partitioned table, however deep.
+    /// </summary>
+    private static void AddPartitions(List<uint> tables, uint relid)
+    {
+        List* partitions = NativeMethods.find_all_inheritors(relid, (int)PgLockMode.None, null);
+        for (int i = 1; partitions is not null && i < partitions->length; i++)
+        {
+            tables.Add(partitions->elements[i].oid_value);
+        }
+    }
+
+    /// <summary>
+    /// Adds a table named in a statement, which may not exist.
+    /// </summary>
+    /// <returns>The table, or zero.</returns>
+    private static uint AddTable(List<uint> tables, RangeVar* relation)
+    {
+        uint relid = relation is null ? 0 : NativeMethods.RangeVarGetRelidExtended(relation, 0, RangeVarMissingOk, default, null);
+        if (relid != 0)
+        {
+            tables.Add(relid);
+        }
+
+        return relid;
+    }
+
+    /// <summary>
+    /// Hides the indexes on this node alone of some tables from a statement, as not live or as not valid. They're locked
+    /// as a rename would lock them, so that no concurrent build, reindex or drop changes their state meanwhile.
+    /// </summary>
+    private static void Hide(List<uint> tables, bool unlive)
+    {
+        if (tables.Count == 0)
+        {
+            return;
+        }
+
+        long[] relids = [.. tables.Distinct().Select(table => (long)table)];
+        SpiResult indexes = Elevated.Run(() => Worf.Read("""
+            SELECT i.indexrelid FROM worf.local_index l JOIN pg_catalog.pg_index i ON i.indexrelid = l.indexrelid
+            WHERE i.indrelid = ANY ($1::pg_catalog.int8[]::pg_catalog.oid[])
+            ORDER BY 1
+            """, 0, SpiParameter.Create(relids)));
+        if (indexes.Count == 0)
+        {
+            return;
+        }
+
+        foreach (SpiRow index in indexes)
+        {
+            NativeMethods.LockRelationOid(index.Get<uint>(0), (int)PgLockMode.ShareUpdateExclusive);
+        }
+
+        SpiResult result = Elevated.Run(() => Spi.Query(unlive
+            ? """
+                UPDATE pg_catalog.pg_index i SET indislive = false FROM worf.local_index l, pg_catalog.pg_class t
+                WHERE i.indexrelid = l.indexrelid AND t.oid = i.indrelid AND i.indrelid = ANY ($1::pg_catalog.int8[]::pg_catalog.oid[]) AND i.indislive
+                RETURNING i.indexrelid, i.indrelid, t.relfilenode
+                """
+            : """
+                UPDATE pg_catalog.pg_index i SET indisvalid = false FROM worf.local_index l
+                WHERE i.indexrelid = l.indexrelid AND i.indrelid = ANY ($1::pg_catalog.int8[]::pg_catalog.oid[]) AND i.indisvalid AND i.indislive
+                RETURNING i.indexrelid, i.indrelid, 0::pg_catalog.oid
+                """,
+            SpiParameter.Create(relids)));
+        foreach (SpiRow row in result)
+        {
+            s_hidden.Add((row.Get<uint>(0), row.Get<uint>(1), unlive, row.Get<uint>(2)));
+            if (unlive)
+            {
+                _ = s_unliveTables.Add(row.Get<uint>(1));
+            }
+
+            NativeMethods.CacheInvalidateRelcacheByRelid(row.Get<uint>(1));
+        }
+
+        NativeMethods.CommandCounterIncrement();
     }
 
     /// <summary>
@@ -682,8 +898,10 @@ internal static unsafe partial class LocalIndex
             s_rebuiltAs.Clear();
             s_droppingConcurrently.Clear();
             s_namedBefore.Clear();
+            s_unliveTables.Clear();
             s_tracking = false;
             s_reindexing = false;
+            s_isolating = false;
             return;
         }
 
