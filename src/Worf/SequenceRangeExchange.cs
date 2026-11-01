@@ -63,10 +63,17 @@ internal static class SequenceRangeExchange
         JsonElement root = document.RootElement;
         uint senderId = root.GetProperty("node_id").GetUInt32();
         string slot = root.GetProperty("slot").GetString() ?? "";
-        Authenticate(slot, senderId);
 
-        // A subscriber that drops its subscription leaves the slot, and this node's fences no longer wait on it.
-        if (root.TryGetProperty("leave", out JsonElement leave) && leave.ValueKind == JsonValueKind.True)
+        // A subscriber that drops its subscription leaves the slot, if it ever called through it, and this node's fences no
+        // longer wait on it.
+        bool leaving = root.TryGetProperty("leave", out JsonElement leave) && leave.ValueKind == JsonValueKind.True;
+        if (leaving && Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range_link WHERE slot_name = $1", SpiParameter.Create(slot)).Count == 0)
+        {
+            return "{}";
+        }
+
+        Authenticate(slot, senderId);
+        if (leaving)
         {
             _ = Spi.Execute("DELETE FROM worf.sequence_range_link WHERE slot_name = $1", SpiParameter.Create(slot));
             SequenceRanges.ForgetNeighbor(senderId);
@@ -236,7 +243,7 @@ internal static class SequenceRangeExchange
         }
         catch (Exception error) when (error is PgException or PgRemoteException)
         {
-            PgLog.Warning($"could not tell node {sub.Origin.Name} that this node leaves slot \"{sub.SlotName}\", so its sequence range fences may wait on this node: {error.Message}");
+            PgLog.Log($"could not tell node {sub.Origin.Name} that this node leaves slot \"{sub.SlotName}\", so its sequence range fences may wait on this node: {error.Message}");
         }
     }
 
