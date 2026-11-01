@@ -842,11 +842,17 @@ public sealed class SequenceRangeTests
             Assert.AreEqual(start[0], end[0], $"{nodes[i].Name} taking no transaction IDs while idle, {phase}");
             if (start[1] != end[1])
             {
-                Assert.IsTrue(await nodes[i].PollQueryUntilAsync(Database, $"SELECT pg_current_wal_flush_lsn() >= '{end[1]}'", token),
+                // An insert position at a page's start lies past the page's header, which is written only with the page's
+                // first record, so the WAL is flushed once it reaches the page's start.
+                string flushed = $"""
+                    CASE WHEN ('{end[1]}'::pg_lsn - '0/0') % 8192 <= 40 THEN '{end[1]}'::pg_lsn - ('{end[1]}'::pg_lsn - '0/0') % 8192
+                        ELSE '{end[1]}'::pg_lsn END
+                    """;
+                Assert.IsTrue(await nodes[i].PollQueryUntilAsync(Database, $"SELECT pg_current_wal_flush_lsn() >= {flushed}", token),
                     $"{nodes[i].Name} flushing its WAL");
                 Assert.AreEqual("", await nodes[i].SafePsqlAsync(Database, $"""
                     SELECT string_agg(resource_manager || ' ' || record_type, ', ')
-                    FROM pg_get_wal_records_info('{start[1]}', '{end[1]}')
+                    FROM pg_get_wal_records_info('{start[1]}', greatest('{start[1]}'::pg_lsn + 1, least('{end[1]}'::pg_lsn, pg_current_wal_flush_lsn())))
                     WHERE resource_manager <> 'Standby' AND record_type NOT IN ('CHECKPOINT_REDO', 'CHECKPOINT_ONLINE', 'FPI_FOR_HINT')
                         AND NOT (resource_manager = 'Heap2' AND record_type IN ('PRUNE', 'PRUNE_ON_ACCESS'))
                     """, token), $"{nodes[i].Name} writing no WAL while idle, {phase}");
