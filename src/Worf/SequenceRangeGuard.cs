@@ -157,12 +157,12 @@ internal static class SequenceRangeGuard
     }
 
     /// <summary>
-    /// Waits, once a sequence reaches the last twentieth of its active block, for the range worker to start switching it,
-    /// so that inserts wait for the switch rather than run the block out while the worker is busy, as in an exchange, or
-    /// waits for the next block to arrive: until another process waits for the sequence's lock, as a switch does for this
-    /// transaction's, or the block is switched. A backend waits once per block, up to twice the exchange timeout, which
-    /// covers an exchange that hangs and the check after it, and only while the worker can switch: a next block is ready
-    /// or requested, and no transaction holds the sequence against it, as a reservation's switch does until it commits.
+    /// Waits, once a sequence reaches the last twentieth of its active block, until the range worker starts the switch,
+    /// which then waits for this transaction's lock on the sequence, or the block is switched, so that inserts wait for a
+    /// worker that is busy, as in an exchange, or for a next block on its way, rather than run the block out. A backend
+    /// waits once per block, up to twice the exchange timeout, which covers an exchange that hangs and the check after it,
+    /// and only while the worker can switch: a next block is ready or requested, and no transaction holds the sequence
+    /// against the switch, as a reservation's does until it commits.
     /// </summary>
     private static void WaitForSwitch(uint seqoid, long lo, bool ready)
     {
