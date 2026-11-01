@@ -487,7 +487,7 @@ internal static class Functions
             }
             catch (PgException)
             {
-                PgLog.Warning($"could not drop slot \"{sub.SlotName}\" on provider, you will probably have to drop it manually");
+                PgLog.Warning($"could not drop slot \"{sub.SlotName}\" on provider, you will probably have to drop it manually; until then, the provider's sequence range fences wait on this node");
             }
 
             // Drop the origin tracking locally.

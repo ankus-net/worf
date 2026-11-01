@@ -325,7 +325,10 @@ internal static class SequenceRangeExchange
                 string failure = error is PgQueryCanceledException
                     ? $"node {sub.Origin.Name} didn't answer within {SequenceRanges.ExchangeTimeout.ToString(CultureInfo.InvariantCulture)} ms"
                     : error.Message;
-                PgLog.Warning($"sequence range exchange with node {sub.Origin.Name} failed: {failure}");
+                PgLog.Warning(new PgDiagnostic($"sequence range exchange with node {sub.Origin.Name} failed: {failure}")
+                {
+                    Detail = (error as PgException)?.Detail,
+                });
             }
         }
 
@@ -627,7 +630,7 @@ internal static class SequenceRangeExchange
                     UNION ALL
                     SELECT NULL, d.name, d.owner_node, d.epoch, d.range_size, d.max_range_size, 0, NULL, d.watermark, NULL, 'disabled', d.root_start, d.root_end
                     FROM worf.sequence_range_dropped d
-                    WHERE NOT EXISTS (SELECT 1 FROM worf.sequence_range r WHERE r.seqoid = pg_catalog.to_regclass(d.name))) s
+                    WHERE d.owned AND NOT EXISTS (SELECT 1 FROM worf.sequence_range r WHERE r.seqoid = pg_catalog.to_regclass(d.name))) s
                 ORDER BY name COLLATE "C"
                 """);
             for (int i = 0; i < sequences.Count; i++)
@@ -856,7 +859,15 @@ internal static class SequenceRangeExchange
             }
             catch (PgException error)
             {
-                PgLog.Warning($"sequence range exchange with node {senderName} skipped sequence {entry.GetProperty("name").GetString()}: {error.Message}");
+                // A sequence dropped here since the exchange began goes unmentioned.
+                if (Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(entry.GetProperty("name").GetString())) is uint seqoid &&
+                    SequenceRanges.SequenceExists(seqoid))
+                {
+                    PgLog.Warning(new PgDiagnostic($"sequence range exchange with node {senderName} skipped sequence {entry.GetProperty("name").GetString()}: {error.Message}")
+                    {
+                        Detail = error.Detail,
+                    });
+                }
             }
         }
 

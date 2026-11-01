@@ -119,6 +119,34 @@ internal static class SequenceRangeGuard
         => Check((uint)sequence.DangerousGetBits(), value, false);
 
     /// <summary>
+    /// Finds the sequence to check a value under that a default which names its sequence as text drew, as the row is
+    /// written: the managed sequence the name finds under the session's search path, as nextval finds it, or otherwise,
+    /// as when it finds nothing or a sequence that isn't managed, the managed sequence the name stands for.
+    /// </summary>
+    /// <param name="name">The name the default gives.</param>
+    /// <param name="sequence">The managed sequence the name stands for.</param>
+    /// <returns>The sequence.</returns>
+    [PgFunction(Sql = """
+        CREATE FUNCTION worf.sequence_range_named(name text, sequence regclass)
+        RETURNS regclass STRICT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
+        """)]
+    [return: PgSqlType("regclass", Schema = "pg_catalog")]
+    internal static PgDatum Named(string name, [PgSqlType("regclass", Schema = "pg_catalog")] PgDatum sequence)
+    {
+        Reload();
+        SpiResult found = Spi.Select("SELECT pg_catalog.to_regclass($1)::oid", 1, SpiParameter.Create(name));
+        if (found.Count == 0 || found[0].Get<uint?>(0) is not uint seqoid || !s_sequences.ContainsKey(seqoid))
+        {
+            return sequence;
+        }
+
+        unsafe
+        {
+            return PgDatum.DangerousCreate(seqoid, (uint)PgBuiltInOid.RegClassOid, PgMemoryContext.Current);
+        }
+    }
+
+    /// <summary>
     /// Checks whether a value a new row holds lies in a block of one of the managed sequences its column uses, as a
     /// column that uses more than one does, without failing.
     /// </summary>

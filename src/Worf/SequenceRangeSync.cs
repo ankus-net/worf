@@ -88,6 +88,34 @@ internal static class SequenceRangeSync
     }
 
     /// <summary>
+    /// Joins a sequence that this node creates under the name of a managed sequence it took part in, and dropped, to the
+    /// owner's epoch again, in the transaction that creates it, as when its table is dropped and created again, so that
+    /// it issues none of its own values, which other nodes' blocks hold, before its blocks come.
+    /// </summary>
+    internal static void JoinRecreated()
+    {
+        if (WorfNode.GetLocalNode(false, true) is not WorfLocalNode node)
+        {
+            return;
+        }
+
+        SpiResult listed = Worf.SelectCatalog(
+            "SELECT name, owner_node, epoch, range_size, max_range_size, root_start, root_end FROM worf.sequence_range_dropped WHERE NOT owned");
+        for (int i = 0; i < listed.Count; i++)
+        {
+            SpiRow row = listed[i];
+            if (Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(row.Get<string>(0))) is uint seqoid &&
+                !SequenceRanges.IsManaged(seqoid))
+            {
+                SequenceRanges.JoinFromNeighbor(seqoid, row.Get<uint>(1), row.Get<int>(2), row.Get<long>(3), row.Get<long>(4), row.Get<long?>(5),
+                    row.Get<long?>(6), node);
+                _ = Spi.Execute("DELETE FROM worf.sequence_range_dropped WHERE name = $1", SpiParameter.Create(row.Get<string>(0)));
+                SequenceRanges.ChangedOnCommit();
+            }
+        }
+    }
+
+    /// <summary>
     /// Quarantines the provider's managed sequences that the restore has created so far, in the transaction that
     /// created them, and joins them.
     /// </summary>

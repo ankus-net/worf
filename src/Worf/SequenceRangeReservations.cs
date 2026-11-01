@@ -76,6 +76,7 @@ internal static class SequenceRangeReservations
         long deadline = Worker.GetCurrentTimestamp() + (long)Int128.Min(timeout.ToComparisonMicroseconds(), long.MaxValue / 2);
         Guid requestId = Guid.NewGuid();
         bool requested = false;
+        Guid? requestedUnder = null;
         try
         {
             while (true)
@@ -83,15 +84,19 @@ internal static class SequenceRangeReservations
                 // Whether the worker still had the request, or the node's parent, before this look at the blocks, so that
                 // a block granted or switched to between the look and the check isn't missed.
                 bool pending = requested && (Pending(requestId) || ReservedNext(seqoid, epoch));
-                if (SequenceRanges.NodeBlock(seqoid, epoch, "active") is (Guid, long, long) active &&
-                    SequenceRanges.StepsLeft(seqoid, info, active) >= needed)
+                (Guid Id, long Lo, long Hi)? active = SequenceRanges.NodeBlock(seqoid, epoch, "active");
+                if (active is not null && SequenceRanges.StepsLeft(seqoid, info, active.Value) >= needed)
                 {
                     break;
                 }
 
-                if (!requested)
+                if (!requested || (!pending && active?.Id != requestedUnder))
                 {
+                    // A block switched to for the request that other sessions drew down before this one looked holds
+                    // too few values now, so the request goes again.
                     requested = true;
+                    requestedUnder = active?.Id;
+                    requestId = Guid.NewGuid();
                     Post(new WorfReservation { RequestId = requestId, Seqoid = seqoid, Kind = (byte)'n', Size = needed });
                 }
                 else if (!pending)

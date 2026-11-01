@@ -585,6 +585,7 @@ internal static partial class Worf
     /// <returns>The rows.</returns>
     internal static unsafe SpiResult SelectCatalog(string commandText, params ReadOnlySpan<SpiParameter> parameters)
     {
+        int nestLevel = PinSearchPath();
         NativeMethods.PushActiveSnapshot(NativeMethods.GetLatestSnapshot());
         try
         {
@@ -593,6 +594,7 @@ internal static partial class Worf
         finally
         {
             NativeMethods.PopActiveSnapshot();
+            NativeMethods.AtEOXact_GUC(true, nestLevel);
         }
     }
 
@@ -607,6 +609,7 @@ internal static partial class Worf
     /// <returns>The rows.</returns>
     internal static unsafe SpiResult Read(string commandText, int limit, params ReadOnlySpan<SpiParameter> parameters)
     {
+        int nestLevel = PinSearchPath();
         NativeMethods.PushActiveSnapshot(NativeMethods.GetTransactionSnapshot());
         try
         {
@@ -615,7 +618,27 @@ internal static partial class Worf
         finally
         {
             NativeMethods.PopActiveSnapshot();
+            NativeMethods.AtEOXact_GUC(true, nestLevel);
         }
+    }
+
+    /// <summary>
+    /// Searches the system catalog first and temporary objects last until the GUC nest level it returns ends, so that a
+    /// query of worf's, run in a user's session, uses the system's operators and functions rather than ones a user put
+    /// ahead of them on the search path.
+    /// </summary>
+    /// <returns>The nest level, which the caller ends with <c>AtEOXact_GUC</c>.</returns>
+    internal static unsafe int PinSearchPath()
+    {
+        int nestLevel = NativeMethods.NewGUCNestLevel();
+        fixed (byte* name = ToServerCString("search_path"))
+        fixed (byte* value = ToServerCString("pg_catalog, pg_temp"))
+        {
+            _ = NativeMethods.set_config_option((sbyte*)name, (sbyte*)value, GucContext.PGC_USERSET, GucSource.PGC_S_SESSION,
+                GucAction.GUC_ACTION_SAVE, true, 0, false);
+        }
+
+        return nestLevel;
     }
 
     /// <summary>

@@ -479,14 +479,14 @@ public sealed class SequenceRangeTests
 
         // The text may be cast or put together in any way that folds to a constant, as a dump restored with an empty
         // search path writes it, and is looked up as the row is written, under the search path the default draws under,
-        // rather than the DDL's.
+        // rather than the DDL's. A name that gives no schema stands for the sequence in the table's.
         _ = await node.SafePsqlAsync(Database, """
             CREATE TABLE named_varchar (id bigint DEFAULT nextval('t_id_seq'::varchar));
             CREATE TABLE named_name (id bigint DEFAULT nextval('t_id_seq'::name::text));
             CREATE TABLE named_concat (id bigint DEFAULT nextval('t_id' || '_seq'));
             SET search_path = '';
             CREATE TABLE public.named_dump (id bigint DEFAULT nextval(('t_id_seq'::text)::regclass));
-            CREATE SEQUENCE other.t_id_seq;
+            CREATE SEQUENCE other.t_id_seq START 888890;
             SET search_path = other;
             CREATE TABLE public.named_other (id bigint DEFAULT nextval('t_id_seq'::text));
             """, token);
@@ -496,7 +496,63 @@ public sealed class SequenceRangeTests
             await AssertOutsideAsync(node, $"INSERT INTO {table} VALUES (888888)");
         }
 
-        _ = await node.SafePsqlAsync(Database, "SET search_path = other; INSERT INTO public.named_other DEFAULT VALUES; INSERT INTO public.named_other VALUES (888888)", token);
+        // A value from a sequence of the name that isn't managed, as one the search path finds first or a temporary one,
+        // or written where the name finds no sequence, as a restore with an empty search path writes rows, is checked
+        // under the managed sequence the name stands for.
+        foreach (string write in new[]
+        {
+            "SET search_path = other; INSERT INTO public.named_other DEFAULT VALUES",
+            "CREATE TEMP SEQUENCE t_id_seq START 888888; INSERT INTO named DEFAULT VALUES",
+            "SET search_path = ''; INSERT INTO public.named VALUES (888888)",
+            "SET search_path = ''; COPY public.named FROM PROGRAM 'echo 888889'",
+            "SET search_path = ''; INSERT INTO public.named2 VALUES (888888)",
+        })
+        {
+            await AssertOutsideAsync(node, write);
+        }
+
+        // A name that gives no schema leaves alone a table in another schema whose default names a sequence of its own.
+        _ = await node.SafePsqlAsync(Database, """
+            CREATE ROLE ra;
+            CREATE ROLE rb;
+            GRANT USAGE ON SCHEMA worf TO ra;
+            CREATE SCHEMA sa AUTHORIZATION ra;
+            CREATE SCHEMA sb AUTHORIZATION rb;
+            SET ROLE rb;
+            CREATE SEQUENCE sb.myseq;
+            CREATE TABLE sb.bt (id bigint DEFAULT nextval('myseq'::text));
+            RESET ROLE;
+            SET ROLE ra;
+            CREATE SEQUENCE sa.myseq;
+            SET search_path = sa;
+            SELECT worf.enable_sequence_range('sa.myseq', participants := '{}', range_size := 100);
+            """, token);
+        Assert.AreEqual("0", await node.SafePsqlAsync(Database, "SELECT count(*) FROM pg_trigger WHERE tgrelid = 'sb.bt'::regclass", token), "sb.bt's triggers");
+        _ = await node.SafePsqlAsync(Database, """
+            SET ROLE rb;
+            SET search_path = sb;
+            ALTER TABLE sb.bt ALTER COLUMN id SET DEFAULT nextval('sb.myseq');
+            ALTER TABLE sb.bt ALTER COLUMN id DROP DEFAULT;
+            ALTER TABLE sb.bt DISABLE TRIGGER ALL;
+            """, token);
+
+        // An update that moves a row into a partition whose trigger, run before the insert there, changes its key, is
+        // checked on every update, as one whose trigger runs before the update.
+        _ = await node.SafePsqlAsync(Database, """
+            CREATE TABLE pm (id bigint DEFAULT nextval('t_id_seq'), region text) PARTITION BY LIST (region);
+            CREATE TABLE pm_us PARTITION OF pm FOR VALUES IN ('us');
+            CREATE TABLE pm_eu PARTITION OF pm FOR VALUES IN ('eu');
+            CREATE FUNCTION rekey() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                IF current_setting('test.rekey', true) = 'on' THEN NEW.id := 888801; END IF;
+                RETURN NEW;
+            END$$;
+            CREATE TRIGGER rekey BEFORE INSERT ON pm_eu FOR EACH ROW EXECUTE FUNCTION rekey();
+            INSERT INTO pm (region) VALUES ('us');
+            """, token);
+        await AssertOutsideAsync(node, "SET test.rekey = on; UPDATE pm SET region = 'eu'");
+        await AssertOutsideAsync(node, "SET test.rekey = on; MERGE INTO pm USING (VALUES (1)) v (x) ON true WHEN MATCHED THEN UPDATE SET region = 'eu'");
+        _ = await node.SafePsqlAsync(Database, "UPDATE pm SET region = 'eu'", token);
         PostgresException unknown = await Assert.ThrowsExactlyAsync<PostgresException>(() => node.SafePsqlAsync(Database,
             "CREATE TABLE named_unknown (id bigint DEFAULT nextval(current_setting('application_name')))", token));
         Assert.AreEqual("0A000", unknown.SqlState);
@@ -586,6 +642,44 @@ public sealed class SequenceRangeTests
         PostgresException notOwned = await Assert.ThrowsExactlyAsync<PostgresException>(() => node.SafePsqlAsync(Database,
             "SET ROLE app; SELECT worf.disable_sequence_range('t_id_seq')", token));
         Assert.AreEqual("42501", notOwned.SqlState);
+
+        // worf's own queries search the system catalog first, whatever search path the session that runs them sets, so an
+        // operator a role puts ahead of PostgreSQL's neither keeps the guard off its table nor drops it later.
+        _ = await node.SafePsqlAsync(Database, """
+            SET ROLE app;
+            CREATE FUNCTION app.never(oid, oid) RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT false';
+            CREATE OPERATOR app.= (LEFTARG = oid, RIGHTARG = oid, FUNCTION = app.never);
+            SET search_path = app, pg_catalog;
+            CREATE TABLE app.shadowed (id bigint PRIMARY KEY DEFAULT nextval('public.t_id_seq'));
+            ALTER TABLE app.shadowed ADD COLUMN v text;
+            """, token);
+        Assert.AreEqual("2", await node.SafePsqlAsync(Database, "SELECT count(*) FROM pg_trigger WHERE tgrelid = 'app.shadowed'::regclass", token),
+            "app.shadowed's guard");
+        await AssertOutsideAsync(node, "SET ROLE app; SET search_path = app, pg_catalog; INSERT INTO app.shadowed VALUES (888888)");
+
+        // worf's workers search only the system catalog, whatever search path the database sets, so the owner of a
+        // database can't put an operator of its own into their queries, which run as a superuser.
+        _ = await node.SafePsqlAsync(Database, "CREATE DATABASE owned OWNER app", token);
+        _ = await node.SafePsqlAsync("owned", "CREATE EXTENSION worf; GRANT USAGE ON SCHEMA worf TO app", token);
+        _ = await node.SafePsqlAsync("owned", $"SELECT * FROM worf.create_node(node_name := 'owned', dsn := '{node.Dsn("owned", SuperUser)}')", token);
+        _ = await node.SafePsqlAsync("owned", """
+            SET ROLE app;
+            CREATE FUNCTION public.eq(oid, oid) RETURNS boolean LANGUAGE plpgsql AS $$
+            BEGIN
+                BEGIN
+                    ALTER ROLE app SUPERUSER;
+                EXCEPTION WHEN insufficient_privilege THEN
+                    NULL;
+                END;
+                RETURN $1 OPERATOR(pg_catalog.=) $2;
+            END$$;
+            CREATE OPERATOR public.= (LEFTARG = oid, RIGHTARG = oid, FUNCTION = public.eq);
+            ALTER DATABASE owned SET search_path = public, pg_catalog;
+            CREATE TABLE owned_rows (id bigserial PRIMARY KEY);
+            SELECT worf.enable_sequence_range('owned_rows_id_seq', participants := '{}', range_size := 100);
+            """, token);
+        Assert.IsTrue(await node.PollQueryUntilAsync("owned", "SELECT state = 'active' FROM worf.sequence_ranges", token), "owned_rows_id_seq active");
+        Assert.AreEqual("f", await node.SafePsqlAsync(Database, "SELECT rolsuper FROM pg_roles WHERE rolname = 'app'", token), "app a superuser");
 
         // worf reads a role's table with PostgreSQL's own scans, on SET DEFAULT and in the range worker, which run none of
         // the functions that its CHECK constraint and index predicate call, so they can't make it a superuser.
@@ -1985,12 +2079,24 @@ public sealed class SequenceRangeTests
 
         await ExecuteAsync(hold, "INSERT INTO t (v) SELECT 'held' FROM generate_series(1, 1000); COMMIT", token);
 
+        // node_b drops u and creates it again. The new sequence joins node_a's epoch as it is created, so that node_b
+        // issues none of its own values, which node_a's blocks may hold, before its blocks come.
+        _ = await nodeB.SafePsqlAsync(Database, "DROP TABLE u; CREATE TABLE u (id bigserial PRIMARY KEY, v text)", token);
+        Assert.AreEqual("t", await nodeB.SafePsqlAsync(Database, "SELECT EXISTS (SELECT 1 FROM worf.sequence_range WHERE seqoid = 'u_id_seq'::regclass)", token),
+            "node_b's new u_id_seq joined as it was created");
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges WHERE sequence = 'u_id_seq'::regclass", token),
+            "node_b drawing from a block of its new u_id_seq");
+        Assert.AreEqual("t", await nodeB.SafePsqlAsync(Database, """
+            WITH i AS (INSERT INTO u (v) VALUES ('again') RETURNING id)
+            SELECT i.id BETWEEN r.active_lo AND r.active_hi FROM i, worf.sequence_ranges r WHERE r.sequence = 'u_id_seq'::regclass
+            """, token), "node_b's key from its block");
+
         // node_b hears of grants beyond node_a's watermark, as when node_a, the owner, went back to before them by less
         // than its WAL position shows. node_a resets, and its fence holds, here on a neighbor that never reports, while
         // node_b asks for a block. With an exchange interval of ten minutes, node_b still asks node_a every ten checks,
         // and draws from a block beyond that watermark soon after the fence lifts.
         _ = await nodeB.SafePsqlAsync(Database, "ALTER SYSTEM SET worf.sequence_range_exchange_interval = '10min'; SELECT pg_reload_conf()", token);
-        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO worf.sequence_range_link VALUES ('ghost', 4242, 10)", token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT pg_create_physical_replication_slot('ghost'); INSERT INTO worf.sequence_range_link VALUES ('ghost', 4242, 10)", token);
         string beyond = await nodeB.SafePsqlAsync(Database, "UPDATE worf.sequence_range SET watermark = watermark + 1000000 WHERE seqoid = 't_id_seq'::regclass RETURNING watermark", token);
         int logpos = nodeA.ReadLog().Length;
         _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.reset_sequence_range('t_id_seq')", token);
@@ -2012,7 +2118,9 @@ public sealed class SequenceRangeTests
             await Task.Delay(TimeSpan.FromMilliseconds(20), token);
         }
 
-        _ = await nodeA.SafePsqlAsync(Database, "DELETE FROM worf.sequence_range_link WHERE node_id = 4242", token);
+        // Dropping the slot a node that is gone used, as drop_subscription asks when it can't reach the provider, lifts the
+        // fence as deleting its link would.
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT pg_drop_replication_slot('ghost')", token);
         Stopwatch lifted = Stopwatch.StartNew();
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, $"SELECT state = 'active' AND active_lo > {beyond} FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token),
             "node_b drawing from a block beyond the watermark it heard of");

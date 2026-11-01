@@ -184,10 +184,21 @@ internal static class Worker
         // Make it easy to identify our processes.
         SetConfigOption("application_name", PgBackgroundWorker.Name);
 
-        // Connect to database if needed.
+        // Connect to database if needed. A worker runs as the bootstrap superuser, so it takes no search path from the
+        // database or its owner, as PostgreSQL's apply worker doesn't, where an operator or function of theirs could
+        // stand in for the system's in worf's queries; only the system catalog is searched.
         if (dboid != 0)
         {
             PgBackgroundWorker.Connect(dboid, 0);
+            unsafe
+            {
+                fixed (byte* name = Worf.ToServerCString("search_path"))
+                fixed (byte* value = Worf.ToServerCString(""))
+                {
+                    _ = NativeMethods.set_config_option((sbyte*)name, (sbyte*)value, GucContext.PGC_SUSET, GucSource.PGC_S_SESSION,
+                        GucAction.GUC_ACTION_SET, true, 0, false);
+                }
+            }
         }
     }
 

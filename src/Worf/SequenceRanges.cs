@@ -141,7 +141,8 @@ using Ankus.Postgres;
         max_range_size bigint NOT NULL,
         watermark bigint,
         root_start bigint,
-        root_end bigint NOT NULL
+        root_end bigint NOT NULL,
+        owned boolean NOT NULL DEFAULT true
     );
 
     CREATE VIEW worf.sequence_ranges AS
@@ -229,8 +230,9 @@ internal static unsafe partial class SequenceRanges
     private const uint TriggerRelationId = 2620;
     private const int PerformDeletionInternal = 0x0001;
 
-    // TRIGGER_TYPE_ROW, TRIGGER_TYPE_BEFORE and TRIGGER_TYPE_UPDATE from catalog/pg_trigger.h.
+    // TRIGGER_TYPE_ROW, TRIGGER_TYPE_BEFORE, TRIGGER_TYPE_INSERT and TRIGGER_TYPE_UPDATE from catalog/pg_trigger.h.
     private const int BeforeUpdateRow = 1 | 2 | 16;
+    private const int BeforeInsertRow = 1 | 2 | 4;
 
     private static readonly string[] s_guardNames = [GuardName, UpdateGuardName, PartitionGuardName, PartitionUpdateGuardName];
 
@@ -420,7 +422,7 @@ internal static unsafe partial class SequenceRanges
         long end = RootEnd(info);
         // A sequence of the name this node owned and dropped starts the next epoch, above the dropped one's grants.
         if (existing.Count == 0 &&
-            Worf.SelectCatalog("SELECT epoch, watermark, root_start, root_end FROM worf.sequence_range_dropped WHERE name = $1", SpiParameter.Create(info.Name))
+            Worf.SelectCatalog("SELECT epoch, watermark, root_start, root_end FROM worf.sequence_range_dropped WHERE name = $1 AND owned", SpiParameter.Create(info.Name))
             is { Count: > 0 } dropped)
         {
             epoch = dropped[0].Get<int>(0) + 1;
@@ -609,14 +611,15 @@ internal static unsafe partial class SequenceRanges
         _ = Spi.Execute("""
             INSERT INTO worf.sequence_range_dropped
             SELECT pg_catalog.quote_ident(n.nspname) || '.' || pg_catalog.quote_ident(c.relname), r.owner_node, r.epoch, r.range_size, r.max_range_size,
-                r.watermark, r.root_start, r.root_end
+                r.watermark, r.root_start, r.root_end, r.owner_node = l.node_id
             FROM worf.sequence_range r
                 JOIN pg_catalog.pg_class c ON c.oid = r.seqoid
                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-                JOIN worf.local_node l ON l.node_id = r.owner_node
+                CROSS JOIN worf.local_node l
             WHERE r.seqoid = $1
             ON CONFLICT (name) DO UPDATE SET owner_node = excluded.owner_node, epoch = excluded.epoch, range_size = excluded.range_size,
-                max_range_size = excluded.max_range_size, watermark = excluded.watermark, root_start = excluded.root_start, root_end = excluded.root_end
+                max_range_size = excluded.max_range_size, watermark = excluded.watermark, root_start = excluded.root_start, root_end = excluded.root_end,
+                owned = excluded.owned
             """, SpiParameter.Create(seqoid));
         ChangedOnCommit();
     }
@@ -1400,7 +1403,7 @@ internal static unsafe partial class SequenceRanges
                 GuardedColumns(TreeRoot(relid)).TryGetValue(column, out (uint TypeOid, List<uint> Sequences, List<string> Names) guarded) &&
                 guarded.TypeOid is Int2Oid or Int4Oid or Int8Oid)
             {
-                s_retyped[(relid, column)] = Effective(guarded);
+                s_retyped[(relid, column)] = Effective(guarded, relid);
             }
         }
 
@@ -1644,6 +1647,11 @@ internal static unsafe partial class SequenceRanges
             Elevated.Run(SequenceRangeSync.JoinRestored);
         }
 
+        if (parsetree->type == NodeTag.T_CreateSeqStmt && Worf.CatalogOid("sequence_range_dropped") != 0)
+        {
+            Elevated.Run(SequenceRangeSync.JoinRecreated);
+        }
+
         if (!AnyManaged())
         {
             return;
@@ -1724,7 +1732,7 @@ internal static unsafe partial class SequenceRanges
                             string column = Worf.FromServer(cmd->name);
                             if (!s_retyped.Remove((relid, column), out List<uint>? kept) || kept is null ||
                                 !GuardedColumns(TreeRoot(relid)).TryGetValue(column, out (uint TypeOid, List<uint> Sequences, List<string> Names) retyped) ||
-                                !Effective(retyped).TrueForAll(kept.Contains))
+                                !Effective(retyped, relid).TrueForAll(kept.Contains))
                             {
                                 CheckColumnRows(relid, column, alter->relation->inh);
                             }
@@ -1795,7 +1803,7 @@ internal static unsafe partial class SequenceRanges
         {
             if (GuardedColumns(relid).TryGetValue(column, out (uint TypeOid, List<uint> Sequences, List<string> Names) guarded))
             {
-                SequenceRangeGuard.CheckRows(relid, inherited, column, Effective(guarded));
+                SequenceRangeGuard.CheckRows(relid, inherited, column, Effective(guarded, relid));
             }
 
             return;
@@ -1808,7 +1816,7 @@ internal static unsafe partial class SequenceRanges
             if (leaf && Beneath(partition, relid, tree.Members) &&
                 GuardedColumns(partition, tree).TryGetValue(column, out (uint TypeOid, List<uint> Sequences, List<string> Names) guarded))
             {
-                SequenceRangeGuard.CheckRows(partition, false, column, Effective(guarded));
+                SequenceRangeGuard.CheckRows(partition, false, column, Effective(guarded, partition));
             }
         }
     }
@@ -1840,8 +1848,8 @@ internal static unsafe partial class SequenceRanges
                 ownPartitions.TryGetValue(leaf, out Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>? columns) ? columns : []);
             foreach ((string column, (uint TypeOid, List<uint> Sequences, List<string> Names) use) in GuardedColumns(leaf, tree))
             {
-                List<uint> sequences = Effective(use);
-                if (!own.TryGetValue(column, out (uint TypeOid, List<uint> Sequences, List<string> Names) before) || !sequences.TrueForAll(Effective(before).Contains))
+                List<uint> sequences = Effective(use, leaf);
+                if (!own.TryGetValue(column, out (uint TypeOid, List<uint> Sequences, List<string> Names) before) || !sequences.TrueForAll(Effective(before, leaf).Contains))
                 {
                     SequenceRangeGuard.CheckRows(leaf, false, column, sequences);
                 }
@@ -1920,7 +1928,8 @@ internal static unsafe partial class SequenceRanges
         uint typid = NativeMethods.typenameTypeId(null, NativeMethods.makeTypeNameFromNameList(typeName));
         SpiResult managed = Elevated.Run(() => Worf.SelectCatalog("SELECT r.seqoid::oid FROM worf.sequence_range r WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = r.seqoid)"));
         return Worf.ReadScalar<string?>("SELECT typdefaultbin::text FROM pg_catalog.pg_type WHERE oid = $1", SpiParameter.Create(typid)) is string expression &&
-            Enumerable.Range(0, managed.Count).Any(i => MayDrawFrom((Node*)NativeMethods.stringToNode(Worf.PStrDup(expression)), managed[i].Get<uint>(0)).Draws);
+            Enumerable.Range(0, managed.Count).Any(i => MayDrawFrom((Node*)NativeMethods.stringToNode(Worf.PStrDup(expression)), managed[i].Get<uint>(0),
+                Worf.ReadScalar<uint>("SELECT typnamespace FROM pg_catalog.pg_type WHERE oid = $1", SpiParameter.Create(typid))).Draws);
     }
 
     private static bool AnyManaged()
@@ -2049,7 +2058,7 @@ internal static unsafe partial class SequenceRanges
         for (int i = 0; i < result.Count; i++)
         {
             (bool draws, string? name) = result[i].Get<string?>(3) is string expression
-                ? MayDrawFrom((Node*)NativeMethods.stringToNode(Worf.PStrDup(expression)), seqoid)
+                ? MayDrawFrom((Node*)NativeMethods.stringToNode(Worf.PStrDup(expression)), seqoid, NativeMethods.get_rel_namespace(result[i].Get<uint>(0)))
                 : (true, null);
             (uint Relid, string Column, uint TypeOid, string? Name) column = (result[i].Get<uint>(0), result[i].Get<string>(1),
                 NativeMethods.getBaseType(result[i].Get<uint>(2)), name);
@@ -2068,7 +2077,7 @@ internal static unsafe partial class SequenceRanges
     /// this check doesn't look into.
     /// </summary>
     /// <returns>Whether it may, and the name it gives the sequence as text, if it does.</returns>
-    private static (bool Draws, string? Name) MayDrawFrom(Node* node, uint seqoid)
+    private static (bool Draws, string? Name) MayDrawFrom(Node* node, uint seqoid, uint schema)
     {
         if (node is null)
         {
@@ -2078,7 +2087,7 @@ internal static unsafe partial class SequenceRanges
         if (node->type == NodeTag.T_FuncExpr && ((FuncExpr*)node)->funcid == NextvalOid)
         {
             (uint oid, string? name) = NextvalTarget((FuncExpr*)node);
-            return name is not null ? (NameMatches(name, seqoid), name) : (oid == 0 || oid == seqoid, null);
+            return name is not null ? (NameMatches(name, seqoid, schema), name) : (oid == 0 || oid == seqoid, null);
         }
 
         List<nint> children = [];
@@ -2089,7 +2098,7 @@ internal static unsafe partial class SequenceRanges
 
         foreach (nint child in children)
         {
-            (bool draws, string? name) = MayDrawFrom((Node*)child, seqoid);
+            (bool draws, string? name) = MayDrawFrom((Node*)child, seqoid, schema);
             if (draws)
             {
                 return (true, name);
@@ -2195,23 +2204,25 @@ internal static unsafe partial class SequenceRanges
     private static bool Immutable(uint funcid) => funcid != 0 && funcid < FirstNormalObjectId && NativeMethods.func_volatile(funcid) == (sbyte)'i';
 
     /// <summary>
-    /// Checks whether a name, as nextval looks it up, may resolve to a sequence under some search path: it names the
-    /// sequence's relation, and its schema, if it names one.
+    /// Checks whether a name, as nextval looks it up in a default of a table or domain in a schema, names a sequence: it
+    /// names the sequence's relation, and its schema, which a name that gives none takes to be the table's or domain's,
+    /// so that a sequence elsewhere with the same name, which a search path may find first, doesn't count.
     /// </summary>
-    private static bool NameMatches(string name, uint seqoid)
+    private static bool NameMatches(string name, uint seqoid, uint schema)
         => QualifiedNameParts(name) is { Count: > 0 } parts && parts[^1] == Worf.FromServer(NativeMethods.get_rel_name(seqoid)) &&
-            (parts.Count == 1 || parts[^2] == Worf.FromServer(NativeMethods.get_namespace_name(NativeMethods.get_rel_namespace(seqoid))));
+            (parts.Count == 1 ? NativeMethods.get_rel_namespace(seqoid) == schema
+                : parts[^2] == Worf.FromServer(NativeMethods.get_namespace_name(NativeMethods.get_rel_namespace(seqoid))));
 
     /// <summary>
-    /// Finds the managed sequences a name may resolve to under some search path.
+    /// Finds the managed sequences a name in a default of a table or domain in a schema names.
     /// </summary>
-    private static List<uint> Matching(string name)
+    private static List<uint> Matching(string name, uint schema)
     {
         SpiResult managed = Elevated.Run(() => Worf.SelectCatalog("SELECT r.seqoid::oid FROM worf.sequence_range r WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = r.seqoid) ORDER BY r.seqoid"));
         List<uint> matching = [];
         for (int i = 0; i < managed.Count; i++)
         {
-            if (NameMatches(name, managed[i].Get<uint>(0)))
+            if (NameMatches(name, managed[i].Get<uint>(0), schema))
             {
                 matching.Add(managed[i].Get<uint>(0));
             }
@@ -2758,6 +2769,13 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
+    /// Checks whether a sequence still exists, which one a concurrent drop removed doesn't.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    /// <returns>Whether it does.</returns>
+    internal static bool SequenceExists(uint seqoid) => NativeMethods.get_rel_relkind(seqoid) == (sbyte)'S';
+
+    /// <summary>
     /// Records this node's high-water mark, its own report, under the sequence's epoch.
     /// </summary>
     private static void Report(uint seqoid, SequenceInfo info, WorfLocalNode node, long? issued = null)
@@ -2910,7 +2928,8 @@ internal static unsafe partial class SequenceRanges
 
         SpiResult? waiting = force ? null : Worf.SelectCatalog("""
             WITH neighbors (node_id) AS (
-                SELECT node_id FROM worf.sequence_range_link
+                SELECT k.node_id FROM worf.sequence_range_link k
+                WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_replication_slots s WHERE s.slot_name = k.slot_name)
                 UNION
                 SELECT s.sub_origin FROM worf.subscription s JOIN worf.local_node l ON l.node_id = s.sub_target)
             SELECT coalesce(o.node_name::text, (SELECT max(n.node_name::text) FROM worf.sequence_range_node n WHERE n.node_id = w.node_id),
@@ -2931,8 +2950,8 @@ internal static unsafe partial class SequenceRanges
         {
             string detail = $"fenced until {string.Join(", ", Enumerable.Range(0, waiting.Count).Select(i => "node " + waiting[i].Get<string>(0)))} " +
                 (waiting.Count == 1 ? "reports the blocks it holds" : "report the blocks they hold") +
-                "; a node that is gone for good holds the fence until the subscriptions between it and this node are dropped, or its rows in " +
-                "worf.sequence_range_link are deleted, or worf.activate_sequence_range lifts it";
+                "; a node that is gone for good holds the fence until the subscriptions between it and this node are dropped, or the slots it " +
+                "used here, or its rows in worf.sequence_range_link are deleted, or worf.activate_sequence_range lifts it";
             _ = Spi.Execute("UPDATE worf.sequence_range SET detail = $2 WHERE seqoid = $1 AND detail IS DISTINCT FROM $2", seq, SpiParameter.Create(detail));
             return false;
         }
@@ -2974,10 +2993,11 @@ internal static unsafe partial class SequenceRanges
     /// <summary>
     /// Bounds a watermark a neighbor reports, of its own or another node's, by what any node could have heard of
     /// granted: no further than the root's end, and on the owner, once its root has started, no further than two of
-    /// its largest blocks beyond both its own watermark and the furthest grant its ledger holds. Only the owner's
-    /// own blocks, two at most at once, can lie beyond that, since every other grant's holder reports it to its
-    /// allocator. A made-up watermark is taken only that far, so that a fence that lifts gives up no more of the
-    /// root's values.
+    /// its largest blocks beyond both its own blocks and the furthest grant its ledger holds. Only the owner's own
+    /// blocks, two at most at once, can lie beyond that, since every other grant's holder reports it to its allocator.
+    /// The bound leaves out the watermarks earlier reports gave, so that made-up ones can't each raise the next one's
+    /// bound. A made-up watermark is taken only that far, so that a fence that lifts gives up no more of the root's
+    /// values. Before the root starts, as an owner that moved collects what the old blocks reached, nothing bounds one.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
     /// <param name="info">The sequence's details.</param>
@@ -2985,15 +3005,16 @@ internal static unsafe partial class SequenceRanges
     /// <returns>The watermark this node takes, and whether that is less than the neighbor reports.</returns>
     internal static (long Mark, bool Bounded) BoundWatermark(uint seqoid, SequenceInfo info, long mark)
     {
+        string furthest = info.Ascending ? "max" : "min";
         SpiResult range = Worf.SelectCatalog($"""
-            SELECT r.root_end, r.max_range_size, r.owner_node = l.node_id AND r.root_start IS NOT NULL, r.watermark,
-                {(info.Ascending ? "max(g.hi)" : "min(g.lo)")}
-            FROM worf.sequence_range r
-                CROSS JOIN worf.local_node l
-                LEFT JOIN worf.sequence_range_block b ON b.seqoid = r.seqoid AND b.epoch = r.epoch AND b.kind = 'r'
-                LEFT JOIN worf.sequence_range_grant g ON g.from_block = b.block_id AND g.kind <> 'x'
+            SELECT r.root_end, r.max_range_size, r.owner_node = l.node_id AND r.root_start IS NOT NULL,
+                (SELECT {furthest}({(info.Ascending ? "o.hi" : "o.lo")}) FROM worf.sequence_range_block o
+                    WHERE o.seqoid = r.seqoid AND o.epoch = r.epoch AND o.kind = 'n' AND o.node_id = l.node_id),
+                (SELECT {furthest}({(info.Ascending ? "g.hi" : "g.lo")}) FROM worf.sequence_range_block b
+                    JOIN worf.sequence_range_grant g ON g.from_block = b.block_id AND g.kind <> 'x'
+                    WHERE b.seqoid = r.seqoid AND b.epoch = r.epoch AND b.kind = 'r')
+            FROM worf.sequence_range r CROSS JOIN worf.local_node l
             WHERE r.seqoid = $1
-            GROUP BY r.root_end, r.max_range_size, r.owner_node, l.node_id, r.root_start, r.watermark
             """, SpiParameter.Create(seqoid));
         if (range.Count == 0)
         {
@@ -3157,13 +3178,19 @@ internal static unsafe partial class SequenceRanges
                 : UsingColumns(seqoid).Find(column => !Checkable(column.TypeOid)) is (uint relid, string column, uint typeOid) && relid != 0
                     ? $"column \"{column}\" of table {QualifiedName(relid)} has type {Worf.FromServer(NativeMethods.format_type_be(typeOid))} here, whose values the guard can't check"
                     : null;
-        _ = Spi.Execute("""
+        // The range worker and the exchange worker may both join a sequence; the first does.
+        if (Spi.Execute("""
             INSERT INTO worf.sequence_range (seqoid, owner_node, epoch, range_size, max_range_size, state, request_size, root_start, root_end, detail)
             VALUES ($1, $2, $3, $4, $5, $6, $4, $9, $7, $8)
+            ON CONFLICT (seqoid) DO NOTHING
             """, SpiParameter.Create(seqoid), SpiParameter.Create(owner), SpiParameter.Create(epoch), SpiParameter.Create(rangeSize),
             SpiParameter.Create(maxRangeSize), SpiParameter.Create(refused is null ? "quarantined" : "refused"),
             SpiParameter.Create(rootEnd ?? RootEnd(info)), SpiParameter.Create(refused),
-            SpiParameter.Create(rootStart ?? (info.Ascending ? info.Min : info.Max)));
+            SpiParameter.Create(rootStart ?? (info.Ascending ? info.Min : info.Max))) == 0)
+        {
+            return;
+        }
+
         if (refused is null)
         {
             Join(seqoid, node);
@@ -3851,15 +3878,18 @@ internal static unsafe partial class SequenceRanges
 
         // A row trigger that runs before an update may change any column, so the update guard of a table that has one, or
         // the root's when any table of the tree does, fires on every update, and otherwise only on one that sets a column it
-        // checks.
+        // checks. So may a partition's row trigger that runs before an insert, as an update moves a row into it, so the
+        // root's update guard fires on every update then too.
         SpiResult before = Worf.Read("""
-            SELECT DISTINCT tgrelid::oid FROM pg_catalog.pg_trigger WHERE tgrelid = ANY ($1::oid[]) AND (tgtype & $2) = $2
-            """, 0, SpiParameter.Create(members.Keys.Select(member => (long)member).ToArray()), SpiParameter.Create(BeforeUpdateRow));
-        HashSet<uint> changing = [.. Enumerable.Range(0, before.Count).Select(i => before[i].Get<uint>(0))];
+            SELECT DISTINCT tgrelid::oid, (tgtype & $2) = $2 FROM pg_catalog.pg_trigger
+            WHERE tgrelid = ANY ($1::oid[]) AND ((tgtype & $2) = $2 OR (tgrelid <> $4 AND (tgtype & $3) = $3))
+            """, 0, SpiParameter.Create(members.Keys.Select(member => (long)member).ToArray()), SpiParameter.Create(BeforeUpdateRow),
+            SpiParameter.Create(BeforeInsertRow), SpiParameter.Create(root));
+        HashSet<uint> changing = [.. Enumerable.Range(0, before.Count).Where(i => before[i].Get<bool>(1)).Select(i => before[i].Get<uint>(0))];
 
         // A moved row's insert into a partition leaves the check of the root's columns to the root's update guard, which
         // compares the row's old and new values, but a partition's own columns are checked as a new row's.
-        InstallPair(root, GuardName, UpdateGuardName, "worf.sequence_range_check", rootColumns, changing.Count > 0, triggers);
+        InstallPair(root, GuardName, UpdateGuardName, "worf.sequence_range_check", rootColumns, before.Count > 0, triggers);
         foreach (uint member in members.Keys)
         {
             InstallPair(member, PartitionGuardName, PartitionUpdateGuardName, "worf.sequence_range_check_update",
@@ -3895,11 +3925,15 @@ internal static unsafe partial class SequenceRanges
 
         // A sequence is named by its oid, which looks up nothing, and one that a default names as text by that text, looked
         // up as the row is written, as the default looks it up, so that the value is checked under the sequence it came
-        // from, if that is managed.
+        // from, if that is managed, and otherwise, as when the name finds nothing or another sequence, under the managed
+        // sequence the name stands for.
+        uint schema = NativeMethods.get_rel_namespace(relid);
         List<(short Attnum, string Name, string Type, List<string> Sequences)> guarded = [.. columns
             .Select(column => (attnums[column.Key], Spi.QuoteIdentifier(column.Key), column.Value.TypeOid == NumericOid ? "numeric" : "bigint",
                 column.Value.Sequences.Select(seq => Spi.QuoteLiteral(seq.ToString(CultureInfo.InvariantCulture)) + "::regclass")
-                    .Concat(column.Value.Names.Select(name => $"pg_catalog.to_regclass({Spi.QuoteLiteral(name)})")).ToList()))
+                    .Concat(column.Value.Names.SelectMany(name => Matching(name, schema).Select(seq =>
+                        $"worf.sequence_range_named({Spi.QuoteLiteral(name)}, {Spi.QuoteLiteral(seq.ToString(CultureInfo.InvariantCulture))}::regclass)"))).ToList()))
+            .Where(column => column.Item4.Count > 0)
             .OrderBy(column => column.Item1)];
         List<string> arguments = [.. columns
             .OrderBy(column => attnums[column.Key])
@@ -3953,8 +3987,8 @@ internal static unsafe partial class SequenceRanges
     /// Lists the managed sequences a column uses: those its defaults name by oid, and those a name a default gives as
     /// text may resolve to.
     /// </summary>
-    private static List<uint> Effective((uint TypeOid, List<uint> Sequences, List<string> Names) use)
-        => [.. use.Sequences.Union(use.Names.SelectMany(Matching))];
+    private static List<uint> Effective((uint TypeOid, List<uint> Sequences, List<string> Names) use, uint relid)
+        => [.. use.Sequences.Union(use.Names.SelectMany(name => Matching(name, NativeMethods.get_rel_namespace(relid))))];
 
     /// <summary>
     /// Finds the root of a table's partition tree: the table itself when it's no partition.
