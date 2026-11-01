@@ -198,10 +198,11 @@ internal static class SequenceRangeWorker
 
         double seconds = Math.Max(now - previous.At, 0) / 1e6;
         double rate = Math.Max(((double)position - previous.Position) / increment, 0) / Math.Max(seconds, RateSample / 1e6);
-        // The peak is written once it moves a tenth from the one the range row holds, however small each check's step.
+        // The peak is written once it rises a tenth above the one the range row holds, however small each check's step,
+        // and not as it decays, so that an idle sequence writes nothing.
         double peak = Math.Max(rate, previous.Peak * Math.Pow(0.99, (now - previous.PeakAt) / 1e6));
         double written = state[0].Get<double?>(4) ?? 0;
-        if (Math.Abs(peak - written) > Math.Max(written * 0.1, 1))
+        if (peak - written > Math.Max(written * 0.1, 1))
         {
             _ = Spi.Execute("UPDATE worf.sequence_range SET peak_rate = $2 WHERE seqoid = $1", SpiParameter.Create(seqoid),
                 SpiParameter.Create(peak));
