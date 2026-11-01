@@ -202,6 +202,17 @@ internal static class SequenceRangeReservations
         List<Guid> recorded = [];
         foreach (WorfReservation reservation in posted)
         {
+            // The sequence's lock comes before its rows, as it does for every change to its ranges, so that a DROP of
+            // the sequence never waits on the worker while the worker waits on its rows. A sequence that a transaction
+            // holds against the lock waits for a later tick, so that the worker waits on no session.
+            unsafe
+            {
+                if (!NativeMethods.ConditionalLockRelationOid(reservation.Seqoid, (int)PgLockMode.RowExclusive))
+                {
+                    continue;
+                }
+            }
+
             SpiResult range = Spi.Query("SELECT owner_node, epoch FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE", false, 1,
                 SpiParameter.Create(reservation.Seqoid));
             if (range.Count > 0 && reservation.Kind == (byte)'n' && Spi.Execute("""
