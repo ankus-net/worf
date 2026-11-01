@@ -709,7 +709,9 @@ internal sealed partial class WorfNode
 
     /// <summary>
     /// Gets the node whose changes a replication origin applied when a transaction ran, and the subscription it applied
-    /// them for, from what worf recorded.
+    /// them for, from what worf recorded. For a transaction older than <see cref="OriginWriterKeptSince"/>, whose record
+    /// can be forgotten, it's what the origin applies for now when worf recorded nothing older, as pglogical takes every
+    /// row's origin to be.
     /// </summary>
     /// <param name="originId">The origin's id.</param>
     /// <param name="xid">The transaction, within the last two billion.</param>
@@ -719,11 +721,32 @@ internal sealed partial class WorfNode
     {
         SpiResult result = Worf.Read("""
             SELECT writer_node, sub_id FROM worf.origin_writer
-            WHERE roident = $1 AND since_xid <= $2::text::xid8
-            ORDER BY since_xid DESC
+            WHERE roident = $1 AND (since_xid <= $2::text::xid8 OR $2::text::xid8 < $3::text::xid8)
+            ORDER BY since_xid <= $2::text::xid8 DESC, since_xid DESC
             LIMIT 1
-            """, 1, SpiParameter.Create((uint)originId), SpiParameter.Create((long)Worf.FullTransactionId(xid)));
+            """, 1, SpiParameter.Create((uint)originId), SpiParameter.Create((long)Worf.FullTransactionId(xid)),
+            SpiParameter.Create((long)OriginWriterKeptSince));
         return result.Count == 0 ? null : (result[0].Get<uint>(0), result[0].Get<uint>(1));
+    }
+
+    /// <summary>
+    /// Gets the full transaction id from which every record in <c>worf.origin_writer</c> that a transaction since needs
+    /// is kept: <c>vacuum_freeze_min_age</c> transactions ago, the age from which vacuum freezes rows as it visits them.
+    /// A record superseded before then is forgotten once an origin is created or dropped.
+    /// </summary>
+    internal static ulong OriginWriterKeptSince
+    {
+        get
+        {
+            ulong next = Worf.NextFullTransactionId;
+            ulong age;
+            unsafe
+            {
+                age = (ulong)Math.Max(NativeGlobals.vacuum_freeze_min_age, 0);
+            }
+
+            return next > age ? next - age : 0;
+        }
     }
 
     /// <summary>
@@ -777,9 +800,10 @@ internal sealed partial class WorfNode
     /// transaction's, which can be older than another transaction's that dropped or created an origin with the id
     /// since; the caller holds the lock on the catalog that creating or dropping it took, which keeps others from
     /// changing the id until it commits. A record of any origin that a later one supersedes for every transaction since
-    /// this database's <c>datfrozenxid</c> is forgotten, as apply treats the rows of older transactions, which vacuum has
-    /// frozen, as having no commit origin, or since the oldest commit timestamp PostgreSQL keeps, when that's later.
-    /// Apply runs this for relay origins it creates and drops, so the statement is planned once.
+    /// <see cref="OriginWriterKeptSince"/> is forgotten, or since this database's <c>datfrozenxid</c> or the oldest commit
+    /// timestamp PostgreSQL keeps, when either is later, as apply treats the rows of older transactions, which vacuum has
+    /// frozen or whose commit timestamps are gone, as having no commit origin. Apply runs this for relay origins it
+    /// creates and drops, so the statement is planned once.
     /// </summary>
     /// <returns>The full transaction id the record starts from.</returns>
     internal static ulong RecordOriginWriter(ushort origin, uint writerNodeId, uint subId)
@@ -796,7 +820,8 @@ internal sealed partial class WorfNode
                 DELETE FROM worf.origin_writer w USING kept WHERE w.roident = kept.roident AND w.since_xid < kept.since_xid
                 """, [typeof(uint), typeof(uint), typeof(uint), typeof(long), typeof(long)]).Keep();
             ulong sinceXid = Worf.NextFullTransactionId;
-            ulong forgetBefore = Math.Max(Worf.DatabaseFrozenFullTransactionId, Worf.OldestCommitTsFullTransactionId);
+            ulong forgetBefore = Math.Max(OriginWriterKeptSince,
+                Math.Max(Worf.DatabaseFrozenFullTransactionId, Worf.OldestCommitTsFullTransactionId));
             _ = s_recordOriginWriter.Execute(SpiParameter.Create((uint)origin), SpiParameter.Create(writerNodeId), SpiParameter.Create(subId),
                 SpiParameter.Create((long)sinceXid), SpiParameter.Create((long)forgetBefore));
             return sinceXid;
@@ -827,9 +852,11 @@ internal sealed partial class WorfNode
 
     /// <summary>
     /// Checks whether every replication origin slot in shared memory is taken while the origin of an enabled PostgreSQL
-    /// subscription, or of one of its table syncs, has none, as one its workers can't set up has. Unlike worf's
-    /// workers, those don't say when they find no slot free. An origin that nothing sets up, such as a disabled
-    /// subscription's or one a user created, has none too, and doesn't count.
+    /// subscription, or of one of its table syncs, has none, and a worker of the subscription runs or can start: its
+    /// owner can log in, its database allows connections, and <c>max_logical_replication_workers</c> leaves room. Unlike
+    /// worf's workers, those don't say when they find no slot free, and exit at once when they do. An origin that nothing
+    /// sets up, such as a disabled subscription's, one whose worker can't start, or one a user created, has none too,
+    /// and doesn't count.
     /// </summary>
     /// <returns>Whether one is.</returns>
     internal static bool OriginSlotWantedElsewhere()
@@ -839,8 +866,14 @@ internal sealed partial class WorfNode
                 EXISTS (SELECT 1 FROM pg_catalog.pg_subscription s
                     JOIN pg_catalog.pg_replication_origin o
                         ON o.roname = 'pg_' || s.oid OR starts_with(o.roname, 'pg_' || s.oid || '_')
+                    JOIN pg_catalog.pg_roles r ON r.oid = s.subowner
+                    JOIN pg_catalog.pg_database d ON d.oid = s.subdbid
                     WHERE s.subenabled AND
-                        NOT EXISTS (SELECT 1 FROM pg_catalog.pg_replication_origin_status st WHERE st.local_id = o.roident))
+                        NOT EXISTS (SELECT 1 FROM pg_catalog.pg_replication_origin_status st WHERE st.local_id = o.roident) AND
+                        (EXISTS (SELECT 1 FROM pg_catalog.pg_stat_subscription w WHERE w.subid = s.oid AND w.pid IS NOT NULL) OR
+                            (r.rolcanlogin AND d.datallowconn AND
+                                (SELECT count(*) FROM pg_catalog.pg_stat_subscription w WHERE w.pid IS NOT NULL) <
+                                    pg_catalog.current_setting('max_logical_replication_workers')::integer)))
             FROM pg_catalog.pg_replication_origin_status
             """);
 

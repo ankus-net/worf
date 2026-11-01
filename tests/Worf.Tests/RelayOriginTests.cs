@@ -97,10 +97,11 @@ public sealed class RelayOriginTests
     /// <summary>
     /// A row keeps the subscription that applied it, though PostgreSQL reuses its origin's id: a table sync's rows are
     /// the subscription's, and another subscription's or another origin's aren't, under keep_local. Relay origins give
-    /// their slots up to those that need them, PostgreSQL subscriptions too, and only then, rather than applying a node's
-    /// changes as another's, and worf forgets what it recorded of them once vacuum has frozen this database's rows that
-    /// could need it. A failed table sync restarts after the delay, and the two-way warning compares the settings the
-    /// workers run with, from the command line too.
+    /// their slots up to those that need them, PostgreSQL subscriptions whose workers can start too, and only then,
+    /// rather than applying a node's changes as another's, and worf forgets what it recorded of them once it's
+    /// superseded for vacuum_freeze_min_age transactions. A frozen row has no commit origin. A failed table sync
+    /// restarts after the delay, and the two-way warning compares the settings the workers run with, from the command
+    /// line too.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -299,21 +300,27 @@ public sealed class RelayOriginTests
         Assert.AreEqual("", await subscriber.SafePsqlAsync(Database, AppliedAsAnother, token), "rows applied as another node's");
 
         // They keep their slots while nothing wants one, as when the apply worker restarts with every slot taken, though
-        // a disabled PostgreSQL subscription's origin and one a user created have none, and give one up to another
-        // subscription that finds none free.
+        // an enabled PostgreSQL subscription whose worker never starts, as its owner can't log in, and an origin a user
+        // created have none, and give one up to another subscription that finds none free.
         const string Relays = "SELECT count(*) || ': ' || string_agg(roname, ',' ORDER BY roname) FROM pg_replication_origin WHERE roname LIKE '%@90__'";
         string relays = await subscriber.SafePsqlAsync(Database, Relays, token);
         Assert.StartsWith("2: ", relays, "the relay origins");
         _ = await subscriber.SafePsqlAsync(Database, $"""
+            CREATE ROLE ghost SUPERUSER NOLOGIN;
             CREATE SUBSCRIPTION pgsub CONNECTION '{provider.Dsn(Database, SuperUser)}' PUBLICATION p WITH (connect = false);
+            ALTER SUBSCRIPTION pgsub OWNER TO ghost;
+            ALTER SUBSCRIPTION pgsub ENABLE;
             SELECT pg_replication_origin_create('other');
             """, token);
+        string records = await subscriber.SafePsqlAsync(Database, "SELECT count(*) FROM worf.origin_writer", token);
         _ = await subscriber.SafePsqlAsync(Database, "SELECT worf.alter_subscription_disable('sub', true)", token);
         _ = await subscriber.SafePsqlAsync(Database, "SELECT worf.alter_subscription_enable('sub', true)", token);
         await WriteAsAsync(provider, $"{back}@9004", "INSERT INTO d VALUES (9, '9004')", token);
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM d WHERE id = 9)", token), "the row after the restart");
         await Task.Delay(TimeSpan.FromMilliseconds(500), token);
         Assert.AreEqual(relays, await subscriber.SafePsqlAsync(Database, Relays, token), "the relay origins after the restart");
+        Assert.AreEqual(records, await subscriber.SafePsqlAsync(Database, "SELECT count(*) FROM worf.origin_writer", token),
+            "origin records after the restart");
         logpos = subscriber.ReadLog().Length;
         await SubscribeAsync(subscriber, "temp2", provider, "{all}", token, "tset");
         Assert.AreEqual("t", await subscriber.SafePsqlAsync(Database,
@@ -321,20 +328,12 @@ public sealed class RelayOriginTests
         Assert.DoesNotContain("could not find free replication state slot", subscriber.ReadLog()[logpos..], "errors for want of a slot");
         _ = await subscriber.SafePsqlAsync(Database, "SELECT worf.drop_subscription('temp2')", token);
 
-        // Once vacuum freezes this database, though no other, what worf recorded before its datfrozenxid is forgotten
-        // as ids are recorded again, while PostgreSQL still keeps the frozen rows' commit timestamps and origins.
-        _ = await subscriber.SafePsqlAsync(Database, "CHECKPOINT", token);
-        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, """
-            SELECT bool_and(catalog_xmin::text::bigint > (SELECT max(since_xid::text::bigint) FROM worf.origin_writer))
-            FROM pg_replication_slots
-            """, token), "the slots' catalog horizon past the records");
-        _ = await subscriber.SafePsqlAsync(Database, "VACUUM FREEZE", token);
-        string frozen = await subscriber.SafePsqlAsync(Database,
-            "SELECT datfrozenxid::text::bigint FROM pg_database WHERE datname = current_database()", token);
-        Assert.AreEqual("t", await subscriber.SafePsqlAsync(Database, $"""
-            SELECT {frozen} > (SELECT max(since_xid::text::bigint) FROM worf.origin_writer)
-                AND {frozen} > (SELECT min(datfrozenxid::text::bigint) FROM pg_database)
-            """, token), "the database frozen past the records, and past other databases");
+        // A record superseded vacuum_freeze_min_age transactions ago, here none, is forgotten as ids are recorded again,
+        // though nothing vacuums.
+        _ = await subscriber.SafePsqlAsync(Database, "ALTER SYSTEM SET vacuum_freeze_min_age = 0", token);
+        _ = await subscriber.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
+        await Task.Delay(TimeSpan.FromSeconds(1), token);
+        string horizon = await subscriber.SafePsqlAsync(Database, "SELECT pg_snapshot_xmax(pg_current_snapshot())", token);
         string recorded = await subscriber.SafePsqlAsync(Database, "SELECT count(*) FROM worf.origin_writer", token);
         for (int id = 10; id <= 13; id++)
         {
@@ -342,24 +341,47 @@ public sealed class RelayOriginTests
             await WriteAsAsync(provider, $"{back}@{writer}", $"INSERT INTO d VALUES ({id}, '{writer}')", token);
         }
 
-        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT count(*) = 13 FROM d", token), "the rows after freezing");
-        Assert.AreEqual("13", await subscriber.SafePsqlAsync(Database,
-            "SELECT count(*) FROM d WHERE v ~ '^9' AND pg_xact_commit_timestamp(xmin) IS NOT NULL", token), "commit timestamps kept");
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT count(*) = 13 FROM d", token), "the rows after the horizon");
         Assert.AreEqual("0", await subscriber.SafePsqlAsync(Database, $"""
             SELECT count(*) FROM (
                 SELECT roident FROM worf.origin_writer
                 GROUP BY roident
-                HAVING count(*) FILTER (WHERE since_xid::text::bigint < {frozen}) > 1) r
-            """, token), "ids that keep records before the one in force when the database was frozen");
+                HAVING count(*) FILTER (WHERE since_xid::text::bigint < {horizon}) > 1) r
+            """, token), "ids that keep superseded records from before the horizon");
         Assert.IsLessThan(int.Parse(recorded, CultureInfo.InvariantCulture), int.Parse(await subscriber.SafePsqlAsync(Database,
-            $"SELECT count(*) FROM worf.origin_writer WHERE since_xid::text::bigint < {frozen}", token), CultureInfo.InvariantCulture),
-            "records from before freezing");
-        Assert.AreEqual("", await subscriber.SafePsqlAsync(Database, AppliedAsAnother, token), "rows applied as another node's after freezing");
+            $"SELECT count(*) FROM worf.origin_writer WHERE since_xid::text::bigint < {horizon}", token), CultureInfo.InvariantCulture),
+            "records from before the horizon");
 
-        // A frozen row, which came through a relay origin whose id has been reused since and whose record is forgotten,
-        // has no commit origin, so the provider's change to it applies under keep_local rather than conflicting with it.
+        // A row whose relay origin's id has been reused since, and whose record is forgotten, is the subscription's that
+        // holds the id now, as pglogical takes it, so the provider's change to it applies under keep_local.
         _ = await provider.SafePsqlAsync(Database, "UPDATE d SET v = 'updated' WHERE id = 2", token);
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT v = 'updated' FROM d WHERE id = 2", token),
+            "the update of a row whose record is forgotten");
+
+        // A row that COPY FREEZE froze has no commit timestamp or origin, as in pglogical, though its transaction isn't
+        // older than its table's relfrozenxid, so the provider's change to it applies under keep_local too.
+        _ = await provider.SafePsqlAsync(Database, "CREATE TABLE f (id integer PRIMARY KEY, v text); INSERT INTO f VALUES (1, 'provider')", token);
+        await using (NpgsqlConnection copier = await subscriber.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction copying = await copier.BeginTransactionAsync(token);
+            await using (NpgsqlCommand command = new("CREATE TABLE f (id integer PRIMARY KEY, v text)", copier, copying))
+            {
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+
+            await using (TextWriter rows = await copier.BeginTextImportAsync("COPY f FROM STDIN (FREEZE)", token))
+            {
+                await rows.WriteAsync("1\tlocal\n".AsMemory(), token);
+            }
+
+            await copying.CommitAsync(token);
+        }
+
+        Assert.AreEqual("t", await subscriber.SafePsqlAsync(Database,
+            "SELECT age(f.xmin) <= age(c.relfrozenxid) FROM f, pg_class c WHERE c.oid = 'f'::regclass", token), "the frozen row's transaction");
+        _ = await provider.SafePsqlAsync(Database, "SELECT * FROM worf.replication_set_add_table('default', 'f')", token);
+        _ = await provider.SafePsqlAsync(Database, "UPDATE f SET v = 'updated' WHERE id = 1", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT v = 'updated' FROM f WHERE id = 1", token),
             "the update of a frozen row");
 
         // They give their slots up to a table sync.
@@ -376,13 +398,13 @@ public sealed class RelayOriginTests
         _ = await subscriber.SafePsqlAsync(Database, "CREATE TABLE d3 (id integer PRIMARY KEY)", token);
         await WaitForSyncAsync(subscriber, "d3", token);
 
-        // They give one up to the PostgreSQL subscription once it's enabled, though its workers don't say they want one,
-        // and not to the origin the user created.
+        // They give one up to the PostgreSQL subscription once its owner can log in, so its worker can start, though its
+        // workers don't say they want one, and not to the origin the user created.
         await WriteAsAsync(provider, $"{back}@9001", "INSERT INTO d VALUES (14, '9001')", token);
         await WriteAsAsync(provider, $"{back}@9002", "INSERT INTO d VALUES (15, '9002')", token);
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT count(*) = 15 FROM d", token), "the rows before another user");
         Assert.StartsWith("2: ", await subscriber.SafePsqlAsync(Database, Relays, token), "the relay origins before another user");
-        _ = await subscriber.SafePsqlAsync(Database, "ALTER SUBSCRIPTION pgsub ENABLE", token);
+        _ = await subscriber.SafePsqlAsync(Database, "ALTER ROLE ghost LOGIN", token);
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, """
             SELECT EXISTS (SELECT 1 FROM pg_replication_origin_status s JOIN pg_subscription p ON s.external_id = 'pg_' || p.oid)
             """, token), "the PostgreSQL subscription's origin set up");

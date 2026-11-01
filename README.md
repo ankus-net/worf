@@ -121,11 +121,16 @@ with `forward_origins` `{all}` another. When one that needs a slot finds none
 free, subscriptions give up the slots of forwarded nodes' origins they no longer
 need, which slows apply; failing that within 10 seconds, its apply or table sync
 stops with an error and retries. They also give them up, within 10 seconds, to
-an enabled PostgreSQL subscription whose origin, or a table sync's, has none;
-other users of origins need the limit raised. `worf.origin_writer` records the
-node and subscription each origin worf creates applies for, a row each time one
-is created or dropped, and forgets those superseded before the database's
-`datfrozenxid`, so vacuum's freezing of the database bounds it.
+an enabled PostgreSQL subscription whose origin, or a table sync's, has none
+while a worker of it runs or can start: its owner can log in, its database
+allows connections, and `max_logical_replication_workers` leaves room. Other
+users of origins need the limit raised. `worf.origin_writer` records the node
+and subscription each origin worf creates applies for, a row each time one is
+created or dropped, and forgets a row once a later one has superseded it for
+`vacuum_freeze_min_age` transactions, as vacuum would freeze rows written before
+then, so it holds a row per origin and those of that many transactions. A
+conflict on a row written before then, whose record is forgotten, takes the row
+to be from what its origin applies for now, as pglogical takes every row.
 
 If you want to handle conflict resolution with last/first update wins (see
 [Conflicts](#conflicts)), you can add this additional option to
@@ -720,9 +725,11 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   The default value is `apply_remote`.
 
   The `keep_local`, `last_update_wins` and `first_update_wins` settings
-  require `track_commit_timestamp` PostgreSQL setting to be enabled. A row
-  older than its table's `relfrozenxid`, which vacuum has frozen, has no commit
-  timestamp or origin here, as in PostgreSQL, so changes to it don't conflict.
+  require `track_commit_timestamp` PostgreSQL setting to be enabled. A row whose
+  tuple header says it's frozen, as vacuum or `COPY FREEZE` leaves it, has no
+  commit timestamp or origin here, as in pglogical, though PostgreSQL may still
+  keep both: an update to it doesn't conflict, and an insert that finds it
+  resolves against a row with no commit timestamp.
 
 - `worf.conflict_log_level`
   Sets the log level for reporting detected conflicts when the
