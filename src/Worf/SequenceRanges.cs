@@ -309,12 +309,19 @@ internal static unsafe partial class SequenceRanges
     internal static PgAtomic<long> ExchangeRequested { get; } = new("worf_sequence_range_exchange");
 
     /// <summary>
+    /// Gets the counter that sessions move as they wake the range worker, so that one that wakes it while it waits, as on
+    /// a lock, which resets its latch, still has it check again at once.
+    /// </summary>
+    internal static PgAtomic<long> CheckRequested { get; } = new("worf_sequence_range_check");
+
+    /// <summary>
     /// Sets up the shared memory.
     /// </summary>
     internal static void ShmemInit()
     {
         PgSharedMemory.Initialize(Version, static () => 0L);
         PgSharedMemory.Initialize(ExchangeRequested, static () => 0L);
+        PgSharedMemory.Initialize(CheckRequested, static () => 0L);
     }
 
     /// <summary>

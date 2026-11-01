@@ -46,8 +46,11 @@ internal static class SequenceRangeGuard
     private static readonly List<(nint QueryDesc, uint Subxact, uint Cid)> s_moving = [];
     private static bool s_movingRegistered;
 
-    // The active blocks, by sequence and start, whose end this backend has woken the range worker for.
-    private static readonly HashSet<(uint Seqoid, long Lo)> s_woken = [];
+    // The points in each sequence's active block, by sequence and value, at which this backend has woken the range worker.
+    private static readonly HashSet<(uint Seqoid, long Mark)> s_woken = [];
+
+    // The active blocks, by sequence and start, whose switch this backend has waited for.
+    private static readonly HashSet<(uint Seqoid, long Lo)> s_waited = [];
 
     /// <summary>
     /// The guard's trigger function. The triggers' conditions do the checking and are never true, so this never runs.
@@ -341,7 +344,11 @@ internal static class SequenceRangeGuard
                     return true;
 
                 case "active":
-                    WakeNearEnd(seqoid, sequence.Ascending, lo, hi, value);
+                    if (WakeNearEnd(seqoid, sequence.Ascending, lo, hi, value))
+                    {
+                        WaitForSwitch(seqoid, lo, sequence.Blocks.Exists(block => block.State == "next"));
+                    }
+
                     if (s_reached.TryGetValue(seqoid, out long reached) && (sequence.Ascending ? reached >= value : reached <= value))
                     {
                         return true;
@@ -365,15 +372,73 @@ internal static class SequenceRangeGuard
     }
 
     /// <summary>
-    /// Wakes the range worker once a sequence reaches the last twentieth of its active block, the least it leaves before
-    /// switching, so that a sequence that runs through a block faster than the worker checks switches in time.
+    /// Wakes the range worker once a sequence passes half its active block, the most it leaves before switching, and
+    /// again once it reaches the last twentieth, the least, so that a sequence that runs through a block faster than the
+    /// worker checks switches in time.
     /// </summary>
-    private static void WakeNearEnd(uint seqoid, bool ascending, long lo, long hi, long value)
+    /// <returns>Whether the value is in the block's last twentieth.</returns>
+    private static bool WakeNearEnd(uint seqoid, bool ascending, long lo, long hi, long value)
     {
+        long half = (long)(((decimal)hi - lo) / 2);
         long tail = (long)(((decimal)hi - lo) / 20);
-        if ((ascending ? value >= hi - tail : value <= lo + tail) && s_woken.Add((seqoid, lo)))
+        bool last = ascending ? value >= hi - tail : value <= lo + tail;
+        long? mark = last ? (ascending ? hi - tail : lo + tail)
+            : (ascending ? value >= hi - half : value <= lo + half) ? (ascending ? hi - half : lo + half)
+            : null;
+        if (mark is long point && s_woken.Add((seqoid, point)))
         {
+            _ = PgAtomic.Add(SequenceRanges.CheckRequested, 1L);
             Worker.WakeRangeWorker();
+        }
+
+        return last;
+    }
+
+    /// <summary>
+    /// Waits, once a sequence reaches the last twentieth of its active block, until the range worker starts the switch,
+    /// which takes the sequence's lock as nextval leaves it held and so waits for this transaction, or the block is
+    /// switched, so that inserts wait for the worker to wake and switch, or for a next block on its way from the exchange
+    /// worker, rather than run the block out. A backend waits once per block, up to twice the exchange timeout, which
+    /// covers an exchange that hangs and the check after it, and only while the worker can switch: a next block is ready
+    /// or requested, and no transaction holds the sequence against the switch, as DDL on it does.
+    /// </summary>
+    private static void WaitForSwitch(uint seqoid, long lo, bool ready)
+    {
+        SpiParameter seq = SpiParameter.Create(seqoid);
+        SpiParameter database = SpiParameter.Create(DatabaseId());
+        if (!s_waited.Add((seqoid, lo)) || !Elevated.Run(() => Worf.SelectCatalog("""
+            SELECT ($3 OR EXISTS (SELECT 1 FROM worf.sequence_range_request WHERE seqoid = $1 AND kind = 'n' AND state = 'open'))
+                AND NOT EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_locks
+                    WHERE locktype = 'relation' AND database = $2 AND relation = $1
+                        AND mode IN ('ShareLock', 'ShareRowExclusiveLock', 'ExclusiveLock', 'AccessExclusiveLock'))
+            """, seq, database, SpiParameter.Create(ready))[0].Get<bool>(0)))
+        {
+            return;
+        }
+
+        long deadline = Worker.GetCurrentTimestamp() + (SequenceRanges.ExchangeTimeout * 2000L);
+        while (Worker.GetCurrentTimestamp() < deadline)
+        {
+            PgInterrupts.Check();
+            Worker.WaitLatch(10);
+            Reload();
+            if (!s_sequences.TryGetValue(seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) sequence) ||
+                !sequence.Blocks.Exists(block => block.State == "active" && block.Lo == lo) ||
+                Elevated.Run(() => Worf.SelectCatalog(
+                    "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_locks WHERE locktype = 'relation' AND database = $2 AND relation = $1 AND NOT granted)",
+                    seq, database)[0].Get<bool>(0)))
+            {
+                return;
+            }
+        }
+    }
+
+    private static uint DatabaseId()
+    {
+        unsafe
+        {
+            return NativeGlobals.MyDatabaseId;
         }
     }
 
@@ -663,6 +728,8 @@ internal static class SequenceRangeGuard
             }
         }
 
+        s_waited.RemoveWhere(waited => !s_sequences.TryGetValue(waited.Seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) sequence) ||
+            !sequence.Blocks.Exists(block => block.State == "active" && block.Lo == waited.Lo));
         s_version = version;
         s_localVersion = localVersion;
     }

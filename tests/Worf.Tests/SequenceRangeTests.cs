@@ -1029,9 +1029,9 @@ public sealed class SequenceRangeTests
 
         Stopwatch sinceId = Stopwatch.StartNew();
 
-        // A switch reaches the backends that cached the blocks as it commits, rather than once the range worker's
-        // exchanges are done, which may hang as here. The block runs low while an exchange hangs, so the switch comes
-        // just before the next one.
+        // The block runs out while an exchange hangs, and an insert that reaches its last twentieth waits for the range
+        // worker to switch, rather than the inserts after it failing at the block's end. The switch reaches the backends that
+        // cached the blocks as it commits, rather than once the exchange worker's call is done.
         string[] active = (await nodeA.SafePsqlAsync(Database, "SELECT active_lo, values_left FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass",
             token)).Split('|');
         int held = int.Parse(active[1], CultureInfo.InvariantCulture) - 10;
@@ -1039,10 +1039,13 @@ public sealed class SequenceRangeTests
         await using (await HoldExchangesAsync(nodeB, token))
         {
             await ExecuteAsync(writer, $"INSERT INTO t (v) SELECT 'held' FROM generate_series(1, {held})", token);
+            for (int i = 0; i < 20; i++)
+            {
+                await ExecuteAsync(writer, "INSERT INTO t (v) VALUES ('held')", token);
+            }
 
-            Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database,
+            Assert.AreEqual("t", await nodeA.SafePsqlAsync(Database,
                 $"SELECT active_lo <> {active[0]} FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token), "node_a switching");
-            await ExecuteAsync(writer, "INSERT INTO t (v) VALUES ('held')", token);
         }
 
         _ = await nodeA.SafePsqlAsync(Database, "ALTER SYSTEM RESET worf.sequence_range_timeout", token);
@@ -1051,7 +1054,7 @@ public sealed class SequenceRangeTests
         await Task.WhenAll(InsertAsync(nodeA, "a"), InsertAsync(nodeB, "b"));
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
         _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
-        string total = (600 + held + 1).ToString(CultureInfo.InvariantCulture);
+        string total = (600 + held + 20).ToString(CultureInfo.InvariantCulture);
         foreach (TestNode node in new[] { nodeA, nodeB })
         {
             Assert.AreEqual($"{total}|{total}|300|300", await node.SafePsqlAsync(Database,
@@ -1088,10 +1091,14 @@ public sealed class SequenceRangeTests
         Assert.AreEqual(1, nodeA.ReadLog()[refused..].Split("has no values left above 32767 for a root").Length - 1, "node_a warned once");
 
         // A session that can't write, here in a read-only transaction, can't reserve the clock after an idle stretch
-        // itself, so the range worker reserves it for the session.
-        Stopwatch readOnly = Stopwatch.StartNew();
-        _ = await nodeA.SafePsqlAsync(Database, "BEGIN READ ONLY; SELECT worf.snowflake_id(); COMMIT", token);
-        Assert.IsLessThan(3000, readOnly.ElapsedMilliseconds, "node_a's Snowflake ID in a read-only transaction");
+        // itself, so the range worker reserves it for the session, even while an exchange hangs, which holds up only the
+        // exchange worker.
+        await using (await HoldExchangesAsync(nodeB, token))
+        {
+            Stopwatch readOnly = Stopwatch.StartNew();
+            _ = await nodeA.SafePsqlAsync(Database, "BEGIN READ ONLY; SELECT worf.snowflake_id(); COMMIT", token);
+            Assert.IsLessThan(3000, readOnly.ElapsedMilliseconds, "node_a's Snowflake ID in a read-only transaction while an exchange hangs");
+        }
 
         // A table that comes to use the sequence can't hold the other node's keys, which may be ones it has yet to issue,
         // unless a session that restores rows brings them.
@@ -1946,13 +1953,40 @@ public sealed class SequenceRangeTests
             await ExecuteAsync(batch, "SELECT worf.reserve_sequence_range('t_id_seq', 10); INSERT INTO t (v) SELECT 'batch' FROM generate_series(1, 10); COMMIT", token);
         }
 
+        // A load's transaction on node_b, whose reservation the range worker switched for, holds nothing that the range
+        // worker or the exchange worker waits on, and another sequence there keeps switching meanwhile, to the blocks node_a
+        // grants it.
+        foreach (TestNode node in nodes)
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE u (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('u_id_seq', participants := '{node_b}', range_size := 10, max_range_size := 10)", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 'u_id_seq'::regclass",
+            token), "node_b drawing from a block of u_id_seq");
+        await using NpgsqlConnection hold = await nodeB.OpenAsync(Database, token);
+        long heldLeft = long.Parse(await nodeB.SafePsqlAsync(Database, "SELECT values_left FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token),
+            CultureInfo.InvariantCulture);
+        await ExecuteAsync(hold, $"BEGIN; SELECT worf.reserve_sequence_range('t_id_seq', {heldLeft + 1000})", token);
+        for (int i = 0; i < 3; i++)
+        {
+            string active = await nodeB.SafePsqlAsync(Database, "SELECT active_lo FROM worf.sequence_ranges WHERE sequence = 'u_id_seq'::regclass", token);
+            _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO u (v) SELECT 'u' FROM generate_series(1, (SELECT values_left FROM worf.sequence_ranges WHERE sequence = 'u_id_seq'::regclass))",
+                token);
+            Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, $"""
+                SELECT active_lo <> {active} AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 'u_id_seq'::regclass
+                """, token), "node_b switching u_id_seq while t_id_seq is held");
+        }
+
+        await ExecuteAsync(hold, "INSERT INTO t (v) SELECT 'held' FROM generate_series(1, 1000); COMMIT", token);
+
         // node_b hears of grants beyond node_a's watermark, as when node_a, the owner, went back to before them by less
         // than its WAL position shows. node_a resets, and its fence holds, here on a neighbor that never reports, while
         // node_b asks for a block. With an exchange interval of ten minutes, node_b still asks node_a every ten checks,
         // and draws from a block beyond that watermark soon after the fence lifts.
         _ = await nodeB.SafePsqlAsync(Database, "ALTER SYSTEM SET worf.sequence_range_exchange_interval = '10min'; SELECT pg_reload_conf()", token);
         _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO worf.sequence_range_link VALUES ('ghost', 4242, 10)", token);
-        string beyond = await nodeB.SafePsqlAsync(Database, "UPDATE worf.sequence_range SET watermark = watermark + 1000000 RETURNING watermark", token);
+        string beyond = await nodeB.SafePsqlAsync(Database, "UPDATE worf.sequence_range SET watermark = watermark + 1000000 WHERE seqoid = 't_id_seq'::regclass RETURNING watermark", token);
         int logpos = nodeA.ReadLog().Length;
         _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.reset_sequence_range('t_id_seq')", token);
         Assert.IsTrue(await nodeA.PollLogAsync(logpos, $"has heard of grants up to {beyond}, beyond this owner's watermark", token), "node_a reset");
@@ -1975,10 +2009,10 @@ public sealed class SequenceRangeTests
 
         _ = await nodeA.SafePsqlAsync(Database, "DELETE FROM worf.sequence_range_link WHERE node_id = 4242", token);
         Stopwatch lifted = Stopwatch.StartNew();
-        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, $"SELECT state = 'active' AND active_lo > {beyond} FROM worf.sequence_ranges", token),
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, $"SELECT state = 'active' AND active_lo > {beyond} FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token),
             "node_b drawing from a block beyond the watermark it heard of");
         Assert.IsLessThan(3.0, lifted.Elapsed.TotalSeconds, "node_b's block soon after node_a's fence lifted");
-        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, $"SELECT state = 'active' AND active_lo > {beyond} FROM worf.sequence_ranges", token),
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, $"SELECT state = 'active' AND active_lo > {beyond} FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token),
             "node_a drawing from a block beyond the watermark");
     }
 

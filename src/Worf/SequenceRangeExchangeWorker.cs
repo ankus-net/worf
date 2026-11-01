@@ -40,10 +40,13 @@ internal static class SequenceRangeExchangeWorker
                 PgInterrupts.Check();
                 Worker.ProcessConfigReload();
 
-                // Backends reload their blocks once the change is committed.
+                // Backends reload their blocks once the change is committed, and the range worker checks at once, since a
+                // block that came may be due, as when the active one ran low before it came.
                 if (SequenceRangeExchange.ExchangeAll())
                 {
                     SequenceRanges.Changed();
+                    _ = PgAtomic.Add(SequenceRanges.CheckRequested, 1L);
+                    Worker.WakeRangeWorker();
                 }
 
                 // A database that manages nothing has asked its providers, and the manager looks again later.
