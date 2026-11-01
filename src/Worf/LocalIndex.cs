@@ -15,7 +15,8 @@ namespace Worf;
 /// Keeps track of the indexes on this node alone: those that a concurrent build whose DDL replicates, or a concurrent
 /// reindex, left when it failed, which the other nodes never built. DDL on them stays on this node, however they're
 /// rebuilt since, as by <c>REINDEX</c>, <c>VACUUM FULL</c>, or <c>ALTER TABLE</c>, which builds an index again under
-/// its name.
+/// its name, and they're kept out of the way of other DDL, which neither chooses names by them nor copies, attaches or
+/// otherwise uses them, so that it does on every node what it does on the others.
 /// </summary>
 internal static unsafe partial class LocalIndex
 {
@@ -363,11 +364,11 @@ internal static unsafe partial class LocalIndex
     }
 
     /// <summary>
-    /// Moves the indexes on this node alone out of a statement's way, unless a statement that this one runs has: out
-    /// of the way of the names that PostgreSQL chooses for the objects that DDL that replicates creates, so that every
-    /// node chooses the same, as <see cref="MoveAside"/> does for apply; and out of sight of DDL that replicates, or
-    /// DDL from another node, that would copy them, attach them to a partitioned index, or have a foreign key use them,
-    /// for none of which every node has them. Such DDL, which can't build an index again, finds them not live.
+    /// Moves the indexes on this node alone out of a statement's way, unless the statement that runs it already has:
+    /// out of the way of the names that PostgreSQL chooses for the objects that DDL that replicates creates, so that
+    /// every node chooses the same, as <see cref="MoveAside"/> does for apply; and out of sight of DDL that replicates,
+    /// or DDL from another node, that would copy them, attach them to a partitioned index, or have a foreign key use
+    /// them, none of which the other nodes can. Such DDL, which can't build an index again, finds them not live.
     /// </summary>
     /// <param name="parsetree">The statement.</param>
     /// <param name="replicated">Whether it's DDL to replicate.</param>
@@ -382,7 +383,6 @@ internal static unsafe partial class LocalIndex
             return null;
         }
 
-        s_isolating = true;
         List<(uint Index, string Name)> moved = rename ? MoveAside() : [];
         List<uint> hidden = [];
         if (hide)
@@ -401,6 +401,7 @@ internal static unsafe partial class LocalIndex
             NativeMethods.CommandCounterIncrement();
         }
 
+        s_isolating = true;
         return (moved, hidden);
     }
 
