@@ -460,9 +460,12 @@ public sealed class ExceptionBehaviourTests
     /// <summary>
     /// A table sync worker stopped once its copy has committed, here while it waits for the apply worker, which waits on
     /// a lock with changes to the table from after the copy skipped, catches up from its copy when it starts again, with
-    /// those changes. When its slot is gone or invalidated, or its origin has no progress, it empties the table and
-    /// copies it again. One cancelled before its copy commits copies a table without a key once, and the cleanup after
-    /// it waits for a session that holds its slot, with a warning, rather than for ever.
+    /// those changes, and leaves its slot to the apply worker when its cleanup can't reach the provider. When its slot is
+    /// gone or invalidated, or its origin has no progress, it copies the table again and merges the copy in, in one
+    /// transaction, so the table is never seen empty: rows it wrote that the provider has since deleted go, though a key
+    /// references the table, and rows written here or under another origin stay. One cancelled before its copy commits
+    /// copies a table without a key once, and the cleanup after it waits for a session that holds its slot, with a
+    /// warning, rather than for ever. Dropping the subscription drops the slots its syncs left.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -482,6 +485,7 @@ public sealed class ExceptionBehaviourTests
             CREATE TABLE elsewhere (id integer);
             SELECT pg_replication_origin_create('elsewhere');
             """, token);
+        _ = await subscriber.SafePsqlAsync(Database, "SELECT pg_replication_origin_create('elsewhere')", token);
         await SubscribeAsync(provider, subscriber, token, "{}");
         string slot = await subscriber.SafePsqlAsync(Database, "SELECT sub_slot_name FROM worf.subscription", token);
         const string SyncWorkers = "SELECT pid FROM pg_stat_activity WHERE backend_type LIKE 'worf sync%'";
@@ -493,6 +497,9 @@ public sealed class ExceptionBehaviourTests
             {
                 _ = await node.SafePsqlAsync(Database, $"CREATE TABLE {table} (id integer PRIMARY KEY, v text)", token);
             }
+
+            // A key on the subscriber references the table.
+            _ = await subscriber.SafePsqlAsync(Database, $"CREATE TABLE {table}_ref (id integer REFERENCES {table})", token);
 
             _ = await provider.SafePsqlAsync(Database, $"INSERT INTO {table} SELECT g, 'copied' FROM generate_series(1, 1000) g", token);
             int logpos = subscriber.ReadLog().Length;
@@ -538,7 +545,42 @@ public sealed class ExceptionBehaviourTests
                 Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, $"SELECT NOT EXISTS ({SyncWorkers})", token), "the sync stopped");
                 Assert.AreEqual("w", await subscriber.SafePsqlAsync(Database,
                     $"SELECT sync_status FROM worf.local_sync_status WHERE sync_relname = '{table}'", token), "the sync left waiting");
-                await applyLock.RollbackAsync(token);
+
+                // Rows written here and under another origin, and one that references the table.
+                _ = await subscriber.SafePsqlAsync(Database, $"""
+                    INSERT INTO {table} VALUES (900001, 'here');
+                    SELECT pg_replication_origin_session_setup('elsewhere');
+                    INSERT INTO {table} VALUES (900002, 'elsewhere');
+                    INSERT INTO {table}_ref VALUES (1);
+                    """, token);
+
+                // The next worker catches up while the table is locked, and can't reach the provider once it's done.
+                if (stop == "resume")
+                {
+                    await using NpgsqlTransaction catchupLock = await tableLocker.BeginTransactionAsync(token);
+                    await using (NpgsqlCommand command = new($"LOCK TABLE {table}", tableLocker, catchupLock))
+                    {
+                        _ = await command.ExecuteNonQueryAsync(token);
+                    }
+
+                    await applyLock.RollbackAsync(token);
+                    Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, $"""
+                        SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+                            WHERE l.relation = '{table}'::regclass AND NOT l.granted AND a.backend_type LIKE 'worf sync%')
+                        """, token), "the catch-up waiting");
+                    _ = await provider.SafePsqlAsync(Database, $"ALTER ROLE {SuperUser} NOLOGIN", token);
+                    await catchupLock.RollbackAsync(token);
+                    Assert.IsTrue(await subscriber.PollLogAsync(logpos, "The subscription's apply worker drops it once it can.", token),
+                        "the slot left to the apply worker");
+                    _ = await provider.SafePsqlAsync(Database, $"ALTER ROLE {SuperUser} LOGIN", token);
+                    Assert.IsTrue(await provider.PollQueryUntilAsync(Database,
+                        $"SELECT NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE starts_with(slot_name, '{slot}_'))", token),
+                        "the slot the sync left dropped");
+                }
+                else
+                {
+                    await applyLock.RollbackAsync(token);
+                }
             }
 
             string syncSlot = await provider.SafePsqlAsync(Database,
@@ -556,19 +598,27 @@ public sealed class ExceptionBehaviourTests
                     break;
             }
 
+            // A session counts the table's rows while it's copied again.
+            using CancellationTokenSource counting = CancellationTokenSource.CreateLinkedTokenSource(token);
+            Task<long> fewest = Task.FromResult(long.MaxValue);
             if (stop != "resume")
             {
+                fewest = FewestRowsAsync(subscriber, table, counting.Token);
                 _ = await provider.SafePsqlAsync(Database, $"ALTER ROLE {SuperUser} LOGIN", token);
             }
 
             Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
                 $"SELECT sync_status = 'r' FROM worf.local_sync_status WHERE sync_relname = '{table}'", token), $"the table synchronized after {stop}");
-            Assert.AreEqual("1000|500500|updated|f|t", await subscriber.SafePsqlAsync(Database, $"""
+            await counting.CancelAsync();
+            Assert.IsGreaterThanOrEqualTo(1000L, await fewest, $"the fewest rows seen during the sync after {stop}");
+            Assert.AreEqual("1000|500500|updated|f|t|here|elsewhere|1", await subscriber.SafePsqlAsync(Database, $"""
                 SELECT count(*), sum(id) - 700000 + 600, (SELECT v FROM {table} WHERE id = 500),
-                    EXISTS (SELECT 1 FROM {table} WHERE id = 600), EXISTS (SELECT 1 FROM {table} WHERE id = 700000)
-                FROM {table}
+                    EXISTS (SELECT 1 FROM {table} WHERE id = 600), EXISTS (SELECT 1 FROM {table} WHERE id = 700000),
+                    (SELECT v FROM {table} WHERE id = 900001), (SELECT v FROM {table} WHERE id = 900002),
+                    (SELECT count(*) FROM {table}_ref)
+                FROM {table} WHERE id < 900000
                 """, token), $"the rows after {stop}");
-            Assert.Contains(stop == "resume" ? $"resuming the catch-up of table public.{table}" : $"truncating table public.{table} to copy it again",
+            Assert.Contains(stop == "resume" ? $"resuming the catch-up of table public.{table}" : $"copying table public.{table} again",
                 subscriber.ReadLog()[logpos..], $"the sync after {stop}");
         }
 
@@ -643,6 +693,28 @@ public sealed class ExceptionBehaviourTests
             "nokey's rows");
         Assert.AreEqual("0", await provider.SafePsqlAsync(Database,
             $"SELECT count(*) FROM pg_replication_slots WHERE starts_with(slot_name, '{slot}_')", token), "the syncs' slots left");
+
+        // Dropping the subscription drops the slots its table syncs left, as one stopped before it caught up leaves.
+        _ = await provider.SafePsqlAsync(Database, $"SELECT pg_create_logical_replication_slot('{slot}_0badf00d', 'worf')", token);
+        _ = await subscriber.SafePsqlAsync(Database, "SELECT worf.drop_subscription('sub')", token);
+        Assert.AreEqual("0", await provider.SafePsqlAsync(Database,
+            $"SELECT count(*) FROM pg_replication_slots WHERE starts_with(slot_name, '{slot}')", token), "the slots left after the drop");
+    }
+
+    /// <summary>
+    /// Counts a table's rows over and over until cancelled, and returns the fewest seen.
+    /// </summary>
+    private static async Task<long> FewestRowsAsync(TestNode node, string table, CancellationToken token)
+    {
+        long fewest = long.MaxValue;
+        await using NpgsqlConnection connection = await node.OpenAsync(Database, CancellationToken.None);
+        await using NpgsqlCommand count = new($"SELECT count(*) FROM {table}", connection);
+        while (!token.IsCancellationRequested)
+        {
+            fewest = Math.Min(fewest, (long)(await count.ExecuteScalarAsync(CancellationToken.None))!);
+        }
+
+        return fewest;
     }
 
     /// <summary>

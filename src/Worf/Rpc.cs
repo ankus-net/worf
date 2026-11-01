@@ -207,6 +207,33 @@ internal static class Rpc
     }
 
     /// <summary>
+    /// Lists the slots in the provider's database that a subscription's table syncs create: the subscription's slot
+    /// name followed by a table's hash.
+    /// </summary>
+    /// <param name="conn">The provider connection, inside a local transaction.</param>
+    /// <param name="slotName">The subscription's slot name.</param>
+    /// <returns>Each slot's name, and whether a process holds it.</returns>
+    internal static List<(string Name, bool Active)> RemoteSyncSlots(PgReplicationConnection conn, string slotName)
+    {
+        IReadOnlyList<string?[]> res;
+        try
+        {
+            res = conn.Query($"""
+                SELECT slot_name, active FROM pg_catalog.pg_replication_slots
+                WHERE database = pg_catalog.current_database() AND plugin = {Spi.QuoteLiteral(Worf.ExtensionName)}
+                    AND slot_name ~ {Spi.QuoteLiteral($"^{slotName}_[0-9a-f]{{8}}$")}
+                """, 2);
+        }
+        catch (PgRemoteException error)
+        {
+            throw new PgException(PgSqlStates.InternalError, "getting remote slot info failed",
+                detail: $"SELECT FROM pg_catalog.pg_replication_slots failed with: ERROR:  {error.Message}\n");
+        }
+
+        return [.. res.Select(row => (row[0]!, row[1] == "t"))];
+    }
+
+    /// <summary>
     /// Drops replication slot on remote node that has been used by the local node.
     /// </summary>
     /// <param name="conn">The provider connection, inside a local transaction.</param>

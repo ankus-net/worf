@@ -21,6 +21,9 @@ internal static unsafe partial class Apply
     private const int ExceptionByTransaction = 2;
     private const int ExceptionWithoutApplying = 3;
 
+    // How many microseconds the apply worker waits before it tries again to drop slots that table syncs left.
+    private const long SyncSlotsRetryInterval = 5_000_000;
+
     private static readonly LinkedList<(ulong LocalEnd, ulong RemoteEnd)> s_lsnMapping = new();
 
     private static bool s_inRemoteTransaction;
@@ -62,6 +65,9 @@ internal static unsafe partial class Apply
     private static long s_reclaimWarnedAt;
     private static long s_reclaimCheckedAt;
     private static long s_elsewhereCheckedAt;
+
+    // When this worker next tries to drop the slots that table syncs left on the provider, or zero.
+    private static long s_syncSlotsRetryAt;
     private static bool s_skipRemoteTransaction;
     private static long s_applyDelay;
     private static uint s_queueRelid;
@@ -258,6 +264,12 @@ internal static unsafe partial class Apply
             _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(50));
         }
 
+        // Slots that the subscription's table syncs left on the provider are dropped, now and while one stays.
+        SetSyncSlotsLeft(false);
+        s_syncSlotsRetryAt = PgBackgroundWorker.RunTransaction(() =>
+            Sync.DropSyncSlots(streamConn, sub.SlotName, Sync.KeptSyncSlots(sub)).Count == 0)
+            ? 0 : Worker.GetCurrentTimestamp() + SyncSlotsRetryInterval;
+
         Worf.StartReplication(streamConn, sub.SlotName, originStartpos, origins, repsets, null, sub.ForceTextTransfer);
 
         if (catchingUp)
@@ -351,6 +363,9 @@ internal static unsafe partial class Apply
                     // Relay origins this worker no longer needs give their slots up to another subscription's, a
                     // table sync's or a relay origin that found none free.
                     ReclaimRelayOriginsIfWanted();
+
+                    // A table sync that couldn't drop its slot leaves it to this worker.
+                    DropSyncSlotsIfLeft();
                 }
             }
         }
@@ -1022,6 +1037,47 @@ internal static unsafe partial class Apply
                 ReclaimRelayOrigins();
             }
         }
+    }
+
+    /// <summary>
+    /// Drops the slots on the provider that the subscription's table syncs left, when one says it left its slot, and
+    /// again every few seconds while one stays, as when something holds it or the provider can't be reached. A table
+    /// sync's slot is the subscription's own while the table synchronizes, so nothing else drops it.
+    /// </summary>
+    private static void DropSyncSlotsIfLeft()
+    {
+        long now = Worker.GetCurrentTimestamp();
+        if (!MyApplyWorker.SyncSlotsLeft && (s_syncSlotsRetryAt == 0 || now < s_syncSlotsRetryAt))
+        {
+            return;
+        }
+
+        SetSyncSlotsLeft(false);
+        WorfSubscription sub = MySubscription!;
+        bool dropped;
+        try
+        {
+            dropped = PgBackgroundWorker.RunTransaction(() =>
+            {
+                using PgReplicationConnection conn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "cleanup");
+                return Sync.DropSyncSlots(conn, sub.SlotName, Sync.KeptSyncSlots(sub)).Count == 0;
+            });
+        }
+        catch (PgException error)
+        {
+            PgLog.Debug1($"could not drop the slots table syncs left on the provider: {error.Message}");
+            dropped = false;
+        }
+
+        s_syncSlotsRetryAt = dropped ? 0 : now + SyncSlotsRetryInterval;
+    }
+
+    private static void SetSyncSlotsLeft(bool left)
+    {
+        using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive();
+        WorfWorker worker = guard[Worker.MyWorfWorker];
+        worker.Worker.Apply.SyncSlotsLeft = left;
+        guard[Worker.MyWorfWorker] = worker;
     }
 
     /// <summary>
@@ -2622,11 +2678,13 @@ internal static unsafe partial class Apply
                     WorfSyncStatus? newsync = Sync.GetTableSyncStatus(subid, sync.Nspname, sync.Relname, true);
 
                     // TODO: what to do here? We don't really want to die, but this can mean many things, for now we
-                    // just assume table is not relevant for us anymore and leave fixing to the user.
+                    // just assume table is not relevant for us anymore and leave fixing to the user. A slot its sync
+                    // left goes.
                     if (newsync is null)
                     {
                         sync.Status = Sync.SyncStatusReady;
                         sync.Statuslsn = 0;
+                        s_syncSlotsRetryAt = Worker.GetCurrentTimestamp();
                     }
                     else
                     {

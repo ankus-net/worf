@@ -380,10 +380,17 @@ internal static unsafe class ApplyHeap
 
         SysScanDescData* scan = NativeMethods.systable_beginscan(relation, indexOid, true, NativeMethods.GetLatestSnapshot(), nkeys, keys);
         HeapTupleData* tuple = NativeMethods.systable_getnext(scan);
-        bool frozen = tuple is not null && (tuple->t_data->t_infomask & HeapXminFrozen) == HeapXminFrozen;
+        bool frozen = tuple is not null && XminFrozen(tuple->t_data);
         NativeMethods.systable_endscan(scan);
         return frozen;
     }
+
+    /// <summary>
+    /// Checks whether a tuple header says its row is frozen, as <c>HeapTupleHeaderXminFrozen</c> does.
+    /// </summary>
+    /// <param name="header">The header.</param>
+    /// <returns>Whether it does.</returns>
+    internal static bool XminFrozen(HeapTupleHeaderData* header) => (header->t_infomask & HeapXminFrozen) == HeapXminFrozen;
 
     private static HeapTupleData* FormTuple(RelationData* relation, WorfTupleData tuple)
     {

@@ -711,13 +711,14 @@ internal sealed partial class WorfNode
     /// Gets the node whose changes a replication origin applied when a transaction ran, and the subscription it applied
     /// them for, from what worf recorded. For a transaction older than <see cref="OriginWriterKeptSince"/>, whose record
     /// can be forgotten, it's what the origin applies for now when worf recorded nothing older, as pglogical takes every
-    /// row's origin to be.
+    /// row's origin to be, unless asked for only what worf recorded.
     /// </summary>
     /// <param name="originId">The origin's id.</param>
     /// <param name="xid">The transaction, within the last two billion.</param>
+    /// <param name="recordedOnly">Whether to take only what worf recorded as of the transaction.</param>
     /// <returns>The node and the subscription, zeros when worf had dropped the origin, or null when worf didn't record
     /// the origin.</returns>
-    internal static (uint Writer, uint SubId)? OriginWriter(ushort originId, uint xid)
+    internal static (uint Writer, uint SubId)? OriginWriter(ushort originId, uint xid, bool recordedOnly = false)
     {
         SpiResult result = Worf.Read("""
             SELECT writer_node, sub_id FROM worf.origin_writer
@@ -725,7 +726,7 @@ internal sealed partial class WorfNode
             ORDER BY since_xid <= $2::text::xid8 DESC, since_xid DESC
             LIMIT 1
             """, 1, SpiParameter.Create((uint)originId), SpiParameter.Create((long)Worf.FullTransactionId(xid)),
-            SpiParameter.Create((long)OriginWriterKeptSince));
+            SpiParameter.Create(recordedOnly ? 0L : (long)OriginWriterKeptSince));
         return result.Count == 0 ? null : (result[0].Get<uint>(0), result[0].Get<uint>(1));
     }
 

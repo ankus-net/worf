@@ -47,4 +47,9 @@ internal struct WorfApplyWorker
     /// delay before restarting a worker that failed.
     /// </summary>
     public bool ExceptionRestartsAtOnce;
+
+    /// <summary>
+    /// Whether a table sync worker of the subscription left its slot on the provider, which the apply worker drops.
+    /// </summary>
+    public bool SyncSlotsLeft;
 }
