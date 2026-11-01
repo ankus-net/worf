@@ -34,11 +34,23 @@ internal static class SequenceRangeWorker
 
             long requested = SequenceRanges.CheckRequested.Value;
 
+            // The range state of a sequence whose drop has committed goes first, which the DROP leaves to this worker.
+            bool forgot = false;
+            try
+            {
+                forgot = PgBackgroundWorker.RunTransaction(() =>
+                    Worf.CatalogOid("sequence_range") != 0 && WorfNode.GetLocalNode(false, true) is not null && SequenceRanges.ForgetDropped());
+            }
+            catch (PgException error)
+            {
+                PgLog.Warning($"could not remove the range state of dropped sequences: {error.Message}");
+            }
+
             // Each sequence is checked in a transaction of its own, so that its locks are held no longer than its check,
             // which an exchange answered meanwhile may wait for.
             (WorfLocalNode Node, List<uint> Sequences)? managed = PgBackgroundWorker.RunTransaction(() =>
                 WorfNode.GetLocalNode(false, true) is WorfLocalNode node ? (node, Sequences()) : ((WorfLocalNode, List<uint>)?)null);
-            bool changed = false;
+            bool changed = forgot;
             if (managed is (WorfLocalNode local, List<uint> sequences) && sequences.Count > 0)
             {
                 if (!managedAny)
@@ -134,7 +146,7 @@ internal static class SequenceRangeWorker
 
     private static List<uint> Sequences()
     {
-        SpiResult rows = Worf.SelectCatalog("SELECT seqoid::oid FROM worf.sequence_range ORDER BY seqoid");
+        SpiResult rows = Worf.SelectCatalog("SELECT r.seqoid::oid FROM worf.sequence_range r WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = r.seqoid) ORDER BY r.seqoid");
         List<uint> sequences = [];
         for (int i = 0; i < rows.Count; i++)
         {

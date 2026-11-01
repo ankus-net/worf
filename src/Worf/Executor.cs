@@ -369,7 +369,7 @@ internal static unsafe partial class Executor
                 RecordDroppedColumn(objectId, subId);
                 if (subId == 0 && NativeMethods.get_rel_relkind(objectId) == (sbyte)'S')
                 {
-                    Elevated.Run(() => SequenceRanges.Forget(objectId));
+                    Elevated.Run(() => SequenceRanges.NoteDropped(objectId));
                 }
             }
 

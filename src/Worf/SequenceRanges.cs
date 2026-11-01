@@ -569,7 +569,7 @@ internal static unsafe partial class SequenceRanges
         bool all = sequence is null || sequence.IsNull;
         uint named = all ? 0 : RequireOwnedSequence(sequence);
         SpiResult managed = Elevated.Run(() => all
-            ? Worf.SelectCatalog("SELECT seqoid::oid FROM worf.sequence_range ORDER BY seqoid")
+            ? Worf.SelectCatalog("SELECT r.seqoid::oid FROM worf.sequence_range r WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = r.seqoid) ORDER BY r.seqoid")
             : Worf.SelectCatalog("SELECT seqoid::oid FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(named)));
         List<uint> sequences = [.. Enumerable.Range(0, managed.Count).Select(i => managed[i].Get<uint>(0))];
         foreach (uint seqoid in all ? sequences : [])
@@ -590,20 +590,22 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
-    /// Removes a dropped sequence's range state. A sequence its owner drops ends its epoch there: the owner keeps the
-    /// epoch, which it tells its neighbors is disabled, so that they keep drawing from their blocks and ask it for no
-    /// more, takes no report of it as one to join, and starts the next epoch above it once a sequence of the same name
-    /// comes under range management again.
+    /// Notes the drop of a sequence under range management, from the DROP itself. A sequence its owner drops ends its
+    /// epoch there: the owner keeps the epoch, which it tells its neighbors is disabled, so that they keep drawing from
+    /// their blocks and ask it for no more, takes no report of it as one to join, and starts the next epoch above it once
+    /// a sequence of the same name comes under range management again. The DROP leaves the sequence's range state, whose
+    /// rows the workers lock as they work, to the range worker, which removes it once the drop has committed, so that
+    /// the DROP never waits on the workers while they wait on it.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
-    internal static void Forget(uint seqoid)
+    internal static void NoteDropped(uint seqoid)
     {
-        if (!Worf.ReadScalar<bool>("SELECT to_regclass('worf.sequence_range') IS NOT NULL"))
+        if (Worf.CatalogOid("sequence_range") == 0 ||
+            !Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range WHERE seqoid = $1)", SpiParameter.Create(seqoid)))
         {
             return;
         }
 
-        SpiParameter seq = SpiParameter.Create(seqoid);
         _ = Spi.Execute("""
             INSERT INTO worf.sequence_range_dropped
             SELECT pg_catalog.quote_ident(n.nspname) || '.' || pg_catalog.quote_ident(c.relname), r.owner_node, r.epoch, r.range_size, r.max_range_size,
@@ -615,17 +617,38 @@ internal static unsafe partial class SequenceRanges
             WHERE r.seqoid = $1
             ON CONFLICT (name) DO UPDATE SET owner_node = excluded.owner_node, epoch = excluded.epoch, range_size = excluded.range_size,
                 max_range_size = excluded.max_range_size, watermark = excluded.watermark, root_start = excluded.root_start, root_end = excluded.root_end
-            """, seq);
-        _ = Spi.Execute("DELETE FROM worf.sequence_range_free WHERE block_id IN (SELECT block_id FROM worf.sequence_range_block WHERE seqoid = $1)", seq);
-        _ = Spi.Execute("DELETE FROM worf.sequence_range_grant WHERE seqoid = $1", seq);
-        _ = Spi.Execute("DELETE FROM worf.sequence_range_block WHERE seqoid = $1", seq);
-        _ = Spi.Execute("DELETE FROM worf.sequence_range_request WHERE seqoid = $1", seq);
-        _ = Spi.Execute("DELETE FROM worf.sequence_range_node WHERE seqoid = $1", seq);
-        _ = Spi.Execute("DELETE FROM worf.sequence_range_absent WHERE seqoid = $1", seq);
-        if (Spi.Execute("DELETE FROM worf.sequence_range WHERE seqoid = $1", seq) > 0)
+            """, SpiParameter.Create(seqoid));
+        ChangedOnCommit();
+    }
+
+    /// <summary>
+    /// Removes the range state of the sequences whose drop has committed, from the range worker, the range rows first,
+    /// as every change to a sequence's ranges locks them, and then the rest. A tick with none to remove only reads.
+    /// </summary>
+    /// <returns>Whether it removed any.</returns>
+    internal static bool ForgetDropped()
+    {
+        if (!Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range r WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = r.seqoid))"))
         {
-            ChangedOnCommit();
+            return false;
         }
+
+        SpiResult gone = Spi.Query("""
+            SELECT r.seqoid::oid FROM worf.sequence_range r WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = r.seqoid)
+            ORDER BY r.seqoid FOR UPDATE
+            """, false, 0);
+        SpiParameter seqoids = SpiParameter.Create(Enumerable.Range(0, gone.Count).Select(i => (long)gone[i].Get<uint>(0)).ToArray());
+        _ = Spi.Execute("""
+            DELETE FROM worf.sequence_range_free WHERE block_id IN (SELECT block_id FROM worf.sequence_range_block WHERE seqoid::oid = ANY ($1::oid[]))
+            """, seqoids);
+        _ = Spi.Execute("DELETE FROM worf.sequence_range_grant WHERE seqoid::oid = ANY ($1::oid[])", seqoids);
+        _ = Spi.Execute("DELETE FROM worf.sequence_range_block WHERE seqoid::oid = ANY ($1::oid[])", seqoids);
+        _ = Spi.Execute("DELETE FROM worf.sequence_range_request WHERE seqoid::oid = ANY ($1::oid[])", seqoids);
+        _ = Spi.Execute("DELETE FROM worf.sequence_range_node WHERE seqoid::oid = ANY ($1::oid[])", seqoids);
+        _ = Spi.Execute("DELETE FROM worf.sequence_range_absent WHERE seqoid::oid = ANY ($1::oid[])", seqoids);
+        _ = Spi.Execute("DELETE FROM worf.sequence_range WHERE seqoid::oid = ANY ($1::oid[])", seqoids);
+
+        return true;
     }
 
     /// <summary>
@@ -1895,7 +1918,7 @@ internal static unsafe partial class SequenceRanges
     private static bool DomainUsesManaged(List* typeName)
     {
         uint typid = NativeMethods.typenameTypeId(null, NativeMethods.makeTypeNameFromNameList(typeName));
-        SpiResult managed = Elevated.Run(() => Worf.SelectCatalog("SELECT seqoid::oid FROM worf.sequence_range"));
+        SpiResult managed = Elevated.Run(() => Worf.SelectCatalog("SELECT r.seqoid::oid FROM worf.sequence_range r WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = r.seqoid)"));
         return Worf.ReadScalar<string?>("SELECT typdefaultbin::text FROM pg_catalog.pg_type WHERE oid = $1", SpiParameter.Create(typid)) is string expression &&
             Enumerable.Range(0, managed.Count).Any(i => MayDrawFrom((Node*)NativeMethods.stringToNode(Worf.PStrDup(expression)), managed[i].Get<uint>(0)).Draws);
     }
@@ -1952,7 +1975,7 @@ internal static unsafe partial class SequenceRanges
     {
         return Elevated.Run(() =>
         {
-            SpiResult managed = Spi.Select("SELECT seqoid::oid FROM worf.sequence_range");
+            SpiResult managed = Spi.Select("SELECT r.seqoid::oid FROM worf.sequence_range r WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = r.seqoid)");
             return Enumerable.Range(0, managed.Count)
                 .Any(i => UsingColumns(managed[i].Get<uint>(0)).Exists(c => c.Relid == relid && c.Column == column));
         });
@@ -2184,7 +2207,7 @@ internal static unsafe partial class SequenceRanges
     /// </summary>
     private static List<uint> Matching(string name)
     {
-        SpiResult managed = Elevated.Run(() => Worf.SelectCatalog("SELECT seqoid::oid FROM worf.sequence_range ORDER BY seqoid"));
+        SpiResult managed = Elevated.Run(() => Worf.SelectCatalog("SELECT r.seqoid::oid FROM worf.sequence_range r WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = r.seqoid) ORDER BY r.seqoid"));
         List<uint> matching = [];
         for (int i = 0; i < managed.Count; i++)
         {
@@ -3745,17 +3768,10 @@ internal static unsafe partial class SequenceRanges
             }
         }
 
+        // Each table, with its inheritors and partitions, is read as StoredValues reads it, running nothing of the user's,
+        // before the sequence, whose lock a DROP of a table takes after the table's.
         SpiParameter seq = SpiParameter.Create(info.Seqoid);
         string pick = info.Ascending ? "max" : "min";
-        // The value a quarantine reserves is never issued.
-        long? last = LastValue(info.Seqoid);
-        Take(last == info.QuarantineEdge ? null : last);
-        Take(issued == info.QuarantineEdge ? null : issued);
-        Take(Worf.ReadScalar<long?>("SELECT last_value FROM worf.sequence_state WHERE seqoid = $1", seq));
-        Take(Worf.ReadScalar<long?>("SELECT watermark FROM worf.sequence_range WHERE seqoid = $1", seq));
-        Take(Worf.ReadScalar<long?>("SELECT " + pick + "(" + (info.Ascending ? "hi" : "lo") +
-            ") FROM worf.sequence_range_block WHERE seqoid = $1 AND kind IN ('n', 'i')", seq));
-        // Each table, with its inheritors and partitions, is read as StoredValues reads it, running nothing of the user's.
         long end = Worf.ReadScalar<long?>("SELECT root_end FROM worf.sequence_range WHERE seqoid = $1", seq) ?? RootEnd(info);
         foreach ((uint relid, string column, _) in UsingColumns(info.Seqoid))
         {
@@ -3765,6 +3781,15 @@ internal static unsafe partial class SequenceRanges
                 Take((long)(info.Ascending ? Math.Ceiling(value) : Math.Floor(value)));
             }
         }
+
+        // The value a quarantine reserves is never issued.
+        long? last = LastValue(info.Seqoid);
+        Take(last == info.QuarantineEdge ? null : last);
+        Take(issued == info.QuarantineEdge ? null : issued);
+        Take(Worf.ReadScalar<long?>("SELECT last_value FROM worf.sequence_state WHERE seqoid = $1", seq));
+        Take(Worf.ReadScalar<long?>("SELECT watermark FROM worf.sequence_range WHERE seqoid = $1", seq));
+        Take(Worf.ReadScalar<long?>("SELECT " + pick + "(" + (info.Ascending ? "hi" : "lo") +
+            ") FROM worf.sequence_range_block WHERE seqoid = $1 AND kind IN ('n', 'i')", seq));
 
         return high;
     }
@@ -3990,7 +4015,7 @@ internal static unsafe partial class SequenceRanges
         }
 
         Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>> uses = [];
-        SpiResult managed = Elevated.Run(() => Worf.SelectCatalog("SELECT seqoid::oid FROM worf.sequence_range ORDER BY seqoid"));
+        SpiResult managed = Elevated.Run(() => Worf.SelectCatalog("SELECT r.seqoid::oid FROM worf.sequence_range r WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = r.seqoid) ORDER BY r.seqoid"));
         for (int i = 0; i < managed.Count; i++)
         {
             uint managedSeq = managed[i].Get<uint>(0);

@@ -42,10 +42,11 @@ CREATE SEQUENCE codes;
 CREATE TABLE coded (code text PRIMARY KEY DEFAULT 'INV-' || nextval('codes'));
 SELECT worf.enable_sequence_range('codes', participants := '{}');
 
--- Disabling keeps the blocks, and dropping the table drops the sequence's range state.
+-- Disabling keeps the blocks, and dropping the table leaves the sequence's range state to the range worker, which removes it.
 SELECT worf.disable_sequence_range('t_id_seq');
 SELECT state FROM worf.sequence_ranges;
 DROP TABLE t;
+DO $$BEGIN FOR i IN 1..600 LOOP EXIT WHEN NOT EXISTS (SELECT 1 FROM worf.sequence_range); PERFORM pg_sleep(0.1); END LOOP; END$$;
 SELECT count(*) FROM worf.sequence_range;
 
 \c regression

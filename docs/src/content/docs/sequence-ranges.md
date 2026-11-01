@@ -57,7 +57,7 @@ A transaction that has called `nextval`, or written a value the guard checked ag
 
 Run `disable_sequence_range` on the old owner, then `enable_sequence_range` on the new one, naming every participant. The new owner's values start above every block the old owner granted, and nodes keep using their blocks until new ones arrive. If the old owner is gone for good, pass `force := true`.
 
-Dropping a managed sequence, or the table that owns it, ends its range management on that node. On the owner, the other nodes hear that it is disabled and keep using the blocks they hold. A sequence of the same name, as `pg_restore` brings back, isn't managed there until `enable_sequence_range` starts a new epoch above the dropped one's values. On another node, one joins the owner's epoch again.
+Dropping a managed sequence, or the table that owns it, ends its range management on that node, and the range worker removes its range state once the drop commits, so the drop never waits on the rows worf's workers hold. On the owner, the other nodes hear that it is disabled and keep using the blocks they hold. A sequence of the same name, as `pg_restore` brings back, isn't managed there until `enable_sequence_range` starts a new epoch above the dropped one's values. On another node, one joins the owner's epoch again.
 
 ## Restores and failover
 
