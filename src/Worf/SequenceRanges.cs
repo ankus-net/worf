@@ -871,8 +871,8 @@ internal static unsafe partial class SequenceRanges
     /// <summary>
     /// Reads the furthest value the tables hold in a block, from each column that uses the sequence and leads a btree
     /// index, whose table isn't locked against reading, so that the read is quick and waits on no DDL. A partitioned
-    /// table's partitions, which take its column's default, are read on their own. Each table is read as its owner, so
-    /// that the user's functions the planner runs have no rights the owner lacks, and only when the owner may read it.
+    /// table's partitions, which take its column's default, are read on their own. The index is read as
+    /// <see cref="StoredValues"/> does, running nothing of the user's.
     /// </summary>
     /// <returns>The value, or null when no row holds one.</returns>
     private static decimal? FurthestStored(SequenceInfo info, (Guid Id, long Lo, long Hi) block)
@@ -880,24 +880,8 @@ internal static unsafe partial class SequenceRanges
         decimal? furthest = null;
         foreach ((uint relid, string column, _) in UsingColumns(info.Seqoid).Where(column => NativeMethods.get_rel_relkind(column.Relid) != (sbyte)'p'))
         {
-            if (!Worf.ReadScalar<bool>("""
-                SELECT EXISTS (
-                    SELECT 1 FROM pg_catalog.pg_index i
-                        JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
-                        JOIN pg_catalog.pg_am m ON m.oid = c.relam
-                        JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
-                        JOIN pg_catalog.pg_class t ON t.oid = i.indrelid
-                    WHERE i.indrelid = $1 AND a.attname = $2 AND m.amname = 'btree' AND i.indisvalid AND i.indpred IS NULL
-                        AND pg_catalog.has_table_privilege(t.relowner, t.oid, 'SELECT')
-                        AND pg_catalog.has_schema_privilege(t.relowner, t.relnamespace, 'USAGE'))
-                """, SpiParameter.Create(relid), SpiParameter.Create(column)) ||
-                !NativeMethods.ConditionalLockRelationOid(relid, (int)PgLockMode.AccessShare))
-            {
-                continue;
-            }
-
-            string query = $"SELECT {(info.Ascending ? "max" : "min")}({Spi.QuoteIdentifier(column)})::numeric FROM {QualifiedName(relid)} WHERE {Spi.QuoteIdentifier(column)} BETWEEN $1 AND $2";
-            if (TableOwner.Run(relid, () => Worf.ReadScalar<decimal?>(query, SpiParameter.Create(block.Lo), SpiParameter.Create(block.Hi))) is decimal value)
+            if (NativeMethods.ConditionalLockRelationOid(relid, (int)PgLockMode.AccessShare) &&
+                StoredValues.Furthest(relid, column, info.Ascending, block.Lo, block.Hi, true) is decimal value)
             {
                 furthest = furthest is not decimal f ? value : info.Ascending ? Math.Max(f, value) : Math.Min(f, value);
             }
@@ -1749,7 +1733,7 @@ internal static unsafe partial class SequenceRanges
         {
             if (GuardedColumns(relid).TryGetValue(column, out (uint TypeOid, List<uint> Sequences) guarded))
             {
-                SequenceRangeGuard.CheckRows(relid, inherited, column, guarded.TypeOid == NumericOid, guarded.Sequences);
+                SequenceRangeGuard.CheckRows(relid, inherited, column, guarded.Sequences);
             }
 
             return;
@@ -1762,7 +1746,7 @@ internal static unsafe partial class SequenceRanges
             if (leaf && Beneath(partition, relid, tree.Members) &&
                 GuardedColumns(partition, tree).TryGetValue(column, out (uint TypeOid, List<uint> Sequences) guarded))
             {
-                SequenceRangeGuard.CheckRows(partition, false, column, guarded.TypeOid == NumericOid, guarded.Sequences);
+                SequenceRangeGuard.CheckRows(partition, false, column, guarded.Sequences);
             }
         }
     }
@@ -1796,7 +1780,7 @@ internal static unsafe partial class SequenceRanges
             {
                 if (!own.TryGetValue(column, out (uint TypeOid, List<uint> Sequences) before) || !sequences.TrueForAll(before.Sequences.Contains))
                 {
-                    SequenceRangeGuard.CheckRows(leaf, false, column, typeOid == NumericOid, sequences);
+                    SequenceRangeGuard.CheckRows(leaf, false, column, sequences);
                 }
             }
         }
@@ -3554,7 +3538,6 @@ internal static unsafe partial class SequenceRanges
 
         SpiParameter seq = SpiParameter.Create(info.Seqoid);
         string pick = info.Ascending ? "max" : "min";
-        string round = info.Ascending ? "ceil" : "floor";
         // The value a quarantine reserves is never issued.
         long? last = LastValue(info.Seqoid);
         Take(last == info.QuarantineEdge ? null : last);
@@ -3563,18 +3546,15 @@ internal static unsafe partial class SequenceRanges
         Take(Worf.ReadScalar<long?>("SELECT watermark FROM worf.sequence_range WHERE seqoid = $1", seq));
         Take(Worf.ReadScalar<long?>("SELECT " + pick + "(" + (info.Ascending ? "hi" : "lo") +
             ") FROM worf.sequence_range_block WHERE seqoid = $1 AND kind IN ('n', 'i')", seq));
-        // Each table is read as its owner, so that the user's functions the planner runs have no rights the owner lacks.
+        // Each table, with its inheritors and partitions, is read as StoredValues reads it, running nothing of the user's.
         long end = Worf.ReadScalar<long?>("SELECT root_end FROM worf.sequence_range WHERE seqoid = $1", seq) ?? RootEnd(info);
-        foreach ((uint relid, string column, uint typeOid) in UsingColumns(info.Seqoid))
+        foreach ((uint relid, string column, _) in UsingColumns(info.Seqoid))
         {
-            string value = Spi.QuoteIdentifier(column);
-            string within = typeOid != NumericOid
-                ? string.Create(CultureInfo.InvariantCulture, $"{value} {(info.Ascending ? "<=" : ">=")} {end}")
-                : info.Ascending
-                    ? string.Create(CultureInfo.InvariantCulture, $"{value} BETWEEN {long.MinValue}::numeric AND {end}::numeric")
-                    : string.Create(CultureInfo.InvariantCulture, $"{value} BETWEEN {end}::numeric AND {long.MaxValue}::numeric");
-            string query = $"SELECT {round}({pick}({value}))::bigint FROM {QualifiedName(relid)} WHERE {within}";
-            Take(TableOwner.Run(relid, () => Worf.ReadScalar<long?>(query)));
+            if (StoredValues.Furthest(relid, column, info.Ascending, info.Ascending ? long.MinValue : end, info.Ascending ? end : long.MaxValue, false)
+                is decimal value)
+            {
+                Take((long)(info.Ascending ? Math.Ceiling(value) : Math.Floor(value)));
+            }
         }
 
         return high;

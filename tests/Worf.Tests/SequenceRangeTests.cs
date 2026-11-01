@@ -337,6 +337,23 @@ public sealed class SequenceRangeTests
             """, token);
         Assert.AreEqual(scans, await node.SafePsqlAsync(Database, Scans, token), "no sequential scan");
 
+        // The rows of a table whose owner has no rights on its schema are checked all the same, and the sequence its
+        // rows use is enabled.
+        _ = await node.SafePsqlAsync(Database, """
+            CREATE ROLE hider;
+            CREATE SCHEMA hidden;
+            CREATE TABLE hidden.h (id bigint PRIMARY KEY);
+            INSERT INTO hidden.h VALUES (-7);
+            CREATE SEQUENCE hidden.hs;
+            CREATE TABLE hidden.h2 (id bigint DEFAULT nextval('hidden.hs'));
+            INSERT INTO hidden.h2 VALUES (500);
+            ALTER TABLE hidden.h OWNER TO hider;
+            ALTER TABLE hidden.h2 OWNER TO hider;
+            ALTER TABLE hidden.h ALTER COLUMN id SET DEFAULT nextval('t_id_seq');
+            SELECT worf.enable_sequence_range('hidden.hs', participants := '{}', range_size := 100);
+            """, token);
+        Assert.AreEqual("500", await node.SafePsqlAsync(Database, "SELECT high_water FROM worf.sequence_range WHERE seqoid = 'hidden.hs'::regclass", token));
+
         // A root starts above the whole values within bigint that the tables hold, which NaN, the infinities and values
         // past bigint don't move, as when the sequence is enabled again, with a column that took its default afterwards.
         _ = await node.SafePsqlAsync(Database, """
@@ -529,8 +546,8 @@ public sealed class SequenceRangeTests
         Assert.AreEqual("42501", reserve.SqlState);
         Assert.Contains("must be owner", reserve.MessageText);
 
-        // The functions the planner runs for a role's table, from a CHECK constraint or an index predicate, run as the
-        // table's owner when worf reads its rows, on SET DEFAULT and in the range worker, so they can't make it a superuser.
+        // worf reads a role's table with PostgreSQL's own scans, on SET DEFAULT and in the range worker, which run none of
+        // the functions that its CHECK constraint and index predicate call, so they can't make it a superuser.
         int escapes = node.ReadLog().Length;
         _ = await node.SafePsqlAsync(Database, """
             SET ROLE app;
@@ -548,10 +565,7 @@ public sealed class SequenceRangeTests
             ALTER TABLE app.x2 ALTER COLUMN id SET DEFAULT nextval('public.t_id_seq');
             """, token);
 
-        // The sequence moves once the table is committed, so that the range worker's read after it sees the table.
         _ = await node.SafePsqlAsync(Database, "SET ROLE app; INSERT INTO app.x2 SELECT FROM generate_series(1, 3)", token);
-        string rangeWorker = await node.SafePsqlAsync(Database, "SELECT pid FROM pg_stat_activity WHERE datname = current_database() AND backend_type LIKE 'worf range%'", token);
-        Assert.IsTrue(await node.PollLogAsync(escapes, $"runs as app in {rangeWorker}", token), "the range worker read the table as its owner");
 
         // worf creates the guard's triggers as the table's owner too, so the functions a partition key runs as its tree is
         // read can't make it a superuser, and runs no event trigger for them, which would find the role's temporary
@@ -580,6 +594,7 @@ public sealed class SequenceRangeTests
             FROM pg_roles WHERE rolname = 'app';
             DROP EVENT TRIGGER audit;
             """, token));
+        string rangeWorker = await node.SafePsqlAsync(Database, "SELECT pid FROM pg_stat_activity WHERE datname = current_database() AND backend_type LIKE 'worf range%'", token);
 
         // Triggers with the guard's names from before worf was installed are replaced as their table comes under the
         // guard, and once it is installed, no trigger takes the guard's names or function, while a restore skips them.
@@ -636,6 +651,11 @@ public sealed class SequenceRangeTests
             PostgresException error = await Assert.ThrowsExactlyAsync<PostgresException>(() => node.SafePsqlAsync("decoys", write, token), write);
             Assert.AreEqual("23514", error.SqlState, write);
         }
+
+        // By now the range worker has read the role's table many times, and nothing ran the role's functions but the role.
+        string escaped = node.ReadLog()[escapes..];
+        Assert.DoesNotContain("runs as postgres", escaped);
+        Assert.DoesNotContain($"in {rangeWorker}", escaped);
 
         async Task AssertOutsideAsync(TestNode target, string sql)
         {

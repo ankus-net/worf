@@ -377,14 +377,14 @@ internal static class SequenceRangeGuard
     /// does for DDL from another node, a value also passes unless one of the sequences may still issue it, as far as
     /// this node knows. A numeric value that isn't a whole number within bigint, as NaN, is none of a sequence's. The
     /// check looks for the values that fail by their spans, so that an index on the column, or a constraint on the column
-    /// that rules the spans out, spares it from reading every row; otherwise it reads them all.
+    /// that rules the spans out, spares it from reading every row; otherwise it reads them all. It reads them as
+    /// <see cref="StoredValues"/> does, whatever the table's row-level security, and running nothing of the user's.
     /// </summary>
     /// <param name="relid">The table.</param>
     /// <param name="inherited">Whether to check its inheritors' and partitions' rows too.</param>
     /// <param name="column">The column.</param>
-    /// <param name="numeric">Whether the column is numeric.</param>
     /// <param name="sequences">The managed sequences the column uses.</param>
-    internal static void CheckRows(uint relid, bool inherited, string column, bool numeric, List<uint> sequences)
+    internal static void CheckRows(uint relid, bool inherited, string column, List<uint> sequences)
     {
         Reload();
         List<(long Lo, long Hi)> refused = [];
@@ -415,31 +415,10 @@ internal static class SequenceRangeGuard
             return;
         }
 
-        string value = Spi.QuoteIdentifier(column);
-        string condition = string.Join(" OR ", spans.Select(span => Within(value, span, numeric)));
-        if (numeric)
-        {
-            condition = $"({condition}) AND {value} = trunc({value})";
-        }
-
         // The table's constraints, as a partition's bound, may rule the spans out, and spare reading its rows, as they spare
-        // PostgreSQL's own check of an attached partition's rows. The query runs as the table's owner, so that the user's
-        // functions the planner runs, as from its constraints and index predicates, have no rights the owner lacks.
+        // PostgreSQL's own check of an attached partition's rows.
         string table = SequenceRanges.QualifiedName(relid);
-        string? outside = TableOwner.Run(relid, () =>
-        {
-            unsafe
-            {
-                fixed (byte* name = Worf.ToServerCString("constraint_exclusion"))
-                fixed (byte* on = Worf.ToServerCString("on"))
-                {
-                    _ = NativeMethods.set_config_option((sbyte*)name, (sbyte*)on, GucContext.PGC_USERSET, GucSource.PGC_S_SESSION,
-                        GucAction.GUC_ACTION_SAVE, true, 0, false);
-                }
-            }
-
-            return Worf.ReadScalar<string?>($"SELECT {value}::text FROM {(inherited ? "" : "ONLY ")}{table} WHERE {condition} LIMIT 1");
-        });
+        string? outside = StoredValues.FindWithin(relid, inherited, column, spans);
         if (outside is not null)
         {
             throw new PgException(CheckViolation,
@@ -552,20 +531,6 @@ internal static class SequenceRangeGuard
 
         return left;
     }
-
-    /// <summary>
-    /// Writes the condition that a value lies in a span. An integer column's span is open where it reaches bigint's
-    /// limit, which its values can't pass, while a numeric column's is closed, since NaN and values beyond bigint's
-    /// limits lie past it.
-    /// </summary>
-    private static string Within(string value, (long Lo, long Hi) span, bool numeric) => span switch
-    {
-        _ when numeric => string.Create(CultureInfo.InvariantCulture, $"{value} BETWEEN {span.Lo}::numeric AND {span.Hi}::numeric"),
-        (long.MinValue, long.MaxValue) => $"{value} IS NOT NULL",
-        (long.MinValue, long hi) => string.Create(CultureInfo.InvariantCulture, $"{value} <= {hi}"),
-        (long lo, long.MaxValue) => string.Create(CultureInfo.InvariantCulture, $"{value} >= {lo}"),
-        (long lo, long hi) => string.Create(CultureInfo.InvariantCulture, $"{value} BETWEEN {lo} AND {hi}"),
-    };
 
     /// <summary>
     /// Checks whether a sequence may still issue a value, for a session that restores rows, as of the statement the
