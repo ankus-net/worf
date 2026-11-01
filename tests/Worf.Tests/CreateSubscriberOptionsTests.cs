@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 
 namespace Worf.Tests;
@@ -119,8 +120,17 @@ public sealed class CreateSubscriberOptionsTests
                     SELECT s.sub_name, s.sub_replication_sets, s.sub_apply_delay, s.sub_force_text_transfer
                     FROM worf.subscription s
                     """, token), $"subscription in {db}");
-                Assert.AreEqual("0", await PsqlAsync(provider, pgport, db,
-                    "SELECT count(*) FROM worf.local_sync_status WHERE sync_status <> 'r'", token), $"sync status in {db}");
+                // worf_create_subscriber marks the subscription ready after it creates it, so an apply worker that starts in
+                // between may still be finishing the subscription's initial step, which it does again after the restart.
+                string notReady;
+                Stopwatch waited = Stopwatch.StartNew();
+                while ((notReady = await PsqlAsync(provider, pgport, db, "SELECT count(*) FROM worf.local_sync_status WHERE sync_status <> 'r'", token)) != "0" &&
+                    waited.Elapsed < TestNode.PollTimeout)
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(100), token);
+                }
+
+                Assert.AreEqual("0", notReady, $"sync status in {db}");
 
                 _ = await provider.SafePsqlAsync(db, "INSERT INTO replicated VALUES (1)", token);
             }
