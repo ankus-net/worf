@@ -378,10 +378,13 @@ internal static unsafe class ApplyHeap
             return false;
         }
 
-        SysScanDescData* scan = NativeMethods.systable_beginscan(relation, indexOid, true, NativeMethods.GetLatestSnapshot(), nkeys, keys);
+        // PostgreSQL 18 checks that a scan's snapshot is registered.
+        SnapshotData* snapshot = NativeMethods.RegisterSnapshot(NativeMethods.GetLatestSnapshot());
+        SysScanDescData* scan = NativeMethods.systable_beginscan(relation, indexOid, true, snapshot, nkeys, keys);
         HeapTupleData* tuple = NativeMethods.systable_getnext(scan);
         bool frozen = tuple is not null && XminFrozen(tuple->t_data);
         NativeMethods.systable_endscan(scan);
+        NativeMethods.UnregisterSnapshot(snapshot);
         return frozen;
     }
 

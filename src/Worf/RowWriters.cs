@@ -85,13 +85,17 @@ internal sealed unsafe class RowWriters(uint subId) : IDisposable
         tuple.t_self.ip_blkid.bi_lo = (ushort)block;
         tuple.t_self.ip_posid = offset;
         int buffer;
-        if (!NativeMethods.heap_fetch(relation, NativeMethods.GetLatestSnapshot(), &tuple, &buffer, false))
+
+        // PostgreSQL 18 checks that a fetch's snapshot is registered.
+        SnapshotData* snapshot = NativeMethods.RegisterSnapshot(NativeMethods.GetLatestSnapshot());
+        bool found = NativeMethods.heap_fetch(relation, snapshot, &tuple, &buffer, false);
+        bool frozen = found && ApplyHeap.XminFrozen(tuple.t_data);
+        if (found)
         {
-            return false;
+            NativeMethods.ReleaseBuffer(buffer);
         }
 
-        bool frozen = ApplyHeap.XminFrozen(tuple.t_data);
-        NativeMethods.ReleaseBuffer(buffer);
+        NativeMethods.UnregisterSnapshot(snapshot);
         return frozen;
     }
 
