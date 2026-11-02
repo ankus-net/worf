@@ -370,21 +370,37 @@ internal static partial class RelCache
     /// <returns>The conversion, or null when the local column's type reads the values.</returns>
     private static unsafe WorfColumnConversion? ColumnConversion(WorfRemoteType remote, FormData_pg_attribute* att)
     {
-        uint local = NativeMethods.getBaseType(att->atttypid);
-        uint readType = 0;
-        string name;
         // Money's binary form counts the smallest units of the currency, so values sent so mean the same only while both
-        // nodes count the same fraction digits, whatever column they go to, and its text, as the copy and text transfer
-        // send, means the same only where it reads here as the same amount.
+        // nodes count the same fraction digits, and are read as what they're sent in, then converted as any value is,
+        // for a column of another type, and its text, as the copy and text transfer send, means the same only where it
+        // reads here as the same amount.
         if (SendsMoney(remote) && ProviderMoneyFormat is string providerFormat && MoneyAlike(providerFormat) is bool binaryAlike)
         {
             string column = Worf.FromServer((sbyte*)&att->attname);
-            return new WorfColumnConversion(column, "money", 0, att->atttypid, att->atttypmod,
-                $"column \"{column}\" gets money from a provider whose lc_monetary formats it as \"{providerFormat}\" where this node's formats it as \"{OutputConfig.MoneyFormat()}\"" +
-                    (binaryAlike ? ", which reads as another amount, or none, in the text the copy and text transfer send" : ""),
-                binaryAlike);
+            string failure = $"column \"{column}\" gets money from a provider whose lc_monetary formats it as \"{providerFormat}\" where this node's formats it as \"{OutputConfig.MoneyFormat()}\"";
+            if (!binaryAlike)
+            {
+                return new WorfColumnConversion(column, "money", 0, att->atttypid, att->atttypmod, failure);
+            }
+
+            failure += ", which reads as another amount, or none, in the text the copy and text transfer send";
+            return ConvertedColumn(remote, att) is WorfColumnConversion converted
+                ? converted.FailingText(failure)
+                : new WorfColumnConversion(column, "money", 0, att->atttypid, att->atttypmod, failure, true);
         }
 
+        return ConvertedColumn(remote, att);
+    }
+
+    /// <summary>
+    /// Finds how a remote column's values convert to the local column's type, as <see cref="ColumnConversion"/> does,
+    /// whatever the nodes' lc_monetary.
+    /// </summary>
+    private static unsafe WorfColumnConversion? ConvertedColumn(WorfRemoteType remote, FormData_pg_attribute* att)
+    {
+        uint local = NativeMethods.getBaseType(att->atttypid);
+        uint readType = 0;
+        string name;
         if (remote.Definition is null)
         {
             if (remote.Oid == local)

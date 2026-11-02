@@ -2357,14 +2357,16 @@ internal static unsafe partial class Apply
 
     /// <summary>
     /// Checks whether an error says nothing about the change's data, as a deadlock, a serialization failure, a lock or
-    /// statement timeout, a cancellation, a shutdown, running out of resources, a lost connection or an I/O error do,
-    /// so applying the transaction again can get past it.
+    /// statement timeout, a cancellation, a shutdown, running out of resources, a lost connection, an I/O error or an
+    /// object not in the state the change needs, as a column every value of which fails while the nodes format money
+    /// differently, do, so applying the transaction again can get past it. A value too short for its type's binary
+    /// form, which fails with a protocol violation, comes from the data.
     /// </summary>
     internal static bool IsTransient(PgException error)
     {
         string state = error.SqlState;
-        return state is "40000" or "40001" or "40003" or "40P01" or "55P03" or "58030" ||
-            state.StartsWith("08", StringComparison.Ordinal) || state.StartsWith("53", StringComparison.Ordinal) ||
+        return state is "40000" or "40001" or "40003" or "40P01" or "55000" or "55P03" or "58030" ||
+            (state.StartsWith("08", StringComparison.Ordinal) && state != "08P01") || state.StartsWith("53", StringComparison.Ordinal) ||
             state.StartsWith("57", StringComparison.Ordinal);
     }
 

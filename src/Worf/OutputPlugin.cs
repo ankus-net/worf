@@ -672,6 +672,11 @@ internal static unsafe partial class OutputPlugin
     {
         List<(string Key, string Value)> msg = OutputConfig.PrepareStartupMessage(data);
 
+        // A reload that changes lc_monetary is looked for from the format the message announces, so that one before the
+        // first change is found too.
+        s_monetary = null;
+        _ = OutputConfig.MonetaryChanged(ref s_monetary);
+
         NativeMethods.OutputPluginPrepareWrite(ctx, lastMessage);
         data.Api!.WriteStartupMessage(ctx->@out, msg);
         NativeMethods.OutputPluginWrite(ctx, lastMessage);

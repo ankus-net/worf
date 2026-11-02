@@ -127,7 +127,9 @@ internal static class Rpc
     }
 
     /// <summary>
-    /// Gets how the provider's session formats money, as <see cref="OutputConfig.MoneyFormat"/> shows it.
+    /// Gets how the provider's session formats money, as <see cref="OutputConfig.MoneyFormat"/> shows it, and keeps
+    /// the session's lc_monetary, in the same statement, so that a reload of the provider's configuration, which takes
+    /// effect between statements, can't change how the copies on the connection format money afterwards.
     /// </summary>
     /// <param name="conn">The provider connection, inside a local transaction.</param>
     /// <returns>The text.</returns>
@@ -137,6 +139,7 @@ internal static class Rpc
         {
             return conn.Query("""
                 SELECT '-1234567'::pg_catalog.money::pg_catalog.text || ' = ' || '-1234567'::pg_catalog.money::pg_catalog.numeric::pg_catalog.text
+                FROM pg_catalog.set_config('lc_monetary', pg_catalog.current_setting('lc_monetary'), false)
                 """, 1)[0][0]!;
         }
         catch (PgRemoteException error)

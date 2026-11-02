@@ -33,7 +33,7 @@ public sealed class ColumnTypeTests
     /// The initial copy converts as replication does, and values convert under the subscriber's settings however
     /// they're sent. In the copy, exception_behaviour skips and records a row that fails, and under error the copy
     /// stops naming the row, column and value, and starts again only after a delay. Money fails when the provider
-    /// formats it differently. A client of the first protocol version gets RELATION messages without the column
+    /// formats it differently, and is copied again until the formats agree. A client of the first protocol version gets RELATION messages without the column
     /// types, and values in PostgreSQL's internal format only from the second.
     /// </summary>
     /// <returns>The test.</returns>
@@ -250,6 +250,7 @@ public sealed class ColumnTypeTests
         // The initial copy converts values as replication does, for a resynchronized table and for a subscription
         // that gets values as text, and so do the values sent afterwards, in binary and as text, all under the
         // subscriber's TimeZone and bytea_output. The row whose value is too big is skipped and recorded.
+        int moneyLogpos = subscriber.ReadLog().Length;
         _ = await subscriber.SafePsqlAsync(Database, """
             SELECT worf.alter_subscription_resynchronize_table('sub', 'zt');
             SELECT worf.alter_subscription_resynchronize_table('sub', 'mt');
@@ -288,6 +289,18 @@ public sealed class ColumnTypeTests
                 synchronize_data := true,
                 force_text_transfer := true)
             """, token);
+        // Money from a provider that formats it differently fails every value, which says nothing of the rows, so the
+        // copies try again rather than skip them, until the formats agree.
+        if (moneyDiffers)
+        {
+            Assert.IsTrue(await subscriber.PollLogAsync(moneyLogpos, "gets money from a provider whose lc_monetary formats it as", token),
+                "the copy of money failing");
+            Assert.AreEqual("0", await subscriber.SafePsqlAsync(Database, "SELECT count(*) FROM worf.exception_log WHERE table_name IN ('mt', 'mnt')", token),
+                "money skipped");
+            _ = await provider.SafePsqlAsync(Database, "ALTER SYSTEM RESET lc_monetary", token);
+            _ = await provider.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
+        }
+
         foreach (string database in new[] { Database, TextDatabase })
         {
             Assert.IsTrue(await subscriber.PollQueryUntilAsync(database, """
@@ -319,15 +332,17 @@ public sealed class ColumnTypeTests
                     remote_new_tuple->>'id', remote_new_tuple->>'n')
                 FROM worf.exception_log WHERE table_name = 'zt'
                 """, token));
-            Assert.AreEqual(moneyDiffers ? "" : "1|$12.35\n2|$12.35",
+            Assert.AreEqual(await provider.SafePsqlAsync(Database, "SELECT concat_ws('|', id, m) FROM mt ORDER BY id", token),
                 await subscriber.SafePsqlAsync(database, "SELECT concat_ws('|', id, m) FROM mt ORDER BY id", token));
-            Assert.AreEqual(moneyDiffers ? "COPY|55000|1\nINSERT|55000|2" : "", await subscriber.SafePsqlAsync(database, """
+            Assert.AreEqual("", await subscriber.SafePsqlAsync(database, """
                 SELECT concat_ws('|', operation, error_sqlstate, remote_new_tuple->>'id')
                 FROM worf.exception_log WHERE table_name = 'mt' ORDER BY log_id
                 """, token));
 
-            // Money counted in other fractional units fails into a numeric column too, rather than turn ¥1,234 into 12.34.
-            Assert.AreEqual(moneyDiffers ? "COPY|55000" : "1|1234.00", await subscriber.SafePsqlAsync(database, """
+            // Money counted in other fractional units waited too, rather than turn ¥1,234 into 12.34, and then means what
+            // it does on the provider.
+            string mnt = await provider.SafePsqlAsync(Database, "SELECT concat_ws('|', id, m::numeric) FROM mnt", token);
+            Assert.AreEqual(mnt, await subscriber.SafePsqlAsync(database, """
                 SELECT concat_ws('|', (SELECT string_agg(concat_ws('|', id, m), ',') FROM mnt),
                     (SELECT string_agg(concat_ws('|', operation, error_sqlstate), ',') FROM worf.exception_log WHERE table_name = 'mnt'))
                 """, token), "mnt's rows and failures");

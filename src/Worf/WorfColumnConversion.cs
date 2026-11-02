@@ -115,7 +115,15 @@ internal sealed unsafe class WorfColumnConversion
     /// <param name="kind">The value's form: <c>i</c> for PostgreSQL's internal one, <c>b</c> for binary, <c>t</c> for
     /// text.</param>
     /// <returns>Whether it converts.</returns>
-    internal bool Converts(char kind) => _textFails ? kind == 't' : kind != 't' || ReadType != 0 || _failure is not null;
+    internal bool Converts(char kind) => _textFails ? kind == 't' || ReadType != 0 : kind != 't' || ReadType != 0 || _failure is not null;
+
+    /// <summary>
+    /// Gets the conversion with every value sent as text failing, as values sent in binary still convert.
+    /// </summary>
+    /// <param name="failure">Why values sent as text fail.</param>
+    /// <returns>The conversion.</returns>
+    internal WorfColumnConversion FailingText(string failure)
+        => new(_column, _sourceType, ReadType, _targetType, _targetTypmod, _failure ?? failure, _failure is null);
 
     /// <summary>
     /// Reads a value sent in binary with a type, without a domain's constraints.
@@ -193,7 +201,7 @@ internal sealed unsafe class WorfColumnConversion
     /// <returns>The datum, in the current memory context.</returns>
     internal ulong Convert(char kind, byte[] data, out bool isnull)
     {
-        CheckReadable();
+        CheckReadable(kind == 't');
 
         fixed (byte* bytes = data)
         {
@@ -234,7 +242,7 @@ internal sealed unsafe class WorfColumnConversion
     /// <returns>The datum, in the current memory context.</returns>
     internal ulong ConvertText(sbyte* text, out bool isnull)
     {
-        CheckReadable();
+        CheckReadable(true);
         Compile();
         return ConvertRead(NativeMethods.InputFunctionCall(_input, text, _typioparam, -1), out isnull);
     }
@@ -296,11 +304,12 @@ internal sealed unsafe class WorfColumnConversion
     }
 
     /// <summary>
-    /// Fails a value when every value fails, or when this node can't read the type it was sent in.
+    /// Fails a value when every value fails, or every value sent as text and it was, or when this node can't read the
+    /// type it was sent in.
     /// </summary>
-    private void CheckReadable()
+    private void CheckReadable(bool text)
     {
-        if (_failure is not null)
+        if (_failure is not null && (!_textFails || text))
         {
             throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState, _failure);
         }

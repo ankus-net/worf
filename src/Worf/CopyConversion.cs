@@ -41,8 +41,9 @@ internal static unsafe partial class CopyConversion
     private static byte[] s_converted = new byte[8192];
     private static int s_convertedLength;
 
-    // How many of the provider's rows a copy that skips or records rows that fail copies in one subtransaction, which
-    // it splits in halves as one fails, until it finds the rows that fail.
+    // How many of the provider's rows a copy that skips or records rows that fail copies in one subtransaction, once a
+    // row failed: as one fails, the rows before it are copied again and the copy goes on after it, or, when COPY names
+    // no row, the batch is split in halves.
     private const int BatchRows = 1000;
 
     // When worf.exception_behaviour skips or records rows: what the exception log records with each, or null, the
@@ -289,8 +290,8 @@ internal static unsafe partial class CopyConversion
 
     /// <summary>
     /// Copies the provider's rows in batches, each in its own COPY and subtransaction. A row that fails is recorded:
-    /// skipped, or kept to disable the subscription as it fails the copy. A copy with few rows that fail takes few
-    /// subtransactions, and transaction IDs, however many rows it copies.
+    /// skipped, or kept to disable the subscription as it fails the copy. Each batch takes a transaction ID, and each
+    /// row that fails about two more, for the rows before it copied again and those after it.
     /// </summary>
     private static ulong CopyInBatches(ParseState* pstate, RelationData* relation, List* attnamelist)
     {
@@ -367,12 +368,13 @@ internal static unsafe partial class CopyConversion
                     throw;
                 }
 
-                ExceptionLog.Record(change, WorfExceptionBehaviour.Discard, error);
+                // The rows before it go first, so that the rows that fail among them are recorded before it, in order.
                 if (failed > start)
                 {
                     copied += CopyBatch(pstate, relation, attnamelist, start, failed - start);
                 }
 
+                ExceptionLog.Record(change, WorfExceptionBehaviour.Discard, error);
                 start = failed + 1;
             }
         }

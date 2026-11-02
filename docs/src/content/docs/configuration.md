@@ -75,8 +75,9 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
     again once it's enabled
 
   Errors that don't come from the data, such as deadlocks, serialization
-  failures, lock and statement timeouts, cancellations, shutdowns and running
-  out of resources, are retried as under `error`. Every skipped change,
+  failures, lock and statement timeouts, cancellations, shutdowns running out of
+  resources, and money that a provider formats otherwise than this node, every
+  value of which fails, are retried as under `error`. Every skipped change,
   including each change of a transaction skipped as a whole, and disabled
   subscriptions are recorded in `worf.exception_log`, with the error, the
   change's rows or queued DDL, and the transaction it belongs to. A value the

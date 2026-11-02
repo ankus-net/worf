@@ -70,9 +70,12 @@ their amounts then differ. When the digits agree but the provider formats money
 in text that the subscriber's doesn't read as the same amount, values sent as
 text, as in the initial copy and with `force_text_transfer`, fail with error
 55000, while values sent in binary, which count the currency's smallest units,
-replicate. A node whose `lc_monetary` changes, on a reload too, checks again: a
-provider ends its stream at its next change, so that the subscriber reconnects,
-and a subscriber finds its columns' conversions again. An older worf doesn't
+replicate, read as `money` and converted as any value is for a column of another
+type. Every `worf.exception_behaviour` retries error 55000, as an error that
+doesn't come from the data, until the formats agree. A node whose `lc_monetary`
+changes, on a reload too, checks again: a provider ends its stream at its next
+change, so that the subscriber reconnects, and a subscriber finds its columns'
+conversions again. An older worf doesn't
 send or read column types, or say how it formats money, so columns replicated
 through an older provider, subscriber or relay node need the same types, and
 money the same `lc_monetary`. `CHECK` constraints, `NOT NULL` constraints, etc.,
@@ -808,8 +811,9 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
     again once it's enabled
 
   Errors that don't come from the data, such as deadlocks, serialization
-  failures, lock and statement timeouts, cancellations, shutdowns and running
-  out of resources, are retried as under `error`. Every skipped change,
+  failures, lock and statement timeouts, cancellations, shutdowns running out of
+  resources, and money that a provider formats otherwise than this node, every
+  value of which fails, are retried as under `error`. Every skipped change,
   including each change of a transaction skipped as a whole, and disabled
   subscriptions are recorded in `worf.exception_log`, with the error, the
   change's rows or queued DDL, and the transaction it belongs to. A value the
