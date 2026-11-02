@@ -390,6 +390,7 @@ internal static class Functions
             // First drop the status, after noting the slots its tables' syncs create, which may be left on the provider.
             List<string> syncSlotNames = Sync.SyncSlotNames(sub);
             Sync.DropSubscriptionSyncStatus(sub.Id);
+            _ = Worf.Execute("DELETE FROM worf.sync_slot WHERE sub_id = $1", SpiParameter.Create(sub.Id));
 
             // Drop the actual subscription.
             WorfNode.DropSubscription(sub.Id);

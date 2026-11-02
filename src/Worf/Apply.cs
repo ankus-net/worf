@@ -298,7 +298,7 @@ internal static unsafe partial class Apply
         // Slots that the subscription's table syncs left on the provider are dropped, now and while one stays.
         SetSyncSlotsLeft(false);
         s_syncSlotsRetryAt = PgBackgroundWorker.RunTransaction(() =>
-            Sync.DropSyncSlots(streamConn, Sync.SyncSlotNames(sub), Sync.KeptSyncSlots(sub)).Count == 0)
+            Sync.DropLeftSyncSlots(streamConn, sub).Count == 0)
             ? 0 : Worker.GetCurrentTimestamp() + SyncSlotsRetryInterval;
 
         Worf.StartReplication(streamConn, sub.SlotName, originStartpos, origins, repsets, null, sub.ForceTextTransfer);
@@ -1132,7 +1132,7 @@ internal static unsafe partial class Apply
             dropped = PgBackgroundWorker.RunTransaction(() =>
             {
                 using PgReplicationConnection conn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "cleanup");
-                return Sync.DropSyncSlots(conn, Sync.SyncSlotNames(sub), Sync.KeptSyncSlots(sub)).Count == 0;
+                return Sync.DropLeftSyncSlots(conn, sub).Count == 0;
             });
         }
         catch (PgException error)

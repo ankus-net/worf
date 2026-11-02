@@ -924,6 +924,17 @@ public sealed partial class ExceptionBehaviourTests
         Assert.AreEqual("0", await provider.SafePsqlAsync(Database,
             $"SELECT count(*) FROM pg_replication_slots WHERE starts_with(slot_name, '{slot}_')", token), "the syncs' slots left");
 
+        // A table sync records its slot as it makes it, so that the apply worker drops it once left, though the table's
+        // sync status has gone since, as once the table is dropped here or leaves the subscription.
+        _ = await provider.SafePsqlAsync(Database, $"SELECT pg_create_logical_replication_slot('{slot}_deadbeef', 'worf')", token);
+        _ = await subscriber.SafePsqlAsync(Database,
+            $"INSERT INTO worf.sync_slot SELECT sub_id, '{slot}_deadbeef' FROM worf.subscription WHERE sub_name = 'sub'", token);
+        _ = await subscriber.SafePsqlAsync(Database, "SELECT worf.alter_subscription_disable('sub', true)", token);
+        _ = await subscriber.SafePsqlAsync(Database, "SELECT worf.alter_subscription_enable('sub', true)", token);
+        Assert.IsTrue(await provider.PollQueryUntilAsync(Database,
+            $"SELECT NOT EXISTS (SELECT FROM pg_replication_slots WHERE slot_name = '{slot}_deadbeef')", token), "the recorded slot dropped");
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT NOT EXISTS (SELECT FROM worf.sync_slot)", token), "the record forgotten");
+
         // Dropping the subscription drops the slots its table syncs left, as one stopped before it caught up leaves, but
         // not another subscription's own, whose name may look like one, as that of a subscription named sub_20261101 does.
         _ = await provider.SafePsqlAsync(Database, $"""

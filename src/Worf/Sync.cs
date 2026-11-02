@@ -16,6 +16,12 @@ using Path = System.IO.Path;
     	sync_statuslsn pg_lsn NOT NULL,
         UNIQUE (sync_subid, sync_nspname, sync_relname)
     );
+
+    CREATE TABLE worf.sync_slot (
+        sub_id oid NOT NULL,
+        slot_name name NOT NULL,
+        PRIMARY KEY (sub_id, slot_name)
+    );
     """, Requires = ["node-tables"])]
 
 namespace Worf;
@@ -342,6 +348,7 @@ internal static class Sync
             while (true)
             {
                 _ = WaitForApply(sub, nspname, relname, target, TimeSpan.MaxValue, waitingSince);
+                RecordSyncSlot(sub);
                 snapshot = EnsureReplicationSlotSnapshot(sub, originConnRepl, "copy_slot", false, out lsn);
                 if (WaitForApply(sub, nspname, relname, lsn, stallTimeout, waitingSince))
                 {
@@ -2082,7 +2089,41 @@ internal static class Sync
     /// <param name="sub">The subscription.</param>
     /// <returns>The slots' names.</returns>
     internal static List<string> SyncSlotNames(WorfSubscription sub)
-        => [.. GetSubscriptionTables(sub.Id).Select(sync => SyncSlotName(sub.SlotName, sync.Nspname, sync.Relname)).Distinct()];
+        => [.. GetSubscriptionTables(sub.Id).Select(sync => SyncSlotName(sub.SlotName, sync.Nspname, sync.Relname))
+            .Concat(Worf.Read("SELECT slot_name::text FROM worf.sync_slot WHERE sub_id = $1", 0, SpiParameter.Create(sub.Id)).Select(row => row.Get<string>(0)))
+            .Distinct()];
+
+    /// <summary>
+    /// Records the slot a table sync is about to make on the provider, in a transaction of its own, so that it is found
+    /// to drop once the sync is done with it, though the table's sync status is gone by then, as once the table leaves
+    /// the subscription or is dropped here.
+    /// </summary>
+    /// <param name="sub">The subscription, with the table's slot name.</param>
+    private static void RecordSyncSlot(WorfSubscription sub)
+        => PgBackgroundWorker.RunTransaction(() => _ = Worf.Execute(
+            "INSERT INTO worf.sync_slot VALUES ($1, $2) ON CONFLICT DO NOTHING", SpiParameter.Create(sub.Id), SpiParameter.Create(sub.SlotName)));
+
+    /// <summary>
+    /// Drops the slots on the provider that a subscription's table syncs left, but those still in use, and forgets the
+    /// ones dropped or gone.
+    /// </summary>
+    /// <param name="conn">The provider connection, inside a local transaction.</param>
+    /// <param name="sub">The subscription.</param>
+    /// <returns>The slots that couldn't be dropped.</returns>
+    internal static List<string> DropLeftSyncSlots(PgReplicationConnection conn, WorfSubscription sub)
+    {
+        List<string> names = SyncSlotNames(sub);
+        HashSet<string> kept = KeptSyncSlots(sub);
+        List<string> left = DropSyncSlots(conn, names, kept);
+        string[] gone = [.. names.Where(name => !kept.Contains(name) && !left.Contains(name))];
+        if (gone.Length > 0)
+        {
+            _ = Worf.Execute("DELETE FROM worf.sync_slot WHERE sub_id = $1 AND slot_name = ANY ($2::text[]::name[])",
+                SpiParameter.Create(sub.Id), SpiParameter.Create(gone));
+        }
+
+        return left;
+    }
 
     /// <summary>
     /// Gets the slots on the provider that a subscription's table syncs still stream from or drop themselves: those of
