@@ -105,6 +105,11 @@ internal static class Worker
             function = "worf_exchange_main";
             name = $"worf exchange {worker.Dboid}";
         }
+        else if (worker.WorkerType == WorfWorkerType.Switch)
+        {
+            function = "worf_switch_main";
+            name = $"worf switch {worker.Dboid}:{worker.Worker.Switch.Seqoid}";
+        }
         else
         {
             function = "worf_apply_main";
@@ -529,6 +534,7 @@ internal static class Worker
         WorfWorkerType.Sync => "sync",
         WorfWorkerType.Range => "range",
         WorfWorkerType.Exchange => "exchange",
+        WorfWorkerType.Switch => "switch",
         _ => throw new ArgumentOutOfRangeException(nameof(type)),
     };
 

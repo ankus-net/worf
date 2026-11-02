@@ -60,7 +60,8 @@ internal static class SequenceRangeWorker
                 }
 
                 changed |= PgBackgroundWorker.RunTransaction(() => SequenceRanges.CheckIdentity(local));
-                foreach (uint seqoid in sequences)
+                // A sequence whose switch worker waits to switch it is left to that.
+                foreach (uint seqoid in sequences.Where(seqoid => !SequenceRangeSwitchWorker.Running(seqoid)))
                 {
                     try
                     {

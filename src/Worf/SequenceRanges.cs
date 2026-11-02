@@ -268,9 +268,6 @@ internal static unsafe partial class SequenceRanges
     // holder's IDs, which carry their times, can't meet the new holder's.
     private static readonly TimeSpan s_snowflakeReuseAfter = TimeSpan.FromDays(1);
 
-    // The range worker's lock timeout for the next try of each sequence's switch, by the block it switches to.
-    private static readonly Dictionary<uint, (Guid Block, int Timeout)> s_switchTimeouts = [];
-
     // When a block that lasted less than an hour is followed by a bigger request, and one that lasted more than a day by
     // a smaller one.
     private static readonly TimeSpan s_growBelow = TimeSpan.FromHours(1);
@@ -3553,7 +3550,8 @@ internal static unsafe partial class SequenceRanges
     /// <param name="info">The sequence's details.</param>
     /// <param name="block">The block.</param>
     /// <param name="forLoad">Whether the block was reserved for a load.</param>
-    /// <param name="lockTimeout">How long to wait for transactions that called nextval, in milliseconds.</param>
+    /// <param name="lockTimeout">How long to wait for transactions that called nextval, in milliseconds, or zero to take
+    /// the sequence's lock only when none holds it, without queueing for it.</param>
     /// <returns>Whether it switched; it doesn't when a transaction that called nextval holds the sequence that long, or
     /// another switch took the block first.</returns>
     internal static bool Switch(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) block, bool forLoad = false, int lockTimeout = 200)
@@ -3578,12 +3576,23 @@ internal static unsafe partial class SequenceRanges
             {
                 PgTransaction.RunInSubtransaction(() =>
                 {
-                    _ = Worf.Execute("SELECT pg_catalog.set_config('lock_timeout', $1, true)", SpiParameter.Create(
-                        Math.Max(lockTimeout, 1).ToString(CultureInfo.InvariantCulture)));
+                    if (lockTimeout == 0)
+                    {
+                        next = NativeMethods.ConditionalLockRelationOid(seqoid, (int)PgLockMode.ShareRowExclusive);
+                        if (!next)
+                        {
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        _ = Worf.Execute("SELECT pg_catalog.set_config('lock_timeout', $1, true)", SpiParameter.Create(
+                            lockTimeout.ToString(CultureInfo.InvariantCulture)));
+                        NativeMethods.LockRelationOid(seqoid, (int)PgLockMode.ShareRowExclusive);
+                    }
 
                     // Another switch may have taken the block while this one read it or waited for the lock. Restarting
                     // the sequence at the block's start would then issue its values again, so this one leaves it.
-                    NativeMethods.LockRelationOid(seqoid, (int)PgLockMode.ShareRowExclusive);
                     next = Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range_block WHERE block_id = $1 AND state = 'next'",
                         SpiParameter.Create(block.Id)).Count > 0;
                     if (next)
@@ -3637,21 +3646,72 @@ internal static unsafe partial class SequenceRanges
 
     /// <summary>
     /// Switches a sequence to its next block as its active one runs low. A switch waits 200 ms for the transactions that
-    /// called nextval, and once the block reaches its last twentieth, where inserts wait for the switch, each try that
-    /// gives up waits twice as long as the last, up to the exchange timeout, so that the transactions drawing from the
-    /// block can't keep the switch from its lock until they run the block out.
+    /// called nextval. Once the block reaches its last twentieth, where inserts wait for the switch, it takes the lock only
+    /// when no transaction holds the sequence, without queueing for it, and otherwise leaves the switch to a switch worker,
+    /// which waits for them as long as they hold it, while the range worker checks the other sequences. A switch that gave
+    /// up would let the inserts waiting behind it run the block out before the next one waited.
     /// </summary>
     private static bool SwitchBeforeEnd(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) next, bool forLoad, bool atEnd)
     {
-        int timeout = atEnd && s_switchTimeouts.TryGetValue(seqoid, out (Guid Block, int Timeout) last) && last.Block == next.Id ? last.Timeout : 200;
-        if (Switch(seqoid, info, next, forLoad, timeout))
+        if (Switch(seqoid, info, next, forLoad, atEnd ? 0 : 200))
         {
-            _ = s_switchTimeouts.Remove(seqoid);
             return true;
         }
 
-        s_switchTimeouts[seqoid] = (next.Id, atEnd ? Math.Min(timeout * 2, Math.Max(ExchangeTimeout, 200)) : 200);
-        return false;
+        // With every worker slot taken, the range worker waits itself, up to the exchange timeout.
+        return atEnd && !SequenceRangeSwitchWorker.Start(seqoid) && Switch(seqoid, info, next, forLoad, Math.Max(ExchangeTimeout, 200));
+    }
+
+    /// <summary>
+    /// Switches a sequence to its next block for its switch worker: waits for the transactions that hold the sequence, as
+    /// long as they hold it, then takes the range row without waiting, so that a reset, which holds the row as it waits
+    /// for the sequence, can't deadlock with it.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    /// <returns>Whether it's done: the sequence switched, or has nothing to switch to. It throws 55P03 when a transaction
+    /// holds the range row.</returns>
+    internal static bool SwitchAtEnd(uint seqoid)
+    {
+        if (!SequenceExists(seqoid) || !IsManaged(seqoid))
+        {
+            return true;
+        }
+
+        _ = Worf.Execute("SET LOCAL lock_timeout = 0");
+        unsafe
+        {
+            NativeMethods.LockRelationOid(seqoid, (int)PgLockMode.ShareRowExclusive);
+        }
+
+        LedgerNoWait = true;
+        try
+        {
+            LockLedger(seqoid);
+            SpiResult rows = Worf.Read("SELECT state, epoch FROM worf.sequence_range WHERE seqoid = $1", 1, SpiParameter.Create(seqoid));
+            if (rows.Count == 0 || rows[0].Get<string>(0) is "collecting" or "refused" || seqoid == SnowflakeIds.NodeSequence())
+            {
+                return true;
+            }
+
+            SequenceInfo info = GetInfo(seqoid);
+            int epoch = rows[0].Get<int>(1);
+            if (NodeBlock(seqoid, epoch, "active") is null || NextBlock(seqoid, epoch) is not (Guid, long, long, bool) next ||
+                !Confirmed(seqoid, info, next.Id))
+            {
+                return true;
+            }
+
+            if (Switch(seqoid, info, (next.Id, next.Lo, next.Hi), next.Reserved))
+            {
+                ChangedOnCommit();
+            }
+
+            return true;
+        }
+        finally
+        {
+            LedgerNoWait = false;
+        }
     }
 
     /// <summary>

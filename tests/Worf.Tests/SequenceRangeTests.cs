@@ -2267,6 +2267,101 @@ public sealed class SequenceRangeTests
     }
 
     /// <summary>
+    /// Transactions that hold a sequence at its block's end, as slow ones among many sessions, or one for longer than the
+    /// exchange timeout, hold up only the inserts into that sequence, which wait for the switch rather than run the block
+    /// out, while another sequence goes on switching.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task HoldersAtABlocksEndHoldUpOnlyTheirSequence()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode node = await StartNodeAsync("node_a", token);
+        _ = await node.SafePsqlAsync(Database, """
+            ALTER SYSTEM RESET worf.sequence_range_check_interval;
+            ALTER SYSTEM SET worf.sequence_range_timeout = '2s';
+            SELECT pg_reload_conf();
+            CREATE TABLE t1 (id bigserial PRIMARY KEY, v int);
+            CREATE TABLE t2 (id bigserial PRIMARY KEY, v int);
+            SELECT worf.enable_sequence_range('t1_id_seq', participants := '{}', range_size := 1000, max_range_size := 1000);
+            SELECT worf.enable_sequence_range('t2_id_seq', participants := '{}', range_size := 1000, max_range_size := 1000);
+            """, token);
+        Assert.IsTrue(await node.PollQueryUntilAsync(Database, """
+            SELECT count(*) = 2 AND bool_and(state = 'active' AND next_lo IS NOT NULL) FROM worf.sequence_ranges
+            """, token), "drawing from blocks with next ones ready");
+
+        // One in thirty of each session's transactions holds t1 for a second, longer than a switch first waits.
+        const int Sessions = 24;
+        const int Transactions = 150;
+        await Task.WhenAll(Enumerable.Range(0, Sessions).Select(async session =>
+        {
+            await using NpgsqlConnection connection = await node.OpenAsync(Database, token);
+            for (int i = 0; i < Transactions; i++)
+            {
+                await using NpgsqlTransaction transaction = await connection.BeginTransactionAsync(token);
+                await using (NpgsqlCommand insert = new("INSERT INTO t1 (v) VALUES (1)", connection, transaction))
+                {
+                    _ = await insert.ExecuteNonQueryAsync(token);
+                }
+
+                if (i % 30 == session % 30)
+                {
+                    await using NpgsqlCommand sleep = new("SELECT pg_sleep(1)", connection, transaction);
+                    _ = await sleep.ExecuteNonQueryAsync(token);
+                }
+
+                await transaction.CommitAsync(token);
+            }
+        }));
+        Assert.AreEqual($"{Sessions * Transactions}", await node.SafePsqlAsync(Database, "SELECT count(*) FROM t1", token));
+
+        // A transaction holds t2 for 6 s once it reaches its block's last twentieth, which the other sessions' inserts
+        // into t2 wait for, while t1's go on through its blocks as fast as before.
+        await using NpgsqlConnection holder = await node.OpenAsync(Database, token);
+        await using NpgsqlTransaction held = await holder.BeginTransactionAsync(token);
+        long left = long.Parse(await node.SafePsqlAsync(Database,
+            "SELECT values_left FROM worf.sequence_ranges WHERE sequence = 't2_id_seq'::regclass", token), CultureInfo.InvariantCulture);
+        await using (NpgsqlCommand insert = new($"INSERT INTO t2 (v) SELECT 0 FROM generate_series(1, {left - 30})", holder, held))
+        {
+            _ = await insert.ExecuteNonQueryAsync(token);
+        }
+
+        using CancellationTokenSource holding = CancellationTokenSource.CreateLinkedTokenSource(token);
+        Task<long>[] t1Inserts = [.. Enumerable.Range(0, 4).Select(async _ =>
+        {
+            await using NpgsqlConnection connection = await node.OpenAsync(Database, token);
+            await using NpgsqlCommand insert = new("INSERT INTO t1 (v) SELECT 2 FROM generate_series(1, 10)", connection);
+            long slowest = 0;
+            while (!holding.IsCancellationRequested)
+            {
+                Stopwatch elapsed = Stopwatch.StartNew();
+                _ = await insert.ExecuteNonQueryAsync(token);
+                slowest = Math.Max(slowest, elapsed.ElapsedMilliseconds);
+            }
+
+            return slowest;
+        })];
+        Task[] t2Inserts = [.. Enumerable.Range(0, 8).Select(async _ =>
+        {
+            await using NpgsqlConnection connection = await node.OpenAsync(Database, token);
+            await using NpgsqlCommand insert = new("INSERT INTO t2 (v) VALUES (2)", connection);
+            for (int i = 0; i < 20; i++)
+            {
+                _ = await insert.ExecuteNonQueryAsync(token);
+            }
+        })];
+        await Task.Delay(TimeSpan.FromSeconds(6), token);
+        Assert.AreEqual(0, t2Inserts.Count(insert => insert.IsCompleted), "t2's inserts didn't wait for the holder");
+        await held.CommitAsync(token);
+        await Task.WhenAll(t2Inserts);
+        await holding.CancelAsync();
+        long t1Slowest = (await Task.WhenAll(t1Inserts)).Max();
+        Assert.IsLessThan(1500L, t1Slowest, "t1's slowest insert, in ms, while t2 was held");
+        Assert.AreEqual($"{left - 30 + 160}", await node.SafePsqlAsync(Database, "SELECT count(*) FROM t2", token));
+        Assert.DoesNotContain("reached maximum value", node.ReadLog(), "inserts that ran a block out");
+    }
+
+    /// <summary>
     /// A subscriber whose structure comes from the provider gets the provider's managed sequences quarantined as they
     /// are created and joins them before rows are copied, so the copied rows don't count against it, and then draws from
     /// blocks of its own.

@@ -34,4 +34,10 @@ internal enum WorfWorkerType
     /// Exchanges a database's sequence ranges with its neighbors, for its range worker.
     /// </summary>
     Exchange,
+
+    /// <summary>
+    /// Switches one of a database's managed sequences to its next block, for its range worker, once the transactions that
+    /// hold it let it.
+    /// </summary>
+    Switch,
 }
