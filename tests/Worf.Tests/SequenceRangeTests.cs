@@ -2112,14 +2112,21 @@ public sealed class SequenceRangeTests
         Assert.AreEqual(before[0], after[0], "the request size");
         Assert.AreEqual(before[1], after[1], "the peak rate");
 
-        // Nor does a load's transaction hold up another session's reservation, whose switch it then finds when it
-        // reserves again.
+        // A reservation holds the sequence until its transaction ends, so that other sessions' inserts can't draw the
+        // load's values down: they wait for the load to commit, and so does another session's reservation, with its
+        // switch, while worf.sequence_ranges still reads.
         await using (NpgsqlConnection batch = await nodeA.OpenAsync(Database, token))
         {
             await ExecuteAsync(batch, "BEGIN; SELECT worf.reserve_sequence_range('t_id_seq', 10)", token);
             long left = long.Parse(await nodeA.SafePsqlAsync(Database, "SELECT values_left FROM worf.sequence_ranges", token), CultureInfo.InvariantCulture);
-            _ = await nodeA.SafePsqlAsync(Database, $"SET statement_timeout = '10s'; SELECT worf.reserve_sequence_range('t_id_seq', {left + 100})", token);
-            await ExecuteAsync(batch, "SELECT worf.reserve_sequence_range('t_id_seq', 10); INSERT INTO t (v) SELECT 'batch' FROM generate_series(1, 10); COMMIT", token);
+            Task<string> inserting = nodeA.SafePsqlAsync(Database, "INSERT INTO t (v) VALUES ('waits')", token);
+            Task<string> reserving = nodeA.SafePsqlAsync(Database, $"SELECT worf.reserve_sequence_range('t_id_seq', {left + 100})", token);
+            await Task.Delay(1000, token);
+            Assert.IsFalse(inserting.IsCompleted, "another session's insert didn't wait for the load");
+            Assert.IsFalse(reserving.IsCompleted, "another session's reservation didn't wait for the load");
+            await ExecuteAsync(batch, "INSERT INTO t (v) SELECT 'batch' FROM generate_series(1, 10); COMMIT", token);
+            _ = await inserting;
+            _ = await reserving;
         }
 
         // A load's transaction on node_b, whose reservation the range worker switched for, holds nothing that the range

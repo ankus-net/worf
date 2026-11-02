@@ -690,9 +690,11 @@ sequence's owner to call these functions.
   owner or pool holder grants nothing until every node it exchanges with
   reports what it holds.
 - `worf.reserve_sequence_range(sequence regclass, count bigint, timeout interval)`
-  Returns once the active block has at least `count` values left, before a
-  load that numbers its rows with the sequence. Run it before the load's
-  transaction calls `nextval`. It needs the privileges of the sequence's owner.
+  Returns once the active block has at least `count` values left, before a load
+  that numbers its rows with the sequence, and holds the sequence until the
+  transaction ends, so that other sessions' inserts into it wait for the load.
+  Run it in the load's transaction, before it calls `nextval`. It needs the
+  privileges of the sequence's owner.
 - `worf.reserve_sequence_values(sequence regclass, lo bigint, hi bigint, timeout interval)`
   Gives this node exactly `[lo, hi]`, for rows that already carry those keys.
   It needs the privileges of the sequence's owner.

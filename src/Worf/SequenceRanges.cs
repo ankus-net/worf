@@ -3985,18 +3985,43 @@ internal static unsafe partial class SequenceRanges
         // block is also visible a moment before other sessions learn of the new file, so such a read could pair the new
         // block with the old position, the quarantine's at the start. The read takes the lock nextval takes, which
         // waits for a switch to finish committing, and lets it go once done, so that it holds off no switch for the
-        // rest of the transaction.
-        NativeMethods.LockRelationOid(seqoid, (int)PgLockMode.RowExclusive);
+        // rest of the transaction. A reservation's transaction, which holds the sequence against nextval for its load,
+        // holds off any switch too, so a read that it holds up reads without the lock, and is good when the reservation
+        // still held the sequence once it was done.
+        string read = "SELECT CASE WHEN is_called THEN last_value END FROM " + Spi.QuoteQualifiedIdentifier(name[0].Get<string>(0), name[0].Get<string>(1));
+        if (!NativeMethods.ConditionalLockRelationOid(seqoid, (int)PgLockMode.RowExclusive))
+        {
+            if (HeldForLoad(seqoid))
+            {
+                long? position = Worf.ReadScalar<long?>(read);
+                if (HeldForLoad(seqoid))
+                {
+                    return position;
+                }
+            }
+
+            NativeMethods.LockRelationOid(seqoid, (int)PgLockMode.RowExclusive);
+        }
+
         try
         {
-            return Worf.ReadScalar<long?>("SELECT CASE WHEN is_called THEN last_value END FROM " +
-                Spi.QuoteQualifiedIdentifier(name[0].Get<string>(0), name[0].Get<string>(1)));
+            return Worf.ReadScalar<long?>(read);
         }
         finally
         {
             NativeMethods.UnlockRelationOid(seqoid, (int)PgLockMode.RowExclusive);
         }
     });
+
+    /// <summary>
+    /// Checks whether another transaction holds a sequence against nextval, as a reservation does for its load.
+    /// </summary>
+    private static bool HeldForLoad(uint seqoid) => Worf.ReadScalar<bool>("""
+        SELECT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_locks
+            WHERE locktype = 'relation' AND database = $1 AND relation = $2 AND mode = 'ExclusiveLock' AND granted
+                AND pid <> pg_catalog.pg_backend_pid())
+        """, SpiParameter.Create(NativeGlobals.MyDatabaseId), SpiParameter.Create(seqoid));
 
     /// <summary>
     /// Counts the values the sequence has left in its active block.

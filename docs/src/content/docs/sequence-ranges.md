@@ -28,7 +28,7 @@ shows each sequence's state, its active and next blocks, and the values left. `w
 | `worf.alter_sequence_range(sequence regclass, range_size bigint DEFAULT NULL, max_range_size bigint DEFAULT NULL)` | Owner | Changes the block sizes, each at least 2 |
 | `worf.disable_sequence_range(sequence regclass)` | Owner | Stops granting. Each node keeps using the blocks it holds |
 | `worf.reset_sequence_range(sequence regclass DEFAULT NULL)` | Any node | Abandons this node's blocks and requests new ones. An owner or pool holder grants nothing until the nodes it granted to report what they hold |
-| `worf.reserve_sequence_range(sequence regclass, count bigint, timeout interval DEFAULT '1 minute')` | Any node | Returns once the active block has at least `count` values left, and a twentieth more for other sessions, switching to the next block when that holds them |
+| `worf.reserve_sequence_range(sequence regclass, count bigint, timeout interval DEFAULT '1 minute')` | Any node | Returns once the active block has at least `count` values left, switching to the next block when that holds them, and holds the sequence until the transaction ends, so that other sessions' inserts into it wait for the load |
 | `worf.reserve_sequence_values(sequence regclass, lo bigint, hi bigint, timeout interval DEFAULT '1 minute')` | Any node | Gives this node exactly `[lo, hi]`, for rows that already carry those keys |
 
 A node's first block has `range_size` values: 100 for `smallint`, 10,000 for `integer` and 1,000,000 for `bigint`. A node whose block lasted under an hour asks for twice as many next time, up to `max_range_size`, and one whose block lasted over a day asks for half. A node also asks for at least two minutes of values at its peak insert rate, taken over ten seconds at least, up to `max_range_size`. A switch for `reserve_sequence_range`, and the load in the block it switches to, count toward neither.
@@ -43,10 +43,13 @@ DDL that brings rows under the triggers, by setting a column's default to the se
 
 To restore rows that other nodes wrote, or that predate range management, as `pg_restore` of a table does, set `worf.sequence_range_restore`, which needs a superuser or `GRANT SET ON PARAMETER`. The triggers and the DDL then refuse only the values a sequence may still issue as far as this node knows: ahead of this node's sequence in its blocks, not yet granted to any node, or past every grant. A node can't tell the values another node has issued from those it has yet to issue, so a restored row may hold a key that node issues again.
 
-A single transaction that needs more values than the active block has left fails at the block's end. Before a large load, reserve enough values, before the transaction calls `nextval` on the sequence:
+A single transaction that needs more values than the active block has left fails at the block's end. Before a large load, reserve enough values in the load's transaction, before it calls `nextval` on the sequence. Other sessions' inserts into the sequence, and their reservations, wait for the load to commit, so that they can't draw its values down:
 
 ```sql
+BEGIN;
 SELECT worf.reserve_sequence_range('inventory_id_seq', 500000);
+-- the load
+COMMIT;
 ```
 
 To load rows that already carry keys, or bring them under the triggers, reserve exactly those keys on the node that loads them. The owner refuses keys that may already be in use. Both reservations need the privileges of the sequence's owner.
