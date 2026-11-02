@@ -33,6 +33,7 @@ internal static class SequenceRangeExchangeWorker
     {
         Worker.WorkerAttach((int)mainArg, WorfWorkerType.Exchange);
         PgLog.Debug1("starting sequence range exchange worker");
+        long started = Worker.GetCurrentTimestamp();
         while (!Worker.GotSigterm && !s_unwatched)
         {
             try
@@ -50,8 +51,10 @@ internal static class SequenceRangeExchangeWorker
                 }
 
                 // A database that manages nothing has asked its providers, and the manager looks again later, unless a
-                // subscription is still making its slot.
-                if (!SequenceRangeExchange.Starting && !PgBackgroundWorker.RunTransaction(Managed))
+                // subscription is still making its slot, for an exchange interval at most, as one may stay stuck in its
+                // initialization.
+                if ((!SequenceRangeExchange.Starting || Worker.GetCurrentTimestamp() - started > SequenceRanges.ExchangeInterval * 1000L) &&
+                    !PgBackgroundWorker.RunTransaction(Managed))
                 {
                     return;
                 }
