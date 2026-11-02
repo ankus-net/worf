@@ -129,6 +129,12 @@ using Ankus.Postgres;
         PRIMARY KEY (seqoid, node_id)
     );
 
+    CREATE TABLE worf.sequence_range_fence_wait (
+        seqoid regclass NOT NULL,
+        node_id oid NOT NULL,
+        PRIMARY KEY (seqoid, node_id)
+    );
+
     CREATE TABLE worf.sequence_range_role (
         role_id oid PRIMARY KEY,
         node_id oid NOT NULL
@@ -656,6 +662,7 @@ internal static unsafe partial class SequenceRanges
         _ = Worf.Execute("DELETE FROM worf.sequence_range_request WHERE seqoid::oid = ANY ($1::oid[])", seqoids);
         _ = Worf.Execute("DELETE FROM worf.sequence_range_node WHERE seqoid::oid = ANY ($1::oid[])", seqoids);
         _ = Worf.Execute("DELETE FROM worf.sequence_range_absent WHERE seqoid::oid = ANY ($1::oid[])", seqoids);
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_fence_wait WHERE seqoid::oid = ANY ($1::oid[])", seqoids);
         _ = Worf.Execute("DELETE FROM worf.sequence_range WHERE seqoid::oid = ANY ($1::oid[])", seqoids);
 
         return true;
@@ -677,9 +684,35 @@ internal static unsafe partial class SequenceRanges
             return;
         }
 
+        // A fence that went up while the node was a neighbor waits for its report still, unless it has reported since.
+        _ = Worf.Execute("""
+            DELETE FROM worf.sequence_range_fence_wait w USING worf.sequence_range r
+            WHERE w.node_id = $1 AND r.seqoid = w.seqoid AND (
+                EXISTS (SELECT 1 FROM worf.sequence_range_node n
+                    WHERE n.seqoid = w.seqoid AND n.node_id = w.node_id AND n.via_node = n.node_id AND n.held_at > r.fenced_at)
+                OR EXISTS (SELECT 1 FROM worf.sequence_range_absent a WHERE a.seqoid = w.seqoid AND a.node_id = w.node_id AND a.absent_at > r.fenced_at))
+            """, SpiParameter.Create(nodeId));
         _ = Worf.Execute("DELETE FROM worf.sequence_range_node WHERE via_node = $1", SpiParameter.Create(nodeId));
         _ = Worf.Execute("DELETE FROM worf.sequence_range_absent WHERE node_id = $1", SpiParameter.Create(nodeId));
     }
+
+    /// <summary>
+    /// Records the nodes a fence that has just gone up waits for: those this node exchanges with now. Each stays in the
+    /// fence's way until its own report, whatever happens to the link or subscriptions meanwhile, as a node restored
+    /// from a backup may have granted it blocks that only its report brings back, or until
+    /// <c>activate_sequence_range</c> lifts the fence.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    private static void RecordFenceWaits(uint seqoid) => _ = Worf.Execute("""
+        INSERT INTO worf.sequence_range_fence_wait
+        SELECT $1, w.node_id FROM (
+            SELECT node_id FROM worf.sequence_range_link
+            UNION
+            SELECT s.sub_origin FROM worf.subscription s JOIN worf.local_node l ON l.node_id = s.sub_target) w
+            CROSS JOIN worf.local_node l
+        WHERE w.node_id <> l.node_id
+        ON CONFLICT DO NOTHING
+        """, SpiParameter.Create(seqoid));
 
     /// <summary>
     /// Checks whether a sequence is under range management.
@@ -2832,6 +2865,7 @@ internal static unsafe partial class SequenceRanges
                     THEN 'active' ELSE 'quarantined' END
             WHERE seqoid = $1
             """, seq, SpiParameter.Create(owner), SpiParameter.Create(epoch));
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_fence_wait WHERE seqoid = $1", seq);
         Report(seqoid, GetInfo(seqoid), node);
         PgLog.Log($"sequence {GetInfo(seqoid).Name} moved to epoch {epoch}");
     }
@@ -2845,6 +2879,7 @@ internal static unsafe partial class SequenceRanges
     {
         SpiParameter seq = SpiParameter.Create(seqoid);
         _ = Worf.Execute("UPDATE worf.sequence_range SET state = 'disabled', fenced_at = NULL WHERE seqoid = $1", seq);
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_fence_wait WHERE seqoid = $1", seq);
         _ = Worf.Execute("UPDATE worf.sequence_range_block SET state = 'spent' WHERE seqoid = $1 AND kind IN ('r', 'p') AND state IN ('open', 'fenced')", seq);
         _ = Worf.Execute("DELETE FROM worf.sequence_range_request WHERE seqoid = $1", seq);
         _ = Worf.Execute("UPDATE worf.sequence_range_node n SET state = 'disabled' FROM worf.local_node l WHERE n.seqoid = $1 AND n.node_id = l.node_id", seq);
@@ -2887,6 +2922,7 @@ internal static unsafe partial class SequenceRanges
                 uint seqoid = fenced[i].Get<uint>(0);
                 if (Worf.Execute("UPDATE worf.sequence_range SET fenced_at = now() WHERE seqoid = $1 AND fenced_at IS NULL", SpiParameter.Create(seqoid)) > 0)
                 {
+                    RecordFenceWaits(seqoid);
                     PgLog.Warning($"sequence {GetInfo(seqoid).Name}: this allocator's timeline or system identifier changed, so it grants nothing until every node it granted to reports");
                 }
             }
@@ -2941,17 +2977,26 @@ internal static unsafe partial class SequenceRanges
             """, seq);
         if (overlap.Count > 0)
         {
+            // Grants that overlap mean values were issued twice already, which no wait undoes, so activate_sequence_range
+            // lifts the fence all the same, saying so.
             string detail = $"grants to {overlap[0].Get<string>(0)} [{overlap[0].Get<long>(1)}, {overlap[0].Get<long>(2)}] and to " +
                 $"{overlap[0].Get<string>(3)} [{overlap[0].Get<long>(4)}, {overlap[0].Get<long>(5)}] overlap";
-            _ = SetDetail(seqoid, detail);
-            return false;
+            if (!force)
+            {
+                _ = SetDetail(seqoid, detail);
+                return false;
+            }
+
+            PgLog.Warning($"sequence {GetInfo(seqoid).Name}: {detail}, so the nodes may hold values in common");
         }
 
         SpiResult? waiting = force ? null : Worf.SelectCatalog("""
             WITH neighbors (node_id) AS (
                 SELECT node_id FROM worf.sequence_range_link
                 UNION
-                SELECT s.sub_origin FROM worf.subscription s JOIN worf.local_node l ON l.node_id = s.sub_target)
+                SELECT s.sub_origin FROM worf.subscription s JOIN worf.local_node l ON l.node_id = s.sub_target
+                UNION
+                SELECT node_id FROM worf.sequence_range_fence_wait WHERE seqoid = $1)
             SELECT coalesce(o.node_name::text, (SELECT max(n.node_name::text) FROM worf.sequence_range_node n WHERE n.node_id = w.node_id),
                 w.node_id::text)
             FROM neighbors w
@@ -2970,8 +3015,8 @@ internal static unsafe partial class SequenceRanges
         {
             string detail = $"fenced until {string.Join(", ", Enumerable.Range(0, waiting.Count).Select(i => "node " + waiting[i].Get<string>(0)))} " +
                 (waiting.Count == 1 ? "reports the blocks it holds" : "report the blocks they hold") +
-                "; a node that is gone for good holds the fence until the subscriptions between it and this node are dropped, or its rows in " +
-                "worf.sequence_range_link are deleted, or worf.activate_sequence_range lifts it";
+                "; a node it exchanged with as the fence went up holds it until that node reports, by subscribing again if the subscriptions " +
+                "between them were dropped, or worf.activate_sequence_range lifts it, which reissues any values it holds that this node lost";
             _ = SetDetail(seqoid, detail);
             return false;
         }
@@ -2984,6 +3029,7 @@ internal static unsafe partial class SequenceRanges
             """, seq, SpiParameter.Create((decimal)NativeMethods.GetSystemIdentifier()),
             SpiParameter.Create((long)Timeline()));
         _ = Worf.Execute("UPDATE worf.sequence_range SET fenced_at = NULL, detail = NULL WHERE seqoid = $1", seq);
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_fence_wait WHERE seqoid = $1", seq);
         if (range[0].Get<uint>(1) == node.Node.Id)
         {
             _ = Worf.Execute(info.Ascending
@@ -3397,6 +3443,7 @@ internal static unsafe partial class SequenceRanges
         if (Worf.Execute("UPDATE worf.sequence_range_block SET state = 'fenced' WHERE seqoid = $1 AND kind IN ('r', 'p') AND state = 'open'", seq) > 0 &&
             Worf.Execute("UPDATE worf.sequence_range SET fenced_at = now() WHERE seqoid = $1 AND fenced_at IS NULL", seq) > 0)
         {
+            RecordFenceWaits(seqoid);
             PgLog.Warning($"sequence {info.Name}: this allocator reset, so it grants nothing until every node it granted to reports");
         }
 

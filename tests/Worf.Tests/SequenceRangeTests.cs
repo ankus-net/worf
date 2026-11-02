@@ -1579,14 +1579,23 @@ public sealed class SequenceRangeTests
         Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database,
             "SELECT fenced_at IS NOT NULL AND detail LIKE 'fenced until node node_c reports%' FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass", token),
             "node_a's fence waiting for node_c alone, once node_b has reported");
+
+        // node_a dropping its subscription to node_c and deleting node_c's link, as drop_subscription asks when it can't
+        // reach the provider, leaves the fence that is up waiting for node_c, whose grants the reset may have lost, until
+        // node_c reports through its own subscription.
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.drop_subscription('a_from_c')", token);
+        _ = await nodeA.SafePsqlAsync(Database, $"DELETE FROM worf.sequence_range_link WHERE node_id = {nodeCId}", token);
+        await Task.Delay(TimeSpan.FromSeconds(1), token);
+        Assert.AreEqual("t", await nodeA.SafePsqlAsync(Database,
+            "SELECT fenced_at IS NOT NULL AND detail LIKE 'fenced until node node_c reports%' FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass", token),
+            "node_a's fence still waiting for node_c");
         await nodeC.StartServerAsync(token);
         Assert.IsTrue(await nodeA.PollLogAsync(downC, "node node_c holds block", token), "node_c's grants back in node_a's ledger");
         Assert.IsTrue(await nodeA.PollLogAsync(downC, "the allocator's fence lifted", token), "node_a's fence lifted once node_c reported");
 
         // Once the subscriptions between node_a and node_c are dropped, node_c leaving its slot as it drops its own, node_a
-        // forgets node_c, and a fence no longer waits for it while it is down.
+        // forgets node_c, and a fence that goes up later doesn't wait for it while it is down.
         _ = await nodeC.SafePsqlAsync(Database, "SELECT worf.drop_subscription('c_from_a')", token);
-        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.drop_subscription('a_from_c')", token);
         Assert.AreEqual("f", await nodeA.SafePsqlAsync(Database,
             $"SELECT EXISTS (SELECT 1 FROM worf.sequence_range_link WHERE slot_name = '{nodeCSlot}' OR node_id = {nodeCId})", token), "node_c's slot left");
         await nodeC.StopAsync("fast", token);

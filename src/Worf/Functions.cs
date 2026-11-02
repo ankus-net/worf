@@ -508,7 +508,7 @@ internal static class Functions
             }
             catch (PgException)
             {
-                PgLog.Warning($"could not drop slot \"{sub.SlotName}\" on provider, you will probably have to drop it manually, and delete this node's rows in worf.sequence_range_link there, which its sequence range fences otherwise wait on");
+                PgLog.Warning($"could not drop slot \"{sub.SlotName}\" on provider, you will probably have to drop it manually. Its sequence range fences wait for this node's reports: delete this node's rows in worf.sequence_range_link there while it has no fence up, so that later ones don't, and one that is up waits until this node subscribes again and reports, or worf.activate_sequence_range lifts it, which reissues any values this node holds that the provider lost");
             }
 
             // Drop the origin tracking locally.
