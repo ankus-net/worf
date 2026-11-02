@@ -124,31 +124,6 @@ internal static class SequenceRangeGuard
         => Check((uint)sequence.DangerousGetBits(), value, false);
 
     /// <summary>
-    /// Finds the sequence to check a value under that a default which names its sequence as text drew, as the row is
-    /// written: the managed sequence the name finds under the session's search path, as nextval finds it, or otherwise,
-    /// as when it finds nothing or a sequence that isn't managed, the managed sequence the name stands for.
-    /// </summary>
-    /// <param name="name">The name the default gives.</param>
-    /// <param name="sequence">The managed sequence the name stands for.</param>
-    /// <returns>The sequence.</returns>
-    [PgFunction(Sql = """
-        CREATE FUNCTION worf.sequence_range_named(name text, sequence regclass)
-        RETURNS regclass STRICT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
-        """)]
-    [return: PgSqlType("regclass", Schema = "pg_catalog")]
-    internal static unsafe PgDatum Named([PgSqlType("text", Schema = "pg_catalog")] PgDatum name,
-        [PgSqlType("regclass", Schema = "pg_catalog")] PgDatum sequence)
-    {
-        Reload();
-
-        // The name is looked up as nextval looks it up, without SQL, so that nothing on the session's search path runs.
-        RangeVar* relation = NativeMethods.makeRangeVarFromNameList(NativeMethods.textToQualifiedNameList((varlena*)name.DangerousGetBits()));
-        uint seqoid = NativeMethods.RangeVarGetRelidExtended(relation, 0, RangeVarMissingOk, default, null);
-        return seqoid == 0 || !s_sequences.ContainsKey(seqoid) ? sequence
-            : PgDatum.DangerousCreate(seqoid, (uint)PgBuiltInOid.RegClassOid, PgMemoryContext.Current);
-    }
-
-    /// <summary>
     /// Checks whether a value a new row holds lies in a block of one of the managed sequences its column uses, as a
     /// column that uses more than one does, without failing.
     /// </summary>
@@ -180,6 +155,123 @@ internal static class SequenceRangeGuard
     internal static bool AdmitsNumeric([PgSqlType("regclass", Schema = "pg_catalog")] PgDatum sequence, PgNumeric value)
         => Whole(value) is decimal exact && exact is >= long.MinValue and <= long.MaxValue &&
             AdmitsValue(sequence, (long)exact);
+
+    /// <summary>
+    /// Checks a value a new row holds in a column whose default names its sequence as text, under the sequence the name
+    /// finds as the row is written, as <see cref="Named"/> finds it.
+    /// </summary>
+    /// <param name="name">The name the default gives.</param>
+    /// <param name="sequence">The managed sequence the name stands for.</param>
+    /// <param name="value">The value.</param>
+    /// <returns>False; a value outside this node's blocks fails.</returns>
+    [PgFunction(Sql = """
+        CREATE FUNCTION worf.sequence_range_check(name text, sequence regclass, value bigint)
+        RETURNS boolean STRICT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
+        """)]
+    internal static bool CheckNamedValue([PgSqlType("text", Schema = "pg_catalog")] PgDatum name,
+        [PgSqlType("regclass", Schema = "pg_catalog")] PgDatum sequence, long value)
+        => Check(Named(name, sequence), value, true);
+
+    /// <summary>
+    /// Checks a numeric value a new row holds in a column whose default names its sequence as text.
+    /// </summary>
+    /// <param name="name">The name the default gives.</param>
+    /// <param name="sequence">The managed sequence the name stands for.</param>
+    /// <param name="value">The value.</param>
+    /// <returns>False; a value outside this node's blocks fails.</returns>
+    [PgFunction(Sql = """
+        CREATE FUNCTION worf.sequence_range_check(name text, sequence regclass, value numeric)
+        RETURNS boolean STRICT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
+        """)]
+    internal static bool CheckNamedNumeric([PgSqlType("text", Schema = "pg_catalog")] PgDatum name,
+        [PgSqlType("regclass", Schema = "pg_catalog")] PgDatum sequence, PgNumeric value)
+        => Check(Named(name, sequence), value, true);
+
+    /// <summary>
+    /// Checks a value an update writes into a column whose default names its sequence as text.
+    /// </summary>
+    /// <param name="name">The name the default gives.</param>
+    /// <param name="sequence">The managed sequence the name stands for.</param>
+    /// <param name="value">The value.</param>
+    /// <returns>False; a value outside this node's blocks fails.</returns>
+    [PgFunction(Sql = """
+        CREATE FUNCTION worf.sequence_range_check_update(name text, sequence regclass, value bigint)
+        RETURNS boolean STRICT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
+        """)]
+    internal static bool CheckNamedUpdate([PgSqlType("text", Schema = "pg_catalog")] PgDatum name,
+        [PgSqlType("regclass", Schema = "pg_catalog")] PgDatum sequence, long value)
+        => Check(Named(name, sequence), value, false);
+
+    /// <summary>
+    /// Checks a numeric value an update writes into a column whose default names its sequence as text.
+    /// </summary>
+    /// <param name="name">The name the default gives.</param>
+    /// <param name="sequence">The managed sequence the name stands for.</param>
+    /// <param name="value">The value.</param>
+    /// <returns>False; a value outside this node's blocks fails.</returns>
+    [PgFunction(Sql = """
+        CREATE FUNCTION worf.sequence_range_check_update(name text, sequence regclass, value numeric)
+        RETURNS boolean STRICT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
+        """)]
+    internal static bool CheckNamedNumericUpdate([PgSqlType("text", Schema = "pg_catalog")] PgDatum name,
+        [PgSqlType("regclass", Schema = "pg_catalog")] PgDatum sequence, PgNumeric value)
+        => Check(Named(name, sequence), value, false);
+
+    /// <summary>
+    /// Checks whether a value a new row holds lies in a block of the sequence a text default's name finds, without
+    /// failing.
+    /// </summary>
+    /// <param name="name">The name the default gives.</param>
+    /// <param name="sequence">The managed sequence the name stands for.</param>
+    /// <param name="value">The value.</param>
+    /// <returns>Whether it does.</returns>
+    [PgFunction(Sql = """
+        CREATE FUNCTION worf.sequence_range_admits(name text, sequence regclass, value bigint)
+        RETURNS boolean STRICT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
+        """)]
+    internal static bool AdmitsNamedValue([PgSqlType("text", Schema = "pg_catalog")] PgDatum name,
+        [PgSqlType("regclass", Schema = "pg_catalog")] PgDatum sequence, long value)
+    {
+        uint seqoid = Named(name, sequence);
+        return !s_moved.Contains(seqoid) && Admits(seqoid, value);
+    }
+
+    /// <summary>
+    /// Checks whether a numeric value a new row holds lies in a block of the sequence a text default's name finds,
+    /// without failing.
+    /// </summary>
+    /// <param name="name">The name the default gives.</param>
+    /// <param name="sequence">The managed sequence the name stands for.</param>
+    /// <param name="value">The value.</param>
+    /// <returns>Whether it does.</returns>
+    [PgFunction(Sql = """
+        CREATE FUNCTION worf.sequence_range_admits(name text, sequence regclass, value numeric)
+        RETURNS boolean STRICT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
+        """)]
+    internal static bool AdmitsNamedNumeric([PgSqlType("text", Schema = "pg_catalog")] PgDatum name,
+        [PgSqlType("regclass", Schema = "pg_catalog")] PgDatum sequence, PgNumeric value)
+    {
+        uint seqoid = Named(name, sequence);
+        return Whole(value) is decimal exact && exact is >= long.MinValue and <= long.MaxValue && !s_moved.Contains(seqoid) &&
+            Admits(seqoid, (long)exact);
+    }
+
+    /// <summary>
+    /// Finds the sequence to check a value under that a default which names its sequence as text drew, as the row is
+    /// written: the managed sequence the name finds under the session's search path, as nextval finds it, or otherwise,
+    /// as when it finds nothing or a sequence that isn't managed, the managed sequence the name stands for. The name is
+    /// looked up as nextval looks it up, without SQL, so that nothing on the session's search path runs.
+    /// </summary>
+    /// <param name="name">The name the default gives.</param>
+    /// <param name="sequence">The managed sequence the name stands for.</param>
+    /// <returns>The sequence.</returns>
+    private static unsafe uint Named(PgDatum name, PgDatum sequence)
+    {
+        Reload();
+        RangeVar* relation = NativeMethods.makeRangeVarFromNameList(NativeMethods.textToQualifiedNameList((varlena*)name.DangerousGetBits()));
+        uint found = NativeMethods.RangeVarGetRelidExtended(relation, 0, RangeVarMissingOk, default, null);
+        return found != 0 && s_sequences.ContainsKey(found) ? found : (uint)sequence.DangerousGetBits();
+    }
 
     /// <summary>
     /// Notes a statement as it starts, so that the guard knows one whose only inserts are rows it moves to another

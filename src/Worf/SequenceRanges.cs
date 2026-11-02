@@ -15,6 +15,7 @@ using Ankus.Postgres;
         request_size bigint NOT NULL,
         high_water bigint,
         watermark bigint,
+        heard_watermark bigint,
         participants name[],
         pool_start bigint,
         root_start bigint,
@@ -2826,6 +2827,7 @@ internal static unsafe partial class SequenceRanges
         _ = Worf.Execute("DELETE FROM worf.sequence_range_request WHERE seqoid = $1", seq);
         _ = Worf.Execute("""
             UPDATE worf.sequence_range r SET owner_node = $2, epoch = $3, parent_node = NULL, distance = NULL, fenced_at = NULL, detail = NULL,
+                heard_watermark = NULL,
                 state = CASE WHEN EXISTS (SELECT 1 FROM worf.sequence_range_block b WHERE b.seqoid = r.seqoid AND b.kind = 'n' AND b.state = 'active')
                     THEN 'active' ELSE 'quarantined' END
             WHERE seqoid = $1
@@ -3011,26 +3013,30 @@ internal static unsafe partial class SequenceRanges
     /// <summary>
     /// Bounds a watermark a neighbor reports, of its own or another node's, by what any node could have heard of
     /// granted: no further than the root's end, and on the owner, once its root has started, no further than two of
-    /// its largest blocks beyond both its own blocks and the furthest grant its ledger holds. Only the owner's own
-    /// blocks, two at most at once, can lie beyond that, since every other grant's holder reports it to its allocator.
-    /// The bound leaves out the watermarks earlier reports gave, so that made-up ones can't each raise the next one's
-    /// bound. A made-up watermark is taken only that far, so that a fence that lifts gives up no more of the root's
-    /// values. Before the root starts, as an owner that moved collects what the old blocks reached, nothing bounds one.
+    /// its largest blocks beyond both its own blocks and the furthest grant its ledger holds of other nodes'. Only the
+    /// owner's own blocks, two at most at once, can lie beyond that, since every other grant's holder reports it to its
+    /// allocator. The bound leaves out the watermarks earlier reports gave, and, once the owner has taken a watermark
+    /// beyond its own and reset, its own blocks beyond that watermark that it hasn't drawn from, which it granted itself
+    /// only because of the report, so that made-up ones can't each raise the next one's bound, however many come. A
+    /// made-up watermark is taken only that far, so that a fence that lifts gives up no more of the root's values.
+    /// Before the root starts, as an owner that moved collects what the old blocks reached, nothing bounds one.
     /// </summary>
-    /// <param name="seqoid">The sequence.</param>
-    /// <param name="info">The sequence's details.</param>
-    /// <param name="mark">The watermark the neighbor reports.</param>
-    /// <returns>The watermark this node takes, and whether that is less than the neighbor reports.</returns>
     internal static (long Mark, bool Bounded) BoundWatermark(uint seqoid, SequenceInfo info, long mark)
     {
         string furthest = info.Ascending ? "max" : "min";
+        string before = info.Ascending ? "o.lo <= r.heard_watermark" : "o.hi >= r.heard_watermark";
         SpiResult range = Worf.SelectCatalog($"""
             SELECT r.root_end, r.max_range_size, r.owner_node = l.node_id AND r.root_start IS NOT NULL,
                 (SELECT {furthest}({(info.Ascending ? "o.hi" : "o.lo")}) FROM worf.sequence_range_block o
-                    WHERE o.seqoid = r.seqoid AND o.epoch = r.epoch AND o.kind = 'n' AND o.node_id = l.node_id),
+                    WHERE o.seqoid = r.seqoid AND o.epoch = r.epoch AND o.kind = 'n' AND o.node_id = l.node_id
+                        AND (r.heard_watermark IS NULL OR o.state = 'retired' OR {before})),
                 (SELECT {furthest}({(info.Ascending ? "g.hi" : "g.lo")}) FROM worf.sequence_range_block b
-                    JOIN worf.sequence_range_grant g ON g.from_block = b.block_id AND g.kind <> 'x'
-                    WHERE b.seqoid = r.seqoid AND b.epoch = r.epoch AND b.kind = 'r')
+                    JOIN worf.sequence_range_grant g ON g.from_block = b.block_id AND g.kind <> 'x' AND g.grantee_id <> l.node_id
+                    WHERE b.seqoid = r.seqoid AND b.epoch = r.epoch AND b.kind = 'r'),
+                r.heard_watermark IS NOT NULL AND EXISTS (
+                    SELECT 1 FROM worf.sequence_range_block o
+                    WHERE o.seqoid = r.seqoid AND o.epoch = r.epoch AND o.kind = 'n' AND o.node_id = l.node_id AND o.state = 'active'
+                        AND NOT {before})
             FROM worf.sequence_range r CROSS JOIN worf.local_node l
             WHERE r.seqoid = $1
             """, SpiParameter.Create(seqoid));
@@ -3041,6 +3047,13 @@ internal static unsafe partial class SequenceRanges
 
         decimal limit = range[0].Get<long>(0);
         List<decimal> known = [.. new[] { range[0].Get<long?>(3), range[0].Get<long?>(4) }.OfType<long>().Select(value => (decimal)value)];
+
+        // The active block beyond the watermark taken counts as far as the sequence has drawn from it.
+        if (range[0].Get<bool>(5) && LastValue(seqoid) is long drawn)
+        {
+            known.Add(drawn);
+        }
+
         if (range[0].Get<bool>(2) && known.Count > 0)
         {
             decimal reach = 2m * range[0].Get<long>(1) * Math.Abs(info.Increment);
@@ -3997,16 +4010,16 @@ internal static unsafe partial class SequenceRanges
             attnums[attributes[i].Get<string>(0)] = attributes[i].Get<short>(1);
         }
 
-        // A sequence is named by its oid, which looks up nothing, and one that a default names as text by that text, looked
-        // up as the row is written, as the default looks it up, so that the value is checked under the sequence it came
-        // from, if that is managed, and otherwise, as when the name finds nothing or another sequence, under the managed
-        // sequence the name stands for.
+        // A sequence is named by its oid, which looks up nothing, and one that a default names as text by that text too,
+        // which the check looks up as the row is written, as the default looks it up, so that the value is checked under
+        // the sequence it came from, if that is managed, and otherwise, as when the name finds nothing or another
+        // sequence, under the managed sequence the name stands for.
         uint schema = NativeMethods.get_rel_namespace(relid);
         List<(short Attnum, string Name, string Type, List<string> Sequences)> guarded = [.. columns
             .Select(column => (attnums[column.Key], Spi.QuoteIdentifier(column.Key), column.Value.TypeOid == NumericOid ? "numeric" : "bigint",
                 column.Value.Sequences.Select(seq => Spi.QuoteLiteral(seq.ToString(CultureInfo.InvariantCulture)) + "::regclass")
                     .Concat(column.Value.Names.SelectMany(name => Matching(name, schema).Select(seq =>
-                        $"worf.sequence_range_named({Spi.QuoteLiteral(name)}, {Spi.QuoteLiteral(seq.ToString(CultureInfo.InvariantCulture))}::regclass)"))).ToList()))
+                        $"{Spi.QuoteLiteral(name)}, {Spi.QuoteLiteral(seq.ToString(CultureInfo.InvariantCulture))}::regclass"))).ToList()))
             .Where(column => column.Item4.Count > 0)
             .OrderBy(column => column.Item1)];
         List<string> arguments = [.. columns

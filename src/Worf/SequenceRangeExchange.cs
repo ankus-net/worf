@@ -1273,14 +1273,16 @@ internal static class SequenceRangeExchange
             // in the root beyond the owner's own shows grants the owner lost, as when it went back on its timeline by less
             // than its WAL position shows. It resets, which fences the root until the nodes it granted to report, and the
             // root then gives up its free values up to the watermark it takes in here.
+            string raised = info.Ascending ? "greatest" : "least";
             if (!wentBack && LostGrants(seqoid, info, node, mark))
             {
                 PgLog.Warning($"sequence {info.Name}: node {senderName} has heard of grants up to {mark}, beyond this owner's watermark, so this owner lost them; it resets");
+                _ = Worf.Execute($"UPDATE worf.sequence_range SET heard_watermark = {raised}(coalesce(heard_watermark, $2), $2) WHERE seqoid = $1",
+                    seq, SpiParameter.Create(mark));
                 SequenceRanges.Reset(seqoid, node, false);
                 received = true;
             }
 
-            string raised = info.Ascending ? "greatest" : "least";
             learned |= Worf.Execute($"""
                 UPDATE worf.sequence_range SET watermark = {raised}(coalesce(watermark, $2), $2)
                 WHERE seqoid = $1 AND watermark IS DISTINCT FROM {raised}(coalesce(watermark, $2), $2)

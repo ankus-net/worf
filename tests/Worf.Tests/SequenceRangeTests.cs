@@ -1548,6 +1548,19 @@ public sealed class SequenceRangeTests
             FROM worf.sequence_range r WHERE r.seqoid = 't_id_seq'::regclass
             """, token), "node_a's root kept above its bound on the made-up watermark");
 
+        // The blocks node_a grants itself beyond the watermark it took, which it hasn't drawn from, don't raise the bound
+        // for the next report, so the same report coming again moves the root no further, however often it comes.
+        string firstWatermark = await nodeA.SafePsqlAsync(Database, "SELECT watermark FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass", token);
+        for (int i = 0; i < 5; i++)
+        {
+            _ = await nodeA.SafePsqlAsync(Database, $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{madeUpWatermark}')", token);
+            await Task.Delay(TimeSpan.FromMilliseconds(500), token);
+        }
+
+        Assert.AreEqual(firstWatermark, await nodeA.SafePsqlAsync(Database, "SELECT watermark FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass", token),
+            "node_a's watermark after the report came again");
+        Assert.AreEqual(1, nodeA.ReadLog()[forgedAt..].Split("node node_b has heard of grants up to").Length - 1, "node_a's resets on node_b's reports");
+
         // node_a waits for node_c's own report after a reset while node_c is down, though node_b relays a fresh report of
         // node_c after node_a has lost its record of node_c's grants and reports, as a recovery to before them would, and
         // takes node_c's grants back into its ledger once node_c reports.
