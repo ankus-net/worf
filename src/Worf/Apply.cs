@@ -76,6 +76,7 @@ internal static unsafe partial class Apply
     // The origins of PostgreSQL subscriptions this worker last gave slots up for, and those it found waiting for none,
     // with when it gives slots up for them again and the delay before that.
     private static readonly HashSet<string> s_gaveUpFor = [];
+    private static long s_gaveUpAt;
     private static readonly Dictionary<string, (long Until, long Delay)> s_notWaiting = [];
 
     // When this worker next tries to drop the slots that table syncs left on the provider, or zero.
@@ -929,6 +930,16 @@ internal static unsafe partial class Apply
         // subscriptions' workers give theirs up.
         s_sessionWriterNodeId = null;
         uint writerNodeId = writer == 0 ? sub.Origin.Id : writer;
+
+        // The slots this worker gave up for other subscriptions' origins are theirs to take for ten seconds, rather than
+        // a new relay origin's, so that whether they wait for one is judged by a slot they could have had.
+        while (s_gaveUpFor.Count > 0 && Worker.GetCurrentTimestamp() < s_gaveUpAt + 10_000_000 && !Worker.GotSigterm &&
+            PgBackgroundWorker.RunTransaction(() => PgReplicationOrigin.Find(name) is null && WorfNode.OriginsWithoutSlots(s_gaveUpFor).Count > 0))
+        {
+            _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(100));
+            PgInterrupts.Check();
+        }
+
         List<ushort> dropped = [];
         (ushort origin, ulong? sinceXid) = RunTakingOriginSlot(() =>
         {
@@ -1094,6 +1105,7 @@ internal static unsafe partial class Apply
             if (wanting.Count > 0)
             {
                 s_gaveUpFor.UnionWith(wanting);
+                s_gaveUpAt = now;
                 ReclaimRelayOrigins();
             }
         }
