@@ -730,11 +730,15 @@ internal static unsafe partial class SequenceRanges
     private static bool CheckSequence(uint seqoid, WorfLocalNode node, double rate, (Guid Block, bool Moved)? backwards, bool apply)
     {
         // The range row is locked first, as every change to a sequence's ranges locks it, so that a check and an exchange
-        // that both change the sequence take their locks in the same order.
+        // that both change the sequence take their locks in the same order. Under the range worker's check, which holds
+        // nextval's lock, a row that a transaction holds leaves the sequence for a later tick.
         SpiParameter seq = SpiParameter.Create(seqoid);
-        SpiResult rows = apply
-            ? Spi.Query("SELECT state, epoch, owner_node FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE", false, 1, seq)
-            : Worf.Read("SELECT state, epoch, owner_node FROM worf.sequence_range WHERE seqoid = $1", 1, seq);
+        if (apply)
+        {
+            LockLedger(seqoid);
+        }
+
+        SpiResult rows = Worf.Read("SELECT state, epoch, owner_node FROM worf.sequence_range WHERE seqoid = $1", 1, seq);
         if (rows.Count == 0)
         {
             return false;
@@ -2925,7 +2929,7 @@ internal static unsafe partial class SequenceRanges
         {
             string detail = $"grants to {overlap[0].Get<string>(0)} [{overlap[0].Get<long>(1)}, {overlap[0].Get<long>(2)}] and to " +
                 $"{overlap[0].Get<string>(3)} [{overlap[0].Get<long>(4)}, {overlap[0].Get<long>(5)}] overlap";
-            _ = Spi.Execute("UPDATE worf.sequence_range SET detail = $2 WHERE seqoid = $1 AND detail IS DISTINCT FROM $2", seq, SpiParameter.Create(detail));
+            _ = SetDetail(seqoid, detail);
             return false;
         }
 
@@ -2954,11 +2958,12 @@ internal static unsafe partial class SequenceRanges
                 (waiting.Count == 1 ? "reports the blocks it holds" : "report the blocks they hold") +
                 "; a node that is gone for good holds the fence until the subscriptions between it and this node are dropped, or its rows in " +
                 "worf.sequence_range_link are deleted, or worf.activate_sequence_range lifts it";
-            _ = Spi.Execute("UPDATE worf.sequence_range SET detail = $2 WHERE seqoid = $1 AND detail IS DISTINCT FROM $2", seq, SpiParameter.Create(detail));
+            _ = SetDetail(seqoid, detail);
             return false;
         }
 
         SequenceInfo info = GetInfo(seqoid);
+        LockLedger(seqoid);
         _ = Spi.Execute("""
             UPDATE worf.sequence_range_block SET state = 'open', sysid = $2, timeline = $3
             WHERE seqoid = $1 AND state = 'fenced'
@@ -2967,7 +2972,6 @@ internal static unsafe partial class SequenceRanges
         _ = Spi.Execute("UPDATE worf.sequence_range SET fenced_at = NULL, detail = NULL WHERE seqoid = $1", seq);
         if (range[0].Get<uint>(1) == node.Node.Id)
         {
-            LockLedger(seqoid);
             _ = Spi.Execute(info.Ascending
                 ? """
                     DELETE FROM worf.sequence_range_free f USING worf.sequence_range_block b, worf.sequence_range r
@@ -3121,7 +3125,7 @@ internal static unsafe partial class SequenceRanges
     /// Locks a sequence's range row before its free spans, as an exchange that updates the row and then grants does, so
     /// that two allocations don't wait on each other.
     /// </summary>
-    private static void LockLedger(uint seqoid)
+    internal static void LockLedger(uint seqoid)
     {
         if (!LedgerNoWait)
         {
@@ -3246,13 +3250,31 @@ internal static unsafe partial class SequenceRanges
         }
         catch (PgException error) when (error.SqlState == SequenceLimitExceeded)
         {
-            SpiParameter seq = SpiParameter.Create(seqoid);
-            if (Worf.ReadScalar<string?>("SELECT detail FROM worf.sequence_range WHERE seqoid = $1", seq) != error.Message)
+            if (SetDetail(seqoid, error.Message))
             {
-                _ = Spi.Execute("UPDATE worf.sequence_range SET detail = $2 WHERE seqoid = $1", seq, SpiParameter.Create(error.Message));
                 PgLog.Warning(error.Message);
             }
         }
+    }
+
+    /// <summary>
+    /// Notes in a sequence's range why it waits, writing only when that changes, once the range row is locked, as every
+    /// change to a sequence's ranges locks it first.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    /// <param name="detail">The note.</param>
+    /// <returns>Whether it changed.</returns>
+    private static bool SetDetail(uint seqoid, string detail)
+    {
+        SpiParameter seq = SpiParameter.Create(seqoid);
+        if (Worf.ReadScalar<string?>("SELECT detail FROM worf.sequence_range WHERE seqoid = $1", seq) == detail)
+        {
+            return false;
+        }
+
+        LockLedger(seqoid);
+        _ = Spi.Execute("UPDATE worf.sequence_range SET detail = $2 WHERE seqoid = $1", seq, SpiParameter.Create(detail));
+        return true;
     }
 
     /// <summary>
