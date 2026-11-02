@@ -17,6 +17,9 @@ internal static unsafe partial class OutputPlugin
 
     private static bool s_startupMessageSent;
 
+    // The lc_monetary this walsender last saw, against which a reload is noticed.
+    private static string? s_monetary;
+
     private static Dictionary<uint, RelMetaCacheEntry>? s_relMetaCache;
 
     private static int s_invalidRelMetaCacheCnt;
@@ -575,6 +578,16 @@ internal static unsafe partial class OutputPlugin
     {
         _ = txn;
         WorfOutputData data = Data(ctx);
+
+        // A reload that changes lc_monetary in the middle of a transaction ends the stream at its next change too, as at
+        // the next transaction's start.
+        if (OutputConfig.AnnouncedMoneyFormat is string announced && OutputConfig.MonetaryChanged(ref s_monetary) &&
+            OutputConfig.MoneyFormat() != announced)
+        {
+            throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState,
+                $"lc_monetary formats money as \"{OutputConfig.MoneyFormat()}\" where this walsender told the subscriber \"{announced}\"",
+                hint: "The subscriber reconnects and hears the new format.");
+        }
 
         // Avoid leaking memory by using and resetting our own context
         PgMemoryContext.RunTransient("worf output msg context", _ =>

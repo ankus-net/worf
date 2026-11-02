@@ -33,8 +33,9 @@ internal sealed unsafe class WorfColumnConversion
     private readonly uint _targetType;
     private readonly int _targetTypmod;
 
-    // Why every value fails, or null.
+    // Why every value fails, or only every value sent as text, or null.
     private readonly string? _failure;
+    private readonly bool _textFails;
 
     // What the conversion keeps once compiled: its memory context, the read type's length, its receive and input
     // functions and their parameter, the compiled conversion and the context it's evaluated in, or, for values with no
@@ -63,8 +64,9 @@ internal sealed unsafe class WorfColumnConversion
     /// <param name="targetType">The local column's type.</param>
     /// <param name="targetTypmod">The local column's type modifier.</param>
     /// <param name="failure">Why every value fails, or null.</param>
+    /// <param name="textFails">Whether only values sent as text fail, while the column type reads those sent in binary.</param>
     internal WorfColumnConversion(string column, string sourceType, uint readType, uint targetType, int targetTypmod,
-        string? failure = null)
+        string? failure = null, bool textFails = false)
     {
         _column = column;
         _sourceType = sourceType;
@@ -72,6 +74,7 @@ internal sealed unsafe class WorfColumnConversion
         _targetType = targetType;
         _targetTypmod = targetTypmod;
         _failure = failure;
+        _textFails = textFails;
     }
 
     /// <summary>
@@ -112,7 +115,7 @@ internal sealed unsafe class WorfColumnConversion
     /// <param name="kind">The value's form: <c>i</c> for PostgreSQL's internal one, <c>b</c> for binary, <c>t</c> for
     /// text.</param>
     /// <returns>Whether it converts.</returns>
-    internal bool Converts(char kind) => kind != 't' || ReadType != 0 || _failure is not null;
+    internal bool Converts(char kind) => _textFails ? kind == 't' : kind != 't' || ReadType != 0 || _failure is not null;
 
     /// <summary>
     /// Reads a value sent in binary with a type, without a domain's constraints.

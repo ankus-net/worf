@@ -89,12 +89,15 @@ public sealed class ColumnTypeTests
         _ = await provider.SafePsqlAsync(Database, """
             CREATE TABLE zt (id integer PRIMARY KEY, n numeric, tz timestamptz, by bytea, e mood[], p mpair, r tstzrange);
             CREATE TABLE mt (id integer PRIMARY KEY, m money);
+            CREATE TABLE mnt (id integer PRIMARY KEY, m money);
             SELECT * FROM worf.create_replication_set('zs');
             SELECT * FROM worf.replication_set_add_table('zs', 'zt');
             SELECT * FROM worf.replication_set_add_table('zs', 'mt');
+            SELECT * FROM worf.replication_set_add_table('zs', 'mnt');
             INSERT INTO zt VALUES (1, 3.7, '2024-01-02 03:04:05+00', 'A', '{angry}', '(angry,1)',
                 '[2024-01-02 03:04:05+00,2024-01-03 03:04:05+00)'), (3, 1e10, NULL, NULL, NULL, NULL, NULL);
             INSERT INTO mt VALUES (1, '12.35');
+            INSERT INTO mnt VALUES (1, '1234');
             """, token);
 
         // int4 to int8 and back, int4 to float4, text to int4, int4 to text, an enum to text, a domain to int8,
@@ -121,6 +124,7 @@ public sealed class ColumnTypeTests
                 s integer, u bit(4), v varbit(3), w integer, x bigint, y timestamp, z fspan, za boolean);
             CREATE TABLE zt (id integer PRIMARY KEY, n integer, tz timestamp, by text, e text[], p text, r tsrange);
             CREATE TABLE mt (id integer PRIMARY KEY, m money);
+            CREATE TABLE mnt (id integer PRIMARY KEY, m numeric);
             CREATE TABLE ut (id integer PRIMARY KEY, a text, c text, r text);
             """, token);
         _ = await subscriber.SafePsqlAsync(Database, $"""
@@ -249,6 +253,7 @@ public sealed class ColumnTypeTests
         _ = await subscriber.SafePsqlAsync(Database, """
             SELECT worf.alter_subscription_resynchronize_table('sub', 'zt');
             SELECT worf.alter_subscription_resynchronize_table('sub', 'mt');
+            SELECT worf.alter_subscription_resynchronize_table('sub', 'mnt');
             """, token);
         // A table whose types are the same on both nodes but whose rows the subscriber's own constraints refuse: a
         // shorter varchar, a domain only it has, and an enum that lacks a label.
@@ -266,6 +271,7 @@ public sealed class ColumnTypeTests
             CREATE TYPE mpair AS (m mood, n integer);
             CREATE TABLE zt (id integer PRIMARY KEY, n integer, tz timestamp, by text, e text[], p text, r tsrange);
             CREATE TABLE mt (id integer PRIMARY KEY, m money);
+            CREATE TABLE mnt (id integer PRIMARY KEY, m numeric);
             CREATE DOMAIN small AS integer CHECK (VALUE < 100);
             CREATE TABLE ct (id integer PRIMARY KEY, v varchar(3), d small, m mood);
             """, token);
@@ -312,6 +318,12 @@ public sealed class ColumnTypeTests
                 SELECT concat_ws('|', operation, error_sqlstate, remote_new_tuple->>'id')
                 FROM worf.exception_log WHERE table_name = 'mt' ORDER BY log_id
                 """, token));
+
+            // Money counted in other fractional units fails into a numeric column too, rather than turn ¥1,234 into 12.34.
+            Assert.AreEqual(moneyDiffers ? "COPY|55000" : "1|1234.00", await subscriber.SafePsqlAsync(database, """
+                SELECT concat_ws('|', (SELECT string_agg(concat_ws('|', id, m), ',') FROM mnt),
+                    (SELECT string_agg(concat_ws('|', operation, error_sqlstate), ',') FROM worf.exception_log WHERE table_name = 'mnt'))
+                """, token), "mnt's rows and failures");
         }
 
         // Each row the copy can't write is skipped and recorded under discard, numbered as the provider's row it is.

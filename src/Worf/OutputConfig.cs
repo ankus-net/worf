@@ -124,7 +124,7 @@ internal static class OutputConfig
     /// Gets how this session's <c>lc_monetary</c> formats money: the text of the amount -1234567, as
     /// <c>'-1234567'::money::text</c> gives it, which shows the currency, the fraction digits and the separators, and
     /// the amount that stands for, as <c>'-1234567'::money::numeric</c> gives it, which depends on the fraction digits
-    /// alone, as in "-$12,345.67 = -12345.67".
+    /// alone, as in "-$1,234,567.00 = -1234567.00".
     /// </summary>
     /// <returns>The text.</returns>
     internal static unsafe string MoneyFormat()
@@ -140,6 +140,23 @@ internal static class OutputConfig
             ulong value = NativeMethods.OidInputFunctionCall(typinput, (sbyte*)amount, typioparam, -1);
             return Worf.FromServer(NativeMethods.OidOutputFunctionCall(typoutput, value)) + " = " +
                 Worf.FromServer(NativeMethods.OidOutputFunctionCall(NumericOutOid, NativeMethods.OidFunctionCall1Coll(CashNumericOid, 0, value)));
+        }
+    }
+
+    /// <summary>
+    /// Checks whether this session's <c>lc_monetary</c> changed since a caller last looked, as a reload changes it, by its
+    /// text, which is cheap enough to look at for every change.
+    /// </summary>
+    /// <param name="seen">The text the caller last saw, which this updates.</param>
+    /// <returns>Whether it changed, and false the first time.</returns>
+    internal static unsafe bool MonetaryChanged(ref string? seen)
+    {
+        fixed (byte* name = "lc_monetary\0"u8)
+        {
+            string current = Worf.FromServer(NativeMethods.GetConfigOption((sbyte*)name, false, false));
+            bool changed = seen is not null && seen != current;
+            seen = current;
+            return changed;
         }
     }
 

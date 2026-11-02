@@ -38,6 +38,9 @@ internal static partial class RelCache
     /// </summary>
     internal static string? ProviderMoneyFormat { get; set; }
 
+    // The lc_monetary that the relations' conversions were found under.
+    private static string? s_monetary;
+
     [PgNativeCallback(nameof(RelcacheInvalidateCallback))]
 #if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
     private static partial RelcacheCallbackFunction InvalidateCallback { get; }
@@ -70,6 +73,18 @@ internal static partial class RelCache
         if (!hash.TryGetValue(remoteid, out WorfRelation? entry))
         {
             throw new PgException(PgSqlStates.InternalError, $"cache lookup failed for remote relation {remoteid}");
+        }
+
+        // Money's conversions depend on how this node formats it, which a reload of lc_monetary changes, so every
+        // relation's are found again then.
+        if (OutputConfig.MonetaryChanged(ref s_monetary))
+        {
+            foreach (WorfRelation other in hash.Values)
+            {
+                other.IsValid = false;
+            }
+
+            s_relationsByReloid.Clear();
         }
 
         // Locking the relation takes the invalidations sent since it was last open, which can leave the mapping stale,
@@ -358,11 +373,16 @@ internal static partial class RelCache
         uint local = NativeMethods.getBaseType(att->atttypid);
         uint readType = 0;
         string name;
-        if (SendsMoney(remote) && ProviderMoneyFormat is string providerFormat && HoldsMoney(att->atttypid) && !MoneyReadsAlike(providerFormat))
+        // Money's binary form counts the smallest units of the currency, so values sent so mean the same only while both
+        // nodes count the same fraction digits, whatever column they go to, and its text, as the copy and text transfer
+        // send, means the same only where it reads here as the same amount.
+        if (SendsMoney(remote) && ProviderMoneyFormat is string providerFormat && MoneyAlike(providerFormat) is bool binaryAlike)
         {
             string column = Worf.FromServer((sbyte*)&att->attname);
             return new WorfColumnConversion(column, "money", 0, att->atttypid, att->atttypmod,
-                $"column \"{column}\" gets money from a provider whose lc_monetary formats it as \"{providerFormat}\" where this node's formats it as \"{OutputConfig.MoneyFormat()}\"");
+                $"column \"{column}\" gets money from a provider whose lc_monetary formats it as \"{providerFormat}\" where this node's formats it as \"{OutputConfig.MoneyFormat()}\"" +
+                    (binaryAlike ? ", which reads as another amount, or none, in the text the copy and text transfer send" : ""),
+                binaryAlike);
         }
 
         if (remote.Definition is null)
@@ -495,18 +515,19 @@ internal static partial class RelCache
             : remote.Definition.Split('(', ')', ',').Any(part => part is MoneyOidText or MoneyArrayOidText);
 
     /// <summary>
-    /// Checks whether money the provider formats one way means here what it means there: its values count the same
-    /// fraction digits, so that its stored amounts agree, and its text, which a value sent as text is, reads here as
-    /// the same amount, or fails to read at all, rather than as another.
+    /// Checks how far money the provider formats one way means here what it means there: in binary, its values count
+    /// the same fraction digits; as text, which the copy and text transfer send, its text for an amount, with the
+    /// separators and the sign, reads here as the same amount, where a text that fails to read, or reads as another
+    /// amount, means that other values may read as amounts a hundred times off.
     /// </summary>
     /// <param name="providerFormat">How the provider formats money, as <see cref="OutputConfig.MoneyFormat"/> shows it.</param>
-    /// <returns>Whether it does.</returns>
-    internal static bool MoneyReadsAlike(string providerFormat)
+    /// <returns>Null when it means the same either way, true when it does only in binary, or false when it doesn't.</returns>
+    internal static bool? MoneyAlike(string providerFormat)
     {
         string local = OutputConfig.MoneyFormat();
         if (providerFormat == local)
         {
-            return true;
+            return null;
         }
 
         if (OutputConfig.MoneyAmount(providerFormat) != OutputConfig.MoneyAmount(local))
@@ -518,42 +539,11 @@ internal static partial class RelCache
         {
             return PgTransaction.RunInSubtransaction(() => Worf.ReadScalar<bool>(
                 "SELECT $1::pg_catalog.money OPERATOR(pg_catalog.=) '-1234567'::pg_catalog.money",
-                SpiParameter.Create(OutputConfig.MoneyText(providerFormat))), PgSubtransactionMode.Atomic);
+                SpiParameter.Create(OutputConfig.MoneyText(providerFormat))), PgSubtransactionMode.Atomic) ? null : true;
         }
         catch (PgException)
         {
             return true;
-        }
-    }
-
-    /// <summary>
-    /// Checks whether a type's values hold money: it's money, or an array, domain or composite type of it.
-    /// </summary>
-    private static bool HoldsMoney(uint typid)
-    {
-        unsafe
-        {
-            uint basetype = NativeMethods.getBaseType(typid);
-            if (basetype is MoneyOid or MoneyArrayOid)
-            {
-                return true;
-            }
-
-            uint element = NativeMethods.get_element_type(basetype);
-            if (element != 0)
-            {
-                return HoldsMoney(element);
-            }
-
-            uint relid = NativeMethods.get_typ_typrelid(basetype);
-            if (relid == 0)
-            {
-                return false;
-            }
-
-            SpiResult attributes = Worf.Read(
-                "SELECT atttypid FROM pg_catalog.pg_attribute WHERE attrelid = $1 AND attnum > 0 AND NOT attisdropped", 0, SpiParameter.Create(relid));
-            return Enumerable.Range(0, attributes.Count).Any(i => HoldsMoney(attributes[i].Get<uint>(0)));
         }
     }
 
