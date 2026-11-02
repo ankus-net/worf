@@ -1094,7 +1094,9 @@ internal static class Sync
     }
 
     /// <summary>
-    /// Waits while a table's sync worker catches up, which it does up to the position an apply worker gave it.
+    /// Waits while a table's sync worker catches up, which it does up to the position an apply worker gave it. A sync
+    /// worker that copies the table again, as one that can't catch up from its first copy does, waits for apply first,
+    /// so it isn't waited for.
     /// </summary>
     /// <param name="subid">The subscription.</param>
     /// <param name="nspname">The table's schema.</param>
@@ -1114,7 +1116,8 @@ internal static class Sync
         {
             using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
             {
-                if (guard.Read((in _, workers) => Worker.SyncFind(workers, myDatabaseId, subid, serverNspname, serverRelname)) < 0)
+                int sync = guard.Read((in _, workers) => Worker.SyncFind(workers, myDatabaseId, subid, serverNspname, serverRelname));
+                if (sync < 0 || guard[sync].Worker.Sync.CopyLsn != 0)
                 {
                     return;
                 }
@@ -1685,11 +1688,17 @@ internal static class Sync
         // A row here can hold a value that another unique index or an exclusion constraint needs for one of the
         // provider's: a row the provider no longer has, or one whose value the provider moved to another row, as a
         // swap of two rows' values does, which the merge writes one row at a time. Under session_replication_role
-        // replica, a deferrable unique index's recheck doesn't fire, so the merge checks those itself.
+        // replica, the recheck of a deferrable unique index or exclusion constraint doesn't fire, so the merge checks
+        // those itself. Under discard and transdiscard, a merge that fails is skipped, leaving the table's rows as they
+        // were, and recorded as the copy commits.
         try
         {
-            ExecuteQuoted(merge.ToString());
-            CheckDeferrableUnique(reloid, only + table);
+            PgTransaction.RunInSubtransaction(() =>
+            {
+                ExecuteQuoted(merge.ToString());
+                CheckDeferrableUnique(reloid, only + table);
+                CheckDeferrableExclusion(reloid, only + table);
+            }, PgSubtransactionMode.Atomic);
         }
         catch (PgException error) when (error.SqlState is PgSqlStates.UniqueViolation or PgSqlStates.ExclusionViolation)
         {
@@ -1697,8 +1706,16 @@ internal static class Sync
                 $"could not merge the copy of table {remoterel.Nspname}.{remoterel.Relname} into the rows it has: {error.Message}",
                 detail: error.Detail,
                 hint: "Rows here hold values the provider's rows take, as rows the provider no longer has, or rows whose values it moved to others. Resynchronize the table with worf.alter_subscription_resynchronize_table, which empties it and copies it again.");
-            CopyConversion.MergeFailed(rel, lsn, failed);
-            throw failed;
+            if (!CopyConversion.SkipMerge(rel, lsn, failed))
+            {
+                throw failed;
+            }
+
+            PgLog.Warning(new PgDiagnostic($"skipped merging the copy of table {remoterel.Nspname}.{remoterel.Relname} into the rows it has: {error.Message}")
+            {
+                Detail = error.Detail,
+                Hint = "Resynchronize the table with worf.alter_subscription_resynchronize_table to give it the provider's rows.",
+            });
         }
 
         _ = Worf.Execute($"DROP TABLE {MergeCopy}");
@@ -1736,6 +1753,39 @@ internal static class Sync
             if (Worf.ReadScalar<bool>($"SELECT EXISTS (SELECT FROM {table}{where} GROUP BY {string.Join(", ", keys)} HAVING pg_catalog.count(*) > 1)"))
             {
                 throw new PgException(PgSqlStates.UniqueViolation, $"duplicate key value violates unique constraint \"{index.Get<string>(0)}\"");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Fails with an exclusion violation when two of a table's rows conflict in a deferrable exclusion constraint, as
+    /// its recheck would at the end of the statement had session_replication_role let it fire: every key of one,
+    /// among the rows the index's predicate takes, compares true with the other's by the constraint's operator.
+    /// </summary>
+    /// <param name="reloid">The table.</param>
+    /// <param name="table">The table's qualified name, after ONLY when it isn't partitioned.</param>
+    private static void CheckDeferrableExclusion(uint reloid, string table)
+    {
+        SpiResult constraints = Worf.Read("""
+            SELECT c.conname::text,
+                (SELECT pg_catalog.array_agg(pg_catalog.pg_get_indexdef(i.indexrelid, k, false) ORDER BY k) FROM pg_catalog.generate_series(1, i.indnkeyatts) k),
+                (SELECT pg_catalog.array_agg(pg_catalog.format('OPERATOR(%I.%s)', n.nspname, o.oprname) ORDER BY e.k)
+                    FROM pg_catalog.unnest(c.conexclop) WITH ORDINALITY e (op, k)
+                        JOIN pg_catalog.pg_operator o ON o.oid = e.op JOIN pg_catalog.pg_namespace n ON n.oid = o.oprnamespace),
+                pg_catalog.pg_get_expr(i.indpred, i.indrelid)
+            FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_index i ON i.indexrelid = c.conindid
+            WHERE c.conrelid = $1 AND c.contype = 'x' AND c.condeferrable
+            """, 0, SpiParameter.Create(reloid));
+        foreach (SpiRow constraint in constraints)
+        {
+            string?[] keys = constraint.Get<string?[]>(1);
+            string?[] operators = constraint.Get<string?[]>(2);
+            string where = constraint.Get<string?>(3) is string predicate ? $" WHERE ({predicate})" : "";
+            string rows = $"(SELECT tableoid, ctid, {string.Join(", ", keys.Select((key, k) => $"({key}) AS k{k}"))} FROM {table}{where})";
+            string conflicts = string.Join(" AND ", operators.Select((op, k) => $"a.k{k} {op} b.k{k}"));
+            if (Worf.ReadScalar<bool>($"SELECT EXISTS (SELECT FROM {rows} a JOIN {rows} b ON (a.tableoid, a.ctid) <> (b.tableoid, b.ctid) AND {conflicts})"))
+            {
+                throw new PgException(PgSqlStates.ExclusionViolation, $"conflicting key value violates exclusion constraint \"{constraint.Get<string>(0)}\"");
             }
         }
     }
@@ -2116,7 +2166,7 @@ internal static class Sync
 
     /// <summary>
     /// Gets the name of the slot a table sync worker creates on the provider: the subscription's followed by a hash of
-    /// the table's name.
+    /// the table's name. No subscription's own slot name ends as one does, so none is taken for another's.
     /// </summary>
     /// <param name="slotName">The subscription's slot name.</param>
     /// <param name="nspname">The table's schema.</param>

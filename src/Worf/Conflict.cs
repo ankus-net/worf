@@ -323,7 +323,7 @@ internal static partial class Conflict
 
         ulong val = typisvarlena ? (ulong)NativeMethods.pg_detoast_datum((varlena*)origval) : origval;
         sbyte* outputstr = NativeMethods.OidOutputFunctionCall(typoutput, val);
-        string result = Worf.FromServer(outputstr);
+        string result = Worf.LoggedText(outputstr);
         NativeMethods.pfree(outputstr);
         return result;
     }

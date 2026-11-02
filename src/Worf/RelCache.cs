@@ -131,6 +131,12 @@ internal static partial class RelCache
 
             entries.Add(entry);
 
+            entry.DeferrableIndexes = Worf.ReadScalar<string?>("""
+                SELECT pg_catalog.string_agg(pg_catalog.quote_ident(c.relname), ', ' ORDER BY c.relname)
+                FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
+                WHERE i.indrelid = $1 AND NOT i.indimmediate AND (NOT i.indisunique OR i.indexprs IS NOT NULL OR i.indpred IS NOT NULL)
+                """, SpiParameter.Create(entry.Reloid));
+
             // Cache trigger info.
             entry.HasTriggers = false;
             TriggerDesc* trigdesc = entry.Rel->trigdesc;
@@ -159,6 +165,21 @@ internal static partial class RelCache
         }
 
         return entry;
+    }
+
+    /// <summary>
+    /// Fails an insert or update into a relation with deferrable indexes whose rechecks apply wouldn't get, which
+    /// would let it commit rows that conflict in them.
+    /// </summary>
+    /// <param name="rel">The relation.</param>
+    internal static void CheckDeferrableIndexes(WorfRelation rel)
+    {
+        if (rel.DeferrableIndexes is not null)
+        {
+            throw new PgException(PgSqlStates.FeatureNotSupported, "worf doesn't support index rechecks needed for deferrable indexes",
+                detail: $"relation {Spi.QuoteQualifiedIdentifier(rel.Nspname, rel.Relname)} has deferrable indexes: {rel.DeferrableIndexes}",
+                hint: "Make the constraints not deferrable, as with ALTER TABLE ... ALTER CONSTRAINT ... NOT DEFERRABLE.");
+        }
     }
 
     /// <summary>

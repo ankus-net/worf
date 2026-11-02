@@ -778,7 +778,7 @@ internal static unsafe partial class DdlLock
             if (Worker.GetCurrentTimestamp() > deadline)
             {
                 throw new PgException(LockNotAvailable,
-                    $"timed out waiting to apply node {waiting[0].NodeId}'s changes up to {Worf.FormatLsn(waiting[0].Lsn)} before DDL");
+                    $"timed out waiting to apply node {NodeName(waiting[0].NodeId)}'s changes up to {Worf.FormatLsn(waiting[0].Lsn)} before DDL");
             }
 
             // Apply can't pass a lock this transaction holds, as on a table that an earlier statement in it locked or
@@ -789,14 +789,21 @@ internal static unsafe partial class DdlLock
                 """, SpiParameter.Create(blocked.ToArray()))[0].Get<bool>(0))
             {
                 throw new PgException(LockNotAvailable,
-                    $"cannot apply node {waiting[0].NodeId}'s changes before DDL while this transaction holds a lock they need",
-                    hint: "Run the DDL before the statements that lock or write to its tables, or in a transaction of its own.");
+                    $"cannot apply node {NodeName(waiting[0].NodeId)}'s changes before DDL while this transaction holds a lock they need",
+                    hint: "Run the DDL in a transaction of its own, or before the statements that lock or write to tables, as DDL locks the indexes on this node alone that it moves aside or hides.");
             }
 
             Worker.WaitLatch(10);
             PgInterrupts.Check();
         }
     }
+
+    /// <summary>
+    /// Names a node for a message, or gives its ID when it's gone.
+    /// </summary>
+    private static string NodeName(uint nodeId)
+        => Elevated.Run(() => Worf.ReadScalar<string?>("SELECT node_name::pg_catalog.text FROM worf.node WHERE node_id = $1", SpiParameter.Create(nodeId)))
+            ?? nodeId.ToString(CultureInfo.InvariantCulture);
 
     /// <summary>
     /// Checks whether every enabled subscription to a node has applied its changes past a WAL position.

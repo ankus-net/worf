@@ -11,9 +11,11 @@ namespace Worf;
 /// its row and column as COPY's errors do. Under <c>worf.exception_behaviour</c> other than <c>error</c>, which copies
 /// every table this way, a row that fails, whether a value fails to convert, its column's input refuses it or a
 /// constraint does, is skipped and recorded in <c>worf.exception_log</c>, or disables the subscription once the copy
-/// rolls back. The table copies in one <c>COPY</c>, in a subtransaction, and a row that fails, which COPY names, has it
-/// copied again in batches, each in its own <c>COPY</c> and subtransaction, which go on past each row that fails, or,
-/// under <c>sub_disable</c>, has the row recorded.
+/// rolls back. Under <c>discard</c> and <c>transdiscard</c>, the table copies in batches, each in its own <c>COPY</c>
+/// and subtransaction, which go on past each row that fails, its values converted first in subtransactions that write
+/// nothing, so that a row whose value fails to convert is left out without a <c>COPY</c> failing. Under
+/// <c>sub_disable</c>, the table copies in one <c>COPY</c>, in a subtransaction, and a row that fails, which COPY names,
+/// is read again to record.
 /// </summary>
 internal static unsafe partial class CopyConversion
 {
@@ -30,17 +32,14 @@ internal static unsafe partial class CopyConversion
     private static int s_rowEnd;
     private static CopyFromStateData* s_cstate;
 
-    // Under discard and transdiscard, a copy whose rows convert has them converted ahead of COPY, a run at a time, so
-    // that a row whose value fails to convert is skipped without failing the copy: the provider's rows that arrived,
-    // their converted text and how much of it COPY has read, and the rows skipped, recorded once the copy commits.
-    private const int AheadRows = 1000;
-    private static bool s_convertAhead;
-    private static byte[] s_raw = new byte[64 * 1024];
-    private static readonly List<(int Start, int Length)> s_rawRows = [];
-    private static byte[] s_ahead = new byte[64 * 1024];
-    private static int s_aheadRead;
-    private static int s_aheadLength;
-    private static readonly List<(WorfFailedChange Change, PgException Error)> s_skipped = [];
+    // The rows of a copy in batches that failed: those of the batch under way, which are recorded in order once it's
+    // copied, and those recorded since, in the copy's transaction, a run at a time, so that a copy that skips many
+    // rows neither keeps them all nor takes a transaction ID for each, and how much of the rows' text they hold.
+    private const int RecordRows = 1000;
+    private const long RecordBytes = 8 * 1024 * 1024;
+    private static readonly List<(ulong Line, WorfFailedChange Change, PgException Error)> s_batchFailed = [];
+    private static readonly List<(WorfFailedChange Change, PgException Error)> s_toRecord = [];
+    private static long s_toRecordBytes;
 
     // Each copied column's conversion, or null, a converted column's name and its type's output function, the memory
     // context a row converts in, a value's text, which COPY's errors show, and the row as converted.
@@ -53,9 +52,8 @@ internal static unsafe partial class CopyConversion
     private static byte[] s_converted = new byte[8192];
     private static int s_convertedLength;
 
-    // How many of the provider's rows a copy that skips or records rows that fail copies in one subtransaction, once a
-    // row failed: as one fails, the rows before it are copied again and the copy goes on after it, or, when COPY names
-    // no row, the batch is split in halves.
+    // How many of the provider's rows a copy in batches copies in one subtransaction: as one fails, the rows before
+    // it are copied again and the copy goes on after it, or, when COPY names no row, the batch is split in halves.
     private const int BatchRows = 1000;
 
     // When worf.exception_behaviour skips or records rows: what the exception log records with each, or null, the
@@ -64,17 +62,18 @@ internal static unsafe partial class CopyConversion
     private static WorfExceptionBehaviour s_behaviour;
     private static List<string> s_columns = [];
 
-    // A row or merge that failed under sub_disable, which disables the subscription once the copy rolls back, and a
-    // merge that failed under another behaviour, which is recorded then.
+    // A row or merge that failed under sub_disable, which disables the subscription once the copy rolls back.
     private static (WorfFailedChange Change, PgException Error)? s_disabling;
-    private static (WorfFailedChange Change, WorfExceptionBehaviour Behaviour, PgException Error)? s_merged;
 
     // A batch of the provider's rows: their bytes, where each starts and how long it is, and the first's number, which
-    // the others follow. Then the next and the end of those a copy of the batch passes to COPY, and how much of the one
-    // converted COPY has read.
+    // the others follow. Then the rows that converted, which COPY reads: their text, where each starts and how long it
+    // is, and which of the batch's rows it is, and the next and the end of those a copy of the batch passes to COPY,
+    // and how much of the one under way COPY has read.
     private static byte[] s_batchData = new byte[64 * 1024];
     private static readonly List<(int Start, int Length)> s_batchRows = new(BatchRows);
     private static ulong s_batchLine;
+    private static byte[] s_batchText = new byte[64 * 1024];
+    private static readonly List<(int Start, int Length, int Row)> s_batchConverted = new(BatchRows);
     private static int s_batchNext;
     private static int s_batchEnd;
     private static int s_batchRead;
@@ -148,8 +147,10 @@ internal static unsafe partial class CopyConversion
             s_context = context;
             s_change = null;
 
-            // Unless worf.exception_behaviour stops at a failure, the copy runs in a subtransaction, which the copy in
-            // batches takes over from as a row fails.
+            // Unless worf.exception_behaviour stops at a failure, the rows that fail are recorded.
+            s_batchFailed.Clear();
+            s_toRecord.Clear();
+            s_toRecordBytes = 0;
             if (Apply.ExceptionBehaviour != WorfExceptionBehaviour.Error)
             {
                 WorfSubscription sub = Apply.MySubscription!;
@@ -166,10 +167,6 @@ internal static unsafe partial class CopyConversion
                 };
             }
 
-            s_convertAhead = s_change is not null && s_behaviour != WorfExceptionBehaviour.SubDisable && s_conversions.Any(conversion => conversion is not null);
-            s_aheadRead = s_aheadLength = 0;
-            s_skipped.Clear();
-
             bool snapshot = !NativeMethods.ActiveSnapshotSet();
             if (snapshot)
             {
@@ -181,26 +178,20 @@ internal static unsafe partial class CopyConversion
             {
                 copied = CopyAll(pstate, relation, attnamelist);
             }
+            else if (s_behaviour != WorfExceptionBehaviour.SubDisable)
+            {
+                copied = CopyInBatches(pstate, relation, attnamelist);
+            }
             else
             {
                 try
                 {
                     copied = PgTransaction.RunInSubtransaction(() => CopyAll(pstate, relation, attnamelist), PgSubtransactionMode.Atomic);
-
-                    // The rows whose values failed to convert are recorded in the copy's transaction, which already has
-                    // a transaction ID, rather than in subtransactions that would take one each.
-                    foreach ((WorfFailedChange change, PgException error) in s_skipped)
-                    {
-                        ExceptionLog.Record(change, WorfExceptionBehaviour.Discard, error, false);
-                    }
                 }
                 catch (PgException error) when (!Apply.IsTransient(error))
                 {
-                    s_convertAhead = false;
-                    s_aheadRead = s_aheadLength = 0;
-                    s_skipped.Clear();
-                    // The rest of the provider's rows are read and passed over, and the copy starts again: under
-                    // sub_disable, to record the row that failed, and otherwise in batches, which find the rows that fail.
+                    // The rest of the provider's rows are read and passed over, and the copy starts again to record the
+                    // row that failed, or, when COPY named none, in batches, which find it.
                     ulong failedLine = s_failedLine;
                     while (!s_ended)
                     {
@@ -213,7 +204,7 @@ internal static unsafe partial class CopyConversion
                     }
 
                     restart();
-                    if (s_behaviour == WorfExceptionBehaviour.SubDisable && failedLine > 0)
+                    if (failedLine > 0)
                     {
                         if (FindRow(failedLine) is WorfFailedChange change)
                         {
@@ -317,7 +308,8 @@ internal static unsafe partial class CopyConversion
     /// <summary>
     /// Copies the provider's rows in batches, each in its own COPY and subtransaction. A row that fails is recorded:
     /// skipped, or kept to disable the subscription as it fails the copy. Each batch takes a transaction ID, and each
-    /// row that fails about two more, for the rows before it copied again and those after it.
+    /// row that COPY fails one or two more, for the rows before it copied again and those after it; a row whose value
+    /// fails to convert takes none.
     /// </summary>
     private static ulong CopyInBatches(ParseState* pstate, RelationData* relation, List* attnamelist)
     {
@@ -351,7 +343,25 @@ internal static unsafe partial class CopyConversion
                 }
             }
 
-            copied += CopyBatch(pstate, relation, attnamelist, 0, s_batchRows.Count);
+            ConvertBatch();
+            copied += CopyBatch(pstate, relation, attnamelist, 0, s_batchConverted.Count);
+
+            // The batch's rows that failed are recorded in order, whether they failed to convert or COPY failed them.
+            s_batchFailed.Sort((x, y) => x.Line.CompareTo(y.Line));
+            foreach ((_, WorfFailedChange change, PgException error) in s_batchFailed)
+            {
+                s_toRecord.Add((change, error));
+                s_toRecordBytes += change.NewTuple?.Length ?? 0;
+            }
+
+            s_batchFailed.Clear();
+            if (s_ended || s_toRecord.Count >= RecordRows || s_toRecordBytes >= RecordBytes)
+            {
+                ExceptionLog.RecordCopied(s_toRecord);
+                s_toRecord.Clear();
+                s_toRecordBytes = 0;
+            }
+
             s_batchLine += (ulong)s_batchRows.Count;
         }
 
@@ -359,9 +369,66 @@ internal static unsafe partial class CopyConversion
     }
 
     /// <summary>
-    /// Copies some of a batch's rows in one COPY and subtransaction. When a row fails, which COPY's errors name, the
-    /// rows before it are copied again, it's recorded, and the copy goes on from the row after it; a failure that names
-    /// none of them has them copied again in halves, down to a row of its own.
+    /// Converts a batch's rows as COPY reads them, as many at a time as convert in one subtransaction, which writes
+    /// nothing and so takes no transaction ID. A row whose value fails to convert, from its data, is left out of the
+    /// copy and kept to record, or, under <c>sub_disable</c>, fails it.
+    /// </summary>
+    private static void ConvertBatch()
+    {
+        s_batchConverted.Clear();
+        int used = 0;
+        int next = 0;
+        string table = $"{s_change!.Relation!.Nspname}.{s_change.Relation.Relname}";
+        bool converts = Array.Exists(s_conversions, conversion => conversion is not null);
+        while (next < s_batchRows.Count)
+        {
+            try
+            {
+                PgTransaction.RunInSubtransaction(() =>
+                {
+                    for (; next < s_batchRows.Count; next++)
+                    {
+                        s_line = s_batchLine + (ulong)next;
+                        if (converts)
+                        {
+                            using PgErrorContext context = PgErrorContext.Push($"converting row {s_line} of the copy of table {table}");
+                            WriteRow(BatchRow(next));
+                        }
+                        else
+                        {
+                            WriteRow(BatchRow(next));
+                        }
+
+                        if (s_batchText.Length - used < s_convertedLength)
+                        {
+                            Array.Resize(ref s_batchText, Math.Max(used + s_convertedLength, s_batchText.Length * 2));
+                        }
+
+                        s_converted.AsSpan(0, s_convertedLength).CopyTo(s_batchText.AsSpan(used));
+                        s_batchConverted.Add((used, s_convertedLength, next));
+                        used += s_convertedLength;
+                    }
+                }, PgSubtransactionMode.Atomic);
+            }
+            catch (PgException error) when (!Apply.IsTransient(error))
+            {
+                WorfFailedChange change = Failed(BatchRow(next));
+                if (s_behaviour == WorfExceptionBehaviour.SubDisable)
+                {
+                    s_disabling = (change, error);
+                    throw;
+                }
+
+                s_batchFailed.Add((s_line, change, error));
+                next++;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Copies some of a batch's converted rows in one COPY and subtransaction. When a row fails, which COPY's errors
+    /// name, the rows before it are copied again, it's kept to record, and the copy goes on from the row after it; a
+    /// failure that names none of them has them copied again in halves, down to a row of its own.
     /// </summary>
     private static ulong CopyBatch(ParseState* pstate, RelationData* relation, List* attnamelist, int start, int count)
     {
@@ -376,7 +443,8 @@ internal static unsafe partial class CopyConversion
             }
             catch (PgException error) when (!Apply.IsTransient(error))
             {
-                ulong first = s_batchLine + (ulong)start;
+                // COPY numbers the rows it reads from one, at the first converted row.
+                ulong first = (ulong)start + 1;
                 int failed = s_failedLine >= first && s_failedLine < first + (ulong)(end - start) ? start + (int)(s_failedLine - first) : -1;
                 if (failed < 0 && end - start > 1)
                 {
@@ -386,21 +454,21 @@ internal static unsafe partial class CopyConversion
                 }
 
                 failed = Math.Max(failed, start);
-                s_line = s_batchLine + (ulong)failed;
-                WorfFailedChange change = Failed(BatchRow(failed));
+                int row = s_batchConverted[failed].Row;
+                s_line = s_batchLine + (ulong)row;
+                WorfFailedChange change = Failed(BatchRow(row));
                 if (s_behaviour == WorfExceptionBehaviour.SubDisable)
                 {
                     s_disabling = (change, error);
                     throw;
                 }
 
-                // The rows before it go first, so that the rows that fail among them are recorded before it, in order.
                 if (failed > start)
                 {
                     copied += CopyBatch(pstate, relation, attnamelist, start, failed - start);
                 }
 
-                ExceptionLog.Record(change, WorfExceptionBehaviour.Discard, error);
+                s_batchFailed.Add((s_line, change, error));
                 start = failed + 1;
             }
         }
@@ -409,15 +477,15 @@ internal static unsafe partial class CopyConversion
     }
 
     /// <summary>
-    /// Copies a batch's rows from one to before another in one COPY and subtransaction, and keeps the line that COPY
-    /// was at, which a failure leaves naming the row that failed.
+    /// Copies a batch's converted rows from one to before another in one COPY and subtransaction, and keeps the line
+    /// that COPY was at, which a failure leaves naming the row that failed.
     /// </summary>
     private static ulong CopyRange(ParseState* pstate, RelationData* relation, List* attnamelist, int start, int end)
         => PgTransaction.RunInSubtransaction(() =>
         {
             s_batchNext = start;
             s_batchEnd = end;
-            s_batchRead = -1;
+            s_batchRead = 0;
             s_cstate = null;
             s_failedLine = 0;
 
@@ -427,9 +495,7 @@ internal static unsafe partial class CopyConversion
                 {
                     CopyFromStateData* cstate = NativeMethods.BeginCopyFrom(pstate, relation, null, null, false, BatchSource, attnamelist, null);
                     s_cstate = cstate;
-
-                    // COPY numbers the lines it reads one after another, from the first row's number.
-                    cstate->cur_lineno = s_batchLine + (ulong)start - 1;
+                    cstate->cur_lineno = (ulong)start;
                     ulong rows = NativeMethods.CopyFrom(cstate);
                     NativeMethods.EndCopyFrom(cstate);
                     return rows;
@@ -452,31 +518,26 @@ internal static unsafe partial class CopyConversion
     private static ReadOnlySpan<byte> BatchRow(int index) => s_batchData.AsSpan(s_batchRows[index].Start, s_batchRows[index].Length);
 
     /// <summary>
-    /// COPY's data source for a copy of a batch: its rows, converted one after another.
+    /// COPY's data source for a copy of a batch: its converted rows, one after another.
     /// </summary>
     private static int ReadBatch(void* outbuf, int minread, int maxread)
     {
         _ = minread;
         Span<byte> output = new(outbuf, maxread);
         int written = 0;
-        while (written < maxread)
+        while (written < maxread && s_batchNext < s_batchEnd)
         {
-            if (s_batchRead < 0 || s_batchRead >= s_convertedLength)
-            {
-                if (s_batchNext >= s_batchEnd)
-                {
-                    break;
-                }
-
-                s_line = s_batchLine + (ulong)s_batchNext;
-                WriteRow(BatchRow(s_batchNext++));
-                s_batchRead = 0;
-            }
-
-            int len = Math.Min(s_convertedLength - s_batchRead, maxread - written);
-            s_converted.AsSpan(s_batchRead, len).CopyTo(output[written..]);
+            (int rowStart, int length, int row) = s_batchConverted[s_batchNext];
+            s_line = s_batchLine + (ulong)row;
+            int len = Math.Min(length - s_batchRead, maxread - written);
+            s_batchText.AsSpan(rowStart + s_batchRead, len).CopyTo(output[written..]);
             s_batchRead += len;
             written += len;
+            if (s_batchRead == length)
+            {
+                s_batchNext++;
+                s_batchRead = 0;
+            }
         }
 
         return written;
@@ -498,18 +559,20 @@ internal static unsafe partial class CopyConversion
     };
 
     /// <summary>
-    /// Notes a merge of a table's copy that failed, unless worf.exception_behaviour stops at failures: it is recorded,
-    /// and disables the subscription under <c>sub_disable</c>, once the merge rolled back.
+    /// Handles a merge of a table's copy that failed, as worf.exception_behaviour says: under <c>discard</c> and
+    /// <c>transdiscard</c>, it is skipped and recorded, as the copy's transaction commits; under <c>sub_disable</c>, it
+    /// disables the subscription and is recorded once the merge rolled back.
     /// </summary>
     /// <param name="rel">The table.</param>
     /// <param name="commitLsn">The position the copy is consistent with.</param>
     /// <param name="error">The failure.</param>
-    internal static void MergeFailed(WorfRelation rel, ulong commitLsn, PgException error)
+    /// <returns>Whether the merge is skipped, rather than failing the copy.</returns>
+    internal static bool SkipMerge(WorfRelation rel, ulong commitLsn, PgException error)
     {
         WorfExceptionBehaviour behaviour = Apply.ExceptionBehaviour;
         if (behaviour == WorfExceptionBehaviour.Error)
         {
-            return;
+            return false;
         }
 
         WorfSubscription sub = Apply.MySubscription!;
@@ -525,26 +588,19 @@ internal static unsafe partial class CopyConversion
         if (behaviour == WorfExceptionBehaviour.SubDisable)
         {
             s_disabling = (change, error);
+            return false;
         }
-        else
-        {
-            s_merged = (change, behaviour, error);
-        }
+
+        ExceptionLog.Record(change, behaviour, error);
+        return true;
     }
 
     /// <summary>
     /// Disables the subscription after a row of its copy, or its merge, failed under <c>sub_disable</c>, once the copy
-    /// rolled back, and records the row, as apply does with a failed remote transaction, or records a merge that failed
-    /// under another behaviour.
+    /// rolled back, and records the row, as apply does with a failed remote transaction.
     /// </summary>
     internal static void DisableAfterFailure()
     {
-        if (s_merged is (WorfFailedChange merged, WorfExceptionBehaviour behaviour, PgException mergeError))
-        {
-            s_merged = null;
-            PgBackgroundWorker.RunTransaction(() => ExceptionLog.Record(merged, behaviour, mergeError));
-        }
-
         if (s_disabling is not (WorfFailedChange change, PgException error))
         {
             return;
@@ -576,25 +632,6 @@ internal static unsafe partial class CopyConversion
         while (true)
         {
             // Rows converted ahead, a run at a time, once those before them are read.
-            if (s_convertAhead)
-            {
-                if (s_aheadRead == s_aheadLength && (s_ended || !ConvertAhead(written == 0)))
-                {
-                    return written;
-                }
-
-                int len = Math.Min(s_aheadLength - s_aheadRead, maxread - written);
-                s_ahead.AsSpan(s_aheadRead, len).CopyTo(output[written..]);
-                s_aheadRead += len;
-                written += len;
-                if (written == maxread)
-                {
-                    return written;
-                }
-
-                continue;
-            }
-
             // A row that didn't fit after others, or the rest of one longer than COPY reads at once.
             if (s_rowStart < s_rowEnd)
             {
@@ -667,90 +704,13 @@ internal static unsafe partial class CopyConversion
     }
 
     /// <summary>
-    /// Takes the provider's rows that have arrived, up to a run of them, waiting for one when asked to, and converts
-    /// them, as many at a time as convert in one subtransaction, which writes nothing and so takes no transaction ID. A
-    /// row whose value fails to convert, from its data, is left out and kept to record.
-    /// </summary>
-    /// <param name="wait">Whether to wait for a row, as when COPY has nothing to read yet.</param>
-    /// <returns>Whether any rows arrived, though every one of them may have failed.</returns>
-    private static bool ConvertAhead(bool wait)
-    {
-        s_rawRows.Clear();
-        int used = 0;
-        while (s_rawRows.Count < AheadRows && !s_ended)
-        {
-            PgReplicationReceiveStatus status = s_conn!.Receive(s_rawRows.Count == 0 && wait ? TimeSpan.FromSeconds(1) : TimeSpan.Zero,
-                out ReadOnlySpan<byte> message);
-            if (status == PgReplicationReceiveStatus.Ended)
-            {
-                s_ended = true;
-                break;
-            }
-
-            if (status != PgReplicationReceiveStatus.Message)
-            {
-                if (s_rawRows.Count > 0 || !wait)
-                {
-                    break;
-                }
-
-                PgInterrupts.Check();
-                continue;
-            }
-
-            if (s_raw.Length - used < message.Length)
-            {
-                Array.Resize(ref s_raw, Math.Max(used + message.Length, s_raw.Length * 2));
-            }
-
-            message.CopyTo(s_raw.AsSpan(used));
-            s_rawRows.Add((used, message.Length));
-            used += message.Length;
-        }
-
-        // A failure leaves COPY's errors naming the row that failed, which they then stop doing.
-        s_aheadRead = s_aheadLength = 0;
-        ulong lineno = s_cstate->cur_lineno;
-        int next = 0;
-        while (next < s_rawRows.Count)
-        {
-            try
-            {
-                PgTransaction.RunInSubtransaction(() =>
-                {
-                    for (; next < s_rawRows.Count; next++)
-                    {
-                        s_line++;
-                        WriteRow(s_raw.AsSpan(s_rawRows[next].Start, s_rawRows[next].Length));
-                        if (s_ahead.Length - s_aheadLength < s_convertedLength)
-                        {
-                            Array.Resize(ref s_ahead, Math.Max(s_aheadLength + s_convertedLength, s_ahead.Length * 2));
-                        }
-
-                        s_converted.AsSpan(0, s_convertedLength).CopyTo(s_ahead.AsSpan(s_aheadLength));
-                        s_aheadLength += s_convertedLength;
-                    }
-                }, PgSubtransactionMode.Atomic);
-            }
-            catch (PgException error) when (!Apply.IsTransient(error))
-            {
-                ForgetValue(lineno);
-                s_skipped.Add((Failed(s_raw.AsSpan(s_rawRows[next].Start, s_rawRows[next].Length)), error));
-                next++;
-            }
-        }
-
-        return s_rawRows.Count > 0;
-    }
-
-    /// <summary>
     /// Writes a row as COPY reads it, with its converted values converted and written as their type's output writes
     /// them. While a value converts, COPY's errors name its row, column and text, which a failure leaves them naming.
     /// </summary>
     private static void WriteRow(ReadOnlySpan<byte> message)
     {
         s_convertedLength = 0;
-        ulong lineno = s_cstate->cur_lineno;
+        ulong lineno = s_cstate is null ? 0 : s_cstate->cur_lineno;
         MemoryContextData* oldcontext = Worf.MemoryContextSwitchTo(s_context);
         try
         {
@@ -770,9 +730,13 @@ internal static unsafe partial class CopyConversion
                 if (field < s_conversions.Length && s_conversions[field] is { } conversion && !raw.SequenceEqual("\\N"u8))
                 {
                     _ = Unescape(raw);
-                    s_cstate->cur_lineno = s_line;
-                    s_cstate->cur_attname = s_names[field];
-                    s_cstate->cur_attval = (sbyte*)s_text;
+                    if (s_cstate is not null)
+                    {
+                        s_cstate->cur_lineno = s_line;
+                        s_cstate->cur_attname = s_names[field];
+                        s_cstate->cur_attval = (sbyte*)s_text;
+                    }
+
                     ulong value = conversion.ConvertText((sbyte*)s_text, out bool isnull);
                     if (isnull)
                     {
@@ -816,6 +780,11 @@ internal static unsafe partial class CopyConversion
     /// </summary>
     private static void ForgetValue(ulong lineno)
     {
+        if (s_cstate is null)
+        {
+            return;
+        }
+
         s_cstate->cur_lineno = lineno;
         s_cstate->cur_attname = null;
         s_cstate->cur_attval = null;

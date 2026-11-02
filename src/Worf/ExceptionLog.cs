@@ -130,6 +130,43 @@ internal static class ExceptionLog
     }
 
     /// <summary>
+    /// Records rows of a table's copy that failed, all in one statement, which takes one transaction ID for them all
+    /// rather than one each, as a copy that skips many rows records them.
+    /// </summary>
+    /// <param name="failures">The rows, of one copy, in order, and their errors.</param>
+    internal static void RecordCopied(IReadOnlyList<(WorfFailedChange Change, PgException Error)> failures)
+    {
+        if (failures.Count == 0)
+        {
+            return;
+        }
+
+        WorfFailedChange change = failures[0].Change;
+        _ = Worf.Execute("""
+            INSERT INTO worf.exception_log (sub_id, sub_name, remote_node_id, remote_xid, remote_commit_ts, remote_commit_lsn,
+                action_counter, operation, schema_name, table_name, remote_new_tuple, behaviour, error_sqlstate, error_message)
+            SELECT $1, $2, $3, $4::text::xid, $5, $6, f.action_counter::integer, $7, $8, $9, f.new_tuple::jsonb, 'discard',
+                f.error_sqlstate, f.error_message
+            FROM ROWS FROM (pg_catalog.unnest($10::bigint[]), pg_catalog.unnest($11::text[]), pg_catalog.unnest($12::text[]),
+                pg_catalog.unnest($13::text[])) WITH ORDINALITY AS f (action_counter, new_tuple, error_sqlstate, error_message, n)
+            ORDER BY f.n
+            """,
+            SpiParameter.Create(change.Subscription.Id),
+            SpiParameter.Create(change.Subscription.Name),
+            SpiParameter.Create(change.WriterNodeId),
+            SpiParameter.Create(change.RemoteXid.ToString(CultureInfo.InvariantCulture)),
+            SpiParameter.Create(new PgTimestampTz(change.CommitTime)),
+            Worf.LsnParameter(change.CommitLsn),
+            SpiParameter.Create<string?>(change.Operation),
+            SpiParameter.Create<string?>(change.Relation?.Nspname),
+            SpiParameter.Create<string?>(change.Relation?.Relname),
+            SpiParameter.Create(failures.Select(failure => (long)failure.Change.ActionCounter).ToArray()),
+            SpiParameter.Create(failures.Select(failure => failure.Change.NewTuple).ToArray()),
+            SpiParameter.Create(failures.Select(failure => failure.Error.SqlState).ToArray()),
+            SpiParameter.Create(failures.Select(failure => failure.Error.Message).ToArray()));
+    }
+
+    /// <summary>
     /// Records the remote transaction a subscription applies again under <c>worf.exception_behaviour</c>, how, and
     /// the error that made it, so that whichever worker applies it next, even after a restart, knows.
     /// </summary>
@@ -255,7 +292,7 @@ internal static class ExceptionLog
                 // Text is recorded as it came, and so is an enum's value in binary, its label, which is also its text.
                 case 't':
                 case 'b' when rel.RemoteType(natt)?.Definition == ProtoNative.EnumDefinition:
-                    Executor.EscapeJson(json, Worf.FromServer(tuple.Data[natt]!));
+                    Executor.EscapeJson(json, Worf.LoggedText(tuple.Data[natt]!));
                     break;
 
                 default:
@@ -304,6 +341,6 @@ internal static class ExceptionLog
         uint typoutput;
         bool typisvarlena;
         NativeMethods.getTypeOutputInfo(type, &typoutput, &typisvarlena);
-        return Worf.FromServer(NativeMethods.OidOutputFunctionCall(typoutput, value));
+        return Worf.LoggedText(NativeMethods.OidOutputFunctionCall(typoutput, value));
     }
 }

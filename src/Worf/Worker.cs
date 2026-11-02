@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Runtime.InteropServices;
 using Ankus.Postgres;
 
@@ -92,10 +93,13 @@ internal static class Worker
         else if (worker.WorkerType == WorfWorkerType.Sync)
         {
             function = "worf_sync_main";
-            // A worker's name is ASCII, so a table name's other characters show as question marks.
-            string relname = new([.. NameStr(worker.Worker.Sync.Relname).Select(c => char.IsAscii(c) ? c : '?')]);
-            name = $"worf sync {Worf.ShortenHash(relname, NameDataLen - 37),27} " +
-                $"{worker.Dboid}:{worker.Worker.Sync.Apply.SubId}";
+            // A worker's name is ASCII, so a table name's other characters show as question marks, followed by a
+            // hash of the name, which tells tables apart whose names differ only in those characters.
+            string table = NameStr(worker.Worker.Sync.Relname);
+            string relname = new([.. table.Select(c => char.IsAscii(c) ? c : '?')]);
+            relname = relname == table ? Worf.ShortenHash(relname, NameDataLen - 37)
+                : Worf.Truncate(relname, NameDataLen - 45) + Worf.HashAny(table).ToString("x8", CultureInfo.InvariantCulture)[..7];
+            name = $"worf sync {relname,27} {worker.Dboid}:{worker.Worker.Sync.Apply.SubId}";
         }
         else if (worker.WorkerType == WorfWorkerType.Range)
         {

@@ -82,6 +82,14 @@ internal sealed unsafe class WorfRelation
     public bool HasTriggers { get; set; }
 
     /// <summary>
+    /// Gets or sets the deferrable indexes of the local relation whose rechecks apply needs and doesn't get, under
+    /// session_replication_role replica, and doesn't do itself: those of exclusion constraints, and unique ones with
+    /// expressions or a predicate, which the conflict search passes over, or null. Only valid as long as relation
+    /// mapping is.
+    /// </summary>
+    public string? DeferrableIndexes { get; set; }
+
+    /// <summary>
     /// Gets the type a local column's values are sent in.
     /// </summary>
     /// <param name="attid">The local column.</param>

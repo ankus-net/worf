@@ -20,17 +20,23 @@ synchronizing another, and each other node whose changes its provider forwards
 with `forward_origins` `{all}` another. When one that needs a slot finds none
 free, subscriptions give up the slots of forwarded nodes' origins they no longer
 need, which slows apply, the last one a subscription applied under going too
-once its own origin has taken its progress; failing that within 10 seconds, its
-apply or table sync stops with an error and retries. They also give them up,
-within 10 seconds or twice `wal_retrieve_retry_interval` if that is longer, to
-an enabled PostgreSQL subscription whose origin, or a table sync's, has none
-while a worker of it runs or can start: its owner can log in, its database
-allows connections, and `max_logical_replication_workers` leaves room. A new
-relay origin of any subscription waits that long while one of them still has
-none, so that a slot given up is theirs to take. One that still has none after
-that, though a slot was free, isn't waiting for one, and they don't give theirs
-up for it again for 10 minutes, then for twice as long each time, up to a day.
-Other users of origins need the limit raised. `worf.origin_writer` records the
+once its own origin has taken its progress. A forwarded node's origin that still
+finds none takes none: its transactions commit under the subscription's own
+origin, as pglogical commits every transaction, with a warning, and their rows
+count as the provider's in conflicts and when they're forwarded on. A
+subscription's own origin, or a table sync's, that finds none within 10 seconds
+stops its apply or table sync with an error, which retries. Subscriptions also
+give up the slots of every forwarded node's origin to an enabled PostgreSQL
+subscription whose origin, or a table sync's, has none while a worker of it runs
+or can start: its owner can log in, its database allows connections, and
+`max_logical_replication_workers` leaves room. They look for one every 10
+seconds, or twice `wal_retrieve_retry_interval` if that is longer, and for as
+long after giving slots up, which is the time PostgreSQL takes to start its
+worker again, no forwarded node's origin takes a slot, so that those given up
+are theirs to take. One that still has none after that, though a slot was free,
+isn't waiting for one, and they don't give theirs up for it again for 10
+minutes, then for twice as long each time, up to a day. Other users of origins
+need the limit raised. `worf.origin_writer` records the
 node and subscription each origin worf creates applies for, a row each time one
 is created or dropped, and forgets a row once a later one has superseded it for
 `vacuum_freeze_min_age` transactions, as vacuum would freeze rows written before

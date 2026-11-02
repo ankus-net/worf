@@ -653,6 +653,127 @@ public sealed class GlobalDdlLockTests
         }
 
         Assert.DoesNotContain("already exists", log);
+
+        // A path that replicated SQL sets with set_config, the INTO of a set operation's first SELECT and an extension
+        // moved to another schema take the names of node_b's own indexes, which move out of their way, and DDL that
+        // takes none moves none.
+        _ = await nodeA.SafePsqlAsync(Database, "CREATE SCHEMA lx; CREATE TABLE lx.lq (a integer); CREATE TABLE lx.lu (a integer)", token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
+        foreach (string index in new[]
+        {
+            "INDEX CONCURRENTLY lq_a_idx ON lx.lq (a)", "INDEX CONCURRENTLY lu_into ON lx.lu (a)", "INDEX CONCURRENTLY pg_buffercache ON lx.lu (a)",
+            "UNIQUE INDEX CONCURRENTLY lu_l ON lx.lu (a)",
+        })
+        {
+            await BuildLocalIndexAsync(nodeB, index, token);
+        }
+
+        _ = await nodeB.SafePsqlAsync(Database, "REINDEX TABLE lx.lq; REINDEX TABLE lx.lu", token);
+        logStart = nodeB.ReadLog().Length;
+        _ = await nodeA.SafePsqlAsync(Database, """
+            SELECT worf.replicate_ddl_command($$SELECT pg_catalog.set_config('search_path', 'lx', false); CREATE INDEX ON lq (a)$$);
+            SELECT 1 AS a INTO lx.lu_into UNION SELECT 2;
+            CREATE EXTENSION pg_buffercache;
+            ALTER EXTENSION pg_buffercache SET SCHEMA lx;
+            CREATE TABLE lx.other (a integer PRIMARY KEY);
+            """, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
+        const string Moved = """
+            SELECT string_agg(c.relname, ',' ORDER BY c.relname) FROM pg_class c
+            WHERE c.relnamespace = 'lx'::regnamespace AND c.relname !~ '^pg_buffercache_' AND c.oid NOT IN (SELECT indexrelid FROM worf.local_index)
+            """;
+        Assert.AreEqual("lq,lq_a_idx,lu,lu_into,other,other_pkey,pg_buffercache", await nodeA.SafePsqlAsync(Database, Moved, token));
+        Assert.AreEqual(await nodeA.SafePsqlAsync(Database, Moved, token), await nodeB.SafePsqlAsync(Database, Moved, token), "node_a's DDL on node_b");
+        Assert.AreEqual("lx.lq_a_idx_local,lx.lu_into_local,lx.lu_l,lx.pg_buffercache_local", await nodeB.SafePsqlAsync(Database, """
+            SELECT string_agg(indexrelid::regclass::text, ',' ORDER BY indexrelid::regclass::text COLLATE "C") FROM worf.local_index
+            WHERE indexrelid::regclass::text LIKE 'lx.%'
+            """, token), "node_b's own indexes in lx");
+        log = nodeB.ReadLog()[logStart..];
+        Assert.DoesNotContain("already exists", log);
+        Assert.DoesNotContain("renamed index \"lu_l\"", log);
+
+        // Replicated SQL that writes duplicate keys to a table with a unique index on node_b alone stops apply there,
+        // rather than drop the index, until the index goes. Transaction control in replicated SQL fails, and SQL
+        // queued with it before applies without it.
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.replicate_ddl_command('INSERT INTO lx.lu VALUES (7), (7)')", token);
+        Assert.IsTrue(await nodeB.PollLogAsync(logStart, "duplicate key value violates unique constraint \"lu_l\"", token), "node_b's apply stopped");
+        Assert.AreEqual("lx.lu_l", await nodeB.SafePsqlAsync(Database, "SELECT to_regclass('lx.lu_l')::text", token));
+        _ = await nodeB.SafePsqlAsync(Database, "DROP INDEX lx.lu_l", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT count(*) = 2 FROM lx.lu WHERE a = 7", token), "node_a's rows on node_b");
+        Assert.DoesNotContain("dropped index", nodeB.ReadLog()[logStart..]);
+        foreach (string sql in new[] { "CREATE TABLE public.c1 (a integer); COMMIT", "SAVEPOINT s; CREATE TABLE public.c1 (a integer)" })
+        {
+            PostgresException control = await Assert.ThrowsExactlyAsync<PostgresException>(
+                () => nodeA.SafePsqlAsync(Database, $"SELECT worf.replicate_ddl_command('{sql}')", token), sql);
+            Assert.AreEqual("2D000", control.SqlState, sql);
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database, """
+            INSERT INTO worf.queue VALUES (now(), current_user, '{ddl_sql}', 'Q', '"CREATE TABLE public.c3 (a integer); COMMIT"');
+            """, token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT to_regclass('public.c3') IS NOT NULL", token), "node_a's old SQL on node_b");
+        Assert.Contains("skipping transaction control statement", nodeB.ReadLog()[logStart..]);
+
+        // Replicated SQL runs on node_b as the role that ran it, whose functions can't set the role back to apply's,
+        // nor can the SQL itself, and settings it makes last until it ends.
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, """
+                SET worf.enable_ddl_replication = off;
+                CREATE ROLE mal LOGIN;
+                GRANT CREATE ON SCHEMA public TO mal;
+                GRANT USAGE ON SCHEMA worf TO mal;
+                """, token);
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE FUNCTION public.mal_f() RETURNS integer LANGUAGE plpgsql AS $f$
+            BEGIN
+                BEGIN
+                    RESET ROLE;
+                    ALTER ROLE mal SUPERUSER;
+                EXCEPTION WHEN OTHERS THEN NULL;
+                END;
+                RETURN 1;
+            END $f$;
+            CREATE TABLE public.mal_t AS SELECT public.mal_f();
+            SELECT worf.replicate_ddl_command($$DO $d$ BEGIN RESET ROLE; ALTER ROLE mal SUPERUSER; EXCEPTION WHEN OTHERS THEN NULL; END $d$;
+                CREATE TABLE public.mal_u (a integer)$$);
+            """, token, user: "mal");
+        PostgresException role = await Assert.ThrowsExactlyAsync<PostgresException>(
+            () => nodeA.SafePsqlAsync(Database, "SELECT worf.replicate_ddl_command('RESET ROLE; CREATE TABLE public.mal_v (a integer)')", token, user: "mal"));
+        Assert.AreEqual("42501", role.SqlState);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            Assert.AreEqual("f|mal|mal", await node.SafePsqlAsync(Database, """
+                SELECT rolsuper, (SELECT tableowner FROM pg_tables WHERE tablename = 'mal_t'), (SELECT tableowner FROM pg_tables WHERE tablename = 'mal_u')
+                FROM pg_roles WHERE rolname = 'mal'
+                """, token), node.Name);
+        }
+    }
+
+    /// <summary>
+    /// Builds an index on a node alone, as a concurrent build whose DDL couldn't be queued leaves it.
+    /// </summary>
+    private static async Task BuildLocalIndexAsync(TestNode node, string index, CancellationToken token)
+    {
+        await using NpgsqlConnection locking = await node.OpenAsync(Database, token);
+        await using NpgsqlConnection building = await node.OpenAsync(Database, token);
+        await using NpgsqlTransaction transaction = await locking.BeginTransactionAsync(token);
+        await using (NpgsqlCommand lockQueue = new("LOCK TABLE worf.queue IN ACCESS EXCLUSIVE MODE", locking, transaction))
+        {
+            _ = await lockQueue.ExecuteNonQueryAsync(token);
+        }
+
+        await using (NpgsqlCommand timeout = new("SET lock_timeout = '300ms'", building))
+        {
+            _ = await timeout.ExecuteNonQueryAsync(token);
+        }
+
+        await using NpgsqlCommand build = new($"CREATE {index}", building);
+        PostgresException unqueued = await Assert.ThrowsExactlyAsync<PostgresException>(() => build.ExecuteNonQueryAsync(token), index);
+        Assert.AreEqual("55P03", unqueued.SqlState, index);
     }
 
     /// <summary>

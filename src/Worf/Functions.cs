@@ -1285,6 +1285,27 @@ internal static class Functions
             _ = ReplicationSet.GetReplicationSetByName(node.Node.Id, setname, false);
         }
 
+        // Apply runs the command in its own transaction, as the role that runs it here, so the command can neither end
+        // or split the transaction nor change the role.
+        List* statements = NativeMethods.raw_parser(Worf.PStrDup(command), RawParseMode.RAW_PARSE_DEFAULT);
+        for (int i = 0; statements is not null && i < statements->length; i++)
+        {
+            Node* statement = ((RawStmt*)statements->elements[i].ptr_value)->stmt;
+            if (statement->type == NodeTag.T_TransactionStmt)
+            {
+                throw new PgException(PgSqlStates.InvalidTransactionTermination, "replicate_ddl_command cannot run transaction control statements");
+            }
+
+            string? setting = statement->type == NodeTag.T_VariableSetStmt && ((VariableSetStmt*)statement)->name is not null
+                ? Worf.FromServer(((VariableSetStmt*)statement)->name)
+                : null;
+            if (setting is "role" or "session_authorization")
+            {
+                throw new PgException(PgSqlStates.InsufficientPrivilege, "replicate_ddl_command cannot change the role",
+                    hint: "Call replicate_ddl_command as the role that is to run the command.");
+            }
+        }
+
         int saveNestlevel = NativeMethods.NewGUCNestLevel();
 
         // Force everything in the query to be fully qualified.
@@ -1688,6 +1709,13 @@ internal static class Functions
         {
             byte cp = name[i];
             slot[i] = (cp >= 'a' && cp <= 'z') || (cp >= '0' && cp <= '9') || cp == '_' ? (char)cp : '_';
+        }
+
+        // A name that ends as a table sync's slot's does, an underscore and eight hex digits, would be taken for another
+        // subscription's, whose cleanup drops it, so its last character becomes an underscore.
+        if (slot.Length >= 9 && slot[^9] == '_' && Array.TrueForAll(slot[^8..], char.IsAsciiHexDigitLower))
+        {
+            slot[^1] = '_';
         }
 
         return new string(slot);

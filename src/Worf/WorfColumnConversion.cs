@@ -13,6 +13,12 @@ namespace Worf;
 internal sealed unsafe class WorfColumnConversion
 {
     /// <summary>
+    /// The detail of the error a value fails with while the nodes format money differently, which tells it from
+    /// other errors with its SQLSTATE: apply tries it again, under every worf.exception_behaviour, until they agree.
+    /// </summary>
+    internal const string FailsUntilFormatsAgree = "Every value of the column fails until the nodes format money alike.";
+
+    /// <summary>
     /// The OID of text, whose values an enum's labels are read as.
     /// </summary>
     internal const uint TextOid = 25;
@@ -311,7 +317,7 @@ internal sealed unsafe class WorfColumnConversion
     {
         if (_failure is not null && (!_textFails || text))
         {
-            throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState, _failure);
+            throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState, _failure, detail: FailsUntilFormatsAgree);
         }
 
         if (ReadType == 0)

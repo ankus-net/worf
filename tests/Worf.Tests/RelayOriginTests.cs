@@ -129,6 +129,10 @@ public sealed class RelayOriginTests
             FROM generate_series(1, 20) d, generate_series(1, 20) n, generate_series(1, 20) s
             """, token), "the longest slot name");
 
+        // No subscription's slot name ends as a table sync's does, so none is taken for another subscription's.
+        Assert.AreEqual("worf_postgres_prov_sub_a3f85cc_", await subscriber.SafePsqlAsync(Database,
+            "SELECT worf.worf_gen_slot_name('postgres', 'prov', 'sub_a3f85ccf')", token));
+
         const string CreateE = "CREATE SEQUENCE e_n_seq; CREATE TABLE e (id integer PRIMARY KEY, v text, n bigint DEFAULT nextval('e_n_seq'))";
         foreach (TestNode node in nodes)
         {
@@ -421,6 +425,7 @@ public sealed class RelayOriginTests
             "wal_level = logical",
             "max_wal_senders = 10",
             "max_replication_slots = 10",
+            "max_worker_processes = 16",
             "track_commit_timestamp = on",
             .. settings,
         ], token);

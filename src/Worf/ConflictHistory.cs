@@ -404,6 +404,17 @@ internal static partial class ConflictHistory
     }
 
     /// <summary>
+    /// Gets how many conflicts the apply transaction under way has recorded, for <see cref="ForgetPending"/>.
+    /// </summary>
+    internal static int PendingCount => s_pending.Count;
+
+    /// <summary>
+    /// Forgets the conflicts recorded by a change whose subtransaction rolled back, as their resolutions didn't happen.
+    /// </summary>
+    /// <param name="count">How many were recorded before the change.</param>
+    internal static void ForgetPending(int count) => s_pending.RemoveRange(count, s_pending.Count - count);
+
+    /// <summary>
     /// Writes the conflicts that committed apply transactions recorded, all in one transaction, or, when that fails,
     /// each in a transaction of its own, so that one record that fails, even as it commits, loses only itself. Apply
     /// calls this after each transaction it commits.

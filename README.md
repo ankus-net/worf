@@ -71,8 +71,8 @@ in text that the subscriber's doesn't read as the same amount, values sent as
 text, as in the initial copy and with `force_text_transfer`, fail with error
 55000, while values sent in binary, which count the currency's smallest units,
 replicate, read as `money` and converted as any value is for a column of another
-type. Every `worf.exception_behaviour` retries error 55000, as an error that
-doesn't come from the data, until the formats agree. A node whose `lc_monetary`
+type. Every `worf.exception_behaviour` retries this error, as one that doesn't
+come from the data, until the formats agree. A node whose `lc_monetary`
 changes, on a reload too, checks again: a provider ends its stream at its next
 change, so that the subscriber reconnects, and a subscriber finds its columns'
 conversions again. An older worf doesn't
@@ -154,17 +154,23 @@ synchronizing another, and each other node whose changes its provider forwards
 with `forward_origins` `{all}` another. When one that needs a slot finds none
 free, subscriptions give up the slots of forwarded nodes' origins they no longer
 need, which slows apply, the last one a subscription applied under going too
-once its own origin has taken its progress; failing that within 10 seconds, its
-apply or table sync stops with an error and retries. They also give them up,
-within 10 seconds or twice `wal_retrieve_retry_interval` if that is longer, to
-an enabled PostgreSQL subscription whose origin, or a table sync's, has none
-while a worker of it runs or can start: its owner can log in, its database
-allows connections, and `max_logical_replication_workers` leaves room. A new
-relay origin of any subscription waits that long while one of them still has
-none, so that a slot given up is theirs to take. One that still has none after
-that, though a slot was free, isn't waiting for one, and they don't give theirs
-up for it again for 10 minutes, then for twice as long each time, up to a day.
-Other users of origins need the limit raised. `worf.origin_writer` records the
+once its own origin has taken its progress. A forwarded node's origin that still
+finds none takes none: its transactions commit under the subscription's own
+origin, as pglogical commits every transaction, with a warning, and their rows
+count as the provider's in conflicts and when they're forwarded on. A
+subscription's own origin, or a table sync's, that finds none within 10 seconds
+stops its apply or table sync with an error, which retries. Subscriptions also
+give up the slots of every forwarded node's origin to an enabled PostgreSQL
+subscription whose origin, or a table sync's, has none while a worker of it runs
+or can start: its owner can log in, its database allows connections, and
+`max_logical_replication_workers` leaves room. They look for one every 10
+seconds, or twice `wal_retrieve_retry_interval` if that is longer, and for as
+long after giving slots up, which is the time PostgreSQL takes to start its
+worker again, no forwarded node's origin takes a slot, so that those given up
+are theirs to take. One that still has none after that, though a slot was free,
+isn't waiting for one, and they don't give theirs up for it again for 10
+minutes, then for twice as long each time, up to a day. Other users of origins
+need the limit raised. `worf.origin_writer` records the
 node and subscription each origin worf creates applies for, a row each time one
 is created or dropped, and forgets a row once a later one has superseded it for
 `vacuum_freeze_min_age` transactions, as vacuum would freeze rows written before
@@ -606,7 +612,11 @@ by extensions will go to `default` replication set.
 - `worf.replicate_ddl_command(command text, replication_sets text[])`
   Execute locally and then send the specified command to the replication queue
   for execution on subscribers which are subscribed to one of the specified
-  `replication_sets`.
+  `replication_sets`. The command runs on every node as the role that called
+  the function, as a security-definer function runs, so neither it nor a
+  function it calls can change the role, and settings it makes last until it
+  ends. It can't control the transaction: `BEGIN`, `COMMIT`, `SAVEPOINT` and
+  the like fail.
 
   Parameters:
   - `command` - DDL query to execute
@@ -811,8 +821,8 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
     again once it's enabled
 
   Errors that don't come from the data, such as deadlocks, serialization
-  failures, lock and statement timeouts, cancellations, shutdowns running out of
-  resources, and money that a provider formats otherwise than this node, every
+  failures, lock and statement timeouts, cancellations, shutdowns, running out
+  of resources, and money that a provider formats otherwise than this node, every
   value of which fails, are retried as under `error`. Every skipped change,
   including each change of a transaction skipped as a whole, and disabled
   subscriptions are recorded in `worf.exception_log`, with the error, the
@@ -842,18 +852,21 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   unique index other than the key, deferrable or not, or an exclusion constraint
   refuses, as when a row the provider has since deleted here holds a value one
   of the provider's rows takes, or the provider moved a value from one row to
-  another, with a hint to resynchronize. Such a merge is recorded as a `MERGE`
-  under `discard` and `transdiscard`, and disables the subscription under
-  `sub_disable`. In a table's initial copy, a row that fails, whether its value
+  another, with a hint to resynchronize. Under `discard` and `transdiscard`,
+  such a merge is skipped instead, leaving the table's rows as they were, with a
+  warning, and recorded as a `MERGE`; under `sub_disable`, it disables the
+  subscription. In a table's initial copy, a row that fails, whether its value
   doesn't convert to its column's type, the column's input refuses it or a
   constraint does, is skipped under `discard` and `transdiscard` and disables
   the subscription under `sub_disable`, and is recorded as a `COPY` with its
   text, its number in the copy as the action counter and the copy's position.
-  Under `discard` and `transdiscard`, a row whose value doesn't convert is left
-  out as the copy goes on; any other row that fails has the table copied again
-  in batches of a thousand rows, each in its own subtransaction, which go on
-  past each row that fails. Under `sub_disable` it has the row it names
-  recorded. Under `error` the copy stops,
+  Under `discard` and `transdiscard`, the table copies in batches of a thousand
+  rows, each in its own subtransaction, which take a transaction ID each and go
+  on past each row that fails: a row whose value doesn't convert is left out
+  before the batch is copied, and a row that the column's input or a constraint
+  refuses has the rows before it copied again. The rows that fail are recorded
+  a thousand at a time. Under `sub_disable` the table copies in one
+  subtransaction, and the row that fails is read again to record. Under `error` the copy stops,
   naming the row, column and value, and starts again after a delay of 5 seconds
   that doubles each time, up to 5 minutes, from the start of a table's last copy
   or the failure of a subscription's first;
@@ -949,24 +962,26 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   trigger or a function it runs writes to or rewrites a table whose index it
   copies or attaches, since the index wouldn't get the rows. Names PostgreSQL
   chooses for new objects are the same on every node, and DDL that takes its
-  name renames it, with a warning. To keep them so, DDL that creates, renames or
-  indexes relations, which includes a composite type's change, rename or move,
-  `SELECT INTO` and `EXPLAIN ANALYZE` of such DDL, moves the indexes on its node
-  alone out of the way in the schemas it does that in, which include those of
-  the partitions an index on a partitioned table or a partition attached builds
-  indexes in, finding names as the role that ran it, until the transaction ends,
-  which holds up other DDL on them meanwhile: DDL from another node that moves
-  or passes over them waits for a local transaction whose DDL moved them. Each
-  statement locks them in the same order, but a transaction whose DDL works in
-  more than one schema can deadlock with one that works in them in another
-  order; PostgreSQL ends one of them, and apply runs its transaction again. DDL
-  that creates no relations, as a function's, another type's or a sequence's
-  change, or a DROP, moves none. A statement that sets something, as `SET
-  search_path` does, and a DO block, a procedure or an extension, which can
-  create relations anywhere, move them in every schema.
-  `worf.replicate_ddl_command` does the same on every node. Relations that a
-  function creates, as one a SELECT calls, can still take other names than on
-  the other nodes.
+  name renames it, with a warning. To keep them so, DDL moves the indexes on its
+  node alone whose names it could take out of its way: those with the names of
+  the relations it creates or renames, or moves to another schema with their
+  indexes and sequences, as `ALTER EXTENSION ... SET SCHEMA` moves an
+  extension's, and those whose names start as those of the tables it creates,
+  alters, indexes or attaches, and of their partitions, from which PostgreSQL
+  chooses names. It finds names as the role that ran it, and after a statement
+  that may set the search path, as `SET search_path` or a SELECT that calls
+  `set_config` can, looks for them in every schema. A DO block, a procedure,
+  `CREATE EXTENSION`, `ALTER EXTENSION ... UPDATE` and `IMPORT FOREIGN SCHEMA`,
+  which can create relations of any name, move every one. An index moved, or
+  passed over, is locked until the transaction ends, so DDL from another node
+  that moves or passes over it waits for a local transaction whose DDL did.
+  Each statement locks those it moves and passes over in one order, but two
+  transactions whose statements lock them in other orders can deadlock; apply
+  looks for deadlocks after 100 ms, sooner than a session with the default
+  `deadlock_timeout`, so it's the one that fails, and runs its transaction
+  again. `worf.replicate_ddl_command` does the same on every node. Relations
+  that a function creates, as one a SELECT calls, can still take other names
+  than on the other nodes.
   DDL from another node that can't build it again, as a unique one that finds
   duplicate keys when a table is rewritten, drops it, with a warning that
   gives its definition. Drop it: until then a unique one still rejects
@@ -989,7 +1004,8 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   How often each node exchanges sequence range reports with its neighbors
   when no request, grant or reset is waiting. A failed exchange is retried
   after a delay that doubles up to this, or up to half
-  `worf.sequence_range_timeout` while something waits on that neighbor. The
+  `worf.sequence_range_timeout` while something waits on that neighbor; one
+  that ran out of time, up to a minute or this, whichever is longer. The
   user in each provider connection string needs `EXECUTE` on
   `worf.sequence_range_exchange`, which `PUBLIC` doesn't have. The default is
   `1min`.
@@ -997,8 +1013,11 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
 - `worf.sequence_range_timeout`
   How long a sequence range exchange waits for the other node's host to
   answer, and for each call to the other node. Inserts near the end of a block
-  wait up to twice this in all for the switch, which then waits up to this for
-  the transactions drawing from the block. The default is `10s`.
+  wait up to twice this in all for the switch, which a switch worker makes once
+  the transactions drawing from the block end, however long they take, and a
+  transaction that runs the block out switches it itself once the other
+  transactions holding the sequence end, waiting up to this for them. The
+  default is `10s`.
 
 - `worf.ddl_lock_timeout`
   How long DDL waits in all for the other nodes to hold back their writes and
@@ -1120,15 +1139,17 @@ constraints must *not be more restrictive* than those on the upstream(s).
 Partial secondary unique indexes are permitted, but will be ignored for
 conflict resolution purposes.
 
-### Unique constraints must not be deferrable
+### Deferrable constraints
 
-On the downstream end worf does not support index-based constraints
-defined as `DEFERRABLE`. It will emit the error
+Apply runs with `session_replication_role` set to `replica`, under which
+PostgreSQL doesn't recheck deferrable unique indexes and exclusion constraints.
+Apply finds conflicts in a deferrable unique index itself, as in any unique
+index, unless the index has expressions or a predicate. It refuses to insert or
+update rows of a table with such an index or a deferrable exclusion constraint,
+with the error
 
     ERROR: worf doesn't support index rechecks needed for deferrable indexes
-    DETAIL: relation "public"."test_relation" has deferrable indexes: "index1", "index2"
-
-if such an index is present when it attempts to apply changes to a table.
+    DETAIL: relation public.test_relation has deferrable indexes: index1, index2
 
 ### DDL
 
@@ -1145,10 +1166,12 @@ A replicated `ALTER TABLE ... ADD COLUMN` with a volatile default, such as
 values.
 
 With `worf.global_ddl_lock`, DDL that takes the lock fails at once with
-SQLSTATE `55P03` when an earlier statement in its transaction locked or wrote
-to rows that another node's changes, which this node applies first, need, as
-`LOCK TABLE`, `TRUNCATE` or an `UPDATE` of a row another node changed can. Run
-such DDL first in its transaction, or in a transaction of its own. A node
+SQLSTATE `55P03` when an earlier statement in its transaction holds a lock that
+another node's changes, which this node applies first, need: on rows or tables
+it locked or wrote to, as `LOCK TABLE`, `TRUNCATE` or an `UPDATE` of a row
+another node changed take, or on the indexes on this node alone that earlier
+DDL moved aside or passed over. Run such DDL first in its transaction, or in a
+transaction of its own. A node
 notices within about a minute that a node holding back its writes for DDL died
 before the DDL committed.
 

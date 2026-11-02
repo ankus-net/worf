@@ -1,4 +1,5 @@
 using Ankus.Postgres;
+using System.Text;
 
 [assembly: PgSql("local_index", """
     CREATE TABLE worf.local_index (
@@ -357,8 +358,9 @@ internal static unsafe partial class LocalIndex
     /// <summary>
     /// Moves the indexes on this node alone out of the way of DDL from another node, or that replicate_ddl_command runs,
     /// which, without them, may create objects under their names, or choose names for its own that would otherwise
-    /// differ from the other nodes'. Only those in the schemas where the DDL creates or names relations are moved, as
-    /// each is locked until the transaction ends, which holds up other DDL on it.
+    /// differ from the other nodes'. Only those whose names the DDL could take are moved, as each is locked until the
+    /// transaction ends, which holds up other DDL on it, and those that its statements will hide are locked with them,
+    /// in one order, so that DDL here and DDL from another node don't deadlock on them.
     /// </summary>
     /// <param name="command">The DDL.</param>
     /// <param name="role">The role that runs it, as which its names are found.</param>
@@ -371,9 +373,11 @@ internal static unsafe partial class LocalIndex
         }
 
         // The statement's names are found as the role that ran it finds them, as its own search path's "$user" does,
-        // as that user rather than with the role set, which a security-definer function can't do. A statement that sets
-        // something, as the search path, changes how the ones after it find names, so every schema's indexes move.
-        HashSet<uint>? schemas = [];
+        // as that user rather than with the role set, which a security-definer function can't do. A statement that may
+        // set something, as the search path, changes where the ones after it find names, so theirs are looked for in
+        // every schema.
+        List<(uint Schema, string Name, bool Prefix)>? names = [];
+        List<uint> hiding = [];
         uint userId;
         int secContext;
         NativeMethods.GetUserIdAndSecContext(&userId, &secContext);
@@ -381,11 +385,18 @@ internal static unsafe partial class LocalIndex
         try
         {
             List* statements = NativeMethods.raw_parser(Worf.PStrDup(command), RawParseMode.RAW_PARSE_DEFAULT);
-            for (int i = 0; schemas is not null && statements is not null && i < statements->length; i++)
+            bool pathKnown = true;
+            for (int i = 0; statements is not null && i < statements->length; i++)
             {
                 Node* statement = ((RawStmt*)statements->elements[i].ptr_value)->stmt;
-                HashSet<uint>? named = statement->type == NodeTag.T_VariableSetStmt ? null : NamingSchemas(statement);
-                schemas = named is null ? null : [.. schemas, .. named];
+                if (names is not null)
+                {
+                    List<(uint Schema, string Name, bool Prefix)>? taken = NamesTaken(statement, pathKnown);
+                    names = taken is null ? null : [.. names, .. taken];
+                }
+
+                UsedTables(statement, hiding, hiding);
+                pathKnown = pathKnown && !MaySet(statement);
             }
         }
         finally
@@ -393,29 +404,78 @@ internal static unsafe partial class LocalIndex
             NativeMethods.SetUserIdAndSecContext(userId, secContext);
         }
 
-        return MoveAside(schemas);
+        return MoveAside(names, hiding);
     }
 
     /// <summary>
-    /// Moves the indexes on this node alone in some schemas out of the way of a statement.
+    /// Checks whether DDL from another node writes rows to existing tables, or may, whose unique indexes on this node
+    /// alone then find duplicates in them, rather than in an index built again.
     /// </summary>
-    /// <param name="schemas">The schemas, or null for every schema.</param>
+    /// <param name="command">The DDL.</param>
+    /// <returns>Whether it may.</returns>
+    internal static bool WritesRows(string command)
+    {
+        List* statements = NativeMethods.raw_parser(Worf.PStrDup(command), RawParseMode.RAW_PARSE_DEFAULT);
+        for (int i = 0; statements is not null && i < statements->length; i++)
+        {
+            Node* statement = ((RawStmt*)statements->elements[i].ptr_value)->stmt;
+            if (MaySet(statement) && statement->type is not (NodeTag.T_VariableSetStmt or NodeTag.T_CreateTableAsStmt) &&
+                !(statement->type == NodeTag.T_SelectStmt && Into((SelectStmt*)statement) is not null))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Checks whether a statement may set something, as the search path, through a function it runs or itself.
+    /// </summary>
+    private static bool MaySet(Node* statement) => statement->type is NodeTag.T_VariableSetStmt or NodeTag.T_SelectStmt or
+        NodeTag.T_InsertStmt or NodeTag.T_UpdateStmt or NodeTag.T_DeleteStmt or NodeTag.T_MergeStmt or NodeTag.T_ExplainStmt or
+        NodeTag.T_CreateTableAsStmt or NodeTag.T_CopyStmt or NodeTag.T_DoStmt or NodeTag.T_CallStmt or NodeTag.T_ExecuteStmt;
+
+    /// <summary>
+    /// Moves the indexes on this node alone whose names a statement could take out of its way, after it locks them and
+    /// those of the tables whose indexes it will hide, in the order of their OIDs.
+    /// </summary>
+    /// <param name="names">The names, or null for every name.</param>
+    /// <param name="hiding">The tables whose indexes on this node alone the statement will hide.</param>
     /// <returns>The indexes moved, with their names.</returns>
-    private static List<(uint Index, string Name)> MoveAside(HashSet<uint>? schemas)
+    private static List<(uint Index, string Name)> MoveAside(List<(uint Schema, string Name, bool Prefix)>? names, List<uint> hiding)
     {
         List<(uint Index, string Name)> moved = [];
-        if (schemas is { Count: 0 })
+        if (names is { Count: 0 } && hiding.Count == 0)
         {
             return moved;
         }
 
-        // They go in the order of their OIDs, on every path, so that DDL here and DDL from another node never deadlock.
-        SpiResult result = Elevated.Run(() => Worf.Read("SELECT indexrelid FROM worf.local_index ORDER BY indexrelid", 0));
-        foreach (uint relid in result.Select(row => row.Get<uint>(0)))
+        SpiResult result = Elevated.Run(() => Worf.Read("""
+            SELECT l.indexrelid, i.indrelid FROM worf.local_index l JOIN pg_catalog.pg_index i ON i.indexrelid = l.indexrelid
+            ORDER BY 1
+            """, 0));
+        List<uint> moving = [];
+        foreach ((uint relid, uint table) in result.Select(row => (row.Get<uint>(0), row.Get<uint>(1))))
+        {
+            bool takes = Takes(names, relid);
+            if (takes || hiding.Contains(table))
+            {
+                NativeMethods.LockRelationOid(relid, (int)PgLockMode.ShareUpdateExclusive);
+            }
+
+            // Its name is read again once it's locked, as a rename may have committed meanwhile.
+            if (takes && Takes(names, relid))
+            {
+                moving.Add(relid);
+            }
+        }
+
+        foreach (uint relid in moving)
         {
             sbyte* name = NativeMethods.get_rel_name(relid);
             uint nspoid = NativeMethods.get_rel_namespace(relid);
-            if (name is null || (schemas is not null && !schemas.Contains(nspoid)))
+            if (name is null)
             {
                 continue;
             }
@@ -431,104 +491,292 @@ internal static unsafe partial class LocalIndex
     }
 
     /// <summary>
-    /// Finds the schemas in which a statement creates, renames or chooses names for relations, whose names an index on
-    /// this node alone could take: those of the tables it creates, alters, indexes or renames, and of their partitions
-    /// and the partitions it attaches, where the indexes it builds on them go. A statement that can create relations
-    /// anywhere, as a DO block, a procedure or an extension can, may take any schema's names, and any other, as a
-    /// function's, a type's or a DROP, none.
+    /// Checks whether a statement could take an index's name: one it gives, or one PostgreSQL chooses from a table's,
+    /// which starts with as much of it as fits beside the rest, at least 20 bytes.
     /// </summary>
-    /// <returns>The schemas, or null for every schema.</returns>
-    private static HashSet<uint>? NamingSchemas(Node* parsetree)
+    private static bool Takes(List<(uint Schema, string Name, bool Prefix)>? names, uint relid)
     {
-        // EXPLAIN ANALYZE runs the statement it explains, and a type's rename or move renames or moves a composite
-        // type's relation.
-        if (parsetree->type == NodeTag.T_ExplainStmt)
+        sbyte* current = NativeMethods.get_rel_name(relid);
+        if (current is null)
         {
-            return NamingSchemas(((ExplainStmt*)parsetree)->query);
+            return false;
         }
 
-        if ((parsetree->type == NodeTag.T_RenameStmt && ((RenameStmt*)parsetree)->renameType == ObjectType.OBJECT_TYPE) ||
-            (parsetree->type == NodeTag.T_AlterObjectSchemaStmt && ((AlterObjectSchemaStmt*)parsetree)->objectType == ObjectType.OBJECT_TYPE))
+        if (names is null)
         {
-            List* typeName = (List*)(parsetree->type == NodeTag.T_RenameStmt ? ((RenameStmt*)parsetree)->@object : ((AlterObjectSchemaStmt*)parsetree)->@object);
-            uint typid = NativeMethods.LookupTypeNameOid(null, NativeMethods.makeTypeNameFromNameList(typeName), true);
-            uint typrelid = typid == 0 ? 0 : NativeMethods.get_typ_typrelid(typid);
-            if (typrelid == 0)
-            {
-                return typid == 0 ? null : [];
-            }
-
-            uint target = parsetree->type == NodeTag.T_AlterObjectSchemaStmt
-                ? NativeMethods.get_namespace_oid(((AlterObjectSchemaStmt*)parsetree)->newschema, true)
-                : NativeMethods.get_rel_namespace(typrelid);
-            return target == 0 ? null : [NativeMethods.get_rel_namespace(typrelid), target];
+            return true;
         }
 
-        (nint relation, bool creating) = parsetree->type switch
-        {
-            NodeTag.T_IndexStmt => ((nint)((IndexStmt*)parsetree)->relation, false),
-            NodeTag.T_CreateStmt or NodeTag.T_CreateForeignTableStmt => ((nint)((CreateStmt*)parsetree)->relation, true),
-            NodeTag.T_AlterTableStmt => ((nint)((AlterTableStmt*)parsetree)->relation, false),
-            NodeTag.T_CreateSeqStmt => ((nint)((CreateSeqStmt*)parsetree)->sequence, true),
-            NodeTag.T_ViewStmt => ((nint)((ViewStmt*)parsetree)->view, true),
-            NodeTag.T_CreateTableAsStmt => ((nint)((CreateTableAsStmt*)parsetree)->into->rel, true),
-            NodeTag.T_SelectStmt => (((SelectStmt*)parsetree)->intoClause is null ? 0 : (nint)((SelectStmt*)parsetree)->intoClause->rel, true),
-            NodeTag.T_CompositeTypeStmt => ((nint)((CompositeTypeStmt*)parsetree)->typevar, true),
-            NodeTag.T_RenameStmt or NodeTag.T_AlterObjectSchemaStmt => (parsetree->type == NodeTag.T_RenameStmt
-                ? (nint)((RenameStmt*)parsetree)->relation : (nint)((AlterObjectSchemaStmt*)parsetree)->relation, false),
-            _ => (0, false),
-        };
-        if (relation != 0)
-        {
-            uint schema = SchemaOf((RangeVar*)relation, creating);
-            uint target = parsetree->type == NodeTag.T_AlterObjectSchemaStmt
-                ? NativeMethods.get_namespace_oid(((AlterObjectSchemaStmt*)parsetree)->newschema, true)
-                : schema;
-            if (schema == 0 || target == 0)
-            {
-                return null;
-            }
-
-            HashSet<uint> schemas = [schema, target];
-            if (parsetree->type is NodeTag.T_IndexStmt or NodeTag.T_AlterTableStmt)
-            {
-                AddTreeSchemas(schemas, (RangeVar*)relation);
-            }
-
-            List* cmds = parsetree->type == NodeTag.T_AlterTableStmt ? ((AlterTableStmt*)parsetree)->cmds : null;
-            for (int i = 0; cmds is not null && i < cmds->length; i++)
-            {
-                AlterTableCmd* cmd = (AlterTableCmd*)cmds->elements[i].ptr_value;
-                if (cmd->subtype == AlterTableType.AT_AttachPartition && cmd->def is not null)
-                {
-                    AddTreeSchemas(schemas, ((PartitionCmd*)cmd->def)->name);
-                }
-            }
-
-            return schemas;
-        }
-
-        return parsetree->type is NodeTag.T_DoStmt or NodeTag.T_CallStmt or NodeTag.T_CreateExtensionStmt or NodeTag.T_AlterExtensionStmt or
-            NodeTag.T_AlterExtensionContentsStmt or NodeTag.T_ImportForeignSchemaStmt
-            ? null
-            : [];
+        string name = Worf.FromServer(current);
+        uint nspoid = NativeMethods.get_rel_namespace(relid);
+        return names.Exists(taken => (taken.Schema == 0 || taken.Schema == nspoid) &&
+            (taken.Prefix ? name.StartsWith(ChosenStart(taken.Name), StringComparison.Ordinal) : name == taken.Name));
     }
 
     /// <summary>
-    /// Adds the schemas of a table and its partitions and inheritors, in which the indexes a statement builds on them go.
+    /// Gives the start of a table's name that the names PostgreSQL chooses from it keep: <c>makeObjectName</c> cuts the
+    /// longer of the two names it joins until they fit, so the table's keeps at least half of what the label leaves.
     /// </summary>
-    private static void AddTreeSchemas(HashSet<uint> schemas, RangeVar* relation)
+    private static string ChosenStart(string table)
     {
-        uint relid = relation is null ? 0 : NativeMethods.RangeVarGetRelidExtended(relation, 0, RangeVarMissingOk, default, null);
+        const int Kept = 20;
+        int bytes = 0;
+        int at = 0;
+        while (at < table.Length)
+        {
+            int length = char.IsSurrogatePair(table, at) ? 2 : 1;
+            bytes += Encoding.UTF8.GetByteCount(table.AsSpan(at, length));
+            if (bytes > Kept)
+            {
+                break;
+            }
+
+            at += length;
+        }
+
+        return table[..at];
+    }
+
+    /// <summary>
+    /// Finds the names a statement may give relations, which an index on this node alone could have: those it gives
+    /// relations it creates or renames, or that a table, index or type it moves to another schema has, with the
+    /// indexes and sequences that move with it, and the starts of those PostgreSQL chooses from the tables it creates,
+    /// alters, indexes or attaches, and from their partitions, for their indexes and sequences. A statement that can
+    /// create relations anywhere, as a DO block, a procedure or an extension can, may take any name, and any other, as
+    /// a function's, a DROP or a statement that names no relation, none.
+    /// </summary>
+    /// <param name="parsetree">The statement.</param>
+    /// <param name="pathKnown">Whether the search path the statement finds names on is the current one.</param>
+    /// <returns>The names, in their schemas or, with a zero schema, in any, or null for every name.</returns>
+    private static List<(uint Schema, string Name, bool Prefix)>? NamesTaken(Node* parsetree, bool pathKnown)
+    {
+        List<(uint Schema, string Name, bool Prefix)> names = [];
+        switch (parsetree->type)
+        {
+            // EXPLAIN ANALYZE runs the statement it explains.
+            case NodeTag.T_ExplainStmt:
+                return NamesTaken(((ExplainStmt*)parsetree)->query, pathKnown);
+
+            case NodeTag.T_DoStmt or NodeTag.T_CallStmt or NodeTag.T_CreateExtensionStmt or NodeTag.T_AlterExtensionStmt or
+                NodeTag.T_ImportForeignSchemaStmt:
+                return null;
+
+            case NodeTag.T_CreateStmt or NodeTag.T_CreateForeignTableStmt:
+                CreateStmt* create = (CreateStmt*)parsetree;
+                uint schema = SchemaOf(create->relation, true, pathKnown);
+                string table = Worf.FromServer(create->relation->relname);
+                names.Add((schema, table, false));
+                names.Add((schema, table, true));
+                AddConstraintNames(names, schema, create->tableElts);
+                break;
+
+            case NodeTag.T_IndexStmt:
+                IndexStmt* index = (IndexStmt*)parsetree;
+                if (index->idxname is not null)
+                {
+                    names.Add((SchemaOf(index->relation, false, pathKnown), Worf.FromServer(index->idxname), false));
+                }
+
+                AddTreeNames(names, index->relation, pathKnown);
+                break;
+
+            case NodeTag.T_AlterTableStmt when ((AlterTableStmt*)parsetree)->objtype == ObjectType.OBJECT_TABLE:
+                AlterTableStmt* alter = (AlterTableStmt*)parsetree;
+                AddTreeNames(names, alter->relation, pathKnown);
+                uint altered = SchemaOf(alter->relation, false, pathKnown);
+                List* cmds = alter->cmds;
+                for (int i = 0; cmds is not null && i < cmds->length; i++)
+                {
+                    AlterTableCmd* cmd = (AlterTableCmd*)cmds->elements[i].ptr_value;
+                    if (cmd->subtype == AlterTableType.AT_AttachPartition && cmd->def is not null)
+                    {
+                        AddTreeNames(names, ((PartitionCmd*)cmd->def)->name, pathKnown);
+                    }
+                    else if (cmd->subtype is AlterTableType.AT_AddConstraint or AlterTableType.AT_AddColumn && cmd->def is not null)
+                    {
+                        AddConstraintNames(names, altered, cmd->def);
+                    }
+                }
+
+                break;
+
+            case NodeTag.T_CreateSeqStmt:
+                names.Add((SchemaOf(((CreateSeqStmt*)parsetree)->sequence, true, pathKnown), Worf.FromServer(((CreateSeqStmt*)parsetree)->sequence->relname), false));
+                break;
+
+            case NodeTag.T_ViewStmt:
+                names.Add((SchemaOf(((ViewStmt*)parsetree)->view, true, pathKnown), Worf.FromServer(((ViewStmt*)parsetree)->view->relname), false));
+                break;
+
+            case NodeTag.T_CompositeTypeStmt:
+                names.Add((SchemaOf(((CompositeTypeStmt*)parsetree)->typevar, true, pathKnown), Worf.FromServer(((CompositeTypeStmt*)parsetree)->typevar->relname), false));
+                break;
+
+            case NodeTag.T_CreateTableAsStmt or NodeTag.T_SelectStmt:
+                IntoClause* into = parsetree->type == NodeTag.T_CreateTableAsStmt ? ((CreateTableAsStmt*)parsetree)->into : Into((SelectStmt*)parsetree);
+                if (into is not null)
+                {
+                    names.Add((SchemaOf(into->rel, true, pathKnown), Worf.FromServer(into->rel->relname), false));
+                }
+
+                break;
+
+            case NodeTag.T_RenameStmt:
+                return RenamedNames((RenameStmt*)parsetree, pathKnown);
+
+            case NodeTag.T_AlterObjectSchemaStmt:
+                return MovedNames((AlterObjectSchemaStmt*)parsetree, pathKnown);
+
+            default:
+                break;
+        }
+
+        return names;
+    }
+
+    /// <summary>
+    /// Finds the name a rename gives a relation, a composite type's relation or the index of a constraint.
+    /// </summary>
+    private static List<(uint Schema, string Name, bool Prefix)>? RenamedNames(RenameStmt* rename, bool pathKnown)
+    {
+        string newname = rename->newname is null ? "" : Worf.FromServer(rename->newname);
+        switch (rename->renameType)
+        {
+            case ObjectType.OBJECT_TABLE or ObjectType.OBJECT_INDEX or ObjectType.OBJECT_SEQUENCE or ObjectType.OBJECT_VIEW or
+                ObjectType.OBJECT_MATVIEW or ObjectType.OBJECT_FOREIGN_TABLE or ObjectType.OBJECT_TABCONSTRAINT:
+                return [(SchemaOf(rename->relation, false, pathKnown), newname, false)];
+
+            case ObjectType.OBJECT_TYPE:
+                uint typid = NativeMethods.LookupTypeNameOid(null, NativeMethods.makeTypeNameFromNameList((List*)rename->@object), true);
+                uint typrelid = typid == 0 ? 0 : NativeMethods.get_typ_typrelid(typid);
+                return typid == 0 ? null : typrelid == 0 ? [] : [(pathKnown ? NativeMethods.get_rel_namespace(typrelid) : 0, newname, false)];
+
+            default:
+                return [];
+        }
+    }
+
+    /// <summary>
+    /// Finds the names that a relation, a composite type's relation or an extension's relations moved to another
+    /// schema take there, with those of the indexes and sequences that move with them.
+    /// </summary>
+    private static List<(uint Schema, string Name, bool Prefix)>? MovedNames(AlterObjectSchemaStmt* move, bool pathKnown)
+    {
+        uint target = NativeMethods.get_namespace_oid(move->newschema, true);
+        uint relid;
+        switch (move->objectType)
+        {
+            case ObjectType.OBJECT_TABLE or ObjectType.OBJECT_SEQUENCE or ObjectType.OBJECT_VIEW or ObjectType.OBJECT_MATVIEW or
+                ObjectType.OBJECT_FOREIGN_TABLE:
+                relid = move->relation is null || !(pathKnown || move->relation->schemaname is not null) ? 0
+                    : NativeMethods.RangeVarGetRelidExtended(move->relation, 0, RangeVarMissingOk, default, null);
+                break;
+
+            case ObjectType.OBJECT_TYPE:
+                uint typid = NativeMethods.LookupTypeNameOid(null, NativeMethods.makeTypeNameFromNameList((List*)move->@object), true);
+                relid = typid == 0 ? 0 : NativeMethods.get_typ_typrelid(typid);
+                if (typid != 0 && relid == 0)
+                {
+                    return [];
+                }
+
+                break;
+
+            case ObjectType.OBJECT_EXTENSION:
+                RelationData* rel = null;
+                ObjectAddress extension = NativeMethods.get_object_address(ObjectType.OBJECT_EXTENSION, move->@object, &rel, (int)PgLockMode.AccessShare, true);
+                return target == 0 || extension.objectId == 0 ? null : [.. Elevated.Run(() => Worf.Read("""
+                    WITH m AS (
+                        SELECT c.oid, c.relname FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_class c ON c.oid = d.objid
+                        WHERE d.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass AND d.refobjid = $1
+                            AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.deptype = 'e'
+                        UNION
+                        SELECT c.oid, c.relname FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_type t ON t.oid = d.objid
+                            JOIN pg_catalog.pg_class c ON c.oid = t.typrelid
+                        WHERE d.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass AND d.refobjid = $1
+                            AND d.classid = 'pg_catalog.pg_type'::pg_catalog.regclass AND d.deptype = 'e'
+                    )
+                    SELECT relname::pg_catalog.text FROM m
+                    UNION
+                    SELECT c.relname::pg_catalog.text FROM m JOIN pg_catalog.pg_index i ON i.indrelid = m.oid JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
+                    """, 0, SpiParameter.Create(extension.objectId))).Select(row => (target, row.Get<string>(0), false))];
+
+            default:
+                return [];
+        }
+
+        return target == 0 || relid == 0 ? null : [.. Elevated.Run(() => Worf.Read("""
+            SELECT relname::pg_catalog.text FROM pg_catalog.pg_class WHERE oid = $1
+            UNION
+            SELECT c.relname::pg_catalog.text FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid WHERE i.indrelid = $1
+            UNION
+            SELECT c.relname::pg_catalog.text FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_class c ON c.oid = d.objid
+            WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
+                AND d.refobjid = $1 AND d.deptype IN ('a', 'i') AND c.relkind = 'S'
+            """, 0, SpiParameter.Create(relid))).Select(row => (target, row.Get<string>(0), false))];
+    }
+
+    /// <summary>
+    /// Finds the table that <c>SELECT ... INTO</c> creates, which the first SELECT of a set operation names.
+    /// </summary>
+    private static IntoClause* Into(SelectStmt* select)
+    {
+        while (select->op != SetOperation.SETOP_NONE && select->larg is not null)
+        {
+            select = select->larg;
+        }
+
+        return select->intoClause;
+    }
+
+    /// <summary>
+    /// Adds the names that the unique, primary key and exclusion constraints a table's columns or table elements
+    /// define give their indexes.
+    /// </summary>
+    private static void AddConstraintNames(List<(uint Schema, string Name, bool Prefix)> names, uint schema, List* elements)
+    {
+        for (int i = 0; elements is not null && i < elements->length; i++)
+        {
+            AddConstraintNames(names, schema, (Node*)elements->elements[i].ptr_value);
+        }
+    }
+
+    private static void AddConstraintNames(List<(uint Schema, string Name, bool Prefix)> names, uint schema, Node* element)
+    {
+        if (element->type == NodeTag.T_ColumnDef)
+        {
+            AddConstraintNames(names, schema, ((ColumnDef*)element)->constraints);
+        }
+        else if (element->type == NodeTag.T_Constraint && ((Constraint*)element)->conname is not null &&
+            ((Constraint*)element)->contype is ConstrType.CONSTR_PRIMARY or ConstrType.CONSTR_UNIQUE or ConstrType.CONSTR_EXCLUSION)
+        {
+            names.Add((schema, Worf.FromServer(((Constraint*)element)->conname), false));
+        }
+    }
+
+    /// <summary>
+    /// Adds the starts of the names PostgreSQL chooses from a table and from its partitions and inheritors, in their
+    /// schemas, for the indexes a statement builds on them and the sequences it creates for them.
+    /// </summary>
+    private static void AddTreeNames(List<(uint Schema, string Name, bool Prefix)> names, RangeVar* relation, bool pathKnown)
+    {
+        uint relid = relation is null || !(pathKnown || relation->schemaname is not null) ? 0
+            : NativeMethods.RangeVarGetRelidExtended(relation, 0, RangeVarMissingOk, default, null);
         if (relid == 0)
         {
+            if (relation is not null)
+            {
+                names.Add((SchemaOf(relation, false, pathKnown), Worf.FromServer(relation->relname), true));
+            }
+
             return;
         }
 
         List* tree = NativeMethods.find_all_inheritors(relid, (int)PgLockMode.None, null);
         for (int i = 0; tree is not null && i < tree->length; i++)
         {
-            _ = schemas.Add(NativeMethods.get_rel_namespace(tree->elements[i].oid_value));
+            uint member = tree->elements[i].oid_value;
+            names.Add((NativeMethods.get_rel_namespace(member), Worf.FromServer(NativeMethods.get_rel_name(member)), true));
         }
     }
 
@@ -537,7 +785,7 @@ internal static unsafe partial class LocalIndex
     /// creates it in, or that of the relation found.
     /// </summary>
     /// <returns>The schema, or zero when it can't be told.</returns>
-    private static uint SchemaOf(RangeVar* relation, bool creating)
+    private static uint SchemaOf(RangeVar* relation, bool creating, bool pathKnown)
     {
         if (relation is null)
         {
@@ -550,7 +798,13 @@ internal static unsafe partial class LocalIndex
         }
 
         // A relation created without a schema goes in the first schema of the path, where one can be created, and a
-        // statement whose path has none, as replicate_ddl_command's empty one, can't be told.
+        // statement whose path has none, as replicate_ddl_command's empty one, or whose path a statement before it may
+        // have set, can't be told.
+        if (!pathKnown)
+        {
+            return 0;
+        }
+
         if (creating)
         {
             List* path = NativeMethods.fetch_search_path(false);
@@ -629,7 +883,7 @@ internal static unsafe partial class LocalIndex
             return false;
         }
 
-        s_moved = rename ? MoveAside(NamingSchemas(parsetree)) : [];
+        s_moved = MoveAside(rename ? NamesTaken(parsetree, true) : [], [.. unlive, .. invalid]);
         s_hidden = [];
         Hide(unlive, true);
         Hide(invalid, false);

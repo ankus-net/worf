@@ -141,7 +141,7 @@ internal static unsafe partial class DdlReplication
         int length = Worf.StrLen(queryString);
         int start = Math.Clamp(pstmt->stmt_location, 0, length);
         int count = pstmt->stmt_len > 0 ? Math.Min(pstmt->stmt_len, length - start) : length - start;
-        string command = Worf.FromServer(new ReadOnlySpan<byte>((byte*)queryString + start, count)).Trim();
+        string command = Worf.FromServerExact(new ReadOnlySpan<byte>((byte*)queryString + start, count), "DDL that replicates").Trim();
         return parsetree->type == NodeTag.T_DropStmt ? DropCommand((DropStmt*)parsetree, command) : command;
     }
 

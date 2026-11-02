@@ -887,6 +887,15 @@ internal sealed partial class WorfNode
     }
 
     /// <summary>
+    /// Checks whether a replication origin has a slot in shared memory, which it keeps until it's dropped.
+    /// </summary>
+    /// <param name="originId">The origin.</param>
+    /// <returns>Whether it has.</returns>
+    internal static bool HasOriginSlot(ushort originId)
+        => Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_replication_origin_status WHERE local_id = $1)",
+            SpiParameter.Create((uint)originId));
+
+    /// <summary>
     /// Lists those of some replication origins that have no slot in shared memory.
     /// </summary>
     /// <param name="names">The origins' names.</param>

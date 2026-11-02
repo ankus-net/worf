@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text;
+using System.Text.Unicode;
 using Ankus.Postgres;
 using Path = System.IO.Path;
 
@@ -239,6 +240,51 @@ internal static partial class Worf
     /// <param name="value">The C string.</param>
     /// <returns>The string.</returns>
     internal static unsafe string FromServer(sbyte* value) => FromServer(new ReadOnlySpan<byte>(value, StrLen(value)));
+
+    /// <summary>
+    /// Converts bytes in the database encoding to a string that must keep them exactly, as DDL that replicates does,
+    /// failing on bytes that a SQL_ASCII database holds that aren't valid UTF-8, which a string can't keep.
+    /// </summary>
+    /// <param name="value">The bytes, without a terminator.</param>
+    /// <param name="what">What holds them, for the error.</param>
+    /// <returns>The string.</returns>
+    internal static string FromServerExact(ReadOnlySpan<byte> value, string what)
+        => NotUtf8InSqlAscii(value)
+            ? throw new PgException(PgSqlStates.CharacterNotInRepertoire, $"{what} holds bytes that aren't valid UTF-8, which worf can't replicate exactly")
+            : FromServer(value);
+
+    /// <summary>
+    /// Converts a value's text in the database encoding to a string for a log, or bytes that a SQL_ASCII database holds
+    /// that aren't valid UTF-8, which a string can't keep, to their hex, as bytea shows them, so that the value can
+    /// be restored from the log.
+    /// </summary>
+    /// <param name="value">The bytes, without a terminator.</param>
+    /// <returns>The string.</returns>
+    internal static string LoggedText(ReadOnlySpan<byte> value)
+        => NotUtf8InSqlAscii(value)
+            ? "\\x" + Convert.ToHexStringLower(value)
+            : FromServer(value);
+
+    /// <summary>
+    /// Checks whether bytes in the database encoding are a SQL_ASCII database's that aren't valid UTF-8.
+    /// </summary>
+    private static bool NotUtf8InSqlAscii(ReadOnlySpan<byte> value)
+    {
+        int encoding;
+        unsafe
+        {
+            encoding = NativeMethods.GetDatabaseEncoding();
+        }
+
+        return encoding == (int)pg_enc.PG_SQL_ASCII && !Utf8.IsValid(value);
+    }
+
+    /// <summary>
+    /// Converts a value's terminated text in the database encoding to a string for a log, as the other overload does.
+    /// </summary>
+    /// <param name="value">The C string.</param>
+    /// <returns>The string.</returns>
+    internal static unsafe string LoggedText(sbyte* value) => LoggedText(new ReadOnlySpan<byte>(value, StrLen(value)));
 
     /// <summary>
     /// Converts a string to a terminated C string in the database encoding.

@@ -45,15 +45,17 @@ constraints must *not be more restrictive* than those on the upstream(s).
 Partial secondary unique indexes are permitted, but will be ignored for
 conflict resolution purposes.
 
-## Unique constraints must not be deferrable
+## Deferrable constraints
 
-On the downstream end worf does not support index-based constraints
-defined as `DEFERRABLE`. It will emit the error
+Apply runs with `session_replication_role` set to `replica`, under which
+PostgreSQL doesn't recheck deferrable unique indexes and exclusion constraints.
+Apply finds conflicts in a deferrable unique index itself, as in any unique
+index, unless the index has expressions or a predicate. It refuses to insert or
+update rows of a table with such an index or a deferrable exclusion constraint,
+with the error
 
     ERROR: worf doesn't support index rechecks needed for deferrable indexes
-    DETAIL: relation "public"."test_relation" has deferrable indexes: "index1", "index2"
-
-if such an index is present when it attempts to apply changes to a table.
+    DETAIL: relation public.test_relation has deferrable indexes: index1, index2
 
 ## DDL
 
@@ -70,10 +72,12 @@ A replicated `ALTER TABLE ... ADD COLUMN` with a volatile default, such as
 values.
 
 With `worf.global_ddl_lock`, DDL that takes the lock fails at once with
-SQLSTATE `55P03` when an earlier statement in its transaction locked or wrote
-to rows that another node's changes, which this node applies first, need, as
-`LOCK TABLE`, `TRUNCATE` or an `UPDATE` of a row another node changed can. Run
-such DDL first in its transaction, or in a transaction of its own. A node
+SQLSTATE `55P03` when an earlier statement in its transaction holds a lock that
+another node's changes, which this node applies first, need: on rows or tables
+it locked or wrote to, as `LOCK TABLE`, `TRUNCATE` or an `UPDATE` of a row
+another node changed take, or on the indexes on this node alone that earlier
+DDL moved aside or passed over. Run such DDL first in its transaction, or in a
+transaction of its own. A node
 notices within about a minute that a node holding back its writes for DDL died
 before the DDL committed.
 
