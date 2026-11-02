@@ -712,6 +712,30 @@ public sealed partial class ExceptionBehaviourTests
         Assert.AreEqual("2", await subscriber.SafePsqlAsync(Database, "SELECT count(*) FROM x", token), "x's rows");
         Assert.DoesNotContain("with OID 0", subscriber.ReadLog(), "the subscriber's log");
 
+        // So does a table renamed, with another created under its name, which the change applies to.
+        await using (NpgsqlConnection renaming = await subscriber.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction rename = await renaming.BeginTransactionAsync(token);
+            await using (NpgsqlCommand command = new("LOCK TABLE x", renaming, rename))
+            {
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+
+            _ = await provider.SafePsqlAsync(Database, "INSERT INTO x DEFAULT VALUES", token);
+            Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE relation = 'x'::regclass AND NOT granted)", token), "the apply worker waiting for x");
+            await using (NpgsqlCommand command = new("ALTER TABLE x RENAME TO x_old; CREATE TABLE x (id serial PRIMARY KEY)", renaming, rename))
+            {
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+
+            await rename.CommitAsync(token);
+        }
+
+        _ = await provider.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
+        Assert.AreEqual("2|1", await subscriber.SafePsqlAsync(Database, "SELECT (SELECT count(*) FROM x_old), (SELECT count(*) FROM x)", token),
+            "the rows of the renamed x and the new x");
+
         foreach (string stop in new[] { "resume", "drop", "zero", "lost" })
         {
             string table = $"stopped_{stop}";
