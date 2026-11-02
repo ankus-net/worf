@@ -326,6 +326,14 @@ internal static unsafe partial class Executor
         Dictionary<uint, (string Name, string?[] Ties)>? ties = ddl is null ? null : LocalIndex.Ties(parsetree);
         bool isolated = LocalIndex.Isolate(parsetree, ddl is not null);
 
+        // A COPY FROM draws a buffer of values from a managed sequence before the guard sees the first of them.
+        bool copying = parsetree->type == NodeTag.T_CopyStmt && ((CopyStmt*)parsetree)->is_from && ((CopyStmt*)parsetree)->relation is not null;
+        if (copying)
+        {
+            SequenceRangeGuard.BeforeCopy(NativeMethods.RangeVarGetRelidExtended(((CopyStmt*)parsetree)->relation, 0, RangeVarMissingOk, default, null));
+            SequenceRangeGuard.Copying++;
+        }
+
         // A statement that commits on its way, and then fails, lets its fence go as its transaction aborts.
         uint xactFlags = DdlReplication.BeginStatement(ddl is not null);
         bool tracking = LocalIndex.BeginStatement(parsetree, ddl is not null);
@@ -343,6 +351,11 @@ internal static unsafe partial class Executor
         }
         finally
         {
+            if (copying)
+            {
+                SequenceRangeGuard.Copying--;
+            }
+
             LocalIndex.EndStatement(tracking);
             LocalIndex.EndIsolation(isolated);
             usedTemp = DdlReplication.EndStatement(xactFlags, ddl is not null);

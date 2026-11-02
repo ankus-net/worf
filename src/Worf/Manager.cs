@@ -245,9 +245,11 @@ internal static class Manager
         else if (now >= s_discoveryAt || requested != s_discoveryRequested)
         {
             // A database that manages nothing needs no range worker, so asking its providers takes one worker slot. The
-            // next round is due an exchange interval after this one starts, however long starting it took.
+            // next round is due an exchange interval after this one starts, however long starting it took. Only the
+            // first round, or one a backend asked for, waits for a subscription making its slot.
+            bool waitsForSlots = s_discoveryAt == 0 || requested != s_discoveryRequested;
             s_discoveryRequested = requested;
-            started = StartRangeWorker(WorfWorkerType.Exchange, dboid, exchangeCrashed);
+            started = StartRangeWorker(WorfWorkerType.Exchange, dboid, exchangeCrashed, waitsForSlots);
             s_watching |= started && !exchangeCrashed;
             s_discoveryAt = Worker.GetCurrentTimestamp() + (SequenceRanges.ExchangeInterval * 1000L);
         }
@@ -277,7 +279,7 @@ internal static class Manager
     /// stop the manager.
     /// </summary>
     /// <returns>Whether it started, or wasn't to start.</returns>
-    private static bool StartRangeWorker(WorfWorkerType type, uint dboid, bool skip)
+    private static bool StartRangeWorker(WorfWorkerType type, uint dboid, bool skip, bool waitsForSlots = true)
     {
         if (skip)
         {
@@ -286,7 +288,12 @@ internal static class Manager
 
         try
         {
-            _ = Worker.WorkerRegister(new WorfWorker { WorkerType = type, Dboid = dboid });
+            _ = Worker.WorkerRegister(new WorfWorker
+            {
+                WorkerType = type,
+                Dboid = dboid,
+                Worker = new WorfWorkerInfo { Exchange = new WorfExchangeWorker { WaitsForSlots = waitsForSlots } },
+            });
             return true;
         }
         catch (PgException error)

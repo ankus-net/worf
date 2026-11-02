@@ -34,8 +34,7 @@ internal static class SequenceRangeSwitchWorker
             }
             catch (PgException error) when (error.SqlState is "55P03" or "40P01")
             {
-                // A transaction held the range row, as a reset does, a slice of the wait for the sequence ran out, or the
-                // wait deadlocked, and the worker waits again.
+                // A transaction held the range row, as a reset does, or the wait deadlocked, and the worker waits again.
                 _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(10));
             }
         }
@@ -50,8 +49,9 @@ internal static class SequenceRangeSwitchWorker
     /// Starts a switch worker for a sequence, unless one runs for it.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
+    /// <param name="name">The sequence's name, for a warning.</param>
     /// <returns>Whether one runs, or false when every worker slot is taken.</returns>
-    internal static bool Start(uint seqoid)
+    internal static bool Start(uint seqoid, string name)
     {
         if (Running(seqoid))
         {
@@ -74,7 +74,7 @@ internal static class SequenceRangeSwitchWorker
             // Each sequence warns once until a worker starts for it, rather than at every check.
             if (s_unstarted.Add(seqoid))
             {
-                PgLog.Warning($"could not start the sequence switch worker for sequence {seqoid}: {error.Message}");
+                PgLog.Warning($"could not start the sequence switch worker for sequence {name}: {error.Message}");
             }
 
             return false;

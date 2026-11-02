@@ -57,6 +57,18 @@ internal static class SequenceRangeGuard
     private static readonly Dictionary<(uint Seqoid, long Lo), long> s_waited = [];
     private static readonly HashSet<(uint Seqoid, long Lo)> s_waitedInTransaction = [];
 
+    // The active blocks, by sequence and start, that this transaction has tried to switch away from itself, as it ran
+    // them out, and how many COPY FROM statements run in this backend, which draw a buffer of values before the guard
+    // sees the first of them.
+    private static readonly HashSet<(uint Seqoid, long Lo)> s_switchedInTransaction = [];
+    private const int CopyBuffered = 1000;
+
+    /// <summary>
+    /// Gets or sets how many COPY FROM statements run in this backend, which draw up to a buffer of values, a thousand,
+    /// before the guard sees the first of them.
+    /// </summary>
+    internal static int Copying { get; set; }
+
     /// <summary>
     /// The guard's trigger function. The triggers' conditions do the checking and are never true, so this never runs.
     /// Its arguments list what the guard checks.
@@ -471,19 +483,23 @@ internal static class SequenceRangeGuard
                         WaitForSwitch(seqoid, lo);
                     }
 
-                    if (s_reached.TryGetValue(seqoid, out long reached) && (sequence.Ascending ? reached >= value : reached <= value))
-                    {
-                        return true;
-                    }
-
-                    long? last = Position(seqoid);
-                    if (last is long position && (sequence.Ascending ? position >= value : position <= value))
+                    bool admitted = s_reached.TryGetValue(seqoid, out long reached) && (sequence.Ascending ? reached >= value : reached <= value);
+                    if (!admitted && Position(seqoid) is long position && (sequence.Ascending ? position >= value : position <= value))
                     {
                         s_reached[seqoid] = position;
-                        return true;
+                        admitted = true;
                     }
 
-                    return false;
+                    // A transaction that runs the block out, which holds the sequence against any other switch, switches
+                    // it itself, so that its later rows take the next block's values: at the block's last value, or, in
+                    // a COPY, which draws a buffer of values before the guard sees them, a buffer before it.
+                    decimal left = sequence.Ascending ? (decimal)hi - value : (decimal)value - lo;
+                    if (admitted && (left == 0 || (Copying > 0 && left < CopyBuffered)))
+                    {
+                        SwitchInTransaction(seqoid, lo);
+                    }
+
+                    return admitted;
 
                 default:
                     return false;
@@ -542,6 +558,18 @@ internal static class SequenceRangeGuard
             _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, static () => s_waitedInTransaction.Clear());
         }
 
+        // A prepared transaction that holds the sequence keeps any switch off until it's committed or rolled back, which
+        // no wait here outlasts.
+        if (Elevated.Run(() => SequenceRanges.PreparedHolder(seqoid)) is string gid)
+        {
+            PgLog.Warning(new PgDiagnostic($"sequence {SequenceRanges.GetInfo(seqoid).Name} can't switch to its next block while prepared transaction \"{gid}\" holds it")
+            {
+                Detail = "Inserts run its active block out, and then fail.",
+                Hint = "COMMIT PREPARED or ROLLBACK PREPARED the transaction.",
+            });
+            return;
+        }
+
         SpiParameter seq = SpiParameter.Create(seqoid);
         SpiParameter database = SpiParameter.Create(DatabaseId());
         long now = Worker.GetCurrentTimestamp();
@@ -584,6 +612,69 @@ internal static class SequenceRangeGuard
             }
 
             now = Worker.GetCurrentTimestamp();
+        }
+    }
+
+    /// <summary>
+    /// Switches a sequence to its next block in this transaction, once for each block, when the transaction holds the
+    /// sequence, as one that drew from it does.
+    /// </summary>
+    private static void SwitchInTransaction(uint seqoid, long lo)
+    {
+        if (!s_switchedInTransaction.Add((seqoid, lo)))
+        {
+            return;
+        }
+
+        if (s_switchedInTransaction.Count == 1)
+        {
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () => s_switchedInTransaction.Clear());
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, static () => s_switchedInTransaction.Clear());
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, static () => s_switchedInTransaction.Clear());
+        }
+
+        if (SequenceRanges.SwitchInTransaction(seqoid))
+        {
+            Reload();
+        }
+    }
+
+    /// <summary>
+    /// Switches the managed sequences that a table's defaults draw from, before a COPY FROM into it, when one's active
+    /// block has less than a buffer of values left, which the COPY would draw before the guard sees the first of them.
+    /// </summary>
+    /// <param name="relid">The table.</param>
+    internal static void BeforeCopy(uint relid)
+    {
+        Reload();
+        if (s_sequences.Count == 0 || relid == 0)
+        {
+            return;
+        }
+
+        SpiResult used = Elevated.Run(() => Worf.Read("""
+            SELECT d.refobjid FROM pg_catalog.pg_attrdef a JOIN pg_catalog.pg_depend d
+                ON d.classid = 'pg_catalog.pg_attrdef'::pg_catalog.regclass AND d.objid = a.oid AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
+            WHERE a.adrelid = $1
+            UNION
+            SELECT d.objid FROM pg_catalog.pg_depend d
+            WHERE d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.refobjid = $1 AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+                AND d.deptype = 'i'
+            """, 0, SpiParameter.Create(relid)));
+        foreach (uint seqoid in used.Select(row => row.Get<uint>(0)))
+        {
+            if (!s_sequences.TryGetValue(seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) sequence) ||
+                !sequence.Blocks.Exists(block => block.State == "active") || Position(seqoid) is not long position)
+            {
+                continue;
+            }
+
+            (long lo, long hi, _) = sequence.Blocks.Find(block => block.State == "active");
+            decimal left = sequence.Ascending ? (decimal)hi - position : (decimal)position - lo;
+            if (position >= lo && position <= hi && left < CopyBuffered)
+            {
+                SwitchInTransaction(seqoid, lo);
+            }
         }
     }
 

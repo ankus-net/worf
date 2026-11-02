@@ -920,6 +920,67 @@ public sealed class SequenceRangeTests
     }
 
     /// <summary>
+    /// A transaction that runs its active block out switches the sequence to the next block itself, whether an
+    /// INSERT ... SELECT, a multi-row VALUES or a COPY, which switches as its rows reach the block's last thousand values.
+    /// A prepared transaction that only read the sequence holds off no switch, while one that drew from it does, which
+    /// the ranges' view names.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task TransactionsSwitchBlocksTheyRunOut()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode node = await StartNodeAsync("node", token, "max_prepared_transactions = 10");
+        _ = await node.SafePsqlAsync(Database, """
+            CREATE TABLE sp (id bigserial PRIMARY KEY, v text);
+            SELECT worf.enable_sequence_range('sp_id_seq', participants := '{}', range_size := 100, max_range_size := 100);
+            CREATE TABLE cp (id bigserial PRIMARY KEY, v text);
+            SELECT worf.enable_sequence_range('cp_id_seq', participants := '{}', range_size := 2000, max_range_size := 2000);
+            """, token);
+        const string Ready = "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = '{0}'::regclass";
+        Assert.IsTrue(await node.PollQueryUntilAsync(Database, string.Format(CultureInfo.InvariantCulture, Ready, "sp_id_seq"), token), "sp's next block");
+        _ = await node.SafePsqlAsync(Database, "INSERT INTO sp (v) SELECT 'first' FROM generate_series(1, 30)", token);
+        Assert.IsTrue(await node.PollQueryUntilAsync(Database, string.Format(CultureInfo.InvariantCulture, Ready, "sp_id_seq"), token), "sp's next block");
+        _ = await node.SafePsqlAsync(Database, "INSERT INTO sp (v) SELECT 'spanning' FROM generate_series(1, 150)", token);
+        Assert.IsTrue(await node.PollQueryUntilAsync(Database, string.Format(CultureInfo.InvariantCulture, Ready, "sp_id_seq"), token), "sp's next block");
+        _ = await node.SafePsqlAsync(Database,
+            $"INSERT INTO sp (v) VALUES {string.Join(", ", Enumerable.Range(1, 60).Select(i => $"('values {i}')"))}", token);
+        Assert.AreEqual("240|240", await node.SafePsqlAsync(Database, "SELECT count(*), count(DISTINCT id) FROM sp", token), "sp's rows");
+
+        Assert.IsTrue(await node.PollQueryUntilAsync(Database, string.Format(CultureInfo.InvariantCulture, Ready, "cp_id_seq"), token), "cp's next block");
+        _ = await node.SafePsqlAsync(Database, "INSERT INTO cp (v) SELECT 'first' FROM generate_series(1, 800)", token);
+        Assert.IsTrue(await node.PollQueryUntilAsync(Database, string.Format(CultureInfo.InvariantCulture, Ready, "cp_id_seq"), token), "cp's next block");
+        await using (NpgsqlConnection copier = await node.OpenAsync(Database, token))
+        {
+            await using TextWriter rows = await copier.BeginTextImportAsync("COPY cp (v) FROM STDIN", token);
+            for (int i = 0; i < 1500; i++)
+            {
+                await rows.WriteAsync($"copied {i}\n".AsMemory(), token);
+            }
+        }
+
+        Assert.AreEqual("2300|2300", await node.SafePsqlAsync(Database, "SELECT count(*), count(DISTINCT id) FROM cp", token), "cp's rows");
+
+        // A prepared transaction that read the sequence leaves its switches be, and one that drew from it is named.
+        _ = await node.SafePsqlAsync(Database, "BEGIN; SELECT last_value FROM sp_id_seq; PREPARE TRANSACTION 'reader'", token);
+        Assert.IsTrue(await node.PollQueryUntilAsync(Database, string.Format(CultureInfo.InvariantCulture, Ready, "sp_id_seq"), token), "sp's next block");
+        string before = await node.SafePsqlAsync(Database, "SELECT active_lo FROM worf.sequence_ranges WHERE sequence = 'sp_id_seq'::regclass", token);
+        _ = await node.SafePsqlAsync(Database, $"SELECT setval('sp_id_seq', active_hi - 2) FROM worf.sequence_ranges WHERE sequence = 'sp_id_seq'::regclass", token);
+        Assert.IsTrue(await node.PollQueryUntilAsync(Database,
+            $"SELECT active_lo <> {before} FROM worf.sequence_ranges WHERE sequence = 'sp_id_seq'::regclass", token), "a switch past the reader");
+        _ = await node.SafePsqlAsync(Database, "COMMIT PREPARED 'reader'", token);
+        Assert.IsTrue(await node.PollQueryUntilAsync(Database, string.Format(CultureInfo.InvariantCulture, Ready, "sp_id_seq"), token), "sp's next block");
+        _ = await node.SafePsqlAsync(Database, "BEGIN; INSERT INTO sp (v) VALUES ('prepared'); PREPARE TRANSACTION 'drawer'", token);
+        _ = await node.SafePsqlAsync(Database, $"SELECT setval('sp_id_seq', active_hi - 2) FROM worf.sequence_ranges WHERE sequence = 'sp_id_seq'::regclass", token);
+        Assert.IsTrue(await node.PollQueryUntilAsync(Database, """
+            SELECT detail LIKE '%prepared transaction "drawer" holds the sequence%' FROM worf.sequence_ranges WHERE sequence = 'sp_id_seq'::regclass
+            """, token), "the prepared transaction named");
+        _ = await node.SafePsqlAsync(Database, "ROLLBACK PREPARED 'drawer'", token);
+        Assert.IsTrue(await node.PollQueryUntilAsync(Database,
+            "SELECT detail IS NULL FROM worf.sequence_ranges WHERE sequence = 'sp_id_seq'::regclass", token), "a switch once it ended");
+    }
+
+    /// <summary>
     /// A session reserves a block right after the database's first sequence is enabled, as the range worker starts. The
     /// range worker switches blocks, and a load's reserved block, while sessions read the ranges' view or have
     /// inserted, but not while a transaction that called nextval stays open. It leaves a block when the sequence moves
@@ -2197,22 +2258,27 @@ public sealed class SequenceRangeTests
             "node_b's new u_id_seq joined the disabled epoch");
 
         // One created again before the word of the disable arrives, as the record put back here stands for, joins the
-        // epoch, and leaves it once the word comes, as it drew no block, with what CREATE SEQUENCE gave it.
+        // epoch, and stays parked once the word comes, as the epoch's values may lie in node_a's blocks, until node_a
+        // enables the sequence again, naming node_b, whose sequence then takes blocks of the new epoch.
         string record = await nodeA.SafePsqlAsync(Database, """
             SELECT owner_node || ', ' || epoch || ', ' || range_size || ', ' || max_range_size || ', ' || coalesce(root_start::text, 'NULL') || ', ' || root_end
             FROM worf.sequence_range WHERE seqoid = 'u_id_seq'::regclass
             """, token);
-        int releasepos = nodeB.ReadLog().Length;
         _ = await nodeB.SafePsqlAsync(Database, $"""
             DROP SEQUENCE u_id_seq;
             INSERT INTO worf.sequence_range_dropped (name, owner_node, epoch, range_size, max_range_size, root_start, root_end, owned)
                 VALUES ('public.u_id_seq', {record}, false);
             CREATE SEQUENCE u_id_seq START 5 CACHE 3;
             """, token);
-        Assert.IsTrue(await nodeB.PollLogAsync(releasepos, "u_id_seq left range management", token), "node_b's new u_id_seq left the disabled epoch");
-        Assert.AreEqual("5|3|t", await nodeB.SafePsqlAsync(Database, """
-            SELECT nextval('u_id_seq'), seqcache, has_sequence_privilege('u_id_seq', 'UPDATE') FROM pg_sequence WHERE seqrelid = 'u_id_seq'::regclass
-            """, token), "node_b's new u_id_seq as it was created");
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, """
+            SELECT state = 'disabled' AND detail LIKE 'the epoch is disabled%' FROM worf.sequence_range WHERE seqoid = 'u_id_seq'::regclass
+            """, token), "node_b's new u_id_seq parked in the disabled epoch");
+        PostgresException disabled = await Assert.ThrowsExactlyAsync<PostgresException>(() => nodeB.SafePsqlAsync(Database, "SELECT nextval('u_id_seq')", token));
+        Assert.AreEqual("2200H", disabled.SqlState, "node_b's parked u_id_seq issues nothing");
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('u_id_seq', participants := '{node_b}')", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_range WHERE seqoid = 'u_id_seq'::regclass", token),
+            "node_b's u_id_seq in the new epoch");
+        _ = await nodeB.SafePsqlAsync(Database, "SELECT nextval('u_id_seq')", token);
 
         // node_b hears of grants beyond node_a's watermark, as when node_a, the owner, went back to before them by less
         // than its WAL position shows. node_a resets, and its fence holds, here on a neighbor that never reports, while
@@ -2916,7 +2982,7 @@ public sealed class SequenceRangeTests
     private static string Next(string value)
         => (long.Parse(value, CultureInfo.InvariantCulture) + 1).ToString(CultureInfo.InvariantCulture);
 
-    private static async Task<TestNode> StartNodeAsync(string name, CancellationToken token)
+    private static async Task<TestNode> StartNodeAsync(string name, CancellationToken token, string? setting = null)
     {
         TestNode node = await TestNode.StartAsync(name,
         [
@@ -2928,6 +2994,7 @@ public sealed class SequenceRangeTests
             "worf.sequence_range_timeout = 5000",
             "max_worker_processes = 16",
             "autovacuum = off",
+            .. setting is null ? Array.Empty<string>() : [setting],
         ], token);
         try
         {

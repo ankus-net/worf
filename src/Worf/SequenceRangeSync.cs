@@ -107,12 +107,10 @@ internal static class SequenceRangeSync
             if (Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(row.Get<string>(0))) is uint seqoid &&
                 !SequenceRanges.IsManaged(seqoid))
             {
-                // The sequence is new, so it gets back what CREATE SEQUENCE gave it should the epoch turn out to be
-                // disabled before it draws a block.
-                string[] created = SequenceRanges.Unquarantined(seqoid);
+                // Should the epoch turn out to be disabled before it draws a block, it stays parked, as the epoch's
+                // values may lie in other nodes' blocks, until a new epoch takes it in.
                 SequenceRanges.JoinFromNeighbor(seqoid, row.Get<uint>(1), row.Get<int>(2), row.Get<long>(3), row.Get<long>(4), row.Get<long?>(5),
                     row.Get<long?>(6), node);
-                _ = Worf.Execute("UPDATE worf.sequence_range SET recreated = $2 WHERE seqoid = $1", SpiParameter.Create(seqoid), SpiParameter.Create(created));
                 _ = Worf.Execute("DELETE FROM worf.sequence_range_dropped WHERE name = $1", SpiParameter.Create(row.Get<string>(0)));
                 SequenceRanges.ChangedOnCommit();
             }

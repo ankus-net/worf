@@ -51,9 +51,10 @@ internal static class SequenceRangeExchangeWorker
                 }
 
                 // A database that manages nothing has asked its providers, and the manager looks again later, unless a
-                // subscription is still making its slot, for an exchange interval at most, as one may stay stuck in its
-                // initialization.
-                if ((!SequenceRangeExchange.Starting || Worker.GetCurrentTimestamp() - started > SequenceRanges.ExchangeInterval * 1000L) &&
+                // subscription is still making its slot in the first round, for an exchange interval at most, as one may
+                // stay stuck in its initialization.
+                if ((!SequenceRangeExchange.Starting || !Worker.MyWorker.Worker.Exchange.WaitsForSlots ||
+                        Worker.GetCurrentTimestamp() - started > SequenceRanges.ExchangeInterval * 1000L) &&
                     !PgBackgroundWorker.RunTransaction(Managed))
                 {
                     return;

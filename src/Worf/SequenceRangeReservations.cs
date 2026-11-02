@@ -86,10 +86,17 @@ internal static class SequenceRangeReservations
                 // a block granted or switched to between the look and the check isn't missed.
                 bool pending = requested && (Pending(requestId) || ReservedNext(seqoid, epoch));
                 (Guid Id, long Lo, long Hi)? active = SequenceRanges.NodeBlock(seqoid, epoch, "active");
-                // A block reserved and switched to since the request serves the load even once other sessions drew on it
-                // before this one looked.
-                if (active is not null && (SequenceRanges.StepsLeft(seqoid, info, active.Value) >= needed ||
-                    (requested && active.Value.Id != requestedUnder && Reserved(active.Value.Id))))
+
+                // The sequence's position is read after the block, so a switch that committed between them leaves the
+                // block read stale, which the block read again tells. A block reserved and switched to since the request
+                // serves the load even once other sessions drew on it before this one looked.
+                long left = active is null ? 0 : SequenceRanges.StepsLeft(seqoid, info, active.Value);
+                if (active is not null && SequenceRanges.NodeBlock(seqoid, epoch, "active")?.Id != active.Value.Id)
+                {
+                    continue;
+                }
+
+                if (active is not null && (left >= needed || (requested && active.Value.Id != requestedUnder && Reserved(active.Value.Id))))
                 {
                     break;
                 }
