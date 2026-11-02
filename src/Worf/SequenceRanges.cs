@@ -271,8 +271,10 @@ internal static unsafe partial class SequenceRanges
     private static readonly TimeSpan s_growBelow = TimeSpan.FromHours(1);
     private static readonly TimeSpan s_shrinkAbove = TimeSpan.FromDays(1);
 
-    // The sequences whose switch the range worker's checks left to a switch worker.
+    // The sequences whose switch the range worker's checks left to a switch worker, and those whose switch worker
+    // couldn't start, as every worker slot was taken, which the range worker waits for itself, briefly.
     private static readonly Dictionary<uint, string> s_handOffs = [];
+    private static readonly HashSet<uint> s_unstarted = [];
 
     /// <summary>
     /// Gets how often the range worker checks each managed sequence.
@@ -3746,20 +3748,23 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
-    /// Switches a sequence to its next block as its active one runs low. The range worker waits for the sequence's lock
-    /// a tenth of a second at most, which outlasts the transactions of concurrent inserts, so that inserts queue behind
-    /// it no longer than that, and the other sequences wait no longer for their checks. Once the block reaches its last
-    /// twentieth, where inserts wait for the switch, or the next block is reserved for a load, whose session waits for
-    /// it, a switch that can't have the lock is left to a switch worker, which waits for those transactions as long as
-    /// they hold the sequence, while the range worker checks the other sequences. The range worker starts it with
-    /// <see cref="HandOff"/> once its check has committed, so that the switch worker waits on no lock of the range
-    /// worker's. A prepared transaction that holds the sequence, which may hold it across restarts, isn't waited for:
-    /// the sequence's range says so, with a warning, and inserts run the block out.
+    /// Switches a sequence to its next block as its active one runs low. The range worker takes the sequence's lock only
+    /// when no transaction that called nextval holds it, without queueing for it, since inserts would queue behind it, and a
+    /// switch that gave up would let them all draw from the block at once, as they might near its end. Once the block
+    /// reaches its last twentieth, where inserts wait for the switch, or the next block is reserved for a load, whose
+    /// session waits for it, a switch that can't have the lock is left to a switch worker, which waits for those
+    /// transactions as long as they hold the sequence, while the range worker checks the other sequences. The range
+    /// worker starts it with <see cref="HandOff"/> once its check has committed, so that the switch worker waits on no
+    /// lock of the range worker's. While every worker slot is taken, the range worker waits for the lock itself, a tenth
+    /// of a second at most, which outlasts the transactions of concurrent inserts. A prepared transaction that holds the
+    /// sequence, which may hold it across restarts, isn't waited for: the sequence's range says so, with a warning, and
+    /// inserts run the block out.
     /// </summary>
     private static bool SwitchBeforeEnd(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) next, bool forLoad, bool atEnd)
     {
-        if (Switch(seqoid, info, next, forLoad, 100))
+        if (Switch(seqoid, info, next, forLoad, s_unstarted.Contains(seqoid) ? 100 : 0))
         {
+            _ = s_unstarted.Remove(seqoid);
             return true;
         }
 
@@ -3812,6 +3817,13 @@ internal static unsafe partial class SequenceRanges
             return false;
         }
 
+        // A switch worker that waits for the sequence, which it can't have until this transaction ends, would deadlock
+        // with this switch, so its wait is cancelled, and it leaves the switch to this transaction.
+        if (SequenceRangeSwitchWorker.Pid(seqoid) is int pid)
+        {
+            _ = Worf.ReadScalar<bool>("SELECT pg_catalog.pg_cancel_backend($1)", SpiParameter.Create(pid));
+        }
+
         try
         {
             return Switch(seqoid, info, (next.Id, next.Lo, next.Hi), next.Reserved, ExchangeTimeout);
@@ -3847,14 +3859,14 @@ internal static unsafe partial class SequenceRanges
 
     /// <summary>
     /// Starts a switch worker for each sequence that the range worker's checks left to one. With every worker slot taken,
-    /// a sequence waits for a later check, which again takes its lock only when no transaction holds it, so that the
-    /// range worker waits on none, and holds up no other sequence.
+    /// a sequence waits for a later check, which waits for its lock a tenth of a second at most, so that the range
+    /// worker holds up no other sequence for longer.
     /// </summary>
     internal static void HandOff()
     {
         foreach ((uint seqoid, string name) in s_handOffs)
         {
-            _ = SequenceRangeSwitchWorker.Start(seqoid, name);
+            _ = SequenceRangeSwitchWorker.Start(seqoid, name) ? s_unstarted.Remove(seqoid) : s_unstarted.Add(seqoid);
         }
 
         s_handOffs.Clear();

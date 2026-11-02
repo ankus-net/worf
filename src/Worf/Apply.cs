@@ -226,10 +226,6 @@ internal static unsafe partial class Apply
         // Run as replica session replication role.
         Worker.SetConfigOption("session_replication_role", "replica", GucContext.PGC_SUSET);
 
-        // Find a deadlock with a local session before the session does, so that apply, which tries the transaction
-        // again, is the one that fails.
-        Worker.SetConfigOption("deadlock_timeout", "100ms", GucContext.PGC_SUSET);
-
         // Disable function body checks during replay. That's necessary because a) the creator of the function might
         // have had it disabled b) the function might be search_path dependant and we don't fix the contents of
         // functions.

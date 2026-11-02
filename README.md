@@ -976,9 +976,8 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   passed over, is locked until the transaction ends, so DDL from another node
   that moves or passes over it waits for a local transaction whose DDL did.
   Each statement locks those it moves and passes over in one order, but two
-  transactions whose statements lock them in other orders can deadlock; apply
-  looks for deadlocks after 100 ms, sooner than a session with the default
-  `deadlock_timeout`, so it's the one that fails, and runs its transaction
+  transactions whose statements lock them in other orders can deadlock;
+  PostgreSQL ends one of them, and when that's apply, it runs its transaction
   again. `worf.replicate_ddl_command` does the same on every node. Relations
   that a function creates, as one a SELECT calls, can still take other names
   than on the other nodes.

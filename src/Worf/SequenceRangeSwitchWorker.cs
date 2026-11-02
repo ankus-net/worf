@@ -1,3 +1,5 @@
+using Ankus.Postgres;
+
 namespace Worf;
 
 /// <summary>
@@ -36,6 +38,11 @@ internal static class SequenceRangeSwitchWorker
             {
                 // A transaction held the range row, as a reset does, or the wait deadlocked, and the worker waits again.
                 _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(10));
+            }
+            catch (PgQueryCanceledException)
+            {
+                // A transaction that runs the block out cancelled the wait to switch the sequence itself.
+                break;
             }
         }
 
@@ -82,13 +89,39 @@ internal static class SequenceRangeSwitchWorker
     }
 
     /// <summary>
+    /// Finds the process of the switch worker that runs for a sequence.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    /// <returns>Its process ID, or null when none runs.</returns>
+    internal static unsafe int? Pid(uint seqoid)
+    {
+        uint dboid = NativeGlobals.MyDatabaseId;
+        using PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share();
+        for (int i = 0; i < guard.Length; i++)
+        {
+            if (guard[i].WorkerType == WorfWorkerType.Switch && guard[i].Dboid == dboid && guard[i].CrashedAt == 0 &&
+                guard[i].Worker.Switch.Seqoid == seqoid && guard[i].Proc != 0)
+            {
+                return ((PGPROC*)guard[i].Proc)->pid;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
     /// Finds whether a switch worker runs for a sequence.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
     /// <returns>Whether one runs.</returns>
     internal static bool Running(uint seqoid)
     {
-        uint dboid = Worker.MyWorker.Dboid;
+        uint dboid;
+        unsafe
+        {
+            dboid = NativeGlobals.MyDatabaseId;
+        }
+
         using PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share();
         for (int i = 0; i < guard.Length; i++)
         {
