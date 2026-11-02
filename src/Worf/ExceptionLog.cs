@@ -117,9 +117,11 @@ internal static class ExceptionLog
             return;
         }
 
+        // The insert's memory goes as it ends, so that the subtransaction's own stays empty, which PostgreSQL then frees as it
+        // commits rather than keep it until the transaction ends, as a copy that records many rows would.
         try
         {
-            PgTransaction.RunInSubtransaction(Insert);
+            PgTransaction.RunInSubtransaction(() => Worf.InOwnContext(Insert));
         }
         catch (PgException)
         {

@@ -431,6 +431,44 @@ internal static partial class Worf
     }
 
     /// <summary>
+    /// Runs work in a memory context of its own under the current one, deleted as the work ends. In a subtransaction,
+    /// that leaves the subtransaction's own context empty, which PostgreSQL then frees as it commits rather than keep it
+    /// until the transaction ends, as it would for each of many subtransactions.
+    /// </summary>
+    /// <param name="work">The work.</param>
+    /// <returns>What the work returns, which mustn't point into its context.</returns>
+    internal static unsafe T InOwnContext<T>(Func<T> work)
+    {
+        MemoryContextData* context;
+        fixed (byte* name = "worf work\0"u8)
+        {
+            // The name is static, as a memory context's has to be.
+            context = NativeMethods.AllocSetContextCreateInternal(NativeGlobals.CurrentMemoryContext, (sbyte*)name, 0, 8 * 1024, 8 * 1024 * 1024);
+        }
+
+        MemoryContextData* oldcontext = MemoryContextSwitchTo(context);
+        try
+        {
+            return work();
+        }
+        finally
+        {
+            _ = MemoryContextSwitchTo(oldcontext);
+            NativeMethods.MemoryContextDelete(context);
+        }
+    }
+
+    /// <summary>
+    /// Runs work in a memory context of its own under the current one, deleted as the work ends.
+    /// </summary>
+    /// <param name="work">The work.</param>
+    internal static void InOwnContext(Action work) => _ = InOwnContext(() =>
+    {
+        work();
+        return 0;
+    });
+
+    /// <summary>
     /// Copies a string into the current memory context in the database encoding, as <c>pstrdup</c> does.
     /// </summary>
     /// <param name="value">The string.</param>

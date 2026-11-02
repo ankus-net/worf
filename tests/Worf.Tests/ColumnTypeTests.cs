@@ -258,9 +258,9 @@ public sealed class ColumnTypeTests
         // A table whose types are the same on both nodes but whose rows the subscriber's own constraints refuse: a
         // shorter varchar, a domain only it has, and an enum that lacks a label.
         _ = await provider.SafePsqlAsync(Database, """
-            CREATE TABLE ct (id integer PRIMARY KEY, v varchar(10), d integer, m mood);
+            CREATE TABLE ct (id integer PRIMARY KEY, v varchar(400), d integer, m mood);
             INSERT INTO ct VALUES (1, 'ok', 1, 'sad'), (2, 'too long', 1, 'sad'), (3, 'ok', 500, 'sad'), (4, 'ok', 1, 'angry'),
-                (5, 'ok', 1, 'happy');
+                (5, 'ok', 1, 'happy'), (6, repeat('x', 300), 1, 'sad');
             SELECT * FROM worf.replication_set_add_table('zs', 'ct');
             """, token);
         _ = await subscriber.SafePsqlAsync(Database, $"CREATE DATABASE {TextDatabase}", token);
@@ -328,8 +328,8 @@ public sealed class ColumnTypeTests
 
         // Each row the copy can't write is skipped and recorded under discard, numbered as the provider's row it is.
         Assert.AreEqual("1\n5", await subscriber.SafePsqlAsync(TextDatabase, "SELECT id FROM ct ORDER BY id", token));
-        Assert.AreEqual("COPY|2|22001|2\nCOPY|3|23514|3\nCOPY|4|22P02|4", await subscriber.SafePsqlAsync(TextDatabase, """
-            SELECT concat_ws('|', operation, action_counter, error_sqlstate, remote_new_tuple->>'id')
+        Assert.AreEqual("COPY|2|22001|2|8\nCOPY|3|23514|3|2\nCOPY|4|22P02|4|2\nCOPY|6|22001|6|300", await subscriber.SafePsqlAsync(TextDatabase, """
+            SELECT concat_ws('|', operation, action_counter, error_sqlstate, remote_new_tuple->>'id', length(remote_new_tuple->>'v'))
             FROM worf.exception_log WHERE table_name = 'ct' ORDER BY action_counter
             """, token));
 
@@ -348,6 +348,29 @@ public sealed class ColumnTypeTests
             "ft's copy didn't fail");
         await Task.Delay(TimeSpan.FromSeconds(2), token);
         Assert.AreEqual(1, CountOccurrences(subscriber.ReadLog()[logpos..], "starting sync of table public.ft"));
+
+        // Under sub_disable, a copy whose row fails disables the subscription and records the row that COPY names,
+        // without copying the rows again to find it.
+        logpos = subscriber.ReadLog().Length;
+        _ = await subscriber.SafePsqlAsync(Database, "ALTER SYSTEM SET worf.exception_behaviour = sub_disable", token);
+        _ = await subscriber.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
+        foreach (string database in new[] { Database, TextDatabase })
+        {
+            _ = await subscriber.SafePsqlAsync(database, "CREATE TABLE dt (id integer PRIMARY KEY, n integer)", token);
+        }
+
+        _ = await provider.SafePsqlAsync(Database, """
+            CREATE TABLE dt (id integer PRIMARY KEY, n numeric);
+            INSERT INTO dt VALUES (1, 1), (2, 1e10), (3, 3);
+            SELECT * FROM worf.replication_set_add_table('zs', 'dt', synchronize_data := true);
+            """, token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(TextDatabase, "SELECT NOT sub_enabled FROM worf.subscription", token),
+            "textsub wasn't disabled");
+        Assert.AreEqual("sub_disable|COPY|2|2|22003", await subscriber.SafePsqlAsync(TextDatabase, """
+            SELECT concat_ws('|', behaviour, operation, action_counter, remote_new_tuple->>'id', error_sqlstate)
+            FROM worf.exception_log WHERE table_name = 'dt'
+            """, token));
+        Assert.AreEqual(0, CountOccurrences(subscriber.ReadLog()[logpos..], "copying table public.dt again"));
     }
 
     /// <summary>
