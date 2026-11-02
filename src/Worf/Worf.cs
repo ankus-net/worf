@@ -980,12 +980,29 @@ internal static partial class Worf
     }
 
     /// <summary>
+    /// Searches the path the database and role set, as <c>RESET search_path</c> would, until the GUC nest level it
+    /// returns ends, so that a row filter's functions find the objects they name without a schema as pglogical's do,
+    /// on a connection that otherwise searches only the system catalog.
+    /// </summary>
+    /// <returns>The nest level, which the caller ends with <see cref="UnpinSearchPath"/>.</returns>
+    internal static unsafe int DefaultSearchPath()
+    {
+        fixed (byte* name = ToServerCString("search_path"))
+        {
+            int nestLevel = NativeMethods.NewGUCNestLevel();
+            _ = NativeMethods.set_config_option((sbyte*)name, NativeMethods.GetConfigOptionResetString((sbyte*)name),
+                GucContext.PGC_USERSET, GucSource.PGC_S_SESSION, GucAction.GUC_ACTION_SAVE, true, 0, false);
+            return nestLevel;
+        }
+    }
+
+    /// <summary>
     /// The search path worf's own SQL runs with, and its workers other than apply and sync run with.
     /// </summary>
     internal const string PinnedSearchPath = "pg_catalog, pg_temp";
 
     /// <summary>
-    /// Puts back the search path that <see cref="PinSearchPath"/> replaced.
+    /// Puts back the search path that <see cref="PinSearchPath"/> or <see cref="DefaultSearchPath"/> replaced.
     /// </summary>
     /// <param name="nestLevel">The nest level it returned.</param>
     internal static void UnpinSearchPath(int nestLevel)
@@ -1475,7 +1492,7 @@ internal static partial class Worf
 
         if (!inTransaction)
         {
-            return WithDefaultSearchPath(PgReplicationConnection.Connect(conninfo.ToString(), applicationName, replication));
+            return WithPinnedSearchPath(PgReplicationConnection.Connect(conninfo.ToString(), applicationName, replication));
         }
 
         PgReplicationConnection? conn = null;
@@ -1499,17 +1516,18 @@ internal static partial class Worf
                 detail: $"dsn was: {s}");
         }
 
-        return WithDefaultSearchPath(conn!);
+        return WithPinnedSearchPath(conn!);
     }
 
     /// <summary>
-    /// Restores the session's default search_path, which <c>libpqwalreceiver</c> empties on the logical replication
-    /// connections it opens. pglogical connects with plain libpq, so its sessions, including the WAL sender that
-    /// evaluates row filters, use the server's default search_path.
+    /// Has the session search only the system catalog and then temporary objects, so that worf's queries to the other
+    /// node use the system's operators and functions rather than ones its database or role put ahead of them, whose
+    /// owner could have them run as the connection's user. Row filters run under the path the database and role set,
+    /// as pglogical's do, through <see cref="DefaultSearchPath"/>.
     /// </summary>
-    private static PgReplicationConnection WithDefaultSearchPath(PgReplicationConnection conn)
+    private static PgReplicationConnection WithPinnedSearchPath(PgReplicationConnection conn)
     {
-        conn.Execute("RESET search_path");
+        conn.Execute($"SET search_path = {PinnedSearchPath}");
         return conn;
     }
 

@@ -1516,25 +1516,34 @@ internal static class Functions
         ulong* values = (ulong*)NativeMethods.palloc((ulong)(reltupdesc->natts * sizeof(ulong)));
         bool* nulls = (bool*)NativeMethods.palloc((ulong)reltupdesc->natts);
 
-        HeapTupleData* htup;
-        while ((htup = NativeMethods.heap_getnext(scandesc, ScanDirection.ForwardScanDirection)) is not null)
+        // The filters run under the path the database and role set, as the WAL sender's do.
+        int nestLevel = Worf.DefaultSearchPath();
+        try
         {
-            // Create a new version of our current HeapTuple. We can't just reuse the current one since it might be
-            // possible that not every current attribute is correctly filled (e.g when atthasmissing is true).
-            NativeMethods.heap_deform_tuple(htup, reltupdesc, values, nulls);
-            HeapTupleData* newHtup = NativeMethods.heap_form_tuple(reltupdesc, values, nulls);
-
-            if (!FilterTuple(newHtup, econtext, rowFilterList))
+            HeapTupleData* htup;
+            while ((htup = NativeMethods.heap_getnext(scandesc, ScanDirection.ForwardScanDirection)) is not null)
             {
-                continue;
+                // Create a new version of our current HeapTuple. We can't just reuse the current one since it might
+                // be possible that not every current attribute is correctly filled (e.g when atthasmissing is true).
+                NativeMethods.heap_deform_tuple(htup, reltupdesc, values, nulls);
+                HeapTupleData* newHtup = NativeMethods.heap_form_tuple(reltupdesc, values, nulls);
+
+                if (!FilterTuple(newHtup, econtext, rowFilterList))
+                {
+                    continue;
+                }
+
+                MemoryContextData* old = NativeGlobals.CurrentMemoryContext;
+                NativeGlobals.CurrentMemoryContext = (MemoryContextData*)owner.DangerousGetPointer();
+                ulong datum = NativeMethods.heap_copy_tuple_as_datum(newHtup, reltupdesc);
+                NativeGlobals.CurrentMemoryContext = old;
+
+                rows.Add(new PgAnyElement(PgDatum.DangerousCreate((nuint)datum, rel->rd_rel->reltype, owner)));
             }
-
-            MemoryContextData* old = NativeGlobals.CurrentMemoryContext;
-            NativeGlobals.CurrentMemoryContext = (MemoryContextData*)owner.DangerousGetPointer();
-            ulong datum = NativeMethods.heap_copy_tuple_as_datum(newHtup, reltupdesc);
-            NativeGlobals.CurrentMemoryContext = old;
-
-            rows.Add(new PgAnyElement(PgDatum.DangerousCreate((nuint)datum, rel->rd_rel->reltype, owner)));
+        }
+        finally
+        {
+            Worf.UnpinSearchPath(nestLevel);
         }
 
         NativeMethods.pfree(values);

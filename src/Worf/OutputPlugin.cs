@@ -533,6 +533,7 @@ internal static unsafe partial class OutputPlugin
             }
 
             NativeMethods.PushActiveSnapshot(NativeMethods.GetTransactionSnapshot());
+            int nestLevel = Worf.DefaultSearchPath();
             try
             {
                 EState* estate = Executor.CreateEstateForRelation(relation, false);
@@ -563,6 +564,7 @@ internal static unsafe partial class OutputPlugin
             }
             finally
             {
+                Worf.UnpinSearchPath(nestLevel);
                 NativeMethods.PopActiveSnapshot();
             }
         }
