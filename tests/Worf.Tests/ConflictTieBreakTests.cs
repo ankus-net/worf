@@ -65,23 +65,34 @@ public sealed class ConflictTieBreakTests
         Assert.Contains("(SQLSTATE 42P17)", nodeA.ReadLog(), "node_a's log");
         Assert.DoesNotContain("terminated by signal", nodeA.ReadLog(), "node_a's log");
 
-        // node_b applies node_a's change. It records its conflicts into a history whose deferred constraint refuses
-        // every row, which fires within the record rather than as apply commits, so apply goes on without the record.
+        // node_b applies node_a's change. It records its conflicts into a history whose trigger writes each row to a table
+        // whose deferred constraint refuses it, which fails as the record commits, in a transaction of its own after
+        // apply's, so apply goes on without the record.
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.drop_subscription('a_from_b')", token);
         _ = await nodeB.SafePsqlAsync(Database, """
             ALTER SYSTEM SET worf.conflict_history_enabled = on;
             SELECT pg_reload_conf();
-            CREATE FUNCTION refuse_history() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'history refused'; END $$;
-            CREATE CONSTRAINT TRIGGER refuse_history AFTER INSERT ON worf.conflict_history DEFERRABLE INITIALLY DEFERRED
-                FOR EACH ROW EXECUTE FUNCTION refuse_history();
-            ALTER TABLE worf.conflict_history ENABLE ALWAYS TRIGGER refuse_history;
+            CREATE TABLE history_audit (sub_name name);
+            CREATE FUNCTION refuse_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'audit refused'; END $$;
+            CREATE CONSTRAINT TRIGGER refuse_audit AFTER INSERT ON history_audit DEFERRABLE INITIALLY DEFERRED
+                FOR EACH ROW EXECUTE FUNCTION refuse_audit();
+            ALTER TABLE history_audit ENABLE ALWAYS TRIGGER refuse_audit;
+            CREATE FUNCTION audit_history() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                INSERT INTO public.history_audit VALUES (NEW.sub_name);
+                RETURN NEW;
+            END $$;
+            CREATE TRIGGER audit_history AFTER INSERT ON worf.conflict_history FOR EACH ROW EXECUTE FUNCTION audit_history();
+            ALTER TABLE worf.conflict_history ENABLE ALWAYS TRIGGER audit_history;
             """, token);
         await SubscribeAsync(nodeB, "b_from_a", nodeA, true, token);
+        int logpos = nodeB.ReadLog().Length;
         committed = await UpdateAsync(nodeB, "b2", token);
         await UpdateAtAsync(nodeA, "a2", committed, token);
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
         Assert.AreEqual(aWins ? "a2" : "b2", await ValueAsync(nodeB, token));
-        Assert.Contains("history refused (SQLSTATE P0001)", nodeB.ReadLog(), "node_b's log");
+        Assert.IsTrue(await nodeB.PollLogAsync(logpos, "audit refused (SQLSTATE P0001)", token), "node_b's warning");
+        Assert.DoesNotContain("exiting with error", nodeB.ReadLog()[logpos..], "node_b's apply");
         Assert.AreEqual("0", await nodeB.SafePsqlAsync(Database, "SELECT count(*) FROM worf.conflict_history", token));
     }
 

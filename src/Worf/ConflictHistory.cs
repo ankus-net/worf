@@ -307,6 +307,11 @@ internal static partial class ConflictHistory
         Context = PgGucContext.SuperuserSet)]
     internal static partial int MaxTupleSize { get; }
 
+    // The records of conflicts in the apply transaction under way, and those of transactions that committed, which have
+    // yet to be written.
+    private static readonly List<WorfConflictRecord> s_pending = [];
+    private static readonly List<WorfConflictRecord> s_committed = [];
+
     private const string InsertSql =
         "INSERT INTO worf.conflict_history (" +
         "sub_id, sub_name, conflict_type, resolution, " +
@@ -351,74 +356,114 @@ internal static partial class ConflictHistory
         RelationData* relation = rel.Rel;
         string schema = Worf.FromServer(NativeMethods.get_namespace_name(relation->rd_rel->relnamespace));
         string table = Worf.FromServer((sbyte*)&relation->rd_rel->relname);
+        TupleDescData* tupdesc = relation->rd_att;
+        string? idxname = null;
+        if (conflictIdxOid != 0)
+        {
+            sbyte* name = NativeMethods.get_rel_name(conflictIdxOid);
+            idxname = name is null ? null : Worf.FromServer(name);
+        }
 
-        // The record is one atomic scope: its statements share its subtransaction, so that one that fails, as DDL
-        // creating the partition may, rolls the whole record back, which then goes unrecorded.
+        // The record is written once the apply transaction commits, in a transaction of its own, so that nothing it
+        // sets off, as a trigger's write to a table whose deferred constraint fails, can stop apply. The partition for
+        // the time recorded, which the row takes from here, is made then too, so that the two agree even across
+        // midnight. A transaction that aborts records nothing.
+        PgTimestampTz recordedAt = new(Worker.GetCurrentTimestamp());
+        if (s_pending.Count == 0)
+        {
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () =>
+            {
+                s_committed.AddRange(s_pending);
+                s_pending.Clear();
+            });
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, static () => s_pending.Clear());
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, static () => s_pending.Clear());
+        }
+
+        s_pending.Add(new WorfConflictRecord
+        {
+            Description = $"the {ConflictTypeToString(conflictType)} conflict on table {schema}.{table}",
+            RecordedAt = recordedAt,
+            SubId = sub.Id,
+            SubName = sub.Name,
+            ConflictType = ConflictTypeToString(conflictType),
+            Resolution = ResolutionToString(resolution),
+            Schema = schema,
+            Table = table,
+            IndexName = idxname,
+            LocalTuple = localtuple is not null && StoreTuples ? TupleToJson(tupdesc, localtuple, MaxTupleSize) : null,
+            LocalXid = localTupleXid != 0 ? localTupleXid.ToString(CultureInfo.InvariantCulture) : null,
+            LocalOrigin = foundLocalOrigin ? localTupleOrigin : null,
+            LocalCommitTs = foundLocalOrigin ? new PgTimestampTz(localTupleCommitTs) : null,
+            RemoteTuple = remotetuple is not null && StoreTuples ? TupleToJson(tupdesc, remotetuple, MaxTupleSize) : null,
+            RemoteOrigin = Worf.ReploriginSessionOrigin,
+            RemoteCommitTs = new PgTimestampTz(Worf.ReploriginSessionOriginTimestamp),
+            RemoteCommitLsn = Worf.ReploriginSessionOriginLsn,
+            HasBeforeTriggers = hasBeforeTriggers,
+        });
+    }
+
+    /// <summary>
+    /// Writes the conflicts that committed apply transactions recorded, all in one transaction, or, when that fails,
+    /// each in a transaction of its own, so that one record that fails, even as it commits, loses only itself. Apply
+    /// calls this after each transaction it commits.
+    /// </summary>
+    internal static void WriteCommitted()
+    {
+        if (s_committed.Count == 0)
+        {
+            return;
+        }
+
+        List<WorfConflictRecord> records = [.. s_committed];
+        s_committed.Clear();
         try
         {
-            PgTransaction.RunInSubtransaction(() =>
-            {
-                // Ensure the partition exists for the time recorded, which the row takes from here, so that the two
-                // agree even across midnight.
-                PgTimestampTz recordedAt = new(Worker.GetCurrentTimestamp());
-                EnsurePartitionExists(recordedAt);
-
-                // Get tuple descriptor for JSONB conversion
-                TupleDescData* tupdesc = relation->rd_att;
-
-                // Get index name if available
-                string? idxname = null;
-                if (conflictIdxOid != 0)
-                {
-                    sbyte* name = NativeMethods.get_rel_name(conflictIdxOid);
-                    idxname = name is null ? null : Worf.FromServer(name);
-                }
-
-                _ = Worf.Execute(InsertSql,
-                    SpiParameter.Create(sub.Id),
-                    SpiParameter.Create(sub.Name),
-                    SpiParameter.Create(ConflictTypeToString(conflictType)),
-                    SpiParameter.Create(ResolutionToString(resolution)),
-                    SpiParameter.Create(schema),
-                    SpiParameter.Create(table),
-                    SpiParameter.Create<string?>(idxname),
-                    SpiParameter.Create<string?>(localtuple is not null && StoreTuples ? TupleToJson(tupdesc, localtuple, MaxTupleSize) : null),
-                    SpiParameter.Create<string?>(localTupleXid != 0 ? localTupleXid.ToString(CultureInfo.InvariantCulture) : null),
-                    SpiParameter.Create<int?>(foundLocalOrigin ? localTupleOrigin : null),
-                    SpiParameter.Create<PgTimestampTz?>(foundLocalOrigin ? new PgTimestampTz(localTupleCommitTs) : null),
-                    SpiParameter.Create<string?>(remotetuple is not null && StoreTuples ? TupleToJson(tupdesc, remotetuple, MaxTupleSize) : null),
-                    SpiParameter.Create((int)Worf.ReploriginSessionOrigin),
-                    SpiParameter.Create(new PgTimestampTz(Worf.ReploriginSessionOriginTimestamp)),
-                    Worf.LsnParameter(Worf.ReploriginSessionOriginLsn),
-                    SpiParameter.Create(hasBeforeTriggers),
-                    SpiParameter.Create(recordedAt));
-
-                // A deferrable constraint on the history fires here rather than as the apply transaction commits,
-                // where its failure would stop apply.
-                SpiResult deferrable = Worf.Read("""
-                    SELECT DISTINCT n.nspname::text, c.conname::text
-                    FROM pg_catalog.pg_partition_tree('worf.conflict_history'::regclass) p
-                        JOIN pg_catalog.pg_constraint c ON c.conrelid = p.relid
-                        JOIN pg_catalog.pg_namespace n ON n.oid = c.connamespace
-                    WHERE c.condeferrable
-                    """, 0);
-                for (int i = 0; i < deferrable.Count; i++)
-                {
-                    _ = Worf.Execute("SET CONSTRAINTS " + Spi.QuoteQualifiedIdentifier(deferrable[i].Get<string>(0), deferrable[i].Get<string>(1)) +
-                        " IMMEDIATE");
-                }
-            }, PgSubtransactionMode.Atomic);
+            PgBackgroundWorker.RunTransaction(() => records.ForEach(Write));
         }
-        catch (PgException error)
+        catch (PgException)
         {
-            // Recording is only observational, so apply goes on without the record.
-            PgLog.Warning(new PgDiagnostic($"conflict_history: recording failed for the {ConflictTypeToString(conflictType)} conflict on table " +
-                $"{schema}.{table}, continuing without recording it: {error.Message} (SQLSTATE {error.SqlState})")
+            foreach (WorfConflictRecord record in records)
             {
-                Detail = error.Detail,
-                Hint = error.Hint,
-            });
+                try
+                {
+                    PgBackgroundWorker.RunTransaction(() => Write(record));
+                }
+                catch (PgException error)
+                {
+                    // Recording is only observational, so apply goes on without the record.
+                    PgLog.Warning(new PgDiagnostic($"conflict_history: recording failed for {record.Description}, continuing without recording it: " +
+                        $"{error.Message} (SQLSTATE {error.SqlState})")
+                    {
+                        Detail = error.Detail,
+                        Hint = error.Hint,
+                    });
+                }
+            }
         }
+    }
+
+    private static void Write(WorfConflictRecord record)
+    {
+        EnsurePartitionExists(record.RecordedAt);
+        _ = Worf.Execute(InsertSql,
+            SpiParameter.Create(record.SubId),
+            SpiParameter.Create(record.SubName),
+            SpiParameter.Create(record.ConflictType),
+            SpiParameter.Create(record.Resolution),
+            SpiParameter.Create(record.Schema),
+            SpiParameter.Create(record.Table),
+            SpiParameter.Create(record.IndexName),
+            SpiParameter.Create(record.LocalTuple),
+            SpiParameter.Create(record.LocalXid),
+            SpiParameter.Create(record.LocalOrigin),
+            SpiParameter.Create(record.LocalCommitTs),
+            SpiParameter.Create(record.RemoteTuple),
+            SpiParameter.Create(record.RemoteOrigin),
+            SpiParameter.Create(record.RemoteCommitTs),
+            Worf.LsnParameter(record.RemoteCommitLsn),
+            SpiParameter.Create(record.HasBeforeTriggers),
+            SpiParameter.Create(record.RecordedAt));
     }
 
     /// <summary>

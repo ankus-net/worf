@@ -803,6 +803,9 @@ internal static unsafe partial class Apply
             _ = s_lsnMapping.AddLast((NativeGlobals.XactLastCommitEnd, endLsn));
         }
 
+        // The conflicts the transaction recorded go into the history now that it has committed.
+        ConflictHistory.WriteCommitted();
+
         // If the xact isn't from the immediate upstream, advance the slot of the node it originally came from so we
         // start replay of that node's change data at the right place.
         //
