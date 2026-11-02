@@ -11,9 +11,9 @@ namespace Worf;
 /// its row and column as COPY's errors do. Under <c>worf.exception_behaviour</c> other than <c>error</c>, which copies
 /// every table this way, a row that fails, whether a value fails to convert, its column's input refuses it or a
 /// constraint does, is skipped and recorded in <c>worf.exception_log</c>, or disables the subscription once the copy
-/// rolls back. The table copies in one <c>COPY</c>, in a subtransaction, and a row that fails has it copied again in
-/// batches, each in its own <c>COPY</c> and subtransaction, which split in halves as one fails, down to the rows that
-/// fail.
+/// rolls back. The table copies in one <c>COPY</c>, in a subtransaction, and a row that fails, which COPY names, has it
+/// copied again in batches, each in its own <c>COPY</c> and subtransaction, which go on past each row that fails, or,
+/// under <c>sub_disable</c>, has the row recorded.
 /// </summary>
 internal static unsafe partial class CopyConversion
 {

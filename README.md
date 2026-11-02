@@ -837,12 +837,13 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   the subscription under `sub_disable`, and is recorded as a `COPY` with its
   text, its number in the copy as the action counter and the copy's position. A
   row that fails has the table copied again in batches of a thousand rows, each
-  in its own subtransaction, which split in halves as one fails, down to the
-  rows that fail. Under `error` the copy stops, naming the row, column and
-  value, and starts again after a delay of 5 seconds that doubles each time, up
-  to 5 minutes, from the start of a table's last copy or the failure of a
-  subscription's first; `worf.alter_subscription_resynchronize_table` starts it
-  again at once. The default is `error`.
+  in its own subtransaction, which go on past each row that fails, or, under
+  `sub_disable`, has the row it names recorded. Under `error` the copy stops,
+  naming the row, column and value, and starts again after a delay of 5 seconds
+  that doubles each time, up to 5 minutes, from the start of a table's last copy
+  or the failure of a subscription's first;
+  `worf.alter_subscription_resynchronize_table` starts it again at once. The
+  default is `error`.
 
 - `worf.enable_ddl_replication`
   Replicates DDL as it runs, through the `ddl_sql` replication set as
