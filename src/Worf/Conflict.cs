@@ -444,7 +444,7 @@ internal static partial class Conflict
             byte[] bytes = Worf.ToServer(outputstr);
             if (bytes.Length > MaxConflictLogAttrLen)
             {
-                outputstr = Worf.FromServer(bytes.AsSpan(0, MaxConflictLogAttrLen - 5)) + "...";
+                outputstr = Worf.Truncate(outputstr, MaxConflictLogAttrLen - 5) + "...";
             }
 
             s.Append(':');

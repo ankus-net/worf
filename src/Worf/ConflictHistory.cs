@@ -537,7 +537,7 @@ internal static partial class ConflictHistory
                 byte[] bytes = Worf.ToServer(outputstr!);
                 if (bytes.Length > maxSize && outputstr != "(unchanged-toast-datum)")
                 {
-                    outputstr = Worf.FromServer(bytes.AsSpan(0, maxSize));
+                    outputstr = Worf.Truncate(outputstr!, maxSize);
                 }
 
                 Executor.EscapeJson(json, outputstr!);

@@ -167,6 +167,39 @@ internal static partial class Worf
     }
 
     /// <summary>
+    /// Cuts a string to the longest start whose bytes in the database encoding fit, at a character's boundary, so that
+    /// they stay valid: PostgreSQL checks a SQL_ASCII database's bytes as UTF-8 as it converts them, and can't tell
+    /// where its characters end.
+    /// </summary>
+    /// <param name="value">The string.</param>
+    /// <param name="maxBytes">The most bytes the start may take.</param>
+    /// <returns>The start.</returns>
+    internal static string Truncate(string value, int maxBytes)
+    {
+        int fits = 0;
+        int over = Math.Min(value.Length, maxBytes) + 1;
+        while (over - fits > 1)
+        {
+            int mid = (fits + over) / 2;
+            if (ToServer(value[..mid]).Length <= maxBytes)
+            {
+                fits = mid;
+            }
+            else
+            {
+                over = mid;
+            }
+        }
+
+        if (fits > 0 && fits < value.Length && char.IsLowSurrogate(value[fits]))
+        {
+            fits--;
+        }
+
+        return value[..fits];
+    }
+
+    /// <summary>
     /// Converts bytes in the database encoding to a string.
     /// </summary>
     /// <param name="value">The bytes, without a terminator.</param>
@@ -1377,7 +1410,7 @@ internal static partial class Worf
 
         string applicationName = $"{ShortenHash(connname, Worker.NameDataLen - ToServer(suffix).Length - 2)}_{suffix}";
         byte[] bytes = ToServer(applicationName);
-        return bytes.Length > Worker.NameDataLen - 1 ? FromServer(bytes.AsSpan(0, Worker.NameDataLen - 1)) : applicationName;
+        return bytes.Length > Worker.NameDataLen - 1 ? Truncate(applicationName, Worker.NameDataLen - 1) : applicationName;
     }
 
     private static PgReplicationConnection ConnectBase(string connstr, string appname, string? suffix, bool replication, string? options)
