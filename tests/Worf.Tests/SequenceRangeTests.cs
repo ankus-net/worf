@@ -2209,16 +2209,7 @@ public sealed class SequenceRangeTests
                 VALUES ('public.u_id_seq', {record}, false);
             CREATE SEQUENCE u_id_seq START 5 CACHE 3;
             """, token);
-        bool released = await nodeB.PollLogAsync(releasepos, "u_id_seq left range management", token);
-        if (!released)
-        {
-            TestContext.WriteLine("DIAG B: " + await nodeB.SafePsqlAsync(Database, "SELECT r::text FROM worf.sequence_range r WHERE seqoid = 'u_id_seq'::regclass", token));
-            TestContext.WriteLine("DIAG B nodes: " + await nodeB.SafePsqlAsync(Database, "SELECT n::text FROM worf.sequence_range_node n WHERE seqoid = 'u_id_seq'::regclass", token));
-            TestContext.WriteLine("DIAG B blocks: " + await nodeB.SafePsqlAsync(Database, "SELECT b::text FROM worf.sequence_range_block b WHERE seqoid = 'u_id_seq'::regclass", token));
-            TestContext.WriteLine("DIAG B log: " + nodeB.ReadLog()[releasepos..]);
-        }
-
-        Assert.IsTrue(released, "node_b's new u_id_seq left the disabled epoch");
+        Assert.IsTrue(await nodeB.PollLogAsync(releasepos, "u_id_seq left range management", token), "node_b's new u_id_seq left the disabled epoch");
         Assert.AreEqual("5|3|t", await nodeB.SafePsqlAsync(Database, """
             SELECT nextval('u_id_seq'), seqcache, has_sequence_privilege('u_id_seq', 'UPDATE') FROM pg_sequence WHERE seqrelid = 'u_id_seq'::regclass
             """, token), "node_b's new u_id_seq as it was created");

@@ -40,8 +40,16 @@ internal static class SequenceRangeWorker
             try
             {
                 forgot = PgBackgroundWorker.RunTransaction(() =>
-                    Worf.CatalogOid("sequence_range") != 0 && WorfNode.GetLocalNode(false, true) is not null &&
-                    SequenceRanges.ForgetDropped() | SequenceRanges.ReleaseRecreated());
+                {
+                    if (Worf.CatalogOid("sequence_range") == 0 || WorfNode.GetLocalNode(false, true) is null)
+                    {
+                        return false;
+                    }
+
+                    bool dropped = SequenceRanges.ForgetDropped();
+                    bool released = SequenceRanges.ReleaseRecreated();
+                    return dropped || released;
+                });
             }
             catch (PgException error)
             {

@@ -3632,9 +3632,11 @@ internal static unsafe partial class SequenceRanges
     /// <returns>Whether it gave any back.</returns>
     internal static bool ReleaseRecreated()
     {
+        // A block abandoned as it came, as one that answers a request no longer open, was never drawn from.
         const string Released = """
             FROM worf.sequence_range r
-            WHERE r.recreated IS NOT NULL AND r.state = 'disabled' AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_block b WHERE b.seqoid = r.seqoid)
+            WHERE r.recreated IS NOT NULL AND r.state = 'disabled' AND NOT EXISTS (
+                SELECT 1 FROM worf.sequence_range_block b WHERE b.seqoid = r.seqoid AND (b.state <> 'abandoned' OR b.activated_at IS NOT NULL))
             """;
         if (!Worf.ReadScalar<bool>($"SELECT EXISTS (SELECT 1 {Released})"))
         {

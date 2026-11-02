@@ -247,8 +247,8 @@ internal static class Manager
             // A database that manages nothing needs no range worker, so asking its providers takes one worker slot. The
             // next round is due an exchange interval after this one starts, however long starting it took.
             s_discoveryRequested = requested;
-            started = StartRangeWorker(WorfWorkerType.Exchange, dboid, exchangeRunning || exchangeCrashed);
-            s_watching |= started && !exchangeRunning && !exchangeCrashed;
+            started = StartRangeWorker(WorfWorkerType.Exchange, dboid, exchangeCrashed);
+            s_watching |= started && !exchangeCrashed;
             s_discoveryAt = Worker.GetCurrentTimestamp() + (SequenceRanges.ExchangeInterval * 1000L);
         }
 

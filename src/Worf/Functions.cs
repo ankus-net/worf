@@ -1504,7 +1504,9 @@ internal static class Functions
         EState* estate = Executor.CreateEstateForRelation(rel, false);
         ExprContext* econtext = Executor.PreparePerTupleEcontext(estate, reltupdesc);
 
-        // Prepare the row filter expression.
+        // Prepare the row filter expression. The filters are prepared, which inlines the SQL functions they call, and
+        // run under the path the database and role set, as the WAL sender's are.
+        int nestLevel = Worf.DefaultSearchPath();
         List<nint> rowFilterList = [];
         foreach (nint rowFilter in tableinfo.RowFilter)
         {
@@ -1521,8 +1523,6 @@ internal static class Functions
         ulong* values = (ulong*)NativeMethods.palloc((ulong)(reltupdesc->natts * sizeof(ulong)));
         bool* nulls = (bool*)NativeMethods.palloc((ulong)reltupdesc->natts);
 
-        // The filters run under the path the database and role set, as the WAL sender's do.
-        int nestLevel = Worf.DefaultSearchPath();
         try
         {
             HeapTupleData* htup;
