@@ -1,4 +1,3 @@
-using System.Globalization;
 using Ankus.Postgres;
 
 namespace Worf;
@@ -33,8 +32,8 @@ internal static class SequenceRangeReservations
     /// <summary>
     /// Returns once the sequence's active block has at least <paramref name="count"/> values left, and a twentieth more
     /// for other sessions, once the range worker has switched to a block that large if needed: the next block, when it
-    /// is, or one granted for the reservation. It then holds the sequence until the transaction ends, so that other
-    /// sessions' inserts into it wait for the load rather than draw the values down.
+    /// is, or one granted for the reservation. Other sessions go on drawing from it, and a load that they leave short
+    /// goes on in the next block, as their inserts do.
     /// </summary>
     [PgFunction(Sql = """
         CREATE FUNCTION worf.reserve_sequence_range(sequence regclass, count bigint, timeout interval DEFAULT '1 minute')
@@ -87,30 +86,17 @@ internal static class SequenceRangeReservations
                 // a block granted or switched to between the look and the check isn't missed.
                 bool pending = requested && (Pending(requestId) || ReservedNext(seqoid, epoch));
                 (Guid Id, long Lo, long Hi)? active = SequenceRanges.NodeBlock(seqoid, epoch, "active");
-                if (active is not null && SequenceRanges.StepsLeft(seqoid, info, active.Value) >= needed)
+                // A block reserved and switched to since the request serves the load even once other sessions drew on it
+                // before this one looked.
+                if (active is not null && (SequenceRanges.StepsLeft(seqoid, info, active.Value) >= needed ||
+                    (requested && active.Value.Id != requestedUnder && Reserved(active.Value.Id))))
                 {
-                    // Once the transactions that drew from the block end, the values left are the load's alone, unless
-                    // they drew it down first, or the worker switched the sequence meanwhile.
-                    Hold(seqoid, deadline, info.Name);
-                    if (SequenceRanges.NodeBlock(seqoid, epoch, "active") is (Guid, long, long) held &&
-                        SequenceRanges.StepsLeft(seqoid, info, held) >= count)
-                    {
-                        break;
-                    }
-
-                    unsafe
-                    {
-                        NativeMethods.UnlockRelationOid(seqoid, (int)PgLockMode.Exclusive);
-                    }
-
-                    requestedUnder = active.Value.Id;
-                    pending = false;
+                    break;
                 }
 
                 if (!requested || (!pending && active?.Id != requestedUnder))
                 {
-                    // A block switched to for the request that other sessions drew down before this one looked holds
-                    // too few values now, so the request goes again.
+                    // The request goes once, and again once the worker switched to a block other than one for it.
                     requested = true;
                     requestedUnder = active?.Id;
                     requestId = Guid.NewGuid();
@@ -147,28 +133,10 @@ internal static class SequenceRangeReservations
     }
 
     /// <summary>
-    /// Holds a sequence against other sessions' nextval until the transaction ends, once the transactions that called it
-    /// end, waiting for them until the reservation's time is up, when it fails with 55P03.
+    /// Checks whether a block was reserved for a load.
     /// </summary>
-    private static void Hold(uint seqoid, long deadline, string name)
-    {
-        long left = deadline - Worker.GetCurrentTimestamp();
-        if (left <= 0)
-        {
-            throw new PgException("57014", $"timed out waiting for the transactions that hold sequence {name}");
-        }
-
-        // The session's own lock_timeout comes back once the lock is taken, and with the rollback of a wait that ran out.
-        string lockTimeout = Worf.ReadScalar<string>("SELECT pg_catalog.current_setting('lock_timeout')");
-        _ = Worf.Execute("SELECT pg_catalog.set_config('lock_timeout', $1, true)", SpiParameter.Create(
-            Math.Max(left / 1000, 1).ToString(CultureInfo.InvariantCulture)));
-        unsafe
-        {
-            NativeMethods.LockRelationOid(seqoid, (int)PgLockMode.Exclusive);
-        }
-
-        _ = Worf.Execute("SELECT pg_catalog.set_config('lock_timeout', $1, true)", SpiParameter.Create(lockTimeout));
-    }
+    private static bool Reserved(Guid blockId)
+        => Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range_block WHERE block_id = $1 AND reserved", SpiParameter.Create(blockId)).Count > 0;
 
     /// <summary>
     /// Checks whether a reserved block waits for the worker to switch to it.

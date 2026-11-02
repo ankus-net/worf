@@ -236,6 +236,12 @@ internal static class Manager
             started = StartRangeWorker(WorfWorkerType.Exchange, dboid, exchangeRunning || exchangeCrashed) &&
                 StartRangeWorker(WorfWorkerType.Range, dboid, rangeRunning || rangeCrashed);
         }
+        else if (exchangeRunning)
+        {
+            // The next round is due an exchange interval after this one ends, as one stays up that long while a
+            // subscription is still making its slot.
+            s_discoveryAt = now + (SequenceRanges.ExchangeInterval * 1000L);
+        }
         else if (now >= s_discoveryAt || requested != s_discoveryRequested)
         {
             // A database that manages nothing needs no range worker, so asking its providers takes one worker slot. The

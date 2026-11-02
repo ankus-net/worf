@@ -34,12 +34,14 @@ internal static class SequenceRangeWorker
 
             long requested = SequenceRanges.CheckRequested.Value;
 
-            // The range state of a sequence whose drop has committed goes first, which the DROP leaves to this worker.
+            // The range state of a sequence whose drop has committed goes first, which the DROP leaves to this worker,
+            // and so does that of a sequence created again that joined a disabled epoch.
             bool forgot = false;
             try
             {
                 forgot = PgBackgroundWorker.RunTransaction(() =>
-                    Worf.CatalogOid("sequence_range") != 0 && WorfNode.GetLocalNode(false, true) is not null && SequenceRanges.ForgetDropped());
+                    Worf.CatalogOid("sequence_range") != 0 && WorfNode.GetLocalNode(false, true) is not null &&
+                    SequenceRanges.ForgetDropped() | SequenceRanges.ReleaseRecreated());
             }
             catch (PgException error)
             {
@@ -104,6 +106,8 @@ internal static class SequenceRangeWorker
                             PgLog.Warning(new PgDiagnostic($"could not check managed sequence {seqoid}: {error.Message}") { Detail = error.Detail });
                         }
                     }
+
+                    SequenceRanges.HandOff();
                 }
 
                 // Snowflake IDs never pass the time reserved ahead, which backends see only once it is durable.

@@ -8,6 +8,9 @@ namespace Worf;
 /// </summary>
 internal static class SequenceRangeSwitchWorker
 {
+    // The sequences whose switch worker couldn't start, which have warned of it.
+    private static readonly HashSet<uint> s_unstarted = [];
+
     /// <summary>
     /// Runs the switch worker.
     /// </summary>
@@ -31,7 +34,8 @@ internal static class SequenceRangeSwitchWorker
             }
             catch (PgException error) when (error.SqlState is "55P03" or "40P01")
             {
-                // A transaction held the range row, as a reset does, or the wait deadlocked, and the worker waits again.
+                // A transaction held the range row, as a reset does, a slice of the wait for the sequence ran out, or the
+                // wait deadlocked, and the worker waits again.
                 _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(10));
             }
         }
@@ -62,11 +66,17 @@ internal static class SequenceRangeSwitchWorker
                 Dboid = Worker.MyWorker.Dboid,
                 Worker = new WorfWorkerInfo { Switch = new WorfSwitchWorker { Seqoid = seqoid } },
             });
+            _ = s_unstarted.Remove(seqoid);
             return true;
         }
         catch (PgException error)
         {
-            PgLog.Warning($"could not start the sequence switch worker for sequence {seqoid}: {error.Message}");
+            // Each sequence warns once until a worker starts for it, rather than at every check.
+            if (s_unstarted.Add(seqoid))
+            {
+                PgLog.Warning($"could not start the sequence switch worker for sequence {seqoid}: {error.Message}");
+            }
+
             return false;
         }
     }

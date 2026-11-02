@@ -670,9 +670,11 @@ internal static class Worker
                 }
             }
 
-            // Poll for worker startup. On Windows, use a shorter interval since process creation is slower and we
-            // want to detect attachment to shared memory as quickly as possible.
-            if (!PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(OperatingSystem.IsWindows() ? 200 : 1000)))
+            // Poll for worker startup. A worker that has started attaches to shared memory soon after, which the
+            // postmaster signals nothing for, so the poll is short then. On Windows, use a shorter interval since
+            // process creation is slower and we want to detect attachment to shared memory as quickly as possible.
+            if (!PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(state.Status == PgBackgroundWorkerStatus.Started ? 10
+                : OperatingSystem.IsWindows() ? 200 : 1000)))
             {
                 throw new OperationCanceledException("The worf worker is stopping.");
             }

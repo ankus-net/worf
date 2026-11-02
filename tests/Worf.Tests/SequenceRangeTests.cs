@@ -537,7 +537,7 @@ public sealed class SequenceRangeTests
             """, token);
 
         // A name that gives no schema, in a table whose schema has nothing of the name, stands for the managed sequence
-        // the search path finds as the DDL runs, and still does after the table moves to such a schema.
+        // of the name, whatever the search path as the DDL runs, and still does after the table moves to such a schema.
         _ = await node.SafePsqlAsync(Database, """
             CREATE SCHEMA s1;
             SET search_path = s1, public;
@@ -546,8 +546,15 @@ public sealed class SequenceRangeTests
             ALTER TABLE public.moved SET SCHEMA s1;
             RESET search_path;
             ALTER TABLE s1.moved ADD COLUMN v text;
+            SET search_path = s1;
+            ALTER TABLE s1.tx ADD COLUMN z int;
+            SET search_path = '';
+            ALTER TABLE s1.tx ADD COLUMN z2 int;
+            RESET search_path;
+            CREATE TEMPORARY SEQUENCE t_id_seq;
+            ALTER TABLE s1.tx ADD COLUMN z3 int;
             """, token);
-        await AssertOutsideAsync(node, "SET search_path = s1, public; INSERT INTO s1.tx VALUES (888882)");
+        await AssertOutsideAsync(node, "SET search_path = s1, public; INSERT INTO s1.tx (id) VALUES (888882)");
         await AssertOutsideAsync(node, "SET search_path = s1, public; INSERT INTO s1.moved VALUES (888880)");
 
         // An update that moves a row into a partition whose trigger, run before the insert there, changes its key, is
@@ -2112,21 +2119,15 @@ public sealed class SequenceRangeTests
         Assert.AreEqual(before[0], after[0], "the request size");
         Assert.AreEqual(before[1], after[1], "the peak rate");
 
-        // A reservation holds the sequence until its transaction ends, so that other sessions' inserts can't draw the
-        // load's values down: they wait for the load to commit, and so does another session's reservation, with its
-        // switch, while worf.sequence_ranges still reads.
+        // A reservation holds nothing that other sessions wait for: their inserts go on while the load's transaction is
+        // open, and so does another session's reservation, with its switch.
         await using (NpgsqlConnection batch = await nodeA.OpenAsync(Database, token))
         {
             await ExecuteAsync(batch, "BEGIN; SELECT worf.reserve_sequence_range('t_id_seq', 10)", token);
             long left = long.Parse(await nodeA.SafePsqlAsync(Database, "SELECT values_left FROM worf.sequence_ranges", token), CultureInfo.InvariantCulture);
-            Task<string> inserting = nodeA.SafePsqlAsync(Database, "INSERT INTO t (v) VALUES ('waits')", token);
-            Task<string> reserving = nodeA.SafePsqlAsync(Database, $"SELECT worf.reserve_sequence_range('t_id_seq', {left + 100})", token);
-            await Task.Delay(1000, token);
-            Assert.IsFalse(inserting.IsCompleted, "another session's insert didn't wait for the load");
-            Assert.IsFalse(reserving.IsCompleted, "another session's reservation didn't wait for the load");
+            _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO t (v) VALUES ('goes on')", token);
+            _ = await nodeA.SafePsqlAsync(Database, $"SELECT worf.reserve_sequence_range('t_id_seq', {left + 100})", token);
             await ExecuteAsync(batch, "INSERT INTO t (v) SELECT 'batch' FROM generate_series(1, 10); COMMIT", token);
-            _ = await inserting;
-            _ = await reserving;
         }
 
         // A load's transaction on node_b, whose reservation the range worker switched for, holds nothing that the range
@@ -2182,6 +2183,8 @@ public sealed class SequenceRangeTests
             """, token);
         Assert.AreEqual("refused", await nodeB.SafePsqlAsync(Database, "SELECT state FROM worf.sequence_range WHERE seqoid = 'u_id_seq'::regclass", token),
             "node_b's moved u_id_seq, which issued values");
+        PostgresException parked = await Assert.ThrowsExactlyAsync<PostgresException>(() => nodeB.SafePsqlAsync(Database, "SELECT nextval('u_id_seq')", token));
+        Assert.AreEqual("2200H", parked.SqlState, "node_b's refused u_id_seq issues nothing");
 
         // Once node_a disables the epoch, node_b forgets the sequence it dropped, so a sequence it creates again under the
         // name doesn't join the disabled epoch.
@@ -2192,6 +2195,24 @@ public sealed class SequenceRangeTests
         _ = await nodeB.SafePsqlAsync(Database, "CREATE SEQUENCE u_id_seq", token);
         Assert.AreEqual("f", await nodeB.SafePsqlAsync(Database, "SELECT EXISTS (SELECT 1 FROM worf.sequence_range WHERE seqoid = 'u_id_seq'::regclass)", token),
             "node_b's new u_id_seq joined the disabled epoch");
+
+        // One created again before the word of the disable arrives, as the record put back here stands for, joins the
+        // epoch, and leaves it once the word comes, as it drew no block, with what CREATE SEQUENCE gave it.
+        string record = await nodeA.SafePsqlAsync(Database, """
+            SELECT owner_node || ', ' || epoch || ', ' || range_size || ', ' || max_range_size || ', ' || coalesce(root_start::text, 'NULL') || ', ' || root_end
+            FROM worf.sequence_range WHERE seqoid = 'u_id_seq'::regclass
+            """, token);
+        int releasepos = nodeB.ReadLog().Length;
+        _ = await nodeB.SafePsqlAsync(Database, $"""
+            DROP SEQUENCE u_id_seq;
+            INSERT INTO worf.sequence_range_dropped (name, owner_node, epoch, range_size, max_range_size, root_start, root_end, owned)
+                VALUES ('public.u_id_seq', {record}, false);
+            CREATE SEQUENCE u_id_seq START 5 CACHE 3;
+            """, token);
+        Assert.IsTrue(await nodeB.PollLogAsync(releasepos, "u_id_seq left range management", token), "node_b's new u_id_seq left the disabled epoch");
+        Assert.AreEqual("5|3|t", await nodeB.SafePsqlAsync(Database, """
+            SELECT nextval('u_id_seq'), seqcache, has_sequence_privilege('u_id_seq', 'UPDATE') FROM pg_sequence WHERE seqrelid = 'u_id_seq'::regclass
+            """, token), "node_b's new u_id_seq as it was created");
 
         // node_b hears of grants beyond node_a's watermark, as when node_a, the owner, went back to before them by less
         // than its WAL position shows. node_a resets, and its fence holds, here on a neighbor that never reports, while
@@ -2221,7 +2242,11 @@ public sealed class SequenceRangeTests
             await Task.Delay(TimeSpan.FromMilliseconds(20), token);
         }
 
-        _ = await nodeA.SafePsqlAsync(Database, "DELETE FROM worf.sequence_range_link WHERE node_id = 4242; SELECT worf.activate_sequence_range('t_id_seq')", token);
+        // The fence stops waiting for the node gone for good, named as the detail names it, and lifts, as node_b has
+        // reported.
+        StringAssert.Contains(await nodeA.SafePsqlAsync(Database, "SELECT detail FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass", token),
+            "node 4242");
+        _ = await nodeA.SafePsqlAsync(Database, "DELETE FROM worf.sequence_range_link WHERE node_id = 4242; SELECT worf.activate_sequence_range('t_id_seq', '4242')", token);
         Stopwatch lifted = Stopwatch.StartNew();
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, $"SELECT state = 'active' AND active_lo > {beyond} FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token),
             "node_b drawing from a block beyond the watermark it heard of");

@@ -678,8 +678,10 @@ sequence's owner to call these functions.
 
 - `worf.enable_sequence_range(sequence regclass, participants text[], range_size bigint, max_range_size bigint, pool_start bigint, force boolean)`
   Puts a sequence under range management, owned by this node.
-- `worf.activate_sequence_range(sequence regclass)`
+- `worf.activate_sequence_range(sequence regclass, node_name name)`
   Starts granting with the nodes that have reported so far, or lifts a fence.
+  With a node named, the fence stops waiting for that node alone, as for one
+  gone for good.
 - `worf.alter_sequence_range(sequence regclass, range_size bigint, max_range_size bigint)`
   Changes the block sizes.
 - `worf.disable_sequence_range(sequence regclass)`
@@ -690,11 +692,10 @@ sequence's owner to call these functions.
   owner or pool holder grants nothing until every node it exchanges with
   reports what it holds.
 - `worf.reserve_sequence_range(sequence regclass, count bigint, timeout interval)`
-  Returns once the active block has at least `count` values left, before a load
-  that numbers its rows with the sequence, and holds the sequence until the
-  transaction ends, so that other sessions' inserts into it wait for the load.
-  Run it in the load's transaction, before it calls `nextval`. It needs the
-  privileges of the sequence's owner.
+  Returns once the active block has at least `count` values left, and a
+  twentieth more for other sessions, before a load that numbers its rows with
+  the sequence. Run it before the load's transaction calls `nextval`. It needs
+  the privileges of the sequence's owner.
 - `worf.reserve_sequence_values(sequence regclass, lo bigint, hi bigint, timeout interval)`
   Gives this node exactly `[lo, hi]`, for rows that already carry those keys.
   It needs the privileges of the sequence's owner.

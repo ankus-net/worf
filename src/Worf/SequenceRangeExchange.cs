@@ -321,8 +321,10 @@ internal static class SequenceRangeExchange
                 // A failed exchange is tried again after a delay that doubles, up to the exchange interval, or half the
                 // exchange timeout while this node waits on the neighbor, as for a block, so that inserts waiting at a
                 // block's end, up to twice the timeout, get it soon after the neighbor is back. A call the watcher
-                // cancelled has run out of time.
-                long most = waiting is not null ? Math.Min(SequenceRanges.ExchangeInterval * 1000L, SequenceRanges.ExchangeTimeout * 500L)
+                // cancelled has run out of time, which held up the calls to the other neighbors, so it backs off up to
+                // the exchange interval all the same.
+                long most = waiting is not null && error is not PgQueryCanceledException
+                    ? Math.Min(SequenceRanges.ExchangeInterval * 1000L, SequenceRanges.ExchangeTimeout * 500L)
                     : SequenceRanges.ExchangeInterval * 1000L;
                 long delay = s_retries.TryGetValue(sub.Id, out (long At, long Delay) retry) ? retry.Delay * 2 : 0;
                 delay = Math.Min(Math.Max(delay, SequenceRanges.CheckInterval * 1000L), Math.Max(most, SequenceRanges.CheckInterval * 1000L));
@@ -1305,10 +1307,12 @@ internal static class SequenceRangeExchange
             SpiParameter.Create(high), SpiParameter.Create(watermark), SpiParameter.Create(call), SpiParameter.Create(Holds(entry)),
             SpiParameter.Create(Nullable(entry, "clock")));
 
-        // The neighbor asks this node to reset, once per rollback it saw, or has reset as this node asked.
+        // The neighbor asks this node to reset, once per rollback it saw, or has reset as this node asked. A node that has
+        // neither started drawing from a block nor granted one since it last reset has nothing it could issue or grant
+        // twice, so a request then, as a made-up one sent again would be, only stops the neighbor asking.
         if (Text(entry, "reset") is string reset && Worf.Execute(
             "UPDATE worf.sequence_range_node SET reset_done = $3::pg_lsn WHERE seqoid = $1 AND node_id = $2 AND reset_done IS DISTINCT FROM $3::pg_lsn",
-            seq, sender, SpiParameter.Create(reset)) > 0)
+            seq, sender, SpiParameter.Create(reset)) > 0 && SequenceRanges.ActedSinceReset(seqoid, node))
         {
             PgLog.Warning($"sequence {info.Name}: node {senderName} saw this node's WAL position move backwards, so it abandons its blocks and requests new ones");
             SequenceRanges.Reset(seqoid, node, false);
