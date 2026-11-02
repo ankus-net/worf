@@ -150,23 +150,25 @@ On a subscriber, PostgreSQL tracks each replication origin in use in one of
 synchronizing another, and each other node whose changes its provider forwards
 with `forward_origins` `{all}` another. When one that needs a slot finds none
 free, subscriptions give up the slots of forwarded nodes' origins they no longer
-need, which slows apply; failing that within 10 seconds, its apply or table sync
-stops with an error and retries. They also give them up, within 10 seconds, to
+need, which slows apply, the last one a subscription applied under going too
+once its own origin has taken its progress; failing that within 10 seconds, its
+apply or table sync stops with an error and retries. They also give them up,
+within 10 seconds or twice `wal_retrieve_retry_interval` if that is longer, to
 an enabled PostgreSQL subscription whose origin, or a table sync's, has none
 while a worker of it runs or can start: its owner can log in, its database
 allows connections, and `max_logical_replication_workers` leaves room. A new
-relay origin waits for those 10 seconds while one of them still has none, so
-that a slot it gave up is theirs to take. One that still has none after that,
-though a slot was free, as while its provider can't be reached, isn't waiting
-for one, and they don't give theirs up for it again for 10 minutes, then for
-twice as long each time, up to a day. Other users of origins need the limit
-raised. `worf.origin_writer` records the node and subscription each origin worf
-creates applies for, a row each time one is created or dropped, and forgets a
-row once a later one has superseded it for `vacuum_freeze_min_age` transactions,
-as vacuum would freeze rows written before then, so it holds a row for each
-origin id and for each creation or drop in that many transactions. A conflict on
-a row written before then, whose record is forgotten, takes the row to be from
-what its origin applies for now, as pglogical takes every row.
+relay origin of any subscription waits that long while one of them still has
+none, so that a slot given up is theirs to take. One that still has none after
+that, though a slot was free, isn't waiting for one, and they don't give theirs
+up for it again for 10 minutes, then for twice as long each time, up to a day.
+Other users of origins need the limit raised. `worf.origin_writer` records the
+node and subscription each origin worf creates applies for, a row each time one
+is created or dropped, and forgets a row once a later one has superseded it for
+`vacuum_freeze_min_age` transactions, as vacuum would freeze rows written before
+then, so it holds a row for each origin id and for each creation or drop in that
+many transactions. A conflict on a row written before then, whose record is
+forgotten, takes the row to be from what its origin applies for now, as
+pglogical takes every row.
 
 If you want to handle conflict resolution with last/first update wins (see
 [Conflicts](#conflicts)), you can add this additional option to
@@ -821,9 +823,10 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   instead, or none when it can't reach the provider, then leaves the slot, with
   a warning, to the subscription's apply worker, which drops it, as it does any
   slot its table syncs left when it starts, and tries again every five seconds
-  while one stays; dropping the subscription drops them too. One that stops
-  after its copy has committed catches up again from where it got to when it
-  restarts, rather than copying again. When its slot is gone or invalidated, or
+  while one stays, and once a minute for the slot of a sync that ended without
+  saying so, as one killed; dropping the subscription drops them too. One that
+  stops after its copy has committed catches up again from where it got to when
+  it restarts, rather than copying again. When its slot is gone or invalidated, or
   its origin has no progress, it copies the table again and merges the copy in,
   in one transaction: the provider's rows replace those with the same replica
   identity or primary key, or join them, and the table's other rows stay, since
@@ -832,9 +835,12 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   the table empties it and copies it again. Writers go on meanwhile, and readers
   see the rows as they were until it commits. A table with neither key fails
   instead, and retries, until it is resynchronized, and so does a merge that a
-  unique index other than the key refuses, as when a row the provider has since
-  deleted here holds a value one of the provider's rows takes, with a hint to
-  resynchronize. In a table's initial copy, a row that fails, whether its value
+  unique index other than the key, deferrable or not, or an exclusion constraint
+  refuses, as when a row the provider has since deleted here holds a value one
+  of the provider's rows takes, or the provider moved a value from one row to
+  another, with a hint to resynchronize. Such a merge is recorded as a `MERGE`
+  under `discard` and `transdiscard`, and disables the subscription under
+  `sub_disable`. In a table's initial copy, a row that fails, whether its value
   doesn't convert to its column's type, the column's input refuses it or a
   constraint does, is skipped under `discard` and `transdiscard` and disables
   the subscription under `sub_disable`, and is recorded as a `COPY` with its
@@ -938,16 +944,23 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   copies or attaches, since the index wouldn't get the rows. Names PostgreSQL
   chooses for new objects are the same on every node, and DDL that takes its
   name renames it, with a warning. To keep them so, DDL that creates, renames or
-  indexes relations moves the indexes on its node alone out of the way in the
-  schemas it does that in, which include those of the partitions an index on a
-  partitioned table or a partition attached builds indexes in, finding names as
-  the role that ran it, until the transaction ends, which holds up other DDL on
-  them meanwhile, in the same order on every path. DDL that creates no
-  relations, as a function's, a type's or a sequence's change, or a DROP, moves
-  none, and a DO block, a procedure or an extension, which can create relations
-  anywhere, moves them in every schema. `worf.replicate_ddl_command` does the
-  same on every node. Relations that a function creates, as one a SELECT calls,
-  can still take other names than on the other nodes.
+  indexes relations, which includes a composite type's change, rename or move,
+  `SELECT INTO` and `EXPLAIN ANALYZE` of such DDL, moves the indexes on its node
+  alone out of the way in the schemas it does that in, which include those of
+  the partitions an index on a partitioned table or a partition attached builds
+  indexes in, finding names as the role that ran it, until the transaction ends,
+  which holds up other DDL on them meanwhile: DDL from another node that moves
+  or passes over them waits for a local transaction whose DDL moved them. Each
+  statement locks them in the same order, but a transaction whose DDL works in
+  more than one schema can deadlock with one that works in them in another
+  order; PostgreSQL ends one of them, and apply runs its transaction again. DDL
+  that creates no relations, as a function's, another type's or a sequence's
+  change, or a DROP, moves none. A statement that sets something, as `SET
+  search_path` does, and a DO block, a procedure or an extension, which can
+  create relations anywhere, move them in every schema.
+  `worf.replicate_ddl_command` does the same on every node. Relations that a
+  function creates, as one a SELECT calls, can still take other names than on
+  the other nodes.
   DDL from another node that can't build it again, as a unique one that finds
   duplicate keys when a table is rewritten, drops it, with a warning that
   gives its definition. Drop it: until then a unique one still rejects

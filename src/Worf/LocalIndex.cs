@@ -64,6 +64,9 @@ internal static unsafe partial class LocalIndex
     private const uint RangeVarMissingOk = 1;
     private const uint CreateTableLikeIndexes = 1 << 6;
 
+    // SECURITY_LOCAL_USERID_CHANGE from miscadmin.h.
+    private const int SecurityLocalUseridChange = 0x0001;
+
     [PgNativeCallback(nameof(TransactionEnding))]
     private static partial XactCallback TransactionCallback { get; }
 
@@ -367,28 +370,27 @@ internal static unsafe partial class LocalIndex
             return [];
         }
 
-        // The statement's names are found as the role that ran it finds them, as its own search path's "$user" does.
+        // The statement's names are found as the role that ran it finds them, as its own search path's "$user" does,
+        // as that user rather than with the role set, which a security-definer function can't do. A statement that sets
+        // something, as the search path, changes how the ones after it find names, so every schema's indexes move.
         HashSet<uint>? schemas = [];
-        int nestLevel = NativeMethods.NewGUCNestLevel();
+        uint userId;
+        int secContext;
+        NativeMethods.GetUserIdAndSecContext(&userId, &secContext);
+        NativeMethods.SetUserIdAndSecContext(NativeMethods.get_role_oid(Worf.PStrDup(role), false), secContext | SecurityLocalUseridChange);
         try
         {
-            fixed (byte* name = Worf.ToServerCString("role"))
-            fixed (byte* value = Worf.ToServerCString(role))
-            {
-                _ = NativeMethods.set_config_option((sbyte*)name, (sbyte*)value, GucContext.PGC_INTERNAL, GucSource.PGC_S_SESSION,
-                    GucAction.GUC_ACTION_SAVE, true, 0, false);
-            }
-
             List* statements = NativeMethods.raw_parser(Worf.PStrDup(command), RawParseMode.RAW_PARSE_DEFAULT);
             for (int i = 0; schemas is not null && statements is not null && i < statements->length; i++)
             {
-                HashSet<uint>? named = NamingSchemas(((RawStmt*)statements->elements[i].ptr_value)->stmt);
+                Node* statement = ((RawStmt*)statements->elements[i].ptr_value)->stmt;
+                HashSet<uint>? named = statement->type == NodeTag.T_VariableSetStmt ? null : NamingSchemas(statement);
                 schemas = named is null ? null : [.. schemas, .. named];
             }
         }
         finally
         {
-            NativeMethods.AtEOXact_GUC(true, nestLevel);
+            NativeMethods.SetUserIdAndSecContext(userId, secContext);
         }
 
         return MoveAside(schemas);
@@ -438,6 +440,30 @@ internal static unsafe partial class LocalIndex
     /// <returns>The schemas, or null for every schema.</returns>
     private static HashSet<uint>? NamingSchemas(Node* parsetree)
     {
+        // EXPLAIN ANALYZE runs the statement it explains, and a type's rename or move renames or moves a composite
+        // type's relation.
+        if (parsetree->type == NodeTag.T_ExplainStmt)
+        {
+            return NamingSchemas(((ExplainStmt*)parsetree)->query);
+        }
+
+        if ((parsetree->type == NodeTag.T_RenameStmt && ((RenameStmt*)parsetree)->renameType == ObjectType.OBJECT_TYPE) ||
+            (parsetree->type == NodeTag.T_AlterObjectSchemaStmt && ((AlterObjectSchemaStmt*)parsetree)->objectType == ObjectType.OBJECT_TYPE))
+        {
+            List* typeName = (List*)(parsetree->type == NodeTag.T_RenameStmt ? ((RenameStmt*)parsetree)->@object : ((AlterObjectSchemaStmt*)parsetree)->@object);
+            uint typid = NativeMethods.LookupTypeNameOid(null, NativeMethods.makeTypeNameFromNameList(typeName), true);
+            uint typrelid = typid == 0 ? 0 : NativeMethods.get_typ_typrelid(typid);
+            if (typrelid == 0)
+            {
+                return typid == 0 ? null : [];
+            }
+
+            uint target = parsetree->type == NodeTag.T_AlterObjectSchemaStmt
+                ? NativeMethods.get_namespace_oid(((AlterObjectSchemaStmt*)parsetree)->newschema, true)
+                : NativeMethods.get_rel_namespace(typrelid);
+            return target == 0 ? null : [NativeMethods.get_rel_namespace(typrelid), target];
+        }
+
         (nint relation, bool creating) = parsetree->type switch
         {
             NodeTag.T_IndexStmt => ((nint)((IndexStmt*)parsetree)->relation, false),
@@ -446,6 +472,7 @@ internal static unsafe partial class LocalIndex
             NodeTag.T_CreateSeqStmt => ((nint)((CreateSeqStmt*)parsetree)->sequence, true),
             NodeTag.T_ViewStmt => ((nint)((ViewStmt*)parsetree)->view, true),
             NodeTag.T_CreateTableAsStmt => ((nint)((CreateTableAsStmt*)parsetree)->into->rel, true),
+            NodeTag.T_SelectStmt => (((SelectStmt*)parsetree)->intoClause is null ? 0 : (nint)((SelectStmt*)parsetree)->intoClause->rel, true),
             NodeTag.T_CompositeTypeStmt => ((nint)((CompositeTypeStmt*)parsetree)->typevar, true),
             NodeTag.T_RenameStmt or NodeTag.T_AlterObjectSchemaStmt => (parsetree->type == NodeTag.T_RenameStmt
                 ? (nint)((RenameStmt*)parsetree)->relation : (nint)((AlterObjectSchemaStmt*)parsetree)->relation, false),
@@ -522,9 +549,12 @@ internal static unsafe partial class LocalIndex
             return NativeMethods.get_namespace_oid(relation->schemaname, true);
         }
 
+        // A relation created without a schema goes in the first schema of the path, where one can be created, and a
+        // statement whose path has none, as replicate_ddl_command's empty one, can't be told.
         if (creating)
         {
-            return NativeMethods.RangeVarGetCreationNamespace(relation);
+            List* path = NativeMethods.fetch_search_path(false);
+            return path is null || path->length == 0 ? 0 : path->elements[0].oid_value;
         }
 
         uint relid = NativeMethods.RangeVarGetRelidExtended(relation, 0, RangeVarMissingOk, default, null);

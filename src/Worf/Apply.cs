@@ -28,8 +28,10 @@ internal static unsafe partial class Apply
     private const int ExceptionByTransaction = 2;
     private const int ExceptionWithoutApplying = 3;
 
-    // How many microseconds the apply worker waits before it tries again to drop slots that table syncs left.
+    // How many microseconds the apply worker waits before it tries again to drop slots that table syncs left, and
+    // between its looks for slots recorded that no sync uses.
     private const long SyncSlotsRetryInterval = 5_000_000;
+    private const long SyncSlotsCheckInterval = 60_000_000;
 
     private static readonly LinkedList<(ulong LocalEnd, ulong RemoteEnd)> s_lsnMapping = new();
 
@@ -76,11 +78,13 @@ internal static unsafe partial class Apply
     // The origins of PostgreSQL subscriptions this worker last gave slots up for, and those it found waiting for none,
     // with when it gives slots up for them again and the delay before that.
     private static readonly HashSet<string> s_gaveUpFor = [];
-    private static long s_gaveUpAt;
+
     private static readonly Dictionary<string, (long Until, long Delay)> s_notWaiting = [];
 
-    // When this worker next tries to drop the slots that table syncs left on the provider, or zero.
+    // When this worker next tries to drop the slots that table syncs left on the provider, or zero, and when it last
+    // looked for slots recorded that no sync uses.
     private static long s_syncSlotsRetryAt;
+    private static long s_syncSlotsCheckedAt;
     private static bool s_skipRemoteTransaction;
     private static long s_applyDelay;
     private static uint s_queueRelid;
@@ -125,6 +129,22 @@ internal static unsafe partial class Apply
     private static bool s_isDdlOrDrop;
     private static uint s_remoteXid;
     private static PgErrorContext? s_errorContext;
+
+    /// <summary>
+    /// Gets how long, in microseconds, slots given up for PostgreSQL subscriptions' origins are left for them: ten
+    /// seconds, or twice wal_retrieve_retry_interval, after which PostgreSQL starts a failed worker again, if longer.
+    /// </summary>
+    private static long OriginSlotHold
+    {
+        get
+        {
+            fixed (byte* name = Worf.ToServerCString("wal_retrieve_retry_interval"))
+            {
+                return Math.Max(10_000_000L, 2_000L * long.Parse(Worf.FromServer(NativeMethods.GetConfigOption((sbyte*)name, false, false)),
+                    CultureInfo.InvariantCulture));
+            }
+        }
+    }
 
     /// <summary>
     /// Gets how far ahead of the local clock a remote transaction's commit time can be for apply to wait for the clock
@@ -453,13 +473,17 @@ internal static unsafe partial class Apply
 
             // Set the current role to the user that executed the command on the origin server, until the command ends. An
             // override would become the session's default role, which no nesting level restores, so later changes would
-            // apply as that role.
+            // apply as that role. A command that runs as its user already, as replicate_ddl_command runs it on its own
+            // node, leaves the role be, which a security-definer function can't set.
             int saveNestlevel = NativeMethods.NewGUCNestLevel();
-            fixed (byte* name = Worf.ToServerCString("role"))
-            fixed (byte* value = Worf.ToServerCString(role))
+            if (role != Worf.FromServer(NativeMethods.GetUserNameFromId(NativeMethods.GetUserId(), false)))
             {
-                _ = NativeMethods.set_config_option((sbyte*)name, (sbyte*)value, GucContext.PGC_INTERNAL, GucSource.PGC_S_SESSION,
-                    GucAction.GUC_ACTION_SAVE, true, 0, false);
+                fixed (byte* name = Worf.ToServerCString("role"))
+                fixed (byte* value = Worf.ToServerCString(role))
+                {
+                    _ = NativeMethods.set_config_option((sbyte*)name, (sbyte*)value, GucContext.PGC_INTERNAL, GucSource.PGC_S_SESSION,
+                        GucAction.GUC_ACTION_SAVE, true, 0, false);
+                }
             }
 
             CommandTag commandTag = NativeMethods.CreateCommandTag(command->stmt);
@@ -931,10 +955,11 @@ internal static unsafe partial class Apply
         s_sessionWriterNodeId = null;
         uint writerNodeId = writer == 0 ? sub.Origin.Id : writer;
 
-        // The slots this worker gave up for other subscriptions' origins are theirs to take for ten seconds, rather than
-        // a new relay origin's, so that whether they wait for one is judged by a slot they could have had.
-        while (s_gaveUpFor.Count > 0 && Worker.GetCurrentTimestamp() < s_gaveUpAt + 10_000_000 && !Worker.GotSigterm &&
-            PgBackgroundWorker.RunTransaction(() => PgReplicationOrigin.Find(name) is null && WorfNode.OriginsWithoutSlots(s_gaveUpFor).Count > 0))
+        // The slots any worker gave up for PostgreSQL subscriptions' origins are theirs to take for as long as their
+        // workers take to try again, rather than a new relay origin's, so that whether they wait for one is judged by a
+        // slot they could have had.
+        while (Worker.GetCurrentTimestamp() < Worker.OriginSlotsGivenUpAt + OriginSlotHold && !Worker.GotSigterm &&
+            PgBackgroundWorker.RunTransaction(() => PgReplicationOrigin.Find(name) is null && WorfNode.OriginsWantingSlots().Count > 0))
         {
             _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(100));
             PgInterrupts.Check();
@@ -968,7 +993,8 @@ internal static unsafe partial class Apply
                 recorded = since;
             }
 
-            if (!TrySetupSession(id) && (!DropRelayOrigins(id, dropped) || !TrySetupSession(id)))
+            if (!TrySetupSession(id) && (!DropRelayOrigins(id, dropped) || !TrySetupSession(id)) &&
+                (!DropRelayOrigins(id, dropped, true) || !TrySetupSession(id)))
             {
                 throw new PgException(PgSqlStates.ConfigurationLimitExceeded,
                     $"no replication origin slot is free for replication origin \"{name}\"", null!,
@@ -1076,7 +1102,7 @@ internal static unsafe partial class Apply
             s_reclaimCheckedAt = wantedAt;
             ReclaimRelayOrigins();
         }
-        else if (s_streamOrigins.Count > 1 && now - s_elsewhereCheckedAt >= 10_000_000)
+        else if (s_streamOrigins.Count > 1 && now - s_elsewhereCheckedAt >= OriginSlotHold)
         {
             s_elsewhereCheckedAt = now;
 
@@ -1105,7 +1131,7 @@ internal static unsafe partial class Apply
             if (wanting.Count > 0)
             {
                 s_gaveUpFor.UnionWith(wanting);
-                s_gaveUpAt = now;
+                Worker.GaveUpOriginSlots();
                 ReclaimRelayOrigins();
             }
         }
@@ -1121,7 +1147,18 @@ internal static unsafe partial class Apply
         long now = Worker.GetCurrentTimestamp();
         if (!MyApplyWorker.SyncSlotsLeft && (s_syncSlotsRetryAt == 0 || now < s_syncSlotsRetryAt))
         {
-            return;
+            // A sync worker that ended without saying so, as one killed, left its slot recorded, which a look every
+            // minute finds.
+            if (now < s_syncSlotsCheckedAt + SyncSlotsCheckInterval)
+            {
+                return;
+            }
+
+            s_syncSlotsCheckedAt = now;
+            if (!PgBackgroundWorker.RunTransaction(() => Sync.RecordedSyncSlotsLeft(MySubscription!)))
+            {
+                return;
+            }
         }
 
         SetSyncSlotsLeft(false);
@@ -1181,8 +1218,10 @@ internal static unsafe partial class Apply
     /// </summary>
     /// <param name="keep">An origin the worker uses next, which stays.</param>
     /// <param name="dropped">The ids of those dropped, once the transaction commits.</param>
+    /// <param name="newest">Whether the newest goes too, its progress given to the worker's own origin, as when no
+    /// other slot can be freed.</param>
     /// <returns>Whether any was dropped.</returns>
-    private static bool DropRelayOrigins(ushort keep, List<ushort> dropped)
+    private static bool DropRelayOrigins(ushort keep, List<ushort> dropped, bool newest = false)
     {
         string slotName = MySubscription!.SlotName;
         ushort session = PgReplicationOrigin.SessionOrigin;
@@ -1191,7 +1230,14 @@ internal static unsafe partial class Apply
         bool any = false;
         foreach ((ushort id, ulong progress) in origins)
         {
-            if (progress >= latest || id == keep || id == session || WorfNode.OriginName(id) is not string name || name == slotName)
+            if ((progress >= latest && !newest) || id == keep || id == session || WorfNode.OriginName(id) is not string name || name == slotName)
+            {
+                continue;
+            }
+
+            // The newest goes only once the worker's own origin, which no session uses then, has taken its progress, so
+            // that a restart still starts after it.
+            if (progress >= latest && (PgReplicationOrigin.Find(slotName) is not ushort own || own == session || !TryAdvance(own, progress)))
             {
                 continue;
             }
@@ -1204,6 +1250,22 @@ internal static unsafe partial class Apply
         }
 
         return any;
+    }
+
+    /// <summary>
+    /// Moves an origin's progress forward, unless a process uses it.
+    /// </summary>
+    private static bool TryAdvance(ushort origin, ulong progress)
+    {
+        try
+        {
+            PgTransaction.RunInSubtransaction(() => PgReplicationOrigin.Advance(origin, new PgLsn(progress), PgLsn.Invalid, false, true));
+            return true;
+        }
+        catch (PgException)
+        {
+            return false;
+        }
     }
 
     /// <summary>
@@ -1818,8 +1880,20 @@ internal static unsafe partial class Apply
 
         string sql = root.GetString()!;
 
-        // Run the extracted SQL, out of the way of the indexes on this node alone, as DDL from the origin runs.
-        RunQueuedCommand(sql, queuedMessage.Role, () => ExecuteSqlCommand(sql, queuedMessage.Role, txJustStarted));
+        // Run the extracted SQL, out of the way of the indexes on this node alone, as DDL from the origin runs, in a
+        // subtransaction, so that one it can't build again is dropped and the SQL runs again. A statement that can't run
+        // in one, as one that builds an index concurrently, runs as the first of apply's transaction, as it ran before.
+        RunQueuedCommand(sql, queuedMessage.Role, () =>
+        {
+            try
+            {
+                PgTransaction.RunInSubtransaction(() => ExecuteSqlCommand(sql, queuedMessage.Role, false), PgSubtransactionMode.Atomic);
+            }
+            catch (PgException error) when (txJustStarted && error.SqlState == PgSqlStates.ActiveSqlTransaction)
+            {
+                ExecuteSqlCommand(sql, queuedMessage.Role, true);
+            }
+        });
     }
 
     /// <summary>

@@ -626,6 +626,33 @@ public sealed class GlobalDdlLockTests
         _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO t VALUES (9, 9)", token);
         Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT FROM t WHERE id = 8)", token), "node_b's write after its DDL");
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT FROM t WHERE id = 9)", token), "node_a's write after its DDL");
+
+        // node_a's SELECT INTO, EXPLAIN ANALYZE of a CREATE TABLE AS, and a composite type's rename and move take the
+        // names of node_b's own indexes, which move out of their way. replicate_ddl_command runs a statement that sets
+        // the search path, and runs from a security-definer function.
+        logStart = nodeB.ReadLog().Length;
+        _ = await nodeA.SafePsqlAsync(Database, """
+            SELECT 1 AS a INTO lp1_w;
+            EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) CREATE TABLE lr_v AS SELECT 1 AS a;
+            CREATE TYPE lcomp2 AS (a integer);
+            ALTER TYPE lcomp2 RENAME TO lp2_v;
+            CREATE TYPE lt_v AS (a integer);
+            ALTER TYPE lt_v SET SCHEMA ls;
+            CREATE FUNCTION definer_ddl(command text) RETURNS boolean LANGUAGE sql SECURITY DEFINER AS 'SELECT worf.replicate_ddl_command(command)';
+            SELECT definer_ddl('CREATE TABLE public.x2 (a integer)');
+            """, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.replicate_ddl_command('SET search_path = ls; CREATE TABLE x1 (a integer)')", token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
+        Assert.AreEqual("lp1_w|lr_v|lp2_v|ls.lt_v|ls.x1|x2", await nodeB.SafePsqlAsync(Database, """
+            SELECT concat_ws('|', to_regclass('lp1_w'), to_regclass('lr_v'), to_regtype('lp2_v'), to_regtype('ls.lt_v'), to_regclass('ls.x1'), to_regclass('x2'))
+            """, token), "node_a's DDL on node_b");
+        log = nodeB.ReadLog()[logStart..];
+        foreach (string index in new[] { "lp1_w", "lr_v", "lp2_v", "lt_v" })
+        {
+            Assert.Contains($"renamed index \"{index}\"", log);
+        }
+
+        Assert.DoesNotContain("already exists", log);
     }
 
     /// <summary>

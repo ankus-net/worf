@@ -90,9 +90,10 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   instead, or none when it can't reach the provider, then leaves the slot, with
   a warning, to the subscription's apply worker, which drops it, as it does any
   slot its table syncs left when it starts, and tries again every five seconds
-  while one stays; dropping the subscription drops them too. One that stops
-  after its copy has committed catches up again from where it got to when it
-  restarts, rather than copying again. When its slot is gone or invalidated, or
+  while one stays, and once a minute for the slot of a sync that ended without
+  saying so, as one killed; dropping the subscription drops them too. One that
+  stops after its copy has committed catches up again from where it got to when
+  it restarts, rather than copying again. When its slot is gone or invalidated, or
   its origin has no progress, it copies the table again and merges the copy in,
   in one transaction: the provider's rows replace those with the same replica
   identity or primary key, or join them, and the table's other rows stay, since
@@ -101,9 +102,12 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   the table empties it and copies it again. Writers go on meanwhile, and readers
   see the rows as they were until it commits. A table with neither key fails
   instead, and retries, until it is resynchronized, and so does a merge that a
-  unique index other than the key refuses, as when a row the provider has since
-  deleted here holds a value one of the provider's rows takes, with a hint to
-  resynchronize. In a table's initial copy, a row that fails, whether its value
+  unique index other than the key, deferrable or not, or an exclusion constraint
+  refuses, as when a row the provider has since deleted here holds a value one
+  of the provider's rows takes, or the provider moved a value from one row to
+  another, with a hint to resynchronize. Such a merge is recorded as a `MERGE`
+  under `discard` and `transdiscard`, and disables the subscription under
+  `sub_disable`. In a table's initial copy, a row that fails, whether its value
   doesn't convert to its column's type, the column's input refuses it or a
   constraint does, is skipped under `discard` and `transdiscard` and disables
   the subscription under `sub_disable`, and is recorded as a `COPY` with its
@@ -207,16 +211,23 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   copies or attaches, since the index wouldn't get the rows. Names PostgreSQL
   chooses for new objects are the same on every node, and DDL that takes its
   name renames it, with a warning. To keep them so, DDL that creates, renames or
-  indexes relations moves the indexes on its node alone out of the way in the
-  schemas it does that in, which include those of the partitions an index on a
-  partitioned table or a partition attached builds indexes in, finding names as
-  the role that ran it, until the transaction ends, which holds up other DDL on
-  them meanwhile, in the same order on every path. DDL that creates no
-  relations, as a function's, a type's or a sequence's change, or a DROP, moves
-  none, and a DO block, a procedure or an extension, which can create relations
-  anywhere, moves them in every schema. `worf.replicate_ddl_command` does the
-  same on every node. Relations that a function creates, as one a SELECT calls,
-  can still take other names than on the other nodes.
+  indexes relations, which includes a composite type's change, rename or move,
+  `SELECT INTO` and `EXPLAIN ANALYZE` of such DDL, moves the indexes on its node
+  alone out of the way in the schemas it does that in, which include those of
+  the partitions an index on a partitioned table or a partition attached builds
+  indexes in, finding names as the role that ran it, until the transaction ends,
+  which holds up other DDL on them meanwhile: DDL from another node that moves
+  or passes over them waits for a local transaction whose DDL moved them. Each
+  statement locks them in the same order, but a transaction whose DDL works in
+  more than one schema can deadlock with one that works in them in another
+  order; PostgreSQL ends one of them, and apply runs its transaction again. DDL
+  that creates no relations, as a function's, another type's or a sequence's
+  change, or a DROP, moves none. A statement that sets something, as `SET
+  search_path` does, and a DO block, a procedure or an extension, which can
+  create relations anywhere, move them in every schema.
+  `worf.replicate_ddl_command` does the same on every node. Relations that a
+  function creates, as one a SELECT calls, can still take other names than on
+  the other nodes.
   DDL from another node that can't build it again, as a unique one that finds
   duplicate keys when a table is rewritten, drops it, with a warning that
   gives its definition. Drop it: until then a unique one still rejects

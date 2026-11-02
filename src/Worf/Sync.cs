@@ -1617,8 +1617,9 @@ internal static class Sync
     /// does that can't catch up from its first copy. The provider's rows replace the table's with the same key, or join
     /// them, and the table's other rows stay, since whether this subscription wrote a row can't be told in general, as
     /// without commit timestamps or once it's frozen. A row the copy leaves as it was isn't written again. A unique
-    /// index other than the key that a row the provider no longer has holds a value in fails the merge, with a hint to
-    /// resynchronize. Writers go on meanwhile, readers see the rows as they were until the merge commits, and
+    /// index other than the key, deferrable or not, or an exclusion constraint, that a row here holds a value in that
+    /// one of the provider's takes fails the merge, with a hint to resynchronize, and is recorded, or disables the
+    /// subscription, as worf.exception_behaviour says. Writers go on meanwhile, readers see the rows as they were until the merge commits, and
     /// session_replication_role replica keeps foreign keys from being checked, as for apply.
     /// </summary>
     /// <param name="originConn">The provider connection, in the copy's transaction.</param>
@@ -1681,22 +1682,62 @@ internal static class Sync
         merge.Append(" WHEN NOT MATCHED THEN INSERT (").Append(string.Join(", ", quoted)).Append(") OVERRIDING SYSTEM VALUE VALUES (")
             .Append(string.Join(", ", quoted.Select(column => $"c.{column}"))).Append(')');
 
-        // A row the provider no longer has can hold a value that another unique index needs for one of the provider's.
+        // A row here can hold a value that another unique index or an exclusion constraint needs for one of the
+        // provider's: a row the provider no longer has, or one whose value the provider moved to another row, as a
+        // swap of two rows' values does, which the merge writes one row at a time. Under session_replication_role
+        // replica, a deferrable unique index's recheck doesn't fire, so the merge checks those itself.
         try
         {
             ExecuteQuoted(merge.ToString());
+            CheckDeferrableUnique(reloid, only + table);
         }
-        catch (PgException error) when (error.SqlState == PgSqlStates.UniqueViolation)
+        catch (PgException error) when (error.SqlState is PgSqlStates.UniqueViolation or PgSqlStates.ExclusionViolation)
         {
-            throw new PgException(PgSqlStates.UniqueViolation,
+            PgException failed = new(error.SqlState,
                 $"could not merge the copy of table {remoterel.Nspname}.{remoterel.Relname} into the rows it has: {error.Message}",
                 detail: error.Detail,
-                hint: "A row the provider no longer has holds a value one of its rows takes. Resynchronize the table with worf.alter_subscription_resynchronize_table, which empties it and copies it again.");
+                hint: "Rows here hold values the provider's rows take, as rows the provider no longer has, or rows whose values it moved to others. Resynchronize the table with worf.alter_subscription_resynchronize_table, which empties it and copies it again.");
+            CopyConversion.MergeFailed(rel, lsn, failed);
+            throw failed;
         }
 
         _ = Worf.Execute($"DROP TABLE {MergeCopy}");
 
         PgLog.Info($"finished synchronization of data for table {remoterel.Nspname}.{remoterel.Relname}");
+    }
+
+    /// <summary>
+    /// Fails with a unique violation when two of a table's rows hold the same values in a deferrable unique index, as
+    /// the index's recheck would at the end of the statement had session_replication_role let it fire: the same values
+    /// of its columns and expressions, among the rows its predicate takes, none of them null unless the index treats
+    /// nulls as equal.
+    /// </summary>
+    /// <param name="reloid">The table.</param>
+    /// <param name="table">The table's qualified name, after ONLY when it isn't partitioned.</param>
+    private static void CheckDeferrableUnique(uint reloid, string table)
+    {
+        SpiResult indexes = Worf.Read("""
+            SELECT c.conname::text, i.indnkeyatts,
+                (SELECT pg_catalog.array_agg(pg_catalog.pg_get_indexdef(i.indexrelid, k, false) ORDER BY k) FROM pg_catalog.generate_series(1, i.indnkeyatts) k),
+                pg_catalog.pg_get_expr(i.indpred, i.indrelid), i.indnullsnotdistinct
+            FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_index i ON i.indexrelid = c.conindid
+            WHERE c.conrelid = $1 AND c.contype IN ('p', 'u') AND c.condeferrable
+            """, 0, SpiParameter.Create(reloid));
+        foreach (SpiRow index in indexes)
+        {
+            string[] keys = [.. index.Get<string?[]>(2).Select(key => $"({key})")];
+            List<string> conditions = [.. index.Get<string?>(3) is string predicate ? [$"({predicate})"] : Array.Empty<string>()];
+            if (!index.Get<bool>(4))
+            {
+                conditions.AddRange(keys.Select(key => $"{key} IS NOT NULL"));
+            }
+
+            string where = conditions.Count == 0 ? "" : $" WHERE {string.Join(" AND ", conditions)}";
+            if (Worf.ReadScalar<bool>($"SELECT EXISTS (SELECT FROM {table}{where} GROUP BY {string.Join(", ", keys)} HAVING pg_catalog.count(*) > 1)"))
+            {
+                throw new PgException(PgSqlStates.UniqueViolation, $"duplicate key value violates unique constraint \"{index.Get<string>(0)}\"");
+            }
+        }
     }
 
     /// <summary>
@@ -2124,6 +2165,23 @@ internal static class Sync
         }
 
         return left;
+    }
+
+    /// <summary>
+    /// Checks, only reading, whether a subscription has a table sync's slot recorded that no sync uses any more.
+    /// </summary>
+    /// <param name="sub">The subscription.</param>
+    /// <returns>Whether it has.</returns>
+    internal static bool RecordedSyncSlotsLeft(WorfSubscription sub)
+    {
+        SpiResult recorded = Worf.Read("SELECT slot_name::text FROM worf.sync_slot WHERE sub_id = $1", 0, SpiParameter.Create(sub.Id));
+        if (recorded.Count == 0)
+        {
+            return false;
+        }
+
+        HashSet<string> kept = KeptSyncSlots(sub);
+        return recorded.Any(row => !kept.Contains(row.Get<string>(0)));
     }
 
     /// <summary>

@@ -389,6 +389,9 @@ internal static class Functions
 
             // First drop the status, after noting the slots its tables' syncs create, which may be left on the provider.
             List<string> syncSlotNames = Sync.SyncSlotNames(sub);
+            SpiResult recordedSyncSlots = Worf.Read("SELECT slot_name::text FROM worf.sync_slot WHERE sub_id = $1 ORDER BY 1", 0,
+                SpiParameter.Create(sub.Id));
+            string syncSlotsLeft = string.Join(", ", recordedSyncSlots.Select(row => $"\"{row.Get<string>(0)}\""));
             Sync.DropSubscriptionSyncStatus(sub.Id);
             _ = Worf.Execute("DELETE FROM worf.sync_slot WHERE sub_id = $1", SpiParameter.Create(sub.Id));
 
@@ -509,7 +512,9 @@ internal static class Functions
             }
             catch (PgException)
             {
-                PgLog.Warning($"could not drop slot \"{sub.SlotName}\" on provider, you will probably have to drop it manually. Its sequence range fences wait for this node's reports: delete this node's rows in worf.sequence_range_link there while it has no fence up, so that later ones don't, and one that is up waits until this node subscribes again and reports, or worf.activate_sequence_range lifts it, which reissues any values this node holds that the provider lost");
+                PgLog.Warning($"could not drop slot \"{sub.SlotName}\" on provider, you will probably have to drop it manually" +
+                    (syncSlotsLeft.Length == 0 ? "" : $", and those its table syncs may have left, {syncSlotsLeft}") +
+                    ". Its sequence range fences wait for this node's reports: delete this node's rows in worf.sequence_range_link there while it has no fence up, so that later ones don't, and one that is up waits until this node subscribes again and reports, or worf.activate_sequence_range naming this node stops the wait for it, which reissues any values this node holds that the provider lost");
             }
 
             // Drop the origin tracking locally.

@@ -111,12 +111,17 @@ internal static partial class Worf
     }
 
     /// <summary>
-    /// Shortens a string as <see cref="ShortenHash(ReadOnlySpan{byte}, int)"/> does.
+    /// Shortens a string as <see cref="ShortenHash(ReadOnlySpan{byte}, int)"/> does, but cuts its start at a
+    /// character's boundary, so that it stays valid.
     /// </summary>
     /// <param name="str">The string.</param>
     /// <param name="maxlen">The maximum length in server encoding bytes.</param>
     /// <returns>The shortened string.</returns>
-    internal static string ShortenHash(string str, int maxlen) => FromServer(ShortenHash(ToServer(str), maxlen));
+    internal static string ShortenHash(string str, int maxlen)
+    {
+        byte[] bytes = ToServer(str);
+        return bytes.Length <= maxlen ? str : Truncate(str, maxlen - 8) + HashAny(bytes).ToString("x8", CultureInfo.InvariantCulture)[..7];
+    }
 
     /// <summary>
     /// Hashes bytes with PostgreSQL's <c>hash_any</c>.
@@ -206,7 +211,10 @@ internal static partial class Worf
     /// <returns>The string.</returns>
     internal static unsafe string FromServer(ReadOnlySpan<byte> value)
     {
-        if (NativeMethods.GetDatabaseEncoding() == (int)pg_enc.PG_UTF8 || value.Length == 0)
+        // A SQL_ASCII database's bytes have no encoding, and PostgreSQL checks them as UTF-8 as it converts them, so they
+        // are read as UTF-8 here, where a byte that isn't stands for U+FFFD, as in a value a conflict's log shows.
+        int encoding = NativeMethods.GetDatabaseEncoding();
+        if (encoding is (int)pg_enc.PG_UTF8 or (int)pg_enc.PG_SQL_ASCII || value.Length == 0)
         {
             return Encoding.UTF8.GetString(value);
         }

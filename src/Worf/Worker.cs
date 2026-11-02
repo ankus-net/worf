@@ -92,7 +92,9 @@ internal static class Worker
         else if (worker.WorkerType == WorfWorkerType.Sync)
         {
             function = "worf_sync_main";
-            name = $"worf sync {Worf.ShortenHash(NameStr(worker.Worker.Sync.Relname), NameDataLen - 37),27} " +
+            // A worker's name is ASCII, so a table name's other characters show as question marks.
+            string relname = new([.. NameStr(worker.Worker.Sync.Relname).Select(c => char.IsAscii(c) ? c : '?')]);
+            name = $"worf sync {Worf.ShortenHash(relname, NameDataLen - 37),27} " +
                 $"{worker.Dboid}:{worker.Worker.Sync.Apply.SubId}";
         }
         else if (worker.WorkerType == WorfWorkerType.Range)
@@ -302,6 +304,30 @@ internal static class Worker
             using PgLwLockShareGuard<WorfContext, WorfWorker> guard = WorfCtx.Share();
             return guard.Header.OriginSlotWantedAt;
         }
+    }
+
+    /// <summary>
+    /// Gets when a worker last gave up replication origin slots for PostgreSQL subscriptions' origins.
+    /// </summary>
+    internal static long OriginSlotsGivenUpAt
+    {
+        get
+        {
+            using PgLwLockShareGuard<WorfContext, WorfWorker> guard = WorfCtx.Share();
+            return guard.Header.OriginSlotsGivenUpAt;
+        }
+    }
+
+    /// <summary>
+    /// Records that this worker gave up replication origin slots for PostgreSQL subscriptions' origins, which every
+    /// worker leaves them for a while.
+    /// </summary>
+    internal static void GaveUpOriginSlots()
+    {
+        using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = WorfCtx.Exclusive();
+        WorfContext ctx = guard.Header;
+        ctx.OriginSlotsGivenUpAt = GetCurrentTimestamp();
+        guard.Header = ctx;
     }
 
     /// <summary>

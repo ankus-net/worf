@@ -2209,7 +2209,16 @@ public sealed class SequenceRangeTests
                 VALUES ('public.u_id_seq', {record}, false);
             CREATE SEQUENCE u_id_seq START 5 CACHE 3;
             """, token);
-        Assert.IsTrue(await nodeB.PollLogAsync(releasepos, "u_id_seq left range management", token), "node_b's new u_id_seq left the disabled epoch");
+        bool released = await nodeB.PollLogAsync(releasepos, "u_id_seq left range management", token);
+        if (!released)
+        {
+            TestContext.WriteLine("DIAG B: " + await nodeB.SafePsqlAsync(Database, "SELECT r::text FROM worf.sequence_range r WHERE seqoid = 'u_id_seq'::regclass", token));
+            TestContext.WriteLine("DIAG B nodes: " + await nodeB.SafePsqlAsync(Database, "SELECT n::text FROM worf.sequence_range_node n WHERE seqoid = 'u_id_seq'::regclass", token));
+            TestContext.WriteLine("DIAG B blocks: " + await nodeB.SafePsqlAsync(Database, "SELECT b::text FROM worf.sequence_range_block b WHERE seqoid = 'u_id_seq'::regclass", token));
+            TestContext.WriteLine("DIAG B log: " + nodeB.ReadLog()[releasepos..]);
+        }
+
+        Assert.IsTrue(released, "node_b's new u_id_seq left the disabled epoch");
         Assert.AreEqual("5|3|t", await nodeB.SafePsqlAsync(Database, """
             SELECT nextval('u_id_seq'), seqcache, has_sequence_privilege('u_id_seq', 'UPDATE') FROM pg_sequence WHERE seqrelid = 'u_id_seq'::regclass
             """, token), "node_b's new u_id_seq as it was created");
@@ -2244,8 +2253,8 @@ public sealed class SequenceRangeTests
 
         // The fence stops waiting for the node gone for good, named as the detail names it, and lifts, as node_b has
         // reported.
-        StringAssert.Contains(await nodeA.SafePsqlAsync(Database, "SELECT detail FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass", token),
-            "node 4242");
+        Assert.Contains("node 4242", await nodeA.SafePsqlAsync(Database, "SELECT detail FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass", token),
+            "node_a's fence waiting for the node gone for good");
         _ = await nodeA.SafePsqlAsync(Database, "DELETE FROM worf.sequence_range_link WHERE node_id = 4242; SELECT worf.activate_sequence_range('t_id_seq', '4242')", token);
         Stopwatch lifted = Stopwatch.StartNew();
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, $"SELECT state = 'active' AND active_lo > {beyond} FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token),

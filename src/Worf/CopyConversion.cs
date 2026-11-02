@@ -51,8 +51,10 @@ internal static unsafe partial class CopyConversion
     private static WorfExceptionBehaviour s_behaviour;
     private static List<string> s_columns = [];
 
-    // A row that failed under sub_disable, which disables the subscription once the copy rolls back.
+    // A row or merge that failed under sub_disable, which disables the subscription once the copy rolls back, and a
+    // merge that failed under another behaviour, which is recorded then.
     private static (WorfFailedChange Change, PgException Error)? s_disabling;
+    private static (WorfFailedChange Change, WorfExceptionBehaviour Behaviour, PgException Error)? s_merged;
 
     // A batch of the provider's rows: their bytes, where each starts and how long it is, and the first's number, which
     // the others follow. Then the next and the end of those a copy of the batch passes to COPY, and how much of the one
@@ -468,11 +470,53 @@ internal static unsafe partial class CopyConversion
     };
 
     /// <summary>
-    /// Disables the subscription after a row of its copy failed under <c>sub_disable</c>, once the copy rolled back,
-    /// and records the row, as apply does with a failed remote transaction.
+    /// Notes a merge of a table's copy that failed, unless worf.exception_behaviour stops at failures: it is recorded,
+    /// and disables the subscription under <c>sub_disable</c>, once the merge rolled back.
+    /// </summary>
+    /// <param name="rel">The table.</param>
+    /// <param name="commitLsn">The position the copy is consistent with.</param>
+    /// <param name="error">The failure.</param>
+    internal static void MergeFailed(WorfRelation rel, ulong commitLsn, PgException error)
+    {
+        WorfExceptionBehaviour behaviour = Apply.ExceptionBehaviour;
+        if (behaviour == WorfExceptionBehaviour.Error)
+        {
+            return;
+        }
+
+        WorfSubscription sub = Apply.MySubscription!;
+        WorfFailedChange change = new()
+        {
+            Subscription = sub,
+            WriterNodeId = sub.Origin.Id,
+            CommitTime = NativeMethods.GetCurrentTransactionStartTimestamp(),
+            CommitLsn = commitLsn,
+            Operation = "MERGE",
+            Relation = rel,
+        };
+        if (behaviour == WorfExceptionBehaviour.SubDisable)
+        {
+            s_disabling = (change, error);
+        }
+        else
+        {
+            s_merged = (change, behaviour, error);
+        }
+    }
+
+    /// <summary>
+    /// Disables the subscription after a row of its copy, or its merge, failed under <c>sub_disable</c>, once the copy
+    /// rolled back, and records the row, as apply does with a failed remote transaction, or records a merge that failed
+    /// under another behaviour.
     /// </summary>
     internal static void DisableAfterFailure()
     {
+        if (s_merged is (WorfFailedChange merged, WorfExceptionBehaviour behaviour, PgException mergeError))
+        {
+            s_merged = null;
+            PgBackgroundWorker.RunTransaction(() => ExceptionLog.Record(merged, behaviour, mergeError));
+        }
+
         if (s_disabling is not (WorfFailedChange change, PgException error))
         {
             return;
@@ -486,7 +530,9 @@ internal static unsafe partial class CopyConversion
             sub.Enabled = false;
             WorfNode.AlterSubscription(sub);
         });
-        PgLog.Log($"disabling subscription {change.Subscription.Name} after a row of table {change.Relation!.Nspname}.{change.Relation.Relname} failed to convert in its copy");
+        PgLog.Log(change.Operation == "MERGE"
+            ? $"disabling subscription {change.Subscription.Name} after the merge of table {change.Relation!.Nspname}.{change.Relation.Relname}'s copy failed"
+            : $"disabling subscription {change.Subscription.Name} after a row of table {change.Relation!.Nspname}.{change.Relation.Relname} failed to convert in its copy");
     }
 
     /// <summary>

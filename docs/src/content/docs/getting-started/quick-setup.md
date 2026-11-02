@@ -19,23 +19,25 @@ On a subscriber, PostgreSQL tracks each replication origin in use in one of
 synchronizing another, and each other node whose changes its provider forwards
 with `forward_origins` `{all}` another. When one that needs a slot finds none
 free, subscriptions give up the slots of forwarded nodes' origins they no longer
-need, which slows apply; failing that within 10 seconds, its apply or table sync
-stops with an error and retries. They also give them up, within 10 seconds, to
+need, which slows apply, the last one a subscription applied under going too
+once its own origin has taken its progress; failing that within 10 seconds, its
+apply or table sync stops with an error and retries. They also give them up,
+within 10 seconds or twice `wal_retrieve_retry_interval` if that is longer, to
 an enabled PostgreSQL subscription whose origin, or a table sync's, has none
 while a worker of it runs or can start: its owner can log in, its database
 allows connections, and `max_logical_replication_workers` leaves room. A new
-relay origin waits for those 10 seconds while one of them still has none, so
-that a slot it gave up is theirs to take. One that still has none after that,
-though a slot was free, as while its provider can't be reached, isn't waiting
-for one, and they don't give theirs up for it again for 10 minutes, then for
-twice as long each time, up to a day. Other users of origins need the limit
-raised. `worf.origin_writer` records the node and subscription each origin worf
-creates applies for, a row each time one is created or dropped, and forgets a
-row once a later one has superseded it for `vacuum_freeze_min_age` transactions,
-as vacuum would freeze rows written before then, so it holds a row for each
-origin id and for each creation or drop in that many transactions. A conflict on
-a row written before then, whose record is forgotten, takes the row to be from
-what its origin applies for now, as pglogical takes every row.
+relay origin of any subscription waits that long while one of them still has
+none, so that a slot given up is theirs to take. One that still has none after
+that, though a slot was free, isn't waiting for one, and they don't give theirs
+up for it again for 10 minutes, then for twice as long each time, up to a day.
+Other users of origins need the limit raised. `worf.origin_writer` records the
+node and subscription each origin worf creates applies for, a row each time one
+is created or dropped, and forgets a row once a later one has superseded it for
+`vacuum_freeze_min_age` transactions, as vacuum would freeze rows written before
+then, so it holds a row for each origin id and for each creation or drop in that
+many transactions. A conflict on a row written before then, whose record is
+forgotten, takes the row to be from what its origin applies for now, as
+pglogical takes every row.
 
 If you want to handle conflict resolution with last/first update wins (see
 [Conflicts](../../conflicts/)), you can add this additional option to

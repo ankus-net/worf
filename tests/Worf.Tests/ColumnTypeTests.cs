@@ -262,6 +262,9 @@ public sealed class ColumnTypeTests
             INSERT INTO ct VALUES (1, 'ok', 1, 'sad'), (2, 'too long', 1, 'sad'), (3, 'ok', 500, 'sad'), (4, 'ok', 1, 'angry'),
                 (5, 'ok', 1, 'happy'), (6, repeat('x', 300), 1, 'sad');
             SELECT * FROM worf.replication_set_add_table('zs', 'ct');
+            CREATE TABLE "zé" (id integer PRIMARY KEY);
+            INSERT INTO "zé" VALUES (1);
+            SELECT * FROM worf.replication_set_add_table('zs', '"zé"');
             """, token);
         _ = await subscriber.SafePsqlAsync(Database, $"CREATE DATABASE {TextDatabase}", token);
         _ = await subscriber.SafePsqlAsync(TextDatabase, "CREATE EXTENSION worf", token);
@@ -274,6 +277,7 @@ public sealed class ColumnTypeTests
             CREATE TABLE mnt (id integer PRIMARY KEY, m numeric);
             CREATE DOMAIN small AS integer CHECK (VALUE < 100);
             CREATE TABLE ct (id integer PRIMARY KEY, v varchar(3), d small, m mood);
+            CREATE TABLE "zé" (id integer PRIMARY KEY);
             """, token);
         _ = await subscriber.SafePsqlAsync(TextDatabase, $"""
             SELECT worf.create_subscription(
@@ -291,6 +295,9 @@ public sealed class ColumnTypeTests
                     AND NOT EXISTS (SELECT 1 FROM worf.local_sync_status WHERE sync_status <> 'r')
                 """, token), $"zt wasn't copied in {database}");
         }
+
+        // A table whose name isn't ASCII syncs too, though a worker's name is ASCII.
+        Assert.AreEqual("1", await subscriber.SafePsqlAsync(TextDatabase, "SELECT count(*) FROM \"zé\"", token), "zé's row");
 
         _ = await provider.SafePsqlAsync(Database, """
             INSERT INTO zt VALUES (2, 3.7, '2024-01-02 03:04:05+00', 'A', '{angry}', '(angry,1)',

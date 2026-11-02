@@ -25,4 +25,6 @@ internal struct WorfContext
     /// no longer need.
     /// </summary>
     public long OriginSlotWantedAt;
+
+    public long OriginSlotsGivenUpAt;
 }
