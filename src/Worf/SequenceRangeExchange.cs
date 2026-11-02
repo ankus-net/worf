@@ -75,7 +75,7 @@ internal static class SequenceRangeExchange
         Authenticate(slot, senderId);
         if (leaving)
         {
-            _ = Spi.Execute("DELETE FROM worf.sequence_range_link WHERE slot_name = $1", SpiParameter.Create(slot));
+            _ = Worf.Execute("DELETE FROM worf.sequence_range_link WHERE slot_name = $1", SpiParameter.Create(slot));
             SequenceRanges.ForgetNeighbor(senderId);
             return "{}";
         }
@@ -147,8 +147,8 @@ internal static class SequenceRangeExchange
 
             if (spoken.Count == 0)
             {
-                _ = Spi.Execute("DELETE FROM worf.sequence_range_role r WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles a WHERE a.oid = r.role_id)");
-                _ = Spi.Execute("INSERT INTO worf.sequence_range_role VALUES ($1, $2)", SpiParameter.Create(role), SpiParameter.Create(senderId));
+                _ = Worf.Execute("DELETE FROM worf.sequence_range_role r WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles a WHERE a.oid = r.role_id)");
+                _ = Worf.Execute("INSERT INTO worf.sequence_range_role VALUES ($1, $2)", SpiParameter.Create(role), SpiParameter.Create(senderId));
             }
         }
 
@@ -162,7 +162,7 @@ internal static class SequenceRangeExchange
                 throw new PgException("42501", $"replication slot \"{slot}\" belongs to another node than this sequence range exchange's");
             }
 
-            _ = Spi.Execute("UPDATE worf.sequence_range_link SET node_id = $2 WHERE slot_name = $1", name, SpiParameter.Create(senderId));
+            _ = Worf.Execute("UPDATE worf.sequence_range_link SET node_id = $2 WHERE slot_name = $1", name, SpiParameter.Create(senderId));
             SequenceRanges.ForgetNeighbor(old);
             PgLog.Log($"node {senderId} takes over replication slot \"{slot}\" from node {old}, which this node forgets");
             return;
@@ -194,8 +194,8 @@ internal static class SequenceRangeExchange
         }
 
         _ = link.Count > 0
-            ? Spi.Execute("UPDATE worf.sequence_range_link SET role_id = $2 WHERE slot_name = $1", name, SpiParameter.Create(role))
-            : Spi.Execute("INSERT INTO worf.sequence_range_link VALUES ($1, $2, $3)", name, SpiParameter.Create(senderId), SpiParameter.Create(role));
+            ? Worf.Execute("UPDATE worf.sequence_range_link SET role_id = $2 WHERE slot_name = $1", name, SpiParameter.Create(role))
+            : Worf.Execute("INSERT INTO worf.sequence_range_link VALUES ($1, $2, $3)", name, SpiParameter.Create(senderId), SpiParameter.Create(role));
     }
 
     /// <summary>
@@ -572,7 +572,7 @@ internal static class SequenceRangeExchange
     {
         if (refusals.Count > 0)
         {
-            _ = Spi.Execute("UPDATE worf.sequence_range_grant SET state = 'acknowledged' WHERE grant_id = ANY ($1) AND state = 'sent'",
+            _ = Worf.Execute("UPDATE worf.sequence_range_grant SET state = 'acknowledged' WHERE grant_id = ANY ($1) AND state = 'sent'",
                 SpiParameter.Create(refusals.ToArray()));
         }
     }
@@ -891,7 +891,7 @@ internal static class SequenceRangeExchange
 
         foreach (uint seqoid in absent)
         {
-            _ = Spi.Execute("""
+            _ = Worf.Execute("""
                 INSERT INTO worf.sequence_range_absent VALUES ($1, $2, now()) ON CONFLICT (seqoid, node_id) DO UPDATE SET absent_at = excluded.absent_at
                 """, SpiParameter.Create(seqoid), SpiParameter.Create(senderId));
         }
@@ -1130,7 +1130,7 @@ internal static class SequenceRangeExchange
         // The range row is locked first, as every change to the sequence's ranges does.
         int epoch = entry.GetProperty("epoch").GetInt32();
         uint owner = entry.GetProperty("owner_id").GetUInt32();
-        SpiResult local = Spi.Query("SELECT owner_node, epoch, state FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE", false, 1,
+        SpiResult local = Worf.Query("SELECT owner_node, epoch, state FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE", false, 1,
             SpiParameter.Create(seqoid));
         if (local.Count == 0)
         {
@@ -1180,7 +1180,7 @@ internal static class SequenceRangeExchange
         // that joins with values reaching into it.
         if (Nullable(entry, "root_start") is long rootStart)
         {
-            _ = Spi.Execute($"UPDATE worf.sequence_range SET root_start = {(info.Ascending ? "greatest" : "least")}(coalesce(root_start, $2), $2) WHERE seqoid = $1 AND epoch = $3",
+            _ = Worf.Execute($"UPDATE worf.sequence_range SET root_start = {(info.Ascending ? "greatest" : "least")}(coalesce(root_start, $2), $2) WHERE seqoid = $1 AND epoch = $3",
                 seq, SpiParameter.Create(rootStart), SpiParameter.Create(epoch));
         }
 
@@ -1193,7 +1193,7 @@ internal static class SequenceRangeExchange
         // The position compared is the latest of the one the tables recorded, the one shared memory holds, which the
         // tables record only once it moves by a WAL segment, and, in an answer, how far this node applied the neighbor's
         // changes, which neither its restart nor its crash forgets, and which stays put while the neighbor is idle.
-        _ = Spi.Execute("SELECT 1 FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2 FOR UPDATE", seq, sender);
+        _ = Worf.Execute("SELECT 1 FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2 FOR UPDATE", seq, sender);
         SpiResult stored = Worf.Read(
             "SELECT CASE WHEN $5 THEN wal_lsn ELSE reply_lsn END::text FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2 AND sysid = $3::numeric AND timeline = $4",
             1, seq, sender, SpiParameter.Create(sysid), SpiParameter.Create(timeline), SpiParameter.Create(call));
@@ -1204,7 +1204,7 @@ internal static class SequenceRangeExchange
         if (Worf.TryParseLsn(walLsn, out ulong position) && latest > position)
         {
             rolledBack = Worf.FormatLsn(latest);
-            _ = Spi.Execute("UPDATE worf.sequence_range_node SET reset_lsn = $3::pg_lsn WHERE seqoid = $1 AND node_id = $2", seq, sender,
+            _ = Worf.Execute("UPDATE worf.sequence_range_node SET reset_lsn = $3::pg_lsn WHERE seqoid = $1 AND node_id = $2", seq, sender,
                 SpiParameter.Create(rolledBack));
         }
         // An allocator that grants values this node already holds lost the grant it made them in, as when it went back too
@@ -1214,7 +1214,7 @@ internal static class SequenceRangeExchange
         if (lost is not null)
         {
             rolledBack = walLsn;
-            _ = Spi.Execute("UPDATE worf.sequence_range_node SET reset_lsn = $3::pg_lsn WHERE seqoid = $1 AND node_id = $2 AND reset_lsn IS NULL", seq,
+            _ = Worf.Execute("UPDATE worf.sequence_range_node SET reset_lsn = $3::pg_lsn WHERE seqoid = $1 AND node_id = $2 AND reset_lsn IS NULL", seq,
                 sender, SpiParameter.Create(walLsn));
             PgLog.Warning($"sequence {info.Name}: node {senderName} {lost}, so it must reset its blocks");
         }
@@ -1229,10 +1229,10 @@ internal static class SequenceRangeExchange
         bool wentBack = rolledBack is not null;
         if (wentBack)
         {
-            _ = Spi.Execute("DELETE FROM worf.sequence_range_request WHERE seqoid = $1 AND parent_node = $2", seq, sender);
+            _ = Worf.Execute("DELETE FROM worf.sequence_range_request WHERE seqoid = $1 AND parent_node = $2", seq, sender);
         }
 
-        _ = Spi.Execute("""
+        _ = Worf.Execute("""
             INSERT INTO worf.sequence_range_node (seqoid, node_id, node_name, via_node, sysid, timeline, wal_lsn, reply_lsn, epoch, state, distance,
                 high_water, watermark, reported_at, holds, clock)
             VALUES ($1, $2, $3, $2, $4::numeric, $5, CASE WHEN $12 THEN $6::pg_lsn END, CASE WHEN NOT $12 THEN $6::pg_lsn END, $7, $8, $9, $10, $11, now(),
@@ -1250,7 +1250,7 @@ internal static class SequenceRangeExchange
             SpiParameter.Create(Nullable(entry, "clock")));
 
         // The neighbor asks this node to reset, once per rollback it saw, or has reset as this node asked.
-        if (Text(entry, "reset") is string reset && Spi.Execute(
+        if (Text(entry, "reset") is string reset && Worf.Execute(
             "UPDATE worf.sequence_range_node SET reset_done = $3::pg_lsn WHERE seqoid = $1 AND node_id = $2 AND reset_done IS DISTINCT FROM $3::pg_lsn",
             seq, sender, SpiParameter.Create(reset)) > 0)
         {
@@ -1261,7 +1261,7 @@ internal static class SequenceRangeExchange
 
         if (Text(entry, "reset_done") is string done)
         {
-            _ = Spi.Execute("UPDATE worf.sequence_range_node SET reset_lsn = NULL WHERE seqoid = $1 AND node_id = $2 AND reset_lsn = $3::pg_lsn",
+            _ = Worf.Execute("UPDATE worf.sequence_range_node SET reset_lsn = NULL WHERE seqoid = $1 AND node_id = $2 AND reset_lsn = $3::pg_lsn",
                 seq, sender, SpiParameter.Create(done));
         }
 
@@ -1281,7 +1281,7 @@ internal static class SequenceRangeExchange
             }
 
             string raised = info.Ascending ? "greatest" : "least";
-            learned |= Spi.Execute($"""
+            learned |= Worf.Execute($"""
                 UPDATE worf.sequence_range SET watermark = {raised}(coalesce(watermark, $2), $2)
                 WHERE seqoid = $1 AND watermark IS DISTINCT FROM {raised}(coalesce(watermark, $2), $2)
                 """, seq, SpiParameter.Create(mark)) > 0;
@@ -1324,7 +1324,7 @@ internal static class SequenceRangeExchange
 
                 still.Add(reported);
 
-                _ = Spi.Execute("""
+                _ = Worf.Execute("""
                     INSERT INTO worf.sequence_range_node (seqoid, node_id, node_name, via_node, high_water, watermark, epoch, state, reported_at,
                         holds, clock)
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, least(coalesce(pg_catalog.to_timestamp($9), now()), now()), $11, $12)
@@ -1341,7 +1341,7 @@ internal static class SequenceRangeExchange
                     SpiParameter.Create(SequenceRanges.StaleAfter()), SpiParameter.Create(Holds(report)), SpiParameter.Create(Nullable(report, "clock")));
             }
 
-            _ = Spi.Execute("""
+            _ = Worf.Execute("""
                 DELETE FROM worf.sequence_range_node WHERE seqoid = $1 AND via_node = $2 AND node_id <> via_node AND NOT node_id = ANY ($3::oid[])
                 """, seq, sender, SpiParameter.Create(still.ToArray()));
             if (ignored > 0)
@@ -1365,8 +1365,8 @@ internal static class SequenceRangeExchange
             // was left alone, as when it came from the ledger this allocator went back from: its values were never used.
             if (fenced && entry.TryGetProperty("held_complete", out JsonElement complete) && complete.GetBoolean())
             {
-                _ = Spi.Execute("UPDATE worf.sequence_range_node SET held_at = now() WHERE seqoid = $1 AND node_id = $2", seq, sender);
-                _ = Spi.Execute("""
+                _ = Worf.Execute("UPDATE worf.sequence_range_node SET held_at = now() WHERE seqoid = $1 AND node_id = $2", seq, sender);
+                _ = Worf.Execute("""
                     UPDATE worf.sequence_range_grant SET state = 'unclaimed'
                     WHERE seqoid = $1 AND grantee_id = $2 AND state = 'sent' AND kind <> 'x' AND NOT grant_id = ANY ($3)
                     """, seq, sender, SpiParameter.Create(heldBlocks.EnumerateArray().Select(block => block.GetProperty("id").GetGuid()).ToArray()));
@@ -1377,7 +1377,7 @@ internal static class SequenceRangeExchange
         // went back and lost the grant: every grant is committed before it is sent. This node resets, which fences its
         // root and pool blocks until the neighbors report what they hold.
         Guid[] acks = [.. entry.GetProperty("acks").EnumerateArray().Select(ack => ack.GetGuid())];
-        _ = Spi.Execute("UPDATE worf.sequence_range_grant SET state = 'acknowledged' WHERE grant_id = ANY ($1) AND grantee_id = $2 AND state = 'sent'",
+        _ = Worf.Execute("UPDATE worf.sequence_range_grant SET state = 'acknowledged' WHERE grant_id = ANY ($1) AND grantee_id = $2 AND state = 'sent'",
             SpiParameter.Create(acks), sender);
         if (!fenced && !wentBack && Worf.ReadScalar<long>("""
             SELECT count(*) FROM unnest($1::uuid[]) a(id)
@@ -1438,7 +1438,7 @@ internal static class SequenceRangeExchange
         // which this transaction takes for each sequence in turn, in the order every exchange takes them.
         if (!call)
         {
-            _ = Spi.Execute("UPDATE worf.sequence_range SET exchanged_at = now() WHERE seqoid = $1", seq);
+            _ = Worf.Execute("UPDATE worf.sequence_range SET exchanged_at = now() WHERE seqoid = $1", seq);
         }
 
         return (granted, received, learned);
@@ -1454,7 +1454,7 @@ internal static class SequenceRangeExchange
         bool isOwner)
     {
         Guid requestId = request.GetProperty("id").GetGuid();
-        if (Spi.Execute("UPDATE worf.sequence_range_grant SET state = 'sent' WHERE request_id = $1 AND kind = 'x'", SpiParameter.Create(requestId)) > 0)
+        if (Worf.Execute("UPDATE worf.sequence_range_grant SET state = 'sent' WHERE request_id = $1 AND kind = 'x'", SpiParameter.Create(requestId)) > 0)
         {
             return null;
         }
@@ -1472,7 +1472,7 @@ internal static class SequenceRangeExchange
         if (!range[0].Get<bool>(2) && high is long h && range[0].Get<long?>(0) is long start && (info.Ascending ? h >= start : h <= start) &&
             seqoid != SnowflakeIds.NodeSequence())
         {
-            _ = Spi.Execute("""
+            _ = Worf.Execute("""
                 INSERT INTO worf.sequence_range_grant VALUES (gen_random_uuid(), $1, $2, NULL, $3, $4, 'x', $5, $5, 'sent', now())
                 ON CONFLICT (request_id) DO UPDATE SET state = 'sent'
                 """, SpiParameter.Create(requestId), SpiParameter.Create(seqoid), SpiParameter.Create(granteeId),
@@ -1569,10 +1569,10 @@ internal static class SequenceRangeExchange
         }
 
         SpiParameter seq = SpiParameter.Create(seqoid);
-        if (Spi.Execute("DELETE FROM worf.sequence_range_request WHERE seqoid = $1 AND kind = 'f' AND lo = $2 AND hi = $3 AND state = 'refused'",
+        if (Worf.Execute("DELETE FROM worf.sequence_range_request WHERE seqoid = $1 AND kind = 'f' AND lo = $2 AND hi = $3 AND state = 'refused'",
             seq, SpiParameter.Create(lo), SpiParameter.Create(hi)) > 0)
         {
-            _ = Spi.Execute("""
+            _ = Worf.Execute("""
                 INSERT INTO worf.sequence_range_grant VALUES (gen_random_uuid(), $1, $2, NULL, $3, $4, 'x', $5, $6, 'sent', now())
                 ON CONFLICT (request_id) DO UPDATE SET state = 'sent'
                 """, SpiParameter.Create(requestId), seq, SpiParameter.Create(granteeId), SpiParameter.Create(granteeName),
@@ -1580,7 +1580,7 @@ internal static class SequenceRangeExchange
             return true;
         }
 
-        _ = Spi.Execute("""
+        _ = Worf.Execute("""
             INSERT INTO worf.sequence_range_request (request_id, seqoid, parent_node, kind, size, lo, hi, created_at)
             SELECT gen_random_uuid(), r.seqoid, r.parent_node, 'f', $4, $2, $3, now()
             FROM worf.sequence_range r
@@ -1595,7 +1595,7 @@ internal static class SequenceRangeExchange
     /// </summary>
     private static void RequestPool(uint seqoid, long childSize)
     {
-        _ = Spi.Execute("""
+        _ = Worf.Execute("""
             INSERT INTO worf.sequence_range_request (request_id, seqoid, parent_node, kind, size, created_at)
             SELECT gen_random_uuid(), r.seqoid, r.parent_node, 'p', least($2::numeric * 16, 4611686018427387903)::bigint, now()
             FROM worf.sequence_range r
@@ -1617,12 +1617,12 @@ internal static class SequenceRangeExchange
         string kind = Text(grant, "kind") ?? "n";
         if (kind == "x")
         {
-            string? refused = Spi.ExecuteScalar<string?>(
+            string? refused = Worf.ExecuteScalar<string?>(
                 "UPDATE worf.sequence_range_request SET state = 'refused' WHERE request_id = $1 AND state = 'open' RETURNING kind::text",
                 SpiParameter.Create(requestId));
             if (refused == "n")
             {
-                _ = Spi.Execute("""
+                _ = Worf.Execute("""
                     UPDATE worf.sequence_range SET state = 'refused',
                         detail = 'node ' || $2 || ' refused this node: its values reach into the root; disable and enable the sequence again on its owner to start a root above them'
                     WHERE seqoid = $1
@@ -1670,12 +1670,12 @@ internal static class SequenceRangeExchange
             Nullable(grant, "not_before"));
         if (pool)
         {
-            _ = Spi.Execute("INSERT INTO worf.sequence_range_free VALUES ($1, $2, $3)", SpiParameter.Create(id), SpiParameter.Create(lo),
+            _ = Worf.Execute("INSERT INTO worf.sequence_range_free VALUES ($1, $2, $3)", SpiParameter.Create(id), SpiParameter.Create(lo),
                 SpiParameter.Create(hi));
         }
 
-        _ = Spi.Execute("DELETE FROM worf.sequence_range_request WHERE request_id = $1", SpiParameter.Create(requestId));
-        _ = Spi.Execute("SET LOCAL synchronous_commit = on");
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_request WHERE request_id = $1", SpiParameter.Create(requestId));
+        _ = Worf.Execute("SET LOCAL synchronous_commit = on");
         return true;
     }
 
@@ -1687,13 +1687,13 @@ internal static class SequenceRangeExchange
     private static void Route(uint seqoid, WorfLocalNode node)
     {
         (uint? parent, int? distance) = Nearest(seqoid, node);
-        _ = Spi.Execute("""
+        _ = Worf.Execute("""
             UPDATE worf.sequence_range SET parent_node = $2, distance = $3,
                 state = CASE WHEN $2 IS NULL AND state IN ('quarantined', 'no_route') THEN 'no_route'
                     WHEN state = 'no_route' THEN 'quarantined' ELSE state END
             WHERE seqoid = $1
             """, SpiParameter.Create(seqoid), SpiParameter.Create(parent), SpiParameter.Create(distance));
-        _ = Spi.Execute("DELETE FROM worf.sequence_range_request WHERE seqoid = $1 AND $2::oid IS NOT NULL AND parent_node <> $2",
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_request WHERE seqoid = $1 AND $2::oid IS NOT NULL AND parent_node <> $2",
             SpiParameter.Create(seqoid), SpiParameter.Create(parent));
     }
 

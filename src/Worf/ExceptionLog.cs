@@ -88,7 +88,7 @@ internal static class ExceptionLog
             }
         }
 
-        void Insert() => _ = Spi.Execute(InsertSql,
+        void Insert() => _ = Worf.Execute(InsertSql,
             SpiParameter.Create(change.Subscription.Id),
             SpiParameter.Create(change.Subscription.Name),
             SpiParameter.Create(change.WriterNodeId),
@@ -136,7 +136,7 @@ internal static class ExceptionLog
     /// <param name="level">How it's applied again.</param>
     /// <param name="error">The error.</param>
     internal static void SaveState(uint subId, ulong commitLsn, int level, PgException error)
-        => _ = Spi.Execute("""
+        => _ = Worf.Execute("""
             INSERT INTO worf.exception_state VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (sub_id) DO UPDATE SET commit_lsn = excluded.commit_lsn, level = excluded.level,
                 error_sqlstate = excluded.error_sqlstate, error_message = excluded.error_message
@@ -162,7 +162,7 @@ internal static class ExceptionLog
     /// </summary>
     /// <param name="subId">The subscription.</param>
     internal static void ForgetState(uint subId)
-        => _ = Spi.Execute("DELETE FROM worf.exception_state WHERE sub_id = $1", SpiParameter.Create(subId));
+        => _ = Worf.Execute("DELETE FROM worf.exception_state WHERE sub_id = $1", SpiParameter.Create(subId));
 
     /// <summary>
     /// Reads a change's rows from its message again, as JSON objects of the text of the columns it sent.

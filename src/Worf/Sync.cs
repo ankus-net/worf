@@ -1353,10 +1353,10 @@ internal static class Sync
             ?? throw new PgException(PgSqlStates.UndefinedObject, $"replication origin \"{originName}\" does not exist");
         PgReplicationOrigin.SetupSession(origin);
 
-        Spi.Execute("SET LOCAL session_replication_role = 'replica'");
+        Worf.Execute("SET LOCAL session_replication_role = 'replica'");
         SetCopyTargetStyle(false);
-        Spi.Execute("SET LOCAL statement_timeout = 0");
-        Spi.Execute("SET LOCAL lock_timeout = 0");
+        Worf.Execute("SET LOCAL statement_timeout = 0");
+        Worf.Execute("SET LOCAL lock_timeout = 0");
     }
 
     /// <summary>
@@ -1365,9 +1365,9 @@ internal static class Sync
     /// </summary>
     private static void SetCopyTargetStyle(bool own)
     {
-        Spi.Execute($"SET LOCAL DATESTYLE TO {(own ? "DEFAULT" : "ISO")}");
-        Spi.Execute($"SET LOCAL INTERVALSTYLE TO {(own ? "DEFAULT" : "POSTGRES")}");
-        Spi.Execute($"SET LOCAL extra_float_digits TO {(own ? "DEFAULT" : "3")}");
+        Worf.Execute($"SET LOCAL DATESTYLE TO {(own ? "DEFAULT" : "ISO")}");
+        Worf.Execute($"SET LOCAL INTERVALSTYLE TO {(own ? "DEFAULT" : "POSTGRES")}");
+        Worf.Execute($"SET LOCAL extra_float_digits TO {(own ? "DEFAULT" : "3")}");
     }
 
     private static void FinishCopyOriginTx(PgReplicationConnection conn)
@@ -1624,7 +1624,7 @@ internal static class Sync
             CopyQuery(originConn, remoterel, replicationSets);
         uint reloid = rel.Reloid;
         string table = Spi.QuoteQualifiedIdentifier(remoterel.Nspname, remoterel.Relname);
-        (bool partitioned, List<string> key) = TableKey(reloid);
+        (bool partitioned, List<string> key, uint index) = TableKey(reloid);
         string only = partitioned ? "" : "ONLY ";
 
         // The provider's rows go into a table of the copy's columns first.
@@ -1635,7 +1635,7 @@ internal static class Sync
         }
 
         create.Append(attnamelist.Count == 0 ? "*" : "").Append(" FROM ONLY ").Append(table).Append(" WITH NO DATA");
-        ExecuteQuoted(create.ToString());
+        _ = Worf.Execute(create.ToString());
         uint copyOid = Worf.ReadScalar<uint>($"SELECT '{MergeCopy}'::regclass::oid");
 
         // The columns the merge writes: the copy's, but those the table generates.
@@ -1651,26 +1651,42 @@ internal static class Sync
         }
 
         CopyRows(originConn, rel, copyOid, attnamelist, converted, query, lsn);
-        _ = Spi.Execute($"ANALYZE {MergeCopy}");
+        _ = Worf.Execute($"ANALYZE {MergeCopy}");
 
         // The copy's rows replace the table's with the same key, or join them. A MERGE needs no arbiter index, which a
-        // deferrable key can't be, and an identity column takes the copy's value.
+        // deferrable key can't be, and an identity column takes the copy's value. It runs under the session's search
+        // path, as apply's changes do, for the triggers it fires, so it names its operators and types with their
+        // schemas: the key's equality operators from its index, and the system's for text.
+        Dictionary<short, string> operators = Worf.KeyEqualityOperators(index);
         string[] quoted = [.. columns.Select(Spi.QuoteIdentifier)];
         string[] rest = [.. columns.Where(column => !key.Contains(column)).Select(Spi.QuoteIdentifier)];
         StringBuilder merge = new("MERGE INTO ");
         merge.Append(only).Append(table).Append(" t USING ").Append(MergeCopy).Append(" c ON ")
-            .Append(string.Join(" AND ", key.Select(Spi.QuoteIdentifier).Select(column => $"t.{column} = c.{column}")));
+            .Append(string.Join(" AND ", key.Select(column => $"t.{Spi.QuoteIdentifier(column)} {KeyOperator(operators, reloid, column)} c.{Spi.QuoteIdentifier(column)}")));
         if (rest.Length > 0)
         {
-            merge.Append(" WHEN MATCHED AND ROW(").Append(string.Join(", ", rest.Select(column => $"t.{column}"))).Append(")::text IS DISTINCT FROM ROW(")
-                .Append(string.Join(", ", rest.Select(column => $"c.{column}"))).Append(")::text THEN UPDATE SET ")
+            merge.Append(" WHEN MATCHED AND ROW(").Append(string.Join(", ", rest.Select(column => $"t.{column}"))).Append(")::pg_catalog.text OPERATOR(pg_catalog.<>) ROW(")
+                .Append(string.Join(", ", rest.Select(column => $"c.{column}"))).Append(")::pg_catalog.text THEN UPDATE SET ")
                 .Append(string.Join(", ", rest.Select(column => $"{column} = c.{column}")));
         }
 
         merge.Append(" WHEN NOT MATCHED THEN INSERT (").Append(string.Join(", ", quoted)).Append(") OVERRIDING SYSTEM VALUE VALUES (")
             .Append(string.Join(", ", quoted.Select(column => $"c.{column}"))).Append(')');
-        ExecuteQuoted(merge.ToString());
-        _ = Spi.Execute($"DROP TABLE {MergeCopy}");
+
+        // A row the provider no longer has can hold a value that another unique index needs for one of the provider's.
+        try
+        {
+            ExecuteQuoted(merge.ToString());
+        }
+        catch (PgException error) when (error.SqlState == PgSqlStates.UniqueViolation)
+        {
+            throw new PgException(PgSqlStates.UniqueViolation,
+                $"could not merge the copy of table {remoterel.Nspname}.{remoterel.Relname} into the rows it has: {error.Message}",
+                detail: error.Detail,
+                hint: "A row the provider no longer has holds a value one of its rows takes. Resynchronize the table with worf.alter_subscription_resynchronize_table, which empties it and copies it again.");
+        }
+
+        _ = Worf.Execute($"DROP TABLE {MergeCopy}");
 
         PgLog.Info($"finished synchronization of data for table {remoterel.Nspname}.{remoterel.Relname}");
     }
@@ -1696,16 +1712,22 @@ internal static class Sync
             hint: "Resynchronize the table with worf.alter_subscription_resynchronize_table, which empties it and copies it again.");
 
     /// <summary>
-    /// Runs a statement a merge composes, whose every name the merge quotes with <see cref="Spi.QuoteIdentifier"/> and
-    /// that binds no values.
+    /// Runs the MERGE a merge composes, whose every name the merge quotes with <see cref="Spi.QuoteIdentifier"/> and
+    /// qualifies, and that binds no values, under the session's search path, for the triggers it fires.
     /// </summary>
     private static void ExecuteQuoted(string sql) => _ = Spi.Execute(sql);
 
     /// <summary>
-    /// Gets whether a table is partitioned, and its key's columns: those of its replica identity index or else its
-    /// primary key, even a deferrable one, which PostgreSQL doesn't take as the replica identity, or none.
+    /// Gets the equality operator a key column's index compares it with, written with its schema.
     /// </summary>
-    private static unsafe (bool Partitioned, List<string> Key) TableKey(uint reloid)
+    private static unsafe string KeyOperator(Dictionary<short, string> operators, uint reloid, string column)
+        => operators.TryGetValue(NativeMethods.get_attnum(reloid, Worf.PStrDup(column)), out string? op) ? op : "OPERATOR(pg_catalog.=)";
+
+    /// <summary>
+    /// Gets whether a table is partitioned, and its key's columns and index: those of its replica identity index or else
+    /// its primary key, even a deferrable one, which PostgreSQL doesn't take as the replica identity, or none.
+    /// </summary>
+    private static unsafe (bool Partitioned, List<string> Key, uint Index) TableKey(uint reloid)
     {
         RelationData* rel = NativeMethods.table_open(reloid, AccessShareLock);
         bool partitioned = rel->rd_rel->relkind == (sbyte)'p';
@@ -1724,7 +1746,7 @@ internal static class Sync
 
         if (index == 0)
         {
-            return (partitioned, []);
+            return (partitioned, [], 0);
         }
 
         SpiResult key = Worf.Read("""
@@ -1733,7 +1755,7 @@ internal static class Sync
                     ON a.attrelid = i.indrelid AND a.attnum = ANY ((i.indkey::smallint[])[0:i.indnkeyatts - 1])
             WHERE i.indexrelid = $1
             """, 0, SpiParameter.Create(index));
-        return (partitioned, [.. Enumerable.Range(0, key.Count).Select(i => key[i].Get<string>(0))]);
+        return (partitioned, [.. Enumerable.Range(0, key.Count).Select(i => key[i].Get<string>(0))], index);
     }
 
     /// <summary>

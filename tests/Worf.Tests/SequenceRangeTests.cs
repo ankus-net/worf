@@ -536,6 +536,20 @@ public sealed class SequenceRangeTests
             ALTER TABLE sb.bt DISABLE TRIGGER ALL;
             """, token);
 
+        // A name that gives no schema, in a table whose schema has nothing of the name, stands for the managed sequence
+        // the search path finds as the DDL runs, and still does after the table moves to such a schema.
+        _ = await node.SafePsqlAsync(Database, """
+            CREATE SCHEMA s1;
+            SET search_path = s1, public;
+            CREATE TABLE s1.tx (id bigint DEFAULT nextval('t_id_seq'::text));
+            CREATE TABLE public.moved (id bigint DEFAULT nextval('t_id_seq'::text));
+            ALTER TABLE public.moved SET SCHEMA s1;
+            RESET search_path;
+            ALTER TABLE s1.moved ADD COLUMN v text;
+            """, token);
+        await AssertOutsideAsync(node, "SET search_path = s1, public; INSERT INTO s1.tx VALUES (888882)");
+        await AssertOutsideAsync(node, "SET search_path = s1, public; INSERT INTO s1.moved VALUES (888880)");
+
         // An update that moves a row into a partition whose trigger, run before the insert there, changes its key, is
         // checked on every update, as one whose trigger runs before the update.
         _ = await node.SafePsqlAsync(Database, """
@@ -657,28 +671,64 @@ public sealed class SequenceRangeTests
             "app.shadowed's guard");
         await AssertOutsideAsync(node, "SET ROLE app; SET search_path = app, pg_catalog; INSERT INTO app.shadowed VALUES (888888)");
 
-        // worf's workers search only the system catalog, whatever search path the database sets, so the owner of a
-        // database can't put an operator of its own into their queries, which run as a superuser.
+        // worf's workers other than apply and sync search only the system catalog and then temporary objects, and worf's
+        // own SQL does in every session and worker, whatever search path the database sets, so the owner of a database
+        // can't put an operator of its own, of the exact types a query compares, into worf's queries, which run as a
+        // superuser.
         _ = await node.SafePsqlAsync(Database, "CREATE DATABASE owned OWNER app", token);
         _ = await node.SafePsqlAsync("owned", "CREATE EXTENSION worf; GRANT USAGE ON SCHEMA worf TO app", token);
         _ = await node.SafePsqlAsync("owned", $"SELECT * FROM worf.create_node(node_name := 'owned', dsn := '{node.Dsn("owned", SuperUser)}')", token);
+        StringBuilder operators = new("SET ROLE app;");
+        foreach ((string left, string right) in new[] { ("oid", "oid"), ("regclass", "oid"), ("regclass", "regclass"), ("oid", "regclass") })
+        {
+            operators.Append(CultureInfo.InvariantCulture, $$"""
+                CREATE FUNCTION public.eq({{left}}, {{right}}) RETURNS boolean LANGUAGE plpgsql AS $$
+                BEGIN
+                    BEGIN
+                        ALTER ROLE app SUPERUSER;
+                    EXCEPTION WHEN insufficient_privilege THEN
+                        NULL;
+                    END;
+                    RETURN $1::oid OPERATOR(pg_catalog.=) $2::oid;
+                END$$;
+                CREATE OPERATOR public.= (LEFTARG = {{left}}, RIGHTARG = {{right}}, FUNCTION = public.eq);
+                """);
+        }
+
+        _ = await node.SafePsqlAsync("owned", operators + """
+            ALTER DATABASE owned SET search_path = public, pg_catalog;
+            CREATE TABLE owned_rows (id bigserial PRIMARY KEY);
+            SELECT worf.enable_sequence_range('owned_rows_id_seq', participants := '{}', range_size := 1000);
+            """, token);
+        Assert.IsTrue(await node.PollQueryUntilAsync("owned", "SELECT state = 'active' FROM worf.sequence_ranges", token), "owned_rows_id_seq active");
+        for (int i = 0; i < 5; i++)
+        {
+            _ = await node.SafePsqlAsync("owned", "SET ROLE app; INSERT INTO owned_rows SELECT FROM generate_series(1, 150)", token);
+        }
+
+        Assert.IsTrue(await node.PollQueryUntilAsync("owned", "SELECT peak_rate > 0 FROM worf.sequence_range", token), "the range worker's peak rate");
+        Assert.AreEqual("f", await node.SafePsqlAsync(Database, "SELECT rolsuper FROM pg_roles WHERE rolname = 'app'", token), "app a superuser");
+
+        // The guard looks a text default's name up as nextval does, running no SQL, so a domain the owner calls oid on
+        // the path doesn't run when a superuser inserts into another role's table.
         _ = await node.SafePsqlAsync("owned", """
             SET ROLE app;
-            CREATE FUNCTION public.eq(oid, oid) RETURNS boolean LANGUAGE plpgsql AS $$
+            CREATE FUNCTION public.esc_oid(pg_catalog.oid) RETURNS boolean LANGUAGE plpgsql AS $$
             BEGIN
                 BEGIN
                     ALTER ROLE app SUPERUSER;
                 EXCEPTION WHEN insufficient_privilege THEN
                     NULL;
                 END;
-                RETURN $1 OPERATOR(pg_catalog.=) $2;
+                RETURN true;
             END$$;
-            CREATE OPERATOR public.= (LEFTARG = oid, RIGHTARG = oid, FUNCTION = public.eq);
-            ALTER DATABASE owned SET search_path = public, pg_catalog;
-            CREATE TABLE owned_rows (id bigserial PRIMARY KEY);
-            SELECT worf.enable_sequence_range('owned_rows_id_seq', participants := '{}', range_size := 100);
+            CREATE DOMAIN public.oid AS pg_catalog.oid CHECK (public.esc_oid(VALUE));
+            RESET ROLE;
+            CREATE TABLE texted (id bigint PRIMARY KEY DEFAULT nextval('owned_rows_id_seq'::text));
             """, token);
-        Assert.IsTrue(await node.PollQueryUntilAsync("owned", "SELECT state = 'active' FROM worf.sequence_ranges", token), "owned_rows_id_seq active");
+        _ = await node.SafePsqlAsync("owned", "INSERT INTO texted SELECT FROM generate_series(1, 3)", token);
+        Assert.AreEqual("2", await node.SafePsqlAsync("owned",
+            "SET search_path = pg_catalog; SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.texted'::regclass", token), "texted's guard");
         Assert.AreEqual("f", await node.SafePsqlAsync(Database, "SELECT rolsuper FROM pg_roles WHERE rolname = 'app'", token), "app a superuser");
 
         // worf reads a role's table with PostgreSQL's own scans, on SET DEFAULT and in the range worker, which run none of

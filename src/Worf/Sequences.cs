@@ -70,7 +70,7 @@ internal static class Sequences
                     continue;
                 }
 
-                SpiResult locked = Spi.Query("SELECT cache_size, last_value FROM worf.sequence_state WHERE seqoid = $1 FOR UPDATE",
+                SpiResult locked = Worf.Query("SELECT cache_size, last_value FROM worf.sequence_state WHERE seqoid = $1 FOR UPDATE",
                     false, 0, SpiParameter.Create(seqoid));
                 if (locked.Count == 0)
                 {
@@ -99,7 +99,7 @@ internal static class Sequences
 
                 long newLastValue = lastValue + cacheSize;
 
-                _ = Spi.Execute("UPDATE worf.sequence_state SET cache_size = $2, last_value = $3 WHERE seqoid = $1",
+                _ = Worf.Execute("UPDATE worf.sequence_state SET cache_size = $2, last_value = $3 WHERE seqoid = $1",
                     SpiParameter.Create(seqoid), SpiParameter.Create(cacheSize), SpiParameter.Create(newLastValue));
 
                 QueueSequence(localNode, seqoid, newLastValue);
@@ -125,7 +125,7 @@ internal static class Sequences
         }
 
         // Now search for it in our tracking table.
-        SpiResult result = Spi.Query("SELECT cache_size FROM worf.sequence_state WHERE seqoid = $1 FOR UPDATE", false, 0,
+        SpiResult result = Worf.Query("SELECT cache_size FROM worf.sequence_state WHERE seqoid = $1 FOR UPDATE", false, 0,
             SpiParameter.Create(seqoid));
         if (result.Count == 0)
         {
@@ -135,7 +135,7 @@ internal static class Sequences
         int cacheSize = result[0].Get<int>(0);
         long lastValue = SequenceGetLastValue(seqoid) + cacheSize;
 
-        _ = Spi.Execute("UPDATE worf.sequence_state SET last_value = $2 WHERE seqoid = $1",
+        _ = Worf.Execute("UPDATE worf.sequence_state SET last_value = $2 WHERE seqoid = $1",
             SpiParameter.Create(seqoid), SpiParameter.Create(lastValue));
 
         QueueSequence(localNode, seqoid, lastValue);
@@ -150,7 +150,7 @@ internal static class Sequences
         // Check if the state record already exists, and if it doesn't insert it.
         if (Worf.ReadScalar<long>("SELECT count(*) FROM worf.sequence_state WHERE seqoid = $1", SpiParameter.Create(seqoid)) == 0)
         {
-            _ = Spi.Execute("INSERT INTO worf.sequence_state VALUES ($1, $2, $3)",
+            _ = Worf.Execute("INSERT INTO worf.sequence_state VALUES ($1, $2, $3)",
                 SpiParameter.Create(seqoid), SpiParameter.Create(SequenceReplicationMinCache),
                 SpiParameter.Create(SequenceGetLastValue(seqoid)));
         }
@@ -167,7 +167,7 @@ internal static class Sequences
     /// <param name="seqoid">The sequence.</param>
     internal static void DropSequenceStateRecord(uint seqoid)
     {
-        _ = Spi.Execute("DELETE FROM worf.sequence_state WHERE seqoid = $1", SpiParameter.Create(seqoid));
+        _ = Worf.Execute("DELETE FROM worf.sequence_state WHERE seqoid = $1", SpiParameter.Create(seqoid));
 
         unsafe
         {

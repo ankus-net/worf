@@ -374,7 +374,7 @@ internal static partial class ConflictHistory
                     idxname = name is null ? null : Worf.FromServer(name);
                 }
 
-                _ = Spi.Execute(InsertSql,
+                _ = Worf.Execute(InsertSql,
                     SpiParameter.Create(sub.Id),
                     SpiParameter.Create(sub.Name),
                     SpiParameter.Create(ConflictTypeToString(conflictType)),
@@ -404,7 +404,7 @@ internal static partial class ConflictHistory
                     """, 0);
                 for (int i = 0; i < deferrable.Count; i++)
                 {
-                    _ = Spi.Execute("SET CONSTRAINTS " + Spi.QuoteQualifiedIdentifier(deferrable[i].Get<string>(0), deferrable[i].Get<string>(1)) +
+                    _ = Worf.Execute("SET CONSTRAINTS " + Spi.QuoteQualifiedIdentifier(deferrable[i].Get<string>(0), deferrable[i].Get<string>(1)) +
                         " IMMEDIATE");
                 }
             }, PgSubtransactionMode.Atomic);
@@ -507,5 +507,5 @@ internal static partial class ConflictHistory
     /// Ensure that a partition exists for a time, which partitions hold by its month in UTC.
     /// </summary>
     private static void EnsurePartitionExists(PgTimestampTz time)
-        => _ = Spi.Execute("SELECT worf.conflict_history_ensure_partition(($1 AT TIME ZONE 'UTC')::date)", SpiParameter.Create(time));
+        => _ = Worf.Execute("SELECT worf.conflict_history_ensure_partition(($1 AT TIME ZONE 'UTC')::date)", SpiParameter.Create(time));
 }

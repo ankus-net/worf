@@ -207,7 +207,7 @@ internal static class SnowflakeIds
                 long target = Math.Max(durable, Math.Max(already, NowMs() + ReserveAheadMs));
                 if (target > durable)
                 {
-                    _ = Spi.Execute("SELECT pg_catalog.setval('worf.snowflake_clock', $1)", SpiParameter.Create(target));
+                    _ = Worf.Execute("SELECT pg_catalog.setval('worf.snowflake_clock', $1)", SpiParameter.Create(target));
 
                     // The flush goes to the end of setval's record, as the insert position may lie past a page header not
                     // yet written.

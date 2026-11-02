@@ -48,10 +48,10 @@ internal static class SequenceRangeSync
     /// <param name="managed">The sequences.</param>
     internal static void RecordForRestore(List<WorfManagedSequence> managed)
     {
-        _ = Spi.Execute("DELETE FROM worf.sequence_range_restore");
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_restore");
         foreach (WorfManagedSequence sequence in managed)
         {
-            _ = Spi.Execute("INSERT INTO worf.sequence_range_restore VALUES ($1, $2, $3, $4, $5, $6, $7)", SpiParameter.Create(sequence.Name),
+            _ = Worf.Execute("INSERT INTO worf.sequence_range_restore VALUES ($1, $2, $3, $4, $5, $6, $7)", SpiParameter.Create(sequence.Name),
                 SpiParameter.Create(sequence.Owner), SpiParameter.Create(sequence.Epoch), SpiParameter.Create(sequence.RangeSize),
                 SpiParameter.Create(sequence.MaxRangeSize), SpiParameter.Create(sequence.RootStart), SpiParameter.Create(sequence.RootEnd));
         }
@@ -60,7 +60,7 @@ internal static class SequenceRangeSync
     /// <summary>
     /// Forgets the provider's managed sequences once the structure is restored.
     /// </summary>
-    internal static void ClearRestore() => _ = Spi.Execute("DELETE FROM worf.sequence_range_restore");
+    internal static void ClearRestore() => _ = Worf.Execute("DELETE FROM worf.sequence_range_restore");
 
     /// <summary>
     /// Joins this node to the provider's managed sequences that exist here, before rows are copied into the tables
@@ -109,7 +109,7 @@ internal static class SequenceRangeSync
             {
                 SequenceRanges.JoinFromNeighbor(seqoid, row.Get<uint>(1), row.Get<int>(2), row.Get<long>(3), row.Get<long>(4), row.Get<long?>(5),
                     row.Get<long?>(6), node);
-                _ = Spi.Execute("DELETE FROM worf.sequence_range_dropped WHERE name = $1", SpiParameter.Create(row.Get<string>(0)));
+                _ = Worf.Execute("DELETE FROM worf.sequence_range_dropped WHERE name = $1", SpiParameter.Create(row.Get<string>(0)));
                 SequenceRanges.ChangedOnCommit();
             }
         }

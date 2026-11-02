@@ -11,6 +11,8 @@ namespace Worf;
 internal static partial class Worf
 {
     private const uint TextOid = 25;
+    private const int AccessShareLock = 1;
+    private const ushort BtEqualStrategyNumber = 3;
 
     /// <summary>
     /// The extension version.
@@ -42,6 +44,7 @@ internal static partial class Worf
     /// </summary>
     internal const string ReplicationOriginAll = "all";
 
+    private static readonly Dictionary<uint, Dictionary<short, string>> s_keyEqualityOperators = [];
     private static string s_tempDirectory = "";
 
     /// <summary>
@@ -651,7 +654,7 @@ internal static partial class Worf
         finally
         {
             NativeMethods.PopActiveSnapshot();
-            NativeMethods.AtEOXact_GUC(true, nestLevel);
+            UnpinSearchPath(nestLevel);
         }
     }
 
@@ -675,7 +678,206 @@ internal static partial class Worf
         finally
         {
             NativeMethods.PopActiveSnapshot();
-            NativeMethods.AtEOXact_GUC(true, nestLevel);
+            UnpinSearchPath(nestLevel);
+        }
+    }
+
+    /// <summary>
+    /// Runs a read-only query of worf's as <see cref="Spi.Select(string, ReadOnlySpan{SpiParameter})"/> does, with the
+    /// search path <see cref="PinSearchPath"/> sets.
+    /// </summary>
+    /// <param name="commandText">The query.</param>
+    /// <param name="parameters">The query's parameters.</param>
+    /// <returns>The rows.</returns>
+    internal static SpiResult Select(string commandText, params ReadOnlySpan<SpiParameter> parameters)
+    {
+        int nestLevel = PinSearchPath();
+        try
+        {
+            return Spi.Select(commandText, parameters);
+        }
+        finally
+        {
+            UnpinSearchPath(nestLevel);
+        }
+    }
+
+    /// <summary>
+    /// Runs a statement of worf's as <see cref="Spi.Execute(string, ReadOnlySpan{SpiParameter})"/> does, with the search
+    /// path <see cref="PinSearchPath"/> sets.
+    /// </summary>
+    /// <param name="commandText">The statement.</param>
+    /// <param name="parameters">The statement's parameters.</param>
+    /// <returns>The number of rows it processed.</returns>
+    internal static long Execute(string commandText, params ReadOnlySpan<SpiParameter> parameters)
+    {
+        int nestLevel = PinSearchPath();
+        try
+        {
+            return Spi.Execute(commandText, parameters);
+        }
+        finally
+        {
+            UnpinSearchPath(nestLevel);
+        }
+    }
+
+    /// <summary>
+    /// Runs a statement of worf's as <see cref="Spi.Execute(SpiCommand)"/> does, with the search path
+    /// <see cref="PinSearchPath"/> sets.
+    /// </summary>
+    /// <param name="command">The statement.</param>
+    /// <returns>The number of rows it processed.</returns>
+    internal static long Execute(SpiCommand command)
+    {
+        int nestLevel = PinSearchPath();
+        try
+        {
+            return Spi.Execute(command);
+        }
+        finally
+        {
+            UnpinSearchPath(nestLevel);
+        }
+    }
+
+    /// <summary>
+    /// Runs a query of worf's as <see cref="Spi.Query(string, bool, int, ReadOnlySpan{SpiParameter})"/> does, with the
+    /// search path <see cref="PinSearchPath"/> sets.
+    /// </summary>
+    /// <param name="commandText">The query.</param>
+    /// <param name="readOnly">Whether it only reads.</param>
+    /// <param name="limit">The most rows to return, or zero for all.</param>
+    /// <param name="parameters">The query's parameters.</param>
+    /// <returns>The rows.</returns>
+    internal static SpiResult Query(string commandText, bool readOnly, int limit, params ReadOnlySpan<SpiParameter> parameters)
+    {
+        int nestLevel = PinSearchPath();
+        try
+        {
+            return Spi.Query(commandText, readOnly, limit, parameters);
+        }
+        finally
+        {
+            UnpinSearchPath(nestLevel);
+        }
+    }
+
+    /// <summary>
+    /// Runs a query of worf's as <see cref="Spi.Query(string, ReadOnlySpan{SpiParameter})"/> does, with the search path
+    /// <see cref="PinSearchPath"/> sets.
+    /// </summary>
+    /// <param name="commandText">The query.</param>
+    /// <param name="parameters">The query's parameters.</param>
+    /// <returns>The rows.</returns>
+    internal static SpiResult Query(string commandText, params ReadOnlySpan<SpiParameter> parameters)
+    {
+        int nestLevel = PinSearchPath();
+        try
+        {
+            return Spi.Query(commandText, parameters);
+        }
+        finally
+        {
+            UnpinSearchPath(nestLevel);
+        }
+    }
+
+    /// <summary>
+    /// Runs a query of worf's as <see cref="Spi.Query(SpiCommand, bool, int)"/> does, with the search path
+    /// <see cref="PinSearchPath"/> sets.
+    /// </summary>
+    /// <param name="command">The query.</param>
+    /// <param name="readOnly">Whether it only reads.</param>
+    /// <param name="limit">The most rows to return, or zero for all.</param>
+    /// <returns>The rows.</returns>
+    internal static SpiResult Query(SpiCommand command, bool readOnly, int limit)
+    {
+        int nestLevel = PinSearchPath();
+        try
+        {
+            return Spi.Query(command, readOnly, limit);
+        }
+        finally
+        {
+            UnpinSearchPath(nestLevel);
+        }
+    }
+
+    /// <summary>
+    /// Runs a query of worf's as <see cref="Spi.ExecuteScalar{T}(string, ReadOnlySpan{SpiParameter})"/> does, with the
+    /// search path <see cref="PinSearchPath"/> sets.
+    /// </summary>
+    /// <typeparam name="T">The column's managed type.</typeparam>
+    /// <param name="commandText">The query.</param>
+    /// <param name="parameters">The query's parameters.</param>
+    /// <returns>The first column of the first row.</returns>
+    internal static T? ExecuteScalar<[PgConvertible] T>(string commandText, params ReadOnlySpan<SpiParameter> parameters)
+    {
+        int nestLevel = PinSearchPath();
+        try
+        {
+            return Spi.ExecuteScalar<T>(commandText, parameters);
+        }
+        finally
+        {
+            UnpinSearchPath(nestLevel);
+        }
+    }
+
+    /// <summary>
+    /// Gets the equality operator of each key column of a unique index, from the column's operator family, written as
+    /// <c>OPERATOR(schema.name)</c>, so that SQL comparing the columns that runs under a user's search path, as SQL that
+    /// fires their triggers does, uses the index's own operators rather than ones the path finds first.
+    /// </summary>
+    /// <param name="indexOid">The index.</param>
+    /// <returns>Each key column's operator, by its attribute number.</returns>
+    internal static unsafe Dictionary<short, string> KeyEqualityOperators(uint indexOid)
+    {
+        if (s_keyEqualityOperators.TryGetValue(indexOid, out Dictionary<short, string>? cached))
+        {
+            return cached;
+        }
+
+        Dictionary<short, string> operators = [];
+        RelationData* index = NativeMethods.index_open(indexOid, AccessShareLock);
+        short* indkey = (short*)(&index->rd_index->indkey + 1);
+        for (int i = 0; i < index->rd_index->indnkeyatts; i++)
+        {
+            uint opcintype = index->rd_opcintype[i];
+            uint op = NativeMethods.get_opfamily_member(index->rd_opfamily[i], opcintype, opcintype, (short)BtEqualStrategyNumber);
+            if (op != 0)
+            {
+                operators[indkey[i]] = $"OPERATOR({ReadScalar<string>("""
+                    SELECT pg_catalog.quote_ident(n.nspname) || '.' || o.oprname
+                    FROM pg_catalog.pg_operator o JOIN pg_catalog.pg_namespace n ON n.oid = o.oprnamespace
+                    WHERE o.oid = $1
+                    """, SpiParameter.Create(op))})";
+            }
+        }
+
+        NativeMethods.index_close(index, AccessShareLock);
+        s_keyEqualityOperators[indexOid] = operators;
+        return operators;
+    }
+
+    /// <summary>
+    /// Runs worf's own work, as a prepared statement's planning and execution, with the search path
+    /// <see cref="PinSearchPath"/> sets.
+    /// </summary>
+    /// <typeparam name="T">The work's result.</typeparam>
+    /// <param name="work">The work.</param>
+    /// <returns>Its result.</returns>
+    internal static T Pinned<T>(Func<T> work)
+    {
+        int nestLevel = PinSearchPath();
+        try
+        {
+            return work();
+        }
+        finally
+        {
+            UnpinSearchPath(nestLevel);
         }
     }
 
@@ -684,18 +886,46 @@ internal static partial class Worf
     /// query of worf's, run in a user's session, uses the system's operators and functions rather than ones a user put
     /// ahead of them on the search path.
     /// </summary>
-    /// <returns>The nest level, which the caller ends with <c>AtEOXact_GUC</c>.</returns>
+    /// <returns>The nest level, which the caller ends with <see cref="UnpinSearchPath"/>, or zero when the path is
+    /// already that, as in worf's workers other than apply and sync.</returns>
     internal static unsafe int PinSearchPath()
     {
-        int nestLevel = NativeMethods.NewGUCNestLevel();
         fixed (byte* name = ToServerCString("search_path"))
-        fixed (byte* value = ToServerCString("pg_catalog, pg_temp"))
         {
-            _ = NativeMethods.set_config_option((sbyte*)name, (sbyte*)value, GucContext.PGC_USERSET, GucSource.PGC_S_SESSION,
-                GucAction.GUC_ACTION_SAVE, true, 0, false);
-        }
+            if (FromServer(NativeMethods.GetConfigOption((sbyte*)name, false, false)) == PinnedSearchPath)
+            {
+                return 0;
+            }
 
-        return nestLevel;
+            int nestLevel = NativeMethods.NewGUCNestLevel();
+            fixed (byte* value = ToServerCString(PinnedSearchPath))
+            {
+                _ = NativeMethods.set_config_option((sbyte*)name, (sbyte*)value, GucContext.PGC_USERSET, GucSource.PGC_S_SESSION,
+                    GucAction.GUC_ACTION_SAVE, true, 0, false);
+            }
+
+            return nestLevel;
+        }
+    }
+
+    /// <summary>
+    /// The search path worf's own SQL runs with, and its workers other than apply and sync run with.
+    /// </summary>
+    internal const string PinnedSearchPath = "pg_catalog, pg_temp";
+
+    /// <summary>
+    /// Puts back the search path that <see cref="PinSearchPath"/> replaced.
+    /// </summary>
+    /// <param name="nestLevel">The nest level it returned.</param>
+    internal static void UnpinSearchPath(int nestLevel)
+    {
+        if (nestLevel > 0)
+        {
+            unsafe
+            {
+                NativeMethods.AtEOXact_GUC(true, nestLevel);
+            }
+        }
     }
 
     /// <summary>
@@ -793,7 +1023,7 @@ internal static partial class Worf
         // No extension, nothing to update. Only run the alter if the versions don't match.
         if (extversion is not null && extversion != Version)
         {
-            Spi.Execute("ALTER EXTENSION " + Spi.QuoteIdentifier(ExtensionName) + " UPDATE");
+            Execute("ALTER EXTENSION " + Spi.QuoteIdentifier(ExtensionName) + " UPDATE");
         }
     }
 

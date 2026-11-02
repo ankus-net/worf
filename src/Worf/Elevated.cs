@@ -34,7 +34,7 @@ internal static unsafe class Elevated
         try
         {
             fixed (byte* name = Worf.ToServerCString("search_path"))
-            fixed (byte* value = Worf.ToServerCString("pg_catalog, pg_temp"))
+            fixed (byte* value = Worf.ToServerCString(Worf.PinnedSearchPath))
             {
                 _ = NativeMethods.set_config_option((sbyte*)name, (sbyte*)value, GucContext.PGC_USERSET, GucSource.PGC_S_SESSION,
                     GucAction.GUC_ACTION_SAVE, true, 0, false);

@@ -163,7 +163,7 @@ internal static unsafe partial class LocalIndex
         }
 
         NativeMethods.CommandCounterIncrement();
-        SpiResult result = Elevated.Run(() => Spi.Query(
+        SpiResult result = Elevated.Run(() => Worf.Query(
             "UPDATE pg_catalog.pg_index SET indisvalid = false WHERE indexrelid = $1 AND indisvalid RETURNING indrelid", SpiParameter.Create(relid)));
         foreach (SpiRow row in result)
         {
@@ -599,7 +599,7 @@ internal static unsafe partial class LocalIndex
                 continue;
             }
 
-            SpiResult result = Elevated.Run(() => Spi.Query(unlive
+            SpiResult result = Elevated.Run(() => Worf.Query(unlive
                 ? "UPDATE pg_catalog.pg_index SET indislive = true WHERE indexrelid = ANY ($1::pg_catalog.int8[]::pg_catalog.oid[]) RETURNING indrelid"
                 : "UPDATE pg_catalog.pg_index SET indisvalid = true WHERE indexrelid = ANY ($1::pg_catalog.int8[]::pg_catalog.oid[]) RETURNING indrelid",
                 SpiParameter.Create(relids)));
@@ -991,7 +991,7 @@ internal static unsafe partial class LocalIndex
             NativeMethods.LockRelationOid(index.Get<uint>(0), (int)PgLockMode.ShareUpdateExclusive);
         }
 
-        SpiResult result = Elevated.Run(() => Spi.Query(unlive
+        SpiResult result = Elevated.Run(() => Worf.Query(unlive
             ? """
                 UPDATE pg_catalog.pg_index i SET indislive = false FROM worf.local_index l, pg_catalog.pg_class t
                 WHERE i.indexrelid = l.indexrelid AND t.oid = i.indrelid AND i.indrelid = ANY ($1::pg_catalog.int8[]::pg_catalog.oid[]) AND i.indislive
@@ -1043,7 +1043,7 @@ internal static unsafe partial class LocalIndex
     private static void Write(string command, params SpiParameter[] parameters)
         => _ = DdlReplication.WithSnapshot(() => Elevated.Run(() =>
         {
-            _ = Spi.Execute(command, parameters);
+            _ = Worf.Execute(command, parameters);
             return true;
         }));
 

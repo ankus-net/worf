@@ -44,7 +44,7 @@ internal static class Monitoring
             ulong oldestConfirmedLsn = 0;
             string? oldestSlot = null;
 
-            SpiResult slots = Spi.Select("SELECT slot_name::text, confirmed_flush_lsn::text FROM pg_catalog.pg_replication_slots");
+            SpiResult slots = Worf.Select("SELECT slot_name::text, confirmed_flush_lsn::text FROM pg_catalog.pg_replication_slots");
             foreach (SpiRow s in slots)
             {
                 string name = s.Get<string>(0);

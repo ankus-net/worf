@@ -597,7 +597,7 @@ internal static unsafe partial class Executor
         {
             string column = Worf.FromServer(attname);
             // worf's catalog is its own, whoever drops the column.
-            Elevated.Run(() => _ = Spi.Execute("""
+            Elevated.Run(() => _ = Worf.Execute("""
                 INSERT INTO worf.dropped_column VALUES ($1, $2::name, $3) ON CONFLICT (relid, attname) DO UPDATE SET attnum = excluded.attnum
                 """, SpiParameter.Create(relid), SpiParameter.Create(column), SpiParameter.Create((short)attnum)));
         }
@@ -607,7 +607,7 @@ internal static unsafe partial class Executor
     /// Forgets the dropped columns recorded for a table.
     /// </summary>
     private static void ForgetDroppedColumns(uint relid)
-        => Elevated.Run(() => _ = Spi.Execute("DELETE FROM worf.dropped_column WHERE relid = $1", SpiParameter.Create(relid)));
+        => Elevated.Run(() => _ = Worf.Execute("DELETE FROM worf.dropped_column WHERE relid = $1", SpiParameter.Create(relid)));
 
     /// <summary>
     /// Checks whether this database has worf's table of dropped columns, as it doesn't before worf is installed.

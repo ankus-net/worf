@@ -1778,7 +1778,7 @@ internal static unsafe partial class Apply
 
         long lastValue = ParseInt64Prefix(lastValueRaw);
 
-        _ = Spi.Execute("SELECT pg_catalog.setval($1, $2)", SpiParameter.Create(reloid), SpiParameter.Create(lastValue));
+        _ = Worf.Execute("SELECT pg_catalog.setval($1, $2)", SpiParameter.Create(reloid), SpiParameter.Create(lastValue));
     }
 
     /// <summary>

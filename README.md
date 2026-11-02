@@ -1195,6 +1195,12 @@ Apply process and the initial COPY process both run with
 `session_replication_role` set to `replica` which means that `ENABLE REPLICA`
 and `ENABLE ALWAYS` triggers will be fired.
 
+They also run under the `search_path` the database and its role set, as
+pglogical's do, so a trigger that calls a function or names a table without a
+schema finds the one a local session would. worf's own queries, in those
+workers and in every session, search only `pg_catalog` and then temporary
+objects, and its other workers run with that path alone.
+
 ### PostgreSQL Version differences
 
 worf can replicate across PostgreSQL major versions. Despite that, long

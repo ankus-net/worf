@@ -238,7 +238,7 @@ internal static unsafe partial class DdlLock
 
         // Write and flush a record, so that walsenders move past it and their subscribers report that they have. Its end,
         // unlike the insert position, which skips a page header when the record fills its page, has been written.
-        _ = Spi.Execute("SELECT pg_catalog.pg_logical_emit_message(false, 'worf_fence', '')");
+        _ = Worf.Execute("SELECT pg_catalog.pg_logical_emit_message(false, 'worf_fence', '')");
         ulong lsn = NativeGlobals.XactLastRecEnd;
         NativeMethods.XLogFlush(lsn);
         return PgDatum.DangerousCreate((nuint)lsn, LsnOid, PgMemoryContext.Current);
@@ -264,7 +264,7 @@ internal static unsafe partial class DdlLock
         // A fence this session kept goes once its rows have.
         if (s_keptFences.Contains(id))
         {
-            Elevated.Run(() => _ = Spi.Execute("DELETE FROM worf.fence WHERE fence_id = $1", SpiParameter.Create(fenceId)));
+            Elevated.Run(() => _ = Worf.Execute("DELETE FROM worf.fence WHERE fence_id = $1", SpiParameter.Create(fenceId)));
             _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, () =>
             {
                 _ = s_keptFences.Remove(id);
@@ -308,7 +308,7 @@ internal static unsafe partial class DdlLock
         {
             foreach ((uint relid, bool blocksWrites) in kept)
             {
-                _ = Spi.Execute("""
+                _ = Worf.Execute("""
                     INSERT INTO worf.fence VALUES ($1, $2, $3, $4, $5, now()) ON CONFLICT DO NOTHING
                     """, SpiParameter.Create(fenceId), SpiParameter.Create(relid), SpiParameter.Create(blocksWrites),
                     SpiParameter.Create(originNode), SpiParameter.Create(originXid));
@@ -346,7 +346,7 @@ internal static unsafe partial class DdlLock
         """)]
     internal static int ReleaseFence(long? fenceId)
     {
-        _ = Spi.Execute("DELETE FROM worf.fence WHERE $1 IS NULL OR fence_id = $1", SpiParameter.Create(fenceId));
+        _ = Worf.Execute("DELETE FROM worf.fence WHERE $1 IS NULL OR fence_id = $1", SpiParameter.Create(fenceId));
         uint dboid = DatabaseId();
         Func<WorfFence, bool> matches = fence => fence.Dboid == dboid && (fenceId is null || fence.Id == unchecked((ulong)fenceId.Value));
 
@@ -376,7 +376,7 @@ internal static unsafe partial class DdlLock
             return;
         }
 
-        Elevated.Run(() => _ = Spi.Execute("DELETE FROM worf.fence WHERE origin_node = $1", SpiParameter.Create(originNode)));
+        Elevated.Run(() => _ = Worf.Execute("DELETE FROM worf.fence WHERE origin_node = $1", SpiParameter.Create(originNode)));
         uint dboid = DatabaseId();
         _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, () => _ = Release(fence => fence.Dboid == dboid && forgotten.Contains(fence.Id)));
     }
@@ -549,7 +549,7 @@ internal static unsafe partial class DdlLock
         if (s_appliedFences.Count == 0)
         {
             _ = PgTransaction.RegisterCallback(PgTransactionEvent.PreCommit, static () => Elevated.Run(() =>
-                _ = Spi.Execute("DELETE FROM worf.fence WHERE fence_id = ANY ($1)",
+                _ = Worf.Execute("DELETE FROM worf.fence WHERE fence_id = ANY ($1)",
                     SpiParameter.Create(s_appliedFences.Select(id => unchecked((long)id)).ToArray()))));
             _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () =>
             {
@@ -670,7 +670,7 @@ internal static unsafe partial class DdlLock
     private static void LetGo(long fenceId, WorfSubscription sub, string reason)
     {
         PgLog.Log($"letting go of fence {fenceId} from node {sub.Origin.Name}, whose DDL {reason}");
-        _ = Spi.Execute("DELETE FROM worf.fence WHERE fence_id = $1", SpiParameter.Create(fenceId));
+        _ = Worf.Execute("DELETE FROM worf.fence WHERE fence_id = $1", SpiParameter.Create(fenceId));
         _ = s_reconcileBounds.Remove(fenceId);
         _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, () =>
             _ = Release(fence => fence.Dboid == DatabaseId() && fence.Id == unchecked((ulong)fenceId)));
@@ -782,7 +782,7 @@ internal static unsafe partial class DdlLock
 
             // Apply can't pass a lock this transaction holds, as on a table that an earlier statement in it locked or
             // wrote to.
-            if (polls % 50 == 0 && blocked.Count > 0 && Spi.Select("""
+            if (polls % 50 == 0 && blocked.Count > 0 && Worf.Select("""
                 SELECT EXISTS (SELECT FROM pg_catalog.unnest($1::pg_catalog.int8[]) AS a (pid)
                     WHERE pg_catalog.pg_backend_pid() = ANY (pg_catalog.pg_blocking_pids(a.pid::pg_catalog.int4)))
                 """, SpiParameter.Create(blocked.ToArray()))[0].Get<bool>(0))

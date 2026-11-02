@@ -17,6 +17,9 @@ internal static class SequenceRangeGuard
     // SESSION_REPLICATION_ROLE_REPLICA from commands/trigger.h.
     private const int SessionReplicationRoleReplica = 1;
 
+    // RVR_MISSING_OK from catalog/namespace.h.
+    private const uint RangeVarMissingOk = 1;
+
     // BOOTSTRAP_SUPERUSERID from catalog/pg_authid_d.h and SECURITY_LOCAL_USERID_CHANGE from miscadmin.h.
     private const uint BootstrapSuperuserId = 10;
     private const int SecurityLocalUseridChange = 0x0001;
@@ -133,19 +136,16 @@ internal static class SequenceRangeGuard
         RETURNS regclass STRICT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
         """)]
     [return: PgSqlType("regclass", Schema = "pg_catalog")]
-    internal static PgDatum Named(string name, [PgSqlType("regclass", Schema = "pg_catalog")] PgDatum sequence)
+    internal static unsafe PgDatum Named([PgSqlType("text", Schema = "pg_catalog")] PgDatum name,
+        [PgSqlType("regclass", Schema = "pg_catalog")] PgDatum sequence)
     {
         Reload();
-        SpiResult found = Spi.Select("SELECT pg_catalog.to_regclass($1)::oid", 1, SpiParameter.Create(name));
-        if (found.Count == 0 || found[0].Get<uint?>(0) is not uint seqoid || !s_sequences.ContainsKey(seqoid))
-        {
-            return sequence;
-        }
 
-        unsafe
-        {
-            return PgDatum.DangerousCreate(seqoid, (uint)PgBuiltInOid.RegClassOid, PgMemoryContext.Current);
-        }
+        // The name is looked up as nextval looks it up, without SQL, so that nothing on the session's search path runs.
+        RangeVar* relation = NativeMethods.makeRangeVarFromNameList(NativeMethods.textToQualifiedNameList((varlena*)name.DangerousGetBits()));
+        uint seqoid = NativeMethods.RangeVarGetRelidExtended(relation, 0, RangeVarMissingOk, default, null);
+        return seqoid == 0 || !s_sequences.ContainsKey(seqoid) ? sequence
+            : PgDatum.DangerousCreate(seqoid, (uint)PgBuiltInOid.RegClassOid, PgMemoryContext.Current);
     }
 
     /// <summary>

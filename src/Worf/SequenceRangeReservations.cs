@@ -207,9 +207,9 @@ internal static class SequenceRangeReservations
         List<Guid> recorded = [];
         foreach (WorfReservation reservation in posted)
         {
-            SpiResult range = Spi.Query("SELECT owner_node, epoch FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE", false, 1,
+            SpiResult range = Worf.Query("SELECT owner_node, epoch FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE", false, 1,
                 SpiParameter.Create(reservation.Seqoid));
-            if (range.Count > 0 && reservation.Kind == (byte)'n' && Spi.Execute("""
+            if (range.Count > 0 && reservation.Kind == (byte)'n' && Worf.Execute("""
                 UPDATE worf.sequence_range_block SET reserved = true
                 WHERE block_id = (
                     SELECT b.block_id FROM worf.sequence_range_block b JOIN pg_catalog.pg_sequence s ON s.seqrelid = b.seqoid
@@ -230,7 +230,7 @@ internal static class SequenceRangeReservations
                 continue;
             }
 
-            if (Spi.Execute("""
+            if (Worf.Execute("""
                 INSERT INTO worf.sequence_range_request (request_id, seqoid, parent_node, kind, size, lo, hi, created_at, reserved)
                 SELECT $1, r.seqoid, r.parent_node, $3::"char", $4, $5, $6, now(), $3 = 'n'
                 FROM worf.sequence_range r
@@ -249,7 +249,7 @@ internal static class SequenceRangeReservations
         // worker with none writes nothing.
         if (Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range_request WHERE state = 'refused' AND created_at < now() - interval '1 minute')"))
         {
-            _ = Spi.Execute("DELETE FROM worf.sequence_range_request WHERE state = 'refused' AND created_at < now() - interval '1 minute'");
+            _ = Worf.Execute("DELETE FROM worf.sequence_range_request WHERE state = 'refused' AND created_at < now() - interval '1 minute'");
         }
 
         return recorded;
@@ -286,7 +286,7 @@ internal static class SequenceRangeReservations
 
         bool imported = reservation.Kind == (byte)'i';
         _ = SequenceRanges.InsertBlock(seqoid, epoch, imported ? 'i' : 'n', lo, hi, imported ? "imported" : "next", node.Node.Id, node, grant, !imported);
-        _ = Spi.Execute("UPDATE worf.sequence_range_grant SET state = 'acknowledged' WHERE grant_id = $1", SpiParameter.Create(grant));
+        _ = Worf.Execute("UPDATE worf.sequence_range_grant SET state = 'acknowledged' WHERE grant_id = $1", SpiParameter.Create(grant));
     }
 
     /// <summary>

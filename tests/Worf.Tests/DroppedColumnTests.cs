@@ -29,8 +29,10 @@ public sealed class DroppedColumnTests
         _ = await provider.SafePsqlAsync(Database, """
             CREATE TABLE t (id integer PRIMARY KEY, a text, b text);
             CREATE TABLE u (id integer PRIMARY KEY, a text, b text);
+            CREATE TABLE w (id integer PRIMARY KEY, v text);
             SELECT * FROM worf.replication_set_add_table('default', 't');
             SELECT * FROM worf.replication_set_add_table('default', 'u');
+            SELECT * FROM worf.replication_set_add_table('default', 'w');
             """, token);
 
         // Apply takes a while over a row of t's with a slow trigger.
@@ -47,6 +49,17 @@ public sealed class DroppedColumnTests
             CREATE TRIGGER slow BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION slow();
             ALTER TABLE t ENABLE ALWAYS TRIGGER slow;
             """, token);
+
+        // Apply's triggers run under the search path the database sets, as a local session's do, so a function of the
+        // database's own that one calls without a schema is the one a local insert calls.
+        _ = await subscriber.SafePsqlAsync(Database, $"""
+            CREATE TABLE w (id integer PRIMARY KEY, v text);
+            CREATE FUNCTION public.upper(text) RETURNS text LANGUAGE sql AS $$SELECT 'custom:' || $1$$;
+            CREATE FUNCTION shout() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN NEW.v := upper(NEW.v); RETURN NEW; END $$;
+            CREATE TRIGGER shout BEFORE INSERT ON w FOR EACH ROW EXECUTE FUNCTION shout();
+            ALTER TABLE w ENABLE ALWAYS TRIGGER shout;
+            ALTER DATABASE {Database} SET search_path = public, pg_catalog;
+            """, token);
         _ = await subscriber.SafePsqlAsync(Database, $"""
             SELECT worf.create_subscription(
                 subscription_name := 'sub',
@@ -60,9 +73,12 @@ public sealed class DroppedColumnTests
                     WHERE subscription_name = 'sub' AND status = 'replicating')
             """, token), "subscription failed to reach \"replicating\" state");
 
-        _ = await provider.SafePsqlAsync(Database, "INSERT INTO t VALUES (1, 'a1', 'b1'); INSERT INTO u VALUES (1, 'a1', 'b1')", token);
+        _ = await provider.SafePsqlAsync(Database, "INSERT INTO t VALUES (1, 'a1', 'b1'); INSERT INTO u VALUES (1, 'a1', 'b1'); INSERT INTO w VALUES (1, 'abc')", token);
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM u WHERE id = 1)", token),
             "the rows before the drop");
+        _ = await subscriber.SafePsqlAsync(Database, "INSERT INTO w VALUES (2, 'abc')", token);
+        Assert.AreEqual("1|custom:abc\n2|custom:abc", await subscriber.SafePsqlAsync(Database, "SELECT * FROM w ORDER BY id", token),
+            "the rows apply and a local session inserted");
 
         _ = await subscriber.SafePsqlAsync(Database, "ALTER TABLE t DROP COLUMN b", token);
         _ = await provider.SafePsqlAsync(Database, """

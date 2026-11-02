@@ -212,7 +212,7 @@ internal static class SequenceRangeWorker
         if (peak - written > Math.Max(written * 0.1, 1))
         {
             SequenceRanges.LockLedger(seqoid);
-            _ = Spi.Execute("UPDATE worf.sequence_range SET peak_rate = $2 WHERE seqoid = $1", SpiParameter.Create(seqoid),
+            _ = Worf.Execute("UPDATE worf.sequence_range SET peak_rate = $2 WHERE seqoid = $1", SpiParameter.Create(seqoid),
                 SpiParameter.Create(peak));
         }
 

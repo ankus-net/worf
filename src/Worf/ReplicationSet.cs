@@ -326,7 +326,7 @@ internal static partial class ReplicationSet
             repset.Id = WorfNode.HashIds(repset.NodeId, Worf.HashAny(repset.Name));
         }
 
-        Spi.Execute("INSERT INTO worf.replication_set (set_id, set_nodeid, set_name, replicate_insert, replicate_update, " +
+        Worf.Execute("INSERT INTO worf.replication_set (set_id, set_nodeid, set_name, replicate_insert, replicate_update, " +
             "replicate_delete, replicate_truncate) VALUES ($1, $2, $3, $4, $5, $6, $7)",
             SpiParameter.Create(repset.Id), SpiParameter.Create(repset.NodeId), SpiParameter.Create(repset.Name),
             SpiParameter.Create(repset.ReplicateInsert), SpiParameter.Create(repset.ReplicateUpdate),
@@ -368,7 +368,7 @@ internal static partial class ReplicationSet
         }
 
         // Everything ok, form a new tuple.
-        Spi.Execute("UPDATE worf.replication_set SET replicate_insert = $2, replicate_update = $3, " +
+        Worf.Execute("UPDATE worf.replication_set SET replicate_insert = $2, replicate_update = $3, " +
             "replicate_delete = $4, replicate_truncate = $5 WHERE set_id = $1",
             SpiParameter.Create(repset.Id), SpiParameter.Create(repset.ReplicateInsert),
             SpiParameter.Create(repset.ReplicateUpdate), SpiParameter.Create(repset.ReplicateDelete),
@@ -390,7 +390,7 @@ internal static partial class ReplicationSet
         ReplicationSetRemoveSeqs(setid, nodeid);
 
         // Remove the tuple.
-        Spi.Execute("DELETE FROM worf.replication_set WHERE set_id = $1", SpiParameter.Create(setid));
+        Worf.Execute("DELETE FROM worf.replication_set WHERE set_id = $1", SpiParameter.Create(setid));
 
         // Cleanup.
         InvalidateRelcache(GetReplicationSetRelOid());
@@ -415,7 +415,7 @@ internal static partial class ReplicationSet
             ReplicationSetRemoveSeqs(setid, row.Get<uint>(1));
 
             // Remove the repset.
-            Spi.Execute("DELETE FROM worf.replication_set WHERE set_id = $1", SpiParameter.Create(setid));
+            Worf.Execute("DELETE FROM worf.replication_set WHERE set_id = $1", SpiParameter.Create(setid));
         }
 
         // Cleanup.
@@ -583,7 +583,7 @@ internal static partial class ReplicationSet
         NativeMethods.table_close(targetrel, (int)PgLockMode.None);
 
         // Insert the tuple to the catalog.
-        _ = Spi.Execute("INSERT INTO worf.replication_set_seq VALUES ($1, $2)",
+        _ = Worf.Execute("INSERT INTO worf.replication_set_seq VALUES ($1, $2)",
             SpiParameter.Create(repset.Id), SpiParameter.Create(seqoid));
 
         // Cleanup.
@@ -801,7 +801,7 @@ internal static partial class ReplicationSet
             uint reloid = row.Get<uint>(1);
 
             // Remove the tuple.
-            Spi.Execute("DELETE FROM worf.replication_set_table WHERE ctid = $1", SpiParameter.Create(row.Get<PgItemPointer>(0)));
+            Worf.Execute("DELETE FROM worf.replication_set_table WHERE ctid = $1", SpiParameter.Create(row.Get<PgItemPointer>(0)));
             DeleteParts(setid, reloid);
             InvalidateRelcache(reloid);
 
@@ -823,7 +823,7 @@ internal static partial class ReplicationSet
             uint seqoid = row.Get<uint>(1);
 
             // Remove the tuple.
-            Spi.Execute("DELETE FROM worf.replication_set_seq WHERE ctid = $1", SpiParameter.Create(row.Get<PgItemPointer>(0)));
+            Worf.Execute("DELETE FROM worf.replication_set_seq WHERE ctid = $1", SpiParameter.Create(row.Get<PgItemPointer>(0)));
 
             // Make sure the SequenceHasReplicationSets sees the changes.
             if (!SequenceHasReplicationSets(nodeid, seqoid))
@@ -992,7 +992,7 @@ internal static partial class ReplicationSet
     /// row.
     /// </summary>
     private static void WriteParts(uint setid, uint reloid, short attnum, byte[] value)
-        => Elevated.Run(() => _ = Spi.Execute($$"""
+        => Elevated.Run(() => _ = Worf.Execute($$"""
             INSERT INTO worf.replication_set_table_part
                 SELECT $1, $2, $3, n, pg_catalog.substring($4, (n - 1) * {{PartSize}} + 1, {{PartSize}})
                 FROM pg_catalog.generate_series(1, (pg_catalog.length($4) + {{PartSize - 1}}) / {{PartSize}}) n
@@ -1002,7 +1002,7 @@ internal static partial class ReplicationSet
     /// Deletes the parts of a table's column list and row filter in a replication set.
     /// </summary>
     private static void DeleteParts(uint setid, uint reloid)
-        => Elevated.Run(() => _ = Spi.Execute("DELETE FROM worf.replication_set_table_part WHERE set_id = $1 AND set_reloid = $2",
+        => Elevated.Run(() => _ = Worf.Execute("DELETE FROM worf.replication_set_table_part WHERE set_id = $1 AND set_reloid = $2",
             SpiParameter.Create(setid), SpiParameter.Create(reloid)));
 
     /// <summary>

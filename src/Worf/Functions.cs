@@ -98,7 +98,7 @@ internal static class Functions
                 // Also drop all the slots associated with the node.
                 try
                 {
-                    _ = Spi.Select("SELECT pg_catalog.pg_drop_replication_slot(slot_name)" +
+                    _ = Worf.Select("SELECT pg_catalog.pg_drop_replication_slot(slot_name)" +
                         "  FROM pg_catalog.pg_replication_slots" +
                         " WHERE plugin = 'worf'" +
                         "   AND database = current_database()" +
@@ -458,7 +458,7 @@ internal static class Functions
                 {
                     foreach ((int pid, bool sync) in pids)
                     {
-                        _ = Elevated.Run(() => Spi.Execute(
+                        _ = Elevated.Run(() => Worf.Execute(
                             "SELECT pg_catalog.pg_cancel_backend($1) WHERE $2 OR pg_catalog.pg_backend_pid() = ANY (pg_catalog.pg_blocking_pids($1))",
                             SpiParameter.Create(pid), SpiParameter.Create(sync)));
                     }
@@ -1838,7 +1838,7 @@ internal static class Functions
             }
 
             // Only add logged relations which are not system relations (catalog, toast).
-            SpiResult relations = Spi.Select(
+            SpiResult relations = Worf.Select(
                 "SELECT c.oid, c.relname::text FROM pg_catalog.pg_class c WHERE c.relnamespace = $1 AND c.relkind = $2 " +
                 "AND c.relpersistence = 'p' AND c.oid >= 16384 ORDER BY c.relname",
                 SpiParameter.Create(nspoid), SpiParameter.Create((sbyte)relkind));

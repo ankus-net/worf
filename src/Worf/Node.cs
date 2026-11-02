@@ -79,7 +79,7 @@ internal sealed partial class WorfNode
             node.Id = Worf.HashAny(node.Name);
         }
 
-        Spi.Execute("INSERT INTO worf.node (node_id, node_name) VALUES ($1, $2)",
+        Worf.Execute("INSERT INTO worf.node (node_id, node_name) VALUES ($1, $2)",
             SpiParameter.Create(node.Id), SpiParameter.Create(node.Name));
 
         Worker.SubscriptionChanged(0, false);
@@ -91,7 +91,7 @@ internal sealed partial class WorfNode
     /// <param name="nodeid">The node.</param>
     internal static void DropNode(uint nodeid)
     {
-        if (Spi.Execute("DELETE FROM worf.node WHERE node_id = $1", SpiParameter.Create(nodeid)) == 0)
+        if (Worf.Execute("DELETE FROM worf.node WHERE node_id = $1", SpiParameter.Create(nodeid)) == 0)
         {
             throw new PgException(PgSqlStates.InternalError, $"node {nodeid} not found");
         }
@@ -179,7 +179,7 @@ internal sealed partial class WorfNode
             throw new PgException(PgSqlStates.InternalError, "current database is already configured as worf node");
         }
 
-        Spi.Execute("INSERT INTO worf.local_node (node_id, node_local_interface) VALUES ($1, $2)",
+        Worf.Execute("INSERT INTO worf.local_node (node_id, node_local_interface) VALUES ($1, $2)",
             SpiParameter.Create(nodeid), SpiParameter.Create(ifid));
     }
 
@@ -191,7 +191,7 @@ internal sealed partial class WorfNode
         LockCatalog("local_node", AccessExclusiveLock);
 
         // Find the local node tuple.
-        if (Spi.Execute("DELETE FROM worf.local_node WHERE ctid = (SELECT ctid FROM worf.local_node LIMIT 1)") == 0)
+        if (Worf.Execute("DELETE FROM worf.local_node WHERE ctid = (SELECT ctid FROM worf.local_node LIMIT 1)") == 0)
         {
             throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState, "local node not found");
         }
@@ -258,7 +258,7 @@ internal sealed partial class WorfNode
             nodeif.Id = HashIds(nodeif.NodeId, Worf.HashAny(nodeif.Name));
         }
 
-        Spi.Execute("INSERT INTO worf.node_interface (if_id, if_name, if_nodeid, if_dsn) VALUES ($1, $2, $3, $4)",
+        Worf.Execute("INSERT INTO worf.node_interface (if_id, if_name, if_nodeid, if_dsn) VALUES ($1, $2, $3, $4)",
             SpiParameter.Create(nodeif.Id), SpiParameter.Create(nodeif.Name), SpiParameter.Create(nodeif.NodeId),
             SpiParameter.Create(nodeif.Dsn));
     }
@@ -269,7 +269,7 @@ internal sealed partial class WorfNode
     /// <param name="ifid">The interface.</param>
     internal static void DropNodeInterface(uint ifid)
     {
-        if (Spi.Execute("DELETE FROM worf.node_interface WHERE if_id = $1", SpiParameter.Create(ifid)) == 0)
+        if (Worf.Execute("DELETE FROM worf.node_interface WHERE if_id = $1", SpiParameter.Create(ifid)) == 0)
         {
             throw new PgException(PgSqlStates.InternalError, $"node interface {ifid} not found");
         }
@@ -280,7 +280,7 @@ internal sealed partial class WorfNode
     /// </summary>
     /// <param name="nodeid">The node.</param>
     internal static void DropNodeInterfaces(uint nodeid)
-        => Spi.Execute("DELETE FROM worf.node_interface WHERE if_nodeid = $1", SpiParameter.Create(nodeid));
+        => Worf.Execute("DELETE FROM worf.node_interface WHERE if_nodeid = $1", SpiParameter.Create(nodeid));
 
     /// <summary>
     /// Get the node interface from the catalog.
@@ -410,7 +410,7 @@ internal sealed partial class WorfNode
             sub.Id = Worf.HashAny(sub.Name);
         }
 
-        _ = Spi.Execute(
+        _ = Worf.Execute(
             "INSERT INTO worf.subscription VALUES ($1, $2::name, $3, $4, $5, $6, $7, $8::name, $9, $10, $11, $12)",
             SpiParameter.Create(sub.Id),
             SpiParameter.Create(sub.Name),
@@ -436,7 +436,7 @@ internal sealed partial class WorfNode
     /// <param name="sub">The subscription.</param>
     internal static void AlterSubscription(WorfSubscription sub)
     {
-        SpiResult result = Spi.Query("SELECT sub_name::text FROM worf.subscription WHERE sub_id = $1 FOR UPDATE", false, 0,
+        SpiResult result = Worf.Query("SELECT sub_name::text FROM worf.subscription WHERE sub_id = $1 FOR UPDATE", false, 0,
             SpiParameter.Create(sub.Id));
         if (result.Count == 0)
         {
@@ -448,7 +448,7 @@ internal sealed partial class WorfNode
             PgLog.Log(new PgDiagnostic("subscription name change is not supported") { SqlState = PgSqlStates.FeatureNotSupported });
         }
 
-        _ = Spi.Execute(
+        _ = Worf.Execute(
             "UPDATE worf.subscription SET sub_origin = $2, sub_target = $3, sub_origin_if = $4, sub_target_if = $5, " +
             "sub_enabled = $6, sub_slot_name = $7::name, sub_replication_sets = $8, sub_forward_origins = $9, " +
             "sub_apply_delay = $10, sub_force_text_transfer = $11 WHERE sub_id = $1",
@@ -475,12 +475,12 @@ internal sealed partial class WorfNode
     /// <param name="subid">The subscription.</param>
     internal static void DropSubscription(uint subid)
     {
-        if (Spi.Execute("DELETE FROM worf.subscription WHERE sub_id = $1", SpiParameter.Create(subid)) == 0)
+        if (Worf.Execute("DELETE FROM worf.subscription WHERE sub_id = $1", SpiParameter.Create(subid)) == 0)
         {
             throw new PgException(PgSqlStates.InternalError, $"subscription {subid} not found");
         }
 
-        _ = Spi.Execute("DELETE FROM worf.exception_state WHERE sub_id = $1", SpiParameter.Create(subid));
+        _ = Worf.Execute("DELETE FROM worf.exception_state WHERE sub_id = $1", SpiParameter.Create(subid));
 
         NativeMethodsCommandCounterIncrement();
 
