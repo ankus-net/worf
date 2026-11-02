@@ -1680,6 +1680,13 @@ internal static unsafe partial class SequenceRanges
     /// <param name="parsetree">The statement, which has run.</param>
     internal static void AfterDdl(Node* parsetree)
     {
+        // A sequence created, renamed or moved to the name of a managed one this node dropped joins its epoch.
+        if (parsetree->type is NodeTag.T_CreateSeqStmt or NodeTag.T_RenameStmt or NodeTag.T_AlterObjectSchemaStmt &&
+            Worf.CatalogOid("sequence_range_dropped") != 0)
+        {
+            Elevated.Run(SequenceRangeSync.JoinRecreated);
+        }
+
         if (parsetree->type is not (NodeTag.T_CreateSeqStmt or NodeTag.T_AlterSeqStmt or NodeTag.T_AlterTableStmt or NodeTag.T_CreateStmt or
             NodeTag.T_AlterDomainStmt or NodeTag.T_CreateDomainStmt or NodeTag.T_CreateTrigStmt or NodeTag.T_DropStmt))
         {
@@ -1689,11 +1696,6 @@ internal static unsafe partial class SequenceRanges
         if (parsetree->type is NodeTag.T_CreateSeqStmt or NodeTag.T_AlterTableStmt && DdlReplication.Restoring())
         {
             Elevated.Run(SequenceRangeSync.JoinRestored);
-        }
-
-        if (parsetree->type == NodeTag.T_CreateSeqStmt && Worf.CatalogOid("sequence_range_dropped") != 0)
-        {
-            Elevated.Run(SequenceRangeSync.JoinRecreated);
         }
 
         if (!AnyManaged())
@@ -3082,11 +3084,13 @@ internal static unsafe partial class SequenceRanges
                 r.heard_watermark IS NOT NULL AND EXISTS (
                     SELECT 1 FROM worf.sequence_range_block o
                     WHERE o.seqoid = r.seqoid AND o.epoch = r.epoch AND o.kind = 'n' AND o.node_id = l.node_id AND o.state = 'active'
-                        AND NOT {before})
+                        AND NOT {before}),
+                r.watermark
             FROM worf.sequence_range r CROSS JOIN worf.local_node l
             WHERE r.seqoid = $1
             """, SpiParameter.Create(seqoid));
-        if (range.Count == 0)
+        // A watermark no further than this node's own moves nothing, as one a neighbor heard of this node's blocks gives.
+        if (range.Count == 0 || (range[0].Get<long?>(6) is long own && (info.Ascending ? mark <= own : mark >= own)))
         {
             return (mark, false);
         }
@@ -3261,17 +3265,27 @@ internal static unsafe partial class SequenceRanges
     /// <param name="rootStart">Where the root may start, or null to take the sequence's first value here.</param>
     /// <param name="rootEnd">Where the root ends, or null to take the sequence's limits here.</param>
     /// <param name="node">This node.</param>
+    /// <param name="refuseIssued">Whether values the sequence issued here before it joins are refused once they reach into
+    /// the root: for a sequence that exists here, once the owner has started the root, rather than one created for a copy
+    /// or restore whose rows haven't arrived, or one whose owner still collects the values every node holds.</param>
     internal static void JoinFromNeighbor(uint seqoid, uint owner, int epoch, long rangeSize, long maxRangeSize, long? rootStart, long? rootEnd,
-        WorfLocalNode node)
+        WorfLocalNode node, bool refuseIssued = true)
     {
         SequenceInfo info = GetInfo(seqoid);
+
+        // A sequence that issued values here before it joins, as one renamed or moved to a managed sequence's name, is
+        // refused once they reach into a started root, as every allocator refuses such a node, so that it never draws
+        // from blocks they may already lie in. Rows other nodes wrote, which lie in their blocks, don't count.
+        long? issued = refuseIssued && rootStart is not null ? LastValue(seqoid) : null;
         string? refused = info.Persistence != 'p' ? "the sequence is temporary or unlogged here"
             : info.Cycle ? "the sequence cycles here"
             : Worf.SelectCatalog("SELECT 1 FROM worf.replication_set_seq WHERE set_seqoid = $1", SpiParameter.Create(seqoid)).Count > 0
                 ? "the sequence is in a replication set here"
                 : UsingColumns(seqoid).Find(column => !Checkable(column.TypeOid)) is (uint relid, string column, uint typeOid) && relid != 0
                     ? $"column \"{column}\" of table {QualifiedName(relid)} has type {Worf.FromServer(NativeMethods.format_type_be(typeOid))} here, whose values the guard can't check"
-                    : null;
+                    : issued is long h && rootStart is long start && (info.Ascending ? h >= start : h <= start)
+                        ? $"the sequence issued values up to {h} here before it joined, which reach into the root; disable and enable it on its owner to start a root above them"
+                        : null;
         // The range worker and the exchange worker may both join a sequence; the first does.
         if (Worf.Execute("""
             INSERT INTO worf.sequence_range (seqoid, owner_node, epoch, range_size, max_range_size, state, request_size, root_start, root_end, detail)

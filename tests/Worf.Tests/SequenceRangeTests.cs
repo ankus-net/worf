@@ -1549,17 +1549,15 @@ public sealed class SequenceRangeTests
             """, token), "node_a's root kept above its bound on the made-up watermark");
 
         // The blocks node_a grants itself beyond the watermark it took, which it hasn't drawn from, don't raise the bound
-        // for the next report, so the same report coming again moves the root no further, however often it comes.
-        string firstWatermark = await nodeA.SafePsqlAsync(Database, "SELECT watermark FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass", token);
+        // for the next report, so the same report coming again resets node_a no more, however often it comes.
         for (int i = 0; i < 5; i++)
         {
             _ = await nodeA.SafePsqlAsync(Database, $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{madeUpWatermark}')", token);
             await Task.Delay(TimeSpan.FromMilliseconds(500), token);
         }
 
-        Assert.AreEqual(firstWatermark, await nodeA.SafePsqlAsync(Database, "SELECT watermark FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass", token),
-            "node_a's watermark after the report came again");
         Assert.AreEqual(1, nodeA.ReadLog()[forgedAt..].Split("node node_b has heard of grants up to").Length - 1, "node_a's resets on node_b's reports");
+        Assert.AreEqual(1, nodeA.ReadLog()[forgedAt..].Split("the allocator's fence lifted").Length - 1, "node_a's fences lifted");
 
         // node_a waits for node_c's own report after a reset while node_c is down, though node_b relays a fresh report of
         // node_c after node_a has lost its record of node_c's grants and reports, as a recovery to before them would, and
@@ -2163,6 +2161,31 @@ public sealed class SequenceRangeTests
             SELECT i.id BETWEEN r.active_lo AND r.active_hi FROM i, worf.sequence_ranges r WHERE r.sequence = 'u_id_seq'::regclass
             """, token), "node_b's key from its block");
 
+        // A sequence renamed or moved to the name of one node_b dropped joins the epoch as it takes the name, and one that
+        // issued values before, which reach into the root, is refused rather than drawing from blocks they may lie in.
+        _ = await nodeB.SafePsqlAsync(Database, "DROP TABLE u; CREATE SEQUENCE renamed_seq; ALTER SEQUENCE renamed_seq RENAME TO u_id_seq", token);
+        Assert.AreEqual("t", await nodeB.SafePsqlAsync(Database, "SELECT EXISTS (SELECT 1 FROM worf.sequence_range WHERE seqoid = 'u_id_seq'::regclass)", token),
+            "node_b's renamed u_id_seq joined");
+        _ = await nodeB.SafePsqlAsync(Database, """
+            DROP SEQUENCE u_id_seq;
+            CREATE SCHEMA elsewhere;
+            CREATE SEQUENCE elsewhere.u_id_seq;
+            SELECT nextval('elsewhere.u_id_seq') FROM generate_series(1, 3);
+            ALTER SEQUENCE elsewhere.u_id_seq SET SCHEMA public;
+            """, token);
+        Assert.AreEqual("refused", await nodeB.SafePsqlAsync(Database, "SELECT state FROM worf.sequence_range WHERE seqoid = 'u_id_seq'::regclass", token),
+            "node_b's moved u_id_seq, which issued values");
+
+        // Once node_a disables the epoch, node_b forgets the sequence it dropped, so a sequence it creates again under the
+        // name doesn't join the disabled epoch.
+        _ = await nodeB.SafePsqlAsync(Database, "DROP SEQUENCE u_id_seq", token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.disable_sequence_range('u_id_seq')", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT NOT EXISTS (SELECT 1 FROM worf.sequence_range_dropped WHERE name = 'public.u_id_seq')", token),
+            "node_b's record of its dropped u_id_seq gone");
+        _ = await nodeB.SafePsqlAsync(Database, "CREATE SEQUENCE u_id_seq", token);
+        Assert.AreEqual("f", await nodeB.SafePsqlAsync(Database, "SELECT EXISTS (SELECT 1 FROM worf.sequence_range WHERE seqoid = 'u_id_seq'::regclass)", token),
+            "node_b's new u_id_seq joined the disabled epoch");
+
         // node_b hears of grants beyond node_a's watermark, as when node_a, the owner, went back to before them by less
         // than its WAL position shows. node_a resets, and its fence holds, here on a neighbor that never reports, while
         // node_b asks for a block. With an exchange interval of ten minutes, node_b still asks node_a every ten checks,
@@ -2191,7 +2214,7 @@ public sealed class SequenceRangeTests
             await Task.Delay(TimeSpan.FromMilliseconds(20), token);
         }
 
-        _ = await nodeA.SafePsqlAsync(Database, "DELETE FROM worf.sequence_range_link WHERE node_id = 4242", token);
+        _ = await nodeA.SafePsqlAsync(Database, "DELETE FROM worf.sequence_range_link WHERE node_id = 4242; SELECT worf.activate_sequence_range('t_id_seq')", token);
         Stopwatch lifted = Stopwatch.StartNew();
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, $"SELECT state = 'active' AND active_lo > {beyond} FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token),
             "node_b drawing from a block beyond the watermark it heard of");

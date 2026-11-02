@@ -81,7 +81,7 @@ internal static class SequenceRangeSync
                 (relid == 0 || SequenceRanges.UsingColumns(found.Item2).Exists(column => column.Relid == relid))))
         {
             SequenceRanges.JoinFromNeighbor(seqoid, sequence.Owner, sequence.Epoch, sequence.RangeSize, sequence.MaxRangeSize, sequence.RootStart,
-                sequence.RootEnd, node);
+                sequence.RootEnd, node, false);
         }
 
         SequenceRanges.ChangedOnCommit();
@@ -135,7 +135,7 @@ internal static class SequenceRangeSync
                 !SequenceRanges.IsManaged(seqoid))
             {
                 SequenceRanges.JoinFromNeighbor(seqoid, row.Get<uint>(1), row.Get<int>(2), row.Get<long>(3), row.Get<long>(4), row.Get<long?>(5),
-                    row.Get<long?>(6), node);
+                    row.Get<long?>(6), node, false);
             }
         }
     }

@@ -929,7 +929,7 @@ internal static class SequenceRangeExchange
     {
         if (Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(entry.GetProperty("name").GetString())) is not uint seqoid)
         {
-            return true;
+            return DroppedEpochFollowed(entry) is null;
         }
 
         SpiParameter seq = SpiParameter.Create(seqoid);
@@ -1110,6 +1110,56 @@ internal static class SequenceRangeExchange
     }
 
     /// <summary>
+    /// Keeps the record of a managed sequence this node dropped, which a sequence created again under its name joins,
+    /// up to date with a neighbor's word of its epoch: once the epoch is disabled the record goes, so that no sequence
+    /// joins a disabled epoch, as no neighbor's report brings one to join, and a later epoch replaces it. It reads first,
+    /// so that an exchange that changes nothing writes nothing.
+    /// </summary>
+    private static void FollowDroppedEpoch(JsonElement entry)
+    {
+        bool? disabled = DroppedEpochFollowed(entry);
+        if (disabled is null)
+        {
+            return;
+        }
+
+        SpiParameter name = SpiParameter.Create(entry.GetProperty("name").GetString());
+        int epoch = entry.GetProperty("epoch").GetInt32();
+        if (disabled.Value)
+        {
+            _ = Worf.Execute("DELETE FROM worf.sequence_range_dropped WHERE name = $1 AND NOT owned", name);
+        }
+        else
+        {
+            _ = Worf.Execute("""
+                UPDATE worf.sequence_range_dropped SET owner_node = $2, epoch = $3, range_size = $4, max_range_size = $5, root_start = $6,
+                    root_end = coalesce($7, root_end)
+                WHERE name = $1 AND NOT owned
+                """, name, SpiParameter.Create(entry.GetProperty("owner_id").GetUInt32()), SpiParameter.Create(epoch),
+                SpiParameter.Create(entry.GetProperty("range_size").GetInt64()), SpiParameter.Create(entry.GetProperty("max_range_size").GetInt64()),
+                SpiParameter.Create(Nullable(entry, "root_start")), SpiParameter.Create(Nullable(entry, "root_end")));
+        }
+    }
+
+    /// <summary>
+    /// Finds how a neighbor's word of an epoch changes this node's record of the managed sequence it dropped, if at all.
+    /// </summary>
+    /// <returns>Whether the record goes, as its epoch is disabled, or false when a later epoch replaces it, or null when
+    /// nothing changes.</returns>
+    private static bool? DroppedEpochFollowed(JsonElement entry)
+    {
+        if (Worf.CatalogOid("sequence_range_dropped") == 0 ||
+            Worf.ReadScalar<int?>("SELECT epoch FROM worf.sequence_range_dropped WHERE name = $1 AND NOT owned",
+                SpiParameter.Create(entry.GetProperty("name").GetString())) is not int dropped)
+        {
+            return null;
+        }
+
+        int epoch = entry.GetProperty("epoch").GetInt32();
+        return entry.GetProperty("state").GetString() == "disabled" && epoch >= dropped ? true : epoch > dropped ? false : null;
+    }
+
+    /// <summary>
     /// Takes in one sequence of a neighbor's message: joins it if it exists here, records the neighbor's reports,
     /// answers its requests when this node is its parent, records grants for this node and the neighbor's
     /// acknowledgements.
@@ -1124,6 +1174,7 @@ internal static class SequenceRangeExchange
         uint? found = Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(entry.GetProperty("name").GetString()));
         if (found is not uint seqoid)
         {
+            FollowDroppedEpoch(entry);
             return (false, false, false);
         }
 
@@ -1141,7 +1192,8 @@ internal static class SequenceRangeExchange
             }
 
             SequenceRanges.JoinFromNeighbor(seqoid, owner, epoch, entry.GetProperty("range_size").GetInt64(),
-                entry.GetProperty("max_range_size").GetInt64(), Nullable(entry, "root_start"), Nullable(entry, "root_end"), node);
+                entry.GetProperty("max_range_size").GetInt64(), Nullable(entry, "root_start"), Nullable(entry, "root_end"), node,
+                entry.GetProperty("state").GetString() != "collecting");
         }
         else if (local[0].Get<int>(1) > epoch)
         {
