@@ -732,17 +732,20 @@ public sealed partial class ExceptionBehaviourTests
             await using (NpgsqlConnection tableLocker = await subscriber.OpenAsync(Database, token))
             await using (NpgsqlConnection applyLocker = await subscriber.OpenAsync(Database, token))
             {
-                // The copy waits for the table, and the apply worker, after the changes from after the copy, for x.
+                // The copy waits on a row a local transaction inserts, and the apply worker, once past the changes from
+                // after the copy, for x, so that the copy commits only once the apply worker can't let the sync catch up.
                 await using NpgsqlTransaction tableLock = await tableLocker.BeginTransactionAsync(token);
-                await using (NpgsqlCommand command = new($"LOCK TABLE {table}", tableLocker, tableLock))
+                await using (NpgsqlCommand command = new($"INSERT INTO {table} OVERRIDING SYSTEM VALUE VALUES (1, 'local')", tableLocker, tableLock))
                 {
                     _ = await command.ExecuteNonQueryAsync(token);
                 }
 
                 _ = await provider.SafePsqlAsync(Database,
                     $"SELECT * FROM worf.replication_set_add_table('default', '{table}', synchronize_data := true)", token);
-                Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
-                    $"SELECT EXISTS (SELECT 1 FROM pg_locks WHERE relation = '{table}'::regclass AND NOT granted)", token), "the copy waiting");
+                Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, """
+                    SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+                        WHERE l.locktype = 'transactionid' AND NOT l.granted AND a.backend_type LIKE 'worf sync%')
+                    """, token), "the copy waiting");
                 _ = await provider.SafePsqlAsync(Database,
                     $"UPDATE {table} SET v = 'updated' WHERE id = 500; DELETE FROM {table} WHERE id = 600; INSERT INTO {table} VALUES (700000, 'new')",
                     token);
@@ -754,7 +757,7 @@ public sealed partial class ExceptionBehaviourTests
 
                 _ = await provider.SafePsqlAsync(Database, "INSERT INTO x DEFAULT VALUES", token);
                 Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
-                    $"SELECT count(*) = 2 FROM pg_locks WHERE relation = '{table}'::regclass AND NOT granted", token), "the apply worker waiting");
+                    "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE relation = 'x'::regclass AND NOT granted)", token), "the apply worker waiting");
                 await tableLock.RollbackAsync(token);
                 Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, $"""
                     SELECT EXISTS (SELECT 1 FROM pg_locks WHERE relation = 'x'::regclass AND NOT granted)
