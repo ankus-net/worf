@@ -1,7 +1,8 @@
 namespace Worf;
 
 /// <summary>
-/// The worker that switches one managed sequence to its next block when transactions hold it at the active block's end.
+/// The worker that switches one managed sequence to its next block when transactions hold it at the active block's end,
+/// or as a load waits for its reserved block.
 /// It waits for them as long as they hold it, while the range worker goes on checking the other sequences. Inserts that
 /// draw from the sequence wait behind it meanwhile, rather than run the block out.
 /// </summary>

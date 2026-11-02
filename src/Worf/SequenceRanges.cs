@@ -3645,31 +3645,33 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
-    /// Switches a sequence to its next block as its active one runs low. A switch waits 200 ms for the transactions that
-    /// called nextval. Once the block reaches its last twentieth, where inserts wait for the switch, it takes the lock only
-    /// when no transaction holds the sequence, without queueing for it, and otherwise leaves the switch to a switch worker,
-    /// which waits for them as long as they hold it, while the range worker checks the other sequences. A switch that gave
-    /// up would let the inserts waiting behind it run the block out before the next one waited.
+    /// Switches a sequence to its next block as its active one runs low. The range worker takes the sequence's lock only
+    /// when no transaction that called nextval holds it, without queueing for it, since inserts would queue behind it, and a
+    /// switch that gave up would let them all draw from the block at once, as they might near its end. Once the block
+    /// reaches its last twentieth, where inserts wait for the switch, or the next block is reserved for a load, whose
+    /// session waits for it, a switch that can't have the lock is left to a switch worker, which waits for those
+    /// transactions as long as they hold the sequence, while the range worker checks the other sequences.
     /// </summary>
     private static bool SwitchBeforeEnd(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) next, bool forLoad, bool atEnd)
     {
-        if (Switch(seqoid, info, next, forLoad, atEnd ? 0 : 200))
+        if (Switch(seqoid, info, next, forLoad, 0))
         {
             return true;
         }
 
         // With every worker slot taken, the range worker waits itself, up to the exchange timeout.
-        return atEnd && !SequenceRangeSwitchWorker.Start(seqoid) && Switch(seqoid, info, next, forLoad, Math.Max(ExchangeTimeout, 200));
+        return (atEnd || forLoad) && !SequenceRangeSwitchWorker.Start(seqoid) && Switch(seqoid, info, next, forLoad, Math.Max(ExchangeTimeout, 200));
     }
 
     /// <summary>
     /// Switches a sequence to its next block for its switch worker: waits for the transactions that hold the sequence, as
-    /// long as they hold it, then takes the range row without waiting, so that a reset, which holds the row as it waits
-    /// for the sequence, can't deadlock with it.
+    /// long as they hold it, then for the range row, which an exchange holds a moment, up to a second without queueing for
+    /// it, so that a reset, which holds the row as it waits for the sequence, can't deadlock with it, and gets the
+    /// sequence in the end.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
     /// <returns>Whether it's done: the sequence switched, or has nothing to switch to. It throws 55P03 when a transaction
-    /// holds the range row.</returns>
+    /// holds the range row longer.</returns>
     internal static bool SwitchAtEnd(uint seqoid)
     {
         if (!SequenceExists(seqoid) || !IsManaged(seqoid))
@@ -3686,7 +3688,21 @@ internal static unsafe partial class SequenceRanges
         LedgerNoWait = true;
         try
         {
-            LockLedger(seqoid);
+            long until = Worker.GetCurrentTimestamp() + 1_000_000;
+            while (true)
+            {
+                try
+                {
+                    LockLedger(seqoid);
+                    break;
+                }
+                catch (PgException error) when (error.SqlState == "55P03" && Worker.GetCurrentTimestamp() < until)
+                {
+                    PgInterrupts.Check();
+                    Worker.WaitLatch(10);
+                }
+            }
+
             SpiResult rows = Worf.Read("SELECT state, epoch FROM worf.sequence_range WHERE seqoid = $1", 1, SpiParameter.Create(seqoid));
             if (rows.Count == 0 || rows[0].Get<string>(0) is "collecting" or "refused" || seqoid == SnowflakeIds.NodeSequence())
             {
@@ -3985,43 +4001,55 @@ internal static unsafe partial class SequenceRanges
         // block is also visible a moment before other sessions learn of the new file, so such a read could pair the new
         // block with the old position, the quarantine's at the start. The read takes the lock nextval takes, which
         // waits for a switch to finish committing, and lets it go once done, so that it holds off no switch for the
-        // rest of the transaction. A reservation's transaction, which holds the sequence against nextval for its load,
-        // holds off any switch too, so a read that it holds up reads without the lock, and is good when the reservation
-        // still held the sequence once it was done.
+        // rest of the transaction. It never queues for the lock, though: a switch that waits for the transactions that
+        // hold the sequence, or a reservation's transaction that holds it for a load, would hold the read up as long. Such
+        // a read goes without the lock, and is good when no switch held the lock as it read and the sequence's file
+        // stayed the same, since a switch writes a new one; while a switch holds it, the read tries again soon.
         string read = "SELECT CASE WHEN is_called THEN last_value END FROM " + Spi.QuoteQualifiedIdentifier(name[0].Get<string>(0), name[0].Get<string>(1));
-        if (!NativeMethods.ConditionalLockRelationOid(seqoid, (int)PgLockMode.RowExclusive))
+        while (true)
         {
-            if (HeldForLoad(seqoid))
+            if (NativeMethods.ConditionalLockRelationOid(seqoid, (int)PgLockMode.RowExclusive))
+            {
+                try
+                {
+                    return Worf.ReadScalar<long?>(read);
+                }
+                finally
+                {
+                    NativeMethods.UnlockRelationOid(seqoid, (int)PgLockMode.RowExclusive);
+                }
+            }
+
+            if (FileUnlessSwitching(seqoid) is uint file)
             {
                 long? position = Worf.ReadScalar<long?>(read);
-                if (HeldForLoad(seqoid))
+                if (FileUnlessSwitching(seqoid) == file)
                 {
                     return position;
                 }
             }
 
-            NativeMethods.LockRelationOid(seqoid, (int)PgLockMode.RowExclusive);
-        }
-
-        try
-        {
-            return Worf.ReadScalar<long?>(read);
-        }
-        finally
-        {
-            NativeMethods.UnlockRelationOid(seqoid, (int)PgLockMode.RowExclusive);
+            PgInterrupts.Check();
+            Worker.WaitLatch(1);
         }
     });
 
     /// <summary>
-    /// Checks whether another transaction holds a sequence against nextval, as a reservation does for its load.
+    /// Finds a sequence's file, as of the latest commit, unless another transaction holds a lock on it that a switch
+    /// takes, or DDL does.
     /// </summary>
-    private static bool HeldForLoad(uint seqoid) => Worf.ReadScalar<bool>("""
-        SELECT EXISTS (
-            SELECT 1 FROM pg_catalog.pg_locks
-            WHERE locktype = 'relation' AND database = $1 AND relation = $2 AND mode = 'ExclusiveLock' AND granted
-                AND pid <> pg_catalog.pg_backend_pid())
-        """, SpiParameter.Create(NativeGlobals.MyDatabaseId), SpiParameter.Create(seqoid));
+    private static uint? FileUnlessSwitching(uint seqoid)
+    {
+        NativeMethods.AcceptInvalidationMessages();
+        return Worf.ReadScalar<bool>("""
+            SELECT EXISTS (
+                SELECT 1 FROM pg_catalog.pg_locks
+                WHERE locktype = 'relation' AND database = $1 AND relation = $2 AND granted AND pid <> pg_catalog.pg_backend_pid()
+                    AND mode IN ('ShareLock', 'ShareRowExclusiveLock', 'AccessExclusiveLock'))
+            """, SpiParameter.Create(NativeGlobals.MyDatabaseId), SpiParameter.Create(seqoid))
+            ? null
+            : Worf.ReadScalar<uint?>("SELECT pg_catalog.pg_relation_filenode($1)", SpiParameter.Create(seqoid));
+    }
 
     /// <summary>
     /// Counts the values the sequence has left in its active block.
