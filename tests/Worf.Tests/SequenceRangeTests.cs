@@ -2094,7 +2094,8 @@ public sealed class SequenceRangeTests
         // node_b hears of grants beyond node_a's watermark, as when node_a, the owner, went back to before them by less
         // than its WAL position shows. node_a resets, and its fence holds, here on a neighbor that never reports, while
         // node_b asks for a block. With an exchange interval of ten minutes, node_b still asks node_a every ten checks,
-        // and draws from a block beyond that watermark soon after the fence lifts.
+        // and draws from a block beyond that watermark soon after the fence lifts: about a second here, and over three on
+        // a busy macOS runner, where node_b's switch alone takes most of one.
         _ = await nodeB.SafePsqlAsync(Database, "ALTER SYSTEM SET worf.sequence_range_exchange_interval = '10min'; SELECT pg_reload_conf()", token);
         _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO worf.sequence_range_link VALUES ('ghost', 4242, 10)", token);
         string beyond = await nodeB.SafePsqlAsync(Database, "UPDATE worf.sequence_range SET watermark = watermark + 1000000 WHERE seqoid = 't_id_seq'::regclass RETURNING watermark", token);
@@ -2122,7 +2123,7 @@ public sealed class SequenceRangeTests
         Stopwatch lifted = Stopwatch.StartNew();
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, $"SELECT state = 'active' AND active_lo > {beyond} FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token),
             "node_b drawing from a block beyond the watermark it heard of");
-        Assert.IsLessThan(3.0, lifted.Elapsed.TotalSeconds, "node_b's block soon after node_a's fence lifted");
+        Assert.IsLessThan(10.0, lifted.Elapsed.TotalSeconds, "node_b's block soon after node_a's fence lifted");
         Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, $"SELECT state = 'active' AND active_lo > {beyond} FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token),
             "node_a drawing from a block beyond the watermark");
     }
