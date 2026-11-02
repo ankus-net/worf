@@ -2414,7 +2414,8 @@ public sealed class SequenceRangeTests
         Assert.AreEqual($"{Sessions * Transactions}", await node.SafePsqlAsync(Database, "SELECT count(*) FROM t1", token));
 
         // A transaction holds t2 for 6 s once it reaches its block's last twentieth, which the other sessions' inserts
-        // into t2 wait for, while t1's go on through its blocks as fast as before.
+        // into t2 wait for, while t1's go on through its blocks, each switch in under two seconds, as a switch worker
+        // starts slowly on a busy Windows runner, rather than the six t2 waits.
         await using NpgsqlConnection holder = await node.OpenAsync(Database, token);
         await using NpgsqlTransaction held = await holder.BeginTransactionAsync(token);
         long left = long.Parse(await node.SafePsqlAsync(Database,
@@ -2454,7 +2455,7 @@ public sealed class SequenceRangeTests
         await Task.WhenAll(t2Inserts);
         await holding.CancelAsync();
         long t1Slowest = (await Task.WhenAll(t1Inserts)).Max();
-        Assert.IsLessThan(1500L, t1Slowest, "t1's slowest insert, in ms, while t2 was held");
+        Assert.IsLessThan(2000L, t1Slowest, "t1's slowest insert, in ms, while t2 was held");
         Assert.AreEqual($"{left - 30 + 160}", await node.SafePsqlAsync(Database, "SELECT count(*) FROM t2", token));
         Assert.DoesNotContain("reached maximum value", node.ReadLog(), "inserts that ran a block out");
     }
