@@ -348,6 +348,9 @@ public sealed class ColumnTypeTests
                 """, token), "mnt's rows and failures");
         }
 
+        // A row whose value fails to convert is left out as the copy goes on, which copies the table once.
+        Assert.AreEqual(0, CountOccurrences(subscriber.ReadLog()[moneyLogpos..], "copying table public.zt again"), "zt's copies");
+
         // Each row the copy can't write is skipped and recorded under discard, numbered as the provider's row it is.
         Assert.AreEqual("1\n5", await subscriber.SafePsqlAsync(TextDatabase, "SELECT id FROM ct ORDER BY id", token));
         Assert.AreEqual("COPY|2|22001|2|8\nCOPY|3|23514|3|2\nCOPY|4|22P02|4|2\nCOPY|6|22001|6|300", await subscriber.SafePsqlAsync(TextDatabase, """

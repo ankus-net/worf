@@ -30,6 +30,18 @@ internal static unsafe partial class CopyConversion
     private static int s_rowEnd;
     private static CopyFromStateData* s_cstate;
 
+    // Under discard and transdiscard, a copy whose rows convert has them converted ahead of COPY, a run at a time, so
+    // that a row whose value fails to convert is skipped without failing the copy: the provider's rows that arrived,
+    // their converted text and how much of it COPY has read, and the rows skipped, recorded once the copy commits.
+    private const int AheadRows = 1000;
+    private static bool s_convertAhead;
+    private static byte[] s_raw = new byte[64 * 1024];
+    private static readonly List<(int Start, int Length)> s_rawRows = [];
+    private static byte[] s_ahead = new byte[64 * 1024];
+    private static int s_aheadRead;
+    private static int s_aheadLength;
+    private static readonly List<(WorfFailedChange Change, PgException Error)> s_skipped = [];
+
     // Each copied column's conversion, or null, a converted column's name and its type's output function, the memory
     // context a row converts in, a value's text, which COPY's errors show, and the row as converted.
     private static WorfColumnConversion?[] s_conversions = [];
@@ -154,6 +166,10 @@ internal static unsafe partial class CopyConversion
                 };
             }
 
+            s_convertAhead = s_change is not null && s_behaviour != WorfExceptionBehaviour.SubDisable && s_conversions.Any(conversion => conversion is not null);
+            s_aheadRead = s_aheadLength = 0;
+            s_skipped.Clear();
+
             bool snapshot = !NativeMethods.ActiveSnapshotSet();
             if (snapshot)
             {
@@ -170,9 +186,19 @@ internal static unsafe partial class CopyConversion
                 try
                 {
                     copied = PgTransaction.RunInSubtransaction(() => CopyAll(pstate, relation, attnamelist), PgSubtransactionMode.Atomic);
+
+                    // The rows whose values failed to convert are recorded in the copy's transaction, which already has
+                    // a transaction ID, rather than in subtransactions that would take one each.
+                    foreach ((WorfFailedChange change, PgException error) in s_skipped)
+                    {
+                        ExceptionLog.Record(change, WorfExceptionBehaviour.Discard, error, false);
+                    }
                 }
                 catch (PgException error) when (!Apply.IsTransient(error))
                 {
+                    s_convertAhead = false;
+                    s_aheadRead = s_aheadLength = 0;
+                    s_skipped.Clear();
                     // The rest of the provider's rows are read and passed over, and the copy starts again: under
                     // sub_disable, to record the row that failed, and otherwise in batches, which find the rows that fail.
                     ulong failedLine = s_failedLine;
@@ -549,6 +575,26 @@ internal static unsafe partial class CopyConversion
         int written = 0;
         while (true)
         {
+            // Rows converted ahead, a run at a time, once those before them are read.
+            if (s_convertAhead)
+            {
+                if (s_aheadRead == s_aheadLength && (s_ended || !ConvertAhead(written == 0)))
+                {
+                    return written;
+                }
+
+                int len = Math.Min(s_aheadLength - s_aheadRead, maxread - written);
+                s_ahead.AsSpan(s_aheadRead, len).CopyTo(output[written..]);
+                s_aheadRead += len;
+                written += len;
+                if (written == maxread)
+                {
+                    return written;
+                }
+
+                continue;
+            }
+
             // A row that didn't fit after others, or the rest of one longer than COPY reads at once.
             if (s_rowStart < s_rowEnd)
             {
@@ -618,6 +664,83 @@ internal static unsafe partial class CopyConversion
             s_rowStart = 0;
             s_rowEnd = row.Length;
         }
+    }
+
+    /// <summary>
+    /// Takes the provider's rows that have arrived, up to a run of them, waiting for one when asked to, and converts
+    /// them, as many at a time as convert in one subtransaction, which writes nothing and so takes no transaction ID. A
+    /// row whose value fails to convert, from its data, is left out and kept to record.
+    /// </summary>
+    /// <param name="wait">Whether to wait for a row, as when COPY has nothing to read yet.</param>
+    /// <returns>Whether any rows arrived, though every one of them may have failed.</returns>
+    private static bool ConvertAhead(bool wait)
+    {
+        s_rawRows.Clear();
+        int used = 0;
+        while (s_rawRows.Count < AheadRows && !s_ended)
+        {
+            PgReplicationReceiveStatus status = s_conn!.Receive(s_rawRows.Count == 0 && wait ? TimeSpan.FromSeconds(1) : TimeSpan.Zero,
+                out ReadOnlySpan<byte> message);
+            if (status == PgReplicationReceiveStatus.Ended)
+            {
+                s_ended = true;
+                break;
+            }
+
+            if (status != PgReplicationReceiveStatus.Message)
+            {
+                if (s_rawRows.Count > 0 || !wait)
+                {
+                    break;
+                }
+
+                PgInterrupts.Check();
+                continue;
+            }
+
+            if (s_raw.Length - used < message.Length)
+            {
+                Array.Resize(ref s_raw, Math.Max(used + message.Length, s_raw.Length * 2));
+            }
+
+            message.CopyTo(s_raw.AsSpan(used));
+            s_rawRows.Add((used, message.Length));
+            used += message.Length;
+        }
+
+        // A failure leaves COPY's errors naming the row that failed, which they then stop doing.
+        s_aheadRead = s_aheadLength = 0;
+        ulong lineno = s_cstate->cur_lineno;
+        int next = 0;
+        while (next < s_rawRows.Count)
+        {
+            try
+            {
+                PgTransaction.RunInSubtransaction(() =>
+                {
+                    for (; next < s_rawRows.Count; next++)
+                    {
+                        s_line++;
+                        WriteRow(s_raw.AsSpan(s_rawRows[next].Start, s_rawRows[next].Length));
+                        if (s_ahead.Length - s_aheadLength < s_convertedLength)
+                        {
+                            Array.Resize(ref s_ahead, Math.Max(s_aheadLength + s_convertedLength, s_ahead.Length * 2));
+                        }
+
+                        s_converted.AsSpan(0, s_convertedLength).CopyTo(s_ahead.AsSpan(s_aheadLength));
+                        s_aheadLength += s_convertedLength;
+                    }
+                }, PgSubtransactionMode.Atomic);
+            }
+            catch (PgException error) when (!Apply.IsTransient(error))
+            {
+                ForgetValue(lineno);
+                s_skipped.Add((Failed(s_raw.AsSpan(s_rawRows[next].Start, s_rawRows[next].Length)), error));
+                next++;
+            }
+        }
+
+        return s_rawRows.Count > 0;
     }
 
     /// <summary>
