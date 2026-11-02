@@ -919,16 +919,26 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   `DROP INDEX CONCURRENTLY` drops it there. DDL that would make other objects
   use it, as a constraint's, the replica identity, the clustering index or a
   partition of another index, fails. DDL that copies its table's indexes with
-  `LIKE`, attaches its table as a partition, indexes the partitioned table
-  above it, adds a foreign key that references its table, or changes the type
-  of a column of a table whose foreign keys reference its table, passes over it
-  on every node, and does what it does on the others. Such DDL fails if an event
+  `LIKE`, attaches its table as a partition, indexes the partitioned table above
+  it, adds a foreign key that references its table, or changes the type or
+  generation expression of a column of a table whose foreign keys reference its
+  table, or the type of an attribute of a composite type such a table uses,
+  passes over it on every node, and does what it does on the others. Such DDL
+  fails if an event
   trigger or a function it runs writes to or rewrites a table whose index it
   copies or attaches, since the index wouldn't get the rows. Names PostgreSQL
   chooses for new objects are the same on every node, and DDL that takes its
-  name renames it, with a warning. To keep them so, DDL that creates or names
-  relations in its schema moves it out of the way until the transaction ends,
-  which holds up other DDL on it meanwhile.
+  name renames it, with a warning. To keep them so, DDL that creates, renames or
+  indexes relations moves the indexes on its node alone out of the way in the
+  schemas it does that in, which include those of the partitions an index on a
+  partitioned table or a partition attached builds indexes in, finding names as
+  the role that ran it, until the transaction ends, which holds up other DDL on
+  them meanwhile, in the same order on every path. DDL that creates no
+  relations, as a function's, a type's or a sequence's change, or a DROP, moves
+  none, and a DO block, a procedure or an extension, which can create relations
+  anywhere, moves them in every schema. `worf.replicate_ddl_command` does the
+  same on every node. Relations that a function creates, as one a SELECT calls,
+  can still take other names than on the other nodes.
   DDL from another node that can't build it again, as a unique one that finds
   duplicate keys when a table is rewritten, drops it, with a warning that
   gives its definition. Drop it: until then a unique one still rejects

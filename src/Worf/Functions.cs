@@ -1297,16 +1297,23 @@ internal static class Functions
         uint userId = NativeMethods.GetUserId();
         Queue.QueueMessage(replicationSetList, userId, Queue.QueueCommandTypeSql, cmd.ToString());
 
-        // Execute the query locally, which the queued command replicates.
+        // Execute the query locally, which the queued command replicates, with the indexes on this node alone out of its
+        // way, as every node runs it, so that each chooses the same names and none copies or uses those indexes.
+        string role = Worf.FromServer(NativeMethods.GetUserNameFromId(userId, false));
+        List<(uint Index, string Name)> moved = LocalIndex.MoveAside(command, role);
         DdlReplication.Suppressed = true;
+        LocalIndex.Applying = true;
         try
         {
-            Apply.ExecuteSqlCommand(command, Worf.FromServer(NativeMethods.GetUserNameFromId(userId, false)), false);
+            Apply.ExecuteSqlCommand(command, role, false);
         }
         finally
         {
             DdlReplication.Suppressed = false;
+            LocalIndex.Applying = false;
         }
+
+        LocalIndex.MoveBack(moved, null);
 
         // Restore the GUC variables we set above.
         NativeMethods.AtEOXact_GUC(true, saveNestlevel);

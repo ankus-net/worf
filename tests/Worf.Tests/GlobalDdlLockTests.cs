@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using Npgsql;
 
 namespace Worf.Tests;
@@ -417,6 +418,10 @@ public sealed class GlobalDdlLockTests
             CREATE TABLE lr (id integer PRIMARY KEY, v integer);
             CREATE TABLE lfk (id integer PRIMARY KEY, y integer);
             CREATE SCHEMA ls;
+            CREATE SCHEMA lsp;
+            CREATE TABLE lpp (id integer PRIMARY KEY, v integer) PARTITION BY RANGE (id);
+            CREATE TABLE lsp.lpp1 PARTITION OF lpp FOR VALUES FROM (0) TO (100);
+            CREATE SEQUENCE lseq;
             """, token);
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
         await using (NpgsqlConnection locking = await nodeB.OpenAsync(Database, token))
@@ -437,6 +442,7 @@ public sealed class GlobalDdlLockTests
             {
                 "INDEX CONCURRENTLY lt_v ON lt (v)", "INDEX CONCURRENTLY lt_v_idx ON lt (v)", "INDEX CONCURRENTLY lt_w_key ON lt (w)",
                 "INDEX CONCURRENTLY lt_w_idx ON lt (w)", "INDEX CONCURRENTLY lp2_v ON lp2 (v)", "INDEX CONCURRENTLY lp1_w ON lp1 (w)",
+                "INDEX CONCURRENTLY lpp1_v_idx ON lsp.lpp1 (v)", "INDEX CONCURRENTLY lt_id_idx ON lt (id)",
                 "UNIQUE INDEX CONCURRENTLY lr_v ON lr (v)",
             })
             {
@@ -446,8 +452,8 @@ public sealed class GlobalDdlLockTests
             }
         }
 
-        Assert.AreEqual("7", await nodeB.SafePsqlAsync(Database, """
-            REINDEX TABLE lt; REINDEX TABLE lp1; REINDEX TABLE lp2; REINDEX TABLE lr;
+        Assert.AreEqual("9", await nodeB.SafePsqlAsync(Database, """
+            REINDEX TABLE lt; REINDEX TABLE lp1; REINDEX TABLE lp2; REINDEX TABLE lr; REINDEX TABLE lsp.lpp1;
             SELECT count(*) FROM worf.local_index l JOIN pg_index i ON i.indexrelid = l.indexrelid WHERE i.indisvalid
             """, token), "node_b's own indexes, valid");
         _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO ld VALUES (1, 1, 1), (2, 1, 1)", token);
@@ -484,7 +490,7 @@ public sealed class GlobalDdlLockTests
         }
 
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
-        Assert.AreEqual("lp1_w,lp2_v,lr_v,lt_v,lt_v_idx,lt_w_idx,lt_w_key|f||bigint|built|lr_v_key,lr_v_key", await nodeB.SafePsqlAsync(Database, """
+        Assert.AreEqual("lp1_w,lp2_v,lpp1_v_idx,lr_v,lt_id_idx,lt_v,lt_v_idx,lt_w_idx,lt_w_key|f||bigint|built|lr_v_key,lr_v_key", await nodeB.SafePsqlAsync(Database, """
             SELECT (SELECT string_agg(c.relname, ',' ORDER BY c.relname) FROM worf.local_index l JOIN pg_class c ON c.oid = l.indexrelid),
                 (SELECT bool_or(c.relispartition) FROM worf.local_index l JOIN pg_class c ON c.oid = l.indexrelid),
                 (SELECT string_agg(i.indexrelid::regclass::text, ',') FROM worf.local_index l JOIN pg_index i ON i.indexrelid = l.indexrelid
@@ -519,6 +525,55 @@ public sealed class GlobalDdlLockTests
             SELECT count(*) FROM pg_locks WHERE pid = pg_backend_pid() AND relation IN (SELECT indexrelid FROM worf.local_index);
             COMMIT;
             """, token), "node_b's own indexes locked");
+
+        // node_a's DDL that creates no relations, as a function's, a type's or a sequence's change, moves none of node_b's
+        // own indexes aside, so it applies while a transaction on node_b uses them.
+        await using (NpgsqlConnection reading = await nodeB.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction open = await reading.BeginTransactionAsync(token);
+            await using (NpgsqlCommand use = new("SELECT count(*) FROM lt", reading, open))
+            {
+                _ = await use.ExecuteScalarAsync(token);
+            }
+
+            _ = await nodeA.SafePsqlAsync(Database, """
+                CREATE FUNCTION lf() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+                CREATE TYPE lmood AS ENUM ('a');
+                ALTER SEQUENCE lseq INCREMENT 2;
+                """, token);
+            Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT seqincrement = 2 FROM pg_sequence WHERE seqrelid = 'lseq'::regclass", token),
+                "node_a's DDL on node_b while node_b's own indexes are in use");
+            await open.RollbackAsync(token);
+        }
+
+        // node_a's index on a partitioned table whose partition is in another schema, and the DDL replicate_ddl_command
+        // runs, choose the same names on node_b, whose own indexes in those schemas move aside, and a LIKE copies none of
+        // them. A foreign key that a composite type's new attribute type, or a generation expression, builds again uses
+        // none of node_b's own indexes on the table it references.
+        bool expressions = int.Parse(await nodeA.SafePsqlAsync(Database, "SHOW server_version_num", token), CultureInfo.InvariantCulture) >= 170000;
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE INDEX ON lpp (v);
+            SELECT worf.replicate_ddl_command('CREATE INDEX ON public.lt (id); CREATE TABLE public.lk_r (LIKE public.lt INCLUDING INDEXES)');
+            CREATE TYPE lcomp AS (id integer, v integer);
+            CREATE TABLE lfk2 OF lcomp (PRIMARY KEY (id));
+            ALTER TABLE lfk2 ADD FOREIGN KEY (v) REFERENCES lr (v);
+            ALTER TYPE lcomp ALTER ATTRIBUTE v TYPE bigint CASCADE;
+            CREATE TABLE lfk3 (id integer PRIMARY KEY, g bigint GENERATED ALWAYS AS (id) STORED REFERENCES lr (v));
+            """ + (expressions ? "ALTER TABLE lfk3 ALTER COLUMN g SET EXPRESSION AS (id + 0);" : ""), token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            Assert.AreEqual("lpp1_v_idx|lt_id_idx|t|lr_v_key|lr_v_key", await node.SafePsqlAsync(Database, """
+                SELECT (SELECT string_agg(c.relname, ',') FROM pg_inherits h JOIN pg_class c ON c.oid = h.inhrelid
+                        WHERE h.inhparent = (SELECT indexrelid FROM pg_index WHERE indrelid = 'lpp'::regclass AND NOT indisprimary)),
+                    (SELECT string_agg(c.relname, ',') FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+                        WHERE i.indrelid = 'lt'::regclass AND i.indkey::text = '1' AND NOT i.indisprimary
+                            AND NOT EXISTS (SELECT FROM worf.local_index l WHERE l.indexrelid = i.indexrelid)),
+                    (SELECT count(*) = 2 FROM pg_index WHERE indrelid = 'lk_r'::regclass),
+                    (SELECT string_agg(conindid::regclass::text, ',') FROM pg_constraint WHERE conrelid = 'lfk2'::regclass AND contype = 'f'),
+                    (SELECT string_agg(conindid::regclass::text, ',') FROM pg_constraint WHERE conrelid = 'lfk3'::regclass AND contype = 'f')
+                """, token), node.Name);
+        }
 
         // node_b's DDL that would build one again and cluster on it fails, its DDL chooses the names node_a's would,
         // renaming its own where it takes their names, or tells node_a the name it chose for a concurrent build, and
@@ -559,10 +614,10 @@ public sealed class GlobalDdlLockTests
                 AND i.indexrelid NOT IN (SELECT indexrelid FROM worf.local_index)
             """;
         string indexes = await nodeA.SafePsqlAsync(Database, Indexes, token);
-        Assert.AreEqual("lk_a_pkey,lk_b_pkey,lk_b_v_idx,lk_b_w_idx,lk_b_w_key,lp1_pkey,lp1_v_idx,lp1_w_idx,lp2_pkey,lp2_v_idx,lp2_w_idx,lt_pkey,lt_v_idx,lt_w_idx1,lt_w_key",
+        Assert.AreEqual("lk_a_pkey,lk_b_id_idx,lk_b_pkey,lk_b_v_idx,lk_b_w_idx,lk_b_w_key,lp1_pkey,lp1_v_idx,lp1_w_idx,lp2_pkey,lp2_v_idx,lp2_w_idx,lt_id_idx,lt_pkey,lt_v_idx,lt_w_idx1,lt_w_key",
             indexes);
         Assert.AreEqual(indexes, await nodeB.SafePsqlAsync(Database, Indexes, token), "node_b's indexes on every node");
-        Assert.AreEqual("lp1_w,lp2_v,lr_v,ls.lt_v,ls.lt_v_idx_local,ls.lt_w_key_local|0", await nodeB.SafePsqlAsync(Database, """
+        Assert.AreEqual("lp1_w,lp2_v,lr_v,ls.lt_id_idx_local,ls.lt_v,ls.lt_v_idx_local,ls.lt_w_key_local,lsp.lpp1_v_idx_local|0", await nodeB.SafePsqlAsync(Database, """
             SELECT string_agg(indexrelid::regclass::text, ',' ORDER BY indexrelid::regclass::text COLLATE "C"),
                 count(*) FILTER (WHERE NOT EXISTS (SELECT FROM pg_class c WHERE c.oid = indexrelid AND c.relnamespace <> 'worf'::regnamespace))
             FROM worf.local_index

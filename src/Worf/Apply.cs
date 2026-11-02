@@ -1806,8 +1806,8 @@ internal static unsafe partial class Apply
 
         string sql = root.GetString()!;
 
-        // Run the extracted SQL.
-        ExecuteSqlCommand(sql, queuedMessage.Role, txJustStarted);
+        // Run the extracted SQL, out of the way of the indexes on this node alone, as DDL from the origin runs.
+        RunQueuedCommand(sql, queuedMessage.Role, () => ExecuteSqlCommand(sql, queuedMessage.Role, txJustStarted));
     }
 
     /// <summary>
@@ -1862,10 +1862,22 @@ internal static unsafe partial class Apply
         }
 
         // A statement that runs concurrently commits along the way, which apply's transaction can't, so it runs
-        // in that transaction instead. The indexes on this node alone, which the origin doesn't have, are out of its
-        // way, and one that it can't build again is dropped, so that it applies.
+        // in that transaction instead.
+        RunQueuedCommand(command.GetString()!, queuedMessage.Role,
+            () => PgTransaction.RunInSubtransaction(() => ExecuteSqlCommand(command.GetString()!, queuedMessage.Role, false, true),
+                PgSubtransactionMode.Atomic));
+
+        NativeMethods.AtEOXact_GUC(true, saveNestlevel);
+    }
+
+    /// <summary>
+    /// Runs a command another node queued with the indexes on this node alone, which the origin doesn't have, out of
+    /// its way, and drops one that it can't build again, so that it applies.
+    /// </summary>
+    private static void RunQueuedCommand(string command, string role, Action run)
+    {
         string origin = MySubscription!.Origin.Name;
-        List<(uint Index, string Name)> moved = LocalIndex.MoveAside(command.GetString()!);
+        List<(uint Index, string Name)> moved = LocalIndex.MoveAside(command, role);
         LocalIndex.Applying = true;
         try
         {
@@ -1873,8 +1885,7 @@ internal static unsafe partial class Apply
             {
                 try
                 {
-                    PgTransaction.RunInSubtransaction(() => ExecuteSqlCommand(command.GetString()!, queuedMessage.Role, false, true),
-                        PgSubtransactionMode.Atomic);
+                    run();
                     break;
                 }
                 catch (PgException error)
@@ -1892,8 +1903,6 @@ internal static unsafe partial class Apply
         }
 
         LocalIndex.MoveBack(moved, origin);
-
-        NativeMethods.AtEOXact_GUC(true, saveNestlevel);
     }
 
     private static void SetDdlSetting(string name, string value)

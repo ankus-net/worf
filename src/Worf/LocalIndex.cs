@@ -68,7 +68,8 @@ internal static unsafe partial class LocalIndex
     private static partial XactCallback TransactionCallback { get; }
 
     /// <summary>
-    /// Gets or sets whether apply runs DDL from another node now.
+    /// Gets or sets whether DDL that every node runs as it is, as apply runs another node's or replicate_ddl_command runs
+    /// here, runs now, which keeps the indexes on this node alone out of its sight.
     /// </summary>
     internal static bool Applying { get; set; }
 
@@ -351,26 +352,43 @@ internal static unsafe partial class LocalIndex
     }
 
     /// <summary>
-    /// Moves the indexes on this node alone out of the way of DDL from another node, which, without them, may create
-    /// objects under their names, or choose names for its own that would otherwise differ from the other nodes'. Only
-    /// those in the schemas where the DDL creates or names relations are moved, as each is locked until the transaction
-    /// ends, which holds up other DDL on it.
+    /// Moves the indexes on this node alone out of the way of DDL from another node, or that replicate_ddl_command runs,
+    /// which, without them, may create objects under their names, or choose names for its own that would otherwise
+    /// differ from the other nodes'. Only those in the schemas where the DDL creates or names relations are moved, as
+    /// each is locked until the transaction ends, which holds up other DDL on it.
     /// </summary>
     /// <param name="command">The DDL.</param>
+    /// <param name="role">The role that runs it, as which its names are found.</param>
     /// <returns>The indexes moved, with their names, for <see cref="MoveBack"/>.</returns>
-    internal static List<(uint Index, string Name)> MoveAside(string command)
+    internal static List<(uint Index, string Name)> MoveAside(string command, string role)
     {
         if (Worf.CatalogOid("local_index") == 0)
         {
             return [];
         }
 
+        // The statement's names are found as the role that ran it finds them, as its own search path's "$user" does.
         HashSet<uint>? schemas = [];
-        List* statements = NativeMethods.raw_parser(Worf.PStrDup(command), RawParseMode.RAW_PARSE_DEFAULT);
-        for (int i = 0; schemas is not null && statements is not null && i < statements->length; i++)
+        int nestLevel = NativeMethods.NewGUCNestLevel();
+        try
         {
-            HashSet<uint>? named = NamingSchemas(((RawStmt*)statements->elements[i].ptr_value)->stmt);
-            schemas = named is null ? null : [.. schemas, .. named];
+            fixed (byte* name = Worf.ToServerCString("role"))
+            fixed (byte* value = Worf.ToServerCString(role))
+            {
+                _ = NativeMethods.set_config_option((sbyte*)name, (sbyte*)value, GucContext.PGC_INTERNAL, GucSource.PGC_S_SESSION,
+                    GucAction.GUC_ACTION_SAVE, true, 0, false);
+            }
+
+            List* statements = NativeMethods.raw_parser(Worf.PStrDup(command), RawParseMode.RAW_PARSE_DEFAULT);
+            for (int i = 0; schemas is not null && statements is not null && i < statements->length; i++)
+            {
+                HashSet<uint>? named = NamingSchemas(((RawStmt*)statements->elements[i].ptr_value)->stmt);
+                schemas = named is null ? null : [.. schemas, .. named];
+            }
+        }
+        finally
+        {
+            NativeMethods.AtEOXact_GUC(true, nestLevel);
         }
 
         return MoveAside(schemas);
@@ -389,7 +407,8 @@ internal static unsafe partial class LocalIndex
             return moved;
         }
 
-        SpiResult result = Elevated.Run(() => Worf.Read("SELECT indexrelid FROM worf.local_index", 0));
+        // They go in the order of their OIDs, on every path, so that DDL here and DDL from another node never deadlock.
+        SpiResult result = Elevated.Run(() => Worf.Read("SELECT indexrelid FROM worf.local_index ORDER BY indexrelid", 0));
         foreach (uint relid in result.Select(row => row.Get<uint>(0)))
         {
             sbyte* name = NativeMethods.get_rel_name(relid);
@@ -411,8 +430,10 @@ internal static unsafe partial class LocalIndex
 
     /// <summary>
     /// Finds the schemas in which a statement creates, renames or chooses names for relations, whose names an index on
-    /// this node alone could take: those of the tables it creates, alters, indexes or renames. A statement that names
-    /// none, as a DROP or a COMMENT does, has none, and one that may otherwise create relations, every schema.
+    /// this node alone could take: those of the tables it creates, alters, indexes or renames, and of their partitions
+    /// and the partitions it attaches, where the indexes it builds on them go. A statement that can create relations
+    /// anywhere, as a DO block, a procedure or an extension can, may take any schema's names, and any other, as a
+    /// function's, a type's or a DROP, none.
     /// </summary>
     /// <returns>The schemas, or null for every schema.</returns>
     private static HashSet<uint>? NamingSchemas(Node* parsetree)
@@ -436,14 +457,52 @@ internal static unsafe partial class LocalIndex
             uint target = parsetree->type == NodeTag.T_AlterObjectSchemaStmt
                 ? NativeMethods.get_namespace_oid(((AlterObjectSchemaStmt*)parsetree)->newschema, true)
                 : schema;
-            return schema == 0 || target == 0 ? null : [schema, target];
+            if (schema == 0 || target == 0)
+            {
+                return null;
+            }
+
+            HashSet<uint> schemas = [schema, target];
+            if (parsetree->type is NodeTag.T_IndexStmt or NodeTag.T_AlterTableStmt)
+            {
+                AddTreeSchemas(schemas, (RangeVar*)relation);
+            }
+
+            List* cmds = parsetree->type == NodeTag.T_AlterTableStmt ? ((AlterTableStmt*)parsetree)->cmds : null;
+            for (int i = 0; cmds is not null && i < cmds->length; i++)
+            {
+                AlterTableCmd* cmd = (AlterTableCmd*)cmds->elements[i].ptr_value;
+                if (cmd->subtype == AlterTableType.AT_AttachPartition && cmd->def is not null)
+                {
+                    AddTreeSchemas(schemas, ((PartitionCmd*)cmd->def)->name);
+                }
+            }
+
+            return schemas;
         }
 
-        return parsetree->type is NodeTag.T_DropStmt or NodeTag.T_CommentStmt or NodeTag.T_GrantStmt or NodeTag.T_GrantRoleStmt or
-            NodeTag.T_VariableSetStmt or NodeTag.T_TruncateStmt or NodeTag.T_AlterOwnerStmt or NodeTag.T_SecLabelStmt or
-            NodeTag.T_ReindexStmt or NodeTag.T_VacuumStmt
-            ? []
-            : null;
+        return parsetree->type is NodeTag.T_DoStmt or NodeTag.T_CallStmt or NodeTag.T_CreateExtensionStmt or NodeTag.T_AlterExtensionStmt or
+            NodeTag.T_AlterExtensionContentsStmt or NodeTag.T_ImportForeignSchemaStmt
+            ? null
+            : [];
+    }
+
+    /// <summary>
+    /// Adds the schemas of a table and its partitions and inheritors, in which the indexes a statement builds on them go.
+    /// </summary>
+    private static void AddTreeSchemas(HashSet<uint> schemas, RangeVar* relation)
+    {
+        uint relid = relation is null ? 0 : NativeMethods.RangeVarGetRelidExtended(relation, 0, RangeVarMissingOk, default, null);
+        if (relid == 0)
+        {
+            return;
+        }
+
+        List* tree = NativeMethods.find_all_inheritors(relid, (int)PgLockMode.None, null);
+        for (int i = 0; tree is not null && i < tree->length; i++)
+        {
+            _ = schemas.Add(NativeMethods.get_rel_namespace(tree->elements[i].oid_value));
+        }
     }
 
     /// <summary>
@@ -511,7 +570,7 @@ internal static unsafe partial class LocalIndex
     /// <summary>
     /// Moves the indexes on this node alone out of a statement's way, unless the statement that runs it already has:
     /// out of the way of the names that PostgreSQL chooses for the objects that DDL that replicates creates, so that
-    /// every node chooses the same, as <see cref="MoveAside(string)"/> does for apply; and out of sight of DDL that replicates,
+    /// every node chooses the same, as <see cref="MoveAside(string, string)"/> does for apply; and out of sight of DDL that replicates,
     /// or DDL from another node, that would copy them, attach them to a partitioned index, or have a foreign key use
     /// them, none of which the other nodes can. Only the indexes of the tables the statement copies, attaches,
     /// indexes the partitions of or references are hidden: those a foreign key or an attached partition would use are
@@ -872,12 +931,13 @@ internal static unsafe partial class LocalIndex
 
                 break;
 
-            case NodeTag.T_AlterTableStmt when ((AlterTableStmt*)parsetree)->objtype == ObjectType.OBJECT_TABLE:
+            case NodeTag.T_AlterTableStmt when ((AlterTableStmt*)parsetree)->objtype is ObjectType.OBJECT_TABLE or ObjectType.OBJECT_TYPE:
+                bool type = ((AlterTableStmt*)parsetree)->objtype == ObjectType.OBJECT_TYPE;
                 List* cmds = ((AlterTableStmt*)parsetree)->cmds;
                 for (int i = 0; cmds is not null && i < cmds->length; i++)
                 {
                     AlterTableCmd* cmd = (AlterTableCmd*)cmds->elements[i].ptr_value;
-                    if (cmd->subtype == AlterTableType.AT_AttachPartition && cmd->def is not null)
+                    if (!type && cmd->subtype == AlterTableType.AT_AttachPartition && cmd->def is not null)
                     {
                         uint attached = AddTable(invalid, ((PartitionCmd*)cmd->def)->name);
                         if (attached != 0)
@@ -885,28 +945,20 @@ internal static unsafe partial class LocalIndex
                             AddPartitions(unlive, attached);
                         }
                     }
-                    else if (cmd->subtype is AlterTableType.AT_AddConstraint or AlterTableType.AT_AddColumn && cmd->def is not null)
+                    else if (!type && cmd->subtype is AlterTableType.AT_AddConstraint or AlterTableType.AT_AddColumn && cmd->def is not null)
                     {
                         AddReferenced(invalid, cmd->def);
                     }
-                    else if (cmd->subtype == AlterTableType.AT_AlterColumnType)
+                    else if (Rewrites(cmd->subtype))
                     {
-                        // A column's new type builds the table's foreign keys again, and those of its inheritors and
-                        // partitions, which may then use any valid unique index on the tables they reference.
+                        // A column's new type or expression builds the table's foreign keys again, and those of its
+                        // inheritors and partitions, which may then use any valid unique index on the tables they
+                        // reference. An attribute's new type in a composite type does so for every table that uses the
+                        // type, which the change cascades to.
                         uint altered = NativeMethods.RangeVarGetRelidExtended(((AlterTableStmt*)parsetree)->relation, 0, RangeVarMissingOk, default, null);
                         if (altered != 0)
                         {
-                            List* tables = NativeMethods.find_all_inheritors(altered, (int)PgLockMode.None, null);
-                            long[] relids = new long[tables is null ? 0 : tables->length];
-                            for (int j = 0; j < relids.Length; j++)
-                            {
-                                relids[j] = tables->elements[j].oid_value;
-                            }
-
-                            invalid.AddRange(Elevated.Run(() => Worf.Read("""
-                                SELECT DISTINCT confrelid FROM pg_catalog.pg_constraint
-                                WHERE contype = 'f' AND conrelid = ANY ($1::pg_catalog.int8[]::pg_catalog.oid[])
-                                """, 0, SpiParameter.Create(relids))).Select(row => row.Get<uint>(0)));
+                            AddRebuiltReferences(invalid, type ? TablesUsingType(NativeMethods.get_rel_type_id(altered)) : [altered]);
                         }
                     }
                 }
@@ -915,6 +967,52 @@ internal static unsafe partial class LocalIndex
 
             default:
                 break;
+        }
+    }
+
+    /// <summary>
+    /// Checks whether an ALTER TABLE action rebuilds a table's foreign keys: a column's new type or, from PostgreSQL 17,
+    /// generation expression.
+    /// </summary>
+    private static bool Rewrites(AlterTableType subtype)
+#if ANKUS_PG15 || ANKUS_PG16
+        => subtype == AlterTableType.AT_AlterColumnType;
+#else
+        => subtype is AlterTableType.AT_AlterColumnType or AlterTableType.AT_SetExpression;
+#endif
+
+    /// <summary>
+    /// Finds the tables that use a composite type: those with a column of it and those created of it.
+    /// </summary>
+    private static List<uint> TablesUsingType(uint typeOid) => typeOid == 0 ? [] : [.. Elevated.Run(() => Worf.Read("""
+        SELECT a.attrelid FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+        WHERE a.atttypid = $1 AND NOT a.attisdropped AND c.relkind IN ('r', 'p')
+        UNION
+        SELECT oid FROM pg_catalog.pg_class WHERE reloftype = $1 AND relkind IN ('r', 'p')
+        """, 0, SpiParameter.Create(typeOid))).Select(row => row.Get<uint>(0))];
+
+    /// <summary>
+    /// Adds the tables that the foreign keys of some tables, their inheritors and their partitions reference, which a
+    /// statement that rebuilds those keys may have use any valid unique index of.
+    /// </summary>
+    private static void AddRebuiltReferences(List<uint> invalid, List<uint> rebuilt)
+    {
+        List<long> relids = [];
+        foreach (uint table in rebuilt)
+        {
+            List* tree = NativeMethods.find_all_inheritors(table, (int)PgLockMode.None, null);
+            for (int j = 0; tree is not null && j < tree->length; j++)
+            {
+                relids.Add(tree->elements[j].oid_value);
+            }
+        }
+
+        if (relids.Count > 0)
+        {
+            invalid.AddRange(Elevated.Run(() => Worf.Read("""
+                SELECT DISTINCT confrelid FROM pg_catalog.pg_constraint
+                WHERE contype = 'f' AND conrelid = ANY ($1::pg_catalog.int8[]::pg_catalog.oid[])
+                """, 0, SpiParameter.Create(relids.ToArray()))).Select(row => row.Get<uint>(0)));
         }
     }
 
