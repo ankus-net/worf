@@ -1134,20 +1134,15 @@ internal static class SequenceRangeExchange
 
         SpiParameter name = SpiParameter.Create(entry.GetProperty("name").GetString());
         int epoch = entry.GetProperty("epoch").GetInt32();
-        if (disabled.Value)
-        {
-            _ = Worf.Execute("DELETE FROM worf.sequence_range_dropped WHERE name = $1 AND NOT owned", name);
-        }
-        else
-        {
-            _ = Worf.Execute("""
+        _ = disabled.Value
+            ? Worf.Execute("DELETE FROM worf.sequence_range_dropped WHERE name = $1 AND NOT owned", name)
+            : Worf.Execute("""
                 UPDATE worf.sequence_range_dropped SET owner_node = $2, epoch = $3, range_size = $4, max_range_size = $5, root_start = $6,
                     root_end = coalesce($7, root_end)
                 WHERE name = $1 AND NOT owned
                 """, name, SpiParameter.Create(entry.GetProperty("owner_id").GetUInt32()), SpiParameter.Create(epoch),
                 SpiParameter.Create(entry.GetProperty("range_size").GetInt64()), SpiParameter.Create(entry.GetProperty("max_range_size").GetInt64()),
                 SpiParameter.Create(Nullable(entry, "root_start")), SpiParameter.Create(Nullable(entry, "root_end")));
-        }
     }
 
     /// <summary>
