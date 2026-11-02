@@ -558,6 +558,7 @@ internal static unsafe partial class DdlLock
                 s_appliedFences.Clear();
             });
             _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, static () => s_appliedFences.Clear());
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, static () => s_appliedFences.Clear());
         }
 
         _ = s_appliedFences.Add(fenceId);

@@ -99,9 +99,16 @@ internal static class SequenceRangeReservations
                     requestId = Guid.NewGuid();
                     Post(new WorfReservation { RequestId = requestId, Seqoid = seqoid, Kind = (byte)'n', Size = needed });
                 }
-                else if (!pending)
+                else if (!pending && Refused(requestId))
                 {
                     throw new PgException("2200H", $"sequence {info.Name} has no free span of {needed} values left");
+                }
+                else if (!pending)
+                {
+                    // A request that went without an answer, as a reset or a new parent drops a node's open requests while
+                    // the allocator is fenced, goes again.
+                    requestId = Guid.NewGuid();
+                    Post(new WorfReservation { RequestId = requestId, Seqoid = seqoid, Kind = (byte)'n', Size = needed });
                 }
                 else if (ReservedNext(seqoid, epoch) && HoldsSequence(seqoid))
                 {
@@ -330,6 +337,13 @@ internal static class SequenceRangeReservations
 
         return range[0].Get<int>(0);
     }
+
+    /// <summary>
+    /// Checks whether this node's parent refused a request, as an allocator with no free span that holds it does.
+    /// </summary>
+    private static bool Refused(Guid requestId)
+        => Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range_request WHERE request_id = $1 AND state = 'refused'",
+            SpiParameter.Create(requestId)).Count > 0;
 
     /// <summary>
     /// Checks whether a request still waits: on the worker, or with this node's parent. A request that does neither

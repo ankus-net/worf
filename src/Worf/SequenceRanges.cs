@@ -583,13 +583,33 @@ internal static unsafe partial class SequenceRanges
     {
         bool all = sequence is null || sequence.IsNull;
         uint named = all ? 0 : RequireOwnedSequence(sequence);
+
+        // The sequences go in the order of their names, as an exchange takes their range rows, so that the two never
+        // deadlock, and each is locked against a DROP as it comes, so that one dropped meanwhile is passed over.
         SpiResult managed = Elevated.Run(() => all
-            ? Worf.SelectCatalog("SELECT r.seqoid::oid FROM worf.sequence_range r WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = r.seqoid) ORDER BY r.seqoid")
+            ? Worf.SelectCatalog("""
+                SELECT r.seqoid::oid FROM worf.sequence_range r
+                    JOIN pg_catalog.pg_class c ON c.oid = r.seqoid
+                    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                ORDER BY pg_catalog.quote_ident(n.nspname) || '.' || pg_catalog.quote_ident(c.relname) COLLATE "C"
+                """)
             : Worf.SelectCatalog("SELECT seqoid::oid FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(named)));
-        List<uint> sequences = [.. Enumerable.Range(0, managed.Count).Select(i => managed[i].Get<uint>(0))];
-        foreach (uint seqoid in all ? sequences : [])
+        List<uint> sequences = [];
+        for (int i = 0; i < managed.Count; i++)
         {
-            RequireOwnedSequence(seqoid);
+            uint seqoid = managed[i].Get<uint>(0);
+            if (all)
+            {
+                NativeMethods.LockRelationOid(seqoid, (int)PgLockMode.AccessShare);
+                if (!SequenceExists(seqoid))
+                {
+                    continue;
+                }
+
+                _ = RequireOwnedSequence(seqoid);
+            }
+
+            sequences.Add(seqoid);
         }
 
         Elevated.Run(() =>
@@ -2687,6 +2707,14 @@ internal static unsafe partial class SequenceRanges
         {
             s_changedOnCommit = false;
             LocalVersion++;
+        });
+
+        // A prepared transaction commits later, maybe in another session, which tells nobody, so the change is told as it
+        // is prepared, and backends that read the state before it commits read it again on the next change.
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, static () =>
+        {
+            s_changedOnCommit = false;
+            Changed();
         });
     }
 

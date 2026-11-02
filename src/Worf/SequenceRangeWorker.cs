@@ -100,7 +100,7 @@ internal static class SequenceRangeWorker
                         // tick.
                         if (error.SqlState != "55P03" && PgBackgroundWorker.RunTransaction(() => SequenceRanges.SequenceExists(seqoid)))
                         {
-                            PgLog.Warning($"could not check managed sequence {seqoid}: {error.Message}");
+                            PgLog.Warning(new PgDiagnostic($"could not check managed sequence {seqoid}: {error.Message}") { Detail = error.Detail });
                         }
                     }
                 }

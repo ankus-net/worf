@@ -534,10 +534,12 @@ internal static class SequenceRangeGuard
             return;
         }
 
+        // PREPARE TRANSACTION ends the transaction too, without committing or aborting it.
         if (s_waitedInTransaction.Count == 1)
         {
             _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () => s_waitedInTransaction.Clear());
             _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, static () => s_waitedInTransaction.Clear());
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, static () => s_waitedInTransaction.Clear());
         }
 
         SpiParameter seq = SpiParameter.Create(seqoid);

@@ -503,6 +503,9 @@ internal static class Worker
                 s_signalWorkers.Clear();
                 s_xacthookSignalWorkers = false;
             });
+
+            // A prepared transaction's workers are signalled as it is prepared, as nothing hooks COMMIT PREPARED.
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, SignalWorkerXactCallback);
         }
 
         if (subid != 0)
