@@ -73,6 +73,7 @@ internal static class SequenceRangeExchange
         }
 
         Authenticate(slot, senderId);
+        TakeTurn();
         if (leaving)
         {
             _ = Worf.Execute("DELETE FROM worf.sequence_range_link WHERE slot_name = $1", SpiParameter.Create(slot));
@@ -537,10 +538,18 @@ internal static class SequenceRangeExchange
         ulong applied = Applied(sub);
         (string message, List<Guid> refusals) = Build(node, sub.Origin.Id, sub.SlotName);
         string reply = SequenceRangeExchangeWorker.Bounded(() => conn.Query("SELECT worf.sequence_range_exchange(" + Spi.QuoteLiteral(message) + ")", 1))[0][0] ?? "{}";
+        TakeTurn();
         AcknowledgeRefusals(refusals);
         using JsonDocument document = JsonDocument.Parse(reply);
         return Process(node, document.RootElement, sub.Origin.Id, sub.Origin.Name, false, applied);
     }
+
+    /// <summary>
+    /// Waits for this node's other exchanges to finish taking in their messages, so that no two lock its ranges in
+    /// different orders, as when a sequence's name names another sequence on a neighbor. A call takes its turn only once
+    /// the neighbor has answered, so that no node waits on another's turn while that node waits on its own.
+    /// </summary>
+    private static void TakeTurn() => _ = Worf.Read("SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('worf.sequence_range_exchange_turn'))", 0);
 
     /// <summary>
     /// Gets the furthest WAL position of the provider whose changes this node has applied through a subscription, under
