@@ -111,10 +111,12 @@ internal static class SequenceRangeExchangeWorker
             }
         }
 
-        // The call fails in the exchange worker, which tries the neighbor again later.
+        // The call fails in the exchange worker, which tries the neighbor again later. One that has exited, as at a shutdown,
+        // is left alone.
         if (overdue != 0)
         {
-            _ = PgBackgroundWorker.RunTransaction(() => Worf.ReadScalar<bool>("SELECT pg_catalog.pg_cancel_backend($1)", SpiParameter.Create(overdue)));
+            _ = PgBackgroundWorker.RunTransaction(() => Worf.ReadScalar<bool>(
+                "SELECT pg_catalog.pg_cancel_backend(pid) FROM pg_catalog.pg_stat_get_activity($1) WHERE pid IS NOT NULL", SpiParameter.Create(overdue)));
         }
 
         return running;

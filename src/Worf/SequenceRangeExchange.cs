@@ -844,7 +844,8 @@ internal static class SequenceRangeExchange
         HashSet<uint> absent = [.. Enumerable.Range(0, fencedOn.Count).Select(i => fencedOn[i].Get<uint>(0))];
         foreach (JsonElement entry in sequences.EnumerateArray())
         {
-            if (absent.Count > 0 && Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(entry.GetProperty("name").GetString())) is uint carried)
+            uint? processed = Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(entry.GetProperty("name").GetString()));
+            if (absent.Count > 0 && processed is uint carried)
             {
                 _ = absent.Remove(carried);
             }
@@ -877,9 +878,8 @@ internal static class SequenceRangeExchange
             }
             catch (PgException error)
             {
-                // A sequence dropped here since the exchange began goes unmentioned.
-                if (Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(entry.GetProperty("name").GetString())) is uint seqoid &&
-                    SequenceRanges.SequenceExists(seqoid))
+                // A sequence dropped here since the exchange began goes unmentioned, though one of its name was created again.
+                if (processed is uint seqoid && SequenceRanges.SequenceExists(seqoid))
                 {
                     PgLog.Warning(new PgDiagnostic($"sequence range exchange with node {senderName} skipped sequence {entry.GetProperty("name").GetString()}: {error.Message}")
                     {

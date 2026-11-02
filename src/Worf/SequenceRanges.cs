@@ -3841,6 +3841,7 @@ internal static unsafe partial class SequenceRanges
             INSERT INTO worf.sequence_range_block
                 (block_id, seqoid, epoch, kind, lo, hi, state, from_node, node_id, sysid, timeline, received_at, retired_at, reserved, not_before)
             VALUES ($1, $2, $3, $4::"char", $5, $6, $7, $8, $9, $10, $11, now(), CASE WHEN $7 = 'abandoned' THEN now() END, $12, $13)
+            ON CONFLICT (block_id) DO NOTHING
             """, SpiParameter.Create(block), SpiParameter.Create(seqoid), SpiParameter.Create(epoch),
             SpiParameter.Create(kind.ToString()), SpiParameter.Create(lo), SpiParameter.Create(hi), SpiParameter.Create(state),
             SpiParameter.Create(fromNode), SpiParameter.Create(node.Node.Id), SpiParameter.Create((decimal)sysid),
