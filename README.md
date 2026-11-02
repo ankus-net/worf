@@ -806,37 +806,39 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   including each change of a transaction skipped as a whole, and disabled
   subscriptions are recorded in `worf.exception_log`, with the error, the
   change's rows or queued DDL, and the transaction it belongs to. A value the
-  subscriber can't read is recorded as its bytes in hex. The
-  transaction that a subscription applies again, and how, is kept in
-  `worf.exception_state` across restarts. Table sync workers catching up
-  after a copy handle failures the same way, streaming from their slot again.
-  When a walsender of their earlier connection, with the same user and
-  application name, still holds the slot after a second, they stop it; they wait
-  for anything else with a warning, and fail after a minute. Their cleanup,
-  which drops the slot, waits five seconds instead, or none when it can't reach
-  the provider, then leaves the slot, with a warning, to the subscription's
-  apply worker, which drops it, as it does any slot its table syncs left when it
-  starts, and tries again every five seconds while one stays; dropping the
-  subscription drops them too. One that stops after its copy has committed
-  catches up again from where it got to when it restarts, rather than copying
-  again. When its slot is gone or invalidated, or its origin has no progress, it
-  copies the table again and merges the copy in, in one transaction: the
-  provider's rows replace those with the same replica identity or primary key,
-  or join them, and the table's other rows stay, as in pglogical, since whether
-  the subscription wrote one can't be told in general. So a row the provider
-  deleted while the sync couldn't catch up stays here; resynchronizing the table
-  empties it and copies it again. Writers go on meanwhile, and readers see the
-  rows as they were until it commits. A table with neither key fails instead,
-  and retries, until it is resynchronized. In a table's initial copy, a row that
-  fails, whether its value doesn't convert to its column's type, the column's
-  input refuses it or a constraint does, is skipped under `discard` and
-  `transdiscard` and disables the subscription under `sub_disable`, and is
-  recorded as a `COPY` with its text, its number in the copy as the action
-  counter and the copy's position. A row that fails other than to convert has
-  the table copied again a row at a time, each in its own subtransaction. Under
-  `error` the copy stops, naming the row, column and value, and starts again
-  after a delay of 5 seconds that doubles each time, up to 5 minutes, from the
-  start of a table's last copy or the failure of a subscription's first;
+  subscriber can't read is recorded as its bytes in hex. The transaction that a
+  subscription applies again, and how, is kept in `worf.exception_state` across
+  restarts. Table sync workers catching up after a copy handle failures the same
+  way, streaming from their slot again. When a walsender of their earlier
+  connection, with the same user and application name, still holds the slot
+  after a second, they stop it; they wait for anything else with a warning, and
+  fail after a minute. Their cleanup, which drops the slot, waits five seconds
+  instead, or none when it can't reach the provider, then leaves the slot, with
+  a warning, to the subscription's apply worker, which drops it, as it does any
+  slot its table syncs left when it starts, and tries again every five seconds
+  while one stays; dropping the subscription drops them too. One that stops
+  after its copy has committed catches up again from where it got to when it
+  restarts, rather than copying again. When its slot is gone or invalidated, or
+  its origin has no progress, it copies the table again and merges the copy in,
+  in one transaction: the provider's rows replace those with the same replica
+  identity or primary key, or join them, and the table's other rows stay, since
+  whether the subscription wrote one can't be told in general. So a row the
+  provider deleted while the sync couldn't catch up stays here; resynchronizing
+  the table empties it and copies it again. Writers go on meanwhile, and readers
+  see the rows as they were until it commits. A table with neither key fails
+  instead, and retries, until it is resynchronized, and so does a merge that a
+  unique index other than the key refuses, as when a row the provider has since
+  deleted here holds a value one of the provider's rows takes, with a hint to
+  resynchronize. In a table's initial copy, a row that fails, whether its value
+  doesn't convert to its column's type, the column's input refuses it or a
+  constraint does, is skipped under `discard` and `transdiscard` and disables
+  the subscription under `sub_disable`, and is recorded as a `COPY` with its
+  text, its number in the copy as the action counter and the copy's position. A
+  row that fails other than to convert has the table copied again a row at a
+  time, each in its own subtransaction. Under `error` the copy stops, naming the
+  row, column and value, and starts again after a delay of 5 seconds that
+  doubles each time, up to 5 minutes, from the start of a table's last copy or
+  the failure of a subscription's first;
   `worf.alter_subscription_resynchronize_table` starts it again at once. The
   default is `error`.
 

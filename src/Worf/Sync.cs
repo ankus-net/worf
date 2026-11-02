@@ -1615,9 +1615,10 @@ internal static class Sync
     /// <summary>
     /// Copies a table that has rows again, in the target transaction, and merges the copy into them, as a table sync
     /// does that can't catch up from its first copy. The provider's rows replace the table's with the same key, or join
-    /// them, and the table's other rows stay, as pglogical keeps them: whether this subscription wrote a row can't be
-    /// told in general, as without commit timestamps or once it's frozen. A row the copy leaves as it was isn't written
-    /// again. Writers go on meanwhile, readers see the rows as they were until the merge commits, and
+    /// them, and the table's other rows stay, since whether this subscription wrote a row can't be told in general, as
+    /// without commit timestamps or once it's frozen. A row the copy leaves as it was isn't written again. A unique
+    /// index other than the key that a row the provider no longer has holds a value in fails the merge, with a hint to
+    /// resynchronize. Writers go on meanwhile, readers see the rows as they were until the merge commits, and
     /// session_replication_role replica keeps foreign keys from being checked, as for apply.
     /// </summary>
     /// <param name="originConn">The provider connection, in the copy's transaction.</param>
