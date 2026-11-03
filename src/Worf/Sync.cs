@@ -647,11 +647,41 @@ internal static class Sync
     }
 
     /// <summary>
+    /// Finishes a sync worker's catch-up: ends the stream and drops the table's slot over the connection it streamed
+    /// on, as PostgreSQL's table sync does, so that the walsender that decoded the slot, and holds a reference to its
+    /// statistics, is the one that drops it, rather than leave the reference behind in a walsender still exiting as
+    /// another connection drops the slot and a later slot takes its place; then closes the connection and finishes.
+    /// A slot the stream's connection can't drop is dropped as a sync that didn't stream drops it.
+    /// </summary>
+    /// <param name="streamConn">The connection the worker streamed on.</param>
+    /// <param name="nspname">The table's schema.</param>
+    /// <param name="relname">The table's name.</param>
+    internal static void FinishCatchup(PgReplicationConnection streamConn, string nspname, string relname)
+    {
+        WorfSubscription sub = Apply.MySubscription!;
+        bool dropped = false;
+        try
+        {
+            streamConn.EndStreaming();
+            PgBackgroundWorker.RunTransaction(() => streamConn.Execute($"DROP_REPLICATION_SLOT \"{sub.SlotName}\" WAIT"));
+            dropped = true;
+        }
+        catch (PgException error)
+        {
+            PgLog.Debug1($"could not drop replication slot \"{sub.SlotName}\" over the stream's connection: {error.Message}");
+        }
+
+        streamConn.Dispose();
+        SyncWorkerFinish(nspname, relname, dropped);
+    }
+
+    /// <summary>
     /// Finishes the sync worker's work.
     /// </summary>
     /// <param name="nspname">The table's schema.</param>
     /// <param name="relname">The table's name.</param>
-    internal static void SyncWorkerFinish(string nspname, string relname)
+    /// <param name="slotDropped">Whether the worker dropped the table's slot already.</param>
+    internal static void SyncWorkerFinish(string nspname, string relname, bool slotDropped = false)
     {
         WorfSubscription sub = Apply.MySubscription!;
 
@@ -663,7 +693,7 @@ internal static class Sync
             NativeMethods.XLogFlush(NativeMethods.GetXLogWriteRecPtr());
         }
 
-        SyncWorkerCleanup(sub);
+        SyncWorkerCleanup(sub, slotDropped);
 
         // In case there is apply process running, it might be waiting for the table status change so tell it to
         // check.
@@ -2235,30 +2265,33 @@ internal static class Sync
     /// reached, is left to the subscription's apply worker, which drops it once it can, rather than holding up the
     /// subscription's later table syncs, which wait for this worker to exit.
     /// </summary>
-    private static void SyncWorkerCleanup(WorfSubscription sub)
+    private static void SyncWorkerCleanup(WorfSubscription sub, bool slotDropped)
     {
-        // Drop the slot on the remote side. The connection is made in a transaction, so that a failure to make it can
-        // be caught.
-        string? left;
-        try
+        // Drop the slot on the remote side, unless the worker did over the connection it streamed on. The connection is
+        // made in a transaction, so that a failure to make it can be caught.
+        if (!slotDropped)
         {
-            using PgReplicationConnection originConn = PgBackgroundWorker.RunTransaction(() => Worf.Connect(sub.OriginIf.Dsn, sub.Name, "cleanup"));
-            int holder = WaitForSlot(originConn, sub, "this sync's cleanup",
-                $"The slot is left to the subscription's apply worker after {CleanupSlotWait} seconds.", CleanupSlotWait);
-            left = holder != 0 ? $"PID {holder} holds it." : null;
-            if (holder == 0)
+            string? left;
+            try
             {
-                PgBackgroundWorker.RunTransaction(() => Rpc.DropRemoteSlot(originConn, sub.SlotName));
+                using PgReplicationConnection originConn = PgBackgroundWorker.RunTransaction(() => Worf.Connect(sub.OriginIf.Dsn, sub.Name, "cleanup"));
+                int holder = WaitForSlot(originConn, sub, "this sync's cleanup",
+                    $"The slot is left to the subscription's apply worker after {CleanupSlotWait} seconds.", CleanupSlotWait);
+                left = holder != 0 ? $"PID {holder} holds it." : null;
+                if (holder == 0)
+                {
+                    PgBackgroundWorker.RunTransaction(() => Rpc.DropRemoteSlot(originConn, sub.SlotName));
+                }
             }
-        }
-        catch (PgException error)
-        {
-            left = error.Message;
-        }
+            catch (PgException error)
+            {
+                left = error.Message;
+            }
 
-        if (left is not null)
-        {
-            LeaveSlot(sub, left);
+            if (left is not null)
+            {
+                LeaveSlot(sub, left);
+            }
         }
 
         // Drop the origin tracking locally.
@@ -2469,7 +2502,7 @@ internal static class Sync
     {
         try
         {
-            SyncWorkerCleanup(sub);
+            SyncWorkerCleanup(sub, false);
         }
         catch (PgException error)
         {

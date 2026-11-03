@@ -487,3 +487,6 @@ $RECYCLE.BIN/
 **/pg_regress/regression.diffs
 **/pg_regress/regression.out
 **/pg_regress/regression.*.diffs
+
+# Claude AI
+.claude/

@@ -558,6 +558,9 @@ public sealed partial class ExceptionBehaviourTests
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE backend_type LIKE 'worf sync%'", token);
         _ = await provider.SafePsqlAsync(Database, $"SELECT pg_cancel_backend({reader.ProcessID})", token);
         _ = await Assert.ThrowsExactlyAsync<PostgresException>(() => reading);
+
+        // The session that read the slot ends, as it has the slot's statistics, which the slot's drop leaves to it.
+        await reader.CloseAsync();
         await moreSubscriptions.CommitAsync(token);
 
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
@@ -658,14 +661,14 @@ public sealed partial class ExceptionBehaviourTests
     }
 
     /// <summary>
-    /// A table sync worker stopped once its copy has committed, here while it waits for the apply worker, which waits on
-    /// a lock with changes to the table from after the copy skipped, catches up from its copy when it starts again, with
-    /// those changes, and leaves its slot to the apply worker when its cleanup can't reach the provider. When its slot is
-    /// gone or invalidated, or its origin has no progress, it copies the table again and merges the copy in, in one
-    /// transaction, so the table is never seen empty, though a key references the table, its own key is an identity or
-    /// deferrable: the provider's rows replace those with the same key, and the table's other rows stay, those written
-    /// here or under another origin, and those the provider has since deleted. One cancelled before its copy commits
-    /// copies a table without a key once, and the cleanup after it waits for a session that holds its slot, with a
+    /// A table sync worker stopped once its copy has committed, here while it waits for the apply worker, which waits on a
+    /// lock with changes to the table from after the copy skipped, catches up from its copy when it starts again, with
+    /// those changes, and drops its slot over the connection it streamed on, which needs no new connection to the provider.
+    /// When its slot is gone or invalidated, or its origin has no progress, it copies the table again and merges the copy
+    /// in, in one transaction, so the table is never seen empty, though a key references the table, its own key is an
+    /// identity or deferrable: the provider's rows replace those with the same key, and the table's other rows stay, those
+    /// written here or under another origin, and those the provider has since deleted. One cancelled before its copy
+    /// commits copies a table without a key once, and the cleanup after it waits for a session that holds its slot, with a
     /// warning, rather than for ever. Dropping the subscription drops the slots its syncs left.
     /// </summary>
     /// <returns>The test.</returns>
@@ -807,7 +810,8 @@ public sealed partial class ExceptionBehaviourTests
                     INSERT INTO {table}_ref VALUES (1);
                     """, token);
 
-                // The next worker catches up while the table is locked, and can't reach the provider once it's done.
+                // The next worker catches up while the table is locked, and can't connect to the provider again once it's
+                // done, which it doesn't need to, as it drops its slot over the connection it streamed on.
                 if (stop == "resume")
                 {
                     await using NpgsqlTransaction catchupLock = await tableLocker.BeginTransactionAsync(token);
@@ -823,12 +827,11 @@ public sealed partial class ExceptionBehaviourTests
                         """, token), "the catch-up waiting");
                     _ = await provider.SafePsqlAsync(Database, $"ALTER ROLE {SuperUser} NOLOGIN", token);
                     await catchupLock.RollbackAsync(token);
-                    Assert.IsTrue(await subscriber.PollLogAsync(logpos, "The subscription's apply worker drops it once it can.", token),
-                        "the slot left to the apply worker");
-                    _ = await provider.SafePsqlAsync(Database, $"ALTER ROLE {SuperUser} LOGIN", token);
                     Assert.IsTrue(await provider.PollQueryUntilAsync(Database,
                         $"SELECT NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE starts_with(slot_name, '{slot}_'))", token),
-                        "the slot the sync left dropped");
+                        "the slot the sync dropped over its stream's connection");
+                    Assert.DoesNotContain("could not drop replication slot", subscriber.ReadLog()[logpos..], "a slot left to the apply worker");
+                    _ = await provider.SafePsqlAsync(Database, $"ALTER ROLE {SuperUser} LOGIN", token);
                 }
                 else
                 {
@@ -937,6 +940,9 @@ public sealed partial class ExceptionBehaviourTests
             Assert.IsTrue(await subscriber.PollLogAsync(logpos, "which this sync's cleanup waits for", token), "the cleanup's warning");
             _ = await provider.SafePsqlAsync(Database, $"SELECT pg_cancel_backend({reader.ProcessID})", token);
             _ = await Assert.ThrowsExactlyAsync<PostgresException>(() => reading);
+
+            // The session that read the slot ends, as it has the slot's statistics, which the slot's drop leaves to it.
+            await reader.CloseAsync();
             await statusLock.RollbackAsync(token);
             await subscriptions.CommitAsync(token);
         }

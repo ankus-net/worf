@@ -900,15 +900,15 @@ internal static unsafe partial class Apply
             // Flush all writes so the latest position can be reported back to the sender.
             NativeMethods.XLogFlush(NativeMethods.GetXLogWriteRecPtr());
 
-            // Disconnect.
-            //
-            // This needs to happen before the SyncWorkerFinish() call otherwise slot drop will fail.
-            s_applyconn!.Dispose();
-
-            // If this is sync worker, finish it.
+            // A sync worker ends its stream and drops its slot over the connection it streamed on, and finishes; an
+            // apply worker disconnects.
             if (me.WorkerType == WorfWorkerType.Sync)
             {
-                Sync.SyncWorkerFinish(Worker.NameStr(me.Worker.Sync.Nspname), Worker.NameStr(me.Worker.Sync.Relname));
+                Sync.FinishCatchup(s_applyconn!, Worker.NameStr(me.Worker.Sync.Nspname), Worker.NameStr(me.Worker.Sync.Relname));
+            }
+            else
+            {
+                s_applyconn!.Dispose();
             }
 
             // Stop gracefully
@@ -2285,8 +2285,7 @@ internal static unsafe partial class Apply
                         Worker.NameStr(me.Worker.Sync.Nspname), Worker.NameStr(me.Worker.Sync.Relname), Sync.SyncStatusSyncdone, endpos));
 
                     NativeMethods.XLogFlush(NativeMethods.GetXLogWriteRecPtr());
-                    s_applyconn!.Dispose();
-                    Sync.SyncWorkerFinish(Worker.NameStr(me.Worker.Sync.Nspname), Worker.NameStr(me.Worker.Sync.Relname));
+                    Sync.FinishCatchup(s_applyconn!, Worker.NameStr(me.Worker.Sync.Nspname), Worker.NameStr(me.Worker.Sync.Relname));
                     Worker.ProcExit(0);
                 }
             }
