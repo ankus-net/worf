@@ -396,6 +396,11 @@ internal static unsafe partial class LocalIndex
                 }
 
                 UsedTables(statement, hiding, hiding);
+                if (pathKnown)
+                {
+                    LockTables(statement);
+                }
+
                 pathKnown = pathKnown && !MaySet(statement);
             }
         }
@@ -405,6 +410,50 @@ internal static unsafe partial class LocalIndex
         }
 
         return MoveAside(names, hiding);
+    }
+
+    /// <summary>
+    /// Takes the locks a statement takes on the tables it alters, indexes, renames or copies the definition of, as it
+    /// would, before the locks on the indexes on this node alone that it moves aside or hides, so that it waits for a
+    /// transaction that holds one of them, as on its own, rather than hold the indexes meanwhile, which that transaction
+    /// may go on to need.
+    /// </summary>
+    private static void LockTables(Node* statement)
+    {
+        switch (statement->type)
+        {
+            case NodeTag.T_AlterTableStmt:
+                AlterTableStmt* alter = (AlterTableStmt*)statement;
+                _ = NativeMethods.RangeVarGetRelidExtended(alter->relation, NativeMethods.AlterTableGetLockLevel(alter->cmds), RangeVarMissingOk, default, null);
+                break;
+
+            case NodeTag.T_IndexStmt:
+                IndexStmt* index = (IndexStmt*)statement;
+                _ = NativeMethods.RangeVarGetRelidExtended(index->relation,
+                    (int)(index->concurrent ? PgLockMode.ShareUpdateExclusive : PgLockMode.Share), RangeVarMissingOk, default, null);
+                break;
+
+            case NodeTag.T_RenameStmt when ((RenameStmt*)statement)->relation is not null:
+                _ = NativeMethods.RangeVarGetRelidExtended(((RenameStmt*)statement)->relation, (int)PgLockMode.AccessExclusive, RangeVarMissingOk, default, null);
+                break;
+
+            case NodeTag.T_CreateStmt:
+                List* elements = ((CreateStmt*)statement)->tableElts;
+                for (int i = 0; elements is not null && i < elements->length; i++)
+                {
+                    Node* element = (Node*)elements->elements[i].ptr_value;
+                    if (element->type == NodeTag.T_TableLikeClause)
+                    {
+                        _ = NativeMethods.RangeVarGetRelidExtended(((TableLikeClause*)element)->relation, (int)PgLockMode.AccessShare,
+                            RangeVarMissingOk, default, null);
+                    }
+                }
+
+                break;
+
+            default:
+                break;
+        }
     }
 
     /// <summary>
@@ -558,8 +607,11 @@ internal static unsafe partial class LocalIndex
             case NodeTag.T_ExplainStmt:
                 return NamesTaken(((ExplainStmt*)parsetree)->query, pathKnown);
 
+            // A statement that runs functions, as a DO block, a procedure, an extension's script or a query does, may
+            // create relations under any name.
             case NodeTag.T_DoStmt or NodeTag.T_CallStmt or NodeTag.T_CreateExtensionStmt or NodeTag.T_AlterExtensionStmt or
-                NodeTag.T_ImportForeignSchemaStmt:
+                NodeTag.T_ImportForeignSchemaStmt or NodeTag.T_SelectStmt or NodeTag.T_InsertStmt or NodeTag.T_UpdateStmt or
+                NodeTag.T_DeleteStmt or NodeTag.T_MergeStmt or NodeTag.T_CopyStmt or NodeTag.T_ExecuteStmt or NodeTag.T_CreateTableAsStmt:
                 return null;
 
             case NodeTag.T_CreateStmt or NodeTag.T_CreateForeignTableStmt:
@@ -581,7 +633,7 @@ internal static unsafe partial class LocalIndex
                 AddTreeNames(names, index->relation, pathKnown);
                 break;
 
-            case NodeTag.T_AlterTableStmt when ((AlterTableStmt*)parsetree)->objtype == ObjectType.OBJECT_TABLE:
+            case NodeTag.T_AlterTableStmt when ((AlterTableStmt*)parsetree)->objtype is ObjectType.OBJECT_TABLE or ObjectType.OBJECT_FOREIGN_TABLE:
                 AlterTableStmt* alter = (AlterTableStmt*)parsetree;
                 AddTreeNames(names, alter->relation, pathKnown);
                 uint altered = SchemaOf(alter->relation, false, pathKnown);
@@ -593,7 +645,8 @@ internal static unsafe partial class LocalIndex
                     {
                         AddTreeNames(names, ((PartitionCmd*)cmd->def)->name, pathKnown);
                     }
-                    else if (cmd->subtype is AlterTableType.AT_AddConstraint or AlterTableType.AT_AddColumn && cmd->def is not null)
+                    else if (cmd->subtype is AlterTableType.AT_AddConstraint or AlterTableType.AT_AddColumn or AlterTableType.AT_AddIdentity &&
+                        cmd->def is not null)
                     {
                         AddConstraintNames(names, altered, cmd->def);
                     }
@@ -611,15 +664,6 @@ internal static unsafe partial class LocalIndex
 
             case NodeTag.T_CompositeTypeStmt:
                 names.Add((SchemaOf(((CompositeTypeStmt*)parsetree)->typevar, true, pathKnown), Worf.FromServer(((CompositeTypeStmt*)parsetree)->typevar->relname), false));
-                break;
-
-            case NodeTag.T_CreateTableAsStmt or NodeTag.T_SelectStmt:
-                IntoClause* into = parsetree->type == NodeTag.T_CreateTableAsStmt ? ((CreateTableAsStmt*)parsetree)->into : Into((SelectStmt*)parsetree);
-                if (into is not null)
-                {
-                    names.Add((SchemaOf(into->rel, true, pathKnown), Worf.FromServer(into->rel->relname), false));
-                }
-
                 break;
 
             case NodeTag.T_RenameStmt:
@@ -753,6 +797,22 @@ internal static unsafe partial class LocalIndex
         {
             names.Add((schema, Worf.FromServer(((Constraint*)element)->conname), false));
         }
+        else if (element->type == NodeTag.T_Constraint && ((Constraint*)element)->contype == ConstrType.CONSTR_IDENTITY)
+        {
+            // An identity column's sequence takes the name its options give, in the schema they give or the table's.
+            List* options = ((Constraint*)element)->options;
+            for (int i = 0; options is not null && i < options->length; i++)
+            {
+                DefElem* option = (DefElem*)options->elements[i].ptr_value;
+                if (Worf.FromServer(option->defname) == "sequence_name" && option->arg is not null && option->arg->type == NodeTag.T_List)
+                {
+                    sbyte* nspname;
+                    sbyte* objname;
+                    NativeMethods.DeconstructQualifiedName((List*)option->arg, &nspname, &objname);
+                    names.Add((nspname is null ? schema : NativeMethods.get_namespace_oid(nspname, true), Worf.FromServer(objname), false));
+                }
+            }
+        }
     }
 
     /// <summary>
@@ -884,6 +944,7 @@ internal static unsafe partial class LocalIndex
             return false;
         }
 
+        LockTables(parsetree);
         s_moved = MoveAside(rename ? NamesTaken(parsetree, true) : [], [.. unlive, .. invalid]);
         s_hidden = [];
         Hide(unlive, true);
@@ -1158,14 +1219,24 @@ internal static unsafe partial class LocalIndex
                 return !((IndexStmt*)parsetree)->concurrent;
             case NodeTag.T_CreateStmt:
                 return true;
-            case NodeTag.T_AlterTableStmt when ((AlterTableStmt*)parsetree)->objtype == ObjectType.OBJECT_TABLE:
-                List* cmds = ((AlterTableStmt*)parsetree)->cmds;
+            case NodeTag.T_AlterTableStmt when ((AlterTableStmt*)parsetree)->objtype is ObjectType.OBJECT_TABLE or ObjectType.OBJECT_FOREIGN_TABLE:
+                // An index on this node alone that the statement names has to keep its name for the statement to find it.
+                AlterTableStmt* alter = (AlterTableStmt*)parsetree;
+                List* cmds = alter->cmds;
+                uint relid = NativeMethods.RangeVarGetRelidExtended(alter->relation, 0, RangeVarMissingOk, default, null);
                 for (int i = 0; cmds is not null && i < cmds->length; i++)
                 {
                     AlterTableCmd* cmd = (AlterTableCmd*)cmds->elements[i].ptr_value;
-                    if (cmd->subtype is AlterTableType.AT_ClusterOn or AlterTableType.AT_ReplicaIdentity or AlterTableType.AT_AddIndexConstraint ||
-                        (cmd->subtype == AlterTableType.AT_AddConstraint && cmd->def is not null && cmd->def->type == NodeTag.T_Constraint &&
-                            ((Constraint*)cmd->def)->indexname is not null))
+                    sbyte* named = cmd->subtype switch
+                    {
+                        AlterTableType.AT_ClusterOn => cmd->name,
+                        AlterTableType.AT_ReplicaIdentity when cmd->def is not null => ((ReplicaIdentityStmt*)cmd->def)->name,
+                        AlterTableType.AT_AddIndexConstraint when cmd->def is not null => ((IndexStmt*)cmd->def)->idxname,
+                        AlterTableType.AT_AddConstraint when cmd->def is not null && cmd->def->type == NodeTag.T_Constraint =>
+                            ((Constraint*)cmd->def)->indexname,
+                        _ => null,
+                    };
+                    if (named is not null && (relid == 0 || Contains(NativeMethods.get_relname_relid(named, NativeMethods.get_rel_namespace(relid)))))
                     {
                         return false;
                     }
