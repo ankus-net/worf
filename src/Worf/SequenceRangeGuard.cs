@@ -50,6 +50,7 @@ internal static partial class SequenceRangeGuard
     // error, which skips the code after the wait.
     private static readonly Dictionary<uint, int> s_waitingFor = [];
     private static bool s_exitHooked;
+    private static int s_backends;
 
     private const int MaxDrawers = 1024;
 
@@ -488,7 +489,9 @@ internal static partial class SequenceRangeGuard
     {
         decimal left = position is long p ? (ascending ? (decimal)hi - p : (decimal)p - lo) : (decimal)hi - lo + 1;
         decimal tail = s_reservedActive.Contains((seqoid, lo)) ? 0 : ((decimal)hi - lo) / 20;
-        return left <= tail || left < Drawing(seqoid).Statements;
+
+        // No more statements can draw than there are backends, so a block with as many values left needs no count.
+        return left <= tail || (left < Backends() && left < Drawing(seqoid).Statements);
     }
 
     /// <summary>
@@ -653,10 +656,18 @@ internal static partial class SequenceRangeGuard
     /// </summary>
     private static void PassGates()
     {
-        if (s_gates.Count > 0 && SequenceRanges.SwitchesPending.Value > 0)
+        if (s_gates.Count == 0 || SequenceRanges.SwitchesPending.Value == 0)
         {
-            TakeGates(LetGates());
+            return;
         }
+
+        List<uint> passing = [.. s_gates.Keys.Where(seqoid => Drawer(seqoid).Switching > 0).Order()];
+        foreach (uint seqoid in passing)
+        {
+            LetGate(seqoid);
+        }
+
+        TakeGates(passing);
     }
 
     /// <summary>
@@ -718,17 +729,42 @@ internal static partial class SequenceRangeGuard
     /// <returns>The numbers.</returns>
     internal static (int Statements, int Waiting) Drawing(uint seqoid)
     {
+        WorfDrawer drawer = Drawer(seqoid);
+        return (drawer.Statements, drawer.Waiting);
+    }
+
+    /// <summary>
+    /// Reads a sequence's entry in the shared table.
+    /// </summary>
+    private static WorfDrawer Drawer(uint seqoid)
+    {
         uint dboid = DatabaseId();
         using PgLwLockShareGuard<WorfDrawers, WorfDrawer> guard = Drawers.Share();
         for (int probe = 0, i = Slot(dboid, seqoid); probe < MaxDrawers && guard[i].Dboid != 0; probe++, i = (i + 1) % MaxDrawers)
         {
             if (guard[i].Dboid == dboid && guard[i].Seqoid == seqoid)
             {
-                return (guard[i].Statements, guard[i].Waiting);
+                return guard[i];
             }
         }
 
-        return (0, 0);
+        return default;
+    }
+
+    /// <summary>
+    /// Reads how many backends the server has room for.
+    /// </summary>
+    private static int Backends()
+    {
+        if (s_backends == 0)
+        {
+            unsafe
+            {
+                s_backends = NativeGlobals.MaxBackends;
+            }
+        }
+
+        return s_backends;
     }
 
     /// <summary>
@@ -741,7 +777,7 @@ internal static partial class SequenceRangeGuard
     /// Counts a statement that takes or lets go of a sequence's gate, or that starts or stops waiting for it to switch.
     /// A sequence that finds no entry free goes uncounted.
     /// </summary>
-    private static void CountDrawer(uint seqoid, int statements, int waiting = 0)
+    private static void CountDrawer(uint seqoid, int statements, int waiting = 0, int switching = 0)
     {
         uint dboid = DatabaseId();
         using PgLwLockExclusiveGuard<WorfDrawers, WorfDrawer> guard = Drawers.Exclusive();
@@ -752,15 +788,23 @@ internal static partial class SequenceRangeGuard
                 WorfDrawer drawer = guard[i];
                 drawer.Statements = Math.Max(drawer.Statements + statements, 0);
                 drawer.Waiting = Math.Max(drawer.Waiting + waiting, 0);
+                drawer.Switching = Math.Max(drawer.Switching + switching, 0);
                 guard[i] = drawer;
                 return;
             }
 
             if (guard[i].Dboid == 0)
             {
-                if (statements > 0 || waiting > 0)
+                if (statements > 0 || waiting > 0 || switching > 0)
                 {
-                    guard[i] = new WorfDrawer { Dboid = dboid, Seqoid = seqoid, Statements = Math.Max(statements, 0), Waiting = Math.Max(waiting, 0) };
+                    guard[i] = new WorfDrawer
+                    {
+                        Dboid = dboid,
+                        Seqoid = seqoid,
+                        Statements = Math.Max(statements, 0),
+                        Waiting = Math.Max(waiting, 0),
+                        Switching = Math.Max(switching, 0),
+                    };
                 }
 
                 return;
@@ -780,8 +824,15 @@ internal static partial class SequenceRangeGuard
     internal static unsafe void ShutGate(uint seqoid, int timeout)
     {
         _ = PgAtomic.Add(SequenceRanges.SwitchesPending, 1L);
-        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () => _ = PgAtomic.Add(SequenceRanges.SwitchesPending, -1L));
-        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, static () => _ = PgAtomic.Add(SequenceRanges.SwitchesPending, -1L));
+        CountDrawer(seqoid, 0, 0, 1);
+        void Done()
+        {
+            CountDrawer(seqoid, 0, 0, -1);
+            _ = PgAtomic.Add(SequenceRanges.SwitchesPending, -1L);
+        }
+
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, Done);
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, Done);
         _ = Worf.Execute($"SET LOCAL lock_timeout = {timeout.ToString(CultureInfo.InvariantCulture)}");
         LOCKTAG tag = GateTag(seqoid);
         _ = NativeMethods.LockAcquire(&tag, ExclusiveLock, false, false);

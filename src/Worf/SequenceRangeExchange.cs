@@ -31,7 +31,11 @@ internal static class SequenceRangeExchange
     // subscriptions whose last call ran out of time, which back off up to a minute.
     private static readonly Dictionary<uint, (long At, long Delay)> s_retries = [];
     private static readonly HashSet<uint> s_timedOut = [];
+
+    // When each subscription's provider whose last call ran out of time was last called.
+    private static readonly Dictionary<uint, long> s_probedAt = [];
     private const long TimedOutBackoff = 60_000_000;
+    private const long TimedOutFirstBackoff = 10_000_000;
 
     // When each link last exchanged, by subscription, and the links with acknowledgements to send.
     private static readonly Dictionary<uint, long> s_exchangedAt = [];
@@ -291,7 +295,16 @@ internal static class SequenceRangeExchange
             return false;
         }
 
-        // A neighbor whose last call ran out of time goes last, so that the calls to the others don't wait on it.
+        // A neighbor whose last call ran out of time goes last, so that the calls to the others don't wait on it, and is
+        // called only while nothing waits on the others, as a block this node asked another neighbor for, or once a
+        // minute, so that a neighbor that never answers holds up the others' calls at most a second a minute.
+        long[] timedOutNodes = [.. due.Where(link => s_timedOut.Contains(link.Sub.Id)).Select(link => (long)link.Sub.Origin.Id)];
+        bool othersWait = timedOutNodes.Length > 0 && (due.Exists(link => !s_timedOut.Contains(link.Sub.Id) && link.Waiting is not null) ||
+            PgBackgroundWorker.RunTransaction(() => Worf.ReadScalar<bool>("""
+                SELECT EXISTS (
+                    SELECT 1 FROM worf.sequence_range_request
+                    WHERE state = 'open' AND parent_node <> ALL ($1::pg_catalog.int8[]::pg_catalog.oid[]))
+                """, SpiParameter.Create(timedOutNodes))));
         bool changed = false;
         foreach ((WorfSubscription sub, string? waiting, bool fenced) in due.OrderBy(link => s_timedOut.Contains(link.Sub.Id)))
         {
@@ -303,6 +316,16 @@ internal static class SequenceRangeExchange
 
             long now = Worker.GetCurrentTimestamp();
             SequenceRangeExchangeWorker.Probing = s_timedOut.Contains(sub.Id);
+            if (SequenceRangeExchangeWorker.Probing)
+            {
+                if (othersWait && now - s_probedAt.GetValueOrDefault(sub.Id) < TimedOutBackoff)
+                {
+                    continue;
+                }
+
+                s_probedAt[sub.Id] = now;
+            }
+
             try
             {
                 (bool received, bool granted) = ExchangeWith(node, sub);
@@ -353,7 +376,8 @@ internal static class SequenceRangeExchange
                 // exchange timeout while this node waits on the neighbor, as for a block, so that inserts waiting at a
                 // block's end, up to twice the timeout, get it soon after the neighbor is back. A call the watcher
                 // cancelled has run out of time, which held up the calls to the other neighbors that came after it, so it
-                // backs off up to a minute, or the exchange interval if that is longer, whatever waits on the neighbor.
+                // backs off from ten seconds up to a minute, or the exchange interval if that is longer, whatever waits on
+                // the neighbor.
                 bool timedOut = error is PgQueryCanceledException;
                 long most = waiting is not null && !timedOut
                     ? Math.Min(SequenceRanges.ExchangeInterval * 1000L, SequenceRanges.ExchangeTimeout * 500L)
@@ -365,7 +389,8 @@ internal static class SequenceRangeExchange
                 }
 
                 long delay = s_retries.TryGetValue(sub.Id, out (long At, long Delay) retry) ? retry.Delay * 2 : 0;
-                delay = Math.Min(Math.Max(delay, SequenceRanges.CheckInterval * 1000L), Math.Max(most, SequenceRanges.CheckInterval * 1000L));
+                long least = timedOut ? Math.Min(TimedOutFirstBackoff, most) : SequenceRanges.CheckInterval * 1000L;
+                delay = Math.Min(Math.Max(delay, Math.Max(least, SequenceRanges.CheckInterval * 1000L)), Math.Max(most, SequenceRanges.CheckInterval * 1000L));
                 s_retries[sub.Id] = (now + delay, delay);
                 string failure = error is PgQueryCanceledException
                     ? $"node {sub.Origin.Name} didn't answer within {(SequenceRangeExchangeWorker.Probing ? Math.Min(SequenceRanges.ExchangeTimeout, 1000) : SequenceRanges.ExchangeTimeout).ToString(CultureInfo.InvariantCulture)} ms"

@@ -97,9 +97,26 @@ internal static class SequenceRangeReservations
                     continue;
                 }
 
-                if (active is not null && (left >= needed || (requested && active.Value.Id != requestedUnder && Reserved(active.Value.Id))))
+                if (active is not null && Reserved(active.Value.Id) && (left >= needed || (requested && active.Value.Id != requestedUnder)))
                 {
                     break;
+                }
+
+                // An active block with values enough left serves the load once the worker has marked it reserved, as a
+                // block switched to for a load is, so that the load counts neither toward the sequence's rate nor toward
+                // the size of its next blocks.
+                if (active is not null && left >= needed)
+                {
+                    if (!requested || active.Value.Id != requestedUnder)
+                    {
+                        requested = true;
+                        requestedUnder = active.Value.Id;
+                        requestId = Guid.NewGuid();
+                        Post(new WorfReservation { RequestId = requestId, Seqoid = seqoid, Kind = (byte)'a', Size = needed, Lo = active.Value.Lo, Hi = active.Value.Hi });
+                    }
+
+                    Wait(requestId, deadline, $"a block of {needed} values of sequence {info.Name}");
+                    continue;
                 }
 
                 if (!requested || (!pending && active?.Id != requestedUnder))
@@ -221,6 +238,26 @@ internal static class SequenceRangeReservations
         {
             WorfRows range = Worf.Query("SELECT owner_node, epoch FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE", false, 1,
                 SpiParameter.Create(reservation.Seqoid));
+
+            // The active block that a session found has values enough left serves its load, and no longer carries the
+            // time it became active, so that it isn't sampled for the rate nor resizes the next request as it ends. One
+            // switched away from since is left alone, and the session looks again.
+            if (reservation.Kind == (byte)'a')
+            {
+                if (range.Count > 0)
+                {
+                    _ = Worf.Execute("""
+                        UPDATE worf.sequence_range_block SET reserved = true, activated_at = NULL
+                        WHERE seqoid = $1 AND epoch = $2 AND kind = 'n' AND state = 'active' AND lo = $3 AND hi = $4
+                        """, SpiParameter.Create(reservation.Seqoid), SpiParameter.Create(range[0].Get<int>(1)), SpiParameter.Create(reservation.Lo),
+                        SpiParameter.Create(reservation.Hi));
+                    SequenceRanges.ChangedOnCommit();
+                }
+
+                recorded.Add(reservation.RequestId);
+                continue;
+            }
+
             if (range.Count > 0 && reservation.Kind == (byte)'n' && Worf.Execute("""
                 UPDATE worf.sequence_range_block SET reserved = true
                 WHERE block_id = (
