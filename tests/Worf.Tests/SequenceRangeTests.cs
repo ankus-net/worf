@@ -920,10 +920,10 @@ public sealed class SequenceRangeTests
     }
 
     /// <summary>
-    /// A transaction that runs its active block out switches the sequence to the next block itself, whether an
-    /// INSERT ... SELECT, a multi-row VALUES or a COPY, which switches as its rows reach the block's last thousand values.
-    /// A prepared transaction that only read the sequence holds off no switch, while one that drew from it does, which
-    /// the ranges' view names.
+    /// A statement that runs its active block out goes on into the next blocks as they arrive, whether an
+    /// INSERT ... SELECT, a multi-row VALUES or a COPY, which checks the sequence for each row rather than for each
+    /// buffer of rows, and wastes no block's values. Values a transaction that rolled back drew are never issued again,
+    /// and a prepared transaction, whether it read the sequence or drew from it, holds off no switch.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -961,7 +961,41 @@ public sealed class SequenceRangeTests
 
         Assert.AreEqual("2300|2300", await node.SafePsqlAsync(Database, "SELECT count(*), count(DISTINCT id) FROM cp", token), "cp's rows");
 
-        // A prepared transaction that read the sequence leaves its switches be, and one that drew from it is named.
+        // Single-row COPYs keep drawing from the block they started in, and a COPY that needs several blocks gets them.
+        string cpBlock = await node.SafePsqlAsync(Database, "SELECT active_lo FROM worf.sequence_ranges WHERE sequence = 'cp_id_seq'::regclass", token);
+        for (int i = 0; i < 5; i++)
+        {
+            await using NpgsqlConnection copier = await node.OpenAsync(Database, token);
+            await using TextWriter rows = await copier.BeginTextImportAsync("COPY cp (v) FROM STDIN", token);
+            await rows.WriteAsync("single\n".AsMemory(), token);
+        }
+
+        Assert.AreEqual(cpBlock, await node.SafePsqlAsync(Database, "SELECT active_lo FROM worf.sequence_ranges WHERE sequence = 'cp_id_seq'::regclass", token),
+            "the block single-row COPYs drew from");
+        await using (NpgsqlConnection copier = await node.OpenAsync(Database, token))
+        {
+            await using TextWriter rows = await copier.BeginTextImportAsync("COPY sp (v) FROM STDIN", token);
+            for (int i = 0; i < 250; i++)
+            {
+                await rows.WriteAsync($"copied {i}\n".AsMemory(), token);
+            }
+        }
+
+        Assert.AreEqual("490|490", await node.SafePsqlAsync(Database, "SELECT count(*), count(DISTINCT id) FROM sp", token), "sp's rows");
+
+        // A transaction that drew across a block's end and rolled back leaves its values issued.
+        string drawn = await node.SafePsqlAsync(Database, """
+            BEGIN;
+            CREATE TEMP TABLE drawn (id bigint) ON COMMIT DROP;
+            WITH inserted AS (INSERT INTO sp (v) SELECT 'rolled back' FROM generate_series(1, 150) RETURNING id) INSERT INTO drawn SELECT id FROM inserted;
+            SELECT string_agg(id::text, ',') FROM drawn;
+            ROLLBACK;
+            """, token);
+        _ = await node.SafePsqlAsync(Database, "INSERT INTO sp (v) SELECT 'after' FROM generate_series(1, 300)", token);
+        Assert.AreEqual("0", await node.SafePsqlAsync(Database, $"SELECT count(*) FROM sp WHERE id IN ({drawn.Split('\n')[^1]})", token),
+            "values a rolled-back transaction drew, issued again");
+
+        // A prepared transaction that read the sequence, or drew from it, leaves its switches be.
         _ = await node.SafePsqlAsync(Database, "BEGIN; SELECT last_value FROM sp_id_seq; PREPARE TRANSACTION 'reader'", token);
         Assert.IsTrue(await node.PollQueryUntilAsync(Database, string.Format(CultureInfo.InvariantCulture, Ready, "sp_id_seq"), token), "sp's next block");
         string before = await node.SafePsqlAsync(Database, "SELECT active_lo FROM worf.sequence_ranges WHERE sequence = 'sp_id_seq'::regclass", token);
@@ -971,13 +1005,12 @@ public sealed class SequenceRangeTests
         _ = await node.SafePsqlAsync(Database, "COMMIT PREPARED 'reader'", token);
         Assert.IsTrue(await node.PollQueryUntilAsync(Database, string.Format(CultureInfo.InvariantCulture, Ready, "sp_id_seq"), token), "sp's next block");
         _ = await node.SafePsqlAsync(Database, "BEGIN; INSERT INTO sp (v) VALUES ('prepared'); PREPARE TRANSACTION 'drawer'", token);
-        _ = await node.SafePsqlAsync(Database, $"SELECT setval('sp_id_seq', active_hi - 2) FROM worf.sequence_ranges WHERE sequence = 'sp_id_seq'::regclass", token);
-        Assert.IsTrue(await node.PollQueryUntilAsync(Database, """
-            SELECT detail LIKE '%prepared transaction "drawer" holds the sequence%' FROM worf.sequence_ranges WHERE sequence = 'sp_id_seq'::regclass
-            """, token), "the prepared transaction named");
+        before = await node.SafePsqlAsync(Database, "SELECT active_lo FROM worf.sequence_ranges WHERE sequence = 'sp_id_seq'::regclass", token);
+        _ = await node.SafePsqlAsync(Database, "INSERT INTO sp (v) SELECT 'past the drawer' FROM generate_series(1, 200)", token);
+        Assert.AreNotEqual(before, await node.SafePsqlAsync(Database,
+            "SELECT active_lo FROM worf.sequence_ranges WHERE sequence = 'sp_id_seq'::regclass", token), "a switch past the drawer");
         _ = await node.SafePsqlAsync(Database, "ROLLBACK PREPARED 'drawer'", token);
-        Assert.IsTrue(await node.PollQueryUntilAsync(Database,
-            "SELECT detail IS NULL FROM worf.sequence_ranges WHERE sequence = 'sp_id_seq'::regclass", token), "a switch once it ended");
+        Assert.DoesNotContain("reached maximum value", node.ReadLog(), "inserts that ran a block out");
     }
 
     /// <summary>
@@ -2113,10 +2146,8 @@ public sealed class SequenceRangeTests
             Assert.IsTrue(await node.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges", token),
                 $"{node.Name} drawing from a block");
 
-            // A load larger than a block fails at the block's end, and succeeds once reserved.
-            PostgresException shortBlock = await Assert.ThrowsExactlyAsync<PostgresException>(() => node.SafePsqlAsync(Database,
-                "INSERT INTO t (v) SELECT 'bulk' FROM generate_series(1, 1000)", token));
-            Assert.AreEqual("2200H", shortBlock.SqlState);
+            // A load larger than a block goes through the blocks as they arrive, and a reserved one at once.
+            _ = await node.SafePsqlAsync(Database, "INSERT INTO t (v) SELECT 'bulk' FROM generate_series(1, 1000)", token);
             _ = await node.SafePsqlAsync(Database, "SELECT worf.reserve_sequence_range('t_id_seq', 1000)", token);
 
             _ = await node.SafePsqlAsync(Database, "INSERT INTO t (v) SELECT 'bulk' FROM generate_series(1, 1000)", token);
@@ -2141,7 +2172,7 @@ public sealed class SequenceRangeTests
             }
         }
 
-        Assert.HasCount(2110, keys);
+        Assert.HasCount(4110, keys);
 
         // A load's transaction holds the sequence from its reservation's switch until it commits, and the range worker
         // leaves the sequence for later rather than wait on it. Neither that load nor one after a reservation of its own,
@@ -2366,8 +2397,8 @@ public sealed class SequenceRangeTests
 
     /// <summary>
     /// Transactions that hold a sequence at its block's end, as slow ones among many sessions, or one for longer than the
-    /// exchange timeout, hold up only the inserts into that sequence, which wait for the switch rather than run the block
-    /// out, while another sequence goes on switching.
+    /// exchange timeout, hold up no inserts: the switch goes on beside them, and the other sessions' inserts go on into
+    /// the next block rather than run the block out, as another sequence's go on switching.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -2414,8 +2445,8 @@ public sealed class SequenceRangeTests
         Assert.AreEqual($"{Sessions * Transactions}", await node.SafePsqlAsync(Database, "SELECT count(*) FROM t1", token));
 
         // A transaction holds t2 for 6 s once it reaches its block's last twentieth, which the other sessions' inserts
-        // into t2 wait for, while t1's go on through its blocks, each switch in under two seconds, as a switch worker
-        // starts slowly on a busy Windows runner, rather than the six t2 waits.
+        // into t2 don't wait for, and t1's go on through its blocks, each switch in under a second, against the one
+        // and a half a switch that waited for the holders took.
         await using NpgsqlConnection holder = await node.OpenAsync(Database, token);
         await using NpgsqlTransaction held = await holder.BeginTransactionAsync(token);
         long left = long.Parse(await node.SafePsqlAsync(Database,
@@ -2450,12 +2481,12 @@ public sealed class SequenceRangeTests
             }
         })];
         await Task.Delay(TimeSpan.FromSeconds(6), token);
-        Assert.AreEqual(0, t2Inserts.Count(insert => insert.IsCompleted), "t2's inserts didn't wait for the holder");
+        Assert.AreEqual(t2Inserts.Length, t2Inserts.Count(insert => insert.IsCompleted), "t2's inserts went on beside the holder");
         await held.CommitAsync(token);
         await Task.WhenAll(t2Inserts);
         await holding.CancelAsync();
         long t1Slowest = (await Task.WhenAll(t1Inserts)).Max();
-        Assert.IsLessThan(2000L, t1Slowest, "t1's slowest insert, in ms, while t2 was held");
+        Assert.IsLessThan(1000L, t1Slowest, "t1's slowest insert, in ms, while t2 was held");
         Assert.AreEqual($"{left - 30 + 160}", await node.SafePsqlAsync(Database, "SELECT count(*) FROM t2", token));
         Assert.DoesNotContain("reached maximum value", node.ReadLog(), "inserts that ran a block out");
     }

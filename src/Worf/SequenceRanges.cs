@@ -276,6 +276,9 @@ internal static unsafe partial class SequenceRanges
     private static readonly Dictionary<uint, string> s_handOffs = [];
     private static readonly HashSet<uint> s_unstarted = [];
 
+    // Whether this transaction switched a sequence itself, which it then can't prepare.
+    private static bool s_refusePrepare;
+
     /// <summary>
     /// Gets how often the range worker checks each managed sequence.
     /// </summary>
@@ -3655,11 +3658,22 @@ internal static unsafe partial class SequenceRanges
     /// <param name="forLoad">Whether the block was reserved for a load.</param>
     /// <param name="lockTimeout">How long to wait for transactions that called nextval, in milliseconds, or zero to take
     /// the sequence's lock only when none holds it, without queueing for it.</param>
+    /// <param name="inTransaction">Whether a session's own transaction switches, which leaves the range row alone, so that
+    /// the exchanges and the range worker, which take it, don't wait for the transaction.</param>
+    /// <param name="beside">Whether the switch goes on beside the transactions that called nextval, taking only the lock
+    /// that keeps other switches and DDL off, rather than wait for them; nextval then reaches the block's start at once,
+    /// and its bounds as the switch commits, so the switch's transaction is to commit at once.</param>
     /// <returns>Whether it switched; it doesn't when a transaction that called nextval holds the sequence that long, or
     /// another switch took the block first.</returns>
-    internal static bool Switch(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) block, bool forLoad = false, int lockTimeout = 200)
+    internal static bool Switch(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) block, bool forLoad = false, int lockTimeout = 200,
+        bool inTransaction = false, bool beside = false)
     {
-        LockLedger(seqoid);
+        int mode = (int)(beside ? PgLockMode.ShareUpdateExclusive : PgLockMode.ShareRowExclusive);
+        if (!inTransaction)
+        {
+            LockLedger(seqoid);
+        }
+
         if (Worf.ReadScalar<long?>("SELECT not_before FROM worf.sequence_range_block WHERE block_id = $1", SpiParameter.Create(block.Id)) is long notBefore &&
             SnowflakeIds.NowMs() <= notBefore)
         {
@@ -3668,20 +3682,21 @@ internal static unsafe partial class SequenceRanges
 
         string lo = block.Lo.ToString(CultureInfo.InvariantCulture);
         string hi = block.Hi.ToString(CultureInfo.InvariantCulture);
-        string start = info.Ascending ? lo : hi;
-
-        // A block of one value, as a Snowflake node number, can't be a sequence's bounds, so the sequence stays
-        // quarantined and the block only marks the value as this node's.
-        if (block.Lo != block.Hi)
+        bool next = true;
+        bool walked = false;
+        double? lasted = null;
+        int nestLevel = NativeMethods.NewGUCNestLevel();
+        try
         {
-            bool next = true;
-            try
+            PgTransaction.RunInSubtransaction(() =>
             {
-                PgTransaction.RunInSubtransaction(() =>
+                // A block of one value, as a Snowflake node number, can't be a sequence's bounds, so the sequence stays
+                // quarantined and the block only marks the value as this node's.
+                if (block.Lo != block.Hi)
                 {
                     if (lockTimeout == 0)
                     {
-                        next = NativeMethods.ConditionalLockRelationOid(seqoid, (int)PgLockMode.ShareRowExclusive);
+                        next = NativeMethods.ConditionalLockRelationOid(seqoid, mode);
                         if (!next)
                         {
                             return;
@@ -3689,47 +3704,77 @@ internal static unsafe partial class SequenceRanges
                     }
                     else
                     {
-                        _ = Worf.Execute("SELECT pg_catalog.set_config('lock_timeout', $1, true)", SpiParameter.Create(
-                            lockTimeout.ToString(CultureInfo.InvariantCulture)));
-                        NativeMethods.LockRelationOid(seqoid, (int)PgLockMode.ShareRowExclusive);
-                    }
+                        fixed (byte* name = Worf.ToServerCString("lock_timeout"))
+                        fixed (byte* value = Worf.ToServerCString(lockTimeout.ToString(CultureInfo.InvariantCulture)))
+                        {
+                            _ = NativeMethods.set_config_option((sbyte*)name, (sbyte*)value, GucContext.PGC_USERSET, GucSource.PGC_S_SESSION,
+                                GucAction.GUC_ACTION_SAVE, true, 0, false);
+                        }
 
-                    // Another switch may have taken the block while this one read it or waited for the lock. Restarting
-                    // the sequence at the block's start would then issue its values again, so this one leaves it.
-                    next = Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range_block WHERE block_id = $1 AND state = 'next'",
-                        SpiParameter.Create(block.Id)).Count > 0;
-                    if (next)
-                    {
-                        RunInternalDdl($"ALTER SEQUENCE {info.Name} NO CYCLE CACHE 1 MINVALUE {lo} MAXVALUE {hi} START WITH {start} RESTART WITH {start}");
+                        NativeMethods.LockRelationOid(seqoid, mode);
                     }
-                    else
-                    {
-                        NativeMethods.UnlockRelationOid(seqoid, (int)PgLockMode.ShareRowExclusive);
-                    }
+                }
 
-                    _ = Worf.Execute("SET LOCAL lock_timeout = 0");
-                });
-            }
-            catch (PgException error) when (error.SqlState == "55P03")
-            {
-                return false;
-            }
+                // Another switch may have taken the block while this one read it or waited for the lock, or, as a
+                // session's own switch doesn't lock the range row, an exchange abandoned it. Moving the sequence into the
+                // block would then issue its values again, so this one leaves it, and the subtransaction gives the lock
+                // back.
+                next = Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range_block WHERE block_id = $1 AND state = 'next'",
+                    SpiParameter.Create(block.Id)).Count > 0;
+                if (!next)
+                {
+                    throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState, "the block was taken");
+                }
 
-            if (!next)
-            {
-                return false;
-            }
+                lasted = Worf.ExecuteScalar<double?>("""
+                    UPDATE worf.sequence_range_block SET state = 'retired', retired_at = now()
+                    WHERE seqoid = $1 AND kind = 'n' AND state = 'active'
+                    RETURNING extract(epoch FROM now() - activated_at)::float8
+                    """, SpiParameter.Create(seqoid));
+                next = Worf.ExecuteScalar<bool?>("""
+                    UPDATE worf.sequence_range_block SET state = 'active', activated_at = CASE WHEN $2 THEN now() END
+                    WHERE block_id = $1 AND state = 'next'
+                    RETURNING true
+                    """, SpiParameter.Create(block.Id), SpiParameter.Create(!forLoad)) is true;
+                if (!next)
+                {
+                    throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState, "the block was taken");
+                }
+
+                if (block.Lo != block.Hi && !SetBounds(seqoid, info, block))
+                {
+                    walked = true;
+                    next = false;
+                    throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState, "the sequence went past the block");
+                }
+            });
+        }
+        catch (PgException error) when (error.SqlState == "55P03" || (!next && error.SqlState == PgSqlStates.ObjectNotInPrerequisiteState))
+        {
+            return false;
+        }
+        finally
+        {
+            // The wait's own lock_timeout goes, whatever the session set.
+            NativeMethods.AtEOXact_GUC(true, nestLevel);
+        }
+
+        if (walked)
+        {
+            _ = Worf.Execute("UPDATE worf.sequence_range_block SET state = 'retired', retired_at = now() WHERE block_id = $1 AND state = 'next'",
+                SpiParameter.Create(block.Id));
+            PgLog.Warning($"sequence {info.Name} went past its next block [{lo}, {hi}] after a switch to it rolled back, so the block is retired unused");
+        }
+
+        if (!next)
+        {
+            return false;
         }
 
         // A block that lasted less than an hour makes the next request bigger, and one that lasted more than a day
         // smaller. A reservation's switch, which retires a block early, and its block, sized for a load, say nothing of
-        // how fast the sequence draws, so neither counts.
-        double? lasted = Worf.ExecuteScalar<double?>("""
-            UPDATE worf.sequence_range_block SET state = 'retired', retired_at = now()
-            WHERE seqoid = $1 AND kind = 'n' AND state = 'active'
-            RETURNING extract(epoch FROM now() - activated_at)::float8
-            """, SpiParameter.Create(seqoid));
-        if (!forLoad && lasted is double seconds)
+        // how fast the sequence draws, so neither counts, and nor does a session's own switch, which leaves the range row.
+        if (!forLoad && !inTransaction && lasted is double seconds)
         {
             string resize = seconds < s_growBelow.TotalSeconds ? "least(request_size * 2, max_range_size)"
                 : seconds > s_shrinkAbove.TotalSeconds ? "greatest(request_size / 2, range_size)"
@@ -3737,13 +3782,52 @@ internal static unsafe partial class SequenceRanges
             _ = Worf.Execute($"UPDATE worf.sequence_range SET request_size = {resize} WHERE seqoid = $1", SpiParameter.Create(seqoid));
         }
 
-        _ = Worf.Execute("UPDATE worf.sequence_range_block SET state = 'active', activated_at = CASE WHEN $2 THEN now() END WHERE block_id = $1",
-            SpiParameter.Create(block.Id), SpiParameter.Create(!forLoad));
-        _ = Worf.Execute("UPDATE worf.sequence_range SET state = 'active', switched_at = now(), detail = NULL WHERE seqoid = $1",
-            SpiParameter.Create(seqoid));
-        // Sessions' guards reload before any nextval reaches the block, which waits for the switch's lock until then.
+        if (!inTransaction)
+        {
+            _ = Worf.Execute("UPDATE worf.sequence_range SET state = 'active', switched_at = now(), detail = NULL WHERE seqoid = $1",
+                SpiParameter.Create(seqoid));
+        }
+
+        // Sessions' guards reload before any nextval reaches the block, which waits for the switch's lock until then. The
+        // switch is logged once it commits.
         ChangedOnCommit();
-        PgLog.Log($"sequence {info.Name} switched to its block [{lo}, {hi}]");
+        string switched = $"sequence {info.Name} switched to its block [{lo}, {hi}]";
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, () => PgLog.Log(switched));
+        return true;
+    }
+
+    /// <summary>
+    /// Makes a block a sequence's bounds without new storage for the sequence, as ALTER SEQUENCE ... RESTART would make:
+    /// the bounds go in its catalog row, with the transaction, and its position moves to the block's start at once, as
+    /// setval moves it, unless it is in the block already, as a switch to the block that rolled back left it. A switch
+    /// that rolls back so never makes the sequence issue a value again: until a switch commits, nextval goes on from the
+    /// block's start under the old bounds, and the next switch to the block goes on from where the sequence got to. A
+    /// position that is in neither the old bounds nor the block, but past the block, went through it that way, so the
+    /// block isn't switched to.
+    /// </summary>
+    /// <returns>Whether the block became the sequence's bounds.</returns>
+    private static bool SetBounds(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) block)
+    {
+        SpiParameter seq = SpiParameter.Create(seqoid);
+        long start = info.Ascending ? block.Lo : block.Hi;
+        SpiResult bounds = Worf.SelectCatalog("SELECT seqmin, seqmax FROM pg_catalog.pg_sequence WHERE seqrelid = $1", seq);
+        long? position = LastValue(seqoid);
+        bool inBlock = position >= block.Lo && position <= block.Hi;
+        bool inOld = position >= bounds[0].Get<long>(0) && position <= bounds[0].Get<long>(1);
+        if (position is long at && !inBlock && !inOld && (info.Ascending ? at > block.Hi : at < block.Lo))
+        {
+            return false;
+        }
+
+        _ = Elevated.Run(() => Worf.Execute("""
+            UPDATE pg_catalog.pg_sequence SET seqmin = $2, seqmax = $3, seqstart = $4, seqcache = 1, seqcycle = false WHERE seqrelid = $1
+            """, seq, SpiParameter.Create(block.Lo), SpiParameter.Create(block.Hi), SpiParameter.Create(start)));
+        NativeMethods.CommandCounterIncrement();
+        if (!inBlock)
+        {
+            _ = Elevated.Run(() => Worf.Execute("SELECT pg_catalog.setval($1::pg_catalog.regclass, $2, false)", seq, SpiParameter.Create(start)));
+        }
+
         return true;
     }
 
@@ -3768,20 +3852,7 @@ internal static unsafe partial class SequenceRanges
             return true;
         }
 
-        if (!atEnd && !forLoad)
-        {
-            return false;
-        }
-
-        if (PreparedHolder(seqoid) is string gid)
-        {
-            string detail = $"can't switch to the next block while prepared transaction \"{gid}\" holds the sequence; COMMIT PREPARED or ROLLBACK PREPARED it";
-            if (SetDetail(seqoid, detail))
-            {
-                PgLog.Warning($"sequence {info.Name} {detail}");
-            }
-        }
-        else
+        if (atEnd || forLoad)
         {
             s_handOffs[seqoid] = info.Name;
         }
@@ -3792,70 +3863,63 @@ internal static unsafe partial class SequenceRanges
     /// <summary>
     /// Switches a sequence to its next block in the transaction that runs its active block out, which holds the
     /// sequence, as nextval leaves it held, so that no worker can switch it until the transaction ends, and the rest of
-    /// the transaction's rows take the next block's values. It waits for the other transactions that hold the sequence
-    /// up to worf.sequence_range_timeout, and then holds it until it ends, so that other sessions' inserts wait for it
-    /// rather than run the block out; a transaction that holds the sequence too as it reaches the block's end fails
-    /// there, as nothing can switch it meanwhile. A prepared transaction that holds the sequence, as long as it may, isn't
-    /// waited for. A transaction that doesn't hold the sequence leaves the switch to the range worker.
+    /// the transaction's rows take the next block's values. It switches only when no other transaction holds the
+    /// sequence, which it couldn't pass. It holds the
+    /// sequence until it ends, so that other sessions' inserts wait for it rather than run the block out, and it can't
+    /// be prepared, as a prepared transaction would hold them up across restarts. A transaction that doesn't hold the
+    /// sequence leaves the switch to the range worker.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
     /// <returns>Whether it switched.</returns>
     internal static bool SwitchInTransaction(uint seqoid) => Elevated.Run(() =>
     {
         SpiParameter seq = SpiParameter.Create(seqoid);
-        SpiResult rows = Worf.Read("SELECT state, epoch FROM worf.sequence_range WHERE seqoid = $1", 1, seq);
+        SpiResult rows = Worf.SelectCatalog("SELECT state, epoch FROM worf.sequence_range WHERE seqoid = $1", seq);
         if (rows.Count == 0 || rows[0].Get<string>(0) != "active" || seqoid == SnowflakeIds.NodeSequence() || !Worf.ReadScalar<bool>("""
             SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_locks WHERE locktype = 'relation' AND relation = $1 AND pid = pg_catalog.pg_backend_pid() AND granted)
+                AND NOT EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_locks
+                    WHERE locktype = 'relation' AND relation = $1 AND granted AND pid IS DISTINCT FROM pg_catalog.pg_backend_pid()
+                        AND database = (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())
+                        AND mode IN ('RowExclusiveLock', 'ShareUpdateExclusiveLock', 'ShareLock', 'ShareRowExclusiveLock', 'ExclusiveLock',
+                            'AccessExclusiveLock'))
             """, seq))
         {
             return false;
         }
 
         SequenceInfo info = GetInfo(seqoid);
-        if (NextBlock(seqoid, rows[0].Get<int>(1)) is not (Guid, long, long, bool) next || !Confirmed(seqoid, info, next.Id) || PreparedHolds(seqoid))
+        if (NextBlock(seqoid, rows[0].Get<int>(1)) is not (Guid, long, long, bool) next || !Confirmed(seqoid, info, next.Id))
         {
             return false;
         }
 
-        // A switch worker that waits for the sequence, which it can't have until this transaction ends, would deadlock
-        // with this switch, so its wait is cancelled, and it leaves the switch to this transaction.
-        if (SequenceRangeSwitchWorker.Pid(seqoid) is int pid)
-        {
-            _ = Worf.ReadScalar<bool>("SELECT pg_catalog.pg_cancel_backend($1)", SpiParameter.Create(pid));
-        }
-
+        bool switched;
         try
         {
-            return Switch(seqoid, info, (next.Id, next.Lo, next.Hi), next.Reserved, ExchangeTimeout);
+            switched = Switch(seqoid, info, (next.Id, next.Lo, next.Hi), next.Reserved, 1000, true);
         }
-        catch (PgException error) when (error.SqlState == "40P01")
+        catch (PgException error) when (error.SqlState is "40P01" or "40001")
         {
             return false;
         }
+
+        if (switched && !s_refusePrepare)
+        {
+            s_refusePrepare = true;
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.PrePrepare, static () =>
+            {
+                s_refusePrepare = false;
+                throw new PgException(PgSqlStates.FeatureNotSupported,
+                    "cannot PREPARE a transaction that switched a managed sequence to its next block",
+                    hint: "The switch holds the sequence, which a prepared transaction would hold across restarts.");
+            });
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () => s_refusePrepare = false);
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, static () => s_refusePrepare = false);
+        }
+
+        return switched;
     });
-
-    /// <summary>
-    /// Checks whether a prepared transaction holds a sequence against a switch, as one that called nextval before it was
-    /// prepared does, rather than one that only read it.
-    /// </summary>
-    private static bool PreparedHolds(uint seqoid) => PreparedHolder(seqoid) is not null;
-
-    /// <summary>
-    /// Finds a prepared transaction that holds a sequence against a switch.
-    /// </summary>
-    /// <returns>Its name, or null.</returns>
-    internal static string? PreparedHolder(uint seqoid) => Worf.ReadScalar<string?>("""
-        SELECT coalesce((
-                SELECT p.gid FROM pg_catalog.pg_locks x JOIN pg_catalog.pg_prepared_xacts p ON p.transaction = x.transactionid
-                WHERE x.locktype = 'transactionid' AND x.virtualtransaction = l.virtualtransaction AND x.pid IS NULL
-                LIMIT 1),
-            'unknown')
-        FROM pg_catalog.pg_locks l
-        WHERE l.locktype = 'relation' AND l.database = (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())
-            AND l.relation = $1 AND l.granted AND l.pid IS NULL
-            AND l.mode IN ('RowExclusiveLock', 'ShareUpdateExclusiveLock', 'ShareLock', 'ShareRowExclusiveLock', 'ExclusiveLock', 'AccessExclusiveLock')
-        LIMIT 1
-        """, SpiParameter.Create(seqoid));
 
     /// <summary>
     /// Starts a switch worker for each sequence that the range worker's checks left to one. With every worker slot taken,
@@ -3873,28 +3937,18 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
-    /// Switches a sequence to its next block for its switch worker: waits for the transactions that hold the sequence, as
-    /// long as they hold it, then for the range row, which an exchange holds a moment, up to a second without queueing for
-    /// it, so that a reset, which holds the row as it waits for the sequence, can't deadlock with it, and gets the
-    /// sequence in the end.
+    /// Switches a sequence to its next block for the switch worker, beside the transactions that hold the sequence, as
+    /// the range worker couldn't wait for them, so that inserts go on into the next block rather than run the active one
+    /// out or wait for them. It switches only while the active block is still in its last twentieth, or the next block
+    /// is reserved for a load, since a transaction that ran the block out may have switched it meanwhile.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
-    /// <returns>Whether it's done: the sequence switched, or has nothing to switch to. It throws 55P03 when a transaction
-    /// holds the range row longer.</returns>
+    /// <returns>Whether the worker is done, or false to try again.</returns>
     internal static bool SwitchAtEnd(uint seqoid)
     {
-        // A prepared transaction holds the sequence until it's committed or rolled back, across restarts too, so the
-        // worker leaves it to the range worker's checks rather than hold its inserts up that long, and they run the block
-        // out. The wait is one, however long, so that no insert gets past it meanwhile.
-        if (!SequenceExists(seqoid) || !IsManaged(seqoid) || PreparedHolds(seqoid))
+        if (!SequenceExists(seqoid) || !IsManaged(seqoid))
         {
             return true;
-        }
-
-        _ = Worf.Execute("SET LOCAL lock_timeout = 0");
-        unsafe
-        {
-            NativeMethods.LockRelationOid(seqoid, (int)PgLockMode.ShareRowExclusive);
         }
 
         LedgerNoWait = true;
@@ -3923,18 +3977,18 @@ internal static unsafe partial class SequenceRanges
 
             SequenceInfo info = GetInfo(seqoid);
             int epoch = rows[0].Get<int>(1);
-            if (NodeBlock(seqoid, epoch, "active") is null || NextBlock(seqoid, epoch) is not (Guid, long, long, bool) next ||
-                !Confirmed(seqoid, info, next.Id))
+            if (NodeBlock(seqoid, epoch, "active") is not (Guid, long, long) active || NextBlock(seqoid, epoch) is not (Guid, long, long, bool) next ||
+                !Confirmed(seqoid, info, next.Id) ||
+                (!next.Reserved && StepsLeft(seqoid, info, active) > Steps(info, active.Lo, active.Hi) / 20))
             {
                 return true;
             }
 
-            if (Switch(seqoid, info, (next.Id, next.Lo, next.Hi), next.Reserved))
-            {
-                ChangedOnCommit();
-            }
-
-            return true;
+            // Nextval reaches the block's start before the switch commits, so the commit doesn't wait for the disk; a
+            // later commit that writes the block's values flushes it.
+            _ = Worf.Execute("SET LOCAL synchronous_commit = off");
+            return Switch(seqoid, info, (next.Id, next.Lo, next.Hi), next.Reserved, ExchangeTimeout, beside: true) ||
+                NextBlock(seqoid, epoch)?.Id != next.Id;
         }
         finally
         {
@@ -4208,19 +4262,25 @@ internal static unsafe partial class SequenceRanges
             WHERE c.oid = $1
             """, 1, SpiParameter.Create(seqoid));
 
-        // A switch's ALTER SEQUENCE writes the sequence to a new file and empties the old one as it commits, under a
-        // lock that a read doesn't wait on, so a read that opened the old file just before could find it empty. Its
-        // block is also visible a moment before other sessions learn of the new file, so such a read could pair the new
-        // block with the old position, the quarantine's at the start. The read takes the lock nextval takes, which
-        // waits for a switch to finish committing, and lets it go once done, so that it holds off no switch for the
-        // rest of the transaction. It never queues for the lock, though: a switch that waits for the transactions that
-        // hold the sequence, or a reservation's transaction that holds it for a load, would hold the read up as long. Such
-        // a read goes without the lock, and is good when no switch held the lock as it read and the sequence's file
-        // stayed the same, since a switch writes a new one; while a switch holds it, the read tries again soon.
+        // A switch moves the sequence's position at once, and its bounds and block as it commits, so a read in between
+        // could pair the old block with the new position, or, just after the switch commits, the new block with the old
+        // position. The read takes a lock that every switch's conflicts with, but not nextval's, which waits for a switch
+        // to finish committing, and lets it go once done, so that it holds off no switch for the rest of the
+        // transaction. It never queues for the lock, though: a switch that waits for the transactions that hold the
+        // sequence, or a reservation's transaction that holds it for a load, would hold the read up as long. Such a read
+        // goes without the lock, and is good when no switch held the lock as it read and the sequence's catalog row and
+        // file stayed the same, since a switch updates the row, and DDL that rewrites the sequence writes a new file;
+        // while a switch holds it, the read tries again soon.
         string read = "SELECT CASE WHEN is_called THEN last_value END FROM " + Spi.QuoteQualifiedIdentifier(name[0].Get<string>(0), name[0].Get<string>(1));
+        // A standby switches nothing, and takes no such lock.
+        if (NativeMethods.RecoveryInProgress())
+        {
+            return Worf.ReadScalar<long?>(read);
+        }
+
         while (true)
         {
-            if (NativeMethods.ConditionalLockRelationOid(seqoid, (int)PgLockMode.RowExclusive))
+            if (NativeMethods.ConditionalLockRelationOid(seqoid, (int)PgLockMode.ShareUpdateExclusive))
             {
                 try
                 {
@@ -4228,14 +4288,14 @@ internal static unsafe partial class SequenceRanges
                 }
                 finally
                 {
-                    NativeMethods.UnlockRelationOid(seqoid, (int)PgLockMode.RowExclusive);
+                    NativeMethods.UnlockRelationOid(seqoid, (int)PgLockMode.ShareUpdateExclusive);
                 }
             }
 
-            if (FileUnlessSwitching(seqoid) is uint file)
+            if (VersionUnlessSwitching(seqoid) is string version)
             {
                 long? position = Worf.ReadScalar<long?>(read);
-                if (FileUnlessSwitching(seqoid) == file)
+                if (VersionUnlessSwitching(seqoid) == version)
                 {
                     return position;
                 }
@@ -4247,20 +4307,23 @@ internal static unsafe partial class SequenceRanges
     });
 
     /// <summary>
-    /// Finds a sequence's file, as of the latest commit, unless another transaction holds a lock on it that a switch
-    /// takes, or DDL does.
+    /// Finds the version of a sequence's catalog row and its file, as of the latest commit, unless another transaction
+    /// holds a lock on it that a switch takes, or DDL does.
     /// </summary>
-    private static uint? FileUnlessSwitching(uint seqoid)
+    private static string? VersionUnlessSwitching(uint seqoid)
     {
         NativeMethods.AcceptInvalidationMessages();
         return Worf.ReadScalar<bool>("""
             SELECT EXISTS (
                 SELECT 1 FROM pg_catalog.pg_locks
                 WHERE locktype = 'relation' AND database = $1 AND relation = $2 AND granted AND pid <> pg_catalog.pg_backend_pid()
-                    AND mode IN ('ShareLock', 'ShareRowExclusiveLock', 'AccessExclusiveLock'))
+                    AND mode IN ('ShareUpdateExclusiveLock', 'ShareLock', 'ShareRowExclusiveLock', 'AccessExclusiveLock'))
             """, SpiParameter.Create(NativeGlobals.MyDatabaseId), SpiParameter.Create(seqoid))
             ? null
-            : Worf.ReadScalar<uint?>("SELECT pg_catalog.pg_relation_filenode($1)", SpiParameter.Create(seqoid));
+            : Worf.SelectCatalog("""
+                SELECT s.xmin::text || '/' || s.ctid::text || '/' || pg_catalog.pg_relation_filenode($1)::text
+                FROM pg_catalog.pg_sequence s WHERE s.seqrelid = $1
+                """, SpiParameter.Create(seqoid)) is { Count: > 0 } row ? row[0].Get<string>(0) : null;
     }
 
     /// <summary>

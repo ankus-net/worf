@@ -10,7 +10,7 @@ namespace Worf;
 /// it lies in a block this node holds and the sequence can never return it. An update that moves a row to another
 /// partition inserts it there, and that insert leaves the check to the update's own.
 /// </summary>
-internal static class SequenceRangeGuard
+internal static partial class SequenceRangeGuard
 {
     private const string CheckViolation = "23514";
 
@@ -58,16 +58,28 @@ internal static class SequenceRangeGuard
     private static readonly HashSet<(uint Seqoid, long Lo)> s_waitedInTransaction = [];
 
     // The active blocks, by sequence and start, that this transaction has tried to switch away from itself, as it ran
-    // them out, and how many COPY FROM statements run in this backend, which draw a buffer of values before the guard
-    // sees the first of them.
+    // them out, and the managed sequences that the COPY FROM statements running in this backend draw from, innermost
+    // last.
     private static readonly HashSet<(uint Seqoid, long Lo)> s_switchedInTransaction = [];
-    private const int CopyBuffered = 1000;
+    private static readonly List<List<uint>> s_copying = [];
 
     /// <summary>
-    /// Gets or sets how many COPY FROM statements run in this backend, which draw up to a buffer of values, a thousand,
-    /// before the guard sees the first of them.
+    /// Gets the setting that a COPY FROM into a table whose defaults draw from a managed sequence reads for each row, in
+    /// the condition <see cref="CopyCondition"/> adds, after the row's defaults drew their values and before COPY
+    /// buffers the row, which the guard's triggers see only once a buffer of rows is written. Reading it checks the
+    /// sequences as the guard checks a row's values: it waits for a switch near a block's end, and switches at the
+    /// block's last value, so that the COPY's later rows take the next block's values.
     /// </summary>
-    internal static int Copying { get; set; }
+    [PgGucString("worf.sequence_range_copy_check", "", "Checks the managed sequences a COPY FROM draws from, for each row.",
+        Context = PgGucContext.Internal, Flags = PgGucOptions.NoShowAll | PgGucOptions.DisallowInFile)]
+    internal static partial string CopyCheck { get; }
+
+    // The setting's show hook, which reads run as, installed once in each process, and the empty value it shows.
+    private static bool s_copyCheckInstalled;
+    private static nint s_copyCheckValue;
+
+    [PgNativeCallback(nameof(CheckCopied))]
+    private static partial GucShowHook CopyCheckShow { get; }
 
     /// <summary>
     /// The guard's trigger function. The triggers' conditions do the checking and are never true, so this never runs.
@@ -414,6 +426,9 @@ internal static class SequenceRangeGuard
     /// </summary>
     private static bool Check(uint seqoid, long value, bool inserted)
     {
+        // A switch beside this transaction, which holds the sequence, gives it new bounds, which nextval reads from the
+        // catalog as this backend last heard of them.
+        Refresh();
         Reload();
         if (inserted && Moved())
         {
@@ -478,11 +493,6 @@ internal static class SequenceRangeGuard
                     return true;
 
                 case "active":
-                    if (WakeNearEnd(seqoid, sequence.Ascending, lo, hi, value))
-                    {
-                        WaitForSwitch(seqoid, lo);
-                    }
-
                     bool admitted = s_reached.TryGetValue(seqoid, out long reached) && (sequence.Ascending ? reached >= value : reached <= value);
                     if (!admitted && Position(seqoid) is long position && (sequence.Ascending ? position >= value : position <= value))
                     {
@@ -490,16 +500,17 @@ internal static class SequenceRangeGuard
                         admitted = true;
                     }
 
-                    // A transaction that runs the block out, which holds the sequence against any other switch, switches
-                    // it itself, so that its later rows take the next block's values: at the block's last value, or, in
-                    // a COPY, which draws a buffer of values before the guard sees them, a buffer before it.
-                    decimal left = sequence.Ascending ? (decimal)hi - value : (decimal)value - lo;
-                    if (admitted && (left == 0 || (Copying > 0 && left < CopyBuffered)))
+                    if (admitted)
                     {
-                        SwitchInTransaction(seqoid, lo);
+                        NearEnd(seqoid, sequence.Ascending, lo, hi, value);
                     }
 
                     return admitted;
+
+                // A switch beside the transactions that hold the sequence moves it to the next block before it commits,
+                // and a value it issued from the block meanwhile is this node's.
+                case "next":
+                    return Position(seqoid) is long issued && issued >= lo && issued <= hi && (sequence.Ascending ? issued >= value : issued <= value);
 
                 default:
                     return false;
@@ -558,18 +569,6 @@ internal static class SequenceRangeGuard
             _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, static () => s_waitedInTransaction.Clear());
         }
 
-        // A prepared transaction that holds the sequence keeps any switch off until it's committed or rolled back, which
-        // no wait here outlasts.
-        if (Elevated.Run(() => SequenceRanges.PreparedHolder(seqoid)) is string gid)
-        {
-            PgLog.Warning(new PgDiagnostic($"sequence {SequenceRanges.GetInfo(seqoid).Name} can't switch to its next block while prepared transaction \"{gid}\" holds it")
-            {
-                Detail = "Inserts run its active block out, and then fail.",
-                Hint = "COMMIT PREPARED or ROLLBACK PREPARED the transaction.",
-            });
-            return;
-        }
-
         SpiParameter seq = SpiParameter.Create(seqoid);
         SpiParameter database = SpiParameter.Create(DatabaseId());
         long now = Worker.GetCurrentTimestamp();
@@ -608,6 +607,8 @@ internal static class SequenceRangeGuard
             if (!s_sequences.TryGetValue(seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) sequence) ||
                 !sequence.Blocks.Exists(block => block.State == "active" && block.Lo == lo))
             {
+                // Nextval takes the sequence's new bounds from the catalog once this backend hears of the switch.
+                Refresh();
                 return;
             }
 
@@ -640,16 +641,36 @@ internal static class SequenceRangeGuard
     }
 
     /// <summary>
-    /// Switches the managed sequences that a table's defaults draw from, before a COPY FROM into it, when one's active
-    /// block has less than a buffer of values left, which the COPY would draw before the guard sees the first of them.
+    /// Waits for the range worker's switch once a value reaches the last twentieth of its active block, and switches in
+    /// this transaction at the block's last value, so that the transaction's later rows take the next block's values.
+    /// </summary>
+    private static void NearEnd(uint seqoid, bool ascending, long lo, long hi, long value)
+    {
+        if (WakeNearEnd(seqoid, ascending, lo, hi, value))
+        {
+            WaitForSwitch(seqoid, lo);
+        }
+
+        if ((ascending ? (decimal)hi - value : (decimal)value - lo) == 0)
+        {
+            SwitchInTransaction(seqoid, lo);
+        }
+    }
+
+    /// <summary>
+    /// Builds the condition a COPY FROM into a table whose defaults draw from a managed sequence runs for each row, which
+    /// reads <see cref="CopyCheck"/>, and starts checking the sequences, until <see cref="EndCopy"/>. The condition is
+    /// always true and stable, so COPY still writes rows a buffer at a time.
     /// </summary>
     /// <param name="relid">The table.</param>
-    internal static void BeforeCopy(uint relid)
+    /// <returns>The condition, unparsed, or null when no managed sequence numbers the table's rows.</returns>
+    internal static unsafe Node* CopyCondition(uint relid)
     {
+        s_copying.Add([]);
         Reload();
         if (s_sequences.Count == 0 || relid == 0)
         {
-            return;
+            return null;
         }
 
         SpiResult used = Elevated.Run(() => Worf.Read("""
@@ -661,7 +682,49 @@ internal static class SequenceRangeGuard
             WHERE d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.refobjid = $1 AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
                 AND d.deptype = 'i'
             """, 0, SpiParameter.Create(relid)));
-        foreach (uint seqoid in used.Select(row => row.Get<uint>(0)))
+        s_copying[^1].AddRange(used.Select(row => row.Get<uint>(0)).Where(s_sequences.ContainsKey));
+        if (s_copying[^1].Count == 0)
+        {
+            return null;
+        }
+
+        if (!s_copyCheckInstalled)
+        {
+            fixed (byte* name = "worf.sequence_range_copy_check\0"u8)
+            {
+                ((config_string*)NativeMethods.find_option((sbyte*)name, false, false, 20))->show_hook = CopyCheckShow;
+            }
+
+            MemoryContextData* old = Worf.MemoryContextSwitchTo(NativeGlobals.TopMemoryContext);
+            s_copyCheckValue = (nint)Worf.PStrDup("");
+            _ = Worf.MemoryContextSwitchTo(old);
+            s_copyCheckInstalled = true;
+        }
+
+        List* parsed = NativeMethods.raw_parser(Worf.PStrDup("SELECT pg_catalog.current_setting('worf.sequence_range_copy_check') IS NOT NULL"),
+            RawParseMode.RAW_PARSE_DEFAULT);
+        SelectStmt* select = (SelectStmt*)((RawStmt*)parsed->elements[0].ptr_value)->stmt;
+        return ((ResTarget*)select->targetList->elements[0].ptr_value)->val;
+    }
+
+    /// <summary>
+    /// Stops checking the sequences of the innermost COPY FROM that <see cref="CopyCondition"/> started.
+    /// </summary>
+    internal static void EndCopy() => s_copying.RemoveAt(s_copying.Count - 1);
+
+    /// <summary>
+    /// Checks the sequences the innermost COPY FROM draws from, after a row's defaults drew their values.
+    /// </summary>
+    private static unsafe sbyte* CheckCopied()
+    {
+        if (s_copying.Count == 0 || s_copying[^1].Count == 0)
+        {
+            return (sbyte*)s_copyCheckValue;
+        }
+
+        Refresh();
+        Reload();
+        foreach (uint seqoid in s_copying[^1])
         {
             if (!s_sequences.TryGetValue(seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) sequence) ||
                 !sequence.Blocks.Exists(block => block.State == "active") || Position(seqoid) is not long position)
@@ -670,11 +733,23 @@ internal static class SequenceRangeGuard
             }
 
             (long lo, long hi, _) = sequence.Blocks.Find(block => block.State == "active");
-            decimal left = sequence.Ascending ? (decimal)hi - position : (decimal)position - lo;
-            if (position >= lo && position <= hi && left < CopyBuffered)
+            if (position >= lo && position <= hi)
             {
-                SwitchInTransaction(seqoid, lo);
+                NearEnd(seqoid, sequence.Ascending, lo, hi, position);
             }
+        }
+
+        return (sbyte*)s_copyCheckValue;
+    }
+
+    /// <summary>
+    /// Hears of the catalog changes other backends committed, as a switch's new bounds for its sequence.
+    /// </summary>
+    private static void Refresh()
+    {
+        unsafe
+        {
+            NativeMethods.AcceptInvalidationMessages();
         }
     }
 

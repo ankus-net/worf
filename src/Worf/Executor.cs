@@ -328,12 +328,24 @@ internal static unsafe partial class Executor
         Dictionary<uint, (string Name, string?[] Ties)>? ties = ddl is null ? null : LocalIndex.Ties(parsetree);
         bool isolated = LocalIndex.Isolate(parsetree, ddl is not null);
 
-        // A COPY FROM draws a buffer of values from a managed sequence before the guard sees the first of them.
+        // A COPY FROM draws a buffer of values from a managed sequence before the guard sees the first of them, so it
+        // checks the sequences for each row in a condition of its own, ahead of any it has.
         bool copying = parsetree->type == NodeTag.T_CopyStmt && ((CopyStmt*)parsetree)->is_from && ((CopyStmt*)parsetree)->relation is not null;
-        if (copying)
+        Node* check = copying
+            ? SequenceRangeGuard.CopyCondition(NativeMethods.RangeVarGetRelidExtended(((CopyStmt*)parsetree)->relation, 0, RangeVarMissingOk, default, null))
+            : null;
+        if (check is not null)
         {
-            SequenceRangeGuard.BeforeCopy(NativeMethods.RangeVarGetRelidExtended(((CopyStmt*)parsetree)->relation, 0, RangeVarMissingOk, default, null));
-            SequenceRangeGuard.Copying++;
+            if (readOnlyTree)
+            {
+                pstmt = (PlannedStmt*)NativeMethods.copyObjectImpl(pstmt);
+                parsetree = pstmt->utilityStmt;
+                readOnlyTree = false;
+            }
+
+            CopyStmt* copy = (CopyStmt*)parsetree;
+            copy->whereClause = copy->whereClause is null ? check
+                : (Node*)NativeMethods.makeBoolExpr(BoolExprType.AND_EXPR, NativeMethods.lappend(NativeMethods.lappend(null, check), copy->whereClause), -1);
         }
 
         // A statement that commits on its way, and then fails, lets its fence go as its transaction aborts.
@@ -355,7 +367,7 @@ internal static unsafe partial class Executor
         {
             if (copying)
             {
-                SequenceRangeGuard.Copying--;
+                SequenceRangeGuard.EndCopy();
             }
 
             LocalIndex.EndStatement(tracking);

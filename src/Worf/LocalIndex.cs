@@ -515,7 +515,8 @@ internal static unsafe partial class LocalIndex
 
     /// <summary>
     /// Gives the start of a table's name that the names PostgreSQL chooses from it keep: <c>makeObjectName</c> cuts the
-    /// longer of the two names it joins until they fit, so the table's keeps at least half of what the label leaves.
+    /// longer of the two names it joins until they fit, so the table's keeps at least half of what the label leaves, and
+    /// puts an underscore after it, so a table's name that short is kept whole, with the underscore.
     /// </summary>
     private static string ChosenStart(string table)
     {
@@ -534,7 +535,7 @@ internal static unsafe partial class LocalIndex
             at += length;
         }
 
-        return table[..at];
+        return at == table.Length ? table + "_" : table[..at];
     }
 
     /// <summary>
