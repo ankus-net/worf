@@ -813,6 +813,27 @@ internal static class Worker
         }
     }
 
+    /// <summary>
+    /// Wakes the supervisor, as once a database is dropped, so that it frees the worker slots that database's workers
+    /// left.
+    /// </summary>
+    internal static void WakeSupervisor()
+    {
+        nint supervisor;
+        using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = WorfCtx.Exclusive())
+        {
+            WorfContext ctx = guard.Header;
+            ctx.SubscriptionsChanged = true;
+            guard.Header = ctx;
+            supervisor = ctx.Supervisor;
+        }
+
+        if (supervisor != 0)
+        {
+            SetProcLatch(supervisor);
+        }
+    }
+
     private static void SignalWorkerXactCallback()
     {
         if (!s_xacthookSignalWorkers)

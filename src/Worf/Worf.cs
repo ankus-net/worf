@@ -1465,23 +1465,48 @@ internal static partial class Worf
     {
         const uint DatabaseRelationId = 1262;
 
-        // Run manager worker for every connectable database.
+        // Every database, and those that allow connections, with their names.
+        HashSet<uint> databases = [];
+        List<(uint Dboid, string Name)> connectable = [];
         RelationData* rel = NativeMethods.table_open(DatabaseRelationId, (int)PgLockMode.AccessShare);
         TableScanDescData* scan = NativeMethods.table_beginscan_catalog(rel, 0, null);
-
         HeapTupleData* tup;
         while ((tup = NativeMethods.heap_getnext(scan, ScanDirection.ForwardScanDirection)) is not null)
         {
             FormData_pg_database* pgdatabase = (FormData_pg_database*)NativeMethods.GETSTRUCT(tup);
-            uint dboid = pgdatabase->oid;
-
-            PgInterrupts.Check();
-
-            // Can't run workers on databases which don't allow connection.
-            if (!pgdatabase->datallowconn)
+            _ = databases.Add(pgdatabase->oid);
+            if (pgdatabase->datallowconn)
             {
-                continue;
+                connectable.Add((pgdatabase->oid, FromServer((sbyte*)&pgdatabase->datname)));
             }
+        }
+
+        NativeMethods.table_endscan(scan);
+        NativeMethods.table_close(rel, (int)PgLockMode.AccessShare);
+
+        // A database dropped, as with DROP DATABASE ... WITH (FORCE), which terminates its workers, has no manager left
+        // to clean up after them, and their slots would be kept for it for good, so they're freed here once their
+        // processes have gone.
+        using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
+        {
+            for (int i = 0; i < guard.Length; i++)
+            {
+                WorfWorker worker = guard[i];
+                if (worker.WorkerType != WorfWorkerType.None && worker.Dboid != 0 && worker.Proc == 0 && !databases.Contains(worker.Dboid))
+                {
+                    PgLog.Debug1($"freeing worf worker slot {i} of dropped database {worker.Dboid}");
+                    worker.WorkerType = WorfWorkerType.None;
+                    worker.Dboid = 0;
+                    worker.CrashedAt = 0;
+                    guard[i] = worker;
+                }
+            }
+        }
+
+        // Run manager worker for every connectable database.
+        foreach ((uint dboid, string name) in connectable)
+        {
+            PgInterrupts.Check();
 
             // Worker already attached, nothing to do.
             using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
@@ -1494,7 +1519,7 @@ internal static partial class Worf
             }
 
             // No record found, try running new worker.
-            PgLog.Debug1($"registering worf manager process for database {FromServer((sbyte*)&pgdatabase->datname)}");
+            PgLog.Debug1($"registering worf manager process for database {name}");
 
             WorfWorker worker = default;
             worker.WorkerType = WorfWorkerType.Manager;
@@ -1502,9 +1527,6 @@ internal static partial class Worf
 
             _ = Worker.WorkerRegister(worker);
         }
-
-        NativeMethods.table_endscan(scan);
-        NativeMethods.table_close(rel, (int)PgLockMode.AccessShare);
     }
 
     /// <summary>

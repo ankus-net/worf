@@ -362,6 +362,12 @@ internal static unsafe partial class Executor
             {
                 NativeMethods.standard_ProcessUtility(pstmt, queryString, readOnlyTree, context, @params, queryEnv, dest, qc);
             }
+
+            // A dropped database's workers leave their slots, which the supervisor frees.
+            if (parsetree->type == NodeTag.T_DropdbStmt)
+            {
+                Worker.WakeSupervisor();
+            }
         }
         finally
         {
