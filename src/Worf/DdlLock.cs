@@ -67,11 +67,9 @@ internal static unsafe partial class DdlLock
     private const string BoundedConnection = "tcp_user_timeout=10000 keepalives_idle=10 keepalives_interval=5 keepalives_count=3";
 
     // How long a kept fence's DDL may take to arrive before apply asks its origin whether it ever will, or, once the
-    // session that kept it has ended, as the origin's connection does when its transaction ends, none: the origin lets
-    // the statement's lock go before it closes the connection, so its answer then is final, and a statement that failed
-    // holds back no writes once it has.
+    // session that kept it has ended, as the origin's connection does when its transaction ends.
     private static readonly TimeSpan s_reconcileAfter = TimeSpan.FromSeconds(10);
-    private static readonly TimeSpan s_orphanedAfter = TimeSpan.Zero;
+    private static readonly TimeSpan s_orphanedAfter = TimeSpan.FromSeconds(1);
 
     // The fences this transaction asked other nodes for, with the subtransaction that did.
     private static readonly List<(ulong Id, uint NodeId, uint Subxact, List<uint> Relids)> s_heldFences = [];

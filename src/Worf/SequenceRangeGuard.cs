@@ -609,8 +609,10 @@ internal static partial class SequenceRangeGuard
             if (!s_sequences.TryGetValue(seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) sequence) ||
                 !sequence.Blocks.Exists(block => block.State == "active" && block.Lo == lo))
             {
-                // Nextval takes the sequence's new bounds from the catalog once this backend hears of the switch.
+                // Nextval takes the sequence's new bounds from the catalog once this backend hears of the switch, which
+                // its commit sends only after it tells backends of the new blocks, so they're read again at once.
                 Refresh();
+                ForgetBounds();
                 return;
             }
 
@@ -753,6 +755,21 @@ internal static partial class SequenceRangeGuard
             NativeMethods.AcceptInvalidationMessages();
         }
     }
+
+    /// <summary>
+    /// Reads every sequence's bounds from the catalog again at its next nextval, as a switch committed whose
+    /// invalidations this backend may not have heard yet.
+    /// </summary>
+    internal static void ForgetBounds()
+    {
+        unsafe
+        {
+            NativeMethods.CatalogCacheFlushCatalog(SequenceRelationId);
+            NativeMethods.InvalidateCatalogSnapshot();
+        }
+    }
+
+    private const uint SequenceRelationId = 2224;
 
     private static uint DatabaseId()
     {
@@ -998,6 +1015,9 @@ internal static partial class SequenceRangeGuard
             return;
         }
 
+        // A change to the blocks, as a switch, tells backends before its commit sends its invalidations, so the
+        // sequences' bounds are read again too.
+        ForgetBounds();
         s_sequences.Clear();
         s_reservedActive.Clear();
         s_moved.Clear();

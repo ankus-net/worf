@@ -276,8 +276,10 @@ internal static unsafe partial class SequenceRanges
     private static readonly Dictionary<uint, string> s_handOffs = [];
     private static readonly HashSet<uint> s_unstarted = [];
 
-    // Whether this transaction switched a sequence itself, which it then can't prepare.
+    // Whether this transaction switched a sequence itself, which it then can't prepare, and where a switch beside the
+    // transactions that hold a sequence moves it as its transaction ends.
     private static bool s_refusePrepare;
+    private static (uint Seqoid, long Start)? s_pendingMove;
 
     /// <summary>
     /// Gets how often the range worker checks each managed sequence.
@@ -3821,9 +3823,9 @@ internal static unsafe partial class SequenceRanges
     /// <param name="seqoid">The sequence.</param>
     /// <param name="info">The sequence's details.</param>
     /// <param name="block">The block.</param>
-    /// <param name="atCommit">Whether the position moves only as the transaction commits, as for a switch beside the
-    /// transactions that hold the sequence, whose nextval would otherwise reach the block before its bounds do, for as
-    /// long as the switch's transaction goes on.</param>
+    /// <param name="atCommit">Whether the position moves only just before the transaction commits, as for a switch beside
+    /// the transactions that hold the sequence, whose nextval would otherwise reach the block before its bounds do, for
+    /// as long as the switch's transaction goes on; the switch moves it last.</param>
     /// <returns>Whether the block became the sequence's bounds.</returns>
     private static bool SetBounds(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) block, bool atCommit)
     {
@@ -3844,16 +3846,22 @@ internal static unsafe partial class SequenceRanges
         NativeMethods.CommandCounterIncrement();
         if (!inBlock && atCommit)
         {
-            _ = PgTransaction.RegisterCallback(PgTransactionEvent.PreCommit, () =>
-                _ = Elevated.Run(() => Worf.Execute("SELECT pg_catalog.setval($1::pg_catalog.regclass, $2, false)", seq, SpiParameter.Create(start))));
+            s_pendingMove = (seqoid, start);
         }
         else if (!inBlock)
         {
-            _ = Elevated.Run(() => Worf.Execute("SELECT pg_catalog.setval($1::pg_catalog.regclass, $2, false)", seq, SpiParameter.Create(start)));
+            Move(seqoid, start);
         }
 
         return true;
     }
+
+    /// <summary>
+    /// Moves a sequence to a block's start, as <c>setval</c> does, at once.
+    /// </summary>
+    private static void Move(uint seqoid, long start)
+        => _ = Elevated.Run(() => Worf.Execute("SELECT pg_catalog.setval($1::pg_catalog.regclass, $2, false)", SpiParameter.Create(seqoid),
+            SpiParameter.Create(start)));
 
     /// <summary>
     /// Switches a sequence to its next block as its active one runs low. The range worker takes the sequence's lock only
@@ -4037,8 +4045,18 @@ internal static unsafe partial class SequenceRanges
             // Nextval reaches the block's start before the switch commits, so the commit doesn't wait for the disk; a
             // later commit that writes the block's values flushes it.
             _ = Worf.Execute("SET LOCAL synchronous_commit = off");
-            return Switch(seqoid, info, (next.Id, next.Lo, next.Hi), next.Reserved, briefly ? 100 : ExchangeTimeout, beside: true, needed: Needed) ||
-                !needed || NextBlock(seqoid, epoch)?.Id != next.Id;
+            s_pendingMove = null;
+            bool switched = Switch(seqoid, info, (next.Id, next.Lo, next.Hi), next.Reserved, briefly ? 100 : ExchangeTimeout, beside: true, needed: Needed);
+
+            // The sequence moves to the block last, just before the transaction commits, so that other sessions'
+            // nextval, which takes the block's bounds as it commits, reaches the block no sooner than it must.
+            if (switched && s_pendingMove is (uint moving, long start))
+            {
+                Move(moving, start);
+            }
+
+            s_pendingMove = null;
+            return switched || !needed || NextBlock(seqoid, epoch)?.Id != next.Id;
         }
         finally
         {

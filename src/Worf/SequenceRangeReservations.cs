@@ -133,10 +133,7 @@ internal static class SequenceRangeReservations
 
         // The worker switched beside this transaction, which may hold the sequence, as nextval leaves it held, and so not
         // hear of its new bounds as it draws from it.
-        unsafe
-        {
-            NativeMethods.AcceptInvalidationMessages();
-        }
+        SequenceRangeGuard.ForgetBounds();
 
         SequenceRanges.ChangedOnCommit();
     }
