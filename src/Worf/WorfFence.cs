@@ -27,8 +27,9 @@ internal struct WorfFence
     public int HolderPid;
 
     /// <summary>
-    /// The session that kept the fence, while the node that asked for it may still be using its connection, or zero.
-    /// Once that session has ended, apply asks the fence's origin about it at once.
+    /// The session that kept the fence, while the node that asked for it may still be using its connection, minus one
+    /// once that session has ended, which marks it as it ends, or zero. Once that session has ended, apply asks the
+    /// fence's origin about it at once.
     /// </summary>
     public int KeeperPid;
 

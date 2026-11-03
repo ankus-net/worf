@@ -67,9 +67,14 @@ internal static unsafe partial class DdlLock
     private const string BoundedConnection = "tcp_user_timeout=10000 keepalives_idle=10 keepalives_interval=5 keepalives_count=3";
 
     // How long a kept fence's DDL may take to arrive before apply asks its origin whether it ever will, or, once the
-    // session that kept it has ended, as the origin's connection does when its transaction ends.
+    // session that kept it has ended, as the origin's connection does when its transaction ends, none: the origin lets
+    // the lock named for the fence go before it closes the connection, so what it answers then is final, and the writes
+    // that a statement that failed, as a unique CREATE INDEX CONCURRENTLY that finds duplicates, held back go on at once.
     private static readonly TimeSpan s_reconcileAfter = TimeSpan.FromSeconds(10);
-    private static readonly TimeSpan s_orphanedAfter = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan s_orphanedAfter = TimeSpan.Zero;
+
+    // How often apply looks again whether it has gone past where the origin was when it said a kept fence's DDL committed.
+    private static readonly TimeSpan s_boundsCheckEvery = TimeSpan.FromSeconds(1);
 
     // The fences this transaction asked other nodes for, with the subtransaction that did.
     private static readonly List<(ulong Id, uint NodeId, uint Subxact, List<uint> Relids)> s_heldFences = [];
@@ -112,6 +117,10 @@ internal static unsafe partial class DdlLock
 
     // Whether this session lets its fences go when it ends, and whether it has read back this database's kept fences.
     private static bool s_releasesOnExit;
+
+    // Whether this session marks the fences it keeps as it ends, and the keeper the marked fences have.
+    private static bool s_keeperExitHooked;
+    private const int KeeperGone = -1;
     private static bool s_loaded;
 
     // When apply last asked an origin about kept fences, and last checked whether it has applied past those whose
@@ -320,6 +329,12 @@ internal static unsafe partial class DdlLock
         _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, () =>
         {
             _ = s_keptFences.Add(id);
+            if (!s_keeperExitHooked)
+            {
+                _ = PgProcess.OnExit(static _ => KeeperExits());
+                s_keeperExitHooked = true;
+            }
+
             using PgLwLockExclusiveGuard<WorfFenceTable, WorfFence> guard = Fences.Exclusive();
             for (int i = 0; i < guard.Length; i++)
             {
@@ -575,7 +590,7 @@ internal static unsafe partial class DdlLock
     {
         long now = Worker.GetCurrentTimestamp();
         bool due = now - s_reconciledAt >= (long)s_reconcileAfter.TotalMicroseconds;
-        bool checkBounds = s_reconcileBounds.Count > 0 && now - s_boundsCheckedAt >= (long)s_orphanedAfter.TotalMicroseconds;
+        bool checkBounds = s_reconcileBounds.Count > 0 && now - s_boundsCheckedAt >= (long)s_boundsCheckEvery.TotalMicroseconds;
         long[] orphaned = [.. OrphanedFences(sub.Origin.Id).Where(fence => !s_reconcileBounds.ContainsKey(fence))];
         if (!due && !checkBounds && orphaned.Length == 0)
         {
@@ -678,11 +693,41 @@ internal static unsafe partial class DdlLock
     }
 
     /// <summary>
+    /// Marks the fences this session keeps as kept by none, as it ends, and wakes the database's apply workers, so that
+    /// the one for the fences' origin asks it about them at once, rather than at its next look.
+    /// </summary>
+    private static void KeeperExits()
+    {
+        uint dboid = DatabaseId();
+        int pid = Environment.ProcessId;
+        bool marked = false;
+        using (PgLwLockExclusiveGuard<WorfFenceTable, WorfFence> guard = Fences.Exclusive())
+        {
+            for (int i = 0; i < guard.Length; i++)
+            {
+                if (guard[i].Id != 0 && guard[i].Dboid == dboid && guard[i].KeeperPid == pid)
+                {
+                    WorfFence fence = guard[i];
+                    fence.KeeperPid = KeeperGone;
+                    guard[i] = fence;
+                    marked = true;
+                }
+            }
+        }
+
+        if (marked)
+        {
+            Worker.WakeApplyWorkers(dboid);
+        }
+    }
+
+    /// <summary>
     /// Lists the fences that a node's DDL kept here whose keeping session has ended, which apply asks the node about
     /// once they're a moment old, by when the DDL of a transaction that committed has usually applied.
     /// </summary>
     private static long[] OrphanedFences(uint originNode)
     {
+        // A keeping session that ended marked its fences, as one whose process is gone.
         if (FenceCount.Value == 0)
         {
             return [];
@@ -695,7 +740,7 @@ internal static unsafe partial class DdlLock
         {
             WorfFence fence = guard[i];
             if (fence.Id != 0 && fence.Dboid == dboid && fence.OriginNode == originNode && fence.KeeperPid != 0 &&
-                NativeMethods.BackendPidGetProc(fence.KeeperPid) is null)
+                (fence.KeeperPid == KeeperGone || NativeMethods.BackendPidGetProc(fence.KeeperPid) is null))
             {
                 _ = orphaned.Add(unchecked((long)fence.Id));
             }

@@ -303,7 +303,9 @@ public sealed class GlobalDdlLockTests
                 Assert.AreEqual("23505", duplicate.SqlState);
             }
 
-            await WritesGoSoonAsync(nodeB, "UPDATE dupe SET v = v WHERE id = 0", "the failed build's fence went", token);
+            Stopwatch released = Stopwatch.StartNew();
+            Assert.IsTrue(await PollSucceedsAsync(nodeB, "UPDATE dupe SET v = v WHERE id = 0", token), "the failed build's fence went");
+            Assert.IsLessThan(1000L, released.ElapsedMilliseconds, "how long the failed build's fence held node_b's writes back, in ms");
             await using (NpgsqlConnection locking = await nodeA.OpenAsync(Database, token))
             {
                 await using NpgsqlTransaction transaction = await locking.BeginTransactionAsync(token);
@@ -991,8 +993,16 @@ public sealed class GlobalDdlLockTests
         await HeldBackAsync(nodeA, nodeB, "ALTER TABLE child ADD FOREIGN KEY (parent_id) REFERENCES parent",
             ["INSERT INTO child VALUES (6, 6)", "DELETE FROM parent"], token);
 
-        // A kept fence holds back node_b's DDL as well as its writes, but not EXPLAIN, and lasts across a restart.
+        // A kept fence holds back node_b's DDL as well as its writes, but not EXPLAIN, and lasts across a restart while
+        // node_a's statement holds the lock named for the fence, as one that commits on its way holds it until the
+        // transaction that queues its DDL ends.
         _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
+        await using NpgsqlConnection statement = await nodeA.OpenAsync(Database, token);
+        await using (NpgsqlCommand hold = new("SELECT pg_advisory_lock(44)", statement))
+        {
+            _ = await hold.ExecuteNonQueryAsync(token);
+        }
+
         await using (NpgsqlConnection keeping = await nodeB.OpenAsync(Database, token))
         {
             await using (NpgsqlCommand keep = new("""
@@ -1013,6 +1023,9 @@ public sealed class GlobalDdlLockTests
 
         await nodeB.StartServerAsync(token);
         Assert.IsFalse(await nodeB.PsqlAsync(Database, "INSERT INTO t VALUES (7, 7)", token), "a write through a kept fence after a restart");
+        await Task.Delay(TimeSpan.FromSeconds(2), token);
+        Assert.IsFalse(await nodeB.PsqlAsync(Database, "INSERT INTO t VALUES (7, 7)", token), "a write through a kept fence node_a still holds");
+        await statement.CloseAsync();
         Assert.AreEqual("1", await nodeB.SafePsqlAsync(Database, "SELECT worf.release_fence(44)", token));
         _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO t VALUES (7, 7)", token);
 

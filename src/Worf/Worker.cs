@@ -814,6 +814,30 @@ internal static class Worker
     }
 
     /// <summary>
+    /// Wakes a database's apply workers, as once a session that kept another node's fence ends.
+    /// </summary>
+    /// <param name="dboid">The database.</param>
+    internal static void WakeApplyWorkers(uint dboid)
+    {
+        List<nint> procs = [];
+        using (PgLwLockShareGuard<WorfContext, WorfWorker> guard = WorfCtx.Share())
+        {
+            for (int i = 0; i < guard.Length; i++)
+            {
+                if (guard[i].WorkerType == WorfWorkerType.Apply && guard[i].Dboid == dboid && guard[i].Proc != 0)
+                {
+                    procs.Add(guard[i].Proc);
+                }
+            }
+        }
+
+        foreach (nint proc in procs)
+        {
+            SetProcLatch(proc);
+        }
+    }
+
+    /// <summary>
     /// Wakes the supervisor, as once a database is dropped, so that it frees the worker slots that database's workers
     /// left.
     /// </summary>
