@@ -3734,8 +3734,11 @@ internal static unsafe partial class SequenceRanges
                 // session's own switch doesn't lock the range row, an exchange abandoned it. Moving the sequence into the
                 // block would then issue its values again, so this one leaves it, and the subtransaction gives the lock
                 // back.
-                next = Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range_block WHERE block_id = $1 AND state = 'next'",
-                    SpiParameter.Create(block.Id)).Count > 0 && (needed is null || needed());
+                // A reservation may have taken the block for a load since the caller read it, which the switch then is.
+                SpiResult nextRow = Worf.SelectCatalog("SELECT reserved FROM worf.sequence_range_block WHERE block_id = $1 AND state = 'next'",
+                    SpiParameter.Create(block.Id));
+                forLoad = forLoad || (nextRow.Count > 0 && nextRow[0].Get<bool>(0));
+                next = nextRow.Count > 0 && (needed is null || needed());
                 if (!next)
                 {
                     throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState, "the block was taken");
@@ -4353,6 +4356,7 @@ internal static unsafe partial class SequenceRanges
             return Worf.ReadScalar<long?>(read);
         }
 
+        long giveUpAt = Worker.GetCurrentTimestamp() + (ExchangeTimeout * 1000L);
         while (true)
         {
             if (NativeMethods.ConditionalLockRelationOid(seqoid, (int)PgLockMode.ShareUpdateExclusive))
@@ -4374,6 +4378,19 @@ internal static unsafe partial class SequenceRanges
                 {
                     return position;
                 }
+            }
+
+            // A lock a switch takes, held as long as worf.sequence_range_timeout, belongs to something else, as DDL left
+            // open in a transaction, which the read gives up on, naming it, rather than wait for.
+            if (Worker.GetCurrentTimestamp() >= giveUpAt)
+            {
+                string holder = Worf.ReadScalar<string?>("""
+                    SELECT string_agg(l.pid || ' (' || l.mode || ')', ', ' ORDER BY l.pid) FROM pg_catalog.pg_locks l
+                    WHERE l.locktype = 'relation' AND l.database = $1 AND l.relation = $2 AND l.granted AND l.pid <> pg_catalog.pg_backend_pid()
+                        AND l.mode IN ('ShareUpdateExclusiveLock', 'ShareLock', 'ShareRowExclusiveLock', 'AccessExclusiveLock')
+                    """, SpiParameter.Create(NativeGlobals.MyDatabaseId), SpiParameter.Create(seqoid)) ?? "none now";
+                throw new PgException(PgSqlStates.ObjectInUse, $"could not read the position of sequence {GetInfo(seqoid).Name}",
+                    detail: $"Processes have held a lock on it that a switch takes for as long as worf.sequence_range_timeout: {holder}.");
             }
 
             PgInterrupts.Check();
