@@ -69,11 +69,9 @@ internal static unsafe partial class Apply
     // The writer and subscription of the origin of the last local row whose stream was looked up.
     private static (ushort Origin, uint Xid, (uint Writer, uint SubId)? Recorded) s_lastOriginWriter;
 
-    // When this worker last warned that it dropped relay origins for want of replication origin slots, and that it
-    // applied another node's transaction under its own origin for want of one, when the want that it last answered
-    // was, and when it last looked for an origin that another user of origins can't set up.
+    // When this worker last warned that it dropped relay origins for want of replication origin slots, when the want
+    // that it last answered was, and when it last looked for an origin that another user of origins can't set up.
     private static long s_reclaimWarnedAt;
-    private static long s_ownOriginWarnedAt;
     private static long s_reclaimCheckedAt;
     private static long s_elsewhereCheckedAt;
 
@@ -988,13 +986,13 @@ internal static unsafe partial class Apply
         bool yielding = writer != 0 && Worker.GetCurrentTimestamp() < Worker.OriginSlotsGivenUpAt + OriginSlotHold;
 
         List<ushort> dropped = [];
-        (ushort origin, ulong? sinceXid, bool own) = RunTakingOriginSlot(() =>
+        (ushort origin, ulong? sinceXid) = RunTakingOriginSlot(() =>
         {
             dropped = [];
             ushort? existing = PgReplicationOrigin.Find(name);
             if (yielding && (existing is null || !WorfNode.HasOriginSlot(existing.Value)))
             {
-                return (SetupOwnOrigin(sub), null, true);
+                throw NoRelaySlot(name, true);
             }
 
             ushort id;
@@ -1024,19 +1022,11 @@ internal static unsafe partial class Apply
             if (!TrySetupSession(id) && (!DropRelayOrigins(id, dropped) || !TrySetupSession(id)) &&
                 (!DropRelayOrigins(id, dropped, true) || !TrySetupSession(id)))
             {
-                if (writer == 0)
-                {
-                    throw new PgException(PgSqlStates.ConfigurationLimitExceeded,
-                        $"no replication origin slot is free for replication origin \"{name}\"", null!,
-                        "Raise max_active_replication_origins, or max_replication_slots before PostgreSQL 18.", null!);
-                }
-
-                RecordDropped(dropped, 0);
-                return (SetupOwnOrigin(sub), null, true);
+                throw NoRelaySlot(name, false);
             }
 
             RecordDropped(dropped, id);
-            return (id, recorded, false);
+            return (id, recorded);
         });
 
         // An id that another origin takes doesn't apply this subscription's changes from then on.
@@ -1061,44 +1051,24 @@ internal static unsafe partial class Apply
             });
         }
 
-        // The session's origin is looked at again for the next transaction, which may find a slot.
-        if (own)
-        {
-            if (now - s_ownOriginWarnedAt >= 60_000_000)
-            {
-                s_ownOriginWarnedAt = now;
-                string writerName = PgBackgroundWorker.RunTransaction(() => Worf.ReadScalar<string?>(
-                    "SELECT node_name::pg_catalog.text FROM worf.node WHERE node_id = $1", SpiParameter.Create(writer))) ?? writer.ToString(CultureInfo.InvariantCulture);
-                PgLog.Warning(new PgDiagnostic($"subscription \"{sub.Name}\" applies node {writerName}'s changes under its own replication origin")
-                {
-                    Detail = (yielding
-                        ? "PostgreSQL subscriptions' origins may take the replication origin slots worf gave up for them, so no relay origin takes one until their workers have tried again. "
-                        : "No replication origin slot is free for a relay origin. ") +
-                        "The rows count as the provider's in conflicts and when they're forwarded, as with pglogical.",
-                    Hint = "Raise max_active_replication_origins, or max_replication_slots before PostgreSQL 18.",
-                });
-            }
-
-            Worf.ReploriginSessionOriginTimestamp = s_remoteCommitTime;
-            Worf.ReploriginSessionOriginLsn = s_remoteCommitLsn;
-            return;
-        }
-
         s_sessionWriterNodeId = writer;
         Worf.ReploriginSessionOriginTimestamp = s_remoteCommitTime;
         Worf.ReploriginSessionOriginLsn = s_remoteCommitLsn;
     }
 
     /// <summary>
-    /// Sets the session up with the worker's own origin, in place of a relay origin that has no slot.
+    /// Fails apply, which tries again once it restarts, when no replication origin slot is free for the origin that
+    /// commits a transaction under the node that wrote it: committed under another origin, the transaction would count
+    /// as that origin's node's, and come back to the node that wrote it, which would apply it again.
     /// </summary>
-    private static ushort SetupOwnOrigin(WorfSubscription sub)
-    {
-        ushort own = PgReplicationOrigin.Find(sub.SlotName)
-            ?? throw new PgException(PgSqlStates.UndefinedObject, $"replication origin \"{sub.SlotName}\" does not exist");
-        PgReplicationOrigin.SetupSession(own);
-        return own;
-    }
+    /// <param name="name">The origin.</param>
+    /// <param name="yielding">Whether slots are free, but held for PostgreSQL subscriptions' workers to try again.</param>
+    private static PgException NoRelaySlot(string name, bool yielding)
+        => new(PgSqlStates.ConfigurationLimitExceeded, $"no replication origin slot is free for replication origin \"{name}\"",
+            detail: yielding
+                ? "PostgreSQL subscriptions' origins may take the replication origin slots worf gave up for them, so no relay origin takes one until their workers have tried again."
+                : "Each node whose changes a provider forwards takes a replication origin slot while its changes apply.",
+            hint: "Raise max_active_replication_origins, or max_replication_slots before PostgreSQL 18.");
 
     /// <summary>
     /// Records the relay origins dropped to free slots, but one whose id the origin set up took, whose own record
