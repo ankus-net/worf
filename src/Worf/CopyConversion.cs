@@ -79,6 +79,23 @@ internal static unsafe partial class CopyConversion
     private static int s_batchEnd;
     private static int s_batchRead;
 
+    // What a copy in batches checks of each row besides COPY, so that a row that fails is left out, rather than fail its
+    // batch's COPY, which would take a transaction ID and a copy of the rows before it again: each copied column's
+    // input, which the conversion step runs on the rows' text, with the input function, type parameter and typmod of
+    // each, and the condition each batch's COPY runs on each row once its defaults are in, which numbers the row as the
+    // provider's, and checks the table's NOT NULL columns and CHECK constraints, leaving a row that fails out as it's
+    // recorded, with each check's error, and the rows it left out in the COPY under way. A later failure of that COPY
+    // copies them again, so they're kept only once it succeeds.
+    private static FmgrInfo* s_checkInputs;
+    private static uint[] s_checkIoparams = [];
+    private static int[] s_checkTypmods = [];
+    private static List* s_checkWhere;
+    private static readonly List<(string State, string Message)> s_checkErrors = [];
+    private static readonly List<(ulong Line, WorfFailedChange Change, PgException Error)> s_checkSkipped = [];
+    private static bool s_checking;
+    private static int s_copyIndex;
+    private static int s_copyRow;
+
     // The line COPY was at as a copy ended, which a failure leaves naming the row that failed.
     private static ulong s_failedLine;
 
@@ -168,6 +185,11 @@ internal static unsafe partial class CopyConversion
                 };
             }
 
+            if (s_change is not null)
+            {
+                PrepareChecks(relation, attnames);
+            }
+
             bool snapshot = !NativeMethods.ActiveSnapshotSet();
             if (snapshot)
             {
@@ -230,6 +252,11 @@ internal static unsafe partial class CopyConversion
         }
         finally
         {
+            s_checkWhere = null;
+            s_checkInputs = null;
+            s_checking = false;
+            s_checkErrors.Clear();
+            s_checkSkipped.Clear();
             s_conn = null;
             s_cstate = null;
             s_conversions = [];
@@ -390,6 +417,131 @@ internal static unsafe partial class CopyConversion
     }
 
     /// <summary>
+    /// Prepares what a copy in batches checks of each row besides COPY: each copied column's input, and the condition
+    /// each batch's COPY runs, of <c>worf.copy_row</c>, which numbers the row, and <c>worf.copy_check</c> on each NOT
+    /// NULL column and enforced CHECK constraint, as COPY would check them once it has computed the generated columns,
+    /// which the condition, run before then, leaves to COPY.
+    /// </summary>
+    private static void PrepareChecks(RelationData* relation, List<string> attnames)
+    {
+        TupleDescData* desc = relation->rd_att;
+        s_checkInputs = (FmgrInfo*)NativeMethods.palloc0((ulong)(sizeof(FmgrInfo) * attnames.Count));
+        s_checkIoparams = new uint[attnames.Count];
+        s_checkTypmods = new int[attnames.Count];
+        for (int i = 0; i < attnames.Count; i++)
+        {
+            int attnum = NativeMethods.attnameAttNum(relation, Worf.PStrDup(attnames[i]), false);
+            if (attnum > 0)
+            {
+                FormData_pg_attribute* att = NativeMethods.TupleDescAttr(desc, attnum - 1);
+                uint input;
+                uint ioparam;
+                NativeMethods.getTypeInputInfo(att->atttypid, &input, &ioparam);
+                NativeMethods.fmgr_info(input, &s_checkInputs[i]);
+                s_checkIoparams[i] = ioparam;
+                s_checkTypmods[i] = att->atttypmod;
+            }
+        }
+
+        uint copyRow = Worf.ReadScalar<uint>("SELECT 'worf.copy_row()'::pg_catalog.regprocedure::pg_catalog.oid");
+        uint copyCheck = Worf.ReadScalar<uint>("SELECT 'worf.copy_check(integer, boolean)'::pg_catalog.regprocedure::pg_catalog.oid");
+        string relname = Worf.FromServer((sbyte*)&relation->rd_rel->relname);
+        s_checkErrors.Clear();
+        List* where = NativeMethods.lappend(null, NativeMethods.makeFuncExpr(copyRow, BoolOid, null, 0, 0, CoercionForm.COERCE_EXPLICIT_CALL));
+
+        void Check(Expr* passes, string state, string message)
+        {
+            List* args = NativeMethods.lappend(NativeMethods.lappend(null,
+                NativeMethods.makeConst(Int4Oid, -1, 0, 4, (ulong)s_checkErrors.Count, false, true)), passes);
+            where = NativeMethods.lappend(where, NativeMethods.makeFuncExpr(copyCheck, BoolOid, args, 0, 0, CoercionForm.COERCE_EXPLICIT_CALL));
+            s_checkErrors.Add((state, message));
+        }
+
+        for (int i = 0; i < desc->natts; i++)
+        {
+            FormData_pg_attribute* att = NativeMethods.TupleDescAttr(desc, i);
+            if (att->attisdropped || !att->attnotnull || att->attgenerated != 0)
+            {
+                continue;
+            }
+
+            NullTest* test = (NullTest*)NativeMethods.palloc0((ulong)sizeof(NullTest));
+            test->xpr.type = NodeTag.T_NullTest;
+            test->arg = (Expr*)NativeMethods.makeVar(1, (short)(i + 1), att->atttypid, att->atttypmod, att->attcollation, 0);
+            test->nulltesttype = NullTestType.IS_NOT_NULL;
+            test->location = -1;
+            string column = Worf.FromServer((sbyte*)&att->attname);
+            Check((Expr*)test, PgSqlStates.NotNullViolation, $"null value in column \"{column}\" of relation \"{relname}\" violates not-null constraint");
+        }
+
+        TupleConstr* constr = desc->constr;
+        for (int i = 0; constr is not null && i < constr->num_check; i++)
+        {
+#if !ANKUS_PG15 && !ANKUS_PG16 && !ANKUS_PG17
+            if (!constr->check[i].ccenforced)
+            {
+                continue;
+            }
+#endif
+            BooleanTest* test = (BooleanTest*)NativeMethods.palloc0((ulong)sizeof(BooleanTest));
+            test->xpr.type = NodeTag.T_BooleanTest;
+            test->arg = (Expr*)NativeMethods.stringToNode(constr->check[i].ccbin);
+            test->booltesttype = BoolTestType.IS_NOT_FALSE;
+            test->location = -1;
+            string name = Worf.FromServer(constr->check[i].ccname);
+            Check((Expr*)test, PgSqlStates.CheckViolation, $"new row for relation \"{relname}\" violates check constraint \"{name}\"");
+        }
+
+        s_checkWhere = where;
+    }
+
+    /// <summary>
+    /// Numbers the row a batch's COPY is at as the provider's, so that its errors name it so, in the copy's condition.
+    /// </summary>
+    /// <returns>True, so that the condition goes on to its checks.</returns>
+    [PgFunction(Sql = """
+        CREATE FUNCTION worf.copy_row() RETURNS boolean VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
+        REVOKE ALL ON FUNCTION worf.copy_row() FROM public;
+        """)]
+    internal static bool CopyRowNumber()
+    {
+        if (s_cstate is not null && s_copyIndex < s_batchEnd)
+        {
+            s_copyRow = s_batchConverted[s_copyIndex].Row;
+            s_line = s_batchLine + (ulong)s_copyRow;
+            s_cstate->cur_lineno = s_line;
+            s_copyIndex++;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Leaves out the row a batch's COPY is at when it fails one of the copy's checks, keeping it to record with the
+    /// check's error, in the copy's condition.
+    /// </summary>
+    /// <param name="check">The check, by its place among the copy's.</param>
+    /// <param name="passes">Whether the row passes it.</param>
+    /// <returns>Whether COPY writes the row.</returns>
+    [PgFunction(Sql = """
+        CREATE FUNCTION worf.copy_check(check_number integer, passes boolean) RETURNS boolean VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
+        REVOKE ALL ON FUNCTION worf.copy_check(integer, boolean) FROM public;
+        """)]
+    internal static bool CopyCheckRow(int check, bool passes)
+    {
+        if (!passes && s_cstate is not null && check >= 0 && check < s_checkErrors.Count)
+        {
+            (string state, string message) = s_checkErrors[check];
+            s_checkSkipped.Add((s_line, Failed(BatchRow(s_copyRow)), new PgException(state, message)));
+        }
+
+        return passes;
+    }
+
+    private const uint BoolOid = 16;
+    private const uint Int4Oid = 23;
+
+    /// <summary>
     /// Converts a batch's rows as COPY reads them, as many at a time as convert in one subtransaction, which writes
     /// nothing and so takes no transaction ID. A row whose value fails to convert, from its data, is left out of the
     /// copy and kept to record, or, under <c>sub_disable</c>, fails it.
@@ -401,6 +553,7 @@ internal static unsafe partial class CopyConversion
         int next = 0;
         string table = $"{s_change!.Relation!.Nspname}.{s_change.Relation.Relname}";
         bool converts = Array.Exists(s_conversions, conversion => conversion is not null);
+        s_checking = s_checkInputs is not null;
         while (next < s_batchRows.Count)
         {
             try
@@ -441,30 +594,18 @@ internal static unsafe partial class CopyConversion
                 next++;
             }
         }
+
+        s_checking = false;
     }
 
     /// <summary>
-    /// Copies some of a batch's converted rows, a run of the provider's rows that follow one another at a time, so that
-    /// COPY, which numbers each run from its first row's number, names the provider's rows in its errors.
+    /// Copies some of a batch's converted rows in one COPY and subtransaction. When a row fails, which COPY's errors
+    /// name by the provider's row, as the copy's condition numbers it, the rows before it are copied again, it's kept to
+    /// record, and the copy goes on from the row after it; a failure that names none of them has them copied again in
+    /// halves, down to a row of its own.
     /// </summary>
     private static ulong CopyBatch(ParseState* pstate, RelationData* relation, List* attnamelist, int start, int count)
-    {
-        ulong copied = 0;
-        int end = start + count;
-        while (start < end)
-        {
-            int run = start + 1;
-            while (run < end && s_batchConverted[run].Row == s_batchConverted[run - 1].Row + 1)
-            {
-                run++;
-            }
-
-            copied += CopyRun(pstate, relation, attnamelist, start, run - start);
-            start = run;
-        }
-
-        return copied;
-    }
+        => CopyRun(pstate, relation, attnamelist, start, count);
 
     /// <summary>
     /// Copies a run of a batch's converted rows in one COPY and subtransaction. When a row fails, which COPY's errors
@@ -484,9 +625,15 @@ internal static unsafe partial class CopyConversion
             }
             catch (PgException error) when (!Apply.IsTransient(error))
             {
-                // COPY numbers the rows it reads from the first's number among the provider's.
-                ulong first = s_batchLine + (ulong)s_batchConverted[start].Row;
-                int failed = s_failedLine >= first && s_failedLine < first + (ulong)(end - start) ? start + (int)(s_failedLine - first) : -1;
+                // The copy's condition numbered the row COPY was at as the provider's.
+                int failed = -1;
+                if (s_failedLine >= s_batchLine)
+                {
+                    int found = s_batchConverted.BinarySearch(start, end - start, (0, 0, (int)Math.Min(s_failedLine - s_batchLine, int.MaxValue)),
+                        Comparer<(int Start, int Length, int Row)>.Create((x, y) => x.Row.CompareTo(y.Row)));
+                    failed = found >= 0 ? found : -1;
+                }
+
                 if (failed < 0 && end - start > 1)
                 {
                     int half = (end - start) / 2;
@@ -535,11 +682,15 @@ internal static unsafe partial class CopyConversion
             {
                 try
                 {
-                    CopyFromStateData* cstate = NativeMethods.BeginCopyFrom(pstate, relation, null, null, false, BatchSource, attnamelist, null);
+                    CopyFromStateData* cstate = NativeMethods.BeginCopyFrom(pstate, relation, (Node*)s_checkWhere, null, false, BatchSource,
+                        attnamelist, null);
                     s_cstate = cstate;
-                    cstate->cur_lineno = s_batchLine + (ulong)s_batchConverted[start].Row - 1;
+                    s_copyIndex = start;
+                    s_checkSkipped.Clear();
                     ulong rows = NativeMethods.CopyFrom(cstate);
                     NativeMethods.EndCopyFrom(cstate);
+                    s_batchFailed.AddRange(s_checkSkipped);
+                    s_checkSkipped.Clear();
                     return rows;
                 }
                 finally
@@ -783,6 +934,13 @@ internal static unsafe partial class CopyConversion
                 }
                 else
                 {
+                    // A value COPY would read itself is read here first, which fails it without a write.
+                    if (s_checking && field < s_checkIoparams.Length && s_checkIoparams[field] != 0 && !raw.SequenceEqual("\\N"u8))
+                    {
+                        _ = Unescape(raw);
+                        _ = NativeMethods.InputFunctionCall(&s_checkInputs[field], (sbyte*)s_text, s_checkIoparams[field], s_checkTypmods[field]);
+                    }
+
                     Append(raw);
                 }
 

@@ -993,6 +993,55 @@ public sealed partial class ExceptionBehaviourTests
     }
 
     /// <summary>
+    /// A table's copy under discard leaves out the rows the subscriber's NOT NULL columns and CHECK constraints refuse,
+    /// and those whose values its column types refuse, without a transaction ID each, recording them in order with the
+    /// provider's row numbers, while a duplicate key, which only COPY finds, still fails its batch's COPY alone.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task CopiedRowsThatFailTakeNoTransactionIdEach()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode provider = await StartNodeAsync("provider", token);
+        await using TestNode subscriber = await StartNodeAsync("subscriber", token);
+        _ = await provider.SafePsqlAsync(Database, """
+            CREATE TABLE f (id integer PRIMARY KEY, v integer, w text, k integer);
+            INSERT INTO f SELECT g, CASE WHEN g % 7 = 0 THEN NULL ELSE g END, CASE WHEN g % 11 = 0 THEN 'long' ELSE 'ok' END,
+                CASE WHEN g = 2501 THEN 1 ELSE g END
+            FROM generate_series(1, 3000) g;
+            SELECT * FROM worf.replication_set_add_all_tables('default', '{public}');
+            """, token);
+        _ = await subscriber.SafePsqlAsync(Database,
+            "CREATE TABLE f (id integer PRIMARY KEY CHECK (id % 5 <> 0), v integer NOT NULL, w varchar(2), k integer UNIQUE)", token);
+        await SetBehaviourAsync(subscriber, "discard", token);
+        long before = long.Parse(await subscriber.SafePsqlAsync(Database, "SELECT pg_snapshot_xmax(pg_current_snapshot())::text", token),
+            System.Globalization.CultureInfo.InvariantCulture);
+        _ = await subscriber.SafePsqlAsync(Database, $"""
+            SELECT worf.create_subscription(subscription_name := 'sub', provider_dsn := '{provider.Dsn(Database, SuperUser)}',
+                synchronize_structure := false, synchronize_data := true)
+            """, token);
+        await WaitForStatusAsync(subscriber, "replicating", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+            "SELECT EXISTS (SELECT 1 FROM worf.local_sync_status) AND NOT EXISTS (SELECT 1 FROM worf.local_sync_status WHERE sync_status <> 'r')", token),
+            "the copy");
+        long used = long.Parse(await subscriber.SafePsqlAsync(Database, "SELECT pg_snapshot_xmax(pg_current_snapshot())::text", token),
+            System.Globalization.CultureInfo.InvariantCulture) - before;
+
+        // The 272 multiples of 11 fail to read, the 390 more of 7 have a null in a NOT NULL column, the 468 more of 5 fail
+        // the CHECK, and row 2501 duplicates row 1's key.
+        Assert.AreEqual("1131|1869", await subscriber.SafePsqlAsync(Database,
+            "SELECT (SELECT count(*) FROM worf.exception_log), (SELECT count(*) FROM f)", token), "the rows recorded and copied");
+        Assert.AreEqual("5|23514,7|23502,11|22001,2501|23505", await subscriber.SafePsqlAsync(Database, """
+            SELECT string_agg(concat_ws('|', action_counter, error_sqlstate), ',' ORDER BY action_counter)
+            FROM worf.exception_log WHERE action_counter IN (5, 7, 11, 2501)
+            """, token), "rows recorded with their provider row numbers");
+        Assert.AreEqual("t", await subscriber.SafePsqlAsync(Database,
+            "SELECT bool_and(a < b) FROM (SELECT action_counter AS a, lead(action_counter) OVER (ORDER BY log_id) AS b FROM worf.exception_log) s WHERE b IS NOT NULL",
+            token), "the rows recorded in order");
+        Assert.IsLessThan(60L, used, "transaction IDs the copy took for 1,131 failed rows");
+    }
+
+    /// <summary>
     /// In SQL_ASCII databases, values that hold a byte that isn't UTF-8 copy and replicate byte for byte, and a row of
     /// the copy that fails under discard, with such a value, is recorded with the value's hex.
     /// </summary>
