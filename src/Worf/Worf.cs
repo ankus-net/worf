@@ -183,7 +183,7 @@ internal static partial class Worf
             return utf8;
         }
 
-        return ConvertEncoding(utf8, (int)pg_enc.PG_UTF8, encoding);
+        return ConvertEncoding(utf8, encoding, false);
     }
 
     /// <summary>
@@ -240,7 +240,7 @@ internal static partial class Worf
             return DecodeSqlAscii(value);
         }
 
-        return Encoding.UTF8.GetString(ConvertEncoding(value, encoding, (int)pg_enc.PG_UTF8));
+        return Encoding.UTF8.GetString(ConvertEncoding(value, encoding, true));
     }
 
     /// <summary>
@@ -403,19 +403,22 @@ internal static partial class Worf
     /// looked up, as perform_default_encoding_conversion does, or, before it has, with pg_server_to_any or
     /// pg_any_to_server, which look it up in the catalog.
     /// </summary>
-    private static unsafe byte[] ConvertEncoding(ReadOnlySpan<byte> value, int from, int to)
+    private static unsafe byte[] ConvertEncoding(ReadOnlySpan<byte> value, int encoding, bool toUtf8)
     {
         PrepareEncodingConversions();
-        FmgrInfo* proc = to == (int)pg_enc.PG_UTF8 ? s_toUtf8 : s_fromUtf8;
+        int from = toUtf8 ? encoding : (int)pg_enc.PG_UTF8;
+        int to = toUtf8 ? (int)pg_enc.PG_UTF8 : encoding;
         fixed (byte* input = value)
         {
             byte empty = 0;
             byte* source = input is null ? &empty : input;
-            if (proc is null)
+
+            // PrepareEncodingConversions looks both up, or neither.
+            if (s_toUtf8 is null)
             {
-                sbyte* converted = to == (int)pg_enc.PG_UTF8
-                    ? NativeMethods.pg_server_to_any((sbyte*)source, value.Length, to)
-                    : NativeMethods.pg_any_to_server((sbyte*)source, value.Length, from);
+                sbyte* converted = toUtf8
+                    ? NativeMethods.pg_server_to_any((sbyte*)source, value.Length, (int)pg_enc.PG_UTF8)
+                    : NativeMethods.pg_any_to_server((sbyte*)source, value.Length, (int)pg_enc.PG_UTF8);
                 if (converted == (sbyte*)source)
                 {
                     return value.ToArray();
@@ -436,7 +439,7 @@ internal static partial class Worf
             byte* result = (byte*)NativeMethods.palloc(((ulong)value.Length * MaxConversionGrowth) + 1);
             try
             {
-                _ = NativeMethods.FunctionCall6Coll(proc, 0, (ulong)from, (ulong)to, (ulong)source, (ulong)result, (ulong)value.Length, 0);
+                _ = NativeMethods.FunctionCall6Coll(toUtf8 ? s_toUtf8 : s_fromUtf8, 0, (ulong)from, (ulong)to, (ulong)source, (ulong)result, (ulong)value.Length, 0);
                 return new ReadOnlySpan<byte>(result, StrLen((sbyte*)result)).ToArray();
             }
             finally
@@ -457,11 +460,12 @@ internal static partial class Worf
         }
 
         StringBuilder result = new(value.Length);
+        Span<char> chars = stackalloc char[2];
         while (!value.IsEmpty)
         {
             if (Rune.DecodeFromUtf8(value, out Rune rune, out int consumed) == OperationStatus.Done)
             {
-                _ = result.Append(rune.ToString());
+                _ = result.Append(chars[..rune.EncodeToUtf16(chars)]);
                 value = value[consumed..];
             }
             else

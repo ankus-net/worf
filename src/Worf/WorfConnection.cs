@@ -342,10 +342,7 @@ internal sealed unsafe partial class WorfConnection : IDisposable
 
         ParseState* pstate = NativeMethods.make_parsestate(null);
         _ = NativeMethods.addRangeTableEntryForRelation(pstate, relation, AccessShareLock, null, false, false);
-        s_copySource = this;
-        s_copyPending = null;
-        s_copyPendingLength = 0;
-        s_copyEnded = false;
+        SetCopySource(this);
         try
         {
             CopyFromStateData* cstate = NativeMethods.BeginCopyFrom(pstate, relation, null, null, false, CopySource, attnamelist,
@@ -371,8 +368,19 @@ internal sealed unsafe partial class WorfConnection : IDisposable
         }
         finally
         {
-            s_copySource = null;
+            SetCopySource(null);
         }
+    }
+
+    /// <summary>
+    /// Makes a connection the copy <see cref="ReadCopy"/> reads, with nothing read of it yet, or none.
+    /// </summary>
+    private static void SetCopySource(WorfConnection? source)
+    {
+        s_copySource = source;
+        s_copyPending = null;
+        s_copyPendingLength = 0;
+        s_copyEnded = false;
     }
 
     /// <summary>
