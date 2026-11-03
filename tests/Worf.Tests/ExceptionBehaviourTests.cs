@@ -987,6 +987,54 @@ public sealed partial class ExceptionBehaviourTests
     }
 
     /// <summary>
+    /// Deferrable unique and exclusion constraints, whose rechecks don't fire under session_replication_role replica,
+    /// hold for the rows apply and the copy write: rows that conflict with none apply, and under discard, a change that
+    /// conflicts is skipped and recorded, and so is a copied row that conflicts with an earlier one.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task DeferrableConstraintsHoldForAppliedAndCopiedRows()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode provider = await StartNodeAsync("provider", token);
+        await using TestNode subscriber = await StartNodeAsync("subscriber", token);
+        _ = await provider.SafePsqlAsync(Database, """
+            CREATE TABLE dk (id integer PRIMARY KEY, email text);
+            CREATE TABLE dx (id integer PRIMARY KEY, r int4range);
+            INSERT INTO dk VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'c');
+            SELECT * FROM worf.replication_set_add_all_tables('default', '{public}');
+            """, token);
+        _ = await subscriber.SafePsqlAsync(Database, """
+            CREATE TABLE dk (id integer PRIMARY KEY, email text UNIQUE DEFERRABLE);
+            CREATE TABLE dx (id integer PRIMARY KEY, r int4range, EXCLUDE USING gist (r WITH &&) DEFERRABLE INITIALLY DEFERRED);
+            """, token);
+        await SetBehaviourAsync(subscriber, "discard", token);
+        _ = await subscriber.SafePsqlAsync(Database, $"""
+            SELECT worf.create_subscription(subscription_name := 'sub', provider_dsn := '{provider.Dsn(Database, SuperUser)}',
+                synchronize_structure := false, synchronize_data := true)
+            """, token);
+        await WaitForStatusAsync(subscriber, "replicating", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+            "SELECT NOT EXISTS (SELECT 1 FROM worf.local_sync_status WHERE sync_status <> 'r')", token), "the copy");
+        Assert.AreEqual("1|a,2|b,3|c", await subscriber.SafePsqlAsync(Database,
+            "SELECT string_agg(concat_ws('|', id, email), ',' ORDER BY id) FROM dk", token), "dk's copy");
+
+        _ = await provider.SafePsqlAsync(Database, "INSERT INTO dx SELECT g, int4range(g * 10, g * 10 + 5) FROM generate_series(1, 1000) g", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT count(*) = 1000 FROM dx", token), "dx's rows that conflict with none");
+        _ = await provider.SafePsqlAsync(Database, "UPDATE dk SET email = 'a' WHERE id = 2", token);
+        _ = await provider.SafePsqlAsync(Database, "INSERT INTO dx VALUES (1001, int4range(10, 20))", token);
+        _ = await provider.SafePsqlAsync(Database, "INSERT INTO dk VALUES (5, 'e')", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM dk WHERE id = 5)", token),
+            "the changes after those that conflict");
+        Assert.AreEqual("b|1000", await subscriber.SafePsqlAsync(Database,
+            "SELECT (SELECT email FROM dk WHERE id = 2), (SELECT count(*) FROM dx)", token), "the rows the conflicting changes left");
+        Assert.AreEqual("COPY|dk|4|23505,UPDATE|dk|2|23505,INSERT|dx|1001|23P01", await subscriber.SafePsqlAsync(Database, """
+            SELECT string_agg(concat_ws('|', operation, table_name, remote_new_tuple->>'id', error_sqlstate), ',' ORDER BY log_id)
+            FROM worf.exception_log
+            """, token), "the conflicts recorded");
+    }
+
+    /// <summary>
     /// Has PostgreSQL invalidate a table sync's slot, which no process holds, for <c>max_slot_wal_keep_size</c>, once
     /// the subscription's own slot has moved on to a WAL segment the checkpoint keeps.
     /// </summary>

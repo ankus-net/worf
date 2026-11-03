@@ -1611,6 +1611,7 @@ internal static class Sync
         (WorfRelation rel, List<string> attnamelist, WorfColumnConversion?[]? converted, string query) =
             CopyQuery(originConn, remoterel, replicationSets);
         CopyRows(originConn, rel, rel.Reloid, attnamelist, converted, query, lsn);
+        CheckCopiedDeferrable(rel, lsn);
 
         PgLog.Info($"finished synchronization of data for table {remoterel.Nspname}.{remoterel.Relname}");
     }
@@ -1721,6 +1722,108 @@ internal static class Sync
         _ = Worf.Execute($"DROP TABLE {MergeCopy}");
 
         PgLog.Info($"finished synchronization of data for table {remoterel.Nspname}.{remoterel.Relname}");
+    }
+
+    /// <summary>
+    /// Checks a table's copy against its deferrable unique and exclusion constraints, whose rechecks COPY under
+    /// session_replication_role replica doesn't fire: a conflict fails the copy, or, as worf.exception_behaviour skips
+    /// or records rows, the later rows of each conflict are deleted and recorded, and the subscription is disabled
+    /// under sub_disable.
+    /// </summary>
+    private static void CheckCopiedDeferrable(WorfRelation rel, ulong lsn)
+    {
+        bool partitioned;
+        long started;
+        unsafe
+        {
+            partitioned = NativeMethods.get_rel_relkind(rel.Reloid) == (sbyte)'p';
+            started = NativeMethods.GetCurrentTransactionStartTimestamp();
+        }
+
+        string table = (partitioned ? "" : "ONLY ") + Spi.QuoteQualifiedIdentifier(rel.Nspname, rel.Relname);
+        try
+        {
+            PgTransaction.RunInSubtransaction(() =>
+            {
+                CheckDeferrableUnique(rel.Reloid, table);
+                CheckDeferrableExclusion(rel.Reloid, table);
+            }, PgSubtransactionMode.Atomic);
+        }
+        catch (PgException error) when (error.SqlState is PgSqlStates.UniqueViolation or PgSqlStates.ExclusionViolation &&
+            Apply.ExceptionBehaviour is not (WorfExceptionBehaviour.Error or WorfExceptionBehaviour.SubDisable))
+        {
+            WorfSubscription sub = Apply.MySubscription!;
+            List<(WorfFailedChange Change, PgException Error)> failures = [];
+            foreach ((string row, PgException conflict) in DeleteDeferrableConflicts(rel.Reloid, table))
+            {
+                failures.Add((new WorfFailedChange
+                {
+                    Subscription = sub,
+                    WriterNodeId = sub.Origin.Id,
+                    CommitTime = started,
+                    CommitLsn = lsn,
+                    Operation = "COPY",
+                    Relation = rel,
+                    NewTuple = row,
+                }, conflict));
+            }
+
+            ExceptionLog.RecordCopied(failures);
+        }
+        catch (PgException error) when (error.SqlState is PgSqlStates.UniqueViolation or PgSqlStates.ExclusionViolation &&
+            Apply.ExceptionBehaviour == WorfExceptionBehaviour.SubDisable)
+        {
+            _ = CopyConversion.SkipMerge(rel, lsn, error, "COPY");
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Deletes the rows of a table that conflict with an earlier row, by its place in the table, in a deferrable unique
+    /// or exclusion constraint.
+    /// </summary>
+    /// <returns>The rows deleted, as JSON, with the conflict each fails.</returns>
+    private static List<(string Row, PgException Error)> DeleteDeferrableConflicts(uint reloid, string table)
+    {
+        List<(string Row, PgException Error)> deleted = [];
+        SpiResult constraints = Worf.Read("""
+            SELECT c.conname::text, c.contype = 'x',
+                (SELECT pg_catalog.array_agg(pg_catalog.pg_get_indexdef(i.indexrelid, k, false) ORDER BY k) FROM pg_catalog.generate_series(1, i.indnkeyatts) k),
+                (SELECT pg_catalog.array_agg(pg_catalog.format('OPERATOR(%I.%s)', n.nspname, o.oprname) ORDER BY e.k)
+                    FROM pg_catalog.unnest(c.conexclop) WITH ORDINALITY e (op, k)
+                        JOIN pg_catalog.pg_operator o ON o.oid = e.op JOIN pg_catalog.pg_namespace n ON n.oid = o.oprnamespace),
+                pg_catalog.pg_get_expr(i.indpred, i.indrelid), i.indnullsnotdistinct
+            FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_index i ON i.indexrelid = c.conindid
+            WHERE c.conrelid = $1 AND c.contype IN ('p', 'u', 'x') AND c.condeferrable
+            """, 0, SpiParameter.Create(reloid));
+        foreach (SpiRow constraint in constraints)
+        {
+            string name = constraint.Get<string>(0);
+            bool exclusion = constraint.Get<bool>(1);
+            string?[] keys = constraint.Get<string?[]>(2);
+            List<string> conditions = [.. constraint.Get<string?>(4) is string predicate ? [$"({predicate})"] : Array.Empty<string>()];
+            if (!exclusion && !constraint.Get<bool>(5))
+            {
+                conditions.AddRange(keys.Select(key => $"({key}) IS NOT NULL"));
+            }
+
+            string where = conditions.Count == 0 ? "" : $" WHERE {string.Join(" AND ", conditions)}";
+            string rows = $"(SELECT tableoid, ctid, {string.Join(", ", keys.Select((key, k) => $"({key}) AS k{k}"))} FROM {table}{where})";
+            string conflicts = exclusion
+                ? string.Join(" AND ", constraint.Get<string?[]>(3).Select((op, k) => $"a.k{k} {op} b.k{k}"))
+                : string.Join(" AND ", keys.Select((_, k) => $"a.k{k} IS NOT DISTINCT FROM b.k{k}"));
+            SpiResult rowsDeleted = Worf.Query($"""
+                DELETE FROM {table} t
+                WHERE (t.tableoid, t.ctid) IN (SELECT b.tableoid, b.ctid FROM {rows} a JOIN {rows} b ON (a.tableoid, a.ctid) < (b.tableoid, b.ctid) AND {conflicts})
+                RETURNING pg_catalog.row_to_json(t)::text
+                """, false, 0);
+            PgException error = exclusion
+                ? new PgException(PgSqlStates.ExclusionViolation, $"conflicting key value violates exclusion constraint \"{name}\"")
+                : new PgException(PgSqlStates.UniqueViolation, $"duplicate key value violates unique constraint \"{name}\"");
+            deleted.AddRange(rowsDeleted.Select(row => (row.Get<string>(0), error)));
+        }
+
+        return deleted;
     }
 
     /// <summary>

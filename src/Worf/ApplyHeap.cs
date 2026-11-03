@@ -110,6 +110,59 @@ internal static unsafe class ApplyHeap
     }
 
     /// <summary>
+    /// Checks a row apply wrote against the relation's deferrable unique and exclusion constraints, whose rechecks it
+    /// doesn't get, and fails as their rechecks would at commit. A column the change didn't send, as an unchanged
+    /// TOAST value, is null to the check.
+    /// </summary>
+    /// <param name="rel">The relation.</param>
+    /// <param name="newtup">The row written.</param>
+    internal static void CheckDeferrable(WorfRelation rel, WorfTupleData newtup)
+    {
+        if (rel.DeferrableChecks is null)
+        {
+            return;
+        }
+
+        NativeMethods.CommandCounterIncrement();
+        RelationData* relation = rel.Rel;
+        HeapTupleData* tuple = FormTuple(relation, newtup);
+        foreach ((string name, bool exclusion, string query, int[] columns) in rel.DeferrableChecks)
+        {
+            SpiParameter[] values = new SpiParameter[columns.Length];
+            for (int k = 0; k < columns.Length; k++)
+            {
+                values[k] = SpiParameter.Create(ColumnBytes(relation, tuple, columns[k]));
+            }
+
+            if (Worf.ReadScalar<bool>(query, values))
+            {
+                throw exclusion
+                    ? new PgException(PgSqlStates.ExclusionViolation, $"conflicting key value violates exclusion constraint \"{name}\"")
+                    : new PgException(PgSqlStates.UniqueViolation, $"duplicate key value violates unique constraint \"{name}\"");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Gives a column's value of a tuple as its type's output, in the database's encoding, or null.
+    /// </summary>
+    private static byte[]? ColumnBytes(RelationData* relation, HeapTupleData* tuple, int attnum)
+    {
+        bool isnull;
+        ulong value = NativeMethods.heap_getattr(tuple, attnum, relation->rd_att, &isnull);
+        if (isnull)
+        {
+            return null;
+        }
+
+        uint typoutput;
+        bool varlena;
+        NativeMethods.getTypeOutputInfo(NativeMethods.TupleDescAttr(relation->rd_att, attnum - 1)->atttypid, &typoutput, &varlena);
+        sbyte* text = NativeMethods.OidOutputFunctionCall(typoutput, varlena ? (ulong)NativeMethods.pg_detoast_datum((varlena*)value) : value);
+        return new ReadOnlySpan<byte>(text, Worf.StrLen(text)).ToArray();
+    }
+
+    /// <summary>
     /// Handle update via low level api.
     /// </summary>
     /// <param name="rel">The relation.</param>

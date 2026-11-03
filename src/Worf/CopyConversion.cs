@@ -597,8 +597,9 @@ internal static unsafe partial class CopyConversion
     /// <param name="rel">The table.</param>
     /// <param name="commitLsn">The position the copy is consistent with.</param>
     /// <param name="error">The failure.</param>
+    /// <param name="operation">What failed: the merge, or the copy, which a deferrable constraint fails as a whole.</param>
     /// <returns>Whether the merge is skipped, rather than failing the copy.</returns>
-    internal static bool SkipMerge(WorfRelation rel, ulong commitLsn, PgException error)
+    internal static bool SkipMerge(WorfRelation rel, ulong commitLsn, PgException error, string operation = "MERGE")
     {
         WorfExceptionBehaviour behaviour = Apply.ExceptionBehaviour;
         if (behaviour == WorfExceptionBehaviour.Error)
@@ -613,7 +614,7 @@ internal static unsafe partial class CopyConversion
             WriterNodeId = sub.Origin.Id,
             CommitTime = NativeMethods.GetCurrentTransactionStartTimestamp(),
             CommitLsn = commitLsn,
-            Operation = "MERGE",
+            Operation = operation,
             Relation = rel,
         };
         if (behaviour == WorfExceptionBehaviour.SubDisable)

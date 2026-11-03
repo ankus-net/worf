@@ -1456,7 +1456,7 @@ internal static unsafe partial class Apply
         RelCache.CheckDeferrableIndexes(rel);
 
         // Handle multi_insert capabilities.
-        if (s_useMultiInsert)
+        if (s_useMultiInsert && rel.DeferrableChecks is null)
         {
             if (rel != s_lastInsertRel)
             {
@@ -1490,6 +1490,7 @@ internal static unsafe partial class Apply
 
         // Normal insert.
         s_applyApi.DoInsert(rel, newtup);
+        ApplyHeap.CheckDeferrable(rel, newtup);
 
         // if INSERT was into our queue, process the message.
         if (rel.Reloid == s_queueRelid)
@@ -1601,6 +1602,7 @@ internal static unsafe partial class Apply
 
         RelCache.CheckDeferrableIndexes(rel);
         s_applyApi.DoUpdate(rel, hasoldtup ? oldtup! : newtup, newtup);
+        ApplyHeap.CheckDeferrable(rel, newtup);
 
         RelCache.RelationClose(rel, PgLockMode.None);
 

@@ -134,8 +134,9 @@ internal static partial class RelCache
             entry.DeferrableIndexes = Worf.ReadScalar<string?>("""
                 SELECT pg_catalog.string_agg(pg_catalog.quote_ident(c.relname), ', ' ORDER BY c.relname)
                 FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
-                WHERE i.indrelid = $1 AND NOT i.indimmediate AND (NOT i.indisunique OR i.indexprs IS NOT NULL OR i.indpred IS NOT NULL)
+                WHERE i.indrelid = $1 AND NOT i.indimmediate AND (i.indexprs IS NOT NULL OR i.indpred IS NOT NULL)
                 """, SpiParameter.Create(entry.Reloid));
+            entry.DeferrableChecks = DeferrableChecks(entry);
 
             // Cache trigger info.
             entry.HasTriggers = false;
@@ -168,18 +169,75 @@ internal static partial class RelCache
     }
 
     /// <summary>
-    /// Fails an insert or update into a relation with deferrable indexes whose rechecks apply wouldn't get, which
-    /// would let it commit rows that conflict in them.
+    /// Fails an insert or update into a relation with deferrable indexes whose rechecks apply wouldn't get, and can't
+    /// do itself, which would let it commit rows that conflict in them.
     /// </summary>
     /// <param name="rel">The relation.</param>
     internal static void CheckDeferrableIndexes(WorfRelation rel)
     {
         if (rel.DeferrableIndexes is not null)
         {
-            throw new PgException(PgSqlStates.FeatureNotSupported, "worf doesn't support index rechecks needed for deferrable indexes",
+            throw new PgException(PgSqlStates.FeatureNotSupported, "worf doesn't support index rechecks needed for deferrable indexes with expressions or a predicate",
                 detail: $"relation {Spi.QuoteQualifiedIdentifier(rel.Nspname, rel.Relname)} has deferrable indexes: {rel.DeferrableIndexes}",
-                hint: "Make the constraints not deferrable, as with ALTER TABLE ... ALTER CONSTRAINT ... NOT DEFERRABLE.");
+                hint: "Make the constraints not deferrable: ALTER TABLE ... ALTER CONSTRAINT ... NOT DEFERRABLE for a unique one, and for an exclusion constraint, drop it and add it again.");
         }
+    }
+
+    /// <summary>
+    /// Builds the checks of a relation's deferrable unique and exclusion constraints on its columns, which apply runs
+    /// after it writes a row, as their rechecks would at commit: whether another row has the same key, or one that the
+    /// constraint's operators find conflicting, as a row conflicts with itself when they find it so.
+    /// </summary>
+    private static List<(string Name, bool Exclusion, string Query, int[] Columns)>? DeferrableChecks(WorfRelation entry)
+    {
+        SpiResult constraints = Worf.Read("""
+            SELECT c.conname::text, c.contype = 'x', i.indnullsnotdistinct,
+                pg_catalog.array_agg(k.attnum::int4 ORDER BY k.n),
+                pg_catalog.array_agg(pg_catalog.quote_ident(a.attname) ORDER BY k.n),
+                pg_catalog.array_agg(pg_catalog.format_type(a.atttypid, a.atttypmod) ORDER BY k.n),
+                pg_catalog.array_agg('OPERATOR(' || pg_catalog.quote_ident(n.nspname) || '.' || o.oprname || ')' ORDER BY k.n)
+            FROM pg_catalog.pg_index i
+                JOIN pg_catalog.pg_constraint c ON c.conindid = i.indexrelid AND c.conrelid = i.indrelid
+                CROSS JOIN LATERAL ROWS FROM (pg_catalog.unnest(i.indkey::pg_catalog.int2[]), pg_catalog.unnest(i.indclass::pg_catalog.oid[]))
+                    WITH ORDINALITY AS k (attnum, opclass, n)
+                JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+                JOIN pg_catalog.pg_opclass oc ON oc.oid = k.opclass
+                JOIN pg_catalog.pg_operator o ON o.oid = CASE WHEN c.contype = 'x' THEN c.conexclop[k.n]
+                    ELSE (SELECT p.amopopr FROM pg_catalog.pg_amop p
+                        WHERE p.amopfamily = oc.opcfamily AND p.amoplefttype = oc.opcintype AND p.amoprighttype = oc.opcintype AND p.amopstrategy = 3) END
+                JOIN pg_catalog.pg_namespace n ON n.oid = o.oprnamespace
+            WHERE i.indrelid = $1 AND NOT i.indimmediate AND i.indexprs IS NULL AND i.indpred IS NULL AND k.n <= i.indnkeyatts
+            GROUP BY c.conname, c.contype, i.indnullsnotdistinct
+            """, 0, SpiParameter.Create(entry.Reloid));
+        if (constraints.Count == 0)
+        {
+            return null;
+        }
+
+        string table = Spi.QuoteQualifiedIdentifier(entry.Nspname, entry.Relname);
+        List<(string Name, bool Exclusion, string Query, int[] Columns)> checks = [];
+        foreach (SpiRow constraint in constraints)
+        {
+            bool nullsEqual = constraint.Get<bool>(2);
+            int[] columns = constraint.Get<int[]>(3);
+            string[] names = constraint.Get<string[]>(4);
+            string[] types = constraint.Get<string[]>(5);
+            string[] operators = constraint.Get<string[]>(6);
+            List<string> others = [];
+            List<string> self = [];
+            for (int k = 0; k < columns.Length; k++)
+            {
+                string value = $"pg_catalog.convert_from(${k + 1}, pg_catalog.getdatabaseencoding())::{types[k]}";
+                others.Add(nullsEqual ? $"({names[k]} {operators[k]} {value} OR ({names[k]} IS NULL AND ${k + 1} IS NULL))" : $"{names[k]} {operators[k]} {value}");
+                self.Add(nullsEqual ? $"({value} {operators[k]} {value} OR ${k + 1} IS NULL)" : $"{value} {operators[k]} {value}");
+            }
+
+            checks.Add((constraint.Get<string>(0), constraint.Get<bool>(1),
+                $"SELECT (SELECT pg_catalog.count(*) FROM ONLY {table} WHERE {string.Join(" AND ", others)}) > CASE WHEN {string.Join(" AND ", self)} THEN 1 ELSE 0 END",
+                columns));
+        }
+
+        return checks;
     }
 
     /// <summary>
