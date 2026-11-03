@@ -221,10 +221,10 @@ internal static class Functions
 
         return PgHeapTuple.Create(
             ("node_id", SpiParameter.Create(node.Node.Id)),
-            ("node_name", SpiParameter.Create(node.Node.Name)),
+            ("node_name", Worf.TextParameter(node.Node.Name)),
             ("sysid", SpiParameter.Create(sysid.ToString(CultureInfo.InvariantCulture))),
-            ("dbname", SpiParameter.Create(Worf.ReadScalar<string>("SELECT pg_catalog.current_database()::text"))),
-            ("replication_sets", SpiParameter.Create(ReplicationSet.StringlistToIdentifierstr(repsets.Select(static repset => repset.Name)))));
+            ("dbname", Worf.TextParameter(Worf.ReadScalar<string>("SELECT pg_catalog.current_database()::text"))),
+            ("replication_sets", Worf.TextParameter(ReplicationSet.StringlistToIdentifierstr(repsets.Select(static repset => repset.Name)))));
     }
 
     /// <summary>
@@ -269,7 +269,7 @@ internal static class Functions
 
         // Now, fetch info about remote node.
         WorfNode origin;
-        using (PgReplicationConnection conn = Worf.Connect(providerDsn, subName, "create"))
+        using (WorfConnection conn = Worf.Connect(providerDsn, subName, "create"))
         {
             (uint nodeId, string nodeName, _, _, _) = Rpc.RemoteNodeInfo(conn);
             origin = new WorfNode { Id = nodeId, Name = nodeName };
@@ -399,7 +399,7 @@ internal static class Functions
 
             // First drop the status, after noting the slots its tables' syncs create, which may be left on the provider.
             List<string> syncSlotNames = Sync.SyncSlotNames(sub);
-            SpiResult recordedSyncSlots = Worf.Read("SELECT slot_name::text FROM worf.sync_slot WHERE sub_id = $1 ORDER BY 1", 0,
+            WorfRows recordedSyncSlots = Worf.Read("SELECT slot_name::text FROM worf.sync_slot WHERE sub_id = $1 ORDER BY 1", 0,
                 SpiParameter.Create(sub.Id));
             string syncSlotsLeft = string.Join(", ", recordedSyncSlots.Select(row => $"\"{row.Get<string>(0)}\""));
             Sync.DropSubscriptionSyncStatus(sub.Id);
@@ -491,7 +491,7 @@ internal static class Functions
                 SpiParameter.Create(sub.SlotName), SpiParameter.Create(sub.Id));
             if (shared)
             {
-                PgLog.Warning($"subscription \"{sub.Name}\" shares slot \"{sub.SlotName}\" with another subscription, which keeps it and its replication origin");
+                WorfLog.Warning($"subscription \"{sub.Name}\" shares slot \"{sub.SlotName}\" with another subscription, which keeps it and its replication origin");
             }
 
             // Note, we can't fail here since we can't assume that the remote node is still reachable or even alive.
@@ -499,7 +499,7 @@ internal static class Functions
             {
                 PgTransaction.RunInSubtransaction(() =>
                 {
-                    using PgReplicationConnection originConn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "cleanup");
+                    using WorfConnection originConn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "cleanup");
 
                     // The walsenders of the workers that just exited can hold the slots a moment longer, as when one is
                     // still finishing a large transaction. Wait for them, as the apply does when it starts.
@@ -514,7 +514,7 @@ internal static class Functions
 
                     if (syncSlots.Count > 0)
                     {
-                        PgLog.Warning($"could not drop slots {string.Join(", ", syncSlots.Select(slot => $"\"{slot}\""))} on provider, you will probably have to drop them manually");
+                        WorfLog.Warning($"could not drop slots {string.Join(", ", syncSlots.Select(slot => $"\"{slot}\""))} on provider, you will probably have to drop them manually");
                     }
 
                     while (Worker.GetCurrentTimestamp() < deadline && Rpc.RemoteSlotActive(originConn, sub.SlotName))
@@ -532,7 +532,7 @@ internal static class Functions
             }
             catch (PgException)
             {
-                PgLog.Warning($"could not drop slot \"{sub.SlotName}\" on provider, you will probably have to drop it manually" +
+                WorfLog.Warning($"could not drop slot \"{sub.SlotName}\" on provider, you will probably have to drop it manually" +
                     (syncSlotsLeft.Length == 0 ? "" : $", and those its table syncs may have left, {syncSlotsLeft}") +
                     ". Its sequence range fences wait for this node's reports: delete this node's rows in worf.sequence_range_link there while it has no fence up, so that later ones don't, and one that is up waits until this node subscribes again and reports, or worf.activate_sequence_range naming this node stops the wait for it, which reissues any values this node holds that the provider lost");
             }
@@ -732,7 +732,7 @@ internal static class Functions
 
         // Read table list from provider.
         List<WorfRemoteRel> remoteTables;
-        using (PgReplicationConnection conn = Worf.Connect(sub.OriginIf.Dsn, subName, "sync"))
+        using (WorfConnection conn = Worf.Connect(sub.OriginIf.Dsn, subName, "sync"))
         {
             remoteTables = Rpc.GetRemoteRepsetTables(conn, sub.ReplicationSets);
         }
@@ -796,8 +796,11 @@ internal static class Functions
 
         using (PgRelation rel = PgRelation.Open(Oid(relation), PgLockMode.AccessShare))
         {
-            nspname = rel.NamespaceName;
-            relname = rel.Name;
+            unsafe
+            {
+                nspname = Worf.FromServer(NativeMethods.get_namespace_name(NativeMethods.get_rel_namespace(rel.Oid)));
+                relname = Worf.FromServer(NativeMethods.get_rel_name(rel.Oid));
+            }
 
             // Reset sync status of the table.
             WorfSyncStatus? oldsync = Sync.GetTableSyncStatus(sub.Id, nspname, relname, true);
@@ -905,8 +908,8 @@ internal static class Functions
         string syncStatus = sync is not null ? SyncStatusToString(sync.Status) : "unknown";
 
         return PgHeapTuple.Create(
-            ("nspname", SpiParameter.Create(nspname)),
-            ("relname", SpiParameter.Create(relname)),
+            ("nspname", Worf.TextParameter(nspname)),
+            ("relname", Worf.TextParameter(relname)),
             ("status", SpiParameter.Create(syncStatus)));
     }
 
@@ -969,13 +972,13 @@ internal static class Functions
             }
 
             rows.Add(PgHeapTuple.Create(
-                ("subscription_name", SpiParameter.Create(sub.Name)),
+                ("subscription_name", Worf.TextParameter(sub.Name)),
                 ("status", SpiParameter.Create(status)),
-                ("provider_node", SpiParameter.Create(sub.Origin.Name)),
-                ("provider_dsn", SpiParameter.Create(sub.OriginIf.Dsn)),
-                ("slot_name", SpiParameter.Create(sub.SlotName)),
-                ("replication_sets", SpiParameter.Create<string[]?>(sub.ReplicationSets.Count > 0 ? [.. sub.ReplicationSets] : null)),
-                ("forward_origins", SpiParameter.Create<string[]?>(sub.ForwardOrigins.Count > 0 ? [.. sub.ForwardOrigins] : null))));
+                ("provider_node", Worf.TextParameter(sub.Origin.Name)),
+                ("provider_dsn", Worf.TextParameter(sub.OriginIf.Dsn)),
+                ("slot_name", Worf.TextParameter(sub.SlotName)),
+                ("replication_sets", Worf.TextArrayParameter(sub.ReplicationSets.Count > 0 ? [.. sub.ReplicationSets] : null)),
+                ("forward_origins", Worf.TextArrayParameter(sub.ForwardOrigins.Count > 0 ? [.. sub.ForwardOrigins] : null))));
         }
 
         return rows;
@@ -1136,7 +1139,7 @@ internal static class Functions
                 if (attnum < 0)
                 {
                     throw new PgException(PgSqlStates.SyntaxError,
-                        $"table {Spi.QuoteQualifiedIdentifier(nspname, relname)} does not have column {attname}");
+                        $"table {Worf.QuoteQualifiedIdentifier(nspname, relname)} does not have column {attname}");
                 }
 
                 idattrs = NativeMethods.bms_del_member(idattrs, attnum - ReplicationSet.FirstLowInvalidHeapAttributeNumber);
@@ -1444,9 +1447,9 @@ internal static class Functions
 
         PgHeapTuple result = PgHeapTuple.Create(
             ("relid", SpiParameter.Create(rel->rd_id)),
-            ("nspname", SpiParameter.Create(nspname)),
-            ("relname", SpiParameter.Create(relname)),
-            ("att_list", SpiParameter.Create(attList.ToArray())),
+            ("nspname", Worf.TextParameter(nspname)),
+            ("relname", Worf.TextParameter(relname)),
+            ("att_list", Worf.TextArrayParameter([.. attList])),
             ("has_row_filter", SpiParameter.Create(tableinfo.RowFilter.Count > 0)));
 
         NativeMethods.table_close(rel, (int)PgLockMode.None);
@@ -1479,11 +1482,11 @@ internal static class Functions
 
             WorfRemoteType type = ProtoNative.ColumnType(att->atttypid);
             rows.Add(PgHeapTuple.Create(
-                ("attname", SpiParameter.Create(Worf.FromServer((sbyte*)&att->attname))),
+                ("attname", Worf.TextParameter(Worf.FromServer((sbyte*)&att->attname))),
                 ("type_oid", SpiParameter.Create(type.Oid)),
-                ("type_nspname", SpiParameter.Create<string?>(type.Nspname)),
-                ("type_name", SpiParameter.Create<string?>(type.Typname)),
-                ("type_definition", SpiParameter.Create<string?>(type.Definition))));
+                ("type_nspname", Worf.TextParameter(type.Nspname)),
+                ("type_name", Worf.TextParameter(type.Typname)),
+                ("type_definition", Worf.TextParameter(type.Definition))));
         }
 
         NativeMethods.table_close(rel, (int)PgLockMode.None);
@@ -1794,11 +1797,11 @@ internal static class Functions
         string relname = Worf.FromServer((sbyte*)&rel->rd_rel->relname);
 
         // Build fake query which includes the expression so that we can pass it to the parser.
-        string buf = $"SELECT {rowFilterStr} FROM {Spi.QuoteQualifiedIdentifier(nspname, relname)}";
+        string buf = $"SELECT {rowFilterStr} FROM {Worf.QuoteQualifiedIdentifier(nspname, relname)}";
 
         // Parse it, providing proper error context, without the position in the fake query.
         List* rawParsetreeList = null;
-        using (PgErrorContext.Push($"invalid row_filter expression \"{rowFilterStr}\""))
+        using (PgErrorContext.Push(Worf.Shown($"invalid row_filter expression \"{rowFilterStr}\"")))
         {
             try
             {
@@ -1900,12 +1903,12 @@ internal static class Functions
             }
 
             // Only add logged relations which are not system relations (catalog, toast).
-            SpiResult relations = Worf.Select(
+            WorfRows relations = Worf.Select(
                 "SELECT c.oid, c.relname::text FROM pg_catalog.pg_class c WHERE c.relnamespace = $1 AND c.relkind = $2 " +
                 "AND c.relpersistence = 'p' AND c.oid >= 16384 ORDER BY c.relname",
                 SpiParameter.Create(nspoid), SpiParameter.Create((sbyte)relkind));
 
-            foreach (SpiRow reltup in relations)
+            foreach (WorfRow reltup in relations)
             {
                 uint reloid = reltup.Get<uint>(0);
                 if (existingRelations.Contains(reloid))
@@ -1916,7 +1919,7 @@ internal static class Functions
                 // Each node's own blocks keep a managed sequence's values apart, so its state isn't replicated.
                 if (relkind == 'S' && SequenceRanges.IsManaged(reloid))
                 {
-                    PgLog.Notice($"sequence {Spi.QuoteQualifiedIdentifier(nspname, reltup.Get<string>(1))} is left out, since it is under sequence range management");
+                    WorfLog.Notice($"sequence {Worf.QuoteQualifiedIdentifier(nspname, reltup.Get<string>(1))} is left out, since it is under sequence range management");
                     continue;
                 }
 

@@ -141,7 +141,7 @@ internal static unsafe partial class DdlReplication
         int length = Worf.StrLen(queryString);
         int start = Math.Clamp(pstmt->stmt_location, 0, length);
         int count = pstmt->stmt_len > 0 ? Math.Min(pstmt->stmt_len, length - start) : length - start;
-        string command = Worf.FromServerExact(new ReadOnlySpan<byte>((byte*)queryString + start, count), "DDL that replicates").Trim();
+        string command = Worf.FromServer(new ReadOnlySpan<byte>((byte*)queryString + start, count)).Trim();
         return parsetree->type == NodeTag.T_DropStmt ? DropCommand((DropStmt*)parsetree, command) : command;
     }
 
@@ -326,11 +326,11 @@ internal static unsafe partial class DdlReplication
                 if (sets.Count > 0 && IncludeDdlRepset)
                 {
                     sets.ForEach(set => ReplicationSet.ReplicationSetRemoveTable(set.Id, relid, false));
-                    PgLog.Notice($"table {name} is unlogged now, so it left its replication sets");
+                    WorfLog.Notice($"table {name} is unlogged now, so it left its replication sets");
                 }
                 else if (sets.Count > 0)
                 {
-                    PgLog.Warning($"table {name} is unlogged now, so its changes no longer replicate");
+                    WorfLog.Warning($"table {name} is unlogged now, so its changes no longer replicate");
                 }
 
                 continue;

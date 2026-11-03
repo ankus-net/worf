@@ -158,7 +158,7 @@ internal static unsafe partial class TemporaryObjectUse
 
         // An object in a catalog with a schema is checked for its own schema, and every object for what it depends on.
         // An object outlasts the session unless it's in the temporary schema, or is part of a temporary relation.
-        SpiResult result = Elevated.Run(() => Worf.Read("""
+        WorfRows result = Elevated.Run(() => Worf.Read("""
             WITH o AS (
                 SELECT c.classid, coalesce(ad.oid, c.objid) AS objid, CASE WHEN ad.oid IS NULL THEN c.objsubid ELSE 0 END AS objsubid,
                     CASE WHEN c.classid IN ('pg_catalog.pg_class'::pg_catalog.regclass, 'pg_catalog.pg_attrdef'::pg_catalog.regclass) THEN c.objid
@@ -407,7 +407,7 @@ internal static unsafe partial class TemporaryObjectUse
     /// </summary>
     private static bool IsTemporaryTable(List<string> names)
         => Worf.ReadScalar<bool>("SELECT coalesce((SELECT relpersistence = 't' FROM pg_catalog.pg_class WHERE oid = pg_catalog.to_regclass($1)), false)",
-            SpiParameter.Create(string.Join('.', names.Select(Spi.QuoteIdentifier))));
+            SpiParameter.Create(string.Join('.', names.Select(Worf.QuoteIdentifier))));
 
     /// <summary>
     /// Checks whether a type named without a schema is temporary.

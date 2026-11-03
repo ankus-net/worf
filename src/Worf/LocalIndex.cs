@@ -169,9 +169,9 @@ internal static unsafe partial class LocalIndex
         }
 
         NativeMethods.CommandCounterIncrement();
-        SpiResult result = Elevated.Run(() => Worf.Query(
+        WorfRows result = Elevated.Run(() => Worf.Query(
             "UPDATE pg_catalog.pg_index SET indisvalid = false WHERE indexrelid = $1 AND indisvalid RETURNING indrelid", SpiParameter.Create(relid)));
-        foreach (SpiRow row in result)
+        foreach (WorfRow row in result)
         {
             s_hidden.Add((relid, row.Get<uint>(0), false, 0));
             NativeMethods.CacheInvalidateRelcacheByRelid(row.Get<uint>(0));
@@ -271,12 +271,12 @@ internal static unsafe partial class LocalIndex
     /// </summary>
     private static void NoteNames(List<uint> tables)
     {
-        SpiResult result = Worf.Read("""
+        WorfRows result = Worf.Read("""
             SELECT i.indrelid, i.indexrelid, c.relname::pg_catalog.text FROM pg_catalog.pg_index i
                 JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
             WHERE i.indrelid = ANY ($1::pg_catalog.int8[]::pg_catalog.oid[])
             """, 0, SpiParameter.Create(tables.Select(table => (long)table).ToArray()));
-        foreach (SpiRow row in result)
+        foreach (WorfRow row in result)
         {
             s_namedBefore[(row.Get<uint>(0), row.Get<string>(2))] = row.Get<uint>(1);
         }
@@ -333,7 +333,7 @@ internal static unsafe partial class LocalIndex
     private static Dictionary<uint, (string Name, string?[] Ties)> ReadTies()
     {
         Dictionary<uint, (string Name, string?[] Ties)> ties = [];
-        SpiResult result = Elevated.Run(() => Worf.Read("""
+        WorfRows result = Elevated.Run(() => Worf.Read("""
             SELECT l.indexrelid, c.relname::pg_catalog.text, ARRAY(
                 SELECT 'partition' WHERE c.relispartition
                 UNION ALL SELECT 'replica identity' WHERE i.indisreplident
@@ -348,7 +348,7 @@ internal static unsafe partial class LocalIndex
                 JOIN pg_catalog.pg_class c ON c.oid = l.indexrelid
                 JOIN pg_catalog.pg_index i ON i.indexrelid = l.indexrelid
             """, 0));
-        foreach (SpiRow row in result)
+        foreach (WorfRow row in result)
         {
             ties[row.Get<uint>(0)] = (row.Get<string>(1), row.Get<string?[]>(2));
         }
@@ -529,7 +529,7 @@ internal static unsafe partial class LocalIndex
             return moved;
         }
 
-        SpiResult result = Elevated.Run(() => Worf.Read("""
+        WorfRows result = Elevated.Run(() => Worf.Read("""
             SELECT l.indexrelid, i.indrelid FROM worf.local_index l JOIN pg_catalog.pg_index i ON i.indexrelid = l.indexrelid
             ORDER BY 1
             """, 0));
@@ -934,7 +934,7 @@ internal static unsafe partial class LocalIndex
             if (NativeMethods.get_relname_relid(target, nspoid) != 0)
             {
                 target = NativeMethods.ChooseRelationName(target, null, Worf.PStrDup("local"), nspoid, false);
-                PgLog.Warning($"renamed index \"{name}\", which is on this node alone, to \"{Worf.FromServer(target)}\", as DDL{(origin is null ? "" : $" from node {origin}")} took its name");
+                WorfLog.Warning($"renamed index \"{name}\", which is on this node alone, to \"{Worf.FromServer(target)}\", as DDL{(origin is null ? "" : $" from node {origin}")} took its name");
             }
 
             NativeMethods.RenameRelationInternal(current, target, true, true);
@@ -1034,11 +1034,11 @@ internal static unsafe partial class LocalIndex
                 continue;
             }
 
-            SpiResult result = Elevated.Run(() => Worf.Query(unlive
+            WorfRows result = Elevated.Run(() => Worf.Query(unlive
                 ? "UPDATE pg_catalog.pg_index SET indislive = true WHERE indexrelid = ANY ($1::pg_catalog.int8[]::pg_catalog.oid[]) RETURNING indrelid"
                 : "UPDATE pg_catalog.pg_index SET indisvalid = true WHERE indexrelid = ANY ($1::pg_catalog.int8[]::pg_catalog.oid[]) RETURNING indrelid",
                 SpiParameter.Create(relids)));
-            foreach (SpiRow row in result)
+            foreach (WorfRow row in result)
             {
                 NativeMethods.CacheInvalidateRelcacheByRelid(row.Get<uint>(0));
             }
@@ -1135,14 +1135,14 @@ internal static unsafe partial class LocalIndex
             : s_asideNames.TryGetValue((nspoid, error.ConstraintName!), out string? before) ? before
             : error.ConstraintName!;
         string definition = Worf.FromServer(NativeMethods.pg_get_indexdef_string(relid));
-        string named = $"INDEX {Spi.QuoteIdentifier(error.ConstraintName!)} ON ";
+        string named = $"INDEX {Worf.QuoteIdentifier(error.ConstraintName!)} ON ";
         int at = definition.IndexOf(named, StringComparison.Ordinal);
-        definition = at < 0 ? definition : $"{definition[..at]}INDEX {Spi.QuoteIdentifier(name)} ON {definition[(at + named.Length)..]}";
+        definition = at < 0 ? definition : $"{definition[..at]}INDEX {Worf.QuoteIdentifier(name)} ON {definition[(at + named.Length)..]}";
 
         ObjectAddress index = Dependency.Address(Dependency.RelationRelationId, relid, 0);
         NativeMethods.performDeletion(&index, DropBehavior.DROP_RESTRICT, 0);
         NativeMethods.CommandCounterIncrement();
-        PgLog.Warning(new PgDiagnostic(
+        WorfLog.Warning(new PgDiagnostic(
             $"dropped index \"{name}\", which is on this node alone, as DDL from node {origin} couldn't build it again: " +
             error.Message.Replace($"\"{error.ConstraintName}\"", $"\"{name}\"", StringComparison.Ordinal))
         {
@@ -1185,7 +1185,7 @@ internal static unsafe partial class LocalIndex
 
         at = SkipSpace(command, at);
         return command.AsSpan(at).StartsWith("on", StringComparison.OrdinalIgnoreCase)
-            ? $"{command[..at]}{Spi.QuoteIdentifier(Worf.FromServer(name))} {command[at..]}"
+            ? $"{command[..at]}{Worf.QuoteIdentifier(Worf.FromServer(name))} {command[at..]}"
             : command;
     }
 
@@ -1460,7 +1460,7 @@ internal static unsafe partial class LocalIndex
         }
 
         long[] relids = [.. tables.Distinct().Select(table => (long)table)];
-        SpiResult indexes = Elevated.Run(() => Worf.Read("""
+        WorfRows indexes = Elevated.Run(() => Worf.Read("""
             SELECT i.indexrelid FROM worf.local_index l JOIN pg_catalog.pg_index i ON i.indexrelid = l.indexrelid
             WHERE i.indrelid = ANY ($1::pg_catalog.int8[]::pg_catalog.oid[])
             ORDER BY 1
@@ -1470,12 +1470,12 @@ internal static unsafe partial class LocalIndex
             return;
         }
 
-        foreach (SpiRow index in indexes)
+        foreach (WorfRow index in indexes)
         {
             NativeMethods.LockRelationOid(index.Get<uint>(0), (int)PgLockMode.ShareUpdateExclusive);
         }
 
-        SpiResult result = Elevated.Run(() => Worf.Query(unlive
+        WorfRows result = Elevated.Run(() => Worf.Query(unlive
             ? """
                 UPDATE pg_catalog.pg_index i SET indislive = false FROM worf.local_index l, pg_catalog.pg_class t
                 WHERE i.indexrelid = l.indexrelid AND t.oid = i.indrelid AND i.indrelid = ANY ($1::pg_catalog.int8[]::pg_catalog.oid[]) AND i.indislive
@@ -1487,7 +1487,7 @@ internal static unsafe partial class LocalIndex
                 RETURNING i.indexrelid, i.indrelid, 0::pg_catalog.oid
                 """,
             SpiParameter.Create(relids)));
-        foreach (SpiRow row in result)
+        foreach (WorfRow row in result)
         {
             s_hidden.Add((row.Get<uint>(0), row.Get<uint>(1), unlive, row.Get<uint>(2)));
             if (unlive)

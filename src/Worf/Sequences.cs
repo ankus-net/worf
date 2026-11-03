@@ -30,13 +30,18 @@ internal static class Sequences
         string seqname;
         unsafe
         {
-            seqname = Spi.QuoteQualifiedIdentifier(
+            seqname = Worf.QuoteQualifiedIdentifier(
                 Worf.FromServer(NativeMethods.get_namespace_name(NativeMethods.get_rel_namespace(seqoid))),
                 Worf.FromServer(NativeMethods.get_rel_name(seqoid)));
         }
 
         return Worf.ReadScalar<long>("SELECT last_value FROM " + seqname);
     }
+
+    /// <summary>
+    /// Gets a relation's name, with its bytes exact.
+    /// </summary>
+    private static unsafe string SequenceName(uint seqoid) => Worf.FromServer(NativeMethods.get_rel_name(seqoid));
 
     /// <summary>
     /// Process sequence updates.
@@ -56,9 +61,9 @@ internal static class Sequences
 
             // A row lock assigns the transaction an ID, so only the rows to update are locked, and a pass with nothing to
             // update writes no commit record.
-            SpiResult states = Worf.Read("SELECT seqoid, last_value FROM worf.sequence_state", 0);
+            WorfRows states = Worf.Read("SELECT seqoid, last_value FROM worf.sequence_state", 0);
 
-            foreach (SpiRow oldseq in states)
+            foreach (WorfRow oldseq in states)
             {
                 PgInterrupts.Check();
 
@@ -70,7 +75,7 @@ internal static class Sequences
                     continue;
                 }
 
-                SpiResult locked = Worf.Query("SELECT cache_size, last_value FROM worf.sequence_state WHERE seqoid = $1 FOR UPDATE",
+                WorfRows locked = Worf.Query("SELECT cache_size, last_value FROM worf.sequence_state WHERE seqoid = $1 FOR UPDATE",
                     false, 0, SpiParameter.Create(seqoid));
                 if (locked.Count == 0)
                 {
@@ -121,15 +126,15 @@ internal static class Sequences
         using PgRelation seqrel = PgRelation.Open(seqoid, PgLockMode.AccessShare);
         if (!seqrel.IsSequence)
         {
-            throw new PgException(PgSqlStates.WrongObjectType, $"\"{seqrel.Name}\" is not a sequence");
+            throw new PgException(PgSqlStates.WrongObjectType, $"\"{SequenceName(seqoid)}\" is not a sequence");
         }
 
         // Now search for it in our tracking table.
-        SpiResult result = Worf.Query("SELECT cache_size FROM worf.sequence_state WHERE seqoid = $1 FOR UPDATE", false, 0,
+        WorfRows result = Worf.Query("SELECT cache_size FROM worf.sequence_state WHERE seqoid = $1 FOR UPDATE", false, 0,
             SpiParameter.Create(seqoid));
         if (result.Count == 0)
         {
-            throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState, $"\"{seqrel.Name}\" is not a replicated sequence");
+            throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState, $"\"{SequenceName(seqoid)}\" is not a replicated sequence");
         }
 
         int cacheSize = result[0].Get<int>(0);

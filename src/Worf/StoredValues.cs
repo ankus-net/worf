@@ -164,7 +164,7 @@ internal static unsafe class StoredValues
     {
         RelationData* rel = (RelationData*)relation;
         uint family = typeOid == NumericOid ? NumericOps : IntegerOps;
-        SpiResult indexes = Worf.Read("""
+        WorfRows indexes = Worf.Read("""
             SELECT i.indexrelid, (i.indoption[0] & 1) <> 0
             FROM pg_catalog.pg_index i
                 JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
@@ -275,7 +275,7 @@ internal static unsafe class StoredValues
             return false;
         }
 
-        SpiResult checks = Worf.Read("""
+        WorfRows checks = Worf.Read("""
             SELECT conbin::text FROM pg_catalog.pg_constraint WHERE conrelid = $1 AND contype = 'c' AND convalidated
             """, 0, SpiParameter.Create(rel->rd_id));
         List* constraints = null;
@@ -291,7 +291,7 @@ internal static unsafe class StoredValues
         }
 
         // A partition's bound, made from its parent's key, of the parent's columns.
-        SpiResult bound = Worf.Read("""
+        WorfRows bound = Worf.Read("""
             SELECT c.relpartbound::text, i.inhparent
             FROM pg_catalog.pg_class c
                 JOIN pg_catalog.pg_inherits i ON i.inhrelid = c.oid

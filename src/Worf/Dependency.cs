@@ -489,7 +489,7 @@ internal static class Dependency
             if ((extra.Flags & (DepflagAuto | DepflagInternal | DepflagExtension)) != 0)
             {
                 // auto-cascades are reported at DEBUG2, not msglevel.
-                PgLog.Debug2($"drop auto-cascades to {objDesc}");
+                WorfLog.Debug2($"drop auto-cascades to {objDesc}");
             }
             else if (!cascade)
             {
@@ -572,7 +572,7 @@ internal static class Dependency
         else if (numReportedClient > 1)
         {
             int total = numReportedClient + numNotReportedClient;
-            PgLog.Write(msglevel, new PgDiagnostic(total == 1
+            WorfLog.Write(msglevel, new PgDiagnostic(total == 1
                 ? $"drop cascades to {total} other object"
                 : $"drop cascades to {total} other objects")
             {
@@ -583,7 +583,7 @@ internal static class Dependency
         else if (numReportedClient == 1)
         {
             // we just use the single item as-is
-            PgLog.Write(msglevel, clientdetail.ToString());
+            WorfLog.Write(msglevel, clientdetail.ToString());
         }
     }
 
@@ -1306,7 +1306,7 @@ internal static class Dependency
 
     private static void AddIfExists(string catalog, uint classId, uint objoid, List<ObjectAddress> addrs)
     {
-        if (Worf.ReadScalar<bool>("SELECT EXISTS (SELECT FROM pg_catalog." + Spi.QuoteIdentifier(catalog) + " WHERE oid = $1)",
+        if (Worf.ReadScalar<bool>("SELECT EXISTS (SELECT FROM pg_catalog." + Worf.QuoteIdentifier(catalog) + " WHERE oid = $1)",
             SpiParameter.Create(objoid)))
         {
             addrs.Add(Address(classId, objoid, 0));

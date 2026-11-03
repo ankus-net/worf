@@ -81,7 +81,7 @@ internal static unsafe partial class DdlLock
 
     // The connection to each node that holds this transaction's fences there until it ends, and the nodes whose
     // connection broke while it held fences the transaction still needs.
-    private static readonly Dictionary<uint, PgReplicationConnection> s_fenceConnections = [];
+    private static readonly Dictionary<uint, WorfConnection> s_fenceConnections = [];
     private static readonly HashSet<uint> s_lostNodes = [];
 
     // The fences of the DDL this transaction queued, which the other nodes keep until it applies there.
@@ -201,7 +201,7 @@ internal static unsafe partial class DdlLock
         List<(uint Relid, bool BlocksWrites)> fenced = [];
         foreach (string? relation in relations)
         {
-            SpiResult result = Worf.SelectCatalog("SELECT pg_catalog.to_regclass($1)::oid", SpiParameter.Create(relation));
+            WorfRows result = Worf.SelectCatalog("SELECT pg_catalog.to_regclass($1)::oid", SpiParameter.Create(relation));
             if (result.Count == 0 || result[0].Get<uint?>(0) is not uint relid)
             {
                 continue;
@@ -487,7 +487,7 @@ internal static unsafe partial class DdlLock
         StringBuilder array = new("ARRAY[");
         for (int i = 0; i < relids.Count; i++)
         {
-            array.Append(i == 0 ? "" : ", ").Append(Spi.QuoteLiteral(QualifiedName(relids[i])));
+            array.Append(i == 0 ? "" : ", ").Append(Worf.QuoteLiteral(QualifiedName(relids[i])));
         }
 
         array.Append("]::text[]");
@@ -498,7 +498,7 @@ internal static unsafe partial class DdlLock
         uint subxact = NativeMethods.GetCurrentSubTransactionId();
         foreach ((uint nodeId, string dsn) in peers)
         {
-            PgReplicationConnection conn = FenceConnection(nodeId, dsn);
+            WorfConnection conn = FenceConnection(nodeId, dsn);
             s_heldFences.Add((fenceId, nodeId, subxact, relids));
             string? lsn;
             try
@@ -616,7 +616,7 @@ internal static unsafe partial class DdlLock
                     }
                 }
 
-                SpiResult kept = Worf.SelectCatalog("""
+                WorfRows kept = Worf.SelectCatalog("""
                     SELECT DISTINCT fence_id, origin_xid FROM worf.fence
                     WHERE origin_node = $1 AND NOT fence_id = ANY ($2)
                         AND (($3 AND kept_at < now() - $4 * interval '1 microsecond')
@@ -631,7 +631,7 @@ internal static unsafe partial class DdlLock
 
                 // Each fence whose keeping session has ended is asked about once, at once.
                 ForgetKeepers([.. kept.Select(row => row.Get<long>(0)).Where(fence => Array.IndexOf(orphaned, fence) >= 0)]);
-                using PgReplicationConnection conn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "fences", BoundedConnection);
+                using WorfConnection conn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "fences", BoundedConnection);
                 for (int i = 0; i < kept.Count; i++)
                 {
                     long fenceId = kept[i].Get<long>(0);
@@ -676,7 +676,7 @@ internal static unsafe partial class DdlLock
         }
         catch (Exception error) when (error is PgException or PgRemoteException)
         {
-            PgLog.Debug1($"could not ask node {sub.Origin.Name} about its fences: {error.Message}");
+            WorfLog.Debug1($"could not ask node {sub.Origin.Name} about its fences: {error.Message}");
         }
     }
 
@@ -685,7 +685,7 @@ internal static unsafe partial class DdlLock
     /// </summary>
     private static void LetGo(long fenceId, WorfSubscription sub, string reason)
     {
-        PgLog.Log($"letting go of fence {fenceId} from node {sub.Origin.Name}, whose DDL {reason}");
+        WorfLog.Log($"letting go of fence {fenceId} from node {sub.Origin.Name}, whose DDL {reason}");
         _ = Worf.Execute("DELETE FROM worf.fence WHERE fence_id = $1", SpiParameter.Create(fenceId));
         _ = s_reconcileBounds.Remove(fenceId);
         _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, () =>
@@ -972,7 +972,7 @@ internal static unsafe partial class DdlLock
             List<(ulong Id, uint Relid, bool BlocksWrites)> kept = [];
             Elevated.Run(() =>
             {
-                SpiResult rows = Worf.SelectCatalog("SELECT fence_id, relid, blocks_writes FROM worf.fence");
+                WorfRows rows = Worf.SelectCatalog("SELECT fence_id, relid, blocks_writes FROM worf.fence");
                 for (int i = 0; i < rows.Count; i++)
                 {
                     kept.Add((unchecked((ulong)rows[i].Get<long>(0)), rows[i].Get<uint>(1), rows[i].Get<bool>(2)));
@@ -1129,14 +1129,14 @@ internal static unsafe partial class DdlLock
     /// stays open while the transaction lasts however long it idles. A node whose server notices only late that this
     /// one died keeps its fence that long, so the connection is probed, and probes the node in turn.
     /// </summary>
-    private static PgReplicationConnection FenceConnection(uint nodeId, string dsn)
+    private static WorfConnection FenceConnection(uint nodeId, string dsn)
     {
-        if (s_fenceConnections.TryGetValue(nodeId, out PgReplicationConnection? open))
+        if (s_fenceConnections.TryGetValue(nodeId, out WorfConnection? open))
         {
             return open;
         }
 
-        PgReplicationConnection conn = Worf.Connect(dsn, "worf_ddl_lock", null, BoundedConnection);
+        WorfConnection conn = Worf.Connect(dsn, "worf_ddl_lock", null, BoundedConnection);
         s_fenceConnections[nodeId] = conn;
         try
         {
@@ -1567,7 +1567,7 @@ internal static unsafe partial class DdlLock
 
     private static void AddSchema(List<uint> tables, string schema)
     {
-        SpiResult result = Worf.SelectCatalog("""
+        WorfRows result = Worf.SelectCatalog("""
             SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
             WHERE n.nspname = $1 AND c.relkind IN ('r', 'p')
             """, SpiParameter.Create(schema));
@@ -1588,7 +1588,7 @@ internal static unsafe partial class DdlLock
             return;
         }
 
-        SpiResult result = Worf.SelectCatalog("""
+        WorfRows result = Worf.SelectCatalog("""
             WITH RECURSIVE built (base, derived) AS (
                 SELECT typbasetype, oid FROM pg_catalog.pg_type WHERE typtype = 'd'
                 UNION ALL SELECT oid, typarray FROM pg_catalog.pg_type WHERE typarray <> 0
@@ -1610,7 +1610,7 @@ internal static unsafe partial class DdlLock
     }
 
     private static string QualifiedName(uint relid)
-        => Spi.QuoteQualifiedIdentifier(Worf.FromServer(NativeMethods.get_namespace_name(NativeMethods.get_rel_namespace(relid))),
+        => Worf.QuoteQualifiedIdentifier(Worf.FromServer(NativeMethods.get_namespace_name(NativeMethods.get_rel_namespace(relid))),
             Worf.FromServer(NativeMethods.get_rel_name(relid)));
 
     /// <summary>
@@ -1650,7 +1650,7 @@ internal static unsafe partial class DdlLock
 
                     pending.AddRange(node.Select(fence => fence.Id).Distinct());
                 }
-                else if (s_fenceConnections.Remove(node.Key, out PgReplicationConnection? conn))
+                else if (s_fenceConnections.Remove(node.Key, out WorfConnection? conn))
                 {
                     _ = s_pendingUnfences.Remove(node.Key);
                     Close(conn);
@@ -1684,7 +1684,7 @@ internal static unsafe partial class DdlLock
         foreach ((uint nodeId, List<ulong> fenceIds) in s_pendingUnfences.ToList())
         {
             _ = s_pendingUnfences.Remove(nodeId);
-            if (!s_fenceConnections.TryGetValue(nodeId, out PgReplicationConnection? conn))
+            if (!s_fenceConnections.TryGetValue(nodeId, out WorfConnection? conn))
             {
                 continue;
             }
@@ -1794,7 +1794,7 @@ internal static unsafe partial class DdlLock
         string xid = unchecked((long)NativeMethods.GetTopFullTransactionId().value).ToString(CultureInfo.InvariantCulture);
         foreach ((ulong fenceId, uint node) in fences)
         {
-            if (!s_fenceConnections.TryGetValue(node, out PgReplicationConnection? conn))
+            if (!s_fenceConnections.TryGetValue(node, out WorfConnection? conn))
             {
                 throw new PgException(LockNotAvailable, $"lost the hold on node {NodeName(node)}'s writes for this transaction's DDL");
             }
@@ -1843,7 +1843,7 @@ internal static unsafe partial class DdlLock
         _ = NativeMethods.LockRelease(&tag, ExclusiveLock, true);
         if (unfence)
         {
-            foreach (PgReplicationConnection conn in s_fenceConnections.Values)
+            foreach (WorfConnection conn in s_fenceConnections.Values)
             {
                 try
                 {
@@ -1851,7 +1851,7 @@ internal static unsafe partial class DdlLock
                 }
                 catch (Exception error) when (error is PgException or PgRemoteException)
                 {
-                    PgLog.Debug1($"could not let go of fence {fenceId}: {error.Message}");
+                    WorfLog.Debug1($"could not let go of fence {fenceId}: {error.Message}");
                 }
             }
         }
@@ -1893,7 +1893,7 @@ internal static unsafe partial class DdlLock
     /// </summary>
     private static void CloseConnections()
     {
-        foreach (PgReplicationConnection conn in s_fenceConnections.Values)
+        foreach (WorfConnection conn in s_fenceConnections.Values)
         {
             Close(conn);
         }
@@ -1910,7 +1910,7 @@ internal static unsafe partial class DdlLock
         }
     }
 
-    private static void Close(PgReplicationConnection conn)
+    private static void Close(WorfConnection conn)
     {
         try
         {

@@ -85,7 +85,7 @@ internal static class Manager
         }
 
         PgBackgroundWorker.RunTransaction(static () =>
-            PgLog.Log($"starting worf database manager for database {Worf.ReadScalar<string>("SELECT pg_catalog.current_database()::text")}"));
+            WorfLog.Log($"starting worf database manager for database {Worf.ReadScalar<string>("SELECT pg_catalog.current_database()::text")}"));
 
         // Brief delay before checking/upgrading extension version. This avoids a race condition where an explicit
         // ALTER EXTENSION UPDATE runs concurrently with our auto-upgrade check on fast systems.
@@ -286,21 +286,12 @@ internal static class Manager
             return true;
         }
 
-        try
+        return Worker.WorkerRegister(new WorfWorker
         {
-            _ = Worker.WorkerRegister(new WorfWorker
-            {
-                WorkerType = type,
-                Dboid = dboid,
-                Worker = new WorfWorkerInfo { Exchange = new WorfExchangeWorker { WaitsForSlots = waitsForSlots } },
-            });
-            return true;
-        }
-        catch (PgException error)
-        {
-            PgLog.Warning($"could not start the sequence {Worker.WorkerTypeName(type)} worker: {error.Message}");
-            return false;
-        }
+            WorkerType = type,
+            Dboid = dboid,
+            Worker = new WorfWorkerInfo { Exchange = new WorfExchangeWorker { WaitsForSlots = waitsForSlots } },
+        }) != -1;
     }
 
     /// <summary>
@@ -388,7 +379,7 @@ internal static class Manager
                                 continue;
                             }
 
-                            PgLog.Log($"restarting the apply worker for subscription {sub.Name} at once, to apply its failed transaction again under worf.exception_behaviour");
+                            WorfLog.Log($"restarting the apply worker for subscription {sub.Name} at once, to apply its failed transaction again under worf.exception_behaviour");
                         }
                     }
                     else
@@ -415,7 +406,12 @@ internal static class Manager
                 apply.Worker.Apply.ExceptionLevel = crashed.ExceptionLevel;
                 apply.Worker.Apply.SyncFailures = crashed.SyncFailures;
 
-                _ = Worker.WorkerRegister(apply);
+                // With every worker slot taken, the subscriptions left wait for the next look.
+                if (Worker.WorkerRegister(apply) == -1)
+                {
+                    ret = false;
+                    break;
+                }
             }
 
             return true;
@@ -437,7 +433,7 @@ internal static class Manager
                 WorfWorker w = guard[worker];
                 if (w.CrashedAt != 0)
                 {
-                    PgLog.Debug2($"cleaning worf worker slot {worker}");
+                    WorfLog.Debug2($"cleaning worf worker slot {worker}");
                     w.WorkerType = WorfWorkerType.None;
                     w.CrashedAt = 0;
                     guard[worker] = w;

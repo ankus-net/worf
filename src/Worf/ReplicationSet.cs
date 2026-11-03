@@ -349,11 +349,11 @@ internal static partial class ReplicationSet
         // tables without replication identity.
         if (repset.ReplicateUpdate || repset.ReplicateDelete)
         {
-            SpiResult tables = Worf.SelectCatalog("SELECT set_reloid::oid FROM worf.replication_set_table WHERE set_id = $1",
+            WorfRows tables = Worf.SelectCatalog("SELECT set_reloid::oid FROM worf.replication_set_table WHERE set_id = $1",
                 SpiParameter.Create(repset.Id));
 
             // Process every individual table in the set.
-            foreach (SpiRow table in tables)
+            foreach (WorfRow table in tables)
             {
                 using PgRelation targetrel = PgRelation.Open(table.Get<uint>(0), PgLockMode.AccessShare);
 
@@ -402,11 +402,11 @@ internal static partial class ReplicationSet
     /// <param name="nodeid">The node.</param>
     internal static void DropNodeReplicationSets(uint nodeid)
     {
-        SpiResult result = Worf.SelectCatalog("SELECT set_id, set_nodeid FROM worf.replication_set WHERE set_nodeid = $1",
+        WorfRows result = Worf.SelectCatalog("SELECT set_id, set_nodeid FROM worf.replication_set WHERE set_nodeid = $1",
             SpiParameter.Create(nodeid));
 
         // Remove matching tuples.
-        foreach (SpiRow row in result)
+        foreach (WorfRow row in result)
         {
             uint setid = row.Get<uint>(0);
 
@@ -429,10 +429,10 @@ internal static partial class ReplicationSet
     /// <returns>The tables.</returns>
     internal static List<uint> ReplicationSetGetTables(uint setid)
     {
-        SpiResult result = Worf.SelectCatalog("SELECT set_reloid::oid FROM worf.replication_set_table WHERE set_id = $1",
+        WorfRows result = Worf.SelectCatalog("SELECT set_reloid::oid FROM worf.replication_set_table WHERE set_id = $1",
             SpiParameter.Create(setid));
         List<uint> res = [];
-        foreach (SpiRow row in result)
+        foreach (WorfRow row in result)
         {
             res.Add(row.Get<uint>(0));
         }
@@ -447,10 +447,10 @@ internal static partial class ReplicationSet
     /// <returns>The sequences.</returns>
     internal static List<uint> ReplicationSetGetSeqs(uint setid)
     {
-        SpiResult result = Worf.SelectCatalog("SELECT set_seqoid::oid FROM worf.replication_set_seq WHERE set_id = $1",
+        WorfRows result = Worf.SelectCatalog("SELECT set_seqoid::oid FROM worf.replication_set_seq WHERE set_id = $1",
             SpiParameter.Create(setid));
         List<uint> res = [];
-        foreach (SpiRow row in result)
+        foreach (WorfRow row in result)
         {
             res.Add(row.Get<uint>(0));
         }
@@ -761,7 +761,7 @@ internal static partial class ReplicationSet
                 res.Append(',');
             }
 
-            res.Append(Spi.QuoteIdentifier(str));
+            res.Append(Worf.QuoteIdentifier(str));
         }
 
         return res.ToString();
@@ -793,10 +793,10 @@ internal static partial class ReplicationSet
     private static void ReplicationSetRemoveTables(uint setid, uint nodeid)
     {
         _ = nodeid;
-        SpiResult result = Worf.SelectCatalog("SELECT ctid, set_reloid::oid FROM worf.replication_set_table WHERE set_id = $1",
+        WorfRows result = Worf.SelectCatalog("SELECT ctid, set_reloid::oid FROM worf.replication_set_table WHERE set_id = $1",
             SpiParameter.Create(setid));
 
-        foreach (SpiRow row in result)
+        foreach (WorfRow row in result)
         {
             uint reloid = row.Get<uint>(1);
 
@@ -815,10 +815,10 @@ internal static partial class ReplicationSet
     /// </summary>
     private static void ReplicationSetRemoveSeqs(uint setid, uint nodeid)
     {
-        SpiResult result = Worf.SelectCatalog("SELECT ctid, set_seqoid::oid FROM worf.replication_set_seq WHERE set_id = $1",
+        WorfRows result = Worf.SelectCatalog("SELECT ctid, set_seqoid::oid FROM worf.replication_set_seq WHERE set_id = $1",
             SpiParameter.Create(setid));
 
-        foreach (SpiRow row in result)
+        foreach (WorfRow row in result)
         {
             uint seqoid = row.Get<uint>(1);
 

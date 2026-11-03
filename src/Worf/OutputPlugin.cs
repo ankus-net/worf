@@ -73,43 +73,43 @@ internal static unsafe partial class OutputPlugin
 
         if (data.ClientBinaryBigendianSet && data.ClientBinaryBigendian != OutputConfig.ServerBigendian)
         {
-            PgLog.Debug1("Binary mode rejected: Server and client endian mismatch");
+            WorfLog.Debug1("Binary mode rejected: Server and client endian mismatch");
             return false;
         }
 
         if (data.ClientBinarySizeofdatum != 0 && data.ClientBinarySizeofdatum != Worf.SizeofDatum)
         {
-            PgLog.Debug1("Binary mode rejected: Server and client sizeof(Datum) mismatch");
+            WorfLog.Debug1("Binary mode rejected: Server and client sizeof(Datum) mismatch");
             return false;
         }
 
         if (data.ClientBinarySizeofint != 0 && data.ClientBinarySizeofint != Worf.SizeofInt)
         {
-            PgLog.Debug1("Binary mode rejected: Server and client sizeof(int) mismatch");
+            WorfLog.Debug1("Binary mode rejected: Server and client sizeof(int) mismatch");
             return false;
         }
 
         if (data.ClientBinarySizeoflong != 0 && data.ClientBinarySizeoflong != Worf.SizeofLong)
         {
-            PgLog.Debug1("Binary mode rejected: Server and client sizeof(long) mismatch");
+            WorfLog.Debug1("Binary mode rejected: Server and client sizeof(long) mismatch");
             return false;
         }
 
         if (data.ClientBinaryFloat4byvalSet && data.ClientBinaryFloat4byval != OutputConfig.ServerFloat4Byval)
         {
-            PgLog.Debug1("Binary mode rejected: Server and client float4byval mismatch");
+            WorfLog.Debug1("Binary mode rejected: Server and client float4byval mismatch");
             return false;
         }
 
         if (data.ClientBinaryFloat8byvalSet && data.ClientBinaryFloat8byval != OutputConfig.ServerFloat8Byval)
         {
-            PgLog.Debug1("Binary mode rejected: Server and client float8byval mismatch");
+            WorfLog.Debug1("Binary mode rejected: Server and client float8byval mismatch");
             return false;
         }
 
         if (data.ClientBinaryIntdatetimesSet && data.ClientBinaryIntdatetimes != OutputConfig.ServerIntegerDatetimes)
         {
-            PgLog.Debug1("Binary mode rejected: Server and client integer datetimes mismatch");
+            WorfLog.Debug1("Binary mode rejected: Server and client integer datetimes mismatch");
             return false;
         }
 
@@ -203,7 +203,7 @@ internal static unsafe partial class OutputPlugin
 
                 if (data.ClientNoTxinfo)
                 {
-                    PgLog.Warning("no_txinfo option ignored for protocols other than json");
+                    WorfLog.Warning("no_txinfo option ignored for protocols other than json");
                     data.ClientNoTxinfo = false;
                 }
             }
@@ -528,7 +528,7 @@ internal static unsafe partial class OutputPlugin
             // Skip empty changes.
             if (newtup is null && oldtup is null)
             {
-                PgLog.Debug1("worf output got empty change");
+                WorfLog.Debug1("worf output got empty change");
                 return false;
             }
 
@@ -645,7 +645,7 @@ internal static unsafe partial class OutputPlugin
                     }
                     else
                     {
-                        PgLog.Debug1("didn't send DELETE change because of missing oldtuple");
+                        WorfLog.Debug1("didn't send DELETE change because of missing oldtuple");
                     }
 
                     break;

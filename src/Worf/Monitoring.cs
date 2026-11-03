@@ -37,15 +37,15 @@ internal static class Monitoring
             }
         }
 
-        PgLog.Debug1($"waiting for {slotName ?? "all local slots"} to pass confirmed_flush position {Worf.FormatLsn(targetLsn)}");
+        WorfLog.Debug1($"waiting for {slotName ?? "all local slots"} to pass confirmed_flush position {Worf.FormatLsn(targetLsn)}");
 
         while (true)
         {
             ulong oldestConfirmedLsn = 0;
             string? oldestSlot = null;
 
-            SpiResult slots = Worf.Select("SELECT slot_name::text, confirmed_flush_lsn::text FROM pg_catalog.pg_replication_slots");
-            foreach (SpiRow s in slots)
+            WorfRows slots = Worf.Select("SELECT slot_name::text, confirmed_flush_lsn::text FROM pg_catalog.pg_replication_slots");
+            foreach (WorfRow s in slots)
             {
                 string name = s.Get<string>(0);
                 ulong confirmedFlush = Worf.TryParseLsn(s.Get<string?>(1) ?? "", out ulong lsn) ? lsn : 0;
@@ -64,7 +64,7 @@ internal static class Monitoring
 
             if (oldestSlot is not null)
             {
-                PgLog.Debug2($"oldest confirmed lsn is {Worf.FormatLsn(oldestConfirmedLsn)} on slot '{oldestSlot}', {(uint)(targetLsn - oldestConfirmedLsn)} bytes left until {Worf.FormatLsn(targetLsn)}");
+                WorfLog.Debug2($"oldest confirmed lsn is {Worf.FormatLsn(oldestConfirmedLsn)} on slot '{oldestSlot}', {(uint)(targetLsn - oldestConfirmedLsn)} bytes left until {Worf.FormatLsn(targetLsn)}");
             }
 
             if (oldestConfirmedLsn >= targetLsn)

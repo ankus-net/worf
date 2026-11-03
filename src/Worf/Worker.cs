@@ -23,6 +23,12 @@ internal static class Worker
 
     private static bool s_xacthookSignalWorkers;
 
+    // Whether the transaction's commit starts every database's manager, even one that had nothing to manage.
+    private static bool s_forgetEveryIdleManager;
+
+    // Whether a registration found every background worker slot taken since one last succeeded.
+    private static bool s_outOfWorkerSlots;
+
     private static ushort s_myWorfWorkerGeneration;
 
     /// <summary>
@@ -50,37 +56,41 @@ internal static class Worker
     }
 
     /// <summary>
-    /// Register the worf worker proccess.
+    /// Register the worf worker proccess. With every background worker slot taken, it warns, as PostgreSQL's logical
+    /// replication launcher does, once until a worker registers again, and the caller tries again later.
     /// </summary>
     /// <param name="worker">The worker to start.</param>
-    /// <returns>The assigned slot number.</returns>
+    /// <returns>The assigned slot number, or -1 when every background worker slot is taken.</returns>
     internal static int WorkerRegister(WorfWorker worker)
     {
         int slot;
-        ushort generation;
+        ushort generation = 0;
         using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = WorfCtx.Exclusive())
         {
             slot = guard.Mutate((ref ctx, workers) => FindEmptyWorkerSlot(workers, worker.Dboid));
-            if (slot == -1)
+            if (slot != -1)
             {
-                throw new PgException(PgSqlStates.InternalError,
-                    "could not register worf worker: all background worker slots are already used");
+                WorfWorker workerShm = guard[slot];
+
+                // Maintain a generation counter for worker registrations; see WaitForWorkerStartup(...). The counter
+                // wraps around.
+                generation = workerShm.Generation == ushort.MaxValue ? (ushort)0 : (ushort)(workerShm.Generation + 1);
+
+                workerShm = worker;
+                workerShm.Generation = generation;
+                workerShm.CrashedAt = 0;
+                workerShm.Proc = 0;
+                workerShm.WorkerType = worker.WorkerType;
+                workerShm.SkipSupervisorWakeup = false;
+                workerShm.TerminateRequested = false;
+                guard[slot] = workerShm;
             }
+        }
 
-            WorfWorker workerShm = guard[slot];
-
-            // Maintain a generation counter for worker registrations; see WaitForWorkerStartup(...). The counter
-            // wraps around.
-            generation = workerShm.Generation == ushort.MaxValue ? (ushort)0 : (ushort)(workerShm.Generation + 1);
-
-            workerShm = worker;
-            workerShm.Generation = generation;
-            workerShm.CrashedAt = 0;
-            workerShm.Proc = 0;
-            workerShm.WorkerType = worker.WorkerType;
-            workerShm.SkipSupervisorWakeup = false;
-            workerShm.TerminateRequested = false;
-            guard[slot] = workerShm;
+        if (slot == -1)
+        {
+            OutOfWorkerSlots();
+            return -1;
         }
 
         string name;
@@ -146,10 +156,11 @@ internal static class Worker
                 guard[slot] = workerShm;
             }
 
-            throw new PgException(PgSqlStates.ConfigurationLimitExceeded,
-                "worker registration failed, you might want to increase max_worker_processes setting");
+            OutOfWorkerSlots();
+            return -1;
         }
 
+        s_outOfWorkerSlots = false;
         using (bgwHandle)
         {
             WaitForWorkerStartup(slot, generation, bgwHandle);
@@ -163,6 +174,22 @@ internal static class Worker
         }
 
         return slot;
+    }
+
+    /// <summary>
+    /// Warns that every background worker slot is taken, once until a worker registers again.
+    /// </summary>
+    private static void OutOfWorkerSlots()
+    {
+        if (!s_outOfWorkerSlots)
+        {
+            s_outOfWorkerSlots = true;
+            WorfLog.Warning(new PgDiagnostic("out of background worker slots")
+            {
+                SqlState = PgSqlStates.ConfigurationLimitExceeded,
+                Hint = "You might need to increase \"max_worker_processes\".",
+            });
+        }
     }
 
     /// <summary>
@@ -189,7 +216,7 @@ internal static class Worker
             s_myWorfWorkerGeneration = worker.Generation;
             dboid = worker.Dboid;
 
-            PgLog.Debug2($"{WorkerTypeName(type)} worker [{Environment.ProcessId}] attaching to slot {slot} generation {s_myWorfWorkerGeneration}");
+            WorfLog.Debug2($"{WorkerTypeName(type)} worker [{Environment.ProcessId}] attaching to slot {slot} generation {s_myWorfWorkerGeneration}");
         }
 
         // Make it easy to identify our processes.
@@ -202,6 +229,29 @@ internal static class Worker
         if (dboid != 0)
         {
             PgBackgroundWorker.Connect(dboid, 0);
+
+            // A worker has no client. In a database whose encoding converts to UTF-8, the encoding of the text that
+            // crosses into and out of .NET, its client encoding is UTF-8, so that PostgreSQL converts that text with the
+            // conversion it keeps for the client, which works between transactions too. The copies a sync worker reads
+            // name their encoding, and apply reads the values it receives in the database encoding, as
+            // Worf.InDatabaseEncoding has it.
+            PgBackgroundWorker.RunTransaction(() =>
+            {
+                if (Worf.ConvertsEncoding)
+                {
+                    unsafe
+                    {
+                        fixed (byte* name = "client_encoding\0"u8)
+                        fixed (byte* value = "UTF8\0"u8)
+                        {
+                            _ = NativeMethods.set_config_option((sbyte*)name, (sbyte*)value, GucContext.PGC_SUSET, GucSource.PGC_S_SESSION,
+                                GucAction.GUC_ACTION_SET, true, 0, false);
+                        }
+                    }
+                }
+
+                Worf.PrepareEncodingConversions();
+            });
             if (type is not (WorfWorkerType.Apply or WorfWorkerType.Sync))
             {
                 unsafe
@@ -524,6 +574,17 @@ internal static class Worker
     }
 
     /// <summary>
+    /// Has the transaction, once it commits, wake the supervisor to start the manager of this database, or of every
+    /// database, even if it had nothing to manage, as once CREATE EXTENSION worf or ALTER DATABASE commits.
+    /// </summary>
+    /// <param name="everyDatabase">Whether every database's manager starts, rather than this database's.</param>
+    internal static void ForgetIdleManagersAtCommit(bool everyDatabase)
+    {
+        s_forgetEveryIdleManager |= everyDatabase;
+        SubscriptionChanged(0, false);
+    }
+
+    /// <summary>
     /// Enqueue signal for supervisor/manager at COMMIT.
     /// </summary>
     /// <param name="subid">The subscription whose apply worker to signal, or zero.</param>
@@ -537,6 +598,7 @@ internal static class Worker
             {
                 s_signalWorkers.Clear();
                 s_xacthookSignalWorkers = false;
+                s_forgetEveryIdleManager = false;
             });
 
             // A prepared transaction's workers are signalled as it is prepared, as nothing hooks COMMIT PREPARED.
@@ -629,8 +691,16 @@ internal static class Worker
     /// </summary>
     private static int FindEmptyWorkerSlot(ReadOnlySpan<WorfWorker> workers, uint dboid)
     {
+        // A free slot that remembers a database whose manager had nothing to manage is taken last.
+        int idle = -1;
         for (int i = 0; i < workers.Length; i++)
         {
+            if (workers[i].WorkerType == WorfWorkerType.None && workers[i].IdleAt != 0 && workers[i].Dboid != dboid)
+            {
+                idle = idle < 0 ? i : idle;
+                continue;
+            }
+
             if (workers[i].WorkerType == WorfWorkerType.None ||
                 (workers[i].CrashedAt != 0 && (workers[i].Dboid == dboid || workers[i].Dboid == 0)))
             {
@@ -638,7 +708,7 @@ internal static class Worker
             }
         }
 
-        return -1;
+        return idle;
     }
 
     /// <summary>
@@ -653,7 +723,7 @@ internal static class Worker
 
             if (GotSigterm)
             {
-                PgLog.Debug1("worf supervisor exiting on SIGTERM");
+                WorfLog.Debug1("worf supervisor exiting on SIGTERM");
                 throw new OperationCanceledException("The worf worker is stopping.");
             }
 
@@ -663,7 +733,7 @@ internal static class Worker
                 WorfWorker worker = guard[slot];
                 if (state.Status == PgBackgroundWorkerStatus.Started && worker.Proc != 0)
                 {
-                    PgLog.Debug2($"{WorkerTypeName(worker.WorkerType)} worker at slot {slot} started with pid {state.ProcessId} and attached to shmem");
+                    WorfLog.Debug2($"{WorkerTypeName(worker.WorkerType)} worker at slot {slot} started with pid {state.ProcessId} and attached to shmem");
                     break;
                 }
 
@@ -685,7 +755,7 @@ internal static class Worker
                     {
                         // The worker we launched (same generation) crashed before attaching to shmem so it didn't
                         // set crashed_at. Mark it crashed so the slot can be re-used.
-                        PgLog.Debug2($"{WorkerTypeName(worker.WorkerType)} worker at slot {slot} exited prematurely");
+                        WorfLog.Debug2($"{WorkerTypeName(worker.WorkerType)} worker at slot {slot} exited prematurely");
                         worker.CrashedAt = GetCurrentTimestamp();
                         guard[slot] = worker;
                     }
@@ -693,7 +763,7 @@ internal static class Worker
                     {
                         // Worker exited normally or self-reported a crash and may have already been replaced. Either
                         // way, we don't care, we're only looking for crashes before shmem attach.
-                        PgLog.Debug2($"{WorkerTypeName(worker.WorkerType)} worker at slot {slot} exited before we noticed it started");
+                        WorfLog.Debug2($"{WorkerTypeName(worker.WorkerType)} worker at slot {slot} exited before we noticed it started");
                     }
 
                     break;
@@ -732,7 +802,7 @@ internal static class Worker
         type = worker.WorkerType;
         uint dboid = worker.Dboid;
 
-        PgLog.Log($"{WorkerTypeName(type)} worker [{Environment.ProcessId}] at slot {MyWorfWorker} generation {s_myWorfWorkerGeneration} {(crash ? "exiting with error" : "detaching cleanly")}");
+        WorfLog.Log($"{WorkerTypeName(type)} worker [{Environment.ProcessId}] at slot {MyWorfWorker} generation {s_myWorfWorkerGeneration} {(crash ? "exiting with error" : "detaching cleanly")}");
 
         // If we crashed we need to report it.
         //
@@ -775,8 +845,11 @@ internal static class Worker
                 ctx.SubscriptionsChanged = true;
             }
 
+            // The free slot of a manager that had nothing to manage keeps its database, so that the supervisor doesn't
+            // start it again at each look.
+            worker.IdleAt = worker.WorkerType == WorfWorkerType.Manager && worker.SkipSupervisorWakeup ? GetCurrentTimestamp() : 0;
+            worker.Dboid = worker.IdleAt != 0 ? worker.Dboid : 0;
             worker.WorkerType = WorfWorkerType.None;
-            worker.Dboid = 0;
             worker.SkipSupervisorWakeup = false;
         }
 
@@ -838,6 +911,46 @@ internal static class Worker
     }
 
     /// <summary>
+    /// Forgets that a database's manager had nothing to manage, or every database's for zero, so that the supervisor
+    /// starts it at its next look. The caller holds the lock exclusively.
+    /// </summary>
+    /// <param name="guard">The caller's lock.</param>
+    /// <param name="dboid">The database, or zero.</param>
+    internal static void ForgetIdleManager(PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard, uint dboid)
+    {
+        for (int i = 0; i < guard.Length; i++)
+        {
+            if (guard[i].WorkerType == WorfWorkerType.None && guard[i].IdleAt != 0 && (dboid == 0 || guard[i].Dboid == dboid))
+            {
+                WorfWorker worker = guard[i];
+                worker.IdleAt = 0;
+                worker.Dboid = 0;
+                guard[i] = worker;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Gets whether a database's manager had nothing to manage at its last start, since a time.
+    /// </summary>
+    /// <param name="workers">The worker slots.</param>
+    /// <param name="dboid">The database.</param>
+    /// <param name="since">The time.</param>
+    /// <returns>Whether it had.</returns>
+    internal static bool ManagerIdle(ReadOnlySpan<WorfWorker> workers, uint dboid, long since)
+    {
+        foreach (WorfWorker worker in workers)
+        {
+            if (worker.WorkerType == WorfWorkerType.None && worker.Dboid == dboid && worker.IdleAt > since)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
     /// Wakes the supervisor, as once a database is dropped, so that it frees the worker slots that database's workers
     /// left.
     /// </summary>
@@ -894,6 +1007,10 @@ internal static class Worker
             ctx.SubscriptionsChanged = true;
             guard.Header = ctx;
 
+            // The database, or after ALTER DATABASE any database, may have something to manage now.
+            ForgetIdleManager(guard, s_forgetEveryIdleManager ? 0 : myDatabaseId);
+            s_forgetEveryIdleManager = false;
+
             // Signal the manager worker, if there's one
             int manager = guard.Read((in _, workers) => ManagerFind(workers, myDatabaseId));
             if (manager >= 0 && guard[manager].Proc != 0)
@@ -938,7 +1055,7 @@ internal static class Worker
                 pid = ((PGPROC*)worker.Proc)->pid;
             }
 
-            PgLog.Debug2($"killing worf {WorkerTypeName(worker.WorkerType)} worker [{pid}] at slot {slot}");
+            WorfLog.Debug2($"killing worf {WorkerTypeName(worker.WorkerType)} worker [{pid}] at slot {slot}");
             worker.TerminateRequested = true;
             guard[slot] = worker;
             SetProcLatch(worker.Proc);

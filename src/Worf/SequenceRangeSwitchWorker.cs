@@ -10,9 +10,6 @@ namespace Worf;
 /// </summary>
 internal static class SequenceRangeSwitchWorker
 {
-    // The sequences whose switch worker couldn't start, which have warned of it.
-    private static readonly HashSet<uint> s_unstarted = [];
-
     /// <summary>
     /// Runs the switch worker.
     /// </summary>
@@ -22,7 +19,7 @@ internal static class SequenceRangeSwitchWorker
     {
         Worker.WorkerAttach((int)mainArg, WorfWorkerType.Switch);
         uint seqoid = Worker.MyWorker.Worker.Switch.Seqoid;
-        PgLog.Debug1($"starting sequence switch worker for sequence {seqoid}");
+        WorfLog.Debug1($"starting sequence switch worker for sequence {seqoid}");
         while (!Worker.GotSigterm)
         {
             PgInterrupts.Check();
@@ -56,37 +53,14 @@ internal static class SequenceRangeSwitchWorker
     /// Starts a switch worker for a sequence, unless one runs for it.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
-    /// <param name="name">The sequence's name, for a warning.</param>
     /// <returns>Whether one runs, or false when every worker slot is taken.</returns>
-    internal static bool Start(uint seqoid, string name)
-    {
-        if (Running(seqoid))
+    internal static bool Start(uint seqoid)
+        => Running(seqoid) || Worker.WorkerRegister(new WorfWorker
         {
-            return true;
-        }
-
-        try
-        {
-            _ = Worker.WorkerRegister(new WorfWorker
-            {
-                WorkerType = WorfWorkerType.Switch,
-                Dboid = Worker.MyWorker.Dboid,
-                Worker = new WorfWorkerInfo { Switch = new WorfSwitchWorker { Seqoid = seqoid } },
-            });
-            _ = s_unstarted.Remove(seqoid);
-            return true;
-        }
-        catch (PgException error)
-        {
-            // Each sequence warns once until a worker starts for it, rather than at every check.
-            if (s_unstarted.Add(seqoid))
-            {
-                PgLog.Warning($"could not start the sequence switch worker for sequence {name}: {error.Message}");
-            }
-
-            return false;
-        }
-    }
+            WorkerType = WorfWorkerType.Switch,
+            Dboid = Worker.MyWorker.Dboid,
+            Worker = new WorfWorkerInfo { Switch = new WorfSwitchWorker { Seqoid = seqoid } },
+        }) != -1;
 
     /// <summary>
     /// Finds the process of the switch worker that runs for a sequence.

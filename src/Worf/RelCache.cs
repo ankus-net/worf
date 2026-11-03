@@ -178,7 +178,7 @@ internal static partial class RelCache
         if (rel.DeferrableIndexes is not null)
         {
             throw new PgException(PgSqlStates.FeatureNotSupported, "worf doesn't support index rechecks needed for deferrable indexes with expressions or a predicate",
-                detail: $"relation {Spi.QuoteQualifiedIdentifier(rel.Nspname, rel.Relname)} has deferrable indexes: {rel.DeferrableIndexes}",
+                detail: $"relation {Worf.QuoteQualifiedIdentifier(rel.Nspname, rel.Relname)} has deferrable indexes: {rel.DeferrableIndexes}",
                 hint: "Make the constraints not deferrable: ALTER TABLE ... ALTER CONSTRAINT ... NOT DEFERRABLE for a unique one, and for an exclusion constraint, drop it and add it again.");
         }
     }
@@ -190,7 +190,7 @@ internal static partial class RelCache
     /// </summary>
     private static List<(string Name, bool Exclusion, string Query, int[] Columns)>? DeferrableChecks(WorfRelation entry)
     {
-        SpiResult constraints = Worf.Read("""
+        WorfRows constraints = Worf.Read("""
             SELECT c.conname::text, c.contype = 'x', i.indnullsnotdistinct,
                 pg_catalog.array_agg(k.attnum::int4 ORDER BY k.n),
                 pg_catalog.array_agg(pg_catalog.quote_ident(a.attname) ORDER BY k.n),
@@ -214,9 +214,9 @@ internal static partial class RelCache
             return null;
         }
 
-        string table = Spi.QuoteQualifiedIdentifier(entry.Nspname, entry.Relname);
+        string table = Worf.QuoteQualifiedIdentifier(entry.Nspname, entry.Relname);
         List<(string Name, bool Exclusion, string Query, int[] Columns)> checks = [];
-        foreach (SpiRow constraint in constraints)
+        foreach (WorfRow constraint in constraints)
         {
             bool nullsEqual = constraint.Get<bool>(2);
             int[] columns = constraint.Get<int[]>(3);
@@ -515,7 +515,7 @@ internal static partial class RelCache
             }
             else
             {
-                SpiResult found = Worf.SelectCatalog("""
+                WorfRows found = Worf.SelectCatalog("""
                     SELECT t.oid FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
                     WHERE n.nspname = $1 AND t.typname = $2
                     """, SpiParameter.Create(remote.Nspname), SpiParameter.Create(remote.Typname));

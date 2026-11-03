@@ -93,7 +93,7 @@ internal static unsafe partial class Apply
     // When each table's sync worker last started, and how many times it has, so that one that fails, as on a value
     // that fails to convert in its copy, starts again only after a delay that doubles each time.
     private static readonly Dictionary<(string Nspname, string Relname), (long StartedAt, int Starts)> s_syncStarts = [];
-    private static PgReplicationConnection? s_applyconn;
+    private static WorfConnection? s_applyconn;
     private static ApplyFunctions s_applyApi = ApplyFunctions.Heap;
     private static WorfRelation? s_lastInsertRel;
     private static int s_lastInsertRelCnt;
@@ -245,7 +245,7 @@ internal static unsafe partial class Apply
         // recorded it, whichever worker slot this one has and across restarts.
         (s_exceptionLsn, s_exceptionLevel, s_exceptionError) = PgBackgroundWorker.RunTransaction(() => ExceptionLog.State(sub.Id));
 
-        PgLog.Log($"starting apply for subscription {sub.Name}");
+        WorfLog.Log($"starting apply for subscription {sub.Name}");
 
         // Set apply delay if any.
         if (sub.ApplyDelay is PgInterval applyDelay)
@@ -256,7 +256,7 @@ internal static unsafe partial class Apply
         // If the subscription isn't initialized yet, initialize it.
         bool catchingUp = Sync.SyncSubscription(sub);
 
-        PgLog.Debug1($"connecting to provider {sub.Origin.Name}, dsn {sub.OriginIf.Dsn}");
+        WorfLog.Debug1($"connecting to provider {sub.Origin.Name}, dsn {sub.OriginIf.Dsn}");
 
         // Cache the queue relation id.
         // TODO: invalidation
@@ -266,7 +266,7 @@ internal static unsafe partial class Apply
 
             ushort originid = PgReplicationOrigin.Find(sub.SlotName)
                 ?? throw new PgException(PgSqlStates.UndefinedObject, $"replication origin \"{sub.SlotName}\" does not exist");
-            PgLog.Debug2($"setting up replication origin {sub.SlotName} (oid {originid})");
+            WorfLog.Debug2($"setting up replication origin {sub.SlotName} (oid {originid})");
             PgReplicationOrigin.SetupSession(originid);
 
             // Relayed transactions advance their relay origins instead, so start after the latest of them all.
@@ -297,7 +297,7 @@ internal static unsafe partial class Apply
         }
 
         // Start the replication.
-        using PgReplicationConnection streamConn = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, null);
+        using WorfConnection streamConn = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, null);
         string repsets = ReplicationSet.StringlistToIdentifierstr(sub.ReplicationSets);
         string origins = ReplicationSet.StringlistToIdentifierstr(sub.ForwardOrigins);
 
@@ -339,7 +339,7 @@ internal static unsafe partial class Apply
     /// <param name="streamConn">The streaming connection.</param>
     /// <returns>Where a table sync worker streams changes again from to apply a failed transaction again, or zero when
     /// the worker was asked to stop.</returns>
-    internal static ulong ApplyWork(PgReplicationConnection streamConn)
+    internal static ulong ApplyWork(WorfConnection streamConn)
     {
         s_applyconn = streamConn;
         s_lastReceived = 0;
@@ -454,7 +454,7 @@ internal static unsafe partial class Apply
 
         MemoryContextData* oldcontext = Worf.MemoryContextSwitchTo(NativeGlobals.MessageContext);
 
-        using PgErrorContext errcallback = PgErrorContext.Push($"during execution of queued SQL statement: {cmdstr}");
+        using PgErrorContext errcallback = PgErrorContext.Push(Worf.Shown($"during execution of queued SQL statement: {cmdstr}"));
 
         sbyte* query = Worf.PStrDup(cmdstr);
         NativeGlobals.debug_query_string = query;
@@ -481,7 +481,7 @@ internal static unsafe partial class Apply
 
                 if (command->stmt->type == NodeTag.T_TransactionStmt)
                 {
-                    PgLog.Warning($"skipping transaction control statement in queued SQL statement: {cmdstr}");
+                    WorfLog.Warning($"skipping transaction control statement in queued SQL statement: {cmdstr}");
                     continue;
                 }
 
@@ -678,7 +678,7 @@ internal static unsafe partial class Apply
     {
         if (s_errorContext is not null)
         {
-            s_errorContext.Text = FormatActionDescription(s_actionName, s_errRel, s_isDdlOrDrop);
+            s_errorContext.Text = Worf.Shown(FormatActionDescription(s_actionName, s_errRel, s_isDdlOrDrop));
         }
     }
 
@@ -781,7 +781,7 @@ internal static unsafe partial class Apply
             if (now - s_clockSkewReportedAt >= 60_000_000)
             {
                 s_clockSkewReportedAt = now;
-                PgLog.Warning(new PgDiagnostic(
+                WorfLog.Warning(new PgDiagnostic(
                     $"remote commit time is {ahead / 1000} ms ahead of the local clock, more than worf.max_clock_skew")
                 {
                     Hint = "Synchronize the nodes' clocks. Until then, local changes can lose to earlier remote ones.",
@@ -874,7 +874,10 @@ internal static unsafe partial class Apply
             ulong xactLastCommitEnd = NativeGlobals.XactLastCommitEnd;
             ushort remoteOriginId = s_remoteOriginId;
             ulong remoteOriginLsn = s_remoteOriginLsn;
-            PgLog.Debug3($"advancing origin oid {remoteOriginId} for forwarded row to {Worf.FormatLsn(xactLastCommitEnd)}");
+            if (PgLog.IsEnabled(PgLogLevel.Debug3))
+            {
+                WorfLog.Debug3($"advancing origin oid {remoteOriginId} for forwarded row to {Worf.FormatLsn(xactLastCommitEnd)}");
+            }
 
             PgBackgroundWorker.RunTransaction(() =>
                 PgReplicationOrigin.Advance(remoteOriginId, new PgLsn(remoteOriginLsn), new PgLsn(xactLastCommitEnd), false, false /* XXX ? */));
@@ -888,7 +891,7 @@ internal static unsafe partial class Apply
         ulong replayStopLsn = me.Worker.Apply.ReplayStopLsn;
         if (replayStopLsn != 0 && replayStopLsn <= endLsn)
         {
-            PgLog.Log($"worf {(me.WorkerType == WorfWorkerType.Sync ? "sync" : "apply")} finished processing; replayed to {Worf.FormatLsn(endLsn)} of required {Worf.FormatLsn(replayStopLsn)}");
+            WorfLog.Log($"worf {(me.WorkerType == WorfWorkerType.Sync ? "sync" : "apply")} finished processing; replayed to {Worf.FormatLsn(endLsn)} of required {Worf.FormatLsn(replayStopLsn)}");
 
             // If this is sync worker, update syncing table state to done.
             if (me.WorkerType == WorfWorkerType.Sync)
@@ -1044,7 +1047,7 @@ internal static unsafe partial class Apply
         if (dropped.Count > 0 && now - s_reclaimWarnedAt >= 60_000_000)
         {
             s_reclaimWarnedAt = now;
-            PgLog.Warning(new PgDiagnostic($"subscription \"{sub.Name}\" dropped relay origins to free replication origin slots")
+            WorfLog.Warning(new PgDiagnostic($"subscription \"{sub.Name}\" dropped relay origins to free replication origin slots")
             {
                 Detail = "Each node whose changes a provider forwards takes a replication origin slot, and dropping and creating relay origins slows apply.",
                 Hint = "Raise max_active_replication_origins, or max_replication_slots before PostgreSQL 18.",
@@ -1215,13 +1218,13 @@ internal static unsafe partial class Apply
         {
             dropped = PgBackgroundWorker.RunTransaction(() =>
             {
-                using PgReplicationConnection conn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "cleanup");
+                using WorfConnection conn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "cleanup");
                 return Sync.DropLeftSyncSlots(conn, sub).Count == 0;
             });
         }
         catch (PgException error)
         {
-            PgLog.Debug1($"could not drop the slots table syncs left on the provider: {error.Message}");
+            WorfLog.Debug1($"could not drop the slots table syncs left on the provider: {error.Message}");
             dropped = false;
         }
 
@@ -1633,7 +1636,7 @@ internal static unsafe partial class Apply
         RelCache.ProviderMoneyFormat = null;
         do
         {
-            string k = Worf.FromServer(NativeMethods.pq_getmsgstring(s));
+            string k = Worf.FromServer(NativeMethods.pq_getmsgrawstring(s));
             if (k.Length == 0)
             {
                 throw new PgException(PgSqlStates.ProtocolViolation, "invalid startup message: key has zero length");
@@ -1645,7 +1648,7 @@ internal static unsafe partial class Apply
             }
 
             // It's OK to have a zero length value
-            string v = Worf.FromServer(NativeMethods.pq_getmsgstring(s));
+            string v = Worf.FromServer(NativeMethods.pq_getmsgrawstring(s));
 
             HandleStartupParam(k, v);
         }
@@ -1668,11 +1671,11 @@ internal static unsafe partial class Apply
 
     private static void HandleStartupParam(string key, string value)
     {
-        PgLog.Debug2($"apply got worf startup msg param  {key}={value}");
+        WorfLog.Debug2($"apply got worf startup msg param  {key}={value}");
 
         if (key == "pg_version")
         {
-            PgLog.Debug1($"upstream Pg version is {value}");
+            WorfLog.Debug1($"upstream Pg version is {value}");
         }
 
         if (key == "encoding")
@@ -1696,7 +1699,7 @@ internal static unsafe partial class Apply
             bool fwd = ParseBoolParam(key, value);
 
             // FIXME: Store this somewhere
-            PgLog.Debug1($"changeset origin forwarding enabled: {(fwd ? "t" : "f")}");
+            WorfLog.Debug1($"changeset origin forwarding enabled: {(fwd ? "t" : "f")}");
         }
 
         // We just ignore a bunch of parameters here because we specify what we require when we send our params to
@@ -1708,7 +1711,7 @@ internal static unsafe partial class Apply
         string? nspname = null;
         string? relname = null;
 
-        using JsonDocument document = JsonDocument.Parse(message);
+        using JsonDocument document = WorfJson.Parse(message);
         JsonElement root = document.RootElement;
 
         // Parse and validate the json message.
@@ -1740,11 +1743,11 @@ internal static unsafe partial class Apply
 
             if (isSchema)
             {
-                nspname = property.Value.GetString();
+                nspname = property.Value.GetWorfString();
             }
             else
             {
-                relname = property.Value.GetString();
+                relname = property.Value.GetWorfString();
             }
         }
 
@@ -1793,7 +1796,7 @@ internal static unsafe partial class Apply
 
         if (oldsync is not null)
         {
-            PgLog.Info($"table sync came from queue for table {schemaname}.{relname} which already being synchronized, skipping");
+            WorfLog.Info($"table sync came from queue for table {schemaname}.{relname} which already being synchronized, skipping");
 
             return;
         }
@@ -1819,7 +1822,7 @@ internal static unsafe partial class Apply
         string? relname = null;
         string? lastValueRaw = null;
 
-        using JsonDocument document = JsonDocument.Parse(queuedMessage.Message);
+        using JsonDocument document = WorfJson.Parse(queuedMessage.Message);
         JsonElement root = document.RootElement;
 
         // Parse and validate the json message.
@@ -1853,7 +1856,7 @@ internal static unsafe partial class Apply
                 throw new PgException(PgSqlStates.InternalError, $"unexpected type for key '{property.Name}': {JsonbType(property.Value)}");
             }
 
-            string? value = property.Value.GetString();
+            string? value = property.Value.GetWorfString();
             switch (target)
             {
                 case 0:
@@ -1898,11 +1901,11 @@ internal static unsafe partial class Apply
         if (reloid == 0)
         {
             WorfSubscription sub = MySubscription!;
-            using (PgReplicationConnection conn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "sequence"))
+            using (WorfConnection conn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "sequence"))
             {
                 if (!Rpc.RemoteReplicatesSequence(conn, nspname, relname, sub.ReplicationSets))
                 {
-                    PgLog.Warning($"skipping the state of sequence {nspname}.{relname}, which doesn't exist here and which provider {sub.Origin.Name} doesn't replicate");
+                    WorfLog.Warning($"skipping the state of sequence {nspname}.{relname}, which doesn't exist here and which provider {sub.Origin.Name} doesn't replicate");
                     return;
                 }
             }
@@ -1914,7 +1917,7 @@ internal static unsafe partial class Apply
         // A managed sequence's position is this node's own, and the provider's would fall outside its block.
         if (SequenceRanges.IsManaged(reloid))
         {
-            PgLog.Warning($"skipping the state of sequence {nspname}.{relname}, which is under range management here");
+            WorfLog.Warning($"skipping the state of sequence {nspname}.{relname}, which is under range management here");
             return;
         }
 
@@ -1928,7 +1931,7 @@ internal static unsafe partial class Apply
     /// </summary>
     private static void HandleSql(QueuedMessage queuedMessage, bool txJustStarted)
     {
-        using JsonDocument document = JsonDocument.Parse(queuedMessage.Message);
+        using JsonDocument document = WorfJson.Parse(queuedMessage.Message);
         JsonElement root = document.RootElement;
 
         // Validate the json and extract the SQL string from it.
@@ -1943,7 +1946,7 @@ internal static unsafe partial class Apply
                 $"malformed message in queued message tuple, expected value type 1 got {JsonbType(root)}");
         }
 
-        string sql = root.GetString()!;
+        string sql = root.GetWorfString()!;
 
         // Run the extracted SQL, out of the way of the indexes on this node alone, as DDL from the origin runs, in a
         // subtransaction, so that one it can't build again is dropped and the SQL runs again. A statement that can't run
@@ -1970,7 +1973,7 @@ internal static unsafe partial class Apply
     /// </summary>
     private static void HandleDdl(QueuedMessage queuedMessage, bool txJustStarted)
     {
-        using JsonDocument document = JsonDocument.Parse(queuedMessage.Message);
+        using JsonDocument document = WorfJson.Parse(queuedMessage.Message);
         JsonElement root = document.RootElement;
         if (root.ValueKind != JsonValueKind.Object ||
             !root.TryGetProperty("search_path", out JsonElement searchPath) || searchPath.ValueKind != JsonValueKind.String ||
@@ -1988,7 +1991,7 @@ internal static unsafe partial class Apply
             foreach (JsonProperty position in positions.EnumerateObject())
             {
                 if (!uint.TryParse(position.Name, NumberStyles.None, CultureInfo.InvariantCulture, out uint nodeId) ||
-                    !Worf.TryParseLsn(position.Value.GetString() ?? "", out ulong lsn))
+                    !Worf.TryParseLsn(position.Value.GetWorfString() ?? "", out ulong lsn))
                 {
                     throw new PgException(PgSqlStates.InternalError, "malformed message in queued message tuple: expected node positions");
                 }
@@ -2000,26 +2003,26 @@ internal static unsafe partial class Apply
         }
 
         if (root.TryGetProperty("fence", out JsonElement fence) &&
-            ulong.TryParse(fence.GetString(), NumberStyles.None, CultureInfo.InvariantCulture, out ulong fenceId))
+            ulong.TryParse(fence.GetWorfString(), NumberStyles.None, CultureInfo.InvariantCulture, out ulong fenceId))
         {
             DdlLock.ReleaseOnCommit(fenceId);
         }
 
         // The statement runs with the settings it ran with, which change what it means.
         int saveNestlevel = NativeMethods.NewGUCNestLevel();
-        SetDdlSetting("search_path", searchPath.GetString()!);
+        SetDdlSetting("search_path", searchPath.GetWorfString()!);
         if (root.TryGetProperty("settings", out JsonElement settings) && settings.ValueKind == JsonValueKind.Object)
         {
             foreach (JsonProperty setting in settings.EnumerateObject())
             {
-                SetDdlSetting(setting.Name, setting.Value.GetString() ?? "");
+                SetDdlSetting(setting.Name, setting.Value.GetWorfString() ?? "");
             }
         }
 
         // A statement that runs concurrently commits along the way, which apply's transaction can't, so it runs
         // in that transaction instead.
-        RunQueuedCommand(command.GetString()!, queuedMessage.Role,
-            () => PgTransaction.RunInSubtransaction(() => ExecuteSqlCommand(command.GetString()!, queuedMessage.Role, false, true),
+        RunQueuedCommand(command.GetWorfString()!, queuedMessage.Role,
+            () => PgTransaction.RunInSubtransaction(() => ExecuteSqlCommand(command.GetWorfString()!, queuedMessage.Role, false, true),
                 PgSubtransactionMode.Atomic));
 
         NativeMethods.AtEOXact_GUC(true, saveNestlevel);
@@ -2034,7 +2037,7 @@ internal static unsafe partial class Apply
         string origin = MySubscription!.Origin.Name;
         List<(uint Index, string Name)> moved;
         bool writesRows;
-        using (PgErrorContext.Push($"during execution of queued SQL statement: {command}"))
+        using (PgErrorContext.Push(Worf.Shown($"during execution of queued SQL statement: {command}")))
         {
             moved = LocalIndex.MoveAside(command, role);
             writesRows = LocalIndex.WritesRows(command);
@@ -2279,7 +2282,7 @@ internal static unsafe partial class Apply
                     me.Worker.Apply.ReplayStopLsn != 0 &&
                     me.Worker.Apply.ReplayStopLsn <= endpos)
                 {
-                    PgLog.Log($"worf sync finished processing via keepalive; provider at {Worf.FormatLsn(endpos)}, required {Worf.FormatLsn(me.Worker.Apply.ReplayStopLsn)}");
+                    WorfLog.Log($"worf sync finished processing via keepalive; provider at {Worf.FormatLsn(endpos)}, required {Worf.FormatLsn(me.Worker.Apply.ReplayStopLsn)}");
 
                     PgBackgroundWorker.RunTransaction(() => Sync.SetTableSyncStatus(me.Worker.Apply.SubId,
                         Worker.NameStr(me.Worker.Sync.Nspname), Worker.NameStr(me.Worker.Sync.Relname), Sync.SyncStatusSyncdone, endpos));
@@ -2473,10 +2476,10 @@ internal static unsafe partial class Apply
         QueuedMessage? queued = operation == "INSERT" && s_exceptionMode ? SkippedQueuedMessage() : null;
         if (queued?.MessageType == Queue.QueueCommandTypeDdl)
         {
-            using JsonDocument document = JsonDocument.Parse(queued.Message);
+            using JsonDocument document = WorfJson.Parse(queued.Message);
             if (document.RootElement.ValueKind == JsonValueKind.Object &&
                 document.RootElement.TryGetProperty("fence", out JsonElement fence) &&
-                ulong.TryParse(fence.GetString(), NumberStyles.None, CultureInfo.InvariantCulture, out ulong fenceId))
+                ulong.TryParse(fence.GetWorfString(), NumberStyles.None, CultureInfo.InvariantCulture, out ulong fenceId))
             {
                 DdlLock.ReleaseOnCommit(fenceId);
             }
@@ -2584,7 +2587,7 @@ internal static unsafe partial class Apply
         ulong commitLsn = s_remoteCommitLsn;
         PgBackgroundWorker.RunTransaction(() => ExceptionLog.SaveState(subId, commitLsn, level, error));
         SetExceptionMarker(s_remoteCommitLsn, level);
-        PgLog.Log($"applying the remote transaction at {Worf.FormatLsn(s_remoteCommitLsn)} under worf.exception_behaviour once the worker restarts");
+        WorfLog.Log($"applying the remote transaction at {Worf.FormatLsn(s_remoteCommitLsn)} under worf.exception_behaviour once the worker restarts");
     }
 
     /// <summary>
@@ -2612,7 +2615,7 @@ internal static unsafe partial class Apply
                     sub.Enabled = false;
                     WorfNode.AlterSubscription(sub);
                 });
-                PgLog.Log($"disabling subscription {change.Subscription.Name} after its remote transaction at {Worf.FormatLsn(s_remoteCommitLsn)} failed");
+                WorfLog.Log($"disabling subscription {change.Subscription.Name} after its remote transaction at {Worf.FormatLsn(s_remoteCommitLsn)} failed");
                 return null;
 
             case WorfExceptionBehaviour.Discard:
@@ -2702,8 +2705,10 @@ internal static unsafe partial class Apply
             PgBackgroundWorker.RunTransaction(() =>
             {
                 // The changes are applied in MessageContext, which is reset after each batch of messages so that a
-                // large transaction doesn't keep every row's memory until it commits.
+                // large transaction doesn't keep every row's memory until it commits, and their text, which the
+                // provider sends in the database encoding, is read in it, whatever the worker's client encoding.
                 MemoryContextData* oldcontext = Worf.MemoryContextSwitchTo(NativeGlobals.MessageContext);
+                int client = Worf.InDatabaseEncoding();
                 try
                 {
                     if (s_remoteOriginName is not null)
@@ -2715,6 +2720,7 @@ internal static unsafe partial class Apply
                 }
                 finally
                 {
+                    Worf.RestoreClientEncoding(client);
                     _ = Worf.MemoryContextSwitchTo(oldcontext);
                 }
             });
@@ -2768,7 +2774,7 @@ internal static unsafe partial class Apply
         s_exceptionError = error;
         s_inRemoteTransaction = false;
         s_restreamFrom = s_remoteCommitLsn;
-        PgLog.Log($"applying the remote transaction at {Worf.FormatLsn(s_remoteCommitLsn)} again under worf.exception_behaviour");
+        WorfLog.Log($"applying the remote transaction at {Worf.FormatLsn(s_remoteCommitLsn)} again under worf.exception_behaviour");
         return true;
     }
 
@@ -2806,7 +2812,7 @@ internal static unsafe partial class Apply
         long statusInterval = StatusInterval();
         bool reported = false;
 
-        PgReplicationConnection conn = s_applyconn ?? throw new InvalidOperationException("The apply connection is not open.");
+        WorfConnection conn = s_applyconn ?? throw new InvalidOperationException("The apply connection is not open.");
         while (s_commitEndLsn is null)
         {
             if (Worker.GotSigterm)
@@ -2915,7 +2921,7 @@ internal static unsafe partial class Apply
     /// <summary>
     /// Send a Standby Status Update message to server.
     /// </summary>
-    private static bool SendFeedback(PgReplicationConnection conn, ulong recvpos, long now, bool force)
+    private static bool SendFeedback(WorfConnection conn, ulong recvpos, long now, bool force)
     {
         // It's legal to not pass a recvpos
         if (recvpos < s_lastRecvpos)
@@ -2970,7 +2976,10 @@ internal static unsafe partial class Apply
         BinaryPrimitives.WriteInt64BigEndian(replyMessage[25..], now);            // sendTime
         replyMessage[33] = 0;                                                     // replyRequested
 
-        PgLog.Debug2($"sending feedback (force {(force ? 1 : 0)}) to recv {Worf.FormatLsn(recvpos)}, write {Worf.FormatLsn(writepos)}, flush {Worf.FormatLsn(flushpos)}");
+        if (PgLog.IsEnabled(PgLogLevel.Debug2))
+        {
+            WorfLog.Debug2($"sending feedback (force {(force ? 1 : 0)}) to recv {Worf.FormatLsn(recvpos)}, write {Worf.FormatLsn(writepos)}, flush {Worf.FormatLsn(flushpos)}");
+        }
 
         conn.Send(replyMessage);
         s_lastSendTime = now;
@@ -3152,8 +3161,6 @@ internal static unsafe partial class Apply
                     continue;
                 }
 
-                s_syncStarts[(sync.Nspname, sync.Relname)] = (now, starts + 1);
-
                 // Relay origins this worker no longer needs give their slots up to the sync worker's origin.
                 ReclaimRelayOrigins();
 
@@ -3166,7 +3173,12 @@ internal static unsafe partial class Apply
                         Sync.SetTableSyncStatus(subid, sync.Nspname, sync.Relname, sync.Status, sync.Statuslsn));
                 }
 
-                StartSyncWorker(sync.Nspname, sync.Relname);
+                // With every worker slot taken, the table waits for the next look, without counting a start.
+                if (StartSyncWorker(sync.Nspname, sync.Relname))
+                {
+                    s_syncStarts[(sync.Nspname, sync.Relname)] = (now, starts + 1);
+                }
+
                 break;
             }
         }
@@ -3238,7 +3250,7 @@ internal static unsafe partial class Apply
             worker.Worker.Apply.SubId == subid && worker.Worker.Sync.CopyLsn != 0 &&
             (worker.Worker.Sync.AppliedLsn < lsn || (worker.Worker.Sync.AppliedLsn == lsn && worker.Worker.Sync.ChangeLsn < changeLsn));
 
-    private static void StartSyncWorker(string nspname, string relname)
+    private static bool StartSyncWorker(string nspname, string relname)
     {
         WorfWorker me = Worker.MyWorker;
 
@@ -3254,7 +3266,7 @@ internal static unsafe partial class Apply
         Worker.NameStrCpy(ref worker.Worker.Sync.Nspname, nspname);
         Worker.NameStrCpy(ref worker.Worker.Sync.Relname, relname);
 
-        _ = Worker.WorkerRegister(worker);
+        return Worker.WorkerRegister(worker) != -1;
     }
 
     private static void SetSyncPending(bool syncPending)

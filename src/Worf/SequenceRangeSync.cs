@@ -18,7 +18,7 @@ internal static class SequenceRangeSync
     internal static List<WorfManagedSequence> FetchManaged(string dsn, string name)
     {
         List<WorfManagedSequence> managed = [];
-        using PgReplicationConnection conn = Worf.Connect(dsn, name, "ranges");
+        using WorfConnection conn = Worf.Connect(dsn, name, "ranges");
         if (conn.Query("SELECT to_regclass('worf.sequence_range') IS NOT NULL", 1)[0][0] != "t")
         {
             return managed;
@@ -99,11 +99,11 @@ internal static class SequenceRangeSync
             return;
         }
 
-        SpiResult listed = Worf.SelectCatalog(
+        WorfRows listed = Worf.SelectCatalog(
             "SELECT name, owner_node, epoch, range_size, max_range_size, root_start, root_end FROM worf.sequence_range_dropped WHERE NOT owned");
         for (int i = 0; i < listed.Count; i++)
         {
-            SpiRow row = listed[i];
+            WorfRow row = listed[i];
             if (Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(row.Get<string>(0))) is uint seqoid &&
                 !SequenceRanges.IsManaged(seqoid))
             {
@@ -128,11 +128,11 @@ internal static class SequenceRangeSync
             return;
         }
 
-        SpiResult listed = Worf.SelectCatalog(
+        WorfRows listed = Worf.SelectCatalog(
             "SELECT name, owner_node, epoch, range_size, max_range_size, root_start, root_end FROM worf.sequence_range_restore");
         for (int i = 0; i < listed.Count; i++)
         {
-            SpiRow row = listed[i];
+            WorfRow row = listed[i];
             if (Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(row.Get<string>(0))) is uint seqoid &&
                 !SequenceRanges.IsManaged(seqoid))
             {

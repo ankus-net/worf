@@ -219,7 +219,7 @@ internal static class SequenceRangeReservations
         List<Guid> recorded = [];
         foreach (WorfReservation reservation in posted)
         {
-            SpiResult range = Worf.Query("SELECT owner_node, epoch FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE", false, 1,
+            WorfRows range = Worf.Query("SELECT owner_node, epoch FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE", false, 1,
                 SpiParameter.Create(reservation.Seqoid));
             if (range.Count > 0 && reservation.Kind == (byte)'n' && Worf.Execute("""
                 UPDATE worf.sequence_range_block SET reserved = true
@@ -333,7 +333,7 @@ internal static class SequenceRangeReservations
     /// </summary>
     private static int RequireUsable(uint seqoid)
     {
-        SpiResult range = Worf.SelectCatalog("SELECT epoch, state FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(seqoid));
+        WorfRows range = Worf.SelectCatalog("SELECT epoch, state FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(seqoid));
         string? state = range.Count == 0 ? null : range[0].Get<string>(1);
         if (state is null or "collecting" or "refused" or "disabled" or "no_route")
         {

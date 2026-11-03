@@ -113,7 +113,7 @@ internal static partial class Conflict
             return;
         }
 
-        PgLog.Warning(new PgDiagnostic(
+        WorfLog.Warning(new PgDiagnostic(
             $"nodes \"{localNode}\" and \"{remoteNode}\" replicate both ways, and their conflict resolution can leave them with different rows")
         {
             Detail = $"worf.conflict_resolution is {localResolution} on node \"{localNode}\" and {remoteResolution} on node \"{remoteNode}\".",
@@ -223,7 +223,7 @@ internal static partial class Conflict
             idxname = name is null ? null! : Worf.FromServer(name);
         }
 
-        string qualrelname = Spi.QuoteQualifiedIdentifier(
+        string qualrelname = Worf.QuoteQualifiedIdentifier(
             Worf.FromServer(NativeMethods.get_namespace_name(relation->rd_rel->relnamespace)),
             Worf.FromServer((sbyte*)&relation->rd_rel->relname));
 
@@ -242,7 +242,7 @@ internal static partial class Conflict
         {
             case WorfConflictType.InsertInsert:
             case WorfConflictType.UpdateUpdate:
-                PgLog.Write(ToPgLogLevel(ConflictLogLevel), new PgDiagnostic(
+                WorfLog.Write(ToPgLogLevel(ConflictLogLevel), new PgDiagnostic(
                     $"CONFLICT: remote {(conflictType == WorfConflictType.InsertInsert ? "INSERT" : "UPDATE")} on relation {qualrelname} (local index {idxname}). Resolution: {ConflictResolutionToString(resolution)}.")
                 {
                     SqlState = PgSqlStates.IntegrityConstraintViolation,
@@ -252,7 +252,7 @@ internal static partial class Conflict
 
             case WorfConflictType.UpdateDelete:
             case WorfConflictType.DeleteDelete:
-                PgLog.Write(ToPgLogLevel(ConflictLogLevel), new PgDiagnostic(
+                WorfLog.Write(ToPgLogLevel(ConflictLogLevel), new PgDiagnostic(
                     $"CONFLICT: remote {(conflictType == WorfConflictType.UpdateDelete ? "UPDATE" : "DELETE")} on relation {qualrelname} replica identity index {idxname} (tuple not found). Resolution: {ConflictResolutionToString(resolution)}.")
                 {
                     SqlState = PgSqlStates.IntegrityConstraintViolation,

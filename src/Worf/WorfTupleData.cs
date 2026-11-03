@@ -108,7 +108,7 @@ internal sealed class WorfTupleData
                     Worf.AppendBinaryStringInfo(&buf, bytes, data.Length);
                 }
 
-                Values[attid] = NativeMethods.OidReceiveFunctionCall(typreceive, &buf, typioparam, att->atttypmod);
+                Values[attid] = Worf.ReceiveValue(typreceive, &buf, typioparam, att->atttypmod);
 
                 if (Worf.UnreadLength(&buf) != 0)
                 {

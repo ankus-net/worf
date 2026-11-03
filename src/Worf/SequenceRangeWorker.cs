@@ -21,7 +21,7 @@ internal static class SequenceRangeWorker
     internal static void RangeMain(nuint mainArg)
     {
         Worker.WorkerAttach((int)mainArg, WorfWorkerType.Range);
-        PgLog.Debug1("starting sequence range worker");
+        WorfLog.Debug1("starting sequence range worker");
         bool managedAny = false;
 
         // Each sequence's active block, its position in it and when that was read as its rate's sample began, and its peak
@@ -44,7 +44,7 @@ internal static class SequenceRangeWorker
             }
             catch (PgException error)
             {
-                PgLog.Warning($"could not remove the range state of dropped sequences: {error.Message}");
+                WorfLog.Warning($"could not remove the range state of dropped sequences: {error.Message}");
             }
 
             // Each sequence is checked in a transaction of its own, so that its locks are held no longer than its check,
@@ -57,7 +57,7 @@ internal static class SequenceRangeWorker
                 if (!managedAny)
                 {
                     managedAny = true;
-                    PgLog.Log("sequence range worker managing sequences");
+                    WorfLog.Log("sequence range worker managing sequences");
                 }
 
                 changed |= PgBackgroundWorker.RunTransaction(() => SequenceRanges.CheckIdentity(local));
@@ -102,7 +102,7 @@ internal static class SequenceRangeWorker
                         // tick.
                         if (error.SqlState != "55P03" && PgBackgroundWorker.RunTransaction(() => SequenceRanges.SequenceExists(seqoid)))
                         {
-                            PgLog.Warning(new PgDiagnostic($"could not check managed sequence {seqoid}: {error.Message}") { Detail = error.Detail });
+                            WorfLog.Warning(new PgDiagnostic($"could not check managed sequence {seqoid}: {error.Message}") { Detail = error.Detail });
                         }
                     }
 
@@ -116,7 +116,7 @@ internal static class SequenceRangeWorker
                 }
                 catch (PgException error)
                 {
-                    PgLog.Warning($"could not reserve the Snowflake clock: {error.Message}");
+                    WorfLog.Warning($"could not reserve the Snowflake clock: {error.Message}");
                 }
 
                 // Requests are committed before the exchange worker sends them, including those that sessions handed over.
@@ -138,7 +138,7 @@ internal static class SequenceRangeWorker
             {
                 if (managedAny)
                 {
-                    PgLog.Log("no managed sequences left, sequence range worker exiting");
+                    WorfLog.Log("no managed sequences left, sequence range worker exiting");
                 }
 
                 return;
@@ -157,7 +157,7 @@ internal static class SequenceRangeWorker
 
     private static List<uint> Sequences()
     {
-        SpiResult rows = Worf.SelectCatalog("SELECT r.seqoid::oid FROM worf.sequence_range r WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = r.seqoid) ORDER BY r.seqoid");
+        WorfRows rows = Worf.SelectCatalog("SELECT r.seqoid::oid FROM worf.sequence_range r WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = r.seqoid) ORDER BY r.seqoid");
         List<uint> sequences = [];
         for (int i = 0; i < rows.Count; i++)
         {
@@ -181,7 +181,7 @@ internal static class SequenceRangeWorker
     private static double Rate(Dictionary<uint, (long Block, long Position, long At, double Peak, long PeakAt)> rates, uint seqoid)
     {
         long now = Worker.GetCurrentTimestamp();
-        SpiResult state = Worf.SelectCatalog("""
+        WorfRows state = Worf.SelectCatalog("""
             SELECT s.seqincrement, b.lo, CASE WHEN s.seqincrement > 0 THEN b.lo ELSE b.hi END,
                 extract(epoch FROM clock_timestamp() - b.activated_at)::float8,
                 (SELECT r.peak_rate FROM worf.sequence_range r WHERE r.seqoid = s.seqrelid)

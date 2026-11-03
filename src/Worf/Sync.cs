@@ -111,12 +111,12 @@ internal static class Sync
         {
             const bool useFailoverSlot = false;
 
-            PgLog.Info($"initializing subscriber {sub.Name}");
+            WorfLog.Info($"initializing subscriber {sub.Name}");
 
             // The provider's managed sequences are joined before any rows arrive.
             List<WorfManagedSequence> managedSequences = PgBackgroundWorker.RunTransaction(() => SequenceRangeSync.FetchManaged(sub.OriginIf.Dsn, sub.Name));
 
-            using PgReplicationConnection originConnRepl = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, "snap");
+            using WorfConnection originConnRepl = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, "snap");
 
             string snapshot = EnsureReplicationSlotSnapshot(sub, originConnRepl, "snap", useFailoverSlot, out lsn);
 
@@ -135,7 +135,7 @@ internal static class Sync
                             xactLastCommitEnd = NativeGlobals.XactLastCommitEnd;
                         }
 
-                        PgLog.Debug3($"advancing origin with oid {originid} for forwarded row to {Worf.FormatLsn(xactLastCommitEnd)} during subscription sync");
+                        WorfLog.Debug3($"advancing origin with oid {originid} for forwarded row to {Worf.FormatLsn(xactLastCommitEnd)} during subscription sync");
                         PgReplicationOrigin.Advance(originid, new PgLsn(lsn), new PgLsn(xactLastCommitEnd), true, true);
                     });
 
@@ -144,7 +144,7 @@ internal static class Sync
                     {
                         if (status == SyncStatusInit)
                         {
-                            PgLog.Info("synchronizing structure");
+                            WorfLog.Info("synchronizing structure");
 
                             PgBackgroundWorker.RunTransaction(() =>
                             {
@@ -166,7 +166,7 @@ internal static class Sync
                     // Copy data.
                     if (SyncKindData(sync.Kind))
                     {
-                        PgLog.Info("synchronizing data");
+                        WorfLog.Info("synchronizing data");
 
                         PgBackgroundWorker.RunTransaction(() =>
                         {
@@ -207,7 +207,7 @@ internal static class Sync
                     // Restore post-data structure (indexes, constraints, etc).
                     if (SyncKindStructureCopy(sync.Kind))
                     {
-                        PgLog.Info("synchronizing constraints");
+                        WorfLog.Info("synchronizing constraints");
 
                         PgBackgroundWorker.RunTransaction(() => SetSubscriptionSyncStatus(sub.Id, SyncStatusConstraints));
 
@@ -252,7 +252,7 @@ internal static class Sync
     {
         PgBackgroundWorker.RunTransaction(() => SetSubscriptionSyncStatus(sub.Id, SyncStatusReady));
 
-        PgLog.Info($"finished synchronization of subscriber {sub.Name}, ready to enter normal replication");
+        WorfLog.Info($"finished synchronization of subscriber {sub.Name}, ready to enter normal replication");
     }
 
     /// <summary>
@@ -314,12 +314,12 @@ internal static class Sync
         {
             if (CatchupStart(sub, out string? lost) is ulong start)
             {
-                PgLog.Log($"resuming the catch-up of table {nspname}.{relname} from {Worf.FormatLsn(start)}");
+                WorfLog.Log($"resuming the catch-up of table {nspname}.{relname} from {Worf.FormatLsn(start)}");
                 statusLsn = start;
                 return SyncStatusCatchup;
             }
 
-            PgLog.Warning(new PgDiagnostic($"copying table {nspname}.{relname} again, as its table sync can't catch up")
+            WorfLog.Warning(new PgDiagnostic($"copying table {nspname}.{relname} again, as its table sync can't catch up")
             {
                 Detail = lost,
             });
@@ -333,7 +333,7 @@ internal static class Sync
         }
 
         List<WorfManagedSequence> managedSequences = PgBackgroundWorker.RunTransaction(() => SequenceRangeSync.FetchManaged(sub.OriginIf.Dsn, sub.Name));
-        using PgReplicationConnection originConnRepl = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, "copy");
+        using WorfConnection originConnRepl = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, "copy");
 
         // Make sure we cleanup the slot if something goes wrong.
         try
@@ -358,7 +358,7 @@ internal static class Sync
                 // Apply stopped short of the snapshot, as on a change that fails. Its slot is dropped to let the
                 // snapshot go until apply gets there. Apply may get no further for twice as long each time after, so
                 // that the copy starts in the end while changes keep coming that each take long to apply.
-                PgLog.Log($"dropping the snapshot for table {nspname}.{relname} until subscription {sub.Name} applies up to {Worf.FormatLsn(lsn)}, " +
+                WorfLog.Log($"dropping the snapshot for table {nspname}.{relname} until subscription {sub.Name} applies up to {Worf.FormatLsn(lsn)}, " +
                     $"since it got no further for {stallTimeout.TotalSeconds:0} s");
                 PgBackgroundWorker.RunTransaction(() => originConnRepl.Execute($"DROP_REPLICATION_SLOT \"{sub.SlotName}\""));
                 target = lsn;
@@ -371,7 +371,7 @@ internal static class Sync
             {
                 // The table's managed sequences are joined before any rows arrive.
                 SequenceRangeSync.JoinBeforeCopy(managedSequences, Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid",
-                    SpiParameter.Create(Spi.QuoteQualifiedIdentifier(nspname, relname))) ?? 0);
+                    SpiParameter.Create(Worf.QuoteQualifiedIdentifier(nspname, relname))) ?? 0);
 
                 ushort originid = EnsureReplicationOrigin(sub);
                 if (merge)
@@ -385,7 +385,7 @@ internal static class Sync
                     xactLastCommitEnd = NativeGlobals.XactLastCommitEnd;
                 }
 
-                PgLog.Debug2($"advancing origin {Apply.MySubscription!.SlotName} (oid {originid}) for forwarded row to {Worf.FormatLsn(xactLastCommitEnd)} after sync error");
+                WorfLog.Debug2($"advancing origin {Apply.MySubscription!.SlotName} (oid {originid}) for forwarded row to {Worf.FormatLsn(xactLastCommitEnd)} after sync error");
                 PgReplicationOrigin.Advance(originid, new PgLsn(lsn), new PgLsn(xactLastCommitEnd), true, true);
 
                 SetTableSyncStatus(sub.Id, nspname, relname, SyncStatusData, lsn);
@@ -421,7 +421,7 @@ internal static class Sync
     /// <returns>The position, or null when the slot is gone or invalidated, or the origin is gone or has no progress.</returns>
     private static ulong? CatchupStart(WorfSubscription sub, out string? lost)
     {
-        using (PgReplicationConnection conn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "resume"))
+        using (WorfConnection conn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "resume"))
         {
             lost = PgBackgroundWorker.RunTransaction(() => Rpc.RemoteSlotLost(conn, sub.SlotName));
             if (lost is not null)
@@ -484,12 +484,12 @@ internal static class Sync
 
         string nspname = Worker.NameStr(mySyncWorker.Nspname);
         string relname = Worker.NameStr(mySyncWorker.Relname);
-        string tablename = Spi.QuoteQualifiedIdentifier(nspname, relname);
+        string tablename = Worf.QuoteQualifiedIdentifier(nspname, relname);
 
         sub.SlotName = SyncSlotName(sub.SlotName, nspname, relname);
 
-        PgLog.Log($"starting sync of table {nspname}.{relname} for subscriber {sub.Name}");
-        PgLog.Debug1($"connecting to provider {sub.OriginIf.Name}, dsn {sub.OriginIf.Dsn}");
+        WorfLog.Log($"starting sync of table {nspname}.{relname} for subscriber {sub.Name}");
+        WorfLog.Debug1($"connecting to provider {sub.OriginIf.Name}, dsn {sub.OriginIf.Dsn}");
 
         // Do the initial sync first.
         char status = SyncTable(sub, nspname, relname, out ulong statusLsn);
@@ -531,7 +531,7 @@ internal static class Sync
         {
             ushort originid = PgReplicationOrigin.Find(sub.SlotName)
                 ?? throw new PgException(PgSqlStates.UndefinedObject, $"replication origin \"{sub.SlotName}\" does not exist");
-            PgLog.Debug2($"setting origin {sub.SlotName} (oid {originid}) for subscription sync");
+            WorfLog.Debug2($"setting origin {sub.SlotName} (oid {originid}) for subscription sync");
             PgReplicationOrigin.SetupSession(originid);
             Apply.LoadStreamOrigins();
 
@@ -556,7 +556,7 @@ internal static class Sync
         // from that transaction.
         for (ulong startLsn = statusLsn; startLsn != 0;)
         {
-            using PgReplicationConnection streamConn = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, CatchupConnection);
+            using WorfConnection streamConn = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, CatchupConnection);
 
             // IDENTIFY_SYSTEM sets up some internal state on walsender so call it even if we don't (yet) want to use
             // any of the results.
@@ -583,7 +583,7 @@ internal static class Sync
     /// </summary>
     /// <param name="streamConn">The replication connection the worker streams on.</param>
     /// <param name="sub">The subscription, with the table's slot name.</param>
-    private static void WaitForCatchupSlot(PgReplicationConnection streamConn, WorfSubscription sub)
+    private static void WaitForCatchupSlot(WorfConnection streamConn, WorfSubscription sub)
     {
         int holder = WaitForSlot(streamConn, sub, "this table sync",
             $"The sync fails after {CatchupSlotWait} seconds, and catches up again when it restarts.", CatchupSlotWait);
@@ -608,7 +608,7 @@ internal static class Sync
     /// <param name="wait">How many seconds to wait.</param>
     /// <returns>The process that still holds the slot after the wait, or when the worker is asked to stop, or zero once
     /// the slot is free.</returns>
-    private static int WaitForSlot(PgReplicationConnection conn, WorfSubscription sub, string waiter, string afterWait, int wait)
+    private static int WaitForSlot(WorfConnection conn, WorfSubscription sub, string waiter, string afterWait, int wait)
     {
         string catchup = Worf.ApplicationName(sub.Name, CatchupConnection);
         long start = Worker.GetCurrentTimestamp();
@@ -632,7 +632,7 @@ internal static class Sync
                 if (notStopped is not null && warned != holder)
                 {
                     warned = holder;
-                    PgLog.Warning(new PgDiagnostic($"replication slot \"{sub.SlotName}\" is active for PID {holder} on the provider, which {waiter} waits for")
+                    WorfLog.Warning(new PgDiagnostic($"replication slot \"{sub.SlotName}\" is active for PID {holder} on the provider, which {waiter} waits for")
                     {
                         Detail = notStopped,
                         Hint = afterWait,
@@ -656,7 +656,7 @@ internal static class Sync
     /// <param name="streamConn">The connection the worker streamed on.</param>
     /// <param name="nspname">The table's schema.</param>
     /// <param name="relname">The table's name.</param>
-    internal static void FinishCatchup(PgReplicationConnection streamConn, string nspname, string relname)
+    internal static void FinishCatchup(WorfConnection streamConn, string nspname, string relname)
     {
         WorfSubscription sub = Apply.MySubscription!;
         bool dropped = false;
@@ -668,7 +668,7 @@ internal static class Sync
         }
         catch (PgException error)
         {
-            PgLog.Debug1($"could not drop replication slot \"{sub.SlotName}\" over the stream's connection: {error.Message}");
+            WorfLog.Debug1($"could not drop replication slot \"{sub.SlotName}\" over the stream's connection: {error.Message}");
         }
 
         streamConn.Dispose();
@@ -708,7 +708,7 @@ internal static class Sync
             }
         }
 
-        PgLog.Log($"finished sync of table {nspname}.{relname} for subscriber {sub.Name}");
+        WorfLog.Log($"finished sync of table {nspname}.{relname} for subscriber {sub.Name}");
     }
 
     /// <summary>
@@ -1294,10 +1294,10 @@ internal static class Sync
     /// Creates the subscription's slot and gets its exported snapshot, using a SQL connection of its own that is closed
     /// once the slot exists.
     /// </summary>
-    private static string EnsureReplicationSlotSnapshot(WorfSubscription sub, PgReplicationConnection replConn, string appName,
+    private static string EnsureReplicationSlotSnapshot(WorfSubscription sub, WorfConnection replConn, string appName,
         bool useFailoverSlot, out ulong lsn)
     {
-        using PgReplicationConnection sqlConn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, appName);
+        using WorfConnection sqlConn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, appName);
         ulong slotLsn = 0;
         string snapshot = PgBackgroundWorker.RunTransaction(() =>
             EnsureReplicationSlotSnapshot(sqlConn, replConn, sub.SlotName, useFailoverSlot, out slotLsn));
@@ -1310,7 +1310,7 @@ internal static class Sync
     /// The reported LSN is the confirmed flush LSN at the point the slot reached consistency and exported its
     /// snapshot.
     /// </summary>
-    private static string EnsureReplicationSlotSnapshot(PgReplicationConnection sqlConn, PgReplicationConnection replConn,
+    private static string EnsureReplicationSlotSnapshot(WorfConnection sqlConn, WorfConnection replConn,
         string slotName, bool useFailoverSlot, out ulong lsn)
     {
         while (true)
@@ -1353,7 +1353,7 @@ internal static class Sync
     /// <summary>
     /// Transaction management for COPY.
     /// </summary>
-    private static void StartCopyOriginTx(PgReplicationConnection conn, string? snapshot)
+    private static void StartCopyOriginTx(WorfConnection conn, string? snapshot)
     {
         List<string> setupQuery =
         [
@@ -1367,7 +1367,7 @@ internal static class Sync
 
         if (snapshot is not null)
         {
-            setupQuery.Add($"SET TRANSACTION SNAPSHOT {Spi.QuoteLiteral(snapshot)}");
+            setupQuery.Add($"SET TRANSACTION SNAPSHOT {Worf.QuoteLiteral(snapshot)}");
         }
 
         try
@@ -1410,7 +1410,7 @@ internal static class Sync
         Worf.Execute($"SET LOCAL extra_float_digits TO {(own ? "DEFAULT" : "3")}");
     }
 
-    private static void FinishCopyOriginTx(PgReplicationConnection conn)
+    private static void FinishCopyOriginTx(WorfConnection conn)
     {
         // Close the transaction and connection on origin node.
         try
@@ -1419,7 +1419,7 @@ internal static class Sync
         }
         catch (PgRemoteException error)
         {
-            PgLog.Warning($"ROLLBACK on origin node failed: ERROR:  {error.Message}\n");
+            WorfLog.Warning($"ROLLBACK on origin node failed: ERROR:  {error.Message}\n");
         }
 
         conn.Dispose();
@@ -1511,7 +1511,7 @@ internal static class Sync
     /// <returns>The local table, the columns that receive the copy's, or none for all of them, each local column's
     /// conversion, by its number less one, or null when no column converts, and the query.</returns>
     private static (WorfRelation Rel, List<string> Columns, WorfColumnConversion?[]? Conversions, string Query) CopyQuery(
-        PgReplicationConnection originConn, WorfRemoteRel remoterel, List<string> replicationSets)
+        WorfConnection originConn, WorfRemoteRel remoterel, List<string> replicationSets)
     {
         // Build the relation map, with the provider's column types and, for money, how it formats it.
         WorfRemoteType?[]? types = Rpc.GetRemoteColumnTypes(originConn, remoterel);
@@ -1538,7 +1538,7 @@ internal static class Sync
                 attlist.Append(',');
             }
 
-            attlist.Append(Spi.QuoteIdentifier(attname));
+            attlist.Append(Worf.QuoteIdentifier(attname));
         }
 
         RelCache.RelationClose(rel, PgLockMode.AccessShare);
@@ -1549,7 +1549,7 @@ internal static class Sync
         // If the table is row-filtered we need to run query over the table to execute the filter.
         if (remoterel.HasRowFilter)
         {
-            string relname = $"{Spi.QuoteIdentifier(remoterel.Nspname)}.{Spi.QuoteIdentifier(remoterel.Relname)}";
+            string relname = $"{Worf.QuoteIdentifier(remoterel.Nspname)}.{Worf.QuoteIdentifier(remoterel.Relname)}";
 
             StringBuilder repsetarr = new();
             first = true;
@@ -1564,15 +1564,15 @@ internal static class Sync
                     repsetarr.Append(',');
                 }
 
-                repsetarr.Append(Spi.QuoteLiteral(repsetName));
+                repsetarr.Append(Worf.QuoteLiteral(repsetName));
             }
 
-            query.Append(CultureInfo.InvariantCulture, $"(SELECT {(attnamelist.Count != 0 ? attlist.ToString() : "*")} FROM worf.table_data_filtered(NULL::{relname}, {Spi.QuoteLiteral(relname)}::regclass, ARRAY[{repsetarr}])) ");
+            query.Append(CultureInfo.InvariantCulture, $"(SELECT {(attnamelist.Count != 0 ? attlist.ToString() : "*")} FROM worf.table_data_filtered(NULL::{relname}, {Worf.QuoteLiteral(relname)}::regclass, ARRAY[{repsetarr}])) ");
         }
         else
         {
             // Otherwise just copy the table.
-            query.Append(CultureInfo.InvariantCulture, $"{Spi.QuoteIdentifier(remoterel.Nspname)}.{Spi.QuoteIdentifier(remoterel.Relname)} ");
+            query.Append(CultureInfo.InvariantCulture, $"{Worf.QuoteIdentifier(remoterel.Nspname)}.{Worf.QuoteIdentifier(remoterel.Relname)} ");
 
             if (attnamelist.Count != 0)
             {
@@ -1588,7 +1588,7 @@ internal static class Sync
     /// <summary>
     /// Starts a COPY TO on the provider.
     /// </summary>
-    private static void StartCopy(PgReplicationConnection originConn, string query)
+    private static void StartCopy(WorfConnection originConn, string query)
     {
         try
         {
@@ -1612,7 +1612,7 @@ internal static class Sync
     /// converts.</param>
     /// <param name="query">The COPY TO.</param>
     /// <param name="lsn">The position the copy is consistent with.</param>
-    private static void CopyRows(PgReplicationConnection originConn, WorfRelation rel, uint into, List<string> attnamelist,
+    private static void CopyRows(WorfConnection originConn, WorfRelation rel, uint into, List<string> attnamelist,
         WorfColumnConversion?[]? converted, string query, ulong lsn)
     {
         StartCopy(originConn, query);
@@ -1635,7 +1635,7 @@ internal static class Sync
     /// <summary>
     /// COPY single table over wire. Runs in the target transaction.
     /// </summary>
-    private static void CopyTableData(PgReplicationConnection originConn, WorfRemoteRel remoterel, List<string> replicationSets,
+    private static void CopyTableData(WorfConnection originConn, WorfRemoteRel remoterel, List<string> replicationSets,
         ulong lsn)
     {
         (WorfRelation rel, List<string> attnamelist, WorfColumnConversion?[]? converted, string query) =
@@ -1643,7 +1643,7 @@ internal static class Sync
         CopyRows(originConn, rel, rel.Reloid, attnamelist, converted, query, lsn);
         CheckCopiedDeferrable(rel, lsn);
 
-        PgLog.Info($"finished synchronization of data for table {remoterel.Nspname}.{remoterel.Relname}");
+        WorfLog.Info($"finished synchronization of data for table {remoterel.Nspname}.{remoterel.Relname}");
     }
 
     /// <summary>
@@ -1660,13 +1660,13 @@ internal static class Sync
     /// <param name="remoterel">The table.</param>
     /// <param name="replicationSets">The replication sets, whose row filters apply.</param>
     /// <param name="lsn">The position the copy is consistent with.</param>
-    private static void MergeTableData(PgReplicationConnection originConn, WorfRemoteRel remoterel, List<string> replicationSets,
+    private static void MergeTableData(WorfConnection originConn, WorfRemoteRel remoterel, List<string> replicationSets,
         ulong lsn)
     {
         (WorfRelation rel, List<string> attnamelist, WorfColumnConversion?[]? converted, string query) =
             CopyQuery(originConn, remoterel, replicationSets);
         uint reloid = rel.Reloid;
-        string table = Spi.QuoteQualifiedIdentifier(remoterel.Nspname, remoterel.Relname);
+        string table = Worf.QuoteQualifiedIdentifier(remoterel.Nspname, remoterel.Relname);
         (bool partitioned, List<string> key, uint index) = TableKey(reloid);
         string only = partitioned ? "" : "ONLY ";
 
@@ -1674,7 +1674,7 @@ internal static class Sync
         StringBuilder create = new("CREATE TEMPORARY TABLE worf_sync_copy ON COMMIT DROP AS SELECT ");
         for (int i = 0; i < attnamelist.Count; i++)
         {
-            create.Append(i == 0 ? "" : ", ").Append(Spi.QuoteIdentifier(attnamelist[i]));
+            create.Append(i == 0 ? "" : ", ").Append(Worf.QuoteIdentifier(attnamelist[i]));
         }
 
         create.Append(attnamelist.Count == 0 ? "*" : "").Append(" FROM ONLY ").Append(table).Append(" WITH NO DATA");
@@ -1682,7 +1682,7 @@ internal static class Sync
         uint copyOid = Worf.ReadScalar<uint>($"SELECT '{MergeCopy}'::regclass::oid");
 
         // The columns the merge writes: the copy's, but those the table generates.
-        SpiResult attributes = Worf.Read("""
+        WorfRows attributes = Worf.Read("""
             SELECT c.attname::text FROM pg_catalog.pg_attribute c
                 JOIN pg_catalog.pg_attribute t ON t.attrelid = $2 AND t.attname = c.attname AND t.attgenerated = ''
             WHERE c.attrelid = $1 AND c.attnum > 0 AND NOT c.attisdropped ORDER BY c.attnum
@@ -1701,11 +1701,11 @@ internal static class Sync
         // path, as apply's changes do, for the triggers it fires, so it names its operators and types with their
         // schemas: the key's equality operators from its index, and the system's for text.
         Dictionary<short, string> operators = Worf.KeyEqualityOperators(index);
-        string[] quoted = [.. columns.Select(Spi.QuoteIdentifier)];
-        string[] rest = [.. columns.Where(column => !key.Contains(column)).Select(Spi.QuoteIdentifier)];
+        string[] quoted = [.. columns.Select(Worf.QuoteIdentifier)];
+        string[] rest = [.. columns.Where(column => !key.Contains(column)).Select(Worf.QuoteIdentifier)];
         StringBuilder merge = new("MERGE INTO ");
         merge.Append(only).Append(table).Append(" t USING ").Append(MergeCopy).Append(" c ON ")
-            .Append(string.Join(" AND ", key.Select(column => $"t.{Spi.QuoteIdentifier(column)} {KeyOperator(operators, reloid, column)} c.{Spi.QuoteIdentifier(column)}")));
+            .Append(string.Join(" AND ", key.Select(column => $"t.{Worf.QuoteIdentifier(column)} {KeyOperator(operators, reloid, column)} c.{Worf.QuoteIdentifier(column)}")));
         if (rest.Length > 0)
         {
             merge.Append(" WHEN MATCHED AND ROW(").Append(string.Join(", ", rest.Select(column => $"t.{column}"))).Append(")::pg_catalog.text OPERATOR(pg_catalog.<>) ROW(")
@@ -1737,11 +1737,11 @@ internal static class Sync
         catch (PgException error) when (error.SqlState is PgSqlStates.UniqueViolation or PgSqlStates.ExclusionViolation &&
             Apply.ExceptionBehaviour is not (WorfExceptionBehaviour.Error or WorfExceptionBehaviour.SubDisable))
         {
-            SpiResult rows = Worf.Read($"SELECT ctid::text FROM {MergeCopy} ORDER BY ctid", 0);
+            WorfRows rows = Worf.Read($"SELECT ctid::text FROM {MergeCopy} ORDER BY ctid", 0);
             List<(WorfFailedChange Change, PgException Error)> skipped = [];
             MergeParts(rel, lsn, reloid, only + table, mergePart, [.. rows.Select(row => row.Get<string>(0))], skipped);
             ExceptionLog.RecordCopied(skipped);
-            PgLog.Warning(new PgDiagnostic($"skipped {skipped.Count} of the rows of the copy of table {remoterel.Nspname}.{remoterel.Relname} as it merged into the rows it has: {error.Message}")
+            WorfLog.Warning(new PgDiagnostic($"skipped {skipped.Count} of the rows of the copy of table {remoterel.Nspname}.{remoterel.Relname} as it merged into the rows it has: {error.Message}")
             {
                 Detail = error.Detail,
                 Hint = "Resynchronize the table with worf.alter_subscription_resynchronize_table to give it the provider's rows.",
@@ -1759,7 +1759,7 @@ internal static class Sync
 
         _ = Worf.Execute($"DROP TABLE {MergeCopy}");
 
-        PgLog.Info($"finished synchronization of data for table {remoterel.Nspname}.{remoterel.Relname}");
+        WorfLog.Info($"finished synchronization of data for table {remoterel.Nspname}.{remoterel.Relname}");
     }
 
     /// <summary>
@@ -1773,7 +1773,7 @@ internal static class Sync
         {
             PgTransaction.RunInSubtransaction(() =>
             {
-                _ = Spi.Execute(merge, SpiParameter.Create(rows.ToArray()));
+                _ = Worf.ExecuteUnpinned(merge, SpiParameter.Create(rows.ToArray()));
                 CheckDeferrableUnique(reloid, table);
                 CheckDeferrableExclusion(reloid, table);
             }, PgSubtransactionMode.Atomic);
@@ -1824,7 +1824,7 @@ internal static class Sync
             started = NativeMethods.GetCurrentTransactionStartTimestamp();
         }
 
-        string table = (partitioned ? "" : "ONLY ") + Spi.QuoteQualifiedIdentifier(rel.Nspname, rel.Relname);
+        string table = (partitioned ? "" : "ONLY ") + Worf.QuoteQualifiedIdentifier(rel.Nspname, rel.Relname);
         try
         {
             PgTransaction.RunInSubtransaction(() =>
@@ -1870,7 +1870,7 @@ internal static class Sync
     private static List<(string Row, PgException Error)> DeleteDeferrableConflicts(uint reloid, string table)
     {
         List<(string Row, PgException Error)> deleted = [];
-        SpiResult constraints = Worf.Read("""
+        WorfRows constraints = Worf.Read("""
             SELECT c.conname::text, c.contype = 'x',
                 (SELECT pg_catalog.array_agg(pg_catalog.pg_get_indexdef(i.indexrelid, k, false) ORDER BY k) FROM pg_catalog.generate_series(1, i.indnkeyatts) k),
                 (SELECT pg_catalog.array_agg(pg_catalog.format('OPERATOR(%I.%s)', n.nspname, o.oprname) ORDER BY e.k)
@@ -1880,7 +1880,7 @@ internal static class Sync
             FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_index i ON i.indexrelid = c.conindid
             WHERE c.conrelid = $1 AND c.contype IN ('p', 'u', 'x') AND c.condeferrable
             """, 0, SpiParameter.Create(reloid));
-        foreach (SpiRow constraint in constraints)
+        foreach (WorfRow constraint in constraints)
         {
             string name = constraint.Get<string>(0);
             bool exclusion = constraint.Get<bool>(1);
@@ -1896,7 +1896,7 @@ internal static class Sync
             string conflicts = exclusion
                 ? string.Join(" AND ", constraint.Get<string?[]>(3).Select((op, k) => $"a.k{k} {op} b.k{k}"))
                 : string.Join(" AND ", keys.Select((_, k) => $"a.k{k} IS NOT DISTINCT FROM b.k{k}"));
-            SpiResult rowsDeleted = Worf.Query($"""
+            WorfRows rowsDeleted = Worf.Query($"""
                 DELETE FROM {table} t
                 WHERE (t.tableoid, t.ctid) IN (SELECT b.tableoid, b.ctid FROM {rows} a JOIN {rows} b ON (a.tableoid, a.ctid) < (b.tableoid, b.ctid) AND {conflicts})
                 RETURNING pg_catalog.row_to_json(t)::text
@@ -1920,14 +1920,14 @@ internal static class Sync
     /// <param name="table">The table's qualified name, after ONLY when it isn't partitioned.</param>
     private static void CheckDeferrableUnique(uint reloid, string table)
     {
-        SpiResult indexes = Worf.Read("""
+        WorfRows indexes = Worf.Read("""
             SELECT c.conname::text, i.indnkeyatts,
                 (SELECT pg_catalog.array_agg(pg_catalog.pg_get_indexdef(i.indexrelid, k, false) ORDER BY k) FROM pg_catalog.generate_series(1, i.indnkeyatts) k),
                 pg_catalog.pg_get_expr(i.indpred, i.indrelid), i.indnullsnotdistinct
             FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_index i ON i.indexrelid = c.conindid
             WHERE c.conrelid = $1 AND c.contype IN ('p', 'u') AND c.condeferrable
             """, 0, SpiParameter.Create(reloid));
-        foreach (SpiRow index in indexes)
+        foreach (WorfRow index in indexes)
         {
             string[] keys = [.. index.Get<string?[]>(2).Select(key => $"({key})")];
             List<string> conditions = [.. index.Get<string?>(3) is string predicate ? [$"({predicate})"] : Array.Empty<string>()];
@@ -1953,7 +1953,7 @@ internal static class Sync
     /// <param name="table">The table's qualified name, after ONLY when it isn't partitioned.</param>
     private static void CheckDeferrableExclusion(uint reloid, string table)
     {
-        SpiResult constraints = Worf.Read("""
+        WorfRows constraints = Worf.Read("""
             SELECT c.conname::text,
                 (SELECT pg_catalog.array_agg(pg_catalog.pg_get_indexdef(i.indexrelid, k, false) ORDER BY k) FROM pg_catalog.generate_series(1, i.indnkeyatts) k),
                 (SELECT pg_catalog.array_agg(pg_catalog.format('OPERATOR(%I.%s)', n.nspname, o.oprname) ORDER BY e.k)
@@ -1963,7 +1963,7 @@ internal static class Sync
             FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_index i ON i.indexrelid = c.conindid
             WHERE c.conrelid = $1 AND c.contype = 'x' AND c.condeferrable
             """, 0, SpiParameter.Create(reloid));
-        foreach (SpiRow constraint in constraints)
+        foreach (WorfRow constraint in constraints)
         {
             string?[] keys = constraint.Get<string?[]>(1);
             string?[] operators = constraint.Get<string?[]>(2);
@@ -1985,7 +1985,7 @@ internal static class Sync
     /// <param name="relname">The table's name.</param>
     internal static void RequireMergeable(string nspname, string relname)
     {
-        if (Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(Spi.QuoteQualifiedIdentifier(nspname, relname))) is uint reloid &&
+        if (Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(Worf.QuoteQualifiedIdentifier(nspname, relname))) is uint reloid &&
             TableKey(reloid).Key.Count == 0)
         {
             throw Unmergeable(nspname, relname);
@@ -1998,10 +1998,10 @@ internal static class Sync
             hint: "Resynchronize the table with worf.alter_subscription_resynchronize_table, which empties it and copies it again.");
 
     /// <summary>
-    /// Runs the MERGE a merge composes, whose every name the merge quotes with <see cref="Spi.QuoteIdentifier"/> and
+    /// Runs the MERGE a merge composes, whose every name the merge quotes with <see cref="Worf.QuoteIdentifier"/> and
     /// qualifies, and that binds no values, under the session's search path, for the triggers it fires.
     /// </summary>
-    private static void ExecuteQuoted(string sql) => _ = Spi.Execute(sql);
+    private static void ExecuteQuoted(string sql) => _ = Worf.ExecuteUnpinned(sql);
 
     /// <summary>
     /// Gets the equality operator a key column's index compares it with, written with its schema.
@@ -2035,7 +2035,7 @@ internal static class Sync
             return (partitioned, [], 0);
         }
 
-        SpiResult key = Worf.Read("""
+        WorfRows key = Worf.Read("""
             SELECT a.attname::text FROM pg_catalog.pg_index i
                 JOIN pg_catalog.pg_attribute a
                     ON a.attrelid = i.indrelid AND a.attnum = ANY ((i.indkey::smallint[])[0:i.indnkeyatts - 1])
@@ -2062,7 +2062,7 @@ internal static class Sync
         bool merge, Action copied)
     {
         // Connect to origin node.
-        PgReplicationConnection originConn = Worf.Connect(originDsn, subName, "copy");
+        WorfConnection originConn = Worf.Connect(originDsn, subName, "copy");
         StartCopyOriginTx(originConn, originSnapshot);
 
         // Copy every table in the target transaction.
@@ -2109,7 +2109,7 @@ internal static class Sync
     /// </summary>
     private static ulong ProviderPosition(WorfSubscription sub)
     {
-        using PgReplicationConnection conn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "copy_position");
+        using WorfConnection conn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "copy_position");
         string? position = PgBackgroundWorker.RunTransaction(() =>
         {
             try
@@ -2177,7 +2177,7 @@ internal static class Sync
 
             if (Stopwatch.GetElapsedTime(waitingSince) >= logAfter)
             {
-                PgLog.Log($"table {nspname}.{relname} waits to copy until subscription {sub.Name} applies up to {Worf.FormatLsn(lsn)}, " +
+                WorfLog.Log($"table {nspname}.{relname} waits to copy until subscription {sub.Name} applies up to {Worf.FormatLsn(lsn)}, " +
                     (applied == 0 ? "and it hasn't said how far it is" : $"and it's at {Worf.FormatLsn(applied)}"));
                 logAfter = Stopwatch.GetElapsedTime(waitingSince) + ApplyWaitLogInterval;
             }
@@ -2228,7 +2228,7 @@ internal static class Sync
         List<string> replicationSets, string originName, ulong lsn, Action<List<WorfRemoteRel>> copied)
     {
         // Connect to origin node.
-        PgReplicationConnection originConn = Worf.Connect(originDsn, subName, "copy");
+        WorfConnection originConn = Worf.Connect(originDsn, subName, "copy");
         StartCopyOriginTx(originConn, originSnapshot);
 
         // Get tables to copy from origin node, and copy every table in the target transaction, which records what
@@ -2274,7 +2274,7 @@ internal static class Sync
             string? left;
             try
             {
-                using PgReplicationConnection originConn = PgBackgroundWorker.RunTransaction(() => Worf.Connect(sub.OriginIf.Dsn, sub.Name, "cleanup"));
+                using WorfConnection originConn = PgBackgroundWorker.RunTransaction(() => Worf.Connect(sub.OriginIf.Dsn, sub.Name, "cleanup"));
                 int holder = WaitForSlot(originConn, sub, "this sync's cleanup",
                     $"The slot is left to the subscription's apply worker after {CleanupSlotWait} seconds.", CleanupSlotWait);
                 left = holder != 0 ? $"PID {holder} holds it." : null;
@@ -2328,7 +2328,7 @@ internal static class Sync
     {
         WorfWorker me = Worker.MyWorker;
         bool tableSync = me.WorkerType == WorfWorkerType.Sync;
-        PgLog.Warning(new PgDiagnostic($"could not drop replication slot \"{sub.SlotName}\" on the provider")
+        WorfLog.Warning(new PgDiagnostic($"could not drop replication slot \"{sub.SlotName}\" on the provider")
         {
             Detail = reason,
             Hint = tableSync ? "The subscription's apply worker drops it once it can."
@@ -2363,7 +2363,7 @@ internal static class Sync
     /// <param name="relname">The table's name.</param>
     /// <returns>The slot's name.</returns>
     internal static string SyncSlotName(string slotName, string nspname, string relname)
-        => $"{slotName}_{Worf.HashAny(Spi.QuoteQualifiedIdentifier(nspname, relname)):x8}";
+        => $"{slotName}_{Worf.HashAny(Worf.QuoteQualifiedIdentifier(nspname, relname)):x8}";
 
     /// <summary>
     /// Gets the names of the slots the table syncs of a subscription's tables create on the provider.
@@ -2392,7 +2392,7 @@ internal static class Sync
     /// <param name="conn">The provider connection, inside a local transaction.</param>
     /// <param name="sub">The subscription.</param>
     /// <returns>The slots that couldn't be dropped.</returns>
-    internal static List<string> DropLeftSyncSlots(PgReplicationConnection conn, WorfSubscription sub)
+    internal static List<string> DropLeftSyncSlots(WorfConnection conn, WorfSubscription sub)
     {
         List<string> names = SyncSlotNames(sub);
         HashSet<string> kept = KeptSyncSlots(sub);
@@ -2414,7 +2414,7 @@ internal static class Sync
     /// <returns>Whether it has.</returns>
     internal static bool RecordedSyncSlotsLeft(WorfSubscription sub)
     {
-        SpiResult recorded = Worf.Read("SELECT slot_name::text FROM worf.sync_slot WHERE sub_id = $1", 0, SpiParameter.Create(sub.Id));
+        WorfRows recorded = Worf.Read("SELECT slot_name::text FROM worf.sync_slot WHERE sub_id = $1", 0, SpiParameter.Create(sub.Id));
         if (recorded.Count == 0)
         {
             return false;
@@ -2464,7 +2464,7 @@ internal static class Sync
     /// <param name="names">The names of the slots the subscription's table syncs create, from <see cref="SyncSlotNames"/>.</param>
     /// <param name="kept">The slots that stay, as those of tables still synchronizing.</param>
     /// <returns>The slots that couldn't be dropped.</returns>
-    internal static List<string> DropSyncSlots(PgReplicationConnection conn, IReadOnlyCollection<string> names, IReadOnlySet<string> kept)
+    internal static List<string> DropSyncSlots(WorfConnection conn, IReadOnlyCollection<string> names, IReadOnlySet<string> kept)
     {
         List<string> left = [];
         foreach ((string name, bool active) in Rpc.RemoteSyncSlots(conn, names))
@@ -2506,7 +2506,7 @@ internal static class Sync
         }
         catch (PgException error)
         {
-            PgLog.Warning($"could not clean up after the failed synchronization: {error.Message}");
+            WorfLog.Warning($"could not clean up after the failed synchronization: {error.Message}");
         }
     }
 
@@ -2518,11 +2518,11 @@ internal static class Sync
         }
         catch (IOException error)
         {
-            PgLog.Warning($"Failed to clean up worf temporary dump file \"{tmpfile}\" on exit/error: {error.Message}");
+            WorfLog.Warning($"Failed to clean up worf temporary dump file \"{tmpfile}\" on exit/error: {error.Message}");
         }
         catch (UnauthorizedAccessException error)
         {
-            PgLog.Warning($"Failed to clean up worf temporary dump file \"{tmpfile}\" on exit/error: {error.Message}");
+            WorfLog.Warning($"Failed to clean up worf temporary dump file \"{tmpfile}\" on exit/error: {error.Message}");
         }
     }
 

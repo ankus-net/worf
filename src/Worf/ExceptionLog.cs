@@ -125,7 +125,7 @@ internal static class ExceptionLog
         }
         catch (PgException)
         {
-            PgLog.Warning("could not record the failed remote change in worf.exception_log");
+            WorfLog.Warning("could not record the failed remote change in worf.exception_log");
         }
     }
 
@@ -208,7 +208,7 @@ internal static class ExceptionLog
     /// <returns>Its commit position, how it's applied again and the error, or zeros and null for none.</returns>
     internal static (ulong CommitLsn, int Level, PgException? Error) State(uint subId)
     {
-        SpiResult state = Worf.SelectCatalog(
+        WorfRows state = Worf.SelectCatalog(
             "SELECT commit_lsn::text, level, error_sqlstate, error_message FROM worf.exception_state WHERE sub_id = $1",
             SpiParameter.Create(subId));
         return state.Count == 0 || !Worf.TryParseLsn(state[0].Get<string>(0), out ulong lsn) ? (0, 0, null)

@@ -443,7 +443,7 @@ internal static partial class ConflictHistory
                 catch (PgException error)
                 {
                     // Recording is only observational, so apply goes on without the record.
-                    PgLog.Warning(new PgDiagnostic($"conflict_history: recording failed for {record.Description}, continuing without recording it: " +
+                    WorfLog.Warning(new PgDiagnostic($"conflict_history: recording failed for {record.Description}, continuing without recording it: " +
                         $"{error.Message} (SQLSTATE {error.SqlState})")
                     {
                         Detail = error.Detail,

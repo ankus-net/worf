@@ -156,7 +156,7 @@ internal sealed unsafe class WorfColumnConversion
             StringInfoData buf;
             NativeMethods.initStringInfo(&buf);
             Worf.AppendBinaryStringInfo(&buf, bytes, data.Length);
-            ulong value = NativeMethods.OidReceiveFunctionCall(typreceive, &buf, typioparam, -1);
+            ulong value = Worf.ReceiveValue(typreceive, &buf, typioparam, -1);
             CheckReadToEnd(&buf);
             return value;
         }
@@ -231,7 +231,7 @@ internal sealed unsafe class WorfColumnConversion
                 StringInfoData buf;
                 NativeMethods.initStringInfo(&buf);
                 Worf.AppendBinaryStringInfo(&buf, bytes, data.Length);
-                value = NativeMethods.ReceiveFunctionCall(_receive, &buf, _typioparam, -1);
+                value = Worf.ReceiveValue(_receive, &buf, _typioparam, -1);
                 CheckReadToEnd(&buf);
             }
 

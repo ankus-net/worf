@@ -23,7 +23,7 @@ internal static unsafe partial class CopyConversion
 
     // The copy in progress: the connection its rows come from and whether they ended, the number of the last row
     // read, a row still to pass to COPY and how much of it is left, and COPY's state.
-    private static PgReplicationConnection? s_conn;
+    private static WorfConnection? s_conn;
     private static bool s_ended;
     private static ulong s_line;
     private static byte[] s_row = new byte[8192];
@@ -118,7 +118,7 @@ internal static unsafe partial class CopyConversion
     /// <param name="commitLsn">The position the copy is consistent with, which the exception log records.</param>
     /// <param name="restart">Starts the provider's copy again, for a copy in batches.</param>
     /// <returns>The number of rows copied.</returns>
-    internal static ulong Copy(PgReplicationConnection conn, WorfRelation rel, uint into, List<string> attnames,
+    internal static ulong Copy(WorfConnection conn, WorfRelation rel, uint into, List<string> attnames,
         WorfColumnConversion?[]? conversions, ulong commitLsn, Action restart)
     {
         RelationData* relation = NativeMethods.table_open(into, RowExclusiveLock);
@@ -236,7 +236,7 @@ internal static unsafe partial class CopyConversion
                         restart();
                     }
 
-                    PgLog.Log($"copying table {rel.Nspname}.{rel.Relname} again in batches, as a row failed: {error.Message}");
+                    WorfLog.Log($"copying table {rel.Nspname}.{rel.Relname} again in batches, as a row failed: {error.Message}");
                     copied = CopyInBatches(pstate, relation, attnamelist);
                 }
             }
@@ -280,7 +280,8 @@ internal static unsafe partial class CopyConversion
     private static ulong CopyAll(ParseState* pstate, RelationData* relation, List* attnamelist)
     {
         s_failedLine = 0;
-        CopyFromStateData* cstate = NativeMethods.BeginCopyFrom(pstate, relation, null, null, false, DataSource, attnamelist, null);
+        CopyFromStateData* cstate = NativeMethods.BeginCopyFrom(pstate, relation, null, null, false, DataSource, attnamelist,
+            Worf.CopyFromOptions());
         s_cstate = cstate;
         ulong copied;
         try
@@ -565,7 +566,7 @@ internal static unsafe partial class CopyConversion
                         s_line = s_batchLine + (ulong)next;
                         if (converts)
                         {
-                            using PgErrorContext context = PgErrorContext.Push($"converting row {s_line} of the copy of table {table}");
+                            using PgErrorContext context = PgErrorContext.Push(Worf.Shown($"converting row {s_line} of the copy of table {table}"));
                             WriteRow(BatchRow(next));
                         }
                         else
@@ -683,7 +684,7 @@ internal static unsafe partial class CopyConversion
                 try
                 {
                     CopyFromStateData* cstate = NativeMethods.BeginCopyFrom(pstate, relation, (Node*)s_checkWhere, null, false, BatchSource,
-                        attnamelist, null);
+                        attnamelist, Worf.CopyFromOptions());
                     s_cstate = cstate;
                     s_copyIndex = start;
                     s_checkSkipped.Clear();
@@ -797,7 +798,7 @@ internal static unsafe partial class CopyConversion
             sub.Enabled = false;
             WorfNode.AlterSubscription(sub);
         });
-        PgLog.Log(change.Operation == "MERGE"
+        WorfLog.Log(change.Operation == "MERGE"
             ? $"disabling subscription {change.Subscription.Name} after the merge of table {change.Relation!.Nspname}.{change.Relation.Relname}'s copy failed"
             : $"disabling subscription {change.Subscription.Name} after a row of table {change.Relation!.Nspname}.{change.Relation.Relname} failed in its copy");
     }

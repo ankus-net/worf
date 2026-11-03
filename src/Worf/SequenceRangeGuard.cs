@@ -679,7 +679,7 @@ internal static partial class SequenceRangeGuard
             return null;
         }
 
-        SpiResult used = Elevated.Run(() => Worf.Read("""
+        WorfRows used = Elevated.Run(() => Worf.Read("""
             SELECT d.refobjid FROM pg_catalog.pg_attrdef a JOIN pg_catalog.pg_depend d
                 ON d.classid = 'pg_catalog.pg_attrdef'::pg_catalog.regclass AND d.objid = a.oid AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
             WHERE a.adrelid = $1
@@ -874,7 +874,7 @@ internal static partial class SequenceRangeGuard
             }
         }
 
-        SpiResult range = Elevated.Run(() => Worf.Read("""
+        WorfRows range = Elevated.Run(() => Worf.Read("""
             SELECT r.root_start, r.watermark, f.lo, f.hi
             FROM worf.sequence_range r
                 LEFT JOIN worf.sequence_range_block b ON b.seqoid = r.seqoid AND b.kind IN ('r', 'p') AND b.state = 'open'
@@ -1034,7 +1034,7 @@ internal static partial class SequenceRangeGuard
 
         // The blocks as last committed, since a switch that committed after this statement's snapshot may already
         // have given the sequence its new block.
-        SpiResult result = Elevated.Run(() => Worf.SelectCatalog("""
+        WorfRows result = Elevated.Run(() => Worf.SelectCatalog("""
             SELECT r.seqoid::oid, s.seqincrement > 0, b.lo, b.hi, b.state,
                 b.node_id = l.node_id AND b.sysid = $1 AND b.timeline = $2, b.reserved
             FROM worf.sequence_range r
@@ -1045,7 +1045,7 @@ internal static partial class SequenceRangeGuard
             """, SpiParameter.Create((decimal)sysid), SpiParameter.Create((long)timeline)));
         for (int i = 0; i < result.Count; i++)
         {
-            SpiRow row = result[i];
+            WorfRow row = result[i];
             uint seqoid = row.Get<uint>(0);
             if (!s_sequences.TryGetValue(seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) sequence))
             {

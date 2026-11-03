@@ -217,7 +217,7 @@ internal static unsafe partial class Executor
             string nspname = Worf.FromServer(NativeMethods.get_namespace_name(NativeMethods.get_rel_namespace(reloid)));
             string relname = Worf.FromServer(NativeMethods.get_rel_name(reloid));
 
-            PgLog.Debug3($"truncating the table {nspname}.{relname}");
+            WorfLog.Debug3($"truncating the table {nspname}.{relname}");
 
             // It's easier to construct json manually than via Jsonb API...
             json.Clear();
@@ -236,7 +236,7 @@ internal static unsafe partial class Executor
                 foreach (WorfRepSet repset in repsets)
                 {
                     repsetNames.Add(repset.Name);
-                    PgLog.Debug1($"truncating the table {nspname}.{relname} for {repset.Name} repset");
+                    WorfLog.Debug1($"truncating the table {nspname}.{relname} for {repset.Name} repset");
                 }
 
                 // Queue the truncate for replication.
@@ -363,10 +363,20 @@ internal static unsafe partial class Executor
                 NativeMethods.standard_ProcessUtility(pstmt, queryString, readOnlyTree, context, @params, queryEnv, dest, qc);
             }
 
-            // A dropped database's workers leave their slots, which the supervisor frees.
+            // A dropped database's workers leave their slots, which the supervisor frees; a database that worf is
+            // created in, or that ALTER DATABASE may have made one to manage, gets its manager once that commits.
             if (parsetree->type == NodeTag.T_DropdbStmt)
             {
                 Worker.WakeSupervisor();
+            }
+            else if (parsetree->type == NodeTag.T_CreateExtensionStmt &&
+                Worf.FromServer(((CreateExtensionStmt*)parsetree)->extname) == Worf.ExtensionName)
+            {
+                Worker.ForgetIdleManagersAtCommit(false);
+            }
+            else if (parsetree->type is NodeTag.T_AlterDatabaseStmt or NodeTag.T_AlterDatabaseSetStmt)
+            {
+                Worker.ForgetIdleManagersAtCommit(true);
             }
         }
         finally

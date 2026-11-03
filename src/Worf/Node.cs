@@ -359,7 +359,7 @@ internal sealed partial class WorfNode
     /// <returns>The subscription.</returns>
     internal static WorfSubscription GetSubscription(uint subid)
     {
-        SpiResult result = Worf.SelectCatalog(SubscriptionQuery + " WHERE sub_id = $1", SpiParameter.Create(subid));
+        WorfRows result = Worf.SelectCatalog(SubscriptionQuery + " WHERE sub_id = $1", SpiParameter.Create(subid));
         if (result.Count == 0)
         {
             throw new PgException(PgSqlStates.InternalError, $"subscription {subid} not found");
@@ -376,7 +376,7 @@ internal sealed partial class WorfNode
     /// <returns>The subscription.</returns>
     internal static WorfSubscription? GetSubscriptionByName(string name, bool missingOk)
     {
-        SpiResult result = Worf.SelectCatalog(SubscriptionQuery + " WHERE sub_name = $1::name", SpiParameter.Create(name));
+        WorfRows result = Worf.SelectCatalog(SubscriptionQuery + " WHERE sub_name = $1::name", SpiParameter.Create(name));
         if (result.Count == 0)
         {
             if (missingOk)
@@ -436,7 +436,7 @@ internal sealed partial class WorfNode
     /// <param name="sub">The subscription.</param>
     internal static void AlterSubscription(WorfSubscription sub)
     {
-        SpiResult result = Worf.Query("SELECT sub_name::text FROM worf.subscription WHERE sub_id = $1 FOR UPDATE", false, 0,
+        WorfRows result = Worf.Query("SELECT sub_name::text FROM worf.subscription WHERE sub_id = $1 FOR UPDATE", false, 0,
             SpiParameter.Create(sub.Id));
         if (result.Count == 0)
         {
@@ -445,7 +445,7 @@ internal sealed partial class WorfNode
 
         if (result[0].Get<string>(0) != sub.Name)
         {
-            PgLog.Log(new PgDiagnostic("subscription name change is not supported") { SqlState = PgSqlStates.FeatureNotSupported });
+            WorfLog.Log(new PgDiagnostic("subscription name change is not supported") { SqlState = PgSqlStates.FeatureNotSupported });
         }
 
         _ = Worf.Execute(
@@ -495,10 +495,10 @@ internal sealed partial class WorfNode
     /// <returns>The subscriptions.</returns>
     internal static List<WorfSubscription> GetNodeSubscriptions(uint nodeid, bool origin)
     {
-        SpiResult result = Worf.SelectCatalog(SubscriptionQuery + (origin ? " WHERE sub_origin = $1" : " WHERE sub_target = $1"),
+        WorfRows result = Worf.SelectCatalog(SubscriptionQuery + (origin ? " WHERE sub_origin = $1" : " WHERE sub_target = $1"),
             SpiParameter.Create(nodeid));
         List<WorfSubscription> res = [];
-        foreach (SpiRow row in result)
+        foreach (WorfRow row in result)
         {
             res.Add(SubscriptionFromRow(row));
         }
@@ -725,7 +725,7 @@ internal sealed partial class WorfNode
     /// the origin.</returns>
     internal static (uint Writer, uint SubId)? OriginWriter(ushort originId, uint xid)
     {
-        SpiResult result = Worf.Read("""
+        WorfRows result = Worf.Read("""
             SELECT writer_node, sub_id FROM worf.origin_writer
             WHERE roident = $1 AND (since_xid <= $2::text::xid8 OR $2::text::xid8 < $3::text::xid8)
             ORDER BY since_xid <= $2::text::xid8 DESC, since_xid DESC
@@ -764,7 +764,7 @@ internal sealed partial class WorfNode
     /// <returns>Each origin's id and the full transaction id its record starts from.</returns>
     internal static Dictionary<ushort, ulong> WorkerOrigins(uint subId, string originName)
     {
-        SpiResult result = Worf.SelectCatalog("""
+        WorfRows result = Worf.SelectCatalog("""
             SELECT o.roident, w.since_xid::text::bigint FROM pg_catalog.pg_replication_origin o,
                 LATERAL (SELECT sub_id, since_xid FROM worf.origin_writer WHERE roident = o.roident ORDER BY since_xid DESC LIMIT 1) w
             WHERE w.sub_id = $1 AND (o.roname = $2 OR starts_with(o.roname, $3))
@@ -793,7 +793,7 @@ internal sealed partial class WorfNode
     internal static List<(ushort Id, string Name)> RelayOrigins(string originName)
     {
         string prefix = originName + RelaySeparator;
-        SpiResult result = Worf.SelectCatalog(
+        WorfRows result = Worf.SelectCatalog(
             "SELECT roident, roname FROM pg_catalog.pg_replication_origin WHERE starts_with(roname, $1)", SpiParameter.Create(prefix));
         return [.. Enumerable.Range(0, result.Count)
             .Select(i => ((ushort)result[i].Get<uint>(0), result[i].Get<string>(1)))
@@ -867,7 +867,7 @@ internal sealed partial class WorfNode
     /// <returns>The origins' names.</returns>
     internal static List<string> OriginsWantingSlots()
     {
-        SpiResult wanting = Worf.Read("""
+        WorfRows wanting = Worf.Read("""
             SELECT o.roname::text FROM pg_catalog.pg_subscription s
                 JOIN pg_catalog.pg_replication_origin o
                     ON o.roname = 'pg_' || s.oid OR starts_with(o.roname, 'pg_' || s.oid || '_')
@@ -902,7 +902,7 @@ internal sealed partial class WorfNode
     /// <returns>The names of those that have none.</returns>
     internal static List<string> OriginsWithoutSlots(IReadOnlyCollection<string> names)
     {
-        SpiResult without = Worf.Read("""
+        WorfRows without = Worf.Read("""
             SELECT o.roname::text FROM pg_catalog.pg_replication_origin o
             WHERE o.roname = ANY ($1) AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_replication_origin_status st WHERE st.local_id = o.roident)
             """, 0, SpiParameter.Create(names.ToArray()));
@@ -971,7 +971,7 @@ internal sealed partial class WorfNode
     private const uint FOideq = 184;
     private const uint FNameeq = 62;
 
-    private static WorfSubscription SubscriptionFromRow(SpiRow row)
+    private static WorfSubscription SubscriptionFromRow(WorfRow row)
     {
         WorfSubscription sub = new()
         {

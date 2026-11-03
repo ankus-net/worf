@@ -383,7 +383,7 @@ internal static class OutputConfig
                     break;
 
                 case OutputPluginParamKey.Unrecognised:
-                    PgLog.Debug1($"Unrecognised worf parameter {elem.name} ignored");
+                    WorfLog.Debug1($"Unrecognised worf parameter {elem.name} ignored");
                     break;
 
                 default:

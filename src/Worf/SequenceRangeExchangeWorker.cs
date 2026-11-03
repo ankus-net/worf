@@ -32,7 +32,7 @@ internal static class SequenceRangeExchangeWorker
     internal static void ExchangeMain(nuint mainArg)
     {
         Worker.WorkerAttach((int)mainArg, WorfWorkerType.Exchange);
-        PgLog.Debug1("starting sequence range exchange worker");
+        WorfLog.Debug1("starting sequence range exchange worker");
         long started = Worker.GetCurrentTimestamp();
         while (!Worker.GotSigterm && !s_unwatched)
         {
