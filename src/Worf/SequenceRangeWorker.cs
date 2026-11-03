@@ -72,7 +72,9 @@ internal static class SequenceRangeWorker
                             // blocks and of its position. A sequence that a transaction holds against it waits for a later
                             // tick, so that the worker waits on no session.
                             // Its next block comes all the same, which a transaction that switched it itself, and so
-                            // holds it against the check, switches to at the block's end.
+                            // holds it against the check, switches to at the block's end, sized by the rate last taken,
+                            // since the position can't be read without the lock, and the transaction's draws, as a
+                            // load's, don't count toward it.
                             unsafe
                             {
                                 if (!NativeMethods.ConditionalLockRelationOid(seqoid, (int)PgLockMode.RowExclusive))
@@ -80,7 +82,7 @@ internal static class SequenceRangeWorker
                                     SequenceRanges.LedgerNoWait = true;
                                     try
                                     {
-                                        return SequenceRanges.Replenish(seqoid, local, Rate(rates, seqoid));
+                                        return SequenceRanges.Replenish(seqoid, local, rates.TryGetValue(seqoid, out (long Block, long Position, long At, double Peak, long PeakAt) last) ? last.Peak : 0);
                                     }
                                     finally
                                     {

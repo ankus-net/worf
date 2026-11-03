@@ -258,10 +258,11 @@ internal static unsafe partial class SequenceRanges
     private static readonly Dictionary<uint, (Guid Block, long Position)> s_positions = [];
 
     // When the range worker last read each sequence's tables for the furthest value they hold in its active block, where
-    // the sequence was then, and the xmax of a snapshot taken just before, past the last transaction that had ended: it
-    // reads them again once the sequence has moved, or a transaction has ended since, whose rows the read couldn't see,
-    // at most once a second, so that a check stays quick while sessions draw from the block.
-    private static readonly Dictionary<uint, (Guid Block, long Position, long At, uint Ended)> s_readStored = [];
+    // the sequence was then, and the xmax and transactions in progress of a snapshot taken just before: it reads them
+    // again once the sequence has moved, or a transaction whose rows the read couldn't see has ended since, one then in
+    // progress or one that started after, at most once a second, so that a check stays quick while sessions draw from
+    // the block.
+    private static readonly Dictionary<uint, (Guid Block, long Position, long At, uint Xmax, uint[] InProgress)> s_readStored = [];
 
     // The active block each sequence was noticed moving backwards in, until it leaves the block, so that a switch that
     // can't be made while transactions hold the sequence, as the one that moved it may, is made once they let it go.
@@ -1094,14 +1095,24 @@ internal static unsafe partial class SequenceRanges
             return true;
         }
 
-        // A sequence's bounds are its block's, so a last value outside the block was a switch or a quarantine.
+        // A sequence's bounds are its block's, so a last value outside the block was a switch or a quarantine. A snapshot's
+        // xmax moves past a transaction that started after the last read once that ends, and one then in progress leaves
+        // its transactions as it ends.
         long at = Worker.GetCurrentTimestamp();
-        uint ended = NativeMethods.GetLatestSnapshot()->xmax;
-        bool read = !s_readStored.TryGetValue(seqoid, out (Guid Block, long Position, long At, uint Ended) last) || last.Block != active.Id ||
-            ((position != last.Position || ended != last.Ended) && at - last.At >= 1_000_000);
+        SnapshotData* latest = NativeMethods.GetLatestSnapshot();
+        uint xmax = latest->xmax;
+        uint[] inProgress = new uint[latest->xcnt];
+        for (int i = 0; i < inProgress.Length; i++)
+        {
+            inProgress[i] = latest->xip[i];
+        }
+
+        bool known = s_readStored.TryGetValue(seqoid, out (Guid Block, long Position, long At, uint Xmax, uint[] InProgress) last);
+        bool ended = known && (xmax != last.Xmax || Array.Exists(last.InProgress, xid => Array.IndexOf(inProgress, xid) < 0));
+        bool read = !known || last.Block != active.Id || ((position != last.Position || ended) && at - last.At >= 1_000_000);
         if (read)
         {
-            s_readStored[seqoid] = (active.Id, position, at, ended);
+            s_readStored[seqoid] = (active.Id, position, at, xmax, inProgress);
         }
 
         if (read && FurthestStored(info, active) is decimal furthest && LastValue(seqoid) is long now &&
