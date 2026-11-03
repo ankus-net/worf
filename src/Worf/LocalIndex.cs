@@ -1,5 +1,5 @@
+using System.Globalization;
 using Ankus.Postgres;
-using System.Text;
 
 [assembly: PgSql("local_index", """
     CREATE TABLE worf.local_index (
@@ -47,12 +47,19 @@ internal static unsafe partial class LocalIndex
     // transaction can't write.
     private static readonly List<uint> s_droppingConcurrently = [];
 
-    // Whether the indexes on this node alone are out of a statement's way, and those moved aside and hidden from it,
-    // and whether those it builds again are hidden too.
+    // Whether the indexes on this node alone are out of a statement's way, and those hidden from it, and whether those
+    // it builds again are hidden too.
     private static bool s_isolating;
     private static bool s_hidingRebuilt;
-    private static List<(uint Index, string Name)> s_moved = [];
     private static List<(uint Index, uint Table, bool Unlive, uint Filenode)> s_hidden = [];
+
+    // Whether the names PostgreSQL chooses for the indexes and sequences a statement creates are made those the other
+    // nodes choose, which no index on this node alone holds there, once it has run; the relations it creates, the
+    // names it gives, and those of the relations it drops, as one an index built again takes.
+    private static bool s_naming;
+    private static readonly List<uint> s_named = [];
+    private static readonly HashSet<string> s_givenNames = [];
+    private static readonly HashSet<(uint Schema, string Name)> s_droppedNames = [];
 
     // The tables whose indexes a statement copies with LIKE ... INCLUDING INDEXES, which have indexes on this node alone,
     // with whether it copies their comments, and the indexes on this node alone whose copies it left out.
@@ -61,11 +68,6 @@ internal static unsafe partial class LocalIndex
 
     // The tables whose indexes on this node alone a statement hides as not live, which nothing may write to meanwhile.
     private static readonly HashSet<uint> s_unliveTables = [];
-
-    // The names of the indexes on this node alone moved out of the way of DDL, by their schemas and the names they have
-    // meanwhile, and their schemas.
-    private static readonly Dictionary<(uint Schema, string Name), string> s_asideNames = [];
-    private static readonly Dictionary<uint, uint> s_movedSchemas = [];
 
     // RVR_MISSING_OK from catalog/namespace.h, and CREATE_TABLE_LIKE_INDEXES and CREATE_TABLE_LIKE_COMMENTS from
     // nodes/parsenodes.h.
@@ -85,6 +87,12 @@ internal static unsafe partial class LocalIndex
     /// here, runs now, which keeps the indexes on this node alone out of its sight.
     /// </summary>
     internal static bool Applying { get; set; }
+
+    /// <summary>
+    /// Gets or sets the node whose DDL apply runs, for the warning when it takes the name of an index on this node alone,
+    /// or null.
+    /// </summary>
+    internal static string? Origin { get; set; }
 
     /// <summary>
     /// Starts tracking the indexes a statement builds, when it builds them concurrently and they may be left on this
@@ -141,6 +149,11 @@ internal static unsafe partial class LocalIndex
     /// <param name="relid">The relation.</param>
     internal static void NoteCreated(uint relid)
     {
+        if (s_naming)
+        {
+            s_named.Add(relid);
+        }
+
         if (s_tracking || s_rebuilding.Count > 0)
         {
             s_created.Add(relid);
@@ -196,6 +209,12 @@ internal static unsafe partial class LocalIndex
     /// <param name="concurrent">Whether it's dropped concurrently.</param>
     internal static void NoteDropped(uint relid, bool internalDrop, bool concurrent)
     {
+        sbyte* droppedName = s_naming ? NativeMethods.get_rel_name(relid) : null;
+        if (droppedName is not null)
+        {
+            _ = s_droppedNames.Add((NativeMethods.get_rel_namespace(relid), Worf.FromServer(droppedName)));
+        }
+
         if (NativeMethods.get_rel_relkind(relid) != (sbyte)'i' || !Contains(relid))
         {
             return;
@@ -365,135 +384,6 @@ internal static unsafe partial class LocalIndex
     }
 
     /// <summary>
-    /// Moves the indexes on this node alone out of the way of DDL from another node, or that replicate_ddl_command runs,
-    /// which, without them, may create objects under their names, or choose names for its own that would otherwise
-    /// differ from the other nodes'. Only those whose names the DDL could take are moved, as each is locked until the
-    /// transaction ends, which holds up other DDL on it, and those that its statements will hide are locked with them,
-    /// in one order, so that DDL here and DDL from another node don't deadlock on them.
-    /// </summary>
-    /// <param name="command">The DDL.</param>
-    /// <param name="role">The role that runs it, as which its names are found.</param>
-    /// <returns>The indexes moved, with their names, for <see cref="MoveBack"/>.</returns>
-    internal static List<(uint Index, string Name)> MoveAside(string command, string role)
-    {
-        if (Worf.CatalogOid("local_index") == 0)
-        {
-            return [];
-        }
-
-        // The statement's names are found as the role that ran it finds them, as its own search path's "$user" does,
-        // as that user rather than with the role set, which a security-definer function can't do. A statement that may
-        // set something, as the search path, changes where the ones after it find names, so theirs are looked for in
-        // every schema.
-        List<(uint Schema, string Name, bool Prefix)>? names = [];
-        List<uint> hiding = [];
-        uint userId;
-        int secContext;
-        NativeMethods.GetUserIdAndSecContext(&userId, &secContext);
-        NativeMethods.SetUserIdAndSecContext(NativeMethods.get_role_oid(Worf.PStrDup(role), false), secContext | SecurityLocalUseridChange);
-        try
-        {
-            List* statements = NativeMethods.raw_parser(Worf.PStrDup(command), RawParseMode.RAW_PARSE_DEFAULT);
-            bool pathKnown = true;
-            for (int i = 0; statements is not null && i < statements->length; i++)
-            {
-                Node* statement = ((RawStmt*)statements->elements[i].ptr_value)->stmt;
-                if (names is not null)
-                {
-                    List<(uint Schema, string Name, bool Prefix)>? taken = NamesTaken(statement, pathKnown);
-                    names = taken is null ? null : [.. names, .. taken];
-                }
-
-                UsedTables(statement, hiding, hiding);
-                if (pathKnown)
-                {
-                    LockTables(statement);
-                }
-
-                pathKnown = pathKnown && !MaySet(statement);
-            }
-        }
-        finally
-        {
-            NativeMethods.SetUserIdAndSecContext(userId, secContext);
-        }
-
-        return MoveAside(names, hiding);
-    }
-
-    /// <summary>
-    /// Takes the locks a statement takes on the tables it alters, indexes, renames or copies the definition of, as it
-    /// would, before the locks on the indexes on this node alone that it moves aside or hides, so that it waits for a
-    /// transaction that holds one of them, as on its own, rather than hold the indexes meanwhile, which that transaction
-    /// may go on to need.
-    /// </summary>
-    private static void LockTables(Node* statement)
-    {
-        switch (statement->type)
-        {
-            case NodeTag.T_AlterTableStmt:
-                AlterTableStmt* alter = (AlterTableStmt*)statement;
-                _ = NativeMethods.RangeVarGetRelidExtended(alter->relation, NativeMethods.AlterTableGetLockLevel(alter->cmds), RangeVarMissingOk, default, null);
-                break;
-
-            case NodeTag.T_IndexStmt:
-                IndexStmt* index = (IndexStmt*)statement;
-                _ = NativeMethods.RangeVarGetRelidExtended(index->relation,
-                    (int)(index->concurrent ? PgLockMode.ShareUpdateExclusive : PgLockMode.Share), RangeVarMissingOk, default, null);
-                break;
-
-            case NodeTag.T_RenameStmt when ((RenameStmt*)statement)->relation is not null:
-                _ = NativeMethods.RangeVarGetRelidExtended(((RenameStmt*)statement)->relation, (int)PgLockMode.AccessExclusive, RangeVarMissingOk, default, null);
-                break;
-
-            case NodeTag.T_CreateStmt:
-                List* elements = ((CreateStmt*)statement)->tableElts;
-                for (int i = 0; elements is not null && i < elements->length; i++)
-                {
-                    Node* element = (Node*)elements->elements[i].ptr_value;
-                    if (element->type == NodeTag.T_TableLikeClause)
-                    {
-                        _ = NativeMethods.RangeVarGetRelidExtended(((TableLikeClause*)element)->relation, (int)PgLockMode.AccessShare,
-                            RangeVarMissingOk, default, null);
-                    }
-                }
-
-                break;
-
-            default:
-                break;
-        }
-    }
-
-    /// <summary>
-    /// Names an index on this node alone that a failure of DDL from another node names, as moved out of its way, by its
-    /// own name, so that the failure reads as it would without the move.
-    /// </summary>
-    /// <param name="error">The failure.</param>
-    /// <param name="moved">The indexes moved, with their own names.</param>
-    /// <returns>The failure, with the indexes' own names.</returns>
-    internal static PgException WithOwnNames(PgException error, List<(uint Index, string Name)> moved)
-    {
-        if (error.ConstraintName is not string aside || moved.Count == 0)
-        {
-            return error;
-        }
-
-        // The names the indexes were moved to, rather than their catalog rows, which a failed transaction can't read.
-        foreach ((uint relid, string name) in moved)
-        {
-            uint nspoid = s_movedSchemas.TryGetValue(relid, out uint schema) ? schema : 0;
-            if (s_asideNames.TryGetValue((nspoid, aside), out string? own) && own == name)
-            {
-                return new PgException(error.SqlState, error.Message.Replace($"\"{aside}\"", $"\"{name}\"", StringComparison.Ordinal),
-                    detail: error.Detail, hint: error.Hint);
-            }
-        }
-
-        return error;
-    }
-
-    /// <summary>
     /// Checks whether DDL from another node writes rows to existing tables, or may, whose unique indexes on this node
     /// alone then find duplicates in them, rather than in an index built again.
     /// </summary>
@@ -523,141 +413,40 @@ internal static unsafe partial class LocalIndex
         NodeTag.T_CreateTableAsStmt or NodeTag.T_CopyStmt or NodeTag.T_DoStmt or NodeTag.T_CallStmt or NodeTag.T_ExecuteStmt;
 
     /// <summary>
-    /// Moves the indexes on this node alone whose names a statement could take out of its way, after it locks them and
-    /// those of the tables whose indexes it will hide, in the order of their OIDs.
-    /// </summary>
-    /// <param name="names">The names, or null for every name.</param>
-    /// <param name="hiding">The tables whose indexes on this node alone the statement will hide.</param>
-    /// <returns>The indexes moved, with their names.</returns>
-    private static List<(uint Index, string Name)> MoveAside(List<(uint Schema, string Name, bool Prefix)>? names, List<uint> hiding)
-    {
-        List<(uint Index, string Name)> moved = [];
-        if (names is { Count: 0 } && hiding.Count == 0)
-        {
-            return moved;
-        }
-
-        WorfRows result = Elevated.Run(() => Worf.Read("""
-            SELECT l.indexrelid, i.indrelid FROM worf.local_index l JOIN pg_catalog.pg_index i ON i.indexrelid = l.indexrelid
-            ORDER BY 1
-            """, 0));
-        List<uint> moving = [];
-        foreach ((uint relid, uint table) in result.Select(row => (row.Get<uint>(0), row.Get<uint>(1))))
-        {
-            bool takes = Takes(names, relid);
-            if (takes || hiding.Contains(table))
-            {
-                NativeMethods.LockRelationOid(relid, (int)PgLockMode.ShareUpdateExclusive);
-            }
-
-            // Its name is read again once it's locked, as a rename may have committed meanwhile.
-            if (takes && Takes(names, relid))
-            {
-                moving.Add(relid);
-            }
-        }
-
-        foreach (uint relid in moving)
-        {
-            sbyte* name = NativeMethods.get_rel_name(relid);
-            uint nspoid = NativeMethods.get_rel_namespace(relid);
-            if (name is null)
-            {
-                continue;
-            }
-
-            moved.Add((relid, Worf.FromServer(name)));
-            sbyte* aside = NativeMethods.ChooseRelationName(name, null, Worf.PStrDup("worf_aside"), nspoid, false);
-            s_asideNames[(nspoid, Worf.FromServer(aside))] = Worf.FromServer(name);
-            s_movedSchemas[relid] = nspoid;
-            NativeMethods.RenameRelationInternal(relid, aside, true, true);
-            NativeMethods.CommandCounterIncrement();
-        }
-
-        return moved;
-    }
-
-    /// <summary>
-    /// Checks whether a statement could take an index's name: one it gives, or one PostgreSQL chooses from a table's,
-    /// which starts with as much of it as fits beside the rest, at least 20 bytes.
-    /// </summary>
-    private static bool Takes(List<(uint Schema, string Name, bool Prefix)>? names, uint relid)
-    {
-        sbyte* current = NativeMethods.get_rel_name(relid);
-        if (current is null)
-        {
-            return false;
-        }
-
-        if (names is null)
-        {
-            return true;
-        }
-
-        string name = Worf.FromServer(current);
-        uint nspoid = NativeMethods.get_rel_namespace(relid);
-        return names.Exists(taken => (taken.Schema == 0 || taken.Schema == nspoid) &&
-            (taken.Prefix ? name.StartsWith(ChosenStart(taken.Name), StringComparison.Ordinal) : name == taken.Name));
-    }
-
-    /// <summary>
-    /// Gives the start of a table's name that the names PostgreSQL chooses from it keep: <c>makeObjectName</c> cuts the
-    /// longer of the two names it joins until they fit, so the table's keeps at least half of what the label leaves, and
-    /// puts an underscore after it, so a table's name that short is kept whole, with the underscore.
-    /// </summary>
-    private static string ChosenStart(string table)
-    {
-        const int Kept = 20;
-        int bytes = 0;
-        int at = 0;
-        while (at < table.Length)
-        {
-            int length = char.IsSurrogatePair(table, at) ? 2 : 1;
-            bytes += Encoding.UTF8.GetByteCount(table.AsSpan(at, length));
-            if (bytes > Kept)
-            {
-                break;
-            }
-
-            at += length;
-        }
-
-        return at == table.Length ? table + "_" : table[..at];
-    }
-
-    /// <summary>
-    /// Finds the names a statement may give relations, which an index on this node alone could have: those it gives
+    /// Finds the names a statement gives relations, which an index on this node alone could have: those it gives
     /// relations it creates or renames, or that a table, index or type it moves to another schema has, with the
-    /// indexes and sequences that move with it, and the starts of those PostgreSQL chooses from the tables it creates,
-    /// alters, indexes or attaches, and from their partitions, for their indexes and sequences. A statement that can
-    /// create relations anywhere, as a DO block, a procedure or an extension can, may take any name, and any other, as
-    /// a function's, a DROP or a statement that names no relation, none.
+    /// indexes and sequences that move with it. A statement that can create relations anywhere, as a DO block, a
+    /// procedure or an extension can, gives none itself, as its own statements give theirs, and neither does any other,
+    /// as a DROP or a statement that names no relation.
     /// </summary>
     /// <param name="parsetree">The statement.</param>
     /// <param name="pathKnown">Whether the search path the statement finds names on is the current one.</param>
-    /// <returns>The names, in their schemas or, with a zero schema, in any, or null for every name.</returns>
-    private static List<(uint Schema, string Name, bool Prefix)>? NamesTaken(Node* parsetree, bool pathKnown)
+    /// <returns>The names, in their schemas or, with a zero schema, in any, or null when it can't be told.</returns>
+    private static List<(uint Schema, string Name)>? NamesTaken(Node* parsetree, bool pathKnown)
     {
-        List<(uint Schema, string Name, bool Prefix)> names = [];
+        List<(uint Schema, string Name)> names = [];
         switch (parsetree->type)
         {
-            // EXPLAIN ANALYZE runs the statement it explains.
+            // EXPLAIN ANALYZE runs the statement it explains, which parse analysis has made a query, as it has a utility
+            // statement that EXPLAIN runs, as CREATE TABLE AS.
             case NodeTag.T_ExplainStmt:
                 return NamesTaken(((ExplainStmt*)parsetree)->query, pathKnown);
 
-            // A statement that runs functions, as a DO block, a procedure, an extension's script or a query does, may
-            // create relations under any name.
-            case NodeTag.T_DoStmt or NodeTag.T_CallStmt or NodeTag.T_CreateExtensionStmt or NodeTag.T_AlterExtensionStmt or
-                NodeTag.T_ImportForeignSchemaStmt or NodeTag.T_SelectStmt or NodeTag.T_InsertStmt or NodeTag.T_UpdateStmt or
-                NodeTag.T_DeleteStmt or NodeTag.T_MergeStmt or NodeTag.T_CopyStmt or NodeTag.T_ExecuteStmt or NodeTag.T_CreateTableAsStmt:
-                return null;
+            case NodeTag.T_Query when ((Query*)parsetree)->utilityStmt is not null:
+                return NamesTaken(((Query*)parsetree)->utilityStmt, pathKnown);
+
+            // A table created from a query, as by CREATE TABLE AS or SELECT INTO, takes the name it gives. The relations
+            // that the functions a statement runs create, as a DO block's, a procedure's, an extension's script's or
+            // a query's do, are created by statements of their own, which give their own names.
+            case NodeTag.T_CreateTableAsStmt when ((CreateTableAsStmt*)parsetree)->into is not null:
+                RangeVar* into = ((CreateTableAsStmt*)parsetree)->into->rel;
+                names.Add((SchemaOf(into, true, pathKnown), Worf.FromServer(into->relname)));
+                break;
 
             case NodeTag.T_CreateStmt or NodeTag.T_CreateForeignTableStmt:
                 CreateStmt* create = (CreateStmt*)parsetree;
                 uint schema = SchemaOf(create->relation, true, pathKnown);
-                string table = Worf.FromServer(create->relation->relname);
-                names.Add((schema, table, false));
-                names.Add((schema, table, true));
+                names.Add((schema, Worf.FromServer(create->relation->relname)));
                 AddConstraintNames(names, schema, create->tableElts);
                 break;
 
@@ -665,43 +454,42 @@ internal static unsafe partial class LocalIndex
                 IndexStmt* index = (IndexStmt*)parsetree;
                 if (index->idxname is not null)
                 {
-                    names.Add((SchemaOf(index->relation, false, pathKnown), Worf.FromServer(index->idxname), false));
+                    names.Add((SchemaOf(index->relation, false, pathKnown), Worf.FromServer(index->idxname)));
                 }
 
-                AddTreeNames(names, index->relation, pathKnown);
                 break;
 
             case NodeTag.T_AlterTableStmt when ((AlterTableStmt*)parsetree)->objtype is ObjectType.OBJECT_TABLE or ObjectType.OBJECT_FOREIGN_TABLE:
                 AlterTableStmt* alter = (AlterTableStmt*)parsetree;
-                AddTreeNames(names, alter->relation, pathKnown);
                 uint altered = SchemaOf(alter->relation, false, pathKnown);
                 List* cmds = alter->cmds;
                 for (int i = 0; cmds is not null && i < cmds->length; i++)
                 {
                     AlterTableCmd* cmd = (AlterTableCmd*)cmds->elements[i].ptr_value;
-                    if (cmd->subtype == AlterTableType.AT_AttachPartition && cmd->def is not null)
-                    {
-                        AddTreeNames(names, ((PartitionCmd*)cmd->def)->name, pathKnown);
-                    }
-                    else if (cmd->subtype is AlterTableType.AT_AddConstraint or AlterTableType.AT_AddColumn or AlterTableType.AT_AddIdentity &&
+                    if (cmd->subtype is AlterTableType.AT_AddConstraint or AlterTableType.AT_AddColumn or AlterTableType.AT_AddIdentity &&
                         cmd->def is not null)
                     {
                         AddConstraintNames(names, altered, cmd->def);
+                    }
+                    else if (cmd->subtype is AlterTableType.AT_AddIndex or AlterTableType.AT_AddIndexConstraint && cmd->def is not null &&
+                        ((IndexStmt*)cmd->def)->idxname is not null)
+                    {
+                        names.Add((altered, Worf.FromServer(((IndexStmt*)cmd->def)->idxname)));
                     }
                 }
 
                 break;
 
             case NodeTag.T_CreateSeqStmt:
-                names.Add((SchemaOf(((CreateSeqStmt*)parsetree)->sequence, true, pathKnown), Worf.FromServer(((CreateSeqStmt*)parsetree)->sequence->relname), false));
+                names.Add((SchemaOf(((CreateSeqStmt*)parsetree)->sequence, true, pathKnown), Worf.FromServer(((CreateSeqStmt*)parsetree)->sequence->relname)));
                 break;
 
             case NodeTag.T_ViewStmt:
-                names.Add((SchemaOf(((ViewStmt*)parsetree)->view, true, pathKnown), Worf.FromServer(((ViewStmt*)parsetree)->view->relname), false));
+                names.Add((SchemaOf(((ViewStmt*)parsetree)->view, true, pathKnown), Worf.FromServer(((ViewStmt*)parsetree)->view->relname)));
                 break;
 
             case NodeTag.T_CompositeTypeStmt:
-                names.Add((SchemaOf(((CompositeTypeStmt*)parsetree)->typevar, true, pathKnown), Worf.FromServer(((CompositeTypeStmt*)parsetree)->typevar->relname), false));
+                names.Add((SchemaOf(((CompositeTypeStmt*)parsetree)->typevar, true, pathKnown), Worf.FromServer(((CompositeTypeStmt*)parsetree)->typevar->relname)));
                 break;
 
             case NodeTag.T_RenameStmt:
@@ -720,19 +508,19 @@ internal static unsafe partial class LocalIndex
     /// <summary>
     /// Finds the name a rename gives a relation, a composite type's relation or the index of a constraint.
     /// </summary>
-    private static List<(uint Schema, string Name, bool Prefix)>? RenamedNames(RenameStmt* rename, bool pathKnown)
+    private static List<(uint Schema, string Name)>? RenamedNames(RenameStmt* rename, bool pathKnown)
     {
         string newname = rename->newname is null ? "" : Worf.FromServer(rename->newname);
         switch (rename->renameType)
         {
             case ObjectType.OBJECT_TABLE or ObjectType.OBJECT_INDEX or ObjectType.OBJECT_SEQUENCE or ObjectType.OBJECT_VIEW or
                 ObjectType.OBJECT_MATVIEW or ObjectType.OBJECT_FOREIGN_TABLE or ObjectType.OBJECT_TABCONSTRAINT:
-                return [(SchemaOf(rename->relation, false, pathKnown), newname, false)];
+                return [(SchemaOf(rename->relation, false, pathKnown), newname)];
 
             case ObjectType.OBJECT_TYPE:
                 uint typid = NativeMethods.LookupTypeNameOid(null, NativeMethods.makeTypeNameFromNameList((List*)rename->@object), true);
                 uint typrelid = typid == 0 ? 0 : NativeMethods.get_typ_typrelid(typid);
-                return typid == 0 ? null : typrelid == 0 ? [] : [(pathKnown ? NativeMethods.get_rel_namespace(typrelid) : 0, newname, false)];
+                return typid == 0 ? null : typrelid == 0 ? [] : [(pathKnown ? NativeMethods.get_rel_namespace(typrelid) : 0, newname)];
 
             default:
                 return [];
@@ -743,7 +531,7 @@ internal static unsafe partial class LocalIndex
     /// Finds the names that a relation, a composite type's relation or an extension's relations moved to another
     /// schema take there, with those of the indexes and sequences that move with them.
     /// </summary>
-    private static List<(uint Schema, string Name, bool Prefix)>? MovedNames(AlterObjectSchemaStmt* move, bool pathKnown)
+    private static List<(uint Schema, string Name)>? MovedNames(AlterObjectSchemaStmt* move, bool pathKnown)
     {
         uint target = NativeMethods.get_namespace_oid(move->newschema, true);
         uint relid;
@@ -782,7 +570,7 @@ internal static unsafe partial class LocalIndex
                     SELECT relname::pg_catalog.text FROM m
                     UNION
                     SELECT c.relname::pg_catalog.text FROM m JOIN pg_catalog.pg_index i ON i.indrelid = m.oid JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
-                    """, 0, SpiParameter.Create(extension.objectId))).Select(row => (target, row.Get<string>(0), false))];
+                    """, 0, SpiParameter.Create(extension.objectId))).Select(row => (target, row.Get<string>(0)))];
 
             default:
                 return [];
@@ -796,7 +584,7 @@ internal static unsafe partial class LocalIndex
             SELECT c.relname::pg_catalog.text FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_class c ON c.oid = d.objid
             WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
                 AND d.refobjid = $1 AND d.deptype IN ('a', 'i') AND c.relkind = 'S'
-            """, 0, SpiParameter.Create(relid))).Select(row => (target, row.Get<string>(0), false))];
+            """, 0, SpiParameter.Create(relid))).Select(row => (target, row.Get<string>(0)))];
     }
 
     /// <summary>
@@ -816,7 +604,7 @@ internal static unsafe partial class LocalIndex
     /// Adds the names that the unique, primary key and exclusion constraints a table's columns or table elements
     /// define give their indexes.
     /// </summary>
-    private static void AddConstraintNames(List<(uint Schema, string Name, bool Prefix)> names, uint schema, List* elements)
+    private static void AddConstraintNames(List<(uint Schema, string Name)> names, uint schema, List* elements)
     {
         for (int i = 0; elements is not null && i < elements->length; i++)
         {
@@ -824,7 +612,7 @@ internal static unsafe partial class LocalIndex
         }
     }
 
-    private static void AddConstraintNames(List<(uint Schema, string Name, bool Prefix)> names, uint schema, Node* element)
+    private static void AddConstraintNames(List<(uint Schema, string Name)> names, uint schema, Node* element)
     {
         if (element->type == NodeTag.T_ColumnDef)
         {
@@ -833,7 +621,7 @@ internal static unsafe partial class LocalIndex
         else if (element->type == NodeTag.T_Constraint && ((Constraint*)element)->conname is not null &&
             ((Constraint*)element)->contype is ConstrType.CONSTR_PRIMARY or ConstrType.CONSTR_UNIQUE or ConstrType.CONSTR_EXCLUSION)
         {
-            names.Add((schema, Worf.FromServer(((Constraint*)element)->conname), false));
+            names.Add((schema, Worf.FromServer(((Constraint*)element)->conname)));
         }
         else if (element->type == NodeTag.T_Constraint && ((Constraint*)element)->contype == ConstrType.CONSTR_IDENTITY)
         {
@@ -847,35 +635,9 @@ internal static unsafe partial class LocalIndex
                     sbyte* nspname;
                     sbyte* objname;
                     NativeMethods.DeconstructQualifiedName((List*)option->arg, &nspname, &objname);
-                    names.Add((nspname is null ? schema : NativeMethods.get_namespace_oid(nspname, true), Worf.FromServer(objname), false));
+                    names.Add((nspname is null ? schema : NativeMethods.get_namespace_oid(nspname, true), Worf.FromServer(objname)));
                 }
             }
-        }
-    }
-
-    /// <summary>
-    /// Adds the starts of the names PostgreSQL chooses from a table and from its partitions and inheritors, in their
-    /// schemas, for the indexes a statement builds on them and the sequences it creates for them.
-    /// </summary>
-    private static void AddTreeNames(List<(uint Schema, string Name, bool Prefix)> names, RangeVar* relation, bool pathKnown)
-    {
-        uint relid = relation is null || !(pathKnown || relation->schemaname is not null) ? 0
-            : NativeMethods.RangeVarGetRelidExtended(relation, 0, RangeVarMissingOk, default, null);
-        if (relid == 0)
-        {
-            if (relation is not null)
-            {
-                names.Add((SchemaOf(relation, false, pathKnown), Worf.FromServer(relation->relname), true));
-            }
-
-            return;
-        }
-
-        List* tree = NativeMethods.find_all_inheritors(relid, (int)PgLockMode.None, null);
-        for (int i = 0; tree is not null && i < tree->length; i++)
-        {
-            uint member = tree->elements[i].oid_value;
-            names.Add((NativeMethods.get_rel_namespace(member), Worf.FromServer(NativeMethods.get_rel_name(member)), true));
         }
     }
 
@@ -915,77 +677,51 @@ internal static unsafe partial class LocalIndex
     }
 
     /// <summary>
-    /// Gives the indexes on this node alone that DDL ran without their names back, or the indexes the DDL built again
-    /// in their places, in whatever schema the DDL moved them to, or where the DDL took one, a new name, with a
-    /// warning.
-    /// </summary>
-    /// <param name="moved">The indexes moved.</param>
-    /// <param name="origin">The node the DDL came from, or null for this node's own DDL.</param>
-    internal static void MoveBack(List<(uint Index, string Name)> moved, string? origin)
-    {
-        Flush();
-        foreach ((uint relid, string name) in moved)
-        {
-            uint current = relid;
-            while (NativeMethods.get_rel_relkind(current) != (sbyte)'i' && s_rebuiltAs.TryGetValue(current, out uint rebuilt))
-            {
-                current = rebuilt;
-            }
-
-            if (NativeMethods.get_rel_relkind(current) != (sbyte)'i' || Worf.FromServer(NativeMethods.get_rel_name(current)) == name)
-            {
-                continue;
-            }
-
-            uint nspoid = NativeMethods.get_rel_namespace(current);
-            sbyte* target = Worf.PStrDup(name);
-            if (NativeMethods.get_relname_relid(target, nspoid) != 0)
-            {
-                target = NativeMethods.ChooseRelationName(target, null, Worf.PStrDup("local"), nspoid, false);
-                WorfLog.Warning($"renamed index \"{name}\", which is on this node alone, to \"{Worf.FromServer(target)}\", as DDL{(origin is null ? "" : $" from node {origin}")} took its name");
-            }
-
-            NativeMethods.RenameRelationInternal(current, target, true, true);
-            NativeMethods.CommandCounterIncrement();
-        }
-    }
-
-    /// <summary>
-    /// Moves the indexes on this node alone out of a statement's way, unless the statement that runs it already has:
-    /// out of the way of the names that PostgreSQL chooses for the objects that DDL that replicates creates, so that
-    /// every node chooses the same, as <see cref="MoveAside(string, string)"/> does for apply; and out of sight of DDL that replicates,
-    /// or DDL from another node, that would copy them, attach them to a partitioned index, or have a foreign key use
-    /// them, none of which the other nodes can. Only the indexes of the tables the statement copies, attaches,
-    /// indexes the partitions of or references are hidden: those a foreign key or an attached partition would use are
-    /// marked not valid, which they're still kept up to date and built again as, and those that a copy or a
-    /// partitioned index would take, which only indexes that aren't live escape, are marked not live, while nothing may
-    /// write to or rewrite their tables. ALTER TABLE that names no index hides those it builds again as not valid as it
-    /// creates them.
+    /// Keeps the indexes on this node alone out of the way of DDL that replicates, or DDL from another node, unless the
+    /// statement that runs it already does: one that has a name the DDL gives a relation is renamed, as
+    /// <see cref="RenameTakenLocals"/> renames it, and once the DDL has run, the names PostgreSQL chose beside them are
+    /// made those the other nodes choose, as <see cref="Reconcile"/> makes them; a copy of a table's indexes leaves them
+    /// out, as <see cref="SkipsCopy"/> does; and they're hidden from DDL that would attach them to a partitioned index
+    /// or have a foreign key use them, none of which the other nodes can. Only the indexes of the tables the statement
+    /// attaches, indexes the partitions of or references are hidden: those a foreign key or an attached partition would
+    /// use are marked not valid, which they're still kept up to date and built again as, and those that a partitioned
+    /// index would take, which only indexes that aren't live escape, are marked not live, while nothing may write to or
+    /// rewrite their tables. ALTER TABLE that names no index hides those it builds again as not valid as it creates
+    /// them.
     /// </summary>
     /// <param name="parsetree">The statement.</param>
     /// <param name="replicated">Whether it's DDL to replicate.</param>
     /// <returns>Whether any are out of its way, for <see cref="EndIsolation"/> and <see cref="Restore"/>.</returns>
     internal static bool Isolate(Node* parsetree, bool replicated)
     {
-        bool rename = replicated && ChoosesNames(parsetree);
+        bool rename = (replicated || Applying) && ChoosesNames(parsetree);
         bool hidingRebuilt = parsetree->type == NodeTag.T_AlterTableStmt && (Applying || rename);
-        List<uint> unlive = [];
-        List<uint> invalid = [];
+        List<(uint Table, string[]? Columns, PgLockMode Lock)> unlive = [];
+        List<(uint Table, string[]? Columns, PgLockMode Lock)> invalid = [];
         if (replicated || Applying)
         {
             UsedTables(parsetree, unlive, invalid);
         }
 
         List<(uint Table, bool Comments)> copied = replicated || Applying ? CopiedTables(parsetree) : [];
-        if (s_isolating || !(rename || hidingRebuilt || unlive.Count > 0 || invalid.Count > 0 || copied.Count > 0) ||
+        List<(uint Schema, string Name)>? given = replicated || Applying ? NamesTaken(parsetree, true) : null;
+        if (s_isolating || !(rename || given is { Count: > 0 } || hidingRebuilt || unlive.Count > 0 || invalid.Count > 0 || copied.Count > 0) ||
             Worf.CatalogOid("local_index") == 0 || !Elevated.Run(() => Worf.ReadScalar<bool>("SELECT EXISTS (SELECT FROM worf.local_index)")))
         {
             return false;
         }
 
         s_copied.AddRange(copied);
-        LockTables(parsetree);
-        s_moved = MoveAside(rename ? NamesTaken(parsetree, true) : [], [.. unlive, .. invalid]);
+        s_named.Clear();
+        s_droppedNames.Clear();
+        s_givenNames.Clear();
+        RenameTakenLocals(given);
+        s_naming = rename;
+        foreach ((uint _, string name) in given ?? [])
+        {
+            _ = s_givenNames.Add(name);
+        }
+
         s_hidden = [];
         Hide(unlive, true);
         Hide(invalid, false);
@@ -1008,12 +744,14 @@ internal static unsafe partial class LocalIndex
             s_unliveTables.Clear();
             s_copied.Clear();
             s_copiesLeftOut.Clear();
+            s_naming = false;
         }
     }
 
     /// <summary>
     /// Brings the indexes on this node alone back once a statement that <see cref="Isolate"/> ran out of their way has
-    /// run: live and valid again, and under their names, as <see cref="MoveBack"/> gives them. A statement that
+    /// run: live and valid again, with the names PostgreSQL chose for what it created made those the other nodes chose,
+    /// as <see cref="Reconcile"/> makes them. A statement that
     /// rewrote a table whose indexes weren't live, which left them unbuilt, fails.
     /// </summary>
     /// <param name="isolated">Whether they were out of its way.</param>
@@ -1025,9 +763,7 @@ internal static unsafe partial class LocalIndex
         }
 
         List<(uint Index, uint Table, bool Unlive, uint Filenode)> hidden = s_hidden;
-        List<(uint Index, string Name)> moved = s_moved;
         s_hidden = [];
-        s_moved = [];
         foreach ((uint _, uint table, bool _, uint filenode) in hidden.Where(index => index.Unlive))
         {
             if (Elevated.Run(() => Worf.ReadScalar<uint>("SELECT relfilenode FROM pg_catalog.pg_class WHERE oid = $1", SpiParameter.Create(table))) != filenode)
@@ -1057,8 +793,198 @@ internal static unsafe partial class LocalIndex
         }
 
         NativeMethods.CommandCounterIncrement();
-        MoveBack(moved, null);
+        Reconcile();
     }
+
+    /// <summary>
+    /// Renames each index on this node alone that has a name DDL that replicates, or DDL from another node, gives a
+    /// relation it creates, renames or moves, which the other nodes don't have, to a name of its own, with a warning,
+    /// so that the DDL does here what it does on them. Only an index that has such a name is renamed, as the rename
+    /// holds it until the transaction ends.
+    /// </summary>
+    /// <param name="given">The names, in their schemas or, with a zero schema, in any.</param>
+    private static void RenameTakenLocals(List<(uint Schema, string Name)>? given)
+    {
+        if (given is not { Count: > 0 })
+        {
+            return;
+        }
+
+        foreach ((uint schema, string name) in given)
+        {
+            WorfRows holders = Elevated.Run(() => Worf.Read("""
+                SELECT c.oid FROM worf.local_index l JOIN pg_catalog.pg_class c ON c.oid = l.indexrelid
+                WHERE c.relname = $1 AND ($2 = 0 OR c.relnamespace = $2) ORDER BY 1
+                """, 0, Worf.TextParameter(name), SpiParameter.Create(schema)));
+            foreach (uint holder in holders.Select(row => row.Get<uint>(0)))
+            {
+                RenameLocalAway(holder);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Renames an index on this node alone whose name DDL takes to a name of its own, with a warning.
+    /// </summary>
+    private static void RenameLocalAway(uint index)
+    {
+        sbyte* name = NativeMethods.get_rel_name(index);
+        uint nspoid = NativeMethods.get_rel_namespace(index);
+        sbyte* target = NativeMethods.ChooseRelationName(name, null, Worf.PStrDup("local"), nspoid, false);
+        WorfLog.Warning($"renamed index \"{Worf.FromServer(name)}\", which is on this node alone, to \"{Worf.FromServer(target)}\", as DDL{(Origin is null ? "" : $" from node {Origin}")} took its name");
+        NativeMethods.RenameRelationInternal(index, target, true, true);
+        NativeMethods.CommandCounterIncrement();
+    }
+
+    /// <summary>
+    /// Gives the indexes and sequences a statement created, under names PostgreSQL chose beside the indexes on this
+    /// node alone, the names it chooses without them, as on the other nodes: the first of the names
+    /// <c>ChooseRelationName</c> tries that no other relation, nor for a constraint's index another constraint, has,
+    /// in the order the statement created them. An index on this node alone that has the name is renamed to a name of
+    /// its own. A relation the statement named itself, or that took the name of one it dropped, as an index built
+    /// again does, keeps its name.
+    /// </summary>
+    private static void Reconcile()
+    {
+        List<uint> named = [.. s_named.Distinct().Order()];
+        s_named.Clear();
+        foreach (uint relid in named)
+        {
+            sbyte kind = NativeMethods.get_rel_relkind(relid);
+            sbyte* current = kind is (sbyte)'i' or (sbyte)'I' or (sbyte)'S' ? NativeMethods.get_rel_name(relid) : null;
+            if (current is null || Contains(relid) || s_givenNames.Contains(Worf.FromServer(current)))
+            {
+                continue;
+            }
+
+            uint nspoid = NativeMethods.get_rel_namespace(relid);
+            if (s_droppedNames.Contains((nspoid, Worf.FromServer(current))) || Naming(relid, kind) is not { } naming)
+            {
+                continue;
+            }
+
+            byte[] target = Chosen(relid, naming.Name1, naming.Name2, naming.Label, nspoid, naming.Constraint);
+            if (target.AsSpan().SequenceEqual(new ReadOnlySpan<byte>(current, Worf.StrLen(current))))
+            {
+                continue;
+            }
+
+            fixed (byte* targetName = target)
+            {
+                uint holder = NativeMethods.get_relname_relid((sbyte*)targetName, nspoid);
+                if (holder != 0 && holder != relid && Contains(holder))
+                {
+                    RenameLocalAway(holder);
+                }
+
+                NativeMethods.RenameRelationInternal(relid, (sbyte*)targetName, true, kind is (sbyte)'i' or (sbyte)'I');
+            }
+
+            NativeMethods.CommandCounterIncrement();
+        }
+
+        s_droppedNames.Clear();
+        s_givenNames.Clear();
+    }
+
+    /// <summary>
+    /// Finds what PostgreSQL chose a created index's or sequence's name from: for an index, as <c>ChooseIndexName</c>
+    /// does, its table's name, its columns' names, joined as <c>ChooseIndexNameAddition</c> joins them, and a label
+    /// for what it is; for a sequence a column owns, as for a serial or identity column, the table's and the column's
+    /// names.
+    /// </summary>
+    /// <returns>The names, label and whether the index backs a constraint, or null for a sequence no column owns.</returns>
+    private static (byte[] Name1, byte[]? Name2, string Label, bool Constraint)? Naming(uint relid, sbyte kind)
+    {
+        if (kind == (sbyte)'S')
+        {
+            WorfRows owner = Elevated.Run(() => Worf.Read("""
+                SELECT c.relname::pg_catalog.text, a.attname::pg_catalog.text FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_class c ON c.oid = d.refobjid
+                    JOIN pg_catalog.pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
+                WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.objid = $1
+                    AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.deptype IN ('a', 'i')
+                """, 1, SpiParameter.Create(relid)));
+            return owner.Count == 0 ? null : (Worf.ToServer(owner[0].Get<string>(0)), Worf.ToServer(owner[0].Get<string>(1)), "seq", false);
+        }
+
+        WorfRows index = Elevated.Run(() => Worf.Read("""
+            SELECT t.relname::pg_catalog.text, i.indisprimary, i.indisexclusion
+            FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class t ON t.oid = i.indrelid WHERE i.indexrelid = $1
+            """, 1, SpiParameter.Create(relid)));
+        if (index.Count == 0)
+        {
+            return null;
+        }
+
+        byte[] table = Worf.ToServer(index[0].Get<string>(0));
+        if (index[0].Get<bool>(1))
+        {
+            return (table, null, "pkey", true);
+        }
+
+        bool constraint = NativeMethods.get_index_constraint(relid) != 0;
+        WorfRows columns = Elevated.Run(() => Worf.Read(
+            "SELECT attname::pg_catalog.text FROM pg_catalog.pg_attribute WHERE attrelid = $1 AND attnum > 0 ORDER BY attnum", 0, SpiParameter.Create(relid)));
+        byte[] addition = Addition([.. columns.Select(column => Worf.ToServer(column.Get<string>(0)))]);
+        return index[0].Get<bool>(2) ? (table, addition, "excl", true) : constraint ? (table, addition, "key", true) : (table, addition, "idx", false);
+    }
+
+    /// <summary>
+    /// Joins an index's column names with underscores, as <c>ChooseIndexNameAddition</c> does: each at most
+    /// NAMEDATALEN - 1 bytes, until the join has NAMEDATALEN bytes or more.
+    /// </summary>
+    private static byte[] Addition(List<byte[]> names)
+    {
+        List<byte> joined = [];
+        foreach (byte[] name in names)
+        {
+            if (joined.Count > 0)
+            {
+                joined.Add((byte)'_');
+            }
+
+            joined.AddRange(name.AsSpan(0, Math.Min(name.Length, Worker.NameDataLen - 1)).ToArray());
+            if (joined.Count >= Worker.NameDataLen)
+            {
+                break;
+            }
+        }
+
+        return [.. joined];
+    }
+
+    /// <summary>
+    /// Chooses a relation's name as <c>ChooseRelationName</c> does, but as though the indexes on this node alone, and the
+    /// relation itself, weren't there.
+    /// </summary>
+    private static byte[] Chosen(uint relid, byte[] name1, byte[]? name2, string label, uint nspoid, bool constraint)
+    {
+        fixed (byte* first = Terminated(name1))
+        fixed (byte* second = name2 is null ? null : Terminated(name2))
+        {
+            for (int pass = 0; ; pass++)
+            {
+                byte[] modlabel = Worf.ToServerCString(pass == 0 ? label : label + pass.ToString(CultureInfo.InvariantCulture));
+                fixed (byte* labelAddress = modlabel)
+                {
+                    sbyte* candidate = NativeMethods.makeObjectName((sbyte*)first, (sbyte*)second, (sbyte*)labelAddress);
+                    uint holder = NativeMethods.get_relname_relid(candidate, nspoid);
+                    bool taken = holder != 0 && holder != relid && !Contains(holder);
+                    if (!taken && constraint && holder != relid && NativeMethods.ConstraintNameExists(candidate, nspoid))
+                    {
+                        taken = true;
+                    }
+
+                    if (!taken)
+                    {
+                        return new ReadOnlySpan<byte>(candidate, Worf.StrLen(candidate)).ToArray();
+                    }
+                }
+            }
+        }
+    }
+
+    private static byte[] Terminated(byte[] name) => [.. name, 0];
 
     /// <summary>
     /// Fails a write to a table whose indexes on this node alone a statement has hidden as not live, as from an event
@@ -1124,10 +1050,9 @@ internal static unsafe partial class LocalIndex
     /// valid on this node, nor exist on the others.
     /// </summary>
     /// <param name="error">The DDL's error.</param>
-    /// <param name="moved">The indexes moved out of the DDL's way.</param>
     /// <param name="origin">The node the DDL came from.</param>
     /// <returns>Whether the index was dropped, so that the DDL can run again.</returns>
-    internal static bool DropUnbuilt(PgException error, List<(uint Index, string Name)> moved, string origin)
+    internal static bool DropUnbuilt(PgException error, string origin)
     {
         // The statement's subtransaction rolled back what it created and dropped.
         s_created.Clear();
@@ -1140,16 +1065,8 @@ internal static unsafe partial class LocalIndex
             return false;
         }
 
-        // The index's definition under the name it has outside apply, which an index built again in its place, under its
-        // name meanwhile, has too.
-        int found = moved.FindIndex(index => index.Index == relid);
-        string name = found >= 0 ? moved[found].Name
-            : s_asideNames.TryGetValue((nspoid, error.ConstraintName!), out string? before) ? before
-            : error.ConstraintName!;
+        string name = error.ConstraintName!;
         string definition = Worf.FromServer(NativeMethods.pg_get_indexdef_string(relid));
-        string named = $"INDEX {Worf.QuoteIdentifier(error.ConstraintName!)} ON ";
-        int at = definition.IndexOf(named, StringComparison.Ordinal);
-        definition = at < 0 ? definition : $"{definition[..at]}INDEX {Worf.QuoteIdentifier(name)} ON {definition[(at + named.Length)..]}";
 
         ObjectAddress index = Dependency.Address(Dependency.RelationRelationId, relid, 0);
         NativeMethods.performDeletion(&index, DropBehavior.DROP_RESTRICT, 0);
@@ -1395,16 +1312,20 @@ internal static unsafe partial class LocalIndex
     }
 
     /// <summary>
-    /// Finds the tables whose existing indexes a statement may attach to a partitioned index, or have a foreign key use:
-    /// the partitions of a partitioned table indexed, which the index may take its partitions from, and those of a
-    /// partition attached, and the tables that a partition attached is, or that foreign keys reference, which take only
-    /// valid indexes. A copy of a table's indexes leaves out its indexes on this node alone as <see cref="SkipsCopy"/>
-    /// has it.
+    /// Finds the indexes on this node alone that a statement would attach to a partitioned index, or have a foreign key
+    /// use, by their tables and the columns those take: the partitions of a partitioned table indexed, whose index by
+    /// the same columns the index may take, and those of a partition attached, which the partitioned table's indexes
+    /// may take, and for a foreign key, the valid unique index by the columns it references, of the table it
+    /// references, or of the partition attached, which the keys that reference the partitioned table use. A copy of a
+    /// table's indexes leaves out its indexes on this node alone as <see cref="SkipsCopy"/> has it, and a foreign key
+    /// that references a primary key uses no other index.
     /// </summary>
     /// <param name="parsetree">The statement.</param>
-    /// <param name="unlive">The tables whose indexes are to be hidden as not live.</param>
-    /// <param name="invalid">The tables whose indexes are to be hidden as not valid.</param>
-    private static void UsedTables(Node* parsetree, List<uint> unlive, List<uint> invalid)
+    /// <param name="unlive">The tables whose indexes by the columns given, or by any for null, are to be hidden as not
+    /// live.</param>
+    /// <param name="invalid">The tables whose valid unique indexes by the columns given, or by any for null, are to be
+    /// hidden as not valid.</param>
+    private static void UsedTables(Node* parsetree, List<(uint Table, string[]? Columns, PgLockMode Lock)> unlive, List<(uint Table, string[]? Columns, PgLockMode Lock)> invalid)
     {
         switch (parsetree->type)
         {
@@ -1412,53 +1333,51 @@ internal static unsafe partial class LocalIndex
                 List* elements = ((CreateStmt*)parsetree)->tableElts;
                 for (int i = 0; elements is not null && i < elements->length; i++)
                 {
-                    Node* element = (Node*)elements->elements[i].ptr_value;
-                    if (element->type != NodeTag.T_TableLikeClause)
-                    {
-                        AddReferenced(invalid, element);
-                    }
+                    AddReferenced(invalid, (Node*)elements->elements[i].ptr_value);
                 }
 
                 break;
 
             case NodeTag.T_IndexStmt when !((IndexStmt*)parsetree)->concurrent && ((IndexStmt*)parsetree)->relation->inh:
-                uint indexed = NativeMethods.RangeVarGetRelidExtended(((IndexStmt*)parsetree)->relation, 0, RangeVarMissingOk, default, null);
+                IndexStmt* index = (IndexStmt*)parsetree;
+                uint indexed = NativeMethods.RangeVarGetRelidExtended(index->relation, 0, RangeVarMissingOk, default, null);
                 if (indexed != 0 && NativeMethods.get_rel_relkind(indexed) == (sbyte)'p')
                 {
-                    AddPartitions(unlive, indexed);
+                    string[]? columns = IndexColumns(index->indexParams);
+                    foreach (uint partition in Partitions(indexed))
+                    {
+                        unlive.Add((partition, columns, PgLockMode.Share));
+                    }
                 }
 
                 break;
 
             case NodeTag.T_AlterTableStmt when ((AlterTableStmt*)parsetree)->objtype is ObjectType.OBJECT_TABLE or ObjectType.OBJECT_TYPE:
                 bool type = ((AlterTableStmt*)parsetree)->objtype == ObjectType.OBJECT_TYPE;
+                uint altered = NativeMethods.RangeVarGetRelidExtended(((AlterTableStmt*)parsetree)->relation, 0, RangeVarMissingOk, default, null);
                 List* cmds = ((AlterTableStmt*)parsetree)->cmds;
                 for (int i = 0; cmds is not null && i < cmds->length; i++)
                 {
                     AlterTableCmd* cmd = (AlterTableCmd*)cmds->elements[i].ptr_value;
-                    if (!type && cmd->subtype == AlterTableType.AT_AttachPartition && cmd->def is not null)
+                    if (!type && cmd->subtype == AlterTableType.AT_AttachPartition && cmd->def is not null && altered != 0)
                     {
-                        uint attached = AddTable(invalid, ((PartitionCmd*)cmd->def)->name);
+                        uint attached = NativeMethods.RangeVarGetRelidExtended(((PartitionCmd*)cmd->def)->name, 0, RangeVarMissingOk, default, null);
                         if (attached != 0)
                         {
-                            AddPartitions(unlive, attached);
+                            AddAttached(unlive, invalid, altered, attached);
                         }
                     }
                     else if (!type && cmd->subtype is AlterTableType.AT_AddConstraint or AlterTableType.AT_AddColumn && cmd->def is not null)
                     {
                         AddReferenced(invalid, cmd->def);
                     }
-                    else if (Rewrites(cmd->subtype))
+                    else if (Rewrites(cmd->subtype) && altered != 0)
                     {
                         // A column's new type or expression builds the table's foreign keys again, and those of its
-                        // inheritors and partitions, which may then use any valid unique index on the tables they
-                        // reference. An attribute's new type in a composite type does so for every table that uses the
-                        // type, which the change cascades to.
-                        uint altered = NativeMethods.RangeVarGetRelidExtended(((AlterTableStmt*)parsetree)->relation, 0, RangeVarMissingOk, default, null);
-                        if (altered != 0)
-                        {
-                            AddRebuiltReferences(invalid, type ? TablesUsingType(NativeMethods.get_rel_type_id(altered)) : [altered]);
-                        }
+                        // inheritors and partitions, which may then use any valid unique index by their columns on the
+                        // tables they reference. An attribute's new type in a composite type does so for every table that
+                        // uses the type, which the change cascades to.
+                        AddRebuiltReferences(invalid, type ? TablesUsingType(NativeMethods.get_rel_type_id(altered)) : [altered]);
                     }
                 }
 
@@ -1466,6 +1385,63 @@ internal static unsafe partial class LocalIndex
 
             default:
                 break;
+        }
+    }
+
+    /// <summary>
+    /// Finds the columns of an index's elements by name, or null when one is an expression.
+    /// </summary>
+    private static string[]? IndexColumns(List* elements)
+    {
+        List<string> columns = [];
+        for (int i = 0; elements is not null && i < elements->length; i++)
+        {
+            IndexElem* element = (IndexElem*)elements->elements[i].ptr_value;
+            if (element->name is null)
+            {
+                return null;
+            }
+
+            columns.Add(Worf.FromServer(element->name));
+        }
+
+        return [.. columns];
+    }
+
+    /// <summary>
+    /// Adds what attaching a partition may use: the attached table's and its partitions' indexes by the columns of each
+    /// of the partitioned table's indexes, which it takes for them, and the attached table's valid unique ones by the
+    /// columns of each foreign key that references the partitioned table, which then uses them.
+    /// </summary>
+    private static void AddAttached(List<(uint Table, string[]? Columns, PgLockMode Lock)> unlive, List<(uint Table, string[]? Columns, PgLockMode Lock)> invalid, uint parent, uint attached)
+    {
+        WorfRows indexes = Elevated.Run(() => Worf.Read("""
+            SELECT array_agg(a.attname::pg_catalog.text ORDER BY k.n) FILTER (WHERE a.attname IS NOT NULL), bool_or(k.attnum = 0)
+            FROM pg_catalog.pg_index i
+                CROSS JOIN LATERAL pg_catalog.unnest(i.indkey::pg_catalog.int2[]) WITH ORDINALITY AS k (attnum, n)
+                LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+            WHERE i.indrelid = $1 AND k.n <= i.indnkeyatts
+            GROUP BY i.indexrelid
+            """, 0, SpiParameter.Create(parent)));
+        List<uint> tables = [attached, .. Partitions(attached)];
+        foreach (WorfRow index in indexes)
+        {
+            string[]? columns = index.Get<bool>(1) ? null : index.Get<string[]>(0);
+            foreach (uint table in tables)
+            {
+                unlive.Add((table, columns, PgLockMode.AccessExclusive));
+            }
+        }
+
+        foreach (WorfRow key in Elevated.Run(() => Worf.Read("""
+            SELECT array_agg(a.attname::pg_catalog.text) FROM pg_catalog.pg_constraint c
+                CROSS JOIN LATERAL pg_catalog.unnest(c.confkey) AS k (attnum)
+                JOIN pg_catalog.pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = k.attnum
+            WHERE c.contype = 'f' AND c.confrelid = $1
+            GROUP BY c.oid
+            """, 0, SpiParameter.Create(parent))))
+        {
+            invalid.Add((attached, key.Get<string[]>(0), PgLockMode.AccessExclusive));
         }
     }
 
@@ -1491,10 +1467,10 @@ internal static unsafe partial class LocalIndex
         """, 0, SpiParameter.Create(typeOid))).Select(row => row.Get<uint>(0))];
 
     /// <summary>
-    /// Adds the tables that the foreign keys of some tables, their inheritors and their partitions reference, which a
-    /// statement that rebuilds those keys may have use any valid unique index of.
+    /// Adds the tables, with the columns, that the foreign keys of some tables, their inheritors and their partitions
+    /// reference, which a statement that rebuilds those keys may have use any valid unique index by those columns of.
     /// </summary>
-    private static void AddRebuiltReferences(List<uint> invalid, List<uint> rebuilt)
+    private static void AddRebuiltReferences(List<(uint Table, string[]? Columns, PgLockMode Lock)> invalid, List<uint> rebuilt)
     {
         List<long> relids = [];
         foreach (uint table in rebuilt)
@@ -1509,20 +1485,35 @@ internal static unsafe partial class LocalIndex
         if (relids.Count > 0)
         {
             invalid.AddRange(Elevated.Run(() => Worf.Read("""
-                SELECT DISTINCT confrelid FROM pg_catalog.pg_constraint
-                WHERE contype = 'f' AND conrelid = ANY ($1::pg_catalog.int8[]::pg_catalog.oid[])
-                """, 0, SpiParameter.Create(relids.ToArray()))).Select(row => row.Get<uint>(0)));
+                SELECT c.confrelid, array_agg(a.attname::pg_catalog.text) FROM pg_catalog.pg_constraint c
+                    CROSS JOIN LATERAL pg_catalog.unnest(c.confkey) AS k (attnum)
+                    JOIN pg_catalog.pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = k.attnum
+                WHERE c.contype = 'f' AND c.conrelid = ANY ($1::pg_catalog.int8[]::pg_catalog.oid[])
+                GROUP BY c.oid, c.confrelid
+                """, 0, SpiParameter.Create(relids.ToArray()))).Select(row => (row.Get<uint>(0), row.Get<string[]?>(1), PgLockMode.ShareRowExclusive)));
         }
     }
 
     /// <summary>
-    /// Adds the tables that the foreign keys of a constraint, or of a column's constraints, reference.
+    /// Adds the table, with the columns, that a foreign key, or a column's foreign keys, reference by name. One that
+    /// references the table's primary key uses no other index.
     /// </summary>
-    private static void AddReferenced(List<uint> tables, Node* node)
+    private static void AddReferenced(List<(uint Table, string[]? Columns, PgLockMode Lock)> tables, Node* node)
     {
         if (node->type == NodeTag.T_Constraint && ((Constraint*)node)->contype == ConstrType.CONSTR_FOREIGN)
         {
-            _ = AddTable(tables, ((Constraint*)node)->pktable);
+            Constraint* key = (Constraint*)node;
+            uint table = key->pktable is null ? 0 : NativeMethods.RangeVarGetRelidExtended(key->pktable, 0, RangeVarMissingOk, default, null);
+            List<string> columns = [];
+            for (int i = 0; key->pk_attrs is not null && i < key->pk_attrs->length; i++)
+            {
+                columns.Add(Worf.FromServer(NativeMethods.NameListToString(NativeMethods.lappend(null, key->pk_attrs->elements[i].ptr_value))));
+            }
+
+            if (table != 0 && columns.Count > 0)
+            {
+                tables.Add((table, [.. columns], PgLockMode.ShareRowExclusive));
+            }
         }
         else if (node->type == NodeTag.T_ColumnDef)
         {
@@ -1535,15 +1526,18 @@ internal static unsafe partial class LocalIndex
     }
 
     /// <summary>
-    /// Adds the partitions under a partitioned table, however deep.
+    /// Finds the partitions under a partitioned table, however deep.
     /// </summary>
-    private static void AddPartitions(List<uint> tables, uint relid)
+    private static List<uint> Partitions(uint relid)
     {
-        List* partitions = NativeMethods.find_all_inheritors(relid, (int)PgLockMode.None, null);
-        for (int i = 1; partitions is not null && i < partitions->length; i++)
+        List<uint> partitions = [];
+        List* tree = NativeMethods.find_all_inheritors(relid, (int)PgLockMode.None, null);
+        for (int i = 1; tree is not null && i < tree->length; i++)
         {
-            tables.Add(partitions->elements[i].oid_value);
+            partitions.Add(tree->elements[i].oid_value);
         }
+
+        return partitions;
     }
 
     /// <summary>
@@ -1562,41 +1556,84 @@ internal static unsafe partial class LocalIndex
     }
 
     /// <summary>
-    /// Hides the indexes on this node alone of some tables from a statement, as not live or as not valid. They're locked
-    /// as a rename would lock them, so that no concurrent build, reindex or drop changes their state meanwhile.
+    /// Hides the indexes on this node alone that a statement would use from it, as not live or as not valid: those by the
+    /// columns it would take them by, in order for a partitioned index, or as a set for a foreign key, which takes only an
+    /// immediate valid unique index without expressions or a predicate, or any for no columns given, as an index with
+    /// expressions is taken for a partitioned one. The statement takes the locks it takes on their tables first, as it
+    /// would on its own, and then the share lock on them that PostgreSQL takes on an index it attaches, which no
+    /// concurrent reindex or drop takes beside it, so that none changes their state meanwhile. Only those it would use
+    /// are hidden, since the change holds them until the transaction ends, as attaching or using them would.
     /// </summary>
-    private static void Hide(List<uint> tables, bool unlive)
+    private static void Hide(List<(uint Table, string[]? Columns, PgLockMode Lock)> requests, bool unlive)
     {
-        if (tables.Count == 0)
+        if (requests.Count == 0)
         {
             return;
         }
 
-        long[] relids = [.. tables.Distinct().Select(table => (long)table)];
-        WorfRows indexes = Elevated.Run(() => Worf.Read("""
-            SELECT i.indexrelid FROM worf.local_index l JOIN pg_catalog.pg_index i ON i.indexrelid = l.indexrelid
-            WHERE i.indrelid = ANY ($1::pg_catalog.int8[]::pg_catalog.oid[])
-            ORDER BY 1
-            """, 0, SpiParameter.Create(relids)));
-        if (indexes.Count == 0)
+        HashSet<uint> matching = [];
+        foreach ((uint table, string[]? columns, PgLockMode _) in requests)
+        {
+            WorfRows candidates = Elevated.Run(() => Worf.Read("""
+                SELECT i.indexrelid, array_agg(a.attname::pg_catalog.text ORDER BY k.n) FILTER (WHERE a.attname IS NOT NULL),
+                    bool_or(k.attnum = 0) OR i.indexprs IS NOT NULL, i.indisunique AND i.indimmediate AND i.indisvalid AND i.indpred IS NULL
+                FROM worf.local_index l JOIN pg_catalog.pg_index i ON i.indexrelid = l.indexrelid
+                    CROSS JOIN LATERAL pg_catalog.unnest(i.indkey::pg_catalog.int2[]) WITH ORDINALITY AS k (attnum, n)
+                    LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+                WHERE i.indrelid = $1 AND k.n <= i.indnkeyatts
+                GROUP BY i.indexrelid, i.indexprs, i.indisunique, i.indimmediate, i.indisvalid, i.indpred
+                """, 0, SpiParameter.Create(table)));
+            foreach (WorfRow candidate in candidates)
+            {
+                string[] keys = candidate.Get<string[]?>(1) ?? [];
+                bool expressions = candidate.Get<bool>(2);
+                bool usable;
+                if (unlive)
+                {
+                    // A partitioned index compares a partition's index with expressions as it attaches it.
+                    usable = columns is null || expressions || keys.SequenceEqual(columns);
+                }
+                else
+                {
+                    // A foreign key takes an immediate valid unique index by its columns in any order.
+                    bool byColumns = columns is null || (keys.Length == columns.Length && !keys.Except(columns).Any());
+                    usable = candidate.Get<bool>(3) && !expressions && byColumns;
+                }
+
+                if (usable)
+                {
+                    _ = matching.Add(candidate.Get<uint>(0));
+                }
+            }
+        }
+
+        if (matching.Count == 0)
         {
             return;
         }
 
-        foreach (WorfRow index in indexes)
+        // The tables first, with the locks the statement takes on them: a foreign key's referenced table, a partitioned
+        // index's partitions, or an attached partition and its partitions.
+        foreach ((uint table, PgLockMode lockMode) in requests.Select(request => (request.Table, request.Lock)).Distinct().OrderBy(request => request.Table))
         {
-            NativeMethods.LockRelationOid(index.Get<uint>(0), (int)PgLockMode.ShareUpdateExclusive);
+            NativeMethods.LockRelationOid(table, (int)lockMode);
+        }
+
+        long[] relids = [.. matching.Order().Select(index => (long)index)];
+        foreach (long index in relids)
+        {
+            NativeMethods.LockRelationOid((uint)index, (int)PgLockMode.Share);
         }
 
         WorfRows result = Elevated.Run(() => Worf.Query(unlive
             ? """
-                UPDATE pg_catalog.pg_index i SET indislive = false FROM worf.local_index l, pg_catalog.pg_class t
-                WHERE i.indexrelid = l.indexrelid AND t.oid = i.indrelid AND i.indrelid = ANY ($1::pg_catalog.int8[]::pg_catalog.oid[]) AND i.indislive
+                UPDATE pg_catalog.pg_index i SET indislive = false FROM pg_catalog.pg_class t
+                WHERE t.oid = i.indrelid AND i.indexrelid = ANY ($1::pg_catalog.int8[]::pg_catalog.oid[]) AND i.indislive
                 RETURNING i.indexrelid, i.indrelid, t.relfilenode
                 """
             : """
-                UPDATE pg_catalog.pg_index i SET indisvalid = false FROM worf.local_index l
-                WHERE i.indexrelid = l.indexrelid AND i.indrelid = ANY ($1::pg_catalog.int8[]::pg_catalog.oid[]) AND i.indisvalid AND i.indislive
+                UPDATE pg_catalog.pg_index i SET indisvalid = false
+                WHERE i.indexrelid = ANY ($1::pg_catalog.int8[]::pg_catalog.oid[]) AND i.indisvalid AND i.indislive
                 RETURNING i.indexrelid, i.indrelid, 0::pg_catalog.oid
                 """,
             SpiParameter.Create(relids)));

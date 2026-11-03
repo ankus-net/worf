@@ -73,7 +73,8 @@ internal static unsafe partial class DdlLock
     private static readonly TimeSpan s_reconcileAfter = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan s_orphanedAfter = TimeSpan.Zero;
 
-    // How often apply looks again whether it has gone past where the origin was when it said a kept fence's DDL committed.
+    // How often apply looks again whether it has gone past where the origin was when it said a kept fence's DDL committed,
+    // besides as soon as it has flushed past it.
     private static readonly TimeSpan s_boundsCheckEvery = TimeSpan.FromSeconds(1);
 
     // The fences this transaction asked other nodes for, with the subtransaction that did.
@@ -127,6 +128,10 @@ internal static unsafe partial class DdlLock
     // transactions committed.
     private static long s_reconciledAt;
     private static long s_boundsCheckedAt;
+
+    // How far this apply worker had flushed at its last look at the bounds, which it looks at again as soon as it flushes
+    // past one.
+    private static ulong s_boundsCheckedFlush;
 
     // The fence of the DDL statement that runs now, and how far each fenced node's WAL had reached.
     private static (ulong Id, List<(uint NodeId, ulong Lsn)> Positions)? s_statementFence;
@@ -590,7 +595,9 @@ internal static unsafe partial class DdlLock
     {
         long now = Worker.GetCurrentTimestamp();
         bool due = now - s_reconciledAt >= (long)s_reconcileAfter.TotalMicroseconds;
-        bool checkBounds = s_reconcileBounds.Count > 0 && now - s_boundsCheckedAt >= (long)s_boundsCheckEvery.TotalMicroseconds;
+        ulong flushed = Worker.MyWorker.Worker.Apply.FlushLsn;
+        bool checkBounds = s_reconcileBounds.Count > 0 && (now - s_boundsCheckedAt >= (long)s_boundsCheckEvery.TotalMicroseconds ||
+            (flushed != s_boundsCheckedFlush && flushed >= s_reconcileBounds.Values.Min()));
         long[] orphaned = [.. OrphanedFences(sub.Origin.Id).Where(fence => !s_reconcileBounds.ContainsKey(fence))];
         if (!due && !checkBounds && orphaned.Length == 0)
         {
@@ -599,6 +606,7 @@ internal static unsafe partial class DdlLock
 
         s_reconciledAt = due ? now : s_reconciledAt;
         s_boundsCheckedAt = now;
+        s_boundsCheckedFlush = flushed;
         try
         {
             PgBackgroundWorker.RunTransaction(() =>

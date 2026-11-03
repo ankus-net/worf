@@ -262,6 +262,10 @@ internal static unsafe partial class SequenceRanges
     // check stays quick while sessions draw from the block.
     private static readonly Dictionary<uint, (Guid Block, long Position, long At)> s_readStored = [];
 
+    // The active block each sequence was noticed moving backwards in, until it leaves the block, so that a switch that
+    // can't be made while transactions hold the sequence, as the one that moved it may, is made once they let it go.
+    private static readonly Dictionary<uint, Guid> s_movedBack = [];
+
     // An allocator gives a Snowflake node number that a node gave up back for use once a day has passed, so the old
     // holder's IDs, which carry their times, can't meet the new holder's.
     private static readonly TimeSpan s_snowflakeReuseAfter = TimeSpan.FromDays(1);
@@ -911,7 +915,9 @@ internal static unsafe partial class SequenceRanges
             // A minute of inserts, at least a twentieth of the block, but no more than half of it, so that a block
             // smaller than a minute's use still serves most of its values while the next ones grow. A block reserved
             // for a load is switched to at once, and so is any once the sequence moved backwards in its block, while one
-            // that is the load's is used up, whose session switches from it at its end.
+            // that is the load's is used up, whose session switches from it at its end. A switch from a block the sequence
+            // moved backwards in is left to a switch worker as at the block's end, so that inserts wait for it rather
+            // than draw again the values that rows hold.
             long margin = Reserved(active.Value.Id) ? 0 : Math.Min(Math.Max(size / 20, (long)(rate * 60)), size / 2);
             bool moved = backwards is (Guid sampled, true) && sampled == active.Value.Id;
             if (next is not null && (left <= margin || moved || next.Value.Reserved))
@@ -921,7 +927,7 @@ internal static unsafe partial class SequenceRanges
                     return true;
                 }
 
-                if (SwitchBeforeEnd(seqoid, info, (next.Value.Id, next.Value.Lo, next.Value.Hi), next.Value.Reserved, !moved && left <= Math.Min(margin, size / 20)))
+                if (SwitchBeforeEnd(seqoid, info, (next.Value.Id, next.Value.Lo, next.Value.Hi), next.Value.Reserved, moved || left <= Math.Min(margin, size / 20)))
                 {
                     changed = true;
                     next = null;
@@ -1031,10 +1037,22 @@ internal static unsafe partial class SequenceRanges
     /// last check, or behind a value a row holds in the block. Since the check went by, the sequence may have issued
     /// values beyond where it was then, so once it has moved, the tables are read, at most once a second, for the
     /// furthest value they hold in the block, through an index on each column that uses the sequence, and the sequence
-    /// then, which has passed every value a committed row holds unless it moved backwards.
+    /// then, which has passed every value a row holds unless it moved backwards. A row that a transaction in progress
+    /// inserts holds its value, as a unique check finds it, so that a <c>setval</c> in the transaction that inserted
+    /// the rows it moves behind is noticed before the transaction commits as after.
     /// </summary>
     private static bool MovedBackwards(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) active)
     {
+        if (s_movedBack.TryGetValue(seqoid, out Guid movedIn))
+        {
+            if (movedIn == active.Id)
+            {
+                return true;
+            }
+
+            _ = s_movedBack.Remove(seqoid);
+        }
+
         if (LastValue(seqoid) is not long position)
         {
             return false;
@@ -1044,6 +1062,7 @@ internal static unsafe partial class SequenceRanges
         if (sampled && (info.Ascending ? position < seen.Position : position > seen.Position))
         {
             WorfLog.Warning($"sequence {info.Name}'s last value moved back from {seen.Position} to {position} in its block [{active.Lo}, {active.Hi}], so it leaves the block");
+            s_movedBack[seqoid] = active.Id;
             return true;
         }
 
@@ -1060,6 +1079,7 @@ internal static unsafe partial class SequenceRanges
             now >= active.Lo && now <= active.Hi && (info.Ascending ? now < furthest : now > furthest))
         {
             WorfLog.Warning($"sequence {info.Name}'s last value moved back to {now}, behind the value {furthest} a row holds in its block [{active.Lo}, {active.Hi}], so it leaves the block");
+            s_movedBack[seqoid] = active.Id;
             return true;
         }
 
@@ -1080,7 +1100,7 @@ internal static unsafe partial class SequenceRanges
         foreach ((uint relid, string column, _) in UsingColumns(info.Seqoid).Where(column => NativeMethods.get_rel_relkind(column.Relid) != (sbyte)'p'))
         {
             if (NativeMethods.ConditionalLockRelationOid(relid, (int)PgLockMode.AccessShare) &&
-                StoredValues.Furthest(relid, column, info.Ascending, block.Lo, block.Hi, true) is decimal value)
+                StoredValues.Furthest(relid, column, info.Ascending, block.Lo, block.Hi, true, held: true) is decimal value)
             {
                 furthest = furthest is not decimal f ? value : info.Ascending ? Math.Max(f, value) : Math.Min(f, value);
             }
@@ -3969,7 +3989,7 @@ internal static unsafe partial class SequenceRanges
             bool done;
             try
             {
-                done = PgBackgroundWorker.RunTransaction(() => SwitchAtEnd(seqoid, true));
+                done = PgBackgroundWorker.RunTransaction(() => SwitchAtEnd(seqoid, true, MovedIn(seqoid)));
             }
             catch (PgException error) when (error.SqlState is "55P03" or "40P01")
             {
@@ -3984,23 +4004,32 @@ internal static unsafe partial class SequenceRanges
                 continue;
             }
 
-            _ = SequenceRangeSwitchWorker.Start(seqoid) ? s_unstarted.Remove(seqoid) : s_unstarted.Add(seqoid);
+            _ = SequenceRangeSwitchWorker.Start(seqoid, MovedIn(seqoid)) ? s_unstarted.Remove(seqoid) : s_unstarted.Add(seqoid);
         }
 
         s_handOffs.Clear();
     }
 
     /// <summary>
+    /// Finds the active block the range worker noticed a sequence moving backwards in.
+    /// </summary>
+    /// <returns>The block, or empty.</returns>
+    private static Guid MovedIn(uint seqoid) => s_movedBack.GetValueOrDefault(seqoid);
+
+    /// <summary>
     /// Switches a sequence to its next block for the switch worker, beside the transactions that hold the sequence, as
     /// the range worker couldn't wait for them, so that inserts go on into the next block rather than run the active one
-    /// out or wait for them. It switches only while the active block is still in its last twentieth, or the next block
-    /// is reserved for a load, since a transaction that ran the block out may have switched it meanwhile.
+    /// out or wait for them. It switches only while the active block is still in its last twentieth, the sequence moved
+    /// backwards in it, or the next block is reserved for a load, since a transaction that ran the block out may have
+    /// switched it meanwhile.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
     /// <param name="briefly">Whether the range worker switches, which waits a tenth of a second at most for the locks,
     /// rather than the switch worker.</param>
+    /// <param name="movedIn">The active block the sequence moved backwards in, which it switches from wherever the
+    /// sequence is in it, or empty.</param>
     /// <returns>Whether the switch is done, or false to try again.</returns>
-    internal static bool SwitchAtEnd(uint seqoid, bool briefly = false)
+    internal static bool SwitchAtEnd(uint seqoid, bool briefly = false, Guid movedIn = default)
     {
         if (!SequenceExists(seqoid) || !IsManaged(seqoid))
         {
@@ -4042,8 +4071,8 @@ internal static unsafe partial class SequenceRanges
             // Whether the switch is still needed is told once the switch holds the lock that every switch takes, so that
             // the block and position it reads aren't those of a switch under way, which moves the sequence first.
             bool needed = true;
-            bool Needed() => needed = NodeBlock(seqoid, epoch, "active")?.Id == active.Id &&
-                (next.Reserved || StepsLeft(seqoid, info, active) <= (Reserved(active.Id) ? 0 : Steps(info, active.Lo, active.Hi) / 20));
+            bool Needed() => needed = NodeBlock(seqoid, epoch, "active")?.Id == active.Id && (next.Reserved || active.Id == movedIn ||
+                StepsLeft(seqoid, info, active) <= (Reserved(active.Id) ? 0 : Steps(info, active.Lo, active.Hi) / 20));
 
             // Nextval reaches the block's start before the switch commits, so the commit doesn't wait for the disk; a
             // later commit that writes the block's values flushes it.

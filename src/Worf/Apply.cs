@@ -2029,23 +2029,22 @@ internal static unsafe partial class Apply
     }
 
     /// <summary>
-    /// Runs a command another node queued with the indexes on this node alone, which the origin doesn't have, out of
-    /// its way, and drops one that it can't build again, so that it applies.
+    /// Runs a command another node queued as the origin ran it, which has none of the indexes on this node alone, each of
+    /// whose statements keeps out of their way, and drops one that it can't build again, so that it applies.
     /// </summary>
     private static void RunQueuedCommand(string command, string role, Action run)
     {
         string origin = MySubscription!.Origin.Name;
-        List<(uint Index, string Name)> moved;
         bool writesRows;
         using (PgErrorContext.Push(Worf.Shown($"during execution of queued SQL statement: {command}")))
         {
-            moved = LocalIndex.MoveAside(command, role);
             writesRows = LocalIndex.WritesRows(command);
         }
 
         // A unique index on this node alone that finds duplicates as the command writes rows, rather than as it builds
         // the index again, stops apply, as the rows can't be written here.
         LocalIndex.Applying = true;
+        LocalIndex.Origin = origin;
         try
         {
             while (true)
@@ -2055,11 +2054,13 @@ internal static unsafe partial class Apply
                     run();
                     break;
                 }
-                catch (PgException error)
+                catch (PgException error) when (!writesRows && error.SqlState == PgSqlStates.UniqueViolation)
                 {
-                    if (writesRows || !LocalIndex.DropUnbuilt(error, moved, origin))
+                    // An index on this node alone that the command couldn't build again is dropped, once the statement
+                    // has unwound, and the command runs again; any other duplicate stops apply.
+                    if (!LocalIndex.DropUnbuilt(error, origin))
                     {
-                        throw LocalIndex.WithOwnNames(error, moved);
+                        throw;
                     }
                 }
             }
@@ -2067,9 +2068,8 @@ internal static unsafe partial class Apply
         finally
         {
             LocalIndex.Applying = false;
+            LocalIndex.Origin = null;
         }
-
-        LocalIndex.MoveBack(moved, origin);
     }
 
     private static void SetDdlSetting(string name, string value)

@@ -4,7 +4,7 @@ namespace Worf;
 
 /// <summary>
 /// The worker that switches one managed sequence to its next block when transactions hold it at the active block's end,
-/// or as a load waits for its reserved block.
+/// or in a block it moved backwards in, or as a load waits for its reserved block.
 /// It waits for them as long as they hold it, while the range worker goes on checking the other sequences. Inserts that
 /// draw from the sequence wait behind it meanwhile, rather than run the block out.
 /// </summary>
@@ -19,6 +19,7 @@ internal static class SequenceRangeSwitchWorker
     {
         Worker.WorkerAttach((int)mainArg, WorfWorkerType.Switch);
         uint seqoid = Worker.MyWorker.Worker.Switch.Seqoid;
+        Guid movedIn = Worker.MyWorker.Worker.Switch.MovedIn;
         WorfLog.Debug1($"starting sequence switch worker for sequence {seqoid}");
         while (!Worker.GotSigterm)
         {
@@ -26,7 +27,7 @@ internal static class SequenceRangeSwitchWorker
             Worker.ProcessConfigReload();
             try
             {
-                if (PgBackgroundWorker.RunTransaction(() => SequenceRanges.SwitchAtEnd(seqoid)))
+                if (PgBackgroundWorker.RunTransaction(() => SequenceRanges.SwitchAtEnd(seqoid, movedIn: movedIn)))
                 {
                     break;
                 }
@@ -53,13 +54,14 @@ internal static class SequenceRangeSwitchWorker
     /// Starts a switch worker for a sequence, unless one runs for it.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
+    /// <param name="movedIn">The active block the sequence moved backwards in, or empty.</param>
     /// <returns>Whether one runs, or false when every worker slot is taken.</returns>
-    internal static bool Start(uint seqoid)
+    internal static bool Start(uint seqoid, Guid movedIn)
         => Running(seqoid) || Worker.WorkerRegister(new WorfWorker
         {
             WorkerType = WorfWorkerType.Switch,
             Dboid = Worker.MyWorker.Dboid,
-            Worker = new WorfWorkerInfo { Switch = new WorfSwitchWorker { Seqoid = seqoid } },
+            Worker = new WorfWorkerInfo { Switch = new WorfSwitchWorker { Seqoid = seqoid, MovedIn = movedIn } },
         }) != -1;
 
     /// <summary>

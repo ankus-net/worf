@@ -262,7 +262,7 @@ internal sealed unsafe partial class WorfConnection : IDisposable
             int remaining = -1;
             if (milliseconds > 0)
             {
-                remaining = (int)Math.Min(NativeMethods.TimestampDifferenceMilliseconds(NativeMethods.GetCurrentTimestamp(), deadline), int.MaxValue);
+                remaining = Milliseconds(NativeMethods.TimestampDifferenceMilliseconds(NativeMethods.GetCurrentTimestamp(), deadline));
                 if (remaining <= 0)
                 {
                     return PgReplicationReceiveStatus.TimedOut;
@@ -376,6 +376,11 @@ internal sealed unsafe partial class WorfConnection : IDisposable
             SetCopySource(null);
         }
     }
+
+    /// <summary>
+    /// Limits a number of milliseconds, which C's long holds, to an int, as a wait's timeout takes it.
+    /// </summary>
+    private static int Milliseconds(long milliseconds) => (int)Math.Min(milliseconds, int.MaxValue);
 
     /// <summary>
     /// Makes a connection the copy <see cref="ReadCopy"/> reads, with nothing read of it yet, or none.

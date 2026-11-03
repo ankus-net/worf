@@ -67,12 +67,6 @@ With `worf.enable_ddl_replication` on, DDL replicates as it runs, and
 Otherwise, managing DDL so that the provider and subscriber database(s) remain
 compatible is the responsibility of the user.
 
-In a `SQL_ASCII` database, DDL whose text holds bytes that aren't valid UTF-8
-fails as it would replicate, with a `character_not_in_repertoire` error, as
-worf can't replicate it exactly; values that hold such bytes replicate byte for
-byte, and a log that shows one, as `worf.exception_log`, shows its hex as bytea
-does.
-
 worf provides the `worf.replicate_ddl_command` function to allow DDL
 to be run on the provider and subscriber at a consistent point.
 

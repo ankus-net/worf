@@ -794,10 +794,13 @@ public sealed class GlobalDdlLockTests
     /// Builds an index on a node alone, as a concurrent build whose DDL couldn't be queued leaves it.
     /// </summary>
     /// <summary>
-    /// DDL that copies, or chooses names beside, the indexes on one node alone waits on nothing that the same DDL
-    /// without them doesn't: a node's transaction and another node's, applied there, that copy tables with such indexes
-    /// in opposite orders, or name indexes on them, both commit, as do a transaction that wrote to a table before it
-    /// copies it and another node's DDL that alters it, and the copies and names come out as on the other node.
+    /// DDL that copies, chooses names beside, or could use the indexes on one node alone waits on nothing that the same
+    /// DDL without them doesn't: a node's transaction and another node's, applied there, that copy tables with such
+    /// indexes in opposite orders, index them under names PostgreSQL chooses, or index a partitioned table and add a
+    /// foreign key that don't use them while the other indexes the partitioned table by other columns and takes one's
+    /// name, all commit, as do a transaction that wrote to a table before it copies it and another node's DDL that alters
+    /// it, and the copies, keys and names come out as on the other node, with an index on one node alone whose name the
+    /// DDL takes renamed.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -812,9 +815,18 @@ public sealed class GlobalDdlLockTests
             CREATE TABLE t1 (id integer PRIMARY KEY, v integer);
             CREATE TABLE t2 (id integer PRIMARY KEY, v integer);
             CREATE TABLE lt (id integer PRIMARY KEY, v integer);
+            CREATE TABLE pt (id integer PRIMARY KEY, v integer) PARTITION BY RANGE (id);
+            CREATE TABLE pt1 PARTITION OF pt FOR VALUES FROM (0) TO (1000);
+            CREATE TABLE r (id integer PRIMARY KEY, lt_id integer);
+            CREATE TABLE s (id integer PRIMARY KEY);
             """, token);
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
-        foreach (string index in new[] { "INDEX CONCURRENTLY t1_v_idx ON t1 (v)", "INDEX CONCURRENTLY t2_v_idx ON t2 (v)", "INDEX CONCURRENTLY lt_v_idx ON lt (v)" })
+        foreach (string index in new[]
+        {
+            "INDEX CONCURRENTLY t1_v_idx ON t1 (v)", "INDEX CONCURRENTLY t2_v_idx ON t2 (v)", "INDEX CONCURRENTLY lt_v_idx ON lt (v)",
+            "INDEX CONCURRENTLY x_a_idx ON t1 (id)", "INDEX CONCURRENTLY y_a_idx ON t2 (id)", "INDEX CONCURRENTLY pz_idx ON pt1 (v)",
+            "UNIQUE INDEX CONCURRENTLY lz_idx ON lt (v)",
+        })
         {
             await BuildLocalIndexAsync(nodeB, index, token);
         }
@@ -843,6 +855,35 @@ public sealed class GlobalDdlLockTests
             await transaction.CommitAsync(token);
         }
 
+        // node_b creates x and then y while node_a's transaction, applied on node_b, creates y_a and then x_a, whose
+        // indexes take names PostgreSQL chooses that start as node_b's own x_a_idx and y_a_idx do, and that none of them
+        // takes.
+        await using (NpgsqlConnection creating = await nodeB.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction transaction = await creating.BeginTransactionAsync(token);
+            await using (NpgsqlCommand first = new("CREATE TABLE x (id integer PRIMARY KEY, a integer UNIQUE)", creating, transaction))
+            {
+                _ = await first.ExecuteNonQueryAsync(token);
+            }
+
+            _ = await nodeA.SafePsqlAsync(Database, """
+                BEGIN;
+                CREATE TABLE y_a (id integer PRIMARY KEY, b integer UNIQUE);
+                CREATE TABLE x_a (id integer PRIMARY KEY, b integer UNIQUE);
+                COMMIT;
+                """, token);
+            await Task.Delay(TimeSpan.FromSeconds(1), token);
+            await using (NpgsqlCommand second = new("CREATE TABLE y (id integer PRIMARY KEY, a integer UNIQUE)", creating, transaction))
+            {
+                _ = await second.ExecuteNonQueryAsync(token);
+            }
+
+            await transaction.CommitAsync(token);
+        }
+
+        // node_a's DDL that indexes t1 and t2 takes the names of node_b's own indexes there, which node_b renames.
+        _ = await nodeA.SafePsqlAsync(Database, "CREATE INDEX ON t1 (v); CREATE INDEX ON t2 (v)", token);
+
         // A transaction that wrote to lt copies it while node_a's DDL alters it.
         await using (NpgsqlConnection writing = await nodeB.OpenAsync(Database, token))
         {
@@ -863,6 +904,31 @@ public sealed class GlobalDdlLockTests
             _ = await altering;
         }
 
+        // node_b's transaction indexes pt and adds a foreign key that references lt, using none of node_b's own indexes,
+        // while another session indexes pt by other columns and node_a's DDL, applied on node_b, takes the name of
+        // node_b's own unique index on lt. Neither waits for the transaction, as PostgreSQL locks node_b's own indexes
+        // no more than to read them.
+        await using (NpgsqlConnection referencing = await nodeB.OpenAsync(Database, token))
+        await using (NpgsqlConnection indexing = await nodeB.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction transaction = await referencing.BeginTransactionAsync(token);
+            await using (NpgsqlCommand first = new("CREATE INDEX ON pt (id); ALTER TABLE r ADD FOREIGN KEY (lt_id) REFERENCES lt (id)",
+                referencing, transaction))
+            {
+                _ = await first.ExecuteNonQueryAsync(token);
+            }
+
+            await using (NpgsqlCommand other = new("SET lock_timeout = '10s'; CREATE INDEX ON pt (id, v)", indexing))
+            {
+                _ = await other.ExecuteNonQueryAsync(token);
+            }
+
+            _ = await nodeA.SafePsqlAsync(Database, "CREATE INDEX lz_idx ON t2 (v)", token);
+            Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT FROM pg_class WHERE relname = 'lz_idx_local')", token),
+                "node_b's own index renamed while the transaction runs");
+            await transaction.CommitAsync(token);
+        }
+
         foreach (TestNode node in new[] { nodeA, nodeB })
         {
             _ = await node.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
@@ -876,6 +942,21 @@ public sealed class GlobalDdlLockTests
         string onA = await nodeA.SafePsqlAsync(Database, Copies, token);
         Assert.AreEqual("a1:a1_pkey,a2:a2_pkey,b1:b1_pkey,b2:b2_pkey,b3:b3_pkey", onA, "the copies on node_a");
         Assert.AreEqual(onA, await nodeB.SafePsqlAsync(Database, Copies, token), "the copies on node_b");
+        const string Key = "SELECT conindid::regclass::text FROM pg_constraint WHERE conrelid = 'r'::regclass AND contype = 'f'";
+        Assert.AreEqual("lt_pkey", await nodeB.SafePsqlAsync(Database, Key, token), "the key's index on node_b");
+        const string Indexes = """
+            SELECT string_agg(i.relname, ',' ORDER BY i.relname)
+            FROM pg_index x JOIN pg_class c ON c.oid = x.indrelid JOIN pg_class i ON i.oid = x.indexrelid
+            WHERE c.relname IN ('t1', 't2', 'x', 'y', 'x_a', 'y_a', 'pt1') AND NOT EXISTS (SELECT FROM worf.local_index l WHERE l.indexrelid = x.indexrelid)
+            """;
+        string indexesOnA = await nodeA.SafePsqlAsync(Database, Indexes, token);
+        Assert.AreEqual("lz_idx,pt1_id_idx,pt1_id_v_idx,pt1_pkey,t1_pkey,t1_v_idx,t2_pkey,t2_v_idx,x_a_b_key,x_a_key,x_a_pkey,x_pkey," +
+            "y_a_b_key,y_a_key,y_a_pkey,y_pkey", indexesOnA, "the indexes on node_a");
+        Assert.AreEqual(indexesOnA, await nodeB.SafePsqlAsync(Database, Indexes, token), "the indexes on node_b, beside its own");
+        Assert.AreEqual("lz_idx_local,pz_idx,t1_v_idx_local,t2_v_idx_local,x_a_idx,y_a_idx", await nodeB.SafePsqlAsync(Database, """
+            SELECT string_agg(c.relname, ',' ORDER BY c.relname) FROM worf.local_index l JOIN pg_class c ON c.oid = l.indexrelid
+            WHERE c.relname NOT LIKE 'lt%'
+            """, token), "node_b's own indexes, those whose names the DDL took renamed");
         Assert.DoesNotContain("deadlock detected", nodeB.ReadLog());
         Assert.DoesNotContain("deadlock detected", nodeA.ReadLog());
     }

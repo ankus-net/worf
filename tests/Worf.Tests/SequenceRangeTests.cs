@@ -1012,9 +1012,21 @@ public sealed class SequenceRangeTests
         _ = await node.SafePsqlAsync(Database, "BEGIN; SELECT last_value FROM sp_id_seq; PREPARE TRANSACTION 'reader'", token);
         Assert.IsTrue(await node.PollQueryUntilAsync(Database, string.Format(CultureInfo.InvariantCulture, Ready, "sp_id_seq"), token), "sp's next block");
         string before = await node.SafePsqlAsync(Database, "SELECT active_lo FROM worf.sequence_ranges WHERE sequence = 'sp_id_seq'::regclass", token);
-        // The sequence's bounds are read as setval reads them, rather than from the range row as the statement's snapshot
-        // sees it, as the range worker may switch meanwhile.
-        _ = await node.SafePsqlAsync(Database, "SELECT setval('sp_id_seq', (pg_sequence_parameters('sp_id_seq'::regclass)).maximum_value - 2)", token);
+        // The range worker may switch the sequence to its next block between the read of its bounds and the setval, which
+        // then finds the new bounds, and is tried again with them.
+        for (int attempt = 0; ; attempt++)
+        {
+            try
+            {
+                _ = await node.SafePsqlAsync(Database, "SELECT setval('sp_id_seq', (pg_sequence_parameters('sp_id_seq'::regclass)).maximum_value - 2)", token);
+                break;
+            }
+            catch (PostgresException error) when (error.SqlState == "22003" && attempt < 10)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(100), token);
+            }
+        }
+
         Assert.IsTrue(await node.PollQueryUntilAsync(Database,
             $"SELECT active_lo <> {before} FROM worf.sequence_ranges WHERE sequence = 'sp_id_seq'::regclass", token), "a switch past the reader");
         _ = await node.SafePsqlAsync(Database, "COMMIT PREPARED 'reader'", token);
@@ -1118,18 +1130,24 @@ public sealed class SequenceRangeTests
             "SELECT NOT EXISTS (SELECT 1 FROM worf.sequence_range_block WHERE seqoid = 't_id_seq'::regclass AND state = 'next' AND reserved)", token),
             "the reserved block switched to");
 
-        // A setval that moves the sequence back in its block, behind rows it holds, makes the worker leave the block.
+        // A setval that moves the sequence back in its block, behind rows it holds, makes the worker leave the block, even
+        // before the transaction that inserted the rows commits.
         int logpos = node.ReadLog().Length;
-        string before = await node.SafePsqlAsync(Database, """
-            BEGIN;
-            CREATE TEMP TABLE moved ON COMMIT DROP AS
-                WITH inserted AS (INSERT INTO t (v) VALUES ('x'), ('y'), ('z') RETURNING id) SELECT min(id) AS id FROM inserted;
-            SELECT active_lo FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass;
-            SELECT setval('t_id_seq', id) FROM moved;
-            COMMIT;
-            """, token);
-        before = before.Split('\n')[0];
-        Assert.IsTrue(await node.PollLogAsync(logpos, "last value moved back", token), "the backwards move noticed");
+        string before = await node.SafePsqlAsync(Database, "SELECT active_lo FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token);
+        await using (NpgsqlConnection moving = await node.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction transaction = await moving.BeginTransactionAsync(token);
+            await using (NpgsqlCommand move = new("""
+                WITH inserted AS (INSERT INTO t (v) VALUES ('x'), ('y'), ('z') RETURNING id) SELECT setval('t_id_seq', min(id)) FROM inserted
+                """, moving, transaction))
+            {
+                _ = await move.ExecuteScalarAsync(token);
+            }
+
+            Assert.IsTrue(await node.PollLogAsync(logpos, "last value moved back", token), "the backwards move noticed before the commit");
+            await transaction.CommitAsync(token);
+        }
+
         Assert.IsTrue(await node.PollQueryUntilAsync(Database,
             $"SELECT state = 'active' AND active_lo <> {before} FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token),
             "a switch away from the block");
@@ -2205,6 +2223,10 @@ public sealed class SequenceRangeTests
             await Task.Delay(1000, token);
         }
 
+        // node_a first draws from a block reserved for nothing, which it doesn't leave early as it would a block its
+        // inserts are near the end of, where a switch the earlier loads' rate calls for, which grows the request, could
+        // come once node_b has heard of the next block, during the loads.
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.reserve_sequence_range('t_id_seq', 2000)", token);
         await SettleBlocksAsync();
         string[] before = (await nodeA.SafePsqlAsync(Database, "SELECT request_size, peak_rate FROM worf.sequence_range", token)).Split('|');
         await using (NpgsqlConnection load = await nodeA.OpenAsync(Database, token))

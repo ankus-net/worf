@@ -38,7 +38,7 @@ internal static unsafe class StoredValues
     /// <param name="spans">The spans.</param>
     /// <returns>The value as text, or null when no row holds one.</returns>
     internal static string? FindWithin(uint relid, bool inherited, string column, List<(long Lo, long Hi)> spans)
-        => WithSnapshot(() =>
+        => WithSnapshot(false, snapshot =>
         {
             foreach (uint table in Tables(relid, inherited))
             {
@@ -47,10 +47,10 @@ internal static unsafe class StoredValues
                 {
                     foreach ((long lo, long hi) in spans)
                     {
-                        if (!Scan(rel, attnum, typeOid, lo, hi, false, value => (found = Whole(value, typeOid)) is not null) &&
+                        if (!Scan(rel, snapshot, attnum, typeOid, lo, hi, false, value => (found = Whole(value, typeOid)) is not null) &&
                             !Refuted(rel, attnum, typeOid, lo, hi))
                         {
-                            _ = Heap(rel, attnum, typeOid, lo, hi, value => (found = Whole(value, typeOid)) is not null);
+                            _ = Heap(rel, snapshot, attnum, typeOid, lo, hi, value => (found = Whole(value, typeOid)) is not null);
                         }
 
                         if (found is not null)
@@ -78,9 +78,11 @@ internal static unsafe class StoredValues
     /// <param name="lo">The span's start.</param>
     /// <param name="hi">The span's end.</param>
     /// <param name="indexOnly">Whether to read only tables with an index on the column, and only the table itself.</param>
+    /// <param name="held">Whether a row that a transaction in progress inserts holds its value, or one that it deletes
+    /// still does, as PostgreSQL's unique checks read them, rather than only the rows the transaction's snapshot sees.</param>
     /// <returns>The value, or null when no row holds one.</returns>
-    internal static decimal? Furthest(uint relid, string column, bool ascending, long lo, long hi, bool indexOnly)
-        => WithSnapshot(() =>
+    internal static decimal? Furthest(uint relid, string column, bool ascending, long lo, long hi, bool indexOnly, bool held = false)
+        => WithSnapshot(held, snapshot =>
         {
             decimal? furthest = null;
             void Take(decimal value) => furthest = furthest is not decimal f ? value : ascending ? Math.Max(f, value) : Math.Min(f, value);
@@ -89,13 +91,13 @@ internal static unsafe class StoredValues
                 Read(table, column, (rel, attnum, typeOid) =>
                 {
                     // An index gives the furthest value first, while the heap gives every value.
-                    if (!Scan(rel, attnum, typeOid, lo, hi, ascending, value =>
+                    if (!Scan(rel, snapshot, attnum, typeOid, lo, hi, ascending, value =>
                         {
                             Take(Value(value, typeOid));
                             return true;
                         }) && !indexOnly)
                     {
-                        _ = Heap(rel, attnum, typeOid, lo, hi, value =>
+                        _ = Heap(rel, snapshot, attnum, typeOid, lo, hi, value =>
                         {
                             Take(Value(value, typeOid));
                             return false;
@@ -160,7 +162,7 @@ internal static unsafe class StoredValues
     /// greatest first when asked, until <paramref name="stop"/> says to stop.
     /// </summary>
     /// <returns>Whether the table has such an index.</returns>
-    private static bool Scan(nint relation, short attnum, uint typeOid, long lo, long hi, bool greatestFirst, Func<ulong, bool> stop)
+    private static bool Scan(nint relation, nint snapshot, short attnum, uint typeOid, long lo, long hi, bool greatestFirst, Func<ulong, bool> stop)
     {
         RelationData* rel = (RelationData*)relation;
         uint family = typeOid == NumericOid ? NumericOps : IntegerOps;
@@ -185,7 +187,7 @@ internal static unsafe class StoredValues
         RelationData* index = NativeMethods.index_open(indexes[0].Get<uint>(0), (int)PgLockMode.AccessShare);
         ScanKeyData* keys = stackalloc ScanKeyData[2];
         Keys(keys, attnum, typeOid, lo, hi);
-        SysScanDescData* scan = NativeMethods.systable_beginscan_ordered(rel, index, NativeMethods.GetActiveSnapshot(), 2, keys);
+        SysScanDescData* scan = NativeMethods.systable_beginscan_ordered(rel, index, (SnapshotData*)snapshot, 2, keys);
         try
         {
             for (HeapTupleData* tuple; (tuple = NativeMethods.systable_getnext_ordered(scan,
@@ -212,12 +214,12 @@ internal static unsafe class StoredValues
     /// Reads the values in a span through the table's heap, until <paramref name="stop"/> says to stop.
     /// </summary>
     /// <returns>Whether it stopped.</returns>
-    private static bool Heap(nint relation, short attnum, uint typeOid, long lo, long hi, Func<ulong, bool> stop)
+    private static bool Heap(nint relation, nint snapshot, short attnum, uint typeOid, long lo, long hi, Func<ulong, bool> stop)
     {
         RelationData* rel = (RelationData*)relation;
         ScanKeyData* keys = stackalloc ScanKeyData[2];
         Keys(keys, attnum, typeOid, lo, hi);
-        SysScanDescData* scan = NativeMethods.systable_beginscan(rel, 0, false, NativeMethods.GetActiveSnapshot(), 2, keys);
+        SysScanDescData* scan = NativeMethods.systable_beginscan(rel, 0, false, (SnapshotData*)snapshot, 2, keys);
         try
         {
             for (HeapTupleData* tuple; (tuple = NativeMethods.systable_getnext(scan)) is not null;)
@@ -358,14 +360,23 @@ internal static unsafe class StoredValues
     }
 
     /// <summary>
-    /// Runs reads with the snapshot a statement of the transaction takes, as <see cref="Worf.Read"/> does.
+    /// Runs reads with the snapshot a statement of the transaction takes, as <see cref="Worf.Read"/> does, which the
+    /// catalog reads beside them use too, and gives the scans that snapshot, or a dirty one, which sees the rows of
+    /// transactions in progress, as <c>InitDirtySnapshot</c> sets it up.
     /// </summary>
-    private static T WithSnapshot<T>(Func<T> read)
+    private static T WithSnapshot<T>(bool dirty, Func<nint, T> read)
     {
         NativeMethods.PushActiveSnapshot(NativeMethods.GetTransactionSnapshot());
         try
         {
-            return read();
+            SnapshotData* snapshot = NativeMethods.GetActiveSnapshot();
+            if (dirty)
+            {
+                snapshot = (SnapshotData*)NativeMethods.palloc0((ulong)sizeof(SnapshotData));
+                snapshot->snapshot_type = SnapshotType.SNAPSHOT_DIRTY;
+            }
+
+            return read((nint)snapshot);
         }
         finally
         {

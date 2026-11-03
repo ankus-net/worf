@@ -214,37 +214,22 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   `DROP INDEX CONCURRENTLY` drops it there. DDL that would make other objects
   use it, as a constraint's, the replica identity, the clustering index or a
   partition of another index, fails. DDL that copies its table's indexes with
-  `LIKE`, attaches its table as a partition, indexes the partitioned table above
-  it, adds a foreign key that references its table, or changes the type or
-  generation expression of a column of a table whose foreign keys reference its
-  table, or the type of an attribute of a composite type such a table uses,
-  passes over it on every node, and does what it does on the others. Such DDL
-  fails if an event
-  trigger or a function it runs writes to or rewrites a table whose index it
-  copies or attaches, since the index wouldn't get the rows. DDL that takes
-  its name renames it, with a warning. So that the names PostgreSQL chooses for
-  new objects come out as on the other nodes, DDL moves the indexes on its node
-  alone whose names it could take out of its way: those with the names of
-  the relations it creates or renames, or moves to another schema with their
-  indexes and sequences, as `ALTER EXTENSION ... SET SCHEMA` moves an
-  extension's, and those whose names start as those of the tables it creates,
-  alters, indexes or attaches, and of their partitions, from which PostgreSQL
-  chooses names. It finds names as the role that ran it, and after a statement
-  that may set the search path, as `SET search_path` or a SELECT that calls
-  `set_config` can, looks for them in every schema. A DO block, a procedure,
-  `CREATE EXTENSION`, `ALTER EXTENSION ... UPDATE` and `IMPORT FOREIGN SCHEMA`,
-  which can create relations of any name, move every one. An index moved, or
-  passed over, is locked until the transaction ends, so DDL from another node
-  that moves or passes over it waits for a local transaction whose DDL did.
-  Each statement first takes the locks it takes on the tables it alters,
-  indexes, renames or copies the definition of, as it would without worf, and
-  then those on the indexes it moves and passes over, in one order, so that it
-  waits for a transaction that holds one of the tables before it holds any
-  index. Two transactions whose statements lock indexes in other orders, as
-  when each runs DDL on the other's tables, can still deadlock; PostgreSQL ends
-  one of them, and when that's apply, it runs its transaction again. A query,
-  an INSERT, UPDATE, DELETE, MERGE, COPY or EXECUTE, or CREATE TABLE AS, runs
-  functions that may create relations of any name, and moves every one too.
+  `LIKE` leaves its copy out. DDL that attaches its table as a partition,
+  indexes the partitioned table above it, adds a foreign key that references
+  its table, or changes the type or generation expression of a column of a
+  table whose foreign keys reference its table, or the type of an attribute of
+  a composite type such a table uses, passes over it where it would use it: a
+  partitioned index by the same columns, or a foreign key's valid unique index
+  by the columns it references. Such DDL then does what it does on the other
+  nodes, and fails if an event trigger or a function it runs writes to or
+  rewrites a table whose index it attaches, since the index wouldn't get the
+  rows. DDL that gives a relation its name renames it, with a warning, and once
+  a statement has run, the indexes and sequences it created that PostgreSQL
+  named beside it get the names the other nodes give them, renaming it if it
+  has one of those names. A statement first takes the locks it takes on the
+  tables, as it would without worf. Only an index it uses, or whose name it
+  takes, is locked until the transaction ends, as PostgreSQL locks an index it
+  uses or a name it takes, so DDL waits on no other such index.
   `worf.replicate_ddl_command` does the same on every node.
   DDL from another node that can't build it again, as a unique one that finds
   duplicate keys when a table is rewritten, drops it, with a warning that
