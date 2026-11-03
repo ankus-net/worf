@@ -1335,7 +1335,8 @@ public sealed class GlobalDdlLockTests
     /// the node has applied past it or learns that it aborted, while its origin keeps writing. A prepared
     /// transaction's DDL that commits applies and lets its fence go. A unique index built concurrently keeps its fence
     /// while it builds, after the connection that asked for it is gone. A build cancelled, or a savepoint rolled back,
-    /// while the other node is stopped doesn't wait for it.
+    /// while the other node is stopped doesn't wait for it. Queued SQL whose DO block commits fails without committing
+    /// apply's transaction, which the node skips.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -1431,6 +1432,21 @@ public sealed class GlobalDdlLockTests
         Assert.AreEqual("cic_v|0", await nodeB.SafePsqlAsync(Database,
             "SELECT (SELECT indexname FROM pg_indexes WHERE indexname = 'cic_v'), (SELECT count(*) FROM worf.fence)", token));
         _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO cic VALUES (2, 2)", token);
+
+        // SQL queued before replicate_ddl_command refused transaction control, a DO block that can't run in a
+        // subtransaction, runs again in apply's transaction but never as a top-level statement, so its COMMIT fails
+        // rather than commit apply's transaction with the table it created, and node_b skips it.
+        int logStart = nodeB.ReadLog().Length;
+        _ = await nodeA.SafePsqlAsync(Database, """
+            INSERT INTO worf.queue VALUES (now(), current_user, '{ddl_sql}', 'Q',
+                to_json('DO $$ BEGIN PERFORM pg_export_snapshot(); CREATE TABLE public.d1 (a integer); COMMIT; END $$'::text));
+            """, token);
+        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO t3 VALUES (2, 2)", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT FROM t3 WHERE id = 2)", token), "node_a's write after it");
+        Assert.AreEqual("", await nodeB.SafePsqlAsync(Database, "SELECT to_regclass('public.d1')", token), "the DO block's table");
+        string log = nodeB.ReadLog()[logStart..];
+        Assert.Contains("invalid transaction termination", log);
+        Assert.DoesNotContain("portal snapshots", log);
     }
 
     /// <summary>

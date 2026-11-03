@@ -201,12 +201,20 @@ public sealed partial class ExceptionBehaviourTests
             await transaction.RollbackAsync(token);
         }
 
+        // While the sync waits, VACUUM empties and truncates the pages of rows deleted since: once a moment's transactions
+        // of other sessions, which hold the rows too, have ended.
         await Task.Delay(TimeSpan.FromSeconds(2), token);
         _ = await provider.SafePsqlAsync(Database, "CREATE TABLE churn AS SELECT generate_series(1, 1000) AS id", token);
         _ = await provider.SafePsqlAsync(Database, "DELETE FROM churn", token);
-        _ = await provider.SafePsqlAsync(Database, "VACUUM churn", token);
-        Assert.AreEqual("0", await provider.SafePsqlAsync(Database, "SELECT pg_relation_size('churn')", token),
-            "the pages VACUUM emptied of the dead rows and truncated");
+        string size = "";
+        for (int attempt = 0; attempt < 20 && size != "0"; attempt++)
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(attempt == 0 ? 0 : 250), token);
+            _ = await provider.SafePsqlAsync(Database, "VACUUM churn", token);
+            size = await provider.SafePsqlAsync(Database, "SELECT pg_relation_size('churn')", token);
+        }
+
+        Assert.AreEqual("0", size, "the pages VACUUM emptied of the dead rows and truncated");
         _ = await subscriber.SafePsqlAsync(Database, "ALTER TABLE t DROP CONSTRAINT not_bad", token);
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
             "SELECT sync_status = 'r' FROM worf.local_sync_status WHERE sync_relname = 'parent'", token), "the table synchronized");
@@ -667,7 +675,9 @@ public sealed partial class ExceptionBehaviourTests
     /// When its slot is gone or invalidated, or its origin has no progress, it copies the table again and merges the copy
     /// in, in one transaction, so the table is never seen empty, though a key references the table, its own key is an
     /// identity or deferrable: the provider's rows replace those with the same key, and the table's other rows stay, those
-    /// written here or under another origin, and those the provider has since deleted. One cancelled before its copy
+    /// written here or under another origin, and those the provider has since deleted. Under discard, a row of the copy
+    /// that a row here holds a unique value of is skipped and recorded, while the others merge and later changes
+    /// arrive. One cancelled before its copy
     /// commits copies a table without a key once, and the cleanup after it waits for a session that holds its slot, with a
     /// warning, rather than for ever. Dropping the subscription drops the slots its syncs left.
     /// </summary>
@@ -739,7 +749,7 @@ public sealed partial class ExceptionBehaviourTests
         Assert.AreEqual("2|1", await subscriber.SafePsqlAsync(Database, "SELECT (SELECT count(*) FROM x_old), (SELECT count(*) FROM x)", token),
             "the rows of the renamed x and the new x");
 
-        foreach (string stop in new[] { "resume", "drop", "zero", "lost" })
+        foreach (string stop in new[] { "resume", "drop", "zero", "lost", "conflict" })
         {
             string table = $"stopped_{stop}";
             _ = await provider.SafePsqlAsync(Database, $"CREATE TABLE {table} (id integer PRIMARY KEY, v text)", token);
@@ -750,6 +760,10 @@ public sealed partial class ExceptionBehaviourTests
                 _ => "integer PRIMARY KEY",
             };
             _ = await subscriber.SafePsqlAsync(Database, $"CREATE TABLE {table} (id {key}, v text)", token);
+            if (stop == "conflict")
+            {
+                _ = await subscriber.SafePsqlAsync(Database, $"CREATE UNIQUE INDEX {table}_v ON {table} (v) WHERE v <> 'copied'", token);
+            }
 
             // A key on the subscriber references the table.
             _ = await subscriber.SafePsqlAsync(Database, $"CREATE TABLE {table}_ref (id integer REFERENCES {table} (id))", token);
@@ -809,6 +823,10 @@ public sealed partial class ExceptionBehaviourTests
                     INSERT INTO {table} OVERRIDING SYSTEM VALUE VALUES (900002, 'elsewhere');
                     INSERT INTO {table}_ref VALUES (1);
                     """, token);
+                if (stop == "conflict")
+                {
+                    _ = await subscriber.SafePsqlAsync(Database, $"INSERT INTO {table} VALUES (900003, 'updated')", token);
+                }
 
                 // The next worker catches up while the table is locked, and can't connect to the provider again once it's
                 // done, which it doesn't need to, as it drops its slot over the connection it streamed on.
@@ -846,6 +864,12 @@ public sealed partial class ExceptionBehaviourTests
                 case "drop":
                     _ = await provider.SafePsqlAsync(Database, $"SELECT pg_drop_replication_slot('{syncSlot}')", token);
                     break;
+                case "conflict":
+                    // The copy again merges row 500's new value, which a row here holds, so under discard that row is
+                    // skipped, and recorded, while the others merge.
+                    _ = await provider.SafePsqlAsync(Database, $"SELECT pg_drop_replication_slot('{syncSlot}')", token);
+                    await SetBehaviourAsync(subscriber, "discard", token);
+                    break;
                 case "zero":
                     _ = await subscriber.SafePsqlAsync(Database, $"SELECT pg_replication_origin_advance('{syncSlot}', '0/0')", token);
                     break;
@@ -867,7 +891,12 @@ public sealed partial class ExceptionBehaviourTests
                 $"SELECT sync_status = 'r' FROM worf.local_sync_status WHERE sync_relname = '{table}'", token), $"the table synchronized after {stop}");
             await counting.CancelAsync();
             Assert.IsGreaterThanOrEqualTo(1000L, await fewest, $"the fewest rows seen during the sync after {stop}");
-            Assert.AreEqual(stop == "resume" ? "1000|500500|updated|f|t|here|elsewhere|1" : "1001|501100|updated|t|t|here|elsewhere|1",
+            Assert.AreEqual(stop switch
+            {
+                "resume" => "1000|500500|updated|f|t|here|elsewhere|1",
+                "conflict" => "1001|501100|copied|t|t|here|elsewhere|1",
+                _ => "1001|501100|updated|t|t|here|elsewhere|1",
+            },
                 await subscriber.SafePsqlAsync(Database, $"""
                 SELECT count(*), sum(id) - 700000 + 600, (SELECT v FROM {table} WHERE id = 500),
                     EXISTS (SELECT 1 FROM {table} WHERE id = 600), EXISTS (SELECT 1 FROM {table} WHERE id = 700000),
@@ -877,6 +906,20 @@ public sealed partial class ExceptionBehaviourTests
                 """, token), $"the rows after {stop}");
             Assert.Contains(stop == "resume" ? $"resuming the catch-up of table public.{table}" : $"copying table public.{table} again",
                 subscriber.ReadLog()[logpos..], $"the sync after {stop}");
+            if (stop == "conflict")
+            {
+                Assert.Contains($"skipped 1 of the rows of the copy of table public.{table}", subscriber.ReadLog()[logpos..]);
+                Assert.AreEqual("MERGE|500|updated|23505", await subscriber.SafePsqlAsync(Database, $"""
+                    SELECT operation, remote_new_tuple->>'id', remote_new_tuple->>'v', error_sqlstate FROM worf.exception_log
+                    WHERE table_name = '{table}'
+                    """, token), "the skipped row recorded");
+
+                // The changes after the copy still arrive.
+                _ = await provider.SafePsqlAsync(Database, $"UPDATE {table} SET v = 'later' WHERE id = 501", token);
+                Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, $"SELECT v = 'later' FROM {table} WHERE id = 501", token),
+                    "a change after the copy");
+                await SetBehaviourAsync(subscriber, "error", token);
+            }
         }
 
         // The copy of a table without a key has its rows, but can't commit them with its status, which a session
@@ -1042,8 +1085,9 @@ public sealed partial class ExceptionBehaviourTests
     }
 
     /// <summary>
-    /// In SQL_ASCII databases, values that hold a byte that isn't UTF-8 copy and replicate byte for byte, and a row of
-    /// the copy that fails under discard, with such a value, is recorded with the value's hex.
+    /// In SQL_ASCII databases, values that hold a byte that isn't UTF-8 copy and replicate byte for byte, inserted or
+    /// updated, and through an update that conflicts with a local one, and a row of the copy that fails under discard,
+    /// with such a value, is recorded with the value's hex.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -1080,6 +1124,7 @@ public sealed partial class ExceptionBehaviourTests
             SELECT * FROM worf.replication_set_add_all_tables('default', '{public}');
             """, token);
         _ = await subscriber.SafePsqlAsync(Ascii, "ALTER SYSTEM SET worf.exception_behaviour = 'discard'", token);
+        _ = await subscriber.SafePsqlAsync(Ascii, "ALTER SYSTEM SET worf.conflict_history_enabled = on", token);
         _ = await subscriber.SafePsqlAsync(Ascii, "SELECT pg_reload_conf()", token);
         _ = await subscriber.SafePsqlAsync(Ascii, $"""
             SELECT worf.create_subscription(subscription_name := 'sub', provider_dsn := '{provider.Dsn(Ascii, SuperUser)}',
@@ -1095,8 +1140,27 @@ public sealed partial class ExceptionBehaviourTests
             END $$;
             """, token);
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Ascii, "SELECT count(*) = 2 FROM tab", token), "the replicated row");
-        Assert.AreEqual("1:6f6e65e9,2:74776fe9", await subscriber.SafePsqlAsync(Ascii,
-            "SELECT string_agg(id || ':' || encode(convert_to(caf, 'SQL_ASCII'), 'hex'), ',' ORDER BY id) FROM tab", token), "the rows' bytes");
+        const string Bytes = "SELECT string_agg(id || ':' || encode(convert_to(caf, 'SQL_ASCII'), 'hex'), ',' ORDER BY id) FROM tab";
+        Assert.AreEqual("1:6f6e65e9,2:74776fe9", await subscriber.SafePsqlAsync(Ascii, Bytes, token), "the rows' bytes");
+
+        // A replicated update of such a row applies, and so does one that conflicts with a local update of another,
+        // whose local row the conflict records.
+        _ = await subscriber.SafePsqlAsync(Ascii, """
+            DO $$
+            BEGIN
+                EXECUTE format('UPDATE %I SET %I = %L WHERE id = 1', 'tab', 'caf', convert_from('\x6c6f63e9', 'SQL_ASCII'));
+            END $$;
+            """, token);
+        _ = await provider.SafePsqlAsync(Ascii, """
+            DO $$
+            BEGIN
+                EXECUTE format('UPDATE %I SET %I = %L WHERE id = 1', 'tab', 'caf', convert_from('\x6e6577e9', 'SQL_ASCII'));
+                EXECUTE format('UPDATE %I SET %I = %L WHERE id = 2', 'tab', 'caf', convert_from('\x74776f32e9', 'SQL_ASCII'));
+            END $$;
+            """, token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Ascii, $"SELECT ({Bytes}) = '1:6e6577e9,2:74776f32e9'", token), "the updated rows' bytes");
+        Assert.AreEqual("1|t", await subscriber.SafePsqlAsync(Ascii,
+            "SELECT count(*), bool_and(position('x6c6f63e9' IN local_tuple::text) > 0) FROM worf.conflict_history", token), "the conflict's local row");
         Assert.AreEqual("COPY|7|23514|t", await subscriber.SafePsqlAsync(Ascii, """
             SELECT concat_ws('|', operation, remote_new_tuple->>'id', error_sqlstate, position('x736576656ee9' IN remote_new_tuple::text) > 0)
             FROM worf.exception_log

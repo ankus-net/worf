@@ -257,10 +257,11 @@ internal static unsafe partial class SequenceRanges
     // last value moving backwards.
     private static readonly Dictionary<uint, (Guid Block, long Position)> s_positions = [];
 
-    // When the range worker last read each sequence's tables for the furthest value they hold in its active block, and
-    // where the sequence was then: it reads them again once the sequence has moved, at most once a second, so that a
-    // check stays quick while sessions draw from the block.
-    private static readonly Dictionary<uint, (Guid Block, long Position, long At)> s_readStored = [];
+    // When the range worker last read each sequence's tables for the furthest value they hold in its active block, where
+    // the sequence was then, and the xmax of a snapshot taken just before, past the last transaction that had ended: it
+    // reads them again once the sequence has moved, or a transaction has ended since, whose rows the read couldn't see,
+    // at most once a second, so that a check stays quick while sessions draw from the block.
+    private static readonly Dictionary<uint, (Guid Block, long Position, long At, uint Ended)> s_readStored = [];
 
     // The active block each sequence was noticed moving backwards in, until it leaves the block, so that a switch that
     // can't be made while transactions hold the sequence, as the one that moved it may, is made once they let it go.
@@ -1037,9 +1038,10 @@ internal static unsafe partial class SequenceRanges
     /// last check, or behind a value a row holds in the block. Since the check went by, the sequence may have issued
     /// values beyond where it was then, so once it has moved, the tables are read, at most once a second, for the
     /// furthest value they hold in the block, through an index on each column that uses the sequence, and the sequence
-    /// then, which has passed every value a row holds unless it moved backwards. A row that a transaction in progress
-    /// inserts holds its value, as a unique check finds it, so that a <c>setval</c> in the transaction that inserted
-    /// the rows it moves behind is noticed before the transaction commits as after.
+    /// then, which has passed every value a committed row holds unless it moved backwards. The guard admits a row's value
+    /// only after the row is written, so rows of transactions in progress are left to a read once they have ended: the
+    /// tables are read again once any transaction has ended since the last read, so that a <c>setval</c> in the
+    /// transaction that inserted the rows it moves behind is noticed once that commits.
     /// </summary>
     private static bool MovedBackwards(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) active)
     {
@@ -1068,11 +1070,12 @@ internal static unsafe partial class SequenceRanges
 
         // A sequence's bounds are its block's, so a last value outside the block was a switch or a quarantine.
         long at = Worker.GetCurrentTimestamp();
-        bool read = !s_readStored.TryGetValue(seqoid, out (Guid Block, long Position, long At) last) || last.Block != active.Id ||
-            (position != last.Position && at - last.At >= 1_000_000);
+        uint ended = NativeMethods.GetLatestSnapshot()->xmax;
+        bool read = !s_readStored.TryGetValue(seqoid, out (Guid Block, long Position, long At, uint Ended) last) || last.Block != active.Id ||
+            ((position != last.Position || ended != last.Ended) && at - last.At >= 1_000_000);
         if (read)
         {
-            s_readStored[seqoid] = (active.Id, position, at);
+            s_readStored[seqoid] = (active.Id, position, at, ended);
         }
 
         if (read && FurthestStored(info, active) is decimal furthest && LastValue(seqoid) is long now &&
@@ -1100,7 +1103,7 @@ internal static unsafe partial class SequenceRanges
         foreach ((uint relid, string column, _) in UsingColumns(info.Seqoid).Where(column => NativeMethods.get_rel_relkind(column.Relid) != (sbyte)'p'))
         {
             if (NativeMethods.ConditionalLockRelationOid(relid, (int)PgLockMode.AccessShare) &&
-                StoredValues.Furthest(relid, column, info.Ascending, block.Lo, block.Hi, true, held: true) is decimal value)
+                StoredValues.Furthest(relid, column, info.Ascending, block.Lo, block.Hi, true) is decimal value)
             {
                 furthest = furthest is not decimal f ? value : info.Ascending ? Math.Max(f, value) : Math.Min(f, value);
             }

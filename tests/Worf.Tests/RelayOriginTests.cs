@@ -418,6 +418,63 @@ public sealed class RelayOriginTests
             """, token), "the relay origins left, and the user's origin");
     }
 
+    /// <summary>
+    /// A subscription whose name gives the slot another subscription uses is refused, and dropping one of two
+    /// subscriptions that share a slot, as made before names were told apart, keeps the slot and replication origin for
+    /// the other, which goes on applying once enabled.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task SubscriptionsKeepTheirOwnSlots()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+
+        TestNode[] nodes = await Task.WhenAll(
+            StartNodeAsync("provider", token),
+            StartNodeAsync("subscriber", token));
+        await using TestNode provider = nodes[0];
+        await using TestNode subscriber = nodes[1];
+        foreach (TestNode node in nodes)
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id integer PRIMARY KEY)", token);
+        }
+
+        _ = await provider.SafePsqlAsync(Database, """
+            SELECT worf.replication_set_add_table('default', 't');
+            SELECT worf.create_replication_set('other');
+            """, token);
+        await SubscribeAsync(subscriber, "s_1", provider, "{}", token, "default");
+
+        PostgresException refused = await Assert.ThrowsExactlyAsync<PostgresException>(() => subscriber.SafePsqlAsync(Database, $"""
+            SELECT worf.create_subscription(subscription_name := 's.1', provider_dsn := '{provider.Dsn(Database, SuperUser)}',
+                replication_sets := '{"{other}"}', synchronize_structure := false, synchronize_data := false)
+            """, token), "a subscription named for s_1's slot");
+        Assert.AreEqual("42710", refused.SqlState);
+        Assert.Contains("which subscription \"s_1\" uses", refused.MessageText);
+
+        // s_2 comes to share s_1's slot, as two subscriptions made before names were told apart could, and is dropped
+        // while s_1 is disabled.
+        await SubscribeAsync(subscriber, "s_2", provider, "{}", token, "other");
+        string slot = await subscriber.SafePsqlAsync(Database, "SELECT sub_slot_name FROM worf.subscription WHERE sub_name = 's_1'", token);
+        string ownSlot = await subscriber.SafePsqlAsync(Database, "SELECT sub_slot_name FROM worf.subscription WHERE sub_name = 's_2'", token);
+        _ = await subscriber.SafePsqlAsync(Database, "SELECT worf.alter_subscription_disable('s_1', true)", token);
+        _ = await subscriber.SafePsqlAsync(Database, "SELECT worf.alter_subscription_disable('s_2', true)", token);
+        _ = await subscriber.SafePsqlAsync(Database, $"UPDATE worf.subscription SET sub_slot_name = '{slot}' WHERE sub_name = 's_2'", token);
+        int logpos = subscriber.ReadLog().Length;
+        _ = await subscriber.SafePsqlAsync(Database, "SELECT worf.drop_subscription('s_2')", token);
+        Assert.Contains($"subscription \"s_2\" shares slot \"{slot}\" with another subscription", subscriber.ReadLog()[logpos..]);
+        Assert.AreEqual("1", await provider.SafePsqlAsync(Database, $"SELECT count(*) FROM pg_replication_slots WHERE slot_name = '{slot}'", token),
+            "s_1's slot");
+        Assert.AreEqual("1", await subscriber.SafePsqlAsync(Database, $"SELECT count(*) FROM pg_replication_origin WHERE roname = '{slot}'", token),
+            "s_1's origin");
+        _ = await provider.SafePsqlAsync(Database, $"SELECT pg_drop_replication_slot('{ownSlot}')", token);
+        _ = await subscriber.SafePsqlAsync(Database, $"SELECT pg_replication_origin_drop('{ownSlot}')", token);
+
+        _ = await provider.SafePsqlAsync(Database, "INSERT INTO t VALUES (1)", token);
+        _ = await subscriber.SafePsqlAsync(Database, "SELECT worf.alter_subscription_enable('s_1', true)", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT FROM t WHERE id = 1)", token), "s_1's row");
+    }
+
     private static async Task<TestNode> StartNodeAsync(string name, CancellationToken token, params string[] settings)
     {
         TestNode node = await TestNode.StartAsync(name,

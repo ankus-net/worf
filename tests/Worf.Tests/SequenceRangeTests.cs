@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Globalization;
+using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using Npgsql;
@@ -1130,8 +1131,8 @@ public sealed class SequenceRangeTests
             "SELECT NOT EXISTS (SELECT 1 FROM worf.sequence_range_block WHERE seqoid = 't_id_seq'::regclass AND state = 'next' AND reserved)", token),
             "the reserved block switched to");
 
-        // A setval that moves the sequence back in its block, behind rows it holds, makes the worker leave the block, even
-        // before the transaction that inserted the rows commits.
+        // A setval that moves the sequence back in its block, behind rows it holds, makes the worker leave the block, though
+        // the worker checked the sequence while the transaction that inserted the rows, and moved it, was in progress.
         int logpos = node.ReadLog().Length;
         string before = await node.SafePsqlAsync(Database, "SELECT active_lo FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token);
         await using (NpgsqlConnection moving = await node.OpenAsync(Database, token))
@@ -1144,10 +1145,11 @@ public sealed class SequenceRangeTests
                 _ = await move.ExecuteScalarAsync(token);
             }
 
-            Assert.IsTrue(await node.PollLogAsync(logpos, "last value moved back", token), "the backwards move noticed before the commit");
+            await Task.Delay(TimeSpan.FromSeconds(1), token);
             await transaction.CommitAsync(token);
         }
 
+        Assert.IsTrue(await node.PollLogAsync(logpos, "last value moved back", token), "the backwards move noticed");
         Assert.IsTrue(await node.PollQueryUntilAsync(Database,
             $"SELECT state = 'active' AND active_lo <> {before} FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token),
             "a switch away from the block");
@@ -1173,7 +1175,7 @@ public sealed class SequenceRangeTests
             INSERT INTO bulk DEFAULT VALUES;
             """, token);
         await Task.Delay(TimeSpan.FromMilliseconds(500), token);
-        _ = await node.SafePsqlAsync(Database, "INSERT INTO bulk SELECT FROM generate_series(1, 50000)", token);
+        _ = await node.SafePsqlAsync(Database, "INSERT INTO bulk SELECT FROM generate_series(1, 40000)", token);
         Assert.IsTrue(await node.PollQueryUntilAsync(Database,
             "SELECT peak_rate * 120 >= max_range_size FROM worf.sequence_range WHERE seqoid = 'bulk_id_seq'::regclass", token),
             "the load's rate, at which two minutes take the largest block");
@@ -1490,7 +1492,8 @@ public sealed class SequenceRangeTests
     /// nothing streams, or that the role streams while it speaks for another node, is refused, and one that relays
     /// reports of more nodes than the provider keeps leaves the rest out. Once the providers subscribe back, every node
     /// exchanges both ways at once, with no deadlock or lock timeout. A provider whose host never answers holds up
-    /// nothing else.
+    /// nothing else. A neighbor's made-up watermark resets the owner once, and its made-up requests to reset, in the
+    /// ten minutes after, not again.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -1693,6 +1696,20 @@ public sealed class SequenceRangeTests
         Assert.AreEqual(1, nodeA.ReadLog()[forgedAt..].Split("node node_b has heard of grants up to").Length - 1, "node_a's resets on node_b's reports");
         Assert.AreEqual(1, nodeA.ReadLog()[forgedAt..].Split("the allocator's fence lifted").Length - 1, "node_a's fences lifted");
 
+        // Requests to reset that node_b makes up, each claiming to have seen node_a's WAL position further on than it is,
+        // reset the sequence no more in the ten minutes in which node_b's made-up watermark reset it, however many come
+        // in the minute that one rollback's resets take.
+        for (int i = 1; i <= 5; i++)
+        {
+            string madeUpReset = madeUpWatermark
+                .Replace("\"watermark\": 9000000000000000000", "\"watermark\": null", StringComparison.Ordinal)
+                .Replace("\"reset\": null", $"\"reset\": \"FF000000/{i}\"", StringComparison.Ordinal);
+            _ = await nodeA.SafePsqlAsync(Database, $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{madeUpReset}')", token);
+        }
+
+        Assert.DoesNotContain("node node_b saw this node's WAL position move backwards", nodeA.ReadLog()[forgedAt..], "node_a's resets on node_b's requests");
+        Assert.AreEqual(1, nodeA.ReadLog()[forgedAt..].Split("the allocator's fence lifted").Length - 1, "node_a's fences lifted after the requests");
+
         // node_a waits for node_c's own report after a reset while node_c is down, though node_b relays a fresh report of
         // node_c after node_a has lost its record of node_c's grants and reports, as a recovery to before them would, and
         // takes node_c's grants back into its ledger once node_c reports.
@@ -1734,6 +1751,157 @@ public sealed class SequenceRangeTests
         int forgotten = nodeA.ReadLog().Length;
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.reset_sequence_range('t_id_seq')", token);
         Assert.IsTrue(await nodeA.PollLogAsync(forgotten, "the allocator's fence lifted", token), "node_a's fence lifted without node_c");
+    }
+
+    /// <summary>
+    /// A forced lift over grants that overlap resets both holders, the other as it hears the owner's next message, and
+    /// marks the grants, so that they fence the root no more. A lift over a new overlap resets both again, here after the
+    /// other holder restarted, as a node takes a neighbor's resets no more than once in ten minutes. A lift that stops
+    /// waiting for a node that's down asks it to reset once it's heard from again.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task ForcedLiftsResetTheHoldersTheyPassOver()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, """
+                CREATE TABLE t (id bigserial PRIMARY KEY, v text);
+                SELECT * FROM worf.replication_set_add_table('default', 't');
+                """, token);
+        }
+
+        await SubscribeAsync(nodeA, "a_from_b", nodeB, token);
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 1000)", token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+        string nodeBId = await nodeB.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
+        const string Fence = "SELECT coalesce(detail, '') FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass AND fenced_at IS NOT NULL";
+
+        for (int lift = 1; lift <= 2; lift++)
+        {
+            // node_a's ledger comes to hold a grant to itself over node_b's active block, and node_a resets, so its fence
+            // finds the grants overlapping once node_b reports.
+            string activeB = await nodeB.SafePsqlAsync(Database, "SELECT active_lo FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token);
+            int logA = nodeA.ReadLog().Length;
+            int logB = nodeB.ReadLog().Length;
+            _ = await nodeA.SafePsqlAsync(Database, $"""
+                INSERT INTO worf.sequence_range_grant (grant_id, request_id, seqoid, grantee_id, grantee_name, kind, lo, hi, state, granted_at)
+                SELECT gen_random_uuid(), gen_random_uuid(), g.seqoid, n.node_id, n.node_name, g.kind, g.lo, g.hi, 'acknowledged', now()
+                FROM worf.sequence_range_grant g CROSS JOIN worf.local_node l JOIN worf.node n ON n.node_id = l.node_id
+                WHERE g.seqoid = 't_id_seq'::regclass AND g.grantee_id = {nodeBId} AND g.lo = {activeB};
+                SELECT worf.reset_sequence_range('t_id_seq');
+                """, token);
+            Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, $"SELECT ({Fence}) LIKE '%overlap%'", token), $"node_a's fence held by the overlap {lift}");
+
+            _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.activate_sequence_range('t_id_seq')", token);
+            Assert.Contains("overlap, so both nodes reset their blocks", nodeA.ReadLog()[logA..], $"node_a's lift over the overlap {lift}");
+            Assert.IsTrue(await nodeB.PollLogAsync(logB, "node node_a lifted a fence over grants of this node's that overlap another's", token),
+                $"node_b's reset on the lift {lift}");
+            await WaitActiveAsync([nodeA, nodeB], token);
+            Assert.AreEqual("0", await nodeA.SafePsqlAsync(Database, """
+                SELECT count(*) FROM worf.sequence_range_grant a JOIN worf.sequence_range_grant b
+                    ON b.seqoid = a.seqoid AND a.grant_id < b.grant_id AND a.lo <= b.hi AND b.lo <= a.hi
+                WHERE a.seqoid = 't_id_seq'::regclass AND a.state NOT IN ('unclaimed', 'overlapped') AND b.state NOT IN ('unclaimed', 'overlapped')
+                    AND a.kind <> 'x' AND b.kind <> 'x'
+                """, token), $"the overlapping grants marked after the lift {lift}");
+
+            if (lift == 1)
+            {
+                // The marked grants fence the root no more: node_a's next reset lifts once node_b reports.
+                _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.reset_sequence_range('t_id_seq')", token);
+                await WaitActiveAsync([nodeA], token);
+                await nodeB.StopAsync("fast", token);
+                await nodeB.StartServerAsync(token);
+                await WaitActiveAsync([nodeB], token);
+            }
+        }
+
+        // node_a's fence stops waiting for node_b while it's down, and node_b resets once node_a hears from it.
+        await nodeB.StopAsync("fast", token);
+        int logged = nodeB.ReadLog().Length;
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.reset_sequence_range('t_id_seq')", token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, $"SELECT ({Fence}) LIKE 'fenced until node node_b%'", token), "node_a's fence waiting for node_b");
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.activate_sequence_range('t_id_seq', 'node_b')", token);
+        await WaitActiveAsync([nodeA], token);
+        await nodeB.StartServerAsync(token);
+        Assert.IsTrue(await nodeB.PollLogAsync(logged, "node node_a lifted its fence without this node's report", token), "node_b's reset once back");
+        await WaitActiveAsync([nodeB], token);
+        await AssertNoSharedValuesAsync([nodeA, nodeB], token);
+    }
+
+    /// <summary>
+    /// A provider that takes calls but never answers holds up a node's exchanges with its other neighbors only until its
+    /// first call runs out of time: it's called after the others from then on, a minute apart, for a second at most, so
+    /// the node's inserts go on through small blocks from the owner without waiting.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task FrozenNeighborsHoldUpNoOtherExchange()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        await using TestNode nodeC = await StartNodeAsync("node_c", token);
+        foreach (TestNode node in new[] { nodeA, nodeB, nodeC })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        await SubscribeAsync(nodeB, "b_from_c", nodeC, token);
+        _ = await nodeA.SafePsqlAsync(Database,
+            "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100, max_range_size := 100)", token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+
+        // node_b's calls to node_c go to a listener that takes connections and never answers.
+        using TcpListener frozen = new(IPAddress.Loopback, 0);
+        frozen.Start();
+        List<TcpClient> taken = [];
+        using CancellationTokenSource stop = CancellationTokenSource.CreateLinkedTokenSource(token);
+        Task taking = Task.Run(async () =>
+        {
+            while (!stop.Token.IsCancellationRequested)
+            {
+                taken.Add(await frozen.AcceptTcpClientAsync(stop.Token));
+            }
+        }, stop.Token);
+        int logpos = nodeB.ReadLog().Length;
+        _ = await nodeB.SafePsqlAsync(Database, $"""
+            UPDATE worf.node_interface SET if_dsn = 'host=127.0.0.1 port={((IPEndPoint)frozen.LocalEndpoint).Port} dbname={Database} user={SuperUser}'
+            WHERE if_nodeid = (SELECT node_id FROM worf.node WHERE node_name = 'node_c')
+            """, token);
+        Assert.IsTrue(await nodeB.PollLogAsync(logpos, "node node_c didn't answer within 5000 ms", token), "node_b's first call to node_c timed out");
+
+        // node_b draws two blocks a second from node_a for fifteen seconds, and no insert waits for one.
+        List<double> waits = [];
+        await using (NpgsqlConnection writer = await nodeB.OpenAsync(Database, token))
+        {
+            await using NpgsqlCommand insert = new("INSERT INTO t (v) VALUES ('b')", writer);
+            Stopwatch running = Stopwatch.StartNew();
+            while (running.Elapsed < TimeSpan.FromSeconds(15))
+            {
+                Stopwatch one = Stopwatch.StartNew();
+                _ = await insert.ExecuteNonQueryAsync(token);
+                waits.Add(one.Elapsed.TotalMilliseconds);
+                await Task.Delay(TimeSpan.FromMilliseconds(5), token);
+            }
+        }
+
+        await stop.CancelAsync();
+        _ = await Task.WhenAny(taking);
+        foreach (TcpClient client in taken)
+        {
+            client.Dispose();
+        }
+
+        waits.Sort();
+        Assert.IsGreaterThan(1000, waits.Count, "node_b's inserts");
+        Assert.IsLessThan(2500.0, waits[^1], "node_b's slowest insert, against the 5000 ms node_c's calls took");
+        Assert.IsLessThan(500.0, waits[(int)(waits.Count * 0.99)], "node_b's 99th percentile insert");
     }
 
     /// <summary>
@@ -2790,18 +2958,20 @@ public sealed class SequenceRangeTests
             }
         }
 
-        // Each exchange call is a session of its own. A slot takes no more than a call an exchange interval, and one where
-        // each end of the while cuts an interval, and these queries take two sessions.
+        // Each exchange call is a session of its own. A slot takes no more than a call an exchange interval over the while
+        // from the first reading of the sessions to the last, and one where each end of the while cuts an interval, as a
+        // session's count goes in once its process exits, and these queries take two sessions.
         TimeSpan idle = span ?? TimeSpan.FromSeconds(2);
-        long calls = (long)(idle / TimeSpan.FromMilliseconds(500)) + 1;
         await Task.Delay(TimeSpan.FromSeconds(1), token);
         const string Next = """
             SELECT pg_snapshot_xmax(pg_current_snapshot()), (SELECT sessions FROM pg_stat_database WHERE datname = current_database()),
                 (SELECT count(*) FROM pg_replication_slots WHERE plugin = 'worf' AND database = current_database()), pg_current_wal_insert_lsn()
             """;
+        Stopwatch window = Stopwatch.StartNew();
         string[][] before = await Task.WhenAll(nodes.Select(async node => (await node.SafePsqlAsync(Database, Next, token)).Split('|')));
         await Task.Delay(idle, token);
         string[][] after = await Task.WhenAll(nodes.Select(async node => (await node.SafePsqlAsync(Database, Next, token)).Split('|')));
+        long calls = (long)(window.Elapsed / TimeSpan.FromMilliseconds(500)) + 2;
         for (int i = 0; i < nodes.Length; i++)
         {
             Assert.AreEqual(before[i][0], after[i][0], $"{nodes[i].Name} used transaction IDs while idle");

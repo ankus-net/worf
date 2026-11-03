@@ -237,14 +237,16 @@ internal static class SequenceRangeHeard
     }
 
     /// <summary>
-    /// Checks whether a neighbor may have this server reset a sequence's blocks now: once every ten minutes, with the
-    /// resets of the minute after it, which one rollback brings for every sequence. A neighbor that saw this node roll
-    /// back keeps asking meanwhile, and neither takes its grants nor answers its requests, so that a message made up to
-    /// reset it can't do so more often. This server starts with none, as after a restore, which takes the first at once.
+    /// Checks whether a neighbor may have this server reset its sequences' blocks now: once every ten minutes, with the
+    /// resets of the minute after it, which one rollback brings for every sequence, each sequence once. A neighbor that
+    /// saw this node roll back keeps asking meanwhile, and neither takes its grants nor answers its requests, so that a
+    /// message made up to reset it can't do so more often. This server starts with none, as after a restore, which takes
+    /// the first at once.
     /// </summary>
     /// <param name="nodeId">The neighbor.</param>
-    /// <returns>Whether it may.</returns>
-    internal static bool MayReset(uint nodeId)
+    /// <returns>When the ten minutes whose resets the neighbor may have made began, so that a sequence it has reset since
+    /// then isn't reset again, or null when it may make none now.</returns>
+    internal static long? MayReset(uint nodeId)
     {
         uint dboid = DatabaseId();
         long now = Worker.GetCurrentTimestamp();
@@ -259,7 +261,7 @@ internal static class SequenceRangeHeard
             WorfHeard heard = guard[i];
             if (heard.ResetAt != 0 && now - heard.ResetAt is >= 60_000_000 and < 600_000_000)
             {
-                return false;
+                return null;
             }
 
             if (heard.ResetAt == 0 || now - heard.ResetAt >= 600_000_000)
@@ -268,10 +270,10 @@ internal static class SequenceRangeHeard
                 guard[i] = heard;
             }
 
-            return true;
+            return heard.ResetAt;
         }
 
-        return true;
+        return now;
     }
 
     private static uint DatabaseId()
