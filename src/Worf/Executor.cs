@@ -312,8 +312,10 @@ internal static unsafe partial class Executor
         // Which objects a DROP drops is known only before it runs, and whether a statement uses temporary objects only
         // as it runs.
         string? ddl = DdlReplication.CommandToQueue(pstmt, queryString, context, out bool sessionLocal);
+        (uint Role, string Settings) ddlContext = default;
         if (ddl is not null)
         {
+            ddlContext = DdlReplication.Context();
             DdlReplication.WithSnapshot(() =>
             {
                 DdlLock.LockNodes(parsetree);
@@ -375,7 +377,7 @@ internal static unsafe partial class Executor
                 ddl = LocalIndex.NameBuilt(parsetree, ddl);
             }
 
-            DdlReplication.QueueDdl(ddl);
+            DdlReplication.QueueDdl(ddl, ddlContext);
             if (tracking)
             {
                 LocalIndex.Queued();

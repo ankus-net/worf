@@ -714,43 +714,59 @@ public sealed class GlobalDdlLockTests
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT to_regclass('public.c3') IS NOT NULL", token), "node_a's old SQL on node_b");
         Assert.Contains("skipping transaction control statement", nodeB.ReadLog()[logStart..]);
 
-        // Replicated SQL runs on node_b as the role that ran it, whose functions can't set the role back to apply's,
-        // nor can the SQL itself, and settings it makes last until it ends.
+        // Replicated SQL runs on node_b with the role that ran it as the session user, as it ran on node_a, so that it,
+        // and the functions it calls, set and reset the role as they could there: a superuser's function that sets its
+        // role, and a role's own that resets it, apply. Neither a reset role nor the session authorization gets to
+        // apply's superuser, the temporary objects the SQL creates go once it ends, and replicated SQL finds names under
+        // the empty search path it ran under on node_a.
         foreach (TestNode node in new[] { nodeA, nodeB })
         {
             _ = await node.SafePsqlAsync(Database, """
                 SET worf.enable_ddl_replication = off;
                 CREATE ROLE mal LOGIN;
-                GRANT CREATE ON SCHEMA public TO mal;
+                CREATE ROLE grp;
+                GRANT grp TO mal;
+                GRANT CREATE ON SCHEMA public TO mal, grp;
                 GRANT USAGE ON SCHEMA worf TO mal;
                 """, token);
         }
 
         _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE FUNCTION public.as_grp() RETURNS integer LANGUAGE plpgsql AS $f$ BEGIN SET LOCAL ROLE grp; RETURN 1; END $f$;
+            CREATE TABLE public.su_t AS SELECT public.as_grp();
+            """, token);
+        _ = await nodeA.SafePsqlAsync(Database, """
             CREATE FUNCTION public.mal_f() RETURNS integer LANGUAGE plpgsql AS $f$
             BEGIN
+                RESET ROLE;
                 BEGIN
-                    RESET ROLE;
+                    PERFORM pg_catalog.set_config('session_authorization', 'postgres', true);
                     ALTER ROLE mal SUPERUSER;
                 EXCEPTION WHEN OTHERS THEN NULL;
                 END;
                 RETURN 1;
             END $f$;
             CREATE TABLE public.mal_t AS SELECT public.mal_f();
-            SELECT worf.replicate_ddl_command($$DO $d$ BEGIN RESET ROLE; ALTER ROLE mal SUPERUSER; EXCEPTION WHEN OTHERS THEN NULL; END $d$;
-                CREATE TABLE public.mal_u (a integer)$$);
+            SELECT worf.replicate_ddl_command($$SET ROLE grp; CREATE TABLE public.mal_u (a integer); RESET ROLE;
+                CREATE DOMAIN pg_temp.jsonb AS pg_catalog.jsonb; CREATE TABLE public.mal_v (a integer)$$);
+            CREATE FUNCTION public.lower(character varying) RETURNS text LANGUAGE sql AS $f$ SELECT 'mal' $f$;
             """, token, user: "mal");
-        PostgresException role = await Assert.ThrowsExactlyAsync<PostgresException>(
-            () => nodeA.SafePsqlAsync(Database, "SELECT worf.replicate_ddl_command('RESET ROLE; CREATE TABLE public.mal_v (a integer)')", token, user: "mal"));
-        Assert.AreEqual("42501", role.SqlState);
+        _ = await nodeA.SafePsqlAsync(Database,
+            "SELECT worf.replicate_ddl_command($$CREATE TABLE public.lw AS SELECT lower('X'::character varying) AS v$$)", token);
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
         foreach (TestNode node in new[] { nodeA, nodeB })
         {
-            Assert.AreEqual("f|mal|mal", await node.SafePsqlAsync(Database, """
-                SELECT rolsuper, (SELECT tableowner FROM pg_tables WHERE tablename = 'mal_t'), (SELECT tableowner FROM pg_tables WHERE tablename = 'mal_u')
+            Assert.AreEqual("f|postgres|mal|grp|mal|x", await node.SafePsqlAsync(Database, """
+                SELECT rolsuper, (SELECT tableowner FROM pg_tables WHERE tablename = 'su_t'), (SELECT tableowner FROM pg_tables WHERE tablename = 'mal_t'),
+                    (SELECT tableowner FROM pg_tables WHERE tablename = 'mal_u'), (SELECT tableowner FROM pg_tables WHERE tablename = 'mal_v'),
+                    (SELECT v FROM public.lw)
                 FROM pg_roles WHERE rolname = 'mal'
                 """, token), node.Name);
         }
+
+        Assert.AreEqual("0", await nodeB.SafePsqlAsync(Database, """
+            SELECT count(*) FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname LIKE 'pg_temp%' AND t.typname = 'jsonb'
+            """, token), "the domain replicated SQL left in apply's temporary schema");
     }
 
     /// <summary>

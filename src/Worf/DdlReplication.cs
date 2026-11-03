@@ -199,20 +199,11 @@ internal static unsafe partial class DdlReplication
     /// Queues a DDL statement that ran, with the settings that change what it means.
     /// </summary>
     /// <param name="command">The statement.</param>
-    internal static void QueueDdl(string command)
+    /// <param name="context">The role and settings the statement started under, from <see cref="Context"/>.</param>
+    internal static void QueueDdl(string command, (uint Role, string Settings) context)
     {
-        StringBuilder json = new("{\"search_path\": ");
-        Executor.EscapeJson(json, Setting("search_path"));
-        json.Append(", \"settings\": {");
-        for (int i = 1; i < s_travelingSettings.Length; i++)
-        {
-            json.Append(i > 1 ? ", " : "");
-            Executor.EscapeJson(json, s_travelingSettings[i]);
-            json.Append(": ");
-            Executor.EscapeJson(json, Setting(s_travelingSettings[i]));
-        }
-
-        json.Append("}, \"command\": ");
+        StringBuilder json = new(context.Settings);
+        json.Append(", \"command\": ");
         Executor.EscapeJson(json, command);
 
         // DDL that locked the other nodes tells each node the fence to release and how far to apply first.
@@ -231,9 +222,30 @@ internal static unsafe partial class DdlReplication
 
         _ = WithSnapshot(() =>
         {
-            Queue.QueueMessage(["ddl_sql"], NativeMethods.GetUserId(), Queue.QueueCommandTypeDdl, json.ToString());
+            Queue.QueueMessage(["ddl_sql"], context.Role, Queue.QueueCommandTypeDdl, json.ToString());
             return true;
         });
+    }
+
+    /// <summary>
+    /// Takes the role and the settings a statement starts under, which other nodes run it under, since a function it
+    /// calls may change them as it runs.
+    /// </summary>
+    /// <returns>The role, and the settings as the queued message gives them.</returns>
+    internal static (uint Role, string Settings) Context()
+    {
+        StringBuilder json = new("{\"search_path\": ");
+        Executor.EscapeJson(json, Setting("search_path"));
+        json.Append(", \"settings\": {");
+        for (int i = 1; i < s_travelingSettings.Length; i++)
+        {
+            json.Append(i > 1 ? ", " : "");
+            Executor.EscapeJson(json, s_travelingSettings[i]);
+            json.Append(": ");
+            Executor.EscapeJson(json, Setting(s_travelingSettings[i]));
+        }
+
+        return (NativeMethods.GetUserId(), json.Append('}').ToString());
     }
 
     /// <summary>

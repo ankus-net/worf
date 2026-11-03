@@ -33,9 +33,6 @@ internal static unsafe partial class Apply
     private const long SyncSlotsRetryInterval = 5_000_000;
     private const long SyncSlotsCheckInterval = 60_000_000;
 
-    // SECURITY_LOCAL_USERID_CHANGE from miscadmin.h.
-    private const int SecurityLocalUseridChange = 0x0001;
-
     private static readonly LinkedList<(ulong LocalEnd, ulong RemoteEnd)> s_lsnMapping = new();
 
     private static bool s_inRemoteTransaction;
@@ -441,16 +438,19 @@ internal static unsafe partial class Apply
     /// Execute an SQL command. This can be multiple multiple queries.
     /// </summary>
     /// <remarks>
-    /// The commands run as the role that ran them on the origin, as a security-definer function runs, so that none can
-    /// set the role, its own or a function's, to another, which would end up as apply's own, and whatever they set
-    /// lasts until they end. They can't control the transaction, which apply commits; replicate_ddl_command refuses
-    /// such statements, and those queued before it did are skipped.
+    /// Another node's commands run with the role that ran them there as the session user, as <see cref="ReplicatedIdentity"/>
+    /// describes, so that they can set and reset the role as they could there, and the temporary objects they create
+    /// go once they end, as no session here keeps them. A node's own commands, as replicate_ddl_command runs them, run as
+    /// its session's user. Whatever the commands set lasts until they end. They can't control the transaction, which
+    /// apply commits; replicate_ddl_command refuses such statements, and those queued before it did are skipped, and a
+    /// DO block or procedure runs atomically, so that a transaction control statement in it fails.
     /// </remarks>
     /// <param name="cmdstr">The commands.</param>
     /// <param name="role">The role that ran them on the origin.</param>
     /// <param name="isTopLevel">Whether the commands may run as a top level statement.</param>
     /// <param name="withoutConcurrently">Whether commands that would run concurrently run in the transaction.</param>
-    internal static void ExecuteSqlCommand(string cmdstr, string role, bool isTopLevel, bool withoutConcurrently = false)
+    /// <param name="applying">Whether another node queued the commands.</param>
+    internal static void ExecuteSqlCommand(string cmdstr, string role, bool isTopLevel, bool withoutConcurrently = false, bool applying = true)
     {
         sbyte* saveDebugQueryString = NativeGlobals.debug_query_string;
 
@@ -467,13 +467,10 @@ internal static unsafe partial class Apply
 
         // Do a limited amount of safety checking against CONCURRENTLY commands executed in situations where they
         // aren't allowed. The sender side should provide protection, but better be safe than sorry.
-        isTopLevel = isTopLevel && commands is not null && commands->length == 1;
+        isTopLevel = isTopLevel && commands is not null && commands->length == 1 &&
+            ((RawStmt*)commands->elements[0].ptr_value)->stmt->type is not (NodeTag.T_DoStmt or NodeTag.T_CallStmt);
 
-        uint userId;
-        int secContext;
-        NativeMethods.GetUserIdAndSecContext(&userId, &secContext);
-        int saveNestlevel = NativeMethods.NewGUCNestLevel();
-        NativeMethods.SetUserIdAndSecContext(NativeMethods.get_role_oid(Worf.PStrDup(role), false), secContext | SecurityLocalUseridChange);
+        int nestLevel = applying ? ReplicatedIdentity.Enter(role) : NativeMethods.NewGUCNestLevel();
         try
         {
             for (int i = 0; commands is not null && i < commands->length; i++)
@@ -492,12 +489,23 @@ internal static unsafe partial class Apply
 
                 ExecuteStatement(command, query, isTopLevel);
             }
+
+            if (applying)
+            {
+                NativeMethods.ResetTempTableNamespace();
+            }
         }
         finally
         {
-            // Restore the GUC variables the commands set.
-            NativeMethods.AtEOXact_GUC(false, saveNestlevel);
-            NativeMethods.SetUserIdAndSecContext(userId, secContext);
+            // Restore the user and the GUC variables the commands set.
+            if (applying)
+            {
+                ReplicatedIdentity.Leave(nestLevel);
+            }
+            else
+            {
+                NativeMethods.AtEOXact_GUC(false, nestLevel);
+            }
         }
 
         NativeGlobals.debug_query_string = saveDebugQueryString;
@@ -1968,6 +1976,9 @@ internal static unsafe partial class Apply
         // Run the extracted SQL, out of the way of the indexes on this node alone, as DDL from the origin runs, in a
         // subtransaction, so that one it can't build again is dropped and the SQL runs again. A statement that can't run
         // in one, as one that builds an index concurrently, runs as the first of apply's transaction, as it ran before.
+        // It finds names under the empty search path that replicate_ddl_command ran it under on the origin.
+        int saveNestlevel = NativeMethods.NewGUCNestLevel();
+        SetDdlSetting("search_path", "");
         RunQueuedCommand(sql, queuedMessage.Role, () =>
         {
             try
@@ -1979,6 +1990,7 @@ internal static unsafe partial class Apply
                 ExecuteSqlCommand(sql, queuedMessage.Role, true);
             }
         });
+        NativeMethods.AtEOXact_GUC(true, saveNestlevel);
     }
 
     /// <summary>
