@@ -33,7 +33,7 @@ internal sealed class WorfFailedChange
     /// <summary>
     /// Gets the change's position in the transaction.
     /// </summary>
-    public uint ActionCounter { get; init; }
+    public long ActionCounter { get; init; }
 
     /// <summary>
     /// Gets what the change does, such as <c>INSERT</c> or <c>QUEUED_SQL</c>, or null.

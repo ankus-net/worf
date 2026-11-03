@@ -1,5 +1,4 @@
 using System.Text;
-using System.Text.Json;
 using Ankus.Postgres;
 
 namespace Worf;
@@ -52,9 +51,11 @@ internal static unsafe partial class CopyConversion
     private static byte[] s_converted = new byte[8192];
     private static int s_convertedLength;
 
-    // How many of the provider's rows a copy in batches copies in one subtransaction: as one fails, the rows before
-    // it are copied again and the copy goes on after it, or, when COPY names no row, the batch is split in halves.
+    // How many of the provider's rows a copy in batches copies in one subtransaction, and how much of their text at
+    // most, past one row: as one fails, the rows before it are copied again and the copy goes on after it, or, when
+    // COPY names no row, the batch is split in halves.
     private const int BatchRows = 1000;
+    private const int BatchBytes = 8 * 1024 * 1024;
 
     // When worf.exception_behaviour skips or records rows: what the exception log records with each, or null, the
     // behaviour, and the copied columns' names.
@@ -173,14 +174,13 @@ internal static unsafe partial class CopyConversion
                 NativeMethods.PushActiveSnapshot(NativeMethods.GetTransactionSnapshot());
             }
 
+            // A copy that skips or records rows copies them all at once first, as fast as one that stops at a failure,
+            // in a subtransaction, and only once a row fails, the copy starts again: under sub_disable to record the row
+            // that failed, and otherwise, or when COPY named none, in batches, which find the rows that fail.
             ulong copied;
             if (s_change is null)
             {
                 copied = CopyAll(pstate, relation, attnamelist);
-            }
-            else if (s_behaviour != WorfExceptionBehaviour.SubDisable)
-            {
-                copied = CopyInBatches(pstate, relation, attnamelist);
             }
             else
             {
@@ -190,8 +190,7 @@ internal static unsafe partial class CopyConversion
                 }
                 catch (PgException error) when (!Apply.IsTransient(error))
                 {
-                    // The rest of the provider's rows are read and passed over, and the copy starts again to record the
-                    // row that failed, or, when COPY named none, in batches, which find it.
+                    // The rest of the provider's rows are read and passed over before the copy starts again.
                     ulong failedLine = s_failedLine;
                     while (!s_ended)
                     {
@@ -204,7 +203,7 @@ internal static unsafe partial class CopyConversion
                     }
 
                     restart();
-                    if (failedLine > 0)
+                    if (s_behaviour == WorfExceptionBehaviour.SubDisable && failedLine > 0)
                     {
                         if (FindRow(failedLine) is WorfFailedChange change)
                         {
@@ -320,7 +319,7 @@ internal static unsafe partial class CopyConversion
         {
             s_batchRows.Clear();
             int used = 0;
-            while (s_batchRows.Count < BatchRows)
+            while (s_batchRows.Count < BatchRows && used < BatchBytes)
             {
                 PgInterrupts.Check();
                 PgReplicationReceiveStatus status = s_conn!.Receive(TimeSpan.FromSeconds(1), out ReadOnlySpan<byte> message);
@@ -332,10 +331,7 @@ internal static unsafe partial class CopyConversion
 
                 if (status == PgReplicationReceiveStatus.Message)
                 {
-                    if (s_batchData.Length - used < message.Length)
-                    {
-                        Array.Resize(ref s_batchData, Math.Max(used + message.Length, s_batchData.Length * 2));
-                    }
+                    Reserve(ref s_batchData, used, message.Length);
 
                     message.CopyTo(s_batchData.AsSpan(used));
                     s_batchRows.Add((used, message.Length));
@@ -346,26 +342,51 @@ internal static unsafe partial class CopyConversion
             ConvertBatch();
             copied += CopyBatch(pstate, relation, attnamelist, 0, s_batchConverted.Count);
 
-            // The batch's rows that failed are recorded in order, whether they failed to convert or COPY failed them.
+            // The batch's rows that failed are recorded in order, whether they failed to convert or COPY failed them, a
+            // run at a time, as soon as a run is that large.
             s_batchFailed.Sort((x, y) => x.Line.CompareTo(y.Line));
             foreach ((_, WorfFailedChange change, PgException error) in s_batchFailed)
             {
                 s_toRecord.Add((change, error));
                 s_toRecordBytes += change.NewTuple?.Length ?? 0;
+                if (s_toRecord.Count >= RecordRows || s_toRecordBytes >= RecordBytes)
+                {
+                    FlushFailures();
+                }
             }
 
             s_batchFailed.Clear();
-            if (s_ended || s_toRecord.Count >= RecordRows || s_toRecordBytes >= RecordBytes)
+            if (s_ended)
             {
-                ExceptionLog.RecordCopied(s_toRecord);
-                s_toRecord.Clear();
-                s_toRecordBytes = 0;
+                FlushFailures();
             }
 
             s_batchLine += (ulong)s_batchRows.Count;
         }
 
         return copied;
+    }
+
+    /// <summary>
+    /// Records the failed rows kept so far.
+    /// </summary>
+    private static void FlushFailures()
+    {
+        ExceptionLog.RecordCopied(s_toRecord);
+        s_toRecord.Clear();
+        s_toRecordBytes = 0;
+    }
+
+    /// <summary>
+    /// Makes room in a buffer for more bytes after those used, doubling it, as far as an array goes.
+    /// </summary>
+    private static void Reserve(ref byte[] buffer, int used, int more)
+    {
+        long needed = (long)used + more;
+        if (needed > buffer.Length)
+        {
+            Array.Resize(ref buffer, (int)Math.Min(Math.Max(needed, (long)buffer.Length * 2), Array.MaxLength));
+        }
     }
 
     /// <summary>
@@ -399,10 +420,7 @@ internal static unsafe partial class CopyConversion
                             WriteRow(BatchRow(next));
                         }
 
-                        if (s_batchText.Length - used < s_convertedLength)
-                        {
-                            Array.Resize(ref s_batchText, Math.Max(used + s_convertedLength, s_batchText.Length * 2));
-                        }
+                        Reserve(ref s_batchText, used, s_convertedLength);
 
                         s_converted.AsSpan(0, s_convertedLength).CopyTo(s_batchText.AsSpan(used));
                         s_batchConverted.Add((used, s_convertedLength, next));
@@ -443,9 +461,15 @@ internal static unsafe partial class CopyConversion
             }
             catch (PgException error) when (!Apply.IsTransient(error))
             {
-                // COPY numbers the rows it reads from one, at the first converted row.
-                ulong first = (ulong)start + 1;
-                int failed = s_failedLine >= first && s_failedLine < first + (ulong)(end - start) ? start + (int)(s_failedLine - first) : -1;
+                // COPY numbers each row as the provider's, as ReadBatch tells it.
+                int failed = -1;
+                if (s_failedLine >= s_batchLine)
+                {
+                    int found = s_batchConverted.BinarySearch(start, end - start, (0, 0, (int)Math.Min(s_failedLine - s_batchLine, int.MaxValue)),
+                        Comparer<(int Start, int Length, int Row)>.Create((x, y) => x.Row.CompareTo(y.Row)));
+                    failed = found >= 0 ? found : -1;
+                }
+
                 if (failed < 0 && end - start > 1)
                 {
                     int half = (end - start) / 2;
@@ -455,7 +479,8 @@ internal static unsafe partial class CopyConversion
 
                 failed = Math.Max(failed, start);
                 int row = s_batchConverted[failed].Row;
-                s_line = s_batchLine + (ulong)row;
+                ulong line = s_batchLine + (ulong)row;
+                s_line = line;
                 WorfFailedChange change = Failed(BatchRow(row));
                 if (s_behaviour == WorfExceptionBehaviour.SubDisable)
                 {
@@ -468,7 +493,7 @@ internal static unsafe partial class CopyConversion
                     copied += CopyBatch(pstate, relation, attnamelist, start, failed - start);
                 }
 
-                s_batchFailed.Add((s_line, change, error));
+                s_batchFailed.Add((line, change, error));
                 start = failed + 1;
             }
         }
@@ -495,7 +520,6 @@ internal static unsafe partial class CopyConversion
                 {
                     CopyFromStateData* cstate = NativeMethods.BeginCopyFrom(pstate, relation, null, null, false, BatchSource, attnamelist, null);
                     s_cstate = cstate;
-                    cstate->cur_lineno = (ulong)start;
                     ulong rows = NativeMethods.CopyFrom(cstate);
                     NativeMethods.EndCopyFrom(cstate);
                     return rows;
@@ -518,17 +542,24 @@ internal static unsafe partial class CopyConversion
     private static ReadOnlySpan<byte> BatchRow(int index) => s_batchData.AsSpan(s_batchRows[index].Start, s_batchRows[index].Length);
 
     /// <summary>
-    /// COPY's data source for a copy of a batch: its converted rows, one after another.
+    /// COPY's data source for a copy of a batch: its converted rows, one at a time, so that COPY, which has counted the
+    /// row it reads as it asks for its data, numbers it as the provider's row, which its errors then name, rather than
+    /// by its place among the rows this copy passes it.
     /// </summary>
     private static int ReadBatch(void* outbuf, int minread, int maxread)
     {
         _ = minread;
         Span<byte> output = new(outbuf, maxread);
         int written = 0;
-        while (written < maxread && s_batchNext < s_batchEnd)
+        if (s_batchNext < s_batchEnd)
         {
             (int rowStart, int length, int row) = s_batchConverted[s_batchNext];
             s_line = s_batchLine + (ulong)row;
+            if (s_batchRead == 0 && s_cstate is not null)
+            {
+                s_cstate->cur_lineno = s_line;
+            }
+
             int len = Math.Min(length - s_batchRead, maxread - written);
             s_batchText.AsSpan(rowStart + s_batchRead, len).CopyTo(output[written..]);
             s_batchRead += len;
@@ -552,7 +583,7 @@ internal static unsafe partial class CopyConversion
         WriterNodeId = s_change.WriterNodeId,
         CommitTime = s_change.CommitTime,
         CommitLsn = s_change.CommitLsn,
-        ActionCounter = (uint)s_line,
+        ActionCounter = (long)Math.Min(s_line, long.MaxValue),
         Operation = Operation,
         Relation = s_change.Relation,
         NewTuple = RowJson(message),
@@ -616,7 +647,7 @@ internal static unsafe partial class CopyConversion
         });
         PgLog.Log(change.Operation == "MERGE"
             ? $"disabling subscription {change.Subscription.Name} after the merge of table {change.Relation!.Nspname}.{change.Relation.Relname}'s copy failed"
-            : $"disabling subscription {change.Subscription.Name} after a row of table {change.Relation!.Nspname}.{change.Relation.Relname} failed to convert in its copy");
+            : $"disabling subscription {change.Subscription.Name} after a row of table {change.Relation!.Nspname}.{change.Relation.Relname} failed in its copy");
     }
 
     /// <summary>
@@ -631,7 +662,6 @@ internal static unsafe partial class CopyConversion
         int written = 0;
         while (true)
         {
-            // Rows converted ahead, a run at a time, once those before them are read.
             // A row that didn't fit after others, or the rest of one longer than COPY reads at once.
             if (s_rowStart < s_rowEnd)
             {
@@ -905,40 +935,39 @@ internal static unsafe partial class CopyConversion
     /// </summary>
     private static string RowJson(ReadOnlySpan<byte> message)
     {
+        // The text goes into the JSON as it is, rather than escaped as \u, which jsonb takes only for ASCII outside a
+        // UTF-8 database, and bytes that aren't UTF-8, as a SQL_ASCII database holds, as their hex.
         ReadOnlySpan<byte> row = message.Length > 0 && message[^1] == (byte)'\n' ? message[..^1] : message;
-        using MemoryStream stream = new();
-        using (Utf8JsonWriter writer = new(stream))
+        StringBuilder json = new("{");
+        int field = 0;
+        int start = 0;
+        for (int i = 0; i <= row.Length && field < s_columns.Count; i++)
         {
-            writer.WriteStartObject();
-            int field = 0;
-            int start = 0;
-            for (int i = 0; i <= row.Length && field < s_columns.Count; i++)
+            if (i < row.Length && row[i] != (byte)'\t')
             {
-                if (i < row.Length && row[i] != (byte)'\t')
-                {
-                    continue;
-                }
-
-                ReadOnlySpan<byte> raw = row[start..i];
-                if (raw.SequenceEqual("\\N"u8))
-                {
-                    writer.WriteNull(s_columns[field]);
-                }
-                else
-                {
-                    // The text is read once it's unescaped, which may move it.
-                    int length = Unescape(raw);
-                    writer.WriteString(s_columns[field], Worf.FromServer(new ReadOnlySpan<byte>(s_text, length)));
-                }
-
-                field++;
-                start = i + 1;
+                continue;
             }
 
-            writer.WriteEndObject();
+            json.Append(field == 0 ? "" : ", ");
+            Executor.EscapeJson(json, s_columns[field]);
+            json.Append(": ");
+            ReadOnlySpan<byte> raw = row[start..i];
+            if (raw.SequenceEqual("\\N"u8))
+            {
+                json.Append("null");
+            }
+            else
+            {
+                // The text is read once it's unescaped, which may move it.
+                int length = Unescape(raw);
+                Executor.EscapeJson(json, Worf.LoggedText(new ReadOnlySpan<byte>(s_text, length)));
+            }
+
+            field++;
+            start = i + 1;
         }
 
-        return Encoding.UTF8.GetString(stream.ToArray());
+        return json.Append('}').ToString();
     }
 
     private const int AccessShareLock = 1;

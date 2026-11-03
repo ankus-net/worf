@@ -12,7 +12,7 @@ using Ankus.Postgres;
         remote_xid xid NOT NULL,
         remote_commit_ts timestamptz NOT NULL,
         remote_commit_lsn pg_lsn NOT NULL,
-        action_counter integer NOT NULL,
+        action_counter bigint NOT NULL,
         operation text,
         schema_name name,
         table_name name,
@@ -95,7 +95,7 @@ internal static class ExceptionLog
             SpiParameter.Create(change.RemoteXid.ToString(CultureInfo.InvariantCulture)),
             SpiParameter.Create(new PgTimestampTz(change.CommitTime)),
             Worf.LsnParameter(change.CommitLsn),
-            SpiParameter.Create((int)change.ActionCounter),
+            SpiParameter.Create(change.ActionCounter),
             SpiParameter.Create<string?>(change.Operation),
             SpiParameter.Create<string?>(schemaName),
             SpiParameter.Create<string?>(tableName),
@@ -131,7 +131,8 @@ internal static class ExceptionLog
 
     /// <summary>
     /// Records rows of a table's copy that failed, all in one statement, which takes one transaction ID for them all
-    /// rather than one each, as a copy that skips many rows records them.
+    /// rather than one each, as a copy that skips many rows records them. A statement that fails, as on a row the log
+    /// can't hold, rolls back alone, and the rows are recorded one at a time, as apply records its changes.
     /// </summary>
     /// <param name="failures">The rows, of one copy, in order, and their errors.</param>
     internal static void RecordCopied(IReadOnlyList<(WorfFailedChange Change, PgException Error)> failures)
@@ -141,11 +142,29 @@ internal static class ExceptionLog
             return;
         }
 
+        try
+        {
+            PgTransaction.RunInSubtransaction(() => Worf.InOwnContext(() => InsertCopied(failures)));
+        }
+        catch (PgException)
+        {
+            foreach ((WorfFailedChange change, PgException error) in failures)
+            {
+                Record(change, WorfExceptionBehaviour.Discard, error);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Inserts rows of a table's copy that failed into the log, in one statement.
+    /// </summary>
+    private static void InsertCopied(IReadOnlyList<(WorfFailedChange Change, PgException Error)> failures)
+    {
         WorfFailedChange change = failures[0].Change;
         _ = Worf.Execute("""
             INSERT INTO worf.exception_log (sub_id, sub_name, remote_node_id, remote_xid, remote_commit_ts, remote_commit_lsn,
                 action_counter, operation, schema_name, table_name, remote_new_tuple, behaviour, error_sqlstate, error_message)
-            SELECT $1, $2, $3, $4::text::xid, $5, $6, f.action_counter::integer, $7, $8, $9, f.new_tuple::jsonb, 'discard',
+            SELECT $1, $2, $3, $4::text::xid, $5, $6, f.action_counter, $7, $8, $9, f.new_tuple::jsonb, 'discard',
                 f.error_sqlstate, f.error_message
             FROM ROWS FROM (pg_catalog.unnest($10::bigint[]), pg_catalog.unnest($11::text[]), pg_catalog.unnest($12::text[]),
                 pg_catalog.unnest($13::text[])) WITH ORDINALITY AS f (action_counter, new_tuple, error_sqlstate, error_message, n)
@@ -160,7 +179,7 @@ internal static class ExceptionLog
             SpiParameter.Create<string?>(change.Operation),
             SpiParameter.Create<string?>(change.Relation?.Nspname),
             SpiParameter.Create<string?>(change.Relation?.Relname),
-            SpiParameter.Create(failures.Select(failure => (long)failure.Change.ActionCounter).ToArray()),
+            SpiParameter.Create(failures.Select(failure => failure.Change.ActionCounter).ToArray()),
             SpiParameter.Create(failures.Select(failure => failure.Change.NewTuple).ToArray()),
             SpiParameter.Create(failures.Select(failure => failure.Error.SqlState).ToArray()),
             SpiParameter.Create(failures.Select(failure => failure.Error.Message).ToArray()));
