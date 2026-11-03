@@ -54,6 +54,11 @@ internal static unsafe partial class LocalIndex
     private static List<(uint Index, string Name)> s_moved = [];
     private static List<(uint Index, uint Table, bool Unlive, uint Filenode)> s_hidden = [];
 
+    // The tables whose indexes a statement copies with LIKE ... INCLUDING INDEXES, which have indexes on this node alone,
+    // with whether it copies their comments, and the indexes on this node alone whose copies it left out.
+    private static readonly List<(uint Table, bool Comments)> s_copied = [];
+    private static readonly HashSet<uint> s_copiesLeftOut = [];
+
     // The tables whose indexes on this node alone a statement hides as not live, which nothing may write to meanwhile.
     private static readonly HashSet<uint> s_unliveTables = [];
 
@@ -62,9 +67,12 @@ internal static unsafe partial class LocalIndex
     private static readonly Dictionary<(uint Schema, string Name), string> s_asideNames = [];
     private static readonly Dictionary<uint, uint> s_movedSchemas = [];
 
-    // RVR_MISSING_OK from catalog/namespace.h, and CREATE_TABLE_LIKE_INDEXES from nodes/parsenodes.h.
+    // RVR_MISSING_OK from catalog/namespace.h, and CREATE_TABLE_LIKE_INDEXES and CREATE_TABLE_LIKE_COMMENTS from
+    // nodes/parsenodes.h.
     private const uint RangeVarMissingOk = 1;
     private const uint CreateTableLikeIndexes = 1 << 6;
+    private const uint CreateTableLikeComments = 1 << 0;
+    private const uint RelationRelationId = 1259;
 
     // SECURITY_LOCAL_USERID_CHANGE from miscadmin.h.
     private const int SecurityLocalUseridChange = 0x0001;
@@ -968,12 +976,14 @@ internal static unsafe partial class LocalIndex
             UsedTables(parsetree, unlive, invalid);
         }
 
-        if (s_isolating || !(rename || hidingRebuilt || unlive.Count > 0 || invalid.Count > 0) || Worf.CatalogOid("local_index") == 0 ||
-            !Elevated.Run(() => Worf.ReadScalar<bool>("SELECT EXISTS (SELECT FROM worf.local_index)")))
+        List<(uint Table, bool Comments)> copied = replicated || Applying ? CopiedTables(parsetree) : [];
+        if (s_isolating || !(rename || hidingRebuilt || unlive.Count > 0 || invalid.Count > 0 || copied.Count > 0) ||
+            Worf.CatalogOid("local_index") == 0 || !Elevated.Run(() => Worf.ReadScalar<bool>("SELECT EXISTS (SELECT FROM worf.local_index)")))
         {
             return false;
         }
 
+        s_copied.AddRange(copied);
         LockTables(parsetree);
         s_moved = MoveAside(rename ? NamesTaken(parsetree, true) : [], [.. unlive, .. invalid]);
         s_hidden = [];
@@ -996,6 +1006,8 @@ internal static unsafe partial class LocalIndex
             s_isolating = false;
             s_hidingRebuilt = false;
             s_unliveTables.Clear();
+            s_copied.Clear();
+            s_copiesLeftOut.Clear();
         }
     }
 
@@ -1279,10 +1291,115 @@ internal static unsafe partial class LocalIndex
     }
 
     /// <summary>
-    /// Finds the tables whose existing indexes a statement may copy, attach to a partitioned index, or have a foreign
-    /// key use: the tables that <c>CREATE TABLE ... LIKE</c> copies the indexes of, the partitions of a partitioned
-    /// table indexed, which the index may take its partitions from, and those of a partition attached, and the tables
-    /// that a partition attached is, or that foreign keys reference, which take only valid indexes.
+    /// Finds the tables that a <c>CREATE TABLE</c> copies the indexes of with <c>LIKE ... INCLUDING INDEXES</c>, with
+    /// whether it copies their comments.
+    /// </summary>
+    private static List<(uint Table, bool Comments)> CopiedTables(Node* parsetree)
+    {
+        List<(uint Table, bool Comments)> copied = [];
+        if (parsetree->type != NodeTag.T_CreateStmt)
+        {
+            return copied;
+        }
+
+        List* elements = ((CreateStmt*)parsetree)->tableElts;
+        for (int i = 0; elements is not null && i < elements->length; i++)
+        {
+            Node* element = (Node*)elements->elements[i].ptr_value;
+            if (element->type == NodeTag.T_TableLikeClause && (((TableLikeClause*)element)->options & CreateTableLikeIndexes) != 0)
+            {
+                uint table = NativeMethods.RangeVarGetRelidExtended(((TableLikeClause*)element)->relation, 0, RangeVarMissingOk, default, null);
+                if (table != 0)
+                {
+                    copied.Add((table, (((TableLikeClause*)element)->options & CreateTableLikeComments) != 0));
+                }
+            }
+        }
+
+        return copied;
+    }
+
+    /// <summary>
+    /// Checks whether an index that <c>CREATE TABLE ... LIKE ... INCLUDING INDEXES</c> is about to build copies one of
+    /// the copied table's indexes on this node alone, which the other nodes don't copy, and which it then leaves out,
+    /// so that it builds the indexes and chooses the names that they do, without hiding the indexes on this node alone,
+    /// which would hold them until the transaction ends. PostgreSQL builds each copy as a statement of its own, made by
+    /// <c>generateClonedIndexStmt</c>, which this compares with the copy it makes of each of those indexes: one of
+    /// them is never a constraint, as a statement for the new table's own constraints is, and a copy of another index
+    /// that's the same builds the same index, under the same name, as the one left out would have.
+    /// </summary>
+    /// <param name="stmt">The index's statement, which runs as a part of the <c>CREATE TABLE</c>.</param>
+    /// <returns>Whether the index is left out.</returns>
+    internal static bool SkipsCopy(IndexStmt* stmt)
+    {
+        if (s_copied.Count == 0 || stmt->relation is null)
+        {
+            return false;
+        }
+
+        uint created = NativeMethods.RangeVarGetRelidExtended(stmt->relation, 0, RangeVarMissingOk, default, null);
+        if (created == 0)
+        {
+            return false;
+        }
+
+        foreach ((uint table, bool comments) in s_copied)
+        {
+            WorfRows locals = Elevated.Run(() => Worf.Read("""
+                SELECT l.indexrelid FROM worf.local_index l JOIN pg_catalog.pg_index i ON i.indexrelid = l.indexrelid
+                WHERE i.indrelid = $1 ORDER BY 1
+                """, 0, SpiParameter.Create(table)));
+            foreach (uint index in locals.Select(row => row.Get<uint>(0)).Where(index => !s_copiesLeftOut.Contains(index)))
+            {
+                if (CopiesIndex(stmt, created, table, index, comments))
+                {
+                    _ = s_copiesLeftOut.Add(index);
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Checks whether an index's statement is the copy that <c>expandTableLikeClause</c> makes of an index.
+    /// </summary>
+    private static bool CopiesIndex(IndexStmt* stmt, uint created, uint table, uint index, bool comments)
+    {
+        RelationData* createdRel = NativeMethods.relation_open(created, (int)PgLockMode.None);
+        RelationData* tableRel = NativeMethods.relation_open(table, (int)PgLockMode.None);
+        RelationData* indexRel = NativeMethods.index_open(index, (int)PgLockMode.AccessShare);
+        try
+        {
+#if ANKUS_PG15
+            AttrMap* attmap = NativeMethods.build_attrmap_by_name(createdRel->rd_att, tableRel->rd_att);
+#else
+            AttrMap* attmap = NativeMethods.build_attrmap_by_name(createdRel->rd_att, tableRel->rd_att, false);
+#endif
+            IndexStmt* copy = NativeMethods.generateClonedIndexStmt(stmt->relation, indexRel, attmap, null);
+            if (comments)
+            {
+                copy->idxcomment = NativeMethods.GetComment(index, RelationRelationId, 0);
+            }
+
+            NativeMethods.free_attrmap(attmap);
+            return NativeMethods.equal(copy, stmt);
+        }
+        finally
+        {
+            NativeMethods.index_close(indexRel, (int)PgLockMode.None);
+            NativeMethods.relation_close(tableRel, (int)PgLockMode.None);
+            NativeMethods.relation_close(createdRel, (int)PgLockMode.None);
+        }
+    }
+
+    /// <summary>
+    /// Finds the tables whose existing indexes a statement may attach to a partitioned index, or have a foreign key use:
+    /// the partitions of a partitioned table indexed, which the index may take its partitions from, and those of a
+    /// partition attached, and the tables that a partition attached is, or that foreign keys reference, which take only
+    /// valid indexes. A copy of a table's indexes leaves out its indexes on this node alone as <see cref="SkipsCopy"/>
+    /// has it.
     /// </summary>
     /// <param name="parsetree">The statement.</param>
     /// <param name="unlive">The tables whose indexes are to be hidden as not live.</param>
@@ -1296,11 +1413,7 @@ internal static unsafe partial class LocalIndex
                 for (int i = 0; elements is not null && i < elements->length; i++)
                 {
                     Node* element = (Node*)elements->elements[i].ptr_value;
-                    if (element->type == NodeTag.T_TableLikeClause && (((TableLikeClause*)element)->options & CreateTableLikeIndexes) != 0)
-                    {
-                        AddTable(unlive, ((TableLikeClause*)element)->relation);
-                    }
-                    else
+                    if (element->type != NodeTag.T_TableLikeClause)
                     {
                         AddReferenced(invalid, element);
                     }

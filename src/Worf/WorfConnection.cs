@@ -2,6 +2,11 @@
 using System.Runtime.InteropServices;
 #endif
 using Ankus.Postgres;
+#if WORF_WINDOWS
+using PgSocket = ulong;
+#else
+using PgSocket = int;
+#endif
 
 namespace Worf;
 
@@ -227,7 +232,7 @@ internal sealed unsafe partial class WorfConnection : IDisposable
         message = default;
         while (true)
         {
-            int socket = -1;
+            PgSocket socket = InvalidSocket;
             sbyte* data = null;
             PgInterrupts.Check();
             int length = Functions->walrcv_receive.Invoke(conn, &data, &socket);
@@ -254,10 +259,10 @@ internal sealed unsafe partial class WorfConnection : IDisposable
                 return PgReplicationReceiveStatus.TimedOut;
             }
 
-            long remaining = -1;
+            int remaining = -1;
             if (milliseconds > 0)
             {
-                remaining = NativeMethods.TimestampDifferenceMilliseconds(NativeMethods.GetCurrentTimestamp(), deadline);
+                remaining = (int)Math.Min(NativeMethods.TimestampDifferenceMilliseconds(NativeMethods.GetCurrentTimestamp(), deadline), int.MaxValue);
                 if (remaining <= 0)
                 {
                     return PgReplicationReceiveStatus.TimedOut;
@@ -434,7 +439,7 @@ internal sealed unsafe partial class WorfConnection : IDisposable
             }
 
             PgInterrupts.Check();
-            int socket = -1;
+            PgSocket socket = InvalidSocket;
             sbyte* data = null;
             int length = Functions->walrcv_receive.Invoke(s_copySource!.Conn, &data, &socket);
             if (length > 0)
@@ -589,7 +594,7 @@ internal sealed unsafe partial class WorfConnection : IDisposable
                         ioFlag = WlSocketConnected;
                     }
 
-                    int events = NativeMethods.WaitLatchOrSocket(NativeGlobals.MyLatch, WlExitOnPmDeath | WlLatchSet | ioFlag, socket(pgconn), 0,
+                    int events = NativeMethods.WaitLatchOrSocket(NativeGlobals.MyLatch, WlExitOnPmDeath | WlLatchSet | ioFlag, ToSocket(socket(pgconn)), 0,
                         PgWaitExtension);
                     if ((events & WlLatchSet) != 0)
                     {
@@ -625,6 +630,15 @@ internal sealed unsafe partial class WorfConnection : IDisposable
     }
 
     /// <summary>
+    /// Makes a socket of the descriptor libpq's <c>PQsocket</c> returns, as C converts it.
+    /// </summary>
+#if WORF_WINDOWS
+    private static PgSocket ToSocket(int descriptor) => unchecked((PgSocket)descriptor);
+#else
+    private static PgSocket ToSocket(int descriptor) => descriptor;
+#endif
+
+    /// <summary>
     /// Finds a function of the libpq that libpqwalreceiver uses: PostgreSQL's dynamic loader searches
     /// libpqwalreceiver and the libraries it depends on; on Windows a module's exports exclude its dependencies, so
     /// libpq is found by name.
@@ -658,6 +672,13 @@ internal sealed unsafe partial class WorfConnection : IDisposable
 #endif
 
     private const uint TextOid = 25;
+
+    // PGINVALID_SOCKET: INVALID_SOCKET on Windows, -1 elsewhere.
+#if WORF_WINDOWS
+    private const PgSocket InvalidSocket = ulong.MaxValue;
+#else
+    private const PgSocket InvalidSocket = -1;
+#endif
     private const int RowExclusiveLock = 3;
     private const int AccessShareLock = 1;
     private const int NoLock = 0;

@@ -311,10 +311,10 @@ internal static class Manager
 
         bool found = PgBackgroundWorker.RunTransaction(() =>
         {
-            // Get local node. If not found, return false and let the main loop wait and retry. This handles the race
-            // condition where the extension is created but create_node() hasn't been called yet.
-            WorfLocalNode? node = WorfNode.GetLocalNode(true, true);
-            if (node is null)
+            // Get local node. If not found, or another transaction holds its lock, return false and let the main loop
+            // wait and retry. This handles the race condition where the extension is created but create_node() hasn't
+            // been called yet.
+            if (!WorfNode.TryGetLocalNodeForUpdate(out WorfLocalNode? node) || node is null)
             {
                 return false;
             }

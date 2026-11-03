@@ -253,6 +253,14 @@ internal static unsafe partial class Executor
     {
         Node* parsetree = pstmt->utilityStmt;
 
+        // A copy of a table's index on this node alone, which CREATE TABLE ... LIKE builds as a statement of its own, is
+        // left out, as the other nodes have no such index to copy.
+        if (context == ProcessUtilityContext.PROCESS_UTILITY_SUBCOMMAND && parsetree->type == NodeTag.T_IndexStmt &&
+            LocalIndex.SkipsCopy((IndexStmt*)parsetree))
+        {
+            return;
+        }
+
         s_droppingWorfObj = false;
 
         // Whether DDL on an index replicates depends on the indexes the statements before built.

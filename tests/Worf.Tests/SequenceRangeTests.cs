@@ -1012,7 +1012,9 @@ public sealed class SequenceRangeTests
         _ = await node.SafePsqlAsync(Database, "BEGIN; SELECT last_value FROM sp_id_seq; PREPARE TRANSACTION 'reader'", token);
         Assert.IsTrue(await node.PollQueryUntilAsync(Database, string.Format(CultureInfo.InvariantCulture, Ready, "sp_id_seq"), token), "sp's next block");
         string before = await node.SafePsqlAsync(Database, "SELECT active_lo FROM worf.sequence_ranges WHERE sequence = 'sp_id_seq'::regclass", token);
-        _ = await node.SafePsqlAsync(Database, $"SELECT setval('sp_id_seq', active_hi - 2) FROM worf.sequence_ranges WHERE sequence = 'sp_id_seq'::regclass", token);
+        // The sequence's bounds are read as setval reads them, rather than from the range row as the statement's snapshot
+        // sees it, as the range worker may switch meanwhile.
+        _ = await node.SafePsqlAsync(Database, "SELECT setval('sp_id_seq', (pg_sequence_parameters('sp_id_seq'::regclass)).maximum_value - 2)", token);
         Assert.IsTrue(await node.PollQueryUntilAsync(Database,
             $"SELECT active_lo <> {before} FROM worf.sequence_ranges WHERE sequence = 'sp_id_seq'::regclass", token), "a switch past the reader");
         _ = await node.SafePsqlAsync(Database, "COMMIT PREPARED 'reader'", token);
@@ -1101,12 +1103,13 @@ public sealed class SequenceRangeTests
 
         _ = await node.SafePsqlAsync(Database, "INSERT INTO t (v) VALUES ('after')", token);
 
-        // A session reserves a block while its own transaction holds the sequence, and loads it.
+        // A session reserves a block while its own transaction holds the sequence, and loads half of it, which keeps the
+        // rest of the block for the step after, whose sequence a switch at the block's end would take away.
         _ = await node.SafePsqlAsync(Database, """
             BEGIN;
             INSERT INTO t (v) VALUES ('first');
             SELECT worf.reserve_sequence_range('t_id_seq', 1000);
-            INSERT INTO t (v) SELECT 'reserved' FROM generate_series(1, 1000);
+            INSERT INTO t (v) SELECT 'reserved' FROM generate_series(1, 500);
             COMMIT;
             """, token);
 

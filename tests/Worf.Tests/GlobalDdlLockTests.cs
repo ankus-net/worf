@@ -303,8 +303,25 @@ public sealed class GlobalDdlLockTests
                 Assert.AreEqual("23505", duplicate.SqlState);
             }
 
+            // The write is tried again over one connection, so that the time is worf's rather than a new connection's.
             Stopwatch released = Stopwatch.StartNew();
-            Assert.IsTrue(await PollSucceedsAsync(nodeB, "UPDATE dupe SET v = v WHERE id = 0", token), "the failed build's fence went");
+            await using (NpgsqlConnection writing = await nodeB.OpenAsync(Database, token))
+            await using (NpgsqlCommand write = new("UPDATE dupe SET v = v WHERE id = 0", writing))
+            {
+                while (true)
+                {
+                    try
+                    {
+                        _ = await write.ExecuteNonQueryAsync(token);
+                        break;
+                    }
+                    catch (PostgresException) when (released.Elapsed < TestNode.PollTimeout)
+                    {
+                        await Task.Delay(TimeSpan.FromMilliseconds(20), token);
+                    }
+                }
+            }
+
             Assert.IsLessThan(1000L, released.ElapsedMilliseconds, "how long the failed build's fence held node_b's writes back, in ms");
             await using (NpgsqlConnection locking = await nodeA.OpenAsync(Database, token))
             {
@@ -580,8 +597,8 @@ public sealed class GlobalDdlLockTests
         // node_b's DDL that would build one again and cluster on it fails, its DDL chooses the names node_a's would,
         // renaming its own where it takes their names, or tells node_a the name it chose for a concurrent build, and
         // neither copies nor keeps its own, which it drops concurrently. DDL whose event trigger writes to a table it
-        // copies the indexes of fails, rather than leave the copied table's own indexes without the row. Concurrent
-        // reindexes of worf's catalogs leave no mark on them, nor one for an index that no longer exists.
+        // copies the indexes of goes ahead, as it leaves the table's own indexes as they are. Concurrent reindexes of
+        // worf's catalogs leave no mark on them, nor one for an index that no longer exists.
         PostgresException clustered = await Assert.ThrowsExactlyAsync<PostgresException>(
             () => nodeB.SafePsqlAsync(Database, "ALTER TABLE lt ALTER COLUMN v TYPE integer, CLUSTER ON lt_v", token));
         Assert.AreEqual("55000", clustered.SqlState);
@@ -595,12 +612,14 @@ public sealed class GlobalDdlLockTests
             CREATE FUNCTION audit() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO lt VALUES (100, 100, 100); END $$;
             CREATE EVENT TRIGGER audit ON ddl_command_end WHEN TAG IN ('CREATE TABLE') EXECUTE FUNCTION audit();
             """, token);
-        PostgresException audited = await Assert.ThrowsExactlyAsync<PostgresException>(
-            () => nodeB.SafePsqlAsync(Database, "CREATE TABLE lk_b (LIKE lt INCLUDING INDEXES)", token));
-        Assert.AreEqual("55000", audited.SqlState);
+        _ = await nodeB.SafePsqlAsync(Database, "CREATE TABLE lk_b (LIKE lt INCLUDING INDEXES)", token);
+        Assert.AreEqual("1|t", await nodeB.SafePsqlAsync(Database, """
+            SELECT (SELECT count(*) FROM lt WHERE id = 100),
+                (SELECT bool_and(i.indislive) FROM worf.local_index l JOIN pg_index i ON i.indexrelid = l.indexrelid WHERE i.indrelid = 'lt'::regclass)
+            """, token), "the event trigger's row, beside node_b's own indexes, live");
         foreach (string sql in new[]
         {
-            "SET worf.enable_ddl_replication = off; DROP EVENT TRIGGER audit; DROP FUNCTION audit()", "CREATE TABLE lk_b (LIKE lt INCLUDING INDEXES)",
+            "SET worf.enable_ddl_replication = off; DROP EVENT TRIGGER audit; DROP FUNCTION audit()",
             "DROP INDEX CONCURRENTLY lt_w_idx", "REINDEX SCHEMA CONCURRENTLY worf",
         })
         {
@@ -774,6 +793,93 @@ public sealed class GlobalDdlLockTests
     /// <summary>
     /// Builds an index on a node alone, as a concurrent build whose DDL couldn't be queued leaves it.
     /// </summary>
+    /// <summary>
+    /// DDL that copies, or chooses names beside, the indexes on one node alone waits on nothing that the same DDL
+    /// without them doesn't: a node's transaction and another node's, applied there, that copy tables with such indexes
+    /// in opposite orders, or name indexes on them, both commit, as do a transaction that wrote to a table before it
+    /// copies it and another node's DDL that alters it, and the copies and names come out as on the other node.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task IndexesOnOneNodeHoldUpNoDdl()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        await SubscribeAsync(nodeA, "a_from_b", nodeB, token);
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE TABLE t1 (id integer PRIMARY KEY, v integer);
+            CREATE TABLE t2 (id integer PRIMARY KEY, v integer);
+            CREATE TABLE lt (id integer PRIMARY KEY, v integer);
+            """, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
+        foreach (string index in new[] { "INDEX CONCURRENTLY t1_v_idx ON t1 (v)", "INDEX CONCURRENTLY t2_v_idx ON t2 (v)", "INDEX CONCURRENTLY lt_v_idx ON lt (v)" })
+        {
+            await BuildLocalIndexAsync(nodeB, index, token);
+        }
+
+        // node_b copies t1 and then t2 while node_a's transaction, applied on node_b, copies t2 and then t1.
+        await using (NpgsqlConnection copying = await nodeB.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction transaction = await copying.BeginTransactionAsync(token);
+            await using (NpgsqlCommand first = new("CREATE TABLE b1 (LIKE t1 INCLUDING INDEXES)", copying, transaction))
+            {
+                _ = await first.ExecuteNonQueryAsync(token);
+            }
+
+            _ = await nodeA.SafePsqlAsync(Database, """
+                BEGIN;
+                CREATE TABLE a1 (LIKE t2 INCLUDING INDEXES);
+                CREATE TABLE a2 (LIKE t1 INCLUDING INDEXES);
+                COMMIT;
+                """, token);
+            await Task.Delay(TimeSpan.FromSeconds(1), token);
+            await using (NpgsqlCommand second = new("CREATE TABLE b2 (LIKE t2 INCLUDING INDEXES)", copying, transaction))
+            {
+                _ = await second.ExecuteNonQueryAsync(token);
+            }
+
+            await transaction.CommitAsync(token);
+        }
+
+        // A transaction that wrote to lt copies it while node_a's DDL alters it.
+        await using (NpgsqlConnection writing = await nodeB.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction transaction = await writing.BeginTransactionAsync(token);
+            await using (NpgsqlCommand insert = new("INSERT INTO lt VALUES (1000, 1)", writing, transaction))
+            {
+                _ = await insert.ExecuteNonQueryAsync(token);
+            }
+
+            Task<string> altering = nodeA.SafePsqlAsync(Database, "ALTER TABLE lt ADD COLUMN w integer", token);
+            await Task.Delay(TimeSpan.FromSeconds(1), token);
+            await using (NpgsqlCommand copy = new("CREATE TABLE b3 (LIKE lt INCLUDING INDEXES)", writing, transaction))
+            {
+                _ = await copy.ExecuteNonQueryAsync(token);
+            }
+
+            await transaction.CommitAsync(token);
+            _ = await altering;
+        }
+
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
+        }
+
+        const string Copies = """
+            SELECT string_agg(c.relname || ':' || i.relname, ',' ORDER BY c.relname, i.relname)
+            FROM pg_index x JOIN pg_class c ON c.oid = x.indrelid JOIN pg_class i ON i.oid = x.indexrelid
+            WHERE c.relname IN ('a1', 'a2', 'b1', 'b2', 'b3')
+            """;
+        string onA = await nodeA.SafePsqlAsync(Database, Copies, token);
+        Assert.AreEqual("a1:a1_pkey,a2:a2_pkey,b1:b1_pkey,b2:b2_pkey,b3:b3_pkey", onA, "the copies on node_a");
+        Assert.AreEqual(onA, await nodeB.SafePsqlAsync(Database, Copies, token), "the copies on node_b");
+        Assert.DoesNotContain("deadlock detected", nodeB.ReadLog());
+        Assert.DoesNotContain("deadlock detected", nodeA.ReadLog());
+    }
+
     private static async Task BuildLocalIndexAsync(TestNode node, string index, CancellationToken token)
     {
         await using NpgsqlConnection locking = await node.OpenAsync(Database, token);

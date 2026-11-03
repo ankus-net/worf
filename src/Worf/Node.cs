@@ -206,7 +206,36 @@ internal sealed partial class WorfNode
     internal static unsafe WorfLocalNode? GetLocalNode(bool forUpdate, bool missingOk)
     {
         uint relid = Worf.CatalogOid(CatalogLocalNode);
-        RelationData* rel = relid == 0 ? null : NativeMethods.table_open(relid, forUpdate ? ShareUpdateExclusiveLock : RowExclusiveLock);
+        return ReadLocalNode(relid == 0 ? null : NativeMethods.table_open(relid, forUpdate ? ShareUpdateExclusiveLock : RowExclusiveLock), forUpdate,
+            missingOk);
+    }
+
+    /// <summary>
+    /// Returns the local node locked against concurrent configuration changes, as <see cref="GetLocalNode"/> does, unless
+    /// another transaction holds the lock, as one that changes the configuration, or REINDEX CONCURRENTLY of worf's
+    /// tables, which waits for transactions with older snapshots, does: a worker that waited for it meanwhile would hold
+    /// such a snapshot, so it looks again later instead.
+    /// </summary>
+    /// <param name="node">The local node, or null when this database is not a worf node.</param>
+    /// <returns>Whether the lock was free.</returns>
+    internal static unsafe bool TryGetLocalNodeForUpdate(out WorfLocalNode? node)
+    {
+        uint relid = Worf.CatalogOid(CatalogLocalNode);
+        if (relid != 0 && !NativeMethods.ConditionalLockRelationOid(relid, ShareUpdateExclusiveLock))
+        {
+            node = null;
+            return false;
+        }
+
+        node = ReadLocalNode(relid == 0 ? null : NativeMethods.table_open(relid, NoLock), true, true);
+        return true;
+    }
+
+    /// <summary>
+    /// Reads the local node from its open catalog, which it closes, keeping the lock taken for an update.
+    /// </summary>
+    private static unsafe WorfLocalNode? ReadLocalNode(RelationData* rel, bool forUpdate, bool missingOk)
+    {
 
         if (rel is null)
         {
