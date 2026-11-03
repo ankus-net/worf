@@ -1149,7 +1149,19 @@ public sealed class SequenceRangeTests
             await transaction.CommitAsync(token);
         }
 
-        Assert.IsTrue(await node.PollLogAsync(logpos, "last value moved back", token), "the backwards move noticed");
+        if (!await node.PollLogAsync(logpos, "last value moved back", token))
+        {
+            Assert.Fail("the backwards move noticed: " + await node.SafePsqlAsync(Database, """
+                SELECT concat_ws(' | ',
+                    (SELECT string_agg(concat_ws(' ', backend_type, state, wait_event_type, wait_event, left(query, 60)), '; ')
+                        FROM pg_stat_activity WHERE backend_type LIKE 'worf%' OR (backend_type = 'client backend' AND pid <> pg_backend_pid())),
+                    (SELECT string_agg(concat_ws(' ', l.pid, l.mode, l.granted), '; ') FROM pg_locks l WHERE l.relation = 't_id_seq'::regclass),
+                    (SELECT concat_ws(' ', last_value, is_called) FROM t_id_seq),
+                    (SELECT concat_ws(' ', state, active_lo, active_hi, next_lo, detail) FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass),
+                    (SELECT string_agg(id::text, ' ' ORDER BY id DESC) FROM (SELECT id FROM t ORDER BY id DESC LIMIT 5) r))
+                """, token));
+        }
+
         Assert.IsTrue(await node.PollQueryUntilAsync(Database,
             $"SELECT state = 'active' AND active_lo <> {before} FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token),
             "a switch away from the block");

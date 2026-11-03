@@ -4145,7 +4145,7 @@ internal static unsafe partial class SequenceRanges
             // of the new bounds, as the commit lets the gate go after it tells backends of them.
             if (switched && s_pendingMove is (uint moving, long start))
             {
-                SequenceRangeGuard.ShutGate(moving, !briefly);
+                SequenceRangeGuard.ShutGate(moving, briefly ? 100 : 1000);
                 Move(moving, start);
             }
 

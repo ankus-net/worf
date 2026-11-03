@@ -759,27 +759,21 @@ internal static partial class SequenceRangeGuard
 
     /// <summary>
     /// Shuts a sequence's switch gate for a switch beside the transactions that hold it, until its transaction ends:
-    /// it waits for the statements that hold the gate to reach their next rows, up to a second, while those that start
-    /// wait for it. Statements that hold the gate let it go at their next row while any switch waits for one.
+    /// it waits for the statements that hold the gate to reach their next rows, while those that start wait for it,
+    /// and fails with 55P03 once the time is up. Statements that hold the gate let it go at their next row while any
+    /// switch waits for one.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
-    /// <param name="wait">Whether to wait for the statements, rather than fail at once while one holds the gate.</param>
-    internal static unsafe void ShutGate(uint seqoid, bool wait)
+    /// <param name="timeout">How long to wait, in milliseconds: a tenth of a second in the range worker, which checks
+    /// the other sequences meanwhile, and a second in a switch worker.</param>
+    internal static unsafe void ShutGate(uint seqoid, int timeout)
     {
         _ = PgAtomic.Add(SequenceRanges.SwitchesPending, 1L);
         _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () => _ = PgAtomic.Add(SequenceRanges.SwitchesPending, -1L));
         _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, static () => _ = PgAtomic.Add(SequenceRanges.SwitchesPending, -1L));
-        if (wait)
-        {
-            _ = Worf.Execute("SET LOCAL lock_timeout = 1000");
-        }
-
+        _ = Worf.Execute($"SET LOCAL lock_timeout = {timeout.ToString(CultureInfo.InvariantCulture)}");
         LOCKTAG tag = GateTag(seqoid);
-        if (NativeMethods.LockAcquire(&tag, ExclusiveLock, false, !wait) == LockAcquireResult.LOCKACQUIRE_NOT_AVAIL)
-        {
-            throw new PgException(PgSqlStates.LockNotAvailable,
-                $"could not switch sequence {SequenceRanges.GetInfo(seqoid).Name} while statements draw from it");
-        }
+        _ = NativeMethods.LockAcquire(&tag, ExclusiveLock, false, false);
     }
 
     /// <summary>
