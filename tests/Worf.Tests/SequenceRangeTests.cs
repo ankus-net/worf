@@ -1115,12 +1115,13 @@ public sealed class SequenceRangeTests
             "SELECT NOT EXISTS (SELECT 1 FROM worf.sequence_range_block WHERE seqoid = 't_id_seq'::regclass AND state = 'next' AND reserved)", token),
             "the reserved block switched to");
 
-        // A setval that moves the sequence back in its block makes the worker leave the block.
+        // A setval that moves the sequence back in its block makes the worker leave the block, which it reads as it sets
+        // the value, since a switch may have come between.
         int logpos = node.ReadLog().Length;
-        string before = await node.SafePsqlAsync(Database, "SELECT active_lo FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token);
         _ = await node.SafePsqlAsync(Database, "INSERT INTO t (v) VALUES ('x'), ('y'), ('z')", token);
         await Task.Delay(TimeSpan.FromMilliseconds(500), token);
-        _ = await node.SafePsqlAsync(Database, $"SELECT setval('t_id_seq', {before})", token);
+        string before = await node.SafePsqlAsync(Database,
+            "SELECT setval('t_id_seq', active_lo) FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token);
         Assert.IsTrue(await node.PollLogAsync(logpos, "last value moved back", token), "the backwards move noticed");
         Assert.IsTrue(await node.PollQueryUntilAsync(Database,
             $"SELECT state = 'active' AND active_lo <> {before} FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token),

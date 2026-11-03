@@ -3754,7 +3754,7 @@ internal static unsafe partial class SequenceRanges
                     throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState, "the block was taken");
                 }
 
-                if (block.Lo != block.Hi && !SetBounds(seqoid, info, block))
+                if (block.Lo != block.Hi && !SetBounds(seqoid, info, block, beside))
                 {
                     walked = true;
                     next = false;
@@ -3818,8 +3818,14 @@ internal static unsafe partial class SequenceRanges
     /// position that is in neither the old bounds nor the block, but past the block, went through it that way, so the
     /// block isn't switched to.
     /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    /// <param name="info">The sequence's details.</param>
+    /// <param name="block">The block.</param>
+    /// <param name="atCommit">Whether the position moves only as the transaction commits, as for a switch beside the
+    /// transactions that hold the sequence, whose nextval would otherwise reach the block before its bounds do, for as
+    /// long as the switch's transaction goes on.</param>
     /// <returns>Whether the block became the sequence's bounds.</returns>
-    private static bool SetBounds(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) block)
+    private static bool SetBounds(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) block, bool atCommit)
     {
         SpiParameter seq = SpiParameter.Create(seqoid);
         long start = info.Ascending ? block.Lo : block.Hi;
@@ -3836,7 +3842,12 @@ internal static unsafe partial class SequenceRanges
             UPDATE pg_catalog.pg_sequence SET seqmin = $2, seqmax = $3, seqstart = $4, seqcache = 1, seqcycle = false WHERE seqrelid = $1
             """, seq, SpiParameter.Create(block.Lo), SpiParameter.Create(block.Hi), SpiParameter.Create(start)));
         NativeMethods.CommandCounterIncrement();
-        if (!inBlock)
+        if (!inBlock && atCommit)
+        {
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.PreCommit, () =>
+                _ = Elevated.Run(() => Worf.Execute("SELECT pg_catalog.setval($1::pg_catalog.regclass, $2, false)", seq, SpiParameter.Create(start))));
+        }
+        else if (!inBlock)
         {
             _ = Elevated.Run(() => Worf.Execute("SELECT pg_catalog.setval($1::pg_catalog.regclass, $2, false)", seq, SpiParameter.Create(start)));
         }
@@ -3935,14 +3946,33 @@ internal static unsafe partial class SequenceRanges
     });
 
     /// <summary>
-    /// Starts a switch worker for each sequence that the range worker's checks left to one. With every worker slot taken,
-    /// a sequence waits for a later check, which waits for its lock a tenth of a second at most, so that the range
-    /// worker holds up no other sequence for longer.
+    /// Switches each sequence that the range worker's checks left to a switch beside its holders, in a transaction of its
+    /// own, which takes a moment, and starts a switch worker for one that another switch or DDL holds up for longer than
+    /// a tenth of a second. With every worker slot taken, a sequence waits for a later check, which waits for its lock a
+    /// tenth of a second at most, so that the range worker holds up no other sequence for longer.
     /// </summary>
     internal static void HandOff()
     {
         foreach ((uint seqoid, string name) in s_handOffs)
         {
+            bool done;
+            try
+            {
+                done = PgBackgroundWorker.RunTransaction(() => SwitchAtEnd(seqoid, true));
+            }
+            catch (PgException error) when (error.SqlState is "55P03" or "40P01")
+            {
+                done = false;
+            }
+
+            // The range worker checks the sequence again at once, for the block after the one switched to.
+            if (done)
+            {
+                _ = s_unstarted.Remove(seqoid);
+                _ = PgAtomic.Add(CheckRequested, 1L);
+                continue;
+            }
+
             _ = SequenceRangeSwitchWorker.Start(seqoid, name) ? s_unstarted.Remove(seqoid) : s_unstarted.Add(seqoid);
         }
 
@@ -3956,8 +3986,10 @@ internal static unsafe partial class SequenceRanges
     /// is reserved for a load, since a transaction that ran the block out may have switched it meanwhile.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
-    /// <returns>Whether the worker is done, or false to try again.</returns>
-    internal static bool SwitchAtEnd(uint seqoid)
+    /// <param name="briefly">Whether the range worker switches, which waits a tenth of a second at most for the locks,
+    /// rather than the switch worker.</param>
+    /// <returns>Whether the switch is done, or false to try again.</returns>
+    internal static bool SwitchAtEnd(uint seqoid, bool briefly = false)
     {
         if (!SequenceExists(seqoid) || !IsManaged(seqoid))
         {
@@ -3967,7 +3999,7 @@ internal static unsafe partial class SequenceRanges
         LedgerNoWait = true;
         try
         {
-            long until = Worker.GetCurrentTimestamp() + 1_000_000;
+            long until = Worker.GetCurrentTimestamp() + (briefly ? 100_000 : 1_000_000);
             while (true)
             {
                 try
@@ -4005,7 +4037,7 @@ internal static unsafe partial class SequenceRanges
             // Nextval reaches the block's start before the switch commits, so the commit doesn't wait for the disk; a
             // later commit that writes the block's values flushes it.
             _ = Worf.Execute("SET LOCAL synchronous_commit = off");
-            return Switch(seqoid, info, (next.Id, next.Lo, next.Hi), next.Reserved, ExchangeTimeout, beside: true, needed: Needed) ||
+            return Switch(seqoid, info, (next.Id, next.Lo, next.Hi), next.Reserved, briefly ? 100 : ExchangeTimeout, beside: true, needed: Needed) ||
                 !needed || NextBlock(seqoid, epoch)?.Id != next.Id;
         }
         finally

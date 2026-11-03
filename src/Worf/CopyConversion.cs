@@ -444,11 +444,34 @@ internal static unsafe partial class CopyConversion
     }
 
     /// <summary>
-    /// Copies some of a batch's converted rows in one COPY and subtransaction. When a row fails, which COPY's errors
+    /// Copies some of a batch's converted rows, a run of the provider's rows that follow one another at a time, so that
+    /// COPY, which numbers each run from its first row's number, names the provider's rows in its errors.
+    /// </summary>
+    private static ulong CopyBatch(ParseState* pstate, RelationData* relation, List* attnamelist, int start, int count)
+    {
+        ulong copied = 0;
+        int end = start + count;
+        while (start < end)
+        {
+            int run = start + 1;
+            while (run < end && s_batchConverted[run].Row == s_batchConverted[run - 1].Row + 1)
+            {
+                run++;
+            }
+
+            copied += CopyRun(pstate, relation, attnamelist, start, run - start);
+            start = run;
+        }
+
+        return copied;
+    }
+
+    /// <summary>
+    /// Copies a run of a batch's converted rows in one COPY and subtransaction. When a row fails, which COPY's errors
     /// name, the rows before it are copied again, it's kept to record, and the copy goes on from the row after it; a
     /// failure that names none of them has them copied again in halves, down to a row of its own.
     /// </summary>
-    private static ulong CopyBatch(ParseState* pstate, RelationData* relation, List* attnamelist, int start, int count)
+    private static ulong CopyRun(ParseState* pstate, RelationData* relation, List* attnamelist, int start, int count)
     {
         ulong copied = 0;
         int end = start + count;
@@ -461,20 +484,14 @@ internal static unsafe partial class CopyConversion
             }
             catch (PgException error) when (!Apply.IsTransient(error))
             {
-                // COPY numbers each row as the provider's, as ReadBatch tells it.
-                int failed = -1;
-                if (s_failedLine >= s_batchLine)
-                {
-                    int found = s_batchConverted.BinarySearch(start, end - start, (0, 0, (int)Math.Min(s_failedLine - s_batchLine, int.MaxValue)),
-                        Comparer<(int Start, int Length, int Row)>.Create((x, y) => x.Row.CompareTo(y.Row)));
-                    failed = found >= 0 ? found : -1;
-                }
-
+                // COPY numbers the rows it reads from the first's number among the provider's.
+                ulong first = s_batchLine + (ulong)s_batchConverted[start].Row;
+                int failed = s_failedLine >= first && s_failedLine < first + (ulong)(end - start) ? start + (int)(s_failedLine - first) : -1;
                 if (failed < 0 && end - start > 1)
                 {
                     int half = (end - start) / 2;
-                    return copied + CopyBatch(pstate, relation, attnamelist, start, half) +
-                        CopyBatch(pstate, relation, attnamelist, start + half, end - start - half);
+                    return copied + CopyRun(pstate, relation, attnamelist, start, half) +
+                        CopyRun(pstate, relation, attnamelist, start + half, end - start - half);
                 }
 
                 failed = Math.Max(failed, start);
@@ -490,7 +507,7 @@ internal static unsafe partial class CopyConversion
 
                 if (failed > start)
                 {
-                    copied += CopyBatch(pstate, relation, attnamelist, start, failed - start);
+                    copied += CopyRun(pstate, relation, attnamelist, start, failed - start);
                 }
 
                 s_batchFailed.Add((line, change, error));
@@ -520,6 +537,7 @@ internal static unsafe partial class CopyConversion
                 {
                     CopyFromStateData* cstate = NativeMethods.BeginCopyFrom(pstate, relation, null, null, false, BatchSource, attnamelist, null);
                     s_cstate = cstate;
+                    cstate->cur_lineno = s_batchLine + (ulong)s_batchConverted[start].Row - 1;
                     ulong rows = NativeMethods.CopyFrom(cstate);
                     NativeMethods.EndCopyFrom(cstate);
                     return rows;
@@ -542,24 +560,17 @@ internal static unsafe partial class CopyConversion
     private static ReadOnlySpan<byte> BatchRow(int index) => s_batchData.AsSpan(s_batchRows[index].Start, s_batchRows[index].Length);
 
     /// <summary>
-    /// COPY's data source for a copy of a batch: its converted rows, one at a time, so that COPY, which has counted the
-    /// row it reads as it asks for its data, numbers it as the provider's row, which its errors then name, rather than
-    /// by its place among the rows this copy passes it.
+    /// COPY's data source for a copy of a batch: its converted rows, one after another.
     /// </summary>
     private static int ReadBatch(void* outbuf, int minread, int maxread)
     {
         _ = minread;
         Span<byte> output = new(outbuf, maxread);
         int written = 0;
-        if (s_batchNext < s_batchEnd)
+        while (written < maxread && s_batchNext < s_batchEnd)
         {
             (int rowStart, int length, int row) = s_batchConverted[s_batchNext];
             s_line = s_batchLine + (ulong)row;
-            if (s_batchRead == 0 && s_cstate is not null)
-            {
-                s_cstate->cur_lineno = s_line;
-            }
-
             int len = Math.Min(length - s_batchRead, maxread - written);
             s_batchText.AsSpan(rowStart + s_batchRead, len).CopyTo(output[written..]);
             s_batchRead += len;
