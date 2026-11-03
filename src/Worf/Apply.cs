@@ -2056,7 +2056,7 @@ internal static unsafe partial class Apply
                 {
                     if (writesRows || !LocalIndex.DropUnbuilt(error, moved, origin))
                     {
-                        throw;
+                        throw LocalIndex.WithOwnNames(error, moved);
                     }
                 }
             }

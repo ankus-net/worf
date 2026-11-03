@@ -58,8 +58,9 @@ internal static unsafe partial class LocalIndex
     private static readonly HashSet<uint> s_unliveTables = [];
 
     // The names of the indexes on this node alone moved out of the way of DDL, by their schemas and the names they have
-    // meanwhile.
+    // meanwhile, and their schemas.
     private static readonly Dictionary<(uint Schema, string Name), string> s_asideNames = [];
+    private static readonly Dictionary<uint, uint> s_movedSchemas = [];
 
     // RVR_MISSING_OK from catalog/namespace.h, and CREATE_TABLE_LIKE_INDEXES from nodes/parsenodes.h.
     private const uint RangeVarMissingOk = 1;
@@ -457,6 +458,34 @@ internal static unsafe partial class LocalIndex
     }
 
     /// <summary>
+    /// Names an index on this node alone that a failure of DDL from another node names, as moved out of its way, by its
+    /// own name, so that the failure reads as it would without the move.
+    /// </summary>
+    /// <param name="error">The failure.</param>
+    /// <param name="moved">The indexes moved, with their own names.</param>
+    /// <returns>The failure, with the indexes' own names.</returns>
+    internal static PgException WithOwnNames(PgException error, List<(uint Index, string Name)> moved)
+    {
+        if (error.ConstraintName is not string aside || moved.Count == 0)
+        {
+            return error;
+        }
+
+        // The names the indexes were moved to, rather than their catalog rows, which a failed transaction can't read.
+        foreach ((uint relid, string name) in moved)
+        {
+            uint nspoid = s_movedSchemas.TryGetValue(relid, out uint schema) ? schema : 0;
+            if (s_asideNames.TryGetValue((nspoid, aside), out string? own) && own == name)
+            {
+                return new PgException(error.SqlState, error.Message.Replace($"\"{aside}\"", $"\"{name}\"", StringComparison.Ordinal),
+                    detail: error.Detail, hint: error.Hint);
+            }
+        }
+
+        return error;
+    }
+
+    /// <summary>
     /// Checks whether DDL from another node writes rows to existing tables, or may, whose unique indexes on this node
     /// alone then find duplicates in them, rather than in an index built again.
     /// </summary>
@@ -532,6 +561,7 @@ internal static unsafe partial class LocalIndex
             moved.Add((relid, Worf.FromServer(name)));
             sbyte* aside = NativeMethods.ChooseRelationName(name, null, Worf.PStrDup("worf_aside"), nspoid, false);
             s_asideNames[(nspoid, Worf.FromServer(aside))] = Worf.FromServer(name);
+            s_movedSchemas[relid] = nspoid;
             NativeMethods.RenameRelationInternal(relid, aside, true, true);
             NativeMethods.CommandCounterIncrement();
         }

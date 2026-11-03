@@ -3675,10 +3675,11 @@ internal static unsafe partial class SequenceRanges
     /// <param name="beside">Whether the switch goes on beside the transactions that called nextval, taking only the lock
     /// that keeps other switches and DDL off, rather than wait for them; nextval then reaches the block's start at once,
     /// and its bounds as the switch commits, so the switch's transaction is to commit at once.</param>
+    /// <param name="needed">Tells, once the switch holds its lock, whether it's still needed, or null when it is.</param>
     /// <returns>Whether it switched; it doesn't when a transaction that called nextval holds the sequence that long, or
     /// another switch took the block first.</returns>
     internal static bool Switch(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) block, bool forLoad = false, int lockTimeout = 200,
-        bool inTransaction = false, bool beside = false)
+        bool inTransaction = false, bool beside = false, Func<bool>? needed = null)
     {
         int mode = (int)(beside ? PgLockMode.ShareUpdateExclusive : PgLockMode.ShareRowExclusive);
         if (!inTransaction)
@@ -3732,7 +3733,7 @@ internal static unsafe partial class SequenceRanges
                 // block would then issue its values again, so this one leaves it, and the subtransaction gives the lock
                 // back.
                 next = Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range_block WHERE block_id = $1 AND state = 'next'",
-                    SpiParameter.Create(block.Id)).Count > 0;
+                    SpiParameter.Create(block.Id)).Count > 0 && (needed is null || needed());
                 if (!next)
                 {
                     throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState, "the block was taken");
@@ -3990,17 +3991,22 @@ internal static unsafe partial class SequenceRanges
             SequenceInfo info = GetInfo(seqoid);
             int epoch = rows[0].Get<int>(1);
             if (NodeBlock(seqoid, epoch, "active") is not (Guid, long, long) active || NextBlock(seqoid, epoch) is not (Guid, long, long, bool) next ||
-                !Confirmed(seqoid, info, next.Id) ||
-                (!next.Reserved && StepsLeft(seqoid, info, active) > (Reserved(active.Id) ? 0 : Steps(info, active.Lo, active.Hi) / 20)))
+                !Confirmed(seqoid, info, next.Id))
             {
                 return true;
             }
 
+            // Whether the switch is still needed is told once the switch holds the lock that every switch takes, so that
+            // the block and position it reads aren't those of a switch under way, which moves the sequence first.
+            bool needed = true;
+            bool Needed() => needed = NodeBlock(seqoid, epoch, "active")?.Id == active.Id &&
+                (next.Reserved || StepsLeft(seqoid, info, active) <= (Reserved(active.Id) ? 0 : Steps(info, active.Lo, active.Hi) / 20));
+
             // Nextval reaches the block's start before the switch commits, so the commit doesn't wait for the disk; a
             // later commit that writes the block's values flushes it.
             _ = Worf.Execute("SET LOCAL synchronous_commit = off");
-            return Switch(seqoid, info, (next.Id, next.Lo, next.Hi), next.Reserved, ExchangeTimeout, beside: true) ||
-                NextBlock(seqoid, epoch)?.Id != next.Id;
+            return Switch(seqoid, info, (next.Id, next.Lo, next.Hi), next.Reserved, ExchangeTimeout, beside: true, needed: Needed) ||
+                !needed || NextBlock(seqoid, epoch)?.Id != next.Id;
         }
         finally
         {

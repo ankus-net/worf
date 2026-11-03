@@ -74,12 +74,9 @@ internal static unsafe partial class ReplicatedIdentity
             return;
         }
 
-        fixed (byte* name = Worf.ToServerCString("session_authorization"))
-        {
-            config_string* option = (config_string*)NativeMethods.find_option((sbyte*)name, false, false, 20);
-            s_check = option->check_hook;
-            option->check_hook = SessionAuthorizationCheck;
-        }
+        GucStringCheckHook* hook = GucOption.CheckHook("session_authorization");
+        s_check = *hook;
+        *hook = SessionAuthorizationCheck;
 
         s_installed = true;
     }

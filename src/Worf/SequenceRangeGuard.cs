@@ -547,13 +547,12 @@ internal static partial class SequenceRangeGuard
     }
 
     /// <summary>
-    /// Waits, once a sequence reaches the last twentieth of its active block, until the range worker starts the switch,
-    /// which takes the sequence's lock as nextval leaves it held and so waits for this transaction, or the block is
-    /// switched, so that inserts wait for the worker to wake and switch, or for a next block on its way from the exchange
-    /// worker, rather than run the block out. A backend waits up to twice the exchange timeout for each block in all,
-    /// which covers an exchange that hangs and the check after it, and waits again in a later transaction when the switch
-    /// gave up on the lock. It waits only while the worker can switch: the sequence draws from blocks, and no transaction holds
-    /// the sequence against the switch, as the worker's own request for the lock does, or DDL on it.
+    /// Waits, once a sequence reaches the last twentieth of its active block, until the block is switched, so that
+    /// inserts wait for the range worker to wake and switch, or for a next block on its way from the exchange worker,
+    /// rather than run the block out. A backend waits up to twice the exchange timeout for each block in all, which
+    /// covers an exchange that hangs and the check after it. It waits only while the worker can switch: the sequence
+    /// draws from blocks, or has used one up and waits for the next, and no transaction holds the sequence against the
+    /// switch, as one that switches it itself does, or DDL on it.
     /// </summary>
     private static void WaitForSwitch(uint seqoid, long lo)
     {
@@ -585,7 +584,7 @@ internal static partial class SequenceRangeGuard
         while (now < deadline)
         {
             if (!Elevated.Run(() => Worf.SelectCatalog("""
-                SELECT EXISTS (SELECT 1 FROM worf.sequence_range WHERE seqoid = $1 AND state = 'active')
+                SELECT EXISTS (SELECT 1 FROM worf.sequence_range WHERE seqoid = $1 AND state IN ('active', 'exhausted'))
                     AND NOT EXISTS (
                         SELECT 1 FROM pg_catalog.pg_locks
                         WHERE locktype = 'relation' AND database = $2 AND relation = $1
@@ -695,10 +694,7 @@ internal static partial class SequenceRangeGuard
 
         if (!s_copyCheckInstalled)
         {
-            fixed (byte* name = "worf.sequence_range_copy_check\0"u8)
-            {
-                ((config_string*)NativeMethods.find_option((sbyte*)name, false, false, 20))->show_hook = CopyCheckShow;
-            }
+            *GucOption.ShowHook("worf.sequence_range_copy_check") = CopyCheckShow;
 
             MemoryContextData* old = Worf.MemoryContextSwitchTo(NativeGlobals.TopMemoryContext);
             s_copyCheckValue = (nint)Worf.PStrDup("");
