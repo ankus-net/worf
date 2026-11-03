@@ -2690,8 +2690,8 @@ public sealed class SequenceRangeTests
         // a busy macOS runner, where node_b's switch alone takes most of one.
         _ = await nodeB.SafePsqlAsync(Database, "ALTER SYSTEM SET worf.sequence_range_exchange_interval = '10min'; SELECT pg_reload_conf()", token);
         _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO worf.sequence_range_link VALUES ('ghost', 4242, 10)", token);
-        string beyond = await nodeB.SafePsqlAsync(Database, "UPDATE worf.sequence_range SET watermark = watermark + 1000000 WHERE seqoid = 't_id_seq'::regclass RETURNING watermark", token);
         int logpos = nodeA.ReadLog().Length;
+        string beyond = await nodeB.SafePsqlAsync(Database, "UPDATE worf.sequence_range SET watermark = watermark + 1000000 WHERE seqoid = 't_id_seq'::regclass RETURNING watermark", token);
         _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.reset_sequence_range('t_id_seq')", token);
         Assert.IsTrue(await nodeA.PollLogAsync(logpos, $"has heard of grants up to {beyond}, beyond this owner's watermark", token), "node_a reset");
         await Task.Delay(TimeSpan.FromSeconds(4), token);
@@ -2818,7 +2818,9 @@ public sealed class SequenceRangeTests
 
         // A transaction holds t2 for 6 s once it reaches its block's last twentieth, which the other sessions' inserts
         // into t2 don't wait for, and t1's go on through its blocks, each switch in under a second and a half on a busy
-        // runner, against the more than one and a half a switch that waited for the holders took.
+        // runner, against the more than one and a half a switch that waited for the holders took. The server times each
+        // of t1's inserts, as the test host's own clock counts the time its other tests keep it from reading the result,
+        // seconds at a time on a Windows runner.
         await using NpgsqlConnection holder = await node.OpenAsync(Database, token);
         await using NpgsqlTransaction held = await holder.BeginTransactionAsync(token);
         long left = long.Parse(await node.SafePsqlAsync(Database,
@@ -2828,11 +2830,18 @@ public sealed class SequenceRangeTests
             _ = await insert.ExecuteNonQueryAsync(token);
         }
 
+        const string T1Insert = "INSERT INTO t1 (v) SELECT 2 FROM generate_series(1, 10)";
+        int timed = node.ReadLog().Length;
         using CancellationTokenSource holding = CancellationTokenSource.CreateLinkedTokenSource(token);
         Task<long>[] t1Inserts = [.. Enumerable.Range(0, 4).Select(async _ =>
         {
             await using NpgsqlConnection connection = await node.OpenAsync(Database, token);
-            await using NpgsqlCommand insert = new("INSERT INTO t1 (v) SELECT 2 FROM generate_series(1, 10)", connection);
+            await using (NpgsqlCommand logged = new("SET log_min_duration_statement = 0", connection))
+            {
+                _ = await logged.ExecuteNonQueryAsync(token);
+            }
+
+            await using NpgsqlCommand insert = new(T1Insert, connection);
             long slowest = 0;
             while (!holding.IsCancellationRequested)
             {
@@ -2857,8 +2866,13 @@ public sealed class SequenceRangeTests
         await held.CommitAsync(token);
         await Task.WhenAll(t2Inserts);
         await holding.CancelAsync();
-        long t1Slowest = (await Task.WhenAll(t1Inserts)).Max();
-        Assert.IsLessThan(1500L, t1Slowest, "t1's slowest insert, in ms, while t2 was held");
+        long t1Seen = (await Task.WhenAll(t1Inserts)).Max();
+        double[] t1Times = [.. node.ReadLog()[timed..].Split('\n')
+            .Where(line => line.Contains($": {T1Insert}", StringComparison.Ordinal) && line.Contains("  execute ", StringComparison.Ordinal))
+            .Select(line => double.Parse(line[(line.IndexOf("duration: ", StringComparison.Ordinal) + 10)..line.IndexOf(" ms", StringComparison.Ordinal)],
+                CultureInfo.InvariantCulture))];
+        Assert.IsGreaterThan(100, t1Times.Length, "t1's inserts the server timed");
+        Assert.IsLessThan(1500.0, t1Times.Max(), $"t1's slowest insert on the server, in ms, while t2 was held; the test host saw {t1Seen}");
         Assert.AreEqual($"{left - 30 + 160}", await node.SafePsqlAsync(Database, "SELECT count(*) FROM t2", token));
         Assert.DoesNotContain("reached maximum value", node.ReadLog(), "inserts that ran a block out");
     }
