@@ -1690,8 +1690,11 @@ internal static class Sync
         // provider's: a row the provider no longer has, or one whose value the provider moved to another row, as a
         // swap of two rows' values does, which the merge writes one row at a time. Under session_replication_role
         // replica, the recheck of a deferrable unique index or exclusion constraint doesn't fire, so the merge checks
-        // those itself. Under discard and transdiscard, a merge that fails is skipped, leaving the table's rows as they
-        // were, and recorded as the copy commits.
+        // those itself. Under discard and transdiscard, a merge that fails is merged again in halves, down to the rows
+        // that fail alone, which are skipped and recorded as the copy commits, so that the provider's other rows, and
+        // the changes after the copy, still arrive.
+        string source = $"(SELECT * FROM {MergeCopy} WHERE ctid OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.tid[]))";
+        string mergePart = merge.ToString().Replace($" USING {MergeCopy} c ON ", $" USING {source} c ON ", StringComparison.Ordinal);
         try
         {
             PgTransaction.RunInSubtransaction(() =>
@@ -1701,27 +1704,78 @@ internal static class Sync
                 CheckDeferrableExclusion(reloid, only + table);
             }, PgSubtransactionMode.Atomic);
         }
+        catch (PgException error) when (error.SqlState is PgSqlStates.UniqueViolation or PgSqlStates.ExclusionViolation &&
+            Apply.ExceptionBehaviour is not (WorfExceptionBehaviour.Error or WorfExceptionBehaviour.SubDisable))
+        {
+            SpiResult rows = Worf.Read($"SELECT ctid::text FROM {MergeCopy} ORDER BY ctid", 0);
+            List<(WorfFailedChange Change, PgException Error)> skipped = [];
+            MergeParts(rel, lsn, reloid, only + table, mergePart, [.. rows.Select(row => row.Get<string>(0))], skipped);
+            ExceptionLog.RecordCopied(skipped);
+            PgLog.Warning(new PgDiagnostic($"skipped {skipped.Count} of the rows of the copy of table {remoterel.Nspname}.{remoterel.Relname} as it merged into the rows it has: {error.Message}")
+            {
+                Detail = error.Detail,
+                Hint = "Resynchronize the table with worf.alter_subscription_resynchronize_table to give it the provider's rows.",
+            });
+        }
         catch (PgException error) when (error.SqlState is PgSqlStates.UniqueViolation or PgSqlStates.ExclusionViolation)
         {
             PgException failed = new(error.SqlState,
                 $"could not merge the copy of table {remoterel.Nspname}.{remoterel.Relname} into the rows it has: {error.Message}",
                 detail: error.Detail,
                 hint: "Rows here hold values the provider's rows take, as rows the provider no longer has, or rows whose values it moved to others. Resynchronize the table with worf.alter_subscription_resynchronize_table, which empties it and copies it again.");
-            if (!CopyConversion.SkipMerge(rel, lsn, failed))
-            {
-                throw failed;
-            }
-
-            PgLog.Warning(new PgDiagnostic($"skipped merging the copy of table {remoterel.Nspname}.{remoterel.Relname} into the rows it has: {error.Message}")
-            {
-                Detail = error.Detail,
-                Hint = "Resynchronize the table with worf.alter_subscription_resynchronize_table to give it the provider's rows.",
-            });
+            CopyConversion.DisableAfterMerge(rel, lsn, failed);
+            throw failed;
         }
 
         _ = Worf.Execute($"DROP TABLE {MergeCopy}");
 
         PgLog.Info($"finished synchronization of data for table {remoterel.Nspname}.{remoterel.Relname}");
+    }
+
+    /// <summary>
+    /// Merges some of a copy's rows, by their places in it, in a subtransaction, and in halves when that fails, down to
+    /// a row that fails alone, which is kept to record.
+    /// </summary>
+    private static void MergeParts(WorfRelation rel, ulong lsn, uint reloid, string table, string merge, List<string> rows,
+        List<(WorfFailedChange Change, PgException Error)> skipped)
+    {
+        try
+        {
+            PgTransaction.RunInSubtransaction(() =>
+            {
+                _ = Spi.Execute(merge, SpiParameter.Create(rows.ToArray()));
+                CheckDeferrableUnique(reloid, table);
+                CheckDeferrableExclusion(reloid, table);
+            }, PgSubtransactionMode.Atomic);
+        }
+        catch (PgException error) when (error.SqlState is PgSqlStates.UniqueViolation or PgSqlStates.ExclusionViolation)
+        {
+            if (rows.Count > 1)
+            {
+                MergeParts(rel, lsn, reloid, table, merge, rows[..(rows.Count / 2)], skipped);
+                MergeParts(rel, lsn, reloid, table, merge, rows[(rows.Count / 2)..], skipped);
+                return;
+            }
+
+            WorfSubscription sub = Apply.MySubscription!;
+            long started;
+            unsafe
+            {
+                started = NativeMethods.GetCurrentTransactionStartTimestamp();
+            }
+
+            skipped.Add((new WorfFailedChange
+            {
+                Subscription = sub,
+                WriterNodeId = sub.Origin.Id,
+                CommitTime = started,
+                CommitLsn = lsn,
+                Operation = "MERGE",
+                Relation = rel,
+                NewTuple = Worf.ReadScalar<string>($"SELECT pg_catalog.row_to_json(c)::text FROM {MergeCopy} c WHERE ctid = $1::pg_catalog.tid",
+                    SpiParameter.Create(rows[0])),
+            }, error));
+        }
     }
 
     /// <summary>
@@ -1773,7 +1827,7 @@ internal static class Sync
         catch (PgException error) when (error.SqlState is PgSqlStates.UniqueViolation or PgSqlStates.ExclusionViolation &&
             Apply.ExceptionBehaviour == WorfExceptionBehaviour.SubDisable)
         {
-            _ = CopyConversion.SkipMerge(rel, lsn, error, "COPY");
+            CopyConversion.DisableAfterMerge(rel, lsn, error, "COPY");
             throw;
         }
     }

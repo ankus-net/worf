@@ -590,25 +590,22 @@ internal static unsafe partial class CopyConversion
     };
 
     /// <summary>
-    /// Handles a merge of a table's copy that failed, as worf.exception_behaviour says: under <c>discard</c> and
-    /// <c>transdiscard</c>, it is skipped and recorded, as the copy's transaction commits; under <c>sub_disable</c>, it
-    /// disables the subscription and is recorded once the merge rolled back.
+    /// Keeps a merge of a table's copy, or the copy, that failed as a whole under <c>sub_disable</c>, to disable the
+    /// subscription and record it once the copy rolled back.
     /// </summary>
     /// <param name="rel">The table.</param>
     /// <param name="commitLsn">The position the copy is consistent with.</param>
     /// <param name="error">The failure.</param>
     /// <param name="operation">What failed: the merge, or the copy, which a deferrable constraint fails as a whole.</param>
-    /// <returns>Whether the merge is skipped, rather than failing the copy.</returns>
-    internal static bool SkipMerge(WorfRelation rel, ulong commitLsn, PgException error, string operation = "MERGE")
+    internal static void DisableAfterMerge(WorfRelation rel, ulong commitLsn, PgException error, string operation = "MERGE")
     {
-        WorfExceptionBehaviour behaviour = Apply.ExceptionBehaviour;
-        if (behaviour == WorfExceptionBehaviour.Error)
+        if (Apply.ExceptionBehaviour != WorfExceptionBehaviour.SubDisable)
         {
-            return false;
+            return;
         }
 
         WorfSubscription sub = Apply.MySubscription!;
-        WorfFailedChange change = new()
+        s_disabling = (new WorfFailedChange
         {
             Subscription = sub,
             WriterNodeId = sub.Origin.Id,
@@ -616,15 +613,7 @@ internal static unsafe partial class CopyConversion
             CommitLsn = commitLsn,
             Operation = operation,
             Relation = rel,
-        };
-        if (behaviour == WorfExceptionBehaviour.SubDisable)
-        {
-            s_disabling = (change, error);
-            return false;
-        }
-
-        ExceptionLog.Record(change, behaviour, error);
-        return true;
+        }, error);
     }
 
     /// <summary>
