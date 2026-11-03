@@ -32,7 +32,8 @@ internal static class SequenceRangeExchange
     private static readonly Dictionary<uint, (long At, long Delay)> s_retries = [];
     private static readonly HashSet<uint> s_timedOut = [];
 
-    // When each subscription's provider whose last call ran out of time was last called.
+    // When each subscription's provider whose last call ran out of time was last called, which the call that ran out of
+    // time counts as.
     private static readonly Dictionary<uint, long> s_probedAt = [];
     private const long TimedOutBackoff = 60_000_000;
     private const long TimedOutFirstBackoff = 10_000_000;
@@ -297,14 +298,10 @@ internal static class SequenceRangeExchange
 
         // A neighbor whose last call ran out of time goes last, so that the calls to the others don't wait on it, and is
         // called only while nothing waits on the others, as a block this node asked another neighbor for, or once a
-        // minute, so that a neighbor that never answers holds up the others' calls at most a second a minute.
+        // minute, so that a neighbor that never answers holds up the others' calls at most a second a minute. A request
+        // that comes up during the call has it give way.
         long[] timedOutNodes = [.. due.Where(link => s_timedOut.Contains(link.Sub.Id)).Select(link => (long)link.Sub.Origin.Id)];
-        bool othersWait = timedOutNodes.Length > 0 && (due.Exists(link => !s_timedOut.Contains(link.Sub.Id) && link.Waiting is not null) ||
-            PgBackgroundWorker.RunTransaction(() => Worf.ReadScalar<bool>("""
-                SELECT EXISTS (
-                    SELECT 1 FROM worf.sequence_range_request
-                    WHERE state = 'open' AND parent_node <> ALL ($1::pg_catalog.int8[]::pg_catalog.oid[]))
-                """, SpiParameter.Create(timedOutNodes))));
+        bool othersWaited = due.Exists(link => !s_timedOut.Contains(link.Sub.Id) && link.Waiting is not null);
         bool changed = false;
         foreach ((WorfSubscription sub, string? waiting, bool fenced) in due.OrderBy(link => s_timedOut.Contains(link.Sub.Id)))
         {
@@ -315,10 +312,15 @@ internal static class SequenceRangeExchange
             }
 
             long now = Worker.GetCurrentTimestamp();
-            SequenceRangeExchangeWorker.Probing = s_timedOut.Contains(sub.Id);
-            if (SequenceRangeExchangeWorker.Probing)
+            SequenceRangeExchangeWorker.Probing = s_timedOut.Contains(sub.Id) ? sub.Origin.Id : 0;
+            if (SequenceRangeExchangeWorker.Probing != 0)
             {
-                if (othersWait && now - s_probedAt.GetValueOrDefault(sub.Id) < TimedOutBackoff)
+                if (now - s_probedAt.GetValueOrDefault(sub.Id) < TimedOutBackoff && (othersWaited ||
+                    PgBackgroundWorker.RunTransaction(() => Worf.ReadScalar<bool>("""
+                        SELECT EXISTS (
+                            SELECT 1 FROM worf.sequence_range_request
+                            WHERE state = 'open' AND parent_node <> ALL ($1::pg_catalog.int8[]::pg_catalog.oid[]))
+                        """, SpiParameter.Create(timedOutNodes)))))
                 {
                     continue;
                 }
@@ -342,6 +344,7 @@ internal static class SequenceRangeExchange
                 s_exchangedAt[sub.Id] = now;
                 _ = s_retries.Remove(sub.Id);
                 _ = s_timedOut.Remove(sub.Id);
+                _ = s_probedAt.Remove(sub.Id);
 
                 // An exchange that changed nothing while something waits makes the next one wait longer, up to the
                 // exchange interval, since the neighbor may not answer it for long, as when a root can't start or a
@@ -372,6 +375,17 @@ internal static class SequenceRangeExchange
                     break;
                 }
 
+                // A probe that gave way to a request on another neighbor before its second was up is tried again after
+                // the same delay, the neighbor having shown nothing new.
+                long probeLimit = Math.Min(SequenceRanges.ExchangeTimeout, 1000) * 1000L;
+                if (error is PgQueryCanceledException && SequenceRangeExchangeWorker.Probing != 0 && Worker.GetCurrentTimestamp() - now < probeLimit &&
+                    s_retries.TryGetValue(sub.Id, out (long At, long Delay) unanswered))
+                {
+                    s_retries[sub.Id] = (now + unanswered.Delay, unanswered.Delay);
+                    WorfLog.Debug1($"sequence range exchange with node {sub.Origin.Name} gave way to a request waiting on another node");
+                    continue;
+                }
+
                 // A failed exchange is tried again after a delay that doubles, up to the exchange interval, or half the
                 // exchange timeout while this node waits on the neighbor, as for a block, so that inserts waiting at a
                 // block's end, up to twice the timeout, get it soon after the neighbor is back. A call the watcher
@@ -386,6 +400,7 @@ internal static class SequenceRangeExchange
                 if (timedOut)
                 {
                     _ = s_timedOut.Add(sub.Id);
+                    s_probedAt[sub.Id] = now;
                 }
 
                 long delay = s_retries.TryGetValue(sub.Id, out (long At, long Delay) retry) ? retry.Delay * 2 : 0;
@@ -393,7 +408,7 @@ internal static class SequenceRangeExchange
                 delay = Math.Min(Math.Max(delay, Math.Max(least, SequenceRanges.CheckInterval * 1000L)), Math.Max(most, SequenceRanges.CheckInterval * 1000L));
                 s_retries[sub.Id] = (now + delay, delay);
                 string failure = error is PgQueryCanceledException
-                    ? $"node {sub.Origin.Name} didn't answer within {(SequenceRangeExchangeWorker.Probing ? Math.Min(SequenceRanges.ExchangeTimeout, 1000) : SequenceRanges.ExchangeTimeout).ToString(CultureInfo.InvariantCulture)} ms"
+                    ? $"node {sub.Origin.Name} didn't answer within {(SequenceRangeExchangeWorker.Probing != 0 ? probeLimit / 1000 : SequenceRanges.ExchangeTimeout).ToString(CultureInfo.InvariantCulture)} ms"
                     : error.Message;
                 // While the subscription's first sync hasn't finished, its slot may not be there yet, or be made again,
                 // so a failure then is no news.
@@ -412,7 +427,7 @@ internal static class SequenceRangeExchange
             }
         }
 
-        SequenceRangeExchangeWorker.Probing = false;
+        SequenceRangeExchangeWorker.Probing = 0;
         return changed;
     }
 

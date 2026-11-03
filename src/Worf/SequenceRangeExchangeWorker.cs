@@ -74,7 +74,9 @@ internal static class SequenceRangeExchangeWorker
     /// of it that has run out of time, or any call as the watcher stops, which also tells the exchange worker to make no
     /// more, in one step with the call's start, so that none starts after the watcher's last look. A call that waits on a
     /// neighbor that never answers doesn't see the exchange worker's own stop request, so it would hold up a server's
-    /// shutdown.
+    /// shutdown. A probe of a neighbor whose last call ran out of time gives way as soon as a request waits on another
+    /// neighbor, which the range worker looks for right after it makes one, so that a frozen neighbor holds up no
+    /// block this node asks another for.
     /// </summary>
     /// <param name="stopping">Whether the watcher stops.</param>
     /// <returns>Whether the exchange worker runs.</returns>
@@ -84,6 +86,23 @@ internal static class SequenceRangeExchangeWorker
         long now = Worker.GetCurrentTimestamp();
         bool running = false;
         int overdue = 0;
+        (long Deadline, uint Node) probe = default;
+        using (PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share())
+        {
+            for (int i = 0; i < guard.Length && !stopping; i++)
+            {
+                WorfExchangeWorker exchange = guard[i].Worker.Exchange;
+                if (guard[i].WorkerType == WorfWorkerType.Exchange && guard[i].Dboid == dboid && guard[i].CrashedAt == 0 &&
+                    guard[i].Proc != 0 && exchange.Deadline > now && exchange.Probing != 0)
+                {
+                    probe = (exchange.Deadline, exchange.Probing);
+                }
+            }
+        }
+
+        bool giveWay = probe.Node != 0 && PgBackgroundWorker.RunTransaction(() => Worf.ReadScalar<bool>("""
+            SELECT EXISTS (SELECT 1 FROM worf.sequence_range_request WHERE state = 'open' AND parent_node <> $1)
+            """, SpiParameter.Create(probe.Node)));
         using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
         {
             for (int i = 0; i < guard.Length; i++)
@@ -96,7 +115,8 @@ internal static class SequenceRangeExchangeWorker
 
                 running = true;
                 long deadline = worker.Worker.Exchange.Deadline;
-                if (worker.Proc != 0 && deadline > 0 && (stopping || now >= deadline))
+                bool givingWay = giveWay && deadline == probe.Deadline && worker.Worker.Exchange.Probing == probe.Node;
+                if (worker.Proc != 0 && deadline > 0 && (stopping || now >= deadline || givingWay))
                 {
                     unsafe
                     {
@@ -104,7 +124,7 @@ internal static class SequenceRangeExchangeWorker
                     }
                 }
 
-                if (stopping || (deadline > 0 && now >= deadline))
+                if (stopping || (deadline > 0 && now >= deadline) || givingWay)
                 {
                     worker.Worker.Exchange.Deadline = stopping ? Stopped : 0;
                     guard[i] = worker;
@@ -140,15 +160,15 @@ internal static class SequenceRangeExchangeWorker
     }
 
     /// <summary>
-    /// Gets or sets whether the calls about to be made go to a neighbor whose last call ran out of time, which they only
-    /// probe for, for a second at most, so that a neighbor that stays frozen holds up the calls to the others that
-    /// little, until one answers in time.
+    /// Gets or sets the node the calls about to be made go to, if its last call ran out of time, which they only probe
+    /// for a second at most, and give way to a request that waits on another node, so that a neighbor that stays frozen
+    /// holds up the calls to the others that little, until one answers in time; or zero.
     /// </summary>
-    internal static bool Probing { get; set; }
+    internal static uint Probing { get; set; }
 
     /// <summary>
     /// Makes a call to a neighbor, from the exchange worker, which its watcher cancels once it has taken longer than
-    /// <c>worf.sequence_range_timeout</c>, or a second while <see cref="Probing"/>.
+    /// <c>worf.sequence_range_timeout</c>, or, as a probe, a second, or as soon as a request waits on another node.
     /// </summary>
     /// <typeparam name="T">The call's result.</typeparam>
     /// <param name="call">The call.</param>
@@ -161,7 +181,7 @@ internal static class SequenceRangeExchangeWorker
             throw new PgException("57P01", "the sequence range exchange worker is stopping");
         }
 
-        SetDeadline(Worker.GetCurrentTimestamp() + (Probing ? Math.Min(SequenceRanges.ExchangeTimeout, 1000) : SequenceRanges.ExchangeTimeout) * 1000L);
+        SetDeadline(Worker.GetCurrentTimestamp() + (Probing != 0 ? Math.Min(SequenceRanges.ExchangeTimeout, 1000) : SequenceRanges.ExchangeTimeout) * 1000L);
         try
         {
             return call();
@@ -197,6 +217,7 @@ internal static class SequenceRangeExchangeWorker
         }
 
         worker.Worker.Exchange.Deadline = deadline;
+        worker.Worker.Exchange.Probing = deadline != 0 ? Probing : 0;
         guard[Worker.MyWorfWorker] = worker;
     }
 

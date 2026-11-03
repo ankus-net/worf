@@ -1895,8 +1895,9 @@ public sealed class SequenceRangeTests
 
     /// <summary>
     /// A provider that takes calls but never answers holds up a node's exchanges with its other neighbors only until its
-    /// first call runs out of time: it's called after the others from then on, a minute apart, for a second at most, so
-    /// the node's inserts go on through small blocks from the owner without waiting.
+    /// first call runs out of time: it's called after the others from then on, only while nothing waits on them or once
+    /// a minute, for a second at most, giving way to a request that comes up meanwhile, so the node's inserts go on
+    /// through small blocks from the owner without waiting on it.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -1936,17 +1937,22 @@ public sealed class SequenceRangeTests
             """, token);
         Assert.IsTrue(await nodeB.PollLogAsync(logpos, "node node_c didn't answer within 5000 ms", token), "node_b's first call to node_c timed out");
 
-        // node_b draws two blocks a second from node_a for fifteen seconds, and no insert waits for one.
-        List<double> waits = [];
+        // node_b draws two blocks a second from node_a for fifteen seconds, and no insert waits for one. The server times
+        // each insert, as the test host's own clock counts the time its other tests keep it from reading the result.
+        const string Insert = "INSERT INTO t (v) VALUES ('b')";
+        int timed = nodeB.ReadLog().Length;
         await using (NpgsqlConnection writer = await nodeB.OpenAsync(Database, token))
         {
-            await using NpgsqlCommand insert = new("INSERT INTO t (v) VALUES ('b')", writer);
+            await using (NpgsqlCommand logged = new("SET log_min_duration_statement = 0", writer))
+            {
+                _ = await logged.ExecuteNonQueryAsync(token);
+            }
+
+            await using NpgsqlCommand insert = new(Insert, writer);
             Stopwatch running = Stopwatch.StartNew();
             while (running.Elapsed < TimeSpan.FromSeconds(15))
             {
-                Stopwatch one = Stopwatch.StartNew();
                 _ = await insert.ExecuteNonQueryAsync(token);
-                waits.Add(one.Elapsed.TotalMilliseconds);
                 await Task.Delay(TimeSpan.FromMilliseconds(5), token);
             }
         }
@@ -1959,7 +1965,11 @@ public sealed class SequenceRangeTests
         }
 
         // Without the backoff, each of node_b's calls to node_c held up its calls to node_a for 5 s, so its inserts waited
-        // seconds for blocks; with it, none waits for a call to node_c longer than a probe's second.
+        // seconds for blocks; with it, none waits for a call to node_c, only for node_a's answers.
+        List<double> waits = [.. nodeB.ReadLog()[timed..].Split('\n')
+            .Where(line => line.Contains($": {Insert}", StringComparison.Ordinal) && line.Contains("  execute ", StringComparison.Ordinal))
+            .Select(line => double.Parse(line[(line.IndexOf("duration: ", StringComparison.Ordinal) + 10)..line.IndexOf(" ms", StringComparison.Ordinal)],
+                CultureInfo.InvariantCulture))];
         waits.Sort();
         Assert.IsGreaterThan(100, waits.Count, "node_b's inserts");
         Assert.IsLessThan(2500.0, waits[^1], "node_b's slowest insert, against the 5000 ms node_c's calls took");
@@ -2323,10 +2333,14 @@ public sealed class SequenceRangeTests
             }
         }
 
-        // node_b writes a few megabytes first, so that its calls show a WAL position the restored copy, which writes as it
-        // starts, stays below.
+        // node_b writes a few megabytes first, and node_a hears its WAL position past them, so that the restored copy,
+        // which writes as it starts, stays below the position node_b last showed.
         _ = await nodeB.SafePsqlAsync(Database, "CREATE TABLE written AS SELECT g, repeat('x', 100) AS v FROM generate_series(1, 20000) g", token);
         await InsertAsync(nodeB, 150, token);
+        string shown = await nodeB.SafePsqlAsync(Database, "SELECT pg_current_wal_lsn()", token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database,
+            $"SELECT wal_lsn >= '{shown}' FROM worf.sequence_range_node WHERE node_name = 'node_b' AND seqoid = 't_id_seq'::regclass", token),
+            "node_a heard node_b's WAL position past its writes");
         string granted = await nodeA.SafePsqlAsync(Database, "SELECT max(hi) FROM worf.sequence_range_grant WHERE grantee_name = 'node_b'", token);
         await RestoreDataAsync(nodeB, copyB, token);
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
