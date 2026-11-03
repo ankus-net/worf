@@ -987,6 +987,68 @@ public sealed partial class ExceptionBehaviourTests
     }
 
     /// <summary>
+    /// In SQL_ASCII databases, values that hold a byte that isn't UTF-8 copy and replicate byte for byte, and a row of
+    /// the copy that fails under discard, with such a value, is recorded with the value's hex.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task SqlAsciiValuesKeepTheirBytes()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode provider = await StartNodeAsync("provider", token);
+        await using TestNode subscriber = await StartNodeAsync("subscriber", token);
+        const string Ascii = "ascii";
+        const string Create = """
+            DO $$
+            BEGIN
+                EXECUTE format('CREATE TABLE %I (id integer PRIMARY KEY CHECK (id < %s), %I text)', 'tab',
+                    current_setting('worf_test.max_id'), 'caf');
+            END $$;
+            """;
+        foreach ((TestNode node, string limit) in new[] { (provider, "100"), (subscriber, "5") })
+        {
+            _ = await node.SafePsqlAsync(Database, $"CREATE DATABASE {Ascii} ENCODING 'SQL_ASCII' LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0", token);
+            _ = await node.SafePsqlAsync(Ascii, $"""
+                CREATE EXTENSION worf;
+                SELECT * FROM worf.create_node(node_name := '{node.Name}_ascii', dsn := '{node.Dsn(Ascii, SuperUser)}');
+                SET worf_test.max_id = '{limit}';
+                {Create}
+                """, token);
+        }
+
+        _ = await provider.SafePsqlAsync(Ascii, """
+            DO $$
+            BEGIN
+                EXECUTE format('INSERT INTO %I VALUES (1, %L), (7, %L)', 'tab',
+                    convert_from('\x6f6e65e9', 'SQL_ASCII'), convert_from('\x736576656ee9', 'SQL_ASCII'));
+            END $$;
+            SELECT * FROM worf.replication_set_add_all_tables('default', '{public}');
+            """, token);
+        _ = await subscriber.SafePsqlAsync(Ascii, "ALTER SYSTEM SET worf.exception_behaviour = 'discard'", token);
+        _ = await subscriber.SafePsqlAsync(Ascii, "SELECT pg_reload_conf()", token);
+        _ = await subscriber.SafePsqlAsync(Ascii, $"""
+            SELECT worf.create_subscription(subscription_name := 'sub', provider_dsn := '{provider.Dsn(Ascii, SuperUser)}',
+                synchronize_structure := false, synchronize_data := true)
+            """, token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Ascii,
+            "SELECT EXISTS (SELECT 1 FROM worf.local_sync_status) AND NOT EXISTS (SELECT 1 FROM worf.local_sync_status WHERE sync_status <> 'r')", token),
+            "the copy");
+        _ = await provider.SafePsqlAsync(Ascii, """
+            DO $$
+            BEGIN
+                EXECUTE format('INSERT INTO %I VALUES (2, %L)', 'tab', convert_from('\x74776fe9', 'SQL_ASCII'));
+            END $$;
+            """, token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Ascii, "SELECT count(*) = 2 FROM tab", token), "the replicated row");
+        Assert.AreEqual("1:6f6e65e9,2:74776fe9", await subscriber.SafePsqlAsync(Ascii,
+            "SELECT string_agg(id || ':' || encode(convert_to(caf, 'SQL_ASCII'), 'hex'), ',' ORDER BY id) FROM tab", token), "the rows' bytes");
+        Assert.AreEqual("COPY|7|23514|t", await subscriber.SafePsqlAsync(Ascii, """
+            SELECT concat_ws('|', operation, remote_new_tuple->>'id', error_sqlstate, position('x736576656ee9' IN remote_new_tuple::text) > 0)
+            FROM worf.exception_log
+            """, token), "the copy's failed row");
+    }
+
+    /// <summary>
     /// Deferrable unique and exclusion constraints, whose rechecks don't fire under session_replication_role replica,
     /// hold for the rows apply and the copy write: rows that conflict with none apply, and under discard, a change that
     /// conflicts is skipped and recorded, and so is a copied row that conflicts with an earlier one.
