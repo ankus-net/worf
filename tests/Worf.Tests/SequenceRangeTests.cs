@@ -1846,6 +1846,54 @@ public sealed class SequenceRangeTests
     }
 
     /// <summary>
+    /// A session that ends while it waits for a switch, as one terminated, leaves no count of it behind: the range worker
+    /// switches the block it waited on, and then leaves the next one alone until it runs low.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task SessionsThatEndWhileWaitingLeaveNoTrace()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode node = await StartNodeAsync("node_a", token);
+        _ = await node.SafePsqlAsync(Database, """
+            CREATE TABLE w (id bigserial PRIMARY KEY, v int);
+            SELECT worf.enable_sequence_range('w_id_seq', participants := '{}', range_size := 100, max_range_size := 100);
+            """, token);
+        const string Active = "SELECT active_lo FROM worf.sequence_ranges WHERE sequence = 'w_id_seq'::regclass";
+        Assert.IsTrue(await node.PollQueryUntilAsync(Database,
+            "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 'w_id_seq'::regclass", token), "w's blocks");
+        // The range row, held, keeps every switch off, so a session that reaches the block's last twentieth waits.
+        string active = await node.SafePsqlAsync(Database, Active, token);
+        await using (NpgsqlConnection holder = await node.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction held = await holder.BeginTransactionAsync(token);
+            await using (NpgsqlCommand hold = new("SELECT 1 FROM worf.sequence_range WHERE seqoid = 'w_id_seq'::regclass FOR NO KEY UPDATE", holder, held))
+            {
+                _ = await hold.ExecuteNonQueryAsync(token);
+            }
+
+            _ = await node.SafePsqlAsync(Database, "INSERT INTO w (v) SELECT 1 FROM generate_series(1, 94)", token);
+
+            await using NpgsqlConnection waiter = await node.OpenAsync(Database, token);
+            await using NpgsqlCommand insert = new("INSERT INTO w (v) SELECT 1 FROM generate_series(1, 5)", waiter);
+            Task<int> waiting = insert.ExecuteNonQueryAsync(token);
+            Assert.IsTrue(await node.PollQueryUntilAsync(Database, $"""
+                SELECT state = 'active' AND now() - query_start > interval '1 second' FROM pg_stat_activity WHERE pid = {waiter.ProcessID}
+                """, token), "the insert waiting for the switch");
+            _ = await node.SafePsqlAsync(Database, $"SELECT pg_terminate_backend({waiter.ProcessID})", token);
+            _ = await Assert.ThrowsAsync<Exception>(() => waiting, "the terminated insert");
+            await held.RollbackAsync(token);
+        }
+
+        // The block it waited on is switched, as it ran low, and the next stays, with nothing waiting for it.
+        Assert.IsTrue(await node.PollQueryUntilAsync(Database, $"SELECT ({Active}) <> {active}", token), "the switch from the low block");
+        string next = await node.SafePsqlAsync(Database, Active, token);
+        _ = await node.SafePsqlAsync(Database, "INSERT INTO w (v) SELECT 1 FROM generate_series(1, 5)", token);
+        await Task.Delay(TimeSpan.FromSeconds(3), token);
+        Assert.AreEqual(next, await node.SafePsqlAsync(Database, Active, token), "the next block, which has most of its values left");
+    }
+
+    /// <summary>
     /// A provider that takes calls but never answers holds up a node's exchanges with its other neighbors only until its
     /// first call runs out of time: it's called after the others from then on, a minute apart, for a second at most, so
     /// the node's inserts go on through small blocks from the owner without waiting.

@@ -46,6 +46,11 @@ internal static partial class SequenceRangeGuard
     private static (long Version, long Local) s_guardedAt = (-1, -1);
     private static bool s_gatesRegistered;
 
+    // The sequences this backend waits for a switch of, which it counts until it stops waiting, or exits, as at a FATAL
+    // error, which skips the code after the wait.
+    private static readonly Dictionary<uint, int> s_waitingFor = [];
+    private static bool s_exitHooked;
+
     private const int MaxDrawers = 1024;
 
     // The keys the gates of each running COPY FROM are taken under, innermost last, which no query descriptor's address
@@ -687,6 +692,7 @@ internal static partial class SequenceRangeGuard
 
     private static unsafe void TakeGate(uint seqoid)
     {
+        HookExit();
         RegisterGates();
         LOCKTAG tag = GateTag(seqoid);
         _ = NativeMethods.LockAcquire(&tag, ShareLock, false, false);
@@ -714,7 +720,7 @@ internal static partial class SequenceRangeGuard
     {
         uint dboid = DatabaseId();
         using PgLwLockShareGuard<WorfDrawers, WorfDrawer> guard = Drawers.Share();
-        for (int i = 0; i < MaxDrawers; i++)
+        for (int probe = 0, i = Slot(dboid, seqoid); probe < MaxDrawers && guard[i].Dboid != 0; probe++, i = (i + 1) % MaxDrawers)
         {
             if (guard[i].Dboid == dboid && guard[i].Seqoid == seqoid)
             {
@@ -726,6 +732,12 @@ internal static partial class SequenceRangeGuard
     }
 
     /// <summary>
+    /// Finds where a sequence's entry starts its search in the shared table. An entry stays once made, with its counts
+    /// at zero, so that no search stops short at a freed one.
+    /// </summary>
+    private static int Slot(uint dboid, uint seqoid) => (int)((dboid * 2654435761UL ^ seqoid) % MaxDrawers);
+
+    /// <summary>
     /// Counts a statement that takes or lets go of a sequence's gate, or that starts or stops waiting for it to switch.
     /// A sequence that finds no entry free goes uncounted.
     /// </summary>
@@ -733,27 +745,26 @@ internal static partial class SequenceRangeGuard
     {
         uint dboid = DatabaseId();
         using PgLwLockExclusiveGuard<WorfDrawers, WorfDrawer> guard = Drawers.Exclusive();
-        int free = -1;
-        for (int i = 0; i < MaxDrawers; i++)
+        for (int probe = 0, i = Slot(dboid, seqoid); probe < MaxDrawers; probe++, i = (i + 1) % MaxDrawers)
         {
             if (guard[i].Dboid == dboid && guard[i].Seqoid == seqoid)
             {
                 WorfDrawer drawer = guard[i];
                 drawer.Statements = Math.Max(drawer.Statements + statements, 0);
                 drawer.Waiting = Math.Max(drawer.Waiting + waiting, 0);
-                guard[i] = drawer.Statements == 0 && drawer.Waiting == 0 ? default : drawer;
+                guard[i] = drawer;
                 return;
             }
 
-            if (free < 0 && guard[i].Dboid == 0)
+            if (guard[i].Dboid == 0)
             {
-                free = i;
-            }
-        }
+                if (statements > 0 || waiting > 0)
+                {
+                    guard[i] = new WorfDrawer { Dboid = dboid, Seqoid = seqoid, Statements = Math.Max(statements, 0), Waiting = Math.Max(waiting, 0) };
+                }
 
-        if (free >= 0 && (statements > 0 || waiting > 0))
-        {
-            guard[free] = new WorfDrawer { Dboid = dboid, Seqoid = seqoid, Statements = Math.Max(statements, 0), Waiting = Math.Max(waiting, 0) };
+                return;
+            }
         }
     }
 
@@ -1051,7 +1062,7 @@ internal static partial class SequenceRangeGuard
         // The switch waits for the gates, which the statement lets go meanwhile, and the range worker switches the block
         // while statements wait for it, however many values it has left.
         List<uint> held = LetGates();
-        CountDrawer(seqoid, 0, 1);
+        CountWaiting(seqoid, 1);
         bool switched;
         try
         {
@@ -1059,11 +1070,57 @@ internal static partial class SequenceRangeGuard
         }
         finally
         {
-            CountDrawer(seqoid, 0, -1);
+            CountWaiting(seqoid, -1);
         }
 
         TakeGates(held);
         return switched;
+    }
+
+    /// <summary>
+    /// Counts this backend as waiting for a sequence's switch, or no longer, in the shared table and its own.
+    /// </summary>
+    private static void CountWaiting(uint seqoid, int change)
+    {
+        HookExit();
+        CountDrawer(seqoid, 0, change);
+        int waiting = s_waitingFor.GetValueOrDefault(seqoid) + change;
+        if (waiting > 0)
+        {
+            s_waitingFor[seqoid] = waiting;
+        }
+        else
+        {
+            _ = s_waitingFor.Remove(seqoid);
+        }
+    }
+
+    /// <summary>
+    /// Takes this backend's counts out of the shared table as it exits, whatever it was doing.
+    /// </summary>
+    private static void HookExit()
+    {
+        if (s_exitHooked)
+        {
+            return;
+        }
+
+        s_exitHooked = true;
+        _ = PgProcess.OnExit(static _ =>
+        {
+            foreach ((uint seqoid, int waiting) in s_waitingFor)
+            {
+                CountDrawer(seqoid, 0, -waiting);
+            }
+
+            foreach (uint seqoid in s_gates.Keys)
+            {
+                CountDrawer(seqoid, -1);
+            }
+
+            s_waitingFor.Clear();
+            s_gates.Clear();
+        });
     }
 
     /// <summary>
@@ -1196,10 +1253,11 @@ internal static partial class SequenceRangeGuard
     /// </summary>
     private static void NearEnd(uint seqoid, bool ascending, long lo, long hi, long value)
     {
-        // What the block has left is what other statements have left it since this row's value, as far as they drew.
+        // What the block has left is what other statements have left it since this row's value, as far as they drew, read
+        // under the lock nextval left this transaction holding.
         bool last = (ascending ? (decimal)hi - value : (decimal)value - lo) == 0;
         bool reserved = s_reservedActive.Contains((seqoid, lo));
-        if (((reserved ? last : WakeNearEnd(seqoid, ascending, lo, hi, value)) || (!last && Short(seqoid, ascending, lo, hi, ReadPosition(seqoid) ?? value))) &&
+        if (((reserved ? last : WakeNearEnd(seqoid, ascending, lo, hi, value)) || (!last && Short(seqoid, ascending, lo, hi, Position(seqoid) ?? value))) &&
             WaitForSwitch(seqoid, lo))
         {
             WaitWhileShort(seqoid);
