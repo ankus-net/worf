@@ -552,7 +552,7 @@ internal static unsafe partial class Executor
             LocalIndex.CheckWrites(written);
         }
 
-        SequenceRangeGuard.StartStatement(queryDesc);
+        SequenceRangeGuard.StartStatement(queryDesc, written);
 
         if (!s_nextExecutorStartHook.IsNull)
         {

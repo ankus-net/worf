@@ -340,6 +340,12 @@ internal static unsafe partial class SequenceRanges
     internal static PgAtomic<long> CheckRequested { get; } = new("worf_sequence_range_check");
 
     /// <summary>
+    /// Gets the number of switches beside the transactions that hold their sequences that wait for, or hold, their
+    /// sequences' switch gates, so that a statement that holds a gate lets it go at its next row.
+    /// </summary>
+    internal static PgAtomic<long> SwitchesPending { get; } = new("worf_sequence_range_switches_pending");
+
+    /// <summary>
     /// Sets up the shared memory.
     /// </summary>
     internal static void ShmemInit()
@@ -347,6 +353,7 @@ internal static unsafe partial class SequenceRanges
         PgSharedMemory.Initialize(Version, static () => 0L);
         PgSharedMemory.Initialize(ExchangeRequested, static () => 0L);
         PgSharedMemory.Initialize(CheckRequested, static () => 0L);
+        PgSharedMemory.Initialize(SwitchesPending, static () => 0L);
     }
 
     /// <summary>
@@ -831,6 +838,18 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
+    /// Gets a managed sequence a next block, or asks for one, while a transaction holds the sequence against the range
+    /// worker's check, as one that switched it itself does, so that the transaction can switch to it at its block's end.
+    /// It reads nothing of the sequence's position, which only the check's lock keeps from moving under it.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    /// <param name="node">This node.</param>
+    /// <param name="rate">The sequence's peak rate in values a second.</param>
+    /// <returns>Whether anything changed, for the guard's caches.</returns>
+    internal static bool Replenish(uint seqoid, WorfLocalNode node, double rate)
+        => CheckSequence(seqoid, node, rate, null, false, false) && CheckSequence(seqoid, node, rate, null, true, false);
+
+    /// <summary>
     /// Finds whether a check has anything to change, or changes it.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
@@ -838,8 +857,10 @@ internal static unsafe partial class SequenceRanges
     /// <param name="rate">The sequence's peak rate in values a second.</param>
     /// <param name="backwards">The active block sampled, and whether the sequence moved backwards in it.</param>
     /// <param name="apply">Whether to change it, rather than only read.</param>
+    /// <param name="switching">Whether to switch it too, rather than only get it a next block.</param>
     /// <returns>Whether there is anything to change, or whether anything changed.</returns>
-    private static bool CheckSequence(uint seqoid, WorfLocalNode node, double rate, (Guid Block, bool Moved)? backwards, bool apply)
+    private static bool CheckSequence(uint seqoid, WorfLocalNode node, double rate, (Guid Block, bool Moved)? backwards, bool apply,
+        bool switching = true)
     {
         // The range row is locked first, as every change to a sequence's ranges locks it, so that a check and an exchange
         // that both change the sequence take their locks in the same order. Under the range worker's check, which holds
@@ -894,7 +915,7 @@ internal static unsafe partial class SequenceRanges
             next = null;
         }
 
-        if (active is null)
+        if (switching && active is null)
         {
             if (next is not null)
             {
@@ -909,7 +930,7 @@ internal static unsafe partial class SequenceRanges
                 next = null;
             }
         }
-        else if (!snowflake)
+        else if (switching && active is not null && !snowflake)
         {
             long left = StepsLeft(seqoid, info, active.Value);
             long size = Steps(info, active.Value.Lo, active.Value.Hi);
@@ -921,14 +942,19 @@ internal static unsafe partial class SequenceRanges
             // than draw again the values that rows hold.
             long margin = Reserved(active.Value.Id) ? 0 : Math.Min(Math.Max(size / 20, (long)(rate * 60)), size / 2);
             bool moved = backwards is (Guid sampled, true) && sampled == active.Value.Id;
-            if (next is not null && (left <= margin || moved || next.Value.Reserved))
+
+            // Statements that draw from the sequence wait for the switch once fewer values are left than there are of
+            // them, since each may draw one before it checks again, so the switch is needed then, or while any waits.
+            bool crowded = Crowded(seqoid, active.Value.Id, left);
+            if (next is not null && (left <= margin || moved || crowded || next.Value.Reserved))
             {
                 if (!apply)
                 {
                     return true;
                 }
 
-                if (SwitchBeforeEnd(seqoid, info, (next.Value.Id, next.Value.Lo, next.Value.Hi), next.Value.Reserved, moved || left <= Math.Min(margin, size / 20)))
+                if (SwitchBeforeEnd(seqoid, info, (next.Value.Id, next.Value.Lo, next.Value.Hi), next.Value.Reserved,
+                    moved || crowded || left <= Math.Min(margin, size / 20)))
                 {
                     changed = true;
                     next = null;
@@ -3008,6 +3034,23 @@ internal static unsafe partial class SequenceRanges
         SpiParameter line = SpiParameter.Create((long)timeline);
         bool changed = false;
 
+        // The range rows of the sequences whose blocks change are locked first, in the order an exchange locks them, as
+        // every change to a sequence's ranges locks its row before the rest.
+        WorfRows changing = Worf.SelectCatalog("""
+            SELECT DISTINCT b.seqoid::oid, pg_catalog.quote_ident(n.nspname) || '.' || pg_catalog.quote_ident(c.relname) COLLATE "C" AS name
+            FROM worf.sequence_range_block b
+                JOIN pg_catalog.pg_class c ON c.oid = b.seqoid
+                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE (b.kind IN ('r', 'p') AND b.state IN ('open', 'fenced') AND b.node_id <> $1)
+                OR (b.kind IN ('r', 'p') AND b.state = 'open' AND (b.sysid <> $2 OR b.timeline <> $3))
+                OR (b.kind IN ('n', 'i') AND b.state IN ('next', 'active', 'imported') AND (b.node_id <> $1 OR b.sysid <> $2 OR b.timeline <> $3))
+            ORDER BY 2
+            """, id, system, line);
+        for (int i = 0; i < changing.Count; i++)
+        {
+            LockLedger(changing[i].Get<uint>(0));
+        }
+
         // Allocator blocks first, so that a node that resets doesn't grant itself from a root it is about to fence. Each
         // change is looked for first, so that a node whose identity stays writes nothing.
         if (Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range_block WHERE kind IN ('r', 'p') AND state IN ('open', 'fenced') AND node_id <> $1)", id))
@@ -3068,6 +3111,15 @@ internal static unsafe partial class SequenceRanges
     {
         SpiParameter seq = SpiParameter.Create(seqoid);
         WorfRows range = Worf.SelectCatalog("SELECT fenced_at IS NOT NULL, owner_node FROM worf.sequence_range WHERE seqoid = $1", seq);
+        if (range.Count == 0 || !range[0].Get<bool>(0))
+        {
+            return false;
+        }
+
+        // The range row is locked before anything changes, as every change to a sequence's ranges locks it first, and
+        // the fence is looked at again under it.
+        LockLedger(seqoid);
+        range = Worf.SelectCatalog("SELECT fenced_at IS NOT NULL, owner_node FROM worf.sequence_range WHERE seqoid = $1", seq);
         if (range.Count == 0 || !range[0].Get<bool>(0))
         {
             return false;
@@ -4023,8 +4075,8 @@ internal static unsafe partial class SequenceRanges
     /// Switches a sequence to its next block for the switch worker, beside the transactions that hold the sequence, as
     /// the range worker couldn't wait for them, so that inserts go on into the next block rather than run the active one
     /// out or wait for them. It switches only while the active block is still in its last twentieth, the sequence moved
-    /// backwards in it, or the next block is reserved for a load, since a transaction that ran the block out may have
-    /// switched it meanwhile.
+    /// backwards in it, statements wait for it or more draw from it than it has values left, or the next block is
+    /// reserved for a load, since a transaction that ran the block out may have switched it meanwhile.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
     /// <param name="briefly">Whether the range worker switches, which waits a tenth of a second at most for the locks,
@@ -4074,8 +4126,12 @@ internal static unsafe partial class SequenceRanges
             // Whether the switch is still needed is told once the switch holds the lock that every switch takes, so that
             // the block and position it reads aren't those of a switch under way, which moves the sequence first.
             bool needed = true;
-            bool Needed() => needed = NodeBlock(seqoid, epoch, "active")?.Id == active.Id && (next.Reserved || active.Id == movedIn ||
-                StepsLeft(seqoid, info, active) <= (Reserved(active.Id) ? 0 : Steps(info, active.Lo, active.Hi) / 20));
+            bool Needed()
+            {
+                long left = StepsLeft(seqoid, info, active);
+                return needed = NodeBlock(seqoid, epoch, "active")?.Id == active.Id && (next.Reserved || active.Id == movedIn ||
+                    left <= (Reserved(active.Id) ? 0 : Steps(info, active.Lo, active.Hi) / 20) || Crowded(seqoid, active.Id, left));
+            }
 
             // Nextval reaches the block's start before the switch commits, so the commit doesn't wait for the disk; a
             // later commit that writes the block's values flushes it.
@@ -4084,9 +4140,12 @@ internal static unsafe partial class SequenceRanges
             bool switched = Switch(seqoid, info, (next.Id, next.Lo, next.Hi), next.Reserved, briefly ? 100 : ExchangeTimeout, beside: true, needed: Needed);
 
             // The sequence moves to the block last, just before the transaction commits, so that other sessions'
-            // nextval, which takes the block's bounds as it commits, reaches the block no sooner than it must.
+            // nextval, which takes the block's bounds as it commits, reaches the block no sooner than it must. The
+            // statements that draw from it let it move only between their rows, and draw again once they have heard
+            // of the new bounds, as the commit lets the gate go after it tells backends of them.
             if (switched && s_pendingMove is (uint moving, long start))
             {
+                SequenceRangeGuard.ShutGate(moving, !briefly);
                 Move(moving, start);
             }
 
@@ -4097,6 +4156,16 @@ internal static unsafe partial class SequenceRanges
         {
             LedgerNoWait = false;
         }
+    }
+
+    /// <summary>
+    /// Checks whether statements wait for a sequence to switch, or more statements draw from it than its active block
+    /// has values left, as each may draw one before it checks again.
+    /// </summary>
+    private static bool Crowded(uint seqoid, Guid active, long left)
+    {
+        (int drawing, int waiting) = SequenceRangeGuard.Drawing(seqoid);
+        return waiting > 0 || (!Reserved(active) && left < drawing);
     }
 
     /// <summary>

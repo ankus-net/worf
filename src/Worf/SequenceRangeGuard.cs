@@ -24,6 +24,45 @@ internal static partial class SequenceRangeGuard
     private const uint BootstrapSuperuserId = 10;
     private const int SecurityLocalUseridChange = 0x0001;
 
+    // ShareLock and ExclusiveLock from storage/lockdefs.h, and LOCKTAG_ADVISORY and DEFAULT_LOCKMETHOD from storage/lock.h.
+    // A sequence's switch gate shows in pg_locks as an advisory lock with the sequence's OID as its object and 3 as its
+    // objsubid, which the keys of pg_advisory_lock never have.
+    private const int ShareLock = 5;
+    private const int ExclusiveLock = 7;
+    private const byte LockTagAdvisory = 10;
+    private const byte DefaultLockMethod = 1;
+    private const ushort GateKey = 3;
+
+    // The switch gates this backend holds, by sequence, with the subtransaction that took each last, and the statements
+    // that took them, by their query descriptors, or the COPY FROM they run, with the gates each took. The sequences
+    // each table's defaults draw from, as of the blocks last read.
+    private static readonly Dictionary<uint, uint> s_gates = [];
+    private static readonly List<(nint Statement, uint Subxact, List<uint> Sequences)> s_gating = [];
+    private static readonly Dictionary<uint, List<uint>> s_drawnBy = [];
+
+    // Whether each table has the guard's triggers, which only tables numbered by a managed sequence have, as of the
+    // versions of the shared and this backend's counters it was looked up at.
+    private static readonly Dictionary<uint, bool> s_guarded = [];
+    private static (long Version, long Local) s_guardedAt = (-1, -1);
+    private static bool s_gatesRegistered;
+
+    private const int MaxDrawers = 1024;
+
+    // The keys the gates of each running COPY FROM are taken under, innermost last, which no query descriptor's address
+    // can be.
+    private static readonly List<nint> s_copyGates = [];
+    private static nint s_lastCopyGate;
+
+    /// <summary>
+    /// Gets the shared table of the statements that hold each sequence's switch gate.
+    /// </summary>
+    internal static PgLwLock<WorfDrawers, WorfDrawer> Drawers { get; } = new("worf_sequence_range_drawers");
+
+    /// <summary>
+    /// Sets up the shared memory.
+    /// </summary>
+    internal static void ShmemInit() => PgSharedMemory.Initialize(Drawers, MaxDrawers, static () => default, static _ => default);
+
     // The blocks this node holds under its current identity, by sequence, as of the versions of the shared and this
     // backend's counters they were read at, and the sequences whose blocks were received under another identity.
     private static readonly Dictionary<uint, (bool Ascending, List<(long Lo, long Hi, string State)> Blocks)> s_sequences = [];
@@ -61,6 +100,9 @@ internal static partial class SequenceRangeGuard
     // them out, and the managed sequences that the COPY FROM statements running in this backend draw from, innermost
     // last.
     private static readonly HashSet<(uint Seqoid, long Lo)> s_switchedInTransaction = [];
+
+    // The sequences this transaction switched itself, which it holds against every other switch until it ends.
+    private static readonly HashSet<uint> s_switchedItself = [];
     private static readonly List<List<uint>> s_copying = [];
 
     // The active blocks, by sequence and start, reserved for a load, which the range worker uses up before it switches.
@@ -301,13 +343,16 @@ internal static partial class SequenceRangeGuard
     }
 
     /// <summary>
-    /// Notes a statement as it starts, so that the guard knows one whose only inserts are rows it moves to another
-    /// partition: an UPDATE, or a MERGE with no INSERT action, of a partitioned table, without a data-modifying WITH. A
-    /// transaction takes on the callbacks that forget them only with the first such statement.
+    /// Notes a statement as it starts: it takes the switch gates of the sequences it draws from, and the guard knows one
+    /// whose only inserts are rows it moves to another partition: an UPDATE, or a MERGE with no INSERT action, of a
+    /// partitioned table, without a data-modifying WITH. A transaction takes on the callbacks that forget them only with
+    /// the first such statement.
     /// </summary>
     /// <param name="queryDesc">The statement.</param>
-    internal static unsafe void StartStatement(QueryDesc* queryDesc)
+    /// <param name="written">The tables it writes to.</param>
+    internal static unsafe void StartStatement(QueryDesc* queryDesc, List<uint> written)
     {
+        GateStatement(queryDesc, written);
         PlannedStmt* statement = queryDesc->plannedstmt;
         if (queryDesc->snapshot is null || statement is null || statement->hasModifyingCTE)
         {
@@ -362,6 +407,450 @@ internal static partial class SequenceRangeGuard
         {
             _ = s_moving.RemoveAll(statement => statement.QueryDesc == (nint)queryDesc);
         }
+
+        CloseGates((nint)queryDesc);
+    }
+
+    /// <summary>
+    /// Takes the switch gates of the managed sequences a statement may draw from as it inserts rows: those the defaults
+    /// and identity columns of the tables it inserts into draw from, and those of every table it writes to through a
+    /// data-modifying WITH. A switch beside the transactions that hold a sequence moves it only while no statement holds
+    /// its gate, so a statement's nextval never reads the bounds the sequence had before a switch with the position the
+    /// switch moved it to: the statement takes the gate, and then hears of the switches committed, before it draws, and
+    /// lets the gate go only between its rows, or as it waits for a switch.
+    /// </summary>
+    private static unsafe void GateStatement(QueryDesc* queryDesc, List<uint> written)
+    {
+        PlannedStmt* statement = queryDesc->plannedstmt;
+        if (statement is null || written.Count == 0 ||
+            !(queryDesc->operation == CmdType.CMD_INSERT || statement->hasModifyingCTE ||
+                (queryDesc->operation == CmdType.CMD_MERGE && MergeInserts(statement))) ||
+            Worf.CatalogOid("sequence_range") == 0 || !written.Exists(Guarded))
+        {
+            return;
+        }
+
+        Reload();
+        if (s_sequences.Count == 0)
+        {
+            return;
+        }
+
+        List<uint> sequences = [.. written.SelectMany(DrawnBy)];
+        OpenGates((nint)queryDesc, sequences);
+        WaitBeforeDrawing(sequences);
+    }
+
+    /// <summary>
+    /// Waits, before a statement that holds its gates draws from a sequence, for the switch, once the active block has
+    /// reached its last twentieth, or the last value of one reserved for a load, or has no more values left than the
+    /// statements that hold the gate, which may each draw one before they check again, so that however many statements
+    /// draw at once, they don't run the block out. The sequence's position is read under the lock a SELECT from it takes,
+    /// which no switch waits for, so the statement holds the sequence against no switch as it waits.
+    /// </summary>
+    private static void WaitBeforeDrawing(List<uint> sequences)
+    {
+        foreach (uint seqoid in sequences.Distinct())
+        {
+            WaitWhileShort(seqoid);
+        }
+    }
+
+    /// <summary>
+    /// Waits for a sequence's switches as long as its active block is short, by what other statements have left of it:
+    /// a statement that waited for a switch checks the next block before it draws, since statements that went on
+    /// meanwhile may have drawn most of it.
+    /// </summary>
+    private static void WaitWhileShort(uint seqoid)
+    {
+        while (s_sequences.TryGetValue(seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) sequence) &&
+            sequence.Blocks.FindIndex(block => block.State == "active") is int index and >= 0)
+        {
+            (long lo, long hi, _) = sequence.Blocks[index];
+            long? position = ReadPosition(seqoid);
+            if ((position is long p && (p < lo || p > hi)) || !Short(seqoid, sequence.Ascending, lo, hi, position) || !WaitForSwitch(seqoid, lo))
+            {
+                return;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Checks whether a sequence's active block has reached its last twentieth, or the last value of one reserved for a
+    /// load, or has no more values left than the statements drawing from it.
+    /// </summary>
+    private static bool Short(uint seqoid, bool ascending, long lo, long hi, long? position)
+    {
+        decimal left = position is long p ? (ascending ? (decimal)hi - p : (decimal)p - lo) : (decimal)hi - lo + 1;
+        decimal tail = s_reservedActive.Contains((seqoid, lo)) ? 0 : ((decimal)hi - lo) / 20;
+        return left <= tail || left < Drawing(seqoid).Statements;
+    }
+
+    /// <summary>
+    /// Reads a sequence's last value, or null when it hasn't issued one, as a SELECT from the sequence does, under the
+    /// lock that takes, rather than nextval's.
+    /// </summary>
+    private static unsafe long? ReadPosition(uint seqoid)
+    {
+        RelationData* rel = NativeMethods.relation_open(seqoid, (int)PgLockMode.AccessShare);
+        try
+        {
+            SysScanDescData* scan = NativeMethods.systable_beginscan(rel, 0, false, null, 0, null);
+            try
+            {
+                HeapTupleData* tuple = NativeMethods.systable_getnext(scan);
+                if (tuple is null)
+                {
+                    return null;
+                }
+
+                bool isnull;
+                long lastValue = (long)NativeMethods.heap_getattr(tuple, 1, rel->rd_att, &isnull);
+                bool called = NativeMethods.heap_getattr(tuple, 3, rel->rd_att, &isnull) != 0;
+                return called ? lastValue : null;
+            }
+            finally
+            {
+                NativeMethods.systable_endscan(scan);
+            }
+        }
+        finally
+        {
+            NativeMethods.relation_close(rel, (int)PgLockMode.None);
+        }
+    }
+
+    /// <summary>
+    /// Checks whether a table has the guard's triggers, from the system catalogs alone, so that a statement that writes
+    /// to a table no managed sequence numbers reads none of worf's tables.
+    /// </summary>
+    private static bool Guarded(uint relid)
+    {
+        (long, long) version = (SequenceRanges.Version.Value, SequenceRanges.LocalVersion);
+        if (version != s_guardedAt)
+        {
+            s_guarded.Clear();
+            s_guardedAt = version;
+        }
+
+        if (!s_guarded.TryGetValue(relid, out bool guarded))
+        {
+            guarded = Elevated.Run(() => Worf.ReadScalar<bool>("""
+                SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger
+                    WHERE tgrelid = $1 AND tgfoid = 'worf.sequence_range_guard'::pg_catalog.regproc)
+                """, SpiParameter.Create(relid)));
+            s_guarded[relid] = guarded;
+        }
+
+        return guarded;
+    }
+
+    /// <summary>
+    /// Checks whether a MERGE has an INSERT action.
+    /// </summary>
+    private static unsafe bool MergeInserts(PlannedStmt* statement)
+    {
+        if (statement->planTree is null || statement->planTree->type != NodeTag.T_ModifyTable)
+        {
+            return true;
+        }
+
+        List* lists = ((ModifyTable*)statement->planTree)->mergeActionLists;
+        for (int i = 0; lists is not null && i < lists->length; i++)
+        {
+            List* actions = (List*)lists->elements[i].ptr_value;
+            for (int j = 0; actions is not null && j < actions->length; j++)
+            {
+                if (((MergeAction*)actions->elements[j].ptr_value)->commandType == CmdType.CMD_INSERT)
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Lists the managed sequences a table's defaults and identity columns draw from.
+    /// </summary>
+    private static List<uint> DrawnBy(uint relid)
+    {
+        if (relid == 0)
+        {
+            return [];
+        }
+
+        if (!s_drawnBy.TryGetValue(relid, out List<uint>? sequences))
+        {
+            WorfRows used = Elevated.Run(() => Worf.Read("""
+                SELECT d.refobjid FROM pg_catalog.pg_attrdef a JOIN pg_catalog.pg_depend d
+                    ON d.classid = 'pg_catalog.pg_attrdef'::pg_catalog.regclass AND d.objid = a.oid AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
+                WHERE a.adrelid = $1
+                UNION
+                SELECT d.objid FROM pg_catalog.pg_depend d
+                WHERE d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.refobjid = $1 AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+                    AND d.deptype = 'i'
+                """, 0, SpiParameter.Create(relid)));
+            sequences = [.. used.Select(row => row.Get<uint>(0)).Where(s_sequences.ContainsKey)];
+            s_drawnBy[relid] = sequences;
+        }
+
+        return sequences;
+    }
+
+    /// <summary>
+    /// Takes the gates of a statement's sequences that this backend doesn't hold, in the sequences' order, and hears of
+    /// the switches committed while it waited for them, so that the statement's first nextval reads their bounds.
+    /// </summary>
+    private static void OpenGates(nint statement, List<uint> sequences)
+    {
+        List<uint> taken = [];
+        foreach (uint seqoid in sequences.Distinct().Order().Where(seqoid => !s_gates.ContainsKey(seqoid)))
+        {
+            TakeGate(seqoid);
+            taken.Add(seqoid);
+        }
+
+        if (taken.Count > 0)
+        {
+            uint subxact;
+            unsafe
+            {
+                subxact = NativeMethods.GetCurrentSubTransactionId();
+            }
+
+            s_gating.Add((statement, subxact, taken));
+            Refresh();
+        }
+    }
+
+    /// <summary>
+    /// Lets go of the gates a statement took, as it ends.
+    /// </summary>
+    private static void CloseGates(nint statement)
+    {
+        int index = s_gating.FindLastIndex(entry => entry.Statement == statement);
+        if (index >= 0)
+        {
+            foreach (uint seqoid in s_gating[index].Sequences)
+            {
+                LetGate(seqoid);
+            }
+
+            s_gating.RemoveAt(index);
+        }
+    }
+
+    /// <summary>
+    /// Lets every gate this backend holds go while a switch waits for one, at a row of a statement that holds them, and
+    /// takes them again once the switch has committed, and hears of it, so that the next row's nextval reads its bounds.
+    /// </summary>
+    private static void PassGates()
+    {
+        if (s_gates.Count > 0 && SequenceRanges.SwitchesPending.Value > 0)
+        {
+            TakeGates(LetGates());
+        }
+    }
+
+    /// <summary>
+    /// Lets every gate this backend holds go, as before it waits for a switch, which waits for the gates.
+    /// </summary>
+    /// <returns>The gates it held.</returns>
+    private static List<uint> LetGates()
+    {
+        List<uint> held = [.. s_gates.Keys.Order()];
+        foreach (uint seqoid in held)
+        {
+            LetGate(seqoid);
+        }
+
+        return held;
+    }
+
+    /// <summary>
+    /// Takes gates again, and hears of the switches committed meanwhile.
+    /// </summary>
+    private static void TakeGates(List<uint> gates)
+    {
+        foreach (uint seqoid in gates)
+        {
+            TakeGate(seqoid);
+        }
+
+        if (gates.Count > 0)
+        {
+            Refresh();
+        }
+    }
+
+    private static unsafe void TakeGate(uint seqoid)
+    {
+        RegisterGates();
+        LOCKTAG tag = GateTag(seqoid);
+        _ = NativeMethods.LockAcquire(&tag, ShareLock, false, false);
+        s_gates[seqoid] = NativeMethods.GetCurrentSubTransactionId();
+        CountDrawer(seqoid, 1);
+    }
+
+    private static unsafe void LetGate(uint seqoid)
+    {
+        if (s_gates.Remove(seqoid))
+        {
+            LOCKTAG tag = GateTag(seqoid);
+            _ = NativeMethods.LockRelease(&tag, ShareLock, false);
+            CountDrawer(seqoid, -1);
+        }
+    }
+
+    /// <summary>
+    /// Reads the number of statements that hold a sequence's gate in this database, which may each draw a value before
+    /// they check the sequence again, and the number that wait for it to switch.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    /// <returns>The numbers.</returns>
+    internal static (int Statements, int Waiting) Drawing(uint seqoid)
+    {
+        uint dboid = DatabaseId();
+        using PgLwLockShareGuard<WorfDrawers, WorfDrawer> guard = Drawers.Share();
+        for (int i = 0; i < MaxDrawers; i++)
+        {
+            if (guard[i].Dboid == dboid && guard[i].Seqoid == seqoid)
+            {
+                return (guard[i].Statements, guard[i].Waiting);
+            }
+        }
+
+        return (0, 0);
+    }
+
+    /// <summary>
+    /// Counts a statement that takes or lets go of a sequence's gate, or that starts or stops waiting for it to switch.
+    /// A sequence that finds no entry free goes uncounted.
+    /// </summary>
+    private static void CountDrawer(uint seqoid, int statements, int waiting = 0)
+    {
+        uint dboid = DatabaseId();
+        using PgLwLockExclusiveGuard<WorfDrawers, WorfDrawer> guard = Drawers.Exclusive();
+        int free = -1;
+        for (int i = 0; i < MaxDrawers; i++)
+        {
+            if (guard[i].Dboid == dboid && guard[i].Seqoid == seqoid)
+            {
+                WorfDrawer drawer = guard[i];
+                drawer.Statements = Math.Max(drawer.Statements + statements, 0);
+                drawer.Waiting = Math.Max(drawer.Waiting + waiting, 0);
+                guard[i] = drawer.Statements == 0 && drawer.Waiting == 0 ? default : drawer;
+                return;
+            }
+
+            if (free < 0 && guard[i].Dboid == 0)
+            {
+                free = i;
+            }
+        }
+
+        if (free >= 0 && (statements > 0 || waiting > 0))
+        {
+            guard[free] = new WorfDrawer { Dboid = dboid, Seqoid = seqoid, Statements = Math.Max(statements, 0), Waiting = Math.Max(waiting, 0) };
+        }
+    }
+
+    /// <summary>
+    /// Shuts a sequence's switch gate for a switch beside the transactions that hold it, until its transaction ends:
+    /// it waits for the statements that hold the gate to reach their next rows, up to a second, while those that start
+    /// wait for it. Statements that hold the gate let it go at their next row while any switch waits for one.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    /// <param name="wait">Whether to wait for the statements, rather than fail at once while one holds the gate.</param>
+    internal static unsafe void ShutGate(uint seqoid, bool wait)
+    {
+        _ = PgAtomic.Add(SequenceRanges.SwitchesPending, 1L);
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () => _ = PgAtomic.Add(SequenceRanges.SwitchesPending, -1L));
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, static () => _ = PgAtomic.Add(SequenceRanges.SwitchesPending, -1L));
+        if (wait)
+        {
+            _ = Worf.Execute("SET LOCAL lock_timeout = 1000");
+        }
+
+        LOCKTAG tag = GateTag(seqoid);
+        if (NativeMethods.LockAcquire(&tag, ExclusiveLock, false, !wait) == LockAcquireResult.LOCKACQUIRE_NOT_AVAIL)
+        {
+            throw new PgException(PgSqlStates.LockNotAvailable,
+                $"could not switch sequence {SequenceRanges.GetInfo(seqoid).Name} while statements draw from it");
+        }
+    }
+
+    /// <summary>
+    /// Names a sequence's switch gate.
+    /// </summary>
+    private static LOCKTAG GateTag(uint seqoid) => new()
+    {
+        locktag_field1 = DatabaseId(),
+        locktag_field2 = seqoid,
+        locktag_field3 = 0,
+        locktag_field4 = GateKey,
+        locktag_type = LockTagAdvisory,
+        locktag_lockmethodid = DefaultLockMethod,
+    };
+
+    /// <summary>
+    /// Keeps track of the gates through the transaction: a subtransaction that commits passes those it took to its
+    /// parent, one that aborts lets them go, as PostgreSQL does their locks, and a transaction that prepares lets them
+    /// all go first, so that a prepared transaction holds none.
+    /// </summary>
+    private static void RegisterGates()
+    {
+        if (s_gatesRegistered)
+        {
+            return;
+        }
+
+        s_gatesRegistered = true;
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, ForgetGates);
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, ForgetGates);
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.PrePrepare, static () => _ = LetGates());
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, ForgetGates);
+        _ = PgTransaction.RegisterSubtransactionCallback(PgSubtransactionEvent.Commit, static (subxact, parent) =>
+        {
+            foreach (uint seqoid in s_gates.Where(gate => gate.Value == subxact.Value).Select(gate => gate.Key).ToList())
+            {
+                s_gates[seqoid] = parent.Value;
+            }
+
+            for (int i = 0; i < s_gating.Count; i++)
+            {
+                if (s_gating[i].Subxact == subxact.Value)
+                {
+                    s_gating[i] = s_gating[i] with { Subxact = parent.Value };
+                }
+            }
+        });
+
+        // The statements of a subtransaction that aborts end without ExecutorEnd.
+        _ = PgTransaction.RegisterSubtransactionCallback(PgSubtransactionEvent.Abort, static (aborted, parent) =>
+        {
+            foreach (uint seqoid in s_gates.Where(gate => gate.Value == aborted.Value).Select(gate => gate.Key).ToList())
+            {
+                _ = s_gates.Remove(seqoid);
+                CountDrawer(seqoid, -1);
+            }
+
+            _ = s_gating.RemoveAll(entry => entry.Subxact == aborted.Value);
+        });
+    }
+
+    private static void ForgetGates()
+    {
+        foreach (uint seqoid in s_gates.Keys)
+        {
+            CountDrawer(seqoid, -1);
+        }
+
+        s_gates.Clear();
+        s_gating.Clear();
+        s_gatesRegistered = false;
     }
 
     /// <summary>
@@ -430,7 +919,8 @@ internal static partial class SequenceRangeGuard
     private static bool Check(uint seqoid, long value, bool inserted)
     {
         // A switch beside this transaction, which holds the sequence, gives it new bounds, which nextval reads from the
-        // catalog as this backend last heard of them.
+        // catalog as this backend last heard of them, and a switch that waits for the gate moves it before the next row.
+        PassGates();
         Refresh();
         Reload();
         if (inserted && Moved())
@@ -554,15 +1044,39 @@ internal static partial class SequenceRangeGuard
     /// draws from blocks, or has used one up and waits for the next, and no transaction holds the sequence against the
     /// switch, as one that switches it itself does, or DDL on it.
     /// </summary>
-    private static void WaitForSwitch(uint seqoid, long lo)
+    /// <returns>Whether the block was switched.</returns>
+    private static bool WaitForSwitch(uint seqoid, long lo)
     {
         // A transaction waits at most once for each block: it holds the sequence from then, as nextval leaves it held,
         // so the switch can't finish before it ends, and a later row of it only slows it.
         if (!s_waitedInTransaction.Add((seqoid, lo)))
         {
-            return;
+            return false;
         }
 
+        // The switch waits for the gates, which the statement lets go meanwhile, and the range worker switches the block
+        // while statements wait for it, however many values it has left.
+        List<uint> held = LetGates();
+        CountDrawer(seqoid, 0, 1);
+        bool switched;
+        try
+        {
+            switched = WaitForSwitchWithoutGates(seqoid, lo);
+        }
+        finally
+        {
+            CountDrawer(seqoid, 0, -1);
+        }
+
+        TakeGates(held);
+        return switched;
+    }
+
+    /// <summary>
+    /// Waits for a switch, with no gate held.
+    /// </summary>
+    private static bool WaitForSwitchWithoutGates(uint seqoid, long lo)
+    {
         // PREPARE TRANSACTION ends the transaction too, without committing or aborting it.
         if (s_waitedInTransaction.Count == 1)
         {
@@ -591,7 +1105,7 @@ internal static partial class SequenceRangeGuard
                             AND mode IN ('ShareLock', 'ShareRowExclusiveLock', 'ExclusiveLock', 'AccessExclusiveLock'))
                 """, seq, database)[0].Get<bool>(0)))
             {
-                return;
+                return false;
             }
 
             // The worker tries the switch again soon after one that gave up on the lock, and requests a block the
@@ -613,11 +1127,13 @@ internal static partial class SequenceRangeGuard
                 // its commit sends only after it tells backends of the new blocks, so they're read again at once.
                 Refresh();
                 ForgetBounds();
-                return;
+                return true;
             }
 
             now = Worker.GetCurrentTimestamp();
         }
+
+        return false;
     }
 
     /// <summary>
@@ -631,17 +1147,52 @@ internal static partial class SequenceRangeGuard
             return;
         }
 
+        List<uint> held = LetGates();
+
         if (s_switchedInTransaction.Count == 1)
         {
-            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () => s_switchedInTransaction.Clear());
-            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, static () => s_switchedInTransaction.Clear());
-            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, static () => s_switchedInTransaction.Clear());
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, ForgetSwitches);
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, ForgetSwitches);
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, ForgetSwitches);
         }
 
-        if (SequenceRanges.SwitchInTransaction(seqoid))
+        // A transaction that switched the sequence itself holds it against the range worker's switches, which would
+        // otherwise come as it waits, so it waits for the next block the worker brings meanwhile, and switches to it.
+        long deadline = Worker.GetCurrentTimestamp() + (SequenceRanges.ExchangeTimeout * 2000L);
+        long woken = 0;
+        while (true)
         {
-            Reload();
+            if (SequenceRanges.SwitchInTransaction(seqoid))
+            {
+                _ = s_switchedItself.Add(seqoid);
+                Reload();
+                break;
+            }
+
+            long now = Worker.GetCurrentTimestamp();
+            if (!s_switchedItself.Contains(seqoid) || now >= deadline)
+            {
+                break;
+            }
+
+            if (now - woken >= 100_000)
+            {
+                woken = now;
+                _ = PgAtomic.Add(SequenceRanges.CheckRequested, 1L);
+                Worker.WakeRangeWorker();
+            }
+
+            PgInterrupts.Check();
+            Worker.WaitLatch(10);
         }
+
+        TakeGates(held);
+    }
+
+    private static void ForgetSwitches()
+    {
+        s_switchedInTransaction.Clear();
+        s_switchedItself.Clear();
     }
 
     /// <summary>
@@ -651,13 +1202,15 @@ internal static partial class SequenceRangeGuard
     /// </summary>
     private static void NearEnd(uint seqoid, bool ascending, long lo, long hi, long value)
     {
+        // What the block has left is what other statements have left it since this row's value, as far as they drew.
         bool last = (ascending ? (decimal)hi - value : (decimal)value - lo) == 0;
-        if (s_reservedActive.Contains((seqoid, lo)) ? last : WakeNearEnd(seqoid, ascending, lo, hi, value))
+        bool reserved = s_reservedActive.Contains((seqoid, lo));
+        if (((reserved ? last : WakeNearEnd(seqoid, ascending, lo, hi, value)) || (!last && Short(seqoid, ascending, lo, hi, ReadPosition(seqoid) ?? value))) &&
+            WaitForSwitch(seqoid, lo))
         {
-            WaitForSwitch(seqoid, lo);
+            WaitWhileShort(seqoid);
         }
-
-        if (last)
+        else if (last)
         {
             SwitchInTransaction(seqoid, lo);
         }
@@ -673,26 +1226,21 @@ internal static partial class SequenceRangeGuard
     internal static unsafe Node* CopyCondition(uint relid)
     {
         s_copying.Add([]);
+        s_copyGates.Add(--s_lastCopyGate);
         Reload();
         if (s_sequences.Count == 0 || relid == 0)
         {
             return null;
         }
 
-        WorfRows used = Elevated.Run(() => Worf.Read("""
-            SELECT d.refobjid FROM pg_catalog.pg_attrdef a JOIN pg_catalog.pg_depend d
-                ON d.classid = 'pg_catalog.pg_attrdef'::pg_catalog.regclass AND d.objid = a.oid AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
-            WHERE a.adrelid = $1
-            UNION
-            SELECT d.objid FROM pg_catalog.pg_depend d
-            WHERE d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.refobjid = $1 AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
-                AND d.deptype = 'i'
-            """, 0, SpiParameter.Create(relid)));
-        s_copying[^1].AddRange(used.Select(row => row.Get<uint>(0)).Where(s_sequences.ContainsKey));
+        s_copying[^1].AddRange(DrawnBy(relid));
         if (s_copying[^1].Count == 0)
         {
             return null;
         }
+
+        OpenGates(s_copyGates[^1], s_copying[^1]);
+        WaitBeforeDrawing(s_copying[^1]);
 
         if (!s_copyCheckInstalled)
         {
@@ -713,7 +1261,12 @@ internal static partial class SequenceRangeGuard
     /// <summary>
     /// Stops checking the sequences of the innermost COPY FROM that <see cref="CopyCondition"/> started.
     /// </summary>
-    internal static void EndCopy() => s_copying.RemoveAt(s_copying.Count - 1);
+    internal static void EndCopy()
+    {
+        CloseGates(s_copyGates[^1]);
+        s_copyGates.RemoveAt(s_copyGates.Count - 1);
+        s_copying.RemoveAt(s_copying.Count - 1);
+    }
 
     /// <summary>
     /// Checks the sequences the innermost COPY FROM draws from, after a row's defaults drew their values.
@@ -725,6 +1278,7 @@ internal static partial class SequenceRangeGuard
             return (sbyte*)s_copyCheckValue;
         }
 
+        PassGates();
         Refresh();
         Reload();
         foreach (uint seqoid in s_copying[^1])
@@ -1019,6 +1573,7 @@ internal static partial class SequenceRangeGuard
         // sequences' bounds are read again too.
         ForgetBounds();
         s_sequences.Clear();
+        s_drawnBy.Clear();
         s_reservedActive.Clear();
         s_moved.Clear();
         s_reached.Clear();

@@ -71,11 +71,21 @@ internal static class SequenceRangeWorker
                             // The lock nextval takes keeps a switch from committing between the reads of the sequence's
                             // blocks and of its position. A sequence that a transaction holds against it waits for a later
                             // tick, so that the worker waits on no session.
+                            // Its next block comes all the same, which a transaction that switched it itself, and so
+                            // holds it against the check, switches to at the block's end.
                             unsafe
                             {
                                 if (!NativeMethods.ConditionalLockRelationOid(seqoid, (int)PgLockMode.RowExclusive))
                                 {
-                                    return false;
+                                    SequenceRanges.LedgerNoWait = true;
+                                    try
+                                    {
+                                        return SequenceRanges.Replenish(seqoid, local, Rate(rates, seqoid));
+                                    }
+                                    finally
+                                    {
+                                        SequenceRanges.LedgerNoWait = false;
+                                    }
                                 }
                             }
 

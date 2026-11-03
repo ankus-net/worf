@@ -1586,6 +1586,7 @@ internal static partial class Worf
         Worker.WorkerShmemInit();
         DdlLock.ShmemInit();
         SequenceRanges.ShmemInit();
+        SequenceRangeGuard.ShmemInit();
         SequenceRangeReservations.ShmemInit();
         SequenceRangeHeard.ShmemInit();
         SnowflakeIds.ShmemInit();

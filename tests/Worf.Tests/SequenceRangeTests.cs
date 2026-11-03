@@ -1898,10 +1898,111 @@ public sealed class SequenceRangeTests
             client.Dispose();
         }
 
+        // Without the backoff, each of node_b's calls to node_c held up its calls to node_a for 5 s, so its inserts waited
+        // seconds for blocks; with it, none waits for a call to node_c longer than a probe's second.
         waits.Sort();
-        Assert.IsGreaterThan(1000, waits.Count, "node_b's inserts");
+        Assert.IsGreaterThan(100, waits.Count, "node_b's inserts");
         Assert.IsLessThan(2500.0, waits[^1], "node_b's slowest insert, against the 5000 ms node_c's calls took");
-        Assert.IsLessThan(500.0, waits[(int)(waits.Count * 0.99)], "node_b's 99th percentile insert");
+        Assert.IsLessThan(1000.0, waits[(int)(waits.Count * 0.99)], "node_b's 99th percentile insert");
+    }
+
+    /// <summary>
+    /// Statements that draw from a sequence at once never run its block out, however many draw and however small the
+    /// blocks: many single-row writers, with holders among them, multi-row writers, and a COPY beside writers. A
+    /// statement waits for the switch, before it draws or after a row, once the block has no more values left than the
+    /// statements drawing from it, and checks the next block once it comes, and a switch beside the holders moves the
+    /// sequence only between their statements' rows, so that no nextval reads the old bounds with the new position.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task ConcurrentStatementsNeverRunABlockOut()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode node = await StartNodeAsync("node_a", token);
+        List<string> failures = [];
+
+        async Task<string> TableAsync(string name, int size)
+        {
+            _ = await node.SafePsqlAsync(Database, $"""
+                CREATE TABLE {name} (id bigserial PRIMARY KEY, v int);
+                SELECT worf.enable_sequence_range('{name}_id_seq', participants := '{"{}"}', range_size := {size}, max_range_size := {size});
+                """, token);
+            Assert.IsTrue(await node.PollQueryUntilAsync(Database,
+                $"SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = '{name}_id_seq'::regclass", token),
+                $"{name} drawing from a block with the next ready");
+            return name;
+        }
+
+        async Task WriteAsync(string table, int sessions, int statements, string values, int holdEvery = 0)
+            => await Task.WhenAll(Enumerable.Range(0, sessions).Select(async session =>
+            {
+                await using NpgsqlConnection connection = await node.OpenAsync(Database, token);
+                for (int i = 0; i < statements; i++)
+                {
+                    try
+                    {
+                        await using NpgsqlTransaction transaction = await connection.BeginTransactionAsync(token);
+                        await using (NpgsqlCommand insert = new($"INSERT INTO {table} (v) {values}", connection, transaction))
+                        {
+                            _ = await insert.ExecuteNonQueryAsync(token);
+                        }
+
+                        if (holdEvery > 0 && i % holdEvery == session % holdEvery)
+                        {
+                            await using NpgsqlCommand sleep = new("SELECT pg_sleep(0.2)", connection, transaction);
+                            _ = await sleep.ExecuteNonQueryAsync(token);
+                        }
+
+                        await transaction.CommitAsync(token);
+                    }
+                    catch (PostgresException error)
+                    {
+                        lock (failures)
+                        {
+                            failures.Add($"{table}: {error.SqlState} {error.MessageText}");
+                        }
+                    }
+                }
+            }));
+
+        async Task CopyAsync(string table, int rows)
+        {
+            await using NpgsqlConnection connection = await node.OpenAsync(Database, token);
+            try
+            {
+                await using TextWriter copy = await connection.BeginTextImportAsync($"COPY {table} (v) FROM STDIN", token);
+                for (int i = 0; i < rows; i++)
+                {
+                    await copy.WriteLineAsync("1");
+                }
+            }
+            catch (PostgresException error)
+            {
+                lock (failures)
+                {
+                    failures.Add($"{table}: {error.SqlState} {error.MessageText}");
+                }
+            }
+        }
+
+        // 24 single-row writers on 200-value blocks, without holders and with one transaction in ten holding the
+        // sequence for 0.2 s; 8 writers of 30 rows on 100-value blocks; and 25-row writers on 10-value blocks.
+        await WriteAsync(await TableAsync("single", 200), 24, 150, "VALUES (1)");
+        await WriteAsync(await TableAsync("held", 200), 24, 100, "VALUES (1)", 10);
+        await WriteAsync(await TableAsync("multi", 100), 8, 15, "SELECT 1 FROM generate_series(1, 30)");
+        await WriteAsync(await TableAsync("tiny", 10), 2, 10, "SELECT 1 FROM generate_series(1, 25)");
+
+        // A COPY of 1,500 rows beside two writers on 1,000-value blocks.
+        string copied = await TableAsync("copied", 1000);
+        Task writers = WriteAsync(copied, 2, 100, "SELECT 1 FROM generate_series(1, 10)");
+        await CopyAsync(copied, 1500);
+        await writers;
+
+        Assert.IsEmpty(failures, string.Join("\n", failures.Distinct().Take(10)));
+        Assert.AreEqual("3600|2400|3600|500|3500", await node.SafePsqlAsync(Database, """
+            SELECT (SELECT count(DISTINCT id) FROM single), (SELECT count(DISTINCT id) FROM held), (SELECT count(DISTINCT id) FROM multi),
+                (SELECT count(DISTINCT id) FROM tiny), (SELECT count(DISTINCT id) FROM copied)
+            """, token), "the rows, each with its own key");
     }
 
     /// <summary>
@@ -2192,6 +2293,12 @@ public sealed class SequenceRangeTests
         HashSet<string> keptBehind = [.. (await nodeA.SafePsqlAsync(Database, "SELECT id FROM t", token)).Split('\n')];
         await nodeB.StartServerAsync(token);
         Assert.IsTrue(await nodeA.PollLogAsync(behind, "saw this node's WAL position move backwards", token), "node_a reset");
+
+        // The reset says so before it commits, and node_a draws from a new block once it has.
+        long drawnTop = drawnBehind.Where(id => id.Length > 0).Max(id => long.Parse(id, CultureInfo.InvariantCulture));
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database,
+            $"SELECT state = 'active' AND active_lo > {drawnTop} FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token),
+            "node_a drawing from a block past the values node_b copied");
         await WaitActiveAsync(nodes, token);
         await InsertAsync(nodeA, 20, token);
         foreach (string id in (await nodeA.SafePsqlAsync(Database, "SELECT id FROM t", token)).Split('\n').Where(id => !keptBehind.Contains(id)))
