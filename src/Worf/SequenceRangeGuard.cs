@@ -97,10 +97,8 @@ internal static partial class SequenceRangeGuard
     // The points in each sequence's active block, by sequence and value, at which this backend has woken the range worker.
     private static readonly HashSet<(uint Seqoid, long Mark)> s_woken = [];
 
-    // The active blocks, by sequence and start, whose switch this backend has waited for, and until when it may, and
-    // those this transaction has.
+    // The active blocks, by sequence and start, whose switch this backend has waited for, and until when it may.
     private static readonly Dictionary<(uint Seqoid, long Lo), long> s_waited = [];
-    private static readonly HashSet<(uint Seqoid, long Lo)> s_waitedInTransaction = [];
 
     // The active blocks, by sequence and start, that this transaction has tried to switch away from itself, as it ran
     // them out, and the managed sequences that the COPY FROM statements running in this backend draw from, innermost
@@ -1096,20 +1094,15 @@ internal static partial class SequenceRangeGuard
     /// Waits, once a sequence reaches the last twentieth of its active block, until the block is switched, so that
     /// inserts wait for the range worker to wake and switch, or for a next block on its way from the exchange worker,
     /// rather than run the block out. A backend waits up to twice the exchange timeout for each block in all, which
-    /// covers an exchange that hangs and the check after it. It waits only while the worker can switch: the sequence
-    /// draws from blocks, or has used one up and waits for the next, and no transaction holds the sequence against the
-    /// switch, as one that switches it itself does, or DDL on it.
+    /// covers an exchange that hangs and the check after it, however many of its statements and rows wait. It waits only
+    /// while the worker can switch: the sequence draws from blocks, or has used one up and waits for the next, and no
+    /// transaction holds the sequence against the switch, as one that switches it itself does, or DDL on it. A switch
+    /// the range worker or a switch worker makes is no such transaction, nor is a lock still waited for, so a statement
+    /// that finds one goes on waiting, and checks again at each of its rows.
     /// </summary>
     /// <returns>Whether the block was switched.</returns>
     private static bool WaitForSwitch(uint seqoid, long lo)
     {
-        // A transaction waits at most once for each block: it holds the sequence from then, as nextval leaves it held,
-        // so the switch can't finish before it ends, and a later row of it only slows it.
-        if (!s_waitedInTransaction.Add((seqoid, lo)))
-        {
-            return false;
-        }
-
         // The switch waits for the gates, which the statement lets go meanwhile, and the range worker switches the block
         // while statements wait for it, however many values it has left.
         List<uint> held = LetGates();
@@ -1179,16 +1172,9 @@ internal static partial class SequenceRangeGuard
     /// </summary>
     private static bool WaitForSwitchWithoutGates(uint seqoid, long lo)
     {
-        // PREPARE TRANSACTION ends the transaction too, without committing or aborting it.
-        if (s_waitedInTransaction.Count == 1)
-        {
-            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () => s_waitedInTransaction.Clear());
-            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, static () => s_waitedInTransaction.Clear());
-            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, static () => s_waitedInTransaction.Clear());
-        }
-
         SpiParameter seq = SpiParameter.Create(seqoid);
         SpiParameter database = SpiParameter.Create(DatabaseId());
+        SpiParameter switching = SpiParameter.Create(Switchers());
         long now = Worker.GetCurrentTimestamp();
         if (!s_waited.TryGetValue((seqoid, lo), out long deadline))
         {
@@ -1203,9 +1189,9 @@ internal static partial class SequenceRangeGuard
                 SELECT EXISTS (SELECT 1 FROM worf.sequence_range WHERE seqoid = $1 AND state IN ('active', 'exhausted'))
                     AND NOT EXISTS (
                         SELECT 1 FROM pg_catalog.pg_locks
-                        WHERE locktype = 'relation' AND database = $2 AND relation = $1
+                        WHERE locktype = 'relation' AND database = $2 AND relation = $1 AND granted AND pid <> ALL ($3::pg_catalog.int4[])
                             AND mode IN ('ShareLock', 'ShareRowExclusiveLock', 'ExclusiveLock', 'AccessExclusiveLock'))
-                """, seq, database)[0].Get<bool>(0)))
+                """, seq, database, switching)[0].Get<bool>(0)))
             {
                 return false;
             }
@@ -1236,6 +1222,28 @@ internal static partial class SequenceRangeGuard
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Lists the processes of this database's range worker and switch workers, whose locks on a sequence are its switches.
+    /// </summary>
+    private static int[] Switchers()
+    {
+        uint dboid = DatabaseId();
+        List<int> pids = [];
+        using PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share();
+        for (int i = 0; i < guard.Length; i++)
+        {
+            if (guard[i].WorkerType is WorfWorkerType.Range or WorfWorkerType.Switch && guard[i].Dboid == dboid && guard[i].Proc != 0)
+            {
+                unsafe
+                {
+                    pids.Add(((PGPROC*)guard[i].Proc)->pid);
+                }
+            }
+        }
+
+        return [.. pids];
     }
 
     /// <summary>
