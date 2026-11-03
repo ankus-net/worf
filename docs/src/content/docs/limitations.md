@@ -49,12 +49,15 @@ conflict resolution purposes.
 
 Apply runs with `session_replication_role` set to `replica`, under which
 PostgreSQL doesn't recheck deferrable unique indexes and exclusion constraints.
-Apply finds conflicts in a deferrable unique index itself, as in any unique
-index, unless the index has expressions or a predicate. It refuses to insert or
-update rows of a table with such an index or a deferrable exclusion constraint,
-with the error
+Apply checks each row it inserts or updates against a table's deferrable unique
+and exclusion constraints itself, as their rechecks would at commit, and fails
+the change with a unique or exclusion violation, which
+`worf.exception_behaviour` handles as any other failure. A table's copy is
+checked against them once it has copied. Apply refuses to insert or update rows
+of a table with a deferrable unique or exclusion constraint whose index has
+expressions or a predicate, with the error
 
-    ERROR: worf doesn't support index rechecks needed for deferrable indexes
+    ERROR: worf doesn't support index rechecks needed for deferrable indexes with expressions or a predicate
     DETAIL: relation public.test_relation has deferrable indexes: index1, index2
 
 ## DDL
@@ -63,6 +66,12 @@ With `worf.enable_ddl_replication` on, DDL replicates as it runs, and
 `worf.include_ddl_repset` adds the tables it creates to replication sets.
 Otherwise, managing DDL so that the provider and subscriber database(s) remain
 compatible is the responsibility of the user.
+
+In a `SQL_ASCII` database, DDL whose text holds bytes that aren't valid UTF-8
+fails as it would replicate, with a `character_not_in_repertoire` error, as
+worf can't replicate it exactly; values that hold such bytes replicate byte for
+byte, and a log that shows one, as `worf.exception_log`, shows its hex as bytea
+does.
 
 worf provides the `worf.replicate_ddl_command` function to allow DDL
 to be run on the provider and subscriber at a consistent point.

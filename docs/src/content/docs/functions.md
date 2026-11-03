@@ -6,11 +6,15 @@ description: Replicate DDL and wait for replication.
 - `worf.replicate_ddl_command(command text, replication_sets text[])`
   Execute locally and then send the specified command to the replication queue
   for execution on subscribers which are subscribed to one of the specified
-  `replication_sets`. The command runs on every node as the role that called
-  the function, as a security-definer function runs, so neither it nor a
-  function it calls can change the role, and settings it makes last until it
-  ends. It can't control the transaction: `BEGIN`, `COMMIT`, `SAVEPOINT` and
-  the like fail.
+  `replication_sets`. The command runs here as the role that called the
+  function, and on the other nodes with that role as the session user, under
+  the empty search path it runs under here, so that it, and the functions it
+  calls, can set and reset the role as they can here, and no further: changing
+  the session authorization fails there unless the role is a superuser. The
+  settings it makes last until it ends, and the temporary objects it creates on
+  the other nodes go once it ends. It can't control the transaction: `BEGIN`,
+  `COMMIT`, `SAVEPOINT` and the like fail, and a DO block or procedure in it
+  runs atomically.
 
   Parameters:
   - `command` - DDL query to execute

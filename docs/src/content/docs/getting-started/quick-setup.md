@@ -21,11 +21,10 @@ with `forward_origins` `{all}` another. When one that needs a slot finds none
 free, subscriptions give up the slots of forwarded nodes' origins they no longer
 need, which slows apply, the last one a subscription applied under going too
 once its own origin has taken its progress. A forwarded node's origin that still
-finds none takes none: its transactions commit under the subscription's own
-origin, as pglogical commits every transaction, with a warning, and their rows
-count as the provider's in conflicts and when they're forwarded on. A
-subscription's own origin, or a table sync's, that finds none within 10 seconds
-stops its apply or table sync with an error, which retries. Subscriptions also
+finds none, or a subscription's own origin, or a table sync's, that finds none
+within 10 seconds, stops its apply or table sync with an error, which retries:
+committed under another origin, a forwarded node's transaction would count as
+that origin's node's, and come back to the node that wrote it. Subscriptions also
 give up the slots of every forwarded node's origin to an enabled PostgreSQL
 subscription whose origin, or a table sync's, has none while a worker of it runs
 or can start: its owner can log in, its database allows connections, and
@@ -38,10 +37,11 @@ isn't waiting for one, and they don't give theirs up for it again for 10
 minutes, then for twice as long each time, up to a day. Other users of origins
 need the limit raised. `worf.origin_writer` records the
 node and subscription each origin worf creates applies for, a row each time one
-is created or dropped, and forgets a row once a later one has superseded it for
+is created or dropped, as when forwarded nodes take turns with fewer slots than
+they need, and forgets a row once a later one has superseded it for
 `vacuum_freeze_min_age` transactions, as vacuum would freeze rows written before
 then, so it holds a row for each origin id and for each creation or drop in that
-many transactions. A conflict on a row written before then, whose record is
+many transactions; each creation or drop locks the table for its transaction. A conflict on a row written before then, whose record is
 forgotten, takes the row to be from what its origin applies for now, as
 pglogical takes every row.
 
