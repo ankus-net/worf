@@ -63,6 +63,9 @@ internal static partial class SequenceRangeGuard
     private static readonly HashSet<(uint Seqoid, long Lo)> s_switchedInTransaction = [];
     private static readonly List<List<uint>> s_copying = [];
 
+    // The active blocks, by sequence and start, reserved for a load, which the range worker uses up before it switches.
+    private static readonly HashSet<(uint Seqoid, long Lo)> s_reservedActive = [];
+
     /// <summary>
     /// Gets the setting that a COPY FROM into a table whose defaults draw from a managed sequence reads for each row, in
     /// the condition <see cref="CopyCondition"/> adds, after the row's defaults drew their values and before COPY
@@ -641,17 +644,19 @@ internal static partial class SequenceRangeGuard
     }
 
     /// <summary>
-    /// Waits for the range worker's switch once a value reaches the last twentieth of its active block, and switches in
-    /// this transaction at the block's last value, so that the transaction's later rows take the next block's values.
+    /// Waits for the range worker's switch once a value reaches the last twentieth of its active block, or the last
+    /// value of one reserved for a load, which the worker uses up, and switches in this transaction at the block's last
+    /// value, so that the transaction's later rows take the next block's values.
     /// </summary>
     private static void NearEnd(uint seqoid, bool ascending, long lo, long hi, long value)
     {
-        if (WakeNearEnd(seqoid, ascending, lo, hi, value))
+        bool last = (ascending ? (decimal)hi - value : (decimal)value - lo) == 0;
+        if (s_reservedActive.Contains((seqoid, lo)) ? last : WakeNearEnd(seqoid, ascending, lo, hi, value))
         {
             WaitForSwitch(seqoid, lo);
         }
 
-        if ((ascending ? (decimal)hi - value : (decimal)value - lo) == 0)
+        if (last)
         {
             SwitchInTransaction(seqoid, lo);
         }
@@ -998,6 +1003,7 @@ internal static partial class SequenceRangeGuard
         }
 
         s_sequences.Clear();
+        s_reservedActive.Clear();
         s_moved.Clear();
         s_reached.Clear();
         s_issuable.Clear();
@@ -1014,7 +1020,7 @@ internal static partial class SequenceRangeGuard
         // have given the sequence its new block.
         SpiResult result = Elevated.Run(() => Worf.SelectCatalog("""
             SELECT r.seqoid::oid, s.seqincrement > 0, b.lo, b.hi, b.state,
-                b.node_id = l.node_id AND b.sysid = $1 AND b.timeline = $2
+                b.node_id = l.node_id AND b.sysid = $1 AND b.timeline = $2, b.reserved
             FROM worf.sequence_range r
                 JOIN pg_catalog.pg_sequence s ON s.seqrelid = r.seqoid
                 CROSS JOIN worf.local_node l
@@ -1040,6 +1046,10 @@ internal static partial class SequenceRangeGuard
             if (row.Get<bool>(5))
             {
                 sequence.Blocks.Add((lo, row.Get<long>(3), state));
+                if (state == "active" && row.Get<bool>(6))
+                {
+                    _ = s_reservedActive.Add((seqoid, lo));
+                }
             }
             else if (state is not "retired")
             {

@@ -763,7 +763,9 @@ internal static partial class Worf
 
     /// <summary>
     /// Selects rows from our catalog tables with the latest snapshot, as the C's catalog scans without a snapshot do,
-    /// so a read after waiting for a lock sees what the lock's holder committed.
+    /// so a read after waiting for a lock sees what the lock's holder committed. The query runs read-only, as SPI then
+    /// takes the snapshot pushed for it, rather than the transaction's, which in REPEATABLE READ is its first; and as a
+    /// writable query does, it sees what the transaction itself wrote before it.
     /// </summary>
     /// <param name="commandText">The query.</param>
     /// <param name="parameters">The query's parameters.</param>
@@ -771,10 +773,11 @@ internal static partial class Worf
     internal static unsafe SpiResult SelectCatalog(string commandText, params ReadOnlySpan<SpiParameter> parameters)
     {
         int nestLevel = PinSearchPath();
+        NativeMethods.CommandCounterIncrement();
         NativeMethods.PushActiveSnapshot(NativeMethods.GetLatestSnapshot());
         try
         {
-            return Spi.Select(commandText, parameters);
+            return Spi.Query(commandText, true, 0, parameters);
         }
         finally
         {

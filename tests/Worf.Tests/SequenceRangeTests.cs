@@ -995,6 +995,19 @@ public sealed class SequenceRangeTests
         Assert.AreEqual("0", await node.SafePsqlAsync(Database, $"SELECT count(*) FROM sp WHERE id IN ({drawn.Split('\n')[^1]})", token),
             "values a rolled-back transaction drew, issued again");
 
+        // A REPEATABLE READ transaction whose snapshot predates switches inserts into the blocks they switched to.
+        await using (NpgsqlConnection repeatable = await node.OpenAsync(Database, token))
+        {
+            await using (NpgsqlCommand begin = new("BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM sp", repeatable))
+            {
+                _ = await begin.ExecuteScalarAsync(token);
+            }
+
+            _ = await node.SafePsqlAsync(Database, "INSERT INTO sp (v) SELECT 'switching' FROM generate_series(1, 250)", token);
+            await using NpgsqlCommand insert = new("INSERT INTO sp (v) SELECT 'repeatable' FROM generate_series(1, 150); COMMIT", repeatable);
+            _ = await insert.ExecuteNonQueryAsync(token);
+        }
+
         // A prepared transaction that read the sequence, or drew from it, leaves its switches be.
         _ = await node.SafePsqlAsync(Database, "BEGIN; SELECT last_value FROM sp_id_seq; PREPARE TRANSACTION 'reader'", token);
         Assert.IsTrue(await node.PollQueryUntilAsync(Database, string.Format(CultureInfo.InvariantCulture, Ready, "sp_id_seq"), token), "sp's next block");
@@ -1016,7 +1029,7 @@ public sealed class SequenceRangeTests
     /// <summary>
     /// A session reserves a block right after the database's first sequence is enabled, as the range worker starts. The
     /// range worker switches blocks, and a load's reserved block, while sessions read the ranges' view or have
-    /// inserted, but not while a transaction that called nextval stays open. It leaves a block when the sequence moves
+    /// inserted, or a transaction that called nextval stays open. It leaves a block when the sequence moves
     /// backwards in it, behind where it was at the last check or behind rows, warns once a root has granted nine tenths
     /// of its values, and partitions of a guarded table keep the guard as they come and go.
     /// </summary>
@@ -1066,8 +1079,7 @@ public sealed class SequenceRangeTests
             _ = await load.ExecuteNonQueryAsync(token);
         }
 
-        // An open transaction that called nextval holds off every switch until it ends.
-        string heldBlock;
+        // An open transaction that called nextval holds off no switch: the others' inserts go on through the blocks.
         await using (NpgsqlConnection holder = await node.OpenAsync(Database, token))
         {
             await using (NpgsqlCommand hold = new("BEGIN; SELECT nextval('t_id_seq')", holder))
@@ -1075,35 +1087,30 @@ public sealed class SequenceRangeTests
                 _ = await hold.ExecuteScalarAsync(token);
             }
 
-            heldBlock = await node.SafePsqlAsync(Database, "SELECT active_lo FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token);
+            string heldBlock = await node.SafePsqlAsync(Database, "SELECT active_lo FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token);
             await using NpgsqlConnection writer = await node.OpenAsync(Database, token);
-            bool exhausted = false;
-            for (int i = 0; i < 5000 && !exhausted; i++)
+            for (int i = 0; i < 100; i++)
             {
-                try
-                {
-                    await using NpgsqlCommand insert = new("INSERT INTO t (v) SELECT 'held' FROM generate_series(1, 10)", writer);
-                    _ = await insert.ExecuteNonQueryAsync(token);
-                }
-                catch (PostgresException error) when (error.SqlState == "2200H")
-                {
-                    exhausted = true;
-                }
+                await using NpgsqlCommand insert = new("INSERT INTO t (v) SELECT 'held' FROM generate_series(1, 10)", writer);
+                _ = await insert.ExecuteNonQueryAsync(token);
             }
 
-            Assert.IsTrue(exhausted, "the sequence ran out while a switch waited");
+            Assert.AreNotEqual(heldBlock, await node.SafePsqlAsync(Database,
+                "SELECT active_lo FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token), "switches beside the transaction");
         }
 
-        Assert.IsTrue(await node.PollQueryUntilAsync(Database,
-            $"SELECT active_lo <> {heldBlock} FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token), "a switch once the transaction ended");
         _ = await node.SafePsqlAsync(Database, "INSERT INTO t (v) VALUES ('after')", token);
 
-        // A session can't reserve a block it would have to switch to while its own transaction holds the sequence.
-        PostgresException held = await Assert.ThrowsExactlyAsync<PostgresException>(() => node.SafePsqlAsync(Database,
-            "BEGIN; INSERT INTO t (v) VALUES ('first'); SELECT worf.reserve_sequence_range('t_id_seq', 100000)", token));
-        Assert.AreEqual("55P03", held.SqlState);
+        // A session reserves a block while its own transaction holds the sequence, and loads it.
+        _ = await node.SafePsqlAsync(Database, """
+            BEGIN;
+            INSERT INTO t (v) VALUES ('first');
+            SELECT worf.reserve_sequence_range('t_id_seq', 1000);
+            INSERT INTO t (v) SELECT 'reserved' FROM generate_series(1, 1000);
+            COMMIT;
+            """, token);
 
-        // The worker switches to the block that was reserved once the transaction has ended.
+        // The worker has switched to the block that was reserved.
         Assert.IsTrue(await node.PollQueryUntilAsync(Database,
             "SELECT NOT EXISTS (SELECT 1 FROM worf.sequence_range_block WHERE seqoid = 't_id_seq'::regclass AND state = 'next' AND reserved)", token),
             "the reserved block switched to");

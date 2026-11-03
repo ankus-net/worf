@@ -236,6 +236,44 @@ internal static class SequenceRangeHeard
         return new PgTimestampTz(assumeHeard ? Math.Max(at, guard.Header.Since) : at);
     }
 
+    /// <summary>
+    /// Checks whether a neighbor may have this server reset a sequence's blocks now: once every ten minutes, with the
+    /// resets of the minute after it, which one rollback brings for every sequence. A neighbor that saw this node roll
+    /// back keeps asking meanwhile, and neither takes its grants nor answers its requests, so that a message made up to
+    /// reset it can't do so more often. This server starts with none, as after a restore, which takes the first at once.
+    /// </summary>
+    /// <param name="nodeId">The neighbor.</param>
+    /// <returns>Whether it may.</returns>
+    internal static bool MayReset(uint nodeId)
+    {
+        uint dboid = DatabaseId();
+        long now = Worker.GetCurrentTimestamp();
+        using PgLwLockExclusiveGuard<WorfHeardTable, WorfHeard> guard = Nodes.Exclusive();
+        for (int i = 0; i < guard.Length; i++)
+        {
+            if (guard[i].Dboid != dboid || guard[i].NodeId != nodeId)
+            {
+                continue;
+            }
+
+            WorfHeard heard = guard[i];
+            if (heard.ResetAt != 0 && now - heard.ResetAt is >= 60_000_000 and < 600_000_000)
+            {
+                return false;
+            }
+
+            if (heard.ResetAt == 0 || now - heard.ResetAt >= 600_000_000)
+            {
+                heard.ResetAt = now;
+                guard[i] = heard;
+            }
+
+            return true;
+        }
+
+        return true;
+    }
+
     private static uint DatabaseId()
     {
         unsafe

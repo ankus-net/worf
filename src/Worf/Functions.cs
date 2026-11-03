@@ -355,6 +355,16 @@ internal static class Functions
             ForceTextTransfer = forceTextTransfer,
         };
 
+        // Names that differ only in characters a slot's name can't hold, or in its end, can give the same slot, and
+        // replication origin, which two subscriptions can't share.
+        if (Worf.ReadScalar<string?>("SELECT sub_name::text FROM worf.subscription WHERE sub_slot_name = $1::name", SpiParameter.Create(sub.SlotName))
+            is string sharing)
+        {
+            throw new PgException(PgSqlStates.DuplicateObject,
+                $"subscription \"{subName}\" would use slot \"{sub.SlotName}\", which subscription \"{sharing}\" uses",
+                hint: "Choose a subscription name that differs in letters, digits or underscores.");
+        }
+
         WorfNode.CreateSubscription(sub);
 
         // Create synchronization status for the subscription.
@@ -477,6 +487,13 @@ internal static class Functions
 
             // Drop the slot on remote side, and those its table syncs left.
             //
+            bool shared = Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.subscription WHERE sub_slot_name = $1::name AND sub_id <> $2)",
+                SpiParameter.Create(sub.SlotName), SpiParameter.Create(sub.Id));
+            if (shared)
+            {
+                PgLog.Warning($"subscription \"{sub.Name}\" shares slot \"{sub.SlotName}\" with another subscription, which keeps it and its replication origin");
+            }
+
             // Note, we can't fail here since we can't assume that the remote node is still reachable or even alive.
             try
             {
@@ -507,7 +524,10 @@ internal static class Functions
                     }
 
                     SequenceRangeExchange.Leave(originConn, node, sub);
-                    Rpc.DropRemoteSlot(originConn, sub.SlotName);
+                    if (!shared)
+                    {
+                        Rpc.DropRemoteSlot(originConn, sub.SlotName);
+                    }
                 });
             }
             catch (PgException)
@@ -517,8 +537,11 @@ internal static class Functions
                     ". Its sequence range fences wait for this node's reports: delete this node's rows in worf.sequence_range_link there while it has no fence up, so that later ones don't, and one that is up waits until this node subscribes again and reports, or worf.activate_sequence_range naming this node stops the wait for it, which reissues any values this node holds that the provider lost");
             }
 
-            // Drop the origin tracking locally.
-            WorfNode.DropOrigins(sub.SlotName);
+            // Drop the origin tracking locally, unless another subscription made before names were told apart shares it.
+            if (!shared)
+            {
+                WorfNode.DropOrigins(sub.SlotName);
+            }
         }
 
         return BoolDatum(sub is not null);

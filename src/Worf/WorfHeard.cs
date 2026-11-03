@@ -49,4 +49,9 @@ internal struct WorfHeard
     /// The WAL position the node's last answer to this server carried, or zero.
     /// </summary>
     public ulong ReplyLsn;
+
+    /// <summary>
+    /// When the node, as a neighbor, last had this server reset a sequence's blocks, or zero.
+    /// </summary>
+    public long ResetAt;
 }

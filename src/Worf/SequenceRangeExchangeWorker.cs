@@ -140,8 +140,15 @@ internal static class SequenceRangeExchangeWorker
     }
 
     /// <summary>
+    /// Gets or sets whether the calls about to be made go to a neighbor whose last call ran out of time, which they only
+    /// probe for, for a second at most, so that a neighbor that stays frozen holds up the calls to the others that
+    /// little, until one answers in time.
+    /// </summary>
+    internal static bool Probing { get; set; }
+
+    /// <summary>
     /// Makes a call to a neighbor, from the exchange worker, which its watcher cancels once it has taken longer than
-    /// <c>worf.sequence_range_timeout</c>.
+    /// <c>worf.sequence_range_timeout</c>, or a second while <see cref="Probing"/>.
     /// </summary>
     /// <typeparam name="T">The call's result.</typeparam>
     /// <param name="call">The call.</param>
@@ -154,7 +161,7 @@ internal static class SequenceRangeExchangeWorker
             throw new PgException("57P01", "the sequence range exchange worker is stopping");
         }
 
-        SetDeadline(Worker.GetCurrentTimestamp() + (SequenceRanges.ExchangeTimeout * 1000L));
+        SetDeadline(Worker.GetCurrentTimestamp() + (Probing ? Math.Min(SequenceRanges.ExchangeTimeout, 1000) : SequenceRanges.ExchangeTimeout) * 1000L);
         try
         {
             return call();

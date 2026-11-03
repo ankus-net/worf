@@ -492,7 +492,7 @@ internal static unsafe partial class DdlLock
             }
             catch (PgRemoteException error)
             {
-                throw new PgException(LockNotAvailable, $"could not hold back writes on node {nodeId}: {error.Message}");
+                throw new PgException(LockNotAvailable, $"could not hold back writes on node {NodeName(nodeId)}: {error.Message}");
             }
 
             // A node that doesn't receive this node's DDL holds nothing back.
@@ -790,7 +790,7 @@ internal static unsafe partial class DdlLock
             {
                 throw new PgException(LockNotAvailable,
                     $"cannot apply node {NodeName(waiting[0].NodeId)}'s changes before DDL while this transaction holds a lock they need",
-                    hint: "Run the DDL in a transaction of its own, or before the statements that lock or write to tables, as DDL locks the indexes on this node alone that it moves aside or hides.");
+                    hint: "Run the DDL in a transaction of its own, or before the statements that lock or write to the tables those changes write to.");
             }
 
             Worker.WaitLatch(10);
@@ -1102,7 +1102,7 @@ internal static unsafe partial class DdlLock
         }
         catch (PgRemoteException error)
         {
-            throw new PgException(LockNotAvailable, $"could not hold back writes on node {nodeId}: {error.Message}");
+            throw new PgException(LockNotAvailable, $"could not hold back writes on node {NodeName(nodeId)}: {error.Message}");
         }
 
         return conn;
@@ -1688,7 +1688,7 @@ internal static unsafe partial class DdlLock
         UnfencePending();
         if (s_lostNodes.Count > 0)
         {
-            throw new PgException(LockNotAvailable, $"lost the hold on node {s_lostNodes.First()}'s writes for this transaction's DDL");
+            throw new PgException(LockNotAvailable, $"lost the hold on node {NodeName(s_lostNodes.First())}'s writes for this transaction's DDL");
         }
 
         if (DdlReplication.Running && s_statementFence is not null)
@@ -1751,7 +1751,7 @@ internal static unsafe partial class DdlLock
         {
             if (!s_fenceConnections.TryGetValue(node, out PgReplicationConnection? conn))
             {
-                throw new PgException(LockNotAvailable, $"lost the hold on node {node}'s writes for this transaction's DDL");
+                throw new PgException(LockNotAvailable, $"lost the hold on node {NodeName(node)}'s writes for this transaction's DDL");
             }
 
             try
@@ -1761,7 +1761,7 @@ internal static unsafe partial class DdlLock
             catch (Exception error) when (error is PgException or PgRemoteException)
             {
                 throw new PgException(LockNotAvailable,
-                    $"lost the hold on node {node}'s writes for this transaction's DDL: {error.Message.Split('\n')[0]}");
+                    $"lost the hold on node {NodeName(node)}'s writes for this transaction's DDL: {error.Message.Split('\n')[0]}");
             }
         }
     }

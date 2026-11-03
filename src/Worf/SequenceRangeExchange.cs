@@ -286,6 +286,7 @@ internal static class SequenceRangeExchange
             }
 
             long now = Worker.GetCurrentTimestamp();
+            SequenceRangeExchangeWorker.Probing = s_timedOut.Contains(sub.Id);
             try
             {
                 (bool received, bool granted) = ExchangeWith(node, sub);
@@ -342,15 +343,26 @@ internal static class SequenceRangeExchange
                 delay = Math.Min(Math.Max(delay, SequenceRanges.CheckInterval * 1000L), Math.Max(most, SequenceRanges.CheckInterval * 1000L));
                 s_retries[sub.Id] = (now + delay, delay);
                 string failure = error is PgQueryCanceledException
-                    ? $"node {sub.Origin.Name} didn't answer within {SequenceRanges.ExchangeTimeout.ToString(CultureInfo.InvariantCulture)} ms"
+                    ? $"node {sub.Origin.Name} didn't answer within {(SequenceRangeExchangeWorker.Probing ? Math.Min(SequenceRanges.ExchangeTimeout, 1000) : SequenceRanges.ExchangeTimeout).ToString(CultureInfo.InvariantCulture)} ms"
                     : error.Message;
-                PgLog.Warning(new PgDiagnostic($"sequence range exchange with node {sub.Origin.Name} failed: {failure}")
+                // While the subscription's first sync hasn't finished, its slot may not be there yet, or be made again,
+                // so a failure then is no news.
+                PgDiagnostic diagnostic = new($"sequence range exchange with node {sub.Origin.Name} failed: {failure}")
                 {
                     Detail = (error as PgException)?.Detail,
-                });
+                };
+                if (PgBackgroundWorker.RunTransaction(() => Sync.GetSubscriptionSyncStatus(sub.Id, true) is { } sync && sync.Status != Sync.SyncStatusReady))
+                {
+                    PgLog.Debug1(diagnostic.Message);
+                }
+                else
+                {
+                    PgLog.Warning(diagnostic);
+                }
             }
         }
 
+        SequenceRangeExchangeWorker.Probing = false;
         return changed;
     }
 
@@ -1319,13 +1331,24 @@ internal static class SequenceRangeExchange
             SpiParameter.Create(high), SpiParameter.Create(watermark), SpiParameter.Create(call), SpiParameter.Create(Holds(entry)),
             SpiParameter.Create(Nullable(entry, "clock")));
 
-        // The neighbor asks this node to reset, once per rollback it saw, or has reset as this node asked. A request that
-        // shows this node's WAL position behind where the neighbor saw it, as a rollback leaves it, resets it. Without
-        // that, a node that has neither started drawing from a block nor granted one since it last reset has nothing it
-        // could issue or grant twice, so a request then, as a made-up one sent again would be, only stops the neighbor
-        // asking, and one that has resets, but only once every ten minutes for each neighbor, so that made-up requests
-        // can't reset it more often; until then the neighbor keeps asking, and neither takes its grants nor answers its
-        // requests.
+        // A neighbor that worf.activate_sequence_range stopped waiting for, as gone, may hold values that the fence's lift
+        // gave out again, so once it's heard from again after the lift, it's asked to reset, at a WAL position of its own,
+        // past any real one; while the fence is still up, its report counts as any other's.
+        if (Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range_absent WHERE seqoid = $1 AND node_id = $2)", seq, sender))
+        {
+            _ = Worf.Execute("""
+                WITH gone AS (DELETE FROM worf.sequence_range_absent WHERE seqoid = $1 AND node_id = $2 RETURNING absent_at)
+                UPDATE worf.sequence_range_node n SET reset_lsn = $3::pg_lsn
+                FROM worf.sequence_range r
+                WHERE n.seqoid = $1 AND n.node_id = $2 AND r.seqoid = $1 AND r.fenced_at IS NULL AND EXISTS (SELECT 1 FROM gone)
+                """, seq, sender, SpiParameter.Create($"FFFFFFFE/{(uint)Worker.GetCurrentTimestamp():X8}"));
+        }
+
+        // The neighbor asks this node to reset, once per rollback it saw, or has reset as this node asked. A node that
+        // has neither started drawing from a block nor granted one since it last reset has nothing it could issue or
+        // grant twice, so a request then, unless it shows this node's WAL position behind where the neighbor saw it, as a
+        // rollback leaves it, only stops the neighbor asking. Any other resets it, as often as
+        // SequenceRangeHeard.MayReset lets the neighbor, whatever WAL position it claims.
         if (Text(entry, "reset") is string reset && Worf.ReadScalar<bool>(
             "SELECT reset_done IS DISTINCT FROM $3::pg_lsn FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2", seq, sender, SpiParameter.Create(reset)))
         {
@@ -1341,12 +1364,17 @@ internal static class SequenceRangeExchange
                 _ = Worf.Execute("UPDATE worf.sequence_range_node SET reset_done = $3::pg_lsn WHERE seqoid = $1 AND node_id = $2", seq, sender,
                     SpiParameter.Create(reset));
             }
-            else if (Worf.Execute("""
-                UPDATE worf.sequence_range_node SET reset_done = $3::pg_lsn, reset_at = now()
-                WHERE seqoid = $1 AND node_id = $2 AND ($4 OR reset_at IS NULL OR reset_at < now() - interval '10 minutes')
-                """, seq, sender, SpiParameter.Create(reset), SpiParameter.Create(behind)) > 0)
+            else if (SequenceRangeHeard.MayReset(senderId) && Worf.Execute("""
+                UPDATE worf.sequence_range_node SET reset_done = $3::pg_lsn, reset_at = now() WHERE seqoid = $1 AND node_id = $2
+                """, seq, sender, SpiParameter.Create(reset)) > 0)
             {
-                PgLog.Warning($"sequence {info.Name}: node {senderName} saw this node's WAL position move backwards, so it abandons its blocks and requests new ones");
+                PgLog.Warning(reset.StartsWith("FFFFFFFF/", StringComparison.Ordinal)
+                    ? $"sequence {info.Name}: node {senderName} lifted a fence over grants of this node's that overlap another's, so it abandons its blocks and requests new ones"
+                    : reset.StartsWith("FFFFFFFE/", StringComparison.Ordinal)
+                    ? $"sequence {info.Name}: node {senderName} lifted its fence without this node's report, so it abandons its blocks and requests new ones"
+                    : behind
+                    ? $"sequence {info.Name}: node {senderName} saw this node's WAL position move backwards, so it abandons its blocks and requests new ones"
+                    : $"sequence {info.Name}: node {senderName} asked this node to reset, so it abandons its blocks and requests new ones");
                 SequenceRanges.Reset(seqoid, node, false);
                 received = true;
             }
@@ -1367,7 +1395,7 @@ internal static class SequenceRangeExchange
             // than its WAL position shows. It resets, which fences the root until the nodes it granted to report, and the
             // root then gives up its free values up to the watermark it takes in here.
             string raised = info.Ascending ? "greatest" : "least";
-            if (!wentBack && LostGrants(seqoid, info, node, mark))
+            if (!wentBack && LostGrants(seqoid, info, node, mark) && SequenceRangeHeard.MayReset(senderId))
             {
                 PgLog.Warning($"sequence {info.Name}: node {senderName} has heard of grants up to {mark}, beyond this owner's watermark, so this owner lost them; it resets");
                 _ = Worf.Execute($"UPDATE worf.sequence_range SET heard_watermark = {raised}(coalesce(heard_watermark, $2), $2) WHERE seqoid = $1",

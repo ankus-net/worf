@@ -908,8 +908,9 @@ internal static unsafe partial class SequenceRanges
             long size = Steps(info, active.Value.Lo, active.Value.Hi);
             // A minute of inserts, at least a twentieth of the block, but no more than half of it, so that a block
             // smaller than a minute's use still serves most of its values while the next ones grow. A block reserved
-            // for a load is switched to at once, and so is any once the sequence moved backwards in its block.
-            long margin = Math.Min(Math.Max(size / 20, (long)(rate * 60)), size / 2);
+            // for a load is switched to at once, and so is any once the sequence moved backwards in its block, while one
+            // that is the load's is used up, whose session switches from it at its end.
+            long margin = Reserved(active.Value.Id) ? 0 : Math.Min(Math.Max(size / 20, (long)(rate * 60)), size / 2);
             bool moved = backwards is (Guid sampled, true) && sampled == active.Value.Id;
             if (next is not null && (left <= margin || moved || next.Value.Reserved))
             {
@@ -918,7 +919,7 @@ internal static unsafe partial class SequenceRanges
                     return true;
                 }
 
-                if (SwitchBeforeEnd(seqoid, info, (next.Value.Id, next.Value.Lo, next.Value.Hi), next.Value.Reserved, !moved && left <= size / 20))
+                if (SwitchBeforeEnd(seqoid, info, (next.Value.Id, next.Value.Lo, next.Value.Hi), next.Value.Reserved, !moved && left <= Math.Min(margin, size / 20)))
                 {
                     changed = true;
                     next = null;
@@ -3051,7 +3052,7 @@ internal static unsafe partial class SequenceRanges
             SELECT a.grantee_name::text, a.lo, a.hi, b.grantee_name::text, b.lo, b.hi, a.grantee_id, b.grantee_id
             FROM worf.sequence_range_grant a JOIN worf.sequence_range_grant b
                 ON b.seqoid = a.seqoid AND a.grant_id < b.grant_id AND a.lo <= b.hi AND b.lo <= a.hi
-            WHERE a.seqoid = $1 AND a.kind <> 'x' AND b.kind <> 'x' AND a.state <> 'unclaimed' AND b.state <> 'unclaimed'
+            WHERE a.seqoid = $1 AND a.kind <> 'x' AND b.kind <> 'x' AND a.state NOT IN ('unclaimed', 'overlapped') AND b.state NOT IN ('unclaimed', 'overlapped')
                 AND (a.seqoid <> 'worf.snowflake_node'::regclass OR a.state <> 'abandoned' AND b.state <> 'abandoned')
             LIMIT 1
             """, seq);
@@ -3068,8 +3069,11 @@ internal static unsafe partial class SequenceRanges
             }
 
             // Both holders give up their blocks and ask for new ones, so that neither issues the values they share from
-            // then on: this node at once, and another as it hears this node's next message.
+            // then on: this node at once, and another as it hears this node's next message, which asks it to reset at a
+            // WAL position of its own, past any real one, so that it resets for each lift and knows why. Every grant that
+            // overlaps another is then marked, so that it fences the root no more.
             PgLog.Warning($"sequence {GetInfo(seqoid).Name}: {detail}, so both nodes reset their blocks");
+            string lift = $"FFFFFFFF/{(uint)Worker.GetCurrentTimestamp():X8}";
             foreach (uint holder in new[] { overlap[0].Get<uint>(6), overlap[0].Get<uint>(7) }.Distinct())
             {
                 if (holder == node.Node.Id)
@@ -3079,10 +3083,18 @@ internal static unsafe partial class SequenceRanges
                 }
                 else
                 {
-                    _ = Worf.Execute("UPDATE worf.sequence_range_node SET reset_lsn = 'FFFFFFFF/FFFFFFFF' WHERE seqoid = $1 AND node_id = $2",
-                        seq, SpiParameter.Create(holder));
+                    _ = Worf.Execute("UPDATE worf.sequence_range_node SET reset_lsn = $3::pg_lsn WHERE seqoid = $1 AND node_id = $2",
+                        seq, SpiParameter.Create(holder), SpiParameter.Create(lift));
                 }
             }
+
+            _ = Worf.Execute("""
+                UPDATE worf.sequence_range_grant a SET state = 'overlapped'
+                WHERE a.seqoid = $1 AND a.kind <> 'x' AND a.state NOT IN ('unclaimed', 'overlapped') AND EXISTS (
+                    SELECT 1 FROM worf.sequence_range_grant b
+                    WHERE b.seqoid = a.seqoid AND b.grant_id <> a.grant_id AND b.kind <> 'x' AND b.state NOT IN ('unclaimed', 'overlapped')
+                        AND a.lo <= b.hi AND b.lo <= a.hi)
+                """, seq);
         }
 
         SpiResult? waiting = force ? null : Worf.SelectCatalog("""
@@ -3979,7 +3991,7 @@ internal static unsafe partial class SequenceRanges
             int epoch = rows[0].Get<int>(1);
             if (NodeBlock(seqoid, epoch, "active") is not (Guid, long, long) active || NextBlock(seqoid, epoch) is not (Guid, long, long, bool) next ||
                 !Confirmed(seqoid, info, next.Id) ||
-                (!next.Reserved && StepsLeft(seqoid, info, active) > Steps(info, active.Lo, active.Hi) / 20))
+                (!next.Reserved && StepsLeft(seqoid, info, active) > (Reserved(active.Id) ? 0 : Steps(info, active.Lo, active.Hi) / 20)))
             {
                 return true;
             }
@@ -4207,6 +4219,13 @@ internal static unsafe partial class SequenceRanges
             """, SpiParameter.Create(seqoid), SpiParameter.Create(epoch), SpiParameter.Create(state));
         return result.Count == 0 ? null : (result[0].Get<Guid>(0), result[0].Get<long>(1), result[0].Get<long>(2));
     }
+
+    /// <summary>
+    /// Checks whether a block was reserved for a load.
+    /// </summary>
+    private static bool Reserved(Guid block)
+        => Worf.SelectCatalog("SELECT reserved FROM worf.sequence_range_block WHERE block_id = $1", SpiParameter.Create(block)) is { Count: > 0 } row &&
+            row[0].Get<bool>(0);
 
     /// <summary>
     /// Finds the next block a sequence switches to: one reserved for a load first, and otherwise the one received first.

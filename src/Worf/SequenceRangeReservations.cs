@@ -7,8 +7,9 @@ namespace Worf;
 /// values for rows that already carry their keys. A session can't commit in the middle of its transaction, so it hands
 /// its request to the range worker and waits. On the owner the worker allocates the block at once, and elsewhere it
 /// commits the request and exchanges it with the node's parent. The worker, not the session, switches to a reserved
-/// block, so that the switch commits at once and neither holds the sequence until the session's transaction ends nor
-/// leaves the session's guard with blocks no other backend sees. Reservations take values the sequence's owner decides
+/// block, beside the session's transaction if it drew from the sequence, so that the switch commits at once and neither
+/// holds the sequence until the session's transaction ends nor leaves the session's guard with blocks no other backend
+/// sees. Reservations take values the sequence's owner decides
 /// on, so they need its privileges.
 /// </summary>
 internal static class SequenceRangeReservations
@@ -120,12 +121,6 @@ internal static class SequenceRangeReservations
                     requestId = Guid.NewGuid();
                     Post(new WorfReservation { RequestId = requestId, Seqoid = seqoid, Kind = (byte)'n', Size = needed });
                 }
-                else if (ReservedNext(seqoid, epoch) && HoldsSequence(seqoid))
-                {
-                    // The worker can't switch while this transaction holds the sequence, as nextval leaves it held.
-                    throw new PgException("55P03", $"could not switch sequence {info.Name} to its reserved block while this transaction holds it",
-                        hint: "Reserve before the transaction calls nextval on the sequence.");
-                }
 
                 Wait(requestId, deadline, $"a block of {needed} values of sequence {info.Name}");
             }
@@ -134,6 +129,13 @@ internal static class SequenceRangeReservations
         {
             // A cancelled session's request doesn't stay behind for the worker.
             Remove(id => id == requestId);
+        }
+
+        // The worker switched beside this transaction, which may hold the sequence, as nextval leaves it held, and so not
+        // hear of its new bounds as it draws from it.
+        unsafe
+        {
+            NativeMethods.AcceptInvalidationMessages();
         }
 
         SequenceRanges.ChangedOnCommit();
@@ -151,16 +153,6 @@ internal static class SequenceRangeReservations
     private static bool ReservedNext(uint seqoid, int epoch)
         => Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range_block WHERE seqoid = $1 AND epoch = $2 AND kind = 'n' AND state = 'next' AND reserved",
             SpiParameter.Create(seqoid), SpiParameter.Create(epoch)).Count > 0;
-
-    /// <summary>
-    /// Checks whether this backend holds a lock on the sequence, which nextval takes until the transaction ends.
-    /// </summary>
-    private static bool HoldsSequence(uint seqoid)
-        => Worf.ReadScalar<bool>("""
-            SELECT EXISTS (
-                SELECT 1 FROM pg_catalog.pg_locks
-                WHERE locktype = 'relation' AND relation = $1 AND pid = pg_catalog.pg_backend_pid() AND granted AND mode <> 'AccessShareLock')
-            """, SpiParameter.Create(seqoid));
 
     private static void ReserveValues(uint seqoid, long lo, long hi, PgInterval timeout)
     {
