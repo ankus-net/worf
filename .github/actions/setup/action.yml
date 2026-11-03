@@ -34,10 +34,10 @@ runs:
       if: runner.os == 'Linux'
       shell: bash
       run: |
-        wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor --yes --output /usr/share/keyrings/llvm.gpg
-        echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] https://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-20 main" | sudo tee /etc/apt/sources.list.d/llvm.list
-        sudo apt-get update
-        sudo apt-get install --yes --no-install-recommends clang-20 libclang-20-dev bison flex libreadline-dev zlib1g-dev libicu-dev pkg-config
+        # Ubuntu 24.04's own archive has LLVM 20, so no third-party repository, whose outages would fail the run, is
+        # needed.
+        sudo apt-get update -o Acquire::Retries=5
+        sudo apt-get install --yes --no-install-recommends -o Acquire::Retries=5 clang-20 libclang-20-dev bison flex libreadline-dev zlib1g-dev libicu-dev pkg-config
         echo /usr/lib/llvm-20/bin >> "$GITHUB_PATH"
 
     - name: Install LLVM and PostgreSQL build dependencies (macOS)
