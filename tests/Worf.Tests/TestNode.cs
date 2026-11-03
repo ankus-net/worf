@@ -160,7 +160,7 @@ internal sealed class TestNode : IAsyncDisposable
                     // A void result reads as null.
                     if (!reader.IsDBNull(i) && reader.GetValue(i) is { } value)
                     {
-                        _ = output.Append(FormatValue(value));
+                        _ = output.Append(FormatValue(value, reader.GetDataTypeName(i)));
                     }
                 }
             }
@@ -317,6 +317,18 @@ internal sealed class TestNode : IAsyncDisposable
         return log + reader.ReadToEnd();
     }
 
+    /// <summary>
+    /// Finds when the server logged each line of its log from a position on that holds a text, by the server's clock,
+    /// which a test host busy with other tests may fall seconds behind in reading.
+    /// </summary>
+    /// <param name="from">The position in the log.</param>
+    /// <param name="text">The text.</param>
+    /// <returns>The times, in order.</returns>
+    public List<DateTime> LogTimes(int from, string text)
+        => [.. ReadLog()[from..].Split('\n')
+            .Where(line => line.StartsWith('[') && line.Contains(text, StringComparison.Ordinal))
+            .Select(line => DateTime.ParseExact(line[1..24], "yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture))];
+
     /// <inheritdoc/>
     public ValueTask DisposeAsync() => _extension.DisposeAsync();
 
@@ -324,9 +336,14 @@ internal sealed class TestNode : IAsyncDisposable
     // holds the log until a moment after the server stops, when the harness replaces its own log.
     private string RestartLogPath => Cluster.LogFilePath + ".restart.log";
 
-    private static string FormatValue(object value) => value switch
+    // Values read as psql prints them: dates and timestamps in ISO form, a timestamp with time zone in UTC, so that SQL
+    // reads one back as the same time whatever the session's time zone.
+    private static string FormatValue(object value, string type) => value switch
     {
         bool b => b ? "t" : "f",
+        DateTime at when type == "timestamp with time zone" => at.ToString("yyyy-MM-dd HH:mm:ss.FFFFFF", CultureInfo.InvariantCulture) + "+00",
+        DateTime at when type == "timestamp without time zone" => at.ToString("yyyy-MM-dd HH:mm:ss.FFFFFF", CultureInfo.InvariantCulture),
+        DateTime at when type == "date" => at.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
         IFormattable formattable => formattable.ToString(null, CultureInfo.InvariantCulture),
         _ => value.ToString() ?? "",
     };

@@ -2334,13 +2334,22 @@ public sealed class SequenceRangeTests
         }
 
         // node_b writes a few megabytes first, and node_a hears its WAL position past them, so that the restored copy,
-        // which writes as it starts, stays below the position node_b last showed.
+        // which writes as it starts, stays below the position node_b last showed. node_b makes its calls one at a time,
+        // so the second that node_a hears after the writes was made after them.
         _ = await nodeB.SafePsqlAsync(Database, "CREATE TABLE written AS SELECT g, repeat('x', 100) AS v FROM generate_series(1, 20000) g", token);
         await InsertAsync(nodeB, 150, token);
-        string shown = await nodeB.SafePsqlAsync(Database, "SELECT pg_current_wal_lsn()", token);
-        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database,
-            $"SELECT wal_lsn >= '{shown}' FROM worf.sequence_range_node WHERE node_name = 'node_b' AND seqoid = 't_id_seq'::regclass", token),
-            "node_a heard node_b's WAL position past its writes");
+        const string HeardFromB = """
+            SELECT worf.sequence_range_heard(node_id, true, '-infinity', false)::text FROM worf.sequence_range_node
+            WHERE node_name = 'node_b' AND seqoid = 't_id_seq'::regclass
+            """;
+        string heard = await nodeA.SafePsqlAsync(Database, "SELECT clock_timestamp()::text", token);
+        for (int call = 0; call < 2; call++)
+        {
+            Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, $"SELECT ({HeardFromB})::timestamptz > '{heard}'", token),
+                "node_a heard node_b's WAL position past its writes");
+            heard = await nodeA.SafePsqlAsync(Database, HeardFromB, token);
+        }
+
         string granted = await nodeA.SafePsqlAsync(Database, "SELECT max(hi) FROM worf.sequence_range_grant WHERE grantee_name = 'node_b'", token);
         await RestoreDataAsync(nodeB, copyB, token);
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,

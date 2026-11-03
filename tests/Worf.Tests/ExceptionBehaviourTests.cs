@@ -1159,6 +1159,9 @@ public sealed partial class ExceptionBehaviourTests
             END $$;
             """, token);
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Ascii, $"SELECT ({Bytes}) = '1:6e6577e9,2:74776f32e9'", token), "the updated rows' bytes");
+
+        // Apply writes the conflict's record in a transaction of its own once the update's has committed.
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Ascii, "SELECT EXISTS (SELECT 1 FROM worf.conflict_history)", token), "the conflict's record");
         Assert.AreEqual("1|t", await subscriber.SafePsqlAsync(Ascii,
             "SELECT count(*), bool_and(position('x6c6f63e9' IN local_tuple::text) > 0) FROM worf.conflict_history", token), "the conflict's local row");
         Assert.AreEqual("COPY|7|23514|t", await subscriber.SafePsqlAsync(Ascii, """

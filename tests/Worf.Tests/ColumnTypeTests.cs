@@ -360,7 +360,7 @@ public sealed class ColumnTypeTests
             """, token));
 
         // Under error, a copy whose value fails to convert stops, naming the row, column and value as COPY does, and
-        // starts again only after a delay.
+        // starts again only after a delay: by the server's clock, it hasn't two seconds after it failed.
         logpos = subscriber.ReadLog().Length;
         _ = await subscriber.SafePsqlAsync(Database, "ALTER SYSTEM SET worf.exception_behaviour = error", token);
         _ = await subscriber.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
@@ -373,7 +373,8 @@ public sealed class ColumnTypeTests
         Assert.IsTrue(await subscriber.PollLogAsync(logpos, "COPY ft, line 1, column n: \"10000000000\"", token),
             "ft's copy didn't fail");
         await Task.Delay(TimeSpan.FromSeconds(2), token);
-        Assert.AreEqual(1, CountOccurrences(subscriber.ReadLog()[logpos..], "starting sync of table public.ft"));
+        DateTime failed = subscriber.LogTimes(logpos, "COPY ft, line 1, column n")[0];
+        _ = Assert.ContainsSingle(subscriber.LogTimes(logpos, "starting sync of table public.ft").Where(at => at <= failed.AddSeconds(2)), "ft's syncs");
 
         // Under sub_disable, a copy whose row fails disables the subscription and records the row that COPY names,
         // without copying the rows again to find it.

@@ -392,13 +392,14 @@ public sealed class RelayOriginTests
         _ = await provider.SafePsqlAsync(Database, "SELECT * FROM worf.replication_set_add_table('default', 'd2', synchronize_data := true)", token);
         await WaitForSyncAsync(subscriber, "d2", token);
 
-        // A sync that fails, here for want of its table, restarts after the delay an apply worker does.
+        // A sync that fails, here for want of its table, restarts after the delay an apply worker does, by the server's
+        // clock.
         logpos = subscriber.ReadLog().Length;
         _ = await provider.SafePsqlAsync(Database, "SELECT * FROM worf.replication_set_add_table('default', 'd3', synchronize_data := true)", token);
         Assert.IsTrue(await subscriber.PollLogAsync(logpos, "starting sync of table public.d3", token), "the sync");
         await Task.Delay(TimeSpan.FromSeconds(3), token);
-        int starts = subscriber.ReadLog()[logpos..].Split("starting sync of table public.d3").Length - 1;
-        Assert.IsLessThanOrEqualTo(OperatingSystem.IsWindows() ? 5 : 2, starts, "sync worker starts in three seconds");
+        List<DateTime> starts = subscriber.LogTimes(logpos, "starting sync of table public.d3");
+        Assert.IsLessThanOrEqualTo(2, starts.Count(at => at <= starts[0].AddSeconds(3)), "sync worker starts in three seconds");
         _ = await subscriber.SafePsqlAsync(Database, "CREATE TABLE d3 (id integer PRIMARY KEY)", token);
         await WaitForSyncAsync(subscriber, "d3", token);
 
