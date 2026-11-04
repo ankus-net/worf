@@ -1894,6 +1894,93 @@ public sealed class SequenceRangeTests
     }
 
     /// <summary>
+    /// A transaction that runs its block out while the range worker can't switch it, here as another session holds the
+    /// sequence's range row, switches to the next block itself, once it has waited twice worf.sequence_range_timeout,
+    /// without taking the range row, which would hold up every exchange until it ended, and with the lock_timeout the
+    /// session set left as it was. Its switch is logged once it commits, and one that switched can't be prepared, as a
+    /// prepared transaction would hold the sequence across restarts; the refused one logs no switch.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task TransactionsThatSwitchThemselvesHoldNoRangeRow()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode node = await StartNodeAsync("node_a", token, "max_prepared_transactions = 2");
+        _ = await node.SafePsqlAsync(Database, """
+            ALTER SYSTEM SET worf.sequence_range_timeout = 1000;
+            SELECT pg_reload_conf();
+            CREATE TABLE ts (id bigserial PRIMARY KEY, v int);
+            SELECT worf.enable_sequence_range('ts_id_seq', participants := '{}', range_size := 10, max_range_size := 10);
+            """, token);
+        const string Range = "SELECT 1 FROM worf.sequence_range WHERE seqoid = 'ts_id_seq'::regclass FOR NO KEY UPDATE";
+        Assert.IsTrue(await node.PollQueryUntilAsync(Database,
+            "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 'ts_id_seq'::regclass", token), "ts's blocks");
+        string active = await node.SafePsqlAsync(Database, "SELECT active_lo FROM worf.sequence_ranges WHERE sequence = 'ts_id_seq'::regclass", token);
+
+        await using NpgsqlConnection holder = await node.OpenAsync(Database, token);
+        await using NpgsqlTransaction held = await holder.BeginTransactionAsync(token);
+        await using (NpgsqlCommand hold = new(Range, holder, held))
+        {
+            _ = await hold.ExecuteNonQueryAsync(token);
+        }
+
+        await using NpgsqlConnection switcher = await node.OpenAsync(Database, token);
+        await using (NpgsqlCommand timeout = new("SET lock_timeout = '1s'", switcher))
+        {
+            _ = await timeout.ExecuteNonQueryAsync(token);
+        }
+
+        await using NpgsqlTransaction switching = await switcher.BeginTransactionAsync(token);
+        await using (NpgsqlCommand insert = new("INSERT INTO ts (v) SELECT 1 FROM generate_series(1, 15)", switcher, switching))
+        {
+            Assert.AreEqual(15, await insert.ExecuteNonQueryAsync(token), "the rows inserted past the block's end");
+        }
+
+        await using (NpgsqlCommand show = new("SHOW lock_timeout", switcher, switching))
+        {
+            Assert.AreEqual("1s", await show.ExecuteScalarAsync(token), "the session's lock_timeout after its own switch");
+        }
+
+        // Once the other session lets the range row go, the switching transaction, still open, doesn't hold it.
+        await held.RollbackAsync(token);
+        Assert.AreEqual("1", await node.SafePsqlAsync(Database, $"{Range} NOWAIT", token), "the range row, free while the switch is open");
+        await switching.CommitAsync(token);
+        Assert.AreEqual("15|15|t", await node.SafePsqlAsync(Database,
+            $"SELECT count(*), count(DISTINCT id), min(id) >= {active} FROM ts", token), "the rows, each with its own key");
+        int switcherPid = switcher.ProcessID;
+        string Switched(string log) => string.Join('\n', log.Split('\n').Where(line => line.Contains($"[{switcherPid}]", StringComparison.Ordinal) &&
+            line.Contains("sequence public.ts_id_seq switched to its block", StringComparison.Ordinal)));
+        Assert.AreNotEqual("", Switched(node.ReadLog()), "the transaction's own switch, logged as it committed");
+
+        // Once the next block is ready, a transaction that switches itself again can't be prepared, and logs nothing.
+        Assert.IsTrue(await node.PollQueryUntilAsync(Database,
+            "SELECT next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 'ts_id_seq'::regclass", token), "ts's next block");
+        await using NpgsqlTransaction heldAgain = await holder.BeginTransactionAsync(token);
+        await using (NpgsqlCommand hold = new(Range, holder, heldAgain))
+        {
+            _ = await hold.ExecuteNonQueryAsync(token);
+        }
+
+        int logpos = node.ReadLog().Length;
+        await using (NpgsqlTransaction preparing = await switcher.BeginTransactionAsync(token))
+        {
+            await using (NpgsqlCommand insert = new("INSERT INTO ts (v) SELECT 2 FROM generate_series(1, 15)", switcher, preparing))
+            {
+                _ = await insert.ExecuteNonQueryAsync(token);
+            }
+
+            await using NpgsqlCommand prepare = new("PREPARE TRANSACTION 'switched'", switcher, preparing);
+            PostgresException refused = await Assert.ThrowsExactlyAsync<PostgresException>(() => prepare.ExecuteNonQueryAsync(token));
+            Assert.AreEqual("0A000", refused.SqlState, "PREPARE after the transaction's own switch");
+        }
+
+        await heldAgain.RollbackAsync(token);
+        Assert.AreEqual("0|", await node.SafePsqlAsync(Database, "SELECT count(*) FILTER (WHERE v = 2), (SELECT string_agg(gid, ',') FROM pg_prepared_xacts) FROM ts", token),
+            "the refused transaction's rows and prepared transactions");
+        Assert.AreEqual("", Switched(node.ReadLog()[logpos..]), "the refused transaction's switch, never logged");
+    }
+
+    /// <summary>
     /// A provider that takes calls but never answers holds up a node's exchanges with its other neighbors only until its
     /// first call runs out of time: it's called after the others from then on, only while nothing waits on them or once
     /// a minute, for a second at most, giving way to a request that comes up meanwhile, so the node's inserts go on
