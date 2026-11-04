@@ -2876,20 +2876,18 @@ public sealed class SequenceRangeTests
         Assert.IsTrue(await nodeA.PollLogAsync(logpos, $"has heard of grants up to {beyond}, beyond this owner's watermark", token), "node_a reset");
         await Task.Delay(TimeSpan.FromSeconds(4), token);
 
-        // The fence lifts just after one of node_b's calls.
-        await using NpgsqlConnection sessions = await nodeA.OpenAsync(Database, token);
-        await using (NpgsqlCommand fresh = new("SET stats_fetch_consistency = none", sessions))
-        {
-            _ = await fresh.ExecuteNonQueryAsync(token);
-        }
-
-        await using NpgsqlCommand count = new("SELECT sessions FROM pg_stat_database WHERE datname = current_database()", sessions);
-        long called = (long)(await count.ExecuteScalarAsync(token))!;
+        // The fence lifts just after one of node_b's calls, which go over the session node_b keeps on node_a, where each
+        // starts a query.
+        await using NpgsqlConnection calls = await nodeA.OpenAsync(Database, token);
+        await using NpgsqlCommand started = new("SELECT max(query_start) FROM pg_stat_activity WHERE application_name = 'b_from_a_range'", calls);
+        object? called = await started.ExecuteScalarAsync(token);
         Stopwatch asked = Stopwatch.StartNew();
-        while ((long)(await count.ExecuteScalarAsync(token))! == called && asked.Elapsed < TestNode.PollTimeout)
+        while (Equals(await started.ExecuteScalarAsync(token), called) && asked.Elapsed < TestNode.PollTimeout)
         {
             await Task.Delay(TimeSpan.FromMilliseconds(20), token);
         }
+
+        Assert.IsLessThan(TestNode.PollTimeout, asked.Elapsed, "node_b's next call");
 
         // The fence stops waiting for the node gone for good, named as the detail names it, and lifts, as node_b has
         // reported.
@@ -3319,20 +3317,18 @@ public sealed class SequenceRangeTests
             }
         }
 
-        // Each exchange call is a session of its own. A slot takes no more than a call an exchange interval over the while
-        // from the first reading of the sessions to the last, and one where each end of the while cuts an interval, as a
-        // session's count goes in once its process exits, and these queries take two sessions.
+        // Each exchange goes over the session kept from the one before, where a session for each call would start a dozen
+        // over the while, so a slot starts no more than two, as when its kept session is made again after a call that
+        // failed, and this check's own sessions, whose counts go in as their processes exit, as many as four.
         TimeSpan idle = span ?? TimeSpan.FromSeconds(2);
         await Task.Delay(TimeSpan.FromSeconds(1), token);
         const string Next = """
             SELECT pg_snapshot_xmax(pg_current_snapshot()), (SELECT sessions FROM pg_stat_database WHERE datname = current_database()),
                 (SELECT count(*) FROM pg_replication_slots WHERE plugin = 'worf' AND database = current_database()), pg_current_wal_insert_lsn()
             """;
-        Stopwatch window = Stopwatch.StartNew();
         string[][] before = await Task.WhenAll(nodes.Select(async node => (await node.SafePsqlAsync(Database, Next, token)).Split('|')));
         await Task.Delay(idle, token);
         string[][] after = await Task.WhenAll(nodes.Select(async node => (await node.SafePsqlAsync(Database, Next, token)).Split('|')));
-        long calls = (long)(window.Elapsed / TimeSpan.FromMilliseconds(500)) + 2;
         for (int i = 0; i < nodes.Length; i++)
         {
             // The records written meanwhile, which name what wrote them, are read first, for either check's message.
@@ -3356,8 +3352,8 @@ public sealed class SequenceRangeTests
             }
 
             Assert.AreEqual(before[i][0], after[i][0], $"{nodes[i].Name} used transaction IDs while idle: {written}");
-            Assert.IsLessThanOrEqualTo((calls * long.Parse(after[i][2], CultureInfo.InvariantCulture)) + 2,
-                long.Parse(after[i][1], CultureInfo.InvariantCulture) - long.Parse(before[i][1], CultureInfo.InvariantCulture), $"{nodes[i].Name}'s exchange calls");
+            Assert.IsLessThanOrEqualTo((long.Parse(after[i][2], CultureInfo.InvariantCulture) * 2) + 4,
+                long.Parse(after[i][1], CultureInfo.InvariantCulture) - long.Parse(before[i][1], CultureInfo.InvariantCulture), $"{nodes[i].Name}'s sessions for exchanges");
             Assert.AreEqual("", written, $"{nodes[i].Name} wrote WAL while idle");
         }
     }

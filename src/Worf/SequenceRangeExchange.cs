@@ -50,6 +50,12 @@ internal static class SequenceRangeExchange
     // The subscriptions whose provider answered the last exchange that their slot isn't streamed yet.
     private static readonly HashSet<uint> s_notStreamed = [];
 
+    // The connection to each subscription's provider that this worker's exchanges go over, kept from one exchange to the
+    // next, as apply keeps its own, rather than a session made and ended for each, with the connection string and the
+    // timeout it was made with, and whether the provider has the exchange function; one that fails, or a call on which
+    // the watcher cancels, is closed.
+    private static readonly Dictionary<uint, (WorfConnection Conn, string Dsn, int Timeout, bool Exchanges)> s_connections = [];
+
     /// <summary>
     /// Answers a neighbor's exchange on the provider end of its subscription.
     /// </summary>
@@ -450,7 +456,15 @@ internal static class SequenceRangeExchange
         List<(WorfSubscription Sub, string? Waiting, bool Fenced)> due = [];
         long now = Worker.GetCurrentTimestamp();
         Starting = false;
-        foreach (WorfSubscription sub in WorfNode.GetNodeSubscriptions(node.Node.Id, false).Where(sub => sub.Enabled))
+        List<WorfSubscription> enabled = [.. WorfNode.GetNodeSubscriptions(node.Node.Id, false).Where(sub => sub.Enabled)];
+
+        // The connections kept for subscriptions dropped or disabled since go.
+        foreach (uint gone in s_connections.Keys.Where(id => !enabled.Exists(sub => sub.Id == id)).ToList())
+        {
+            Disconnect(gone);
+        }
+
+        foreach (WorfSubscription sub in enabled)
         {
             // The neighbor ties each exchange to the subscription's slot, which a new subscription makes as it starts,
             // and which its apply worker has to have streamed.
@@ -481,20 +495,110 @@ internal static class SequenceRangeExchange
     }
 
     /// <summary>
-    /// Exchanges with a subscription's provider. The exchange worker's watcher cancels a connection or call that takes
-    /// longer than <c>worf.sequence_range_timeout</c>, and the provider ends a call that runs that long. Each waits in
-    /// a transaction, which the cancellation aborts, so that the worker goes on.
+    /// Exchanges with a subscription's provider, over the connection kept from the last exchange, or a new one. The
+    /// exchange worker's watcher cancels a connection or call that takes longer than <c>worf.sequence_range_timeout</c>,
+    /// and the provider ends a call that runs that long. Each waits in a transaction, which the cancellation aborts, so
+    /// that the worker goes on. A kept connection that fails, as once the provider restarted, is made again, once, before
+    /// the exchange counts as failed.
     /// </summary>
     /// <returns>Whether this node received a block, and whether it granted one.</returns>
     private static (bool Received, bool Granted) ExchangeWith(WorfLocalNode node, WorfSubscription sub)
     {
+        bool kept = s_connections.TryGetValue(sub.Id, out (WorfConnection Conn, string Dsn, int Timeout, bool Exchanges) connection) &&
+            connection.Dsn == sub.OriginIf.Dsn;
+        try
+        {
+            return ExchangeOver(node, sub);
+        }
+        catch (Exception error) when (kept && error is PgException or PgRemoteException && error is not PgQueryCanceledException)
+        {
+            return ExchangeOver(node, sub);
+        }
+    }
+
+    /// <summary>
+    /// Exchanges with a subscription's provider over the connection kept for it, made now if there is none, and closes
+    /// the connection if the exchange fails.
+    /// </summary>
+    private static (bool Received, bool Granted) ExchangeOver(WorfLocalNode node, WorfSubscription sub)
+    {
+        try
+        {
+            WorfConnection conn = Connection(sub);
+            if (!s_connections[sub.Id].Exchanges)
+            {
+                if (!PgBackgroundWorker.RunTransaction(() => SequenceRangeExchangeWorker.Bounded(() => Rpc.RemoteFunctionExists(conn, "worf", "sequence_range_exchange", 1, null))))
+                {
+                    return (false, false);
+                }
+
+                s_connections[sub.Id] = s_connections[sub.Id] with { Exchanges = true };
+            }
+
+            bool changed = false;
+            bool gave = false;
+
+            // A grant this node makes from the provider's request goes back in a second call, after this node commits it.
+            for (int call = 0; call < 2; call++)
+            {
+                (bool granted, bool received) = PgBackgroundWorker.RunTransaction(() => Call(node, sub, conn));
+                changed |= received;
+                gave |= granted;
+                if (received)
+                {
+                    _ = s_acksWaiting.Add(sub.Id);
+                }
+                else if (call == 0)
+                {
+                    _ = s_acksWaiting.Remove(sub.Id);
+                }
+
+                if (!granted)
+                {
+                    break;
+                }
+            }
+
+            return (changed, gave);
+        }
+        catch
+        {
+            Disconnect(sub.Id);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Gets the connection kept for a subscription's provider, setting its statement timeout again once
+    /// <c>worf.sequence_range_timeout</c> has changed, or makes one, once the provider's host is found to answer.
+    /// </summary>
+    private static WorfConnection Connection(WorfSubscription sub)
+    {
+        int timeout = SequenceRanges.ExchangeTimeout;
+        string setTimeout = $"SET statement_timeout = {timeout.ToString(CultureInfo.InvariantCulture)}";
+        if (s_connections.TryGetValue(sub.Id, out (WorfConnection Conn, string Dsn, int Timeout, bool Exchanges) kept) && kept.Dsn == sub.OriginIf.Dsn)
+        {
+            if (kept.Timeout != timeout)
+            {
+                PgBackgroundWorker.RunTransaction(() => SequenceRangeExchangeWorker.Bounded(() =>
+                {
+                    kept.Conn.Execute(setTimeout);
+                    return true;
+                }));
+                s_connections[sub.Id] = kept with { Timeout = timeout };
+            }
+
+            return kept.Conn;
+        }
+
+        Disconnect(sub.Id);
         RequireReachable(sub.OriginIf.Dsn, sub.Origin.Name);
-        using WorfConnection conn = PgBackgroundWorker.RunTransaction(() => SequenceRangeExchangeWorker.Bounded(() =>
+        WorfConnection conn = PgBackgroundWorker.RunTransaction(() => SequenceRangeExchangeWorker.Bounded(() =>
         {
             WorfConnection opened = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "range");
             try
             {
-                opened.Execute($"SET statement_timeout = {SequenceRanges.ExchangeTimeout.ToString(CultureInfo.InvariantCulture)}");
+                opened.Execute(setTimeout);
                 return opened;
             }
             catch
@@ -503,36 +607,19 @@ internal static class SequenceRangeExchange
                 throw;
             }
         }));
-        if (!PgBackgroundWorker.RunTransaction(() => SequenceRangeExchangeWorker.Bounded(() => Rpc.RemoteFunctionExists(conn, "worf", "sequence_range_exchange", 1, null))))
+        s_connections[sub.Id] = (conn, sub.OriginIf.Dsn, timeout, false);
+        return conn;
+    }
+
+    /// <summary>
+    /// Closes the connection kept for a subscription's provider, if there is one.
+    /// </summary>
+    private static void Disconnect(uint subId)
+    {
+        if (s_connections.Remove(subId, out (WorfConnection Conn, string Dsn, int Timeout, bool Exchanges) kept))
         {
-            return (false, false);
+            kept.Conn.Dispose();
         }
-
-        bool changed = false;
-        bool gave = false;
-
-        // A grant this node makes from the provider's request goes back in a second call, after this node commits it.
-        for (int call = 0; call < 2; call++)
-        {
-            (bool granted, bool received) = PgBackgroundWorker.RunTransaction(() => Call(node, sub, conn));
-            changed |= received;
-            gave |= granted;
-            if (received)
-            {
-                _ = s_acksWaiting.Add(sub.Id);
-            }
-            else if (call == 0)
-            {
-                _ = s_acksWaiting.Remove(sub.Id);
-            }
-
-            if (!granted)
-            {
-                break;
-            }
-        }
-
-        return (changed, gave);
     }
 
     /// <summary>
