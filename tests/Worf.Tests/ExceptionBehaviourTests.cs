@@ -1091,7 +1091,7 @@ public sealed partial class ExceptionBehaviourTests
     /// A copy in which no row fails costs about the same CPU under error and under discard, which copies at once as
     /// error does unless a row fails, each within half again of the other's: the copy hands COPY every message received
     /// rather than one row at a time, and discard reads the rows no differently. On Linux, where /proc gives the
-    /// worker's CPU.
+    /// worker's CPU; the copies run at once.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -1105,15 +1105,23 @@ public sealed partial class ExceptionBehaviourTests
             INSERT INTO n SELECT g, g, 'x' FROM generate_series(1, 1000000) g;
             SELECT * FROM worf.replication_set_add_all_tables('default', '{public}');
             """, token);
+        // The two copies run at once, so that whatever else the machine runs weighs on both alike.
+        await using TestNode underError = await StartNodeAsync("sub_error", token);
+        await using TestNode underDiscard = await StartNodeAsync("sub_discard", token);
         Dictionary<string, double> cpu = [];
-        foreach (string behaviour in new[] { "error", "discard" })
+        await Task.WhenAll(new[] { ("error", underError), ("discard", underDiscard) }.Select(async copy =>
         {
-            await using TestNode subscriber = await StartNodeAsync($"sub_{behaviour}", token);
+            (string behaviour, TestNode subscriber) = copy;
             _ = await subscriber.SafePsqlAsync(Database, "CREATE TABLE n (id integer PRIMARY KEY, v integer, w text)", token);
             await SetBehaviourAsync(subscriber, behaviour, token);
-            (cpu[behaviour], _) = await CopyAsync(provider, subscriber, token);
+            (double used, _) = await CopyAsync(provider, subscriber, token, $"sub_{behaviour}");
+            lock (cpu)
+            {
+                cpu[behaviour] = used;
+            }
+
             Assert.AreEqual("1000000", await subscriber.SafePsqlAsync(Database, "SELECT count(*) FROM n", token), $"the rows copied under {behaviour}");
-        }
+        }));
 
         TestContext.WriteLine($"apply worker CPU: error {cpu["error"]:0.00} s, discard {cpu["discard"]:0.00} s");
         Assert.IsLessThan(cpu["discard"] * 1.5, cpu["error"], "the copy's CPU under error, against discard's");
@@ -1161,10 +1169,10 @@ public sealed partial class ExceptionBehaviourTests
     /// Subscribes with the table's data and waits for the copy, which the apply worker makes, taking the CPU it used and
     /// the most private memory it held meanwhile.
     /// </summary>
-    private static async Task<(double Cpu, long PeakKb)> CopyAsync(TestNode provider, TestNode subscriber, CancellationToken token)
+    private static async Task<(double Cpu, long PeakKb)> CopyAsync(TestNode provider, TestNode subscriber, CancellationToken token, string name = "sub")
     {
         _ = await subscriber.SafePsqlAsync(Database, $"""
-            SELECT worf.create_subscription(subscription_name := 'sub', provider_dsn := '{provider.Dsn(Database, SuperUser)}',
+            SELECT worf.create_subscription(subscription_name := '{name}', provider_dsn := '{provider.Dsn(Database, SuperUser)}',
                 synchronize_structure := false, synchronize_data := true)
             """, token);
         double cpu = 0;
