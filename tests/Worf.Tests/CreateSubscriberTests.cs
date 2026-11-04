@@ -72,7 +72,6 @@ public sealed class CreateSubscriberTests
             "log_line_prefix = '[%m] [%p] [%d] '",
             "log_statement = 'all'",
             "worf.synchronous_commit = true",
-            "worf.sequence_range_check_interval = 100",
             "worf.sequence_range_exchange_interval = 500",
 
             // The subscriber takes the provider's settings, and keeps a row its subscription's changes conflict with.

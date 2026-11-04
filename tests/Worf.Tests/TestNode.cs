@@ -137,6 +137,14 @@ internal sealed class TestNode : IAsyncDisposable
     public async Task<string> SafePsqlAsync(string dbname, string sql, CancellationToken cancellationToken, string user = "postgres")
     {
         await using NpgsqlConnection connection = await OpenAsync(dbname, cancellationToken, user);
+        return await QueryAsync(connection, sql, cancellationToken);
+    }
+
+    /// <summary>
+    /// Runs SQL on a session and returns its rows as <see cref="SafePsqlAsync"/> does.
+    /// </summary>
+    private static async Task<string> QueryAsync(NpgsqlConnection connection, string sql, CancellationToken cancellationToken)
+    {
         await using NpgsqlCommand command = new(sql, connection) { CommandTimeout = 0 };
         await using NpgsqlDataReader reader = await command.ExecuteReaderAsync(cancellationToken);
 
@@ -191,7 +199,9 @@ internal sealed class TestNode : IAsyncDisposable
     }
 
     /// <summary>
-    /// Runs a query until it returns <c>t</c>, as <c>poll_query_until</c> does.
+    /// Runs a query until it returns <c>t</c>, as <c>poll_query_until</c> does, on one session while it lasts rather
+    /// than a session each time, which a server spawns a process for. A query that fails on the session, as once the
+    /// server restarted, runs again on a new one, whose failure ends the poll as a query's always has.
     /// </summary>
     /// <param name="dbname">The database.</param>
     /// <param name="sql">The query.</param>
@@ -200,17 +210,41 @@ internal sealed class TestNode : IAsyncDisposable
     public async Task<bool> PollQueryUntilAsync(string dbname, string sql, CancellationToken cancellationToken)
     {
         Stopwatch elapsed = Stopwatch.StartNew();
-        while (elapsed.Elapsed < PollTimeout)
+        NpgsqlConnection? connection = null;
+        try
         {
-            if (await SafePsqlAsync(dbname, sql, cancellationToken) == "t")
+            while (elapsed.Elapsed < PollTimeout)
             {
-                return true;
+                string result;
+                try
+                {
+                    connection ??= await OpenAsync(dbname, cancellationToken);
+                    result = await QueryAsync(connection, sql, cancellationToken);
+                }
+                catch (NpgsqlException) when (connection is not null && !cancellationToken.IsCancellationRequested)
+                {
+                    await connection.DisposeAsync();
+                    connection = await OpenAsync(dbname, cancellationToken);
+                    result = await QueryAsync(connection, sql, cancellationToken);
+                }
+
+                if (result == "t")
+                {
+                    return true;
+                }
+
+                await Task.Delay(TimeSpan.FromMilliseconds(100), cancellationToken);
             }
 
-            await Task.Delay(TimeSpan.FromMilliseconds(100), cancellationToken);
+            return false;
         }
-
-        return false;
+        finally
+        {
+            if (connection is not null)
+            {
+                await connection.DisposeAsync();
+            }
+        }
     }
 
     /// <summary>
