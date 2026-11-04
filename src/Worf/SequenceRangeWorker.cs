@@ -27,6 +27,13 @@ internal static class SequenceRangeWorker
         // Each sequence's active block, its position in it and when that was read as its rate's sample began, and its peak
         // rate in values a second, and when that was worked out.
         Dictionary<uint, (long Block, long Position, long At, double Peak, long PeakAt)> rates = [];
+
+        // What each sequence's last full check saw: the shared count of committed range changes, the sequence's position,
+        // the count of requests for checks, and when.
+        Dictionary<uint, (long Version, long? Position, long Requested, long At)> checkedAt = [];
+
+        // What the last tick that looked for dropped sequences and checked this node's identity saw, and when.
+        (long Version, long Requested, long At) lookedAt = (-1, -1, 0);
         while (!Worker.GotSigterm)
         {
             PgInterrupts.Check();
@@ -34,12 +41,22 @@ internal static class SequenceRangeWorker
 
             long requested = SequenceRanges.CheckRequested.Value;
 
+            // Dropped sequences are looked for, and this node's identity checked, once a committed change to the ranges or a
+            // session asks, and each second for what nothing announces, as a restore.
+            long changes = SequenceRanges.Version.Value;
+            long started = Worker.GetCurrentTimestamp();
+            bool look = changes != lookedAt.Version || requested != lookedAt.Requested || started - lookedAt.At >= 1_000_000;
+            if (look)
+            {
+                lookedAt = (changes, requested, started);
+            }
+
             // The range state of a sequence whose drop has committed goes first, which the DROP leaves to this worker,
             // and so does that of a sequence created again that joined a disabled epoch.
             bool forgot = false;
             try
             {
-                forgot = PgBackgroundWorker.RunTransaction(() =>
+                forgot = look && PgBackgroundWorker.RunTransaction(() =>
                     Worf.CatalogOid("sequence_range") != 0 && WorfNode.GetLocalNode(false, true) is not null && SequenceRanges.ForgetDropped());
             }
             catch (PgException error)
@@ -60,10 +77,15 @@ internal static class SequenceRangeWorker
                     WorfLog.Log("sequence range worker managing sequences");
                 }
 
-                changed |= PgBackgroundWorker.RunTransaction(() => SequenceRanges.CheckIdentity(local));
+                changed |= look && PgBackgroundWorker.RunTransaction(() => SequenceRanges.CheckIdentity(local));
                 // A sequence whose switch worker waits to switch it is left to that. Those that statements wait on go first,
                 // including those that statements begin to wait on during the tick, which go next, so that their switches
                 // wait for no other sequence's check, however many sequences a busy node takes long to check.
+                foreach (uint gone in checkedAt.Keys.Where(seqoid => !sequences.Contains(seqoid)).ToList())
+                {
+                    _ = checkedAt.Remove(gone);
+                }
+
                 List<uint> toCheck = [.. sequences.Where(seqoid => !SequenceRangeSwitchWorker.Running(seqoid))];
                 while (toCheck.Count > 0)
                 {
@@ -99,6 +121,21 @@ internal static class SequenceRangeWorker
 
                             try
                             {
+                                // A sequence that hasn't moved since a check less than a second ago, whose blocks no change
+                                // committed since has touched, which no statement waits on and no session asked to have
+                                // checked, has nothing new for the check, which still runs each second for what time alone
+                                // changes, as a fence's wait or a rate's decay.
+                                long version = SequenceRanges.Version.Value;
+                                long? position = Worf.ReadScalar<long?>("SELECT pg_catalog.pg_sequence_last_value($1)", SpiParameter.Create(seqoid));
+                                long now = Worker.GetCurrentTimestamp();
+                                if (checkedAt.TryGetValue(seqoid, out (long Version, long? Position, long Requested, long At) seen) &&
+                                    seen.Version == version && seen.Position == position && seen.Requested == requested && now - seen.At < 1_000_000 &&
+                                    SequenceRangeGuard.Drawing(seqoid).Waiting == 0)
+                                {
+                                    return false;
+                                }
+
+                                checkedAt[seqoid] = (version, position, requested, now);
                                 SequenceRanges.LedgerNoWait = true;
                                 double rate = Rate(rates, seqoid);
                                 _ = SequenceRanges.LiftFence(seqoid, local, false);
