@@ -3526,6 +3526,7 @@ public sealed class SequenceRangeTests
             "wal_level = logical",
             "max_wal_senders = 10",
             "max_replication_slots = 10",
+            "worf.sequence_range_check_interval = 100",
             "worf.sequence_range_exchange_interval = 500",
             "worf.sequence_range_timeout = 5000",
             "max_worker_processes = 16",
