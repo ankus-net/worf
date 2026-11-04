@@ -855,6 +855,8 @@ public sealed class GlobalDdlLockTests
             await transaction.CommitAsync(token);
         }
 
+        await AssertNoDeadlockAsync("the copies in opposite orders");
+
         // node_b creates x and then y while node_a's transaction, applied on node_b, creates y_a and then x_a, whose
         // indexes take names PostgreSQL chooses that start as node_b's own x_a_idx and y_a_idx do, and that none of them
         // takes.
@@ -881,6 +883,8 @@ public sealed class GlobalDdlLockTests
             await transaction.CommitAsync(token);
         }
 
+        await AssertNoDeadlockAsync("the tables created in opposite orders");
+
         // node_a's DDL that indexes t1 and t2 takes the names of node_b's own indexes there, which node_b renames.
         _ = await nodeA.SafePsqlAsync(Database, "CREATE INDEX ON t1 (v); CREATE INDEX ON t2 (v)", token);
 
@@ -903,6 +907,8 @@ public sealed class GlobalDdlLockTests
             await transaction.CommitAsync(token);
             _ = await altering;
         }
+
+        await AssertNoDeadlockAsync("the copy of a table written to while altered");
 
         // node_b's transaction indexes pt and adds a foreign key that references lt, using none of node_b's own indexes,
         // while another session indexes pt by other columns and node_a's DDL, applied on node_b, takes the name of
@@ -957,8 +963,19 @@ public sealed class GlobalDdlLockTests
             SELECT string_agg(c.relname, ',' ORDER BY c.relname) FROM worf.local_index l JOIN pg_class c ON c.oid = l.indexrelid
             WHERE c.relname NOT LIKE 'lt%'
             """, token), "node_b's own indexes, those whose names the DDL took renamed");
-        Assert.DoesNotContain("deadlock detected", nodeB.ReadLog());
-        Assert.DoesNotContain("deadlock detected", nodeA.ReadLog());
+        await AssertNoDeadlockAsync("the indexes and key");
+
+        // Each node has applied the other's DDL so far, which a deadlock with apply would have held back and logged.
+        async Task AssertNoDeadlockAsync(string what)
+        {
+            foreach (TestNode node in new[] { nodeA, nodeB })
+            {
+                _ = await node.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
+            }
+
+            Assert.DoesNotContain("deadlock detected", nodeB.ReadLog(), what);
+            Assert.DoesNotContain("deadlock detected", nodeA.ReadLog(), what);
+        }
     }
 
     private static async Task BuildLocalIndexAsync(TestNode node, string index, CancellationToken token)

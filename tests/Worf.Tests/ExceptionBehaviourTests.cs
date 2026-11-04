@@ -1088,14 +1088,15 @@ public sealed partial class ExceptionBehaviourTests
     }
 
     /// <summary>
-    /// A copy under error costs no more CPU than under discard, which copies at once as error does unless a row fails:
-    /// the copy hands COPY every message received rather than one row at a time. On Linux, where /proc gives the
+    /// A copy in which no row fails costs about the same CPU under error and under discard, which copies at once as
+    /// error does unless a row fails, each within half again of the other's: the copy hands COPY every message received
+    /// rather than one row at a time, and discard reads the rows no differently. On Linux, where /proc gives the
     /// worker's CPU.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
     [OSCondition(OperatingSystems.Linux)]
-    public async Task CopiesUnderErrorCostNoMoreThanUnderDiscard()
+    public async Task CopiesCostTheSameUnderErrorAndDiscard()
     {
         CancellationToken token = TestContext.CancellationToken;
         await using TestNode provider = await StartNodeAsync("provider", token);
@@ -1115,7 +1116,8 @@ public sealed partial class ExceptionBehaviourTests
         }
 
         TestContext.WriteLine($"apply worker CPU: error {cpu["error"]:0.00} s, discard {cpu["discard"]:0.00} s");
-        Assert.IsLessThan(cpu["discard"] * 1.6, cpu["error"], "the copy's CPU under error, against discard's");
+        Assert.IsLessThan(cpu["discard"] * 1.5, cpu["error"], "the copy's CPU under error, against discard's");
+        Assert.IsLessThan(cpu["error"] * 1.5, cpu["discard"], "the copy's CPU under discard, against error's");
     }
 
     /// <summary>
