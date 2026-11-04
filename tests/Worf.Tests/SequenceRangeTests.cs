@@ -3268,9 +3268,8 @@ public sealed class SequenceRangeTests
         long calls = (long)(window.Elapsed / TimeSpan.FromMilliseconds(500)) + 2;
         for (int i = 0; i < nodes.Length; i++)
         {
-            Assert.AreEqual(before[i][0], after[i][0], $"{nodes[i].Name} used transaction IDs while idle");
-            Assert.IsLessThanOrEqualTo((calls * long.Parse(after[i][2], CultureInfo.InvariantCulture)) + 2,
-                long.Parse(after[i][1], CultureInfo.InvariantCulture) - long.Parse(before[i][1], CultureInfo.InvariantCulture), $"{nodes[i].Name}'s exchange calls");
+            // The records written meanwhile, which name what wrote them, are read first, for either check's message.
+            string written = "";
             if (before[i][3] != after[i][3])
             {
                 // An insert position at a page's start lies past the page's header, which is written only with the page's
@@ -3281,13 +3280,18 @@ public sealed class SequenceRangeTests
                     """;
                 Assert.IsTrue(await nodes[i].PollQueryUntilAsync(Database, $"SELECT pg_current_wal_flush_lsn() >= {flushed}", token),
                     $"{nodes[i].Name} flushing its WAL");
-                Assert.AreEqual("", await nodes[i].SafePsqlAsync(Database, $"""
-                    SELECT string_agg(resource_manager || ' ' || record_type, ', ')
+                written = await nodes[i].SafePsqlAsync(Database, $"""
+                    SELECT string_agg(concat_ws(' ', resource_manager, record_type, 'xid', xid, description, block_ref), '; ')
                     FROM pg_get_wal_records_info('{before[i][3]}', greatest('{before[i][3]}'::pg_lsn + 1, least('{after[i][3]}'::pg_lsn, pg_current_wal_flush_lsn())))
                     WHERE resource_manager <> 'Standby' AND record_type NOT IN ('CHECKPOINT_REDO', 'CHECKPOINT_ONLINE', 'FPI_FOR_HINT')
                         AND NOT (resource_manager = 'Heap2' AND record_type IN ('PRUNE', 'PRUNE_ON_ACCESS'))
-                    """, token), $"{nodes[i].Name} wrote WAL while idle");
+                    """, token);
             }
+
+            Assert.AreEqual(before[i][0], after[i][0], $"{nodes[i].Name} used transaction IDs while idle: {written}");
+            Assert.IsLessThanOrEqualTo((calls * long.Parse(after[i][2], CultureInfo.InvariantCulture)) + 2,
+                long.Parse(after[i][1], CultureInfo.InvariantCulture) - long.Parse(before[i][1], CultureInfo.InvariantCulture), $"{nodes[i].Name}'s exchange calls");
+            Assert.AreEqual("", written, $"{nodes[i].Name} wrote WAL while idle");
         }
     }
 
