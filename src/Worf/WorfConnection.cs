@@ -420,12 +420,13 @@ internal sealed unsafe partial class WorfConnection : IDisposable
 
     /// <summary>
     /// Mirrors tablesync.c's copy_read_data: hands COPY the stream's bytes, waiting on the socket and latch, and
-    /// returns fewer than minread bytes only at the end of the stream.
+    /// returns fewer than minread bytes only at the end of the stream. It fills COPY's buffer with every message
+    /// already received, rather than return after each, which is a row, so that COPY isn't called back once a row.
     /// </summary>
     private static int ReadCopy(void* output, int minread, int maxread)
     {
         int read = 0;
-        while (maxread > 0 && read < minread)
+        while (maxread > 0)
         {
             if (s_copyPendingLength > 0)
             {
@@ -455,6 +456,10 @@ internal sealed unsafe partial class WorfConnection : IDisposable
             else if (length < 0)
             {
                 s_copyEnded = true;
+            }
+            else if (read >= minread)
+            {
+                break;
             }
             else
             {
