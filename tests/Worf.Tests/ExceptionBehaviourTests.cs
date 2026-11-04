@@ -1082,6 +1082,137 @@ public sealed partial class ExceptionBehaviourTests
             "SELECT bool_and(a < b) FROM (SELECT action_counter AS a, lead(action_counter) OVER (ORDER BY log_id) AS b FROM worf.exception_log) s WHERE b IS NOT NULL",
             token), "the rows recorded in order");
         Assert.IsLessThan(60L, used, "transaction IDs the copy took for 1,131 failed rows");
+        Assert.AreEqual("bigint", await subscriber.SafePsqlAsync(Database,
+            "SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'worf.exception_log'::regclass AND attname = 'action_counter'", token),
+            "action_counter, which numbers a copy's rows past 2^31");
+    }
+
+    /// <summary>
+    /// A copy under error costs no more CPU than under discard, which copies at once as error does unless a row fails:
+    /// the copy hands COPY every message received rather than one row at a time. On Linux, where /proc gives the
+    /// worker's CPU.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [OSCondition(OperatingSystems.Linux)]
+    public async Task CopiesUnderErrorCostNoMoreThanUnderDiscard()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode provider = await StartNodeAsync("provider", token);
+        _ = await provider.SafePsqlAsync(Database, """
+            CREATE TABLE n (id integer PRIMARY KEY, v integer, w text);
+            INSERT INTO n SELECT g, g, 'x' FROM generate_series(1, 1000000) g;
+            SELECT * FROM worf.replication_set_add_all_tables('default', '{public}');
+            """, token);
+        Dictionary<string, double> cpu = [];
+        foreach (string behaviour in new[] { "error", "discard" })
+        {
+            await using TestNode subscriber = await StartNodeAsync($"sub_{behaviour}", token);
+            _ = await subscriber.SafePsqlAsync(Database, "CREATE TABLE n (id integer PRIMARY KEY, v integer, w text)", token);
+            await SetBehaviourAsync(subscriber, behaviour, token);
+            (cpu[behaviour], _) = await CopyAsync(provider, subscriber, token);
+            Assert.AreEqual("1000000", await subscriber.SafePsqlAsync(Database, "SELECT count(*) FROM n", token), $"the rows copied under {behaviour}");
+        }
+
+        TestContext.WriteLine($"apply worker CPU: error {cpu["error"]:0.00} s, discard {cpu["discard"]:0.00} s");
+        Assert.IsLessThan(cpu["discard"] * 1.6, cpu["error"], "the copy's CPU under error, against discard's");
+    }
+
+    /// <summary>
+    /// A copy under discard of rows wide enough that a thousand of them would take hundreds of megabytes copies them in
+    /// runs of 8 MB at most, and records the ones that fail as each run fills, so that the copying worker's memory stays
+    /// bounded however wide and many they are: its private memory, which /proc gives on Linux, stays under 800 MB, a
+    /// run's worth and what the collector leaves for a while, where runs of a thousand rows took 3.2 GB here.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [OSCondition(OperatingSystems.Linux)]
+    public async Task WideRowsCopyInBoundedMemory()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode provider = await StartNodeAsync("provider", token);
+        await using TestNode subscriber = await StartNodeAsync("subscriber", token);
+        _ = await provider.SafePsqlAsync(Database, """
+            CREATE TABLE w (id integer PRIMARY KEY, v integer, t text);
+            INSERT INTO w SELECT g, g, repeat(md5(g::text), 32768) FROM generate_series(1, 400) g;
+            SELECT * FROM worf.replication_set_add_all_tables('default', '{public}');
+            """, token);
+        _ = await subscriber.SafePsqlAsync(Database, "CREATE TABLE w (id integer PRIMARY KEY, v integer CHECK (v % 2 = 0), t text)", token);
+        await SetBehaviourAsync(subscriber, "discard", token);
+        (_, long peakKb) = await CopyAsync(provider, subscriber, token);
+
+        // The odd rows fail the CHECK and are recorded, in order, each with its whole value.
+        Assert.AreEqual("200|200|1048576", await subscriber.SafePsqlAsync(Database, """
+            SELECT (SELECT count(*) FROM w WHERE v % 2 = 0 AND length(t) = 1048576),
+                (SELECT count(*) FROM worf.exception_log WHERE (remote_new_tuple->>'id')::integer % 2 = 1),
+                (SELECT min(length(remote_new_tuple->>'t')) FROM worf.exception_log)
+            """, token), "the rows copied and recorded");
+        Assert.AreEqual("t", await subscriber.SafePsqlAsync(Database,
+            "SELECT bool_and(a < b) FROM (SELECT action_counter AS a, lead(action_counter) OVER (ORDER BY log_id) AS b FROM worf.exception_log) s WHERE b IS NOT NULL",
+            token), "the rows recorded in order");
+        TestContext.WriteLine($"apply worker private memory: {peakKb / 1024} MB");
+        Assert.IsLessThan(800L * 1024, peakKb, "the copying worker's private memory, in kB");
+    }
+
+    /// <summary>
+    /// Subscribes with the table's data and waits for the copy, which the apply worker makes, taking the CPU it used and
+    /// the most private memory it held meanwhile.
+    /// </summary>
+    private static async Task<(double Cpu, long PeakKb)> CopyAsync(TestNode provider, TestNode subscriber, CancellationToken token)
+    {
+        _ = await subscriber.SafePsqlAsync(Database, $"""
+            SELECT worf.create_subscription(subscription_name := 'sub', provider_dsn := '{provider.Dsn(Database, SuperUser)}',
+                synchronize_structure := false, synchronize_data := true)
+            """, token);
+        double cpu = 0;
+        long peakKb = 0;
+        Stopwatch waited = Stopwatch.StartNew();
+        while (waited.Elapsed < TestNode.PollTimeout)
+        {
+            string pid = await subscriber.SafePsqlAsync(Database, "SELECT pid FROM pg_stat_activity WHERE backend_type LIKE 'worf apply%'", token);
+            if (int.TryParse(pid, out int apply))
+            {
+                (double Cpu, long RssAnonKb)? process = ReadProcess(apply);
+                if (process is (double used, long rss))
+                {
+                    cpu = Math.Max(cpu, used);
+                    peakKb = Math.Max(peakKb, rss);
+                }
+            }
+
+            if (await subscriber.SafePsqlAsync(Database,
+                "SELECT EXISTS (SELECT 1 FROM worf.local_sync_status) AND NOT EXISTS (SELECT 1 FROM worf.local_sync_status WHERE sync_status <> 'r')",
+                token) == "t")
+            {
+                return (cpu, peakKb);
+            }
+
+            await Task.Delay(TimeSpan.FromMilliseconds(50), token);
+        }
+
+        Assert.Fail("the copy didn't finish");
+        return default;
+    }
+
+    /// <summary>
+    /// Reads a process's CPU time and private memory from /proc, or null once it has exited.
+    /// </summary>
+    private static (double Cpu, long RssAnonKb)? ReadProcess(int pid)
+    {
+        try
+        {
+            string[] stat = File.ReadAllText($"/proc/{pid}/stat").Split(')')[1].Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            double cpu = (double.Parse(stat[11], System.Globalization.CultureInfo.InvariantCulture) +
+                double.Parse(stat[12], System.Globalization.CultureInfo.InvariantCulture)) / 100.0;
+            long rss = File.ReadAllLines($"/proc/{pid}/status").Where(line => line.StartsWith("RssAnon:", StringComparison.Ordinal))
+                .Select(line => long.Parse(line.Split(' ', StringSplitOptions.RemoveEmptyEntries)[1], System.Globalization.CultureInfo.InvariantCulture))
+                .FirstOrDefault();
+            return (cpu, rss);
+        }
+        catch (IOException)
+        {
+            return null;
+        }
     }
 
     /// <summary>
