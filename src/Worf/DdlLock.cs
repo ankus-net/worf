@@ -648,7 +648,8 @@ internal static unsafe partial class DdlLock
                     // point, and one too old for the origin to know of finished long ago. Reached means below the next
                     // transaction ID, which age() counts from, and not a snapshot's xmax, which a transaction still in
                     // progress or prepared can be at or above while none after it has ended. A statement that commits on
-                    // its way holds a lock named for its fence until the transaction that queues its DDL ends.
+                    // its way holds a lock named for its fence until the transaction that queues its DDL ends, and keeps
+                    // the fence under no transaction.
                     ulong key = unchecked((ulong)fenceId);
                     string?[] row = conn.Query($"""
                         SELECT CASE WHEN EXISTS (SELECT FROM pg_catalog.pg_locks l JOIN pg_catalog.pg_database d ON d.oid = l.database
@@ -656,6 +657,7 @@ internal static unsafe partial class DdlLock
                                     AND l.classid = {(key >> 32).ToString(CultureInfo.InvariantCulture)}
                                     AND l.objid = {(key & uint.MaxValue).ToString(CultureInfo.InvariantCulture)})
                             THEN 'in progress'
+                            WHEN x = '0'::pg_catalog.xid8 THEN 'ended'
                             WHEN pg_catalog.age(pg_catalog.xid(x)) <= 0 THEN 'aborted'
                             ELSE pg_catalog.pg_xact_status(x) END, pg_catalog.pg_current_wal_insert_lsn()
                         FROM (SELECT '{kept[i].Get<long>(1).ToString(CultureInfo.InvariantCulture)}'::pg_catalog.xid8 AS x) AS fence
@@ -663,6 +665,29 @@ internal static unsafe partial class DdlLock
                     if (row[0] == "in progress")
                     {
                         continue;
+                    }
+
+                    // Once a statement's lock is gone, the transaction that queued its DDL has committed, and a statement
+                    // that queued none, as one that failed, never will, which the queue then shows, read after the lock
+                    // was found gone, as the transaction lets the lock go only once it shows as committed. Of the queue,
+                    // only the DDL's messages are read. A queue locked against the read, as by DDL waiting to queue, is
+                    // waited for no longer than a moment, and the DDL is then taken to have committed, as before the
+                    // statement's lock was asked about.
+                    if (row[0] == "ended")
+                    {
+                        conn.Execute("SET lock_timeout = 1000");
+                        try
+                        {
+                            row = conn.Query($"""
+                                SELECT CASE WHEN EXISTS (SELECT FROM worf.queue WHERE message_type = '{Queue.QueueCommandTypeDdl}'
+                                        AND message OPERATOR(pg_catalog.->>) 'fence' = '{key.ToString(CultureInfo.InvariantCulture)}')
+                                    THEN 'committed' ELSE 'aborted' END, pg_catalog.pg_current_wal_insert_lsn()
+                                """, 2)[0];
+                        }
+                        catch (PgRemoteException error) when (error.SqlState == LockNotAvailable)
+                        {
+                            row = ["committed", conn.Query("SELECT pg_catalog.pg_current_wal_insert_lsn()", 1)[0][0]];
+                        }
                     }
 
                     // The origin's WAL had passed the transaction's commit once the origin said it committed, so once
@@ -1761,8 +1786,10 @@ internal static unsafe partial class DdlLock
     }
 
     /// <summary>
-    /// Keeps the fence of a statement that commits on its way, at its first commit, on each node that holds it, and
-    /// takes the lock named for it, which PostgreSQL lets go of if a transaction of the statement aborts.
+    /// Keeps the fence of a statement that commits on its way, at its first commit, on each node that holds it, under no
+    /// transaction, since the one that will queue its DDL hasn't begun, and takes the lock named for it, which PostgreSQL
+    /// lets go of if a transaction of the statement aborts. A node that asks about the fence once the lock is gone looks
+    /// for its DDL in the queue.
     /// </summary>
     private static void KeepStatementFence(ulong fenceId)
     {
@@ -1784,22 +1811,22 @@ internal static unsafe partial class DdlLock
         LOCKTAG tag = StatementLockTag(fenceId);
         _ = NativeMethods.LockAcquire(&tag, ExclusiveLock, true, false);
         s_statementLock = fenceId;
-        Keep(kept);
+        Keep(kept, false);
     }
 
     /// <summary>
-    /// Keeps fences on the nodes that hold them, under this transaction.
+    /// Keeps fences on the nodes that hold them, under this transaction, or under none.
     /// </summary>
-    private static void Keep(List<(ulong Id, uint NodeId)> fences)
+    private static void Keep(List<(ulong Id, uint NodeId)> fences, bool underTransaction = true)
     {
         if (fences.Count == 0)
         {
             return;
         }
 
-        // The transaction's ID, as txid_current() gives it, which the other nodes ask about.
+        // The transaction's ID, as txid_current() gives it, which the other nodes ask about, or zero.
         string nodeId = WorfNode.GetLocalNode(false, false)!.Node.Id.ToString(CultureInfo.InvariantCulture);
-        string xid = unchecked((long)NativeMethods.GetTopFullTransactionId().value).ToString(CultureInfo.InvariantCulture);
+        string xid = underTransaction ? unchecked((long)NativeMethods.GetTopFullTransactionId().value).ToString(CultureInfo.InvariantCulture) : "0";
         foreach ((ulong fenceId, uint node) in fences)
         {
             if (!s_fenceConnections.TryGetValue(node, out WorfConnection? conn))

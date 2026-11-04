@@ -297,32 +297,46 @@ public sealed class GlobalDdlLockTests
         _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO dupe VALUES (1, 1), (2, 1)", token);
         await using (NpgsqlConnection building = await nodeA.OpenAsync(Database, token))
         {
+            // The write is tried again over one connection, and timed on the servers' clocks from the build's failure,
+            // as node_a logs it, to node_b's write, so that the time is worf's rather than the client's. Fences whose
+            // session had ended for a second were let go of before, so that a write waited at least that long. node_b
+            // lets the fence go as one whose DDL never committed, rather than once it has applied as far as node_a had
+            // written when it asked, which it waited for when it took the build's first transaction for the DDL's.
+            await using NpgsqlConnection writing = await nodeB.OpenAsync(Database, token);
+            int failedAt = nodeA.ReadLog().Length;
+            int letGoAt = nodeB.ReadLog().Length;
             await using (NpgsqlCommand build = new("CREATE UNIQUE INDEX CONCURRENTLY dupe_v ON dupe (v)", building))
             {
                 PostgresException duplicate = await Assert.ThrowsExactlyAsync<PostgresException>(() => build.ExecuteNonQueryAsync(token));
                 Assert.AreEqual("23505", duplicate.SqlState);
             }
 
-            // The write is tried again over one connection, so that the time is worf's rather than a new connection's.
-            Stopwatch released = Stopwatch.StartNew();
-            await using (NpgsqlConnection writing = await nodeB.OpenAsync(Database, token))
-            await using (NpgsqlCommand write = new("UPDATE dupe SET v = v WHERE id = 0", writing))
+            await using (NpgsqlCommand write = new("""
+                WITH w AS (UPDATE dupe SET v = v WHERE id = 0)
+                SELECT to_char(clock_timestamp() AT TIME ZONE current_setting('log_timezone'), 'YYYY-MM-DD HH24:MI:SS.MS')
+                """, writing))
             {
-                while (true)
+                Stopwatch released = Stopwatch.StartNew();
+                DateTime? wrote = null;
+                while (wrote is null)
                 {
                     try
                     {
-                        _ = await write.ExecuteNonQueryAsync(token);
-                        break;
+                        wrote = DateTime.ParseExact((string)(await write.ExecuteScalarAsync(token))!, "yyyy-MM-dd HH:mm:ss.fff",
+                            CultureInfo.InvariantCulture);
                     }
                     catch (PostgresException) when (released.Elapsed < TestNode.PollTimeout)
                     {
                         await Task.Delay(TimeSpan.FromMilliseconds(20), token);
                     }
                 }
+
+                DateTime failed = nodeA.LogTimes(failedAt, "could not create unique index \"dupe_v\"").Single();
+                Assert.IsLessThan(1000.0, (wrote.Value - failed).TotalMilliseconds, "how long the failed build's fence held node_b's writes back, in ms");
+                Assert.IsTrue(await nodeB.PollLogAsync(letGoAt, "from node node_a, whose DDL never committed", token), "node_b letting the failed build's fence go");
+                Assert.DoesNotContain("whose DDL this node has gone past", nodeB.ReadLog()[letGoAt..], "node_b waiting to apply past the failed build");
             }
 
-            Assert.IsLessThan(1000L, released.ElapsedMilliseconds, "how long the failed build's fence held node_b's writes back, in ms");
             await using (NpgsqlConnection locking = await nodeA.OpenAsync(Database, token))
             {
                 await using NpgsqlTransaction transaction = await locking.BeginTransactionAsync(token);
