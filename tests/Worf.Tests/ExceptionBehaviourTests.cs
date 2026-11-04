@@ -1120,9 +1120,10 @@ public sealed partial class ExceptionBehaviourTests
 
     /// <summary>
     /// A copy under discard of rows wide enough that a thousand of them would take hundreds of megabytes copies them in
-    /// runs of 8 MB at most, and records the ones that fail as each run fills, so that the copying worker's memory stays
-    /// bounded however wide and many they are: its private memory, which /proc gives on Linux, stays under 800 MB, a
-    /// run's worth and what the collector leaves for a while, where runs of a thousand rows took 3.2 GB here.
+    /// runs of 8 MB at most, and records the ones that fail as each run fills, from the run's own buffer, so that the
+    /// copying worker's memory stays bounded however wide and many they are: its private memory, which /proc gives on
+    /// Linux, stays under 200 MB, where runs of a thousand rows took 3.2 GB here, and failed rows kept as strings until
+    /// the collector took them 323 MB.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -1151,7 +1152,7 @@ public sealed partial class ExceptionBehaviourTests
             "SELECT bool_and(a < b) FROM (SELECT action_counter AS a, lead(action_counter) OVER (ORDER BY log_id) AS b FROM worf.exception_log) s WHERE b IS NOT NULL",
             token), "the rows recorded in order");
         TestContext.WriteLine($"apply worker private memory: {peakKb / 1024} MB");
-        Assert.IsLessThan(800L * 1024, peakKb, "the copying worker's private memory, in kB");
+        Assert.IsLessThan(200L * 1024, peakKb, "the copying worker's private memory, in kB");
     }
 
     /// <summary>

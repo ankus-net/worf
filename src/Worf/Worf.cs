@@ -531,7 +531,7 @@ internal static partial class Worf
     /// <summary>
     /// Checks whether bytes in the database encoding are a SQL_ASCII database's that aren't valid UTF-8.
     /// </summary>
-    private static bool NotUtf8InSqlAscii(ReadOnlySpan<byte> value)
+    internal static bool NotUtf8InSqlAscii(ReadOnlySpan<byte> value)
     {
         int encoding;
         unsafe
@@ -1372,6 +1372,43 @@ internal static partial class Worf
             (_, ulong array, _) = ExactParameter(SpiParameter.Create(values));
             return SpiParameter.Create(PgDatum.DangerousCreate((nuint)array, TextArrayOid, PgMemoryContext.Current));
         }
+    }
+
+    /// <summary>
+    /// Makes a text array parameter of texts already in the database encoding, each a run of a buffer's bytes, or null,
+    /// in PostgreSQL's memory, so that large texts take no strings of their own.
+    /// </summary>
+    /// <param name="buffer">The texts' bytes.</param>
+    /// <param name="texts">Each text's start and length in them, or a length of -1 for null.</param>
+    /// <returns>The parameter.</returns>
+    internal static unsafe SpiParameter TextArrayParameter(byte[] buffer, IReadOnlyList<(int Start, int Length)> texts)
+    {
+        int count = texts.Count;
+        ulong* elements = (ulong*)NativeMethods.palloc((nuint)(sizeof(ulong) * Math.Max(count, 1)));
+        bool* nulls = (bool*)NativeMethods.palloc0((nuint)Math.Max(count, 1));
+        fixed (byte* address = buffer)
+        {
+            for (int i = 0; i < count; i++)
+            {
+                (int start, int length) = texts[i];
+                nulls[i] = length < 0;
+                elements[i] = length < 0 ? 0 : (ulong)NativeMethods.cstring_to_text_with_len((sbyte*)(address + start), length);
+            }
+        }
+
+        // The array holds copies of the texts, which go as soon as it's made.
+        int dims = count;
+        int lbs = 1;
+        ArrayType* array = NativeMethods.construct_md_array(elements, nulls, count == 0 ? 0 : 1, &dims, &lbs, TextOid, -1, false, (sbyte)'i');
+        for (int i = 0; i < count; i++)
+        {
+            if (!nulls[i])
+            {
+                NativeMethods.pfree((void*)elements[i]);
+            }
+        }
+
+        return SpiParameter.Create(PgDatum.DangerousCreate((nuint)array, TextArrayOid, PgMemoryContext.Current));
     }
 
     /// <summary>

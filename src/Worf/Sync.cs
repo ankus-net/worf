@@ -1738,9 +1738,9 @@ internal static class Sync
             Apply.ExceptionBehaviour is not (WorfExceptionBehaviour.Error or WorfExceptionBehaviour.SubDisable))
         {
             WorfRows rows = Worf.Read($"SELECT ctid::text FROM {MergeCopy} ORDER BY ctid", 0);
-            List<(WorfFailedChange Change, PgException Error)> skipped = [];
-            MergeParts(rel, lsn, reloid, only + table, mergePart, [.. rows.Select(row => row.Get<string>(0))], skipped);
-            ExceptionLog.RecordCopied(skipped);
+            List<(string Place, PgException Error)> skipped = [];
+            MergeParts(reloid, only + table, mergePart, [.. rows.Select(row => row.Get<string>(0))], skipped);
+            RecordSkipped(rel, lsn, skipped);
             WorfLog.Warning(new PgDiagnostic($"skipped {skipped.Count} of the rows of the copy of table {remoterel.Nspname}.{remoterel.Relname} as it merged into the rows it has: {error.Message}")
             {
                 Detail = error.Detail,
@@ -1764,10 +1764,9 @@ internal static class Sync
 
     /// <summary>
     /// Merges some of a copy's rows, by their places in it, in a subtransaction, and in halves when that fails, down to
-    /// a row that fails alone, which is kept to record.
+    /// a row that fails alone, whose place is kept to record.
     /// </summary>
-    private static void MergeParts(WorfRelation rel, ulong lsn, uint reloid, string table, string merge, List<string> rows,
-        List<(WorfFailedChange Change, PgException Error)> skipped)
+    private static void MergeParts(uint reloid, string table, string merge, List<string> rows, List<(string Place, PgException Error)> skipped)
     {
         try
         {
@@ -1782,30 +1781,70 @@ internal static class Sync
         {
             if (rows.Count > 1)
             {
-                MergeParts(rel, lsn, reloid, table, merge, rows[..(rows.Count / 2)], skipped);
-                MergeParts(rel, lsn, reloid, table, merge, rows[(rows.Count / 2)..], skipped);
+                MergeParts(reloid, table, merge, rows[..(rows.Count / 2)], skipped);
+                MergeParts(reloid, table, merge, rows[(rows.Count / 2)..], skipped);
                 return;
             }
 
-            WorfSubscription sub = Apply.MySubscription!;
-            long started;
-            unsafe
+            skipped.Add((rows[0], error));
+        }
+    }
+
+    /// <summary>
+    /// Records the rows of a table's copy that its merge skipped, by their places in the copy, with their errors, from
+    /// the copy, a thousand at a time, and, of a thousand the log can't hold, each alone.
+    /// </summary>
+    private static void RecordSkipped(WorfRelation rel, ulong lsn, List<(string Place, PgException Error)> skipped)
+    {
+        const string Rows = $"""
+            SELECT pg_catalog.row_to_json(c)::pg_catalog.text, f.error_sqlstate, f.error_message
+            FROM ROWS FROM (pg_catalog.unnest($1::pg_catalog.tid[]), pg_catalog.unnest($2::pg_catalog.text[]), pg_catalog.unnest($3::pg_catalog.text[]))
+                WITH ORDINALITY AS f (place, error_sqlstate, error_message, n)
+                JOIN {MergeCopy} c ON c.ctid OPERATOR(pg_catalog.=) f.place
+            ORDER BY f.n
+            """;
+        WorfFailedChange change = CopiedChange(rel, lsn, "MERGE");
+        foreach ((string Place, PgException Error)[] run in skipped.Chunk(1000))
+        {
+            if (Record(run))
             {
-                started = NativeMethods.GetCurrentTransactionStartTimestamp();
+                continue;
             }
 
-            skipped.Add((new WorfFailedChange
+            int unrecorded = run.Count(row => !Record([row]));
+            if (unrecorded > 0)
             {
-                Subscription = sub,
-                WriterNodeId = sub.Origin.Id,
-                CommitTime = started,
-                CommitLsn = lsn,
-                Operation = "MERGE",
-                Relation = rel,
-                NewTuple = Worf.ReadScalar<string>($"SELECT pg_catalog.row_to_json(c)::text FROM {MergeCopy} c WHERE ctid = $1::pg_catalog.tid",
-                    SpiParameter.Create(rows[0])),
-            }, error));
+                WorfLog.Warning($"could not record {unrecorded} of the rows the merge of table {rel.Nspname}.{rel.Relname}'s copy skipped in worf.exception_log");
+            }
         }
+
+        bool Record((string Place, PgException Error)[] rows) => ExceptionLog.TryRecordCopied(change, Rows,
+            SpiParameter.Create(rows.Select(row => row.Place).ToArray()),
+            SpiParameter.Create(rows.Select(row => row.Error.SqlState).ToArray()),
+            SpiParameter.Create(rows.Select(row => row.Error.Message).ToArray()));
+    }
+
+    /// <summary>
+    /// Describes a table's copy as the exception log records its rows that fail.
+    /// </summary>
+    private static WorfFailedChange CopiedChange(WorfRelation rel, ulong lsn, string operation)
+    {
+        WorfSubscription sub = Apply.MySubscription!;
+        long started;
+        unsafe
+        {
+            started = NativeMethods.GetCurrentTransactionStartTimestamp();
+        }
+
+        return new WorfFailedChange
+        {
+            Subscription = sub,
+            WriterNodeId = sub.Origin.Id,
+            CommitTime = started,
+            CommitLsn = lsn,
+            Operation = operation,
+            Relation = rel,
+        };
     }
 
     /// <summary>
@@ -1817,11 +1856,9 @@ internal static class Sync
     private static void CheckCopiedDeferrable(WorfRelation rel, ulong lsn)
     {
         bool partitioned;
-        long started;
         unsafe
         {
             partitioned = NativeMethods.get_rel_relkind(rel.Reloid) == (sbyte)'p';
-            started = NativeMethods.GetCurrentTransactionStartTimestamp();
         }
 
         string table = (partitioned ? "" : "ONLY ") + Worf.QuoteQualifiedIdentifier(rel.Nspname, rel.Relname);
@@ -1836,23 +1873,7 @@ internal static class Sync
         catch (PgException error) when (error.SqlState is PgSqlStates.UniqueViolation or PgSqlStates.ExclusionViolation &&
             Apply.ExceptionBehaviour is not (WorfExceptionBehaviour.Error or WorfExceptionBehaviour.SubDisable))
         {
-            WorfSubscription sub = Apply.MySubscription!;
-            List<(WorfFailedChange Change, PgException Error)> failures = [];
-            foreach ((string row, PgException conflict) in DeleteDeferrableConflicts(rel.Reloid, table))
-            {
-                failures.Add((new WorfFailedChange
-                {
-                    Subscription = sub,
-                    WriterNodeId = sub.Origin.Id,
-                    CommitTime = started,
-                    CommitLsn = lsn,
-                    Operation = "COPY",
-                    Relation = rel,
-                    NewTuple = row,
-                }, conflict));
-            }
-
-            ExceptionLog.RecordCopied(failures);
+            DeleteDeferrableConflicts(rel.Reloid, table, CopiedChange(rel, lsn, "COPY"));
         }
         catch (PgException error) when (error.SqlState is PgSqlStates.UniqueViolation or PgSqlStates.ExclusionViolation &&
             Apply.ExceptionBehaviour == WorfExceptionBehaviour.SubDisable)
@@ -1864,12 +1885,11 @@ internal static class Sync
 
     /// <summary>
     /// Deletes the rows of a table that conflict with an earlier row, by its place in the table, in a deferrable unique
-    /// or exclusion constraint.
+    /// or exclusion constraint, and records them, as they're deleted, with the conflict each fails, or, when the log
+    /// can't hold one of them, each alone.
     /// </summary>
-    /// <returns>The rows deleted, as JSON, with the conflict each fails.</returns>
-    private static List<(string Row, PgException Error)> DeleteDeferrableConflicts(uint reloid, string table)
+    private static void DeleteDeferrableConflicts(uint reloid, string table, WorfFailedChange change)
     {
-        List<(string Row, PgException Error)> deleted = [];
         WorfRows constraints = Worf.Read("""
             SELECT c.conname::text, c.contype = 'x',
                 (SELECT pg_catalog.array_agg(pg_catalog.pg_get_indexdef(i.indexrelid, k, false) ORDER BY k) FROM pg_catalog.generate_series(1, i.indnkeyatts) k),
@@ -1896,18 +1916,31 @@ internal static class Sync
             string conflicts = exclusion
                 ? string.Join(" AND ", constraint.Get<string?[]>(3).Select((op, k) => $"a.k{k} {op} b.k{k}"))
                 : string.Join(" AND ", keys.Select((_, k) => $"a.k{k} IS NOT DISTINCT FROM b.k{k}"));
-            WorfRows rowsDeleted = Worf.Query($"""
-                DELETE FROM {table} t
-                WHERE (t.tableoid, t.ctid) IN (SELECT b.tableoid, b.ctid FROM {rows} a JOIN {rows} b ON (a.tableoid, a.ctid) < (b.tableoid, b.ctid) AND {conflicts})
-                RETURNING pg_catalog.row_to_json(t)::text
-                """, false, 0);
+            string conflicting = $"SELECT b.tableoid, b.ctid FROM {rows} a JOIN {rows} b ON (a.tableoid, a.ctid) < (b.tableoid, b.ctid) AND {conflicts}";
             PgException error = exclusion
                 ? new PgException(PgSqlStates.ExclusionViolation, $"conflicting key value violates exclusion constraint \"{name}\"")
                 : new PgException(PgSqlStates.UniqueViolation, $"duplicate key value violates unique constraint \"{name}\"");
-            deleted.AddRange(rowsDeleted.Select(row => (row.Get<string>(0), error)));
+            if (ExceptionLog.TryRecordCopied(change, $"DELETE FROM {table} t WHERE (t.tableoid, t.ctid) IN ({conflicting}) {Returning(1)}",
+                SpiParameter.Create(error.SqlState), SpiParameter.Create(error.Message)))
+            {
+                continue;
+            }
+
+            foreach (WorfRow place in Worf.Read($"SELECT DISTINCT tableoid, ctid::pg_catalog.text FROM ({conflicting}) c", 0))
+            {
+                const string One = "t.tableoid OPERATOR(pg_catalog.=) $1 AND t.ctid OPERATOR(pg_catalog.=) $2::pg_catalog.tid";
+                SpiParameter tableoid = SpiParameter.Create(place.Get<uint>(0));
+                SpiParameter ctid = SpiParameter.Create(place.Get<string>(1));
+                if (!ExceptionLog.TryRecordCopied(change, $"DELETE FROM {table} t WHERE {One} {Returning(3)}", tableoid, ctid,
+                    SpiParameter.Create(error.SqlState), SpiParameter.Create(error.Message)))
+                {
+                    _ = Worf.Execute($"DELETE FROM {table} t WHERE {One}", tableoid, ctid);
+                    WorfLog.Warning("could not record the failed remote change in worf.exception_log");
+                }
+            }
         }
 
-        return deleted;
+        static string Returning(int error) => $"RETURNING pg_catalog.row_to_json(t)::pg_catalog.text, ${error}::pg_catalog.text, ${error + 1}::pg_catalog.text";
     }
 
     /// <summary>

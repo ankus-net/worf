@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Text;
 using Ankus.Postgres;
 
@@ -31,14 +32,23 @@ internal static unsafe partial class CopyConversion
     private static int s_rowEnd;
     private static CopyFromStateData* s_cstate;
 
-    // The rows of a copy in batches that failed: those of the batch under way, which are recorded in order once it's
-    // copied, and those recorded since, in the copy's transaction, a run at a time, so that a copy that skips many
-    // rows neither keeps them all nor takes a transaction ID for each, and how much of the rows' text they hold.
+    // The rows of a copy in batches that failed: those of the batch under way, by their place in it, which are recorded
+    // in order once it's copied, and those to record since, in the copy's transaction, a run at a time, so that a copy
+    // that skips many rows neither keeps them all nor takes a transaction ID for each. The rows to record are written as
+    // the exception log records them, one after another, in the database encoding, which PostgreSQL takes as they are,
+    // so that rows however wide take no memory of their own, and each copied column's name as a JSON string. A row
+    // goes in whole up to the most text PostgreSQL holds in a value, and is recorded without its data past that.
     private const int RecordRows = 1000;
-    private const long RecordBytes = 8 * 1024 * 1024;
-    private static readonly List<(ulong Line, WorfFailedChange Change, PgException Error)> s_batchFailed = [];
-    private static readonly List<(WorfFailedChange Change, PgException Error)> s_toRecord = [];
-    private static long s_toRecordBytes;
+    private const int RecordBytes = 8 * 1024 * 1024;
+    private const int MaxJson = 0x3fffffff - 4;
+    private static readonly List<(ulong Line, int Row, PgException Error)> s_batchFailed = [];
+    private static readonly List<(long ActionCounter, int Start, int Length, PgException Error)> s_toRecord = [];
+    private static byte[] s_toRecordJson = new byte[64 * 1024];
+    private static int s_toRecordBytes;
+    private static int s_rowJsonStart;
+    private static bool s_rowTooLarge;
+    private static byte[][] s_columnNames = [];
+    private static readonly SearchValues<byte> s_jsonEscapes = SearchValues.Create([.. Enumerable.Range(0, 0x20).Select(b => (byte)b), (byte)'"', (byte)'\\']);
 
     // Each copied column's conversion, or null, a converted column's name and its type's output function, the memory
     // context a row converts in, a value's text, which COPY's errors show, and the row as converted.
@@ -91,7 +101,7 @@ internal static unsafe partial class CopyConversion
     private static int[] s_checkTypmods = [];
     private static List* s_checkWhere;
     private static readonly List<(string State, string Message)> s_checkErrors = [];
-    private static readonly List<(ulong Line, WorfFailedChange Change, PgException Error)> s_checkSkipped = [];
+    private static readonly List<(ulong Line, int Row, PgException Error)> s_checkSkipped = [];
     private static bool s_checking;
     private static int s_copyIndex;
     private static int s_copyRow;
@@ -174,6 +184,12 @@ internal static unsafe partial class CopyConversion
                 WorfSubscription sub = Apply.MySubscription!;
                 s_behaviour = Apply.ExceptionBehaviour;
                 s_columns = attnames;
+                s_columnNames = [.. attnames.Select(attname =>
+                {
+                    StringBuilder name = new();
+                    Executor.EscapeJson(name, attname);
+                    return Worf.ToServer(name.Append(": ").ToString());
+                })];
                 s_change = new WorfFailedChange
                 {
                     Subscription = sub,
@@ -265,6 +281,11 @@ internal static unsafe partial class CopyConversion
             s_context = null;
             s_text = null;
             s_change = null;
+            s_columnNames = [];
+            s_batchFailed.Clear();
+            s_toRecord.Clear();
+            s_toRecordBytes = 0;
+            Release();
             if (table != relation)
             {
                 NativeMethods.table_close(table, NoLock);
@@ -373,10 +394,11 @@ internal static unsafe partial class CopyConversion
             // The batch's rows that failed are recorded in order, whether they failed to convert or COPY failed them, a
             // run at a time, as soon as a run is that large.
             s_batchFailed.Sort((x, y) => x.Line.CompareTo(y.Line));
-            foreach ((_, WorfFailedChange change, PgException error) in s_batchFailed)
+            foreach ((ulong line, int row, PgException error) in s_batchFailed)
             {
-                s_toRecord.Add((change, error));
-                s_toRecordBytes += change.NewTuple?.Length ?? 0;
+                int start = s_toRecordBytes;
+                int length = AppendRowJson(BatchRow(row), line);
+                s_toRecord.Add(((long)Math.Min(line, long.MaxValue), start, length, error));
                 if (s_toRecord.Count >= RecordRows || s_toRecordBytes >= RecordBytes)
                 {
                     FlushFailures();
@@ -400,9 +422,24 @@ internal static unsafe partial class CopyConversion
     /// </summary>
     private static void FlushFailures()
     {
-        ExceptionLog.RecordCopied(s_toRecord);
+        ExceptionLog.RecordCopied(s_change!, s_toRecord, s_toRecordJson);
         s_toRecord.Clear();
         s_toRecordBytes = 0;
+    }
+
+    /// <summary>
+    /// Gives back the buffers a copy grew for its rows, as a memory context goes once a copy ends, so that a worker
+    /// keeps none of a wide table's rows' size after it.
+    /// </summary>
+    private static void Release()
+    {
+        const int Batch = 64 * 1024;
+        const int Row = 8192;
+        s_batchData = s_batchData.Length > Batch ? new byte[Batch] : s_batchData;
+        s_batchText = s_batchText.Length > Batch ? new byte[Batch] : s_batchText;
+        s_toRecordJson = s_toRecordJson.Length > Batch ? new byte[Batch] : s_toRecordJson;
+        s_converted = s_converted.Length > Row ? new byte[Row] : s_converted;
+        s_row = s_row.Length > Row ? new byte[Row] : s_row;
     }
 
     /// <summary>
@@ -533,7 +570,7 @@ internal static unsafe partial class CopyConversion
         if (!passes && s_cstate is not null && check >= 0 && check < s_checkErrors.Count)
         {
             (string state, string message) = s_checkErrors[check];
-            s_checkSkipped.Add((s_line, Failed(BatchRow(s_copyRow)), new PgException(state, message)));
+            s_checkSkipped.Add((s_line, s_copyRow, new PgException(state, message)));
         }
 
         return passes;
@@ -584,14 +621,13 @@ internal static unsafe partial class CopyConversion
             }
             catch (PgException error) when (!Apply.IsTransient(error))
             {
-                WorfFailedChange change = Failed(BatchRow(next));
                 if (s_behaviour == WorfExceptionBehaviour.SubDisable)
                 {
-                    s_disabling = (change, error);
+                    s_disabling = (Failed(BatchRow(next)), error);
                     throw;
                 }
 
-                s_batchFailed.Add((s_line, change, error));
+                s_batchFailed.Add((s_line, next, error));
                 next++;
             }
         }
@@ -646,10 +682,9 @@ internal static unsafe partial class CopyConversion
                 int row = s_batchConverted[failed].Row;
                 ulong line = s_batchLine + (ulong)row;
                 s_line = line;
-                WorfFailedChange change = Failed(BatchRow(row));
                 if (s_behaviour == WorfExceptionBehaviour.SubDisable)
                 {
-                    s_disabling = (change, error);
+                    s_disabling = (Failed(BatchRow(row)), error);
                     throw;
                 }
 
@@ -658,7 +693,7 @@ internal static unsafe partial class CopyConversion
                     copied += CopyRun(pstate, relation, attnamelist, start, failed - start);
                 }
 
-                s_batchFailed.Add((line, change, error));
+                s_batchFailed.Add((line, row, error));
                 start = failed + 1;
             }
         }
@@ -740,17 +775,24 @@ internal static unsafe partial class CopyConversion
     /// <summary>
     /// Describes a row of the copy that failed, as the exception log records it.
     /// </summary>
-    private static WorfFailedChange Failed(ReadOnlySpan<byte> message) => new()
+    private static WorfFailedChange Failed(ReadOnlySpan<byte> message)
     {
-        Subscription = s_change!.Subscription,
-        WriterNodeId = s_change.WriterNodeId,
-        CommitTime = s_change.CommitTime,
-        CommitLsn = s_change.CommitLsn,
-        ActionCounter = (long)Math.Min(s_line, long.MaxValue),
-        Operation = Operation,
-        Relation = s_change.Relation,
-        NewTuple = RowJson(message),
-    };
+        int start = s_toRecordBytes;
+        int length = AppendRowJson(message, s_line);
+        string? json = length < 0 ? null : Worf.FromServer(s_toRecordJson.AsSpan(start, length));
+        s_toRecordBytes = start;
+        return new()
+        {
+            Subscription = s_change!.Subscription,
+            WriterNodeId = s_change.WriterNodeId,
+            CommitTime = s_change.CommitTime,
+            CommitLsn = s_change.CommitLsn,
+            ActionCounter = (long)Math.Min(s_line, long.MaxValue),
+            Operation = Operation,
+            Relation = s_change.Relation,
+            NewTuple = json,
+        };
+    }
 
     /// <summary>
     /// Keeps a merge of a table's copy, or the copy, that failed as a whole under <c>sub_disable</c>, to disable the
@@ -1091,43 +1133,127 @@ internal static unsafe partial class CopyConversion
     }
 
     /// <summary>
-    /// Writes a row as the exception log records a row: a JSON object of the columns' text.
+    /// Writes a row as the exception log records a row, a JSON object of the columns' text, after the rows to record.
     /// </summary>
-    private static string RowJson(ReadOnlySpan<byte> message)
+    /// <param name="message">The row, as the provider sent it.</param>
+    /// <param name="line">The row's number, which a warning names.</param>
+    /// <returns>The JSON's length, or -1 for a row too large to record its data.</returns>
+    private static int AppendRowJson(ReadOnlySpan<byte> message, ulong line)
     {
         // The text goes into the JSON as it is, rather than escaped as \u, which jsonb takes only for ASCII outside a
-        // UTF-8 database, and bytes that aren't UTF-8, as a SQL_ASCII database holds, as their hex.
+        // UTF-8 database, and bytes that aren't UTF-8, as a SQL_ASCII database holds, as their hex. The text of every
+        // server encoding is escaped byte by byte, as none uses bytes below 0x80 within its characters.
         ReadOnlySpan<byte> row = message.Length > 0 && message[^1] == (byte)'\n' ? message[..^1] : message;
-        StringBuilder json = new("{");
+        s_rowJsonStart = s_toRecordBytes;
+        s_rowTooLarge = false;
+        AppendJson("{"u8);
         int field = 0;
         int start = 0;
-        for (int i = 0; i <= row.Length && field < s_columns.Count; i++)
+        for (int i = 0; i <= row.Length && field < s_columnNames.Length; i++)
         {
             if (i < row.Length && row[i] != (byte)'\t')
             {
                 continue;
             }
 
-            json.Append(field == 0 ? "" : ", ");
-            Executor.EscapeJson(json, s_columns[field]);
-            json.Append(": ");
+            AppendJson(field == 0 ? ""u8 : ", "u8);
+            AppendJson(s_columnNames[field]);
             ReadOnlySpan<byte> raw = row[start..i];
             if (raw.SequenceEqual("\\N"u8))
             {
-                json.Append("null");
+                AppendJson("null"u8);
             }
             else
             {
                 // The text is read once it's unescaped, which may move it.
                 int length = Unescape(raw);
-                Executor.EscapeJson(json, Worf.LoggedText(new ReadOnlySpan<byte>(s_text, length)));
+                AppendJsonString(new ReadOnlySpan<byte>(s_text, length));
             }
 
             field++;
             start = i + 1;
         }
 
-        return json.Append('}').ToString();
+        AppendJson("}"u8);
+        if (s_rowTooLarge)
+        {
+            s_toRecordBytes = s_rowJsonStart;
+            WorfLog.Warning($"row {line} of the copy of table {s_change!.Relation!.Nspname}.{s_change.Relation.Relname} is too large for worf.exception_log to record its data");
+            return -1;
+        }
+
+        return s_toRecordBytes - s_rowJsonStart;
+    }
+
+    /// <summary>
+    /// Writes text as a JSON string after the rows to record, with its quotes, backslashes and control characters
+    /// escaped, or, as bytes of a SQL_ASCII database that aren't UTF-8, as their hex.
+    /// </summary>
+    private static void AppendJsonString(ReadOnlySpan<byte> value)
+    {
+        AppendJson("\""u8);
+        if (Worf.NotUtf8InSqlAscii(value))
+        {
+            AppendJson("\\\\x"u8);
+            foreach (byte b in value)
+            {
+                AppendJson(["0123456789abcdef"u8[b >> 4], "0123456789abcdef"u8[b & 0xf]]);
+            }
+        }
+        else
+        {
+            while (value.IndexOfAny(s_jsonEscapes) is int escape and >= 0)
+            {
+                AppendJson(value[..escape]);
+                byte c = value[escape];
+                switch (c)
+                {
+                    case (byte)'\b':
+                        AppendJson("\\b"u8);
+                        break;
+                    case (byte)'\f':
+                        AppendJson("\\f"u8);
+                        break;
+                    case (byte)'\n':
+                        AppendJson("\\n"u8);
+                        break;
+                    case (byte)'\r':
+                        AppendJson("\\r"u8);
+                        break;
+                    case (byte)'\t':
+                        AppendJson("\\t"u8);
+                        break;
+                    case (byte)'"' or (byte)'\\':
+                        AppendJson([(byte)'\\', c]);
+                        break;
+                    default:
+                        AppendJson([(byte)'\\', (byte)'u', (byte)'0', (byte)'0', "0123456789abcdef"u8[c >> 4], "0123456789abcdef"u8[c & 0xf]]);
+                        break;
+                }
+
+                value = value[(escape + 1)..];
+            }
+
+            AppendJson(value);
+        }
+
+        AppendJson("\""u8);
+    }
+
+    /// <summary>
+    /// Adds bytes to the rows to record, unless the row being written is already too large to record.
+    /// </summary>
+    private static void AppendJson(ReadOnlySpan<byte> bytes)
+    {
+        if (s_rowTooLarge || s_toRecordBytes - s_rowJsonStart + (long)bytes.Length > MaxJson)
+        {
+            s_rowTooLarge = true;
+            return;
+        }
+
+        Reserve(ref s_toRecordJson, s_toRecordBytes, bytes.Length);
+        bytes.CopyTo(s_toRecordJson.AsSpan(s_toRecordBytes));
+        s_toRecordBytes += bytes.Length;
     }
 
     private const int AccessShareLock = 1;

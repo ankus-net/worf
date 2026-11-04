@@ -134,34 +134,92 @@ internal static class ExceptionLog
     /// rather than one each, as a copy that skips many rows records them. A statement that fails, as on a row the log
     /// can't hold, rolls back alone, and the rows are recorded one at a time, as apply records its changes.
     /// </summary>
-    /// <param name="failures">The rows, of one copy, in order, and their errors.</param>
-    internal static void RecordCopied(IReadOnlyList<(WorfFailedChange Change, PgException Error)> failures)
+    /// <param name="change">The copy, which the rows share.</param>
+    /// <param name="failures">The rows, of the copy, in order: each one's number, its JSON, by where it is in the
+    /// rows' text, or a length of -1 when it has none, and its error.</param>
+    /// <param name="json">The rows' text, in the database encoding.</param>
+    internal static void RecordCopied(WorfFailedChange change, IReadOnlyList<(long ActionCounter, int Start, int Length, PgException Error)> failures,
+        byte[] json)
     {
         if (failures.Count == 0)
         {
             return;
         }
 
-        try
+        if (TryRecord(failures))
         {
-            PgTransaction.RunInSubtransaction(() => Worf.InOwnContext(() => InsertCopied(failures)));
+            return;
         }
-        catch (PgException)
+
+        for (int i = 0; i < failures.Count; i++)
         {
-            foreach ((WorfFailedChange change, PgException error) in failures)
+            if (!TryRecord([failures[i]]))
             {
-                Record(change, WorfExceptionBehaviour.Discard, error);
+                WorfLog.Warning("could not record the failed remote change in worf.exception_log");
+            }
+        }
+
+        bool TryRecord(IReadOnlyList<(long ActionCounter, int Start, int Length, PgException Error)> rows)
+        {
+            try
+            {
+                PgTransaction.RunInSubtransaction(() => Worf.InOwnContext(() => InsertCopied(change, rows, json)));
+                return true;
+            }
+            catch (PgException)
+            {
+                return false;
             }
         }
     }
 
     /// <summary>
-    /// Inserts rows of a table's copy that failed into the log, in one statement.
+    /// Records rows of a table's copy that failed, which a query gives, each as its JSON and error, in one statement with
+    /// the query, so that however many and wide they are, none is kept but in the log.
     /// </summary>
-    private static void InsertCopied(IReadOnlyList<(WorfFailedChange Change, PgException Error)> failures)
+    /// <param name="change">The copy, which the rows share.</param>
+    /// <param name="rows">The query, of each row's JSON, SQLSTATE and message, in order, which may change the rows it
+    /// gives, as a DELETE … RETURNING does.</param>
+    /// <param name="parameters">The query's parameters.</param>
+    /// <returns>Whether the rows were recorded; otherwise the query has had no effect, as when the log can't hold
+    /// one of them.</returns>
+    internal static bool TryRecordCopied(WorfFailedChange change, string rows, params SpiParameter[] parameters)
     {
-        WorfFailedChange change = failures[0].Change;
-        _ = Worf.Execute("""
+        int n = parameters.Length;
+        try
+        {
+            PgTransaction.RunInSubtransaction(() => Worf.InOwnContext(() => _ = Worf.Execute($"""
+                WITH f (new_tuple, error_sqlstate, error_message) AS ({rows})
+                INSERT INTO worf.exception_log (sub_id, sub_name, remote_node_id, remote_xid, remote_commit_ts, remote_commit_lsn,
+                    action_counter, operation, schema_name, table_name, remote_new_tuple, behaviour, error_sqlstate, error_message)
+                SELECT ${n + 1}, ${n + 2}, ${n + 3}, ${n + 4}::pg_catalog.text::pg_catalog.xid, ${n + 5}, ${n + 6}, 0, ${n + 7}, ${n + 8},
+                    ${n + 9}, f.new_tuple::pg_catalog.jsonb, 'discard', f.error_sqlstate, f.error_message
+                FROM f
+                """,
+                [.. parameters,
+                    SpiParameter.Create(change.Subscription.Id),
+                    SpiParameter.Create(change.Subscription.Name),
+                    SpiParameter.Create(change.WriterNodeId),
+                    SpiParameter.Create(change.RemoteXid.ToString(CultureInfo.InvariantCulture)),
+                    SpiParameter.Create(new PgTimestampTz(change.CommitTime)),
+                    Worf.LsnParameter(change.CommitLsn),
+                    SpiParameter.Create<string?>(change.Operation),
+                    SpiParameter.Create<string?>(change.Relation?.Nspname),
+                    SpiParameter.Create<string?>(change.Relation?.Relname)])));
+            return true;
+        }
+        catch (PgException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Inserts rows of a table's copy that failed into the log, in one statement, which takes their text as it is.
+    /// </summary>
+    private static void InsertCopied(WorfFailedChange change, IReadOnlyList<(long ActionCounter, int Start, int Length, PgException Error)> failures,
+        byte[] json)
+        => _ = Worf.Execute("""
             INSERT INTO worf.exception_log (sub_id, sub_name, remote_node_id, remote_xid, remote_commit_ts, remote_commit_lsn,
                 action_counter, operation, schema_name, table_name, remote_new_tuple, behaviour, error_sqlstate, error_message)
             SELECT $1, $2, $3, $4::text::xid, $5, $6, f.action_counter, $7, $8, $9, f.new_tuple::jsonb, 'discard',
@@ -179,11 +237,10 @@ internal static class ExceptionLog
             SpiParameter.Create<string?>(change.Operation),
             SpiParameter.Create<string?>(change.Relation?.Nspname),
             SpiParameter.Create<string?>(change.Relation?.Relname),
-            SpiParameter.Create(failures.Select(failure => failure.Change.ActionCounter).ToArray()),
-            SpiParameter.Create(failures.Select(failure => failure.Change.NewTuple).ToArray()),
+            SpiParameter.Create(failures.Select(failure => failure.ActionCounter).ToArray()),
+            Worf.TextArrayParameter(json, [.. failures.Select(failure => (failure.Start, failure.Length))]),
             SpiParameter.Create(failures.Select(failure => failure.Error.SqlState).ToArray()),
             SpiParameter.Create(failures.Select(failure => failure.Error.Message).ToArray()));
-    }
 
     /// <summary>
     /// Records the remote transaction a subscription applies again under <c>worf.exception_behaviour</c>, how, and
