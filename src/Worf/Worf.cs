@@ -1042,7 +1042,9 @@ internal static partial class Worf
         {
             return NeedsExact(commandText, parameters)
                 ? RunExact(commandText, true, 0, parameters)
-                : new WorfRows(Spi.Query(commandText, true, 0, parameters));
+                : new WorfRows(PlanCache.Get(commandText, parameters) is SpiPreparedStatement plan
+                    ? plan.Query(true, 0, parameters)
+                    : Spi.Query(commandText, true, 0, parameters));
         }
         finally
         {
@@ -1068,7 +1070,9 @@ internal static partial class Worf
         {
             return NeedsExact(commandText, parameters)
                 ? RunExact(commandText, true, limit, parameters)
-                : new WorfRows(Spi.Select(commandText, limit, parameters));
+                : new WorfRows(PlanCache.Get(commandText, parameters) is SpiPreparedStatement plan
+                    ? plan.Select(limit, parameters)
+                    : Spi.Select(commandText, limit, parameters));
         }
         finally
         {
@@ -1091,7 +1095,9 @@ internal static partial class Worf
         {
             return NeedsExact(commandText, parameters)
                 ? RunExact(commandText, true, 0, parameters)
-                : new WorfRows(Spi.Select(commandText, parameters));
+                : new WorfRows(PlanCache.Get(commandText, parameters) is SpiPreparedStatement plan
+                    ? plan.Select(parameters)
+                    : Spi.Select(commandText, parameters));
         }
         finally
         {
@@ -1129,7 +1135,9 @@ internal static partial class Worf
     internal static long ExecuteUnpinned(string commandText, params ReadOnlySpan<SpiParameter> parameters)
         => NeedsExact(commandText, parameters)
             ? RunExact(commandText, false, 0, parameters).RowsAffected
-            : Spi.Execute(commandText, parameters);
+            : PlanCache.Get(commandText, parameters) is SpiPreparedStatement plan
+                ? plan.Execute(parameters)
+                : Spi.Execute(commandText, parameters);
 
     /// <summary>
     /// Runs a statement of worf's as <see cref="Spi.Execute(SpiCommand)"/> does, with the search path
@@ -1155,7 +1163,9 @@ internal static partial class Worf
         {
             return NeedsExact(commandText, parameters)
                 ? RunExact(commandText, readOnly, limit, parameters)
-                : new WorfRows(Spi.Query(commandText, readOnly, limit, parameters));
+                : new WorfRows(PlanCache.Get(commandText, parameters) is SpiPreparedStatement plan
+                    ? plan.Query(readOnly, limit, parameters)
+                    : Spi.Query(commandText, readOnly, limit, parameters));
         }
         finally
         {
