@@ -463,13 +463,21 @@ internal static partial class SequenceRangeGuard
     /// <summary>
     /// Waits for a sequence's switches as long as its active block is short, by what other statements have left of it:
     /// a statement that waited for a switch checks the next block before it draws, since statements that went on
-    /// meanwhile may have drawn most of it.
+    /// meanwhile may have drawn most of it. It reads the blocks as last committed, with the gate held, since a switch
+    /// may have committed while it waited for the gate, so that the position isn't taken for one past an old block.
     /// </summary>
     private static void WaitWhileShort(uint seqoid)
     {
-        while (s_sequences.TryGetValue(seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) sequence) &&
-            sequence.Blocks.FindIndex(block => block.State == "active") is int index and >= 0)
+        while (true)
         {
+            Refresh();
+            Reload();
+            if (!s_sequences.TryGetValue(seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) sequence) ||
+                sequence.Blocks.FindIndex(block => block.State == "active") is not (int index and >= 0))
+            {
+                return;
+            }
+
             (long lo, long hi, _) = sequence.Blocks[index];
             long? position = ReadPosition(seqoid);
             if ((position is long p && (p < lo || p > hi)) || !Short(seqoid, sequence.Ascending, lo, hi, position, () => ReadPosition(seqoid)) ||
@@ -668,14 +676,15 @@ internal static partial class SequenceRangeGuard
     }
 
     /// <summary>
-    /// Lets every gate this backend holds go while a switch waits for one, at a row of a statement that holds them, and
+    /// Lets the gates this backend holds go while a switch waits for them, at a row of a statement that holds them, and
     /// takes them again once the switch has committed, and hears of it, so that the next row's nextval reads its bounds.
     /// </summary>
-    private static void PassGates()
+    /// <returns>The sequences whose gates it let go, which the statement checks before it draws from them again.</returns>
+    private static List<uint> PassGates()
     {
         if (s_gates.Count == 0 || SequenceRanges.SwitchesPending.Value == 0)
         {
-            return;
+            return [];
         }
 
         List<uint> passing = [.. s_gates.Keys.Where(seqoid => Drawer(seqoid).Switching > 0).Order()];
@@ -685,6 +694,7 @@ internal static partial class SequenceRangeGuard
         }
 
         TakeGates(passing);
+        return passing;
     }
 
     /// <summary>
@@ -993,9 +1003,16 @@ internal static partial class SequenceRangeGuard
     {
         // A switch beside this transaction, which holds the sequence, gives it new bounds, which nextval reads from the
         // catalog as this backend last heard of them, and a switch that waits for the gate moves it before the next row.
-        PassGates();
+        // The row's value is in the block switched from, so the statement checks the new block before it draws again,
+        // as one that takes its gates does: while it waited, uncounted, the others may have drawn most of it.
+        List<uint> passed = PassGates();
         Refresh();
         Reload();
+        foreach (uint passedSeqoid in passed)
+        {
+            WaitWhileShort(passedSeqoid);
+        }
+
         if (inserted && Moved())
         {
             return false;
@@ -1408,7 +1425,7 @@ internal static partial class SequenceRangeGuard
             return (sbyte*)s_copyCheckValue;
         }
 
-        PassGates();
+        _ = PassGates();
         Refresh();
         Reload();
         foreach (uint seqoid in s_copying[^1])
