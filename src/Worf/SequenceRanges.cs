@@ -3985,10 +3985,10 @@ internal static unsafe partial class SequenceRanges
     /// Switches a sequence to its next block in the transaction that runs its active block out, which holds the
     /// sequence, as nextval leaves it held, so that no worker can switch it until the transaction ends, and the rest of
     /// the transaction's rows take the next block's values. It switches only when no other transaction holds the
-    /// sequence, which it couldn't pass. It holds the
-    /// sequence until it ends, so that other sessions' inserts wait for it rather than run the block out, and it can't
-    /// be prepared, as a prepared transaction would hold them up across restarts. A transaction that doesn't hold the
-    /// sequence leaves the switch to the range worker.
+    /// sequence, which it couldn't pass; the range worker's checks and switch workers draw no values, and its lock waits
+    /// for theirs. It holds the sequence until it ends, so that other sessions' inserts wait for it rather than run the
+    /// block out, and it can't be prepared, as a prepared transaction would hold them up across restarts. A transaction
+    /// that doesn't hold the sequence leaves the switch to the range worker.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
     /// <returns>Whether it switched.</returns>
@@ -4001,10 +4001,11 @@ internal static unsafe partial class SequenceRanges
                 AND NOT EXISTS (
                     SELECT 1 FROM pg_catalog.pg_locks
                     WHERE locktype = 'relation' AND relation = $1 AND granted AND pid IS DISTINCT FROM pg_catalog.pg_backend_pid()
+                        AND pid <> ALL ($2::pg_catalog.int4[])
                         AND database = (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())
                         AND mode IN ('RowExclusiveLock', 'ShareUpdateExclusiveLock', 'ShareLock', 'ShareRowExclusiveLock', 'ExclusiveLock',
                             'AccessExclusiveLock'))
-            """, seq))
+            """, seq, SpiParameter.Create(SequenceRangeGuard.Switchers())))
         {
             return false;
         }
@@ -4046,9 +4047,13 @@ internal static unsafe partial class SequenceRanges
     /// Switches each sequence that the range worker's checks left to a switch beside its holders, in a transaction of its
     /// own, which takes a moment, and starts a switch worker for one that another switch or DDL holds up for longer than
     /// a tenth of a second. With every worker slot taken, a sequence waits for a later check, which waits for its lock a
-    /// tenth of a second at most, so that the range worker holds up no other sequence for longer.
+    /// tenth of a second at most, so that the range worker holds up no other sequence for longer. A sequence switched
+    /// gets its next block at once, rather than at the range worker's next check of it, after every other sequence's,
+    /// so that the statements that run through its blocks wait for one switch a block.
     /// </summary>
-    internal static void HandOff()
+    /// <param name="node">This node.</param>
+    /// <param name="peak">Each sequence's peak rate, in values a second, as the range worker last took it.</param>
+    internal static void HandOff(WorfLocalNode node, Func<uint, double> peak)
     {
         foreach ((uint seqoid, string name) in s_handOffs)
         {
@@ -4062,11 +4067,29 @@ internal static unsafe partial class SequenceRanges
                 done = false;
             }
 
-            // The range worker checks the sequence again at once, for the block after the one switched to.
+            // The sequence gets the block after the one switched to now, unless a transaction holds it against the
+            // check, as a later check then gets it.
             if (done)
             {
                 _ = s_unstarted.Remove(seqoid);
-                _ = PgAtomic.Add(CheckRequested, 1L);
+                try
+                {
+                    LedgerNoWait = true;
+                    if (PgBackgroundWorker.RunTransaction(() => Replenish(seqoid, node, peak(seqoid))))
+                    {
+                        Changed();
+                        SequenceRangeExchangeWorker.Wake();
+                    }
+                }
+                catch (PgException error) when (error.SqlState is "55P03" or "40P01")
+                {
+                    _ = PgAtomic.Add(CheckRequested, 1L);
+                }
+                finally
+                {
+                    LedgerNoWait = false;
+                }
+
                 continue;
             }
 

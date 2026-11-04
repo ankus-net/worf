@@ -1246,7 +1246,7 @@ internal static partial class SequenceRangeGuard
     /// <summary>
     /// Lists the processes of this database's range worker and switch workers, whose locks on a sequence are its switches.
     /// </summary>
-    private static int[] Switchers()
+    internal static int[] Switchers()
     {
         uint dboid = DatabaseId();
         List<int> pids = [];
