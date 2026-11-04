@@ -3495,10 +3495,14 @@ public sealed class SequenceRangeTests
         }
     }
 
+    /// <summary>
+    /// Copies a directory as a backup takes a data directory, leaving out the files that belong to the server that ran
+    /// it, as pg_basebackup does: Windows may still list a stopped server's postmaster.pid, deleted, which can't be read.
+    /// </summary>
     private static void CopyDirectory(string source, string target)
     {
         _ = Directory.CreateDirectory(target);
-        foreach (string file in Directory.EnumerateFiles(source))
+        foreach (string file in Directory.EnumerateFiles(source).Where(file => Path.GetFileName(file) is not ("postmaster.pid" or "postmaster.opts")))
         {
             File.Copy(file, Path.Join(target, Path.GetFileName(file)));
         }
