@@ -472,7 +472,8 @@ internal static partial class SequenceRangeGuard
         {
             (long lo, long hi, _) = sequence.Blocks[index];
             long? position = ReadPosition(seqoid);
-            if ((position is long p && (p < lo || p > hi)) || !Short(seqoid, sequence.Ascending, lo, hi, position) || !WaitForSwitch(seqoid, lo))
+            if ((position is long p && (p < lo || p > hi)) || !Short(seqoid, sequence.Ascending, lo, hi, position, () => ReadPosition(seqoid)) ||
+                !WaitForSwitch(seqoid, lo))
             {
                 return;
             }
@@ -483,13 +484,31 @@ internal static partial class SequenceRangeGuard
     /// Checks whether a sequence's active block has reached its last twentieth, or the last value of one reserved for a
     /// load, or has no more values left than the statements drawing from it.
     /// </summary>
-    private static bool Short(uint seqoid, bool ascending, long lo, long hi, long? position)
+    /// <param name="seqoid">The sequence.</param>
+    /// <param name="ascending">Whether it ascends.</param>
+    /// <param name="lo">The active block's lowest value.</param>
+    /// <param name="hi">The active block's highest value.</param>
+    /// <param name="position">The sequence's position, or null before it issues a value from the block.</param>
+    /// <param name="reread">Reads the position again.</param>
+    private static bool Short(uint seqoid, bool ascending, long lo, long hi, long? position, Func<long?> reread)
     {
-        decimal left = position is long p ? (ascending ? (decimal)hi - p : (decimal)p - lo) : (decimal)hi - lo + 1;
         decimal tail = s_reservedActive.Contains((seqoid, lo)) ? 0 : ((decimal)hi - lo) / 20;
+        decimal Left(long? at) => at is long p ? (ascending ? (decimal)hi - p : (decimal)p - lo) : (decimal)hi - lo + 1;
 
         // No more statements can draw than there are backends, so a block with as many values left needs no count.
-        return left <= tail || (left < Backends() && left < Drawing(seqoid).Statements);
+        decimal left = Left(position);
+        if (left <= tail || left >= Backends())
+        {
+            return left <= tail;
+        }
+
+        // The position is read again after the count, so that every value drawn since is either in it or one a counted
+        // statement may draw: a statement draws only while it holds the gate, and one that takes it later checks, with
+        // this one counted, before it draws. Read the other way round, a statement could draw the block's last value
+        // and then let the gate go to wait for the switch between the reads, and neither would count it.
+        int drawing = Drawing(seqoid).Statements;
+        left = Left(reread());
+        return left <= tail || left < drawing;
     }
 
     /// <summary>
@@ -1316,7 +1335,7 @@ internal static partial class SequenceRangeGuard
         // under the lock nextval left this transaction holding.
         bool last = (ascending ? (decimal)hi - value : (decimal)value - lo) == 0;
         bool reserved = s_reservedActive.Contains((seqoid, lo));
-        if (((reserved ? last : WakeNearEnd(seqoid, ascending, lo, hi, value)) || (!last && Short(seqoid, ascending, lo, hi, Position(seqoid) ?? value))) &&
+        if (((reserved ? last : WakeNearEnd(seqoid, ascending, lo, hi, value)) || (!last && Short(seqoid, ascending, lo, hi, Position(seqoid) ?? value, () => Position(seqoid) ?? value))) &&
             WaitForSwitch(seqoid, lo))
         {
             WaitWhileShort(seqoid);
