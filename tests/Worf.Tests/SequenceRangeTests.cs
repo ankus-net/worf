@@ -333,7 +333,10 @@ public sealed class SequenceRangeTests
             CREATE TABLE ip_old (id bigint NOT NULL CHECK (id < 1), v text);
             INSERT INTO ip_old SELECT -g, 'old' FROM generate_series(1, 20000) g;
             ANALYZE indexed, ip_old;
+            SELECT pg_stat_force_next_flush();
             """, token);
+
+        // The setup's own statistics are flushed before the count, rather than as its session ends, which may be after.
         const string Scans = "SELECT sum(seq_scan) FROM pg_stat_user_tables WHERE relid IN ('indexed'::regclass, 'ip_old'::regclass)";
         string scans = await node.SafePsqlAsync(Database, Scans, token);
         _ = await node.SafePsqlAsync(Database, """
