@@ -3317,13 +3317,13 @@ public sealed class SequenceRangeTests
             }
         }
 
-        // Each exchange goes over the session kept from the one before, where a session for each call would start a dozen
-        // over the while, so a slot starts no more than two, as when its kept session is made again after a call that
-        // failed, and this check's own sessions, whose counts go in as their processes exit, as many as four.
+        // Each exchange goes over the session its node keeps from the one before, so while the nodes manage sequences, each
+        // slot's subscriber has a session for its exchanges that started before the while, where a session for each call
+        // would last only as long as the call.
         TimeSpan idle = span ?? TimeSpan.FromSeconds(2);
         await Task.Delay(TimeSpan.FromSeconds(1), token);
         const string Next = """
-            SELECT pg_snapshot_xmax(pg_current_snapshot()), (SELECT sessions FROM pg_stat_database WHERE datname = current_database()),
+            SELECT pg_snapshot_xmax(pg_current_snapshot()), clock_timestamp(),
                 (SELECT count(*) FROM pg_replication_slots WHERE plugin = 'worf' AND database = current_database()), pg_current_wal_insert_lsn()
             """;
         string[][] before = await Task.WhenAll(nodes.Select(async node => (await node.SafePsqlAsync(Database, Next, token)).Split('|')));
@@ -3352,8 +3352,13 @@ public sealed class SequenceRangeTests
             }
 
             Assert.AreEqual(before[i][0], after[i][0], $"{nodes[i].Name} used transaction IDs while idle: {written}");
-            Assert.IsLessThanOrEqualTo((long.Parse(after[i][2], CultureInfo.InvariantCulture) * 2) + 4,
-                long.Parse(after[i][1], CultureInfo.InvariantCulture) - long.Parse(before[i][1], CultureInfo.InvariantCulture), $"{nodes[i].Name}'s sessions for exchanges");
+            if (managed)
+            {
+                Assert.AreEqual("t", await nodes[i].SafePsqlAsync(Database, $"""
+                    SELECT count(*) >= {after[i][2]} FROM pg_stat_activity WHERE application_name LIKE '%\_range' AND backend_start < '{before[i][1]}'
+                    """, token), $"{nodes[i].Name}'s neighbors' sessions for exchanges, kept from before the while");
+            }
+
             Assert.AreEqual("", written, $"{nodes[i].Name} wrote WAL while idle");
         }
     }
