@@ -31,10 +31,13 @@ internal static class SequenceRangeSwitchWorker
                 {
                     break;
                 }
+
+                SequenceRangeGuard.CountAttempt(seqoid);
             }
             catch (PgException error) when (error.SqlState is "55P03" or "40P01")
             {
                 // A transaction held the range row, as a reset does, or the wait deadlocked, and the worker waits again.
+                SequenceRangeGuard.CountAttempt(seqoid);
                 _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(10));
             }
             catch (PgQueryCanceledException)

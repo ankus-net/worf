@@ -2166,6 +2166,73 @@ public sealed class SequenceRangeTests
     }
 
     /// <summary>
+    /// Statements that reach the end of a block whose next block is here wait for the switch however long the range
+    /// worker takes to make it, as on a node too busy to check its sequences in time, rather than give up after twice the
+    /// exchange timeout and run the block out, and statement_timeout ends such a wait, as it does a lock's. On Linux and
+    /// macOS, where the worker can be stopped.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [OSCondition(OperatingSystems.Linux | OperatingSystems.OSX)]
+    public async Task StatementsWaitOutASlowSwitch()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode node = await StartNodeAsync("node_a", token, "worf.sequence_range_timeout = 1000");
+        _ = await node.SafePsqlAsync(Database, """
+            CREATE TABLE s (id bigserial PRIMARY KEY, v int);
+            SELECT worf.enable_sequence_range('s_id_seq', participants := '{}', range_size := 100, max_range_size := 100);
+            """, token);
+        Assert.IsTrue(await node.PollQueryUntilAsync(Database,
+            "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 's_id_seq'::regclass", token),
+            "s drawing from a block with the next ready");
+
+        // The range worker stops while four writers draw past the block's end, for longer than twice the exchange timeout.
+        string worker = await node.SafePsqlAsync(Database, "SELECT pid FROM pg_stat_activity WHERE backend_type LIKE 'worf range%'", token);
+        (int stopped, _, string error) = await ProcessRunner.RunAsync("kill", ["-STOP", worker], token);
+        Assert.AreEqual(0, stopped, error);
+        List<string> failures = [];
+        Task writers = Task.WhenAll(Enumerable.Range(0, 4).Select(async _ =>
+        {
+            await using NpgsqlConnection connection = await node.OpenAsync(Database, token);
+            for (int i = 0; i < 40; i++)
+            {
+                try
+                {
+                    await ExecuteAsync(connection, "INSERT INTO s (v) VALUES (1)", token);
+                }
+                catch (PostgresException failure)
+                {
+                    lock (failures)
+                    {
+                        failures.Add($"{failure.SqlState} {failure.MessageText}");
+                    }
+                }
+            }
+        }));
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(5), token);
+            Assert.IsFalse(writers.IsCompleted, "the writers waiting for the switch");
+            Assert.IsEmpty(failures, string.Join("; ", failures.Distinct()));
+            Assert.AreEqual("t", await node.SafePsqlAsync(Database, "SELECT max(id) <= 100 FROM s", token), "the rows drawn from the first block");
+
+            // A statement waiting for the switch ends at its statement_timeout.
+            PostgresException timedOut = await Assert.ThrowsExactlyAsync<PostgresException>(() => node.SafePsqlAsync(Database,
+                "SET statement_timeout = '1s'; INSERT INTO s (v) VALUES (1)", token));
+            Assert.AreEqual("57014", timedOut.SqlState);
+        }
+        finally
+        {
+            (int resumed, _, error) = await ProcessRunner.RunAsync("kill", ["-CONT", worker], token);
+            Assert.AreEqual(0, resumed, error);
+        }
+
+        await writers;
+        Assert.IsEmpty(failures, string.Join("; ", failures.Distinct()));
+        Assert.AreEqual("160|160", await node.SafePsqlAsync(Database, "SELECT count(*), count(DISTINCT id) FROM s", token), "the rows, each with its own key");
+    }
+
+    /// <summary>
     /// In a cascade, a node two links from the owner gets its blocks from its parent's pool block, and a node whose
     /// link to the owner is dropped finds the owner through another neighbor, which relays its reports without writing.
     /// A late joiner whose values reach into the root is refused by the pool holder it asks, one sequence's failure

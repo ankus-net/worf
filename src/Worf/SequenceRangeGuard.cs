@@ -761,6 +761,27 @@ internal static partial class SequenceRangeGuard
     }
 
     /// <summary>
+    /// Counts the range worker's check of a sequence, or a switch worker's try at switching it, for the statements that
+    /// wait for its switch.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    internal static void CountAttempt(uint seqoid)
+    {
+        uint dboid = DatabaseId();
+        using PgLwLockExclusiveGuard<WorfDrawers, WorfDrawer> guard = Drawers.Exclusive();
+        for (int probe = 0, i = Slot(dboid, seqoid); probe < MaxDrawers && guard[i].Dboid != 0; probe++, i = (i + 1) % MaxDrawers)
+        {
+            if (guard[i].Dboid == dboid && guard[i].Seqoid == seqoid)
+            {
+                WorfDrawer drawer = guard[i];
+                drawer.Attempts++;
+                guard[i] = drawer;
+                return;
+            }
+        }
+    }
+
+    /// <summary>
     /// Reads a sequence's entry in the shared table.
     /// </summary>
     private static WorfDrawer Drawer(uint seqoid)
@@ -1129,8 +1150,13 @@ internal static partial class SequenceRangeGuard
     /// <summary>
     /// Waits, once a sequence reaches the last twentieth of its active block, until the block is switched, so that
     /// inserts wait for the range worker to wake and switch, or for a next block on its way from the exchange worker,
-    /// rather than run the block out. A backend waits up to twice the exchange timeout for each block in all, which
-    /// covers an exchange that hangs and the check after it, however many of its statements and rows wait. It waits only
+    /// rather than run the block out. While the next block is still to come, as over an exchange that may hang, a
+    /// backend waits up to twice the exchange timeout for each block in all, which covers an exchange that hangs and the
+    /// check after it, however many of its statements and rows wait. Once the next block is here, the switch is this
+    /// node's alone, and a backend waits for it as for a lock, until it comes, or statement_timeout or a cancellation
+    /// ends the wait, however long a busy node takes to come to the sequence, while a range or switch worker runs to make
+    /// it; once a worker has tried and not switched it, as when a transaction holds its range row, the time is up as
+    /// before. It waits only
     /// while the worker can switch: the sequence draws from blocks, or has used one up and waits for the next, and no
     /// transaction holds the sequence against the switch, as one that switches it itself does, or DDL on it. A switch
     /// the range worker or a switch worker makes is no such transaction, nor is a lock still waited for, so a statement
@@ -1218,18 +1244,25 @@ internal static partial class SequenceRangeGuard
             s_waited.Add((seqoid, lo), deadline);
         }
 
+        long attempts = Drawer(seqoid).Attempts;
         long woken = 0;
-        while (now < deadline)
+        long checkedHolders = now - 200_000;
+        while (true)
         {
-            if (!Elevated.Run(() => Worf.SelectCatalog("""
-                SELECT EXISTS (SELECT 1 FROM worf.sequence_range WHERE seqoid = $1 AND state IN ('active', 'exhausted'))
-                    AND NOT EXISTS (
-                        SELECT 1 FROM pg_catalog.pg_locks
-                        WHERE locktype = 'relation' AND database = $2 AND relation = $1 AND granted AND pid <> ALL ($3::pg_catalog.int4[])
-                            AND mode IN ('ShareLock', 'ShareRowExclusiveLock', 'ExclusiveLock', 'AccessExclusiveLock'))
-                """, seq, database, switching)[0].Get<bool>(0)))
+            // The holders are read a few times a second, as pg_locks takes every lock partition's lock to read them.
+            if (now - checkedHolders >= 200_000)
             {
-                return false;
+                checkedHolders = now;
+                if (!Elevated.Run(() => Worf.SelectCatalog("""
+                    SELECT EXISTS (SELECT 1 FROM worf.sequence_range WHERE seqoid = $1 AND state IN ('active', 'exhausted'))
+                        AND NOT EXISTS (
+                            SELECT 1 FROM pg_catalog.pg_locks
+                            WHERE locktype = 'relation' AND database = $2 AND relation = $1 AND granted AND pid <> ALL ($3::pg_catalog.int4[])
+                                AND mode IN ('ShareLock', 'ShareRowExclusiveLock', 'ExclusiveLock', 'AccessExclusiveLock'))
+                    """, seq, database, switching)[0].Get<bool>(0)))
+                {
+                    return false;
+                }
             }
 
             // The worker tries the switch again soon after one that gave up on the lock, and requests a block the
@@ -1255,9 +1288,13 @@ internal static partial class SequenceRangeGuard
             }
 
             now = Worker.GetCurrentTimestamp();
+            // A try that began before this backend waited may not have seen it, so it waits for one more.
+            if (now >= deadline &&
+                !(sequence.Blocks.Exists(block => block.State == "next") && Switchers().Length > 0 && Drawer(seqoid).Attempts <= attempts + 1))
+            {
+                return false;
+            }
         }
-
-        return false;
     }
 
     /// <summary>

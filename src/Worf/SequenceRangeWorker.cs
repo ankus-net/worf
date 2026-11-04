@@ -62,10 +62,14 @@ internal static class SequenceRangeWorker
 
                 changed |= PgBackgroundWorker.RunTransaction(() => SequenceRanges.CheckIdentity(local));
                 // A sequence whose switch worker waits to switch it is left to that. Those that statements wait on go first,
-                // so that their switches wait for no other sequence's check.
-                foreach (uint seqoid in sequences.Where(seqoid => !SequenceRangeSwitchWorker.Running(seqoid))
-                    .OrderByDescending(seqoid => SequenceRangeGuard.Drawing(seqoid).Waiting > 0))
+                // including those that statements begin to wait on during the tick, which go next, so that their switches
+                // wait for no other sequence's check, however many sequences a busy node takes long to check.
+                List<uint> toCheck = [.. sequences.Where(seqoid => !SequenceRangeSwitchWorker.Running(seqoid))];
+                while (toCheck.Count > 0)
                 {
+                    int next = Math.Max(toCheck.FindIndex(seqoid => SequenceRangeGuard.Drawing(seqoid).Waiting > 0), 0);
+                    uint seqoid = toCheck[next];
+                    toCheck.RemoveAt(next);
                     try
                     {
                         changed |= PgBackgroundWorker.RunTransaction(() =>
@@ -121,6 +125,7 @@ internal static class SequenceRangeWorker
                     }
 
                     SequenceRanges.HandOff(local, seqoid => rates.TryGetValue(seqoid, out (long Block, long Position, long At, double Peak, long PeakAt) last) ? last.Peak : 0);
+                    SequenceRangeGuard.CountAttempt(seqoid);
                 }
 
                 // Snowflake IDs never pass the time reserved ahead, which backends see only once it is durable.
