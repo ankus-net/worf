@@ -517,16 +517,13 @@ internal static partial class Worf
     internal static unsafe string FromServer(sbyte* value) => FromServer(new ReadOnlySpan<byte>(value, StrLen(value)));
 
     /// <summary>
-    /// Converts a value's text in the database encoding to a string for a log, or bytes that a SQL_ASCII database holds
-    /// that aren't valid UTF-8, which a string can't keep, to their hex, as bytea shows them, so that the value can
-    /// be restored from the log.
+    /// Converts a value's text in the database encoding to a string for a log, keeping a SQL_ASCII database's bytes
+    /// that aren't valid UTF-8 as <see cref="FromServer(ReadOnlySpan{byte})"/> does, so that they go into the log's
+    /// JSON byte for byte through <see cref="TextParameter"/>, as <c>to_jsonb</c> keeps them in such a database.
     /// </summary>
     /// <param name="value">The bytes, without a terminator.</param>
     /// <returns>The string.</returns>
-    internal static string LoggedText(ReadOnlySpan<byte> value)
-        => NotUtf8InSqlAscii(value)
-            ? "\\x" + Convert.ToHexStringLower(value)
-            : FromServer(value);
+    internal static string LoggedText(ReadOnlySpan<byte> value) => FromServer(value);
 
     /// <summary>
     /// Checks whether bytes in the database encoding are a SQL_ASCII database's that aren't valid UTF-8.

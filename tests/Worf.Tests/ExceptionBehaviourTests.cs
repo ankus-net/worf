@@ -1329,8 +1329,9 @@ public sealed partial class ExceptionBehaviourTests
 
     /// <summary>
     /// In SQL_ASCII databases, values that hold a byte that isn't UTF-8 copy and replicate byte for byte, inserted or
-    /// updated, and through an update that conflicts with a local one, and a row of the copy that fails under discard,
-    /// with such a value, is recorded with the value's hex.
+    /// updated, and through an update that conflicts with a local one, whose record keeps the local row's bytes, and a
+    /// row of the copy that fails under discard, with such a value, is recorded with the value's bytes, apart from one
+    /// whose text is their hex.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -1361,8 +1362,8 @@ public sealed partial class ExceptionBehaviourTests
         _ = await provider.SafePsqlAsync(Ascii, """
             DO $$
             BEGIN
-                EXECUTE format('INSERT INTO %I VALUES (1, %L), (7, %L)', 'tab',
-                    convert_from('\x6f6e65e9', 'SQL_ASCII'), convert_from('\x736576656ee9', 'SQL_ASCII'));
+                EXECUTE format('INSERT INTO %I VALUES (1, %L), (7, %L), (8, %L)', 'tab',
+                    convert_from('\x6f6e65e9', 'SQL_ASCII'), convert_from('\x736576656ee9', 'SQL_ASCII'), '\x736576656ee9');
             END $$;
             SELECT * FROM worf.replication_set_add_all_tables('default', '{public}');
             """, token);
@@ -1405,12 +1406,14 @@ public sealed partial class ExceptionBehaviourTests
 
         // Apply writes the conflict's record in a transaction of its own once the update's has committed.
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Ascii, "SELECT EXISTS (SELECT 1 FROM worf.conflict_history)", token), "the conflict's record");
-        Assert.AreEqual("1|t", await subscriber.SafePsqlAsync(Ascii,
-            "SELECT count(*), bool_and(position('x6c6f63e9' IN local_tuple::text) > 0) FROM worf.conflict_history", token), "the conflict's local row");
-        Assert.AreEqual("COPY|7|23514|t", await subscriber.SafePsqlAsync(Ascii, """
-            SELECT concat_ws('|', operation, remote_new_tuple->>'id', error_sqlstate, position('x736576656ee9' IN remote_new_tuple::text) > 0)
+        Assert.AreEqual("1|6c6f63e9", await subscriber.SafePsqlAsync(Ascii,
+            "SELECT count(*), string_agg(encode(convert_to(local_tuple->>'caf', 'SQL_ASCII'), 'hex'), ',') FROM worf.conflict_history", token),
+            "the conflict's local row");
+        Assert.AreEqual("COPY|7|23514|736576656ee9,COPY|8|23514|5c78373336353736363536656539", await subscriber.SafePsqlAsync(Ascii, """
+            SELECT string_agg(concat_ws('|', operation, remote_new_tuple->>'id', error_sqlstate,
+                encode(convert_to(remote_new_tuple->>'caf', 'SQL_ASCII'), 'hex')), ',' ORDER BY remote_new_tuple->>'id')
             FROM worf.exception_log
-            """, token), "the copy's failed row");
+            """, token), "the copy's failed rows, one with such a value and one whose text is that value's hex");
     }
 
     /// <summary>

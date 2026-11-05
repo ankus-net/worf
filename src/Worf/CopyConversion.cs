@@ -1187,56 +1187,44 @@ internal static unsafe partial class CopyConversion
 
     /// <summary>
     /// Writes text as a JSON string after the rows to record, with its quotes, backslashes and control characters
-    /// escaped, or, as bytes of a SQL_ASCII database that aren't UTF-8, as their hex.
+    /// escaped, and its other bytes as they are, as <c>to_jsonb</c> writes a SQL_ASCII database's that aren't UTF-8.
     /// </summary>
     private static void AppendJsonString(ReadOnlySpan<byte> value)
     {
         AppendJson("\""u8);
-        if (Worf.NotUtf8InSqlAscii(value))
+        while (value.IndexOfAny(s_jsonEscapes) is int escape and >= 0)
         {
-            AppendJson("\\\\x"u8);
-            foreach (byte b in value)
+            AppendJson(value[..escape]);
+            byte c = value[escape];
+            switch (c)
             {
-                AppendJson(["0123456789abcdef"u8[b >> 4], "0123456789abcdef"u8[b & 0xf]]);
-            }
-        }
-        else
-        {
-            while (value.IndexOfAny(s_jsonEscapes) is int escape and >= 0)
-            {
-                AppendJson(value[..escape]);
-                byte c = value[escape];
-                switch (c)
-                {
-                    case (byte)'\b':
-                        AppendJson("\\b"u8);
-                        break;
-                    case (byte)'\f':
-                        AppendJson("\\f"u8);
-                        break;
-                    case (byte)'\n':
-                        AppendJson("\\n"u8);
-                        break;
-                    case (byte)'\r':
-                        AppendJson("\\r"u8);
-                        break;
-                    case (byte)'\t':
-                        AppendJson("\\t"u8);
-                        break;
-                    case (byte)'"' or (byte)'\\':
-                        AppendJson([(byte)'\\', c]);
-                        break;
-                    default:
-                        AppendJson([(byte)'\\', (byte)'u', (byte)'0', (byte)'0', "0123456789abcdef"u8[c >> 4], "0123456789abcdef"u8[c & 0xf]]);
-                        break;
-                }
-
-                value = value[(escape + 1)..];
+                case (byte)'\b':
+                    AppendJson("\\b"u8);
+                    break;
+                case (byte)'\f':
+                    AppendJson("\\f"u8);
+                    break;
+                case (byte)'\n':
+                    AppendJson("\\n"u8);
+                    break;
+                case (byte)'\r':
+                    AppendJson("\\r"u8);
+                    break;
+                case (byte)'\t':
+                    AppendJson("\\t"u8);
+                    break;
+                case (byte)'"' or (byte)'\\':
+                    AppendJson([(byte)'\\', c]);
+                    break;
+                default:
+                    AppendJson([(byte)'\\', (byte)'u', (byte)'0', (byte)'0', "0123456789abcdef"u8[c >> 4], "0123456789abcdef"u8[c & 0xf]]);
+                    break;
             }
 
-            AppendJson(value);
+            value = value[(escape + 1)..];
         }
 
+        AppendJson(value);
         AppendJson("\""u8);
     }
 

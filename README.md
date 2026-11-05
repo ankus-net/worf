@@ -1177,9 +1177,9 @@ Otherwise, managing DDL so that the provider and subscriber database(s) remain
 compatible is the responsibility of the user.
 
 Names, DDL and values replicate in the database's encoding byte for byte,
-including the bytes a `SQL_ASCII` database holds that aren't valid UTF-8; a
-log that shows such a value, as `worf.exception_log`, shows its hex as bytea
-does.
+including the bytes a `SQL_ASCII` database holds that aren't valid UTF-8, which
+`worf.exception_log` and `worf.conflict_history` keep in their JSON as
+`to_jsonb` does in such a database.
 
 worf provides the `worf.replicate_ddl_command` function to allow DDL
 to be run on the provider and subscriber at a consistent point.

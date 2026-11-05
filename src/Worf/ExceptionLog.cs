@@ -90,18 +90,18 @@ internal static class ExceptionLog
 
         void Insert() => _ = Worf.Execute(InsertSql,
             SpiParameter.Create(change.Subscription.Id),
-            SpiParameter.Create(change.Subscription.Name),
+            Worf.TextParameter(change.Subscription.Name),
             SpiParameter.Create(change.WriterNodeId),
             SpiParameter.Create(change.RemoteXid.ToString(CultureInfo.InvariantCulture)),
             SpiParameter.Create(new PgTimestampTz(change.CommitTime)),
             Worf.LsnParameter(change.CommitLsn),
             SpiParameter.Create(change.ActionCounter),
             SpiParameter.Create<string?>(change.Operation),
-            SpiParameter.Create<string?>(schemaName),
-            SpiParameter.Create<string?>(tableName),
-            SpiParameter.Create<string?>(oldTuple),
-            SpiParameter.Create<string?>(newTuple),
-            SpiParameter.Create<string?>(change.QueuedMessage),
+            Worf.TextParameter(schemaName),
+            Worf.TextParameter(tableName),
+            Worf.TextParameter(oldTuple),
+            Worf.TextParameter(newTuple),
+            Worf.TextParameter(change.QueuedMessage),
             SpiParameter.Create(behaviour switch
             {
                 WorfExceptionBehaviour.Discard => "discard",
@@ -109,7 +109,7 @@ internal static class ExceptionLog
                 _ => "sub_disable",
             }),
             SpiParameter.Create(error.SqlState),
-            SpiParameter.Create(error.Message));
+            Worf.TextParameter(error.Message));
 
         if (!isolated)
         {
