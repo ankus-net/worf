@@ -222,8 +222,9 @@ internal static class Sync
             }
             catch (PgException)
             {
-                // A row that failed to convert under sub_disable disables the subscription, once the copy rolled back.
-                // The next worker starts later each time the synchronization fails.
+                // A row of the copy that failed under sub_disable, whether a value failed to convert or a constraint
+                // failed it, disables the subscription once the copy rolled back. The next worker starts later each
+                // time the synchronization fails.
                 CleanupAfterError(sub);
                 CopyConversion.DisableAfterFailure();
                 CountSyncFailures(true);
@@ -398,7 +399,8 @@ internal static class Sync
         }
         catch (PgException)
         {
-            // A row that failed to convert under sub_disable disables the subscription, once the copy rolled back.
+            // A row of the copy that failed under sub_disable, whether a value failed to convert or a constraint failed
+            // it, disables the subscription once the copy rolled back.
             CleanupAfterError(sub);
             CopyConversion.DisableAfterFailure();
             throw;

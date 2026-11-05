@@ -377,14 +377,13 @@ public sealed class ColumnTypeTests
         _ = Assert.ContainsSingle(subscriber.LogTimes(logpos, "starting sync of table public.ft").Where(at => at <= failed.AddSeconds(2)), "ft's syncs");
 
         // Under sub_disable, a copy whose row fails disables the subscription and records the row that COPY names,
-        // without copying the rows again to find it.
+        // without copying the rows again to find it, and says the row failed, whether a CHECK constraint failed it or,
+        // in the other database, as ft's or dt's, a value failed to convert.
         logpos = subscriber.ReadLog().Length;
         _ = await subscriber.SafePsqlAsync(Database, "ALTER SYSTEM SET worf.exception_behaviour = sub_disable", token);
         _ = await subscriber.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
-        foreach (string database in new[] { Database, TextDatabase })
-        {
-            _ = await subscriber.SafePsqlAsync(database, "CREATE TABLE dt (id integer PRIMARY KEY, n integer)", token);
-        }
+        _ = await subscriber.SafePsqlAsync(Database, "CREATE TABLE dt (id integer PRIMARY KEY, n integer)", token);
+        _ = await subscriber.SafePsqlAsync(TextDatabase, "CREATE TABLE dt (id integer PRIMARY KEY, n numeric CHECK (n <> 3))", token);
 
         _ = await provider.SafePsqlAsync(Database, """
             CREATE TABLE dt (id integer PRIMARY KEY, n numeric);
@@ -393,11 +392,23 @@ public sealed class ColumnTypeTests
             """, token);
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(TextDatabase, "SELECT NOT sub_enabled FROM worf.subscription", token),
             "textsub wasn't disabled");
-        Assert.AreEqual("sub_disable|COPY|2|2|22003", await subscriber.SafePsqlAsync(TextDatabase, """
+        Assert.AreEqual("sub_disable|COPY|3|3|23514", await subscriber.SafePsqlAsync(TextDatabase, """
             SELECT concat_ws('|', behaviour, operation, action_counter, remote_new_tuple->>'id', error_sqlstate)
             FROM worf.exception_log WHERE table_name = 'dt'
             """, token));
         Assert.AreEqual(0, CountOccurrences(subscriber.ReadLog()[logpos..], "copying table public.dt again"));
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT NOT sub_enabled FROM worf.subscription", token), "sub wasn't disabled");
+        string disabled = subscriber.ReadLog()[logpos..];
+        Assert.Contains("disabling subscription textsub after a row of table public.dt failed in its copy", disabled);
+        Assert.Contains("disabling subscription sub after a row of table public.", disabled);
+        Assert.DoesNotContain("failed to convert", disabled);
+
+        // The subscriptions' first syncs, which their sequence range exchanges can get ahead of, logged no failure for
+        // want of their slots, on either node.
+        foreach (TestNode node in new[] { provider, subscriber })
+        {
+            Assert.DoesNotContain("carries this sequence range exchange", node.ReadLog(), node.Name);
+        }
     }
 
     /// <summary>

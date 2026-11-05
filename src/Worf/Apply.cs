@@ -982,8 +982,9 @@ internal static unsafe partial class Apply
         // one transaction with the origin's creation. They give them up first, so that the new origin takes the id of
         // one of them, as PostgreSQL gives the lowest free id, and its record replaces the drop's. A relay origin that
         // still finds none, or that would take one of the slots any worker gave up for PostgreSQL subscriptions'
-        // origins while their workers take to try again, takes none: the transaction commits under the worker's own
-        // origin, as pglogical commits every transaction, and its rows count as the provider's.
+        // origins while their workers take to try again, waits for one, and the worker exits with 53400 once
+        // RunTakingOriginSlot gives up, to try again: committing under the worker's own origin would count the rows as
+        // the provider's, which then sends them back to the node that wrote them.
         s_sessionWriterNodeId = null;
         uint writerNodeId = writer == 0 ? sub.Origin.Id : writer;
         bool yielding = writer != 0 && Worker.GetCurrentTimestamp() < Worker.OriginSlotsGivenUpAt + OriginSlotHold;

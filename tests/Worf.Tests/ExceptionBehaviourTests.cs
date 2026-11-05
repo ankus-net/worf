@@ -1038,7 +1038,8 @@ public sealed partial class ExceptionBehaviourTests
     /// <summary>
     /// A table's copy under discard leaves out the rows the subscriber's NOT NULL columns and CHECK constraints refuse,
     /// and those whose values its column types refuse, without a transaction ID each, recording them in order with the
-    /// provider's row numbers, while a duplicate key, which only COPY finds, still fails its batch's COPY alone.
+    /// provider's row numbers, while a duplicate key, which only COPY finds, still fails its batch's COPY alone. An error
+    /// that ends a copy in batches names the provider's row.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -1085,6 +1086,35 @@ public sealed partial class ExceptionBehaviourTests
         Assert.AreEqual("bigint", await subscriber.SafePsqlAsync(Database,
             "SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'worf.exception_log'::regclass AND attname = 'action_counter'", token),
             "action_counter, which numbers a copy's rows past 2^31");
+
+        // An error that ends a copy in batches, here a cancel while a row waits for a transaction here that holds its key,
+        // names the provider's row as COPY's line. Row 2501's key, which only COPY finds taken, starts the batches.
+        _ = await provider.SafePsqlAsync(Database, """
+            CREATE TABLE g (id integer PRIMARY KEY, k integer);
+            INSERT INTO g SELECT g, CASE WHEN g = 2501 THEN 1 ELSE g END FROM generate_series(1, 3000) g;
+            """, token);
+        _ = await subscriber.SafePsqlAsync(Database, "CREATE TABLE g (id integer PRIMARY KEY, k integer UNIQUE)", token);
+        int logpos = subscriber.ReadLog().Length;
+        await using (NpgsqlConnection holding = await subscriber.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction held = await holding.BeginTransactionAsync(token);
+            await using (NpgsqlCommand hold = new("INSERT INTO g VALUES (900000, 2600)", holding, held))
+            {
+                _ = await hold.ExecuteNonQueryAsync(token);
+            }
+
+            _ = await provider.SafePsqlAsync(Database, "SELECT * FROM worf.replication_set_add_table('default', 'g', synchronize_data := true)", token);
+            Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, """
+                SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+                    WHERE l.locktype = 'transactionid' AND NOT l.granted AND a.backend_type LIKE 'worf sync%')
+                """, token), "the copy waiting for row 2600's key");
+            _ = await subscriber.SafePsqlAsync(Database, "SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE backend_type LIKE 'worf sync%'", token);
+            Assert.IsTrue(await subscriber.PollLogAsync(logpos, "COPY g, line 2600", token), "the cancelled row's line");
+            await held.RollbackAsync(token);
+        }
+
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+            "SELECT sync_status = 'r' FROM worf.local_sync_status WHERE sync_relname = 'g'", token), "g's copy once the key is free");
     }
 
     /// <summary>

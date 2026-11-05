@@ -47,8 +47,12 @@ internal static class SequenceRangeExchange
     // before that, which doubles from the check interval up to the exchange interval while nothing changes.
     private static readonly Dictionary<uint, (string What, long At, long Delay)> s_waits = [];
 
-    // The subscriptions whose provider answered the last exchange that their slot isn't streamed yet.
+    // The subscriptions whose provider answered the last exchange that their slot isn't streamed yet, those whose
+    // provider answered the last call that it has no such slot, and those whose last exchange failed so, logged only
+    // if the next fails so too, as a subscription that is being dropped no longer has one.
     private static readonly HashSet<uint> s_notStreamed = [];
+    private static readonly HashSet<uint> s_noSlot = [];
+    private static readonly HashSet<uint> s_noSlotOnce = [];
 
     // The connection to each subscription's provider that this worker's exchanges go over, kept from one exchange to the
     // next, as apply keeps its own, rather than a session made and ended for each, with the connection string and the
@@ -90,10 +94,19 @@ internal static class SequenceRangeExchange
         }
 
         // A slot that isn't streamed yet, which a subscription's first exchanges can find before its apply worker
-        // streams it, is no failure: the subscriber asks again soon.
-        if (!Authenticate(slot, senderId))
+        // streams it, is no failure: the subscriber asks again soon. Nor is one that isn't there, as before the apply
+        // worker makes it, or once the subscription is dropped, which the subscriber logs if it lasts, so that this node
+        // logs no error for it; one that a subscriber leaves must be there.
+        switch (Authenticate(slot, senderId))
         {
-            return """{"streamed":false}""";
+            case null when !leaving:
+                return """{"streamed":false,"slot":false}""";
+            case null:
+                throw new PgException("42501", $"no worf replication slot \"{slot}\" carries this sequence range exchange");
+            case false:
+                return """{"streamed":false}""";
+            default:
+                break;
         }
 
         TakeTurn();
@@ -123,8 +136,8 @@ internal static class SequenceRangeExchange
     /// the slot its old node was bound to once the role may speak for it, or, for a superuser, once the old node has
     /// been silent for as long as a neighbor counts as in touch, and the old node is forgotten.
     /// </summary>
-    /// <returns>Whether the slot is streamed or bound, or false while it's neither.</returns>
-    private static bool Authenticate(string slot, uint senderId)
+    /// <returns>Whether the slot is streamed or bound, false while it's neither, or null when there's no such slot.</returns>
+    private static bool? Authenticate(string slot, uint senderId)
     {
         uint role;
         unsafe
@@ -140,7 +153,7 @@ internal static class SequenceRangeExchange
             """, name);
         if (slots.Count == 0)
         {
-            throw new PgException("42501", $"no worf replication slot \"{slot}\" carries this sequence range exchange");
+            return null;
         }
 
         bool active = slots[0].Get<bool>(0);
@@ -336,6 +349,7 @@ internal static class SequenceRangeExchange
 
             try
             {
+                _ = s_noSlot.Remove(sub.Id);
                 (bool received, bool granted) = ExchangeWith(node, sub);
 
                 // A provider whose slot isn't streamed yet is asked again after a check interval.
@@ -348,6 +362,7 @@ internal static class SequenceRangeExchange
 
                 changed |= received;
                 s_exchangedAt[sub.Id] = now;
+                _ = s_noSlotOnce.Remove(sub.Id);
                 _ = s_retries.Remove(sub.Id);
                 _ = s_timedOut.Remove(sub.Id);
                 _ = s_probedAt.Remove(sub.Id);
@@ -417,12 +432,20 @@ internal static class SequenceRangeExchange
                     ? $"node {sub.Origin.Name} didn't answer within {(SequenceRangeExchangeWorker.Probing != 0 ? probeLimit / 1000 : SequenceRanges.ExchangeTimeout).ToString(CultureInfo.InvariantCulture)} ms"
                     : error.Message;
                 // While the subscription's first sync hasn't finished, its slot may not be there yet, or be made again,
-                // so a failure then is no news.
+                // so a failure then is no news, and neither is the first exchange that finds the slot gone, as the
+                // subscription may be being dropped, which drops it before the drop commits.
                 PgDiagnostic diagnostic = new($"sequence range exchange with node {sub.Origin.Name} failed: {failure}")
                 {
                     Detail = (error as PgException)?.Detail,
                 };
-                if (PgBackgroundWorker.RunTransaction(() => Sync.GetSubscriptionSyncStatus(sub.Id, true) is { } sync && sync.Status != Sync.SyncStatusReady))
+                bool noSlot = s_noSlot.Contains(sub.Id);
+                if (!noSlot)
+                {
+                    _ = s_noSlotOnce.Remove(sub.Id);
+                }
+
+                if ((noSlot && s_noSlotOnce.Add(sub.Id)) ||
+                    PgBackgroundWorker.RunTransaction(() => Sync.GetSubscriptionSyncStatus(sub.Id, true) is { } sync && sync.Status != Sync.SyncStatusReady))
                 {
                     WorfLog.Debug1(diagnostic.Message);
                 }
@@ -463,6 +486,8 @@ internal static class SequenceRangeExchange
         {
             Disconnect(gone);
         }
+
+        _ = s_noSlotOnce.RemoveWhere(id => !enabled.Exists(sub => sub.Id == id));
 
         foreach (WorfSubscription sub in enabled)
         {
@@ -728,6 +753,13 @@ internal static class SequenceRangeExchange
         using JsonDocument document = JsonDocument.Parse(reply);
         if (document.RootElement.TryGetProperty("streamed", out JsonElement streamed) && streamed.ValueKind == JsonValueKind.False)
         {
+            // A provider without the slot answers so, rather than failing the call, which would log an error there too.
+            if (document.RootElement.TryGetProperty("slot", out JsonElement slot) && slot.ValueKind == JsonValueKind.False)
+            {
+                _ = s_noSlot.Add(sub.Id);
+                throw new PgException("42501", $"no worf replication slot \"{sub.SlotName}\" carries this sequence range exchange");
+            }
+
             _ = s_notStreamed.Add(sub.Id);
             return (false, false);
         }

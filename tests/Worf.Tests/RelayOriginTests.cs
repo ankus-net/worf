@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using Npgsql;
 
@@ -417,6 +418,49 @@ public sealed class RelayOriginTests
             SELECT count(*), EXISTS (SELECT 1 FROM pg_replication_origin_status WHERE external_id = 'other')
             FROM pg_replication_origin WHERE roname LIKE '%@90__'
             """, token), "the relay origins left, and the user's origin");
+
+        // With every slot taken by origins that aren't relay origins, here another subscription's, a forwarded node's
+        // transactions wait for one, rather than committing under the subscription's own origin, which would send their
+        // rows back to the node that wrote them as the provider's, and record nothing meanwhile, neither the origin they
+        // would create for a node writing here for the first time nor a claim on it for each. The relay origin left gives its slot up once the
+        // provider's own row, applied under the subscription's origin, moves the worker's restart past it. The node's
+        // transaction comes once relay origins no longer leave slots given up for PostgreSQL subscriptions to them, ten
+        // seconds after the last that wants one, here the one disabled, which keeps its slot, so that it looks for a slot
+        // of its own.
+        _ = await subscriber.SafePsqlAsync(Database, "ALTER SUBSCRIPTION pgsub DISABLE", token);
+        Stopwatch sinceWanted = Stopwatch.StartNew();
+        _ = await provider.SafePsqlAsync(Database, "INSERT INTO d VALUES (16, 'provider')", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM d WHERE id = 16)", token), "the provider's row");
+        await SubscribeAsync(subscriber, "temp3", provider, "{all}", token, "tset");
+        Assert.AreEqual("0", await subscriber.SafePsqlAsync(Database, """
+            SELECT count(*) FROM pg_replication_origin o JOIN pg_replication_origin_status s ON s.local_id = o.roident WHERE o.roname LIKE '%@90__'
+            """, token), "relay origins with slots");
+        _ = await provider.SafePsqlAsync(Database, $"SELECT pg_replication_origin_create('{back}@9006')", token);
+        records = await subscriber.SafePsqlAsync(Database, "SELECT count(*) FROM worf.origin_writer", token);
+        if (TimeSpan.FromSeconds(11) - sinceWanted.Elapsed is TimeSpan left && left > TimeSpan.Zero)
+        {
+            await Task.Delay(left, token);
+        }
+
+        await WriteAsAsync(provider, $"{back}@9006", "INSERT INTO d VALUES (17, '9006')", token);
+        await WriteAsAsync(provider, $"{back}@9006", "INSERT INTO d VALUES (18, '9006')", token);
+        await Task.Delay(TimeSpan.FromSeconds(2), token);
+        Assert.AreEqual("0|" + records, await subscriber.SafePsqlAsync(Database,
+            "SELECT (SELECT count(*) FROM d WHERE id IN (17, 18)), (SELECT count(*) FROM worf.origin_writer)", token),
+            "the rows and records while every slot is taken");
+        _ = await subscriber.SafePsqlAsync(Database, "SELECT worf.drop_subscription('temp3')", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT count(*) = 2 FROM d WHERE id IN (17, 18)", token), "the rows once a slot is free");
+        Assert.AreEqual("2", await subscriber.SafePsqlAsync(Database, """
+            SELECT count(*) FROM d, pg_replication_origin o
+            WHERE d.id IN (17, 18) AND o.roident = (pg_xact_commit_timestamp_origin(d.xmin)).roident AND o.roname LIKE '%@9006'
+            """, token), "the rows under the node's relay origin");
+
+        // The subscriptions dropped while their sequence range exchanges went on, and those that started, logged no
+        // failure for want of their slots, on either node.
+        foreach (TestNode node in nodes)
+        {
+            Assert.DoesNotContain("carries this sequence range exchange", node.ReadLog(), node.Name);
+        }
     }
 
     /// <summary>
