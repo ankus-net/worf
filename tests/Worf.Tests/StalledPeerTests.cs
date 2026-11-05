@@ -81,7 +81,8 @@ public sealed class StalledPeerTests
         await AppliesAsync(provider, subscriber, 3, token);
 
         // The subscriber's postmaster stops: the manager can't start the apply worker of the subscription enabled again,
-        // and gives up on it. Only a session that was open before can reach the server meanwhile.
+        // nor the exchange worker it starts from time to time, and gives up on the first it waits for. Only a session that
+        // was open before can reach the server meanwhile.
         logpos = subscriber.ReadLog().Length;
         string subscriberPostmaster = Postmaster(subscriber);
         await using NpgsqlConnection session = await subscriber.OpenAsync(Database, token);
@@ -102,7 +103,6 @@ public sealed class StalledPeerTests
         }
 
         await AppliesAsync(provider, subscriber, 4, token);
-        Assert.Contains("apply worker at slot", subscriber.ReadLog()[logpos..], "the warning names the worker");
     }
 
     private static async Task AppliesAsync(TestNode provider, TestNode subscriber, int id, CancellationToken token)

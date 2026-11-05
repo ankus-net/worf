@@ -677,9 +677,9 @@ public sealed partial class ExceptionBehaviourTests
     /// When its slot is gone or invalidated, or its origin has no progress, it copies the table again and merges the copy
     /// in, in one transaction, so the table is never seen empty, though a key references the table, its own key is an
     /// identity or deferrable: the provider's rows replace those with the same key, and the table's other rows stay, those
-    /// written here or under another origin, and those the provider has since deleted. Under discard, a row of the copy
-    /// that a row here holds a unique value of is skipped and recorded, while the others merge and later changes
-    /// arrive. One cancelled before its copy
+    /// written here or under another origin, and those the provider has since deleted. Under transdiscard, as under
+    /// discard, a row of the copy that a row here holds a unique value of is skipped and recorded under transdiscard,
+    /// while the others merge and later changes arrive. One cancelled before its copy
     /// commits copies a table without a key once, and the cleanup after it waits for a session that holds its slot, with a
     /// warning, rather than for ever. Dropping the subscription drops the slots its syncs left.
     /// </summary>
@@ -929,10 +929,10 @@ public sealed partial class ExceptionBehaviourTests
                     _ = await provider.SafePsqlAsync(Database, $"SELECT pg_drop_replication_slot('{syncSlot}')", token);
                     break;
                 case "conflict":
-                    // The copy again merges row 500's new value, which a row here holds, so under discard that row is
-                    // skipped, and recorded, while the others merge.
+                    // The copy again merges row 500's new value, which a row here holds, so under transdiscard, as under
+                    // discard, that row is skipped, and recorded under transdiscard, while the others merge.
                     _ = await provider.SafePsqlAsync(Database, $"SELECT pg_drop_replication_slot('{syncSlot}')", token);
-                    await SetBehaviourAsync(subscriber, "discard", token);
+                    await SetBehaviourAsync(subscriber, "transdiscard", token);
                     break;
                 case "zero":
                     _ = await subscriber.SafePsqlAsync(Database, $"SELECT pg_replication_origin_advance('{syncSlot}', '0/0')", token);
@@ -973,8 +973,8 @@ public sealed partial class ExceptionBehaviourTests
             if (stop == "conflict")
             {
                 Assert.Contains($"skipped 1 of the rows of the copy of table public.{table}", subscriber.ReadLog()[logpos..]);
-                Assert.AreEqual("MERGE|500|updated|23505", await subscriber.SafePsqlAsync(Database, $"""
-                    SELECT operation, remote_new_tuple->>'id', remote_new_tuple->>'v', error_sqlstate FROM worf.exception_log
+                Assert.AreEqual("MERGE|500|updated|23505|transdiscard", await subscriber.SafePsqlAsync(Database, $"""
+                    SELECT operation, remote_new_tuple->>'id', remote_new_tuple->>'v', error_sqlstate, behaviour FROM worf.exception_log
                     WHERE table_name = '{table}'
                     """, token), "the skipped row recorded");
 
@@ -1103,7 +1103,7 @@ public sealed partial class ExceptionBehaviourTests
     /// A table's copy under discard leaves out the rows the subscriber's NOT NULL columns and CHECK constraints refuse,
     /// and those whose values its column types refuse, without a transaction ID each, recording them in order with the
     /// provider's row numbers, while a duplicate key, which only COPY finds, still fails its batch's COPY alone. An error
-    /// that ends a copy in batches names the provider's row.
+    /// that ends a copy in batches names the provider's row. Under transdiscard, the rows are recorded as its own.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -1152,7 +1152,9 @@ public sealed partial class ExceptionBehaviourTests
             "action_counter, which numbers a copy's rows past 2^31");
 
         // An error that ends a copy in batches, here a cancel while a row waits for a transaction here that holds its key,
-        // names the provider's row as COPY's line. Row 2501's key, which only COPY finds taken, starts the batches.
+        // names the provider's row as COPY's line. Row 2501's key, which only COPY finds taken, starts the batches, and
+        // under transdiscard is recorded as transdiscard's.
+        await SetBehaviourAsync(subscriber, "transdiscard", token);
         _ = await provider.SafePsqlAsync(Database, """
             CREATE TABLE g (id integer PRIMARY KEY, k integer);
             INSERT INTO g SELECT g, CASE WHEN g = 2501 THEN 1 ELSE g END FROM generate_series(1, 3000) g;
@@ -1179,12 +1181,17 @@ public sealed partial class ExceptionBehaviourTests
 
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
             "SELECT sync_status = 'r' FROM worf.local_sync_status WHERE sync_relname = 'g'", token), "g's copy once the key is free");
+        Assert.AreEqual("f|discard|1131,g|transdiscard|1", await subscriber.SafePsqlAsync(Database, """
+            SELECT string_agg(concat_ws('|', table_name, behaviour, n), ',' ORDER BY table_name)
+            FROM (SELECT table_name, behaviour, count(*) AS n FROM worf.exception_log GROUP BY 1, 2) b
+            """, token), "the behaviour each copy's rows were recorded under");
     }
 
     /// <summary>
     /// A copy in which no row fails costs about the same CPU under error and under discard, which copies at once as
-    /// error does unless a row fails, each within half again of the other's: the copy hands COPY every message received
-    /// rather than one row at a time, and discard reads the rows no differently. On Linux, where /proc gives the
+    /// error does unless a row fails: under error, which does no more than discard, within a fifth more than discard's,
+    /// and under discard within half again of error's. The copy hands COPY every message received rather than one row
+    /// at a time, which cost error a third more than discard, and discard reads the rows no differently. On Linux, where /proc gives the
     /// worker's CPU; the copies run at once.
     /// </summary>
     /// <returns>The test.</returns>
@@ -1218,7 +1225,7 @@ public sealed partial class ExceptionBehaviourTests
         }));
 
         TestContext.WriteLine($"apply worker CPU: error {cpu["error"]:0.00} s, discard {cpu["discard"]:0.00} s");
-        Assert.IsLessThan(cpu["discard"] * 1.5, cpu["error"], "the copy's CPU under error, against discard's");
+        Assert.IsLessThan(cpu["discard"] * 1.2, cpu["error"], "the copy's CPU under error, against discard's");
         Assert.IsLessThan(cpu["error"] * 1.5, cpu["discard"], "the copy's CPU under discard, against error's");
     }
 

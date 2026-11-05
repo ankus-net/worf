@@ -193,7 +193,7 @@ internal static class ExceptionLog
                 INSERT INTO worf.exception_log (sub_id, sub_name, remote_node_id, remote_xid, remote_commit_ts, remote_commit_lsn,
                     action_counter, operation, schema_name, table_name, remote_new_tuple, behaviour, error_sqlstate, error_message)
                 SELECT ${n + 1}, ${n + 2}, ${n + 3}, ${n + 4}::pg_catalog.text::pg_catalog.xid, ${n + 5}, ${n + 6}, 0, ${n + 7}, ${n + 8},
-                    ${n + 9}, f.new_tuple::pg_catalog.jsonb, 'discard', f.error_sqlstate, f.error_message
+                    ${n + 9}, f.new_tuple::pg_catalog.jsonb, ${n + 10}, f.error_sqlstate, f.error_message
                 FROM f
                 """,
                 [.. parameters,
@@ -205,7 +205,8 @@ internal static class ExceptionLog
                     Worf.LsnParameter(change.CommitLsn),
                     SpiParameter.Create<string?>(change.Operation),
                     SpiParameter.Create<string?>(change.Relation?.Nspname),
-                    SpiParameter.Create<string?>(change.Relation?.Relname)])));
+                    SpiParameter.Create<string?>(change.Relation?.Relname),
+                    SpiParameter.Create(CopyBehaviour)])));
             return true;
         }
         catch (PgException)
@@ -222,7 +223,7 @@ internal static class ExceptionLog
         => _ = Worf.Execute("""
             INSERT INTO worf.exception_log (sub_id, sub_name, remote_node_id, remote_xid, remote_commit_ts, remote_commit_lsn,
                 action_counter, operation, schema_name, table_name, remote_new_tuple, behaviour, error_sqlstate, error_message)
-            SELECT $1, $2, $3, $4::text::xid, $5, $6, f.action_counter, $7, $8, $9, f.new_tuple::jsonb, 'discard',
+            SELECT $1, $2, $3, $4::text::xid, $5, $6, f.action_counter, $7, $8, $9, f.new_tuple::jsonb, $14,
                 f.error_sqlstate, f.error_message
             FROM ROWS FROM (pg_catalog.unnest($10::bigint[]), pg_catalog.unnest($11::text[]), pg_catalog.unnest($12::text[]),
                 pg_catalog.unnest($13::text[])) WITH ORDINALITY AS f (action_counter, new_tuple, error_sqlstate, error_message, n)
@@ -240,7 +241,12 @@ internal static class ExceptionLog
             SpiParameter.Create(failures.Select(failure => failure.ActionCounter).ToArray()),
             Worf.TextArrayParameter(json, [.. failures.Select(failure => (failure.Start, failure.Length))]),
             SpiParameter.Create(failures.Select(failure => failure.Error.SqlState).ToArray()),
-            SpiParameter.Create(failures.Select(failure => failure.Error.Message).ToArray()));
+            SpiParameter.Create(failures.Select(failure => failure.Error.Message).ToArray()),
+            SpiParameter.Create(CopyBehaviour));
+
+    // The behaviour a copy's skipped rows are recorded under: transdiscard skips a copy's rows one by one, as discard
+    // does, and records them under its own name, as apply does the changes it skips.
+    private static string CopyBehaviour => Apply.ExceptionBehaviour == WorfExceptionBehaviour.Transdiscard ? "transdiscard" : "discard";
 
     /// <summary>
     /// Records the remote transaction a subscription applies again under <c>worf.exception_behaviour</c>, how, and
