@@ -463,6 +463,30 @@ internal static unsafe partial class CopyConversion
     /// </summary>
     private static void PrepareChecks(RelationData* relation, List<string> attnames)
     {
+        PrepareInputs(relation, attnames);
+        uint copyRow = Worf.ReadScalar<uint>("SELECT 'worf.copy_row()'::pg_catalog.regprocedure::pg_catalog.oid");
+        uint copyCheck = Worf.ReadScalar<uint>("SELECT 'worf.copy_check(integer, boolean)'::pg_catalog.regprocedure::pg_catalog.oid");
+        s_checkErrors.Clear();
+        List* where = NativeMethods.lappend(null, NativeMethods.makeFuncExpr(copyRow, BoolOid, null, 0, 0, CoercionForm.COERCE_EXPLICIT_CALL));
+        if (!FiresBeforeRowInsert(relation))
+        {
+            foreach ((nint passes, string state, string message) in ConstraintTests(relation))
+            {
+                List* args = NativeMethods.lappend(NativeMethods.lappend(null,
+                    NativeMethods.makeConst(Int4Oid, -1, 0, 4, (ulong)s_checkErrors.Count, false, true)), (void*)passes);
+                where = NativeMethods.lappend(where, NativeMethods.makeFuncExpr(copyCheck, BoolOid, args, 0, 0, CoercionForm.COERCE_EXPLICIT_CALL));
+                s_checkErrors.Add((state, message));
+            }
+        }
+
+        s_checkWhere = where;
+    }
+
+    /// <summary>
+    /// Looks up the input function of each copied column, which the copy checks each row's values with.
+    /// </summary>
+    private static void PrepareInputs(RelationData* relation, List<string> attnames)
+    {
         TupleDescData* desc = relation->rd_att;
         s_checkInputs = (FmgrInfo*)NativeMethods.palloc0((ulong)(sizeof(FmgrInfo) * attnames.Count));
         s_checkIoparams = new uint[attnames.Count];
@@ -481,29 +505,36 @@ internal static unsafe partial class CopyConversion
                 s_checkTypmods[i] = att->atttypmod;
             }
         }
+    }
 
-        uint copyRow = Worf.ReadScalar<uint>("SELECT 'worf.copy_row()'::pg_catalog.regprocedure::pg_catalog.oid");
-        uint copyCheck = Worf.ReadScalar<uint>("SELECT 'worf.copy_check(integer, boolean)'::pg_catalog.regprocedure::pg_catalog.oid");
-        string relname = Worf.FromServer((sbyte*)&relation->rd_rel->relname);
-        s_checkErrors.Clear();
-        List* where = NativeMethods.lappend(null, NativeMethods.makeFuncExpr(copyRow, BoolOid, null, 0, 0, CoercionForm.COERCE_EXPLICIT_CALL));
-
-        void Check(Expr* passes, string state, string message)
-        {
-            List* args = NativeMethods.lappend(NativeMethods.lappend(null,
-                NativeMethods.makeConst(Int4Oid, -1, 0, 4, (ulong)s_checkErrors.Count, false, true)), passes);
-            where = NativeMethods.lappend(where, NativeMethods.makeFuncExpr(copyCheck, BoolOid, args, 0, 0, CoercionForm.COERCE_EXPLICIT_CALL));
-            s_checkErrors.Add((state, message));
-        }
-
-        bool triggered = false;
+    /// <summary>
+    /// Checks whether a table has a BEFORE ROW INSERT trigger that fires under apply's replica role, which can change a
+    /// row before COPY checks it.
+    /// </summary>
+    private static bool FiresBeforeRowInsert(RelationData* relation)
+    {
         Trigger* trigger = relation->trigdesc is null ? null : relation->trigdesc->triggers;
         for (int i = 0; trigger is not null && i < relation->trigdesc->numtriggers; i++, trigger++)
         {
-            triggered |= (trigger->tgtype & BeforeRowInsert) == BeforeRowInsert && trigger->tgenabled is (sbyte)'A' or (sbyte)'R';
+            if ((trigger->tgtype & BeforeRowInsert) == BeforeRowInsert && trigger->tgenabled is (sbyte)'A' or (sbyte)'R')
+            {
+                return true;
+            }
         }
 
-        for (int i = 0; i < desc->natts && !triggered; i++)
+        return false;
+    }
+
+    /// <summary>
+    /// Builds the tests of a table's NOT NULL columns and enforced CHECK constraints, with the errors COPY would raise,
+    /// but those on generated columns, which COPY computes after the condition runs.
+    /// </summary>
+    private static List<(nint Passes, string State, string Message)> ConstraintTests(RelationData* relation)
+    {
+        TupleDescData* desc = relation->rd_att;
+        string relname = Worf.FromServer((sbyte*)&relation->rd_rel->relname);
+        List<(nint Passes, string State, string Message)> tests = [];
+        for (int i = 0; i < desc->natts; i++)
         {
             FormData_pg_attribute* att = NativeMethods.TupleDescAttr(desc, i);
             if (att->attisdropped || !att->attnotnull || att->attgenerated != 0)
@@ -516,12 +547,12 @@ internal static unsafe partial class CopyConversion
             test->arg = (Expr*)NativeMethods.makeVar(1, (short)(i + 1), att->atttypid, att->atttypmod, att->attcollation, 0);
             test->nulltesttype = NullTestType.IS_NOT_NULL;
             test->location = -1;
-            string column = Worf.FromServer((sbyte*)&att->attname);
-            Check((Expr*)test, PgSqlStates.NotNullViolation, $"null value in column \"{column}\" of relation \"{relname}\" violates not-null constraint");
+            tests.Add(((nint)test, PgSqlStates.NotNullViolation,
+                $"null value in column \"{Worf.FromServer((sbyte*)&att->attname)}\" of relation \"{relname}\" violates not-null constraint"));
         }
 
         TupleConstr* constr = desc->constr;
-        for (int i = 0; constr is not null && i < constr->num_check && !triggered; i++)
+        for (int i = 0; constr is not null && i < constr->num_check; i++)
         {
 #if !ANKUS_PG15 && !ANKUS_PG16 && !ANKUS_PG17
             if (!constr->check[i].ccenforced)
@@ -540,11 +571,11 @@ internal static unsafe partial class CopyConversion
             test->arg = (Expr*)expression;
             test->booltesttype = BoolTestType.IS_NOT_FALSE;
             test->location = -1;
-            string name = Worf.FromServer(constr->check[i].ccname);
-            Check((Expr*)test, PgSqlStates.CheckViolation, $"new row for relation \"{relname}\" violates check constraint \"{name}\"");
+            tests.Add(((nint)test, PgSqlStates.CheckViolation,
+                $"new row for relation \"{relname}\" violates check constraint \"{Worf.FromServer(constr->check[i].ccname)}\""));
         }
 
-        s_checkWhere = where;
+        return tests;
     }
 
     /// <summary>
