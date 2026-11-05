@@ -42,7 +42,8 @@ public sealed class GlobalDdlLockTests
     /// identity take beside it are those the other node takes, so later DDL on them applies. DDL from the other node that
     /// can't build it again drops it, and concurrent reindexes of worf's catalogs leave no mark behind. The DDL lock's
     /// messages name nodes, a queued statement whose role is missing names the statement, and replicated SQL runs as its
-    /// role, leaves no temporary objects and finds names as on its node.
+    /// role, as does the work it defers to its commit, leaves no temporary objects or cursors and finds names as on its
+    /// node.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -894,13 +895,41 @@ public sealed class GlobalDdlLockTests
             """, token, user: "mal");
         _ = await nodeA.SafePsqlAsync(Database,
             "SELECT worf.replicate_ddl_command($$CREATE TABLE public.lw AS SELECT lower('X'::character varying) AS v$$)", token);
+
+        // The work replicated SQL defers to its commit runs as its role too, before the temporary objects it leaves go:
+        // a deferred constraint trigger, which apply's replica role fires as it fires always, that tries to make its role
+        // a superuser and leaves a domain in the temporary schema, and a cursor held over the commit, which on node_b closes unread, as no session there could read it.
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE TABLE public.mal_d (a integer);
+            CREATE TABLE public.mal_who (who text);
+            CREATE FUNCTION public.mal_escalate(who text) RETURNS integer LANGUAGE plpgsql AS $f$
+            BEGIN
+                INSERT INTO public.mal_who VALUES (who || ' ' || current_user);
+                BEGIN
+                    ALTER ROLE mal SUPERUSER;
+                EXCEPTION WHEN OTHERS THEN NULL;
+                END;
+                RETURN 1;
+            END $f$;
+            CREATE FUNCTION public.mal_df() RETURNS trigger LANGUAGE plpgsql AS $f$
+            BEGIN
+                PERFORM public.mal_escalate('trigger');
+                CREATE DOMAIN pg_temp.jsonb AS pg_catalog.jsonb;
+                RETURN NULL;
+            END $f$;
+            CREATE CONSTRAINT TRIGGER mal_dt AFTER INSERT ON public.mal_d DEFERRABLE INITIALLY DEFERRED
+                FOR EACH ROW EXECUTE FUNCTION public.mal_df();
+            ALTER TABLE public.mal_d ENABLE ALWAYS TRIGGER mal_dt;
+            SELECT worf.replicate_ddl_command($$INSERT INTO public.mal_d VALUES (1);
+                DECLARE mal_c CURSOR WITH HOLD FOR SELECT public.mal_escalate('cursor')$$);
+            """, token, user: "mal");
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
-        foreach (TestNode node in new[] { nodeA, nodeB })
+        foreach ((TestNode node, string ran) in new[] { (nodeA, "cursor mal,trigger mal"), (nodeB, "trigger mal") })
         {
-            Assert.AreEqual("f|postgres|mal|grp|mal|x", await node.SafePsqlAsync(Database, """
+            Assert.AreEqual($"f|postgres|mal|grp|mal|x|{ran}", await node.SafePsqlAsync(Database, """
                 SELECT rolsuper, (SELECT tableowner FROM pg_tables WHERE tablename = 'su_t'), (SELECT tableowner FROM pg_tables WHERE tablename = 'mal_t'),
                     (SELECT tableowner FROM pg_tables WHERE tablename = 'mal_u'), (SELECT tableowner FROM pg_tables WHERE tablename = 'mal_v'),
-                    (SELECT v FROM public.lw)
+                    (SELECT v FROM public.lw), (SELECT string_agg(who, ',' ORDER BY who) FROM public.mal_who)
                 FROM pg_roles WHERE rolname = 'mal'
                 """, token), node.Name);
         }

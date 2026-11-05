@@ -169,6 +169,9 @@ internal static unsafe partial class Apply
 
     // When the last message had arrived as apply last asked the provider for a reply, so that it asks once a silence.
     private static long s_pingedAt;
+
+    // The role the last of the current transaction's SQL from another node ran as, whose deferred work runs as it.
+    private static string? s_replicatedRole;
     private static ulong s_lastWritepos;
     private static ulong s_lastFlushpos;
     private static long s_lastSendTime;
@@ -495,9 +498,14 @@ internal static unsafe partial class Apply
                 ExecuteStatement(command, query, isTopLevel);
             }
 
+            // The cursors the commands declared close, as no session here could fetch from them, and one held open
+            // would run its query at commit as apply's own superuser. The deferred work they queued runs as the role
+            // just before the transaction commits.
             if (applying)
             {
+                NativeMethods.PerformPortalClose(null);
                 NativeMethods.ResetTempTableNamespace();
+                s_replicatedRole = role;
             }
         }
         finally
@@ -693,6 +701,7 @@ internal static unsafe partial class Apply
     {
         s_xactActionCounter = 1;
         s_actionName = "BEGIN";
+        s_replicatedRole = null;
 
         ProtoNative.ReadBegin(s, out ulong commitLsn, out long commitTime, out s_remoteXid);
 
@@ -838,6 +847,7 @@ internal static unsafe partial class Apply
             MultiInsertFinish();
 
             s_applyApi.OnCommit();
+            RunDeferredWorkAsReplicatedRole();
 
             // We need to write end_lsn to the commit record. It's set once deferred triggers have run, just before the
             // record is written: from PostgreSQL 16, an abort advances the origin too, and has to leave it at the
@@ -849,6 +859,34 @@ internal static unsafe partial class Apply
         }
 
         FinishCommit(endLsn, false);
+    }
+
+    /// <summary>
+    /// Runs the deferred work of a transaction that ran another node's SQL, as committing it would, just before it
+    /// commits, as the role the SQL ran as, and then drops what that work left in apply's temporary schema, so that
+    /// none of it runs as apply's own superuser or outlasts the transaction: the deferred triggers fire, as before
+    /// PostgreSQL 18 they would as whoever the user is at commit, and from 18 each as the role that queued it, and the
+    /// cursors they declared close.
+    /// </summary>
+    private static void RunDeferredWorkAsReplicatedRole()
+    {
+        if (s_replicatedRole is not string role)
+        {
+            return;
+        }
+
+        s_replicatedRole = null;
+        int nestLevel = ReplicatedIdentity.Enter(role);
+        try
+        {
+            NativeMethods.AfterTriggerFireDeferred();
+            NativeMethods.PerformPortalClose(null);
+            NativeMethods.ResetTempTableNamespace();
+        }
+        finally
+        {
+            ReplicatedIdentity.Leave(nestLevel);
+        }
     }
 
     /// <summary>
