@@ -82,19 +82,10 @@ internal sealed unsafe class WorfRelation
     public bool HasTriggers { get; set; }
 
     /// <summary>
-    /// Gets or sets the deferrable indexes of the local relation whose rechecks apply needs and doesn't get, under
-    /// session_replication_role replica, and can't do itself: those with expressions or a predicate, or null. Only
-    /// valid as long as relation mapping is.
+    /// Gets or sets whether the local relation has deferrable unique or exclusion constraints, whose rechecks
+    /// <see cref="ReplicaRechecks"/> has fire for the rows apply writes. Only valid as long as relation mapping is.
     /// </summary>
-    public string? DeferrableIndexes { get; set; }
-
-    /// <summary>
-    /// Gets or sets the checks apply runs itself after it writes a row, for the deferrable unique and exclusion
-    /// constraints of the local relation on its columns, whose rechecks it doesn't get, or null: each constraint's name,
-    /// whether it excludes, the query that tells whether a row other than the one written conflicts with it, and the
-    /// columns, by number, whose values, as bytea, are the query's parameters. Only valid as long as relation mapping is.
-    /// </summary>
-    public List<(string Name, bool Exclusion, string Query, int[] Columns)>? DeferrableChecks { get; set; }
+    public bool HasRechecks { get; set; }
 
     /// <summary>
     /// Gets the type a local column's values are sent in.

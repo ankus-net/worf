@@ -126,8 +126,10 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   a thousand rows and 8 MB, in order. A deferrable unique or exclusion
   constraint, whose recheck doesn't fire as the copy writes, is checked once
   the table has copied: a conflict fails the copy under `error`, disables the
-  subscription under `sub_disable`, and otherwise the later rows of each
-  conflict are deleted and recorded. Under `error` the copy stops,
+  subscription under `sub_disable`, and otherwise a row is deleted and
+  recorded when it conflicts with an earlier row that stays, as rows checked
+  in the copy's order would be. Such rows, and those a merge skips, have no
+  number in the copy, and are recorded with 0 as the action counter. Under `error` the copy stops,
   naming the row, column and value, and starts again after a delay of 5 seconds
   that doubles each time, up to 5 minutes, from the start of a table's last copy
   or the failure of a subscription's first;

@@ -876,8 +876,10 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   a thousand rows and 8 MB, in order. A deferrable unique or exclusion
   constraint, whose recheck doesn't fire as the copy writes, is checked once
   the table has copied: a conflict fails the copy under `error`, disables the
-  subscription under `sub_disable`, and otherwise the later rows of each
-  conflict are deleted and recorded. Under `error` the copy stops,
+  subscription under `sub_disable`, and otherwise a row is deleted and
+  recorded when it conflicts with an earlier row that stays, as rows checked
+  in the copy's order would be. Such rows, and those a merge skips, have no
+  number in the copy, and are recorded with 0 as the action counter. Under `error` the copy stops,
   naming the row, column and value, and starts again after a delay of 5 seconds
   that doubles each time, up to 5 minutes, from the start of a table's last copy
   or the failure of a subscription's first;
@@ -1157,17 +1159,14 @@ conflict resolution purposes.
 ### Deferrable constraints
 
 Apply runs with `session_replication_role` set to `replica`, under which
-PostgreSQL doesn't recheck deferrable unique indexes and exclusion constraints.
-Apply checks each row it inserts or updates against a table's deferrable unique
-and exclusion constraints itself, as their rechecks would at commit, and fails
-the change with a unique or exclusion violation, which
-`worf.exception_behaviour` handles as any other failure. A table's copy is
-checked against them once it has copied. Apply refuses to insert or update rows
-of a table with a deferrable unique or exclusion constraint whose index has
-expressions or a predicate, with the error
-
-    ERROR: worf doesn't support index rechecks needed for deferrable indexes with expressions or a predicate
-    DETAIL: relation public.test_relation has deferrable indexes: index1, index2
+PostgreSQL doesn't fire the triggers that recheck deferrable unique and
+exclusion constraints. worf has them fire for the rows apply writes, so that
+PostgreSQL rechecks them as it does a session's rows, whatever their expressions
+and predicates: at commit for a constraint that is initially deferred, which
+fails the remote transaction as a whole, and as each change ends for one that is
+initially immediate, waiting for a transaction here that writes a conflicting
+row. `worf.exception_behaviour` handles the failure as any other. A table's copy
+is checked against them once it has copied.
 
 ### DDL
 

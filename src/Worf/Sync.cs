@@ -1621,16 +1621,22 @@ internal static class Sync
         // Execute COPY FROM. A table whose values convert is copied with their conversions, under this node's own
         // settings, which conversions follow, as in replication, and so is any table under worf.exception_behaviour
         // other than error, which skips or records the rows that fail.
-        if (converted is null && (Apply.ExceptionBehaviour == WorfExceptionBehaviour.Error || attnamelist.Count == 0))
+        // PostgreSQL rechecks the table's deferrable constraints for the copied rows at commit, as for a session's.
+        _ = ReplicaRechecks.Firing(into, () =>
         {
-            _ = originConn.CopyInto(into, attnamelist.Count != 0 ? attnamelist : null);
-        }
-        else
-        {
-            SetCopyTargetStyle(converted is not null);
-            _ = CopyConversion.Copy(originConn, rel, into, attnamelist, converted, lsn, () => StartCopy(originConn, query));
-            SetCopyTargetStyle(false);
-        }
+            if (converted is null && (Apply.ExceptionBehaviour == WorfExceptionBehaviour.Error || attnamelist.Count == 0))
+            {
+                _ = originConn.CopyInto(into, attnamelist.Count != 0 ? attnamelist : null);
+            }
+            else
+            {
+                SetCopyTargetStyle(converted is not null);
+                _ = CopyConversion.Copy(originConn, rel, into, attnamelist, converted, lsn, () => StartCopy(originConn, query));
+                SetCopyTargetStyle(false);
+            }
+
+            return true;
+        });
     }
 
     /// <summary>
@@ -1730,7 +1736,7 @@ internal static class Sync
         {
             PgTransaction.RunInSubtransaction(() =>
             {
-                ExecuteQuoted(merge.ToString());
+                _ = ReplicaRechecks.Firing(reloid, () => Worf.ExecuteUnpinned(merge.ToString()));
                 CheckDeferrableUnique(reloid, only + table);
                 CheckDeferrableExclusion(reloid, only + table);
             }, PgSubtransactionMode.Atomic);
@@ -1777,7 +1783,7 @@ internal static class Sync
         {
             PgTransaction.RunInSubtransaction(() =>
             {
-                _ = Worf.ExecuteUnpinned(merge, SpiParameter.Create(Tid(from)), SpiParameter.Create(Tid(to)));
+                _ = ReplicaRechecks.Firing(reloid, () => Worf.ExecuteUnpinned(merge, SpiParameter.Create(Tid(from)), SpiParameter.Create(Tid(to))));
                 CheckDeferrableUnique(reloid, table);
                 CheckDeferrableExclusion(reloid, table);
             }, PgSubtransactionMode.Atomic);
@@ -1909,9 +1915,10 @@ internal static class Sync
     }
 
     /// <summary>
-    /// Deletes the rows of a table that conflict with an earlier row, by its place in the table, in a deferrable unique
-    /// or exclusion constraint, and records them, as they're deleted, with the conflict each fails, or, when the log
-    /// can't hold one of them, each alone.
+    /// Deletes the rows of a table that conflict, in a deferrable unique or exclusion constraint, with an earlier row,
+    /// by its place in the table, that stays, as rows checked one after another in the copy's order would: a row that
+    /// conflicts only with rows that are deleted stays. The rows deleted are recorded with their columns' text, as
+    /// other rows of the copy are, and the conflict each fails, or, when the log can't hold them, each alone.
     /// </summary>
     private static void DeleteDeferrableConflicts(uint reloid, string table, WorfFailedChange change)
     {
@@ -1941,32 +1948,83 @@ internal static class Sync
             string conflicts = exclusion
                 ? string.Join(" AND ", constraint.Get<string?[]>(3).Select((op, k) => $"a.k{k} {op} b.k{k}"))
                 : string.Join(" AND ", keys.Select((_, k) => $"a.k{k} IS NOT DISTINCT FROM b.k{k}"));
-            string conflicting = $"SELECT b.tableoid, b.ctid FROM {rows} a JOIN {rows} b ON (a.tableoid, a.ctid) < (b.tableoid, b.ctid) AND {conflicts}";
-            PgException error = exclusion
-                ? new PgException(PgSqlStates.ExclusionViolation, $"conflicting key value violates exclusion constraint \"{name}\"")
-                : new PgException(PgSqlStates.UniqueViolation, $"duplicate key value violates unique constraint \"{name}\"");
-            if (ExceptionLog.TryRecordCopied(change, $"DELETE FROM {table} t WHERE (t.tableoid, t.ctid) IN ({conflicting}) {Returning(1)}",
-                SpiParameter.Create(error.SqlState), SpiParameter.Create(error.Message)))
+
+            // Each pair of rows that conflict, the earlier first.
+            WorfRows pairs = Worf.Read($"""
+                SELECT a.tableoid, a.ctid::pg_catalog.text, b.tableoid, b.ctid::pg_catalog.text
+                FROM {rows} a JOIN {rows} b ON (a.tableoid, a.ctid) < (b.tableoid, b.ctid) AND {conflicts}
+                """, 0);
+            if (pairs.Count == 0)
             {
                 continue;
             }
 
-            foreach (WorfRow place in Worf.Read($"SELECT DISTINCT tableoid, ctid::pg_catalog.text FROM ({conflicting}) c", 0))
+            // In the table's order, a row is deleted when it conflicts with an earlier row that stays.
+            Dictionary<(uint Table, long Place), List<(uint Table, long Place)>> earlier = [];
+            Dictionary<(uint Table, long Place), string> involved = [];
+            foreach (WorfRow pair in pairs)
             {
-                const string One = "t.tableoid OPERATOR(pg_catalog.=) $1 AND t.ctid OPERATOR(pg_catalog.=) $2::pg_catalog.tid";
-                SpiParameter tableoid = SpiParameter.Create(place.Get<uint>(0));
-                SpiParameter ctid = SpiParameter.Create(place.Get<string>(1));
-                if (!ExceptionLog.TryRecordCopied(change, $"DELETE FROM {table} t WHERE {One} {Returning(3)}", tableoid, ctid,
-                    SpiParameter.Create(error.SqlState), SpiParameter.Create(error.Message)))
+                (uint, long) a = (pair.Get<uint>(0), Position(pair.Get<string>(1)));
+                (uint, long) b = (pair.Get<uint>(2), Position(pair.Get<string>(3)));
+                involved[a] = pair.Get<string>(1);
+                involved[b] = pair.Get<string>(3);
+                if (!earlier.TryGetValue(b, out List<(uint, long)>? list))
                 {
-                    _ = Worf.Execute($"DELETE FROM {table} t WHERE {One}", tableoid, ctid);
-                    WorfLog.Warning("could not record the failed remote change in worf.exception_log");
+                    earlier[b] = list = [];
+                }
+
+                list.Add(a);
+            }
+
+            HashSet<(uint, long)> deleted = [];
+            List<(uint Table, string Tid)> doomed = [];
+            foreach ((uint, long) row in involved.Keys.Order())
+            {
+                if (earlier.TryGetValue(row, out List<(uint, long)>? partners) && partners.Exists(partner => !deleted.Contains(partner)))
+                {
+                    _ = deleted.Add(row);
+                    doomed.Add((row.Item1, involved[row]));
                 }
             }
-        }
 
-        static string Returning(int error) => $"RETURNING pg_catalog.row_to_json(t)::pg_catalog.text, ${error}::pg_catalog.text, ${error + 1}::pg_catalog.text";
+            PgException error = exclusion
+                ? new PgException(PgSqlStates.ExclusionViolation, $"conflicting key value violates exclusion constraint \"{name}\"")
+                : new PgException(PgSqlStates.UniqueViolation, $"duplicate key value violates unique constraint \"{name}\"");
+            foreach ((uint Table, string Tid)[] run in doomed.Chunk(1000))
+            {
+                if (Delete(run))
+                {
+                    continue;
+                }
+
+                foreach ((uint Table, string Tid) one in run)
+                {
+                    if (!Delete([one]))
+                    {
+                        _ = Worf.Execute($"DELETE FROM {table} t WHERE t.tableoid OPERATOR(pg_catalog.=) $1 AND t.ctid OPERATOR(pg_catalog.=) $2::pg_catalog.tid",
+                            SpiParameter.Create(one.Table), SpiParameter.Create(one.Tid));
+                        WorfLog.Warning("could not record the failed remote change in worf.exception_log");
+                    }
+                }
+            }
+
+            bool Delete((uint Table, string Tid)[] run) => ExceptionLog.TryRecordCopied(change, $"""
+                DELETE FROM {table} t USING ROWS FROM (pg_catalog.unnest($1::pg_catalog.oid[]), pg_catalog.unnest($2::pg_catalog.tid[])) AS d (tableoid, place)
+                WHERE t.tableoid OPERATOR(pg_catalog.=) d.tableoid AND t.ctid OPERATOR(pg_catalog.=) d.place
+                RETURNING (SELECT pg_catalog.json_object_agg(e.key, e.value) FROM pg_catalog.json_each_text(pg_catalog.row_to_json(t)) e)::pg_catalog.text,
+                    $3::pg_catalog.text, $4::pg_catalog.text
+                """,
+                SpiParameter.Create(run.Select(row => row.Table).ToArray()), SpiParameter.Create(run.Select(row => row.Tid).ToArray()),
+                SpiParameter.Create(error.SqlState), SpiParameter.Create(error.Message));
+        }
     }
+
+    // The text of a row's keys, k0, k1 and so on after a prefix, as PostgreSQL shows a key in an error's detail.
+    private static string KeyText(int keys, string prefix)
+        => $"pg_catalog.concat_ws(', ', {string.Join(", ", Enumerable.Range(0, keys).Select(k => $"COALESCE({prefix}{k}::pg_catalog.text, 'null')"))})";
+
+    // An index's keys as PostgreSQL names them in an error's detail.
+    private static string KeyColumns(string?[] keys) => string.Join(", ", keys);
 
     /// <summary>
     /// Fails with a unique violation when two of a table's rows hold the same values in a deferrable unique index, as
@@ -1995,9 +2053,12 @@ internal static class Sync
             }
 
             string where = conditions.Count == 0 ? "" : $" WHERE {string.Join(" AND ", conditions)}";
-            if (Worf.ReadScalar<bool>($"SELECT EXISTS (SELECT FROM {table}{where} GROUP BY {string.Join(", ", keys)} HAVING pg_catalog.count(*) > 1)"))
+            string? duplicate = Worf.ReadScalar<string?>(
+                $"SELECT {KeyText(keys.Length, "d.k")} FROM (SELECT {string.Join(", ", keys.Select((key, k) => $"{key} AS k{k}"))} FROM {table}{where}) d GROUP BY {string.Join(", ", keys.Select((_, k) => $"d.k{k}"))} HAVING pg_catalog.count(*) > 1 LIMIT 1");
+            if (duplicate is not null)
             {
-                throw new PgException(PgSqlStates.UniqueViolation, $"duplicate key value violates unique constraint \"{index.Get<string>(0)}\"");
+                throw new PgException(PgSqlStates.UniqueViolation, $"duplicate key value violates unique constraint \"{index.Get<string>(0)}\"",
+                    detail: $"Key ({KeyColumns(index.Get<string?[]>(2))})=({duplicate}) already exists.");
             }
         }
     }
@@ -2028,9 +2089,13 @@ internal static class Sync
             string where = constraint.Get<string?>(3) is string predicate ? $" WHERE ({predicate})" : "";
             string rows = $"(SELECT tableoid, ctid, {string.Join(", ", keys.Select((key, k) => $"({key}) AS k{k}"))} FROM {table}{where})";
             string conflicts = string.Join(" AND ", operators.Select((op, k) => $"a.k{k} {op} b.k{k}"));
-            if (Worf.ReadScalar<bool>($"SELECT EXISTS (SELECT FROM {rows} a JOIN {rows} b ON (a.tableoid, a.ctid) <> (b.tableoid, b.ctid) AND {conflicts})"))
+            WorfRows pair = Worf.Read(
+                $"SELECT {KeyText(keys.Length, "b.k")}, {KeyText(keys.Length, "a.k")} FROM {rows} a JOIN {rows} b ON (a.tableoid, a.ctid) < (b.tableoid, b.ctid) AND {conflicts} LIMIT 1", 1);
+            if (pair.Count > 0)
             {
-                throw new PgException(PgSqlStates.ExclusionViolation, $"conflicting key value violates exclusion constraint \"{constraint.Get<string>(0)}\"");
+                string columns = KeyColumns(keys);
+                throw new PgException(PgSqlStates.ExclusionViolation, $"conflicting key value violates exclusion constraint \"{constraint.Get<string>(0)}\"",
+                    detail: $"Key ({columns})=({pair[0].Get<string>(0)}) conflicts with existing key ({columns})=({pair[0].Get<string>(1)}).");
             }
         }
     }

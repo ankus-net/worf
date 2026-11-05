@@ -78,7 +78,7 @@ internal static unsafe class ApplySpi
 
         cmd.Append(')');
 
-        ExecuteComposed(cmd.ToString(), args);
+        ExecuteComposed(rel, cmd.ToString(), args);
     }
 
     /// <summary>
@@ -140,7 +140,7 @@ internal static unsafe class ApplySpi
             narg++;
         }
 
-        ExecuteComposed(cmd.ToString(), args);
+        ExecuteComposed(rel, cmd.ToString(), args);
     }
 
     /// <summary>
@@ -177,14 +177,16 @@ internal static unsafe class ApplySpi
             narg++;
         }
 
-        ExecuteComposed(cmd.ToString(), args);
+        ExecuteComposed(rel, cmd.ToString(), args);
     }
 
     /// <summary>
     /// Runs a statement composed of quoted names, parameter references and the key's operators, which come from the
     /// catalog, under the session's search path, for the triggers it fires.
     /// </summary>
-    private static void ExecuteComposed(string sql, List<SpiParameter> args) => _ = Worf.ExecuteUnpinned(sql, [.. args]);
+    // Each statement starts a writer of the relation, whose deferrable constraints' rechecks fire for its rows.
+    private static void ExecuteComposed(WorfRelation rel, string sql, List<SpiParameter> args)
+        => _ = rel.HasRechecks ? ReplicaRechecks.Firing(rel.Reloid, () => Worf.ExecuteUnpinned(sql, [.. args])) : Worf.ExecuteUnpinned(sql, [.. args]);
 
     /// <summary>
     /// Gets the equality operators of a table's replica identity index, which the statements name with their schemas, as

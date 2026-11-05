@@ -1482,9 +1482,11 @@ public sealed partial class ExceptionBehaviourTests
     }
 
     /// <summary>
-    /// Deferrable unique and exclusion constraints, whose rechecks don't fire under session_replication_role replica,
-    /// hold for the rows apply and the copy write: rows that conflict with none apply, and under discard, a change that
-    /// conflicts is skipped and recorded, and so is a copied row that conflicts with an earlier one.
+    /// Deferrable unique and exclusion constraints, whose rechecks don't fire under session_replication_role replica
+    /// unless worf has them, hold for the rows apply and the copy write: rows that conflict with none apply, and under
+    /// discard, a change that conflicts is skipped and recorded, and so is a copied row that conflicts with an earlier
+    /// one. Apply waits for a transaction here that wrote a conflicting row, and constraints on expressions and with
+    /// predicates hold as well.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -1496,12 +1498,15 @@ public sealed partial class ExceptionBehaviourTests
         _ = await provider.SafePsqlAsync(Database, """
             CREATE TABLE dk (id integer PRIMARY KEY, email text);
             CREATE TABLE dx (id integer PRIMARY KEY, r int4range);
+            CREATE TABLE dr (id integer PRIMARY KEY, r int4range);
             INSERT INTO dk VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'c');
+            INSERT INTO dr VALUES (1, '[1,3)'), (2, '[2,4)'), (3, '[3,5)'), (4, '[10,12)');
             SELECT * FROM worf.replication_set_add_all_tables('default', '{public}');
             """, token);
         _ = await subscriber.SafePsqlAsync(Database, """
             CREATE TABLE dk (id integer PRIMARY KEY, email text UNIQUE DEFERRABLE);
             CREATE TABLE dx (id integer PRIMARY KEY, r int4range, EXCLUDE USING gist (r WITH &&) DEFERRABLE INITIALLY DEFERRED);
+            CREATE TABLE dr (id integer PRIMARY KEY, r int4range, EXCLUDE USING gist (r WITH &&) DEFERRABLE);
             """, token);
         await SetBehaviourAsync(subscriber, "discard", token);
         _ = await subscriber.SafePsqlAsync(Database, $"""
@@ -1514,6 +1519,15 @@ public sealed partial class ExceptionBehaviourTests
         Assert.AreEqual("1|a,2|b,3|c", await subscriber.SafePsqlAsync(Database,
             "SELECT string_agg(concat_ws('|', id, email), ',' ORDER BY id) FROM dk", token), "dk's copy");
 
+        // Of copied rows that conflict, only those that conflict with an earlier row that stays go, as rows checked one
+        // after another would: [3,5) conflicts only with [2,4), which goes. A row that goes is recorded with its columns'
+        // text, as the copy's other rows are.
+        Assert.AreEqual("1,3,4|COPY|2|[2,4)|string", await subscriber.SafePsqlAsync(Database, """
+            SELECT (SELECT string_agg(id::text, ',' ORDER BY id) FROM dr), operation, remote_new_tuple->>'id', remote_new_tuple->>'r',
+                jsonb_typeof(remote_new_tuple->'id')
+            FROM worf.exception_log WHERE table_name = 'dr'
+            """, token), "dr's copy");
+
         _ = await provider.SafePsqlAsync(Database, "INSERT INTO dx SELECT g, int4range(g * 10, g * 10 + 5) FROM generate_series(1, 1000) g", token);
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT count(*) = 1000 FROM dx", token), "dx's rows that conflict with none");
         _ = await provider.SafePsqlAsync(Database, "UPDATE dk SET email = 'a' WHERE id = 2", token);
@@ -1525,8 +1539,57 @@ public sealed partial class ExceptionBehaviourTests
             "SELECT (SELECT email FROM dk WHERE id = 2), (SELECT count(*) FROM dx)", token), "the rows the conflicting changes left");
         Assert.AreEqual("COPY|dk|4|23505,UPDATE|dk|2|23505,INSERT|dx|1001|23P01", await subscriber.SafePsqlAsync(Database, """
             SELECT string_agg(concat_ws('|', operation, table_name, remote_new_tuple->>'id', error_sqlstate), ',' ORDER BY log_id)
-            FROM worf.exception_log
+            FROM worf.exception_log WHERE table_name IN ('dk', 'dx')
             """, token), "the conflicts recorded");
+
+        // A row that a transaction here has written and not yet committed holds its range too: apply's commit waits for
+        // the transaction, as PostgreSQL's recheck does, and once it commits, the conflicting transaction is skipped as
+        // a whole, as a transaction whose commit fails is.
+        await using (NpgsqlConnection local = await subscriber.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction writing = await local.BeginTransactionAsync(token);
+            await using (NpgsqlCommand insert = new("INSERT INTO dx VALUES (2000, int4range(50000, 50010))", local, writing))
+            {
+                _ = await insert.ExecuteNonQueryAsync(token);
+            }
+
+            _ = await provider.SafePsqlAsync(Database, "INSERT INTO dx VALUES (2001, int4range(50005, 50020))", token);
+            Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, """
+                SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+                    WHERE l.locktype = 'transactionid' AND NOT l.granted AND a.backend_type LIKE 'worf apply%')
+                """, token), "apply waiting for the transaction that holds the range");
+            await writing.CommitAsync(token);
+        }
+
+        _ = await provider.SafePsqlAsync(Database, "INSERT INTO dk VALUES (12, 'z')", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM dk WHERE id = 12)", token), "the change after it");
+        Assert.AreEqual("2000|INSERT|dx|2001|23P01", await subscriber.SafePsqlAsync(Database, """
+            SELECT (SELECT string_agg(id::text, ',') FROM dx WHERE id >= 2000),
+                (SELECT string_agg(concat_ws('|', operation, table_name, remote_new_tuple->>'id', error_sqlstate), ',' ORDER BY log_id)
+                    FROM worf.exception_log WHERE table_name = 'dx' AND remote_new_tuple->>'id' = '2001')
+            """, token), "the row here kept, and the replicated one that conflicts with it recorded");
+        _ = await subscriber.SafePsqlAsync(Database, "REINDEX TABLE dx", token);
+
+        // An exclusion constraint on an expression, with a predicate, holds as well, and rows that conflict with none
+        // apply.
+        foreach (TestNode node in new[] { provider, subscriber })
+        {
+            _ = await node.SafePsqlAsync(Database, node == provider
+                ? "CREATE TABLE dz (id integer PRIMARY KEY, lo integer, hi integer)"
+                : "CREATE TABLE dz (id integer PRIMARY KEY, lo integer, hi integer, EXCLUDE USING gist (int4range(lo, hi) WITH &&) WHERE (lo >= 0) DEFERRABLE)",
+                token);
+        }
+
+        _ = await provider.SafePsqlAsync(Database, """
+            SELECT * FROM worf.replication_set_add_table('default', 'dz');
+            INSERT INTO dz SELECT g, g * 10, g * 10 + 5 FROM generate_series(1, 1000) g;
+            INSERT INTO dz VALUES (1001, -5, 100), (1002, 10, 20);
+            """, token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT count(*) = 1001 FROM dz", token), "dz's rows that conflict with none");
+        Assert.AreEqual("INSERT|dz|1002|23P01", await subscriber.SafePsqlAsync(Database, """
+            SELECT string_agg(concat_ws('|', operation, table_name, remote_new_tuple->>'id', error_sqlstate), ',')
+            FROM worf.exception_log WHERE table_name = 'dz'
+            """, token), "dz's conflict recorded");
     }
 
     /// <summary>

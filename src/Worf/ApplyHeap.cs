@@ -110,40 +110,6 @@ internal static unsafe class ApplyHeap
     }
 
     /// <summary>
-    /// Checks a row apply wrote against the relation's deferrable unique and exclusion constraints, whose rechecks it
-    /// doesn't get, and fails as their rechecks would at commit. A column the change didn't send, as an unchanged
-    /// TOAST value, is null to the check.
-    /// </summary>
-    /// <param name="rel">The relation.</param>
-    /// <param name="newtup">The row written.</param>
-    internal static void CheckDeferrable(WorfRelation rel, WorfTupleData newtup)
-    {
-        if (rel.DeferrableChecks is null)
-        {
-            return;
-        }
-
-        NativeMethods.CommandCounterIncrement();
-        RelationData* relation = rel.Rel;
-        HeapTupleData* tuple = FormTuple(relation, newtup);
-        foreach ((string name, bool exclusion, string query, int[] columns) in rel.DeferrableChecks)
-        {
-            SpiParameter[] values = new SpiParameter[columns.Length];
-            for (int k = 0; k < columns.Length; k++)
-            {
-                values[k] = SpiParameter.Create(ColumnBytes(relation, tuple, columns[k]));
-            }
-
-            if (Worf.ReadScalar<bool>(query, values))
-            {
-                throw exclusion
-                    ? new PgException(PgSqlStates.ExclusionViolation, $"conflicting key value violates exclusion constraint \"{name}\"")
-                    : new PgException(PgSqlStates.UniqueViolation, $"duplicate key value violates unique constraint \"{name}\"");
-            }
-        }
-    }
-
-    /// <summary>
     /// Gives a column's value of a tuple as its type's output, in the database's encoding, or null.
     /// </summary>
     private static byte[]? ColumnBytes(RelationData* relation, HeapTupleData* tuple, int attnum)
@@ -308,7 +274,8 @@ internal static unsafe class ApplyHeap
                 oldest.Writer.Dispose();
             }
 
-            PgRelationWriter writer = PgRelationWriter.Open(rel.Reloid);
+            PgRelationWriter writer = rel.HasRechecks ? ReplicaRechecks.Firing(rel.Reloid, () => PgRelationWriter.Open(rel.Reloid))
+                : PgRelationWriter.Open(rel.Reloid);
             entry = (writer, writer.CreateReplicatedRow(), writer.CreateReplicatedRow(), NativeMethods.RelationGetReplicaIndex(rel.Rel));
             s_writers.Add(rel.Reloid, entry);
             s_writerOrder.Enqueue(rel.Reloid);
