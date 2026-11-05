@@ -1,6 +1,7 @@
 using Npgsql;
 
 using System.Diagnostics;
+using System.Globalization;
 using System.Text.RegularExpressions;
 
 namespace Worf.Tests;
@@ -679,7 +680,8 @@ public sealed partial class ExceptionBehaviourTests
     /// identity or deferrable: the provider's rows replace those with the same key, and the table's other rows stay, those
     /// written here or under another origin, and those the provider has since deleted. Under transdiscard, as under
     /// discard, a row of the copy that a row here holds a unique value of, or that a CHECK constraint here refuses, is
-    /// skipped and recorded under transdiscard, while the others merge and later changes arrive. One cancelled before its copy
+    /// skipped and recorded under transdiscard, while the others merge and later changes arrive, those whose values rows
+    /// the table keeps hold all at once, without a transaction ID each. One cancelled before its copy
     /// commits copies a table without a key once, and the cleanup after it waits for a session that holds its slot, with a
     /// warning, rather than for ever. Dropping the subscription drops the slots its syncs left.
     /// </summary>
@@ -813,6 +815,7 @@ public sealed partial class ExceptionBehaviourTests
             "SELECT sync_status = 'r' FROM worf.local_sync_status WHERE sync_relname = 'status_wait'", token), "status_wait synchronized");
         Assert.AreEqual("1", await subscriber.SafePsqlAsync(Database, "SELECT count(*) FROM status_wait", token), "status_wait's row");
 
+        long mergeFrom = 0;
         foreach (string stop in new[] { "resume", "drop", "zero", "lost", "conflict" })
         {
             string table = $"stopped_{stop}";
@@ -826,7 +829,9 @@ public sealed partial class ExceptionBehaviourTests
             _ = await subscriber.SafePsqlAsync(Database, $"CREATE TABLE {table} (id {key}, v text)", token);
             if (stop == "conflict")
             {
+                _ = await provider.SafePsqlAsync(Database, $"ALTER TABLE {table} ADD COLUMN u integer", token);
                 _ = await subscriber.SafePsqlAsync(Database, $"""
+                    ALTER TABLE {table} ADD COLUMN u integer UNIQUE;
                     CREATE UNIQUE INDEX {table}_v ON {table} (v) WHERE v <> 'copied';
                     ALTER TABLE {table} ADD CHECK (id <> 700000);
                     """, token);
@@ -934,9 +939,16 @@ public sealed partial class ExceptionBehaviourTests
                 case "conflict":
                     // The copy again merges row 500's new value, which a row here holds, and row 700000, which a CHECK
                     // constraint here refuses, so under transdiscard, as under discard, those rows are skipped, and
-                    // recorded under transdiscard, while the others merge.
-                    _ = await provider.SafePsqlAsync(Database, $"SELECT pg_drop_replication_slot('{syncSlot}')", token);
+                    // recorded under transdiscard, while the others merge. Rows 1 to 300 take values of u that rows here
+                    // the provider doesn't have hold, and are skipped at once, without a transaction ID each.
+                    _ = await provider.SafePsqlAsync(Database, $"""
+                        UPDATE {table} SET u = id + 2000 WHERE id <= 300;
+                        SELECT pg_drop_replication_slot('{syncSlot}');
+                        """, token);
+                    _ = await subscriber.SafePsqlAsync(Database, $"INSERT INTO {table} SELECT g, 'held ' || g, g - 798000 FROM generate_series(800001, 800300) g", token);
                     await SetBehaviourAsync(subscriber, "transdiscard", token);
+                    mergeFrom = long.Parse(await subscriber.SafePsqlAsync(Database, "SELECT pg_snapshot_xmax(pg_current_snapshot())::text", token),
+                        CultureInfo.InvariantCulture);
                     break;
                 case "zero":
                     _ = await subscriber.SafePsqlAsync(Database, $"SELECT pg_replication_origin_advance('{syncSlot}', '0/0')", token);
@@ -970,17 +982,25 @@ public sealed partial class ExceptionBehaviourTests
                     EXISTS (SELECT 1 FROM {table} WHERE id = 600), EXISTS (SELECT 1 FROM {table} WHERE id = 700000),
                     (SELECT v FROM {table} WHERE id = 900001), (SELECT v FROM {table} WHERE id = 900002),
                     (SELECT count(*) FROM {table}_ref)
-                FROM {table} WHERE id < 900000
+                FROM {table} WHERE id < 800000
                 """, token), $"the rows after {stop}");
             Assert.Contains(stop == "resume" ? $"resuming the catch-up of table public.{table}" : $"copying table public.{table} again",
                 subscriber.ReadLog()[logpos..], $"the sync after {stop}");
             if (stop == "conflict")
             {
-                Assert.Contains($"skipped 2 of the rows of the copy of table public.{table}", subscriber.ReadLog()[logpos..]);
+                long merged = long.Parse(await subscriber.SafePsqlAsync(Database, "SELECT pg_snapshot_xmax(pg_current_snapshot())::text", token),
+                    CultureInfo.InvariantCulture) - mergeFrom;
+                Assert.Contains($"skipped 302 of the rows of the copy of table public.{table}", subscriber.ReadLog()[logpos..]);
                 Assert.AreEqual("MERGE|500|updated|23505|transdiscard\nMERGE|700000|new|23514|transdiscard", await subscriber.SafePsqlAsync(Database, $"""
                     SELECT operation, remote_new_tuple->>'id', remote_new_tuple->>'v', error_sqlstate, behaviour FROM worf.exception_log
-                    WHERE table_name = '{table}' ORDER BY (remote_new_tuple->>'id')::integer
+                    WHERE table_name = '{table}' AND remote_new_tuple->>'u' IS NULL ORDER BY (remote_new_tuple->>'id')::integer
                     """, token), "the skipped rows recorded");
+                Assert.AreEqual($"300|300|300|duplicate key value violates unique constraint \"{table}_u_key\"", await subscriber.SafePsqlAsync(Database, $"""
+                    SELECT count(*), (SELECT count(*) FROM {table} WHERE id <= 300 AND u IS NULL), (SELECT count(*) FROM {table} WHERE v LIKE 'held %'),
+                        string_agg(DISTINCT error_message, ',')
+                    FROM worf.exception_log WHERE table_name = '{table}' AND (remote_new_tuple->>'u')::integer > 2000
+                    """, token), "the rows whose values rows here held, recorded, and the rows they'd have replaced and the rows that held them");
+                Assert.IsLessThan(150L, merged, "transaction IDs the merge took for 300 rows whose values rows here held");
 
                 // The changes after the copy still arrive.
                 _ = await provider.SafePsqlAsync(Database, $"UPDATE {table} SET v = 'later' WHERE id = 501", token);
@@ -1108,7 +1128,8 @@ public sealed partial class ExceptionBehaviourTests
     /// and those whose values its column types refuse, without a transaction ID each, recording them in order with the
     /// provider's row numbers, while a duplicate key, which only COPY finds, still fails its batch's COPY alone. An error
     /// that ends a copy in batches names the provider's row. Under transdiscard, the rows are recorded as its own. Rows
-    /// that a BEFORE ROW trigger fills in, or whose generated column a CHECK names, copy as COPY would copy them.
+    /// that a BEFORE ROW trigger fills in, or whose generated column a CHECK names, copy as COPY would copy them. Rows
+    /// whose keys the table already holds are left out of COPY and recorded without a transaction ID each too.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -1128,7 +1149,7 @@ public sealed partial class ExceptionBehaviourTests
             "CREATE TABLE f (id integer PRIMARY KEY CHECK (id % 5 <> 0), v integer NOT NULL, w varchar(2), k integer UNIQUE)", token);
         await SetBehaviourAsync(subscriber, "discard", token);
         long before = long.Parse(await subscriber.SafePsqlAsync(Database, "SELECT pg_snapshot_xmax(pg_current_snapshot())::text", token),
-            System.Globalization.CultureInfo.InvariantCulture);
+            CultureInfo.InvariantCulture);
         _ = await subscriber.SafePsqlAsync(Database, $"""
             SELECT worf.create_subscription(subscription_name := 'sub', provider_dsn := '{provider.Dsn(Database, SuperUser)}',
                 synchronize_structure := false, synchronize_data := true)
@@ -1138,7 +1159,7 @@ public sealed partial class ExceptionBehaviourTests
             "SELECT EXISTS (SELECT 1 FROM worf.local_sync_status) AND NOT EXISTS (SELECT 1 FROM worf.local_sync_status WHERE sync_status <> 'r')", token),
             "the copy");
         long used = long.Parse(await subscriber.SafePsqlAsync(Database, "SELECT pg_snapshot_xmax(pg_current_snapshot())::text", token),
-            System.Globalization.CultureInfo.InvariantCulture) - before;
+            CultureInfo.InvariantCulture) - before;
 
         // The 272 multiples of 11 fail to read, the 390 more of 7 have a null in a NOT NULL column, the 468 more of 5 fail
         // the CHECK, and row 2501 duplicates row 1's key.
@@ -1217,6 +1238,30 @@ public sealed partial class ExceptionBehaviourTests
             SELECT (SELECT count(*) FROM tr), (SELECT count(*) FROM tr WHERE v = 0), (SELECT count(*) FROM gen),
                 (SELECT count(*) FROM worf.exception_log WHERE table_name IN ('tr', 'gen'))
             """, token), "the rows the trigger fills and those the generated column's CHECK passes");
+
+        // Rows whose keys the table already holds are left out of their batches' COPY and recorded with the error COPY
+        // raises, without a transaction ID each.
+        _ = await provider.SafePsqlAsync(Database, """
+            CREATE TABLE held (id integer PRIMARY KEY, v text);
+            INSERT INTO held SELECT g, 'provider' FROM generate_series(1, 3000) g;
+            """, token);
+        _ = await subscriber.SafePsqlAsync(Database, """
+            CREATE TABLE held (id integer PRIMARY KEY, v text);
+            INSERT INTO held SELECT g, 'here' FROM generate_series(2, 3000, 2) g;
+            """, token);
+        before = long.Parse(await subscriber.SafePsqlAsync(Database, "SELECT pg_snapshot_xmax(pg_current_snapshot())::text", token),
+            CultureInfo.InvariantCulture);
+        _ = await provider.SafePsqlAsync(Database, "SELECT * FROM worf.replication_set_add_table('default', 'held', synchronize_data := true)", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+            "SELECT sync_status = 'r' FROM worf.local_sync_status WHERE sync_relname = 'held'", token), "held's copy");
+        used = long.Parse(await subscriber.SafePsqlAsync(Database, "SELECT pg_snapshot_xmax(pg_current_snapshot())::text", token),
+            CultureInfo.InvariantCulture) - before;
+        Assert.AreEqual("1500|1500|1500|duplicate key value violates unique constraint \"held_pkey\"", await subscriber.SafePsqlAsync(Database, """
+            SELECT (SELECT count(*) FROM held WHERE v = 'provider'), (SELECT count(*) FROM held WHERE v = 'here'), count(*),
+                string_agg(DISTINCT error_message, ',')
+            FROM worf.exception_log WHERE table_name = 'held' AND error_sqlstate = '23505'
+            """, token), "the rows copied, those held, and those recorded");
+        Assert.IsLessThan(60L, used, "transaction IDs the copy took for 1,500 rows whose keys were held");
     }
 
     /// <summary>
@@ -1379,10 +1424,10 @@ public sealed partial class ExceptionBehaviourTests
         try
         {
             string[] stat = File.ReadAllText($"/proc/{pid}/stat").Split(')')[1].Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            double cpu = (double.Parse(stat[11], System.Globalization.CultureInfo.InvariantCulture) +
-                double.Parse(stat[12], System.Globalization.CultureInfo.InvariantCulture)) / 100.0;
+            double cpu = (double.Parse(stat[11], CultureInfo.InvariantCulture) +
+                double.Parse(stat[12], CultureInfo.InvariantCulture)) / 100.0;
             long rss = File.ReadAllLines($"/proc/{pid}/status").Where(line => line.StartsWith("RssAnon:", StringComparison.Ordinal))
-                .Select(line => long.Parse(line.Split(' ', StringSplitOptions.RemoveEmptyEntries)[1], System.Globalization.CultureInfo.InvariantCulture))
+                .Select(line => long.Parse(line.Split(' ', StringSplitOptions.RemoveEmptyEntries)[1], CultureInfo.InvariantCulture))
                 .FirstOrDefault();
             return (cpu, rss);
         }

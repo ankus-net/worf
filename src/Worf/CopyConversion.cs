@@ -70,6 +70,12 @@ internal static unsafe partial class CopyConversion
     // behaviour, and the copied columns' names.
     private static WorfFailedChange? s_change;
     private static WorfExceptionBehaviour s_behaviour;
+
+    // The target's immediate unique indexes that a batch's rows are checked against before its COPY under discard and
+    // transdiscard: each one's name and key columns, the fields of its key in the copy's rows, and the query that finds
+    // the rows whose keys the table holds or an earlier row of the batch takes; and the keys' text as it's checked.
+    private static readonly List<(string Name, string Columns, int[] Fields, string Query)> s_heldKeyChecks = [];
+    private static byte[] s_keyText = [];
     private static List<string> s_columns = [];
 
     // A row or merge that failed under sub_disable, which disables the subscription once the copy rolls back.
@@ -252,7 +258,7 @@ internal static unsafe partial class CopyConversion
                     }
 
                     WorfLog.Log($"copying table {rel.Nspname}.{rel.Relname} again in batches, as a row failed: {error.Message}");
-                    copied = CopyInBatches(pstate, relation, attnamelist);
+                    copied = CopyInBatches(pstate, relation, attnamelist, attnames);
                 }
             }
 
@@ -358,11 +364,12 @@ internal static unsafe partial class CopyConversion
     /// row that COPY fails one or two more, for the rows before it copied again and those after it; a row whose value
     /// fails to convert takes none.
     /// </summary>
-    private static ulong CopyInBatches(ParseState* pstate, RelationData* relation, List* attnamelist)
+    private static ulong CopyInBatches(ParseState* pstate, RelationData* relation, List* attnamelist, List<string> attnames)
     {
         s_ended = false;
         s_batchLine = 1;
         ulong copied = 0;
+        PrepareHeldKeyChecks(relation, attnames);
         while (!s_ended)
         {
             s_batchRows.Clear();
@@ -388,6 +395,7 @@ internal static unsafe partial class CopyConversion
             }
 
             ConvertBatch();
+            LeaveOutHeldKeys();
             copied += CopyBatch(pstate, relation, attnamelist, 0, s_batchConverted.Count);
 
             // The batch's rows that failed are recorded in order, whether they failed to convert or COPY failed them, a
@@ -414,6 +422,170 @@ internal static unsafe partial class CopyConversion
         }
 
         return copied;
+    }
+
+    /// <summary>
+    /// Finds the target's immediate unique indexes on columns the copy writes, without expressions or a predicate, whose
+    /// keys a batch's rows are checked against before its COPY under discard and transdiscard: COPY fails a row whose
+    /// key the table holds, which then costs the transaction IDs of the batch's subtransactions that fail and copy its
+    /// rows again.
+    /// </summary>
+    private static void PrepareHeldKeyChecks(RelationData* relation, List<string> attnames)
+    {
+        s_heldKeyChecks.Clear();
+        if (s_behaviour is not (WorfExceptionBehaviour.Discard or WorfExceptionBehaviour.Transdiscard))
+        {
+            return;
+        }
+
+        uint reloid = relation->rd_id;
+        string table = (relation->rd_rel->relkind == (sbyte)'p' ? "" : "ONLY ") + Worf.QuoteQualifiedIdentifier(
+            Worf.FromServer(NativeMethods.get_namespace_name(relation->rd_rel->relnamespace)), Worf.FromServer(NativeMethods.get_rel_name(reloid)));
+        WorfRows indexes = Worf.Read("""
+            SELECT i.indexrelid, x.relname::pg_catalog.text, i.indnullsnotdistinct, pg_catalog.array_agg(a.attnum ORDER BY k.n),
+                pg_catalog.array_agg(a.attname::pg_catalog.text ORDER BY k.n), pg_catalog.array_agg(pg_catalog.format_type(a.atttypid, NULL) ORDER BY k.n)
+            FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class x ON x.oid = i.indexrelid
+                CROSS JOIN LATERAL pg_catalog.unnest(i.indkey::pg_catalog.int2[]) WITH ORDINALITY AS k (attnum, n)
+                JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+            WHERE i.indrelid = $1 AND i.indisunique AND i.indimmediate AND i.indisvalid AND i.indislive AND i.indpred IS NULL
+                AND i.indexprs IS NULL AND k.n <= i.indnkeyatts
+            GROUP BY i.indexrelid, x.relname, i.indnullsnotdistinct
+            """, 0, SpiParameter.Create(reloid));
+        foreach (WorfRow index in indexes)
+        {
+            short[] attnums = index.Get<short[]>(3);
+            string[] columns = index.Get<string[]>(4);
+            string[] types = index.Get<string[]>(5);
+            int[] fields = [.. columns.Select(column => attnames.IndexOf(column))];
+            Dictionary<short, string> operators = Worf.KeyEqualityOperators(index.Get<uint>(0));
+            if (Array.Exists(fields, field => field < 0) || !Array.TrueForAll(attnums, operators.ContainsKey))
+            {
+                continue;
+            }
+
+            bool nullsEqual = index.Get<bool>(2);
+            string Equal(string left, string right, int k) => nullsEqual
+                ? $"({left} {operators[attnums[k]]} {right} OR ({left} IS NULL AND {right} IS NULL))"
+                : $"{left} {operators[attnums[k]]} {right}";
+            IEnumerable<int> keys = Enumerable.Range(0, columns.Length);
+
+            // The batch's rows whose keys the table holds, and those whose keys an earlier row of the batch takes, with
+            // the earlier row, each with its key as PostgreSQL shows it.
+            string query = $"""
+                WITH u AS (
+                    SELECT {string.Join(", ", keys.Select(k => $"r.k{k}::{types[k]} AS k{k}"))}, r.n
+                    FROM ROWS FROM ({string.Join(", ", keys.Select(k => $"pg_catalog.unnest(${k + 1}::pg_catalog.text[])"))},
+                        pg_catalog.unnest(${columns.Length + 1}::pg_catalog.int4[])) AS r ({string.Join(", ", keys.Select(k => $"k{k}"))}, n))
+                SELECT b.n, -1, {Sync.KeyText(columns.Length, "b.k")} FROM u b
+                WHERE EXISTS (SELECT FROM {table} t WHERE {string.Join(" AND ", keys.Select(k => Equal($"t.{Worf.QuoteIdentifier(columns[k])}", $"b.k{k}", k)))})
+                UNION ALL
+                SELECT b.n, a.n, {Sync.KeyText(columns.Length, "b.k")} FROM u a JOIN u b ON a.n OPERATOR(pg_catalog.<) b.n
+                    AND {string.Join(" AND ", keys.Select(k => Equal($"a.k{k}", $"b.k{k}", k)))}
+                """;
+            s_heldKeyChecks.Add((index.Get<string>(1), string.Join(", ", columns.Select(Worf.QuoteIdentifier)), fields, query));
+        }
+    }
+
+    /// <summary>
+    /// Leaves out of a batch's COPY its rows whose keys the table already holds in one of the indexes
+    /// <see cref="PrepareHeldKeyChecks"/> found, or an earlier row of the batch that's copied takes, and keeps them to
+    /// record with the error COPY would raise, so that they cost no subtransaction. A row that the check can't read, as
+    /// one whose key's text its type doesn't take, or that a key written since fails, as one a concurrent transaction
+    /// writes, is left for COPY to fail.
+    /// </summary>
+    private static void LeaveOutHeldKeys()
+    {
+        if (s_heldKeyChecks.Count == 0 || s_batchConverted.Count == 0)
+        {
+            return;
+        }
+
+        HashSet<int> left = [];
+        foreach ((string name, string columns, int[] fields, string query) in s_heldKeyChecks)
+        {
+            List<int> rows = [.. Enumerable.Range(0, s_batchConverted.Count).Where(row => !left.Contains(row))];
+            List<(int Start, int Length)>[] texts = [.. fields.Select(_ => new List<(int Start, int Length)>(rows.Count))];
+            int used = 0;
+            foreach (int row in rows)
+            {
+                (int start, int length, int _) = s_batchConverted[row];
+                ReadOnlySpan<byte> text = s_batchText.AsSpan(start, length);
+                if (text.Length > 0 && text[^1] == (byte)'\n')
+                {
+                    text = text[..^1];
+                }
+
+                for (int k = 0; k < fields.Length; k++)
+                {
+                    ReadOnlySpan<byte> raw = Field(text, fields[k]);
+                    if (raw.SequenceEqual("\\N"u8))
+                    {
+                        texts[k].Add((0, -1));
+                        continue;
+                    }
+
+                    int unescaped = Unescape(raw);
+                    Reserve(ref s_keyText, used, unescaped);
+                    new ReadOnlySpan<byte>(s_text, unescaped).CopyTo(s_keyText.AsSpan(used));
+                    texts[k].Add((used, unescaped));
+                    used += unescaped;
+                }
+            }
+
+            WorfRows found;
+            try
+            {
+                found = PgTransaction.RunInSubtransaction(() => Worf.Read(query, 0,
+                    [.. texts.Select(keys => Worf.TextArrayParameter(s_keyText, keys)), SpiParameter.Create(rows.ToArray())]), PgSubtransactionMode.Atomic);
+            }
+            catch (PgException error) when (!Apply.IsTransient(error))
+            {
+                continue;
+            }
+
+            // In the batch's order, a row is left out when the table holds its key, or an earlier row that's copied
+            // takes it.
+            foreach (IGrouping<int, WorfRow> row in found.GroupBy(match => match.Get<int>(0)).OrderBy(group => group.Key))
+            {
+                if (row.Any(match => match.Get<int>(1) < 0 || !left.Contains(match.Get<int>(1))))
+                {
+                    _ = left.Add(row.Key);
+                    int provider = s_batchConverted[row.Key].Row;
+                    s_batchFailed.Add((s_batchLine + (ulong)provider, provider, new PgException(PgSqlStates.UniqueViolation,
+                        $"duplicate key value violates unique constraint \"{name}\"",
+                        detail: $"Key ({columns})=({row.First().Get<string>(2)}) already exists.")));
+                }
+            }
+        }
+
+        if (left.Count > 0)
+        {
+            int kept = 0;
+            for (int row = 0; row < s_batchConverted.Count; row++)
+            {
+                if (!left.Contains(row))
+                {
+                    s_batchConverted[kept++] = s_batchConverted[row];
+                }
+            }
+
+            s_batchConverted.RemoveRange(kept, s_batchConverted.Count - kept);
+        }
+    }
+
+    /// <summary>
+    /// A field of a row in COPY's text format, by its place.
+    /// </summary>
+    private static ReadOnlySpan<byte> Field(ReadOnlySpan<byte> row, int field)
+    {
+        for (int i = 0; i < field; i++)
+        {
+            int tab = row.IndexOf((byte)'\t');
+            row = tab < 0 ? [] : row[(tab + 1)..];
+        }
+
+        int end = row.IndexOf((byte)'\t');
+        return end < 0 ? row : row[..end];
     }
 
     /// <summary>

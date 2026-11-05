@@ -121,8 +121,14 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   the start in batches of up to a thousand rows and 8 MB, each in its own
   subtransaction, which take a transaction ID each and go on past each row that
   fails: a row whose value doesn't convert is left out before the batch is
-  copied, and a row that the column's input or a constraint refuses has the
-  rows before it copied again. The rows that fail are recorded in runs of up to
+  copied, as is a row whose key one of the table's immediate unique indexes
+  without expressions or a predicate already holds, or an earlier row of the
+  batch takes, and a row that its column's input, a `NOT NULL` column or a
+  `CHECK` constraint refuses is left out as the batch is copied, unless a
+  `BEFORE ROW` trigger or a generated column could change it first. A row
+  that `COPY` refuses otherwise, as one whose key a concurrent transaction
+  writes, or that a foreign key or a trigger refuses, has the batch's rows
+  before it copied again. The rows that fail are recorded in runs of up to
   a thousand rows and 8 MB, in order. A deferrable unique or exclusion
   constraint, whose recheck doesn't fire as the copy writes, is checked once
   the table has copied: a conflict fails the copy under `error`, disables the
