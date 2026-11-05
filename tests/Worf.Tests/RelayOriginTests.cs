@@ -442,8 +442,16 @@ public sealed class RelayOriginTests
             await Task.Delay(left, token);
         }
 
-        await WriteAsAsync(provider, $"{back}@9006", "INSERT INTO d VALUES (17, '9006')", token);
-        await WriteAsAsync(provider, $"{back}@9006", "INSERT INTO d VALUES (18, '9006')", token);
+        // Two transactions under the node's origin, on one session, as a session that ended may still hold the origin.
+        await using (NpgsqlConnection writing = await provider.OpenAsync(Database, token))
+        {
+            foreach (string sql in new[] { $"SELECT pg_replication_origin_session_setup('{back}@9006')", "INSERT INTO d VALUES (17, '9006')", "INSERT INTO d VALUES (18, '9006')" })
+            {
+                await using NpgsqlCommand command = new(sql, writing);
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+        }
+
         await Task.Delay(TimeSpan.FromSeconds(2), token);
         Assert.AreEqual("0|" + records, await subscriber.SafePsqlAsync(Database,
             "SELECT (SELECT count(*) FROM d WHERE id IN (17, 18)), (SELECT count(*) FROM worf.origin_writer)", token),
