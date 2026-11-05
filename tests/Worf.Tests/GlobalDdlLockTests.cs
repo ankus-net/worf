@@ -810,6 +810,8 @@ public sealed class GlobalDdlLockTests
         // Replicated SQL that writes duplicate keys to a table with a unique index on node_b alone stops apply there,
         // rather than drop the index, until the index goes. Transaction control in replicated SQL fails, and SQL
         // queued with it before applies without it.
+        int insertedAtA = nodeA.ReadLog().Length;
+        int insertedAtB = nodeB.ReadLog().Length;
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.replicate_ddl_command('INSERT INTO lx.lu VALUES (7), (7)')", token);
         Assert.IsTrue(await nodeB.PollLogAsync(logStart, "duplicate key value violates unique constraint \"lu_l\"", token), "node_b's apply stopped");
         Assert.AreEqual("lx.lu_l", await nodeB.SafePsqlAsync(Database, "SELECT to_regclass('lx.lu_l')::text", token));
@@ -819,6 +821,10 @@ public sealed class GlobalDdlLockTests
             node_a's rows on node_b
             {await nodeB.DescribeReplicationAsync(Database, token)}
             {await nodeA.DescribeReplicationAsync(Database, token)}
+            node_b's log since the insert:
+            {nodeB.ReadLog()[insertedAtB..]}
+            node_a's log since the insert:
+            {nodeA.ReadLog()[insertedAtA..]}
             """);
         Assert.DoesNotContain("dropped index", nodeB.ReadLog()[logStart..]);
         foreach (string sql in new[] { "CREATE TABLE public.c1 (a integer); COMMIT", "SAVEPOINT s; CREATE TABLE public.c1 (a integer)" })

@@ -396,11 +396,15 @@ public sealed class ColumnTypeTests
             SELECT concat_ws('|', behaviour, operation, action_counter, remote_new_tuple->>'id', error_sqlstate)
             FROM worf.exception_log WHERE table_name = 'dt'
             """, token));
-        Assert.AreEqual(0, CountOccurrences(subscriber.ReadLog()[logpos..], "copying table public.dt again"));
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT NOT sub_enabled FROM worf.subscription", token), "sub wasn't disabled");
+
+        // A sync worker says it disabled its subscription once that has committed, so the message may reach the log
+        // after a query sees the subscription disabled.
+        Assert.IsTrue(await subscriber.PollLogAsync(logpos, "disabling subscription textsub after a row of table public.dt failed in its copy", token),
+            "textsub's message");
+        Assert.IsTrue(await subscriber.PollLogAsync(logpos, "disabling subscription sub after a row of table public.", token), "sub's message");
         string disabled = subscriber.ReadLog()[logpos..];
-        Assert.Contains("disabling subscription textsub after a row of table public.dt failed in its copy", disabled);
-        Assert.Contains("disabling subscription sub after a row of table public.", disabled);
+        Assert.AreEqual(0, CountOccurrences(disabled, "copying table public.dt again"));
         Assert.DoesNotContain("failed to convert", disabled);
 
         // The subscriptions' first syncs, which their sequence range exchanges can get ahead of, logged no failure for

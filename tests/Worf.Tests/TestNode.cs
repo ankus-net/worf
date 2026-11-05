@@ -284,7 +284,7 @@ internal sealed class TestNode : IAsyncDisposable
                 WHERE pid <> pg_catalog.pg_backend_pid() ORDER BY pid
                 """),
             ("waiting locks", "SELECT pid, locktype, relation::pg_catalog.regclass, transactionid, mode FROM pg_catalog.pg_locks WHERE NOT granted"),
-            ("subscriptions", "SELECT * FROM worf.show_subscription_status()"),
+            ("subscriptions", "SELECT subscription_name, status, provider_node, slot_name, replication_sets::text, forward_origins::text FROM worf.show_subscription_status()"),
             ("slots", "SELECT slot_name, active, active_pid, restart_lsn, confirmed_flush_lsn FROM pg_catalog.pg_replication_slots"),
             ("origins", "SELECT * FROM pg_catalog.pg_replication_origin_status"),
         })
