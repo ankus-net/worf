@@ -814,7 +814,12 @@ public sealed class GlobalDdlLockTests
         Assert.IsTrue(await nodeB.PollLogAsync(logStart, "duplicate key value violates unique constraint \"lu_l\"", token), "node_b's apply stopped");
         Assert.AreEqual("lx.lu_l", await nodeB.SafePsqlAsync(Database, "SELECT to_regclass('lx.lu_l')::text", token));
         _ = await nodeB.SafePsqlAsync(Database, "DROP INDEX lx.lu_l", token);
-        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT count(*) = 2 FROM lx.lu WHERE a = 7", token), "node_a's rows on node_b");
+        bool applied = await nodeB.PollQueryUntilAsync(Database, "SELECT count(*) = 2 FROM lx.lu WHERE a = 7", token);
+        Assert.IsTrue(applied, applied ? "" : $"""
+            node_a's rows on node_b
+            {await nodeB.DescribeReplicationAsync(Database, token)}
+            {await nodeA.DescribeReplicationAsync(Database, token)}
+            """);
         Assert.DoesNotContain("dropped index", nodeB.ReadLog()[logStart..]);
         foreach (string sql in new[] { "CREATE TABLE public.c1 (a integer); COMMIT", "SAVEPOINT s; CREATE TABLE public.c1 (a integer)" })
         {

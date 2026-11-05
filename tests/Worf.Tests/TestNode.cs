@@ -268,6 +268,44 @@ internal sealed class TestNode : IAsyncDisposable
     }
 
     /// <summary>
+    /// Describes the node's replication as it stands, for a failure's message: its sessions and what they wait on, the
+    /// locks they wait for, worf's subscriptions, slots and replication origins.
+    /// </summary>
+    /// <param name="dbname">The database.</param>
+    /// <param name="cancellationToken">Cancels the queries.</param>
+    /// <returns>The description.</returns>
+    public async Task<string> DescribeReplicationAsync(string dbname, CancellationToken cancellationToken)
+    {
+        StringBuilder description = new($"{Name}:");
+        foreach ((string what, string sql) in new[]
+        {
+            ("sessions", """
+                SELECT pid, backend_type, state, wait_event_type, wait_event, xact_start, left(query, 100) FROM pg_catalog.pg_stat_activity
+                WHERE pid <> pg_catalog.pg_backend_pid() ORDER BY pid
+                """),
+            ("waiting locks", "SELECT pid, locktype, relation::pg_catalog.regclass, transactionid, mode FROM pg_catalog.pg_locks WHERE NOT granted"),
+            ("subscriptions", "SELECT * FROM worf.show_subscription_status()"),
+            ("slots", "SELECT slot_name, active, active_pid, restart_lsn, confirmed_flush_lsn FROM pg_catalog.pg_replication_slots"),
+            ("origins", "SELECT * FROM pg_catalog.pg_replication_origin_status"),
+        })
+        {
+            string rows;
+            try
+            {
+                rows = await SafePsqlAsync(dbname, sql, cancellationToken);
+            }
+            catch (NpgsqlException error)
+            {
+                rows = error.Message;
+            }
+
+            _ = description.Append(CultureInfo.InvariantCulture, $"\n{what}:\n{rows}");
+        }
+
+        return description.ToString();
+    }
+
+    /// <summary>
     /// Polls the node's server log until it has the text after a position.
     /// </summary>
     /// <param name="logpos">The position in the log to look from.</param>
