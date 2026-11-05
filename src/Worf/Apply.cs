@@ -3080,17 +3080,23 @@ internal static unsafe partial class Apply
                             WorfWorker w = guard[worker];
                             w.Worker.Apply.ReplayStopLsn = endLsn;
                             guard[worker] = w;
-                            sync.Status = Sync.SyncStatusCatchup;
-
-                            PgBackgroundWorker.RunTransaction(() =>
-                                Sync.SetTableSyncStatus(subid, sync.Nspname, sync.Relname, sync.Status, sync.Statuslsn));
-
-                            if (guard[worker].Proc != 0)
-                            {
-                                Worker.SetProcLatch(guard[worker].Proc);
-                            }
-
                             caughtUp = true;
+                        }
+                    }
+
+                    // The sync worker catches up to the position set above once the catalog says so. The transaction
+                    // runs with the workers' lock released, as one that waits on a lock, or fails and releases every
+                    // lightweight lock as it aborts, mustn't hold it, and the worker is found again to be woken.
+                    if (caughtUp)
+                    {
+                        sync.Status = Sync.SyncStatusCatchup;
+                        PgBackgroundWorker.RunTransaction(() =>
+                            Sync.SetTableSyncStatus(subid, sync.Nspname, sync.Relname, sync.Status, sync.Statuslsn));
+                        using PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share();
+                        int worker = guard.Read((in _, workers) => Worker.SyncFind(workers, myDatabaseId, subid, syncNspname, syncRelname));
+                        if (worker >= 0 && guard[worker].Proc != 0)
+                        {
+                            Worker.SetProcLatch(guard[worker].Proc);
                         }
                     }
 

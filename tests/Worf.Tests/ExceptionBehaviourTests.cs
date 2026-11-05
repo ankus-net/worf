@@ -669,6 +669,8 @@ public sealed partial class ExceptionBehaviourTests
     }
 
     /// <summary>
+    /// The apply worker records that a table's sync may catch up without holding the workers' shared lock, so that the
+    /// subscriptions' status shows while the record waits on a row lock.
     /// A table sync worker stopped once its copy has committed, here while it waits for the apply worker, which waits on a
     /// lock with changes to the table from after the copy skipped, catches up from its copy when it starts again, with
     /// those changes, and drops its slot over the connection it streamed on, which needs no new connection to the provider.
@@ -748,6 +750,68 @@ public sealed partial class ExceptionBehaviourTests
         _ = await provider.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
         Assert.AreEqual("2|1", await subscriber.SafePsqlAsync(Database, "SELECT (SELECT count(*) FROM x_old), (SELECT count(*) FROM x)", token),
             "the rows of the renamed x and the new x");
+
+        // The apply worker records that a sync may catch up with the workers' shared lock released, so that while the
+        // record waits on a lock, the subscriptions' status shows, and the other workers go on, rather than wait on the
+        // lock, which nothing can cancel.
+        foreach (TestNode node in new[] { provider, subscriber })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE status_wait (id integer PRIMARY KEY)", token);
+        }
+
+        _ = await provider.SafePsqlAsync(Database, "INSERT INTO status_wait VALUES (1)", token);
+        await using (NpgsqlConnection tableLocker = await subscriber.OpenAsync(Database, token))
+        await using (NpgsqlConnection applyLocker = await subscriber.OpenAsync(Database, token))
+        await using (NpgsqlConnection statusLocker = await subscriber.OpenAsync(Database, token))
+        await using (NpgsqlConnection reading = await subscriber.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction tableLock = await tableLocker.BeginTransactionAsync(token);
+            await using (NpgsqlCommand command = new("INSERT INTO status_wait VALUES (1)", tableLocker, tableLock))
+            {
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+
+            _ = await provider.SafePsqlAsync(Database, "SELECT * FROM worf.replication_set_add_table('default', 'status_wait', synchronize_data := true)", token);
+            Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, """
+                SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+                    WHERE l.locktype = 'transactionid' AND NOT l.granted AND a.backend_type LIKE 'worf sync%')
+                """, token), "status_wait's copy waiting");
+            await using NpgsqlTransaction applyLock = await applyLocker.BeginTransactionAsync(token);
+            await using (NpgsqlCommand command = new("LOCK TABLE x", applyLocker, applyLock))
+            {
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+
+            _ = await provider.SafePsqlAsync(Database, "INSERT INTO x DEFAULT VALUES", token);
+            Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE relation = 'x'::regclass AND NOT granted)", token), "the apply worker waiting for x");
+            await tableLock.RollbackAsync(token);
+            Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+                "SELECT EXISTS (SELECT 1 FROM worf.local_sync_status WHERE sync_relname = 'status_wait' AND sync_status = 'w')", token),
+                "status_wait's sync waiting for the apply worker");
+            await using NpgsqlTransaction statusLock = await statusLocker.BeginTransactionAsync(token);
+            await using (NpgsqlCommand command = new("SELECT FROM worf.local_sync_status WHERE sync_relname = 'status_wait' FOR UPDATE", statusLocker,
+                statusLock))
+            {
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+
+            await applyLock.RollbackAsync(token);
+            Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, """
+                SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+                    WHERE l.locktype = 'transactionid' AND NOT l.granted AND a.backend_type LIKE 'worf apply%')
+                """, token), "the apply worker's record waiting");
+            await using NpgsqlCommand read = new("SELECT string_agg(status, ',') FROM worf.show_subscription_status()", reading);
+            Task<object?> status = read.ExecuteScalarAsync(token);
+            bool shown = await Task.WhenAny(status, Task.Delay(TimeSpan.FromSeconds(5), token)) == status;
+            await statusLock.RollbackAsync(token);
+            Assert.IsTrue(shown, "the status shown while the record waits");
+            Assert.AreEqual("replicating", await status);
+        }
+
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+            "SELECT sync_status = 'r' FROM worf.local_sync_status WHERE sync_relname = 'status_wait'", token), "status_wait synchronized");
+        Assert.AreEqual("1", await subscriber.SafePsqlAsync(Database, "SELECT count(*) FROM status_wait", token), "status_wait's row");
 
         foreach (string stop in new[] { "resume", "drop", "zero", "lost", "conflict" })
         {
