@@ -278,19 +278,30 @@ public sealed class RelayOriginTests
             "SELECT pg_replication_origin_progress(roname, false) < 'FF/0' FROM pg_replication_origin WHERE roname LIKE '%@9001'", token),
             "the relay origin's progress");
 
-        // Four writers take turns with two slots for relay origins, and each row keeps its writer. A relay origin gives
-        // its slot up before the next is created, which takes its id, so a turn records nothing of the drop.
+        // Writers take turns with two slots for relay origins, here those of 9001 and 9005, and each row keeps its
+        // writer. A relay origin that set up the session within the last minute keeps its slot, so a third writer's
+        // transaction stops apply with 53400, as PostgreSQL's apply worker stops when no slot is free, rather than drop
+        // and create an origin for each transaction; once the worker starts again, an origin that hasn't applied since
+        // gives its slot up before the next is created, which takes its id, so a turn records nothing of the drop.
+        await WriteAsAsync(provider, $"{back}@9005", "INSERT INTO c VALUES (3, '9005')", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM c WHERE id = 3)", token), "the fifth writer's row");
         string turns = await subscriber.SafePsqlAsync(Database, "SELECT pg_snapshot_xmax(pg_current_snapshot())", token);
-        for (int id = 2; id <= 8; id++)
+        logpos = subscriber.ReadLog().Length;
+        for (int id = 2; id <= 4; id++)
         {
-            int writer = 9000 + ((id - 1) % 4) + 1;
+            int writer = 9000 + id;
             await WriteAsAsync(provider, $"{back}@{writer}", $"INSERT INTO d VALUES ({id}, '{writer}')", token);
         }
 
-        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT count(*) = 8 FROM d", token), "the writers' rows");
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT count(*) = 4 FROM d", token), "the writers' rows");
+        string turnLog = subscriber.ReadLog()[logpos..];
+        string[] waitLines = [.. turnLog.Split('\n').Where(line => line.Contains("no replication origin slot is free for replication origin", StringComparison.Ordinal))];
+        IEnumerable<int> waits = Enumerable.Range(9002, 3).Where(writer => waitLines.Any(line => line.Contains($"@{writer}\"", StringComparison.Ordinal)));
+        Assert.AreEqual("9002,9004", string.Join(",", waits), "the writers that waited, but not 9003, which took the slot of 9005, unused since the worker started again");
+        Assert.Contains("which it keeps for a minute after its changes last applied", turnLog, "the reason the slots were kept");
         Assert.AreEqual("t", await subscriber.SafePsqlAsync(Database,
             "SELECT max(n) > 1 FROM (SELECT count(*) n FROM worf.origin_writer GROUP BY roident) c", token), "an id recorded more than once");
-        Assert.AreEqual("7|0", await subscriber.SafePsqlAsync(Database, $"""
+        Assert.AreEqual("3|0", await subscriber.SafePsqlAsync(Database, $"""
             SELECT count(*) FILTER (WHERE writer_node <> 0), count(*) FILTER (WHERE writer_node = 0)
             FROM worf.origin_writer WHERE since_xid >= '{turns}'
             """, token), "relay origins and drops recorded in the turns");
@@ -342,11 +353,11 @@ public sealed class RelayOriginTests
         string recorded = await subscriber.SafePsqlAsync(Database, "SELECT count(*) FROM worf.origin_writer", token);
         for (int id = 10; id <= 13; id++)
         {
-            int writer = 9000 + ((id - 1) % 4) + 1;
+            int writer = id % 2 == 0 ? 9002 : 9004;
             await WriteAsAsync(provider, $"{back}@{writer}", $"INSERT INTO d VALUES ({id}, '{writer}')", token);
         }
 
-        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT count(*) = 13 FROM d", token), "the rows after the horizon");
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT count(*) = 9 FROM d", token), "the rows after the horizon");
         Assert.AreEqual("0", await subscriber.SafePsqlAsync(Database, $"""
             SELECT count(*) FROM (
                 SELECT roident FROM worf.origin_writer
@@ -406,9 +417,9 @@ public sealed class RelayOriginTests
 
         // They give one up to the PostgreSQL subscription once its owner can log in, so its worker can start, though its
         // workers don't say they want one, and not to the origin the user created.
-        await WriteAsAsync(provider, $"{back}@9001", "INSERT INTO d VALUES (14, '9001')", token);
+        await WriteAsAsync(provider, $"{back}@9004", "INSERT INTO d VALUES (14, '9004')", token);
         await WriteAsAsync(provider, $"{back}@9002", "INSERT INTO d VALUES (15, '9002')", token);
-        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT count(*) = 15 FROM d", token), "the rows before another user");
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT count(*) = 11 FROM d", token), "the rows before another user");
         Assert.StartsWith("2: ", await subscriber.SafePsqlAsync(Database, Relays, token), "the relay origins before another user");
         _ = await subscriber.SafePsqlAsync(Database, "ALTER ROLE ghost LOGIN", token);
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, """
