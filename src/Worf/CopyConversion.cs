@@ -37,10 +37,9 @@ internal static unsafe partial class CopyConversion
     // that skips many rows neither keeps them all nor takes a transaction ID for each. The rows to record are written as
     // the exception log records them, one after another, in the database encoding, which PostgreSQL takes as they are,
     // so that rows however wide take no memory of their own, and each copied column's name as a JSON string. A row
-    // goes in whole up to the most text PostgreSQL holds in a value, and is recorded without its data past that.
+    // goes in whole up to the most jsonb holds, and is recorded without its data past that.
     private const int RecordRows = 1000;
     private const int RecordBytes = 8 * 1024 * 1024;
-    private const int MaxJson = 0x3fffffff - 4;
     private static readonly List<(ulong Line, int Row, PgException Error)> s_batchFailed = [];
     private static readonly List<(long ActionCounter, int Start, int Length, PgException Error)> s_toRecord = [];
     private static byte[] s_toRecordJson = new byte[64 * 1024];
@@ -1141,8 +1140,8 @@ internal static unsafe partial class CopyConversion
     private static int AppendRowJson(ReadOnlySpan<byte> message, ulong line)
     {
         // The text goes into the JSON as it is, rather than escaped as \u, which jsonb takes only for ASCII outside a
-        // UTF-8 database, and bytes that aren't UTF-8, as a SQL_ASCII database holds, as their hex. The text of every
-        // server encoding is escaped byte by byte, as none uses bytes below 0x80 within its characters.
+        // UTF-8 database, with a SQL_ASCII database's bytes that aren't UTF-8. The text of every server encoding is
+        // escaped byte by byte, as none uses bytes below 0x80 within its characters.
         ReadOnlySpan<byte> row = message.Length > 0 && message[^1] == (byte)'\n' ? message[..^1] : message;
         s_rowJsonStart = s_toRecordBytes;
         s_rowTooLarge = false;
@@ -1162,6 +1161,12 @@ internal static unsafe partial class CopyConversion
             if (raw.SequenceEqual("\\N"u8))
             {
                 AppendJson("null"u8);
+            }
+            else if (raw.Length - (3L * raw.Count((byte)'\\')) > ExceptionLog.MaxJsonBytes)
+            {
+                // Text that unescaped would still be too large for jsonb, as an escape takes four bytes at most, isn't
+                // unescaped to find that out.
+                s_rowTooLarge = true;
             }
             else
             {
@@ -1233,7 +1238,7 @@ internal static unsafe partial class CopyConversion
     /// </summary>
     private static void AppendJson(ReadOnlySpan<byte> bytes)
     {
-        if (s_rowTooLarge || s_toRecordBytes - s_rowJsonStart + (long)bytes.Length > MaxJson)
+        if (s_rowTooLarge || s_toRecordBytes - s_rowJsonStart + (long)bytes.Length > ExceptionLog.MaxJsonBytes)
         {
             s_rowTooLarge = true;
             return;

@@ -1267,6 +1267,39 @@ public sealed partial class ExceptionBehaviourTests
     }
 
     /// <summary>
+    /// A row of a copy under discard too large for jsonb, whose values hold at most 2^28 - 1 bytes, is recorded
+    /// without its data, with a warning, rather than not at all, and isn't written as JSON at all once it's past what
+    /// jsonb holds, so that the copying worker's private memory, which /proc gives on Linux, stays near what copying
+    /// the row takes, about 3.2 GB under discard for a value of 270 MB: under 4.6 GB, where the JSON grew to a gigabyte
+    /// and the worker to 6 GB.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [OSCondition(OperatingSystems.Linux)]
+    public async Task RowsTooLargeForJsonbAreRecordedWithoutTheirData()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode provider = await StartNodeAsync("provider", token);
+        await using TestNode subscriber = await StartNodeAsync("subscriber", token);
+        _ = await provider.SafePsqlAsync(Database, """
+            CREATE TABLE h (id integer PRIMARY KEY, v integer, t text);
+            INSERT INTO h VALUES (1, 1, repeat('x', 270 * 1024 * 1024)), (2, 2, 'small');
+            SELECT * FROM worf.replication_set_add_all_tables('default', '{public}');
+            """, token);
+        _ = await subscriber.SafePsqlAsync(Database, "CREATE TABLE h (id integer PRIMARY KEY, v integer CHECK (v % 2 = 0), t text)", token);
+        await SetBehaviourAsync(subscriber, "discard", token);
+        int logpos = subscriber.ReadLog().Length;
+        (_, long peakKb) = await CopyAsync(provider, subscriber, token);
+
+        Assert.AreEqual("1|1|23514|t", await subscriber.SafePsqlAsync(Database, """
+            SELECT (SELECT count(*) FROM h), action_counter, error_sqlstate, remote_new_tuple IS NULL FROM worf.exception_log
+            """, token), "the row copied, and the one recorded without its data");
+        Assert.Contains("row 1 of the copy of table public.h is too large for worf.exception_log to record its data", subscriber.ReadLog()[logpos..]);
+        TestContext.WriteLine($"apply worker private memory: {peakKb / 1024} MB");
+        Assert.IsLessThan(4600L * 1024, peakKb, "the copying worker's private memory, in kB");
+    }
+
+    /// <summary>
     /// Subscribes with the table's data and waits for the copy, which the apply worker makes, taking the CPU it used and
     /// the most private memory it held meanwhile.
     /// </summary>

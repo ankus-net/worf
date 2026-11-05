@@ -46,6 +46,13 @@ namespace Worf;
 /// </summary>
 internal static class ExceptionLog
 {
+    /// <summary>
+    /// The most bytes of JSON text a row recorded as jsonb may take: jsonb holds a value of at most 2^28 - 1 bytes, its
+    /// JEntry's offsets being 28 bits wide, and the text, whose quotes, colons and commas take about what jsonb's
+    /// entries do, leaves room for a few more bytes a column that jsonb takes.
+    /// </summary>
+    internal const int MaxJsonBytes = 0x0FFFFFFF - 8192;
+
     private const string InsertSql =
         "INSERT INTO worf.exception_log (sub_id, sub_name, remote_node_id, remote_xid, remote_commit_ts, " +
         "remote_commit_lsn, action_counter, operation, schema_name, table_name, remote_old_tuple, remote_new_tuple, " +
@@ -86,6 +93,14 @@ internal static class ExceptionLog
                 // rollback released the relation the read opened.
                 RelCache.ForgetOpenRelations();
             }
+        }
+
+        // A row too large for jsonb is recorded without it, as a copy's row is.
+        (bool oldTooLarge, bool newTooLarge) = (TooLarge(oldTuple), TooLarge(newTuple));
+        if (oldTooLarge || newTooLarge)
+        {
+            WorfLog.Warning("the failed remote change's row is too large for worf.exception_log to record its data");
+            (oldTuple, newTuple) = (oldTooLarge ? null : oldTuple, newTooLarge ? null : newTuple);
         }
 
         void Insert() => _ = Worf.Execute(InsertSql,
@@ -247,6 +262,8 @@ internal static class ExceptionLog
     // The behaviour a copy's skipped rows are recorded under: transdiscard skips a copy's rows one by one, as discard
     // does, and records them under its own name, as apply does the changes it skips.
     private static string CopyBehaviour => Apply.ExceptionBehaviour == WorfExceptionBehaviour.Transdiscard ? "transdiscard" : "discard";
+
+    private static bool TooLarge(string? json) => json is not null && json.Length > MaxJsonBytes / 3 && Worf.ToServer(json).Length > MaxJsonBytes;
 
     /// <summary>
     /// Records the remote transaction a subscription applies again under <c>worf.exception_behaviour</c>, how, and
