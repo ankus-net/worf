@@ -1093,6 +1093,23 @@ In this state, conflicts are not detected.
 
   The default is `1024`.
 
+### PostgreSQL settings
+
+- `wal_receiver_timeout`
+  As PostgreSQL's apply worker does, apply stops once its provider has sent
+  nothing for this long, asking it for a reply halfway through, and each call
+  it makes to its provider as it starts gives up after this long. The manager
+  gives up on a worker that hasn't started after this long, with a warning,
+  and starts it again later. `0` turns these off.
+
+- `log_lock_waits`
+  worf's workers log a wait for a lock that outlasts `deadlock_timeout`, with
+  the lock and the processes that hold it, as PostgreSQL does by default from
+  version 18, unless the server's configuration sets it. Apply waits for a lock
+  that a session holds for as long as the session holds it, as PostgreSQL's
+  apply does; the manager gives up after 5 seconds, with a warning, and waits
+  for it again on its next look.
+
 ## Limitations and restrictions
 
 ### Superuser is required

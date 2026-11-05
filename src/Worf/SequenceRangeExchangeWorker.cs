@@ -27,11 +27,11 @@ internal static class SequenceRangeExchangeWorker
     /// <summary>
     /// Runs the exchange worker.
     /// </summary>
-    /// <param name="mainArg">The worker's slot.</param>
+    /// <param name="mainArg">The worker's slot and its generation.</param>
     [PgBackgroundWorker(EntryPoint = "worf_exchange_main")]
     internal static void ExchangeMain(nuint mainArg)
     {
-        Worker.WorkerAttach((int)mainArg, WorfWorkerType.Exchange);
+        Worker.WorkerAttach(mainArg, WorfWorkerType.Exchange);
         WorfLog.Debug1("starting sequence range exchange worker");
         long started = Worker.GetCurrentTimestamp();
         while (!Worker.GotSigterm && !s_unwatched)

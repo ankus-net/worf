@@ -459,16 +459,15 @@ internal static class Sync
     /// <summary>
     /// The sync worker's entry point.
     /// </summary>
-    /// <param name="mainArg">The worker's slot.</param>
+    /// <param name="mainArg">The worker's slot and its generation.</param>
     [PgBackgroundWorker(EntryPoint = "worf_sync_main")]
     internal static void SyncMain(nuint mainArg)
     {
-        int slot = (int)mainArg;
 
         // Setup shmem.
-        Worker.WorkerAttach(slot, WorfWorkerType.Sync);
+        Worker.WorkerAttach(mainArg, WorfWorkerType.Sync);
         WorfSyncWorker mySyncWorker = Worker.MyWorker.Worker.Sync;
-        Apply.MyApplyWorkerSlot = slot;
+        Apply.MyApplyWorkerSlot = Worker.MyWorfWorker;
 
         // Setup synchronous commit according to the user's wishes
         Worker.SetConfigOption("synchronous_commit", Worf.SynchronousCommit ? "local" : "off");

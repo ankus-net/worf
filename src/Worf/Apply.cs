@@ -166,6 +166,9 @@ internal static unsafe partial class Apply
     private static ulong s_lastReceived;
 
     private static ulong s_lastRecvpos;
+
+    // When the last message had arrived as apply last asked the provider for a reply, so that it asks once a silence.
+    private static long s_pingedAt;
     private static ulong s_lastWritepos;
     private static ulong s_lastFlushpos;
     private static long s_lastSendTime;
@@ -193,15 +196,14 @@ internal static unsafe partial class Apply
     /// <summary>
     /// The apply worker's entry point.
     /// </summary>
-    /// <param name="mainArg">The worker's slot.</param>
+    /// <param name="mainArg">The worker's slot and its generation.</param>
     [PgBackgroundWorker(EntryPoint = "worf_apply_main")]
     internal static void ApplyMain(nuint mainArg)
     {
-        int slot = (int)mainArg;
 
         // Setup shmem.
-        Worker.WorkerAttach(slot, WorfWorkerType.Apply);
-        MyApplyWorkerSlot = slot;
+        Worker.WorkerAttach(mainArg, WorfWorkerType.Apply);
+        MyApplyWorkerSlot = Worker.MyWorfWorker;
 
         // Load correct apply API.
         if (Worf.UseSpi)
@@ -296,32 +298,35 @@ internal static unsafe partial class Apply
             Sync.WaitForCatchup(sub.Id, sync.Nspname, sync.Relname);
         }
 
-        // Start the replication.
-        using WorfConnection streamConn = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, null);
+        // Start the replication. Each call to the provider gives up after wal_receiver_timeout, and runs in a
+        // transaction, as a call cancelled outside one wouldn't come back as an error to name.
+        using WorfConnection streamConn = FromProvider(sub, "accept the replication connection",
+            () => PgBackgroundWorker.RunTransaction(() => Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, null)));
         string repsets = ReplicationSet.StringlistToIdentifierstr(sub.ReplicationSets);
         string origins = ReplicationSet.StringlistToIdentifierstr(sub.ForwardOrigins);
 
         // IDENTIFY_SYSTEM sets up some internal state on walsender so call it even if we don't (yet) want to use
         // any of the results.
-        _ = PgBackgroundWorker.RunTransaction(() => Worf.IdentifySystem(streamConn));
+        _ = FromProvider(sub, "identify itself", () => PgBackgroundWorker.RunTransaction(() => Worf.IdentifySystem(streamConn)));
 
         // The walsender of an apply worker that has just exited, as when the subscription's interface changes,
         // can hold the slot a moment longer. Wait for it, as the sync worker's cleanup does, rather than failing
         // and being restarted seconds later. A slot that stays busy fails below as before.
         long deadline = Worker.GetCurrentTimestamp() + 5000000L;
         while (!Worker.GotSigterm && Worker.GetCurrentTimestamp() < deadline &&
-            PgBackgroundWorker.RunTransaction(() => Rpc.RemoteSlotActive(streamConn, sub.SlotName)))
+            FromProvider(sub, $"say whether slot \"{sub.SlotName}\" is in use", () => PgBackgroundWorker.RunTransaction(() => Rpc.RemoteSlotActive(streamConn, sub.SlotName))))
         {
             _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(50));
         }
 
         // Slots that the subscription's table syncs left on the provider are dropped, now and while one stays.
         SetSyncSlotsLeft(false);
-        s_syncSlotsRetryAt = PgBackgroundWorker.RunTransaction(() =>
-            Sync.DropLeftSyncSlots(streamConn, sub).Count == 0)
+        s_syncSlotsRetryAt = FromProvider(sub, "drop the slots the subscription's table syncs left", () => PgBackgroundWorker.RunTransaction(() =>
+            Sync.DropLeftSyncSlots(streamConn, sub).Count == 0))
             ? 0 : Worker.GetCurrentTimestamp() + SyncSlotsRetryInterval;
 
-        Worf.StartReplication(streamConn, sub.SlotName, originStartpos, origins, repsets, null, sub.ForceTextTransfer);
+        FromProvider(sub, $"start streaming from slot \"{sub.SlotName}\"", () => PgBackgroundWorker.RunTransaction(() =>
+            Worf.StartReplication(streamConn, sub.SlotName, originStartpos, origins, repsets, null, sub.ForceTextTransfer)));
 
         if (catchingUp)
         {
@@ -402,6 +407,8 @@ internal static unsafe partial class Apply
                 {
                     throw new PgException(PgSqlStates.InternalError, "data stream ended");
                 }
+
+                CheckProviderSilence(streamConn);
 
                 // confirm all writes at once
                 SendFeedback(streamConn, s_lastReceived, Worker.GetCurrentTimestamp(), false);
@@ -884,6 +891,13 @@ internal static unsafe partial class Apply
         }
 
         s_inRemoteTransaction = false;
+
+        // An error between transactions, as when the provider goes silent, has no change to name, as PostgreSQL's apply
+        // names none outside a message.
+        if (s_errorContext is not null)
+        {
+            s_errorContext.Text = "";
+        }
 
         // Stop replay if we're doing limited replay and we've replayed up to the last record we're supposed to
         // process.
@@ -2658,6 +2672,103 @@ internal static unsafe partial class Apply
     }
 
     /// <summary>
+    /// Makes one of the calls to the provider that apply makes as it starts, giving up once wal_receiver_timeout has
+    /// passed without an answer, as a provider that accepts a connection and then answers nothing would hold the
+    /// worker, and with it the subscription, for good. The call's deadline goes in the worker's slot, and the
+    /// database's manager cancels the call once it has passed, as the exchange worker's watcher cancels its calls,
+    /// since cancelling a query cancels a wait on the provider. The error names what the call waited for.
+    /// </summary>
+    private static T FromProvider<T>(WorfSubscription sub, string what, Func<T> call)
+    {
+        int timeout;
+        unsafe
+        {
+            timeout = NativeGlobals.wal_receiver_timeout;
+        }
+
+        if (timeout <= 0)
+        {
+            return call();
+        }
+
+        long deadline = Worker.GetCurrentTimestamp() + (timeout * 1000L);
+        SetCallDeadline(deadline);
+        try
+        {
+            return call();
+        }
+        catch (Exception error) when (error is PgQueryCanceledException or PgException { SqlState: "57014" } && Worker.GetCurrentTimestamp() >= deadline)
+        {
+            throw new PgException(PgSqlStates.ConnectionFailure, $"timed out waiting for provider \"{sub.Origin.Name}\" to {what}",
+                detail: $"It hadn't answered within wal_receiver_timeout ({timeout} ms).");
+        }
+        finally
+        {
+            SetCallDeadline(0);
+        }
+    }
+
+    private static void FromProvider(WorfSubscription sub, string what, Action call) => _ = FromProvider(sub, what, () =>
+    {
+        call();
+        return true;
+    });
+
+    /// <summary>
+    /// Publishes the deadline of the call to the provider about to start, waking the manager to watch it, or clears it
+    /// as the call ends.
+    /// </summary>
+    private static void SetCallDeadline(long deadline)
+    {
+        using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
+        {
+            WorfWorker worker = guard[Worker.MyWorfWorker];
+            worker.Worker.Apply.CallDeadline = deadline;
+            guard[Worker.MyWorfWorker] = worker;
+        }
+
+        if (deadline != 0)
+        {
+            Worker.WakeManager();
+        }
+    }
+
+    /// <summary>
+    /// Ends the worker once the provider has sent nothing for wal_receiver_timeout, as PostgreSQL's apply worker does,
+    /// and asks for a reply once half of that has passed, which a walsender that is still there answers at once: one
+    /// that streams sends keepalives while it has nothing else to send, so its silence means it, or the connection,
+    /// is stuck.
+    /// </summary>
+    private static void CheckProviderSilence(WorfConnection conn)
+    {
+        int timeout;
+        unsafe
+        {
+            timeout = NativeGlobals.wal_receiver_timeout;
+        }
+
+        if (timeout <= 0)
+        {
+            return;
+        }
+
+        long now = Worker.GetCurrentTimestamp();
+        long silent = now - conn.LastReceivedAt;
+        if (silent >= timeout * 1000L)
+        {
+            throw new PgException(PgSqlStates.ConnectionFailure,
+                $"terminating worf {Worker.WorkerTypeName(Worker.MyWorker.WorkerType)} worker for subscription \"{MySubscription!.Name}\" due to timeout",
+                detail: $"Provider \"{MySubscription.Origin.Name}\" sent nothing within wal_receiver_timeout ({timeout} ms).");
+        }
+
+        if (silent >= timeout * 500L && s_pingedAt != conn.LastReceivedAt)
+        {
+            _ = SendFeedback(conn, s_lastReceived, now, true, requestReply: true);
+            s_pingedAt = conn.LastReceivedAt;
+        }
+    }
+
+    /// <summary>
     /// Moves the origin back to the failed remote transaction's commit position, from which the provider sends the
     /// transaction again. From PostgreSQL 16, an abort advances the origin as a commit does, and one after the end
     /// position was set for the commit, as when the commit fails a serialization check, would skip the transaction.
@@ -2866,6 +2977,8 @@ internal static unsafe partial class Apply
 
             if (s_commitEndLsn is null)
             {
+                CheckProviderSilence(conn);
+
                 // confirm all writes at once
                 SendFeedback(conn, s_lastReceived, Worker.GetCurrentTimestamp(), false);
 
@@ -2922,7 +3035,7 @@ internal static unsafe partial class Apply
     /// <summary>
     /// Send a Standby Status Update message to server.
     /// </summary>
-    private static bool SendFeedback(WorfConnection conn, ulong recvpos, long now, bool force)
+    private static bool SendFeedback(WorfConnection conn, ulong recvpos, long now, bool force, bool requestReply = false)
     {
         // It's legal to not pass a recvpos
         if (recvpos < s_lastRecvpos)
@@ -2975,7 +3088,7 @@ internal static unsafe partial class Apply
         BinaryPrimitives.WriteUInt64BigEndian(replyMessage[9..], flushpos);       // flush
         BinaryPrimitives.WriteUInt64BigEndian(replyMessage[17..], writepos);      // apply
         BinaryPrimitives.WriteInt64BigEndian(replyMessage[25..], now);            // sendTime
-        replyMessage[33] = 0;                                                     // replyRequested
+        replyMessage[33] = requestReply ? (byte)1 : (byte)0;                      // replyRequested
 
         if (PgLog.IsEnabled(PgLogLevel.Debug2))
         {

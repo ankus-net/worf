@@ -1962,7 +1962,7 @@ internal static partial class Worf
             {
                 try
                 {
-                    PgBackgroundWorker.RunTransaction(StartManagerWorkers);
+                    StartManagerWorkers(PgBackgroundWorker.RunTransaction(ConnectableDatabases));
                 }
                 catch (OperationCanceledException) when (Worker.GotSigterm)
                 {
@@ -1984,13 +1984,12 @@ internal static partial class Worf
     private static TimeSpan SupervisorInterval => TimeSpan.FromMilliseconds(OperatingSystem.IsWindows() ? 30000 : 180000);
 
     /// <summary>
-    /// Start the manager workers for every db which has a worf node. Note that we start workers that are not
-    /// necessary here. We do this because we need to check every individual database to check if there is worf
-    /// node setup and it's not possible to switch connections to different databases within one background
-    /// worker. The workers that won't find any worf node setup will exit immediately during startup. Must be run
-    /// inside a transaction.
+    /// Lists the databases that allow connections, and frees the worker slots of those dropped. Runs in a
+    /// transaction, which ends before the managers start, as PostgreSQL's logical replication launcher starts its
+    /// workers, so that waiting for one holds no lock and no snapshot.
     /// </summary>
-    private static unsafe void StartManagerWorkers()
+    /// <returns>The databases that allow connections, with their names.</returns>
+    private static unsafe List<(uint Dboid, string Name)> ConnectableDatabases()
     {
         const uint DatabaseRelationId = 1262;
 
@@ -2032,6 +2031,18 @@ internal static partial class Worf
             }
         }
 
+        return connectable;
+    }
+
+    /// <summary>
+    /// Start the manager workers for every db which has a worf node. Note that we start workers that are not
+    /// necessary here. We do this because we need to check every individual database to check if there is worf
+    /// node setup and it's not possible to switch connections to different databases within one background
+    /// worker. The workers that won't find any worf node setup will exit immediately during startup.
+    /// </summary>
+    /// <param name="connectable">The databases that allow connections, with their names.</param>
+    private static void StartManagerWorkers(List<(uint Dboid, string Name)> connectable)
+    {
         // Run manager worker for every connectable database, but one whose manager had nothing to manage since the
         // supervisor's last regular look.
         long idleSince = Worker.GetCurrentTimestamp() - ((long)SupervisorInterval.TotalMilliseconds * 1000);

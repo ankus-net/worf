@@ -58,4 +58,10 @@ internal struct WorfApplyWorker
     /// starts later each time.
     /// </summary>
     public int SyncFailures;
+
+    /// <summary>
+    /// When the call the worker is making to the provider as it starts runs out of time, after which the database's
+    /// manager cancels it, as a timestamp, or zero.
+    /// </summary>
+    public long CallDeadline;
 }

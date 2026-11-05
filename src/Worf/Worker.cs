@@ -144,7 +144,7 @@ internal static class Worker
             StartTime = PgBackgroundWorkerStartTime.RecoveryFinished,
             RestartDelay = null,
             NotifyProcessId = myProcPid,
-            Argument = (nuint)slot,
+            Argument = Argument(slot, generation),
         };
 
         if (!PgBackgroundWorker.TryStart(bgw, out PgBackgroundWorkerHandle? bgwHandle))
@@ -194,29 +194,33 @@ internal static class Worker
 
     /// <summary>
     /// Attach the current master process to the shared context. Called during worker startup to inform the master
-    /// the worker is ready and give it access to the worker's PGPROC.
+    /// the worker is ready and give it access to the worker's PGPROC. A worker that whoever registered it gave up on
+    /// before it attached, as one that took too long to start, finds its slot marked crashed or registered again, and
+    /// exits without touching it.
     /// </summary>
-    /// <param name="slot">The worker's slot.</param>
+    /// <param name="mainArg">The worker's argument, which names its slot and the slot's generation.</param>
     /// <param name="type">The worker's type.</param>
-    internal static void WorkerAttach(int slot, WorfWorkerType type)
+    internal static void WorkerAttach(nuint mainArg, WorfWorkerType type)
     {
-        uint dboid;
+        int slot = (int)(uint)mainArg;
+        ushort generation = (ushort)(mainArg >> 32);
+        uint dboid = 0;
+        bool givenUp;
         using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = WorfCtx.Exclusive())
         {
-            _ = PgProcess.OnExit(static code => WorkerDetach(code != 0));
-
-            MyWorfWorker = slot;
             WorfWorker worker = guard[slot];
-            unsafe
+            givenUp = worker.Generation != generation || worker.WorkerType != type || worker.CrashedAt != 0 || worker.Proc != 0;
+            if (!givenUp)
             {
-                worker.Proc = (nint)NativeGlobals.MyProc;
+                Attach(guard, slot, worker);
+                dboid = worker.Dboid;
             }
+        }
 
-            guard[slot] = worker;
-            s_myWorfWorkerGeneration = worker.Generation;
-            dboid = worker.Dboid;
-
-            WorfLog.Debug2($"{WorkerTypeName(type)} worker [{Environment.ProcessId}] attaching to slot {slot} generation {s_myWorfWorkerGeneration}");
+        if (givenUp)
+        {
+            WorfLog.Log($"{WorkerTypeName(type)} worker [{Environment.ProcessId}] at slot {slot} generation {generation} exiting, as it was given up on before it started");
+            ProcExit(0);
         }
 
         // Make it easy to identify our processes.
@@ -254,16 +258,40 @@ internal static class Worker
             });
             if (type is not (WorfWorkerType.Apply or WorfWorkerType.Sync))
             {
-                unsafe
+                SetSessionOption("search_path", Worf.PinnedSearchPath);
+            }
+
+            // A wait on a heavyweight lock that outlasts deadlock_timeout is logged with the lock and its holders, as
+            // from PostgreSQL 18 by default, unless the server's configuration says otherwise: a worker has no
+            // client to show it to, and apply waits on locks that sessions hold for as long as they hold them, as
+            // PostgreSQL's own apply does. The manager, which every apply worker in the database waits on to start,
+            // gives up on a lock after a while instead, and tries again on its next look.
+            unsafe
+            {
+                fixed (byte* name = "log_lock_waits\0"u8)
+                fixed (byte* value = "on\0"u8)
                 {
-                    fixed (byte* name = Worf.ToServerCString("search_path"))
-                    fixed (byte* value = Worf.ToServerCString(Worf.PinnedSearchPath))
-                    {
-                        _ = NativeMethods.set_config_option((sbyte*)name, (sbyte*)value, GucContext.PGC_SUSET, GucSource.PGC_S_SESSION,
-                            GucAction.GUC_ACTION_SET, true, 0, false);
-                    }
+                    NativeMethods.SetConfigOption((sbyte*)name, (sbyte*)value, GucContext.PGC_SUSET, GucSource.PGC_S_DYNAMIC_DEFAULT);
                 }
             }
+
+            if (type == WorfWorkerType.Manager)
+            {
+                SetSessionOption("lock_timeout", $"{Manager.LockTimeout}ms");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Sets a setting for the rest of the session, as <c>SET</c> does.
+    /// </summary>
+    private static unsafe void SetSessionOption(string name, string value)
+    {
+        fixed (byte* cname = Worf.ToServerCString(name))
+        fixed (byte* cvalue = Worf.ToServerCString(value))
+        {
+            _ = NativeMethods.set_config_option((sbyte*)cname, (sbyte*)cvalue, GucContext.PGC_SUSET, GucSource.PGC_S_SESSION,
+                GucAction.GUC_ACTION_SET, true, 0, false);
         }
     }
 
@@ -712,11 +740,46 @@ internal static class Worker
     }
 
     /// <summary>
+    /// Attaches this process to its slot, under the workers' lock, and has it detach as the process exits.
+    /// </summary>
+    private static void Attach(PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard, int slot, WorfWorker worker)
+    {
+        _ = PgProcess.OnExit(static code => WorkerDetach(code != 0));
+
+        MyWorfWorker = slot;
+        unsafe
+        {
+            worker.Proc = (nint)NativeGlobals.MyProc;
+        }
+
+        guard[slot] = worker;
+        s_myWorfWorkerGeneration = worker.Generation;
+
+        WorfLog.Debug2($"{WorkerTypeName(worker.WorkerType)} worker [{Environment.ProcessId}] attaching to slot {slot} generation {s_myWorfWorkerGeneration}");
+    }
+
+    /// <summary>
+    /// The argument a worker starts with: its slot, and in the upper half, the slot's generation, which it checks as it
+    /// attaches.
+    /// </summary>
+    private static nuint Argument(int slot, ushort generation) => (uint)slot | ((nuint)generation << 32);
+
+    /// <summary>
     /// This is our own version of WaitForBackgroundWorkerStartup where we wait until worker actually attaches to
-    /// our shmem.
+    /// our shmem. As PostgreSQL's logical replication launcher does, it gives up on a worker that hasn't attached
+    /// within <c>wal_receiver_timeout</c>, as one whose process never started or hangs before it attaches: it warns,
+    /// marks the slot crashed, so that the worker starts again later and nothing waits on it meanwhile, and stops the
+    /// worker, which exits as it attaches if it gets that far.
     /// </summary>
     private static void WaitForWorkerStartup(int slot, ushort generation, PgBackgroundWorkerHandle handle)
     {
+        int timeout;
+        unsafe
+        {
+            timeout = NativeGlobals.wal_receiver_timeout;
+        }
+
+        long deadline = timeout > 0 ? GetCurrentTimestamp() + (timeout * 1000L) : 0;
         while (true)
         {
             PgInterrupts.Check();
@@ -766,6 +829,24 @@ internal static class Worker
                         WorfLog.Debug2($"{WorkerTypeName(worker.WorkerType)} worker at slot {slot} exited before we noticed it started");
                     }
 
+                    break;
+                }
+
+                if (deadline != 0 && GetCurrentTimestamp() >= deadline)
+                {
+                    if (worker.WorkerType != WorfWorkerType.None && worker.Generation == generation && worker.CrashedAt == 0)
+                    {
+                        worker.CrashedAt = GetCurrentTimestamp();
+                        guard[slot] = worker;
+                    }
+
+                    handle.Terminate();
+                    WorfLog.Warning(new PgDiagnostic($"{WorkerTypeName(worker.WorkerType)} worker at slot {slot} took too long to start; canceled")
+                    {
+                        Detail = state.Status == PgBackgroundWorkerStatus.Started
+                            ? $"Its process {state.ProcessId} hadn't attached to worf's shared memory after {timeout} ms."
+                            : $"The postmaster hadn't started its process after {timeout} ms.",
+                    });
                     break;
                 }
             }

@@ -16,11 +16,11 @@ internal static class SequenceRangeWorker
     /// <summary>
     /// Runs the range worker.
     /// </summary>
-    /// <param name="mainArg">The worker's slot.</param>
+    /// <param name="mainArg">The worker's slot and its generation.</param>
     [PgBackgroundWorker(EntryPoint = "worf_range_main")]
     internal static void RangeMain(nuint mainArg)
     {
-        Worker.WorkerAttach((int)mainArg, WorfWorkerType.Range);
+        Worker.WorkerAttach(mainArg, WorfWorkerType.Range);
         WorfLog.Debug1("starting sequence range worker");
         bool managedAny = false;
 

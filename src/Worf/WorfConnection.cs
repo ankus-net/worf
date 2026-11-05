@@ -49,6 +49,11 @@ internal sealed unsafe partial class WorfConnection : IDisposable
     /// </summary>
     internal int ServerVersion { get; }
 
+    /// <summary>
+    /// Gets when the last message of a streaming copy arrived, or when the copy started, as a timestamp.
+    /// </summary>
+    internal long LastReceivedAt { get; private set; }
+
     [PgNativeCallback(nameof(ReadCopy))]
     private static partial copy_data_source_cb CopySource { get; }
 
@@ -213,6 +218,8 @@ internal sealed unsafe partial class WorfConnection : IDisposable
         {
             throw new PgException(PgSqlStates.ProtocolViolation, $"The replication command returned status {(int)status}; a copy was expected.");
         }
+
+        LastReceivedAt = NativeMethods.GetCurrentTimestamp();
     }
 
     /// <summary>
@@ -251,6 +258,7 @@ internal sealed unsafe partial class WorfConnection : IDisposable
                 // libpqwalreceiver's buffer is freed by the connection's next call, so the message is copied first.
                 new ReadOnlySpan<byte>(data, length).CopyTo(_message);
                 message = _message.AsSpan(0, length);
+                LastReceivedAt = NativeMethods.GetCurrentTimestamp();
                 return PgReplicationReceiveStatus.Message;
             }
 

@@ -13,11 +13,11 @@ internal static class SequenceRangeSwitchWorker
     /// <summary>
     /// Runs the switch worker.
     /// </summary>
-    /// <param name="mainArg">The worker's slot.</param>
+    /// <param name="mainArg">The worker's slot and its generation.</param>
     [PgBackgroundWorker(EntryPoint = "worf_switch_main")]
     internal static void SwitchMain(nuint mainArg)
     {
-        Worker.WorkerAttach((int)mainArg, WorfWorkerType.Switch);
+        Worker.WorkerAttach(mainArg, WorfWorkerType.Switch);
         uint seqoid = Worker.MyWorker.Worker.Switch.Seqoid;
         Guid movedIn = Worker.MyWorker.Worker.Switch.MovedIn;
         WorfLog.Debug1($"starting sequence switch worker for sequence {seqoid}");

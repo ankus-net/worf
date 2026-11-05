@@ -9,6 +9,7 @@ internal static class Manager
 {
     private const long InitialSleep = 10000;
     private const long MaxSleep = 180000;
+    private const string LockNotAvailable = "55P03";
 
     // When the manager next runs the exchange worker to ask this database's providers of the sequences they manage, and
     // the exchange counter it last saw, which a backend that learned of a sequence raises.
@@ -30,18 +31,23 @@ internal static class Manager
     internal static long RestartDelay => MinSleep;
 
     /// <summary>
+    /// Gets how long the manager waits for a heavyweight lock, in milliseconds, before it gives up and looks again
+    /// later, as every apply worker in the database waits on the manager to start it.
+    /// </summary>
+    internal static int LockTimeout => 5000;
+
+    /// <summary>
     /// Entry point for manager worker.
     /// </summary>
-    /// <param name="mainArg">The worker's slot.</param>
+    /// <param name="mainArg">The worker's slot and its generation.</param>
     [PgBackgroundWorker(EntryPoint = "worf_manager_main")]
     internal static void ManagerMain(nuint mainArg)
     {
-        int slot = (int)mainArg;
         uint extoid = 0;
         long sleepTimer = InitialSleep;
 
         // Setup shmem.
-        Worker.WorkerAttach(slot, WorfWorkerType.Manager);
+        Worker.WorkerAttach(mainArg, WorfWorkerType.Manager);
 
         // Check if the extension is installed. We retry a few times with a short delay to handle the race condition
         // where the extension is being dropped and recreated (e.g., between init_fail and init regression tests).
@@ -94,29 +100,45 @@ internal static class Manager
             NativeMethods.pg_usleep(100000);  // 100ms
         }
 
-        // Use separate transaction to avoid lock escalation.
-        PgBackgroundWorker.RunTransaction(Worf.ManageExtension);
+        // Use separate transaction to avoid lock escalation. A session that holds the extension's catalog, as one that
+        // updates the extension itself, leaves the update to it.
+        try
+        {
+            PgBackgroundWorker.RunTransaction(Worf.ManageExtension);
+        }
+        catch (PgException error) when (error.SqlState == LockNotAvailable)
+        {
+            GaveUpOnLock();
+        }
 
         // Main wait loop.
         while (!Worker.GotSigterm)
         {
             Worker.ProcessConfigReload();
 
-            // The database may have become a template since, as one is copied once it does.
-            if (PgBackgroundWorker.RunTransaction(IsIdleTemplate))
+            // The database may have become a template since, as one is copied once it does. Then launch the apply
+            // workers, and the range worker for managed sequences, and handle sequences, updating the sleep timer as
+            // necessary. A lock that another session holds too long is waited for again on the next look.
+            bool processedAll;
+            try
             {
-                ExitIdle();
-                return;
+                if (PgBackgroundWorker.RunTransaction(IsIdleTemplate))
+                {
+                    ExitIdle();
+                    return;
+                }
+
+                processedAll = ManageApplyWorkers();
+                processedAll &= ManageRangeWorker();
+                sleepTimer = Sequences.SynchronizeSequences()
+                    ? Math.Min(sleepTimer * 2, MaxSleep)
+                    : Math.Max(sleepTimer / 2, MinSleep);
             }
-
-            // Launch the apply workers, and the range worker for managed sequences.
-            bool processedAll = ManageApplyWorkers();
-            processedAll &= ManageRangeWorker();
-
-            // Handle sequences and update our sleep timer as necessary.
-            sleepTimer = Sequences.SynchronizeSequences()
-                ? Math.Min(sleepTimer * 2, MaxSleep)
-                : Math.Max(sleepTimer / 2, MinSleep);
+            catch (PgException error) when (error.SqlState == LockNotAvailable)
+            {
+                GaveUpOnLock();
+                processedAll = false;
+            }
 
             // A database that subscribes but manages no sequence runs the exchange worker again when the next exchange
             // is due, even if the last one ran past it.
@@ -132,6 +154,13 @@ internal static class Manager
                 sleep = Math.Min(sleep, SequenceRanges.CheckInterval);
             }
 
+            // An apply worker's call to its provider is cancelled once its deadline has passed.
+            long callDeadline = WatchProviderCalls();
+            if (callDeadline != 0)
+            {
+                sleep = Math.Clamp((callDeadline - Worker.GetCurrentTimestamp()) / 1000, 1, sleep);
+            }
+
             if (!PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(sleep)) &&
                 !PgBackgroundWorker.CanContinue)
             {
@@ -145,6 +174,72 @@ internal static class Manager
         {
             _ = SequenceRangeExchangeWorker.Watch(true);
         }
+    }
+
+    /// <summary>
+    /// Warns that the manager gave up waiting for a lock, which its next look waits for again.
+    /// </summary>
+    private static void GaveUpOnLock()
+    {
+        bool logged;
+        unsafe
+        {
+            logged = NativeGlobals.log_lock_waits;
+        }
+
+        WorfLog.Warning(new PgDiagnostic($"worf manager gave up waiting for a lock after {LockTimeout} ms, and will wait for it again")
+        {
+            SqlState = LockNotAvailable,
+            Detail = logged ? "The log's \"still waiting\" message before this names the lock and the processes that hold it." : null,
+            Hint = logged ? null : "Turn on log_lock_waits for the log to name the lock and the processes that hold it.",
+        });
+    }
+
+    /// <summary>
+    /// Cancels the calls to their providers that the database's apply workers make as they start once their deadlines
+    /// have passed, each once, as a provider that never answers would otherwise hold a worker for good.
+    /// </summary>
+    /// <returns>The earliest deadline still to come, or zero.</returns>
+    private static long WatchProviderCalls()
+    {
+        uint dboid = Worker.MyWorker.Dboid;
+        long now = Worker.GetCurrentTimestamp();
+        long next = 0;
+        List<int> overdue = [];
+        using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
+        {
+            for (int i = 0; i < guard.Length; i++)
+            {
+                WorfWorker worker = guard[i];
+                long deadline = worker.Worker.Apply.CallDeadline;
+                if (worker.WorkerType != WorfWorkerType.Apply || worker.Dboid != dboid || worker.Proc == 0 || deadline == 0)
+                {
+                    continue;
+                }
+
+                if (now < deadline)
+                {
+                    next = next == 0 ? deadline : Math.Min(next, deadline);
+                    continue;
+                }
+
+                unsafe
+                {
+                    overdue.Add(((PGPROC*)worker.Proc)->pid);
+                }
+
+                worker.Worker.Apply.CallDeadline = 0;
+                guard[i] = worker;
+            }
+        }
+
+        foreach (int pid in overdue)
+        {
+            _ = PgBackgroundWorker.RunTransaction(() => Worf.ReadScalar<bool>(
+                "SELECT pg_catalog.pg_cancel_backend(pid) FROM pg_catalog.pg_stat_get_activity($1) WHERE pid IS NOT NULL", SpiParameter.Create(pid)));
+        }
+
+        return next;
     }
 
     /// <summary>
@@ -309,6 +404,9 @@ internal static class Manager
             workers = guard.Read((in _, slots) => Worker.ApplyFindAll(slots, dboid));
         }
 
+        // The workers to start are found in a transaction, and started once it has ended, as PostgreSQL's logical
+        // replication launcher starts its workers, so that waiting for one holds no lock and no snapshot.
+        List<(WorfSubscription Sub, int Slot, WorfApplyWorker Crashed)> subsToStart = [];
         bool found = PgBackgroundWorker.RunTransaction(() =>
         {
             // Get local node. If not found, or another transaction holds its lock, return false and let the main loop
@@ -321,7 +419,6 @@ internal static class Manager
 
             // Get list of subscribers.
             List<WorfSubscription> subscriptions = WorfNode.GetNodeSubscriptions(node.Node.Id, false);
-            List<(WorfSubscription Sub, WorfApplyWorker Crashed)> subsToStart = [];
 
             // Check for active workers for each subscription.
             foreach (WorfSubscription sub in subscriptions)
@@ -389,29 +486,7 @@ internal static class Manager
                     }
                 }
 
-                subsToStart.Add((sub, applyWorker.Worker.Apply));
-            }
-
-            foreach ((WorfSubscription sub, WorfApplyWorker crashed) in subsToStart)
-            {
-                WorfWorker apply = default;
-                apply.WorkerType = WorfWorkerType.Apply;
-                apply.Dboid = dboid;
-                apply.Worker.Apply.SubId = sub.Id;
-                apply.Worker.Apply.SyncPending = true;
-                apply.Worker.Apply.ReplayStopLsn = 0;
-
-                // A crashed worker's failed transaction is applied again under worf.exception_behaviour.
-                apply.Worker.Apply.ExceptionLsn = crashed.ExceptionLsn;
-                apply.Worker.Apply.ExceptionLevel = crashed.ExceptionLevel;
-                apply.Worker.Apply.SyncFailures = crashed.SyncFailures;
-
-                // With every worker slot taken, the subscriptions left wait for the next look.
-                if (Worker.WorkerRegister(apply) == -1)
-                {
-                    ret = false;
-                    break;
-                }
+                subsToStart.Add((sub, apply, applyWorker.Worker.Apply));
             }
 
             return true;
@@ -438,6 +513,43 @@ internal static class Manager
                     w.CrashedAt = 0;
                     guard[worker] = w;
                 }
+            }
+        }
+
+        // The slots left over are free by now, so a worker started below can't be one that was just stopped. A crashed
+        // worker's own slot is freed as its replacement starts, which takes the first free slot, so that the
+        // subscription never has two.
+        foreach ((WorfSubscription sub, int slot, WorfApplyWorker crashed) in subsToStart)
+        {
+            if (slot >= 0)
+            {
+                using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive();
+                WorfWorker w = guard[slot];
+                if (w.WorkerType == WorfWorkerType.Apply && w.Worker.Apply.SubId == sub.Id && w.Proc == 0 && w.CrashedAt != 0)
+                {
+                    w.WorkerType = WorfWorkerType.None;
+                    w.CrashedAt = 0;
+                    guard[slot] = w;
+                }
+            }
+
+            WorfWorker apply = default;
+            apply.WorkerType = WorfWorkerType.Apply;
+            apply.Dboid = dboid;
+            apply.Worker.Apply.SubId = sub.Id;
+            apply.Worker.Apply.SyncPending = true;
+            apply.Worker.Apply.ReplayStopLsn = 0;
+
+            // A crashed worker's failed transaction is applied again under worf.exception_behaviour.
+            apply.Worker.Apply.ExceptionLsn = crashed.ExceptionLsn;
+            apply.Worker.Apply.ExceptionLevel = crashed.ExceptionLevel;
+            apply.Worker.Apply.SyncFailures = crashed.SyncFailures;
+
+            // With every worker slot taken, the subscriptions left wait for the next look.
+            if (Worker.WorkerRegister(apply) == -1)
+            {
+                ret = false;
+                break;
             }
         }
 
