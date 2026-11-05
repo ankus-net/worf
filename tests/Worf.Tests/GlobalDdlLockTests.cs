@@ -751,9 +751,14 @@ public sealed class GlobalDdlLockTests
                 CREATE INDEX ON lx.lfn (id);
                 RETURN 1;
             END $f$;
+            CREATE FUNCTION public.lmk2() RETURNS integer LANGUAGE plpgsql AS $f$
+            BEGIN
+                CREATE TABLE lx.lfm (id integer PRIMARY KEY, b integer UNIQUE);
+                RETURN 1;
+            END $f$;
             """, token);
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
-        foreach (string index in new[] { "lid_seq1", "lid_seq2", "lid_seq3", "lft_c_seq", "lfn_pkey", "lfn_rel", "lfn_id_idx" })
+        foreach (string index in new[] { "lid_seq1", "lid_seq2", "lid_seq3", "lft_c_seq", "lfn_pkey", "lfn_rel", "lfn_id_idx", "lfm", "lfm_pkey", "lfm_b_key" })
         {
             await BuildLocalIndexAsync(nodeB, $"INDEX CONCURRENTLY {index} ON lx.lq (a)", token);
         }
@@ -766,6 +771,7 @@ public sealed class GlobalDdlLockTests
             ALTER TABLE lx.li3 ALTER COLUMN n ADD GENERATED ALWAYS AS IDENTITY (SEQUENCE NAME lx.lid_seq3);
             ALTER FOREIGN TABLE lx.lft ADD COLUMN c serial;
             SELECT worf.replicate_ddl_command('SELECT public.lmk()');
+            CREATE TABLE lx.lfm_t AS SELECT public.lmk2() AS v;
             """, token);
         _ = await nodeB.SafePsqlAsync(Database, "ALTER TABLE lx.lri ADD UNIQUE (a), REPLICA IDENTITY USING INDEX lri_pkey", token);
         foreach (TestNode node in new[] { nodeA, nodeB })
@@ -775,9 +781,9 @@ public sealed class GlobalDdlLockTests
 
         const string Chosen = """
             SELECT string_agg(c.relname, ',' ORDER BY c.relname) FROM pg_class c
-            WHERE c.relnamespace = 'lx'::regnamespace AND c.relname ~ '^l(i[123]|id_|ft|fn|ri)' AND c.oid NOT IN (SELECT indexrelid FROM worf.local_index)
+            WHERE c.relnamespace = 'lx'::regnamespace AND c.relname ~ '^l(i[123]|id_|ft|fn|fm|ri)' AND c.oid NOT IN (SELECT indexrelid FROM worf.local_index)
             """;
-        Assert.AreEqual("lfn,lfn_id_idx,lfn_pkey,lfn_rel,lft,lft_c_seq,li1,li2,li2_pkey,li3,li3_pkey,lid_seq1,lid_seq2,lid_seq3,lri,lri_a_key,lri_pkey",
+        Assert.AreEqual("lfm,lfm_b_key,lfm_pkey,lfm_t,lfn,lfn_id_idx,lfn_pkey,lfn_rel,lft,lft_c_seq,li1,li2,li2_pkey,li3,li3_pkey,lid_seq1,lid_seq2,lid_seq3,lri,lri_a_key,lri_pkey",
             await nodeA.SafePsqlAsync(Database, Chosen, token), "the names on node_a");
         Assert.AreEqual(await nodeA.SafePsqlAsync(Database, Chosen, token), await nodeB.SafePsqlAsync(Database, Chosen, token), "the names on node_b");
         _ = await nodeA.SafePsqlAsync(Database, """
@@ -788,6 +794,7 @@ public sealed class GlobalDdlLockTests
             ALTER TABLE lx.lfn DROP CONSTRAINT lfn_pkey;
             DROP INDEX lx.lfn_id_idx;
             DROP TABLE lx.lfn_rel;
+            ALTER TABLE lx.lfm DROP CONSTRAINT lfm_b_key;
             """, token);
         _ = await nodeB.SafePsqlAsync(Database, "ALTER TABLE lx.lri DROP CONSTRAINT lri_a_key", token);
         foreach (TestNode node in new[] { nodeA, nodeB })
@@ -795,14 +802,14 @@ public sealed class GlobalDdlLockTests
             _ = await node.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
         }
 
-        Assert.AreEqual("lfn,lft,lft_c_seq,li1,li2,li2_pkey,li3,li3_pkey,lid_seq1,lid_seq2,lid_seq3,lri,lri_pkey",
+        Assert.AreEqual("lfm,lfm_pkey,lfm_t,lfn,lft,lft_c_seq,li1,li2,li2_pkey,li3,li3_pkey,lid_seq1,lid_seq2,lid_seq3,lri,lri_pkey",
             await nodeA.SafePsqlAsync(Database, Chosen, token), "the names on node_a after the later DDL");
         Assert.AreEqual(await nodeA.SafePsqlAsync(Database, Chosen, token), await nodeB.SafePsqlAsync(Database, Chosen, token),
             "the names on node_b after the later DDL");
-        Assert.AreEqual("lfn_id_idx_local,lfn_pkey_local,lfn_rel_local,lft_c_seq_local,lid_seq1_local,lid_seq2_local,lid_seq3_local,lri_a_key_local",
+        Assert.AreEqual("lfm_b_key_local,lfm_local,lfm_pkey_local,lfn_id_idx_local,lfn_pkey_local,lfn_rel_local,lft_c_seq_local,lid_seq1_local,lid_seq2_local,lid_seq3_local,lri_a_key_local",
             await nodeB.SafePsqlAsync(Database, """
                 SELECT string_agg(c.relname, ',' ORDER BY c.relname) FROM worf.local_index l JOIN pg_class c ON c.oid = l.indexrelid
-                WHERE c.relname ~ '^l(id_|ft|fn|ri)'
+                WHERE c.relname ~ '^l(id_|ft|fn|fm|ri)'
                 """, token), "node_b's own indexes, renamed");
         log = nodeB.ReadLog()[logStart..];
         Assert.DoesNotContain("already exists", log);

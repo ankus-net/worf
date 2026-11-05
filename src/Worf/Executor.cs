@@ -334,7 +334,7 @@ internal static unsafe partial class Executor
         // DDL that replicates can't make other objects use an index on this node alone, and neither it nor DDL from
         // another node chooses names or finds indexes to use by those indexes, which the other nodes don't have.
         Dictionary<uint, (string Name, string?[] Ties)>? ties = ddl is null ? null : LocalIndex.Ties(parsetree);
-        bool isolated = LocalIndex.Isolate(parsetree, ddl is not null);
+        bool isolated = LocalIndex.Isolate(parsetree, ddl is not null, context == ProcessUtilityContext.PROCESS_UTILITY_SUBCOMMAND);
 
         // A COPY FROM draws a buffer of values from a managed sequence before the guard sees the first of them, so it
         // checks the sequences for each row in a condition of its own, ahead of any it has.

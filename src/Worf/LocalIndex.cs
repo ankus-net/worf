@@ -677,8 +677,10 @@ internal static unsafe partial class LocalIndex
     }
 
     /// <summary>
-    /// Keeps the indexes on this node alone out of the way of DDL that replicates, or DDL from another node, unless the
-    /// statement that runs it already does: one that has a name the DDL gives a relation is renamed, as
+    /// Keeps the indexes on this node alone out of the way of DDL that replicates, or DDL from another node, and of DDL
+    /// that a function it calls runs, whose work joins the statement's, which alone ends it; the commands PostgreSQL
+    /// runs for a statement, with names it chose, are the statement's own: one that has a name the DDL gives a relation
+    /// is renamed, as
     /// <see cref="RenameTakenLocals"/> renames it, and once the DDL has run, the names PostgreSQL chose beside them are
     /// made those the other nodes choose, as <see cref="Reconcile"/> makes them; a copy of a table's indexes leaves them
     /// out, as <see cref="SkipsCopy"/> does; and they're hidden from DDL that would attach them to a partitioned index
@@ -691,9 +693,15 @@ internal static unsafe partial class LocalIndex
     /// </summary>
     /// <param name="parsetree">The statement.</param>
     /// <param name="replicated">Whether it's DDL to replicate.</param>
+    /// <param name="subcommand">Whether PostgreSQL runs it for another statement.</param>
     /// <returns>Whether any are out of its way, for <see cref="EndIsolation"/> and <see cref="Restore"/>.</returns>
-    internal static bool Isolate(Node* parsetree, bool replicated)
+    internal static bool Isolate(Node* parsetree, bool replicated, bool subcommand)
     {
+        if (s_isolating && subcommand)
+        {
+            return false;
+        }
+
         bool rename = (replicated || Applying) && ChoosesNames(parsetree);
         bool hidingRebuilt = parsetree->type == NodeTag.T_AlterTableStmt && (Applying || rename);
         List<(uint Table, string[]? Columns, PgLockMode Lock)> unlive = [];
@@ -705,29 +713,35 @@ internal static unsafe partial class LocalIndex
 
         List<(uint Table, bool Comments)> copied = replicated || Applying ? CopiedTables(parsetree) : [];
         List<(uint Schema, string Name)>? given = replicated || Applying ? NamesTaken(parsetree, true) : null;
-        if (s_isolating || !(rename || given is { Count: > 0 } || hidingRebuilt || unlive.Count > 0 || invalid.Count > 0 || copied.Count > 0) ||
+        if (!(rename || given is { Count: > 0 } || hidingRebuilt || unlive.Count > 0 || invalid.Count > 0 || copied.Count > 0) ||
             Worf.CatalogOid("local_index") == 0 || !Elevated.Run(() => Worf.ReadScalar<bool>("SELECT EXISTS (SELECT FROM worf.local_index)")))
         {
             return false;
         }
 
+        // A statement that one being isolated runs adds what it needs to that statement's isolation, which ends it.
+        bool nested = s_isolating;
+        if (!nested)
+        {
+            s_named.Clear();
+            s_droppedNames.Clear();
+            s_givenNames.Clear();
+            s_hidden = [];
+        }
+
         s_copied.AddRange(copied);
-        s_named.Clear();
-        s_droppedNames.Clear();
-        s_givenNames.Clear();
         RenameTakenLocals(given);
-        s_naming = rename;
+        s_naming |= rename;
         foreach ((uint _, string name) in given ?? [])
         {
             _ = s_givenNames.Add(name);
         }
 
-        s_hidden = [];
         Hide(unlive, true);
         Hide(invalid, false);
-        s_hidingRebuilt = hidingRebuilt;
+        s_hidingRebuilt |= hidingRebuilt;
         s_isolating = true;
-        return true;
+        return !nested;
     }
 
     /// <summary>
