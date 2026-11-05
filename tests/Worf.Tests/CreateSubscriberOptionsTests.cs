@@ -97,8 +97,8 @@ public sealed class CreateSubscriberOptionsTests
             (int exitCode, string stdout, string stderr) = await CreateSubscriberCommand.RunAsync(command,
             [
                 "--pgdata", backupDir, "--subscriber-name", "test_subscriber",
-                $"--subscriber-dsn=host=localhost port={pgport.ToString(CultureInfo.InvariantCulture)} user=super",
-                $"--provider-dsn=host=localhost port={providerPort.ToString(CultureInfo.InvariantCulture)} user=super connect_timeout=2000",
+                $"--subscriber-dsn=host=127.0.0.1 port={pgport.ToString(CultureInfo.InvariantCulture)} user=super",
+                $"--provider-dsn=host=127.0.0.1 port={providerPort.ToString(CultureInfo.InvariantCulture)} user=super connect_timeout=2000",
                 "--databases=postgres,otherdb", "--replication-sets=default ddl_sql", "--apply-delay=5", "--text-types",
                 "--extra-basebackup-args=-c fast", "--stop", "-v", "-v",
                 $"--hba-conf={Path.Join(AppContext.BaseDirectory, "TestFiles", "regress-pg_hba.conf")}",

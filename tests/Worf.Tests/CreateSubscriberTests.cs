@@ -80,8 +80,8 @@ public sealed class CreateSubscriberTests
         ], token);
         int providerPort = provider.Cluster.Port;
         int pgport = CreateSubscriberCommand.FreePort();
-        string providerDsn = $"postgresql://super@localhost:{providerPort.ToString(CultureInfo.InvariantCulture)}/postgres";
-        string subscriberDsn = $"postgresql://super@localhost:{pgport.ToString(CultureInfo.InvariantCulture)}/postgres";
+        string providerDsn = $"postgresql://super@127.0.0.1:{providerPort.ToString(CultureInfo.InvariantCulture)}/postgres";
+        string subscriberDsn = $"postgresql://super@127.0.0.1:{pgport.ToString(CultureInfo.InvariantCulture)}/postgres";
         string backupDir = Path.Join(work.FullName, "backupdir");
 
         string command = await CreateSubscriberCommand.InstallAsync(provider.Installation, Path.Join(work.FullName, "bin"));

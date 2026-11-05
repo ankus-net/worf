@@ -80,12 +80,8 @@ internal sealed class TestNode : IAsyncDisposable
         TestNode node = new(name, cluster);
         try
         {
-            await using (NpgsqlConnection connection = await cluster.OpenConnectionAsync(cancellationToken))
-            {
-                _ = await QueryAsync(connection, "CREATE EXTENSION worf", cancellationToken);
-            }
-
-            await node.TrustOutputPluginAsync(cancellationToken);
+            await using NpgsqlConnection connection = await cluster.OpenConnectionAsync(cancellationToken);
+            _ = await QueryAsync(connection, "CREATE EXTENSION worf", cancellationToken);
         }
         catch
         {
@@ -394,8 +390,9 @@ internal sealed class TestNode : IAsyncDisposable
     /// <summary>
     /// Gets the fixture whose publication of worf, and staged installation, the test run's nodes share, starting it the
     /// first time, the settings that load worf from them, the fixture's own, which name the publication's library and,
-    /// from PostgreSQL 18, its control files, and the publication's directory, the first in the library path. Its
-    /// server stops once they're read, as no test uses it.
+    /// from PostgreSQL 18, its control files, with worf in output_plugin_libraries, which current PostgreSQL releases
+    /// require of every output plugin, as a DBA lists it, where the server has that setting, and the publication's
+    /// directory, the first in the library path. Its server stops once they're read, as no test uses it.
     /// </summary>
     private static async Task<(PostgresExtensionTest Fixture, string[] Settings, string Publication)> SharedAsync(CancellationToken cancellationToken)
     {
@@ -417,6 +414,8 @@ internal sealed class TestNode : IAsyncDisposable
                     await using (NpgsqlCommand read = new("""
                         SELECT name, setting FROM pg_catalog.pg_settings
                         WHERE name IN ('shared_preload_libraries', 'dynamic_library_path', 'extension_control_path')
+                        UNION ALL
+                        SELECT name, 'pgoutput, test_decoding, worf' FROM pg_catalog.pg_settings WHERE name = 'output_plugin_libraries'
                         """, connection))
                     await using (NpgsqlDataReader reader = await read.ExecuteReaderAsync(cancellationToken))
                     {
@@ -473,28 +472,6 @@ internal sealed class TestNode : IAsyncDisposable
         IFormattable formattable => formattable.ToString(null, CultureInfo.InvariantCulture),
         _ => value.ToString() ?? "",
     };
-
-    /// <summary>
-    /// Lists worf in output_plugin_libraries, which current PostgreSQL releases require of every output plugin, as a
-    /// DBA does. Earlier minor releases have no such setting.
-    /// </summary>
-    private async Task TrustOutputPluginAsync(CancellationToken cancellationToken)
-    {
-        const string Setting = "pgoutput, test_decoding, worf";
-        const string Database = "postgres";
-        if (await SafePsqlAsync(Database, "SELECT count(*) FROM pg_settings WHERE name = 'output_plugin_libraries'", cancellationToken) != "1")
-        {
-            return;
-        }
-
-        _ = await SafePsqlAsync(Database, $"ALTER SYSTEM SET output_plugin_libraries = {Setting}", cancellationToken);
-        _ = await SafePsqlAsync(Database, "SELECT pg_reload_conf()", cancellationToken);
-        if (!await PollQueryUntilAsync(Database, $"SELECT current_setting('output_plugin_libraries') = '{Setting}'", cancellationToken))
-        {
-            throw new InvalidOperationException("output_plugin_libraries did not take effect");
-        }
-    }
-
     private async Task RunPgCtlAsync(IReadOnlyList<string> arguments, CancellationToken cancellationToken,
         IReadOnlyDictionary<string, string>? environment = null)
     {
