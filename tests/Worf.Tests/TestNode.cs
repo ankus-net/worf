@@ -269,7 +269,9 @@ internal sealed class TestNode : IAsyncDisposable
 
     /// <summary>
     /// Describes the node's replication as it stands, for a failure's message: its sessions and what they wait on, the
-    /// locks they wait for, worf's subscriptions, slots and replication origins.
+    /// locks they wait for, slots, replication origins and worf's subscriptions, and outside Windows the server's
+    /// processes, which show a worker that never connected. Each query gives up after a while, as one that waits on a
+    /// lightweight lock can't be cancelled, and worf's status, which takes worf's own, comes last.
     /// </summary>
     /// <param name="dbname">The database.</param>
     /// <param name="cancellationToken">Cancels the queries.</param>
@@ -284,22 +286,32 @@ internal sealed class TestNode : IAsyncDisposable
                 WHERE pid <> pg_catalog.pg_backend_pid() ORDER BY pid
                 """),
             ("waiting locks", "SELECT pid, locktype, relation::pg_catalog.regclass, transactionid, mode FROM pg_catalog.pg_locks WHERE NOT granted"),
-            ("subscriptions", "SELECT subscription_name, status, provider_node, slot_name, replication_sets::text, forward_origins::text FROM worf.show_subscription_status()"),
             ("slots", "SELECT slot_name, active, active_pid, restart_lsn, confirmed_flush_lsn FROM pg_catalog.pg_replication_slots"),
             ("origins", "SELECT * FROM pg_catalog.pg_replication_origin_status"),
+            ("subscriptions", "SELECT subscription_name, status, provider_node, slot_name, replication_sets::text, forward_origins::text FROM worf.show_subscription_status()"),
         })
         {
             string rows;
+            using CancellationTokenSource patience = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            patience.CancelAfter(TimeSpan.FromSeconds(15));
             try
             {
-                rows = await SafePsqlAsync(dbname, sql, cancellationToken);
+                rows = await SafePsqlAsync(dbname, sql, patience.Token);
             }
-            catch (NpgsqlException error)
+            catch (Exception error) when (error is NpgsqlException or OperationCanceledException && !cancellationToken.IsCancellationRequested)
             {
                 rows = error.Message;
             }
 
             _ = description.Append(CultureInfo.InvariantCulture, $"\n{what}:\n{rows}");
+        }
+
+        if (!OperatingSystem.IsWindows())
+        {
+            string postmaster = File.ReadLines(Path.Join(Cluster.DataDirectory, "postmaster.pid")).First().Trim();
+            (_, string processes, _) = await ProcessRunner.RunAsync("ps", ["-A", "-o", "pid=,ppid=,stat=,etime=,command="], cancellationToken);
+            _ = description.Append(CultureInfo.InvariantCulture, $"\nprocesses:\n{string.Join('\n', processes.Split('\n')
+                .Where(line => line.Split(' ', StringSplitOptions.RemoveEmptyEntries) is [_, string parent, ..] && parent == postmaster))}");
         }
 
         return description.ToString();
