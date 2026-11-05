@@ -1724,7 +1724,7 @@ internal static class Sync
         // those itself. Under discard and transdiscard, a merge that fails is merged again in halves, down to the rows
         // that fail alone, which are skipped and recorded as the copy commits, so that the provider's other rows, and
         // the changes after the copy, still arrive.
-        string source = $"(SELECT * FROM {MergeCopy} WHERE ctid OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.tid[]))";
+        string source = $"(SELECT * FROM {MergeCopy} WHERE ctid OPERATOR(pg_catalog.>=) $1::pg_catalog.tid AND ctid OPERATOR(pg_catalog.<) $2::pg_catalog.tid)";
         string mergePart = merge.ToString().Replace($" USING {MergeCopy} c ON ", $" USING {source} c ON ", StringComparison.Ordinal);
         try
         {
@@ -1735,12 +1735,12 @@ internal static class Sync
                 CheckDeferrableExclusion(reloid, only + table);
             }, PgSubtransactionMode.Atomic);
         }
-        catch (PgException error) when (error.SqlState is PgSqlStates.UniqueViolation or PgSqlStates.ExclusionViolation &&
+        catch (PgException error) when (IsIntegrityViolation(error) &&
             Apply.ExceptionBehaviour is not (WorfExceptionBehaviour.Error or WorfExceptionBehaviour.SubDisable))
         {
-            WorfRows rows = Worf.Read($"SELECT ctid::text FROM {MergeCopy} ORDER BY ctid", 0);
             List<(string Place, PgException Error)> skipped = [];
-            MergeParts(reloid, only + table, mergePart, [.. rows.Select(row => row.Get<string>(0))], skipped);
+            long last = Position(Worf.ReadScalar<string>($"SELECT max(ctid)::text FROM {MergeCopy}"));
+            MergeParts(reloid, only + table, mergePart, 0, last + 1, skipped);
             RecordSkipped(rel, lsn, skipped);
             WorfLog.Warning(new PgDiagnostic($"skipped {skipped.Count} of the rows of the copy of table {remoterel.Nspname}.{remoterel.Relname} as it merged into the rows it has: {error.Message}")
             {
@@ -1748,12 +1748,14 @@ internal static class Sync
                 Hint = "Resynchronize the table with worf.alter_subscription_resynchronize_table to give it the provider's rows.",
             });
         }
-        catch (PgException error) when (error.SqlState is PgSqlStates.UniqueViolation or PgSqlStates.ExclusionViolation)
+        catch (PgException error) when (IsIntegrityViolation(error))
         {
             PgException failed = new(error.SqlState,
                 $"could not merge the copy of table {remoterel.Nspname}.{remoterel.Relname} into the rows it has: {error.Message}",
                 detail: error.Detail,
-                hint: "Rows here hold values the provider's rows take, as rows the provider no longer has, or rows whose values it moved to others. Resynchronize the table with worf.alter_subscription_resynchronize_table, which empties it and copies it again.");
+                hint: error.SqlState is PgSqlStates.UniqueViolation or PgSqlStates.ExclusionViolation
+                    ? "Rows here hold values the provider's rows take, as rows the provider no longer has, or rows whose values it moved to others. Resynchronize the table with worf.alter_subscription_resynchronize_table, which empties it and copies it again."
+                    : "The provider's rows break a constraint of the table here, which the provider's table doesn't have.");
             CopyConversion.DisableAfterMerge(rel, lsn, failed);
             throw failed;
         }
@@ -1764,32 +1766,54 @@ internal static class Sync
     }
 
     /// <summary>
-    /// Merges some of a copy's rows, by their places in it, in a subtransaction, and in halves when that fails, down to
-    /// a row that fails alone, whose place is kept to record.
+    /// Merges the rows of a copy from one place in it up to another, in a subtransaction, and in halves when that fails,
+    /// down to a row that fails alone, whose place is kept to record. A place is a row's block and offset, as one
+    /// number, so that a range takes no memory however many rows it holds, and PostgreSQL scans it as a range of
+    /// ctids.
     /// </summary>
-    private static void MergeParts(uint reloid, string table, string merge, List<string> rows, List<(string Place, PgException Error)> skipped)
+    private static void MergeParts(uint reloid, string table, string merge, long from, long to, List<(string Place, PgException Error)> skipped)
     {
         try
         {
             PgTransaction.RunInSubtransaction(() =>
             {
-                _ = Worf.ExecuteUnpinned(merge, SpiParameter.Create(rows.ToArray()));
+                _ = Worf.ExecuteUnpinned(merge, SpiParameter.Create(Tid(from)), SpiParameter.Create(Tid(to)));
                 CheckDeferrableUnique(reloid, table);
                 CheckDeferrableExclusion(reloid, table);
             }, PgSubtransactionMode.Atomic);
         }
-        catch (PgException error) when (error.SqlState is PgSqlStates.UniqueViolation or PgSqlStates.ExclusionViolation)
+        catch (PgException error) when (IsIntegrityViolation(error))
         {
-            if (rows.Count > 1)
+            WorfRow rows = Worf.Read($"""
+                SELECT count(*)::pg_catalog.int8, min(ctid)::pg_catalog.text FROM {MergeCopy}
+                WHERE ctid OPERATOR(pg_catalog.>=) $1::pg_catalog.tid AND ctid OPERATOR(pg_catalog.<) $2::pg_catalog.tid
+                """, 1, SpiParameter.Create(Tid(from)), SpiParameter.Create(Tid(to)))[0];
+            if (rows.Get<long>(0) > 1)
             {
-                MergeParts(reloid, table, merge, rows[..(rows.Count / 2)], skipped);
-                MergeParts(reloid, table, merge, rows[(rows.Count / 2)..], skipped);
+                long middle = from + ((to - from) / 2);
+                MergeParts(reloid, table, merge, from, middle, skipped);
+                MergeParts(reloid, table, merge, middle, to, skipped);
                 return;
             }
 
-            skipped.Add((rows[0], error));
+            skipped.Add((rows.Get<string>(1), error));
         }
     }
+
+    /// <summary>
+    /// Checks whether an error is an integrity constraint's, which a row of a copy can break when it merges: a key, a
+    /// CHECK or NOT NULL constraint, or an exclusion constraint.
+    /// </summary>
+    private static bool IsIntegrityViolation(PgException error) => error.SqlState?.StartsWith("23", StringComparison.Ordinal) == true;
+
+    // A row's place as one number, its block above its offset, and back as a tid's text.
+    private static long Position(string tid)
+    {
+        string[] parts = tid.Trim('(', ')').Split(',');
+        return (long.Parse(parts[0], CultureInfo.InvariantCulture) << 16) | long.Parse(parts[1], CultureInfo.InvariantCulture);
+    }
+
+    private static string Tid(long position) => string.Create(CultureInfo.InvariantCulture, $"({position >> 16},{position & 0xffff})");
 
     /// <summary>
     /// Records the rows of a table's copy that its merge skipped, by their places in the copy, with their errors, from

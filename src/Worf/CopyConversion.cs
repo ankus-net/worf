@@ -456,8 +456,10 @@ internal static unsafe partial class CopyConversion
     /// <summary>
     /// Prepares what a copy in batches checks of each row besides COPY: each copied column's input, and the condition
     /// each batch's COPY runs, of <c>worf.copy_row</c>, which numbers the row, and <c>worf.copy_check</c> on each NOT
-    /// NULL column and enforced CHECK constraint, as COPY would check them once it has computed the generated columns,
-    /// which the condition, run before then, leaves to COPY.
+    /// NULL column and enforced CHECK constraint, as COPY would check them. The condition runs before COPY fires the
+    /// table's BEFORE ROW triggers and computes its generated columns, so it leaves to COPY the constraints of a table
+    /// that has such a trigger that fires under apply's replica role, which can change a row, and those that name a
+    /// generated column.
     /// </summary>
     private static void PrepareChecks(RelationData* relation, List<string> attnames)
     {
@@ -494,7 +496,14 @@ internal static unsafe partial class CopyConversion
             s_checkErrors.Add((state, message));
         }
 
-        for (int i = 0; i < desc->natts; i++)
+        bool triggered = false;
+        Trigger* trigger = relation->trigdesc is null ? null : relation->trigdesc->triggers;
+        for (int i = 0; trigger is not null && i < relation->trigdesc->numtriggers; i++, trigger++)
+        {
+            triggered |= (trigger->tgtype & BeforeRowInsert) == BeforeRowInsert && trigger->tgenabled is (sbyte)'A' or (sbyte)'R';
+        }
+
+        for (int i = 0; i < desc->natts && !triggered; i++)
         {
             FormData_pg_attribute* att = NativeMethods.TupleDescAttr(desc, i);
             if (att->attisdropped || !att->attnotnull || att->attgenerated != 0)
@@ -512,7 +521,7 @@ internal static unsafe partial class CopyConversion
         }
 
         TupleConstr* constr = desc->constr;
-        for (int i = 0; constr is not null && i < constr->num_check; i++)
+        for (int i = 0; constr is not null && i < constr->num_check && !triggered; i++)
         {
 #if !ANKUS_PG15 && !ANKUS_PG16 && !ANKUS_PG17
             if (!constr->check[i].ccenforced)
@@ -520,9 +529,15 @@ internal static unsafe partial class CopyConversion
                 continue;
             }
 #endif
+            Node* expression = (Node*)NativeMethods.stringToNode(constr->check[i].ccbin);
+            if (NamesGenerated(desc, expression))
+            {
+                continue;
+            }
+
             BooleanTest* test = (BooleanTest*)NativeMethods.palloc0((ulong)sizeof(BooleanTest));
             test->xpr.type = NodeTag.T_BooleanTest;
-            test->arg = (Expr*)NativeMethods.stringToNode(constr->check[i].ccbin);
+            test->arg = (Expr*)expression;
             test->booltesttype = BoolTestType.IS_NOT_FALSE;
             test->location = -1;
             string name = Worf.FromServer(constr->check[i].ccname);
@@ -530,6 +545,26 @@ internal static unsafe partial class CopyConversion
         }
 
         s_checkWhere = where;
+    }
+
+    /// <summary>
+    /// Checks whether an expression on a table's row names one of its generated columns, or the whole row, which
+    /// holds them.
+    /// </summary>
+    private static bool NamesGenerated(TupleDescData* desc, Node* expression)
+    {
+        Bitmapset* attnums = null;
+        NativeMethods.pull_varattnos(expression, 1, &attnums);
+        for (int member = NativeMethods.bms_next_member(attnums, -1); member >= 0; member = NativeMethods.bms_next_member(attnums, member))
+        {
+            int attnum = member + FirstLowInvalidHeapAttributeNumber;
+            if (attnum == 0 || (attnum > 0 && NativeMethods.TupleDescAttr(desc, attnum - 1)->attgenerated != 0))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -1252,4 +1287,9 @@ internal static unsafe partial class CopyConversion
     private const int AccessShareLock = 1;
     private const int RowExclusiveLock = 3;
     private const int NoLock = 0;
+
+    // TRIGGER_TYPE_ROW, TRIGGER_TYPE_BEFORE and TRIGGER_TYPE_INSERT from catalog/pg_trigger.h, and
+    // FirstLowInvalidHeapAttributeNumber from access/sysattr.h, by which pull_varattnos offsets its attribute numbers.
+    private const short BeforeRowInsert = (1 << 0) | (1 << 1) | (1 << 2);
+    private const int FirstLowInvalidHeapAttributeNumber = -7;
 }

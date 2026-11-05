@@ -678,8 +678,8 @@ public sealed partial class ExceptionBehaviourTests
     /// in, in one transaction, so the table is never seen empty, though a key references the table, its own key is an
     /// identity or deferrable: the provider's rows replace those with the same key, and the table's other rows stay, those
     /// written here or under another origin, and those the provider has since deleted. Under transdiscard, as under
-    /// discard, a row of the copy that a row here holds a unique value of is skipped and recorded under transdiscard,
-    /// while the others merge and later changes arrive. One cancelled before its copy
+    /// discard, a row of the copy that a row here holds a unique value of, or that a CHECK constraint here refuses, is
+    /// skipped and recorded under transdiscard, while the others merge and later changes arrive. One cancelled before its copy
     /// commits copies a table without a key once, and the cleanup after it waits for a session that holds its slot, with a
     /// warning, rather than for ever. Dropping the subscription drops the slots its syncs left.
     /// </summary>
@@ -826,7 +826,10 @@ public sealed partial class ExceptionBehaviourTests
             _ = await subscriber.SafePsqlAsync(Database, $"CREATE TABLE {table} (id {key}, v text)", token);
             if (stop == "conflict")
             {
-                _ = await subscriber.SafePsqlAsync(Database, $"CREATE UNIQUE INDEX {table}_v ON {table} (v) WHERE v <> 'copied'", token);
+                _ = await subscriber.SafePsqlAsync(Database, $"""
+                    CREATE UNIQUE INDEX {table}_v ON {table} (v) WHERE v <> 'copied';
+                    ALTER TABLE {table} ADD CHECK (id <> 700000);
+                    """, token);
             }
 
             // A key on the subscriber references the table.
@@ -929,8 +932,9 @@ public sealed partial class ExceptionBehaviourTests
                     _ = await provider.SafePsqlAsync(Database, $"SELECT pg_drop_replication_slot('{syncSlot}')", token);
                     break;
                 case "conflict":
-                    // The copy again merges row 500's new value, which a row here holds, so under transdiscard, as under
-                    // discard, that row is skipped, and recorded under transdiscard, while the others merge.
+                    // The copy again merges row 500's new value, which a row here holds, and row 700000, which a CHECK
+                    // constraint here refuses, so under transdiscard, as under discard, those rows are skipped, and
+                    // recorded under transdiscard, while the others merge.
                     _ = await provider.SafePsqlAsync(Database, $"SELECT pg_drop_replication_slot('{syncSlot}')", token);
                     await SetBehaviourAsync(subscriber, "transdiscard", token);
                     break;
@@ -958,7 +962,7 @@ public sealed partial class ExceptionBehaviourTests
             Assert.AreEqual(stop switch
             {
                 "resume" => "1000|500500|updated|f|t|here|elsewhere|1",
-                "conflict" => "1001|501100|copied|t|t|here|elsewhere|1",
+                "conflict" => "1000|-198900|copied|t|f|here|elsewhere|1",
                 _ => "1001|501100|updated|t|t|here|elsewhere|1",
             },
                 await subscriber.SafePsqlAsync(Database, $"""
@@ -972,11 +976,11 @@ public sealed partial class ExceptionBehaviourTests
                 subscriber.ReadLog()[logpos..], $"the sync after {stop}");
             if (stop == "conflict")
             {
-                Assert.Contains($"skipped 1 of the rows of the copy of table public.{table}", subscriber.ReadLog()[logpos..]);
-                Assert.AreEqual("MERGE|500|updated|23505|transdiscard", await subscriber.SafePsqlAsync(Database, $"""
+                Assert.Contains($"skipped 2 of the rows of the copy of table public.{table}", subscriber.ReadLog()[logpos..]);
+                Assert.AreEqual("MERGE|500|updated|23505|transdiscard\nMERGE|700000|new|23514|transdiscard", await subscriber.SafePsqlAsync(Database, $"""
                     SELECT operation, remote_new_tuple->>'id', remote_new_tuple->>'v', error_sqlstate, behaviour FROM worf.exception_log
-                    WHERE table_name = '{table}'
-                    """, token), "the skipped row recorded");
+                    WHERE table_name = '{table}' ORDER BY (remote_new_tuple->>'id')::integer
+                    """, token), "the skipped rows recorded");
 
                 // The changes after the copy still arrive.
                 _ = await provider.SafePsqlAsync(Database, $"UPDATE {table} SET v = 'later' WHERE id = 501", token);
@@ -1103,7 +1107,8 @@ public sealed partial class ExceptionBehaviourTests
     /// A table's copy under discard leaves out the rows the subscriber's NOT NULL columns and CHECK constraints refuse,
     /// and those whose values its column types refuse, without a transaction ID each, recording them in order with the
     /// provider's row numbers, while a duplicate key, which only COPY finds, still fails its batch's COPY alone. An error
-    /// that ends a copy in batches names the provider's row. Under transdiscard, the rows are recorded as its own.
+    /// that ends a copy in batches names the provider's row. Under transdiscard, the rows are recorded as its own. Rows
+    /// that a BEFORE ROW trigger fills in, or whose generated column a CHECK names, copy as COPY would copy them.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -1185,6 +1190,33 @@ public sealed partial class ExceptionBehaviourTests
             SELECT string_agg(concat_ws('|', table_name, behaviour, n), ',' ORDER BY table_name)
             FROM (SELECT table_name, behaviour, count(*) AS n FROM worf.exception_log GROUP BY 1, 2) b
             """, token), "the behaviour each copy's rows were recorded under");
+
+        // The checks run before COPY fires BEFORE ROW triggers and computes generated columns, so a row that a trigger
+        // that fires under apply's replica role fills in, and one whose generated column a CHECK names, copy as COPY
+        // would copy them.
+        _ = await provider.SafePsqlAsync(Database, """
+            CREATE TABLE tr (id integer PRIMARY KEY, v integer);
+            CREATE TABLE gen (id integer PRIMARY KEY, v integer);
+            INSERT INTO tr SELECT g, CASE WHEN g % 2 = 0 THEN NULL ELSE g END FROM generate_series(1, 10) g;
+            INSERT INTO gen SELECT g, g FROM generate_series(1, 10) g;
+            """, token);
+        _ = await subscriber.SafePsqlAsync(Database, """
+            CREATE TABLE tr (id integer PRIMARY KEY, v integer NOT NULL);
+            CREATE FUNCTION tr_fill() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.v := coalesce(NEW.v, 0); RETURN NEW; END $$;
+            CREATE TRIGGER tr_fill BEFORE INSERT ON tr FOR EACH ROW EXECUTE FUNCTION tr_fill();
+            ALTER TABLE tr ENABLE ALWAYS TRIGGER tr_fill;
+            CREATE TABLE gen (id integer PRIMARY KEY, v integer, g integer GENERATED ALWAYS AS (v * 2) STORED CHECK (g IS NOT NULL));
+            """, token);
+        _ = await provider.SafePsqlAsync(Database, """
+            SELECT * FROM worf.replication_set_add_table('default', 'tr', synchronize_data := true);
+            SELECT * FROM worf.replication_set_add_table('default', 'gen', synchronize_data := true);
+            """, token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+            "SELECT count(*) = 2 FROM worf.local_sync_status WHERE sync_relname IN ('tr', 'gen') AND sync_status = 'r'", token), "tr's and gen's copies");
+        Assert.AreEqual("10|5|10|0", await subscriber.SafePsqlAsync(Database, """
+            SELECT (SELECT count(*) FROM tr), (SELECT count(*) FROM tr WHERE v = 0), (SELECT count(*) FROM gen),
+                (SELECT count(*) FROM worf.exception_log WHERE table_name IN ('tr', 'gen'))
+            """, token), "the rows the trigger fills and those the generated column's CHECK passes");
     }
 
     /// <summary>
