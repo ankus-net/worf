@@ -976,8 +976,10 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   its table, or changes the type or generation expression of a column of a
   table whose foreign keys reference its table, or the type of an attribute of
   a composite type such a table uses, passes over it where it would use it: a
-  partitioned index by the same columns, or a foreign key's valid unique index
-  by the columns it references. Such DDL then does what it does on the other
+  partitioned index that PostgreSQL may take it for, as one that matches it in
+  uniqueness, access method, columns, included columns, and whether each has a
+  predicate, or a foreign key's valid unique index by the columns it
+  references. Such DDL then does what it does on the other
   nodes, and fails if an event trigger or a function it runs writes to or
   rewrites a table whose index it attaches, since the index wouldn't get the
   rows. DDL that gives a relation its name renames it, with a warning, and once

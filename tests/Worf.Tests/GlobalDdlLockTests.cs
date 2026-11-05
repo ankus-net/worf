@@ -959,7 +959,9 @@ public sealed class GlobalDdlLockTests
     /// it, a transaction that creates a table whose short name starts as such indexes' names do and another node's DDL on
     /// their table, and a transaction that copies tables in one order and another node's replicated SQL that sets the
     /// search path and copies them in the other, and the copies, keys and names come out as on the other node, with an
-    /// index on one node alone whose name the DDL takes renamed.
+    /// index on one node alone whose name the DDL takes renamed. Transactions that index partitioned tables in opposite
+    /// orders, one by columns that such indexes of their partitions can't be taken for and the other by columns that
+    /// they could be, wait for neither.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -1161,6 +1163,39 @@ public sealed class GlobalDdlLockTests
             _ = await node.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
         }
 
+        // node_b's transaction indexes pt and then pq by v and an included id, which node_b's own indexes on v of their
+        // partitions can't be taken for, while another indexes pq and then pt by v alone, which they could be: only the
+        // indexes a partitioned index may take are hidden from it, so neither waits for the other, as without node_b's
+        // own indexes.
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE TABLE pq (id integer PRIMARY KEY, v integer) PARTITION BY RANGE (id);
+            CREATE TABLE pq1 PARTITION OF pq FOR VALUES FROM (0) TO (1000);
+            """, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
+        await BuildLocalIndexAsync(nodeB, "INDEX CONCURRENTLY qz_idx ON pq1 (v)", token);
+        await using (NpgsqlConnection including = await nodeB.OpenAsync(Database, token))
+        await using (NpgsqlConnection matching = await nodeB.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction inclusive = await including.BeginTransactionAsync(token);
+            await using NpgsqlTransaction plain = await matching.BeginTransactionAsync(token);
+            foreach ((NpgsqlConnection connection, NpgsqlTransaction transaction, string sql) in new[]
+            {
+                (including, inclusive, "SET LOCAL lock_timeout = '10s'; CREATE INDEX pt_b2 ON pt (v) INCLUDE (id)"),
+                (matching, plain, "SET LOCAL lock_timeout = '10s'; CREATE INDEX pq_a2 ON pq (v)"),
+                (including, inclusive, "CREATE INDEX pq_b2 ON pq (v) INCLUDE (id)"),
+                (matching, plain, "CREATE INDEX pt_a2 ON pt (v)"),
+            })
+            {
+                await using NpgsqlCommand command = new(sql, connection, transaction);
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+
+            await inclusive.CommitAsync(token);
+            await plain.CommitAsync(token);
+        }
+
+        await AssertNoDeadlockAsync("the partitioned indexes in opposite orders");
+
         const string Copies = """
             SELECT string_agg(c.relname || ':' || i.relname, ',' ORDER BY c.relname, i.relname)
             FROM pg_index x JOIN pg_class c ON c.oid = x.indrelid JOIN pg_class i ON i.oid = x.indexrelid
@@ -1177,10 +1212,10 @@ public sealed class GlobalDdlLockTests
             WHERE c.relname IN ('t1', 't2', 'x', 'y', 'x_a', 'y_a', 'pt1') AND NOT EXISTS (SELECT FROM worf.local_index l WHERE l.indexrelid = x.indexrelid)
             """;
         string indexesOnA = await nodeA.SafePsqlAsync(Database, Indexes, token);
-        Assert.AreEqual("lz_idx,pt1_id_idx,pt1_id_v_idx,pt1_pkey,t1_pkey,t1_v_idx,t2_pkey,t2_v_idx,x_a_b_key,x_a_key,x_a_pkey,x_pkey," +
+        Assert.AreEqual("lz_idx,pt1_id_idx,pt1_id_v_idx,pt1_pkey,pt1_v_id_idx,pt1_v_idx,t1_pkey,t1_v_idx,t2_pkey,t2_v_idx,x_a_b_key,x_a_key,x_a_pkey,x_pkey," +
             "y_a_b_key,y_a_key,y_a_pkey,y_pkey", indexesOnA, "the indexes on node_a");
         Assert.AreEqual(indexesOnA, await nodeB.SafePsqlAsync(Database, Indexes, token), "the indexes on node_b, beside its own");
-        Assert.AreEqual("lz_idx_local,m1_v_idx,m2_v_idx,pz_idx,t1_v_idx_local,t2_v_idx_local,x_a_idx,y_a_idx", await nodeB.SafePsqlAsync(Database, """
+        Assert.AreEqual("lz_idx_local,m1_v_idx,m2_v_idx,pz_idx,qz_idx,t1_v_idx_local,t2_v_idx_local,x_a_idx,y_a_idx", await nodeB.SafePsqlAsync(Database, """
             SELECT string_agg(c.relname, ',' ORDER BY c.relname) FROM worf.local_index l JOIN pg_class c ON c.oid = l.indexrelid
             WHERE c.relname NOT LIKE 'lt%'
             """, token), "node_b's own indexes, those whose names the DDL took renamed");

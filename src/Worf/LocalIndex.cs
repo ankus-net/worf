@@ -704,7 +704,7 @@ internal static unsafe partial class LocalIndex
 
         bool rename = (replicated || Applying) && ChoosesNames(parsetree);
         bool hidingRebuilt = parsetree->type == NodeTag.T_AlterTableStmt && (Applying || rename);
-        List<(uint Table, string[]? Columns, PgLockMode Lock)> unlive = [];
+        List<(uint Table, IndexShape Shape, PgLockMode Lock)> unlive = [];
         List<(uint Table, string[]? Columns, PgLockMode Lock)> invalid = [];
         if (replicated || Applying)
         {
@@ -737,8 +737,8 @@ internal static unsafe partial class LocalIndex
             _ = s_givenNames.Add(name);
         }
 
-        Hide(unlive, true);
-        Hide(invalid, false);
+        HideUnlive(unlive);
+        HideInvalid(invalid);
         s_hidingRebuilt |= hidingRebuilt;
         s_isolating = true;
         return !nested;
@@ -1339,7 +1339,7 @@ internal static unsafe partial class LocalIndex
     /// live.</param>
     /// <param name="invalid">The tables whose valid unique indexes by the columns given, or by any for null, are to be
     /// hidden as not valid.</param>
-    private static void UsedTables(Node* parsetree, List<(uint Table, string[]? Columns, PgLockMode Lock)> unlive, List<(uint Table, string[]? Columns, PgLockMode Lock)> invalid)
+    private static void UsedTables(Node* parsetree, List<(uint Table, IndexShape Shape, PgLockMode Lock)> unlive, List<(uint Table, string[]? Columns, PgLockMode Lock)> invalid)
     {
         switch (parsetree->type)
         {
@@ -1355,12 +1355,14 @@ internal static unsafe partial class LocalIndex
             case NodeTag.T_IndexStmt when !((IndexStmt*)parsetree)->concurrent && ((IndexStmt*)parsetree)->relation->inh:
                 IndexStmt* index = (IndexStmt*)parsetree;
                 uint indexed = NativeMethods.RangeVarGetRelidExtended(index->relation, 0, RangeVarMissingOk, default, null);
-                if (indexed != 0 && NativeMethods.get_rel_relkind(indexed) == (sbyte)'p')
+                if (indexed != 0 && NativeMethods.get_rel_relkind(indexed) == (sbyte)'p' && index->excludeOpNames is null)
                 {
-                    string[]? columns = IndexColumns(index->indexParams);
+                    IndexShape shape = new(index->unique, index->nulls_not_distinct, Worf.FromServer(index->accessMethod),
+                        [.. IndexColumns(index->indexParams), .. IndexColumns(index->indexIncludingParams)], ListLength(index->indexParams),
+                        index->whereClause is not null, false);
                     foreach (uint partition in Partitions(indexed))
                     {
-                        unlive.Add((partition, columns, PgLockMode.Share));
+                        unlive.Add((partition, shape, PgLockMode.Share));
                     }
                 }
 
@@ -1403,23 +1405,41 @@ internal static unsafe partial class LocalIndex
     }
 
     /// <summary>
-    /// Finds the columns of an index's elements by name, or null when one is an expression.
+    /// Finds the columns of an index's elements by name, with an empty one for an expression.
     /// </summary>
-    private static string[]? IndexColumns(List* elements)
+    private static List<string> IndexColumns(List* elements)
     {
         List<string> columns = [];
         for (int i = 0; elements is not null && i < elements->length; i++)
         {
             IndexElem* element = (IndexElem*)elements->elements[i].ptr_value;
-            if (element->name is null)
-            {
-                return null;
-            }
-
-            columns.Add(Worf.FromServer(element->name));
+            columns.Add(element->name is null ? "" : Worf.FromServer(element->name));
         }
 
-        return [.. columns];
+        return columns;
+    }
+
+    private static int ListLength(List* list) => list is null ? 0 : list->length;
+
+    /// <summary>
+    /// Reads the shapes of a table's indexes, or of those on this node alone, by which a partitioned index may take them.
+    /// </summary>
+    /// <param name="table">The table.</param>
+    /// <param name="local">Whether only those on this node alone.</param>
+    /// <returns>Each index and its shape.</returns>
+    private static List<(uint Index, IndexShape Shape)> IndexShapes(uint table, bool local)
+    {
+        WorfRows indexes = Elevated.Run(() => Worf.Read("""
+            SELECT i.indexrelid, i.indisunique, i.indnullsnotdistinct, m.amname::pg_catalog.text,
+                array_agg(COALESCE(a.attname::pg_catalog.text, '') ORDER BY k.n), i.indnkeyatts::pg_catalog.int4, i.indpred IS NOT NULL, i.indisexclusion
+            FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid JOIN pg_catalog.pg_am m ON m.oid = c.relam
+                CROSS JOIN LATERAL pg_catalog.unnest(i.indkey::pg_catalog.int2[]) WITH ORDINALITY AS k (attnum, n)
+                LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum AND k.attnum > 0
+            WHERE i.indrelid = $1 AND (NOT $2 OR i.indexrelid IN (SELECT indexrelid FROM worf.local_index))
+            GROUP BY i.indexrelid, i.indisunique, i.indnullsnotdistinct, m.amname, i.indnkeyatts, i.indpred, i.indisexclusion
+            """, 0, SpiParameter.Create(table), SpiParameter.Create(local)));
+        return [.. indexes.Select(row => (row.Get<uint>(0), new IndexShape(row.Get<bool>(1), row.Get<bool>(2), row.Get<string>(3),
+            row.Get<string[]>(4), row.Get<int>(5), row.Get<bool>(6), row.Get<bool>(7))))];
     }
 
     /// <summary>
@@ -1427,23 +1447,14 @@ internal static unsafe partial class LocalIndex
     /// of the partitioned table's indexes, which it takes for them, and the attached table's valid unique ones by the
     /// columns of each foreign key that references the partitioned table, which then uses them.
     /// </summary>
-    private static void AddAttached(List<(uint Table, string[]? Columns, PgLockMode Lock)> unlive, List<(uint Table, string[]? Columns, PgLockMode Lock)> invalid, uint parent, uint attached)
+    private static void AddAttached(List<(uint Table, IndexShape Shape, PgLockMode Lock)> unlive, List<(uint Table, string[]? Columns, PgLockMode Lock)> invalid, uint parent, uint attached)
     {
-        WorfRows indexes = Elevated.Run(() => Worf.Read("""
-            SELECT array_agg(a.attname::pg_catalog.text ORDER BY k.n) FILTER (WHERE a.attname IS NOT NULL), bool_or(k.attnum = 0)
-            FROM pg_catalog.pg_index i
-                CROSS JOIN LATERAL pg_catalog.unnest(i.indkey::pg_catalog.int2[]) WITH ORDINALITY AS k (attnum, n)
-                LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
-            WHERE i.indrelid = $1 AND k.n <= i.indnkeyatts
-            GROUP BY i.indexrelid
-            """, 0, SpiParameter.Create(parent)));
         List<uint> tables = [attached, .. Partitions(attached)];
-        foreach (WorfRow index in indexes)
+        foreach ((uint _, IndexShape shape) in IndexShapes(parent, false))
         {
-            string[]? columns = index.Get<bool>(1) ? null : index.Get<string[]>(0);
             foreach (uint table in tables)
             {
-                unlive.Add((table, columns, PgLockMode.AccessExclusive));
+                unlive.Add((table, shape, PgLockMode.AccessExclusive));
             }
         }
 
@@ -1570,21 +1581,33 @@ internal static unsafe partial class LocalIndex
     }
 
     /// <summary>
-    /// Hides the indexes on this node alone that a statement would use from it, as not live or as not valid: those by the
-    /// columns it would take them by, in order for a partitioned index, or as a set for a foreign key, which takes only an
-    /// immediate valid unique index without expressions or a predicate, or any for no columns given, as an index with
-    /// expressions is taken for a partitioned one. The statement takes the locks it takes on their tables first, as it
-    /// would on its own, and then the share lock on them that PostgreSQL takes on an index it attaches, which no
-    /// concurrent reindex or drop takes beside it, so that none changes their state meanwhile. Only those it would use
-    /// are hidden, since the change holds them until the transaction ends, as attaching or using them would.
+    /// Hides the indexes on this node alone that a partitioned index a statement creates, or a partition it attaches,
+    /// may take for its own, as not live, those whose shape PostgreSQL compares alike, as <see cref="Hide"/> hides them.
     /// </summary>
-    private static void Hide(List<(uint Table, string[]? Columns, PgLockMode Lock)> requests, bool unlive)
+    private static void HideUnlive(List<(uint Table, IndexShape Shape, PgLockMode Lock)> requests)
     {
-        if (requests.Count == 0)
+        HashSet<uint> matching = [];
+        foreach ((uint table, IndexShape shape, PgLockMode _) in requests)
         {
-            return;
+            foreach ((uint index, IndexShape candidate) in IndexShapes(table, true))
+            {
+                if (candidate.MayMatch(shape))
+                {
+                    _ = matching.Add(index);
+                }
+            }
         }
 
+        Hide([.. requests.Select(request => (request.Table, request.Lock))], matching, true);
+    }
+
+    /// <summary>
+    /// Hides the indexes on this node alone that a foreign key a statement adds or builds again may use, as not valid,
+    /// as <see cref="Hide"/> hides them: an immediate valid unique index without expressions or a predicate, by its
+    /// columns as a set, or any such for no columns given.
+    /// </summary>
+    private static void HideInvalid(List<(uint Table, string[]? Columns, PgLockMode Lock)> requests)
+    {
         HashSet<uint> matching = [];
         foreach ((uint table, string[]? columns, PgLockMode _) in requests)
         {
@@ -1600,27 +1623,29 @@ internal static unsafe partial class LocalIndex
             foreach (WorfRow candidate in candidates)
             {
                 string[] keys = candidate.Get<string[]?>(1) ?? [];
-                bool expressions = candidate.Get<bool>(2);
-                bool usable;
-                if (unlive)
-                {
-                    // A partitioned index compares a partition's index with expressions as it attaches it.
-                    usable = columns is null || expressions || keys.SequenceEqual(columns);
-                }
-                else
-                {
-                    // A foreign key takes an immediate valid unique index by its columns in any order.
-                    bool byColumns = columns is null || (keys.Length == columns.Length && !keys.Except(columns).Any());
-                    usable = candidate.Get<bool>(3) && !expressions && byColumns;
-                }
-
-                if (usable)
+                bool byColumns = columns is null || (keys.Length == columns.Length && !keys.Except(columns).Any());
+                if (candidate.Get<bool>(3) && !candidate.Get<bool>(2) && byColumns)
                 {
                     _ = matching.Add(candidate.Get<uint>(0));
                 }
             }
         }
 
+        Hide([.. requests.Select(request => (request.Table, request.Lock))], matching, false);
+    }
+
+    /// <summary>
+    /// Hides indexes on this node alone that a statement would use from it, as not live or as not valid. The statement
+    /// takes the locks it takes on their tables first, as it would on its own, and then the share lock on them that
+    /// PostgreSQL takes on an index it attaches, which no concurrent reindex or drop takes beside it, so that none
+    /// changes their state meanwhile. Only those it would use are hidden, since the change holds them until the
+    /// transaction ends, as attaching or using them would.
+    /// </summary>
+    /// <param name="tables">The tables, with the locks the statement takes on them.</param>
+    /// <param name="matching">The indexes.</param>
+    /// <param name="unlive">Whether they're hidden as not live, rather than not valid.</param>
+    private static void Hide(List<(uint Table, PgLockMode Lock)> tables, HashSet<uint> matching, bool unlive)
+    {
         if (matching.Count == 0)
         {
             return;
@@ -1628,7 +1653,7 @@ internal static unsafe partial class LocalIndex
 
         // The tables first, with the locks the statement takes on them: a foreign key's referenced table, a partitioned
         // index's partitions, or an attached partition and its partitions.
-        foreach ((uint table, PgLockMode lockMode) in requests.Select(request => (request.Table, request.Lock)).Distinct().OrderBy(request => request.Table))
+        foreach ((uint table, PgLockMode lockMode) in tables.Distinct().OrderBy(request => request.Table))
         {
             NativeMethods.LockRelationOid(table, (int)lockMode);
         }
