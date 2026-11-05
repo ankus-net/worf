@@ -17,10 +17,9 @@ internal sealed class TestNode : IAsyncDisposable
     /// </summary>
     internal static TimeSpan PollTimeout { get; } = TimeSpan.FromSeconds(180);
 
-    // The fixture that published worf and staged the installation the test run selects, which the nodes share,
-    // stopped once started, with the settings that load worf from them and the publication's directory, made once.
+    // The publication of worf the test run's nodes share, made once.
     private static readonly SemaphoreSlim s_sharedLock = new(1, 1);
-    private static (PostgresExtensionTest Fixture, string[] Settings, string Publication)? s_shared;
+    private static SharedPublication? s_shared;
 
     private TestNode(string name, PostgresTestCluster cluster)
     {
@@ -63,19 +62,19 @@ internal sealed class TestNode : IAsyncDisposable
     public static async Task<TestNode> StartAsync(string name, IReadOnlyList<string> configuration,
         CancellationToken cancellationToken, PostgresInstallation? installation = null)
     {
-        (PostgresExtensionTest shared, string[] settings, _) = await SharedAsync(cancellationToken);
+        SharedPublication shared = await SharedAsync(cancellationToken);
 
         // Clusters go where the harness puts its own, as ankus test --pgdata says, and their logs beside its own,
         // which outlast the run.
         string? dataDirectory = Environment.GetEnvironmentVariable("ANKUS_TEST_DATA_DIRECTORY");
         PostgresTestCluster cluster = await PostgresTestCluster.StartAsync(new PostgresTestClusterOptions
         {
-            Installation = installation ?? shared.Cluster.Installation,
+            Installation = installation ?? shared.Installation,
             DataDirectoryBase = string.IsNullOrEmpty(dataDirectory)
-                ? new PostgresTestClusterOptions { Installation = shared.Cluster.Installation }.DataDirectoryBase
+                ? new PostgresTestClusterOptions { Installation = shared.Installation }.DataDirectoryBase
                 : dataDirectory,
-            LogDirectory = Path.GetDirectoryName(shared.Cluster.LogFilePath)!,
-            PostgreSqlConfiguration = [.. settings, .. configuration],
+            LogDirectory = shared.LogDirectory,
+            PostgreSqlConfiguration = [.. shared.Settings, .. configuration],
         }, cancellationToken);
         TestNode node = new(name, cluster);
         try
@@ -99,7 +98,7 @@ internal sealed class TestNode : IAsyncDisposable
     /// <param name="cancellationToken">Cancels publishing.</param>
     /// <returns>The directory.</returns>
     public static async Task<string> PublicationAsync(CancellationToken cancellationToken)
-        => (await SharedAsync(cancellationToken)).Publication;
+        => (await SharedAsync(cancellationToken)).Directory;
 
     /// <summary>
     /// Deletes the publication and staged installation the test run's nodes shared, once they've all stopped.
@@ -107,10 +106,10 @@ internal sealed class TestNode : IAsyncDisposable
     /// <returns>The work.</returns>
     public static async Task DisposeSharedAsync()
     {
-        if (s_shared is (PostgresExtensionTest fixture, _, _))
+        if (s_shared is { } shared)
         {
             s_shared = null;
-            await fixture.DisposeAsync();
+            await shared.DisposeAsync();
         }
     }
 
@@ -388,68 +387,14 @@ internal sealed class TestNode : IAsyncDisposable
     public ValueTask DisposeAsync() => Cluster.DisposeAsync();
 
     /// <summary>
-    /// Gets the fixture whose publication of worf, and staged installation, the test run's nodes share, starting it the
-    /// first time, the settings that load worf from them, the fixture's own, which name the publication's library and,
-    /// from PostgreSQL 18, its control files, with worf in output_plugin_libraries, which current PostgreSQL releases
-    /// require of every output plugin, as a DBA lists it, where the server has that setting, and the publication's
-    /// directory, the first in the library path. Its server stops once they're read, as no test uses it.
+    /// Gets the publication of worf the test run's nodes share, making it the first time.
     /// </summary>
-    private static async Task<(PostgresExtensionTest Fixture, string[] Settings, string Publication)> SharedAsync(CancellationToken cancellationToken)
+    private static async Task<SharedPublication> SharedAsync(CancellationToken cancellationToken)
     {
         await s_sharedLock.WaitAsync(cancellationToken);
         try
         {
-            if (s_shared is not { } shared)
-            {
-                PostgresExtensionTest fixture = await PostgresExtensionTest.StartAsync(new PostgresExtensionTestOptions
-                {
-                    ProjectPath = RepositoryPaths.ExtensionProject,
-                    SharedPreload = true,
-                }, cancellationToken);
-                try
-                {
-                    List<string> settings = [];
-                    string publication = "";
-                    await using (NpgsqlConnection connection = await fixture.Cluster.OpenConnectionAsync(cancellationToken))
-                    await using (NpgsqlCommand read = new("""
-                        SELECT name, setting FROM pg_catalog.pg_settings
-                        WHERE name IN ('shared_preload_libraries', 'dynamic_library_path', 'extension_control_path')
-                        UNION ALL
-                        SELECT name, 'pgoutput, test_decoding, worf' FROM pg_catalog.pg_settings WHERE name = 'output_plugin_libraries'
-                        """, connection))
-                    await using (NpgsqlDataReader reader = await read.ExecuteReaderAsync(cancellationToken))
-                    {
-                        while (await reader.ReadAsync(cancellationToken))
-                        {
-                            if (reader.GetString(0) == "dynamic_library_path")
-                            {
-                                publication = reader.GetString(1).Split(Path.PathSeparator)[0];
-                            }
-
-                            // A setting's quoted value takes backslashes, as in Windows paths, and quotes doubled.
-                            string value = reader.GetString(1).Replace("\\", "\\\\", StringComparison.Ordinal).Replace("'", "''", StringComparison.Ordinal);
-                            settings.Add($"{reader.GetString(0)} = '{value}'");
-                        }
-                    }
-
-                    (int exitCode, string stdout, string stderr) = await ProcessRunner.RunAsync(fixture.Cluster.Installation.PgCtlPath,
-                        ["stop", "-D", fixture.Cluster.DataDirectory, "-m", "fast", "-w"], cancellationToken);
-                    if (exitCode != 0)
-                    {
-                        throw new InvalidOperationException($"pg_ctl stop failed: {stdout}{stderr}");
-                    }
-
-                    shared = (fixture, [.. settings], publication);
-                    s_shared = shared;
-                }
-                catch
-                {
-                    await fixture.DisposeAsync();
-                    throw;
-                }
-            }
-
-            return shared;
+            return s_shared ??= await SharedPublication.StartAsync(cancellationToken);
         }
         finally
         {

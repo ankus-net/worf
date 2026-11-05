@@ -43,6 +43,10 @@ jobs:
     defaults:
       run:
         shell: bash
+    # The tests' nodes load the worf the build step publishes, rather than the test harness building and publishing it
+    # again in its own directories, which every node then waited for.
+    env:
+      WORF_TEST_PUBLICATION: src/Worf/bin/ankus/pg${{ matrix.postgresql }}/${{ matrix.platform }}/Release
     steps:
       - uses: actions/checkout@v7
 
