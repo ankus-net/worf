@@ -545,16 +545,14 @@ internal static unsafe partial class CopyConversion
 
             // In the batch's order, a row is left out when the table holds its key, or an earlier row that's copied
             // takes it.
-            foreach (IGrouping<int, WorfRow> row in found.GroupBy(match => match.Get<int>(0)).OrderBy(group => group.Key))
+            foreach (IGrouping<int, WorfRow> row in found.GroupBy(match => match.Get<int>(0)).OrderBy(group => group.Key)
+                .Where(group => group.Any(match => match.Get<int>(1) < 0 || !left.Contains(match.Get<int>(1)))))
             {
-                if (row.Any(match => match.Get<int>(1) < 0 || !left.Contains(match.Get<int>(1))))
-                {
-                    _ = left.Add(row.Key);
-                    int provider = s_batchConverted[row.Key].Row;
-                    s_batchFailed.Add((s_batchLine + (ulong)provider, provider, new PgException(PgSqlStates.UniqueViolation,
-                        $"duplicate key value violates unique constraint \"{name}\"",
-                        detail: $"Key ({columns})=({row.First().Get<string>(2)}) already exists.")));
-                }
+                _ = left.Add(row.Key);
+                int provider = s_batchConverted[row.Key].Row;
+                s_batchFailed.Add((s_batchLine + (ulong)provider, provider, new PgException(PgSqlStates.UniqueViolation,
+                    $"duplicate key value violates unique constraint \"{name}\"",
+                    detail: $"Key ({columns})=({row.First().Get<string>(2)}) already exists.")));
             }
         }
 

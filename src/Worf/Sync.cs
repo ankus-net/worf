@@ -1837,8 +1837,6 @@ internal static class Sync
                 string equal = $"{left}.{quoted} {operators[attnums[k]]} {right}.{quoted}";
                 return nullsEqual ? $"({equal} OR ({left}.{quoted} IS NULL AND {right}.{quoted} IS NULL))" : equal;
             }));
-            string text = $"pg_catalog.concat_ws(', ', {string.Join(", ", names.Select(name => $"COALESCE(b.{Worf.QuoteIdentifier(name)}::pg_catalog.text, 'null')"))})";
-
             // The copy's rows whose values a row the table keeps holds, and those whose values an earlier row of the
             // copy takes, with that row.
             checks.Add((index.Get<string>(1), $"""
@@ -1868,13 +1866,11 @@ internal static class Sync
                 HashSet<long> left = [];
                 List<(string Place, PgException Error)> skipped = [];
                 PgException error = new(PgSqlStates.UniqueViolation, $"duplicate key value violates unique constraint \"{name}\"");
-                foreach (IGrouping<string, WorfRow> row in found.GroupBy(match => match.Get<string>(0)).OrderBy(group => Position(group.Key)))
+                foreach (IGrouping<string, WorfRow> row in found.GroupBy(match => match.Get<string>(0)).OrderBy(group => Position(group.Key))
+                    .Where(group => group.Any(match => match.Get<string?>(1) is not string earlier || !left.Contains(Position(earlier)))))
                 {
-                    if (row.Any(match => match.Get<string?>(1) is not string earlier || !left.Contains(Position(earlier))))
-                    {
-                        _ = left.Add(Position(row.Key));
-                        skipped.Add((row.Key, error));
-                    }
+                    _ = left.Add(Position(row.Key));
+                    skipped.Add((row.Key, error));
                 }
 
                 RecordSkipped(rel, lsn, skipped);
@@ -2095,13 +2091,11 @@ internal static class Sync
 
             HashSet<(uint, long)> deleted = [];
             List<(uint Table, string Tid)> doomed = [];
-            foreach ((uint, long) row in involved.Keys.Order())
+            foreach ((uint, long) row in involved.Keys.Order()
+                .Where(row => earlier.TryGetValue(row, out List<(uint, long)>? partners) && partners.Exists(partner => !deleted.Contains(partner))))
             {
-                if (earlier.TryGetValue(row, out List<(uint, long)>? partners) && partners.Exists(partner => !deleted.Contains(partner)))
-                {
-                    _ = deleted.Add(row);
-                    doomed.Add((row.Item1, involved[row]));
-                }
+                _ = deleted.Add(row);
+                doomed.Add((row.Item1, involved[row]));
             }
 
             PgException error = exclusion
@@ -2114,14 +2108,11 @@ internal static class Sync
                     continue;
                 }
 
-                foreach ((uint Table, string Tid) one in run)
+                foreach ((uint Table, string Tid) one in run.Where(one => !Delete([one])))
                 {
-                    if (!Delete([one]))
-                    {
-                        _ = Worf.Execute($"DELETE FROM {table} t WHERE t.tableoid OPERATOR(pg_catalog.=) $1 AND t.ctid OPERATOR(pg_catalog.=) $2::pg_catalog.tid",
-                            SpiParameter.Create(one.Table), SpiParameter.Create(one.Tid));
-                        WorfLog.Warning("could not record the failed remote change in worf.exception_log");
-                    }
+                    _ = Worf.Execute($"DELETE FROM {table} t WHERE t.tableoid OPERATOR(pg_catalog.=) $1 AND t.ctid OPERATOR(pg_catalog.=) $2::pg_catalog.tid",
+                        SpiParameter.Create(one.Table), SpiParameter.Create(one.Tid));
+                    WorfLog.Warning("could not record the failed remote change in worf.exception_log");
                 }
             }
 
