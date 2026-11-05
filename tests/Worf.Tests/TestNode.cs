@@ -17,12 +17,19 @@ internal sealed class TestNode : IAsyncDisposable
     /// </summary>
     internal static TimeSpan PollTimeout { get; } = TimeSpan.FromSeconds(180);
 
-    private readonly PostgresExtensionTest _extension;
+    // The fixture that published worf and staged the installation the test run selects, which the nodes on that
+    // installation share, stopped once started, with the settings that load worf from them, made once.
+    private static readonly SemaphoreSlim s_sharedLock = new(1, 1);
+    private static (PostgresExtensionTest Fixture, string[] Settings)? s_shared;
 
-    private TestNode(string name, PostgresExtensionTest extension)
+    // What the node owns: its cluster, or the fixture of a node on an installation of its own.
+    private readonly IAsyncDisposable _owner;
+
+    private TestNode(string name, PostgresTestCluster cluster, IAsyncDisposable owner)
     {
         Name = name;
-        _extension = extension;
+        Cluster = cluster;
+        _owner = owner;
     }
 
     /// <summary>
@@ -33,7 +40,7 @@ internal sealed class TestNode : IAsyncDisposable
     /// <summary>
     /// Gets the node's cluster.
     /// </summary>
-    public PostgresTestCluster Cluster => _extension.Cluster;
+    public PostgresTestCluster Cluster { get; }
 
     /// <summary>
     /// Gets the node's PostgreSQL installation.
@@ -46,7 +53,10 @@ internal sealed class TestNode : IAsyncDisposable
     public string ConnStr => $"host=127.0.0.1 port={Cluster.Port.ToString(CultureInfo.InvariantCulture)}";
 
     /// <summary>
-    /// Starts a node with worf in shared_preload_libraries and the given settings.
+    /// Starts a node with worf in shared_preload_libraries and the given settings. Nodes on the installation the test
+    /// run selects share one publication of worf, and before PostgreSQL 18, one staged copy of the installation with
+    /// worf's files in it, which the harness would otherwise make for each node; each still has a cluster of its own,
+    /// with worf created in its test database, as the harness creates it.
     /// </summary>
     /// <param name="name">The node's name.</param>
     /// <param name="configuration">The node's postgresql.conf settings.</param>
@@ -56,14 +66,35 @@ internal sealed class TestNode : IAsyncDisposable
     public static async Task<TestNode> StartAsync(string name, IReadOnlyList<string> configuration,
         CancellationToken cancellationToken, PostgresInstallation? installation = null)
     {
-        PostgresExtensionTestOptions options = installation is null
-            ? new()
+        TestNode node;
+        if (installation is null)
+        {
+            (PostgresExtensionTest shared, string[] settings) = await SharedAsync(cancellationToken);
+            // Clusters go where the harness puts its own, as ankus test --pgdata says.
+            string? dataDirectory = Environment.GetEnvironmentVariable("ANKUS_TEST_DATA_DIRECTORY");
+            PostgresTestCluster cluster = await PostgresTestCluster.StartAsync(new PostgresTestClusterOptions
             {
-                ProjectPath = RepositoryPaths.ExtensionProject,
-                SharedPreload = true,
-                PostgreSqlConfiguration = configuration,
+                Installation = shared.Cluster.Installation,
+                DataDirectoryBase = string.IsNullOrEmpty(dataDirectory)
+                    ? new PostgresTestClusterOptions { Installation = shared.Cluster.Installation }.DataDirectoryBase
+                    : dataDirectory,
+                PostgreSqlConfiguration = [.. settings, .. configuration],
+            }, cancellationToken);
+            node = new(name, cluster, cluster);
+            try
+            {
+                await using NpgsqlConnection connection = await cluster.OpenConnectionAsync(cancellationToken);
+                _ = await QueryAsync(connection, "CREATE EXTENSION worf", cancellationToken);
             }
-            : new()
+            catch
+            {
+                await node.DisposeAsync();
+                throw;
+            }
+        }
+        else
+        {
+            PostgresExtensionTest extension = await PostgresExtensionTest.StartAsync(new PostgresExtensionTestOptions
             {
                 ProjectPath = RepositoryPaths.ExtensionProject,
                 SharedPreload = true,
@@ -76,10 +107,10 @@ internal sealed class TestNode : IAsyncDisposable
                     ["AnkusPgConfigPath"] = installation.PgConfigPath,
                     ["AnkusPostgresMajor"] = installation.Version.Major.ToString(CultureInfo.InvariantCulture),
                 },
-            };
-        PostgresExtensionTest extension = await PostgresExtensionTest.StartAsync(options, cancellationToken);
+            }, cancellationToken);
+            node = new(name, extension.Cluster, extension);
+        }
 
-        TestNode node = new(name, extension);
         try
         {
             await node.TrustOutputPluginAsync(cancellationToken);
@@ -91,6 +122,19 @@ internal sealed class TestNode : IAsyncDisposable
         }
 
         return node;
+    }
+
+    /// <summary>
+    /// Deletes the publication and staged installation the test run's nodes shared, once they've all stopped.
+    /// </summary>
+    /// <returns>The work.</returns>
+    public static async Task DisposeSharedAsync()
+    {
+        if (s_shared is (PostgresExtensionTest fixture, _))
+        {
+            s_shared = null;
+            await fixture.DisposeAsync();
+        }
     }
 
     /// <summary>
@@ -364,7 +408,68 @@ internal sealed class TestNode : IAsyncDisposable
             .Select(line => DateTime.ParseExact(line[1..24], "yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture))];
 
     /// <inheritdoc/>
-    public ValueTask DisposeAsync() => _extension.DisposeAsync();
+    public ValueTask DisposeAsync() => _owner.DisposeAsync();
+
+    /// <summary>
+    /// Gets the fixture whose publication of worf, and staged installation, the nodes on the installation the test run
+    /// selects share, starting it the first time, and the settings that load worf from them: the fixture's own, which
+    /// name the publication's library and, from PostgreSQL 18, its control files. Its server stops once they're read,
+    /// as no test uses it.
+    /// </summary>
+    private static async Task<(PostgresExtensionTest Fixture, string[] Settings)> SharedAsync(CancellationToken cancellationToken)
+    {
+        await s_sharedLock.WaitAsync(cancellationToken);
+        try
+        {
+            if (s_shared is not { } shared)
+            {
+                PostgresExtensionTest fixture = await PostgresExtensionTest.StartAsync(new PostgresExtensionTestOptions
+                {
+                    ProjectPath = RepositoryPaths.ExtensionProject,
+                    SharedPreload = true,
+                }, cancellationToken);
+                try
+                {
+                    List<string> settings = [];
+                    await using (NpgsqlConnection connection = await fixture.Cluster.OpenConnectionAsync(cancellationToken))
+                    await using (NpgsqlCommand read = new("""
+                        SELECT name, setting FROM pg_catalog.pg_settings
+                        WHERE name IN ('shared_preload_libraries', 'dynamic_library_path', 'extension_control_path')
+                        """, connection))
+                    await using (NpgsqlDataReader reader = await read.ExecuteReaderAsync(cancellationToken))
+                    {
+                        while (await reader.ReadAsync(cancellationToken))
+                        {
+                            // A setting's quoted value takes backslashes, as in Windows paths, and quotes doubled.
+                            string value = reader.GetString(1).Replace("\\", "\\\\", StringComparison.Ordinal).Replace("'", "''", StringComparison.Ordinal);
+                            settings.Add($"{reader.GetString(0)} = '{value}'");
+                        }
+                    }
+
+                    (int exitCode, string stdout, string stderr) = await ProcessRunner.RunAsync(fixture.Cluster.Installation.PgCtlPath,
+                        ["stop", "-D", fixture.Cluster.DataDirectory, "-m", "fast", "-w"], cancellationToken);
+                    if (exitCode != 0)
+                    {
+                        throw new InvalidOperationException($"pg_ctl stop failed: {stdout}{stderr}");
+                    }
+
+                    shared = (fixture, [.. settings]);
+                    s_shared = shared;
+                }
+                catch
+                {
+                    await fixture.DisposeAsync();
+                    throw;
+                }
+            }
+
+            return shared;
+        }
+        finally
+        {
+            _ = s_sharedLock.Release();
+        }
+    }
 
     // A server started again logs to a file beside the harness's: on Windows the cmd.exe that pg_ctl runs it under
     // holds the log until a moment after the server stops, when the harness replaces its own log.
