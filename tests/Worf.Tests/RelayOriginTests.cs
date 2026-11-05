@@ -472,9 +472,10 @@ public sealed class RelayOriginTests
     }
 
     /// <summary>
-    /// A subscription whose name gives the slot another subscription uses is refused, and dropping one of two
-    /// subscriptions that share a slot, as made before names were told apart, keeps the slot and replication origin for
-    /// the other, which goes on applying once enabled.
+    /// Names that differ give slots that differ, even when a slot's characters can't hold them whole, as databases'
+    /// names, so that subscriptions of the same name in a cluster's databases keep slots and replication origins of their
+    /// own, and dropping one of two subscriptions that share a slot, as made before names were told apart, keeps the
+    /// slot and replication origin for the other, which goes on applying once enabled.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -498,12 +499,12 @@ public sealed class RelayOriginTests
             """, token);
         await SubscribeAsync(subscriber, "s_1", provider, "{}", token, "default");
 
+        // A subscription's name holds only what a slot's name does, so a name like s_1's but for that is refused.
         PostgresException refused = await Assert.ThrowsExactlyAsync<PostgresException>(() => subscriber.SafePsqlAsync(Database, $"""
             SELECT worf.create_subscription(subscription_name := 's.1', provider_dsn := '{provider.Dsn(Database, SuperUser)}',
                 replication_sets := '{"{other}"}', synchronize_structure := false, synchronize_data := false)
-            """, token), "a subscription named for s_1's slot");
-        Assert.AreEqual("42710", refused.SqlState);
-        Assert.Contains("which subscription \"s_1\" uses", refused.MessageText);
+            """, token), "a subscription named like s_1");
+        Assert.AreEqual("42602", refused.SqlState);
 
         // s_2 comes to share s_1's slot, as two subscriptions made before names were told apart could, and is dropped
         // while s_1 is disabled.
@@ -526,6 +527,35 @@ public sealed class RelayOriginTests
         _ = await provider.SafePsqlAsync(Database, "INSERT INTO t VALUES (1)", token);
         _ = await subscriber.SafePsqlAsync(Database, "SELECT worf.alter_subscription_enable('s_1', true)", token);
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT FROM t WHERE id = 1)", token), "s_1's row");
+
+        // Subscriptions of the same name in databases whose names a slot's characters both write as a_b get slots and
+        // replication origins of their own, so dropping one leaves the other replicating.
+        foreach (string dbname in new[] { "a-b", "a_b" })
+        {
+            _ = await subscriber.SafePsqlAsync(Database, $"CREATE DATABASE \"{dbname}\"", token);
+            _ = await subscriber.SafePsqlAsync(dbname, $$"""
+                CREATE EXTENSION worf;
+                CREATE TABLE t (id integer PRIMARY KEY);
+                SELECT * FROM worf.create_node(node_name := 'sub_{{dbname.Replace('-', '_')}}', dsn := '{{subscriber.Dsn(dbname, SuperUser)}}');
+                SELECT worf.create_subscription(subscription_name := 's', provider_dsn := '{{provider.Dsn(Database, SuperUser)}}',
+                    replication_sets := '{default}', synchronize_structure := false, synchronize_data := false);
+                """, token);
+            Assert.IsTrue(await subscriber.PollQueryUntilAsync(dbname,
+                "SELECT EXISTS (SELECT FROM worf.show_subscription_status() WHERE status = 'replicating')", token), $"{dbname}'s subscription");
+        }
+
+        string[] slots = [await subscriber.SafePsqlAsync("a-b", "SELECT sub_slot_name FROM worf.subscription", token),
+            await subscriber.SafePsqlAsync("a_b", "SELECT sub_slot_name FROM worf.subscription", token)];
+        Assert.AreNotEqual(slots[0], slots[1], "the two databases' slots");
+        _ = await subscriber.SafePsqlAsync("a_b", "SELECT worf.drop_subscription('s')", token);
+        Assert.AreEqual("1|1", await subscriber.SafePsqlAsync(Database, $"""
+            SELECT (SELECT count(*) FROM pg_replication_origin WHERE roname = '{slots[0]}'),
+                (SELECT count(*) FROM pg_replication_origin WHERE roname = '{slots[1]}') + 1
+            """, token), "a-b's origin, and none left for a_b");
+        Assert.AreEqual("1", await provider.SafePsqlAsync(Database, $"SELECT count(*) FROM pg_replication_slots WHERE slot_name = '{slots[0]}'", token),
+            "a-b's slot");
+        _ = await provider.SafePsqlAsync(Database, "INSERT INTO t VALUES (2)", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync("a-b", "SELECT EXISTS (SELECT FROM t WHERE id = 2)", token), "a-b's row");
     }
 
     private static async Task<TestNode> StartNodeAsync(string name, CancellationToken token, params string[] settings)

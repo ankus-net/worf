@@ -1700,7 +1700,9 @@ internal static class Functions
     /// <c>worf_&lt;subscriber database name&gt;_&lt;provider node name&gt;_&lt;subscription name&gt;</c>, at most 54
     /// bytes, which leaves room in a 63-byte name for a table sync's suffix of an underscore and 8 hex digits. The
     /// <c>worf_</c> prefix is a byte longer than pglogical's <c>pgl_</c>, so the database's name takes 15 bytes at
-    /// most, rather than 16.
+    /// most, rather than 16. A name that a slot's characters can't hold whole, as one with a capital or a hyphen, is
+    /// written with an underscore for each such character and a hash of the whole name after, as a name too long is,
+    /// so that names that differ, as those of a cluster's databases do, give slots and replication origins that differ.
     /// </summary>
     /// <param name="dbname">The subscriber's database.</param>
     /// <param name="providerNode">The provider node's name.</param>
@@ -1709,19 +1711,12 @@ internal static class Functions
     internal static string GenSlotName(string dbname, string providerNode, string subscriptionName)
     {
         List<byte> name = [.. "worf_"u8];
-        name.AddRange(Worf.ShortenHash(Worf.ToServer(dbname), 15));
+        name.AddRange(SlotNamePart(Worf.ToServer(dbname), 15));
         name.Add((byte)'_');
-        name.AddRange(Worf.ShortenHash(Worf.ToServer(providerNode), 16));
+        name.AddRange(SlotNamePart(Worf.ToServer(providerNode), 16));
         name.Add((byte)'_');
-        name.AddRange(Worf.ShortenHash(Worf.ToServer(subscriptionName), 16));
-
-        // Replace all the invalid characters in slot name with underscore.
-        char[] slot = new char[name.Count];
-        for (int i = 0; i < name.Count; i++)
-        {
-            byte cp = name[i];
-            slot[i] = (cp >= 'a' && cp <= 'z') || (cp >= '0' && cp <= '9') || cp == '_' ? (char)cp : '_';
-        }
+        name.AddRange(SlotNamePart(Worf.ToServer(subscriptionName), 16));
+        char[] slot = [.. name.Select(b => (char)b)];
 
         // A name that ends as a table sync's slot's does, an underscore and eight hex digits, would be taken for another
         // subscription's, whose cleanup drops it, so its last character becomes an underscore.
@@ -1731,6 +1726,23 @@ internal static class Functions
         }
 
         return new string(slot);
+    }
+
+    /// <summary>
+    /// Writes one of the names a slot's name is made of in the characters a slot's name holds, lowercase letters,
+    /// digits and underscores, in at most a number of bytes: as it is, shortened with a hash when it's too long, or
+    /// with an underscore for each other character and a hash of the whole name after.
+    /// </summary>
+    private static byte[] SlotNamePart(byte[] part, int maxlen)
+    {
+        static bool Held(byte c) => c is (>= (byte)'a' and <= (byte)'z') or (>= (byte)'0' and <= (byte)'9') or (byte)'_';
+        if (Array.TrueForAll(part, Held))
+        {
+            return Worf.ShortenHash(part, maxlen);
+        }
+
+        byte[] held = [.. part.Take(maxlen - 8).Select(c => Held(c) ? c : (byte)'_')];
+        return [.. held, .. Encoding.ASCII.GetBytes(Worf.HashAny(part).ToString("x8", CultureInfo.InvariantCulture)[..7])];
     }
 
     /// <summary>
