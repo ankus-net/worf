@@ -93,17 +93,19 @@ jobs:
 
       # Bindings depend on the PostgreSQL symbols worf uses, so restored ones go stale when worf starts using another.
       # Main saves them again whenever its build compiles them, without the sets the build no longer uses: Ankus names
-      # each set by a 64-digit key and updates its time whenever a build uses it. Other branches and tags use main's
-      # rather than storing their own. Each image and build saves under its own key, so the sets pruned are only ones an
-      # earlier build of the same kind left.
+      # each set by a 64-digit key and updates its time whenever a build uses it. A pull request saves the sets its build
+      # compiled too, under its own ref, which only its later runs read, so a PR that uses new symbols compiles them once
+      # rather than in every run until main has them; pruned to the sets the build used, they're tens of megabytes a
+      # job. Other branches and tags use main's rather than storing their own. Each image and build saves under its own
+      # key, so the sets pruned are only ones an earlier build of the same kind left.
       - name: Prune Ankus bindings
-        if: steps.build.outputs.compiled-bindings == 'true' && github.ref == 'refs/heads/main'
+        if: steps.build.outputs.compiled-bindings == 'true' && (github.ref == 'refs/heads/main' || github.event_name == 'pull_request')
         run: |
           key=$(printf '[0-9A-F]%.0s' {1..64})
           find "$AnkusBindingCacheDirectory" -mindepth 1 -maxdepth 2 -name "$key*" ! -newer "$RUNNER_TEMP/build-start" -prune -exec rm -rf {} +
 
       - name: Save Ankus bindings
-        if: steps.build.outputs.compiled-bindings == 'true' && github.ref == 'refs/heads/main'
+        if: steps.build.outputs.compiled-bindings == 'true' && (github.ref == 'refs/heads/main' || github.event_name == 'pull_request')
         uses: actions/cache/save@v6
         with:
           path: ${{ runner.temp }}/ankus-bindings
