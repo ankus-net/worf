@@ -2310,6 +2310,87 @@ public sealed class SequenceRangeTests
     }
 
     /// <summary>
+    /// A statement that waits for a switch a worker tries and can't make, here as a session holds the range row, waits
+    /// twice the exchange timeout for the block in all, rather than again at each of its rows after; a load through
+    /// small blocks retires none of them unused, as statements still waiting for a switch that has come, until they next
+    /// look, don't bring another at once; and once more sequences than the shared table of drawing statements holds
+    /// have been drawn from and dropped, a new one's statements are still counted, and their wait ends as before.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task SwitchWaitsEndAndRetireNoBlockUnused()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode node = await StartNodeAsync("node_a", token, "worf.sequence_range_timeout = 1000");
+        await using NpgsqlConnection holder = await node.OpenAsync(Database, token);
+
+        async Task<TimeSpan> TailAsync(string table)
+        {
+            _ = await node.SafePsqlAsync(Database, $"""
+                CREATE TABLE {table} (id bigserial PRIMARY KEY, v int);
+                SELECT worf.enable_sequence_range('{table}_id_seq', participants := '{"{}"}', range_size := 1000, max_range_size := 1000);
+                """, token);
+            Assert.IsTrue(await node.PollQueryUntilAsync(Database,
+                $"SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = '{table}_id_seq'::regclass", token),
+                $"{table}'s blocks");
+            await using NpgsqlTransaction held = await holder.BeginTransactionAsync(token);
+            await using (NpgsqlCommand hold = new($"SELECT 1 FROM worf.sequence_range WHERE seqoid = '{table}_id_seq'::regclass FOR NO KEY UPDATE",
+                holder, held))
+            {
+                _ = await hold.ExecuteNonQueryAsync(token);
+            }
+
+            // The block's last twentieth starts 50 values from its end, where each row waits for the switch.
+            _ = await node.SafePsqlAsync(Database, $"INSERT INTO {table} (v) SELECT 1 FROM generate_series(1, 945)", token);
+            Stopwatch tail = Stopwatch.StartNew();
+            _ = await node.SafePsqlAsync(Database, $"INSERT INTO {table} (v) SELECT 2 FROM generate_series(1, 40)", token);
+            tail.Stop();
+            await held.RollbackAsync(token);
+            Assert.AreEqual("985|985", await node.SafePsqlAsync(Database, $"SELECT count(*), count(DISTINCT id) FROM {table}", token), $"{table}'s rows");
+            return tail.Elapsed;
+        }
+
+        TimeSpan waited = await TailAsync("w");
+        Assert.IsLessThan(TimeSpan.FromSeconds(6), waited, "40 rows in the block's last twentieth, which waited for the switch once");
+
+        // Four writers draw one row at a time through blocks of ten.
+        _ = await node.SafePsqlAsync(Database, """
+            CREATE TABLE b (id bigserial PRIMARY KEY, v int);
+            SELECT worf.enable_sequence_range('b_id_seq', participants := '{}', range_size := 10, max_range_size := 10);
+            """, token);
+        Assert.IsTrue(await node.PollQueryUntilAsync(Database,
+            "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 'b_id_seq'::regclass", token), "b's blocks");
+        await Task.WhenAll(Enumerable.Range(0, 4).Select(async _ =>
+        {
+            await using NpgsqlConnection connection = await node.OpenAsync(Database, token);
+            for (int i = 0; i < 50; i++)
+            {
+                await ExecuteAsync(connection, "INSERT INTO b (v) VALUES (1)", token);
+            }
+        }));
+        Assert.AreEqual("200|0", await node.SafePsqlAsync(Database, """
+            SELECT (SELECT count(DISTINCT id) FROM b), count(*) FROM worf.sequence_range_block k
+            WHERE k.seqoid = 'b_id_seq'::regclass AND k.kind = 'n' AND k.state = 'retired' AND NOT EXISTS (SELECT FROM b WHERE b.id BETWEEN k.lo AND k.hi)
+            """, token), "b's rows, and its blocks retired unused");
+
+        // More sequences than the shared table holds are drawn from and dropped.
+        Stopwatch made = Stopwatch.StartNew();
+        for (int batch = 0; batch < 1050; batch += 150)
+        {
+            _ = await node.SafePsqlAsync(Database, string.Join("\n", Enumerable.Range(batch + 1, 150).Select(i => $"""
+                CREATE TABLE d{i} (id bigserial PRIMARY KEY);
+                SELECT worf.enable_sequence_range('d{i}_id_seq', participants := '{"{}"}', range_size := 10);
+                INSERT INTO d{i} DEFAULT VALUES;
+                DROP TABLE d{i};
+                """)), token);
+        }
+
+        TestContext.WriteLine($"1,050 sequences made, drawn from and dropped in {made.Elapsed}");
+        waited = await TailAsync("n");
+        Assert.IsLessThan(TimeSpan.FromSeconds(6), waited, "40 rows in a new sequence's block's last twentieth, after 1,050 others");
+    }
+
+    /// <summary>
     /// In a cascade, a node two links from the owner gets its blocks from its parent's pool block, and a node whose
     /// link to the owner is dropped finds the owner through another neighbor, which relays its reports without writing.
     /// A late joiner whose values reach into the root is refused by the pool holder it asks, one sequence's failure

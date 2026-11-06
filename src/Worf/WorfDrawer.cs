@@ -8,7 +8,8 @@ namespace Worf;
 internal struct WorfDrawer
 {
     /// <summary>
-    /// The sequence's database, or zero for an unused entry.
+    /// The sequence's database, or zero for an entry never used. An entry whose counts are all zero is free for another
+    /// sequence.
     /// </summary>
     public uint Dboid;
 
@@ -23,9 +24,15 @@ internal struct WorfDrawer
     public int Statements;
 
     /// <summary>
-    /// The number of statements that wait for the switch.
+    /// The number of statements that wait for the switch from the active block that <see cref="WaitingFor"/> starts.
     /// </summary>
     public int Waiting;
+
+    /// <summary>
+    /// The start of the active block the waiting statements wait to leave, so that those that still wait for a switch
+    /// that has come, until they next look, don't count for the block after it.
+    /// </summary>
+    public long WaitingFor;
 
     /// <summary>
     /// The number of switches that wait for, or hold, the gate.

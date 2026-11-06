@@ -950,7 +950,7 @@ internal static unsafe partial class SequenceRanges
 
             // Statements that draw from the sequence wait for the switch once fewer values are left than there are of
             // them, since each may draw one before it checks again, so the switch is needed then, or while any waits.
-            bool crowded = Crowded(seqoid, active.Value.Id, left);
+            bool crowded = Crowded(seqoid, active.Value.Id, active.Value.Lo, left);
             if (next is not null && (left <= margin || moved || crowded || next.Value.Reserved))
             {
                 if (!apply)
@@ -4228,7 +4228,7 @@ internal static unsafe partial class SequenceRanges
             {
                 long left = StepsLeft(seqoid, info, active);
                 return needed = NodeBlock(seqoid, epoch, "active")?.Id == active.Id && (next.Reserved || active.Id == movedIn ||
-                    left <= (Reserved(active.Id) ? 0 : Steps(info, active.Lo, active.Hi) / 20) || Crowded(seqoid, active.Id, left));
+                    left <= (Reserved(active.Id) ? 0 : Steps(info, active.Lo, active.Hi) / 20) || Crowded(seqoid, active.Id, active.Lo, left));
             }
 
             // Nextval reaches the block's start before the switch commits, so the commit doesn't wait for the disk; a
@@ -4257,12 +4257,13 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
-    /// Checks whether statements wait for a sequence to switch, or more statements draw from it than its active block
-    /// has values left, as each may draw one before it checks again.
+    /// Checks whether statements wait for a sequence to switch from its active block, or more statements draw from it
+    /// than the block has values left, as each may draw one before it checks again. Statements that waited for the
+    /// switch from the block before, until they next look, don't count, so that a switch doesn't bring another at once.
     /// </summary>
-    private static bool Crowded(uint seqoid, Guid active, long left)
+    private static bool Crowded(uint seqoid, Guid active, long activeLo, long left)
     {
-        (int drawing, int waiting) = SequenceRangeGuard.Drawing(seqoid);
+        (int drawing, int waiting) = SequenceRangeGuard.Drawing(seqoid, activeLo);
         return waiting > 0 || (!Reserved(active) && left < drawing);
     }
 

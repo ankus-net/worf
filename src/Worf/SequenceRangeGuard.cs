@@ -48,7 +48,7 @@ internal static partial class SequenceRangeGuard
 
     // The sequences this backend waits for a switch of, which it counts until it stops waiting, or exits, as at a FATAL
     // error, which skips the code after the wait.
-    private static readonly Dictionary<uint, int> s_waitingFor = [];
+    private static readonly Dictionary<uint, (int Count, long Lo)> s_waitingFor = [];
     private static bool s_exitHooked;
     private static int s_backends;
 
@@ -98,7 +98,7 @@ internal static partial class SequenceRangeGuard
     private static readonly HashSet<(uint Seqoid, long Mark)> s_woken = [];
 
     // The active blocks, by sequence and start, whose switch this backend has waited for, and until when it may.
-    private static readonly Dictionary<(uint Seqoid, long Lo), long> s_waited = [];
+    private static readonly Dictionary<(uint Seqoid, long Lo), (long Deadline, bool Expired)> s_waited = [];
 
     // The active blocks, by sequence and start, that this transaction has tried to switch away from itself, as it ran
     // them out, each with the subtransaction that tried, and the managed sequences that the COPY FROM statements
@@ -778,14 +778,15 @@ internal static partial class SequenceRangeGuard
 
     /// <summary>
     /// Reads the number of statements that hold a sequence's gate in this database, which may each draw a value before
-    /// they check the sequence again, and the number that wait for it to switch.
+    /// they check the sequence again, and the number that wait for it to switch, from an active block, or from any.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
+    /// <param name="activeLo">The active block's start, or null for any.</param>
     /// <returns>The numbers.</returns>
-    internal static (int Statements, int Waiting) Drawing(uint seqoid)
+    internal static (int Statements, int Waiting) Drawing(uint seqoid, long? activeLo = null)
     {
         WorfDrawer drawer = Drawer(seqoid);
-        return (drawer.Statements, drawer.Waiting);
+        return (drawer.Statements, activeLo is null || drawer.WaitingFor == activeLo ? drawer.Waiting : 0);
     }
 
     /// <summary>
@@ -844,47 +845,66 @@ internal static partial class SequenceRangeGuard
     }
 
     /// <summary>
-    /// Finds where a sequence's entry starts its search in the shared table. An entry stays once made, with its counts
-    /// at zero, so that no search stops short at a freed one.
+    /// Finds where a sequence's entry starts its search in the shared table. An entry stays once made, so that no search
+    /// stops short at a freed one, but one whose counts are all zero is free for another sequence, so that sequences
+    /// dropped never fill the table.
     /// </summary>
     private static int Slot(uint dboid, uint seqoid) => (int)((dboid * 2654435761UL ^ seqoid) % MaxDrawers);
 
     /// <summary>
-    /// Counts a statement that takes or lets go of a sequence's gate, or that starts or stops waiting for it to switch.
-    /// A sequence that finds no entry free goes uncounted.
+    /// Counts a statement that takes or lets go of a sequence's gate, or that starts or stops waiting for it to switch
+    /// from an active block, which counts only those waiting for the same block. A sequence that finds no entry free, as
+    /// while more than the table holds are counted at once, goes uncounted.
     /// </summary>
-    private static void CountDrawer(uint seqoid, int statements, int waiting = 0, int switching = 0)
+    private static void CountDrawer(uint seqoid, int statements, int waiting = 0, int switching = 0, long waitingFor = 0)
     {
         uint dboid = DatabaseId();
         using PgLwLockExclusiveGuard<WorfDrawers, WorfDrawer> guard = Drawers.Exclusive();
+        int free = -1;
         for (int probe = 0, i = Slot(dboid, seqoid); probe < MaxDrawers; probe++, i = (i + 1) % MaxDrawers)
         {
             if (guard[i].Dboid == dboid && guard[i].Seqoid == seqoid)
             {
                 WorfDrawer drawer = guard[i];
                 drawer.Statements = Math.Max(drawer.Statements + statements, 0);
-                drawer.Waiting = Math.Max(drawer.Waiting + waiting, 0);
+                if (waiting > 0 && drawer.WaitingFor != waitingFor)
+                {
+                    drawer.Waiting = 0;
+                    drawer.WaitingFor = waitingFor;
+                }
+
+                if (waiting > 0 || drawer.WaitingFor == waitingFor)
+                {
+                    drawer.Waiting = Math.Max(drawer.Waiting + waiting, 0);
+                }
+
                 drawer.Switching = Math.Max(drawer.Switching + switching, 0);
                 guard[i] = drawer;
                 return;
             }
 
+            if (free < 0 && (guard[i].Dboid == 0 || guard[i] is { Statements: 0, Waiting: 0, Switching: 0 }))
+            {
+                free = i;
+            }
+
             if (guard[i].Dboid == 0)
             {
-                if (statements > 0 || waiting > 0 || switching > 0)
-                {
-                    guard[i] = new WorfDrawer
-                    {
-                        Dboid = dboid,
-                        Seqoid = seqoid,
-                        Statements = Math.Max(statements, 0),
-                        Waiting = Math.Max(waiting, 0),
-                        Switching = Math.Max(switching, 0),
-                    };
-                }
-
-                return;
+                break;
             }
+        }
+
+        if (free >= 0 && (statements > 0 || waiting > 0 || switching > 0))
+        {
+            guard[free] = new WorfDrawer
+            {
+                Dboid = dboid,
+                Seqoid = seqoid,
+                Statements = Math.Max(statements, 0),
+                Waiting = Math.Max(waiting, 0),
+                WaitingFor = waiting > 0 ? waitingFor : 0,
+                Switching = Math.Max(switching, 0),
+            };
         }
     }
 
@@ -1204,7 +1224,7 @@ internal static partial class SequenceRangeGuard
         // The switch waits for the gates, which the statement lets go meanwhile, and the range worker switches the block
         // while statements wait for it, however many values it has left.
         List<uint> held = LetGates();
-        CountWaiting(seqoid, 1);
+        CountWaiting(seqoid, lo, 1);
         bool switched;
         try
         {
@@ -1212,7 +1232,7 @@ internal static partial class SequenceRangeGuard
         }
         finally
         {
-            CountWaiting(seqoid, -1);
+            CountWaiting(seqoid, lo, -1);
         }
 
         TakeGates(held);
@@ -1222,14 +1242,14 @@ internal static partial class SequenceRangeGuard
     /// <summary>
     /// Counts this backend as waiting for a sequence's switch, or no longer, in the shared table and its own.
     /// </summary>
-    private static void CountWaiting(uint seqoid, int change)
+    private static void CountWaiting(uint seqoid, long lo, int change)
     {
         HookExit();
-        CountDrawer(seqoid, 0, change);
-        int waiting = s_waitingFor.GetValueOrDefault(seqoid) + change;
+        CountDrawer(seqoid, 0, change, waitingFor: lo);
+        int waiting = s_waitingFor.GetValueOrDefault(seqoid).Count + change;
         if (waiting > 0)
         {
-            s_waitingFor[seqoid] = waiting;
+            s_waitingFor[seqoid] = (waiting, lo);
         }
         else
         {
@@ -1250,9 +1270,9 @@ internal static partial class SequenceRangeGuard
         s_exitHooked = true;
         _ = PgProcess.OnExit(static _ =>
         {
-            foreach ((uint seqoid, int waiting) in s_waitingFor)
+            foreach ((uint seqoid, (int waiting, long lo)) in s_waitingFor)
             {
-                CountDrawer(seqoid, 0, -waiting);
+                CountDrawer(seqoid, 0, -waiting, waitingFor: lo);
             }
 
             foreach (uint seqoid in s_gates.Keys)
@@ -1274,13 +1294,24 @@ internal static partial class SequenceRangeGuard
         SpiParameter database = SpiParameter.Create(DatabaseId());
         SpiParameter switching = SpiParameter.Create(Switchers());
         long now = Worker.GetCurrentTimestamp();
-        if (!s_waited.TryGetValue((seqoid, lo), out long deadline))
+        if (!s_waited.TryGetValue((seqoid, lo), out (long Deadline, bool Expired) waited))
         {
-            deadline = now + (SequenceRanges.ExchangeTimeout * 2000L);
-            s_waited.Add((seqoid, lo), deadline);
+            waited = (now + (SequenceRanges.ExchangeTimeout * 2000L), false);
+            s_waited.Add((seqoid, lo), waited);
         }
 
-        long attempts = Drawer(seqoid).Attempts;
+        // A wait for the block that ran out of time already, as an earlier row's, waits no more, unless the block has
+        // switched since.
+        if (waited.Expired)
+        {
+            Reload();
+            return !s_sequences.TryGetValue(seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) known) ||
+                !known.Blocks.Exists(block => block.State == "active" && block.Lo == lo);
+        }
+
+        long deadline = waited.Deadline;
+        WorfDrawer counted = Drawer(seqoid);
+        long attempts = counted.Attempts;
         long woken = 0;
         long checkedHolders = now - 200_000;
         while (true)
@@ -1324,10 +1355,12 @@ internal static partial class SequenceRangeGuard
             }
 
             now = Worker.GetCurrentTimestamp();
-            // A try that began before this backend waited may not have seen it, so it waits for one more.
+            // A try that began before this backend waited may not have seen it, so it waits for one more, as far as the
+            // shared table counts the sequence's tries.
             if (now >= deadline &&
-                !(sequence.Blocks.Exists(block => block.State == "next") && Switchers().Length > 0 && Drawer(seqoid).Attempts <= attempts + 1))
+                !(counted.Dboid != 0 && sequence.Blocks.Exists(block => block.State == "next") && Switchers().Length > 0 && Drawer(seqoid).Attempts <= attempts + 1))
             {
+                s_waited[(seqoid, lo)] = (deadline, true);
                 return false;
             }
         }
