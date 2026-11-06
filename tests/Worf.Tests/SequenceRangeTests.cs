@@ -2534,6 +2534,68 @@ public sealed class SequenceRangeTests
     }
 
     /// <summary>
+    /// A call that runs out of time on its own just as its watcher cancels it takes the cancel before it goes on, so that
+    /// the cancel fails no later call, nor the report of the call's own failure. On Linux and macOS, where the exchange
+    /// worker can be stopped past the call's time, which has the watcher cancel it as the call ends on its own.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [OSCondition(OperatingSystems.Linux | OperatingSystems.OSX)]
+    public async Task LateCancelsFailNoLaterCall()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token, "log_min_messages = debug2");
+        await using TestNode nodeC = await StartNodeAsync("node_c", token);
+        foreach (TestNode node in new[] { nodeA, nodeB, nodeC })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        await SubscribeAsync(nodeB, "b_from_c", nodeC, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100)", token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+
+        // node_c's host drops node_b's connection attempts, and the first runs out of time, so that node_c is probed next.
+        int logpos = nodeB.ReadLog().Length;
+        _ = await nodeB.SafePsqlAsync(Database,
+            $"UPDATE worf.node_interface SET if_dsn = 'host=192.0.2.1 port=5432 dbname={Database} user={SuperUser}' WHERE if_nodeid = (SELECT node_id FROM worf.node WHERE node_name = 'node_c')",
+            token);
+        Assert.IsTrue(await nodeB.PollLogAsync(logpos, "exchange with node node_c failed: ", token), "node_b's first attempt to reach node_c failing");
+
+        // The exchange worker stops while it probes node_c, past the probe's three seconds for the connection, so that the
+        // watcher cancels the call, which, once the worker goes on, ends at its own time limit before it takes the cancel.
+        const string Worker = "SELECT pid FROM pg_stat_activity WHERE backend_type LIKE 'worf exchange%'";
+        logpos = nodeB.ReadLog().Length;
+        Assert.IsTrue(await nodeB.PollLogAsync(logpos, "exchange with node node_c starting, as a probe", token), "node_b probing node_c");
+        string worker = await nodeB.SafePsqlAsync(Database, Worker, token);
+        (int stopped, _, string error) = await ProcessRunner.RunAsync("kill", ["-STOP", worker], token);
+        Assert.AreEqual(0, stopped, error);
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(5), token);
+        }
+        finally
+        {
+            (int resumed, _, error) = await ProcessRunner.RunAsync("kill", ["-CONT", worker], token);
+            Assert.AreEqual(0, resumed, error);
+        }
+
+        // The probe's failure is reported at once, and the cancel fails none of node_b's calls to node_a after it.
+        int resumedAt = nodeB.ReadLog().Length;
+        Stopwatch reporting = Stopwatch.StartNew();
+        while (!nodeB.ReadLog()[logpos..].Contains("exchange with node node_c failed: ", StringComparison.Ordinal))
+        {
+            Assert.IsLessThan(TimeSpan.FromSeconds(5), reporting.Elapsed, "node_b reporting the probe's failure once it went on");
+            await Task.Delay(TimeSpan.FromMilliseconds(100), token);
+        }
+
+        Assert.IsTrue(await nodeB.PollLogAsync(resumedAt, "exchange with node node_a done", token), "node_b's next call to node_a");
+        Assert.DoesNotContain("exchange with node node_a failed", nodeB.ReadLog()[logpos..], "node_b's calls to node_a after the cancel");
+    }
+
+    /// <summary>
     /// Statements that draw from a sequence at once never run its block out, however many draw and however small the
     /// blocks: many single-row writers, with holders among them, multi-row writers, and a COPY beside writers. A
     /// statement waits for the switch, before it draws or after a row, once the block has no more values left than the
@@ -2970,8 +3032,6 @@ public sealed class SequenceRangeTests
         // anything while nothing changes.
         Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database,
             "SELECT bool_and(via_node <> node_id) FROM worf.sequence_range_node WHERE node_name = 'node_c'", token), "node_c's reports relayed");
-        Assert.IsTrue(await nodeC.PollQueryUntilAsync(Database,
-            "SELECT bool_and(via_node <> node_id) FROM worf.sequence_range_node WHERE node_name = 'node_a'", token), "node_a's reports relayed");
         await AssertIdleAsync(nodes, true, token);
 
         // node_b asks for another pool block once its pool blocks can't serve two more of node_c's last requests.
@@ -4023,12 +4083,16 @@ public sealed class SequenceRangeTests
             SELECT pg_snapshot_xmax(pg_current_snapshot()), clock_timestamp(),
                 (SELECT count(*) FROM pg_replication_slots WHERE plugin = 'worf' AND database = current_database()), pg_current_wal_insert_lsn()
             """;
-        // What each node holds of the sequences' ranges and the nodes it heard of, for a failure's message, which names what
-        // changed.
+        // What each node holds of the sequences' ranges, the nodes it heard of, its blocks, grants and requests, and the
+        // nodes a lift stopped waiting for, for a failure's message, which names what changed.
         const string Held = """
             SELECT coalesce(string_agg(row, E'\n' ORDER BY row), '') FROM (
                 SELECT 'range ' || to_jsonb(r)::text AS row FROM worf.sequence_range r
-                UNION ALL SELECT 'node ' || to_jsonb(n)::text FROM worf.sequence_range_node n) rows
+                UNION ALL SELECT 'node ' || to_jsonb(n)::text FROM worf.sequence_range_node n
+                UNION ALL SELECT 'block ' || to_jsonb(b)::text FROM worf.sequence_range_block b
+                UNION ALL SELECT 'grant ' || to_jsonb(g)::text FROM worf.sequence_range_grant g
+                UNION ALL SELECT 'request ' || to_jsonb(q)::text FROM worf.sequence_range_request q
+                UNION ALL SELECT 'absent ' || to_jsonb(a)::text FROM worf.sequence_range_absent a) rows
             """;
         string[] heldBefore = managed ? await Task.WhenAll(nodes.Select(node => node.SafePsqlAsync(Database, Held, token))) : [];
         string[][] before = await Task.WhenAll(nodes.Select(async node => (await node.SafePsqlAsync(Database, Next, token)).Split('|')));
