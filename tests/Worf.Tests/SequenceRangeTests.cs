@@ -1793,8 +1793,8 @@ public sealed class SequenceRangeTests
 
     /// <summary>
     /// A forced lift over grants that overlap resets both holders, the other as it hears the owner's next message, and
-    /// marks the grants, so that they fence the root no more. A lift over a new overlap within ten minutes resets both
-    /// again at once, as a node takes the resets of the node that granted its blocks whenever it lifts, though it takes
+    /// marks the grants, so that they fence the root no more. A lift over a new overlap within ten minutes, here among
+    /// three holders, resets them all at once, as a node takes the resets of the node that granted its blocks whenever it lifts, though it takes
     /// another neighbor's no more than once in ten minutes. A lift that stops waiting for a node that's down asks it to
     /// reset once it's heard from again, at once too, and doesn't take the blocks it reports back into its ledger.
     /// </summary>
@@ -1832,12 +1832,18 @@ public sealed class SequenceRangeTests
                 SELECT gen_random_uuid(), gen_random_uuid(), g.seqoid, n.node_id, n.node_name, g.kind, g.lo, g.hi, 'acknowledged', now()
                 FROM worf.sequence_range_grant g CROSS JOIN worf.local_node l JOIN worf.node n ON n.node_id = l.node_id
                 WHERE g.seqoid = 't_id_seq'::regclass AND g.grantee_id = {nodeBId} AND g.lo = {activeB};
+                {(lift == 2 ? $"""
+                    INSERT INTO worf.sequence_range_grant (grant_id, request_id, seqoid, grantee_id, grantee_name, kind, lo, hi, state, granted_at)
+                    SELECT gen_random_uuid(), gen_random_uuid(), g.seqoid, 4242, 'node_x', g.kind, g.lo, g.hi, 'acknowledged', now()
+                    FROM worf.sequence_range_grant g WHERE g.seqoid = 't_id_seq'::regclass AND g.grantee_id = {nodeBId} AND g.lo = {activeB};
+                    """ : "")}
                 SELECT worf.reset_sequence_range('t_id_seq');
                 """, token);
             Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, $"SELECT ({Fence}) LIKE '%overlap%'", token), $"node_a's fence held by the overlap {lift}");
 
             _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.activate_sequence_range('t_id_seq')", token);
-            Assert.Contains("overlap, so both nodes reset their blocks", nodeA.ReadLog()[logA..], $"node_a's lift over the overlap {lift}");
+            Assert.Contains(lift == 1 ? "overlap, so both nodes reset their blocks" : "among others, so the 3 nodes that hold grants that overlap reset their blocks",
+                nodeA.ReadLog()[logA..], $"node_a's lift over the overlap {lift}");
             Assert.IsTrue(await nodeB.PollLogAsync(logB, "node node_a lifted a fence over grants of this node's that overlap another's", token),
                 $"node_b's reset on the lift {lift}");
             await WaitActiveAsync([nodeA, nodeB], token);
