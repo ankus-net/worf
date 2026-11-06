@@ -1891,27 +1891,34 @@ public sealed class SequenceRangeTests
         _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO t (v) VALUES ('a')", token);
         string nodeAId = await nodeA.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
         string bSlot = await nodeB.SafePsqlAsync(Database, "SELECT sub_slot_name FROM worf.subscription WHERE sub_name = 'b_from_a'", token);
-        string[] identity = (await nodeB.SafePsqlAsync(Database,
-            "SELECT (SELECT system_identifier FROM pg_control_system()), (SELECT timeline_id FROM pg_control_checkpoint()), pg_current_wal_insert_lsn()", token)).Split('|');
         string[] range = (await nodeA.SafePsqlAsync(Database, """
             SELECT epoch, range_size, max_range_size, coalesce(watermark::text, 'null'), coalesce(root_start::text, 'null'), coalesce(root_end::text, 'null')
             FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass
             """, token)).Split('|');
-        string Request(string reset) => $$"""
+
+        // Each request carries node_b's WAL position as it is then, so that node_a doesn't take an earlier one for node_b
+        // going back.
+        async Task<string> RequestAsync(string reset)
+        {
+            string[] identity = (await nodeB.SafePsqlAsync(Database,
+                "SELECT (SELECT system_identifier FROM pg_control_system()), (SELECT timeline_id FROM pg_control_checkpoint()), pg_current_wal_insert_lsn()", token)).Split('|');
+            return $$"""
             {"node_id": {{nodeBId}}, "node_name": "node_b", "slot": "{{bSlot}}", "sysid": "{{identity[0]}}", "timeline": {{identity[1]}}, "wal_lsn": "{{identity[2]}}", "sequences": [
                 {"name": "public.t_id_seq", "owner_id": {{nodeAId}}, "epoch": {{range[0]}}, "range_size": {{range[1]}}, "max_range_size": {{range[2]}},
                     "distance": 1, "high_water": null, "watermark": {{range[3]}}, "state": "active", "root_start": {{range[4]}}, "root_end": {{range[5]}},
                     "reset": "{{reset}}", "reset_done": null, "held_complete": false, "held": [], "requests": [], "reports": [], "grants": [], "acks": []}]}
             """;
+        }
+
         int asked = nodeA.ReadLog().Length;
-        _ = await nodeA.SafePsqlAsync(Database, $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{Request("0/10")}')", token);
+        _ = await nodeA.SafePsqlAsync(Database, $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{await RequestAsync("0/10")}')", token);
         Assert.Contains("node node_b asked this node to reset", nodeA.ReadLog()[asked..], "node_a's reset at node_b's made-up request");
 
         // node_a draws from a block again, so that a reset would have something to give up.
         await WaitActiveAsync([nodeA, nodeB], token);
         _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO t (v) VALUES ('a')", token);
         asked = nodeA.ReadLog().Length;
-        _ = await nodeA.SafePsqlAsync(Database, $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{Request("0/11")}')", token);
+        _ = await nodeA.SafePsqlAsync(Database, $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{await RequestAsync("0/11")}')", token);
         Assert.DoesNotContain("asked this node to reset", nodeA.ReadLog()[asked..], "node_a's reset at node_b's next made-up request");
         await WaitActiveAsync([nodeA, nodeB], token);
         await AssertNoSharedValuesAsync([nodeA, nodeB], token);
@@ -2472,7 +2479,8 @@ public sealed class SequenceRangeTests
                 CultureInfo.InvariantCulture))];
         waits.Sort();
         Assert.IsGreaterThan(100, waits.Count, "node_b's inserts");
-        Assert.IsLessThan(2500.0, waits[^1], "node_b's slowest insert, against the 5000 ms each attempt to reach node_c took");
+        Assert.IsLessThan(4000.0, waits[^1],
+            "node_b's slowest insert, against the 5000 ms each attempt to reach node_c took, as a probe that gave way is made again within the three seconds of its connection");
     }
 
     /// <summary>
