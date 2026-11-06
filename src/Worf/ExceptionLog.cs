@@ -189,12 +189,12 @@ internal static class ExceptionLog
     }
 
     /// <summary>
-    /// Records rows of a table's copy that failed, which a query gives, each as its JSON and error, in one statement with
-    /// the query, so that however many and wide they are, none is kept but in the log.
+    /// Records rows of a table's copy that failed, which a query gives, each as its JSON, number and error, in one
+    /// statement with the query, so that however many and wide they are, none is kept but in the log.
     /// </summary>
     /// <param name="change">The copy, which the rows share.</param>
-    /// <param name="rows">The query, of each row's JSON, SQLSTATE and message, in order, which may change the rows it
-    /// gives, as a DELETE … RETURNING does.</param>
+    /// <param name="rows">The query, of each row's JSON, its number in the copy or 0, SQLSTATE and message, in order,
+    /// which may change the rows it gives, as a DELETE … RETURNING does.</param>
     /// <param name="parameters">The query's parameters.</param>
     /// <returns>Whether the rows were recorded; otherwise the query has had no effect, as when the log can't hold
     /// one of them.</returns>
@@ -204,10 +204,10 @@ internal static class ExceptionLog
         try
         {
             PgTransaction.RunInSubtransaction(() => Worf.InOwnContext(() => _ = Worf.Execute($"""
-                WITH f (new_tuple, error_sqlstate, error_message) AS ({rows})
+                WITH f (new_tuple, action_counter, error_sqlstate, error_message) AS ({rows})
                 INSERT INTO worf.exception_log (sub_id, sub_name, remote_node_id, remote_xid, remote_commit_ts, remote_commit_lsn,
                     action_counter, operation, schema_name, table_name, remote_new_tuple, behaviour, error_sqlstate, error_message)
-                SELECT ${n + 1}, ${n + 2}, ${n + 3}, ${n + 4}::pg_catalog.text::pg_catalog.xid, ${n + 5}, ${n + 6}, 0, ${n + 7}, ${n + 8},
+                SELECT ${n + 1}, ${n + 2}, ${n + 3}, ${n + 4}::pg_catalog.text::pg_catalog.xid, ${n + 5}, ${n + 6}, f.action_counter, ${n + 7}, ${n + 8},
                     ${n + 9}, f.new_tuple::pg_catalog.jsonb, ${n + 10}, f.error_sqlstate, f.error_message
                 FROM f
                 """,

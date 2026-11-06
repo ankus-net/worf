@@ -863,13 +863,15 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   of the provider's rows takes, or the provider moved a value from one row to
   another, with a hint to resynchronize. Under `discard` and `transdiscard`,
   the rows the merge writes that a `NOT NULL` column or `CHECK` constraint
-  refuses, and those whose values in an immediate unique index without
-  expressions or a predicate a row the table keeps holds, are skipped at
-  once, and the rest merged again, in halves if it still fails, down to the
-  rows that fail alone, each half taking a transaction ID; skipped rows are
-  recorded as a `MERGE` with their rows, with a warning,
-  so that the provider's other rows, and its changes after the copy, still
-  arrive; under `sub_disable`, it disables the subscription. In a table's initial copy, a row that fails, whether its value
+  refuses, and those that an immediate unique index or exclusion constraint
+  refuses, as a row the table keeps or an earlier row of the copy holds their
+  values, whatever the index's expressions and predicate, are skipped at
+  once, unless a `BEFORE ROW` trigger could change them first, and the rest
+  merged again, in halves if it still fails, down to the rows that fail
+  alone, as on a trigger's error, each half taking a transaction ID; skipped
+  rows are recorded as a `MERGE` with their columns' text and their numbers
+  in the copy, with a warning, so that the provider's other rows, and its
+  changes after the copy, still arrive; under `sub_disable`, it disables the subscription. In a table's initial copy, a row that fails, whether its value
   doesn't convert to its column's type, the column's input refuses it or a
   constraint does, is skipped under `discard` and `transdiscard` and disables
   the subscription under `sub_disable`, and is recorded as a `COPY` with its
@@ -880,21 +882,24 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   the start in batches of up to a thousand rows and 8 MB, each in its own
   subtransaction, which take a transaction ID each and go on past each row that
   fails: a row whose value doesn't convert is left out before the batch is
-  copied, as is a row whose key one of the table's immediate unique indexes
-  without expressions or a predicate already holds, or an earlier row of the
-  batch takes, and a row that its column's input, a `NOT NULL` column or a
-  `CHECK` constraint refuses is left out as the batch is copied, unless a
-  `BEFORE ROW` trigger or a generated column could change it first. A row
-  that `COPY` refuses otherwise, as one whose key a concurrent transaction
-  writes, or that a foreign key or a trigger refuses, has the batch's rows
-  before it copied again. The rows that fail are recorded in runs of up to
-  a thousand rows and 8 MB, in order. A deferrable unique or exclusion
-  constraint, whose recheck doesn't fire as the copy writes, is checked once
-  the table has copied: a conflict fails the copy under `error`, disables the
-  subscription under `sub_disable`, and otherwise a row is deleted and
-  recorded when it conflicts with an earlier row that stays, as rows checked
-  in the copy's order would be. Such rows, and those a merge skips, have no
-  number in the copy, and are recorded with 0 as the action counter. Under `error` the copy stops,
+  copied, as is a row that one of the table's immediate unique indexes or
+  exclusion constraints refuses, as a row the table holds or an earlier row
+  of the batch that's copied holds its values, whatever the index's
+  expressions and predicate, and a row that its column's input, a `NOT NULL`
+  column or a `CHECK` constraint refuses is left out as the batch is copied;
+  neither check runs where a `BEFORE ROW` trigger or a generated column could
+  change the row first. A row that `COPY` refuses otherwise, as one whose key
+  a concurrent transaction writes, one that a trigger refuses, or one that a
+  deferrable constraint that is initially immediate refuses as the batch's
+  `COPY` ends, has the batch's rows before it copied again. Foreign keys
+  aren't checked, as for apply. The rows that fail are recorded in runs of up
+  to a thousand rows and 8 MB, in order. A deferrable unique or exclusion
+  constraint that is initially deferred is checked once the table has copied:
+  a conflict fails the copy under `error`, disables the subscription under
+  `sub_disable`, and otherwise a row is deleted and recorded when it
+  conflicts with an earlier row that stays, as rows checked in the copy's
+  order would be. Such rows have no number in the copy, which the table
+  doesn't keep, and are recorded with 0 as the action counter. Under `error` the copy stops,
   naming the row, column and value, and starts again after a delay of 5 seconds
   that doubles each time, up to 5 minutes, from the start of a table's last copy
   or the failure of a subscription's first;
@@ -1181,11 +1186,16 @@ Apply runs with `session_replication_role` set to `replica`, under which
 PostgreSQL doesn't fire the triggers that recheck deferrable unique and
 exclusion constraints. worf has them fire for the rows apply writes, so that
 PostgreSQL rechecks them as it does a session's rows, whatever their expressions
-and predicates: at commit for a constraint that is initially deferred, which
-fails the remote transaction as a whole, and as each change ends for one that is
-initially immediate, waiting for a transaction here that writes a conflicting
-row. `worf.exception_behaviour` handles the failure as any other. A table's copy
-is checked against them once it has copied.
+and predicates, at commit, waiting for a transaction here that writes a
+conflicting row: a failure fails the remote transaction as a whole. Apply
+doesn't know where the provider's statements ended, at which PostgreSQL checks a
+constraint that is initially immediate, so it checks those at commit too, and
+rows that swap values, as one statement may, apply. Under `discard`, a
+transaction whose commit fails on such a constraint is applied again change by
+change, with it checked as each change ends, so that the change that conflicts is
+the one skipped. `worf.exception_behaviour` handles the failure otherwise as any
+other. A table's copy has those that are initially immediate checked as each
+`COPY` ends, and those that are initially deferred once it has copied.
 
 ### DDL
 

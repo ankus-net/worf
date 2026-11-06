@@ -53,7 +53,9 @@ public sealed class DocumentationTests
     /// <summary>
     /// The configuration says which rows of a copy in batches have the batch's earlier rows copied again: only those
     /// COPY itself refuses, while rows that don't convert, that a column's input, a NOT NULL column or a CHECK constraint
-    /// refuses, or whose keys the table holds, are left out.
+    /// refuses, or that an immediate unique index or exclusion constraint refuses, are left out; which rows a merge skips
+    /// at once and how it records them; that foreign keys aren't checked; and when the copy and apply recheck deferrable
+    /// constraints.
     /// </summary>
     [TestMethod]
     public void CopyDocsSayWhichRowsCopyAgain()
@@ -62,11 +64,23 @@ public sealed class DocumentationTests
         {
             Assert.DoesNotContain("a row that the column's input or a constraint refuses has the rows before it copied again", text,
                 $"the rows copied again, in {name} (179)");
-            Assert.Contains("A row that `COPY` refuses otherwise, as one whose key a concurrent transaction writes, or that a foreign key or a trigger refuses, has the batch's rows before it copied again.",
+            Assert.Contains("A row that `COPY` refuses otherwise, as one whose key a concurrent transaction writes, one that a trigger refuses,",
                 text, $"the rows copied again, in {name} (179)");
-            Assert.Contains("and those whose values in an immediate unique index without expressions or a predicate a row the table keeps holds, are skipped at once",
-                text, $"the rows a merge skips at once, in {name} (173)");
+            Assert.DoesNotContain("without expressions or a predicate", text, $"the rows skipped at once, in {name} (40, 173)");
+            Assert.Contains("and those that an immediate unique index or exclusion constraint refuses, as a row the table keeps or an earlier row of the copy holds their values, whatever the index's expressions and predicate, are skipped at once, unless a `BEFORE ROW` trigger could change them first",
+                text, $"the rows a merge skips at once, in {name} (40, 173, 251)");
+            Assert.Contains("skipped rows are recorded as a `MERGE` with their columns' text and their numbers in the copy", text,
+                $"how a merge's skipped rows are recorded, in {name} (256)");
+            Assert.DoesNotContain("or that a foreign key or a trigger refuses", text, $"foreign keys, in {name} (257)");
+            Assert.Contains("Foreign keys aren't checked, as for apply.", text, $"foreign keys, in {name} (257)");
+            Assert.DoesNotContain("whose recheck doesn't fire as the copy writes", text, $"the copy's deferrable rechecks, in {name} (257)");
+            Assert.Contains("or one that a deferrable constraint that is initially immediate refuses as the batch's `COPY` ends, has the batch's rows before it copied again",
+                text, $"the copy's deferrable rechecks, in {name} (257)");
+            Assert.DoesNotContain("and those a merge skips, have no number in the copy", text, $"the rows recorded with 0, in {name} (256, 257)");
         }
+
+        Assert.Contains("so it checks those at commit too, and rows that swap values, as one statement may, apply", s_readme,
+            "apply's deferrable rechecks (253)");
     }
 
     // A file's words, one space apart, without the slashes that start a comment's lines.
