@@ -260,23 +260,37 @@ internal static class SequenceRangeHeard
             }
 
             WorfHeard heard = guard[i];
-            long every = Math.Max(heard.ResetEvery, 600_000_000L);
-            if (heard.ResetAt != 0 && now - heard.ResetAt >= 60_000_000 && now - heard.ResetAt < every)
-            {
-                return null;
-            }
-
-            if (heard.ResetAt == 0 || now - heard.ResetAt >= every)
-            {
-                heard.ResetEvery = heard.ResetAt != 0 && now - heard.ResetAt < 86_400_000_000L ? Math.Min(every * 2, 86_400_000_000L) : 600_000_000L;
-                heard.ResetAt = now;
-                guard[i] = heard;
-            }
-
-            return heard.ResetAt;
+            (long? window, heard.ResetAt, heard.ResetEvery) = ResetWindow(heard.ResetAt, heard.ResetEvery, now);
+            guard[i] = heard;
+            return window;
         }
 
         return now;
+    }
+
+    /// <summary>
+    /// Works out whether a neighbor may have this server reset now, as <see cref="MayReset"/> tells, from when its
+    /// resets' window last began and how long it lasts.
+    /// </summary>
+    /// <param name="resetAt">When the window last began, or zero for none yet.</param>
+    /// <param name="resetEvery">How long it lasts, in microseconds, or zero for ten minutes.</param>
+    /// <param name="now">The time now.</param>
+    /// <returns>When the window the neighbor may reset in began, or null when it may not now, and when the window
+    /// begins and how long it lasts from now on.</returns>
+    internal static (long? Window, long ResetAt, long ResetEvery) ResetWindow(long resetAt, long resetEvery, long now)
+    {
+        long every = Math.Max(resetEvery, 600_000_000L);
+        if (resetAt != 0 && now - resetAt >= 60_000_000 && now - resetAt < every)
+        {
+            return (null, resetAt, resetEvery);
+        }
+
+        if (resetAt == 0 || now - resetAt >= every)
+        {
+            return (now, now, resetAt != 0 && now - resetAt < 86_400_000_000L ? Math.Min(every * 2, 86_400_000_000L) : 600_000_000L);
+        }
+
+        return (resetAt, resetAt, resetEvery);
     }
 
     private static uint DatabaseId()
