@@ -42,7 +42,7 @@ internal static class SequenceRangeSwitchWorker
             }
             catch (PgQueryCanceledException)
             {
-                // A transaction that runs the block out cancelled the wait to switch the sequence itself.
+                // A cancellation, as pg_cancel_backend's, ends the worker, and the range worker checks the sequence again.
                 break;
             }
         }

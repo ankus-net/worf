@@ -1558,15 +1558,21 @@ internal static class SequenceRangeExchange
             }
 
             bool behind = Worf.TryParseLsn(reset, out ulong seen) && seen > insert;
+
+            // A fence's lift asks the holders of the grants it gave out again, or that overlap, to reset, which the
+            // node that granted them may ask at once, however recently it asked before, as it decides those blocks in
+            // any case; a request from any other neighbor waits for SequenceRangeHeard.MayReset.
+            bool lifted = reset.StartsWith("FFFFFFFF/", StringComparison.Ordinal) || reset.StartsWith("FFFFFFFE/", StringComparison.Ordinal);
+            bool fromGrantor = lifted && Worf.ReadScalar<bool>("SELECT parent_node = $2 FROM worf.sequence_range WHERE seqoid = $1", seq, sender);
             if (!behind && !SequenceRanges.ActedSinceReset(seqoid, node))
             {
                 _ = Worf.Execute("UPDATE worf.sequence_range_node SET reset_done = $3::pg_lsn WHERE seqoid = $1 AND node_id = $2", seq, sender,
                     SpiParameter.Create(reset));
             }
-            else if (SequenceRangeHeard.MayReset(senderId) is long window && Worf.Execute("""
+            else if ((fromGrantor ? Worker.GetCurrentTimestamp() : SequenceRangeHeard.MayReset(senderId)) is long window && Worf.Execute("""
                 UPDATE worf.sequence_range_node SET reset_done = $3::pg_lsn, reset_at = pg_catalog.clock_timestamp()
-                WHERE seqoid = $1 AND node_id = $2 AND (reset_at IS NULL OR reset_at < $4)
-                """, seq, sender, SpiParameter.Create(reset), SpiParameter.Create(new PgTimestampTz(window))) > 0)
+                WHERE seqoid = $1 AND node_id = $2 AND ($5 OR reset_at IS NULL OR reset_at < $4)
+                """, seq, sender, SpiParameter.Create(reset), SpiParameter.Create(new PgTimestampTz(window)), SpiParameter.Create(fromGrantor)) > 0)
             {
                 WorfLog.Warning(reset.StartsWith("FFFFFFFF/", StringComparison.Ordinal)
                     ? $"sequence {info.Name}: node {senderName} lifted a fence over grants of this node's that overlap another's, so it abandons its blocks and requests new ones"

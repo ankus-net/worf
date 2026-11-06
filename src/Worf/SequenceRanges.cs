@@ -3168,13 +3168,24 @@ internal static unsafe partial class SequenceRanges
                 return false;
             }
 
-            // Both holders give up their blocks and ask for new ones, so that neither issues the values they share from
-            // then on: this node at once, and another as it hears this node's next message, which asks it to reset at a
+            // The holders of every grant that overlaps another give up their blocks and ask for new ones, so that none
+            // issues the values they share from then on: this node at once, and another as it hears this node's next
+            // message, which asks it to reset at a
             // WAL position of its own, past any real one, so that it resets for each lift and knows why. Every grant that
             // overlaps another is then marked, so that it fences the root no more.
-            WorfLog.Warning($"sequence {GetInfo(seqoid).Name}: {detail}, so both nodes reset their blocks");
+            WorfRows holders = Worf.SelectCatalog("""
+                SELECT DISTINCT g.grantee_id FROM worf.sequence_range_grant g
+                WHERE g.seqoid = $1 AND g.kind <> 'x' AND g.state NOT IN ('unclaimed', 'overlapped') AND EXISTS (
+                    SELECT 1 FROM worf.sequence_range_grant o
+                    WHERE o.seqoid = g.seqoid AND o.grant_id <> g.grant_id AND o.kind <> 'x' AND o.state NOT IN ('unclaimed', 'overlapped')
+                        AND g.lo <= o.hi AND o.lo <= g.hi
+                        AND (g.seqoid <> 'worf.snowflake_node'::regclass OR g.state <> 'abandoned' AND o.state <> 'abandoned'))
+                """, seq);
+            WorfLog.Warning(holders.Count > 2
+                ? $"sequence {GetInfo(seqoid).Name}: {detail}, among others, so the {holders.Count} nodes that hold grants that overlap reset their blocks"
+                : $"sequence {GetInfo(seqoid).Name}: {detail}, so both nodes reset their blocks");
             string lift = $"FFFFFFFF/{(uint)Worker.GetCurrentTimestamp():X8}";
-            foreach (uint holder in new[] { overlap[0].Get<uint>(6), overlap[0].Get<uint>(7) }.Distinct())
+            foreach (uint holder in Enumerable.Range(0, holders.Count).Select(i => holders[i].Get<uint>(0)))
             {
                 if (holder == node.Node.Id)
                 {
@@ -3378,11 +3389,28 @@ internal static unsafe partial class SequenceRanges
             return;
         }
 
+        // A block whose values the ledger has granted again, as a lift that stopped waiting for its holder gave them
+        // out, or whose holder this allocator asked to reset at such a lift, isn't taken back, which would fence the
+        // allocator again on the overlap: its holder resets instead, as asked at once.
+        SpiParameter seq = SpiParameter.Create(seqoid);
+        SpiParameter holder = SpiParameter.Create(holderId);
+        if (Worf.ReadScalar<bool>("""
+            SELECT EXISTS (SELECT 1 FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2 AND reset_lsn IS NOT NULL)
+                OR EXISTS (
+                    SELECT 1 FROM worf.sequence_range_grant g
+                    WHERE g.seqoid = $1 AND g.kind <> 'x' AND g.state NOT IN ('unclaimed', 'overlapped', 'abandoned') AND g.lo <= $4 AND $3 <= g.hi)
+            """, seq, holder, SpiParameter.Create(lo), SpiParameter.Create(hi)))
+        {
+            _ = Worf.Execute("UPDATE worf.sequence_range_node SET reset_lsn = coalesce(reset_lsn, $3::pg_lsn) WHERE seqoid = $1 AND node_id = $2",
+                seq, holder, SpiParameter.Create($"FFFFFFFE/{(uint)Worker.GetCurrentTimestamp():X8}"));
+            return;
+        }
+
         WorfRows from = Worf.SelectCatalog("""
             SELECT block_id FROM worf.sequence_range_block
             WHERE seqoid = $1 AND kind IN ('r', 'p') AND state IN ('open', 'fenced') AND lo <= $2 AND $3 <= hi
             LIMIT 1
-            """, SpiParameter.Create(seqoid), SpiParameter.Create(lo), SpiParameter.Create(hi));
+            """, seq, SpiParameter.Create(lo), SpiParameter.Create(hi));
         if (from.Count == 0)
         {
             return;
@@ -4031,13 +4059,12 @@ internal static unsafe partial class SequenceRanges
     /// when no transaction that called nextval holds it, without queueing for it, since inserts would queue behind it, and a
     /// switch that gave up would let them all draw from the block at once, as they might near its end. Once the block
     /// reaches its last twentieth, where inserts wait for the switch, or the next block is reserved for a load, whose
-    /// session waits for it, a switch that can't have the lock is left to a switch worker, which waits for those
-    /// transactions as long as they hold the sequence, while the range worker checks the other sequences. The range
-    /// worker starts it with <see cref="HandOff"/> once its check has committed, so that the switch worker waits on no
-    /// lock of the range worker's. While every worker slot is taken, the range worker waits for the lock itself, a tenth
-    /// of a second at most, which outlasts the transactions of concurrent inserts. A prepared transaction that holds the
-    /// sequence, which may hold it across restarts, isn't waited for: the sequence's range says so, with a warning, and
-    /// inserts run the block out.
+    /// session waits for it, a switch that can't have the lock is left to a switch worker, which switches beside those
+    /// transactions, without waiting for them, while the range worker checks the other sequences. The range worker
+    /// starts it with <see cref="HandOff"/> once its check has committed, so that the switch worker waits on no lock of
+    /// the range worker's. While every worker slot is taken, the range worker switches beside them itself, waiting a
+    /// tenth of a second at most for the switch gate. A prepared transaction that holds the sequence, which may hold it
+    /// across restarts, is switched beside as any other.
     /// </summary>
     private static bool SwitchBeforeEnd(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) next, bool forLoad, bool atEnd)
     {

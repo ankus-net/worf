@@ -928,7 +928,8 @@ public sealed class SequenceRangeTests
     /// <summary>
     /// A statement that runs its active block out goes on into the next blocks as they arrive, whether an
     /// INSERT ... SELECT, a multi-row VALUES or a COPY, which checks the sequence for each row rather than for each
-    /// buffer of rows, and wastes no block's values. Values a transaction that rolled back drew are never issued again,
+    /// buffer of rows, so it takes the next block's values as soon as it's switched to. Values a transaction that rolled
+    /// back drew are never issued again,
     /// and a prepared transaction, whether it read the sequence or drew from it, holds off no switch.
     /// </summary>
     /// <returns>The test.</returns>
@@ -1792,9 +1793,10 @@ public sealed class SequenceRangeTests
 
     /// <summary>
     /// A forced lift over grants that overlap resets both holders, the other as it hears the owner's next message, and
-    /// marks the grants, so that they fence the root no more. A lift over a new overlap resets both again, here after the
-    /// other holder restarted, as a node takes a neighbor's resets no more than once in ten minutes. A lift that stops
-    /// waiting for a node that's down asks it to reset once it's heard from again.
+    /// marks the grants, so that they fence the root no more. A lift over a new overlap within ten minutes resets both
+    /// again at once, as a node takes the resets of the node that granted its blocks whenever it lifts, though it takes
+    /// another neighbor's no more than once in ten minutes. A lift that stops waiting for a node that's down asks it to
+    /// reset once it's heard from again, at once too, and doesn't take the blocks it reports back into its ledger.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -1850,10 +1852,7 @@ public sealed class SequenceRangeTests
             {
                 // The marked grants fence the root no more: node_a's next reset lifts once node_b reports.
                 _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.reset_sequence_range('t_id_seq')", token);
-                await WaitActiveAsync([nodeA], token);
-                await nodeB.StopAsync("fast", token);
-                await nodeB.StartServerAsync(token);
-                await WaitActiveAsync([nodeB], token);
+                await WaitActiveAsync([nodeA, nodeB], token);
             }
         }
 

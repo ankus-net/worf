@@ -280,11 +280,13 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
 
 - `worf.sequence_range_timeout`
   How long a sequence range exchange waits to connect to the other node, and
-  for each call to it, before the range worker cancels it. Inserts near the end
-  of a block wait up to twice this in all for the switch, which a switch worker
-  makes beside the transactions drawing from the block, without waiting for
-  them. A call to a node whose last call ran out of time waits a second at
-  most, until one answers. The default is `10s`.
+  for each call to it, before the range worker cancels it. Inserts near the
+  end of a block wait for the switch, which a switch worker makes beside the
+  transactions drawing from the block, without waiting for them: up to twice
+  this for each block in all while its next block is still to come, or once a
+  worker has tried and couldn't switch it, and otherwise until it comes, as
+  for a lock. A call to a node whose last call ran out of time waits a second
+  at most, until one answers. The default is `10s`.
 
 - `worf.ddl_lock_timeout`
   How long DDL waits in all for the other nodes to hold back their writes and
