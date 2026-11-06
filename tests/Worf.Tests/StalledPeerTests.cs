@@ -1,3 +1,5 @@
+using System.Net;
+using System.Net.Sockets;
 using Npgsql;
 
 namespace Worf.Tests;
@@ -21,8 +23,9 @@ public sealed class StalledPeerTests
     /// Apply asks a provider that sends nothing for a reply once half of wal_receiver_timeout has passed, and stops
     /// once all of it has, as PostgreSQL's apply worker does. A call it makes to its provider as it starts, here a
     /// connection that a stopped postmaster never accepts, gives up after wal_receiver_timeout and names what it waited
-    /// for. The manager gives up on a worker that the postmaster hasn't started after wal_receiver_timeout, with a
-    /// warning, rather than wait for it while every other worker of the database waits on the manager. Each
+    /// for, and so does a table sync's call to a server that takes the connection and never answers. The manager gives
+    /// up on a worker that the postmaster hasn't started after wal_receiver_timeout, with a warning naming its
+    /// subscription, rather than wait for it while every other worker of the database waits on the manager. Each
     /// subscription replicates again once the process goes on. Processes are stopped with signals, which Windows lacks.
     /// </summary>
     /// <returns>The test.</returns>
@@ -80,6 +83,61 @@ public sealed class StalledPeerTests
 
         await AppliesAsync(provider, subscriber, 3, token);
 
+        // A table sync that starts while apply streams, for a table the provider adds, connects to a server that takes
+        // connections and never answers, here a listener the provider's interface names now: its connection gives up as
+        // apply's does.
+        _ = await subscriber.SafePsqlAsync(Database, "CREATE TABLE t2 (id integer PRIMARY KEY)", token);
+        _ = await provider.SafePsqlAsync(Database, "CREATE TABLE t2 (id integer PRIMARY KEY); INSERT INTO t2 VALUES (1)", token);
+        logpos = subscriber.ReadLog().Length;
+        string dsn = await subscriber.SafePsqlAsync(Database,
+            "SELECT if_dsn FROM worf.node_interface WHERE if_nodeid = (SELECT node_id FROM worf.node WHERE node_name = 'provider')", token);
+        using (TcpListener frozen = new(IPAddress.Loopback, 0))
+        {
+            frozen.Start();
+            List<TcpClient> taken = [];
+            using CancellationTokenSource stop = CancellationTokenSource.CreateLinkedTokenSource(token);
+            Task taking = Task.Run(async () =>
+            {
+                try
+                {
+                    while (true)
+                    {
+                        taken.Add(await frozen.AcceptTcpClientAsync(stop.Token));
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    // The listener stops.
+                }
+            }, token);
+            try
+            {
+                _ = await subscriber.SafePsqlAsync(Database, $"""
+                    UPDATE worf.node_interface SET if_dsn = 'host=127.0.0.1 port={((IPEndPoint)frozen.LocalEndpoint).Port} dbname={Database} user={SuperUser}'
+                    WHERE if_nodeid = (SELECT node_id FROM worf.node WHERE node_name = 'provider')
+                    """, token);
+                _ = await provider.SafePsqlAsync(Database, "SELECT * FROM worf.replication_set_add_table('default', 't2', synchronize_data := true)", token);
+                Assert.IsTrue(await subscriber.PollLogAsync(logpos, "timed out waiting for provider \"provider\" to list its managed sequences", token),
+                    "the table sync giving up on its first call");
+            }
+            finally
+            {
+                await stop.CancelAsync();
+                await taking;
+                foreach (TcpClient client in taken)
+                {
+                    client.Dispose();
+                }
+
+                _ = await subscriber.SafePsqlAsync(Database,
+                    $"UPDATE worf.node_interface SET if_dsn = '{dsn.Replace("'", "''", StringComparison.Ordinal)}' WHERE if_nodeid = (SELECT node_id FROM worf.node WHERE node_name = 'provider')", token);
+            }
+        }
+
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+            "SELECT sync_status = 'r' FROM worf.local_sync_status WHERE sync_relname = 't2'", token), "t2 synchronized once the provider answers");
+        await AppliesAsync(provider, subscriber, 5, token);
+
         // The subscriber's postmaster stops: the manager can't start the apply worker of the subscription enabled again,
         // nor the exchange worker it starts from time to time, and gives up on the first it waits for. Only a session that
         // was open before can reach the server meanwhile.
@@ -95,14 +153,14 @@ public sealed class StalledPeerTests
                 _ = await command.ExecuteScalarAsync(token);
             }
 
-            Assert.IsTrue(await subscriber.PollLogAsync(logpos, "took too long to start; canceled", token), "the manager giving up on the worker");
+            Assert.IsTrue(await subscriber.PollLogAsync(logpos, "worker for subscription \"sub\" at slot", token), "the manager giving up on the worker, naming its subscription");
         }
         finally
         {
             await SignalAsync("-CONT", subscriberPostmaster, token);
         }
 
-        await AppliesAsync(provider, subscriber, 4, token);
+        await AppliesAsync(provider, subscriber, 6, token);
     }
 
     private static async Task AppliesAsync(TestNode provider, TestNode subscriber, int id, CancellationToken token)

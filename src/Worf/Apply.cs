@@ -1297,11 +1297,11 @@ internal static unsafe partial class Apply
         bool dropped;
         try
         {
-            dropped = PgBackgroundWorker.RunTransaction(() =>
+            dropped = FromProvider(sub, "drop the slots table syncs left", () => PgBackgroundWorker.RunTransaction(() =>
             {
                 using WorfConnection conn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "cleanup");
                 return Sync.DropLeftSyncSlots(conn, sub).Count == 0;
-            });
+            }));
         }
         catch (PgException error)
         {
@@ -1984,13 +1984,15 @@ internal static unsafe partial class Apply
         if (reloid == 0)
         {
             WorfSubscription sub = MySubscription!;
-            using (WorfConnection conn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "sequence"))
+            bool replicated = FromProvider(sub, $"say whether it replicates sequence {nspname}.{relname}", () =>
             {
-                if (!Rpc.RemoteReplicatesSequence(conn, nspname, relname, sub.ReplicationSets))
-                {
-                    WorfLog.Warning($"skipping the state of sequence {nspname}.{relname}, which doesn't exist here and which provider {sub.Origin.Name} doesn't replicate");
-                    return;
-                }
+                using WorfConnection conn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "sequence");
+                return Rpc.RemoteReplicatesSequence(conn, nspname, relname, sub.ReplicationSets);
+            });
+            if (!replicated)
+            {
+                WorfLog.Warning($"skipping the state of sequence {nspname}.{relname}, which doesn't exist here and which provider {sub.Origin.Name} doesn't replicate");
+                return;
             }
 
             throw new PgException(PgSqlStates.UndefinedTable, $"relation \"{nspname}.{relname}\" does not exist",
@@ -2741,65 +2743,17 @@ internal static unsafe partial class Apply
 
     /// <summary>
     /// Makes one of the calls to the provider that apply makes as it starts, giving up once wal_receiver_timeout has
-    /// passed without an answer, as a provider that accepts a connection and then answers nothing would hold the
-    /// worker, and with it the subscription, for good. The call's deadline goes in the worker's slot, and the
-    /// database's manager cancels the call once it has passed, as the exchange worker's watcher cancels its calls,
-    /// since cancelling a query cancels a wait on the provider. The error names what the call waited for.
+    /// passed without an answer, as <see cref="Worker.WithProviderDeadline"/> does; the error names what the call
+    /// waited for.
     /// </summary>
     private static T FromProvider<T>(WorfSubscription sub, string what, Func<T> call)
-    {
-        int timeout;
-        unsafe
-        {
-            timeout = NativeGlobals.wal_receiver_timeout;
-        }
-
-        if (timeout <= 0)
-        {
-            return call();
-        }
-
-        long deadline = Worker.GetCurrentTimestamp() + (timeout * 1000L);
-        SetCallDeadline(deadline);
-        try
-        {
-            return call();
-        }
-        catch (Exception error) when (error is PgQueryCanceledException or PgException { SqlState: "57014" } && Worker.GetCurrentTimestamp() >= deadline)
-        {
-            throw new PgException(PgSqlStates.ConnectionFailure, $"timed out waiting for provider \"{sub.Origin.Name}\" to {what}",
-                detail: $"It hadn't answered within wal_receiver_timeout ({timeout} ms).");
-        }
-        finally
-        {
-            SetCallDeadline(0);
-        }
-    }
+        => Worker.WithProviderDeadline(() => $"provider \"{sub.Origin.Name}\" to {what}", call);
 
     private static void FromProvider(WorfSubscription sub, string what, Action call) => _ = FromProvider(sub, what, () =>
     {
         call();
         return true;
     });
-
-    /// <summary>
-    /// Publishes the deadline of the call to the provider about to start, waking the manager to watch it, or clears it
-    /// as the call ends.
-    /// </summary>
-    private static void SetCallDeadline(long deadline)
-    {
-        using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
-        {
-            WorfWorker worker = guard[Worker.MyWorfWorker];
-            worker.Worker.Apply.CallDeadline = deadline;
-            guard[Worker.MyWorfWorker] = worker;
-        }
-
-        if (deadline != 0)
-        {
-            Worker.WakeManager();
-        }
-    }
 
     /// <summary>
     /// Ends the worker once the provider has sent nothing for wal_receiver_timeout, as PostgreSQL's apply worker does,

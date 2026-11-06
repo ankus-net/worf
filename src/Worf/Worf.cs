@@ -2109,6 +2109,17 @@ internal static partial class Worf
             inTransaction = NativeMethods.IsTransactionState();
         }
 
+        // An apply or table sync worker's connection gives up once wal_receiver_timeout has passed, as a server that
+        // takes the connection and then answers nothing would hold the worker for good, which libpq's connect_timeout
+        // doesn't bound here. A worker connects in a transaction, so that the cancellation that ends the wait is an
+        // error it can catch.
+        string described = $"the connection \"{applicationName}\" to {(replication ? "replicate" : "connect")}";
+        if (!inTransaction && Worker.MyWorfWorker >= 0 && Worker.MyWorker.WorkerType is WorfWorkerType.Apply or WorfWorkerType.Sync)
+        {
+            return Worker.WithProviderDeadline(() => described,
+                () => PgBackgroundWorker.RunTransaction(() => WithPinnedSearchPath(WorfConnection.Connect(conninfo.ToString(), applicationName, replication))));
+        }
+
         if (!inTransaction)
         {
             return WithPinnedSearchPath(WorfConnection.Connect(conninfo.ToString(), applicationName, replication));
@@ -2117,7 +2128,8 @@ internal static partial class Worf
         WorfConnection? conn = null;
         try
         {
-            PgTransaction.RunInSubtransaction(() => conn = WorfConnection.Connect(conninfo.ToString(), applicationName, replication));
+            Worker.WithProviderDeadline(() => described,
+                () => PgTransaction.RunInSubtransaction(() => conn = WorfConnection.Connect(conninfo.ToString(), applicationName, replication)));
         }
         catch (PgException error) when (error.SqlState == PgSqlStates.ConnectionFailure)
         {

@@ -36,6 +36,9 @@ internal static class Worker
     /// </summary>
     internal static int MyWorfWorker { get; set; } = -1;
 
+    // How many calls to a provider with a deadline this worker is within.
+    private static int s_providerCalls;
+
     /// <summary>
     /// Init shmem needed for workers.
     /// </summary>
@@ -773,13 +776,9 @@ internal static class Worker
     /// </summary>
     private static void WaitForWorkerStartup(int slot, ushort generation, PgBackgroundWorkerHandle handle)
     {
-        int timeout;
-        unsafe
-        {
-            timeout = NativeGlobals.wal_receiver_timeout;
-        }
-
-        long deadline = timeout > 0 ? GetCurrentTimestamp() + (timeout * 1000L) : 0;
+        int timeout = ProviderTimeout;
+        long deadline = GetCurrentTimestamp() + (timeout * 1000L);
+        (string Kind, uint SubId, string? Table, string Detail)? gaveUp = null;
         while (true)
         {
             PgInterrupts.Check();
@@ -832,7 +831,7 @@ internal static class Worker
                     break;
                 }
 
-                if (deadline != 0 && GetCurrentTimestamp() >= deadline)
+                if (GetCurrentTimestamp() >= deadline)
                 {
                     if (worker.WorkerType != WorfWorkerType.None && worker.Generation == generation && worker.CrashedAt == 0)
                     {
@@ -841,12 +840,11 @@ internal static class Worker
                     }
 
                     handle.Terminate();
-                    WorfLog.Warning(new PgDiagnostic($"{WorkerTypeName(worker.WorkerType)} worker at slot {slot} took too long to start; canceled")
-                    {
-                        Detail = state.Status == PgBackgroundWorkerStatus.Started
+                    gaveUp = (WorkerTypeName(worker.WorkerType), worker.WorkerType is WorfWorkerType.Apply or WorfWorkerType.Sync ? worker.Worker.Apply.SubId : 0,
+                        worker.WorkerType == WorfWorkerType.Sync ? Worf.QuoteQualifiedIdentifier(NameStr(worker.Worker.Sync.Nspname), NameStr(worker.Worker.Sync.Relname)) : null,
+                        state.Status == PgBackgroundWorkerStatus.Started
                             ? $"Its process {state.ProcessId} hadn't attached to worf's shared memory after {timeout} ms."
-                            : $"The postmaster hadn't started its process after {timeout} ms.",
-                    });
+                            : $"The postmaster hadn't started its process after {timeout} ms.");
                     break;
                 }
             }
@@ -859,6 +857,113 @@ internal static class Worker
             {
                 throw new OperationCanceledException("The worf worker is stopping.");
             }
+        }
+
+        // The warning names the subscription the worker was for, read once the slots are let go.
+        if (gaveUp is (string kind, uint subId, var table, string detail))
+        {
+            string? subscription = subId == 0 ? null
+                : PgBackgroundWorker.RunTransaction(() => Worf.ReadScalar<string?>("SELECT sub_name::text FROM worf.subscription WHERE sub_id = $1",
+                    SpiParameter.Create(subId)));
+            string what = subscription is null ? "" : table is null ? $" for subscription \"{subscription}\"" : $" for table {table} of subscription \"{subscription}\"";
+            WorfLog.Warning(new PgDiagnostic($"{kind} worker{what} at slot {slot} took too long to start; canceled") { Detail = detail });
+        }
+    }
+
+    /// <summary>
+    /// Gets how long, in milliseconds, a call to another server, or a worker's start, may take: wal_receiver_timeout, as
+    /// PostgreSQL's apply worker and launcher take, or its default, a minute, when it's zero.
+    /// </summary>
+    internal static int ProviderTimeout
+    {
+        get
+        {
+            unsafe
+            {
+                return NativeGlobals.wal_receiver_timeout > 0 ? NativeGlobals.wal_receiver_timeout : 60_000;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Makes a call to a provider from an apply or table sync worker, as a connection or a query, giving up once
+    /// <see cref="ProviderTimeout"/> has passed without an answer, as a provider that accepts a connection and then
+    /// answers nothing would hold the worker for good: the deadline goes in the worker's slot, and the database's manager
+    /// cancels the call once it has passed, since cancelling a query cancels a wait on the provider. A call made within
+    /// another has the other's deadline. Elsewhere the call runs as it is. Within a transaction, the cancellation ends
+    /// the transaction, as it isn't an error a subtransaction catches, so the error's context names what the call waited
+    /// for.
+    /// </summary>
+    /// <typeparam name="T">The call's result.</typeparam>
+    /// <param name="what">What the call waits for, as the error names it.</param>
+    /// <param name="call">The call.</param>
+    /// <returns>Its result.</returns>
+    internal static T WithProviderDeadline<T>(Func<string> what, Func<T> call)
+    {
+        if (s_providerCalls > 0 || MyWorfWorker < 0 || MyWorker.WorkerType is not (WorfWorkerType.Apply or WorfWorkerType.Sync))
+        {
+            return call();
+        }
+
+        int timeout = ProviderTimeout;
+        long deadline = GetCurrentTimestamp() + (timeout * 1000L);
+        bool inTransaction;
+        unsafe
+        {
+            inTransaction = NativeMethods.IsTransactionState();
+        }
+
+        SetCallDeadline(deadline);
+        s_providerCalls++;
+        try
+        {
+            if (!inTransaction)
+            {
+                return call();
+            }
+
+            using PgErrorContext waiting = PgErrorContext.Push(Worf.Shown($"waiting up to wal_receiver_timeout ({timeout} ms) for {what()}"));
+            return call();
+        }
+        catch (Exception error) when (error is PgQueryCanceledException or PgException { SqlState: "57014" } && GetCurrentTimestamp() >= deadline)
+        {
+            throw new PgException(PgSqlStates.ConnectionFailure, $"timed out waiting for {what()}",
+                detail: $"It hadn't answered within wal_receiver_timeout ({timeout} ms).");
+        }
+        finally
+        {
+            s_providerCalls--;
+            SetCallDeadline(0);
+        }
+    }
+
+    /// <summary>
+    /// Makes a call to a provider, as the other overload does.
+    /// </summary>
+    /// <param name="what">What the call waits for, as the error names it.</param>
+    /// <param name="call">The call.</param>
+    internal static void WithProviderDeadline(Func<string> what, Action call) => _ = WithProviderDeadline(what, () =>
+    {
+        call();
+        return true;
+    });
+
+    /// <summary>
+    /// Publishes the deadline of the call to the provider about to start, waking the manager to watch it, or clears it
+    /// as the call ends.
+    /// </summary>
+    private static void SetCallDeadline(long deadline)
+    {
+        using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = WorfCtx.Exclusive())
+        {
+            WorfWorker worker = guard[MyWorfWorker];
+            worker.Worker.Apply.CallDeadline = deadline;
+            guard[MyWorfWorker] = worker;
+        }
+
+        if (deadline != 0)
+        {
+            WakeManager();
         }
     }
 

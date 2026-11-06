@@ -212,7 +212,7 @@ internal static class Manager
             {
                 WorfWorker worker = guard[i];
                 long deadline = worker.Worker.Apply.CallDeadline;
-                if (worker.WorkerType != WorfWorkerType.Apply || worker.Dboid != dboid || worker.Proc == 0 || deadline == 0)
+                if (worker.WorkerType is not (WorfWorkerType.Apply or WorfWorkerType.Sync) || worker.Dboid != dboid || worker.Proc == 0 || deadline == 0)
                 {
                     continue;
                 }

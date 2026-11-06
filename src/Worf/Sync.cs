@@ -114,7 +114,8 @@ internal static class Sync
             WorfLog.Info($"initializing subscriber {sub.Name}");
 
             // The provider's managed sequences are joined before any rows arrive.
-            List<WorfManagedSequence> managedSequences = PgBackgroundWorker.RunTransaction(() => SequenceRangeSync.FetchManaged(sub.OriginIf.Dsn, sub.Name));
+            List<WorfManagedSequence> managedSequences = Worker.WithProviderDeadline(() => $"provider \"{sub.Origin.Name}\" to list its managed sequences",
+                () => PgBackgroundWorker.RunTransaction(() => SequenceRangeSync.FetchManaged(sub.OriginIf.Dsn, sub.Name)));
 
             using WorfConnection originConnRepl = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, "snap");
 
@@ -333,7 +334,8 @@ internal static class Sync
             PgBackgroundWorker.RunTransaction(() => RequireMergeable(nspname, relname));
         }
 
-        List<WorfManagedSequence> managedSequences = PgBackgroundWorker.RunTransaction(() => SequenceRangeSync.FetchManaged(sub.OriginIf.Dsn, sub.Name));
+        List<WorfManagedSequence> managedSequences = Worker.WithProviderDeadline(() => $"provider \"{sub.Origin.Name}\" to list its managed sequences",
+                () => PgBackgroundWorker.RunTransaction(() => SequenceRangeSync.FetchManaged(sub.OriginIf.Dsn, sub.Name)));
         using WorfConnection originConnRepl = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, "copy");
 
         // Make sure we cleanup the slot if something goes wrong.
@@ -423,13 +425,14 @@ internal static class Sync
     /// <returns>The position, or null when the slot is gone or invalidated, or the origin is gone or has no progress.</returns>
     private static ulong? CatchupStart(WorfSubscription sub, out string? lost)
     {
-        using (WorfConnection conn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "resume"))
+        lost = Worker.WithProviderDeadline(() => $"provider \"{sub.Origin.Name}\" to say whether slot \"{sub.SlotName}\" can go on", () =>
         {
-            lost = PgBackgroundWorker.RunTransaction(() => Rpc.RemoteSlotLost(conn, sub.SlotName));
-            if (lost is not null)
-            {
-                return null;
-            }
+            using WorfConnection conn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "resume");
+            return PgBackgroundWorker.RunTransaction(() => Rpc.RemoteSlotLost(conn, sub.SlotName));
+        });
+        if (lost is not null)
+        {
+            return null;
         }
 
         (ulong? start, lost) = PgBackgroundWorker.RunTransaction<(ulong?, string?)>(() =>
@@ -2399,17 +2402,20 @@ internal static class Sync
     /// </summary>
     private static ulong ProviderPosition(WorfSubscription sub)
     {
-        using WorfConnection conn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "copy_position");
-        string? position = PgBackgroundWorker.RunTransaction(() =>
+        string? position = Worker.WithProviderDeadline(() => $"provider \"{sub.Origin.Name}\" to report its WAL position", () =>
         {
-            try
+            using WorfConnection conn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "copy_position");
+            return PgBackgroundWorker.RunTransaction(() =>
             {
-                return conn.Query("SELECT pg_catalog.pg_current_wal_lsn()", 1)[0][0];
-            }
-            catch (PgRemoteException error)
-            {
-                throw new PgException(PgSqlStates.InternalError, $"could not read the provider's WAL position: ERROR:  {error.Message}\n");
-            }
+                try
+                {
+                    return conn.Query("SELECT pg_catalog.pg_current_wal_lsn()", 1)[0][0];
+                }
+                catch (PgRemoteException error)
+                {
+                    throw new PgException(PgSqlStates.InternalError, $"could not read the provider's WAL position: ERROR:  {error.Message}\n");
+                }
+            });
         });
 
         return Worf.TryParseLsn(position ?? "", out ulong lsn) ? lsn
@@ -2564,7 +2570,7 @@ internal static class Sync
             string? left;
             try
             {
-                using WorfConnection originConn = PgBackgroundWorker.RunTransaction(() => Worf.Connect(sub.OriginIf.Dsn, sub.Name, "cleanup"));
+                using WorfConnection originConn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "cleanup");
                 int holder = WaitForSlot(originConn, sub, "this sync's cleanup",
                     $"The slot is left to the subscription's apply worker after {CleanupSlotWait} seconds.", CleanupSlotWait);
                 left = holder != 0 ? $"PID {holder} holds it." : null;
