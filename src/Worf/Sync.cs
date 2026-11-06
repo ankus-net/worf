@@ -2176,12 +2176,12 @@ internal static class Sync
             }
 
             bool Delete((uint Table, string Tid)[] run) => ExceptionLog.TryRecordCopied(change, $"""
-                DELETE FROM {table} t USING ROWS FROM (pg_catalog.unnest($1::pg_catalog.oid[]), pg_catalog.unnest($2::pg_catalog.tid[])) AS d (tableoid, place)
+                DELETE FROM {table} t USING ROWS FROM (pg_catalog.unnest($1::pg_catalog.int8[]::pg_catalog.oid[]), pg_catalog.unnest($2::pg_catalog.tid[])) AS d (tableoid, place)
                 WHERE t.tableoid OPERATOR(pg_catalog.=) d.tableoid AND t.ctid OPERATOR(pg_catalog.=) d.place
                 RETURNING (SELECT pg_catalog.json_object_agg(e.key, e.value) FROM pg_catalog.json_each_text(pg_catalog.row_to_json(t)) e)::pg_catalog.text,
                     $3::pg_catalog.text, $4::pg_catalog.text
                 """,
-                SpiParameter.Create(run.Select(row => row.Table).ToArray()), SpiParameter.Create(run.Select(row => row.Tid).ToArray()),
+                SpiParameter.Create(run.Select(row => (long)row.Table).ToArray()), SpiParameter.Create(run.Select(row => row.Tid).ToArray()),
                 SpiParameter.Create(error.SqlState), SpiParameter.Create(error.Message));
         }
     }

@@ -1622,7 +1622,9 @@ public sealed partial class ExceptionBehaviourTests
             CREATE TABLE dk (id integer PRIMARY KEY, email text);
             CREATE TABLE dx (id integer PRIMARY KEY, r int4range);
             CREATE TABLE dr (id integer PRIMARY KEY, r int4range);
+            CREATE TABLE dd (id integer PRIMARY KEY, email text);
             INSERT INTO dk VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'c');
+            INSERT INTO dd VALUES (1, 'd'), (2, 'd');
             INSERT INTO dr VALUES (1, '[1,3)'), (2, '[2,4)'), (3, '[3,5)'), (4, '[10,12)');
             SELECT * FROM worf.replication_set_add_all_tables('default', '{public}');
             """, token);
@@ -1630,6 +1632,7 @@ public sealed partial class ExceptionBehaviourTests
             CREATE TABLE dk (id integer PRIMARY KEY, email text UNIQUE DEFERRABLE);
             CREATE TABLE dx (id integer PRIMARY KEY, r int4range, EXCLUDE USING gist (r WITH &&) DEFERRABLE INITIALLY DEFERRED);
             CREATE TABLE dr (id integer PRIMARY KEY, r int4range, EXCLUDE USING gist (r WITH &&) DEFERRABLE);
+            CREATE TABLE dd (id integer PRIMARY KEY, email text UNIQUE DEFERRABLE INITIALLY DEFERRED);
             """, token);
         await SetBehaviourAsync(subscriber, "discard", token);
         _ = await subscriber.SafePsqlAsync(Database, $"""
@@ -1650,6 +1653,12 @@ public sealed partial class ExceptionBehaviourTests
                 jsonb_typeof(remote_new_tuple->'id')
             FROM worf.exception_log WHERE table_name = 'dr'
             """, token), "dr's copy");
+
+        // A conflict in an initially deferred constraint, checked once the table has copied, is deleted and recorded too.
+        Assert.AreEqual("1|COPY|2|d|23505", await subscriber.SafePsqlAsync(Database, """
+            SELECT (SELECT string_agg(id::text, ',' ORDER BY id) FROM dd), operation, remote_new_tuple->>'id', remote_new_tuple->>'email', error_sqlstate
+            FROM worf.exception_log WHERE table_name = 'dd'
+            """, token), "dd's copy");
 
         _ = await provider.SafePsqlAsync(Database, "INSERT INTO dx SELECT g, int4range(g * 10, g * 10 + 5) FROM generate_series(1, 1000) g", token);
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT count(*) = 1000 FROM dx", token), "dx's rows that conflict with none");

@@ -825,12 +825,11 @@ public sealed class GlobalDdlLockTests
         Assert.AreEqual("lx.lu_l", await nodeB.SafePsqlAsync(Database, "SELECT to_regclass('lx.lu_l')::text", token));
         _ = await nodeB.SafePsqlAsync(Database, "DROP INDEX lx.lu_l", token);
         bool applied = await nodeB.PollQueryUntilAsync(Database, "SELECT count(*) = 2 FROM lx.lu WHERE a = 7", token);
-        // PostgreSQL's logical decoding can fail an assertion as it starts again from a slot's restart position, which
-        // an assert-enabled build's walsender, as the tests run, aborts at each time apply connects; the failure says so.
+        // A failed assertion in a server, as an assert-enabled build's walsender aborts at, is named in the failure.
         string traps = string.Join('\n', new[] { nodeA, nodeB }.SelectMany(node => node.ReadLog().Split('\n')
             .Where(line => line.StartsWith("TRAP:", StringComparison.Ordinal)).Distinct().Select(line => $"{node.Name}: {line}")));
         Assert.IsTrue(applied, applied ? "" : $"""
-            node_a's rows on node_b{(traps.Length > 0 ? $", as PostgreSQL failed an assertion:\n{traps}" : "")}
+            node_a's rows on node_b{(traps.Length > 0 ? $", with failed assertions:\n{traps}" : "")}
             {await nodeB.DescribeReplicationAsync(Database, token)}
             {await nodeA.DescribeReplicationAsync(Database, token)}
             node_b's log since the insert:

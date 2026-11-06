@@ -287,7 +287,9 @@ internal static class SequenceRangeHeard
 
         if (resetAt == 0 || now - resetAt >= every)
         {
-            return (now, now, resetAt != 0 && now - resetAt < 86_400_000_000L ? Math.Min(every * 2, 86_400_000_000L) : 600_000_000L);
+            // The window starts again from ten minutes only after a day in which the neighbor could have reset this
+            // server and didn't.
+            return (now, now, resetAt != 0 && now - resetAt < every + 86_400_000_000L ? Math.Min(every * 2, 86_400_000_000L) : 600_000_000L);
         }
 
         return (resetAt, resetAt, resetEvery);

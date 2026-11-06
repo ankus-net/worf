@@ -15,8 +15,9 @@ public sealed class ResetWindowTests
     /// <summary>
     /// A neighbor's first request resets at once, with the requests of the minute after it, which one rollback brings
     /// for every sequence, and the next comes ten minutes on, then twice as long after each reset within a day of the
-    /// one before, up to a day, so that requests made up to reset a node come ever more seldom; after a day without one,
-    /// a request again resets at once and the next again comes ten minutes on.
+    /// one before, up to a day, so that requests made up to reset a node come ever more seldom, once a day at most while
+    /// they keep coming; after a day in which one could have reset the node and none came, a request again resets at
+    /// once and the next again comes ten minutes on.
     /// </summary>
     [TestMethod]
     public void ResetRequestsBackOffUpToADay()
@@ -40,6 +41,22 @@ public sealed class ResetWindowTests
         // 10, 20, 40, 80, 160, 320 and 640 minutes apart, the next to come 1,280 minutes on, past the day; then, after the
         // quiet, at once and ten minutes on.
         Assert.AreEqual("0,10,30,70,150,310,630,1270,4320,4330", string.Join(",", allowed), "the minutes at which a request reset the node");
+
+        // A request every minute for ten days resets the node at most once a day after the first day, as the window
+        // stays a day while the requests keep coming.
+        (resetAt, resetEvery) = (0, 0);
+        int[] perDay = new int[10];
+        for (long minute = 0; minute < 10 * 24 * 60; minute++)
+        {
+            long now = start + (minute * Minute);
+            (long? window, resetAt, resetEvery) = SequenceRangeHeard.ResetWindow(resetAt, resetEvery, now);
+            if (window == now)
+            {
+                perDay[minute / (24 * 60)]++;
+            }
+        }
+
+        Assert.AreEqual("8,1,1,1,1,1,1,1,1,1", string.Join(",", perDay), "the resets of each of ten days of a request a minute");
 
         // A request within the minute after a reset counts in its window, and one after it waits.
         (long? sameMinute, long at, long every) = SequenceRangeHeard.ResetWindow(start, 600_000_000, start + (Minute / 2));
