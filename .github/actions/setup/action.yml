@@ -35,9 +35,19 @@ runs:
       shell: bash
       run: |
         # Ubuntu 24.04's own archive has LLVM 20, so no third-party repository, whose outages would fail the run, is
-        # needed.
-        sudo apt-get update -o Acquire::Retries=5
-        sudo apt-get install --yes --no-install-recommends -o Acquire::Retries=5 clang-20 libclang-20-dev bison flex libreadline-dev zlib1g-dev libicu-dev pkg-config
+        # needed. The runner's own mirror, first in its mirror list, sometimes serves a few kilobytes a second, which
+        # would take most of the job's time, so the download, which takes seconds, gets three minutes before it's made
+        # again without that mirror.
+        packages=(clang-20 libclang-20-dev bison flex libreadline-dev zlib1g-dev libicu-dev pkg-config)
+        fetch() {
+          sudo timeout 180 apt-get update -o Acquire::Retries=5 &&
+            sudo timeout 180 apt-get install --yes --no-install-recommends --download-only -o Acquire::Retries=5 "${packages[@]}"
+        }
+        if ! fetch; then
+          sudo sed -i 1d /etc/apt/apt-mirrors.txt
+          fetch
+        fi
+        sudo apt-get install --yes --no-install-recommends "${packages[@]}"
         echo /usr/lib/llvm-20/bin >> "$GITHUB_PATH"
 
     - name: Install LLVM and PostgreSQL build dependencies (macOS)
