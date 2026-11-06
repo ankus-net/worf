@@ -131,8 +131,27 @@ public sealed class RelayOriginTests
             """, token), "the longest slot name");
 
         // No subscription's slot name ends as a table sync's does, so none is taken for another subscription's.
-        Assert.AreEqual("worf_postgres_prov_sub_a3f85cc_", await subscriber.SafePsqlAsync(Database,
-            "SELECT worf.worf_gen_slot_name('postgres', 'prov', 'sub_a3f85ccf')", token));
+        Assert.AreEqual("worf_postgres_prov_abcdefg_1234567_|t", await subscriber.SafePsqlAsync(Database, """
+            SELECT worf.worf_gen_slot_name('postgres', 'prov', 'abcdefg_12345678'),
+                worf.worf_gen_slot_name('postgres', 'prov', 'sub_a3f85ccf') !~ '_[0-9a-f]{8}$'
+            """, token), "slot names that would end as a table sync's");
+
+        // A name that ends as a hash of another name's would, in seven hex digits, is written with a hash of its own, so
+        // that databases named a-b and a_b066b732 don't share a slot and replication origin. A subscription whose
+        // replication origin already exists, as another database's subscription's, is refused.
+        Assert.AreEqual("worf_a_b066b732_prov_s|f", await subscriber.SafePsqlAsync(Database, """
+            SELECT worf.worf_gen_slot_name('a-b', 'prov', 's'),
+                worf.worf_gen_slot_name('a-b', 'prov', 's') = worf.worf_gen_slot_name('a_b066b732', 'prov', 's')
+            """, token), "the slots of names crafted to collide");
+        _ = await subscriber.SafePsqlAsync(Database,
+            "SELECT pg_replication_origin_create(worf.worf_gen_slot_name(current_database(), 'provider', 'taken'))", token);
+        PostgresException taken = await Assert.ThrowsExactlyAsync<PostgresException>(() => subscriber.SafePsqlAsync(Database, $"""
+            SELECT worf.create_subscription(subscription_name := 'taken', provider_dsn := '{provider.Dsn(Database, SuperUser)}',
+                synchronize_structure := false, synchronize_data := false)
+            """, token));
+        Assert.StartsWith("subscription \"taken\" would use replication origin \"", taken.MessageText, "the subscription whose origin exists");
+        _ = await subscriber.SafePsqlAsync(Database,
+            "SELECT pg_replication_origin_drop(worf.worf_gen_slot_name(current_database(), 'provider', 'taken'))", token);
 
         const string CreateE = "CREATE SEQUENCE e_n_seq; CREATE TABLE e (id integer PRIMARY KEY, v text, n bigint DEFAULT nextval('e_n_seq'))";
         foreach (TestNode node in nodes)

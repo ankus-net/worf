@@ -356,13 +356,23 @@ internal static class Functions
         };
 
         // Names that differ only in characters a slot's name can't hold, or in its end, can give the same slot, and
-        // replication origin, which two subscriptions can't share.
+        // replication origin, which two subscriptions can't share: neither can a subscription of another database of
+        // the cluster, whose replication origins this one's share, nor a replication origin left of that name, which
+        // the subscription would take as its own progress.
         if (Worf.ReadScalar<string?>("SELECT sub_name::text FROM worf.subscription WHERE sub_slot_name = $1::name", SpiParameter.Create(sub.SlotName))
             is string sharing)
         {
             throw new PgException(PgSqlStates.DuplicateObject,
                 $"subscription \"{subName}\" would use slot \"{sub.SlotName}\", which subscription \"{sharing}\" uses",
                 hint: "Choose a subscription name that differs in letters, digits or underscores.");
+        }
+
+        if (Worf.ReadScalar<bool>("SELECT EXISTS (SELECT FROM pg_catalog.pg_replication_origin WHERE roname = $1)", SpiParameter.Create(sub.SlotName)))
+        {
+            throw new PgException(PgSqlStates.DuplicateObject,
+                $"subscription \"{subName}\" would use replication origin \"{sub.SlotName}\", which already exists",
+                detail: "Another database's subscription may use it, or it was left behind.",
+                hint: "Choose a subscription name that differs in letters, digits or underscores, or drop the origin with pg_replication_origin_drop if nothing uses it.");
         }
 
         WorfNode.CreateSubscription(sub);
@@ -1731,12 +1741,16 @@ internal static class Functions
     /// <summary>
     /// Writes one of the names a slot's name is made of in the characters a slot's name holds, lowercase letters,
     /// digits and underscores, in at most a number of bytes: as it is, shortened with a hash when it's too long, or
-    /// with an underscore for each other character and a hash of the whole name after.
+    /// with an underscore for each other character and a hash of the whole name after. A name that's written as it
+    /// is never ends as one with a hash does, in seven hex digits after at most the bytes a hash leaves before them;
+    /// such a name is written with a hash of its own, so that it can't give the part another name's hash gives.
     /// </summary>
     private static byte[] SlotNamePart(byte[] part, int maxlen)
     {
         static bool Held(byte c) => c is (>= (byte)'a' and <= (byte)'z') or (>= (byte)'0' and <= (byte)'9') or (byte)'_';
-        if (Array.TrueForAll(part, Held))
+        static bool Hex(byte c) => c is (>= (byte)'a' and <= (byte)'f') or (>= (byte)'0' and <= (byte)'9');
+        bool hashedLike = part.Length >= 7 && part.Length <= maxlen - 1 && Array.TrueForAll(part[^7..], Hex);
+        if (Array.TrueForAll(part, Held) && !hashedLike)
         {
             return Worf.ShortenHash(part, maxlen);
         }
