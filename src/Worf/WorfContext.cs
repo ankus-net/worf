@@ -33,4 +33,11 @@ internal struct WorfContext
     public long OwnOriginSlotWantedAt;
 
     public long OriginSlotsGivenUpAt;
+
+    /// <summary>
+    /// When a transaction that may have given a database something to manage, as CREATE EXTENSION worf, last committed
+    /// and forgot that managers had nothing to manage, so that a manager that looked before it, and may not have seen
+    /// it, isn't taken for idle as it exits.
+    /// </summary>
+    public long IdleForgottenAt;
 }

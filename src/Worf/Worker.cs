@@ -1049,15 +1049,19 @@ internal static class Worker
             // However, if SkipSupervisorWakeup is set, the manager is exiting because the extension isn't
             // installed in this database. Don't wake the supervisor immediately - let it restart on its normal
             // timeout. This prevents rapid cycling for databases without worf.
-            if (worker.WorkerType == WorfWorkerType.Manager && !worker.SkipSupervisorWakeup)
+            //
+            // A manager whose look began before a transaction that may have given it something to manage, as CREATE
+            // EXTENSION worf, committed may not have seen it, and so isn't idle: the supervisor starts it again at once.
+            bool idle = worker.WorkerType == WorfWorkerType.Manager && worker.SkipSupervisorWakeup && worker.IdleAt > ctx.IdleForgottenAt;
+            if (worker.WorkerType == WorfWorkerType.Manager && !idle)
             {
                 ctx.SubscriptionsChanged = true;
             }
 
-            // The free slot of a manager that had nothing to manage keeps its database, so that the supervisor doesn't
-            // start it again at each look.
-            worker.IdleAt = worker.WorkerType == WorfWorkerType.Manager && worker.SkipSupervisorWakeup ? GetCurrentTimestamp() : 0;
-            worker.Dboid = worker.IdleAt != 0 ? worker.Dboid : 0;
+            // The free slot of a manager that had nothing to manage keeps its database, and when it looked, so that the
+            // supervisor doesn't start it again at each look.
+            worker.IdleAt = idle ? worker.IdleAt : 0;
+            worker.Dboid = idle ? worker.Dboid : 0;
             worker.WorkerType = WorfWorkerType.None;
             worker.SkipSupervisorWakeup = false;
         }
@@ -1127,6 +1131,9 @@ internal static class Worker
     /// <param name="dboid">The database, or zero.</param>
     internal static void ForgetIdleManager(PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard, uint dboid)
     {
+        WorfContext ctx = guard.Header;
+        ctx.IdleForgottenAt = GetCurrentTimestamp();
+        guard.Header = ctx;
         for (int i = 0; i < guard.Length; i++)
         {
             if (guard[i].WorkerType == WorfWorkerType.None && guard[i].IdleAt != 0 && (dboid == 0 || guard[i].Dboid == dboid))

@@ -43,9 +43,10 @@ internal struct WorfWorker
     public bool TerminateRequested;
 
     /// <summary>
-    /// When the database's manager last exited with nothing to manage, as in a database without worf, on a slot that is
-    /// free, or zero. The supervisor starts no manager for the database again until its next regular look, or a
-    /// transaction there that changes what it manages, as CREATE EXTENSION worf, commits.
+    /// When the database's manager, which last exited with nothing to manage, as in a database without worf, began to
+    /// look at what it manages, on a slot that is free, or zero. The supervisor starts no manager for the database again
+    /// until its next regular look, or a transaction there that changes what it manages, as CREATE EXTENSION worf,
+    /// commits.
     /// </summary>
     public long IdleAt;
 

@@ -49,44 +49,23 @@ internal static class Manager
         // Setup shmem.
         Worker.WorkerAttach(mainArg, WorfWorkerType.Manager);
 
-        // Check if the extension is installed. We retry a few times with a short delay to handle the race condition
-        // where the extension is being dropped and recreated (e.g., between init_fail and init regression tests).
-        // Without this retry, we might exit just before the extension is created, causing the supervisor to not
-        // restart us until the next latch timeout.
-        for (int retry = 0; retry < 5; retry++)
+        // A database without worf, or a template that isn't a node, has nothing to manage. The manager notes when it
+        // looked, so that a CREATE EXTENSION worf that commits after then, which it may not see, has the supervisor
+        // start it again.
+        long lookedAt = Worker.GetCurrentTimestamp();
+        extoid = PgBackgroundWorker.RunTransaction(static () =>
         {
-            extoid = PgBackgroundWorker.RunTransaction(static () =>
+            unsafe
             {
-                unsafe
+                fixed (byte* name = Worf.ToServerCString(Worf.ExtensionName))
                 {
-                    fixed (byte* name = Worf.ToServerCString(Worf.ExtensionName))
-                    {
-                        return NativeMethods.get_extension_oid((sbyte*)name, true);
-                    }
+                    return NativeMethods.get_extension_oid((sbyte*)name, true);
                 }
-            });
-
-            if (extoid != 0)
-            {
-                break;
             }
-
-            // Extension not found, wait and retry
-            if (retry < 4)
-            {
-                if (!PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(200)) && !PgBackgroundWorker.CanContinue)
-                {
-                    return;
-                }
-
-                PgInterrupts.Check();
-            }
-        }
-
-        // If the extension is still not installed after retries, exit.
+        });
         if (extoid == 0 || PgBackgroundWorker.RunTransaction(IsIdleTemplate))
         {
-            ExitIdle();
+            ExitIdle(lookedAt);
             return;
         }
 
@@ -122,9 +101,10 @@ internal static class Manager
             bool processedAll;
             try
             {
+                long looked = Worker.GetCurrentTimestamp();
                 if (PgBackgroundWorker.RunTransaction(IsIdleTemplate))
                 {
-                    ExitIdle();
+                    ExitIdle(looked);
                     return;
                 }
 
@@ -267,14 +247,16 @@ internal static class Manager
             WorfNode.GetLocalNode(false, true) is null;
 
     /// <summary>
-    /// Exits with nothing to manage, marking it so that the detach handler doesn't wake the supervisor, which would
-    /// start the manager again at once, as for a database without worf.
+    /// Exits with nothing to manage, marking it, with when the manager looked, so that the detach handler doesn't wake
+    /// the supervisor, which would start the manager again at once, as for a database without worf.
     /// </summary>
-    private static void ExitIdle()
+    /// <param name="lookedAt">When the manager began to look at what it manages.</param>
+    private static void ExitIdle(long lookedAt)
     {
         using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive();
         WorfWorker me = guard[Worker.MyWorfWorker];
         me.SkipSupervisorWakeup = true;
+        me.IdleAt = lookedAt;
         guard[Worker.MyWorfWorker] = me;
     }
 
