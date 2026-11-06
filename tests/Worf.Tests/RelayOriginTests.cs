@@ -486,7 +486,8 @@ public sealed class RelayOriginTests
     /// Names that differ give slots that differ, even when a slot's characters can't hold them whole, as databases'
     /// names, so that subscriptions of the same name in a cluster's databases keep slots and replication origins of their
     /// own, and dropping one of two subscriptions that share a slot, as made before names were told apart, keeps the
-    /// slot and replication origin for the other, which goes on applying once enabled.
+    /// slot and replication origin for the other, which goes on applying once enabled. A drop waits for a process that
+    /// still holds the subscription's origin to let it go.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -558,7 +559,31 @@ public sealed class RelayOriginTests
         string[] slots = [await subscriber.SafePsqlAsync("a-b", "SELECT sub_slot_name FROM worf.subscription", token),
             await subscriber.SafePsqlAsync("a_b", "SELECT sub_slot_name FROM worf.subscription", token)];
         Assert.AreNotEqual(slots[0], slots[1], "the two databases' slots");
-        _ = await subscriber.SafePsqlAsync("a_b", "SELECT worf.drop_subscription('s')", token);
+
+        // A process that still holds the replication origin of a subscription being dropped, as a worker that has left its
+        // slot holds it until its process exits, has the drop wait for it to let the origin go.
+        _ = await subscriber.SafePsqlAsync("a_b", "SELECT worf.alter_subscription_disable('s', true)", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync("a_b",
+            "SELECT NOT EXISTS (SELECT 1 FROM pg_stat_activity WHERE backend_type LIKE 'worf apply%' AND datname = 'a_b')", token), "a_b's apply worker gone");
+        await using (NpgsqlConnection holding = await subscriber.OpenAsync("a_b", token))
+        {
+            await using (NpgsqlCommand hold = new($"SELECT pg_replication_origin_session_setup('{slots[1]}')", holding))
+            {
+                _ = await hold.ExecuteNonQueryAsync(token);
+            }
+
+            Task<string> dropping = subscriber.SafePsqlAsync("a_b", "SELECT worf.drop_subscription('s')", token);
+            Assert.IsTrue(await subscriber.PollQueryUntilAsync("a_b",
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event = 'ReplicationOriginDrop')", token), "the drop waiting for the origin");
+            Assert.IsFalse(dropping.IsCompleted, "the drop, while the origin is held");
+            await using (NpgsqlCommand reset = new("SELECT pg_replication_origin_session_reset()", holding))
+            {
+                _ = await reset.ExecuteNonQueryAsync(token);
+            }
+
+            _ = await dropping;
+        }
+
         Assert.AreEqual("1|1", await subscriber.SafePsqlAsync(Database, $"""
             SELECT (SELECT count(*) FROM pg_replication_origin WHERE roname = '{slots[0]}'),
                 (SELECT count(*) FROM pg_replication_origin WHERE roname = '{slots[1]}') + 1
