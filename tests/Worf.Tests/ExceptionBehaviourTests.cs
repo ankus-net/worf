@@ -1609,7 +1609,8 @@ public sealed partial class ExceptionBehaviourTests
     /// unless worf has them, hold for the rows apply and the copy write: rows that conflict with none apply, and under
     /// discard, a change that conflicts is skipped and recorded, and so is a copied row that conflicts with an earlier
     /// one. Apply waits for a transaction here that wrote a conflicting row, and constraints on expressions and with
-    /// predicates hold as well. Under error, a copy that conflicts fails naming the keys.
+    /// predicates hold as well. Rows that swap values, as a statement may under a constraint that is initially
+    /// immediate, apply. Under error, a copy that conflicts fails naming the keys.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -1723,9 +1724,40 @@ public sealed partial class ExceptionBehaviourTests
             FROM worf.exception_log WHERE table_name = 'dz'
             """, token), "dz's conflict recorded");
 
+        // Rows that swap values, which a deferrable constraint that is initially immediate lets a statement do, as it
+        // checks them at the statement's end, apply, under discard and under error, with nothing recorded.
+        foreach (TestNode node in new[] { provider, subscriber })
+        {
+            _ = await node.SafePsqlAsync(Database, """
+                CREATE TABLE sw (id integer PRIMARY KEY, k integer UNIQUE DEFERRABLE);
+                CREATE TABLE sr (id integer PRIMARY KEY, r int4range, EXCLUDE USING gist (r WITH &&) DEFERRABLE);
+                """, token);
+        }
+
+        _ = await provider.SafePsqlAsync(Database, """
+            SELECT * FROM worf.replication_set_add_table('default', 'sw');
+            SELECT * FROM worf.replication_set_add_table('default', 'sr');
+            INSERT INTO sw VALUES (1, 1), (2, 2);
+            INSERT INTO sr VALUES (1, '[1,3)'), (2, '[3,5)');
+            UPDATE sw SET k = 3 - k;
+            UPDATE sr SET r = CASE id WHEN 1 THEN int4range(3, 5) ELSE int4range(1, 3) END;
+            INSERT INTO sw VALUES (3, 3);
+            """, token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM sw WHERE id = 3)", token), "the row after the swaps");
+        await SetBehaviourAsync(subscriber, "error", token);
+        _ = await provider.SafePsqlAsync(Database, """
+            UPDATE sw SET k = 3 - k WHERE id < 3;
+            UPDATE sr SET r = CASE id WHEN 1 THEN int4range(1, 3) ELSE int4range(3, 5) END;
+            INSERT INTO sw VALUES (4, 4);
+            """, token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM sw WHERE id = 4)", token), "the row after the swaps back");
+        Assert.AreEqual("1=1,2=2,3=3,4=4|1=[1,3),2=[3,5)|0", await subscriber.SafePsqlAsync(Database, """
+            SELECT (SELECT string_agg(id || '=' || k, ',' ORDER BY id) FROM sw), (SELECT string_agg(id || '=' || r, ',' ORDER BY id) FROM sr),
+                (SELECT count(*) FROM worf.exception_log WHERE table_name IN ('sw', 'sr'))
+            """, token), "the swapped rows, and nothing recorded");
+
         // Under error, a copy whose rows conflict in a deferrable unique index or exclusion constraint fails with the
         // keys in its detail, as PostgreSQL's recheck names them.
-        await SetBehaviourAsync(subscriber, "error", token);
         foreach (TestNode node in new[] { provider, subscriber })
         {
             _ = await node.SafePsqlAsync(Database, node == provider
@@ -1747,6 +1779,43 @@ public sealed partial class ExceptionBehaviourTests
             SELECT worf.replication_set_remove_table('default', 'du');
             SELECT worf.replication_set_remove_table('default', 'dv');
             """, token);
+    }
+
+    /// <summary>
+    /// A deferrable constraint's recheck still fires for a row apply writes when the table's relcache entry is built
+    /// again as the writer starts, here as the planner folds a column's immutable default that analyzes the table, which
+    /// SPI's apply, worf.use_spi, plans for each change: the conflicting change is skipped and recorded under discard.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task DeferrableRechecksOutlastRelcacheRebuilds()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode provider = await StartNodeAsync("provider", token);
+        await using TestNode subscriber = await StartNodeAsync("subscriber", token, "worf.use_spi = on", "worf.conflict_resolution = 'error'");
+        _ = await provider.SafePsqlAsync(Database, """
+            CREATE TABLE rk (id integer PRIMARY KEY, k integer);
+            SELECT * FROM worf.replication_set_add_table('default', 'rk');
+            """, token);
+        _ = await subscriber.SafePsqlAsync(Database, """
+            CREATE FUNCTION rk_analyze() RETURNS integer LANGUAGE plpgsql AS $$ BEGIN ANALYZE public.rk; RETURN 0; END $$;
+            CREATE FUNCTION rk_analyzed() RETURNS integer IMMUTABLE LANGUAGE plpgsql AS $$ BEGIN RETURN rk_analyze(); END $$;
+            CREATE TABLE rk (id integer PRIMARY KEY, k integer UNIQUE DEFERRABLE, x integer DEFAULT rk_analyzed());
+            INSERT INTO rk VALUES (0, 5, 0);
+            """, token);
+        await SetBehaviourAsync(subscriber, "discard", token);
+        _ = await subscriber.SafePsqlAsync(Database, $"""
+            SELECT worf.create_subscription(subscription_name := 'sub', provider_dsn := '{provider.Dsn(Database, SuperUser)}',
+                synchronize_structure := false, synchronize_data := false)
+            """, token);
+        await WaitForStatusAsync(subscriber, "replicating", token);
+        _ = await provider.SafePsqlAsync(Database, "INSERT INTO rk VALUES (1, 5)", token);
+        _ = await provider.SafePsqlAsync(Database, "INSERT INTO rk VALUES (2, 6)", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM rk WHERE id = 2)", token), "the change after the conflict");
+        Assert.AreEqual("0,2|INSERT|1|23505", await subscriber.SafePsqlAsync(Database, """
+            SELECT (SELECT string_agg(id::text, ',' ORDER BY id) FROM rk),
+                (SELECT string_agg(concat_ws('|', operation, remote_new_tuple->>'id', error_sqlstate), ',') FROM worf.exception_log)
+            """, token), "the conflicting change skipped and recorded");
     }
 
     /// <summary>

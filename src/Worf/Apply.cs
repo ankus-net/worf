@@ -2523,6 +2523,14 @@ internal static unsafe partial class Apply
     }
 
     /// <summary>
+    /// Gets whether the rechecks of the deferrable constraints that are initially immediate wait for commit, as apply
+    /// doesn't know where the provider's statements ended, at which PostgreSQL checks them: rows that swap values, which
+    /// each statement left unique, then apply. A transaction applied change by change, after its commit failed on one,
+    /// has them checked as each change ends, so that the change that conflicts is the one skipped.
+    /// </summary>
+    internal static bool RechecksAtCommit => !s_exceptionMode || s_exceptionLevel != ExceptionByChange;
+
+    /// <summary>
     /// Checks whether an error says nothing about the change's data, as a deadlock, a serialization failure, a lock or
     /// statement timeout, a cancellation, a shutdown, running out of resources, a lost connection, an I/O error or a
     /// column every value of which fails while the nodes format money differently, do, so applying the transaction
@@ -2706,11 +2714,13 @@ internal static unsafe partial class Apply
             case WorfExceptionBehaviour.Discard:
             case WorfExceptionBehaviour.Transdiscard:
                 // A transaction whose commit fails, as on a deferred constraint, or that fails again change by change
-                // is skipped as a whole next time. One whose commit fails even then, outside its subtransaction, is
-                // recorded now and not applied at all. One that fails when it isn't applied stops the worker until
-                // the error is fixed.
+                // is skipped as a whole next time, but one whose commit fails on a recheck that waited for commit only
+                // as apply had it wait is applied change by change first, where the recheck fires as each change ends.
+                // One whose commit fails even then, outside its subtransaction, is recorded now and not applied at all.
+                // One that fails when it isn't applied stops the worker until the error is fixed.
                 int level = s_exceptionMode ? s_exceptionLevel + 1
-                    : ExceptionBehaviour == WorfExceptionBehaviour.Transdiscard || s_changeOperation == "COMMIT"
+                    : ExceptionBehaviour == WorfExceptionBehaviour.Transdiscard ||
+                        (s_changeOperation == "COMMIT" && !(ReplicaRechecks.Deferred && error.SqlState is PgSqlStates.UniqueViolation or PgSqlStates.ExclusionViolation))
                         ? ExceptionByTransaction
                         : ExceptionByChange;
                 if (level > ExceptionWithoutApplying)
@@ -2917,6 +2927,7 @@ internal static unsafe partial class Apply
         // worf doesn't have "statements" as such, so we'll report one statement per applied transaction. The
         // transaction's start sets the transaction timestamp used by current_timestamp.
         s_applyApi.OnBegin();
+        ReplicaRechecks.Deferred = false;
 
         if (!s_exceptionMode || s_exceptionLevel == ExceptionByChange)
         {

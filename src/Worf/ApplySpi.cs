@@ -184,9 +184,11 @@ internal static unsafe class ApplySpi
     /// Runs a statement composed of quoted names, parameter references and the key's operators, which come from the
     /// catalog, under the session's search path, for the triggers it fires.
     /// </summary>
-    // Each statement starts a writer of the relation, whose deferrable constraints' rechecks fire for its rows.
+    // Each statement starts a writer of the relation, whose deferrable constraints' rechecks fire for its rows, at
+    // commit as apply says.
     private static void ExecuteComposed(WorfRelation rel, string sql, List<SpiParameter> args)
-        => _ = rel.HasRechecks ? ReplicaRechecks.Firing(rel.Reloid, () => Worf.ExecuteUnpinned(sql, [.. args])) : Worf.ExecuteUnpinned(sql, [.. args]);
+        => _ = rel.HasRechecks ? ReplicaRechecks.Firing(rel.Reloid, () => Worf.ExecuteUnpinned(sql, [.. args]), Apply.RechecksAtCommit)
+            : Worf.ExecuteUnpinned(sql, [.. args]);
 
     /// <summary>
     /// Gets the equality operators of a table's replica identity index, which the statements name with their schemas, as
