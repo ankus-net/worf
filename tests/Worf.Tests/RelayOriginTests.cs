@@ -297,11 +297,11 @@ public sealed class RelayOriginTests
             "SELECT pg_replication_origin_progress(roname, false) < 'FF/0' FROM pg_replication_origin WHERE roname LIKE '%@9001'", token),
             "the relay origin's progress");
 
-        // Writers take turns with two slots for relay origins, here those of 9001 and 9005, and each row keeps its
-        // writer. A relay origin that set up the session within the last minute keeps its slot, so a third writer's
-        // transaction stops apply with 53400, as PostgreSQL's apply worker stops when no slot is free, rather than drop
-        // and create an origin for each transaction; once the worker starts again, an origin that hasn't applied since
-        // gives its slot up before the next is created, which takes its id, so a turn records nothing of the drop.
+        // Writers take turns with the one slot the leftover progress leaves relay origins, and each row keeps its
+        // writer. Each writer's transaction takes the slot of the worker's other relay origin, though it set up the
+        // session within the last minute, with a warning, rather than stop apply: each turn drops an origin and creates
+        // the next, which takes its id, so a turn records nothing of the drop, and takes a transaction ID or two, rather
+        // than one for each try at a slot.
         await WriteAsAsync(provider, $"{back}@9005", "INSERT INTO c VALUES (3, '9005')", token);
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM c WHERE id = 3)", token), "the fifth writer's row");
         string turns = await subscriber.SafePsqlAsync(Database, "SELECT pg_snapshot_xmax(pg_current_snapshot())", token);
@@ -313,11 +313,12 @@ public sealed class RelayOriginTests
         }
 
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT count(*) = 4 FROM d", token), "the writers' rows");
+        long turned = long.Parse(await subscriber.SafePsqlAsync(Database, "SELECT pg_snapshot_xmax(pg_current_snapshot())", token), CultureInfo.InvariantCulture) -
+            long.Parse(turns, CultureInfo.InvariantCulture);
         string turnLog = subscriber.ReadLog()[logpos..];
-        string[] waitLines = [.. turnLog.Split('\n').Where(line => line.Contains("no replication origin slot is free for replication origin", StringComparison.Ordinal))];
-        IEnumerable<int> waits = Enumerable.Range(9002, 3).Where(writer => waitLines.Any(line => line.Contains($"@{writer}\"", StringComparison.Ordinal)));
-        Assert.AreEqual("9002,9004", string.Join(",", waits), "the writers that waited, but not 9003, which took the slot of 9005, unused since the worker started again");
-        Assert.Contains("which it keeps for a minute after its changes last applied", turnLog, "the reason the slots were kept");
+        Assert.DoesNotContain("no replication origin slot is free for replication origin", turnLog, "a writer that waited for a slot");
+        Assert.Contains("dropped relay origins to free replication origin slots", subscriber.ReadLog(), "the warning of the turns, once a minute");
+        Assert.IsLessThan(20L, turned, "transaction IDs the three turns took");
         Assert.AreEqual("t", await subscriber.SafePsqlAsync(Database,
             "SELECT max(n) > 1 FROM (SELECT count(*) n FROM worf.origin_writer GROUP BY roident) c", token), "an id recorded more than once");
         Assert.AreEqual("3|0", await subscriber.SafePsqlAsync(Database, $"""
@@ -339,7 +340,7 @@ public sealed class RelayOriginTests
         // created have none, and give one up to another subscription that finds none free.
         const string Relays = "SELECT count(*) || ': ' || string_agg(roname, ',' ORDER BY roname) FROM pg_replication_origin WHERE roname LIKE '%@90__'";
         string relays = await subscriber.SafePsqlAsync(Database, Relays, token);
-        Assert.StartsWith("2: ", relays, "the relay origins");
+        Assert.StartsWith("1: ", relays, "the relay origin of the last writer, which took the slot");
         _ = await subscriber.SafePsqlAsync(Database, $"""
             CREATE ROLE ghost SUPERUSER NOLOGIN;
             CREATE SUBSCRIPTION pgsub CONNECTION '{provider.Dsn(Database, SuperUser)}' PUBLICATION p WITH (connect = false);
@@ -439,7 +440,11 @@ public sealed class RelayOriginTests
         await WriteAsAsync(provider, $"{back}@9004", "INSERT INTO d VALUES (14, '9004')", token);
         await WriteAsAsync(provider, $"{back}@9002", "INSERT INTO d VALUES (15, '9002')", token);
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT count(*) = 11 FROM d", token), "the rows before another user");
-        Assert.StartsWith("2: ", await subscriber.SafePsqlAsync(Database, Relays, token), "the relay origins before another user");
+        Assert.AreEqual("t", await subscriber.SafePsqlAsync(Database, $"""
+            SELECT count(*) = current_setting('{limit}')::integer
+                AND count(*) FILTER (WHERE o.roname LIKE '%@90__') >= 1
+            FROM pg_replication_origin_status s LEFT JOIN pg_replication_origin o ON o.roident = s.local_id
+            """, token), "the relay origins holding every slot the others leave, before another user");
         _ = await subscriber.SafePsqlAsync(Database, "ALTER ROLE ghost LOGIN", token);
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, """
             SELECT EXISTS (SELECT 1 FROM pg_replication_origin_status s JOIN pg_subscription p ON s.external_id = 'pg_' || p.oid)

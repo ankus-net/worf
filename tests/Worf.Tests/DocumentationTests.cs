@@ -53,7 +53,19 @@ public sealed class DocumentationTests
                 text, $"how long inserts wait for a switch, in {name} (130)");
         }
 
+        Assert.Contains("The switch waits for the gate as for a lock, for as long as it takes in a switch worker", s_sequenceRanges,
+            "a switch's wait for the gate (142, 210)");
+        Assert.Contains("is a deadlock that PostgreSQL detects, ending one of them with SQLSTATE `40P01`", s_sequenceRanges, "a cycle through the gate (142)");
+
+        Assert.Contains("or that changed the type of an identity column a managed sequence numbers, unless a savepoint rolled it back", s_sequenceRanges,
+            "prepared column type changes (144)");
+        Assert.Contains("holds up only that sequence's exchanges, which leave it out until the transaction ends", s_sequenceRanges, "prepared holders (144)");
+        Assert.Contains("after its server starts, a node draws from a block its parent granted only once a message of the parent's made after it heard of the start has come and committed",
+            s_sequenceRanges, "a returning node (46, 74)");
+
         string ranges = Read("src", "Worf", "SequenceRanges.cs");
+        Assert.DoesNotContain("which switches beside those transactions, without waiting for them, while the range worker checks", ranges,
+            "the switch worker's wait (146)");
         Assert.DoesNotContain("isn't waited for: the sequence's range says so, with a warning, and inserts run the block out", ranges, "prepared holders (146)");
         Assert.Contains("A prepared transaction that holds the sequence, which may hold it across restarts, is switched beside as any other.", ranges,
             "prepared holders (146)");

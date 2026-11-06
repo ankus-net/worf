@@ -68,8 +68,12 @@ internal static unsafe partial class Apply
     private static readonly Dictionary<ushort, long> s_relayUsedAt = [];
 
     // How long, in microseconds, a relay origin keeps its slot after it last set up the session, rather than give it up
-    // to another of the worker's relay origins.
+    // to another of the worker's relay origins, while another slot can be had.
     private const long RelayOriginHold = 60_000_000;
+
+    // How long, in microseconds, a relay origin waits for a slot to come free before the worker's other relay origins
+    // take turns with it.
+    private const long RelayTurnWait = 1_000_000;
 
     // The writer and subscription of the origin of the last local row whose stream was looked up.
     private static (ushort Origin, uint Xid, (uint Writer, uint SubId)? Recorded) s_lastOriginWriter;
@@ -78,6 +82,7 @@ internal static unsafe partial class Apply
     // that it last answered was, and when it last looked for an origin that another user of origins can't set up.
     private static long s_reclaimWarnedAt;
     private static long s_reclaimCheckedAt;
+    private static long s_ownReclaimCheckedAt;
     private static long s_elsewhereCheckedAt;
 
     // The origins of PostgreSQL subscriptions this worker last gave slots up for, and those it found waiting for none,
@@ -360,6 +365,7 @@ internal static unsafe partial class Apply
 
         // Only workers that find no replication origin slot free from now on have relay origins give theirs up.
         s_reclaimCheckedAt = Worker.OriginSlotWantedAt;
+        s_ownReclaimCheckedAt = Worker.OwnOriginSlotWantedAt;
 
         // Init the MessageContext which we use for easier cleanup, once, as a table sync worker streams again.
         if (!s_messageContextCreated)
@@ -1053,15 +1059,26 @@ internal static unsafe partial class Apply
         // and that haven't set up the session within RelayOriginHold, give theirs up, as worf.origin_writer still
         // names the node that wrote the rows committed under them, all in one transaction with the origin's creation.
         // They give them up first, so that the new origin takes the id of one of them, as PostgreSQL gives the lowest
-        // free id, and its record replaces the drop's. A relay origin that still finds none, as when more nodes' changes
-        // take turns than slots hold, which would otherwise drop and create an origin for each transaction, or that
-        // would take one of the slots any worker gave up for PostgreSQL subscriptions' origins while their workers
-        // take to try again, waits for one, and the worker exits with 53400 once RunTakingOriginSlot gives up, to try
-        // again, as PostgreSQL's apply worker does when no slot is free: committing under the worker's own origin
-        // would count the rows as the provider's, which then sends them back to the node that wrote them.
+        // free id, and its record replaces the drop's. When more nodes' changes take turns than slots hold, the worker's
+        // other relay origins give theirs up even so, once a slot hasn't come free within RelayTurnWait, the newest's
+        // progress going to the worker's own origin, so that apply goes on, dropping and creating an origin at each
+        // turn, with a warning. A relay origin that finds none
+        // to take, as when other subscriptions' origins hold them all, or that would take one of the slots any worker
+        // gave up for PostgreSQL subscriptions' origins while their workers take to try again, waits for one, without
+        // writing, and the worker exits with 53400 once RunTakingOriginSlot gives up, to try again, as PostgreSQL's
+        // apply worker does when no slot is free: committing under the worker's own origin would count the rows as the
+        // provider's, which then sends them back to the node that wrote them.
         s_sessionWriterNodeId = null;
         uint writerNodeId = writer == 0 ? sub.Origin.Id : writer;
         bool yielding = writer != 0 && Worker.GetCurrentTimestamp() < Worker.OriginSlotsGivenUpAt + OriginSlotHold;
+
+        // A slot that another user of origins gives up a moment later, as a table sync that's ending, or another worker
+        // asked to give up a relay origin it no longer needs, is waited for, up to RelayTurnWait and without writing,
+        // before this worker's other relay origins, which set up the session lately, take turns with this one.
+        if (!yielding)
+        {
+            WaitForOriginSlot(name, sub.SlotName);
+        }
 
         List<ushort> dropped = [];
         (ushort origin, ulong? sinceXid) = RunTakingOriginSlot(() =>
@@ -1071,6 +1088,14 @@ internal static unsafe partial class Apply
             if (yielding && (existing is null || !WorfNode.HasOriginSlot(existing.Value)))
             {
                 throw NoRelaySlot(name, true);
+            }
+
+            // A transaction that would find no slot fails before it writes, so that waiting for one takes no
+            // transaction IDs.
+            if ((existing is null || !WorfNode.HasOriginSlot(existing.Value)) && WorfNode.OriginSlotsFull() &&
+                !s_streamOrigins.Keys.Any(other => other != existing && WorfNode.OriginName(other) is string otherName && otherName != sub.SlotName))
+            {
+                throw NoRelaySlot(name, false);
             }
 
             ushort id;
@@ -1090,7 +1115,7 @@ internal static unsafe partial class Apply
             {
                 if (WorfNode.OriginSlotsFull())
                 {
-                    _ = DropRelayOrigins(0, dropped);
+                    _ = DropRelayOrigins(0, dropped) || DropRelayOrigins(0, dropped, true) || DropRelayOrigins(0, dropped, true, false, 1);
                 }
 
                 (id, ulong since) = WorfNode.CreateOrigin(name, writerNodeId, sub.Id);
@@ -1098,14 +1123,15 @@ internal static unsafe partial class Apply
             }
 
             if (!TrySetupSession(id) && (!DropRelayOrigins(id, dropped) || !TrySetupSession(id)) &&
-                (!DropRelayOrigins(id, dropped, true) || !TrySetupSession(id)))
+                (!DropRelayOrigins(id, dropped, true) || !TrySetupSession(id)) &&
+                (!DropRelayOrigins(id, dropped, true, false, 1) || !TrySetupSession(id)))
             {
                 throw NoRelaySlot(name, false);
             }
 
             RecordDropped(dropped, id);
             return (id, recorded);
-        });
+        }, own: false);
 
         // An id that another origin takes doesn't apply this subscription's changes from then on.
         foreach (ushort id in dropped)
@@ -1151,8 +1177,35 @@ internal static unsafe partial class Apply
         => new(PgSqlStates.ConfigurationLimitExceeded, $"no replication origin slot is free for replication origin \"{name}\"",
             detail: yielding
                 ? "PostgreSQL subscriptions' origins may take the replication origin slots worf gave up for them, so no relay origin takes one until their workers have tried again."
-                : "Each node whose changes a provider forwards takes a replication origin slot, which it keeps for a minute after its changes last applied.",
+                : "Each node whose changes a provider forwards takes a replication origin slot, and other origins hold every slot.",
             hint: "Raise max_active_replication_origins, or max_replication_slots before PostgreSQL 18.");
+
+    /// <summary>
+    /// Waits, up to <see cref="RelayTurnWait"/>, for a replication origin slot for a relay origin that has none, while
+    /// every slot is taken and none of this worker's relay origins that haven't set up the session within
+    /// <see cref="RelayOriginHold"/> could give one up, asking the other workers to give up theirs meanwhile, in
+    /// transactions that only read.
+    /// </summary>
+    private static void WaitForOriginSlot(string name, string slotName)
+    {
+        long until = Worker.GetCurrentTimestamp() + RelayTurnWait;
+        while (PgBackgroundWorker.RunTransaction(() =>
+        {
+            long now = Worker.GetCurrentTimestamp();
+            return (PgReplicationOrigin.Find(name) is not ushort have || !WorfNode.HasOriginSlot(have)) && WorfNode.OriginSlotsFull() &&
+                !s_streamOrigins.Keys.Any(id => WorfNode.OriginName(id) is string relay && relay != slotName && relay != name &&
+                    (!s_relayUsedAt.TryGetValue(id, out long usedAt) || now - usedAt >= RelayOriginHold));
+        }))
+        {
+            if (Worker.GotSigterm || Worker.GetCurrentTimestamp() >= until)
+            {
+                return;
+            }
+
+            MarkOwnWant(Worker.WantOriginSlot(false));
+            _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(50));
+        }
+    }
 
     /// <summary>
     /// Records the relay origins dropped to free slots, but one whose id the origin set up took, whose own record
@@ -1186,8 +1239,10 @@ internal static unsafe partial class Apply
     /// </summary>
     /// <typeparam name="T">The transaction's result.</typeparam>
     /// <param name="work">The transaction's work.</param>
+    /// <param name="own">Whether the slot is for a subscription's or table sync's own origin, rather than a relay
+    /// origin, for which other workers give up even the relay origins they used last.</param>
     /// <returns>Its result.</returns>
-    internal static T RunTakingOriginSlot<T>(Func<T> work)
+    internal static T RunTakingOriginSlot<T>(Func<T> work, bool own = true)
     {
         long deadline = Worker.GetCurrentTimestamp() + 10_000_000;
         while (true)
@@ -1198,7 +1253,7 @@ internal static unsafe partial class Apply
             }
             catch (PgException error) when (error.SqlState == PgSqlStates.ConfigurationLimitExceeded)
             {
-                Worker.WantOriginSlot();
+                MarkOwnWant(Worker.WantOriginSlot(own));
                 if (Worker.GotSigterm || Worker.GetCurrentTimestamp() >= deadline)
                 {
                     throw;
@@ -1206,6 +1261,16 @@ internal static unsafe partial class Apply
 
                 _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(100));
             }
+        }
+    }
+
+    // A worker's own want of a slot isn't one for it to answer by giving up its own relay origins.
+    private static void MarkOwnWant(long wantedAt)
+    {
+        s_reclaimCheckedAt = Math.Max(s_reclaimCheckedAt, wantedAt);
+        if (Worker.OwnOriginSlotWantedAt == wantedAt)
+        {
+            s_ownReclaimCheckedAt = Math.Max(s_ownReclaimCheckedAt, wantedAt);
         }
     }
 
@@ -1227,7 +1292,17 @@ internal static unsafe partial class Apply
     {
         long wantedAt = Worker.OriginSlotWantedAt;
         long now = Worker.GetCurrentTimestamp();
-        if (wantedAt > s_reclaimCheckedAt)
+        // Another subscription's or table sync's worker can't apply without its own origin, so this worker gives up even
+        // its newest relay origin for it, as its writer's next transaction makes it again, taking turns; for another's
+        // relay origin, only those it no longer needs.
+        long ownWantedAt = Worker.OwnOriginSlotWantedAt;
+        if (ownWantedAt > s_ownReclaimCheckedAt)
+        {
+            s_ownReclaimCheckedAt = ownWantedAt;
+            s_reclaimCheckedAt = Math.Max(s_reclaimCheckedAt, wantedAt);
+            ReclaimRelayOrigins(true);
+        }
+        else if (wantedAt > s_reclaimCheckedAt)
         {
             s_reclaimCheckedAt = wantedAt;
             ReclaimRelayOrigins();
@@ -1366,22 +1441,33 @@ internal static unsafe partial class Apply
     /// <param name="dropped">The ids of those dropped, once the transaction commits.</param>
     /// <param name="newest">Whether the newest goes too, its progress given to the worker's own origin, as when no
     /// other slot can be freed.</param>
-    /// <param name="held">Whether those that set up the session within <see cref="RelayOriginHold"/> stay, as they do
-    /// for another of the worker's relay origins, which would otherwise take turns with them for each transaction, but
-    /// not for the origins of other subscriptions and table syncs, which ask for slots seldom.</param>
+    /// <param name="held">Whether those that set up the session within <see cref="RelayOriginHold"/> stay, as they do at
+    /// first for another of the worker's relay origins, which would otherwise take turns with them for each transaction,
+    /// until no slot can be had otherwise, but not for the origins of other subscriptions and table syncs, which ask for
+    /// slots seldom.</param>
+    /// <param name="most">How many to drop at most, those that set up the session least lately first, and of those that
+    /// hold a slot, as dropping one that holds none frees none.</param>
     /// <returns>Whether any was dropped.</returns>
-    private static bool DropRelayOrigins(ushort keep, List<ushort> dropped, bool newest = false, bool held = true)
+    private static bool DropRelayOrigins(ushort keep, List<ushort> dropped, bool newest = false, bool held = true, int most = int.MaxValue)
     {
         string slotName = MySubscription!.SlotName;
         ushort session = PgReplicationOrigin.SessionOrigin;
         long now = Worker.GetCurrentTimestamp();
-        List<(ushort Id, ulong Progress)> origins = [.. s_streamOrigins.Keys.Select(id => (id, PgReplicationOrigin.GetProgress(id, false).Value))];
+        List<(ushort Id, ulong Progress)> origins = [.. s_streamOrigins.Keys.Select(id => (id, PgReplicationOrigin.GetProgress(id, false).Value))
+            .OrderBy(origin => s_relayUsedAt.GetValueOrDefault(origin.id))];
         ulong latest = origins.Count == 0 ? 0 : origins.Max(o => o.Progress);
         bool any = false;
+        int left = most;
         foreach ((ushort id, ulong progress) in origins)
         {
+            if (left == 0)
+            {
+                break;
+            }
+
             if ((progress >= latest && !newest) || id == keep || id == session || WorfNode.OriginName(id) is not string name || name == slotName ||
-                (held && s_relayUsedAt.TryGetValue(id, out long usedAt) && now - usedAt < RelayOriginHold))
+                (held && s_relayUsedAt.TryGetValue(id, out long usedAt) && now - usedAt < RelayOriginHold) ||
+                (most != int.MaxValue && !WorfNode.HasOriginSlot(id)))
             {
                 continue;
             }
@@ -1397,6 +1483,7 @@ internal static unsafe partial class Apply
             {
                 dropped.Add(id);
                 any = true;
+                left--;
             }
         }
 

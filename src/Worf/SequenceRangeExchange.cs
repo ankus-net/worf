@@ -39,6 +39,9 @@ internal static class SequenceRangeExchange
     // The subscriptions whose last probe gave way to a request on another neighbor.
     private static readonly HashSet<uint> s_gaveWay = [];
 
+    // The sequences, with the prepared transactions holding their range rows, that this process has warned of.
+    private static readonly HashSet<(uint Seqoid, string Gid)> s_preparedHolders = [];
+
     // The neighbors whose messages the current transaction took in, with when their servers started and whether they
     // made them knowing this server was back, noted once it commits.
     private static readonly List<(uint Sender, long? StartedAt, bool Confirmed)> s_onCommit = [];
@@ -1121,6 +1124,21 @@ internal static class SequenceRangeExchange
                 _ = absent.Remove(carried);
             }
 
+            // A sequence whose range row a prepared transaction holds, which it may hold across restarts, is left out, so
+            // that the exchange doesn't wait on it while the other sequences' blocks wait on the exchange.
+            if (processed is uint locked && PreparedHolder(locked) is string gid)
+            {
+                if (s_preparedHolders.Add((locked, gid)))
+                {
+                    WorfLog.Warning(new PgDiagnostic($"sequence {entry.GetProperty("name").GetWorfString()}: prepared transaction \"{gid}\" holds its range row, so it exchanges no blocks until the transaction ends")
+                    {
+                        Hint = $"Commit or roll back the prepared transaction with COMMIT PREPARED or ROLLBACK PREPARED '{gid}'.",
+                    });
+                }
+
+                continue;
+            }
+
             try
             {
                 if (!heard || !Unchanged(node, root, entry, senderId, call, applied))
@@ -2162,6 +2180,13 @@ internal static class SequenceRangeExchange
 
         s_onCommit.Add((senderId, startedAt, confirmed));
     }
+
+    /// <summary>
+    /// Gets the prepared transaction that holds a sequence's range row, as one that locked or updated it, or null.
+    /// </summary>
+    private static string? PreparedHolder(uint seqoid) => Worf.ReadScalar<string?>("""
+        SELECT x.gid FROM worf.sequence_range r JOIN pg_catalog.pg_prepared_xacts x ON x.transaction = r.xmax WHERE r.seqoid = $1
+        """, SpiParameter.Create(seqoid));
 
     // Whether a request to reset comes from a fence's lift, at a WAL position past any real one.
     private static bool IsLift(string reset) => reset.StartsWith("FFFFFFFF/", StringComparison.Ordinal) || reset.StartsWith("FFFFFFFE/", StringComparison.Ordinal);

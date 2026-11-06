@@ -165,7 +165,9 @@ using Ankus.Postgres;
                 ELSE (CASE WHEN l.last_value BETWEEN a.lo AND a.hi THEN l.last_value ELSE a.hi::numeric - s.seqincrement END - a.lo) / -s.seqincrement
             END::bigint AS values_left,
             n.lo AS next_lo, n.hi AS next_hi, r.peak_rate AS insert_rate, r.switched_at AS last_switch,
-            r.exchanged_at AS last_exchange, r.detail
+            r.exchanged_at AS last_exchange,
+            coalesce((SELECT pg_catalog.format('prepared transaction %L holds the range row, so the sequence exchanges no blocks until it ends', x.gid)
+                FROM pg_catalog.pg_prepared_xacts x WHERE x.transaction = r.xmax), r.detail) AS detail
         FROM worf.sequence_range r
             JOIN pg_catalog.pg_sequence s ON s.seqrelid = r.seqoid
             LEFT JOIN worf.node o ON o.node_id = r.owner_node
@@ -1729,6 +1731,8 @@ internal static unsafe partial class SequenceRanges
     private static void Retyped(uint seqoid)
     {
         SequenceInfo info = GetInfo(seqoid);
+        NoteSwitch(null, ($"changed the type of a column that sequence {info.Name} numbers",
+            "The change holds the sequence's range row until the transaction ends, which a prepared transaction would hold across restarts, keeping the sequence from switching or exchanging blocks."));
         if (ActiveBlock(seqoid) is (long lo, long hi))
         {
             RunInternalDdl($"ALTER SEQUENCE {info.Name} MINVALUE {lo.ToString(CultureInfo.InvariantCulture)} MAXVALUE {hi.ToString(CultureInfo.InvariantCulture)}");
@@ -4060,11 +4064,13 @@ internal static unsafe partial class SequenceRanges
     /// switch that gave up would let them all draw from the block at once, as they might near its end. Once the block
     /// reaches its last twentieth, where inserts wait for the switch, or the next block is reserved for a load, whose
     /// session waits for it, a switch that can't have the lock is left to a switch worker, which switches beside those
-    /// transactions, without waiting for them, while the range worker checks the other sequences. The range worker
-    /// starts it with <see cref="HandOff"/> once its check has committed, so that the switch worker waits on no lock of
-    /// the range worker's. While every worker slot is taken, the range worker switches beside them itself, waiting a
-    /// tenth of a second at most for the switch gate. A prepared transaction that holds the sequence, which may hold it
-    /// across restarts, is switched beside as any other.
+    /// transactions, without waiting for them to end, while the range worker checks the other sequences. The switch
+    /// worker does wait, as for a lock and for as long as it takes, for the statements that hold the sequence's switch
+    /// gate to reach their next rows, which a statement that waits for another lock, or is paused within its rows, holds
+    /// up. The range worker starts it with <see cref="HandOff"/> once its check has committed, so that the switch worker
+    /// waits on no lock of the range worker's. While every worker slot is taken, the range worker switches beside them
+    /// itself, waiting a tenth of a second at most for the switch gate. A prepared transaction that holds the sequence,
+    /// which may hold it across restarts, is switched beside as any other.
     /// </summary>
     private static bool SwitchBeforeEnd(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) next, bool forLoad, bool atEnd)
     {
@@ -4273,7 +4279,7 @@ internal static unsafe partial class SequenceRanges
             // of the new bounds, as the commit lets the gate go after it tells backends of them.
             if (switched && s_pendingMove is (uint moving, long start))
             {
-                SequenceRangeGuard.ShutGate(moving, briefly ? 100 : 1000);
+                SequenceRangeGuard.ShutGate(moving, briefly ? 100 : 0);
                 Move(moving, start);
             }
 

@@ -1038,13 +1038,17 @@ internal static partial class SequenceRangeGuard
 
     /// <summary>
     /// Shuts a sequence's switch gate for a switch beside the transactions that hold it, until its transaction ends:
-    /// it waits for the statements that hold the gate to reach their next rows, while those that start wait for it,
-    /// and fails with 55P03 once the time is up. Statements that hold the gate let it go at their next row while any
-    /// switch waits for one.
+    /// it waits for the statements that hold the gate to reach their next rows, as for a lock, while those that start
+    /// wait at the door, which it shuts first, and so do statements waiting for the switch. A statement that holds the
+    /// gate while it waits for another lock holds the switch up until it has that lock, and one paused within its rows,
+    /// as a COPY waiting for its client, until it goes on; a cycle of such waits, as when the transaction the statement
+    /// waits for waits for the switch, is a deadlock that PostgreSQL's deadlock detector sees, as every wait in it is
+    /// for a lock. Statements that hold the gate let it go at their next row while any switch waits for one.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
-    /// <param name="timeout">How long to wait, in milliseconds: a tenth of a second in the range worker, which checks
-    /// the other sequences meanwhile, and a second in a switch worker.</param>
+    /// <param name="timeout">How long to wait, in milliseconds, after which the switch fails with 55P03: a tenth of a
+    /// second in the range worker, which checks the other sequences meanwhile and leaves the switch to a switch worker;
+    /// or zero, for as long as it takes, in a switch worker.</param>
     internal static unsafe void ShutGate(uint seqoid, int timeout)
     {
         _ = PgAtomic.Add(SequenceRanges.SwitchesPending, 1L);
@@ -1058,36 +1062,38 @@ internal static partial class SequenceRangeGuard
         _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, Done);
         _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, Done);
         _ = Worf.Execute($"SET LOCAL lock_timeout = {timeout.ToString(CultureInfo.InvariantCulture)}");
+
+        // A switch worker, which waits for as long as it takes, looks for a deadlock last, so that the deadlock detector
+        // ends the statement in a cycle through the gate, which can go on once it's retried, rather than the switch,
+        // which another switch worker would make again into the same cycle.
+        if (timeout == 0)
+        {
+            _ = Worf.Execute("SET LOCAL deadlock_timeout = '1h'");
+        }
+
         LOCKTAG door = GateTag(seqoid, DoorKey);
         _ = NativeMethods.LockAcquire(&door, ExclusiveLock, false, false);
-
-        // A statement that holds the gate while it waits for another lock, as an insert's for a key another transaction
-        // writes, has drawn its row's values, and lets the gate go at its next row, so the switch goes on beside it
-        // rather than wait: the transaction it waits for may be waiting for this switch, which the deadlock detector
-        // can't see. The shut door keeps statements from taking the gate meanwhile.
         LOCKTAG tag = GateTag(seqoid);
-        long deadline = Worker.GetCurrentTimestamp() + (timeout * 1000L);
-        while (NativeMethods.LockAcquire(&tag, ExclusiveLock, false, true) == LockAcquireResult.LOCKACQUIRE_NOT_AVAIL)
+        _ = NativeMethods.LockAcquire(&tag, ExclusiveLock, false, false);
+    }
+
+    /// <summary>
+    /// Waits, as for a lock, for a switch of a sequence that holds its door to end, if one does, so that a statement
+    /// waiting for the switch shows in pg_locks as waiting for the switch's transaction, and a cycle through it is a
+    /// deadlock PostgreSQL's deadlock detector sees.
+    /// </summary>
+    /// <returns>Whether a switch held the door.</returns>
+    private static unsafe bool WaitAtDoor(uint seqoid)
+    {
+        LOCKTAG door = GateTag(seqoid, DoorKey);
+        bool shut = NativeMethods.LockAcquire(&door, ShareLock, false, true) == LockAcquireResult.LOCKACQUIRE_NOT_AVAIL;
+        if (shut)
         {
-            if (Worf.ReadScalar<bool>("""
-                SELECT NOT EXISTS (
-                    SELECT 1 FROM pg_catalog.pg_locks g LEFT JOIN pg_catalog.pg_stat_activity a ON a.pid = g.pid
-                    WHERE g.locktype = 'advisory' AND g.database = $1 AND g.classid = $2 AND g.objid = 0 AND g.objsubid = $3 AND g.granted
-                        AND g.pid <> pg_catalog.pg_backend_pid() AND a.wait_event_type IS DISTINCT FROM 'Lock')
-                """, SpiParameter.Create(DatabaseId()), SpiParameter.Create(seqoid), SpiParameter.Create((int)GateKey)))
-            {
-                return;
-            }
-
-            if (Worker.GetCurrentTimestamp() >= deadline)
-            {
-                throw new PgException("55P03", $"canceling statement due to lock timeout",
-                    detail: $"Statements drawing from sequence {SequenceRanges.GetInfo(seqoid).Name} held its switch gate.");
-            }
-
-            PgInterrupts.Check();
-            Worker.WaitLatch(20);
+            _ = NativeMethods.LockAcquire(&door, ShareLock, false, false);
         }
+
+        _ = NativeMethods.LockRelease(&door, ShareLock, false);
+        return shut;
     }
 
     /// <summary>
@@ -1368,8 +1374,8 @@ internal static partial class SequenceRangeGuard
     /// node's alone, and a backend waits for it as for a lock, until it comes, or statement_timeout or a cancellation
     /// ends the wait, however long a busy node takes to come to the sequence, while a range or switch worker runs to make
     /// it; once a worker has tried and not switched it, as when a transaction holds its range row, the time is up as
-    /// before. It waits only
-    /// while the worker can switch: the sequence draws from blocks, or has used one up and waits for the next, and no
+    /// before. A switch under way, which waits for the statements that hold the sequence's gate, is waited for at its
+    /// door, as for a lock, and that wait doesn't count toward the time. It waits only while the worker can switch: the sequence draws from blocks, or has used one up and waits for the next, and no
     /// transaction holds the sequence against the switch, as one that switches it itself does, or DDL on it. A switch
     /// the range worker or a switch worker makes is no such transaction, nor is a lock still waited for, so a statement
     /// that finds one goes on waiting, and checks again at each of its rows.
@@ -1497,8 +1503,16 @@ internal static partial class SequenceRangeGuard
                 Worker.WakeRangeWorker();
             }
 
+            // A switch that holds the door is waited for as for a lock, however long it waits for the statements that
+            // hold the gate, and the time is up only once one fails, as when the deadlock detector ends it.
             PgInterrupts.Check();
-            Worker.WaitLatch(10);
+            long atDoor = Worker.GetCurrentTimestamp();
+            bool shut = WaitAtDoor(seqoid);
+            if (!shut)
+            {
+                Worker.WaitLatch(10);
+            }
+
             Reload();
             if (!s_sequences.TryGetValue(seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) sequence) ||
                 !sequence.Blocks.Exists(block => block.State == "active" && block.Lo == lo))
@@ -1511,6 +1525,11 @@ internal static partial class SequenceRangeGuard
             }
 
             now = Worker.GetCurrentTimestamp();
+            if (shut)
+            {
+                deadline += now - atDoor;
+            }
+
             // A try that began before this backend waited may not have seen it, so it waits for one more, as far as the
             // shared table counts the sequence's tries.
             if (now >= deadline &&

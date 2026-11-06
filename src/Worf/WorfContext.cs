@@ -26,5 +26,11 @@ internal struct WorfContext
     /// </summary>
     public long OriginSlotWantedAt;
 
+    /// <summary>
+    /// When a worker last found no replication origin slot free for its subscription's or table sync's own origin, for
+    /// others to give up even the relay origins they used last.
+    /// </summary>
+    public long OwnOriginSlotWantedAt;
+
     public long OriginSlotsGivenUpAt;
 }

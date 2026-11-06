@@ -417,14 +417,37 @@ internal static class Worker
 
     /// <summary>
     /// Records that this worker found no replication origin slot free, so that the workers of other subscriptions give
-    /// up the slots of relay origins they no longer need.
+    /// up the slots of relay origins they no longer need, and, for a subscription's or table sync's own origin, without
+    /// which it can't apply anything, even those they used last.
     /// </summary>
-    internal static void WantOriginSlot()
+    /// <param name="own">Whether the slot is for a subscription's or table sync's own origin, rather than a relay
+    /// origin.</param>
+    /// <returns>When the want was recorded.</returns>
+    internal static long WantOriginSlot(bool own)
     {
         using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = WorfCtx.Exclusive();
         WorfContext ctx = guard.Header;
-        ctx.OriginSlotWantedAt = GetCurrentTimestamp();
+        long now = GetCurrentTimestamp();
+        ctx.OriginSlotWantedAt = now;
+        if (own)
+        {
+            ctx.OwnOriginSlotWantedAt = now;
+        }
+
         guard.Header = ctx;
+        return now;
+    }
+
+    /// <summary>
+    /// Gets when a worker last found no replication origin slot free for its subscription's or table sync's own origin.
+    /// </summary>
+    internal static long OwnOriginSlotWantedAt
+    {
+        get
+        {
+            using PgLwLockShareGuard<WorfContext, WorfWorker> guard = WorfCtx.Share();
+            return guard.Header.OwnOriginSlotWantedAt;
+        }
     }
 
     /// <summary>
