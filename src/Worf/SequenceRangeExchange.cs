@@ -412,6 +412,15 @@ internal static class SequenceRangeExchange
                     break;
                 }
 
+                // A cancel the watcher sent for an earlier call, which ended first, isn't this neighbor's: the exchange is
+                // made again at once.
+                if (error is PgQueryCanceledException && SequenceRangeExchangeWorker.TakeOwedCancel())
+                {
+                    s_retries[sub.Id] = (now, s_retries.GetValueOrDefault(sub.Id).Delay);
+                    WorfLog.Debug1($"sequence range exchange with node {sub.Origin.Name} met the cancel of an earlier call, and is made again");
+                    continue;
+                }
+
                 // A probe that gave way to a request on another neighbor before its time was up is made again in the
                 // next round, without giving way, the neighbor having shown nothing new.
                 long probeLimit = SequenceRangeExchangeWorker.LastLimit * 1000L;

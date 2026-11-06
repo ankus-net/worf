@@ -19,6 +19,9 @@ internal static class SequenceRangeExchangeWorker
     // Whether this exchange worker's watcher stopped.
     private static bool s_unwatched;
 
+    // Whether the watcher cancelled a call that ended before the cancel came, which is still to come.
+    private static bool s_cancelOwed;
+
     /// <summary>
     /// Gets whether this exchange worker's watcher stopped, so that it makes no more calls.
     /// </summary>
@@ -65,6 +68,7 @@ internal static class SequenceRangeExchangeWorker
             catch (PgQueryCanceledException)
             {
                 // Its watcher cancelled a call just as it ended, and the exchanges go on.
+                _ = TakeOwedCancel();
             }
         }
     }
@@ -213,31 +217,57 @@ internal static class SequenceRangeExchangeWorker
         }
 
         LastLimit = CallLimit(connecting);
-        SetDeadline(Worker.GetCurrentTimestamp() + (LastLimit * 1000L));
+        long deadline = Worker.GetCurrentTimestamp() + (LastLimit * 1000L);
+        _ = SetDeadline(deadline);
+        bool canceled = false;
         try
         {
             return call();
         }
+        catch (PgQueryCanceledException)
+        {
+            canceled = true;
+            throw;
+        }
         finally
         {
-            SetDeadline(0);
+            // A call the watcher cancelled that ended first, as at its own time limit, which is the watcher's too, leaves
+            // the cancel to come later, during another call or between calls.
+            if (SetDeadline(0) == 0 && !canceled)
+            {
+                s_cancelOwed = true;
+            }
         }
+    }
+
+    /// <summary>
+    /// Takes a cancel the watcher sent for a call that had already ended, as the one that just came: the call it came
+    /// during, or the exchange, didn't run out of time, and is made again.
+    /// </summary>
+    /// <returns>Whether a cancel was owed.</returns>
+    internal static bool TakeOwedCancel()
+    {
+        bool owed = s_cancelOwed;
+        s_cancelOwed = false;
+        return owed;
     }
 
     /// <summary>
     /// Sets the deadline of the call about to start, or clears it as the call ends, unless the watcher has stopped: a
     /// call doesn't start then.
     /// </summary>
-    private static void SetDeadline(long deadline)
+    /// <returns>The deadline it replaced: zero, as a call ends, if the watcher cancelled the call.</returns>
+    private static long SetDeadline(long deadline)
     {
         if (Worker.MyWorfWorker < 0)
         {
-            return;
+            return Stopped;
         }
 
         using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive();
         WorfWorker worker = guard[Worker.MyWorfWorker];
-        if (worker.Worker.Exchange.Deadline == Stopped)
+        long replaced = worker.Worker.Exchange.Deadline;
+        if (replaced == Stopped)
         {
             s_unwatched = true;
             if (deadline != 0)
@@ -245,13 +275,14 @@ internal static class SequenceRangeExchangeWorker
                 throw new PgException("57P01", "the sequence range exchange worker is stopping, since its watcher stopped");
             }
 
-            return;
+            return replaced;
         }
 
         worker.Worker.Exchange.Deadline = deadline;
         worker.Worker.Exchange.Probing = deadline != 0 && Yields ? Probing : 0;
         worker.Worker.Exchange.StartedAt = deadline != 0 ? Worker.GetCurrentTimestamp() : 0;
         guard[Worker.MyWorfWorker] = worker;
+        return replaced;
     }
 
     private static bool Managed()
