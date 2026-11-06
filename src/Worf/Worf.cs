@@ -1051,6 +1051,30 @@ internal static partial class Worf
     }
 
     /// <summary>
+    /// Ends the work of a subtransaction that changed the catalogs with a record logical decoding takes a base snapshot
+    /// from: the invalidations its last command left are logged first, as the end of a command logs them, and then a
+    /// transactional message, so that the message is the subtransaction's last record. Decoding that starts again inside
+    /// a subtransaction takes it as a transaction of its own, and executes its invalidations only once a change after
+    /// that point has given it a base snapshot; an assert-enabled build aborts on one whose records after that point are
+    /// invalidations alone, as after an index build or ANALYZE, whose inplace updates of the catalog it doesn't decode,
+    /// or after a catalog change whose invalidations are logged as the subtransaction commits.
+    /// </summary>
+    internal static void EndForDecoding()
+    {
+        unsafe
+        {
+            if (NativeMethods.GetCurrentTransactionIdIfAny() == 0)
+            {
+                return;
+            }
+
+            NativeMethods.CommandCounterIncrement();
+        }
+
+        Elevated.Run(() => _ = Execute("SELECT pg_catalog.pg_logical_emit_message(true, 'worf', '')"));
+    }
+
+    /// <summary>
     /// Selects rows with the snapshot a statement of the transaction takes, as SPI's writable helpers do, without
     /// assigning the transaction an ID as they do even for a SELECT: an idle worker then writes no commit records, and
     /// a read before DROP INDEX CONCURRENTLY leaves it the first action in its transaction.

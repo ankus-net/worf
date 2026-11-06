@@ -189,6 +189,7 @@ internal static class HeldValues
                     if (indexed)
                     {
                         _ = Worf.Execute("DROP TABLE worf_held_keys");
+                        Worf.EndForDecoding();
                     }
                 }, PgSubtransactionMode.Atomic);
             }

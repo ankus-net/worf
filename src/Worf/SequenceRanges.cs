@@ -3895,6 +3895,9 @@ internal static unsafe partial class SequenceRanges
                     next = false;
                     throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState, "the sequence went past the block");
                 }
+
+                // The sequence's new bounds change the catalog, whose invalidations would otherwise come last.
+                Worf.EndForDecoding();
             });
         }
         catch (PgException error) when (error.SqlState == "55P03" || (!next && error.SqlState == PgSqlStates.ObjectNotInPrerequisiteState))
