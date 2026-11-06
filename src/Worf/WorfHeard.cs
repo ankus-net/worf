@@ -54,4 +54,10 @@ internal struct WorfHeard
     /// When the node, as a neighbor, last had this server reset a sequence's blocks, or zero.
     /// </summary>
     public long ResetAt;
+
+    /// <summary>
+    /// How long, in microseconds, after <see cref="ResetAt"/> the node may next have this server reset: ten minutes,
+    /// twice as long after each reset that comes within a day of the one before, up to a day.
+    /// </summary>
+    public long ResetEvery;
 }

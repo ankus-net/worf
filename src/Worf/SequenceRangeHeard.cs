@@ -238,10 +238,11 @@ internal static class SequenceRangeHeard
 
     /// <summary>
     /// Checks whether a neighbor may have this server reset its sequences' blocks now: once every ten minutes, with the
-    /// resets of the minute after it, which one rollback brings for every sequence, each sequence once. A neighbor that
-    /// saw this node roll back keeps asking meanwhile, and neither takes its grants nor answers its requests, so that a
-    /// message made up to reset it can't do so more often. This server starts with none, as after a restore, which takes
-    /// the first at once.
+    /// resets of the minute after it, which one rollback brings for every sequence, each sequence once, and twice as
+    /// long after each reset that comes within a day of the one before, up to a day, so that messages made up to reset
+    /// it, which may fence an owner's root until every participant reports, do so ever more seldom, while a rollback,
+    /// which comes seldom, resets it at once. A neighbor that saw this node roll back keeps asking meanwhile. This server
+    /// starts with none, as after a restore, which takes the first at once.
     /// </summary>
     /// <param name="nodeId">The neighbor.</param>
     /// <returns>When the ten minutes whose resets the neighbor may have made began, so that a sequence it has reset since
@@ -259,13 +260,15 @@ internal static class SequenceRangeHeard
             }
 
             WorfHeard heard = guard[i];
-            if (heard.ResetAt != 0 && now - heard.ResetAt is >= 60_000_000 and < 600_000_000)
+            long every = Math.Max(heard.ResetEvery, 600_000_000L);
+            if (heard.ResetAt != 0 && now - heard.ResetAt >= 60_000_000 && now - heard.ResetAt < every)
             {
                 return null;
             }
 
-            if (heard.ResetAt == 0 || now - heard.ResetAt >= 600_000_000)
+            if (heard.ResetAt == 0 || now - heard.ResetAt >= every)
             {
+                heard.ResetEvery = heard.ResetAt != 0 && now - heard.ResetAt < 86_400_000_000L ? Math.Min(every * 2, 86_400_000_000L) : 600_000_000L;
                 heard.ResetAt = now;
                 guard[i] = heard;
             }

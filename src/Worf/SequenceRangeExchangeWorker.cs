@@ -86,7 +86,7 @@ internal static class SequenceRangeExchangeWorker
         long now = Worker.GetCurrentTimestamp();
         bool running = false;
         int overdue = 0;
-        (long Deadline, uint Node) probe = default;
+        (long Deadline, uint Node, long StartedAt) probe = default;
         using (PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share())
         {
             for (int i = 0; i < guard.Length && !stopping; i++)
@@ -95,14 +95,16 @@ internal static class SequenceRangeExchangeWorker
                 if (guard[i].WorkerType == WorfWorkerType.Exchange && guard[i].Dboid == dboid && guard[i].CrashedAt == 0 &&
                     guard[i].Proc != 0 && exchange.Deadline > now && exchange.Probing != 0)
                 {
-                    probe = (exchange.Deadline, exchange.Probing);
+                    probe = (exchange.Deadline, exchange.Probing, exchange.StartedAt);
                 }
             }
         }
 
+        // A probe gives way to a request on another node that came up since it started, not to one that already waited,
+        // as the once-a-minute probe of a neighbor would otherwise give way for as long as another's requests stay open.
         bool giveWay = probe.Node != 0 && PgBackgroundWorker.RunTransaction(() => Worf.ReadScalar<bool>("""
-            SELECT EXISTS (SELECT 1 FROM worf.sequence_range_request WHERE state = 'open' AND parent_node <> $1)
-            """, SpiParameter.Create(probe.Node)));
+            SELECT EXISTS (SELECT 1 FROM worf.sequence_range_request WHERE state = 'open' AND parent_node <> $1 AND created_at >= $2)
+            """, SpiParameter.Create(probe.Node), SpiParameter.Create(new PgTimestampTz(probe.StartedAt))));
         using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
         {
             for (int i = 0; i < guard.Length; i++)
@@ -172,8 +174,9 @@ internal static class SequenceRangeExchangeWorker
     /// </summary>
     /// <typeparam name="T">The call's result.</typeparam>
     /// <param name="call">The call.</param>
+    /// <param name="connecting">Whether the call makes the connection to the neighbor.</param>
     /// <returns>Its result.</returns>
-    internal static T Bounded<T>(Func<T> call)
+    internal static T Bounded<T>(Func<T> call, bool connecting = false)
     {
         // A worker asked to stop makes no new call, which its stop request might not reach.
         if (Worker.GotSigterm)
@@ -181,7 +184,8 @@ internal static class SequenceRangeExchangeWorker
             throw new PgException("57P01", "the sequence range exchange worker is stopping");
         }
 
-        SetDeadline(Worker.GetCurrentTimestamp() + (Probing != 0 ? Math.Min(SequenceRanges.ExchangeTimeout, 1000) : SequenceRanges.ExchangeTimeout) * 1000L);
+        // A probe's connection, which takes a few round trips more than a call, has three seconds.
+        SetDeadline(Worker.GetCurrentTimestamp() + (Probing != 0 ? Math.Min(SequenceRanges.ExchangeTimeout, connecting ? 3000 : 1000) : SequenceRanges.ExchangeTimeout) * 1000L);
         try
         {
             return call();
@@ -218,6 +222,7 @@ internal static class SequenceRangeExchangeWorker
 
         worker.Worker.Exchange.Deadline = deadline;
         worker.Worker.Exchange.Probing = deadline != 0 ? Probing : 0;
+        worker.Worker.Exchange.StartedAt = deadline != 0 ? Worker.GetCurrentTimestamp() : 0;
         guard[Worker.MyWorfWorker] = worker;
     }
 
