@@ -2205,12 +2205,71 @@ public sealed class SequenceRangeTests
                 WHERE q.state = 'open' AND n.node_name = 'node_a')
             """, token), "node_b's request to node_a, open as w's root has run out");
 
-        // Once node_c answers again, node_b's request for a block of u reaches it, though a request on node_a stays
-        // open, which a call to a neighbor that ran out of time only gives way to while nothing waits on that neighbor
-        // itself.
-        _ = await nodeB.SafePsqlAsync(Database,
-            $"UPDATE worf.node_interface SET if_dsn = '{nodeCDsn}' WHERE if_nodeid = (SELECT node_id FROM worf.node WHERE node_name = 'node_c')", token);
-        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, UNext, token), "node_b's next block of u, from node_c once it answers again");
+        // Once node_c answers again, over a link with 300 ms round trips, node_b's request for a block of u reaches it,
+        // though a request on node_a stays open: a probe of a neighbor that ran out of time gives way only to requests
+        // that come up as it runs, and its connection, which takes a few round trips, has three seconds.
+        using TcpListener slow = new(IPAddress.Loopback, 0);
+        slow.Start();
+        string[] dsnParts = nodeCDsn.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        int nodeCPort = int.Parse(dsnParts.Single(part => part.StartsWith("port=", StringComparison.Ordinal))[5..], CultureInfo.InvariantCulture);
+        using CancellationTokenSource relaying = CancellationTokenSource.CreateLinkedTokenSource(token);
+        Task relay = Task.Run(async () =>
+        {
+            async Task PumpAsync(NetworkStream from, NetworkStream to)
+            {
+                byte[] buffer = new byte[65536];
+                int read;
+                while ((read = await from.ReadAsync(buffer, relaying.Token)) > 0)
+                {
+                    await Task.Delay(150, relaying.Token);
+                    await to.WriteAsync(buffer.AsMemory(0, read), relaying.Token);
+                }
+            }
+
+            List<Task> links = [];
+            try
+            {
+                while (true)
+                {
+                    TcpClient client = await slow.AcceptTcpClientAsync(relaying.Token);
+                    links.Add(Task.Run(async () =>
+                    {
+                        using TcpClient near = client;
+                        using TcpClient far = new();
+                        try
+                        {
+                            await far.ConnectAsync(IPAddress.Loopback, nodeCPort, relaying.Token);
+                            _ = await Task.WhenAny(PumpAsync(near.GetStream(), far.GetStream()), PumpAsync(far.GetStream(), near.GetStream()));
+                        }
+                        catch (Exception error) when (error is IOException or SocketException or OperationCanceledException)
+                        {
+                            // A link ends as either side closes, or as the relay stops.
+                        }
+                    }, relaying.Token));
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // The relay stops.
+            }
+
+            await Task.WhenAll(links.Select(link => link.ContinueWith(_ => { }, TaskScheduler.Default)));
+        }, relaying.Token);
+        try
+        {
+            string slowDsn = string.Join(' ', dsnParts.Select(part =>
+                part.StartsWith("port=", StringComparison.Ordinal) ? $"port={((IPEndPoint)slow.LocalEndpoint).Port}"
+                : part.StartsWith("host=", StringComparison.Ordinal) ? "host=127.0.0.1"
+                : part));
+            _ = await nodeB.SafePsqlAsync(Database,
+                $"UPDATE worf.node_interface SET if_dsn = '{slowDsn}' WHERE if_nodeid = (SELECT node_id FROM worf.node WHERE node_name = 'node_c')", token);
+            Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, UNext, token), "node_b's next block of u, from node_c once it answers again");
+        }
+        finally
+        {
+            await relaying.CancelAsync();
+            await relay;
+        }
     }
 
     /// <summary>
