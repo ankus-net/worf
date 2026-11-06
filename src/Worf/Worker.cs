@@ -655,7 +655,8 @@ internal static class Worker
                 s_forgetEveryIdleManager = false;
             });
 
-            // A prepared transaction's workers are signalled as it is prepared, as nothing hooks COMMIT PREPARED.
+            // A prepared transaction's workers are signalled as it is prepared, and again once COMMIT PREPARED has
+            // committed it, which the utility hook sees.
             _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, SignalWorkerXactCallback);
         }
 
@@ -1047,8 +1048,9 @@ internal static class Worker
             // subscriptions).
             //
             // However, if SkipSupervisorWakeup is set, the manager is exiting because the extension isn't
-            // installed in this database. Don't wake the supervisor immediately - let it restart on its normal
-            // timeout. This prevents rapid cycling for databases without worf.
+            // installed in this database, or the database is an idle template, and doesn't wake the supervisor, so
+            // that a database without worf doesn't start its manager over and over, nor a template keep a connection
+            // that copying it would wait for; a change, as CREATE EXTENSION worf, wakes the supervisor.
             //
             // A manager whose look began before a transaction that may have given it something to manage, as CREATE
             // EXTENSION worf, committed may not have seen it, and so isn't idle: the supervisor starts it again at once.
@@ -1184,6 +1186,42 @@ internal static class Worker
         if (supervisor != 0)
         {
             SetProcLatch(supervisor);
+        }
+    }
+
+    /// <summary>
+    /// Signals the database's manager and the supervisor once COMMIT PREPARED has committed a prepared transaction,
+    /// which they heard of as it was prepared, before anyone could see what it did, as CREATE EXTENSION worf, a
+    /// subscription it created or ALTER DATABASE: managers that found nothing to manage then start again.
+    /// </summary>
+    internal static void SignalPreparedCommitted()
+    {
+        uint myDatabaseId;
+        unsafe
+        {
+            myDatabaseId = NativeGlobals.MyDatabaseId;
+        }
+
+        List<nint> latches = [];
+        using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = WorfCtx.Exclusive();
+        WorfContext ctx = guard.Header;
+        ctx.SubscriptionsChanged = true;
+        guard.Header = ctx;
+        ForgetIdleManager(guard, 0);
+        int manager = guard.Read((in _, workers) => ManagerFind(workers, myDatabaseId));
+        if (manager >= 0 && guard[manager].Proc != 0)
+        {
+            latches.Add(guard[manager].Proc);
+        }
+
+        if (ctx.Supervisor != 0)
+        {
+            latches.Add(ctx.Supervisor);
+        }
+
+        foreach (nint proc in latches)
+        {
+            SetProcLatch(proc);
         }
     }
 

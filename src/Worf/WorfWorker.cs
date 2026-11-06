@@ -44,9 +44,9 @@ internal struct WorfWorker
 
     /// <summary>
     /// When the database's manager, which last exited with nothing to manage, as in a database without worf, began to
-    /// look at what it manages, on a slot that is free, or zero. The supervisor starts no manager for the database again
-    /// until its next regular look, or a transaction there that changes what it manages, as CREATE EXTENSION worf,
-    /// commits.
+    /// look at what it manages, on a slot that is free, or zero. The supervisor looks again only once something wakes it
+    /// with a change, and starts no manager for the database then until a transaction there that changes what it
+    /// manages, as CREATE EXTENSION worf, commits, or a supervisor interval has passed since the manager looked.
     /// </summary>
     public long IdleAt;
 

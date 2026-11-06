@@ -1,3 +1,5 @@
+using System.Diagnostics;
+
 namespace Worf.Tests;
 
 /// <summary>
@@ -50,5 +52,37 @@ public sealed class WorkerSlotTests
             "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = 'kept' AND backend_type LIKE 'worf manager%')", token),
             "the manager of the database created after them");
         Assert.DoesNotContain("all background worker slots are already used", node.ReadLog());
+    }
+
+    /// <summary>
+    /// CREATE EXTENSION worf in a prepared transaction gives the database its manager once COMMIT PREPARED commits it,
+    /// though the manager that PREPARE TRANSACTION woke found nothing to manage then.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task PreparedExtensionsGetTheirManager()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode node = await TestNode.StartAsync("node", ["max_prepared_transactions = 2"], token);
+        _ = await node.SafePsqlAsync(Database, "CREATE DATABASE prepared", token);
+        const string Manager = "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = 'prepared' AND backend_type LIKE 'worf manager%')";
+        _ = await node.SafePsqlAsync("prepared", $"""
+            BEGIN;
+            CREATE EXTENSION worf;
+            SELECT * FROM worf.create_node(node_name := 'prepared', dsn := '{node.Dsn("prepared")}');
+            PREPARE TRANSACTION 'extension';
+            """, token);
+
+        // The manager that the prepared transaction woke finds nothing to manage yet, and exits.
+        await Task.Delay(TimeSpan.FromSeconds(3), token);
+        Assert.IsTrue(await node.PollQueryUntilAsync(Database, $"SELECT NOT ({Manager})", token), "no manager while the extension is prepared");
+
+        _ = await node.SafePsqlAsync("prepared", "COMMIT PREPARED 'extension'", token);
+        Stopwatch starting = Stopwatch.StartNew();
+        while (await node.SafePsqlAsync(Database, Manager, token) != "t")
+        {
+            Assert.IsLessThan(TimeSpan.FromSeconds(30), starting.Elapsed, "the manager once COMMIT PREPARED committed the extension");
+            await Task.Delay(TimeSpan.FromMilliseconds(200), token);
+        }
     }
 }

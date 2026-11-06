@@ -372,10 +372,16 @@ internal static unsafe partial class Executor
             }
 
             // A dropped database's workers leave their slots, which the supervisor frees; a database that worf is
-            // created in, or that ALTER DATABASE may have made one to manage, gets its manager once that commits.
+            // created in, or that ALTER DATABASE may have made one to manage, gets its manager once that commits, and
+            // one whose prepared transaction did either once COMMIT PREPARED has committed it.
             if (parsetree->type == NodeTag.T_DropdbStmt)
             {
                 Worker.WakeSupervisor();
+            }
+            else if (parsetree->type == NodeTag.T_TransactionStmt &&
+                ((TransactionStmt*)parsetree)->kind == TransactionStmtKind.TRANS_STMT_COMMIT_PREPARED)
+            {
+                Worker.SignalPreparedCommitted();
             }
             else if (parsetree->type == NodeTag.T_CreateExtensionStmt &&
                 Worf.FromServer(((CreateExtensionStmt*)parsetree)->extname) == Worf.ExtensionName)
