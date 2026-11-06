@@ -101,12 +101,14 @@ internal static partial class SequenceRangeGuard
     private static readonly Dictionary<(uint Seqoid, long Lo), long> s_waited = [];
 
     // The active blocks, by sequence and start, that this transaction has tried to switch away from itself, as it ran
-    // them out, and the managed sequences that the COPY FROM statements running in this backend draw from, innermost
-    // last.
-    private static readonly HashSet<(uint Seqoid, long Lo)> s_switchedInTransaction = [];
+    // them out, each with the subtransaction that tried, and the managed sequences that the COPY FROM statements
+    // running in this backend draw from, innermost last.
+    private static readonly Dictionary<(uint Seqoid, long Lo), uint> s_switchedInTransaction = [];
 
-    // The sequences this transaction switched itself, which it holds against every other switch until it ends.
-    private static readonly HashSet<uint> s_switchedItself = [];
+    // The sequences this transaction switched itself, which it holds against every other switch until it ends, each with
+    // the subtransaction that switched it, whose rollback to a savepoint lets the sequence go and undoes the switch.
+    private static readonly Dictionary<uint, uint> s_switchedItself = [];
+    private static bool s_switchesRegistered;
     private static readonly List<List<uint>> s_copying = [];
 
     // The active blocks, by sequence and start, reserved for a load, which the range worker uses up before it switches.
@@ -480,9 +482,35 @@ internal static partial class SequenceRangeGuard
 
             (long lo, long hi, _) = sequence.Blocks[index];
             long? position = ReadPosition(seqoid);
-            if ((position is long p && (p < lo || p > hi)) || !Short(seqoid, sequence.Ascending, lo, hi, position, () => ReadPosition(seqoid)) ||
-                !WaitForSwitch(seqoid, lo))
+
+            // A position past the block, in the next one, as a switch to it that rolled back leaves it, has run the block
+            // out, while its bounds are still the block's, as has one at its last value.
+            bool past = position is long p && (sequence.Ascending ? p > hi : p < lo);
+            if (position is long q && (q < lo || q > hi) && !past)
             {
+                return;
+            }
+
+            if (!past && !Short(seqoid, sequence.Ascending, lo, hi, position, () => ReadPosition(seqoid)))
+            {
+                return;
+            }
+
+            if (!WaitForSwitch(seqoid, lo))
+            {
+                // A statement that would draw from a block run out, which no worker switched in time, switches it in its
+                // transaction, as one that drew the block's last value does, taking the lock on the sequence that nextval
+                // takes first.
+                if (past || position == (sequence.Ascending ? hi : lo))
+                {
+                    unsafe
+                    {
+                        NativeMethods.LockRelationOid(seqoid, (int)PgLockMode.RowExclusive);
+                    }
+
+                    SwitchInTransaction(seqoid, lo);
+                }
+
                 return;
             }
         }
@@ -1112,9 +1140,17 @@ internal static partial class SequenceRangeGuard
                     return admitted;
 
                 // A switch beside the transactions that hold the sequence moves it to the next block before it commits,
-                // and a value it issued from the block meanwhile is this node's.
+                // and so does one that rolled back, and a value it issued from the block meanwhile is this node's. The
+                // sequence's bounds are still the active block's, past which nextval fails, so the row is the active
+                // block's last: it waits for the switch, or switches in its transaction.
                 case "next":
-                    return Position(seqoid) is long issued && issued >= lo && issued <= hi && (sequence.Ascending ? issued >= value : issued <= value);
+                    bool issuedHere = Position(seqoid) is long issued && issued >= lo && issued <= hi && (sequence.Ascending ? issued >= value : issued <= value);
+                    if (issuedHere && sequence.Blocks.Find(block => block.State == "active") is (long activeLo, long activeHi, "active"))
+                    {
+                        NearEnd(seqoid, sequence.Ascending, activeLo, activeHi, sequence.Ascending ? activeHi : activeLo);
+                    }
+
+                    return issuedHere;
 
                 default:
                     return false;
@@ -1325,18 +1361,50 @@ internal static partial class SequenceRangeGuard
     /// </summary>
     private static void SwitchInTransaction(uint seqoid, long lo)
     {
-        if (!s_switchedInTransaction.Add((seqoid, lo)))
+        uint subxact;
+        unsafe
+        {
+            subxact = NativeMethods.GetCurrentSubTransactionId();
+        }
+
+        if (!s_switchedInTransaction.TryAdd((seqoid, lo), subxact))
         {
             return;
         }
 
         List<uint> held = LetGates();
 
-        if (s_switchedInTransaction.Count == 1)
+        // A savepoint that rolls back undoes the switches made under it, so the transaction may try them again.
+        if (s_switchedInTransaction.Count == 1 && !s_switchesRegistered)
         {
+            s_switchesRegistered = true;
             _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, ForgetSwitches);
             _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, ForgetSwitches);
             _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, ForgetSwitches);
+            _ = PgTransaction.RegisterSubtransactionCallback(PgSubtransactionEvent.Abort, static (aborted, parent) =>
+            {
+                foreach ((uint, long) block in s_switchedInTransaction.Where(entry => entry.Value == aborted.Value).Select(entry => entry.Key).ToList())
+                {
+                    _ = s_switchedInTransaction.Remove(block);
+                }
+
+                foreach (uint sequence in s_switchedItself.Where(entry => entry.Value == aborted.Value).Select(entry => entry.Key).ToList())
+                {
+                    _ = s_switchedItself.Remove(sequence);
+                }
+            });
+            _ = PgTransaction.RegisterSubtransactionCallback(PgSubtransactionEvent.Commit, static (committed, parent) =>
+            {
+                foreach ((uint, long) block in s_switchedInTransaction.Where(entry => entry.Value == committed.Value).Select(entry => entry.Key).ToList())
+                {
+                    s_switchedInTransaction[block] = parent.Value;
+                }
+
+                foreach (uint sequence in s_switchedItself.Where(entry => entry.Value == committed.Value).Select(entry => entry.Key).ToList())
+                {
+                    s_switchedItself[sequence] = parent.Value;
+                }
+            });
         }
 
         // A transaction that switched the sequence itself holds it against the range worker's switches, which would
@@ -1347,13 +1415,13 @@ internal static partial class SequenceRangeGuard
         {
             if (SequenceRanges.SwitchInTransaction(seqoid))
             {
-                _ = s_switchedItself.Add(seqoid);
+                _ = s_switchedItself.TryAdd(seqoid, subxact);
                 Reload();
                 break;
             }
 
             long now = Worker.GetCurrentTimestamp();
-            if (!s_switchedItself.Contains(seqoid) || now >= deadline)
+            if (!s_switchedItself.ContainsKey(seqoid) || now >= deadline)
             {
                 break;
             }
@@ -1376,6 +1444,7 @@ internal static partial class SequenceRangeGuard
     {
         s_switchedInTransaction.Clear();
         s_switchedItself.Clear();
+        s_switchesRegistered = false;
     }
 
     /// <summary>

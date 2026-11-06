@@ -1923,7 +1923,9 @@ public sealed class SequenceRangeTests
     /// sequence's range row, switches to the next block itself, once it has waited twice worf.sequence_range_timeout,
     /// without taking the range row, which would hold up every exchange until it ended, and with the lock_timeout the
     /// session set left as it was. Its switch is logged once it commits, and one that switched can't be prepared, as a
-    /// prepared transaction would hold the sequence across restarts; the refused one logs no switch.
+    /// prepared transaction would hold the sequence across restarts; the refused one logs no switch. A switch that rolls
+    /// back, or that a savepoint rolls back, leaves no insert to fail, and the savepoint's transaction may switch again or
+    /// be prepared, without the switch logged.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -2003,6 +2005,56 @@ public sealed class SequenceRangeTests
         Assert.AreEqual("0|", await node.SafePsqlAsync(Database, "SELECT count(*) FILTER (WHERE v = 2), (SELECT string_agg(gid, ',') FROM pg_prepared_xacts) FROM ts", token),
             "the refused transaction's rows and prepared transactions");
         Assert.AreEqual("", Switched(node.ReadLog()[logpos..]), "the refused transaction's switch, never logged");
+
+        // A switch that rolls back leaves the sequence in the next block, as its values may have been seen, while its
+        // bounds stay the active block's. A later insert then waits for the switch as at the block's end, or switches
+        // in its transaction, rather than fail. A savepoint that rolls a switch back lets its transaction switch again
+        // and be prepared, and its switch is never logged.
+        await using NpgsqlConnection other = await node.OpenAsync(Database, token);
+        foreach (string rollback in new[] { "ROLLBACK", "ROLLBACK TO SAVEPOINT s", "PREPARE" })
+        {
+            Assert.IsTrue(await node.PollQueryUntilAsync(Database,
+                "SELECT values_left > 0 AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 'ts_id_seq'::regclass", token),
+                $"ts's active and next blocks before {rollback}");
+            await using NpgsqlTransaction heldOnce = await holder.BeginTransactionAsync(token);
+            await using (NpgsqlCommand hold = new(Range, holder, heldOnce))
+            {
+                _ = await hold.ExecuteNonQueryAsync(token);
+            }
+
+            // The run draws the active block's last value and one of the next block's.
+            long left = long.Parse(await node.SafePsqlAsync(Database,
+                "SELECT values_left + 1 FROM worf.sequence_ranges WHERE sequence = 'ts_id_seq'::regclass", token), CultureInfo.InvariantCulture);
+            logpos = node.ReadLog().Length;
+            string runOut = $"INSERT INTO ts (v) SELECT 3 FROM generate_series(1, {left})";
+            string sql = rollback switch
+            {
+                "ROLLBACK" => $"BEGIN; {runOut}; ROLLBACK",
+                "ROLLBACK TO SAVEPOINT s" => $"BEGIN; SAVEPOINT s; {runOut}; ROLLBACK TO SAVEPOINT s; INSERT INTO ts (v) SELECT 4 FROM generate_series(1, 3); COMMIT",
+                _ => $"BEGIN; SAVEPOINT s; {runOut}; ROLLBACK TO SAVEPOINT s; PREPARE TRANSACTION 'unswitched'",
+            };
+            await using (NpgsqlCommand command = new(sql, switcher))
+            {
+                _ = await command.ExecuteNonQueryAsync(token);
+            }
+
+            if (rollback == "PREPARE")
+            {
+                Assert.AreEqual("", Switched(node.ReadLog()[logpos..]), "the switch the savepoint rolled back, never logged");
+                _ = await node.SafePsqlAsync(Database, "COMMIT PREPARED 'unswitched'", token);
+            }
+
+            await using (NpgsqlCommand insert = new("INSERT INTO ts (v) SELECT 5 FROM generate_series(1, 3)", other))
+            {
+                Assert.AreEqual(3, await insert.ExecuteNonQueryAsync(token), $"another session's rows after {rollback}");
+            }
+
+            await heldOnce.RollbackAsync(token);
+        }
+
+        Assert.AreEqual("3|9|t", await node.SafePsqlAsync(Database,
+            "SELECT count(*) FILTER (WHERE v = 4), count(*) FILTER (WHERE v = 5), count(*) = count(DISTINCT id) FROM ts", token),
+            "the rows after the switches that rolled back, each with its own key");
     }
 
     /// <summary>

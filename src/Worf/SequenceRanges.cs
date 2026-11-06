@@ -159,6 +159,7 @@ using Ankus.Postgres;
             a.lo AS active_lo, a.hi AS active_hi,
             CASE
                 WHEN a.block_id IS NULL THEN NULL
+                WHEN (s.seqincrement > 0 AND l.last_value > a.hi) OR (s.seqincrement < 0 AND l.last_value < a.lo) THEN 0
                 WHEN s.seqincrement > 0 THEN
                     (a.hi - CASE WHEN l.last_value BETWEEN a.lo AND a.hi THEN l.last_value ELSE a.lo::numeric - s.seqincrement END) / s.seqincrement
                 ELSE (CASE WHEN l.last_value BETWEEN a.lo AND a.hi THEN l.last_value ELSE a.hi::numeric - s.seqincrement END - a.lo) / -s.seqincrement
@@ -282,9 +283,12 @@ internal static unsafe partial class SequenceRanges
     private static readonly Dictionary<uint, string> s_handOffs = [];
     private static readonly HashSet<uint> s_unstarted = [];
 
-    // Whether this transaction switched a sequence itself, which it then can't prepare, and where a switch beside the
-    // transactions that hold a sequence moves it as its transaction ends.
-    private static bool s_refusePrepare;
+    // The subtransactions, by ID, in which this transaction switched a sequence itself, which it then can't prepare, or
+    // whose switches are logged as it commits, so that a switch that rolled back to a savepoint is neither; whether
+    // their callbacks are registered; and where a switch beside the transactions that hold a sequence moves it as its
+    // transaction ends.
+    private static readonly List<(uint Subxact, string? Logged)> s_switchedIn = [];
+    private static bool s_switchedInRegistered;
     private static (uint Seqoid, long Start)? s_pendingMove;
 
     /// <summary>
@@ -2814,6 +2818,9 @@ internal static unsafe partial class SequenceRanges
             LocalVersion++;
         });
 
+        // A savepoint that rolls back undoes the changes made under it too, as a switch, which this backend has read.
+        _ = PgTransaction.RegisterSubtransactionCallback(PgSubtransactionEvent.Abort, static (aborted, parent) => LocalVersion++);
+
         // A prepared transaction commits later, maybe in another session, which tells nobody, so the change is told as it
         // is prepared, and backends that read the state before it commits read it again on the next change.
         _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, static () =>
@@ -3893,11 +3900,75 @@ internal static unsafe partial class SequenceRanges
         }
 
         // Sessions' guards reload before any nextval reaches the block, which waits for the switch's lock until then. The
-        // switch is logged once it commits.
+        // switch is logged once it commits, unless a savepoint it's under rolls back first.
         ChangedOnCommit();
-        string switched = $"sequence {info.Name} switched to its block [{lo}, {hi}]";
-        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, () => WorfLog.Log(switched));
+        NoteSwitch($"sequence {info.Name} switched to its block [{lo}, {hi}]", false);
         return true;
+    }
+
+    /// <summary>
+    /// Notes a switch in the current subtransaction, to log once the transaction commits, or a session's own switch,
+    /// which the transaction can't be prepared with, unless the subtransaction rolls back first: a subtransaction that
+    /// commits passes its switches to its parent.
+    /// </summary>
+    /// <param name="logged">What to log of the switch, or null for a session's own switch.</param>
+    /// <param name="own">Whether it's a session's own switch.</param>
+    private static void NoteSwitch(string? logged, bool own)
+    {
+        if (!s_switchedInRegistered)
+        {
+            s_switchedInRegistered = true;
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.PrePrepare, static () =>
+            {
+                if (s_switchedIn.Exists(switched => switched.Logged is null))
+                {
+                    ForgetSwitched();
+                    throw new PgException(PgSqlStates.FeatureNotSupported,
+                        "cannot PREPARE a transaction that switched a managed sequence to its next block",
+                        hint: "The switch holds the sequence, which a prepared transaction would hold across restarts.");
+                }
+            });
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () =>
+            {
+                foreach ((uint _, string? logged) in s_switchedIn.Where(switched => switched.Logged is not null))
+                {
+                    WorfLog.Log(logged!);
+                }
+
+                ForgetSwitched();
+            });
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, ForgetSwitched);
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, ForgetSwitched);
+            _ = PgTransaction.RegisterSubtransactionCallback(PgSubtransactionEvent.Abort,
+                static (aborted, _) => s_switchedIn.RemoveAll(switched => switched.Subxact == aborted.Value));
+            _ = PgTransaction.RegisterSubtransactionCallback(PgSubtransactionEvent.Commit, static (committed, parent) =>
+            {
+                for (int i = 0; i < s_switchedIn.Count; i++)
+                {
+                    if (s_switchedIn[i].Subxact == committed.Value)
+                    {
+                        s_switchedIn[i] = (parent.Value, s_switchedIn[i].Logged);
+                    }
+                }
+            });
+        }
+
+        uint subxact = NativeMethods.GetCurrentSubTransactionId();
+        if (own)
+        {
+            s_switchedIn.Add((subxact, null));
+        }
+
+        if (logged is not null)
+        {
+            s_switchedIn.Add((subxact, logged));
+        }
+    }
+
+    private static void ForgetSwitched()
+    {
+        s_switchedIn.Clear();
+        s_switchedInRegistered = false;
     }
 
     /// <summary>
@@ -4026,18 +4097,11 @@ internal static unsafe partial class SequenceRanges
             return false;
         }
 
-        if (switched && !s_refusePrepare)
+        // The switch holds the sequence until the transaction ends, unless a savepoint it's under rolls back, which lets
+        // the lock go.
+        if (switched)
         {
-            s_refusePrepare = true;
-            _ = PgTransaction.RegisterCallback(PgTransactionEvent.PrePrepare, static () =>
-            {
-                s_refusePrepare = false;
-                throw new PgException(PgSqlStates.FeatureNotSupported,
-                    "cannot PREPARE a transaction that switched a managed sequence to its next block",
-                    hint: "The switch holds the sequence, which a prepared transaction would hold across restarts.");
-            });
-            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () => s_refusePrepare = false);
-            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, static () => s_refusePrepare = false);
+            NoteSwitch(null, true);
         }
 
         return switched;
