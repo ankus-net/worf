@@ -3935,6 +3935,18 @@ public sealed class SequenceRangeTests
             }
         }
 
+        // A node's last draws raise its high water, which reaches the nodes it doesn't exchange with only as a neighbor
+        // relays its report, so each node's record of every other node's high water is waited for too, before the while.
+        if (managed)
+        {
+            Stopwatch heard = Stopwatch.StartNew();
+            while (!await HighWaterHeardAsync(nodes, token))
+            {
+                Assert.IsLessThan(TestNode.PollTimeout, heard.Elapsed, "every node's record of the others' high water");
+                await Task.Delay(TimeSpan.FromMilliseconds(200), token);
+            }
+        }
+
         // Each exchange goes over the session its node keeps from the one before, so while the nodes manage sequences, each
         // slot's subscriber has a session for its exchanges that started before the while, where a session for each call
         // would last only as long as the call.
@@ -3979,6 +3991,35 @@ public sealed class SequenceRangeTests
 
             Assert.AreEqual("", written, $"{nodes[i].Name} wrote WAL while idle");
         }
+    }
+
+    /// <summary>
+    /// Checks whether each node's record of every other node's high water, for each sequence both manage, is the other
+    /// node's own.
+    /// </summary>
+    private static async Task<bool> HighWaterHeardAsync(TestNode[] nodes, CancellationToken token)
+    {
+        string[] own = await Task.WhenAll(nodes.Select(node => node.SafePsqlAsync(Database, """
+            SELECT coalesce(string_agg(r.seqoid::regclass::text || '=' || coalesce(r.high_water::text, ''), ','), '') FROM worf.sequence_range r
+            """, token)));
+        string[] heard = await Task.WhenAll(nodes.Select(node => node.SafePsqlAsync(Database, """
+            SELECT coalesce(string_agg(n.node_name || ':' || n.seqoid::regclass::text || '=' || coalesce(n.high_water::text, ''), ','), '')
+            FROM worf.sequence_range_node n CROSS JOIN worf.local_node l WHERE n.node_id <> l.node_id
+            """, token)));
+        Dictionary<string, string> owned = [];
+        for (int i = 0; i < nodes.Length; i++)
+        {
+            foreach (string entry in own[i].Split(',', StringSplitOptions.RemoveEmptyEntries))
+            {
+                owned[$"{nodes[i].Name}:{entry[..entry.IndexOf('=', StringComparison.Ordinal)]}"] = entry[(entry.IndexOf('=', StringComparison.Ordinal) + 1)..];
+            }
+        }
+
+        return heard.SelectMany(records => records.Split(',', StringSplitOptions.RemoveEmptyEntries)).All(record =>
+        {
+            int equals = record.IndexOf('=', StringComparison.Ordinal);
+            return !owned.TryGetValue(record[..equals], out string? value) || value == record[(equals + 1)..];
+        });
     }
 
     private static async Task ExecuteAsync(NpgsqlConnection connection, string sql, CancellationToken token)
