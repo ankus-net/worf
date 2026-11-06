@@ -60,8 +60,9 @@ public sealed class DocumentationTests
         Assert.Contains("or that changed the type of an identity column a managed sequence numbers, unless a savepoint rolled it back", s_sequenceRanges,
             "prepared column type changes (144)");
         Assert.Contains("holds up only that sequence's exchanges, which leave it out until the transaction ends", s_sequenceRanges, "prepared holders (144)");
-        Assert.Contains("after its server starts, a node draws from a block its parent granted only once a message of the parent's made after it heard of the start has come and committed",
+        Assert.Contains("after its server starts, a node draws from a block its parent granted only once a message of the parent's, made after it heard of the start and asked every reset it owes the node, has come and committed with each reset it asks taken in",
             s_sequenceRanges, "a returning node (46, 74)");
+        Assert.Contains("is asked to reset once it's heard from again after the fence lifted, whatever it reports", s_sequenceRanges, "an unchanged report");
 
         string ranges = Read("src", "Worf", "SequenceRanges.cs");
         Assert.DoesNotContain("which switches beside those transactions, without waiting for them, while the range worker checks", ranges,
