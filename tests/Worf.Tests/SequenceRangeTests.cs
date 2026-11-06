@@ -2079,7 +2079,8 @@ public sealed class SequenceRangeTests
     /// A provider that takes calls but never answers holds up a node's exchanges with its other neighbors only until its
     /// first call runs out of time: it's called after the others from then on, only while nothing waits on them or once
     /// a minute, for a second at most, giving way to a request that comes up meanwhile, so the node's inserts go on
-    /// through small blocks from the owner without waiting on it.
+    /// through small blocks from the owner without waiting on it. Once it answers again, a request that waits on it
+    /// reaches it, though requests on the owner keep coming up.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -2091,14 +2092,20 @@ public sealed class SequenceRangeTests
         await using TestNode nodeC = await StartNodeAsync("node_c", token);
         foreach (TestNode node in new[] { nodeA, nodeB, nodeC })
         {
-            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text); CREATE TABLE u (id bigserial PRIMARY KEY)", token);
         }
 
         await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
         await SubscribeAsync(nodeB, "b_from_c", nodeC, token);
         _ = await nodeA.SafePsqlAsync(Database,
             "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100, max_range_size := 100)", token);
+        _ = await nodeC.SafePsqlAsync(Database,
+            "SELECT worf.enable_sequence_range('u_id_seq', participants := '{node_b}', range_size := 10, max_range_size := 10)", token);
         await WaitActiveAsync([nodeA, nodeB], token);
+        const string UNext = "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 'u_id_seq'::regclass";
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, UNext, token), "node_b's blocks of u from node_c");
+        string nodeCDsn = await nodeB.SafePsqlAsync(Database,
+            "SELECT if_dsn FROM worf.node_interface WHERE if_nodeid = (SELECT node_id FROM worf.node WHERE node_name = 'node_c')", token);
 
         // node_b's calls to node_c go to a listener that takes connections and never answers.
         using TcpListener frozen = new(IPAddress.Loopback, 0);
@@ -2118,6 +2125,9 @@ public sealed class SequenceRangeTests
             WHERE if_nodeid = (SELECT node_id FROM worf.node WHERE node_name = 'node_c')
             """, token);
         Assert.IsTrue(await nodeB.PollLogAsync(logpos, "node node_c didn't answer within 5000 ms", token), "node_b's first call to node_c timed out");
+
+        // node_b runs into its next block of u, so that it waits on node_c for another.
+        _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO u SELECT FROM generate_series(1, 15)", token);
 
         // node_b draws two blocks a second from node_a for fifteen seconds, and no insert waits for one. The server times
         // each insert, as the test host's own clock counts the time its other tests keep it from reading the result.
@@ -2156,6 +2166,31 @@ public sealed class SequenceRangeTests
         Assert.IsGreaterThan(100, waits.Count, "node_b's inserts");
         Assert.IsLessThan(2500.0, waits[^1], "node_b's slowest insert, against the 5000 ms node_c's calls took");
         Assert.IsLessThan(1000.0, waits[(int)(waits.Count * 0.99)], "node_b's 99th percentile insert");
+
+        // Once node_c answers again, node_b's request for a block of u reaches it, though node_b's inserts into t keep
+        // requests on node_a coming up, which a call to a neighbor that ran out of time only gives way to while nothing
+        // waits on that neighbor itself.
+        _ = await nodeB.SafePsqlAsync(Database,
+            $"UPDATE worf.node_interface SET if_dsn = '{nodeCDsn}' WHERE if_nodeid = (SELECT node_id FROM worf.node WHERE node_name = 'node_c')", token);
+        using CancellationTokenSource drawing = CancellationTokenSource.CreateLinkedTokenSource(token);
+        Task drawingT = Task.Run(async () =>
+        {
+            await using NpgsqlConnection writer = await nodeB.OpenAsync(Database, token);
+            while (!drawing.Token.IsCancellationRequested)
+            {
+                await ExecuteAsync(writer, Insert, token);
+                await Task.Delay(TimeSpan.FromMilliseconds(5), token);
+            }
+        }, token);
+        try
+        {
+            Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, UNext, token), "node_b's next block of u, from node_c once it answers again");
+        }
+        finally
+        {
+            await drawing.CancelAsync();
+            await drawingT;
+        }
     }
 
     /// <summary>

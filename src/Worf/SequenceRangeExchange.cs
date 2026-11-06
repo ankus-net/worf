@@ -330,8 +330,11 @@ internal static class SequenceRangeExchange
                 break;
             }
 
+            // A neighbor whose last call ran out of time that this node waits on itself, as for a block it asked it for, is
+            // called as any other once its delay is up, with the whole timeout and giving way to no other request, so that
+            // a neighbor that missed a call isn't cut off for as long as requests on others keep coming up.
             long now = Worker.GetCurrentTimestamp();
-            SequenceRangeExchangeWorker.Probing = s_timedOut.Contains(sub.Id) ? sub.Origin.Id : 0;
+            SequenceRangeExchangeWorker.Probing = s_timedOut.Contains(sub.Id) && waiting is null ? sub.Origin.Id : 0;
             if (SequenceRangeExchangeWorker.Probing != 0)
             {
                 if (now - s_probedAt.GetValueOrDefault(sub.Id) < TimedOutBackoff && (othersWaited ||
