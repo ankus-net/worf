@@ -31,9 +31,13 @@ public sealed class WorkerSlotTests
                 CREATE EXTENSION worf;
                 SELECT * FROM worf.create_node(node_name := 'node{i}', dsn := '{node.Dsn(database)}');
                 """, token);
-            Assert.IsTrue(await node.PollQueryUntilAsync(Database,
-                $"SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = '{database}' AND backend_type LIKE 'worf manager%')", token),
-                $"{database}'s manager");
+            if (!await node.PollQueryUntilAsync(Database,
+                $"SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = '{database}' AND backend_type LIKE 'worf manager%')", token))
+            {
+                // The sessions and processes, as the supervisor's wait shows among them, say why no manager started.
+                Assert.Fail($"{database}'s manager\n{await node.DescribeReplicationAsync(Database, token)}");
+            }
+
             _ = await node.SafePsqlAsync(Database, $"DROP DATABASE {database} WITH (FORCE)", token);
         }
 
