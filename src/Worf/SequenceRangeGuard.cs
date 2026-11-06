@@ -33,6 +33,10 @@ internal static partial class SequenceRangeGuard
     private const byte DefaultLockMethod = 1;
     private const ushort GateKey = 3;
 
+    // A sequence's door, an advisory lock beside its gate with 4 as its objsubid, which a statement passes as it takes
+    // the gate, and a switch shuts as it waits for the gate, so that no statement takes the gate meanwhile.
+    private const ushort DoorKey = 4;
+
     // The switch gates this backend holds, by sequence, with the subtransaction that took each last, and the statements
     // that took them, by their query descriptors, or the COPY FROM they run, with the gates each took. The sequences
     // each table's defaults draw from, as of the blocks last read.
@@ -760,8 +764,13 @@ internal static partial class SequenceRangeGuard
     {
         HookExit();
         RegisterGates();
+
+        // The door, which a switch shuts, is passed on the way.
+        LOCKTAG door = GateTag(seqoid, DoorKey);
+        _ = NativeMethods.LockAcquire(&door, ShareLock, false, false);
         LOCKTAG tag = GateTag(seqoid);
         _ = NativeMethods.LockAcquire(&tag, ShareLock, false, false);
+        _ = NativeMethods.LockRelease(&door, ShareLock, false);
         s_gates[seqoid] = NativeMethods.GetCurrentSubTransactionId();
         CountDrawer(seqoid, 1);
     }
@@ -930,19 +939,47 @@ internal static partial class SequenceRangeGuard
         _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, Done);
         _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, Done);
         _ = Worf.Execute($"SET LOCAL lock_timeout = {timeout.ToString(CultureInfo.InvariantCulture)}");
+        LOCKTAG door = GateTag(seqoid, DoorKey);
+        _ = NativeMethods.LockAcquire(&door, ExclusiveLock, false, false);
+
+        // A statement that holds the gate while it waits for another lock, as an insert's for a key another transaction
+        // writes, has drawn its row's values, and lets the gate go at its next row, so the switch goes on beside it
+        // rather than wait: the transaction it waits for may be waiting for this switch, which the deadlock detector
+        // can't see. The shut door keeps statements from taking the gate meanwhile.
         LOCKTAG tag = GateTag(seqoid);
-        _ = NativeMethods.LockAcquire(&tag, ExclusiveLock, false, false);
+        long deadline = Worker.GetCurrentTimestamp() + (timeout * 1000L);
+        while (NativeMethods.LockAcquire(&tag, ExclusiveLock, false, true) == LockAcquireResult.LOCKACQUIRE_NOT_AVAIL)
+        {
+            if (Worf.ReadScalar<bool>("""
+                SELECT NOT EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_locks g LEFT JOIN pg_catalog.pg_stat_activity a ON a.pid = g.pid
+                    WHERE g.locktype = 'advisory' AND g.database = $1 AND g.classid = $2 AND g.objid = 0 AND g.objsubid = $3 AND g.granted
+                        AND g.pid <> pg_catalog.pg_backend_pid() AND a.wait_event_type IS DISTINCT FROM 'Lock')
+                """, SpiParameter.Create(DatabaseId()), SpiParameter.Create(seqoid), SpiParameter.Create((int)GateKey)))
+            {
+                return;
+            }
+
+            if (Worker.GetCurrentTimestamp() >= deadline)
+            {
+                throw new PgException("55P03", $"canceling statement due to lock timeout",
+                    detail: $"Statements drawing from sequence {SequenceRanges.GetInfo(seqoid).Name} held its switch gate.");
+            }
+
+            PgInterrupts.Check();
+            Worker.WaitLatch(20);
+        }
     }
 
     /// <summary>
     /// Names a sequence's switch gate.
     /// </summary>
-    private static LOCKTAG GateTag(uint seqoid) => new()
+    private static LOCKTAG GateTag(uint seqoid, ushort key = GateKey) => new()
     {
         locktag_field1 = DatabaseId(),
         locktag_field2 = seqoid,
         locktag_field3 = 0,
-        locktag_field4 = GateKey,
+        locktag_field4 = key,
         locktag_type = LockTagAdvisory,
         locktag_lockmethodid = DefaultLockMethod,
     };

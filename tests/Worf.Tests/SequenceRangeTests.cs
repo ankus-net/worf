@@ -2329,6 +2329,45 @@ public sealed class SequenceRangeTests
     }
 
     /// <summary>
+    /// A switch goes on beside a statement that holds the sequence's switch gate while it waits for another lock, which
+    /// has drawn its row's values: here an insert ON CONFLICT DO NOTHING waits for the key of a transaction that then
+    /// runs its block out and waits for the switch, a wait the deadlock detector can't see, and both end.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task SwitchesPassStatementsWaitingOnOtherLocks()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode node = await StartNodeAsync("node_a", token, "worf.sequence_range_timeout = 1000");
+        _ = await node.SafePsqlAsync(Database, """
+            CREATE TABLE k (id bigserial PRIMARY KEY, u int UNIQUE);
+            SELECT worf.enable_sequence_range('k_id_seq', participants := '{}', range_size := 100, max_range_size := 100);
+            """, token);
+        Assert.IsTrue(await node.PollQueryUntilAsync(Database,
+            "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 'k_id_seq'::regclass", token), "k's blocks");
+
+        await using NpgsqlConnection writer = await node.OpenAsync(Database, token);
+        await using NpgsqlTransaction writing = await writer.BeginTransactionAsync(token);
+        await ExecuteAsync(writer, "INSERT INTO k (u) VALUES (1)", token);
+        await using NpgsqlConnection waiter = await node.OpenAsync(Database, token);
+        Task waiting = ExecuteAsync(waiter, "INSERT INTO k (u) VALUES (1) ON CONFLICT DO NOTHING", token);
+        Assert.IsTrue(await node.PollQueryUntilAsync(Database,
+            $"SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = {waiter.ProcessID} AND locktype = 'transactionid' AND NOT granted)", token),
+            "the insert waiting for the key");
+
+        Stopwatch run = Stopwatch.StartNew();
+        await using (NpgsqlCommand past = new("INSERT INTO k (u) SELECT g FROM generate_series(2, 150) g", writer, writing))
+        {
+            Assert.AreEqual(149, await past.ExecuteNonQueryAsync(token), "the rows past the block's end");
+        }
+
+        Assert.IsLessThan(TimeSpan.FromSeconds(10), run.Elapsed, "the rows past the block's end, beside the waiting insert");
+        await writing.CommitAsync(token);
+        await waiting;
+        Assert.AreEqual("150|150", await node.SafePsqlAsync(Database, "SELECT count(*), count(DISTINCT id) FROM k", token), "the rows, each with its own key");
+    }
+
+    /// <summary>
     /// A statement that waits for a switch a worker tries and can't make, here as a session holds the range row, waits
     /// twice the exchange timeout for the block in all, rather than again at each of its rows after; a load through
     /// small blocks retires none of them unused, as statements still waiting for a switch that has come, until they next
@@ -2370,7 +2409,7 @@ public sealed class SequenceRangeTests
         }
 
         TimeSpan waited = await TailAsync("w");
-        Assert.IsLessThan(TimeSpan.FromSeconds(6), waited, "40 rows in the block's last twentieth, which waited for the switch once");
+        Assert.IsLessThan(TimeSpan.FromSeconds(3.5), waited, "40 rows in the block's last twentieth, which waited for the switch once");
 
         // Four writers draw one row at a time through blocks of ten.
         _ = await node.SafePsqlAsync(Database, """
@@ -2406,7 +2445,7 @@ public sealed class SequenceRangeTests
 
         TestContext.WriteLine($"1,050 sequences made, drawn from and dropped in {made.Elapsed}");
         waited = await TailAsync("n");
-        Assert.IsLessThan(TimeSpan.FromSeconds(6), waited, "40 rows in a new sequence's block's last twentieth, after 1,050 others");
+        Assert.IsLessThan(TimeSpan.FromSeconds(3.5), waited, "40 rows in a new sequence's block's last twentieth, after 1,050 others");
     }
 
     /// <summary>
