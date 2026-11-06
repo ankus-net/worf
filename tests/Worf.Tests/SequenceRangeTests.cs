@@ -2416,7 +2416,7 @@ public sealed class SequenceRangeTests
     {
         CancellationToken token = TestContext.CancellationToken;
         await using TestNode nodeA = await StartNodeAsync("node_a", token);
-        await using TestNode nodeB = await StartNodeAsync("node_b", token, "log_min_messages = debug1");
+        await using TestNode nodeB = await StartNodeAsync("node_b", token, "log_min_messages = debug2");
         await using TestNode nodeC = await StartNodeAsync("node_c", token);
         foreach (TestNode node in new[] { nodeA, nodeB, nodeC })
         {
@@ -2434,7 +2434,15 @@ public sealed class SequenceRangeTests
         _ = await nodeB.SafePsqlAsync(Database,
             $"UPDATE worf.node_interface SET if_dsn = 'host=192.0.2.1 port=5432 dbname={Database} user={SuperUser}' WHERE if_nodeid = (SELECT node_id FROM worf.node WHERE node_name = 'node_c')",
             token);
-        Assert.IsTrue(await nodeB.PollLogAsync(logpos, "exchange with node node_c failed: ", token), "node_b's first connection attempt to node_c failed");
+        if (!await nodeB.PollLogAsync(logpos, "exchange with node node_c failed: ", token))
+        {
+            Assert.Fail("node_b's first connection attempt to node_c failed; node_b's workers: " + await nodeB.SafePsqlAsync(Database, """
+                SELECT string_agg(concat_ws(' ', a.backend_type, a.pid, a.state, a.wait_event_type, a.wait_event, left(a.query, 120),
+                    (SELECT string_agg(concat_ws(':', l.locktype, l.mode, l.relation::regclass, l.objid, l.objsubid, l.transactionid), ';')
+                        FROM pg_locks l WHERE l.pid = a.pid AND NOT l.granted)), ' | ')
+                FROM pg_stat_activity a WHERE a.backend_type LIKE 'worf%'
+                """, token));
+        }
 
         // node_b draws two blocks a second from node_a for fifteen seconds, and no insert waits for one. The server times
         // each insert, as the test host's own clock counts the time its other tests keep it from reading the result.

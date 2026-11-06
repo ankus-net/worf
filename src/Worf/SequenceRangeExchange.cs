@@ -363,7 +363,9 @@ internal static class SequenceRangeExchange
             try
             {
                 _ = s_noSlot.Remove(sub.Id);
+                WorfLog.Debug2($"sequence range exchange with node {sub.Origin.Name} starting{(SequenceRangeExchangeWorker.Probing != 0 ? ", as a probe" : "")}");
                 (bool received, bool granted) = ExchangeWith(node, sub);
+                WorfLog.Debug2($"sequence range exchange with node {sub.Origin.Name} done");
 
                 // A provider whose slot isn't streamed yet is asked again after a check interval.
                 if (s_notStreamed.Contains(sub.Id))
