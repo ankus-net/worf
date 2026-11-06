@@ -83,7 +83,7 @@ public sealed class NameEncodingTests
         string query = "SELECT string_agg(pg_temp.counted(t, c, v), ',' ORDER BY n) FROM (VALUES " + string.Join(", ", tables.Select((table, i) =>
             $"({i}, convert_from('{table}', '{encoding}'), convert_from('{column}', '{encoding}'), 'v{i}')")) + ") s (n, t, c, v)";
         const string Counted = """
-            CREATE FUNCTION pg_temp.counted(tab text, col text, val text) RETURNS text LANGUAGE plpgsql AS $$
+            CREATE OR REPLACE FUNCTION pg_temp.counted(tab text, col text, val text) RETURNS text LANGUAGE plpgsql AS $$
             DECLARE
                 result text;
             BEGIN

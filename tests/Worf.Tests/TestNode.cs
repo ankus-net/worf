@@ -220,8 +220,8 @@ internal sealed class TestNode : IAsyncDisposable
 
     /// <summary>
     /// Runs a query until it returns <c>t</c>, as <c>poll_query_until</c> does, on one session while it lasts rather
-    /// than a session each time, which a server spawns a process for. A query that fails on the session, as once the
-    /// server restarted, runs again on a new one, whose failure ends the poll as a query's always has.
+    /// than a session each time, which a server spawns a process for. A server that refuses the session or drops it, as
+    /// while it starts or recovers or once it restarted, is polled again on a new one; any other failure ends the poll.
     /// </summary>
     /// <param name="dbname">The database.</param>
     /// <param name="sql">The query.</param>
@@ -235,22 +235,25 @@ internal sealed class TestNode : IAsyncDisposable
         {
             while (elapsed.Elapsed < PollTimeout)
             {
-                string result;
                 try
                 {
                     connection ??= await OpenAsync(dbname, cancellationToken);
-                    result = await QueryAsync(connection, sql, cancellationToken);
+                    if (await QueryAsync(connection, sql, cancellationToken) == "t")
+                    {
+                        return true;
+                    }
                 }
-                catch (NpgsqlException) when (connection is not null && !cancellationToken.IsCancellationRequested)
+                catch (NpgsqlException error) when (!cancellationToken.IsCancellationRequested &&
+                    (error is not PostgresException postgres || postgres.SqlState.StartsWith("57", StringComparison.Ordinal) ||
+                        postgres.SqlState.StartsWith("08", StringComparison.Ordinal)))
                 {
-                    await connection.DisposeAsync();
-                    connection = await OpenAsync(dbname, cancellationToken);
-                    result = await QueryAsync(connection, sql, cancellationToken);
-                }
-
-                if (result == "t")
-                {
-                    return true;
+                    // A server that is still starting or recovering refuses the connection, and one that restarted drops
+                    // it, so it's made again at the next poll; any other error fails at once.
+                    if (connection is not null)
+                    {
+                        await connection.DisposeAsync();
+                        connection = null;
+                    }
                 }
 
                 await Task.Delay(TimeSpan.FromMilliseconds(100), cancellationToken);
