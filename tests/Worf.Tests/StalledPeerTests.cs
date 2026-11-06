@@ -163,6 +163,53 @@ public sealed class StalledPeerTests
         await AppliesAsync(provider, subscriber, 6, token);
     }
 
+    /// <summary>
+    /// An apply worker that stops while it copies a subscription's tables starts the copy again, and a connection it
+    /// makes for the copy to a provider whose postmaster has stopped gives up after wal_receiver_timeout, naming what it
+    /// waited for, rather than wait on it for good; once the provider goes on, the copy completes. Processes are stopped
+    /// with signals, which Windows lacks.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [OSCondition(OperatingSystems.Linux | OperatingSystems.OSX)]
+    public async Task RestartedCopiesTimeOut()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode provider = await StartNodeAsync("provider", token);
+        await using TestNode subscriber = await StartNodeAsync("subscriber", token);
+        _ = await provider.SafePsqlAsync(Database, "INSERT INTO t SELECT g FROM generate_series(1, 1000000) g", token);
+        _ = await subscriber.SafePsqlAsync(Database, $"""
+            SELECT worf.create_subscription(
+                subscription_name := 'sub',
+                provider_dsn := '{provider.Dsn(Database, SuperUser)}',
+                synchronize_structure := false,
+                synchronize_data := true)
+            """, token);
+
+        // The apply worker stops while the copy's rows stream, and the provider's postmaster stops, so that the copy the
+        // restarted worker starts again connects to a server that takes the connection and never answers.
+        Assert.IsTrue(await provider.PollQueryUntilAsync(Database,
+            "SELECT EXISTS (SELECT FROM pg_stat_activity WHERE query LIKE 'COPY %' AND state = 'active')", token), "the copy streaming");
+        int logpos = subscriber.ReadLog().Length;
+        string providerPostmaster = Postmaster(provider);
+        await SignalAsync("-STOP", providerPostmaster, token);
+        try
+        {
+            _ = await subscriber.SafePsqlAsync(Database,
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE backend_type LIKE 'worf apply%'", token);
+            Assert.IsTrue(await subscriber.PollLogAsync(logpos, "timed out waiting for provider \"provider\"", token), "the copy giving up on its call");
+        }
+        finally
+        {
+            await SignalAsync("-CONT", providerPostmaster, token);
+        }
+
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+            "SELECT EXISTS (SELECT FROM worf.show_subscription_status() WHERE status = 'replicating')", token), "the subscription replicating");
+        Assert.AreEqual("1000000", await subscriber.SafePsqlAsync(Database, "SELECT count(*) FROM t", token), "the copied rows");
+        await AppliesAsync(provider, subscriber, 1000001, token);
+    }
+
     private static async Task AppliesAsync(TestNode provider, TestNode subscriber, int id, CancellationToken token)
     {
         _ = await provider.SafePsqlAsync(Database, $"INSERT INTO t VALUES ({id})", token);
