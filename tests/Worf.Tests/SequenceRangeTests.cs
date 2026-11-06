@@ -1797,6 +1797,7 @@ public sealed class SequenceRangeTests
     /// three holders, resets them all at once, as a node takes the resets of the node that granted its blocks whenever it lifts, though it takes
     /// another neighbor's no more than once in ten minutes. A lift that stops waiting for a node that's down asks it to
     /// reset once it's heard from again, at once too, and doesn't take the blocks it reports back into its ledger.
+    /// Requests to reset that a neighbor's role makes up reset the owner once in a window for the sequence.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -1872,6 +1873,37 @@ public sealed class SequenceRangeTests
         await nodeB.StartServerAsync(token);
         Assert.IsTrue(await nodeB.PollLogAsync(logged, "node node_a lifted its fence without this node's report", token), "node_b's reset once back");
         await WaitActiveAsync([nodeB], token);
+        await AssertNoSharedValuesAsync([nodeA, nodeB], token);
+
+        // Requests to reset that node_b's role makes up, as a neighbor's role can, reset node_a, the owner, once in a window
+        // for the sequence, which grows from ten minutes as such resets keep coming: the first resets it, and one right
+        // after doesn't.
+        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO t (v) VALUES ('a')", token);
+        string nodeAId = await nodeA.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
+        string bSlot = await nodeB.SafePsqlAsync(Database, "SELECT sub_slot_name FROM worf.subscription WHERE sub_name = 'b_from_a'", token);
+        string[] identity = (await nodeB.SafePsqlAsync(Database,
+            "SELECT (SELECT system_identifier FROM pg_control_system()), (SELECT timeline_id FROM pg_control_checkpoint()), pg_current_wal_insert_lsn()", token)).Split('|');
+        string[] range = (await nodeA.SafePsqlAsync(Database, """
+            SELECT epoch, range_size, max_range_size, coalesce(watermark::text, 'null'), coalesce(root_start::text, 'null'), coalesce(root_end::text, 'null')
+            FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass
+            """, token)).Split('|');
+        string Request(string reset) => $$"""
+            {"node_id": {{nodeBId}}, "node_name": "node_b", "slot": "{{bSlot}}", "sysid": "{{identity[0]}}", "timeline": {{identity[1]}}, "wal_lsn": "{{identity[2]}}", "sequences": [
+                {"name": "public.t_id_seq", "owner_id": {{nodeAId}}, "epoch": {{range[0]}}, "range_size": {{range[1]}}, "max_range_size": {{range[2]}},
+                    "distance": 1, "high_water": null, "watermark": {{range[3]}}, "state": "active", "root_start": {{range[4]}}, "root_end": {{range[5]}},
+                    "reset": "{{reset}}", "reset_done": null, "held_complete": false, "held": [], "requests": [], "reports": [], "grants": [], "acks": []}]}
+            """;
+        int asked = nodeA.ReadLog().Length;
+        _ = await nodeA.SafePsqlAsync(Database, $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{Request("0/10")}')", token);
+        Assert.Contains("node node_b asked this node to reset", nodeA.ReadLog()[asked..], "node_a's reset at node_b's made-up request");
+
+        // node_a draws from a block again, so that a reset would have something to give up.
+        await WaitActiveAsync([nodeA, nodeB], token);
+        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO t (v) VALUES ('a')", token);
+        asked = nodeA.ReadLog().Length;
+        _ = await nodeA.SafePsqlAsync(Database, $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{Request("0/11")}')", token);
+        Assert.DoesNotContain("asked this node to reset", nodeA.ReadLog()[asked..], "node_a's reset at node_b's next made-up request");
+        await WaitActiveAsync([nodeA, nodeB], token);
         await AssertNoSharedValuesAsync([nodeA, nodeB], token);
     }
 
