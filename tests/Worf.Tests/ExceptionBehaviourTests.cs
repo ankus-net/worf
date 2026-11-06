@@ -1531,7 +1531,7 @@ public sealed partial class ExceptionBehaviourTests
     /// unless worf has them, hold for the rows apply and the copy write: rows that conflict with none apply, and under
     /// discard, a change that conflicts is skipped and recorded, and so is a copied row that conflicts with an earlier
     /// one. Apply waits for a transaction here that wrote a conflicting row, and constraints on expressions and with
-    /// predicates hold as well.
+    /// predicates hold as well. Under error, a copy that conflicts fails naming the keys.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -1635,6 +1635,31 @@ public sealed partial class ExceptionBehaviourTests
             SELECT string_agg(concat_ws('|', operation, table_name, remote_new_tuple->>'id', error_sqlstate), ',')
             FROM worf.exception_log WHERE table_name = 'dz'
             """, token), "dz's conflict recorded");
+
+        // Under error, a copy whose rows conflict in a deferrable unique index or exclusion constraint fails with the
+        // keys in its detail, as PostgreSQL's recheck names them.
+        await SetBehaviourAsync(subscriber, "error", token);
+        foreach (TestNode node in new[] { provider, subscriber })
+        {
+            _ = await node.SafePsqlAsync(Database, node == provider
+                ? "CREATE TABLE du (id integer PRIMARY KEY, email text); CREATE TABLE dv (id integer PRIMARY KEY, r int4range)"
+                : "CREATE TABLE du (id integer PRIMARY KEY, email text UNIQUE DEFERRABLE); CREATE TABLE dv (id integer PRIMARY KEY, r int4range, EXCLUDE USING gist (r WITH &&) DEFERRABLE)",
+                token);
+        }
+
+        int logpos = subscriber.ReadLog().Length;
+        _ = await provider.SafePsqlAsync(Database, """
+            INSERT INTO du VALUES (1, 'u'), (2, 'u');
+            INSERT INTO dv VALUES (1, '[1,5)'), (2, '[3,8)');
+            SELECT * FROM worf.replication_set_add_table('default', 'du', synchronize_data := true);
+            SELECT * FROM worf.replication_set_add_table('default', 'dv', synchronize_data := true);
+            """, token);
+        Assert.IsTrue(await subscriber.PollLogAsync(logpos, "DETAIL:  Key (email)=(u) already exists.", token), "du's failed copy, naming the key");
+        Assert.IsTrue(await subscriber.PollLogAsync(logpos, ") conflicts with existing key (r)=([", token), "dv's failed copy, naming the keys");
+        _ = await provider.SafePsqlAsync(Database, """
+            SELECT worf.replication_set_remove_table('default', 'du');
+            SELECT worf.replication_set_remove_table('default', 'dv');
+            """, token);
     }
 
     /// <summary>
