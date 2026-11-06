@@ -95,6 +95,7 @@ Managed sequences can't cycle, be temporary or unlogged, or be in a replication 
 - changing the default or identity of a column that uses one, other than giving a column the sequence owns a default of `nextval` of it, and the default of a domain that uses one;
 - dropping, renaming or disabling the guard triggers and making them depend on an extension, and, wherever worf is installed, creating other triggers with their names or function or renaming a trigger to or from them;
 - `TRUNCATE ... RESTART IDENTITY` that would restart one, including through `CASCADE` or inheritance without `ONLY`.
+- `PREPARE TRANSACTION` for a transaction that switched one itself, or that ran `enable_sequence_range`, `alter_sequence_range`, `disable_sequence_range`, `activate_sequence_range`, `reset_sequence_range`, `reserve_sequence_range` or `reserve_sequence_values`, unless a savepoint rolled it back: a prepared transaction would hold the sequence, or its range row, across restarts, and the sequence could neither switch nor exchange blocks until it ended.
 
 A `CREATE TRIGGER` of the guard, as a restored dump holds, is skipped, since worf creates the triggers on the tables that need them, and replaces any triggers with their names that predate it. A column that uses a managed sequence can change its type, an identity column's sequence with it as long as the new type holds the blocks the node draws from, or be dropped, and worf puts the triggers back for the columns that still use one. A type change with `USING`, or from `numeric`, checks the column's rows again.
 

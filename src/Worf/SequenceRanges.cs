@@ -283,11 +283,11 @@ internal static unsafe partial class SequenceRanges
     private static readonly Dictionary<uint, string> s_handOffs = [];
     private static readonly HashSet<uint> s_unstarted = [];
 
-    // The subtransactions, by ID, in which this transaction switched a sequence itself, which it then can't prepare, or
-    // whose switches are logged as it commits, so that a switch that rolled back to a savepoint is neither; whether
-    // their callbacks are registered; and where a switch beside the transactions that hold a sequence moves it as its
-    // transaction ends.
-    private static readonly List<(uint Subxact, string? Logged)> s_switchedIn = [];
+    // The subtransactions, by ID, in which this transaction switched a sequence itself, or ran a function that holds a
+    // sequence's range row until it ends, which it then can't prepare, with what it did, or whose switches are logged as
+    // it commits, so that a switch or function that rolled back to a savepoint is neither; whether their callbacks are
+    // registered; and where a switch beside the transactions that hold a sequence moves it as its transaction ends.
+    private static readonly List<(uint Subxact, string? Logged, (string Did, string Hint)? Refused)> s_switchedIn = [];
     private static bool s_switchedInRegistered;
     private static (uint Seqoid, long Start)? s_pendingMove;
 
@@ -375,6 +375,7 @@ internal static unsafe partial class SequenceRanges
     {
         uint seqoid = RequireOwnedSequence(sequence);
         CheckSizes(seqoid, rangeSize, maxRangeSize);
+        HoldsRangeRow("worf.enable_sequence_range");
         Elevated.Run(() => Enable(seqoid, participants, rangeSize, maxRangeSize, poolStart, force == true));
     }
 
@@ -534,6 +535,7 @@ internal static unsafe partial class SequenceRanges
         [PgSqlType("name", Schema = "pg_catalog")] PgDatum? nodeName)
     {
         uint seqoid = RequireOwnedSequence(sequence);
+        HoldsRangeRow("worf.activate_sequence_range");
         if (nodeName is null || nodeName.IsNull)
         {
             Elevated.Run(() => ActivateOrLift(seqoid));
@@ -608,6 +610,7 @@ internal static unsafe partial class SequenceRanges
     {
         uint seqoid = RequireOwnedSequence(sequence);
         CheckSizes(seqoid, rangeSize, maxRangeSize);
+        HoldsRangeRow("worf.alter_sequence_range");
         Elevated.Run(() => RequireOwner(seqoid, WorfNode.GetLocalNode(true, false)!));
         Elevated.Run(() => _ = Worf.Execute("""
             UPDATE worf.sequence_range
@@ -629,6 +632,7 @@ internal static unsafe partial class SequenceRanges
     internal static void DisableSequenceRange([PgSqlType("regclass", Schema = "pg_catalog")] PgDatum sequence)
     {
         uint seqoid = RequireOwnedSequence(sequence);
+        HoldsRangeRow("worf.disable_sequence_range");
         Elevated.Run(() =>
         {
             RequireOwner(seqoid, WorfNode.GetLocalNode(true, false)!);
@@ -650,6 +654,7 @@ internal static unsafe partial class SequenceRanges
     {
         bool all = sequence is null || sequence.IsNull;
         uint named = all ? 0 : RequireOwnedSequence(sequence);
+        HoldsRangeRow("worf.reset_sequence_range");
 
         // The sequences go in the order of their names, as an exchange takes their range rows, so that the two never
         // deadlock, and each is locked against a DROP as it comes, so that one dropped meanwhile is passed over.
@@ -3902,35 +3907,42 @@ internal static unsafe partial class SequenceRanges
         // Sessions' guards reload before any nextval reaches the block, which waits for the switch's lock until then. The
         // switch is logged once it commits, unless a savepoint it's under rolls back first.
         ChangedOnCommit();
-        NoteSwitch($"sequence {info.Name} switched to its block [{lo}, {hi}]", false);
+        NoteSwitch($"sequence {info.Name} switched to its block [{lo}, {hi}]", null);
         return true;
     }
 
     /// <summary>
-    /// Notes a switch in the current subtransaction, to log once the transaction commits, or a session's own switch,
-    /// which the transaction can't be prepared with, unless the subtransaction rolls back first: a subtransaction that
-    /// commits passes its switches to its parent.
+    /// Refuses to prepare the transaction once a function has taken a sequence's range row in it, unless a savepoint
+    /// it ran under rolls back: a prepared transaction would hold the row across restarts, and the sequence could
+    /// neither switch nor exchange blocks until it ended.
     /// </summary>
-    /// <param name="logged">What to log of the switch, or null for a session's own switch.</param>
-    /// <param name="own">Whether it's a session's own switch.</param>
-    private static void NoteSwitch(string? logged, bool own)
+    /// <param name="function">The function.</param>
+    internal static void HoldsRangeRow(string function) => NoteSwitch(null, ($"ran {function}",
+        "The function holds the sequence's range row until the transaction ends, which a prepared transaction would hold across restarts, keeping the sequence from switching or exchanging blocks."));
+
+    /// <summary>
+    /// Notes a switch in the current subtransaction, to log once the transaction commits, or what the transaction can't
+    /// be prepared with, as a session's own switch, unless the subtransaction rolls back first: a subtransaction that
+    /// commits passes them to its parent.
+    /// </summary>
+    /// <param name="logged">What to log of the switch, or null.</param>
+    /// <param name="refused">What the transaction did that it can't be prepared with, and why, or null.</param>
+    private static void NoteSwitch(string? logged, (string Did, string Hint)? refused)
     {
         if (!s_switchedInRegistered)
         {
             s_switchedInRegistered = true;
             _ = PgTransaction.RegisterCallback(PgTransactionEvent.PrePrepare, static () =>
             {
-                if (s_switchedIn.Exists(switched => switched.Logged is null))
+                if (s_switchedIn.Find(switched => switched.Refused is not null).Refused is (string did, string hint))
                 {
                     ForgetSwitched();
-                    throw new PgException(PgSqlStates.FeatureNotSupported,
-                        "cannot PREPARE a transaction that switched a managed sequence to its next block",
-                        hint: "The switch holds the sequence, which a prepared transaction would hold across restarts.");
+                    throw new PgException(PgSqlStates.FeatureNotSupported, $"cannot PREPARE a transaction that {did}", hint: hint);
                 }
             });
             _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () =>
             {
-                foreach ((uint _, string? logged) in s_switchedIn.Where(switched => switched.Logged is not null))
+                foreach ((uint _, string? logged, _) in s_switchedIn.Where(switched => switched.Logged is not null))
                 {
                     WorfLog.Log(logged!);
                 }
@@ -3947,22 +3959,13 @@ internal static unsafe partial class SequenceRanges
                 {
                     if (s_switchedIn[i].Subxact == committed.Value)
                     {
-                        s_switchedIn[i] = (parent.Value, s_switchedIn[i].Logged);
+                        s_switchedIn[i] = s_switchedIn[i] with { Subxact = parent.Value };
                     }
                 }
             });
         }
 
-        uint subxact = NativeMethods.GetCurrentSubTransactionId();
-        if (own)
-        {
-            s_switchedIn.Add((subxact, null));
-        }
-
-        if (logged is not null)
-        {
-            s_switchedIn.Add((subxact, logged));
-        }
+        s_switchedIn.Add((NativeMethods.GetCurrentSubTransactionId(), logged, refused));
     }
 
     private static void ForgetSwitched()
@@ -4101,7 +4104,7 @@ internal static unsafe partial class SequenceRanges
         // the lock go.
         if (switched)
         {
-            NoteSwitch(null, true);
+            NoteSwitch(null, ("switched a managed sequence to its next block", "The switch holds the sequence, which a prepared transaction would hold across restarts."));
         }
 
         return switched;

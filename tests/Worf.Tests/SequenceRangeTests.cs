@@ -1926,7 +1926,8 @@ public sealed class SequenceRangeTests
     /// prepared transaction would hold the sequence across restarts; the refused one logs no switch, and
     /// worf.sequence_ranges shows its sequence meanwhile. A switch that rolls
     /// back, or that a savepoint rolls back, leaves no insert to fail, and the savepoint's transaction may switch again or
-    /// be prepared, without the switch logged.
+    /// be prepared, without the switch logged. Nor can a transaction that ran a function that takes the sequence's range
+    /// row be prepared.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -2061,6 +2062,18 @@ public sealed class SequenceRangeTests
         Assert.AreEqual("3|9|t", await node.SafePsqlAsync(Database,
             "SELECT count(*) FILTER (WHERE v = 4), count(*) FILTER (WHERE v = 5), count(*) = count(DISTINCT id) FROM ts", token),
             "the rows after the switches that rolled back, each with its own key");
+
+        // A transaction that ran a function that takes the sequence's range row can't be prepared either, as the row
+        // would stay held across restarts, unless a savepoint rolled the function back.
+        PostgresException altered = await Assert.ThrowsExactlyAsync<PostgresException>(() => node.SafePsqlAsync(Database,
+            "BEGIN; SELECT worf.alter_sequence_range('ts_id_seq', range_size := 10); PREPARE TRANSACTION 'altered'", token));
+        Assert.AreEqual("0A000|cannot PREPARE a transaction that ran worf.alter_sequence_range", $"{altered.SqlState}|{altered.MessageText}");
+        _ = await node.SafePsqlAsync(Database, """
+            BEGIN; SAVEPOINT a; SELECT worf.alter_sequence_range('ts_id_seq', range_size := 10); ROLLBACK TO SAVEPOINT a;
+            PREPARE TRANSACTION 'unaltered';
+            COMMIT PREPARED 'unaltered';
+            """, token);
+        Assert.AreEqual("", await node.SafePsqlAsync(Database, "SELECT string_agg(gid, ',') FROM pg_prepared_xacts", token), "prepared transactions");
     }
 
     /// <summary>

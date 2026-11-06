@@ -43,6 +43,7 @@ internal static class SequenceRangeReservations
     internal static void ReserveSequenceRange([PgSqlType("regclass", Schema = "pg_catalog")] PgDatum sequence, long count, PgInterval timeout)
     {
         uint seqoid = RequireOwnership(sequence);
+        SequenceRanges.HoldsRangeRow("worf.reserve_sequence_range");
         Elevated.Run(() => ReserveRange(seqoid, count, timeout));
     }
 
@@ -57,6 +58,7 @@ internal static class SequenceRangeReservations
     internal static void ReserveSequenceValues([PgSqlType("regclass", Schema = "pg_catalog")] PgDatum sequence, long lo, long hi, PgInterval timeout)
     {
         uint seqoid = RequireOwnership(sequence);
+        SequenceRanges.HoldsRangeRow("worf.reserve_sequence_values");
         Elevated.Run(() => ReserveValues(seqoid, lo, hi, timeout));
     }
 
