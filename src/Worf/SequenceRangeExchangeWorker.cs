@@ -16,6 +16,10 @@ internal static class SequenceRangeExchangeWorker
     // none would cancel a call that never ends.
     private const long Stopped = -1;
 
+    // The deadline the watcher leaves on a call it cancels until it has sent the cancel, which the call, if it ended on
+    // its own meanwhile, waits for.
+    private const long Cancelling = -2;
+
     // Whether this exchange worker's watcher stopped.
     private static bool s_unwatched;
 
@@ -135,18 +139,31 @@ internal static class SequenceRangeExchangeWorker
 
                 if (stopping || (deadline > 0 && now >= deadline) || givingWay)
                 {
-                    worker.Worker.Exchange.Deadline = stopping ? Stopped : 0;
+                    worker.Worker.Exchange.Deadline = stopping ? Stopped : Cancelling;
                     guard[i] = worker;
                 }
             }
         }
 
         // The call fails in the exchange worker, which tries the neighbor again later. One that has exited, as at a shutdown,
-        // is left alone.
+        // is left alone. The cancel sent, a call that ended on its own meanwhile, which waits for it, takes it.
         if (overdue != 0)
         {
             _ = PgBackgroundWorker.RunTransaction(() => Worf.ReadScalar<bool>(
                 "SELECT pg_catalog.pg_cancel_backend(pid) FROM pg_catalog.pg_stat_get_activity($1) WHERE pid IS NOT NULL", SpiParameter.Create(overdue)));
+        }
+
+        using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
+        {
+            for (int i = 0; i < guard.Length; i++)
+            {
+                WorfWorker worker = guard[i];
+                if (worker.WorkerType == WorfWorkerType.Exchange && worker.Dboid == dboid && worker.Worker.Exchange.Deadline == Cancelling)
+                {
+                    worker.Worker.Exchange.Deadline = 0;
+                    guard[i] = worker;
+                }
+            }
         }
 
         return running;
@@ -231,13 +248,75 @@ internal static class SequenceRangeExchangeWorker
         }
         finally
         {
-            // A call the watcher cancelled that ended first, as at its own time limit, which is the watcher's too, leaves
-            // the cancel to come later, during another call or between calls.
-            if (SetDeadline(0) == 0 && !canceled)
+            // A call the watcher cancelled that ended first, as at its own time limit, which is the watcher's too, takes
+            // the cancel that comes after it, so that it lands in no later call, nor in the work between calls.
+            if (SetDeadline(0) is 0 or Cancelling && !canceled)
             {
-                s_cancelOwed = true;
+                AwaitCancel();
             }
         }
+    }
+
+    /// <summary>
+    /// Waits for the cancel of a call that the watcher cancelled as it ended on its own, and takes it: until the watcher
+    /// has sent it and it has come, or, should the watcher fail first, for <c>worf.sequence_range_timeout</c>, after
+    /// which the next cancel that comes is taken for it. In a transaction, the cancel is taken in a subtransaction that
+    /// it rolls back, as an exception block takes an error.
+    /// </summary>
+    private static void AwaitCancel()
+    {
+        bool inTransaction;
+        unsafe
+        {
+            inTransaction = NativeMethods.IsTransactionState();
+        }
+
+        long started = Worker.GetCurrentTimestamp();
+        long sentAt = 0;
+        while (true)
+        {
+            try
+            {
+                if (inTransaction)
+                {
+                    if (PgInterrupts.IsPending)
+                    {
+                        PgTransaction.RunInSubtransaction(PgInterrupts.Check);
+                    }
+                }
+                else
+                {
+                    PgInterrupts.Check();
+                }
+            }
+            catch (PgQueryCanceledException)
+            {
+                return;
+            }
+
+            long now = Worker.GetCurrentTimestamp();
+            if (sentAt == 0 && Deadline() != Cancelling)
+            {
+                sentAt = now;
+            }
+
+            if ((sentAt != 0 && now - sentAt >= 1_000_000) || now - started >= SequenceRanges.ExchangeTimeout * 1000L)
+            {
+                s_cancelOwed = true;
+                return;
+            }
+
+            Worker.WaitLatch(10);
+        }
+    }
+
+    /// <summary>
+    /// Reads the deadline the exchange worker's slot holds.
+    /// </summary>
+    private static long Deadline()
+    {
+        using PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share();
+        return guard[Worker.MyWorfWorker].Worker.Exchange.Deadline;
     }
 
     /// <summary>
@@ -267,6 +346,15 @@ internal static class SequenceRangeExchangeWorker
         using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive();
         WorfWorker worker = guard[Worker.MyWorfWorker];
         long replaced = worker.Worker.Exchange.Deadline;
+        if (replaced == Cancelling && deadline == 0)
+        {
+            // The watcher marks the cancel sent itself.
+            worker.Worker.Exchange.Probing = 0;
+            worker.Worker.Exchange.StartedAt = 0;
+            guard[Worker.MyWorfWorker] = worker;
+            return replaced;
+        }
+
         if (replaced == Stopped)
         {
             s_unwatched = true;
