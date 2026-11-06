@@ -2765,11 +2765,18 @@ public sealed class SequenceRangeTests
         await using (NpgsqlConnection writer = await node.OpenAsync(Database, token))
         {
             Assert.IsTrue(await node.PollQueryUntilAsync(Database, Ready, token), "k's next block before the COPY");
+            string drawn = await node.SafePsqlAsync(Database, "SELECT pg_sequence_last_value('k_id_seq')", token);
             Task past;
             await using (TextWriter copy = await copier.BeginTextImportAsync("COPY k (u) FROM STDIN", token))
             {
+                // The COPY takes its row, and then waits for its client, before the other rows run past the block's end: a
+                // row it took later would let the switch they wait for pass, as rows do.
                 await copy.WriteAsync("10\n");
                 await copy.FlushAsync(token);
+                Assert.IsTrue(await node.PollQueryUntilAsync(Database, $"""
+                    SELECT pg_sequence_last_value('k_id_seq') IS DISTINCT FROM {(drawn == "" ? "NULL" : drawn)}
+                        AND EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = {copier.ProcessID} AND wait_event = 'ClientRead')
+                    """, token), "the COPY's row taken, and the COPY waiting for its client");
                 past = await PastTheEndAsync(writer);
                 Assert.IsTrue(await WaitingAtDoorAsync(writer), "the rows past the block's end waiting for the switch during the COPY");
                 await Task.Delay(TimeSpan.FromSeconds(3), token);
@@ -2963,6 +2970,8 @@ public sealed class SequenceRangeTests
         // anything while nothing changes.
         Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database,
             "SELECT bool_and(via_node <> node_id) FROM worf.sequence_range_node WHERE node_name = 'node_c'", token), "node_c's reports relayed");
+        Assert.IsTrue(await nodeC.PollQueryUntilAsync(Database,
+            "SELECT bool_and(via_node <> node_id) FROM worf.sequence_range_node WHERE node_name = 'node_a'", token), "node_a's reports relayed");
         await AssertIdleAsync(nodes, true, token);
 
         // node_b asks for another pool block once its pool blocks can't serve two more of node_c's last requests.
@@ -4014,6 +4023,14 @@ public sealed class SequenceRangeTests
             SELECT pg_snapshot_xmax(pg_current_snapshot()), clock_timestamp(),
                 (SELECT count(*) FROM pg_replication_slots WHERE plugin = 'worf' AND database = current_database()), pg_current_wal_insert_lsn()
             """;
+        // What each node holds of the sequences' ranges and the nodes it heard of, for a failure's message, which names what
+        // changed.
+        const string Held = """
+            SELECT coalesce(string_agg(row, E'\n' ORDER BY row), '') FROM (
+                SELECT 'range ' || to_jsonb(r)::text AS row FROM worf.sequence_range r
+                UNION ALL SELECT 'node ' || to_jsonb(n)::text FROM worf.sequence_range_node n) rows
+            """;
+        string[] heldBefore = managed ? await Task.WhenAll(nodes.Select(node => node.SafePsqlAsync(Database, Held, token))) : [];
         string[][] before = await Task.WhenAll(nodes.Select(async node => (await node.SafePsqlAsync(Database, Next, token)).Split('|')));
         await Task.Delay(idle, token);
         string[][] after = await Task.WhenAll(nodes.Select(async node => (await node.SafePsqlAsync(Database, Next, token)).Split('|')));
@@ -4039,7 +4056,16 @@ public sealed class SequenceRangeTests
                     """, token);
             }
 
-            Assert.AreEqual(before[i][0], after[i][0], $"{nodes[i].Name} used transaction IDs while idle: {written}");
+            string changed = "";
+            if (managed && before[i][0] != after[i][0])
+            {
+                string heldAfter = await nodes[i].SafePsqlAsync(Database, Held, token);
+                HashSet<string> rows = [.. heldBefore[i].Split('\n')];
+                changed = $"\nbefore: {string.Join("\n  ", heldBefore[i].Split('\n').Except(heldAfter.Split('\n')))}" +
+                    $"\nafter: {string.Join("\n  ", heldAfter.Split('\n').Where(row => !rows.Contains(row)))}";
+            }
+
+            Assert.AreEqual(before[i][0], after[i][0], $"{nodes[i].Name} used transaction IDs while idle: {written}{changed}");
             if (managed)
             {
                 Assert.AreEqual("t", await nodes[i].SafePsqlAsync(Database, $"""
