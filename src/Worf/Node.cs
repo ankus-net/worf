@@ -724,14 +724,20 @@ internal sealed partial class WorfNode
 
     /// <summary>
     /// Drops a replication origin that worf created, and records that worf applies nothing under its id from now on,
-    /// as an origin worf doesn't know can take the id next.
+    /// as an origin worf doesn't know can take the id next. A worker that has stopped lets its session's origin go only
+    /// as its process exits, which can come a while after it leaves its worker slot, as on Windows, so the drop waits
+    /// for that, as PostgreSQL's DROP SUBSCRIPTION does.
     /// </summary>
     /// <param name="originName">The origin.</param>
-    internal static void DropOrigin(string originName)
+    internal static unsafe void DropOrigin(string originName)
     {
         if (PgReplicationOrigin.Find(originName) is ushort origin)
         {
-            PgReplicationOrigin.Drop(originName, false);
+            fixed (byte* name = Worf.ToServerCString(originName))
+            {
+                NativeMethods.replorigin_drop_by_name((sbyte*)name, false, false);
+            }
+
             RecordOriginDropped(origin);
         }
     }
