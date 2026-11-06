@@ -1748,45 +1748,7 @@ public sealed class SequenceRangeTests
         Assert.DoesNotContain("node node_b saw this node's WAL position move backwards", nodeA.ReadLog()[forgedAt..], "node_a's resets on node_b's requests");
         Assert.AreEqual(1, nodeA.ReadLog()[forgedAt..].Split("the allocator's fence lifted").Length - 1, "node_a's fences lifted after the requests");
 
-        // Requests to reset that node_a, node_b's grantor, makes up as a fence's lift asks, naming no block node_b holds
-        // from it, reset node_b's sequence no more often than any neighbor's requests do, however many come and though
-        // node_b draws between them. One that names a block node_b holds from node_a resets it at once, and the same
-        // request again, once node_b has given the block up, doesn't.
-        string[] ownedNow = (await nodeA.SafePsqlAsync(Database, """
-            SELECT epoch, range_size, max_range_size, coalesce(watermark::text, 'null'), root_start, root_end
-            FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass
-            """, token)).Split('|');
-        string Lift(string reset, string grants) => $$"""
-            {"node_id": {{nodeAId}}, "node_name": "node_a", "slot": "{{slot}}", "sysid": "1", "timeline": 1, "wal_lsn": "0/0", "sequences": [
-                {"name": "public.t_id_seq", "owner_id": {{nodeAId}}, "epoch": {{ownedNow[0]}}, "range_size": {{ownedNow[1]}}, "max_range_size": {{ownedNow[2]}},
-                    "distance": 0, "high_water": null, "watermark": {{ownedNow[3]}}, "state": "active", "root_start": {{ownedNow[4]}}, "root_end": {{ownedNow[5]}},
-                    "reset": "{{reset}}", "reset_grants": [{{grants}}], "reset_done": null, "held_complete": false, "held": [], "requests": [], "reports": [],
-                    "grants": [], "acks": []}]}
-            """;
-        const string Lifted = "node node_a lifted a fence over grants of this node's that overlap another's";
-        int lifting = nodeB.ReadLog().Length;
-        for (int i = 1; i <= 4; i++)
-        {
-            await InsertAsync(nodeB, 20, token);
-            _ = await nodeB.SafePsqlAsync(Database,
-                $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{Lift($"FFFFFFFF/0000000{i}", "")}')", token);
-        }
-
-        Assert.IsLessThanOrEqualTo(1, nodeB.ReadLog()[lifting..].Split(Lifted).Length - 1, "node_b's resets on lifts that name none of its blocks");
-        await InsertAsync(nodeB, 20, token);
-        string heldBlock = await nodeB.SafePsqlAsync(Database, $"""
-            SELECT block_id FROM worf.sequence_range_block
-            WHERE seqoid = 't_id_seq'::regclass AND from_node = {nodeAId} AND state <> 'abandoned' ORDER BY received_at DESC LIMIT 1
-            """, token);
-        Assert.AreNotEqual("", heldBlock, "a block node_b holds from node_a");
-        lifting = nodeB.ReadLog().Length;
-        _ = await nodeB.SafePsqlAsync(Database,
-            $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{Lift("FFFFFFFF/00000010", $"\"{heldBlock}\"")}')", token);
-        Assert.AreEqual(1, nodeB.ReadLog()[lifting..].Split(Lifted).Length - 1, "node_b's reset on a lift that names a block it holds");
-        await InsertAsync(nodeB, 20, token);
-        _ = await nodeB.SafePsqlAsync(Database,
-            $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{Lift("FFFFFFFF/00000011", $"\"{heldBlock}\"")}')", token);
-        Assert.AreEqual(1, nodeB.ReadLog()[lifting..].Split(Lifted).Length - 1, "node_b's resets on the same lift again, once it gave the block up");
+        await LiftsResetOnlyAsTheyNameHeldBlocksAsync(nodeA, nodeB, nodeAId, slot, token);
 
         // node_a waits for node_c's own report after a reset while node_c is down, though node_b relays a fresh report of
         // node_c after node_a has lost its record of node_c's grants and reports, as a recovery to before them would, and
@@ -4041,6 +4003,51 @@ public sealed class SequenceRangeTests
             await connection.DisposeAsync();
             throw;
         }
+    }
+
+    /// <summary>
+    /// Requests to reset that node_a, node_b's grantor, makes up as a fence's lift asks, naming no block node_b holds
+    /// from it, reset node_b's sequence no more often than any neighbor's requests do, however many come and though
+    /// node_b draws between them. One that names a block node_b holds from node_a resets it at once, and the same request
+    /// again, once node_b has given the block up, doesn't.
+    /// </summary>
+    private static async Task LiftsResetOnlyAsTheyNameHeldBlocksAsync(TestNode nodeA, TestNode nodeB, string nodeAId, string slot, CancellationToken token)
+    {
+        string[] ownedNow = (await nodeA.SafePsqlAsync(Database, """
+            SELECT epoch, range_size, max_range_size, coalesce(watermark::text, 'null'), root_start, root_end
+            FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass
+            """, token)).Split('|');
+        string Lift(string reset, string grants) => $$"""
+            {"node_id": {{nodeAId}}, "node_name": "node_a", "slot": "{{slot}}", "sysid": "1", "timeline": 1, "wal_lsn": "0/0", "sequences": [
+                {"name": "public.t_id_seq", "owner_id": {{nodeAId}}, "epoch": {{ownedNow[0]}}, "range_size": {{ownedNow[1]}}, "max_range_size": {{ownedNow[2]}},
+                    "distance": 0, "high_water": null, "watermark": {{ownedNow[3]}}, "state": "active", "root_start": {{ownedNow[4]}}, "root_end": {{ownedNow[5]}},
+                    "reset": "{{reset}}", "reset_grants": [{{grants}}], "reset_done": null, "held_complete": false, "held": [], "requests": [], "reports": [],
+                    "grants": [], "acks": []}]}
+            """;
+        const string Lifted = "node node_a lifted a fence over grants of this node's that overlap another's";
+        int lifting = nodeB.ReadLog().Length;
+        for (int i = 1; i <= 4; i++)
+        {
+            await InsertAsync(nodeB, 20, token);
+            _ = await nodeB.SafePsqlAsync(Database,
+                $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{Lift($"FFFFFFFF/0000000{i}", "")}')", token);
+        }
+
+        Assert.IsLessThanOrEqualTo(1, nodeB.ReadLog()[lifting..].Split(Lifted).Length - 1, "node_b's resets on lifts that name none of its blocks");
+        await InsertAsync(nodeB, 20, token);
+        string heldBlock = await nodeB.SafePsqlAsync(Database, $"""
+            SELECT block_id FROM worf.sequence_range_block
+            WHERE seqoid = 't_id_seq'::regclass AND from_node = {nodeAId} AND state <> 'abandoned' ORDER BY received_at DESC LIMIT 1
+            """, token);
+        Assert.AreNotEqual("", heldBlock, "a block node_b holds from node_a");
+        lifting = nodeB.ReadLog().Length;
+        _ = await nodeB.SafePsqlAsync(Database,
+            $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{Lift("FFFFFFFF/00000010", $"\"{heldBlock}\"")}')", token);
+        Assert.AreEqual(1, nodeB.ReadLog()[lifting..].Split(Lifted).Length - 1, "node_b's reset on a lift that names a block it holds");
+        await InsertAsync(nodeB, 20, token);
+        _ = await nodeB.SafePsqlAsync(Database,
+            $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{Lift("FFFFFFFF/00000011", $"\"{heldBlock}\"")}')", token);
+        Assert.AreEqual(1, nodeB.ReadLog()[lifting..].Split(Lifted).Length - 1, "node_b's resets on the same lift again, once it gave the block up");
     }
 
     /// <summary>

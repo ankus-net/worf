@@ -1122,9 +1122,9 @@ internal static unsafe partial class Apply
                 recorded = since;
             }
 
-            if (!TrySetupSession(id) && (!DropRelayOrigins(id, dropped) || !TrySetupSession(id)) &&
-                (!DropRelayOrigins(id, dropped, true) || !TrySetupSession(id)) &&
-                (!DropRelayOrigins(id, dropped, true, false, 1) || !TrySetupSession(id)))
+            // Each pass gives up more of the worker's other relay origins, until the session has a slot.
+            Func<bool>[] freeing = [() => DropRelayOrigins(id, dropped), () => DropRelayOrigins(id, dropped, true), () => DropRelayOrigins(id, dropped, true, false, 1)];
+            if (!TrySetupSession(id) && !Array.Exists(freeing, free => free() && TrySetupSession(id)))
             {
                 throw NoRelaySlot(name, false);
             }
@@ -1465,9 +1465,12 @@ internal static unsafe partial class Apply
                 break;
             }
 
-            if ((progress >= latest && !newest) || id == keep || id == session || WorfNode.OriginName(id) is not string name || name == slotName ||
-                (held && s_relayUsedAt.TryGetValue(id, out long usedAt) && now - usedAt < RelayOriginHold) ||
-                (most != int.MaxValue && !WorfNode.HasOriginSlot(id)))
+            if ((progress >= latest && !newest) || id == keep || id == session || WorfNode.OriginName(id) is not string name || name == slotName)
+            {
+                continue;
+            }
+
+            if (Stays(id, held, most, now))
             {
                 continue;
             }
@@ -1489,6 +1492,11 @@ internal static unsafe partial class Apply
 
         return any;
     }
+
+    // Whether a relay origin stays as the worker gives slots up: one that set up the session lately while those are held,
+    // or, while only some are dropped, one that holds no slot to give.
+    private static bool Stays(ushort id, bool held, int most, long now)
+        => (held && s_relayUsedAt.TryGetValue(id, out long usedAt) && now - usedAt < RelayOriginHold) || (most != int.MaxValue && !WorfNode.HasOriginSlot(id));
 
     /// <summary>
     /// Moves an origin's progress forward, unless a process uses it.

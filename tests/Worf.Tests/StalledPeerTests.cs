@@ -124,13 +124,13 @@ public sealed class StalledPeerTests
             {
                 await stop.CancelAsync();
                 await taking;
-                foreach (TcpClient client in taken)
-                {
-                    client.Dispose();
-                }
-
                 _ = await subscriber.SafePsqlAsync(Database,
                     $"UPDATE worf.node_interface SET if_dsn = '{dsn.Replace("'", "''", StringComparison.Ordinal)}' WHERE if_nodeid = (SELECT node_id FROM worf.node WHERE node_name = 'provider')", token);
+            }
+
+            foreach (TcpClient client in taken)
+            {
+                client.Dispose();
             }
         }
 
