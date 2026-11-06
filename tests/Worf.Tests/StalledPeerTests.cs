@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using Npgsql;
@@ -210,6 +211,50 @@ public sealed class StalledPeerTests
         await AppliesAsync(provider, subscriber, 1000001, token);
     }
 
+    /// <summary>
+    /// With wal_receiver_timeout off, a call apply makes to its provider as it starts, here a connection that a stopped
+    /// postmaster never accepts, still gives up, after a minute, rather than wait for good. Processes are stopped with
+    /// signals, which Windows lacks.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [OSCondition(OperatingSystems.Linux | OperatingSystems.OSX)]
+    public async Task ProviderCallsTimeOutWithoutWalReceiverTimeout()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode provider = await StartNodeAsync("provider", token);
+        await using TestNode subscriber = await StartNodeAsync("subscriber", token, "0");
+        _ = await subscriber.SafePsqlAsync(Database, $"""
+            SELECT worf.create_subscription(
+                subscription_name := 'sub',
+                provider_dsn := '{provider.Dsn(Database, SuperUser)}',
+                synchronize_structure := false,
+                synchronize_data := false)
+            """, token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+            "SELECT EXISTS (SELECT FROM worf.show_subscription_status() WHERE status = 'replicating')", token), "the subscription replicating");
+        await AppliesAsync(provider, subscriber, 1, token);
+
+        int logpos = subscriber.ReadLog().Length;
+        string providerPostmaster = Postmaster(provider);
+        await SignalAsync("-STOP", providerPostmaster, token);
+        try
+        {
+            Stopwatch waiting = Stopwatch.StartNew();
+            _ = await subscriber.SafePsqlAsync(Database,
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE backend_type LIKE 'worf apply%'", token);
+            Assert.IsTrue(await subscriber.PollLogAsync(logpos,
+                "timed out waiting for provider \"provider\" to accept the replication connection", token), "apply giving up on the connection");
+            Assert.IsGreaterThan(TimeSpan.FromSeconds(55), waiting.Elapsed, "apply's wait for the connection, a minute with wal_receiver_timeout off");
+        }
+        finally
+        {
+            await SignalAsync("-CONT", providerPostmaster, token);
+        }
+
+        await AppliesAsync(provider, subscriber, 2, token);
+    }
+
     private static async Task AppliesAsync(TestNode provider, TestNode subscriber, int id, CancellationToken token)
     {
         _ = await provider.SafePsqlAsync(Database, $"INSERT INTO t VALUES ({id})", token);
@@ -224,14 +269,14 @@ public sealed class StalledPeerTests
         Assert.AreEqual(0, exitCode, error);
     }
 
-    private static async Task<TestNode> StartNodeAsync(string name, CancellationToken token)
+    private static async Task<TestNode> StartNodeAsync(string name, CancellationToken token, string walReceiverTimeout = "2s")
     {
         TestNode node = await TestNode.StartAsync(name,
         [
             "wal_level = logical",
             "max_wal_senders = 10",
             "max_replication_slots = 10",
-            "wal_receiver_timeout = '2s'",
+            $"wal_receiver_timeout = '{walReceiverTimeout}'",
         ], token);
         try
         {
