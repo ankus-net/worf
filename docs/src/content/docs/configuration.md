@@ -295,7 +295,7 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   this for each block in all while its next block is still to come, or once a
   worker has tried and couldn't switch it, and otherwise until it comes, as
   for a lock. A call to a node whose last call ran out of time waits a second
-  at most, until one answers. The default is `10s`.
+  at most, three for the connection, until one answers. The default is `10s`.
 
 - `worf.ddl_lock_timeout`
   How long DDL waits in all for the other nodes to hold back their writes and

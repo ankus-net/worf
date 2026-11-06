@@ -26,7 +26,16 @@ public sealed class DocumentationTests
             s_sequenceRanges, "a neighbor asking to reset (130)");
         Assert.Contains("and twice as long after each reset that comes within a day of the one before, up to a day", s_sequenceRanges,
             "how often made-up requests reset a node (6)");
-        Assert.Contains("and so are both holders of grants that overlap, on every forced lift", s_sequenceRanges, "a forced lift's resets (130, 47)");
+        Assert.DoesNotContain("both holders", s_sequenceRanges, "a forced lift's resets (130, 47)");
+        Assert.Contains("and so is every holder of grants that overlap, on every forced lift", s_sequenceRanges, "a forced lift's resets (130, 47)");
+        Assert.Contains("every holder of a grant that overlaps another resets, the others as they hear from this node", s_sequenceRanges,
+            "a forced lift's resets (130)");
+        Assert.DoesNotContain("while one that missed a call is reached again within a minute of answering", s_sequenceRanges, "a slow neighbor (130, 125)");
+        Assert.Contains("and is made again in the next round without giving way", s_sequenceRanges, "a slow neighbor (125)");
+        Assert.DoesNotContain("no more than once every ten minutes for each neighbor", s_sequenceRanges, "made-up resets (130, 211)");
+        Assert.Contains("so a grantor resets a node no more often than it grants it blocks", s_sequenceRanges, "a grantor's lifts (211)");
+        Assert.Contains("a node whose last call ran out of time, as one whose host drops connection attempts, after the others", s_sequenceRanges,
+            "an unreachable neighbor (212)");
         Assert.DoesNotContain("leaves no block's values unused", s_sequenceRanges, "a COPY's switch (130)");
         Assert.Contains("A switch retires what its block has left", s_sequenceRanges, "a COPY's switch (130)");
         Assert.Contains("a statement that would draw from it waits for the switch as at the block's end, or makes it in its transaction",
@@ -37,6 +46,8 @@ public sealed class DocumentationTests
 
         foreach ((string name, string text) in new[] { ("README.md", s_readme), ("configuration.md", s_configuration) })
         {
+            Assert.DoesNotContain("ran out of time waits a second at most, until one answers", text, $"a probe's time, in {name} (130)");
+            Assert.Contains("ran out of time waits a second at most, three for the connection, until one answers", text, $"a probe's time, in {name} (130)");
             Assert.DoesNotContain("wait up to twice this in all for the switch", text, $"how long inserts wait for a switch, in {name} (130)");
             Assert.Contains("up to twice this for each block in all while its next block is still to come, or once a worker has tried and couldn't switch it, and otherwise until it comes, as for a lock",
                 text, $"how long inserts wait for a switch, in {name} (130)");

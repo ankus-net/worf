@@ -60,4 +60,15 @@ internal struct WorfHeard
     /// twice as long after each reset that comes within a day of the one before, up to a day.
     /// </summary>
     public long ResetEvery;
+
+    /// <summary>
+    /// When a transaction that took in a message of the node's made after it heard of this server's start last
+    /// committed, or zero before one has since this server started.
+    /// </summary>
+    public long ConfirmedAt;
+
+    /// <summary>
+    /// When the node's server started, as its last message said, or zero.
+    /// </summary>
+    public long StartedAt;
 }

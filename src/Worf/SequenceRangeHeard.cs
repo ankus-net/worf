@@ -186,6 +186,92 @@ internal static class SequenceRangeHeard
     }
 
     /// <summary>
+    /// Gets when this server started, as its messages tell its neighbors, which they say back once they've heard it.
+    /// </summary>
+    internal static long Started
+    {
+        get
+        {
+            using PgLwLockShareGuard<WorfHeardTable, WorfHeard> guard = Nodes.Share();
+            return guard.Header.Since;
+        }
+    }
+
+    /// <summary>
+    /// Records when a node's server started, as its message says.
+    /// </summary>
+    /// <param name="nodeId">The node.</param>
+    /// <param name="startedAt">When its server started.</param>
+    internal static void RecordStarted(uint nodeId, long startedAt)
+    {
+        using PgLwLockExclusiveGuard<WorfHeardTable, WorfHeard> guard = Nodes.Exclusive();
+        int slot = Find(guard, nodeId, nodeId);
+        if (slot >= 0)
+        {
+            WorfHeard heard = guard[slot];
+            heard.StartedAt = startedAt;
+            guard[slot] = heard;
+        }
+    }
+
+    /// <summary>
+    /// Gets when a node's server started, as its last message said, or zero.
+    /// </summary>
+    /// <param name="nodeId">The node.</param>
+    /// <returns>The time.</returns>
+    internal static long StartedOf(uint nodeId)
+    {
+        uint dboid = DatabaseId();
+        using PgLwLockShareGuard<WorfHeardTable, WorfHeard> guard = Nodes.Share();
+        for (int i = 0; i < guard.Length; i++)
+        {
+            if (guard[i].Dboid == dboid && guard[i].NodeId == nodeId)
+            {
+                return guard[i].StartedAt;
+            }
+        }
+
+        return 0;
+    }
+
+    /// <summary>
+    /// Notes, as a transaction that took in a node's message commits, a message the node made once it had heard of this
+    /// server's start, that this server has heard from it since it started, and done what the message asked, as a reset.
+    /// </summary>
+    /// <param name="nodeId">The node.</param>
+    internal static void Confirm(uint nodeId)
+    {
+        using PgLwLockExclusiveGuard<WorfHeardTable, WorfHeard> guard = Nodes.Exclusive();
+        int slot = Find(guard, nodeId, nodeId);
+        if (slot >= 0)
+        {
+            WorfHeard heard = guard[slot];
+            heard.ConfirmedAt = Worker.GetCurrentTimestamp();
+            guard[slot] = heard;
+        }
+    }
+
+    /// <summary>
+    /// Checks whether this server has taken in a node's own message, and committed it, since it started.
+    /// </summary>
+    /// <param name="nodeId">The node.</param>
+    /// <returns>Whether it has.</returns>
+    internal static bool Confirmed(uint nodeId)
+    {
+        uint dboid = DatabaseId();
+        using PgLwLockShareGuard<WorfHeardTable, WorfHeard> guard = Nodes.Share();
+        for (int i = 0; i < guard.Length; i++)
+        {
+            if (guard[i].Dboid == dboid && guard[i].NodeId == nodeId)
+            {
+                return guard[i].ConfirmedAt != 0;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
     /// Checks whether the table holds a node's entry.
     /// </summary>
     /// <param name="nodeId">The node.</param>

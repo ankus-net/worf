@@ -149,11 +149,16 @@ internal static class SequenceRangeExchangeWorker
     }
 
     /// <summary>
-    /// Wakes the database's exchange worker, as when a request waits to be sent.
+    /// Wakes the database's exchange worker, as when a request waits to be sent, from a worker or a backend.
     /// </summary>
     internal static void Wake()
     {
-        uint dboid = Worker.MyWorker.Dboid;
+        uint dboid;
+        unsafe
+        {
+            dboid = NativeGlobals.MyDatabaseId;
+        }
+
         using PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share();
         for (int i = 0; i < guard.Length; i++)
         {
@@ -166,10 +171,30 @@ internal static class SequenceRangeExchangeWorker
 
     /// <summary>
     /// Gets or sets the node the calls about to be made go to, if its last call ran out of time, which they only probe
-    /// for a second at most, and give way to a request that waits on another node, so that a neighbor that stays frozen
-    /// holds up the calls to the others that little, until one answers in time; or zero.
+    /// for a second at most, three for the connection, and give way to a request that waits on another node, so that a
+    /// neighbor that stays frozen holds up the calls to the others that little, until one answers in time; or zero.
     /// </summary>
     internal static uint Probing { get; set; }
+
+    /// <summary>
+    /// Gets or sets whether a probe gives way to a request that waits on another node. One that gave way last time
+    /// doesn't, so that a neighbor slow to answer is reached though requests on the others keep coming.
+    /// </summary>
+    internal static bool Yields { get; set; } = true;
+
+    /// <summary>
+    /// Gets how long, in milliseconds, the last call that started had.
+    /// </summary>
+    internal static int LastLimit { get; private set; }
+
+    /// <summary>
+    /// Gets how long, in milliseconds, a call about to start has: <c>worf.sequence_range_timeout</c>, or, as a probe,
+    /// a second, or three for the connection, which takes a few round trips more.
+    /// </summary>
+    /// <param name="connecting">Whether the call makes the connection to the neighbor.</param>
+    /// <returns>The limit.</returns>
+    internal static int CallLimit(bool connecting)
+        => Probing != 0 ? Math.Min(SequenceRanges.ExchangeTimeout, connecting ? 3000 : 1000) : SequenceRanges.ExchangeTimeout;
 
     /// <summary>
     /// Makes a call to a neighbor, from the exchange worker, which its watcher cancels once it has taken longer than
@@ -187,8 +212,8 @@ internal static class SequenceRangeExchangeWorker
             throw new PgException("57P01", "the sequence range exchange worker is stopping");
         }
 
-        // A probe's connection, which takes a few round trips more than a call, has three seconds.
-        SetDeadline(Worker.GetCurrentTimestamp() + (Probing != 0 ? Math.Min(SequenceRanges.ExchangeTimeout, connecting ? 3000 : 1000) : SequenceRanges.ExchangeTimeout) * 1000L);
+        LastLimit = CallLimit(connecting);
+        SetDeadline(Worker.GetCurrentTimestamp() + (LastLimit * 1000L));
         try
         {
             return call();
@@ -224,7 +249,7 @@ internal static class SequenceRangeExchangeWorker
         }
 
         worker.Worker.Exchange.Deadline = deadline;
-        worker.Worker.Exchange.Probing = deadline != 0 ? Probing : 0;
+        worker.Worker.Exchange.Probing = deadline != 0 && Yields ? Probing : 0;
         worker.Worker.Exchange.StartedAt = deadline != 0 ? Worker.GetCurrentTimestamp() : 0;
         guard[Worker.MyWorfWorker] = worker;
     }

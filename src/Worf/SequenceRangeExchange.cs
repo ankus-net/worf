@@ -35,6 +35,13 @@ internal static class SequenceRangeExchange
     // When each subscription's provider whose last call ran out of time was last called, which the call that ran out of
     // time counts as.
     private static readonly Dictionary<uint, long> s_probedAt = [];
+
+    // The subscriptions whose last probe gave way to a request on another neighbor.
+    private static readonly HashSet<uint> s_gaveWay = [];
+
+    // The neighbors whose messages the current transaction took in, with when their servers started and whether they
+    // made them knowing this server was back, noted once it commits.
+    private static readonly List<(uint Sender, long? StartedAt, bool Confirmed)> s_onCommit = [];
     private const long TimedOutBackoff = 60_000_000;
     private const long TimedOutFirstBackoff = 10_000_000;
 
@@ -317,8 +324,10 @@ internal static class SequenceRangeExchange
 
         // A neighbor whose last call ran out of time goes last, so that the calls to the others don't wait on it, and is
         // called only while nothing waits on the others, as a block this node asked another neighbor for, or once a
-        // minute, so that a neighbor that never answers holds up the others' calls at most a second a minute. A request
-        // that comes up during the call has it give way.
+        // minute, so that a neighbor that never answers holds up the others' calls at most three seconds a minute. A
+        // request that comes up during the call has it give way, and the call is made again in the next round without
+        // giving way, so that a neighbor that answers, though slowly, is reached while requests on the others keep
+        // coming.
         long[] timedOutNodes = [.. due.Where(link => s_timedOut.Contains(link.Sub.Id)).Select(link => (long)link.Sub.Origin.Id)];
         bool othersWaited = due.Exists(link => !s_timedOut.Contains(link.Sub.Id) && link.Waiting is not null);
         bool changed = false;
@@ -332,9 +341,10 @@ internal static class SequenceRangeExchange
 
             long now = Worker.GetCurrentTimestamp();
             SequenceRangeExchangeWorker.Probing = s_timedOut.Contains(sub.Id) ? sub.Origin.Id : 0;
+            SequenceRangeExchangeWorker.Yields = !s_gaveWay.Contains(sub.Id);
             if (SequenceRangeExchangeWorker.Probing != 0)
             {
-                if (now - s_probedAt.GetValueOrDefault(sub.Id) < TimedOutBackoff && (othersWaited ||
+                if (SequenceRangeExchangeWorker.Yields && now - s_probedAt.GetValueOrDefault(sub.Id) < TimedOutBackoff && (othersWaited ||
                     PgBackgroundWorker.RunTransaction(() => Worf.ReadScalar<bool>("""
                         SELECT EXISTS (
                             SELECT 1 FROM worf.sequence_range_request
@@ -366,6 +376,7 @@ internal static class SequenceRangeExchange
                 _ = s_retries.Remove(sub.Id);
                 _ = s_timedOut.Remove(sub.Id);
                 _ = s_probedAt.Remove(sub.Id);
+                _ = s_gaveWay.Remove(sub.Id);
 
                 // An exchange that changed nothing while something waits makes the next one wait longer, up to the
                 // exchange interval, since the neighbor may not answer it for long, as when a root can't start or a
@@ -396,16 +407,19 @@ internal static class SequenceRangeExchange
                     break;
                 }
 
-                // A probe that gave way to a request on another neighbor before its second was up is tried again after
-                // the same delay, the neighbor having shown nothing new.
-                long probeLimit = Math.Min(SequenceRanges.ExchangeTimeout, 1000) * 1000L;
-                if (error is PgQueryCanceledException && SequenceRangeExchangeWorker.Probing != 0 && Worker.GetCurrentTimestamp() - now < probeLimit &&
-                    s_retries.TryGetValue(sub.Id, out (long At, long Delay) unanswered))
+                // A probe that gave way to a request on another neighbor before its time was up is made again in the
+                // next round, without giving way, the neighbor having shown nothing new.
+                long probeLimit = SequenceRangeExchangeWorker.LastLimit * 1000L;
+                if (error is PgQueryCanceledException && SequenceRangeExchangeWorker.Probing != 0 && SequenceRangeExchangeWorker.Yields &&
+                    Worker.GetCurrentTimestamp() - now < probeLimit && s_retries.TryGetValue(sub.Id, out (long At, long Delay) unanswered))
                 {
-                    s_retries[sub.Id] = (now + unanswered.Delay, unanswered.Delay);
+                    _ = s_gaveWay.Add(sub.Id);
+                    s_retries[sub.Id] = (now, unanswered.Delay);
                     WorfLog.Debug1($"sequence range exchange with node {sub.Origin.Name} gave way to a request waiting on another node");
                     continue;
                 }
+
+                _ = s_gaveWay.Remove(sub.Id);
 
                 // A failed exchange is tried again after a delay that doubles, up to the exchange interval, or half the
                 // exchange timeout while this node waits on the neighbor, as for a block, so that inserts waiting at a
@@ -413,7 +427,7 @@ internal static class SequenceRangeExchange
                 // cancelled has run out of time, which held up the calls to the other neighbors that came after it, so it
                 // backs off from ten seconds up to a minute, or the exchange interval if that is longer, whatever waits on
                 // the neighbor.
-                bool timedOut = error is PgQueryCanceledException;
+                bool timedOut = error is PgQueryCanceledException or PgException { SqlState: PgSqlStates.QueryCanceled };
                 long most = waiting is not null && !timedOut
                     ? Math.Min(SequenceRanges.ExchangeInterval * 1000L, SequenceRanges.ExchangeTimeout * 500L)
                     : timedOut ? Math.Max(SequenceRanges.ExchangeInterval * 1000L, TimedOutBackoff)
@@ -429,7 +443,7 @@ internal static class SequenceRangeExchange
                 delay = Math.Min(Math.Max(delay, Math.Max(least, SequenceRanges.CheckInterval * 1000L)), Math.Max(most, SequenceRanges.CheckInterval * 1000L));
                 s_retries[sub.Id] = (now + delay, delay);
                 string failure = error is PgQueryCanceledException
-                    ? $"node {sub.Origin.Name} didn't answer within {(SequenceRangeExchangeWorker.Probing != 0 ? probeLimit / 1000 : SequenceRanges.ExchangeTimeout).ToString(CultureInfo.InvariantCulture)} ms"
+                    ? $"node {sub.Origin.Name} didn't answer within {SequenceRangeExchangeWorker.LastLimit.ToString(CultureInfo.InvariantCulture)} ms"
                     : error.Message;
                 // While the subscription's first sync hasn't finished, its slot may not be there yet, or be made again,
                 // so a failure then is no news, and neither is the first exchange that finds the slot gone, as the
@@ -457,6 +471,7 @@ internal static class SequenceRangeExchange
         }
 
         SequenceRangeExchangeWorker.Probing = 0;
+        SequenceRangeExchangeWorker.Yields = true;
         return changed;
     }
 
@@ -616,10 +631,12 @@ internal static class SequenceRangeExchange
             return kept.Conn;
         }
 
+        // The host is checked within the connection's time, so that one that drops connection attempts runs out of time as
+        // one that takes them and never answers does.
         Disconnect(sub.Id);
-        RequireReachable(sub.OriginIf.Dsn, sub.Origin.Name);
         WorfConnection conn = PgBackgroundWorker.RunTransaction(() => SequenceRangeExchangeWorker.Bounded(connecting: true, call: () =>
         {
+            RequireReachable(sub.OriginIf.Dsn, sub.Origin.Name);
             WorfConnection opened = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "range");
             try
             {
@@ -648,10 +665,11 @@ internal static class SequenceRangeExchange
     }
 
     /// <summary>
-    /// Waits, no longer than <c>worf.sequence_range_timeout</c>, for a host the provider's connection string names to
-    /// accept a connection. libpq keeps no timeout of its own for the connection this backend waits for on its latch, so
-    /// a host that never answers would hold the worker, and the exchanges with every other provider, until the
-    /// operating system gives up. A provider reached over a local socket needs no check.
+    /// Waits, no longer than the connection's call has, for a host the provider's connection string names to accept a
+    /// connection. libpq keeps no timeout of its own for the connection this backend waits for on its latch, so a host
+    /// that never answers would hold the worker, and the exchanges with every other provider, until the operating
+    /// system gives up. One that hasn't answered in time has run out of time, as a call that the watcher cancels has; one
+    /// that refused has failed. A provider reached over a local socket needs no check.
     /// </summary>
     private static void RequireReachable(string dsn, string nodeName)
     {
@@ -669,7 +687,8 @@ internal static class SequenceRangeExchange
 
         string[] ports = (options.GetValueOrDefault("port") is { Length: > 0 } port ? port
             : Environment.GetEnvironmentVariable("PGPORT") is { Length: > 0 } environment ? environment : "5432").Split(',');
-        long deadline = Worker.GetCurrentTimestamp() + (SequenceRanges.ExchangeTimeout * 1000L);
+        int limit = SequenceRangeExchangeWorker.LastLimit;
+        long deadline = Worker.GetCurrentTimestamp() + (limit * 1000L);
         for (int i = 0; i < hosts.Length; i++)
         {
             if (int.TryParse(ports[ports.Length == 1 ? 0 : Math.Min(i, ports.Length - 1)], NumberStyles.None, CultureInfo.InvariantCulture, out int number) &&
@@ -679,8 +698,8 @@ internal static class SequenceRangeExchange
             }
         }
 
-        throw new PgException(PgSqlStates.ConnectionFailure,
-            $"could not reach node {nodeName} within {SequenceRanges.ExchangeTimeout.ToString(CultureInfo.InvariantCulture)} ms");
+        throw new PgException(Worker.GetCurrentTimestamp() >= deadline ? PgSqlStates.QueryCanceled : PgSqlStates.ConnectionFailure,
+            $"could not reach node {nodeName} within {limit.ToString(CultureInfo.InvariantCulture)} ms");
     }
 
     /// <summary>
@@ -868,6 +887,11 @@ internal static class SequenceRangeExchange
                 writer.WriteString("slot", WorfJson.Encode(slot));
             }
 
+            // When this server started, and when the neighbor's did, as it last said, which tells it that a message
+            // this server makes from now on was made knowing it's back.
+            writer.WriteNumber("started_at", SequenceRangeHeard.Started);
+            writer.WriteNumber("heard_started_at", SequenceRangeHeard.StartedOf(neighbor));
+
             writer.WriteStartArray("sequences");
             // An epoch this node owned of a sequence it dropped goes out as disabled, with nothing else.
             WorfRows sequences = Worf.SelectCatalog("""
@@ -944,8 +968,18 @@ internal static class SequenceRangeExchange
             "SELECT reset_lsn::text, reset_done::text, state = 'fenced' FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2",
             seq, peer);
         bool neighborFenced = neighborRow.Count > 0 && neighborRow[0].Get<bool?>(2) == true;
-        WriteNullable(writer, "reset", neighborRow.Count > 0 ? neighborRow[0].Get<string?>(0) : null);
+        string? askedReset = neighborRow.Count > 0 ? neighborRow[0].Get<string?>(0) : null;
+        WriteNullable(writer, "reset", askedReset);
         WriteNullable(writer, "reset_done", neighborRow.Count > 0 ? neighborRow[0].Get<string?>(1) : null);
+
+        // A fence's lift names the grants this node made the neighbor that it hasn't heard the neighbor give up, of which
+        // the neighbor must hold one for the lift to reset it at once.
+        if (askedReset is not null && IsLift(askedReset))
+        {
+            WriteArray(writer, "reset_grants", Worf.SelectCatalog("""
+                SELECT grant_id FROM worf.sequence_range_grant WHERE seqoid = $1 AND grantee_id = $2 AND kind <> 'x' AND state <> 'abandoned'
+                """, seq, peer), grant => writer.WriteStringValue(grant.Get<Guid>(0)));
+        }
 
         // The blocks this node holds from the neighbor: every one while the neighbor is a fenced allocator, so
         // that it can rebuild its ledger, and otherwise those abandoned lately, which it marks so.
@@ -1067,6 +1101,10 @@ internal static class SequenceRangeExchange
         // The neighbor is heard from now, in shared memory, which an exchange that changes nothing else is all it writes to,
         // unless shared memory has no room for it, and then its report is written to the tables.
         bool heard = SequenceRangeHeard.Record(senderId, senderId, Worker.GetCurrentTimestamp());
+        bool knowsStart = root.TryGetProperty("heard_started_at", out JsonElement heardStarted) && heardStarted.TryGetInt64(out long heardStartedAt) &&
+            heardStartedAt == SequenceRangeHeard.Started;
+        OnCommit(senderId, root.TryGetProperty("started_at", out JsonElement started) && started.TryGetInt64(out long startedAt) ? startedAt : null, knowsStart);
+
         if (!root.TryGetProperty("sequences", out JsonElement sequences))
         {
             return (false, false);
@@ -1545,7 +1583,8 @@ internal static class SequenceRangeExchange
         // The neighbor asks this node to reset, once per rollback it saw, or has reset as this node asked. A node that
         // has neither started drawing from a block nor granted one since it last reset has nothing it could issue or
         // grant twice, so a request then, unless it shows this node's WAL position behind where the neighbor saw it, as a
-        // rollback leaves it, only stops the neighbor asking. Any other resets it, as often as
+        // rollback leaves it, or comes from a fence's lift, which may have given the blocks it holds out again, only
+        // stops the neighbor asking. Any other resets it, as often as
         // SequenceRangeHeard.MayReset lets the neighbor, whatever WAL position it claims, and the sequence once in those
         // ten minutes, however many requests come in the minute that a rollback's resets take.
         if (Text(entry, "reset") is string reset && Worf.ReadScalar<bool>(
@@ -1561,10 +1600,18 @@ internal static class SequenceRangeExchange
 
             // A fence's lift asks the holders of the grants it gave out again, or that overlap, to reset, which the
             // node that granted them may ask at once, however recently it asked before, as it decides those blocks in
-            // any case; a request from any other neighbor waits for SequenceRangeHeard.MayReset.
-            bool lifted = reset.StartsWith("FFFFFFFF/", StringComparison.Ordinal) || reset.StartsWith("FFFFFFFE/", StringComparison.Ordinal);
-            bool fromGrantor = lifted && Worf.ReadScalar<bool>("SELECT parent_node = $2 FROM worf.sequence_range WHERE seqoid = $1", seq, sender);
-            if (!behind && !SequenceRanges.ActedSinceReset(seqoid, node))
+            // any case, when it names a block this node holds from it, which the reset gives up, so that it can't reset
+            // this node more often than it grants it blocks; any other request waits for SequenceRangeHeard.MayReset.
+            Guid[] named = entry.TryGetProperty("reset_grants", out JsonElement grants) && grants.ValueKind == JsonValueKind.Array
+                ? [.. grants.EnumerateArray().Select(grant => grant.ValueKind == JsonValueKind.String && grant.TryGetGuid(out Guid id) ? id : Guid.Empty)]
+                : [];
+            bool fromGrantor = IsLift(reset) && named.Length > 0 && Worf.ReadScalar<bool>("""
+                SELECT r.parent_node = $2 AND EXISTS (
+                    SELECT 1 FROM worf.sequence_range_block b
+                    WHERE b.seqoid = $1 AND b.from_node = $2 AND b.block_id = ANY ($3) AND b.state <> 'abandoned')
+                FROM worf.sequence_range r WHERE r.seqoid = $1
+                """, seq, sender, SpiParameter.Create(named));
+            if (!behind && !IsLift(reset) && !SequenceRanges.ActedSinceReset(seqoid, node))
             {
                 _ = Worf.Execute("UPDATE worf.sequence_range_node SET reset_done = $3::pg_lsn WHERE seqoid = $1 AND node_id = $2", seq, sender,
                     SpiParameter.Create(reset));
@@ -2079,6 +2126,45 @@ internal static class SequenceRangeExchange
         => entry.TryGetProperty("holds", out JsonElement holds) && holds.ValueKind == JsonValueKind.Array
             ? [.. holds.EnumerateArray().Select(number => number.GetInt64())]
             : null;
+
+    /// <summary>
+    /// Notes, once the transaction that takes in a neighbor's message commits, when the neighbor's server started, which
+    /// this server's messages say back from then on, so that one says it only once what this server made of the
+    /// neighbor's return, as a request to reset, has committed and goes out with it; and, for a message the neighbor made
+    /// knowing this server was back, that this server has heard from it since it started, with what the message asked
+    /// done. A savepoint that rolls back forgets what was noted so far.
+    /// </summary>
+    private static void OnCommit(uint senderId, long? startedAt, bool confirmed)
+    {
+        if (s_onCommit.Count == 0)
+        {
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () =>
+            {
+                foreach ((uint sender, long? started, bool confirmed) in s_onCommit)
+                {
+                    if (started is long at)
+                    {
+                        SequenceRangeHeard.RecordStarted(sender, at);
+                    }
+
+                    if (confirmed)
+                    {
+                        SequenceRangeHeard.Confirm(sender);
+                    }
+                }
+
+                s_onCommit.Clear();
+            });
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, static () => s_onCommit.Clear());
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, static () => s_onCommit.Clear());
+            _ = PgTransaction.RegisterSubtransactionCallback(PgSubtransactionEvent.Abort, static (_, _) => s_onCommit.Clear());
+        }
+
+        s_onCommit.Add((senderId, startedAt, confirmed));
+    }
+
+    // Whether a request to reset comes from a fence's lift, at a WAL position past any real one.
+    private static bool IsLift(string reset) => reset.StartsWith("FFFFFFFF/", StringComparison.Ordinal) || reset.StartsWith("FFFFFFFE/", StringComparison.Ordinal);
 
     private static void WriteNullable(Utf8JsonWriter writer, string name, long? value)
     {

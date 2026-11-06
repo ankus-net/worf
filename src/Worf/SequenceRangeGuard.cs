@@ -78,6 +78,11 @@ internal static partial class SequenceRangeGuard
     private static readonly Dictionary<uint, (bool Ascending, List<(long Lo, long Hi, string State)> Blocks)> s_sequences = [];
     private static readonly HashSet<uint> s_moved = [];
     private static long s_version = -1;
+
+    // The node that granted each sequence's active block, its parent, when another node did, and the grantors this
+    // backend has seen this server hear from since it started.
+    private static readonly Dictionary<uint, uint> s_grantors = [];
+    private static readonly HashSet<uint> s_confirmed = [];
     private static long s_localVersion = -1;
 
     // The furthest position each sequence is known to have reached, which only moves forward within a block.
@@ -474,14 +479,27 @@ internal static partial class SequenceRangeGuard
     /// </summary>
     private static void WaitWhileShort(uint seqoid)
     {
+        WaitForGrantor(seqoid);
+        bool waitedForBlock = false;
         while (true)
         {
             Refresh();
             Reload();
-            if (!s_sequences.TryGetValue(seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) sequence) ||
-                sequence.Blocks.FindIndex(block => block.State == "active") is not (int index and >= 0))
+            if (!s_sequences.TryGetValue(seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) sequence))
             {
                 return;
+            }
+
+            if (sequence.Blocks.FindIndex(block => block.State == "active") is not (int index and >= 0))
+            {
+                // A sequence with no block to draw from, as one that just reset, waits for the block it asked for, once.
+                if (waitedForBlock || !WaitForBlock(seqoid))
+                {
+                    return;
+                }
+
+                waitedForBlock = true;
+                continue;
             }
 
             (long lo, long hi, _) = sequence.Blocks[index];
@@ -518,6 +536,107 @@ internal static partial class SequenceRangeGuard
                 return;
             }
         }
+    }
+
+    /// <summary>
+    /// Waits, with the statement's gates let go, for a sequence that has no block to draw from, as one that just reset,
+    /// to switch to the one its range worker asks for, while the sequence is active, or quarantined until its blocks
+    /// come, up to twice <c>worf.sequence_range_timeout</c>, as for the next block at a block's end.
+    /// </summary>
+    /// <returns>Whether the sequence has a block to draw from.</returns>
+    private static bool WaitForBlock(uint seqoid)
+    {
+        SpiParameter seq = SpiParameter.Create(seqoid);
+        bool Coming() => Elevated.Run(() => Worf.SelectCatalog(
+            "SELECT EXISTS (SELECT 1 FROM worf.sequence_range WHERE seqoid = $1 AND state IN ('active', 'quarantined'))", seq)[0].Get<bool>(0));
+        if (!Coming())
+        {
+            return false;
+        }
+
+        List<uint> held = LetGates();
+        try
+        {
+            long deadline = Worker.GetCurrentTimestamp() + (SequenceRanges.ExchangeTimeout * 2000L);
+            long checkedComing = Worker.GetCurrentTimestamp();
+            while (true)
+            {
+                _ = PgAtomic.Add(SequenceRanges.CheckRequested, 1L);
+                Worker.WakeRangeWorker();
+                PgInterrupts.Check();
+                Worker.WaitLatch(50);
+                Reload();
+                if (s_sequences.TryGetValue(seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) sequence) &&
+                    sequence.Blocks.Exists(block => block.State == "active"))
+                {
+                    Refresh();
+                    ForgetBounds();
+                    return true;
+                }
+
+                long now = Worker.GetCurrentTimestamp();
+                if (now >= deadline)
+                {
+                    return false;
+                }
+
+                if (now - checkedComing >= 1_000_000)
+                {
+                    checkedComing = now;
+                    if (!Coming())
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        finally
+        {
+            TakeGates(held);
+        }
+    }
+
+    /// <summary>
+    /// Waits, before a statement draws from a block the sequence's parent granted this node, until this server has
+    /// taken in a message of the parent's since it started: a node that was away while its parent's fence lifted without
+    /// its report, as when <c>worf.activate_sequence_range</c> stopped waiting for it, holds values the lift gave out
+    /// again, and the parent's first message after asks it to reset, so it draws none of them. The statement lets its
+    /// gates go and waits as for a lock, until the parent answers, <c>statement_timeout</c> or a cancellation.
+    /// </summary>
+    private static void WaitForGrantor(uint seqoid)
+    {
+        Reload();
+        if (!s_grantors.TryGetValue(seqoid, out uint grantor) || s_confirmed.Contains(grantor))
+        {
+            return;
+        }
+
+        if (!SequenceRangeHeard.Confirmed(grantor))
+        {
+            List<uint> held = LetGates();
+            try
+            {
+                long woken = 0;
+                while (!SequenceRangeHeard.Confirmed(grantor))
+                {
+                    long now = Worker.GetCurrentTimestamp();
+                    if (now - woken >= 1_000_000)
+                    {
+                        woken = now;
+                        SequenceRangeExchangeWorker.Wake();
+                    }
+
+                    PgInterrupts.Check();
+                    Worker.WaitLatch(100);
+                }
+            }
+            finally
+            {
+                TakeGates(held);
+            }
+        }
+
+        _ = s_confirmed.Add(grantor);
     }
 
     /// <summary>
@@ -1896,6 +2015,7 @@ internal static partial class SequenceRangeGuard
         // sequences' bounds are read again too.
         ForgetBounds();
         s_sequences.Clear();
+        s_grantors.Clear();
         s_drawnBy.Clear();
         s_reservedActive.Clear();
         s_moved.Clear();
@@ -1914,7 +2034,8 @@ internal static partial class SequenceRangeGuard
         // have given the sequence its new block.
         WorfRows result = Elevated.Run(() => Worf.SelectCatalog("""
             SELECT r.seqoid::oid, s.seqincrement > 0, b.lo, b.hi, b.state,
-                b.node_id = l.node_id AND b.sysid = $1 AND b.timeline = $2, b.reserved
+                b.node_id = l.node_id AND b.sysid = $1 AND b.timeline = $2, b.reserved,
+                CASE WHEN b.from_node = r.parent_node AND b.from_node <> l.node_id THEN b.from_node END
             FROM worf.sequence_range r
                 JOIN pg_catalog.pg_sequence s ON s.seqrelid = r.seqoid
                 CROSS JOIN worf.local_node l
@@ -1943,6 +2064,11 @@ internal static partial class SequenceRangeGuard
                 if (state == "active" && row.Get<bool>(6))
                 {
                     _ = s_reservedActive.Add((seqoid, lo));
+                }
+
+                if (state == "active" && row.Get<uint?>(7) is uint grantor)
+                {
+                    s_grantors[seqoid] = grantor;
                 }
             }
             else if (state is not "retired")

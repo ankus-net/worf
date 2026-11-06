@@ -1748,6 +1748,46 @@ public sealed class SequenceRangeTests
         Assert.DoesNotContain("node node_b saw this node's WAL position move backwards", nodeA.ReadLog()[forgedAt..], "node_a's resets on node_b's requests");
         Assert.AreEqual(1, nodeA.ReadLog()[forgedAt..].Split("the allocator's fence lifted").Length - 1, "node_a's fences lifted after the requests");
 
+        // Requests to reset that node_a, node_b's grantor, makes up as a fence's lift asks, naming no block node_b holds
+        // from it, reset node_b's sequence no more often than any neighbor's requests do, however many come and though
+        // node_b draws between them. One that names a block node_b holds from node_a resets it at once, and the same
+        // request again, once node_b has given the block up, doesn't.
+        string[] ownedNow = (await nodeA.SafePsqlAsync(Database, """
+            SELECT epoch, range_size, max_range_size, coalesce(watermark::text, 'null'), root_start, root_end
+            FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass
+            """, token)).Split('|');
+        string Lift(string reset, string grants) => $$"""
+            {"node_id": {{nodeAId}}, "node_name": "node_a", "slot": "{{slot}}", "sysid": "1", "timeline": 1, "wal_lsn": "0/0", "sequences": [
+                {"name": "public.t_id_seq", "owner_id": {{nodeAId}}, "epoch": {{ownedNow[0]}}, "range_size": {{ownedNow[1]}}, "max_range_size": {{ownedNow[2]}},
+                    "distance": 0, "high_water": null, "watermark": {{ownedNow[3]}}, "state": "active", "root_start": {{ownedNow[4]}}, "root_end": {{ownedNow[5]}},
+                    "reset": "{{reset}}", "reset_grants": [{{grants}}], "reset_done": null, "held_complete": false, "held": [], "requests": [], "reports": [],
+                    "grants": [], "acks": []}]}
+            """;
+        const string Lifted = "node node_a lifted a fence over grants of this node's that overlap another's";
+        int lifting = nodeB.ReadLog().Length;
+        for (int i = 1; i <= 4; i++)
+        {
+            await InsertAsync(nodeB, 20, token);
+            _ = await nodeB.SafePsqlAsync(Database,
+                $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{Lift($"FFFFFFFF/0000000{i}", "")}')", token);
+        }
+
+        Assert.IsLessThanOrEqualTo(1, nodeB.ReadLog()[lifting..].Split(Lifted).Length - 1, "node_b's resets on lifts that name none of its blocks");
+        await InsertAsync(nodeB, 20, token);
+        string heldBlock = await nodeB.SafePsqlAsync(Database, $"""
+            SELECT block_id FROM worf.sequence_range_block
+            WHERE seqoid = 't_id_seq'::regclass AND from_node = {nodeAId} AND state <> 'abandoned' ORDER BY received_at DESC LIMIT 1
+            """, token);
+        Assert.AreNotEqual("", heldBlock, "a block node_b holds from node_a");
+        lifting = nodeB.ReadLog().Length;
+        _ = await nodeB.SafePsqlAsync(Database,
+            $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{Lift("FFFFFFFF/00000010", $"\"{heldBlock}\"")}')", token);
+        Assert.AreEqual(1, nodeB.ReadLog()[lifting..].Split(Lifted).Length - 1, "node_b's reset on a lift that names a block it holds");
+        await InsertAsync(nodeB, 20, token);
+        _ = await nodeB.SafePsqlAsync(Database,
+            $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{Lift("FFFFFFFF/00000011", $"\"{heldBlock}\"")}')", token);
+        Assert.AreEqual(1, nodeB.ReadLog()[lifting..].Split(Lifted).Length - 1, "node_b's resets on the same lift again, once it gave the block up");
+
         // node_a waits for node_c's own report after a reset while node_c is down, though node_b relays a fresh report of
         // node_c after node_a has lost its record of node_c's grants and reports, as a recovery to before them would, and
         // takes node_c's grants back into its ledger once node_c reports.
@@ -1863,7 +1903,11 @@ public sealed class SequenceRangeTests
             }
         }
 
-        // node_a's fence stops waiting for node_b while it's down, and node_b resets once node_a hears from it.
+        // node_a's fence stops waiting for node_b while it's down, and node_b resets once node_a hears from it. An insert
+        // on node_b as soon as it's back waits for node_a's first message, which asks it to reset, so it draws from none
+        // of the blocks it held, whose values the lift may have given out again.
+        string[] heldBefore = (await nodeB.SafePsqlAsync(Database,
+            "SELECT active_lo, active_hi FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token)).Split('|');
         await nodeB.StopAsync("fast", token);
         int logged = nodeB.ReadLog().Length;
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.reset_sequence_range('t_id_seq')", token);
@@ -1871,6 +1915,10 @@ public sealed class SequenceRangeTests
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.activate_sequence_range('t_id_seq', 'node_b')", token);
         await WaitActiveAsync([nodeA], token);
         await nodeB.StartServerAsync(token);
+        long drawn = long.Parse(await nodeB.SafePsqlAsync(Database, "SET statement_timeout = '60s'; INSERT INTO t (v) VALUES ('back') RETURNING id", token),
+            CultureInfo.InvariantCulture);
+        Assert.IsFalse(drawn >= long.Parse(heldBefore[0], CultureInfo.InvariantCulture) && drawn <= long.Parse(heldBefore[1], CultureInfo.InvariantCulture),
+            $"node_b's first value once back, {drawn}, drawn from the block it held before, [{heldBefore[0]}, {heldBefore[1]}]");
         Assert.IsTrue(await nodeB.PollLogAsync(logged, "node node_a lifted its fence without this node's report", token), "node_b's reset once back");
         await WaitActiveAsync([nodeB], token);
         await AssertNoSharedValuesAsync([nodeA, nodeB], token);
@@ -2116,9 +2164,10 @@ public sealed class SequenceRangeTests
     /// <summary>
     /// A provider that takes calls but never answers holds up a node's exchanges with its other neighbors only until its
     /// first call runs out of time: it's called after the others from then on, only while nothing waits on them or once
-    /// a minute, for a second at most, giving way to a request that comes up meanwhile, so the node's inserts go on
-    /// through small blocks from the owner without waiting on it. Once it answers again, a request that waits on it
-    /// reaches it, though a request on another node stays open.
+    /// a minute, for a second at most, three for the connection, giving way to a request that comes up meanwhile, so the
+    /// node's inserts go on through small blocks from the owner without waiting on it. Once it answers again, though
+    /// slowly, a request that waits on it reaches it, though a request on another node stays open and the node keeps
+    /// drawing blocks from the owner, as a probe that gave way is made again without giving way.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -2244,8 +2293,9 @@ public sealed class SequenceRangeTests
             """, token), "node_b's request to node_a, open as w's root has run out");
 
         // Once node_c answers again, over a link with 300 ms round trips, node_b's request for a block of u reaches it,
-        // though a request on node_a stays open: a probe of a neighbor that ran out of time gives way only to requests
-        // that come up as it runs, and its connection, which takes a few round trips, has three seconds.
+        // though a request on node_a stays open and node_b keeps drawing blocks of t from node_a, each a request that a
+        // probe of node_c gives way to: the probe is made again without giving way, and its connection, which takes a
+        // few round trips, has three seconds.
         using TcpListener slow = new(IPAddress.Loopback, 0);
         slow.Start();
         string[] dsnParts = nodeCDsn.Split(' ', StringSplitOptions.RemoveEmptyEntries);
@@ -2301,13 +2351,90 @@ public sealed class SequenceRangeTests
                 : part));
             _ = await nodeB.SafePsqlAsync(Database,
                 $"UPDATE worf.node_interface SET if_dsn = '{slowDsn}' WHERE if_nodeid = (SELECT node_id FROM worf.node WHERE node_name = 'node_c')", token);
-            Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, UNext, token), "node_b's next block of u, from node_c once it answers again");
+            using CancellationTokenSource drawing = CancellationTokenSource.CreateLinkedTokenSource(token);
+            Task draws = Task.Run(async () =>
+            {
+                await using NpgsqlConnection writer = await nodeB.OpenAsync(Database, token);
+                await using NpgsqlCommand insert = new(Insert, writer);
+                while (!drawing.Token.IsCancellationRequested)
+                {
+                    _ = await insert.ExecuteNonQueryAsync(token);
+                    await Task.Delay(TimeSpan.FromMilliseconds(5), token);
+                }
+            }, token);
+            bool reached = await nodeB.PollQueryUntilAsync(Database, UNext, token);
+            await drawing.CancelAsync();
+            await draws;
+            Assert.IsTrue(reached, "node_b's next block of u, from node_c once it answers again, while node_b draws from node_a");
         }
         finally
         {
             await relaying.CancelAsync();
             await relay;
         }
+    }
+
+    /// <summary>
+    /// A provider whose host drops connection attempts holds up a node's exchanges with its other neighbors only until
+    /// the first attempt runs out of time, as one that takes calls and never answers does: it's called after the others
+    /// from then on, so the node's inserts go on through small blocks from the owner without waiting on it.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task UnreachableNeighborsHoldUpNoOtherExchange()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        await using TestNode nodeC = await StartNodeAsync("node_c", token);
+        foreach (TestNode node in new[] { nodeA, nodeB, nodeC })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        await SubscribeAsync(nodeB, "b_from_c", nodeC, token);
+        _ = await nodeA.SafePsqlAsync(Database,
+            "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100, max_range_size := 100)", token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+
+        // node_c's host drops node_b's connection attempts.
+        int logpos = nodeB.ReadLog().Length;
+        _ = await nodeB.SafePsqlAsync(Database,
+            $"UPDATE worf.node_interface SET if_dsn = 'host=192.0.2.1 port=5432 dbname={Database} user={SuperUser}' WHERE if_nodeid = (SELECT node_id FROM worf.node WHERE node_name = 'node_c')",
+            token);
+        Assert.IsTrue(await nodeB.PollLogAsync(logpos, "exchange with node node_c failed: could not reach node node_c within ", token),
+            "node_b's first connection attempt to node_c timed out");
+
+        // node_b draws two blocks a second from node_a for fifteen seconds, and no insert waits for one. The server times
+        // each insert, as the test host's own clock counts the time its other tests keep it from reading the result.
+        const string Insert = "INSERT INTO t (v) VALUES ('b')";
+        int timed = nodeB.ReadLog().Length;
+        await using (NpgsqlConnection writer = await nodeB.OpenAsync(Database, token))
+        {
+            await using (NpgsqlCommand logged = new("SET log_min_duration_statement = 0", writer))
+            {
+                _ = await logged.ExecuteNonQueryAsync(token);
+            }
+
+            await using NpgsqlCommand insert = new(Insert, writer);
+            Stopwatch running = Stopwatch.StartNew();
+            while (running.Elapsed < TimeSpan.FromSeconds(15))
+            {
+                _ = await insert.ExecuteNonQueryAsync(token);
+                await Task.Delay(TimeSpan.FromMilliseconds(5), token);
+            }
+        }
+
+        // Each attempt to reach node_c held up node_b's calls to node_a for 5 s, until the first counted as running out of
+        // time.
+        List<double> waits = [.. nodeB.ReadLog()[timed..].Split('\n')
+            .Where(line => line.Contains($": {Insert}", StringComparison.Ordinal) && line.Contains("  execute ", StringComparison.Ordinal))
+            .Select(line => double.Parse(line[(line.IndexOf("duration: ", StringComparison.Ordinal) + 10)..line.IndexOf(" ms", StringComparison.Ordinal)],
+                CultureInfo.InvariantCulture))];
+        waits.Sort();
+        Assert.IsGreaterThan(100, waits.Count, "node_b's inserts");
+        Assert.IsLessThan(2500.0, waits[^1], "node_b's slowest insert, against the 5000 ms each attempt to reach node_c took");
     }
 
     /// <summary>
