@@ -6,6 +6,10 @@ using System.Text.Unicode;
 using Ankus.Postgres;
 using Path = System.IO.Path;
 
+[assembly: PgSql("decoding-mark", """
+    CREATE TABLE worf.decoding_mark ();
+    """)]
+
 namespace Worf;
 
 /// <summary>
@@ -1053,11 +1057,14 @@ internal static partial class Worf
     /// <summary>
     /// Ends the work of a subtransaction that changed the catalogs with a record logical decoding takes a base snapshot
     /// from: the invalidations its last command left are logged first, as the end of a command logs them, and then a
-    /// transactional message, so that the message is the subtransaction's last record. Decoding that starts again inside
-    /// a subtransaction takes it as a transaction of its own, and executes its invalidations only once a change after
-    /// that point has given it a base snapshot; an assert-enabled build aborts on one whose records after that point are
-    /// invalidations alone, as after an index build or ANALYZE, whose inplace updates of the catalog it doesn't decode,
-    /// or after a catalog change whose invalidations are logged as the subtransaction commits.
+    /// row of worf.decoding_mark is inserted and deleted, so that a heap change is the subtransaction's last record.
+    /// Decoding that starts again inside a subtransaction takes it as a transaction of its own, and executes its
+    /// invalidations only once a change after that point has given it a base snapshot; an assert-enabled build aborts on
+    /// one whose records after that point are invalidations alone, as after an index build or ANALYZE, whose inplace
+    /// updates of the catalog it doesn't decode, or after a catalog change whose invalidations are logged as the
+    /// subtransaction commits. A heap change gives the base snapshot before decoding looks at its origin, so it does so
+    /// where a provider leaves out other nodes' changes, as a transactional message doesn't. The table has no columns and
+    /// no index, and each row goes at once, so that sessions don't wait on each other.
     /// </summary>
     internal static void EndForDecoding()
     {
@@ -1071,7 +1078,13 @@ internal static partial class Worf
             NativeMethods.CommandCounterIncrement();
         }
 
-        Elevated.Run(() => _ = Execute("SELECT pg_catalog.pg_logical_emit_message(true, 'worf', '')"));
+        Elevated.Run(() =>
+        {
+            if (ExecuteScalar<string>("INSERT INTO worf.decoding_mark DEFAULT VALUES RETURNING ctid::text") is string mark)
+            {
+                _ = Execute("DELETE FROM worf.decoding_mark WHERE ctid = $1::tid", SpiParameter.Create(mark));
+            }
+        });
     }
 
     /// <summary>
