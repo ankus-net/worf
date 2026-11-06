@@ -1108,21 +1108,24 @@ internal static class SequenceRangeExchange
         bool heard = SequenceRangeHeard.Record(senderId, senderId, Worker.GetCurrentTimestamp());
         bool knowsStart = root.TryGetProperty("heard_started_at", out JsonElement heardStarted) && heardStarted.TryGetInt64(out long heardStartedAt) &&
             heardStartedAt == SequenceRangeHeard.Started;
-        OnCommit(senderId, root.TryGetProperty("started_at", out JsonElement started) && started.TryGetInt64(out long startedAt) ? startedAt : null, knowsStart);
-
+        long? startedAt = root.TryGetProperty("started_at", out JsonElement started) && started.TryGetInt64(out long since) ? since : null;
         if (!root.TryGetProperty("sequences", out JsonElement sequences))
         {
+            OnCommit(senderId, startedAt, knowsStart);
             return (false, false);
         }
 
         // A sequence this node is fenced on that the neighbor's message doesn't carry has no block on the neighbor.
         WorfRows fencedOn = Worf.Read("SELECT seqoid::oid FROM worf.sequence_range WHERE fenced_at IS NOT NULL", 0);
         HashSet<uint> absent = [.. Enumerable.Range(0, fencedOn.Count).Select(i => fencedOn[i].Get<uint>(0))];
+        List<long> carriedSequences = [];
+        bool undone = false;
         foreach (JsonElement entry in sequences.EnumerateArray())
         {
             uint? processed = Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(entry.GetProperty("name").GetWorfString()));
-            if (absent.Count > 0 && processed is uint carried)
+            if (processed is uint carried)
             {
+                carriedSequences.Add(carried);
                 _ = absent.Remove(carried);
             }
 
@@ -1138,6 +1141,7 @@ internal static class SequenceRangeExchange
                     });
                 }
 
+                undone |= Text(entry, "reset") is not null;
                 continue;
             }
 
@@ -1169,6 +1173,8 @@ internal static class SequenceRangeExchange
             }
             catch (PgException error)
             {
+                undone |= Text(entry, "reset") is not null;
+
                 // A sequence dropped here since the exchange began goes unmentioned, though one of its name was created again.
                 if (processed is uint seqoid && SequenceRanges.SequenceExists(seqoid))
                 {
@@ -1186,6 +1192,16 @@ internal static class SequenceRangeExchange
                 INSERT INTO worf.sequence_range_absent VALUES ($1, $2, now()) ON CONFLICT (seqoid, node_id) DO UPDATE SET absent_at = excluded.absent_at
                 """, SpiParameter.Create(seqoid), SpiParameter.Create(senderId));
         }
+
+        // The neighbor's start is said back only once this node has asked all it makes of the neighbor's return: a
+        // sequence left out, as one whose range row a prepared transaction holds, or whose part of the message failed,
+        // may still owe the neighbor a request to reset, after a fence's lift that stopped waiting for it. And the message
+        // counts as made knowing this server is back only if every request to reset it carries was taken in.
+        bool asking = carriedSequences.Count > 0 && Worf.ReadScalar<bool>("""
+            SELECT EXISTS (SELECT 1 FROM worf.sequence_range_absent a JOIN worf.sequence_range r ON r.seqoid = a.seqoid
+                WHERE a.node_id = $1 AND a.seqoid = ANY ($2::oid[]) AND r.fenced_at IS NULL)
+            """, SpiParameter.Create(senderId), SpiParameter.Create(carriedSequences.ToArray()));
+        OnCommit(senderId, asking ? null : startedAt, knowsStart && !undone);
 
         // The neighbor's WAL position, once compared with the last one.
         if (Worf.TryParseLsn(root.GetProperty("wal_lsn").GetWorfString() ?? "", out ulong lsn))
@@ -1212,7 +1228,8 @@ internal static class SequenceRangeExchange
     /// Checks, only reading, whether one sequence of a neighbor's message would change nothing here: the neighbor
     /// reports what it reported before, relays nothing new, asks for nothing that this node can answer yet, as an
     /// owner still collecting reports can't, grants and gives up nothing, acknowledges nothing new, and leaves this
-    /// node's route as it is, while neither node is fenced. Such a message is only noted in shared memory, so that
+    /// node's route as it is, while neither node is fenced and this node owes the neighbor no request to reset after a
+    /// fence's lift that stopped waiting for it. Such a message is only noted in shared memory, so that
     /// exchanges between idle nodes, or toward an owner whose root can't start, write nothing and use no transaction
     /// IDs.
     /// </summary>
@@ -1240,8 +1257,10 @@ internal static class SequenceRangeExchange
             return local[0].Get<int>(0) > epoch;
         }
 
+        // A neighbor that a fence's lift stopped waiting for is asked to reset once it's heard from again, whatever it reports.
         SequenceInfo info = SequenceRanges.GetInfo(seqoid);
         if (local[0].Get<bool>(2) || state == "fenced" || (state == "disabled" && local[0].Get<string>(1) != "disabled") ||
+            Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range_absent WHERE seqoid = $1 AND node_id = $2)", seq, sender) ||
             (entry.GetProperty("requests").GetArrayLength() > 0 && local[0].Get<string>(1) != "collecting" &&
                 !Unanswerable(seqoid, info, epoch, entry.GetProperty("requests"), local[0].Get<uint>(5) == node.Node.Id)) ||
             entry.GetProperty("grants").GetArrayLength() > 0)

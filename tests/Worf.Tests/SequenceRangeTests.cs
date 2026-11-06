@@ -4,6 +4,7 @@ using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
 using Npgsql;
 using Npgsql.Replication;
 using Npgsql.Replication.Internal;
@@ -1798,7 +1799,8 @@ public sealed class SequenceRangeTests
     /// marks the grants, so that they fence the root no more. A lift over a new overlap within ten minutes, here among
     /// three holders, resets them all at once, as a node takes the resets of the node that granted its blocks whenever it lifts, though it takes
     /// another neighbor's no more than once in ten minutes. A lift that stops waiting for a node that's down asks it to
-    /// reset once it's heard from again, at once too, and doesn't take the blocks it reports back into its ledger.
+    /// reset once it's heard from again, whatever it reports, at once too, and doesn't take the blocks it reports back into
+    /// its ledger; the node draws nothing meanwhile, nor while a prepared transaction holds either node's range row.
     /// Requests to reset that a neighbor's role makes up reset the owner once in a window for the sequence.
     /// </summary>
     /// <returns>The test.</returns>
@@ -1806,8 +1808,8 @@ public sealed class SequenceRangeTests
     public async Task ForcedLiftsResetTheHoldersTheyPassOver()
     {
         CancellationToken token = TestContext.CancellationToken;
-        await using TestNode nodeA = await StartNodeAsync("node_a", token);
-        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        await using TestNode nodeA = await StartNodeAsync("node_a", token, "max_prepared_transactions = 2");
+        await using TestNode nodeB = await StartNodeAsync("node_b", token, "max_prepared_transactions = 2");
         foreach (TestNode node in new[] { nodeA, nodeB })
         {
             _ = await node.SafePsqlAsync(Database, """
@@ -1867,16 +1869,66 @@ public sealed class SequenceRangeTests
 
         // node_a's fence stops waiting for node_b while it's down, and node_b resets once node_a hears from it. An insert
         // on node_b as soon as it's back waits for node_a's first message, which asks it to reset, so it draws from none
-        // of the blocks it held, whose values the lift may have given out again.
+        // of the blocks it held, whose values the lift may have given out again. A prepared transaction holds node_b's
+        // range row as it stops, which leaves the sequence out of the exchanges, so that the insert waits until it ends.
+        string nodeAId = await nodeA.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
+        string bSlot = await nodeB.SafePsqlAsync(Database, "SELECT sub_slot_name FROM worf.subscription WHERE sub_name = 'b_from_a'", token);
         string[] heldBefore = (await nodeB.SafePsqlAsync(Database,
             "SELECT active_lo, active_hi FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token)).Split('|');
+        _ = await nodeB.SafePsqlAsync(Database,
+            "BEGIN; SELECT 1 FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass FOR NO KEY UPDATE; PREPARE TRANSACTION 'held_b'", token);
         await nodeB.StopAsync("fast", token);
+        (int controlExit, string control) = await nodeB.RunProgramAsync("pg_controldata", ["-D", nodeB.Cluster.DataDirectory], token);
+        Assert.AreEqual(0, controlExit, control);
+        string stoppedAt = control.Split('\n').Single(line => line.StartsWith("Latest checkpoint location:", StringComparison.Ordinal))
+            .Split(':', 2)[1].Trim();
         int logged = nodeB.ReadLog().Length;
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.reset_sequence_range('t_id_seq')", token);
         Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, $"SELECT ({Fence}) LIKE 'fenced until node node_b%'", token), "node_a's fence waiting for node_b");
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.activate_sequence_range('t_id_seq', 'node_b')", token);
         await WaitActiveAsync([nodeA], token);
+
+        // A message of node_b's that reports just what node_a recorded of it, at the WAL position it stopped at, is asked
+        // to reset all the same. While a prepared transaction holds node_a's range row, which leaves the sequence out,
+        // node_a asks nothing, and so its answers don't say back the start that node_b's message gave.
+        string[] recorded = (await nodeA.SafePsqlAsync(Database, $"""
+            SELECT n.sysid, n.timeline, n.epoch, n.state, coalesce(n.distance::text, 'null'), coalesce(n.high_water::text, 'null'),
+                coalesce(n.watermark::text, 'null'), coalesce(pg_catalog.array_to_json(n.holds)::text, 'null'), coalesce(n.clock::text, 'null'),
+                r.range_size, r.max_range_size, coalesce(r.root_start::text, 'null'), coalesce(r.root_end::text, 'null')
+            FROM worf.sequence_range_node n JOIN worf.sequence_range r ON r.seqoid = n.seqoid
+            WHERE n.seqoid = 't_id_seq'::regclass AND n.node_id = {nodeBId}
+            """, token)).Split('|');
+        string Report(string started) => $$"""
+            {"node_id": {{nodeBId}}, "node_name": "node_b", "slot": "{{bSlot}}", "sysid": "{{recorded[0]}}", "timeline": {{recorded[1]}}, "wal_lsn": "{{stoppedAt}}",{{started}} "sequences": [
+                {"name": "public.t_id_seq", "owner_id": {{nodeAId}}, "epoch": {{recorded[2]}}, "range_size": {{recorded[9]}}, "max_range_size": {{recorded[10]}},
+                    "distance": {{recorded[4]}}, "high_water": {{recorded[5]}}, "watermark": {{recorded[6]}}, "state": "{{recorded[3]}}", "root_start": {{recorded[11]}},
+                    "root_end": {{recorded[12]}}, "holds": {{recorded[7]}}, "clock": {{recorded[8]}}, "reset": null, "reset_done": null, "held_complete": false,
+                    "held": [], "requests": [], "reports": [], "grants": [], "acks": []}]}
+            """;
+        const string MadeUpStart = "4242";
+        _ = await nodeA.SafePsqlAsync(Database,
+            "BEGIN; SELECT 1 FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass FOR NO KEY UPDATE; PREPARE TRANSACTION 'held_a'", token);
+        _ = await nodeA.SafePsqlAsync(Database,
+            $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{Report($" \"started_at\": {MadeUpStart},")}')", token);
+        using (JsonDocument answer = JsonDocument.Parse(await nodeA.SafePsqlAsync(Database,
+            $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{Report("")}')", token)))
+        {
+            Assert.AreNotEqual(long.Parse(MadeUpStart, CultureInfo.InvariantCulture), answer.RootElement.GetProperty("heard_started_at").GetInt64(),
+                "node_a's answer, while it still owes node_b a request to reset");
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database, "ROLLBACK PREPARED 'held_a'", token);
+        _ = await nodeA.SafePsqlAsync(Database, $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{Report("")}')", token);
+        Assert.AreEqual("t", await nodeA.SafePsqlAsync(Database,
+            $"SELECT reset_lsn::text LIKE 'FFFFFFFE/%' FROM worf.sequence_range_node WHERE seqoid = 't_id_seq'::regclass AND node_id = {nodeBId}", token),
+            "node_a's request that node_b reset, at node_b's message that reports what it reported before");
+
         await nodeB.StartServerAsync(token);
+        int waited = nodeB.ReadLog().Length;
+        Assert.IsFalse(await nodeB.PsqlAsync(Database, "SET statement_timeout = '10s'; INSERT INTO t (v) VALUES ('back')", token),
+            "node_b's insert while a prepared transaction holds its range row");
+        Assert.Contains("canceling statement due to statement timeout", nodeB.ReadLog()[waited..], "node_b's insert waiting for node_a's request to reset");
+        _ = await nodeB.SafePsqlAsync(Database, "ROLLBACK PREPARED 'held_b'", token);
         long drawn = long.Parse(await nodeB.SafePsqlAsync(Database, "SET statement_timeout = '60s'; INSERT INTO t (v) VALUES ('back') RETURNING id", token),
             CultureInfo.InvariantCulture);
         Assert.IsFalse(drawn >= long.Parse(heldBefore[0], CultureInfo.InvariantCulture) && drawn <= long.Parse(heldBefore[1], CultureInfo.InvariantCulture),
@@ -1889,8 +1941,6 @@ public sealed class SequenceRangeTests
         // for the sequence, which grows from ten minutes as such resets keep coming: the first resets it, and one right
         // after doesn't.
         _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO t (v) VALUES ('a')", token);
-        string nodeAId = await nodeA.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
-        string bSlot = await nodeB.SafePsqlAsync(Database, "SELECT sub_slot_name FROM worf.subscription WHERE sub_name = 'b_from_a'", token);
         string[] range = (await nodeA.SafePsqlAsync(Database, """
             SELECT epoch, range_size, max_range_size, coalesce(watermark::text, 'null'), coalesce(root_start::text, 'null'), coalesce(root_end::text, 'null')
             FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass
