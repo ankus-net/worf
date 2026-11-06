@@ -367,12 +367,15 @@ internal static class Functions
                 hint: "Choose a subscription name that differs in letters, digits or underscores.");
         }
 
-        if (Worf.ReadScalar<bool>("SELECT EXISTS (SELECT FROM pg_catalog.pg_replication_origin WHERE roname = $1)", SpiParameter.Create(sub.SlotName)))
+        // An origin this transaction created is the caller's to start the subscription from, as worf_create_subscriber
+        // creates it at the position its restore point reached.
+        if (Worf.ReadScalar<uint?>("SELECT xmin::text::pg_catalog.int8::pg_catalog.oid FROM pg_catalog.pg_replication_origin WHERE roname = $1",
+            SpiParameter.Create(sub.SlotName)) is uint creator && !CreatedHere(creator))
         {
             throw new PgException(PgSqlStates.DuplicateObject,
                 $"subscription \"{subName}\" would use replication origin \"{sub.SlotName}\", which already exists",
                 detail: "Another database's subscription may use it, or it was left behind.",
-                hint: "Choose a subscription name that differs in letters, digits or underscores, or drop the origin with pg_replication_origin_drop if nothing uses it.");
+                hint: "Choose a subscription name that differs in letters, digits or underscores, or drop the origin with pg_replication_origin_drop if nothing uses it. An origin created in the same transaction as the subscription is taken as its own.");
         }
 
         WorfNode.CreateSubscription(sub);
@@ -1736,6 +1739,15 @@ internal static class Functions
         }
 
         return new string(slot);
+    }
+
+    // Whether a transaction is this one, or one of its subtransactions.
+    private static bool CreatedHere(uint xid)
+    {
+        unsafe
+        {
+            return NativeMethods.TransactionIdIsCurrentTransactionId(xid);
+        }
     }
 
     /// <summary>

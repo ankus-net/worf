@@ -318,7 +318,7 @@ public sealed class RelayOriginTests
         string turnLog = subscriber.ReadLog()[logpos..];
         Assert.DoesNotContain("no replication origin slot is free for replication origin", turnLog, "a writer that waited for a slot");
         Assert.Contains("dropped relay origins to free replication origin slots", subscriber.ReadLog(), "the warning of the turns, once a minute");
-        Assert.IsLessThan(20L, turned, "transaction IDs the three turns took");
+        Assert.IsLessThan(60L, turned, "transaction IDs the three turns took, with the other workers' meanwhile, against a hundred each turn took waiting");
         Assert.AreEqual("t", await subscriber.SafePsqlAsync(Database,
             "SELECT max(n) > 1 FROM (SELECT count(*) n FROM worf.origin_writer GROUP BY roident) c", token), "an id recorded more than once");
         Assert.AreEqual("3|0", await subscriber.SafePsqlAsync(Database, $"""

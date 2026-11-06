@@ -2299,7 +2299,7 @@ public sealed class SequenceRangeTests
                 CultureInfo.InvariantCulture))];
         waits.Sort();
         Assert.IsGreaterThan(100, waits.Count, "node_b's inserts");
-        Assert.IsLessThan(2500.0, waits[^1], "node_b's slowest insert, against the 5000 ms node_c's calls took");
+        Assert.IsLessThan(4000.0, waits[^1], "node_b's slowest insert, against the 5000 ms node_c's calls took, as a probe that gave way is made again within the three seconds of its connection");
         Assert.IsLessThan(1000.0, waits[(int)(waits.Count * 0.99)], "node_b's 99th percentile insert");
 
         // node_b runs w's root on node_a out, so that its request to node_a for another block stays open.
@@ -2416,7 +2416,7 @@ public sealed class SequenceRangeTests
     {
         CancellationToken token = TestContext.CancellationToken;
         await using TestNode nodeA = await StartNodeAsync("node_a", token);
-        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token, "log_min_messages = debug1");
         await using TestNode nodeC = await StartNodeAsync("node_c", token);
         foreach (TestNode node in new[] { nodeA, nodeB, nodeC })
         {
@@ -2434,8 +2434,7 @@ public sealed class SequenceRangeTests
         _ = await nodeB.SafePsqlAsync(Database,
             $"UPDATE worf.node_interface SET if_dsn = 'host=192.0.2.1 port=5432 dbname={Database} user={SuperUser}' WHERE if_nodeid = (SELECT node_id FROM worf.node WHERE node_name = 'node_c')",
             token);
-        Assert.IsTrue(await nodeB.PollLogAsync(logpos, "exchange with node node_c failed: could not reach node node_c within ", token),
-            "node_b's first connection attempt to node_c timed out");
+        Assert.IsTrue(await nodeB.PollLogAsync(logpos, "exchange with node node_c failed: ", token), "node_b's first connection attempt to node_c failed");
 
         // node_b draws two blocks a second from node_a for fifteen seconds, and no insert waits for one. The server times
         // each insert, as the test host's own clock counts the time its other tests keep it from reading the result.

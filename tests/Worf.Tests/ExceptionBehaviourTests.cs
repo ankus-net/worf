@@ -1065,13 +1065,13 @@ public sealed partial class ExceptionBehaviourTests
                 long merged = long.Parse(await subscriber.SafePsqlAsync(Database, "SELECT pg_snapshot_xmax(pg_current_snapshot())::text", token),
                     CultureInfo.InvariantCulture) - mergeFrom;
                 Assert.Contains($"skipped 305 of the rows of the copy of table public.{table}", subscriber.ReadLog()[logpos..]);
-                Assert.AreEqual($"""
-                    MERGE|402|23505|duplicate key value violates unique constraint "{table}_j_key"|transdiscard
-                    MERGE|404|23P01|conflicting key value violates exclusion constraint "{table}_r"|transdiscard
-                    MERGE|406|23P01|conflicting key value violates exclusion constraint "{table}_r"|transdiscard
-                    MERGE|500|23505|duplicate key value violates unique constraint "{table}_v"|transdiscard
-                    MERGE|700000|23514|new row for relation "{table}" violates check constraint "{table}_id_check"|transdiscard
-                    """, await subscriber.SafePsqlAsync(Database, $"""
+                Assert.AreEqual(string.Join('\n',
+                    $"MERGE|402|23505|duplicate key value violates unique constraint \"{table}_j_key\"|transdiscard",
+                    $"MERGE|404|23P01|conflicting key value violates exclusion constraint \"{table}_r\"|transdiscard",
+                    $"MERGE|406|23P01|conflicting key value violates exclusion constraint \"{table}_r\"|transdiscard",
+                    $"MERGE|500|23505|duplicate key value violates unique constraint \"{table}_v\"|transdiscard",
+                    $"MERGE|700000|23514|new row for relation \"{table}\" violates check constraint \"{table}_id_check\"|transdiscard"),
+                    await subscriber.SafePsqlAsync(Database, $"""
                     SELECT operation, remote_new_tuple->>'id', error_sqlstate, error_message, behaviour FROM worf.exception_log
                     WHERE table_name = '{table}' AND remote_new_tuple->>'u' IS NULL ORDER BY (remote_new_tuple->>'id')::integer
                     """, token), "the skipped rows recorded");

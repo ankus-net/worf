@@ -342,6 +342,9 @@ for (int dbnum = 0; dbnum < databaseList.Length; dbnum++)
 
     // Create the identifier which is setup with the position to which we already caught up using physical
     // replication.
+    // The origin, the node and the subscription are made in one transaction, so that the subscription takes the origin
+    // as its own, and its apply worker starts only once its sync status says it needs no copy.
+    _ = Query(subscriberConn, "BEGIN");
     PrintMsg(VerbosityLevel.Verbose, $"Creating replication origin for database {db}...\n");
     InitializeReplicationOrigin(subscriberConn, slotNames[dbnum], remoteLsn);
 
@@ -351,6 +354,14 @@ for (int dbnum = 0; dbnum < databaseList.Length; dbnum++)
 
     WorfSubscribe(subscriberConn, subscriberName, subConnstr, provConnstr, replicationSets, applyDelay,
         forceTextTransfer);
+    try
+    {
+        _ = Query(subscriberConn, "COMMIT");
+    }
+    catch (LibpqException error)
+    {
+        throw Die($"Could not commit the subscription, status PGRES_FATAL_ERROR: {error.Message}\n");
+    }
 
     subscriberConn.Dispose();
     subscriberConn = null;
