@@ -107,8 +107,12 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   refuses, as when a row the provider has since deleted here holds a value one
   of the provider's rows takes, or the provider moved a value from one row to
   another, with a hint to resynchronize. Under `discard` and `transdiscard`,
-  such a merge is merged again in halves, down to the rows that fail alone,
-  which are skipped and recorded as a `MERGE` with their rows, with a warning,
+  the rows the merge writes that a `NOT NULL` column or `CHECK` constraint
+  refuses, and those whose values in an immediate unique index without
+  expressions or a predicate a row the table keeps holds, are skipped at
+  once, and the rest merged again, in halves if it still fails, down to the
+  rows that fail alone, each half taking a transaction ID; skipped rows are
+  recorded as a `MERGE` with their rows, with a warning,
   so that the provider's other rows, and its changes after the copy, still
   arrive; under `sub_disable`, it disables the subscription. In a table's initial copy, a row that fails, whether its value
   doesn't convert to its column's type, the column's input refuses it or a

@@ -681,7 +681,8 @@ public sealed partial class ExceptionBehaviourTests
     /// written here or under another origin, and those the provider has since deleted. Under transdiscard, as under
     /// discard, a row of the copy that a row here holds a unique value of, or that a CHECK constraint here refuses, is
     /// skipped and recorded under transdiscard, while the others merge and later changes arrive, those whose values rows
-    /// the table keeps hold all at once, without a transaction ID each. One cancelled before its copy
+    /// the table keeps hold all at once, without a transaction ID each, and a merge of 300,000 rows in halves takes the
+    /// sync worker little memory, on Linux, where /proc gives it. One cancelled before its copy
     /// commits copies a table without a key once, and the cleanup after it waits for a session that holds its slot, with a
     /// warning, rather than for ever. Dropping the subscription drops the slots its syncs left.
     /// </summary>
@@ -816,7 +817,7 @@ public sealed partial class ExceptionBehaviourTests
         Assert.AreEqual("1", await subscriber.SafePsqlAsync(Database, "SELECT count(*) FROM status_wait", token), "status_wait's row");
 
         long mergeFrom = 0;
-        foreach (string stop in new[] { "resume", "drop", "zero", "lost", "conflict" })
+        foreach (string stop in new[] { "resume", "drop", "zero", "lost", "conflict", "halves" })
         {
             string table = $"stopped_{stop}";
             _ = await provider.SafePsqlAsync(Database, $"CREATE TABLE {table} (id integer PRIMARY KEY, v text)", token);
@@ -836,11 +837,15 @@ public sealed partial class ExceptionBehaviourTests
                     ALTER TABLE {table} ADD CHECK (id <> 700000);
                     """, token);
             }
+            else if (stop == "halves")
+            {
+                _ = await subscriber.SafePsqlAsync(Database, $"CREATE UNIQUE INDEX {table}_v ON {table} (v) WHERE v <> 'copied'", token);
+            }
 
             // A key on the subscriber references the table.
             _ = await subscriber.SafePsqlAsync(Database, $"CREATE TABLE {table}_ref (id integer REFERENCES {table} (id))", token);
 
-            _ = await provider.SafePsqlAsync(Database, $"INSERT INTO {table} SELECT g, 'copied' FROM generate_series(1, 1000) g", token);
+            _ = await provider.SafePsqlAsync(Database, $"INSERT INTO {table} SELECT g, 'copied' FROM generate_series(1, {(stop == "halves" ? 300000 : 1000)}) g", token);
             int logpos = subscriber.ReadLog().Length;
             await using (NpgsqlConnection tableLocker = await subscriber.OpenAsync(Database, token))
             await using (NpgsqlConnection applyLocker = await subscriber.OpenAsync(Database, token))
@@ -895,7 +900,7 @@ public sealed partial class ExceptionBehaviourTests
                     INSERT INTO {table} OVERRIDING SYSTEM VALUE VALUES (900002, 'elsewhere');
                     INSERT INTO {table}_ref VALUES (1);
                     """, token);
-                if (stop == "conflict")
+                if (stop is "conflict" or "halves")
                 {
                     _ = await subscriber.SafePsqlAsync(Database, $"INSERT INTO {table} VALUES (900003, 'updated')", token);
                 }
@@ -950,6 +955,24 @@ public sealed partial class ExceptionBehaviourTests
                     mergeFrom = long.Parse(await subscriber.SafePsqlAsync(Database, "SELECT pg_snapshot_xmax(pg_current_snapshot())::text", token),
                         CultureInfo.InvariantCulture);
                     break;
+                case "halves":
+                    // The copy again merges 300,000 rows, of which row 500's new value, held by a row here in a partial
+                    // unique index, which only merging in halves finds, fails: the halves are ranges of the copy's rows,
+                    // which take no memory however many rows they hold. The 300 rows the provider changed that a CHECK
+                    // constraint here refuses are skipped at once, without a transaction ID each, while row 12345, which
+                    // another refuses, as neither is valid, stays as it is here, as the merge doesn't write it.
+                    _ = await provider.SafePsqlAsync(Database, $"""
+                        UPDATE {table} SET v = 'changed' WHERE id % 1000 = 7;
+                        SELECT pg_drop_replication_slot('{syncSlot}');
+                        """, token);
+                    _ = await subscriber.SafePsqlAsync(Database, $"""
+                        ALTER TABLE {table} ADD CONSTRAINT {table}_changed CHECK (v <> 'changed') NOT VALID;
+                        ALTER TABLE {table} ADD CONSTRAINT {table}_12345 CHECK (id <> 12345) NOT VALID;
+                        """, token);
+                    await SetBehaviourAsync(subscriber, "transdiscard", token);
+                    mergeFrom = long.Parse(await subscriber.SafePsqlAsync(Database, "SELECT pg_snapshot_xmax(pg_current_snapshot())::text", token),
+                        CultureInfo.InvariantCulture);
+                    break;
                 case "zero":
                     _ = await subscriber.SafePsqlAsync(Database, $"SELECT pg_replication_origin_advance('{syncSlot}', '0/0')", token);
                     break;
@@ -961,9 +984,15 @@ public sealed partial class ExceptionBehaviourTests
             // A session counts the table's rows while it's copied again.
             using CancellationTokenSource counting = CancellationTokenSource.CreateLinkedTokenSource(token);
             Task<long> fewest = Task.FromResult(long.MaxValue);
+            Task<long> peakKb = Task.FromResult(0L);
             if (stop != "resume")
             {
                 fewest = FewestRowsAsync(subscriber, table, counting.Token);
+                if (stop == "halves" && OperatingSystem.IsLinux())
+                {
+                    peakKb = PeakSyncMemoryAsync(subscriber, counting.Token);
+                }
+
                 _ = await provider.SafePsqlAsync(Database, $"ALTER ROLE {SuperUser} LOGIN", token);
             }
 
@@ -975,6 +1004,7 @@ public sealed partial class ExceptionBehaviourTests
             {
                 "resume" => "1000|500500|updated|f|t|here|elsewhere|1",
                 "conflict" => "1000|-198900|copied|t|f|here|elsewhere|1",
+                "halves" => "300001|45000150600|copied|t|t|here|elsewhere|1",
                 _ => "1001|501100|updated|t|t|here|elsewhere|1",
             },
                 await subscriber.SafePsqlAsync(Database, $"""
@@ -1006,6 +1036,27 @@ public sealed partial class ExceptionBehaviourTests
                 _ = await provider.SafePsqlAsync(Database, $"UPDATE {table} SET v = 'later' WHERE id = 501", token);
                 Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, $"SELECT v = 'later' FROM {table} WHERE id = 501", token),
                     "a change after the copy");
+                await SetBehaviourAsync(subscriber, "error", token);
+            }
+
+            if (stop == "halves")
+            {
+                long merged = long.Parse(await subscriber.SafePsqlAsync(Database, "SELECT pg_snapshot_xmax(pg_current_snapshot())::text", token),
+                    CultureInfo.InvariantCulture) - mergeFrom;
+                Assert.Contains($"skipped 301 of the rows of the copy of table public.{table}", subscriber.ReadLog()[logpos..]);
+                Assert.AreEqual($"300|0|1|new row for relation \"{table}\" violates check constraint \"{table}_changed\"", await subscriber.SafePsqlAsync(Database, $"""
+                    SELECT count(*), (SELECT count(*) FROM {table} WHERE v = 'changed'), (SELECT count(*) FROM {table} WHERE id = 12345),
+                        string_agg(DISTINCT error_message, ',')
+                    FROM worf.exception_log WHERE table_name = '{table}' AND error_sqlstate = '23514'
+                    """, token), "the changed rows the CHECK refused, recorded and left as they were, and row 12345, left alone");
+                Assert.IsLessThan(150L, merged, "transaction IDs the merge took for 300 rows a CHECK refused");
+                if (OperatingSystem.IsLinux())
+                {
+                    long peak = await peakKb;
+                    TestContext.WriteLine($"sync worker private memory merging in halves: {peak / 1024} MB");
+                    Assert.IsLessThan(80L * 1024, peak, "the sync worker's private memory merging 300,000 rows in halves, in kB");
+                }
+
                 await SetBehaviourAsync(subscriber, "error", token);
             }
         }
@@ -1414,6 +1465,33 @@ public sealed partial class ExceptionBehaviourTests
 
         Assert.Fail("the copy didn't finish");
         return default;
+    }
+
+    /// <summary>
+    /// Watches the private memory of the subscriber's table sync workers until cancelled, and returns its peak, in kB.
+    /// </summary>
+    private static async Task<long> PeakSyncMemoryAsync(TestNode subscriber, CancellationToken token)
+    {
+        long peakKb = 0;
+        try
+        {
+            while (true)
+            {
+                string pids = await subscriber.SafePsqlAsync(Database,
+                    "SELECT string_agg(pid::text, ',') FROM pg_stat_activity WHERE backend_type LIKE 'worf sync%'", token);
+                foreach ((double _, long rss) in pids.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                    .Select(pid => int.TryParse(pid, out int sync) ? ReadProcess(sync) : null).OfType<(double Cpu, long RssAnonKb)>())
+                {
+                    peakKb = Math.Max(peakKb, rss);
+                }
+
+                await Task.Delay(TimeSpan.FromMilliseconds(50), token);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            return peakKb;
+        }
     }
 
     /// <summary>
