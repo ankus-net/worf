@@ -1923,7 +1923,8 @@ public sealed class SequenceRangeTests
     /// sequence's range row, switches to the next block itself, once it has waited twice worf.sequence_range_timeout,
     /// without taking the range row, which would hold up every exchange until it ended, and with the lock_timeout the
     /// session set left as it was. Its switch is logged once it commits, and one that switched can't be prepared, as a
-    /// prepared transaction would hold the sequence across restarts; the refused one logs no switch. A switch that rolls
+    /// prepared transaction would hold the sequence across restarts; the refused one logs no switch, and
+    /// worf.sequence_ranges shows its sequence meanwhile. A switch that rolls
     /// back, or that a savepoint rolls back, leaves no insert to fail, and the savepoint's transaction may switch again or
     /// be prepared, without the switch logged.
     /// </summary>
@@ -1971,6 +1972,11 @@ public sealed class SequenceRangeTests
         // Once the other session lets the range row go, the switching transaction, still open, doesn't hold it.
         await held.RollbackAsync(token);
         Assert.AreEqual("1", await node.SafePsqlAsync(Database, $"{Range} NOWAIT", token), "the range row, free while the switch is open");
+
+        // worf.sequence_ranges reads the sequence's position without waiting for the switch, which holds the sequence.
+        Assert.AreEqual("t", await node.SafePsqlAsync(Database,
+            "SET statement_timeout = '500ms'; SELECT values_left IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 'ts_id_seq'::regclass", token),
+            "the sequence's position while the switch is open");
         await switching.CommitAsync(token);
         Assert.AreEqual("15|15|t", await node.SafePsqlAsync(Database,
             $"SELECT count(*), count(DISTINCT id), min(id) >= {active} FROM ts", token), "the rows, each with its own key");

@@ -4507,7 +4507,10 @@ internal static unsafe partial class SequenceRanges
 
     /// <summary>
     /// Returns the last value a managed sequence issued, as <c>worf.sequence_ranges</c> shows it, without the lock that
-    /// <c>pg_sequence_last_value</c> takes, which would hold off every switch until the reader's transaction ends.
+    /// <c>pg_sequence_last_value</c> takes, which would hold off every switch until the reader's transaction ends, and
+    /// without waiting for a switch under way, as a session's own holds the sequence until its transaction ends: the
+    /// position is the sequence's as a SELECT from it reads it, which may already be in the block a switch that hasn't
+    /// committed moves it to.
     /// </summary>
     /// <param name="sequence">The sequence.</param>
     /// <returns>The last value, or null before its first.</returns>
@@ -4521,7 +4524,7 @@ internal static unsafe partial class SequenceRanges
 
         // As pg_sequence_last_value, it needs SELECT or USAGE on the sequence.
         return Worf.ReadScalar<bool>("SELECT pg_catalog.has_sequence_privilege($1, 'SELECT, USAGE')", SpiParameter.Create(seqoid))
-            ? LastValue(seqoid)
+            ? Elevated.Run(() => Worf.ReadScalar<long?>(PositionRead(seqoid)))
             : throw new PgException("42501", $"permission denied for sequence {GetInfo(seqoid).Name}");
     }
 
@@ -4535,10 +4538,6 @@ internal static unsafe partial class SequenceRanges
     /// <returns>The last value, or null.</returns>
     internal static long? LastValue(uint seqoid) => Elevated.Run(() =>
     {
-        WorfRows name = Worf.Read("""
-            SELECT n.nspname::text, c.relname::text FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-            WHERE c.oid = $1
-            """, 1, SpiParameter.Create(seqoid));
 
         // A switch moves the sequence's position at once, and its bounds and block as it commits, so a read in between
         // could pair the old block with the new position, or, just after the switch commits, the new block with the old
@@ -4549,7 +4548,7 @@ internal static unsafe partial class SequenceRanges
         // goes without the lock, and is good when no switch held the lock as it read and the sequence's catalog row and
         // file stayed the same, since a switch updates the row, and DDL that rewrites the sequence writes a new file;
         // while a switch holds it, the read tries again soon.
-        string read = "SELECT CASE WHEN is_called THEN last_value END FROM " + Worf.QuoteQualifiedIdentifier(name[0].Get<string>(0), name[0].Get<string>(1));
+        string read = PositionRead(seqoid);
         // A standby switches nothing, and takes no such lock.
         if (NativeMethods.RecoveryInProgress())
         {
@@ -4593,10 +4592,24 @@ internal static unsafe partial class SequenceRanges
                     detail: $"Processes have held a lock on it that a switch takes for as long as worf.sequence_range_timeout: {holder}.");
             }
 
+            // The read tries again a hundred times a second, as pg_locks takes every lock partition's lock to read them.
             PgInterrupts.Check();
-            Worker.WaitLatch(1);
+            Worker.WaitLatch(10);
         }
     });
+
+    /// <summary>
+    /// Writes the query that reads a sequence's last value from its row, or null before its first, under the lock a
+    /// SELECT takes, which no switch waits for.
+    /// </summary>
+    private static string PositionRead(uint seqoid)
+    {
+        WorfRow name = Worf.Read("""
+            SELECT n.nspname::text, c.relname::text FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.oid = $1
+            """, 1, SpiParameter.Create(seqoid))[0];
+        return "SELECT CASE WHEN is_called THEN last_value END FROM " + Worf.QuoteQualifiedIdentifier(name.Get<string>(0), name.Get<string>(1));
+    }
 
     /// <summary>
     /// Finds the version of a sequence's catalog row and its file, as of the latest commit, unless another transaction
