@@ -100,11 +100,14 @@ internal static class SequenceRangeExchangeWorker
             }
         }
 
-        // A probe gives way to a request on another node that came up since it started, not to one that already waited,
-        // as the once-a-minute probe of a neighbor would otherwise give way for as long as another's requests stay open.
+        // A probe gives way to a request on another node made within the exchange timeout, which that node is about to
+        // answer, but not to one that has stayed open longer, as one the node can't answer, so that the once-a-minute probe
+        // of a neighbor doesn't give way for as long as such a request stays open.
         bool giveWay = probe.Node != 0 && PgBackgroundWorker.RunTransaction(() => Worf.ReadScalar<bool>("""
-            SELECT EXISTS (SELECT 1 FROM worf.sequence_range_request WHERE state = 'open' AND parent_node <> $1 AND created_at >= $2)
-            """, SpiParameter.Create(probe.Node), SpiParameter.Create(new PgTimestampTz(probe.StartedAt))));
+            SELECT EXISTS (
+                SELECT 1 FROM worf.sequence_range_request
+                WHERE state = 'open' AND parent_node <> $1 AND created_at >= least($2, pg_catalog.clock_timestamp() - $3 * interval '1 millisecond'))
+            """, SpiParameter.Create(probe.Node), SpiParameter.Create(new PgTimestampTz(probe.StartedAt)), SpiParameter.Create(SequenceRanges.ExchangeTimeout)));
         using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
         {
             for (int i = 0; i < guard.Length; i++)

@@ -664,11 +664,24 @@ public sealed class RelayOriginTests
 
     /// <summary>
     /// Commits a transaction under a replication origin, as apply does for the node it names, and that creates the
-    /// origin when asked.
+    /// origin when asked. The session of an earlier write under the origin, which has ended, may hold it a moment longer
+    /// as its process exits, so the write waits for it.
     /// </summary>
-    private static Task<string> WriteAsAsync(TestNode node, string origin, string sql, CancellationToken token, bool create = false)
-        => node.SafePsqlAsync(Database,
-            $"{(create ? $"SELECT pg_replication_origin_create('{origin}'); " : "")}SELECT pg_replication_origin_session_setup('{origin}'); {sql}", token);
+    private static async Task<string> WriteAsAsync(TestNode node, string origin, string sql, CancellationToken token, bool create = false)
+    {
+        string setup = $"{(create ? $"SELECT pg_replication_origin_create('{origin}'); " : "")}SELECT pg_replication_origin_session_setup('{origin}'); ";
+        for (Stopwatch waited = Stopwatch.StartNew(); ; await Task.Delay(TimeSpan.FromMilliseconds(100), token))
+        {
+            try
+            {
+                return await node.SafePsqlAsync(Database, setup + sql, token);
+            }
+            catch (PostgresException error) when (error.SqlState == "55006" && !create && waited.Elapsed < TimeSpan.FromSeconds(30))
+            {
+                // The origin is still the ended session's.
+            }
+        }
+    }
 
     private static async Task WaitForSyncAsync(TestNode subscriber, string table, CancellationToken token)
         => Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
