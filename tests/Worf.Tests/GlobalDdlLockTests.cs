@@ -829,7 +829,7 @@ public sealed class GlobalDdlLockTests
         string traps = string.Join('\n', new[] { nodeA, nodeB }.SelectMany(node => node.ReadLog().Split('\n')
             .Where(line => line.StartsWith("TRAP:", StringComparison.Ordinal)).Distinct().Select(line => $"{node.Name}: {line}")));
         Assert.IsTrue(applied, applied ? "" : $"""
-            node_a's rows on node_b{(traps.Length > 0 ? $", with failed assertions:\n{traps}" : "")}
+            node_a's rows on node_b{(traps.Length > 0 ? $", with failed assertions:\n{traps}\nnode_a's WAL its slots decode again:\n{await nodeA.DescribeDecodedWalAsync(Database, token)}" : "")}
             {await nodeB.DescribeReplicationAsync(Database, token)}
             {await nodeA.DescribeReplicationAsync(Database, token)}
             node_b's log since the insert:

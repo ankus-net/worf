@@ -271,6 +271,46 @@ internal sealed class TestNode : IAsyncDisposable
     }
 
     /// <summary>
+    /// Describes the WAL each logical slot decodes again as it starts, from its restart point to the point it has
+    /// confirmed, for a failure's message: the transaction records, and every record of each transaction that logged
+    /// invalidations there, as pg_waldump shows them, which name the subtransaction logical decoding stopped at.
+    /// </summary>
+    /// <param name="dbname">The database.</param>
+    /// <param name="cancellationToken">Cancels the queries.</param>
+    /// <returns>The description.</returns>
+    public async Task<string> DescribeDecodedWalAsync(string dbname, CancellationToken cancellationToken)
+    {
+        StringBuilder described = new();
+        string slots = await SafePsqlAsync(dbname, """
+            SELECT slot_name || '|' || restart_lsn || '|' || confirmed_flush_lsn FROM pg_replication_slots
+            WHERE slot_type = 'logical' AND restart_lsn IS NOT NULL AND confirmed_flush_lsn IS NOT NULL
+            """, cancellationToken);
+        foreach (string[] slot in slots.Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(line => line.Split('|')))
+        {
+            (_, string output) = await RunProgramAsync("pg_waldump", ["-p", Path.Join(Cluster.DataDirectory, "pg_wal"), "-s", slot[1], "-e", slot[2]],
+                cancellationToken);
+            string[] records = output.Split('\n');
+            HashSet<string> invalidating = [.. records.Where(record => record.Contains("INVALIDATION", StringComparison.Ordinal))
+                .Select(Transaction).Where(xid => xid is not ("" or "0"))];
+            _ = described.Append(CultureInfo.InvariantCulture, $"slot {slot[0]}, {slot[1]} to {slot[2]}:\n");
+            foreach (string record in records.Where(record => record.Contains("rmgr: Transaction", StringComparison.Ordinal) ||
+                invalidating.Contains(Transaction(record))).Take(400))
+            {
+                _ = described.Append("  ").Append(record).Append('\n');
+            }
+        }
+
+        return described.ToString();
+
+        // The transaction a record names, as pg_waldump prints it after "tx:".
+        static string Transaction(string record)
+        {
+            int at = record.IndexOf("tx:", StringComparison.Ordinal);
+            return at < 0 ? "" : new string([.. record[(at + 3)..].TrimStart().TakeWhile(char.IsAsciiDigit)]);
+        }
+    }
+
+    /// <summary>
     /// Describes the node's replication as it stands, for a failure's message: its sessions and what they wait on, the
     /// locks they wait for, slots, replication origins and worf's subscriptions, and outside Windows the server's
     /// processes, which show a worker that never connected. Each query gives up after a while, as one that waits on a
