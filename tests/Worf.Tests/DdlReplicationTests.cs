@@ -363,6 +363,61 @@ public sealed class DdlReplicationTests
         Assert.AreEqual("0", await nodeC.SafePsqlAsync(Database, "SELECT count(*) FROM worf.queue WHERE message_type = 'D'", token));
     }
 
+    /// <summary>
+    /// Logical decoding of a subscriber's WAL that starts again inside the subtransaction apply runs queued DDL in, after
+    /// the subtransaction's first record, takes the rest of it, here an ANALYZE, whose records are invalidations, and
+    /// decodes what comes after, however often it starts again, with the column the DDL added: the transactional message
+    /// apply writes last in the subtransaction gives decoding a change to set its snapshot from, without which an
+    /// assert-enabled build aborts, and the subtransaction's invalidations aren't executed.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task DecodingStartsAgainInsideAppliedDdl()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "SET worf.enable_ddl_replication = off; CREATE TABLE u (a int); CREATE TABLE v (a int)", token);
+        }
+
+        _ = await nodeB.SafePsqlAsync(Database, "SELECT 1 FROM pg_create_logical_replication_slot('td', 'test_decoding')", token);
+
+        // node_a's queued SQL adds a column to u, waits, and analyzes u, in one subtransaction of node_b's apply.
+        Task queued = nodeA.SafePsqlAsync(Database,
+            "SELECT worf.replicate_ddl_command('ALTER TABLE public.u ADD COLUMN b int; SELECT pg_catalog.pg_sleep(4); ANALYZE public.u')", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE backend_type LIKE 'worf apply%' AND wait_event = 'PgSleep')", token),
+            "node_b's apply inside the queued SQL");
+
+        // Decoding moves its restart point past the subtransaction's first record, while another transaction stays open.
+        _ = await nodeB.SafePsqlAsync(Database, "CHECKPOINT; SELECT count(*) FROM pg_logical_slot_get_changes('td', NULL, NULL)", token);
+        await using NpgsqlConnection open = await nodeB.OpenAsync(Database, token);
+        await using NpgsqlTransaction held = await open.BeginTransactionAsync(token);
+        await using (NpgsqlCommand insert = new("INSERT INTO v VALUES (1)", open, held))
+        {
+            _ = await insert.ExecuteNonQueryAsync(token);
+        }
+
+        await queued;
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
+            "SELECT reltuples >= 0 FROM pg_class WHERE oid = 'public.u'::regclass AND relnatts = 2", token), "the queued SQL applied on node_b");
+        for (int round = 0; round < 2; round++)
+        {
+            _ = await nodeB.SafePsqlAsync(Database, "CHECKPOINT; SELECT count(*) FROM pg_logical_slot_get_changes('td', NULL, NULL)", token);
+        }
+
+        // A row written afterwards decodes with the column the queued SQL added.
+        await held.CommitAsync(token);
+        _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO u VALUES (2, 3)", token);
+        Assert.AreEqual("table public.u: INSERT: a[integer]:2 b[integer]:3", await nodeB.SafePsqlAsync(Database,
+            "SELECT data FROM pg_logical_slot_get_changes('td', NULL, NULL) WHERE data LIKE 'table public.u: INSERT%'", token),
+            "the row decoded after the queued SQL, with its new column");
+        Assert.DoesNotContain("TRAP:", nodeB.ReadLog(), "node_b's log");
+    }
+
     private static async Task<TestNode> StartNodeAsync(string name, CancellationToken token)
     {
         TestNode node = await TestNode.StartAsync(name,

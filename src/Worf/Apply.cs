@@ -526,6 +526,16 @@ internal static unsafe partial class Apply
             }
         }
 
+        // Logical decoding of this node's WAL takes a subtransaction it starts again in the middle of, after the
+        // subtransaction's first record, as a transaction of its own, and executes the invalidations of one that has no
+        // change after that point only once it has a base snapshot, which only a change gives it; an assert-enabled
+        // build aborts then. A transactional message, the commands' last record, is such a change, so that the
+        // invalidations of the DDL apply runs in a subtransaction are executed wherever decoding starts again in it.
+        if (applying && NativeMethods.GetCurrentTransactionIdIfAny() != 0)
+        {
+            Elevated.Run(() => _ = Worf.Execute("SELECT pg_catalog.pg_logical_emit_message(true, 'worf', '')"));
+        }
+
         NativeGlobals.debug_query_string = saveDebugQueryString;
     }
 
