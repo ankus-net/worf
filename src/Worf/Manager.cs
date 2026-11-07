@@ -48,6 +48,7 @@ internal static class Manager
 
         // Setup shmem.
         Worker.WorkerAttach(mainArg, WorfWorkerType.Manager);
+        ForgetCancelling();
 
         // A database without worf, or a template that isn't a node, has nothing to manage. The manager notes when it
         // looked, so that a CREATE EXTENSION worf that commits after then, which it may not see, has the supervisor
@@ -173,6 +174,26 @@ internal static class Manager
             Detail = logged ? "The log's \"still waiting\" message before this names the lock and the processes that hold it." : null,
             Hint = logged ? null : "Turn on log_lock_waits for the log to name the lock and the processes that hold it.",
         });
+    }
+
+    /// <summary>
+    /// Clears the marks of the calls an earlier manager of the database was cancelling when it exited, which it may not
+    /// have sent, so that the calls that ended on their own wait for them no longer.
+    /// </summary>
+    private static void ForgetCancelling()
+    {
+        uint dboid = Worker.MyWorker.Dboid;
+        using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive();
+        for (int i = 0; i < guard.Length; i++)
+        {
+            WorfWorker worker = guard[i];
+            if (worker.WorkerType is WorfWorkerType.Apply or WorfWorkerType.Sync && worker.Dboid == dboid &&
+                worker.Worker.Apply.CallDeadline == Worker.CancellingCall)
+            {
+                worker.Worker.Apply.CallDeadline = 0;
+                guard[i] = worker;
+            }
+        }
     }
 
     /// <summary>

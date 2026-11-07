@@ -1925,7 +1925,7 @@ public sealed class SequenceRangeTests
 
         await nodeB.StartServerAsync(token);
         int waited = nodeB.ReadLog().Length;
-        Assert.IsFalse(await nodeB.PsqlAsync(Database, "SET statement_timeout = '10s'; INSERT INTO t (v) VALUES ('back')", token),
+        Assert.IsFalse(await nodeB.PsqlAsync(Database, "SET statement_timeout = '5s'; INSERT INTO t (v) VALUES ('back')", token),
             "node_b's insert while a prepared transaction holds its range row");
         Assert.Contains("canceling statement due to statement timeout", nodeB.ReadLog()[waited..], "node_b's insert waiting for node_a's request to reset");
         _ = await nodeB.SafePsqlAsync(Database, "ROLLBACK PREPARED 'held_b'", token);

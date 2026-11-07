@@ -333,6 +333,7 @@ public sealed class StalledPeerTests
 
         Stopwatch applying = Stopwatch.StartNew();
         await AppliesAsync(provider, subscriber, 2, token);
+        TestContext.WriteLine($"the next row after {applying.Elapsed.TotalSeconds:F1} s");
         if (managerExits)
         {
             Assert.IsLessThan(TimeSpan.FromSeconds(5), applying.Elapsed, "the next row, once the manager exited before its cancel, against wal_receiver_timeout's 10 s");
