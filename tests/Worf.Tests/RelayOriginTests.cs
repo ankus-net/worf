@@ -335,6 +335,19 @@ public sealed class RelayOriginTests
             """;
         Assert.AreEqual("", await subscriber.SafePsqlAsync(Database, AppliedAsAnother, token), "rows applied as another node's");
 
+        // Turns after one whose wait for a slot ended with none come free don't wait: twenty more, rotating among the
+        // writers and ending with the last one's, take well under the second each took waiting.
+        Stopwatch turning = Stopwatch.StartNew();
+        for (int id = 100; id < 120; id++)
+        {
+            int writer = 9001 + ((id + 4) % 5);
+            await WriteAsAsync(provider, $"{back}@{writer}", $"INSERT INTO d VALUES ({id}, '{writer}')", token);
+        }
+
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT count(*) = 24 FROM d", token), "the rotating writers' rows");
+        Assert.IsLessThan(TimeSpan.FromSeconds(10), turning.Elapsed, "twenty turns among the writers");
+        Assert.AreEqual("", await subscriber.SafePsqlAsync(Database, AppliedAsAnother, token), "rotating writers' rows applied as another node's");
+
         // They keep their slots while nothing wants one, as when the apply worker restarts with every slot taken, though
         // an enabled PostgreSQL subscription whose worker never starts, as its owner can't log in, and an origin a user
         // created have none, and give one up to another subscription that finds none free.
@@ -377,7 +390,7 @@ public sealed class RelayOriginTests
             await WriteAsAsync(provider, $"{back}@{writer}", $"INSERT INTO d VALUES ({id}, '{writer}')", token);
         }
 
-        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT count(*) = 9 FROM d", token), "the rows after the horizon");
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT count(*) = 29 FROM d", token), "the rows after the horizon");
         Assert.AreEqual("0", await subscriber.SafePsqlAsync(Database, $"""
             SELECT count(*) FROM (
                 SELECT roident FROM worf.origin_writer
@@ -439,7 +452,7 @@ public sealed class RelayOriginTests
         // workers don't say they want one, and not to the origin the user created.
         await WriteAsAsync(provider, $"{back}@9004", "INSERT INTO d VALUES (14, '9004')", token);
         await WriteAsAsync(provider, $"{back}@9002", "INSERT INTO d VALUES (15, '9002')", token);
-        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT count(*) = 11 FROM d", token), "the rows before another user");
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT count(*) = 31 FROM d", token), "the rows before another user");
         Assert.AreEqual("t", await subscriber.SafePsqlAsync(Database, $"""
             SELECT count(*) = current_setting('{limit}')::integer
                 AND count(*) FILTER (WHERE o.roname LIKE '%@90__') >= 1
@@ -504,6 +517,47 @@ public sealed class RelayOriginTests
         {
             Assert.DoesNotContain("carries this sequence range exchange", node.ReadLog(), node.Name);
         }
+    }
+
+    /// <summary>
+    /// Subscriptions of two databases whose slots' names come out the same, as the parts they join with underscores hold
+    /// underscores, here m's provider_s and m_provider's s, can't both be made: create_subscription makes the first's
+    /// replication origin, which refuses the second, though the first's worker is still making its slot, as while a
+    /// transaction on the provider is open.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task SubscriptionsOfOtherDatabasesShareNoSlot()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        TestNode[] nodes = await Task.WhenAll(
+            StartNodeAsync("provider", token),
+            StartNodeAsync("subscriber", token));
+        await using TestNode provider = nodes[0];
+        await using TestNode subscriber = nodes[1];
+        foreach (string dbname in new[] { "m", "m_provider" })
+        {
+            _ = await subscriber.SafePsqlAsync(Database, $"CREATE DATABASE {dbname}", token);
+            _ = await subscriber.SafePsqlAsync(dbname, $"""
+                CREATE EXTENSION worf;
+                SELECT * FROM worf.create_node(node_name := 'sub_{dbname}', dsn := '{subscriber.Dsn(dbname, SuperUser)}');
+                """, token);
+        }
+
+        await using NpgsqlConnection open = await provider.OpenAsync(Database, token);
+        await using (NpgsqlCommand begin = new("BEGIN; SELECT pg_current_xact_id()", open))
+        {
+            _ = await begin.ExecuteScalarAsync(token);
+        }
+
+        string Subscribe(string name) => $"""
+            SELECT worf.create_subscription(subscription_name := '{name}', provider_dsn := '{provider.Dsn(Database, SuperUser)}',
+                synchronize_structure := false, synchronize_data := false)
+            """;
+        _ = await subscriber.SafePsqlAsync("m", Subscribe("provider_s"), token);
+        PostgresException shared = await Assert.ThrowsExactlyAsync<PostgresException>(() => subscriber.SafePsqlAsync("m_provider", Subscribe("s"), token),
+            "m_provider's subscription");
+        Assert.StartsWith("subscription \"s\" would use replication origin \"worf_m_provider_provider_s\"", shared.MessageText);
     }
 
     /// <summary>

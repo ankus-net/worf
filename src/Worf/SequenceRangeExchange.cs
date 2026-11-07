@@ -538,8 +538,12 @@ internal static class SequenceRangeExchange
             (string? waiting, bool fenced) = Waiting(sub.Origin.Id);
             bool asks = waiting is not null &&
                 (!s_waits.TryGetValue(sub.Id, out (string What, long At, long Delay) wait) || wait.What != waiting || now >= wait.At);
-            if (!retrying && (!s_exchangedAt.TryGetValue(sub.Id, out long at) || now - at >= SequenceRanges.ExchangeInterval * 1000L ||
-                s_acksWaiting.Contains(sub.Id) || asks))
+
+            // A statement that waits to draw from a block the neighbor granted, until this server hears from it since it
+            // started, makes the exchange due, once a second at most.
+            bool exchanged = s_exchangedAt.TryGetValue(sub.Id, out long at);
+            bool wanted = (!exchanged || now - at >= 1_000_000) && SequenceRangeHeard.Wanted(sub.Origin.Id, now - 2_000_000);
+            if (!retrying && (!exchanged || now - at >= SequenceRanges.ExchangeInterval * 1000L || s_acksWaiting.Contains(sub.Id) || asks || wanted))
             {
                 due.Add((sub, waiting, fenced));
             }
@@ -904,7 +908,7 @@ internal static class SequenceRangeExchange
             // When this server started, and when the neighbor's did, as it last said, which tells it that a message
             // this server makes from now on was made knowing it's back.
             writer.WriteNumber("started_at", SequenceRangeHeard.Started);
-            writer.WriteNumber("heard_started_at", SequenceRangeHeard.StartedOf(neighbor));
+            writer.WriteNumber("heard_started_at", PendingStart(neighbor) ?? SequenceRangeHeard.StartedOf(neighbor));
 
             writer.WriteStartArray("sequences");
             // An epoch this node owned of a sequence it dropped goes out as disabled, with nothing else.
@@ -1184,8 +1188,13 @@ internal static class SequenceRangeExchange
             {
                 undone |= Text(entry, "reset") is not null;
 
-                // A sequence dropped here since the exchange began goes unmentioned, though one of its name was created again.
-                if (processed is uint seqoid && SequenceRanges.SequenceExists(seqoid))
+                // A sequence dropped here since the exchange began goes unmentioned, though one of its name was created again,
+                // and one whose range row stayed locked is taken in at a later exchange.
+                if (error.SqlState == "55P03")
+                {
+                    WorfLog.Debug1($"sequence range exchange with node {senderName} left out sequence {entry.GetProperty("name").GetWorfString()}, whose range row another transaction holds");
+                }
+                else if (processed is uint seqoid && SequenceRanges.SequenceExists(seqoid))
                 {
                     WorfLog.Warning(new PgDiagnostic($"sequence range exchange with node {senderName} skipped sequence {entry.GetProperty("name").GetWorfString()}: {error.Message}")
                     {
@@ -1492,11 +1501,32 @@ internal static class SequenceRangeExchange
             return (false, false, false);
         }
 
-        // The range row is locked first, as every change to the sequence's ranges does.
+        // The range row is locked first, as every change to the sequence's ranges does, waiting a quarter of
+        // worf.sequence_range_timeout at most, up to a second, as a transaction that ran a block out holds it until it
+        // ends, so that the exchange, which holds the node's turn, goes on with the other sequences.
         int epoch = entry.GetProperty("epoch").GetInt32();
         uint owner = entry.GetProperty("owner_id").GetUInt32();
-        WorfRows local = Worf.Query("SELECT owner_node, epoch, state FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE", false, 1,
-            SpiParameter.Create(seqoid));
+        WorfRows local;
+        int nestLevel;
+        unsafe
+        {
+            nestLevel = NativeMethods.NewGUCNestLevel();
+        }
+
+        try
+        {
+            _ = Worf.Execute($"SET LOCAL lock_timeout = {Math.Min(1000, SequenceRanges.ExchangeTimeout / 4).ToString(CultureInfo.InvariantCulture)}");
+            local = Worf.Query("SELECT owner_node, epoch, state FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE", false, 1,
+                SpiParameter.Create(seqoid));
+        }
+        finally
+        {
+            unsafe
+            {
+                NativeMethods.AtEOXact_GUC(true, nestLevel);
+            }
+        }
+
         if (local.Count == 0)
         {
             // An epoch this node owns and no longer manages, as after it dropped the sequence, is no epoch to join.
@@ -1647,9 +1677,10 @@ internal static class SequenceRangeExchange
             bool behind = Worf.TryParseLsn(reset, out ulong seen) && seen > insert;
 
             // A fence's lift asks the holders of the grants it gave out again, or that overlap, to reset, which the
-            // node that granted them may ask at once, however recently it asked before, as it decides those blocks in
-            // any case, when it names a block this node holds from it, which the reset gives up, so that it can't reset
-            // this node more often than it grants it blocks; any other request waits for SequenceRangeHeard.MayReset.
+            // node that granted them may ask, when it names a block this node holds from it, in a window of its own, so
+            // that another reset doesn't hold it up, but no more often than other requests, as one made up may name
+            // the blocks this node's answers list; the reset gives them up. Any other request waits for
+            // SequenceRangeHeard.MayReset as well.
             Guid[] named = entry.TryGetProperty("reset_grants", out JsonElement grants) && grants.ValueKind == JsonValueKind.Array
                 ? [.. grants.EnumerateArray().Select(grant => grant.ValueKind == JsonValueKind.String && grant.TryGetGuid(out Guid id) ? id : Guid.Empty)]
                 : [];
@@ -1664,10 +1695,10 @@ internal static class SequenceRangeExchange
                 _ = Worf.Execute("UPDATE worf.sequence_range_node SET reset_done = $3::pg_lsn WHERE seqoid = $1 AND node_id = $2", seq, sender,
                     SpiParameter.Create(reset));
             }
-            else if ((fromGrantor ? Worker.GetCurrentTimestamp() : SequenceRangeHeard.MayReset(senderId)) is long window && Worf.Execute("""
+            else if (SequenceRangeHeard.MayReset(senderId, fromGrantor) is long window && Worf.Execute("""
                 UPDATE worf.sequence_range_node SET reset_done = $3::pg_lsn, reset_at = pg_catalog.clock_timestamp()
-                WHERE seqoid = $1 AND node_id = $2 AND ($5 OR reset_at IS NULL OR reset_at < $4)
-                """, seq, sender, SpiParameter.Create(reset), SpiParameter.Create(new PgTimestampTz(window)), SpiParameter.Create(fromGrantor)) > 0)
+                WHERE seqoid = $1 AND node_id = $2 AND (reset_at IS NULL OR reset_at < $4)
+                """, seq, sender, SpiParameter.Create(reset), SpiParameter.Create(new PgTimestampTz(window))) > 0)
             {
                 WorfLog.Warning(reset.StartsWith("FFFFFFFF/", StringComparison.Ordinal)
                     ? $"sequence {info.Name}: node {senderName} lifted a fence over grants of this node's that overlap another's, so it abandons its blocks and requests new ones"
@@ -2174,6 +2205,16 @@ internal static class SequenceRangeExchange
         => entry.TryGetProperty("holds", out JsonElement holds) && holds.ValueKind == JsonValueKind.Array
             ? [.. holds.EnumerateArray().Select(number => number.GetInt64())]
             : null;
+
+    /// <summary>
+    /// Gets when a neighbor's server started, as the message this transaction took in from it says, once it has asked
+    /// all it makes of the neighbor's return: the answer to that message, which goes out only if the transaction commits,
+    /// says it back, as the messages after do.
+    /// </summary>
+    /// <param name="neighbor">The neighbor.</param>
+    /// <returns>The time, or null.</returns>
+    private static long? PendingStart(uint neighbor)
+        => s_onCommit.FindLast(noted => noted.Sender == neighbor && noted.StartedAt is not null).StartedAt;
 
     /// <summary>
     /// Notes, once the transaction that takes in a neighbor's message commits, when the neighbor's server started, which

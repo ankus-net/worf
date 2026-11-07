@@ -18,6 +18,9 @@ VerbosityLevel verbosity = VerbosityLevel.Normal;
 
 // Die closes these.
 LibpqConnection? subscriberConn = null;
+
+// The origin the subscriber's uncommitted transaction created, whose progress its rollback leaves behind.
+(string Name, int Id)? uncommittedOrigin = null;
 LibpqConnection? providerConn = null;
 
 string? remoteLsn;
@@ -363,6 +366,8 @@ for (int dbnum = 0; dbnum < databaseList.Length; dbnum++)
         throw Die($"Could not commit the subscription, status PGRES_FATAL_ERROR: {error.Message}\n");
     }
 
+    uncommittedOrigin = null;
+
     subscriberConn.Dispose();
     subscriberConn = null;
 }
@@ -521,6 +526,11 @@ bool TryParseOption(string[] args, ref int index, out string option, out string?
 InvalidOperationException Die(string message)
 {
     Console.Error.Write(message);
+
+    if (subscriberConn is not null && uncommittedOrigin is (string name, int id))
+    {
+        ClearRolledBackOrigin(subscriberConn, name, id);
+    }
 
     subscriberConn?.Dispose();
     providerConn?.Dispose();
@@ -838,7 +848,7 @@ void InitializeReplicationOrigin(LibpqConnection conn, string originName, string
     string query = $"SELECT pg_replication_origin_create({EscapeLiteral(originName)})";
     try
     {
-        _ = Query(conn, query);
+        uncommittedOrigin = (originName, int.Parse(QueryValue(conn, query)!, CultureInfo.InvariantCulture));
     }
     catch (LibpqException error)
     {
@@ -856,6 +866,39 @@ void InitializeReplicationOrigin(LibpqConnection conn, string originName, string
         {
             throw Die($"Could not advance replication origin \"{query}\": status PGRES_FATAL_ERROR: {error.Message}\n");
         }
+    }
+}
+
+// Rolls back the transaction that created an origin and clears the progress it gave it, which stays in shared memory
+// for the freed id, through a restart, and which an origin created next with the id would start from: origins take the
+// lowest free id, so ones created in turn reach it, and dropping one clears its id's progress.
+void ClearRolledBackOrigin(LibpqConnection conn, string originName, int id)
+{
+    try
+    {
+        _ = Query(conn, "ROLLBACK");
+        List<string> created = [];
+        try
+        {
+            for (int taken = 0; taken < id;)
+            {
+                string name = $"{originName}_cleared_{created.Count}";
+                taken = int.Parse(QueryValue(conn, $"SELECT pg_replication_origin_create({EscapeLiteral(name)})")!,
+                    CultureInfo.InvariantCulture);
+                created.Add(name);
+            }
+        }
+        finally
+        {
+            foreach (string name in created)
+            {
+                _ = Query(conn, $"SELECT pg_replication_origin_drop({EscapeLiteral(name)})");
+            }
+        }
+    }
+    catch (LibpqException error)
+    {
+        Console.Error.WriteLine($"WARNING: could not clear the progress of replication origin \"{originName}\": {error.Message}");
     }
 }
 

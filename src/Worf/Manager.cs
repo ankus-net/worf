@@ -192,7 +192,7 @@ internal static class Manager
             {
                 WorfWorker worker = guard[i];
                 long deadline = worker.Worker.Apply.CallDeadline;
-                if (worker.WorkerType is not (WorfWorkerType.Apply or WorfWorkerType.Sync) || worker.Dboid != dboid || worker.Proc == 0 || deadline == 0)
+                if (worker.WorkerType is not (WorfWorkerType.Apply or WorfWorkerType.Sync) || worker.Dboid != dboid || worker.Proc == 0 || deadline <= 0)
                 {
                     continue;
                 }
@@ -208,15 +208,38 @@ internal static class Manager
                     overdue.Add(((PGPROC*)worker.Proc)->pid);
                 }
 
-                worker.Worker.Apply.CallDeadline = 0;
+                worker.Worker.Apply.CallDeadline = Worker.CancellingCall;
                 guard[i] = worker;
             }
         }
 
-        foreach (int pid in overdue)
+        if (overdue.Count == 0)
         {
-            _ = PgBackgroundWorker.RunTransaction(() => Worf.ReadScalar<bool>(
-                "SELECT pg_catalog.pg_cancel_backend(pid) FROM pg_catalog.pg_stat_get_activity($1) WHERE pid IS NOT NULL", SpiParameter.Create(pid)));
+            return next;
+        }
+
+        // A call that ended on its own meanwhile waits for the cancel, and takes it, once it is marked sent.
+        try
+        {
+            foreach (int pid in overdue)
+            {
+                _ = PgBackgroundWorker.RunTransaction(() => Worf.ReadScalar<bool>(
+                    "SELECT pg_catalog.pg_cancel_backend(pid) FROM pg_catalog.pg_stat_get_activity($1) WHERE pid IS NOT NULL", SpiParameter.Create(pid)));
+            }
+        }
+        finally
+        {
+            using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive();
+            for (int i = 0; i < guard.Length; i++)
+            {
+                WorfWorker worker = guard[i];
+                if (worker.WorkerType is WorfWorkerType.Apply or WorfWorkerType.Sync && worker.Dboid == dboid &&
+                    worker.Worker.Apply.CallDeadline == Worker.CancellingCall)
+                {
+                    worker.Worker.Apply.CallDeadline = 0;
+                    guard[i] = worker;
+                }
+            }
         }
 
         return next;

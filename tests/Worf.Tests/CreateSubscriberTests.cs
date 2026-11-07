@@ -209,6 +209,73 @@ public sealed class CreateSubscriberTests
     }
 
     /// <summary>
+    /// A subscriber whose subscription fails to commit leaves no progress for its origin's id, which the rollback frees,
+    /// so the next origin created with that id, as a PostgreSQL subscription's, starts from nothing.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task FailedSubscriberLeavesNoOriginProgress()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        using TemporaryDirectory work = new($"worf-create-subscriber-failed-{Guid.NewGuid():N}");
+        await using TestNode provider = await TestNode.StartAsync("provider",
+            ["wal_level = logical", "max_wal_senders = 10", "max_replication_slots = 10", "track_commit_timestamp = on"], token);
+        int pgport = CreateSubscriberCommand.FreePort();
+        string port = pgport.ToString(CultureInfo.InvariantCulture);
+        string providerDsn = $"postgresql://super@127.0.0.1:{provider.Cluster.Port.ToString(CultureInfo.InvariantCulture)}/postgres";
+        string backupDir = Path.Join(work.FullName, "backupdir");
+        string command = await CreateSubscriberCommand.InstallAsync(provider.Installation, Path.Join(work.FullName, "bin"));
+
+        // The copy's CREATE EXTENSION worf gives its sync status a trigger that refuses the tool's update of it, in the
+        // transaction that created and advanced the origin.
+        _ = await provider.SafePsqlAsync(Database, """
+            CREATE USER super SUPERUSER;
+            CREATE EXTENSION worf;
+            SELECT * FROM worf.create_node(node_name := 'test_provider', dsn := 'dbname=postgres user=super');
+            CREATE FUNCTION refuse() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION 'refused'; END$$;
+            CREATE FUNCTION add_refusal() RETURNS event_trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                IF to_regclass('worf.local_sync_status') IS NOT NULL THEN
+                    CREATE TRIGGER refuse BEFORE UPDATE ON worf.local_sync_status EXECUTE FUNCTION refuse();
+                END IF;
+            END$$;
+            CREATE EVENT TRIGGER add_refusal ON ddl_command_end WHEN TAG IN ('CREATE EXTENSION') EXECUTE FUNCTION add_refusal();
+            """, token);
+        string autoConf = Path.Join(provider.Cluster.DataDirectory, "postgresql.auto.conf");
+        await File.WriteAllLinesAsync(autoConf,
+            (await File.ReadAllLinesAsync(autoConf, token)).Where(static line => !line.TrimStart().StartsWith("port", StringComparison.Ordinal)),
+            token);
+        _ = await provider.SafePsqlAsync(Database, "CHECKPOINT", token);
+
+        try
+        {
+            (int exitCode, string stdout, string stderr) = await CreateSubscriberCommand.RunAsync(command,
+            [
+                "-D", backupDir, "--subscriber-name=test_subscriber", $"--subscriber-dsn=postgresql://super@127.0.0.1:{port}/postgres",
+                $"--provider-dsn={providerDsn}", "--drop-slot-if-exists", "-v",
+                $"--hba-conf={Path.Join(AppContext.BaseDirectory, "TestFiles", "regress-pg_hba.conf")}",
+                $"--postgresql-conf={Path.Join(provider.Cluster.DataDirectory, "postgresql.conf")}",
+            ], work.FullName, new Dictionary<string, string> { ["PGPORT"] = port }, token);
+            TestContext.WriteLine(stdout);
+            TestContext.WriteLine(stderr);
+            Assert.AreNotEqual(0, exitCode, "worf_create_subscriber with its update refused");
+            Assert.Contains("refused", stderr);
+
+            (int started, string startOutput) = await provider.RunProgramAsync("pg_ctl",
+                ["start", "-w", "-D", backupDir, "-o", $"-p {port}", "-l", Path.Join(work.FullName, "subscriber.log")], token);
+            Assert.AreEqual(0, started, startOutput);
+            Assert.AreEqual("1|0/0", await SubscriberAsync(provider, pgport, """
+                SELECT pg_catalog.pg_replication_origin_create('later')::text || '|' ||
+                    coalesce(pg_catalog.pg_replication_origin_progress('later', false), '0/0')::text
+                """, token), "the id and the progress of the origin created next");
+        }
+        finally
+        {
+            await StopAsync(provider, backupDir);
+        }
+    }
+
+    /// <summary>
     /// Runs psql against the subscriber and checks that it succeeds, as <c>command_ok</c> does.
     /// </summary>
     private async Task AssertPsqlOkAsync(TestNode provider, int port, IReadOnlyList<string> arguments, string name,

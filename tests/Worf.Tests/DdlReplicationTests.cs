@@ -433,6 +433,78 @@ public sealed class DdlReplicationTests
         Assert.DoesNotContain("TRAP:", nodeB.ReadLog(), "node_b's log");
     }
 
+    /// <summary>
+    /// replicate_ddl_command called inside a subtransaction, a savepoint or a PL/pgSQL block that catches errors, runs the
+    /// command there after queueing it, so decoding of the node's WAL that starts again inside the subtransaction takes
+    /// the rest of it, here an ANALYZE, whose records are invalidations: the message the command writes last gives
+    /// decoding a change to set its snapshot from, without which an assert-enabled build aborts at every restart.
+    /// </summary>
+    /// <param name="block">Whether the call runs in a PL/pgSQL block with an exception clause rather than a savepoint.</param>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task DecodingStartsAgainInsideReplicatedDdl(bool block)
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        _ = await nodeA.SafePsqlAsync(Database, "SET worf.enable_ddl_replication = off; CREATE TABLE u (a int); CREATE TABLE v (a int)", token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT 1 FROM pg_create_logical_replication_slot('td', 'test_decoding')", token);
+        const string Command = "ALTER TABLE public.u ADD COLUMN b int; SELECT pg_catalog.pg_sleep(4); ANALYZE public.u";
+        Task queued = nodeA.SafePsqlAsync(Database, block
+            ? $"DO $$ BEGIN PERFORM worf.replicate_ddl_command('{Command}'); EXCEPTION WHEN raise_exception THEN NULL; END $$"
+            : $"BEGIN; SAVEPOINT s; SELECT worf.replicate_ddl_command('{Command}'); RELEASE s; COMMIT", token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database,
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE query LIKE '%replicate_ddl_command%' AND wait_event = 'PgSleep')", token),
+            "node_a inside the command");
+
+        // Decoding moves its restart point past the subtransaction's first record while another transaction stays open.
+        const string Decode = "CHECKPOINT; SELECT count(*) FROM pg_logical_slot_get_changes('td', NULL, NULL)";
+        _ = await nodeA.SafePsqlAsync(Database, Decode, token);
+        await using NpgsqlConnection open = await nodeA.OpenAsync(Database, token);
+        await using NpgsqlTransaction held = await open.BeginTransactionAsync(token);
+        await using (NpgsqlCommand insert = new("INSERT INTO v VALUES (1)", open, held))
+        {
+            _ = await insert.ExecuteNonQueryAsync(token);
+        }
+
+        await queued;
+        for (int round = 0; round < 2; round++)
+        {
+            _ = await nodeA.SafePsqlAsync(Database, Decode, token);
+        }
+
+        await held.CommitAsync(token);
+        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO u VALUES (2, 3)", token);
+        Assert.AreEqual("table public.u: INSERT: a[integer]:2 b[integer]:3", await nodeA.SafePsqlAsync(Database,
+            "SELECT data FROM pg_logical_slot_get_changes('td', NULL, NULL) WHERE data LIKE 'table public.u: INSERT%'", token),
+            "the row decoded after the command, with its new column");
+        Assert.DoesNotContain("TRAP:", nodeA.ReadLog(), "node_a's log");
+    }
+
+    /// <summary>
+    /// A node with a publication of all its tables applies other nodes' DDL, which ends with a record decoding takes a
+    /// base snapshot from: that record belongs to no table, so the publication neither sends it nor needs a replica
+    /// identity for it.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task DdlAppliesBesidePublicationOfAllTables()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeB.SafePsqlAsync(Database, "CREATE PUBLICATION everything FOR ALL TABLES", token);
+        _ = await nodeA.SafePsqlAsync(Database, "CREATE TABLE w (a int PRIMARY KEY); ALTER TABLE w ADD COLUMN c int", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
+            "SELECT string_agg(attname, ',' ORDER BY attnum) = 'a,c' FROM pg_attribute WHERE attrelid = to_regclass('public.w') AND attnum > 0", token),
+            "node_a's DDL on node_b");
+        Assert.AreEqual("replicating", await nodeB.SafePsqlAsync(Database,
+            "SELECT status FROM worf.show_subscription_status() WHERE subscription_name = 'b_from_a'", token));
+        Assert.DoesNotContain("replica identity", nodeB.ReadLog(), "node_b's log");
+    }
+
     private static async Task<TestNode> StartNodeAsync(string name, CancellationToken token)
     {
         TestNode node = await TestNode.StartAsync(name,

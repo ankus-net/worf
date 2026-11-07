@@ -510,6 +510,7 @@ internal sealed partial class WorfNode
         }
 
         _ = Worf.Execute("DELETE FROM worf.exception_state WHERE sub_id = $1", SpiParameter.Create(subid));
+        _ = Worf.Execute("DELETE FROM worf.exception_skip WHERE sub_id = $1", SpiParameter.Create(subid));
 
         NativeMethodsCommandCounterIncrement();
 

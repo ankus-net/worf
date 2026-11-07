@@ -282,13 +282,15 @@ internal sealed class TestNode : IAsyncDisposable
     {
         StringBuilder described = new();
         string slots = await SafePsqlAsync(dbname, """
-            SELECT slot_name || '|' || restart_lsn || '|' || confirmed_flush_lsn FROM pg_replication_slots
+            SELECT slot_name || '|' || restart_lsn || '|' || confirmed_flush_lsn || '|' || pg_walfile_name(restart_lsn) FROM pg_replication_slots
             WHERE slot_type = 'logical' AND restart_lsn IS NOT NULL AND confirmed_flush_lsn IS NOT NULL
             """, cancellationToken);
         foreach (string[] slot in slots.Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(line => line.Split('|')))
         {
-            (_, string output) = await RunProgramAsync("pg_waldump", ["-p", Path.Join(Cluster.DataDirectory, "pg_wal"), "-s", slot[1], "-e", slot[2]],
-                cancellationToken);
+            // The start segment is named, as pg_waldump otherwise takes the segment size from the directory's first file,
+            // which may be one the server has created but not yet written.
+            (_, string output) = await RunProgramAsync("pg_waldump",
+                ["-p", Path.Join(Cluster.DataDirectory, "pg_wal"), "-s", slot[1], "-e", slot[2], slot[3]], cancellationToken);
             string[] records = output.Split('\n');
             HashSet<string> invalidating = [.. records.Where(record => record.Contains("INVALIDATION", StringComparison.Ordinal))
                 .Select(Transaction).Where(xid => xid is not ("" or "0"))];

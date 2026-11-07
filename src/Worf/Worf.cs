@@ -6,10 +6,6 @@ using System.Text.Unicode;
 using Ankus.Postgres;
 using Path = System.IO.Path;
 
-[assembly: PgSql("decoding-mark", """
-    CREATE TABLE worf.decoding_mark ();
-    """)]
-
 namespace Worf;
 
 /// <summary>
@@ -621,7 +617,8 @@ internal static partial class Worf
             "SELECT datfrozenxid::text::bigint FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database()"));
 
     /// <summary>
-    /// Gets the replication origin of this session, <c>replorigin_session_origin</c>.
+    /// Gets or sets the replication origin of this session, <c>replorigin_session_origin</c>, which the records the
+    /// session writes carry.
     /// </summary>
     internal static ushort ReploriginSessionOrigin
     {
@@ -633,6 +630,18 @@ internal static partial class Worf
                 return NativeGlobals.DangerousAddressOf_replorigin_xact_state()->origin;
 #else
                 return NativeGlobals.replorigin_session_origin;
+#endif
+            }
+        }
+
+        set
+        {
+            unsafe
+            {
+#if ANKUS_PG19
+                NativeGlobals.DangerousAddressOf_replorigin_xact_state()->origin = value;
+#else
+                NativeGlobals.replorigin_session_origin = value;
 #endif
             }
         }
@@ -1054,37 +1063,53 @@ internal static partial class Worf
         }
     }
 
+    // WAL_LEVEL_LOGICAL, which every supported version numbers 2.
+    private const int WalLevelLogical = 2;
+
     /// <summary>
     /// Ends the work of a subtransaction that changed the catalogs with a record logical decoding takes a base snapshot
     /// from: the invalidations its last command left are logged first, as the end of a command logs them, and then a
-    /// row of worf.decoding_mark is inserted and deleted, so that a heap change is the subtransaction's last record.
-    /// Decoding that starts again inside a subtransaction takes it as a transaction of its own, and executes its
-    /// invalidations only once a change after that point has given it a base snapshot; an assert-enabled build aborts on
-    /// one whose records after that point are invalidations alone, as after an index build or ANALYZE, whose inplace
-    /// updates of the catalog it doesn't decode, or after a catalog change whose invalidations are logged as the
-    /// subtransaction commits. A heap change gives the base snapshot before decoding looks at its origin, so it does so
-    /// where a provider leaves out other nodes' changes, as a transactional message doesn't. The table has no columns and
-    /// no index, and each row goes at once, so that sessions don't wait on each other.
+    /// transactional logical message, so that a change is the subtransaction's last record. Decoding that starts again
+    /// inside a subtransaction takes it as a transaction of its own, and executes its invalidations only once a change
+    /// after that point has given it a base snapshot; an assert-enabled build aborts on one whose records after that
+    /// point are invalidations alone, as after an index build or ANALYZE, whose inplace updates of the catalog it doesn't
+    /// decode. Decoding drops a message of another node's origin before taking a snapshot from it, so the message is
+    /// written with no origin, which every provider decodes; it belongs to no table, so no publication sends it and no
+    /// replica identity applies. A top-level transaction needs none, as decoding gives one that changed the catalogs a
+    /// base snapshot as it commits, and a server that writes no logical WAL needs none either.
     /// </summary>
     internal static void EndForDecoding()
     {
         unsafe
         {
-            if (NativeMethods.GetCurrentTransactionIdIfAny() == 0)
+            if (NativeMethods.GetCurrentTransactionIdIfAny() == 0 || NativeMethods.GetCurrentTransactionNestLevel() <= 1 ||
+                NativeGlobals.wal_level < WalLevelLogical)
             {
                 return;
             }
 
             NativeMethods.CommandCounterIncrement();
-        }
 
-        Elevated.Run(() =>
-        {
-            if (ExecuteScalar<string>("INSERT INTO worf.decoding_mark DEFAULT VALUES RETURNING ctid::text") is string mark)
+            // The message is the subtransaction's own record only if it is written here: an SPI statement runs in a
+            // subtransaction of its own.
+            ushort origin = ReploriginSessionOrigin;
+            ReploriginSessionOrigin = 0;
+            try
             {
-                _ = Execute("DELETE FROM worf.decoding_mark WHERE ctid = $1::tid", SpiParameter.Create(mark));
+                fixed (byte* prefix = "worf\0"u8)
+                {
+#if ANKUS_PG15 || ANKUS_PG16
+                    _ = NativeMethods.LogLogicalMessage((sbyte*)prefix, (sbyte*)prefix, 0, true);
+#else
+                    _ = NativeMethods.LogLogicalMessage((sbyte*)prefix, (sbyte*)prefix, 0, true, false);
+#endif
+                }
             }
-        });
+            finally
+            {
+                ReploriginSessionOrigin = origin;
+            }
+        }
     }
 
     /// <summary>

@@ -252,6 +252,45 @@ internal static class SequenceRangeHeard
     }
 
     /// <summary>
+    /// Notes that a statement waits for this server to hear from a node, its grantor, since it started, which makes the
+    /// exchange with the node due.
+    /// </summary>
+    /// <param name="nodeId">The node.</param>
+    internal static void Want(uint nodeId)
+    {
+        using PgLwLockExclusiveGuard<WorfHeardTable, WorfHeard> guard = Nodes.Exclusive();
+        int slot = Find(guard, nodeId, nodeId);
+        if (slot >= 0)
+        {
+            WorfHeard heard = guard[slot];
+            heard.WantedAt = Worker.GetCurrentTimestamp();
+            guard[slot] = heard;
+        }
+    }
+
+    /// <summary>
+    /// Checks whether a statement waits for this server to hear from a node since it started, as it did since a time,
+    /// while it hasn't yet.
+    /// </summary>
+    /// <param name="nodeId">The node.</param>
+    /// <param name="since">The time.</param>
+    /// <returns>Whether one does.</returns>
+    internal static bool Wanted(uint nodeId, long since)
+    {
+        uint dboid = DatabaseId();
+        using PgLwLockShareGuard<WorfHeardTable, WorfHeard> guard = Nodes.Share();
+        for (int i = 0; i < guard.Length; i++)
+        {
+            if (guard[i].Dboid == dboid && guard[i].NodeId == nodeId)
+            {
+                return guard[i].ConfirmedAt == 0 && guard[i].WantedAt >= since;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
     /// Checks whether this server has taken in a node's own message, and committed it, since it started.
     /// </summary>
     /// <param name="nodeId">The node.</param>
@@ -325,15 +364,20 @@ internal static class SequenceRangeHeard
     /// <summary>
     /// Checks whether a neighbor may have this server reset its sequences' blocks now: once every ten minutes, with the
     /// resets of the minute after it, which one rollback brings for every sequence, each sequence once, and twice as
-    /// long after each reset that comes within a day of the one before, up to a day, so that messages made up to reset
-    /// it, which may fence an owner's root until every participant reports, do so ever more seldom, while a rollback,
-    /// which comes seldom, resets it at once. A neighbor that saw this node roll back keeps asking meanwhile. This server
-    /// starts with none, as after a restore, which takes the first at once.
+    /// long after each reset that comes within a day of the last window's end, up to a day, and half as long for each two
+    /// days and a window more in which none came, so that messages made up to reset it, which may fence an owner's root
+    /// until every participant reports, do so ever more seldom, however they pause, while a rollback, which comes seldom,
+    /// resets it at once. A neighbor that saw this node roll back keeps asking meanwhile. This server starts with none, as
+    /// after a restore, which takes the first at once.
     /// </summary>
     /// <param name="nodeId">The neighbor.</param>
     /// <returns>When the ten minutes whose resets the neighbor may have made began, so that a sequence it has reset since
     /// then isn't reset again, or null when it may make none now.</returns>
-    internal static long? MayReset(uint nodeId)
+    /// <param name="lift">Whether the request is the neighbor's, as this server's grantor, from a fence's lift that names
+    /// blocks it granted this server, which it may make in a window of its own, so that another reset doesn't hold it
+    /// up, ten seconds at first rather than ten minutes, as a fence the grantor forced may come soon after another, and
+    /// growing as the other window does, so that made up ones reset this server ever more seldom.</param>
+    internal static long? MayReset(uint nodeId, bool lift = false)
     {
         uint dboid = DatabaseId();
         long now = Worker.GetCurrentTimestamp();
@@ -346,7 +390,16 @@ internal static class SequenceRangeHeard
             }
 
             WorfHeard heard = guard[i];
-            (long? window, heard.ResetAt, heard.ResetEvery) = ResetWindow(heard.ResetAt, heard.ResetEvery, now);
+            long? window;
+            if (lift)
+            {
+                (window, heard.LiftResetAt, heard.LiftResetEvery) = ResetWindow(heard.LiftResetAt, heard.LiftResetEvery, now, 10_000_000L);
+            }
+            else
+            {
+                (window, heard.ResetAt, heard.ResetEvery) = ResetWindow(heard.ResetAt, heard.ResetEvery, now);
+            }
+
             guard[i] = heard;
             return window;
         }
@@ -363,19 +416,29 @@ internal static class SequenceRangeHeard
     /// <param name="now">The time now.</param>
     /// <returns>When the window the neighbor may reset in began, or null when it may not now, and when the window
     /// begins and how long it lasts from now on.</returns>
-    internal static (long? Window, long ResetAt, long ResetEvery) ResetWindow(long resetAt, long resetEvery, long now)
+    /// <param name="shortest">The window's shortest, in microseconds: ten minutes, or ten seconds for a grantor's lifts.</param>
+    internal static (long? Window, long ResetAt, long ResetEvery) ResetWindow(long resetAt, long resetEvery, long now, long shortest = 600_000_000L)
     {
-        long every = Math.Max(resetEvery, 600_000_000L);
+        long every = Math.Max(resetEvery, shortest);
         if (resetAt != 0 && now - resetAt >= 60_000_000 && now - resetAt < every)
         {
             return (null, resetAt, resetEvery);
         }
 
-        if (resetAt == 0 || now - resetAt >= every)
+        if (resetAt == 0)
         {
-            // The window starts again from ten minutes only after a day in which the neighbor could have reset this
-            // server and didn't.
-            return (now, now, resetAt != 0 && now - resetAt < every + 86_400_000_000L ? Math.Min(every * 2, 86_400_000_000L) : 600_000_000L);
+            return (now, now, shortest);
+        }
+
+        if (now - resetAt >= every)
+        {
+            // The window doubles after a reset within a day of its end, and halves for each two days and a window more
+            // in which the neighbor could have reset this server and didn't, which would have let a neighbor that kept
+            // asking reset it at least twice, so one that pauses resets it no more often than one that keeps asking.
+            long quiet = now - resetAt - every;
+            return (now, now, quiet < 86_400_000_000L
+                ? Math.Min(every * 2, 86_400_000_000L)
+                : Math.Max(every >> (int)Math.Min(quiet / (172_800_000_000L + every), 62), shortest));
         }
 
         return (resetAt, resetAt, resetEvery);

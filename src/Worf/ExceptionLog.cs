@@ -37,6 +37,17 @@ using Ankus.Postgres;
 
     COMMENT ON TABLE worf.exception_state IS
         'The remote transaction each subscription applies again under worf.exception_behaviour, and how';
+
+    CREATE TABLE worf.exception_skip (
+        sub_id oid NOT NULL,
+        action_counter bigint NOT NULL,
+        error_sqlstate text NOT NULL,
+        error_message text NOT NULL,
+        PRIMARY KEY (sub_id, action_counter)
+    );
+
+    COMMENT ON TABLE worf.exception_skip IS
+        'The changes of the remote transaction each subscription applies again change by change that it skips, as they conflict at commit';
     """, Requires = ["node-tables"])]
 
 namespace Worf;
@@ -300,7 +311,35 @@ internal static class ExceptionLog
     /// </summary>
     /// <param name="subId">The subscription.</param>
     internal static void ForgetState(uint subId)
-        => _ = Worf.Execute("DELETE FROM worf.exception_state WHERE sub_id = $1", SpiParameter.Create(subId));
+    {
+        _ = Worf.Execute("DELETE FROM worf.exception_state WHERE sub_id = $1", SpiParameter.Create(subId));
+        _ = Worf.Execute("DELETE FROM worf.exception_skip WHERE sub_id = $1", SpiParameter.Create(subId));
+    }
+
+    /// <summary>
+    /// Records changes of the remote transaction a subscription applies again change by change that it skips, by their
+    /// places in the transaction, with the errors they're recorded with.
+    /// </summary>
+    /// <param name="subId">The subscription.</param>
+    /// <param name="skips">The changes, and their errors.</param>
+    internal static void SaveSkips(uint subId, IReadOnlyDictionary<long, PgException> skips)
+        => _ = Worf.Execute("""
+            INSERT INTO worf.exception_skip
+            SELECT $1, s.action_counter, s.error_sqlstate, s.error_message
+            FROM ROWS FROM (pg_catalog.unnest($2::pg_catalog.int8[]), pg_catalog.unnest($3::pg_catalog.text[]), pg_catalog.unnest($4::pg_catalog.text[]))
+                AS s (action_counter, error_sqlstate, error_message)
+            ON CONFLICT (sub_id, action_counter) DO NOTHING
+            """, SpiParameter.Create(subId), SpiParameter.Create(skips.Keys.ToArray()), SpiParameter.Create(skips.Values.Select(error => error.SqlState).ToArray()),
+            SpiParameter.Create(skips.Values.Select(error => error.Message).ToArray()));
+
+    /// <summary>
+    /// Reads the changes of the remote transaction a subscription applies again change by change that it skips.
+    /// </summary>
+    /// <param name="subId">The subscription.</param>
+    /// <returns>The changes, by their places in the transaction, with their errors.</returns>
+    internal static Dictionary<long, PgException> Skips(uint subId)
+        => Worf.SelectCatalog("SELECT action_counter, error_sqlstate, error_message FROM worf.exception_skip WHERE sub_id = $1", SpiParameter.Create(subId))
+            .ToDictionary(row => row.Get<long>(0), row => new PgException(row.Get<string>(1), row.Get<string>(2)));
 
     /// <summary>
     /// Reads a change's rows from its message again, as JSON objects of the text of the columns it sent.

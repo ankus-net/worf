@@ -823,8 +823,11 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   - `error` - stop, and apply the transaction again when the worker
     restarts, until the error is fixed
   - `discard` - apply the transaction again change by change, skipping the
-    changes that fail, or the whole transaction when it fails at commit, as
-    on a deferred constraint
+    changes that fail, and those whose rows conflict at commit in a
+    deferrable unique or exclusion constraint with a row that stays, which
+    it applies again without, so rows that swap values still apply; or the
+    whole transaction when it fails at commit otherwise, as on a deferred
+    constraint trigger
   - `transdiscard` - skip the whole transaction
   - `sub_disable` - disable the subscription, which applies the transaction
     again once it's enabled
@@ -867,8 +870,9 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   refuses, as a row the table keeps or an earlier row of the copy holds their
   values, whatever the index's expressions and predicate, are skipped at
   once, unless a `BEFORE ROW` trigger could change them first, and the rest
-  merged again, in halves if it still fails, down to the rows that fail
-  alone, as on a trigger's error, each half taking a transaction ID; skipped
+  merged again, and if it still fails, the rows it writes in halves, and a
+  few rows each alone, down to the rows that fail alone, as on a trigger's
+  error, each part taking a transaction ID; skipped
   rows are recorded as a `MERGE` with their columns' text and their numbers
   in the copy, with a warning, so that the provider's other rows, and its
   changes after the copy, still arrive; under `sub_disable`, it disables the subscription. In a table's initial copy, a row that fails, whether its value

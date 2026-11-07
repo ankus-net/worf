@@ -24,16 +24,26 @@ public sealed class DocumentationTests
         Assert.DoesNotContain("neither takes the node's grants nor answers its requests", s_sequenceRanges, "a neighbor asking to reset (130)");
         Assert.Contains("takes no grant from the node and answers none of its requests while it sees the node's WAL position behind where it was",
             s_sequenceRanges, "a neighbor asking to reset (130)");
-        Assert.Contains("and twice as long after each reset that comes within a day of the one before, up to a day", s_sequenceRanges,
-            "how often made-up requests reset a node (6)");
+        Assert.DoesNotContain("and twice as long after each reset that comes within a day of the one before, up to a day", s_sequenceRanges,
+            "how often made-up requests reset a node (130/146)");
+        Assert.Contains("and twice as long after each reset that comes within a day of the end of the last such window, up to a day, and half as long, down to ten minutes, for each two days and a window more in which the neighbor could have and didn't",
+            s_sequenceRanges, "how often made-up requests reset a node (6, 130/146, 290)");
         Assert.DoesNotContain("both holders", s_sequenceRanges, "a forced lift's resets (130, 47)");
-        Assert.Contains("and so is every holder of grants that overlap, on every forced lift", s_sequenceRanges, "a forced lift's resets (130, 47)");
+        Assert.Contains("whether or not it has drawn since it last reset, and so is every holder of grants that overlap, on every forced lift.", s_sequenceRanges,
+            "a forced lift's resets (130, 47, 294)");
         Assert.Contains("every holder of a grant that overlaps another resets, the others as they hear from this node", s_sequenceRanges,
             "a forced lift's resets (130)");
         Assert.DoesNotContain("while one that missed a call is reached again within a minute of answering", s_sequenceRanges, "a slow neighbor (130, 125)");
         Assert.Contains("and is made again in the next round without giving way", s_sequenceRanges, "a slow neighbor (125)");
         Assert.DoesNotContain("no more than once every ten minutes for each neighbor", s_sequenceRanges, "made-up resets (130, 211)");
-        Assert.Contains("so a grantor resets a node no more often than it grants it blocks", s_sequenceRanges, "a grantor's lifts (211)");
+        Assert.DoesNotContain("so a grantor resets a node no more often than it grants it blocks", s_sequenceRanges, "a grantor's lifts (211)");
+        Assert.Contains("has a limit of its own, so that another request's reset doesn't hold it up, which starts at ten seconds rather than ten minutes",
+            s_sequenceRanges, "a grantor's lifts (211)");
+        Assert.DoesNotContain("without waiting for them, and commits at once", s_sequenceRanges, "a switch worker's wait (130/146)");
+        Assert.DoesNotContain("three seconds a minute at most", s_sequenceRanges, "an unreachable neighbor's cost (294)");
+        Assert.Contains("A switch worker waits for the gate before it locks the sequence's range row", s_sequenceRanges, "a paused gate holder (291)");
+        Assert.Contains("A statement whose plan names the sequence, as an insert through a default that draws from it or a `SELECT` of `nextval`, waits until then",
+            s_sequenceRanges, "a returning node's draws (292, 293)");
         Assert.Contains("a node whose last call ran out of time, as one whose host drops connection attempts, after the others", s_sequenceRanges,
             "an unreachable neighbor (212)");
         Assert.DoesNotContain("leaves no block's values unused", s_sequenceRanges, "a COPY's switch (130)");

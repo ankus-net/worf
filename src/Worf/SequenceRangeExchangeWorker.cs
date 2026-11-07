@@ -258,55 +258,15 @@ internal static class SequenceRangeExchangeWorker
     }
 
     /// <summary>
-    /// Waits for the cancel of a call that the watcher cancelled as it ended on its own, and takes it: until the watcher
-    /// has sent it and it has come, or, should the watcher fail first, for <c>worf.sequence_range_timeout</c>, after
-    /// which the next cancel that comes is taken for it. In a transaction, the cancel is taken in a subtransaction that
-    /// it rolls back, as an exception block takes an error.
+    /// Waits for the cancel of a call that the watcher cancelled as it ended on its own, and takes it, as
+    /// <see cref="Worker.AwaitCancel"/> does, waiting for the watcher up to <c>worf.sequence_range_timeout</c>, after
+    /// which the next cancel that comes is taken for it.
     /// </summary>
     private static void AwaitCancel()
     {
-        bool inTransaction;
-        unsafe
+        if (!Worker.AwaitCancel(static () => Deadline() == Cancelling, SequenceRanges.ExchangeTimeout * 1000L))
         {
-            inTransaction = NativeMethods.IsTransactionState();
-        }
-
-        long started = Worker.GetCurrentTimestamp();
-        long sentAt = 0;
-        while (true)
-        {
-            try
-            {
-                if (inTransaction)
-                {
-                    if (PgInterrupts.IsPending)
-                    {
-                        PgTransaction.RunInSubtransaction(PgInterrupts.Check);
-                    }
-                }
-                else
-                {
-                    PgInterrupts.Check();
-                }
-            }
-            catch (PgQueryCanceledException)
-            {
-                return;
-            }
-
-            long now = Worker.GetCurrentTimestamp();
-            if (sentAt == 0 && Deadline() != Cancelling)
-            {
-                sentAt = now;
-            }
-
-            if ((sentAt != 0 && now - sentAt >= 1_000_000) || now - started >= SequenceRanges.ExchangeTimeout * 1000L)
-            {
-                s_cancelOwed = true;
-                return;
-            }
-
-            Worker.WaitLatch(10);
+            s_cancelOwed = true;
         }
     }
 

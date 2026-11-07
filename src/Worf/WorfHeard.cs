@@ -56,16 +56,32 @@ internal struct WorfHeard
     public long ResetAt;
 
     /// <summary>
-    /// How long, in microseconds, after <see cref="ResetAt"/> the node may next have this server reset: ten minutes,
-    /// twice as long after each reset that comes within a day of the one before, up to a day.
+    /// How long, in microseconds, after <see cref="ResetAt"/> the node may next have this server reset, as
+    /// <see cref="SequenceRangeHeard.ResetWindow"/> works it out.
     /// </summary>
     public long ResetEvery;
+
+    /// <summary>
+    /// When the node, as this server's grantor, last had it reset a sequence's blocks with a fence's lift that named
+    /// blocks it granted, or zero.
+    /// </summary>
+    public long LiftResetAt;
+
+    /// <summary>
+    /// How long, in microseconds, after <see cref="LiftResetAt"/> the node may next have this server reset so.
+    /// </summary>
+    public long LiftResetEvery;
 
     /// <summary>
     /// When a transaction that took in a message of the node's made after it heard of this server's start last
     /// committed, or zero before one has since this server started.
     /// </summary>
     public long ConfirmedAt;
+
+    /// <summary>
+    /// When a statement last waited for this server to hear from the node, its grantor, since it started, or zero.
+    /// </summary>
+    public long WantedAt;
 
     /// <summary>
     /// When the node's server started, as its last message said, or zero.

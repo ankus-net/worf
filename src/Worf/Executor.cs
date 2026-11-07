@@ -357,6 +357,11 @@ internal static unsafe partial class Executor
         }
 
         // A statement that commits on its way, and then fails, lets its fence go as its transaction aborts.
+        // What a transaction COMMIT PREPARED commits did is read while it is still prepared.
+        (string Xid, bool Worf)? committedPrepared = parsetree->type == NodeTag.T_TransactionStmt &&
+            ((TransactionStmt*)parsetree)->kind == TransactionStmtKind.TRANS_STMT_COMMIT_PREPARED
+            ? PreparedTransaction(Worf.FromServer(((TransactionStmt*)parsetree)->gid))
+            : null;
         uint xactFlags = DdlReplication.BeginStatement(ddl is not null);
         bool tracking = LocalIndex.BeginStatement(parsetree, ddl is not null);
         bool usedTemp;
@@ -378,10 +383,9 @@ internal static unsafe partial class Executor
             {
                 Worker.WakeSupervisor();
             }
-            else if (parsetree->type == NodeTag.T_TransactionStmt &&
-                ((TransactionStmt*)parsetree)->kind == TransactionStmtKind.TRANS_STMT_COMMIT_PREPARED)
+            else if (committedPrepared is (string xid, bool worf) && PreparedChanges(xid, worf) is bool everyDatabase)
             {
-                Worker.SignalPreparedCommitted();
+                Worker.SignalPreparedCommitted(everyDatabase);
             }
             else if (parsetree->type == NodeTag.T_CreateExtensionStmt &&
                 Worf.FromServer(((CreateExtensionStmt*)parsetree)->extname) == Worf.ExtensionName)
@@ -546,6 +550,49 @@ internal static unsafe partial class Executor
 
             Dependency.CheckDependency(obj, behavior);
         }
+    }
+
+    /// <summary>
+    /// Gets the xid of a transaction this database has prepared, which is older than those of its subtransactions, and
+    /// whether it holds a lock on any of worf's tables here, as one that changed them does until it commits; or null if
+    /// the database has no prepared transaction by that name.
+    /// </summary>
+    /// <param name="gid">The prepared transaction's name.</param>
+    /// <returns>The xid, as text, and whether it holds such a lock.</returns>
+    private static (string Xid, bool Worf)? PreparedTransaction(string gid)
+        => Worf.SelectCatalog("""
+            SELECT p.transaction::text, CASE WHEN pg_catalog.to_regnamespace($2) IS NOT NULL THEN EXISTS (
+                SELECT 1 FROM pg_catalog.pg_locks l JOIN pg_catalog.pg_class c ON c.oid = l.relation
+                WHERE l.locktype = 'relation' AND l.virtualtransaction = '-1/' || p.transaction::text
+                    AND l.database = d.oid AND c.relnamespace = pg_catalog.to_regnamespace($2)) ELSE false END
+            FROM pg_catalog.pg_prepared_xacts p JOIN pg_catalog.pg_database d ON d.datname = p.database
+            WHERE p.gid = $1 AND p.database = pg_catalog.current_database()
+            """, SpiParameter.Create(gid), SpiParameter.Create(Worf.ExtensionName)) is { Count: > 0 } rows
+            ? (rows[0].Get<string>(0), rows[0].Get<bool>(1))
+            : null;
+
+    /// <summary>
+    /// Tells, once COMMIT PREPARED has committed a transaction, whether it changed a database, which may give any
+    /// database's manager something to manage, or else worf here, or neither, as rows it wrote are no older than its xid.
+    /// </summary>
+    /// <param name="xid">The committed transaction's xid, as text.</param>
+    /// <param name="worf">Whether it held a lock on any of worf's tables here.</param>
+    /// <returns>Whether every database's managers may have something to manage, or only this one's, or null for none.</returns>
+    private static bool? PreparedChanges(string xid, bool worf)
+    {
+        SpiParameter since = SpiParameter.Create(xid);
+        if (Worf.SelectCatalog("""
+            SELECT 1 FROM pg_catalog.pg_database WHERE pg_catalog.age(xmin) <= pg_catalog.age($1::xid)
+            UNION ALL SELECT 1 FROM pg_catalog.pg_db_role_setting WHERE pg_catalog.age(xmin) <= pg_catalog.age($1::xid)
+            LIMIT 1
+            """, since).Count > 0)
+        {
+            return true;
+        }
+
+        return worf || Worf.SelectCatalog(
+            "SELECT 1 FROM pg_catalog.pg_extension WHERE extname = $2 AND pg_catalog.age(xmin) <= pg_catalog.age($1::xid)",
+            since, SpiParameter.Create(Worf.ExtensionName)).Count > 0 ? false : null;
     }
 
     private static void WorfExecutorStart(QueryDesc* queryDesc, int eflags)

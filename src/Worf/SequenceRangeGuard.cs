@@ -83,6 +83,10 @@ internal static partial class SequenceRangeGuard
     // backend has seen this server hear from since it started.
     private static readonly Dictionary<uint, uint> s_grantors = [];
     private static readonly HashSet<uint> s_confirmed = [];
+
+    // Whether the guard is reading the blocks to find the grantors a statement's plan names.
+    private static bool s_namingGrantors;
+
     private static long s_localVersion = -1;
 
     // The furthest position each sequence is known to have reached, which only moves forward within a block.
@@ -367,6 +371,7 @@ internal static partial class SequenceRangeGuard
     /// <param name="written">The tables it writes to.</param>
     internal static unsafe void StartStatement(QueryDesc* queryDesc, List<uint> written)
     {
+        WaitForNamedGrantors(queryDesc->plannedstmt);
         GateStatement(queryDesc, written);
         PlannedStmt* statement = queryDesc->plannedstmt;
         if (queryDesc->snapshot is null || statement is null || statement->hasModifyingCTE)
@@ -597,6 +602,101 @@ internal static partial class SequenceRangeGuard
     }
 
     /// <summary>
+    /// Waits, before any statement whose plan names a managed sequence other than as a table it reads, as one that calls
+    /// nextval on it, or inserts through a default that draws from it, does, until this server has heard from the grantor
+    /// of the sequence's active block since it started, as <see cref="WaitForGrantor"/> does for the statements that
+    /// hold the gates, so that a statement that draws outside them, as a SELECT of nextval, draws none of the block's
+    /// values meanwhile either.
+    /// </summary>
+    private static unsafe void WaitForNamedGrantors(PlannedStmt* statement)
+    {
+        // The guard's own reads of the blocks are statements too, and worf's workers, whose exchanges bring the grantor's
+        // answer, draw nothing, nor does a standby. A statement that names no sequence but as a table it reads reads none
+        // of worf's tables either, so that it never waits on them.
+        if (s_namingGrantors || Worker.MyWorfWorker >= 0 || statement is null || statement->relationOids is null ||
+            NativeGlobals.creating_extension || SequenceRanges.Recovering() || !NamesSequence(statement) ||
+            Worf.CatalogOid("sequence_range_block") == 0)
+        {
+            return;
+        }
+
+        s_namingGrantors = true;
+        bool unconfirmed = false;
+        try
+        {
+            Reload();
+            foreach (uint grantor in s_grantors.Values)
+            {
+                unconfirmed |= !s_confirmed.Contains(grantor);
+            }
+        }
+        finally
+        {
+            s_namingGrantors = false;
+        }
+
+        if (!unconfirmed)
+        {
+            return;
+        }
+
+        // A sequence the statement reads as a table, as SELECT last_value FROM one does, isn't drawn from.
+        List* oids = statement->relationOids;
+        for (int i = 0; i < oids->length; i++)
+        {
+            uint seqoid = oids->elements[i].oid_value;
+            if (s_grantors.ContainsKey(seqoid) && NamesSequence(statement, seqoid))
+            {
+                WaitForGrantor(seqoid);
+            }
+        }
+    }
+
+    // Whether a statement's plan names a sequence other than as a table it reads, as nextval's argument does, but
+    // worf's Snowflake node numbers, whose IDs carry their times, so that a node issues them while its grantor is away.
+    private static unsafe bool NamesSequence(PlannedStmt* statement) => NamesSequence(statement, 0);
+
+    // Whether a statement's plan names a sequence, or a given one, as NamesSequence tells.
+    private static unsafe bool NamesSequence(PlannedStmt* statement, uint sequence)
+    {
+        List* oids = statement->relationOids;
+        uint snowflake = 0;
+        for (int i = 0; i < oids->length; i++)
+        {
+            uint oid = oids->elements[i].oid_value;
+            if ((sequence == 0 ? NativeMethods.get_rel_relkind(oid) == (sbyte)'S' : oid == sequence) && !ReadsAsTable(statement, oid))
+            {
+                if (snowflake == 0)
+                {
+                    snowflake = Worf.CatalogOid("snowflake_node");
+                }
+
+                if (oid != snowflake)
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    // Whether a statement's range table holds a relation.
+    private static unsafe bool ReadsAsTable(PlannedStmt* statement, uint relid)
+    {
+        for (int i = 0; statement->rtable is not null && i < statement->rtable->length; i++)
+        {
+            RangeTblEntry* rte = (RangeTblEntry*)statement->rtable->elements[i].ptr_value;
+            if (rte->rtekind == RTEKind.RTE_RELATION && rte->relid == relid)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
     /// Waits, before a statement draws from a block the sequence's parent granted this node, until this server has
     /// taken in a message of the parent's since it started: a node that was away while its parent's fence lifted without
     /// its report, as when <c>worf.activate_sequence_range</c> stopped waiting for it, holds values the lift gave out
@@ -619,10 +719,12 @@ internal static partial class SequenceRangeGuard
                 long woken = 0;
                 while (!SequenceRangeHeard.Confirmed(grantor))
                 {
+                    // The wait makes the exchange with the grantor due, each second while it lasts.
                     long now = Worker.GetCurrentTimestamp();
                     if (now - woken >= 1_000_000)
                     {
                         woken = now;
+                        SequenceRangeHeard.Want(grantor);
                         SequenceRangeExchangeWorker.Wake();
                     }
 
@@ -1048,7 +1150,8 @@ internal static partial class SequenceRangeGuard
     /// <param name="seqoid">The sequence.</param>
     /// <param name="timeout">How long to wait, in milliseconds, after which the switch fails with 55P03: a tenth of a
     /// second in the range worker, which checks the other sequences meanwhile and leaves the switch to a switch worker;
-    /// or zero, for as long as it takes, in a switch worker.</param>
+    /// or a second in a switch worker, which waits for the gate first, as long as it takes, with
+    /// <see cref="AwaitGate"/>, and again after such a failure.</param>
     internal static unsafe void ShutGate(uint seqoid, int timeout)
     {
         _ = PgAtomic.Add(SequenceRanges.SwitchesPending, 1L);
@@ -1062,19 +1165,56 @@ internal static partial class SequenceRangeGuard
         _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, Done);
         _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, Done);
         _ = Worf.Execute($"SET LOCAL lock_timeout = {timeout.ToString(CultureInfo.InvariantCulture)}");
-
-        // A switch worker, which waits for as long as it takes, looks for a deadlock last, so that the deadlock detector
-        // ends the statement in a cycle through the gate, which can go on once it's retried, rather than the switch,
-        // which another switch worker would make again into the same cycle.
-        if (timeout == 0)
-        {
-            _ = Worf.Execute("SET LOCAL deadlock_timeout = '1h'");
-        }
-
         LOCKTAG door = GateTag(seqoid, DoorKey);
         _ = NativeMethods.LockAcquire(&door, ExclusiveLock, false, false);
         LOCKTAG tag = GateTag(seqoid);
         _ = NativeMethods.LockAcquire(&tag, ExclusiveLock, false, false);
+    }
+
+    /// <summary>
+    /// Waits, as for a lock, for as long as it takes, until the statements that hold
+    /// a sequence's switch gate have let it go, with the door shut meanwhile, and then lets both go: a switch worker waits
+    /// so before it locks the sequence's range row, so that a statement paused within its rows, as a COPY waiting for its
+    /// client, holds up only the switch and the statements that wait for it, and not the exchanges and the range worker,
+    /// which wait for that row. A cycle of waits through the gate is a deadlock that PostgreSQL's deadlock detector ends,
+    /// as the switch worker looks for one last, in the statement, which can go on once it's retried, rather than in the
+    /// switch, which the switch worker would make again into the same cycle.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    internal static unsafe void AwaitGate(uint seqoid)
+    {
+        _ = PgAtomic.Add(SequenceRanges.SwitchesPending, 1L);
+        CountDrawer(seqoid, 0, 0, 1);
+        int nestLevel = NativeMethods.NewGUCNestLevel();
+        LOCKTAG door = GateTag(seqoid, DoorKey);
+        LOCKTAG tag = GateTag(seqoid);
+        bool shut = false;
+        bool taken = false;
+        try
+        {
+            _ = Worf.Execute("SET LOCAL lock_timeout = 0");
+            _ = Worf.Execute("SET LOCAL deadlock_timeout = '1h'");
+            _ = NativeMethods.LockAcquire(&door, ExclusiveLock, false, false);
+            shut = true;
+            _ = NativeMethods.LockAcquire(&tag, ExclusiveLock, false, false);
+            taken = true;
+        }
+        finally
+        {
+            if (taken)
+            {
+                _ = NativeMethods.LockRelease(&tag, ExclusiveLock, false);
+            }
+
+            if (shut)
+            {
+                _ = NativeMethods.LockRelease(&door, ExclusiveLock, false);
+            }
+
+            NativeMethods.AtEOXact_GUC(true, nestLevel);
+            CountDrawer(seqoid, 0, 0, -1);
+            _ = PgAtomic.Add(SequenceRanges.SwitchesPending, -1L);
+        }
     }
 
     /// <summary>

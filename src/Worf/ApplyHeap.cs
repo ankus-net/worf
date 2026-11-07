@@ -274,7 +274,7 @@ internal static unsafe class ApplyHeap
                 oldest.Writer.Dispose();
             }
 
-            PgRelationWriter writer = rel.HasRechecks ? ReplicaRechecks.Firing(rel.Reloid, () => PgRelationWriter.Open(rel.Reloid), Apply.RechecksAtCommit)
+            PgRelationWriter writer = rel.HasRechecks ? ReplicaRechecks.Firing(rel.Reloid, () => PgRelationWriter.Open(rel.Reloid), true)
                 : PgRelationWriter.Open(rel.Reloid);
             entry = (writer, writer.CreateReplicatedRow(), writer.CreateReplicatedRow(), NativeMethods.RelationGetReplicaIndex(rel.Rel));
             s_writers.Add(rel.Reloid, entry);

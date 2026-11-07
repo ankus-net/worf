@@ -895,6 +895,12 @@ internal static class Worker
     }
 
     /// <summary>
+    /// The deadline the manager leaves on a call to a provider it cancels until it has sent the cancel, which the call, if
+    /// it ended on its own meanwhile, waits for.
+    /// </summary>
+    internal const long CancellingCall = -2;
+
+    /// <summary>
     /// Gets how long, in milliseconds, a call to another server, or a worker's start, may take: wal_receiver_timeout, as
     /// PostgreSQL's apply worker and launcher take, or its default, a minute, when it's zero.
     /// </summary>
@@ -905,6 +911,22 @@ internal static class Worker
             unsafe
             {
                 return NativeGlobals.wal_receiver_timeout > 0 ? NativeGlobals.wal_receiver_timeout : 60_000;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Gets <see cref="ProviderTimeout"/> as messages name it.
+    /// </summary>
+    internal static string ProviderTimeoutShown
+    {
+        get
+        {
+            unsafe
+            {
+                return NativeGlobals.wal_receiver_timeout > 0
+                    ? $"wal_receiver_timeout ({NativeGlobals.wal_receiver_timeout} ms)"
+                    : "a minute (wal_receiver_timeout is 0)";
             }
         }
     }
@@ -929,16 +951,16 @@ internal static class Worker
             return call();
         }
 
-        int timeout = ProviderTimeout;
-        long deadline = GetCurrentTimestamp() + (timeout * 1000L);
+        long deadline = GetCurrentTimestamp() + (ProviderTimeout * 1000L);
         bool inTransaction;
         unsafe
         {
             inTransaction = NativeMethods.IsTransactionState();
         }
 
-        SetCallDeadline(deadline);
+        _ = SetCallDeadline(deadline);
         s_providerCalls++;
+        bool canceled = false;
         try
         {
             if (!inTransaction)
@@ -946,19 +968,95 @@ internal static class Worker
                 return call();
             }
 
-            using PgErrorContext waiting = PgErrorContext.Push(Worf.Shown($"waiting up to wal_receiver_timeout ({timeout} ms) for {what()}"));
+            using PgErrorContext waiting = PgErrorContext.Push(Worf.Shown($"waiting up to {ProviderTimeoutShown} for {what()}"));
             return call();
         }
-        catch (Exception error) when (error is PgQueryCanceledException or PgException { SqlState: "57014" } && GetCurrentTimestamp() >= deadline)
+        catch (Exception error) when (error is PgQueryCanceledException or PgException { SqlState: "57014" })
         {
-            throw new PgException(PgSqlStates.ConnectionFailure, $"timed out waiting for {what()}",
-                detail: $"It hadn't answered within wal_receiver_timeout ({timeout} ms).");
+            canceled = true;
+            if (GetCurrentTimestamp() >= deadline)
+            {
+                throw new PgException(PgSqlStates.ConnectionFailure, $"timed out waiting for {what()}",
+                    detail: $"It hadn't answered within {ProviderTimeoutShown}.");
+            }
+
+            throw;
         }
         finally
         {
             s_providerCalls--;
-            SetCallDeadline(0);
+
+            // A call the manager cancelled that ended first takes the cancel that comes after it, so that it lands in
+            // no later call, nor in the stream, a copy or an applied transaction.
+            if (SetCallDeadline(0) is 0 or CancellingCall && !canceled)
+            {
+                _ = AwaitCancel(static () => ReadCallDeadline() == CancellingCall, ProviderTimeout * 1000L);
+            }
         }
+    }
+
+    /// <summary>
+    /// Waits for the cancel of a call that its watcher cancelled as it ended on its own, and takes it: until the watcher
+    /// has sent it, as it shows once <paramref name="sending"/> is false, and it has come, or, should the watcher fail
+    /// first, for a limit. In a transaction, the cancel is taken in a subtransaction that it rolls back, as an exception
+    /// block takes an error.
+    /// </summary>
+    /// <param name="sending">Whether the watcher is still to send the cancel.</param>
+    /// <param name="limit">How long, in microseconds, to wait for the watcher.</param>
+    /// <returns>Whether the cancel came; if not, it may still come.</returns>
+    internal static bool AwaitCancel(Func<bool> sending, long limit)
+    {
+        bool inTransaction;
+        unsafe
+        {
+            inTransaction = NativeMethods.IsTransactionState();
+        }
+
+        long started = GetCurrentTimestamp();
+        long sentAt = 0;
+        while (true)
+        {
+            try
+            {
+                if (inTransaction)
+                {
+                    if (PgInterrupts.IsPending)
+                    {
+                        PgTransaction.RunInSubtransaction(PgInterrupts.Check);
+                    }
+                }
+                else
+                {
+                    PgInterrupts.Check();
+                }
+            }
+            catch (PgQueryCanceledException)
+            {
+                return true;
+            }
+
+            long now = GetCurrentTimestamp();
+            if (sentAt == 0 && !sending())
+            {
+                sentAt = now;
+            }
+
+            if ((sentAt != 0 && now - sentAt >= 1_000_000) || now - started >= limit)
+            {
+                return false;
+            }
+
+            WaitLatch(10);
+        }
+    }
+
+    /// <summary>
+    /// Reads the deadline of the call to a provider that this worker's slot holds.
+    /// </summary>
+    private static long ReadCallDeadline()
+    {
+        using PgLwLockShareGuard<WorfContext, WorfWorker> guard = WorfCtx.Share();
+        return guard[MyWorfWorker].Worker.Apply.CallDeadline;
     }
 
     /// <summary>
@@ -974,21 +1072,30 @@ internal static class Worker
 
     /// <summary>
     /// Publishes the deadline of the call to the provider about to start, waking the manager to watch it, or clears it
-    /// as the call ends.
+    /// as the call ends, unless the manager is cancelling it: the manager marks the cancel sent itself.
     /// </summary>
-    private static void SetCallDeadline(long deadline)
+    /// <returns>The deadline it replaced: zero or <see cref="CancellingCall"/>, as a call ends, if the manager cancelled
+    /// the call.</returns>
+    private static long SetCallDeadline(long deadline)
     {
+        long replaced;
         using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = WorfCtx.Exclusive())
         {
             WorfWorker worker = guard[MyWorfWorker];
-            worker.Worker.Apply.CallDeadline = deadline;
-            guard[MyWorfWorker] = worker;
+            replaced = worker.Worker.Apply.CallDeadline;
+            if (replaced != CancellingCall || deadline != 0)
+            {
+                worker.Worker.Apply.CallDeadline = deadline;
+                guard[MyWorfWorker] = worker;
+            }
         }
 
         if (deadline != 0)
         {
             WakeManager();
         }
+
+        return replaced;
     }
 
     /// <summary>
@@ -1190,11 +1297,13 @@ internal static class Worker
     }
 
     /// <summary>
-    /// Signals the database's manager and the supervisor once COMMIT PREPARED has committed a prepared transaction,
-    /// which they heard of as it was prepared, before anyone could see what it did, as CREATE EXTENSION worf, a
-    /// subscription it created or ALTER DATABASE: managers that found nothing to manage then start again.
+    /// Signals the database's manager and the supervisor once COMMIT PREPARED has committed a prepared transaction that
+    /// created or changed worf here, or changed a database: they heard of it as it was prepared, before anyone could see
+    /// what it did, and a manager that found nothing to manage then starts again, this database's or, after a change to
+    /// a database, every one's.
     /// </summary>
-    internal static void SignalPreparedCommitted()
+    /// <param name="everyDatabase">Whether the transaction changed a database, rather than only worf here.</param>
+    internal static void SignalPreparedCommitted(bool everyDatabase)
     {
         uint myDatabaseId;
         unsafe
@@ -1207,7 +1316,7 @@ internal static class Worker
         WorfContext ctx = guard.Header;
         ctx.SubscriptionsChanged = true;
         guard.Header = ctx;
-        ForgetIdleManager(guard, 0);
+        ForgetIdleManager(guard, everyDatabase ? 0 : myDatabaseId);
         int manager = guard.Read((in _, workers) => ManagerFind(workers, myDatabaseId));
         if (manager >= 0 && guard[manager].Proc != 0)
         {

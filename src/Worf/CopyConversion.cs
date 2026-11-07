@@ -455,7 +455,39 @@ internal static unsafe partial class CopyConversion
         // with each row's place in the batch.
         s_heldTable = (relation->rd_rel->relkind == (sbyte)'p' ? "" : "ONLY ") + Worf.QuoteQualifiedIdentifier(
             Worf.FromServer(NativeMethods.get_namespace_name(relation->rd_rel->relnamespace)), Worf.FromServer(NativeMethods.get_rel_name(reloid)));
-        string[] read = [.. s_heldConstraints.SelectMany(constraint => constraint.Reads).Distinct()];
+        // A row that a NOT NULL column or a CHECK constraint refuses, as the condition each batch's COPY runs tests them,
+        // isn't copied, so it holds no key for the batch's later rows: the candidates are only the rows that pass the
+        // tests of the columns the copy writes.
+        List<string> tests = [];
+        HashSet<string> tested = [];
+        if (!FiresBeforeRowInsert(relation))
+        {
+            foreach (WorfRow test in Worf.Read("""
+                SELECT a.attname::pg_catalog.text, NULL::pg_catalog.text[] FROM pg_catalog.pg_attribute a
+                WHERE a.attrelid = $1 AND a.attname = ANY ($2) AND a.attnum > 0 AND NOT a.attisdropped AND a.attnotnull AND a.attgenerated = ''
+                UNION ALL
+                SELECT pg_catalog.pg_get_expr(c.conbin, c.conrelid), ARRAY(SELECT a.attname::pg_catalog.text FROM pg_catalog.pg_attribute a
+                    WHERE a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey))
+                FROM pg_catalog.pg_constraint c
+                WHERE c.conrelid = $1 AND c.contype = 'c' AND (pg_catalog.to_jsonb(c) ->> 'conenforced') IS DISTINCT FROM 'false'
+                    AND NOT (0 = ANY (c.conkey)) AND NOT EXISTS (SELECT FROM pg_catalog.pg_attribute a
+                        WHERE a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey) AND (a.attgenerated <> '' OR NOT (a.attname = ANY ($2))))
+                """, 0, SpiParameter.Create(reloid), SpiParameter.Create(attnames.ToArray())))
+            {
+                if (test.Get<string[]?>(1) is string[] columns)
+                {
+                    tests.Add($"({test.Get<string>(0)}) IS NOT FALSE");
+                    tested.UnionWith(columns);
+                }
+                else
+                {
+                    tests.Add($"{Worf.QuoteIdentifier(test.Get<string>(0))} IS NOT NULL");
+                    _ = tested.Add(test.Get<string>(0));
+                }
+            }
+        }
+
+        string[] read = [.. s_heldConstraints.SelectMany(constraint => constraint.Reads).Concat(tested).Distinct()];
         WorfRows types = Worf.Read("""
             SELECT a.attname::pg_catalog.text, pg_catalog.format_type(a.atttypid, NULL) FROM pg_catalog.pg_attribute a
             WHERE a.attrelid = $1 AND a.attname = ANY ($2) AND NOT a.attisdropped
@@ -463,12 +495,13 @@ internal static unsafe partial class CopyConversion
         Dictionary<string, string> typeOf = types.ToDictionary(row => row.Get<string>(0), row => row.Get<string>(1));
         s_heldFields = [.. read.Select(column => attnames.IndexOf(column))];
         s_heldRow = HeldValues.FreeName(attnames, "worf_row");
-        s_heldCandidates = $"""
-            (SELECT {string.Join(", ", read.Select((column, j) => $"r.c{j}::{typeOf[column]} AS {Worf.QuoteIdentifier(column)}"))},
+        string rows = $"""
+            SELECT {string.Join(", ", read.Select((column, j) => $"r.c{j}::{typeOf[column]} AS {Worf.QuoteIdentifier(column)}"))},
                 r.n::pg_catalog.int8 AS {Worf.QuoteIdentifier(s_heldRow)}
             FROM ROWS FROM ({string.Join(", ", read.Select((_, j) => $"pg_catalog.unnest(${j + 1}::pg_catalog.text[])"))},
-                pg_catalog.unnest(${read.Length + 1}::pg_catalog.int4[])) AS r ({string.Join(", ", read.Select((_, j) => $"c{j}"))}, n))
+                pg_catalog.unnest(${read.Length + 1}::pg_catalog.int4[])) AS r ({string.Join(", ", read.Select((_, j) => $"c{j}"))}, n)
             """;
+        s_heldCandidates = tests.Count == 0 ? $"({rows})" : $"(SELECT * FROM ({rows}) AS c WHERE {string.Join(" AND ", tests)})";
     }
 
     /// <summary>
@@ -647,22 +680,14 @@ internal static unsafe partial class CopyConversion
     }
 
     /// <summary>
-    /// Checks whether a table has a BEFORE ROW INSERT trigger that fires under apply's replica role, which can change a
-    /// row before COPY checks it.
+    /// Checks whether a table, or one of its partitions, has a BEFORE ROW INSERT trigger that fires under apply's replica
+    /// role, which can change a row before COPY checks it.
     /// </summary>
-    private static bool FiresBeforeRowInsert(RelationData* relation)
-    {
-        Trigger* trigger = relation->trigdesc is null ? null : relation->trigdesc->triggers;
-        for (int i = 0; trigger is not null && i < relation->trigdesc->numtriggers; i++, trigger++)
-        {
-            if ((trigger->tgtype & BeforeRowInsert) == BeforeRowInsert && trigger->tgenabled is (sbyte)'A' or (sbyte)'R')
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
+    private static bool FiresBeforeRowInsert(RelationData* relation) => Worf.ReadScalar<bool>("""
+        SELECT EXISTS (SELECT FROM pg_catalog.pg_trigger g
+            WHERE (g.tgrelid = $1 OR g.tgrelid IN (SELECT p.relid FROM pg_catalog.pg_partition_tree($1) p))
+                AND g.tgenabled IN ('A', 'R') AND (g.tgtype OPERATOR(pg_catalog.&) $2) = $2)
+        """, SpiParameter.Create(relation->rd_id), SpiParameter.Create(BeforeRowInsert));
 
     /// <summary>
     /// Builds the tests of a table's NOT NULL columns and enforced CHECK constraints, with the errors COPY would raise,

@@ -49,6 +49,13 @@ internal static unsafe partial class Apply
     private static PgException? s_exceptionError;
     private static bool s_recordSkipped;
 
+    // The changes of the transaction applied again change by change that it skips, as they conflict at commit, by their
+    // places in it, with their errors; the transaction IDs of the subtransactions its applied changes took, with their
+    // places; and whether the last commit found more to skip.
+    private static Dictionary<long, PgException> s_exceptionSkips = [];
+    private static readonly List<(uint Xid, long Action)> s_changeXids = [];
+    private static bool s_skipsAdded;
+
     // Whether the stream passed the failed transaction without sending it again.
     private static bool s_exceptionPassed;
 
@@ -66,6 +73,9 @@ internal static unsafe partial class Apply
     // created it, and when each relay origin last set up the session since the worker started.
     private static Dictionary<ushort, ulong> s_streamOrigins = [];
     private static readonly Dictionary<ushort, long> s_relayUsedAt = [];
+
+    // When a relay origin's wait for a replication origin slot last ended with none come free, or zero.
+    private static long s_turnWaitedOutAt;
 
     // How long, in microseconds, a relay origin keeps its slot after it last set up the session, rather than give it up
     // to another of the worker's relay origins, while another slot can be had.
@@ -259,6 +269,7 @@ internal static unsafe partial class Apply
         // A crashed worker's failed transaction is applied again under worf.exception_behaviour, as the worker
         // recorded it, whichever worker slot this one has and across restarts.
         (s_exceptionLsn, s_exceptionLevel, s_exceptionError) = PgBackgroundWorker.RunTransaction(() => ExceptionLog.State(sub.Id));
+        s_exceptionSkips = PgBackgroundWorker.RunTransaction(() => ExceptionLog.Skips(sub.Id));
 
         WorfLog.Log($"starting apply for subscription {sub.Name}");
 
@@ -532,12 +543,9 @@ internal static unsafe partial class Apply
             }
         }
 
-        // The DDL apply runs in a subtransaction ends with a record logical decoding takes a base snapshot from, wherever
-        // decoding starts again in it.
-        if (applying)
-        {
-            Worf.EndForDecoding();
-        }
+        // DDL run in a subtransaction, as apply runs it and as replicate_ddl_command may be called, ends with a record
+        // logical decoding takes a base snapshot from, wherever decoding starts again in it.
+        Worf.EndForDecoding();
 
         NativeGlobals.debug_query_string = saveDebugQueryString;
     }
@@ -718,6 +726,7 @@ internal static unsafe partial class Apply
     private static void HandleBegin(StringInfoData* s)
     {
         s_xactActionCounter = 1;
+        s_changeXids.Clear();
         s_actionName = "BEGIN";
         s_replicatedRole = null;
 
@@ -863,6 +872,10 @@ internal static unsafe partial class Apply
         if (inTransaction)
         {
             MultiInsertFinish();
+            if (s_exceptionMode && s_exceptionLevel == ExceptionByChange)
+            {
+                SkipConflictsAtCommit();
+            }
 
             s_applyApi.OnCommit();
             RunDeferredWorkAsReplicatedRole();
@@ -1181,11 +1194,18 @@ internal static unsafe partial class Apply
     /// Waits, up to <see cref="RelayTurnWait"/>, for a replication origin slot for a relay origin that has none, while
     /// every slot is taken and none of this worker's relay origins that haven't set up the session within
     /// <see cref="RelayOriginHold"/> could give one up, asking the other workers to give up theirs meanwhile, in
-    /// transactions that only read.
+    /// transactions that only read. Once a wait has ended with no slot come free, the turns after it, within
+    /// <see cref="RelayOriginHold"/>, wait no more, as the worker's own relay origins taking turns hold the slots.
     /// </summary>
     private static void WaitForOriginSlot(string name, string slotName)
     {
-        long until = Worker.GetCurrentTimestamp() + RelayTurnWait;
+        long started = Worker.GetCurrentTimestamp();
+        if (started - s_turnWaitedOutAt < RelayOriginHold)
+        {
+            return;
+        }
+
+        long until = started + RelayTurnWait;
         while (PgBackgroundWorker.RunTransaction(() =>
         {
             long now = Worker.GetCurrentTimestamp();
@@ -1194,14 +1214,22 @@ internal static unsafe partial class Apply
                     (!s_relayUsedAt.TryGetValue(id, out long usedAt) || now - usedAt >= RelayOriginHold));
         }))
         {
-            if (Worker.GotSigterm || Worker.GetCurrentTimestamp() >= until)
+            if (Worker.GotSigterm)
             {
+                return;
+            }
+
+            if (Worker.GetCurrentTimestamp() >= until)
+            {
+                s_turnWaitedOutAt = Worker.GetCurrentTimestamp();
                 return;
             }
 
             MarkOwnWant(Worker.WantOriginSlot(false));
             _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(50));
         }
+
+        s_turnWaitedOutAt = 0;
     }
 
     /// <summary>
@@ -2606,8 +2634,26 @@ internal static unsafe partial class Apply
             {
                 DispatchChangeMessage(message, startedTx);
 
+                // A change that conflicts at commit is skipped, once read, so that it's recorded as it was.
+                if (s_exceptionSkips.TryGetValue(s_xactActionCounter, out PgException? skip) && message.Length > 0)
+                {
+                    TrackChange(message[0] switch
+                    {
+                        (byte)'I' => "INSERT",
+                        (byte)'U' => "UPDATE",
+                        (byte)'D' => "DELETE",
+                        _ => null,
+                    });
+                    throw skip;
+                }
+
                 // The change's writers can't outlive its subtransaction.
                 s_applyApi.OnCommit();
+                uint xid = NativeMethods.GetCurrentTransactionIdIfAny();
+                if (xid != 0)
+                {
+                    s_changeXids.Add((xid, s_xactActionCounter));
+                }
             }, PgSubtransactionMode.Atomic);
         }
         catch (PgException error) when (!IsTransient(error))
@@ -2619,12 +2665,75 @@ internal static unsafe partial class Apply
     }
 
     /// <summary>
-    /// Gets whether the rechecks of the deferrable constraints that are initially immediate wait for commit, as apply
-    /// doesn't know where the provider's statements ended, at which PostgreSQL checks them: rows that swap values, which
-    /// each statement left unique, then apply. A transaction applied change by change, after its commit failed on one,
-    /// has them checked as each change ends, so that the change that conflicts is the one skipped.
+    /// Finds, before a transaction applied again change by change commits, its changes whose rows conflict in a
+    /// deferrable unique or exclusion constraint, whose rechecks wait for commit, as apply doesn't know where the
+    /// provider's statements ended, with a row that stays, as the changes applied one after another would, and has the
+    /// transaction applied again without them: rows that swap values, which each of the provider's statements left
+    /// unique, still apply, and only the changes that conflict are skipped and recorded. A row's change is the one whose
+    /// subtransaction wrote it last, and a row no change of the transaction wrote stays.
     /// </summary>
-    internal static bool RechecksAtCommit => !s_exceptionMode || s_exceptionLevel != ExceptionByChange;
+    private static void SkipConflictsAtCommit()
+    {
+        if (s_changeXids.Count == 0)
+        {
+            return;
+        }
+
+        Dictionary<long, long> actionOf = [];
+        foreach ((uint xid, long action) in s_changeXids)
+        {
+            actionOf[xid] = action;
+        }
+
+        SpiParameter ours = SpiParameter.Create(actionOf.Keys.ToArray());
+        Dictionary<long, List<(long Partner, PgException Conflict)>> partners = [];
+        foreach ((_, PgException conflict, string rows, string conflicts) in Sync.DeferrableConstraints(0))
+        {
+            foreach (WorfRow pair in Worf.Read($"""
+                SELECT a.xmin::pg_catalog.text::pg_catalog.int8, b.xmin::pg_catalog.text::pg_catalog.int8
+                FROM {rows} a JOIN {rows} b ON (a.tableoid, a.ctid) < (b.tableoid, b.ctid) AND {conflicts}
+                WHERE a.xmin::pg_catalog.text::pg_catalog.int8 OPERATOR(pg_catalog.=) ANY ($1)
+                    OR b.xmin::pg_catalog.text::pg_catalog.int8 OPERATOR(pg_catalog.=) ANY ($1)
+                """, 0, ours))
+            {
+                long first = actionOf.GetValueOrDefault(pair.Get<long>(0));
+                long second = actionOf.GetValueOrDefault(pair.Get<long>(1));
+                (long later, long earlier) = first > second ? (first, second) : (second, first);
+                if (!partners.TryGetValue(later, out List<(long, PgException)>? list))
+                {
+                    partners[later] = list = [];
+                }
+
+                list.Add((earlier, conflict));
+            }
+        }
+
+        Dictionary<long, PgException> skips = [];
+        foreach (long action in partners.Keys.Order())
+        {
+            int stays = partners[action].FindIndex(partner => partner.Partner == 0 || !skips.ContainsKey(partner.Partner));
+            if (stays >= 0)
+            {
+                skips[action] = partners[action][stays].Conflict;
+            }
+        }
+
+        if (skips.Count == 0)
+        {
+            return;
+        }
+
+        foreach ((long action, PgException conflict) in skips)
+        {
+            s_exceptionSkips[action] = conflict;
+        }
+
+        s_skipsAdded = true;
+        long firstSkip = skips.Keys.Min();
+        throw new PgException(skips[firstSkip].SqlState, $"{skips[firstSkip].Message}, which the remote transaction's change #{firstSkip} conflicts in at commit",
+            detail: skips.Count == 1 ? "The transaction is applied again without that change."
+                : $"The transaction is applied again without the {skips.Count} changes that conflict.");
+    }
 
     /// <summary>
     /// Checks whether an error says nothing about the change's data, as a deadlock, a serialization failure, a lock or
@@ -2774,7 +2883,15 @@ internal static unsafe partial class Apply
         // The worker that applies the transaction again learns how from the subscription's state.
         uint subId = MySubscription!.Id;
         ulong commitLsn = s_remoteCommitLsn;
-        PgBackgroundWorker.RunTransaction(() => ExceptionLog.SaveState(subId, commitLsn, level, error));
+        Dictionary<long, PgException> skips = s_exceptionSkips;
+        PgBackgroundWorker.RunTransaction(() =>
+        {
+            ExceptionLog.SaveState(subId, commitLsn, level, error);
+            if (level == ExceptionByChange && skips.Count > 0)
+            {
+                ExceptionLog.SaveSkips(subId, skips);
+            }
+        });
         SetExceptionMarker(s_remoteCommitLsn, level);
         WorfLog.Log($"applying the remote transaction at {Worf.FormatLsn(s_remoteCommitLsn)} under worf.exception_behaviour once the worker restarts");
     }
@@ -2809,6 +2926,14 @@ internal static unsafe partial class Apply
 
             case WorfExceptionBehaviour.Discard:
             case WorfExceptionBehaviour.Transdiscard:
+                // A transaction applied change by change whose commit found changes that conflict is applied so again,
+                // without them.
+                if (s_skipsAdded)
+                {
+                    s_skipsAdded = false;
+                    return ExceptionByChange;
+                }
+
                 // A transaction whose commit fails, as on a deferred constraint, or that fails again change by change
                 // is skipped as a whole next time, but one whose commit fails on a recheck that waited for commit only
                 // as apply had it wait is applied change by change first, where the recheck fires as each change ends.
@@ -2983,6 +3108,7 @@ internal static unsafe partial class Apply
             s_exceptionPassed = false;
             s_exceptionLsn = 0;
             s_exceptionError = null;
+            s_exceptionSkips.Clear();
             if (Worker.MyWorker.WorkerType == WorfWorkerType.Apply)
             {
                 SetExceptionMarker(0, 0);

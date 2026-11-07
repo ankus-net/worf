@@ -246,6 +246,7 @@ public sealed class StalledPeerTests
             Assert.IsTrue(await subscriber.PollLogAsync(logpos,
                 "timed out waiting for provider \"provider\" to accept the replication connection", token), "apply giving up on the connection");
             Assert.IsGreaterThan(TimeSpan.FromSeconds(55), waiting.Elapsed, "apply's wait for the connection, a minute with wal_receiver_timeout off");
+            Assert.Contains("It hadn't answered within a minute (wal_receiver_timeout is 0).", subscriber.ReadLog()[logpos..], "the wait the failure names");
         }
         finally
         {
@@ -253,6 +254,82 @@ public sealed class StalledPeerTests
         }
 
         await AppliesAsync(provider, subscriber, 2, token);
+    }
+
+    /// <summary>
+    /// A call apply makes to its provider that ends on its own after the manager found it overdue, but before the
+    /// manager's cancel came, takes the cancel, which then fails nothing after it. The manager is held between the two by
+    /// a lock on pg_proc, where its first cancel looks up the functions it calls; processes are stopped with signals,
+    /// which Windows lacks.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [OSCondition(OperatingSystems.Linux | OperatingSystems.OSX)]
+    public async Task LateProviderCancelsFailNoLaterCall()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode provider = await StartNodeAsync("provider", token);
+        await using TestNode subscriber = await StartNodeAsync("subscriber", token);
+        _ = await subscriber.SafePsqlAsync(Database, $"""
+            SELECT worf.create_subscription(
+                subscription_name := 'sub',
+                provider_dsn := '{provider.Dsn(Database, SuperUser)}',
+                synchronize_structure := false,
+                synchronize_data := false)
+            """, token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+            "SELECT EXISTS (SELECT FROM worf.show_subscription_status() WHERE status = 'replicating')", token), "the subscription replicating");
+        await AppliesAsync(provider, subscriber, 1, token);
+
+        await using NpgsqlConnection holder = await subscriber.OpenAsync(Database, token);
+        const string ManagerWaits = """
+            SELECT EXISTS (SELECT FROM pg_catalog.pg_locks l JOIN pg_catalog.pg_stat_activity a USING (pid)
+                WHERE NOT l.granted AND l.relation = 'pg_catalog.pg_proc'::regclass AND a.backend_type LIKE 'worf manager%')
+            """;
+        _ = await HolderAsync(holder, ManagerWaits, token);
+        int logpos = subscriber.ReadLog().Length;
+        string providerPostmaster = Postmaster(provider);
+        await SignalAsync("-STOP", providerPostmaster, token);
+        bool providerStopped = true;
+        try
+        {
+            // The apply worker starts again and waits for its connection, which the manager finds overdue after
+            // wal_receiver_timeout and then waits for the lock.
+            _ = await subscriber.SafePsqlAsync(Database,
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE backend_type LIKE 'worf apply%'", token);
+            Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+                "SELECT EXISTS (SELECT FROM pg_stat_activity WHERE backend_type LIKE 'worf apply%' AND wait_event = 'LibpqwalreceiverConnect')", token),
+                "the apply worker waiting for its connection");
+            _ = await HolderAsync(holder, "BEGIN; LOCK TABLE pg_catalog.pg_proc IN ACCESS EXCLUSIVE MODE", token);
+            Stopwatch waiting = Stopwatch.StartNew();
+            while (await HolderAsync(holder, ManagerWaits, token) is not true)
+            {
+                Assert.IsLessThan(TimeSpan.FromSeconds(10), waiting.Elapsed, "the manager waiting for the lock as it cancels the overdue connection");
+                await Task.Delay(TimeSpan.FromMilliseconds(50), token);
+            }
+
+            // The connection then ends on its own, and the manager's cancel comes after it.
+            await SignalAsync("-CONT", providerPostmaster, token);
+            providerStopped = false;
+            await Task.Delay(TimeSpan.FromMilliseconds(300), token);
+            _ = await HolderAsync(holder, "COMMIT", token);
+        }
+        finally
+        {
+            if (providerStopped)
+            {
+                await SignalAsync("-CONT", providerPostmaster, token);
+            }
+        }
+
+        await AppliesAsync(provider, subscriber, 2, token);
+        Assert.DoesNotContain("canceling statement due to user request", subscriber.ReadLog()[logpos..], "the cancel failing a later call");
+    }
+
+    private static async Task<object?> HolderAsync(NpgsqlConnection holder, string sql, CancellationToken token)
+    {
+        await using NpgsqlCommand command = new(sql, holder);
+        return await command.ExecuteScalarAsync(token);
     }
 
     private static async Task AppliesAsync(TestNode provider, TestNode subscriber, int id, CancellationToken token)

@@ -380,6 +380,14 @@ internal static class Functions
 
         WorfNode.CreateSubscription(sub);
 
+        // The subscription's replication origin is made now, rather than once its worker has made the slot, so that a
+        // subscription of another database whose slot's name comes out the same, as names joined with underscores that
+        // hold underscores can, finds it and is refused, whatever the first's worker is waiting for.
+        if (PgReplicationOrigin.Find(sub.SlotName) is null)
+        {
+            _ = WorfNode.CreateOrigin(sub.SlotName, origin.Id, sub.Id);
+        }
+
         // Create synchronization status for the subscription.
         Sync.CreateLocalSyncStatus(new WorfSyncStatus
         {

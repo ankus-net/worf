@@ -4228,6 +4228,12 @@ internal static unsafe partial class SequenceRanges
             return true;
         }
 
+        // A switch worker waits for the gate before it locks the range row, which exchanges and the range worker wait for.
+        if (!briefly)
+        {
+            SequenceRangeGuard.AwaitGate(seqoid);
+        }
+
         LedgerNoWait = true;
         try
         {
@@ -4282,7 +4288,7 @@ internal static unsafe partial class SequenceRanges
             // of the new bounds, as the commit lets the gate go after it tells backends of them.
             if (switched && s_pendingMove is (uint moving, long start))
             {
-                SequenceRangeGuard.ShutGate(moving, briefly ? 100 : 0);
+                SequenceRangeGuard.ShutGate(moving, briefly ? 100 : 1000);
                 Move(moving, start);
             }
 

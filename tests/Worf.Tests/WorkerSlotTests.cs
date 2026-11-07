@@ -85,4 +85,33 @@ public sealed class WorkerSlotTests
             await Task.Delay(TimeSpan.FromMilliseconds(200), token);
         }
     }
+
+    /// <summary>
+    /// COMMIT PREPARED of a transaction that changed neither worf nor a database starts no manager, in its own database
+    /// or any other, though the managers that found nothing to manage there exited.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task UnrelatedPreparedCommitsStartNoManager()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode node = await TestNode.StartAsync("node", ["max_prepared_transactions = 2", "log_min_messages = debug1"], token);
+        for (int i = 0; i < 3; i++)
+        {
+            _ = await node.SafePsqlAsync(Database, $"CREATE DATABASE unrelated{i}", token);
+        }
+
+        _ = await node.SafePsqlAsync("unrelated0", "CREATE TABLE t (a int)", token);
+        await Task.Delay(TimeSpan.FromSeconds(3), token);
+        int before = Starts();
+        for (int i = 0; i < 20; i++)
+        {
+            _ = await node.SafePsqlAsync("unrelated0", $"BEGIN; INSERT INTO t VALUES ({i}); PREPARE TRANSACTION 'unrelated'; COMMIT PREPARED 'unrelated'", token);
+        }
+
+        await Task.Delay(TimeSpan.FromSeconds(3), token);
+        Assert.AreEqual(before, Starts(), "managers started by 20 unrelated COMMIT PREPARED");
+
+        int Starts() => node.ReadLog().Split('\n').Count(line => line.Contains("starting background worker process \"worf manager", StringComparison.Ordinal));
+    }
 }

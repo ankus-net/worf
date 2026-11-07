@@ -2534,6 +2534,88 @@ public sealed class SequenceRangeTests
     }
 
     /// <summary>
+    /// After its server restarts, a node draws nothing from a block its grantor granted until the grantor has answered,
+    /// whatever statement would draw: a SELECT of nextval, or an insert into a table whose defaults don't draw from the
+    /// sequence, waits as an insert into the sequence's table does, here until statement_timeout while the grantor is
+    /// down, and goes on once it's back.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task RestartedNodesDrawNothingBeforeTheirGrantorAnswers()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text); CREATE TABLE other (id bigint)", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100)", token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+        await InsertAsync(nodeB, 10, token);
+
+        await nodeA.StopAsync("fast", token);
+        await nodeB.StopAsync("fast", token);
+        await nodeB.StartServerAsync(token);
+        foreach (string draw in new[] { "SELECT nextval('t_id_seq')", "INSERT INTO other VALUES (nextval('t_id_seq'))", "INSERT INTO t (v) VALUES ('x')" })
+        {
+            PostgresException refused = await Assert.ThrowsExactlyAsync<PostgresException>(() =>
+                nodeB.SafePsqlAsync(Database, $"SET statement_timeout = '2s'; {draw}", token), draw);
+            Assert.AreEqual("57014", refused.SqlState, $"{draw}: {refused.MessageText}");
+        }
+
+        // A read of the sequence as a table draws nothing, and doesn't wait.
+        _ = await nodeB.SafePsqlAsync(Database, "SET statement_timeout = '2s'; SELECT last_value FROM t_id_seq", token);
+        await nodeA.StartServerAsync(token);
+        Assert.AreNotEqual("", await nodeB.SafePsqlAsync(Database, "SELECT nextval('t_id_seq')", token), "nextval once node_a is back");
+        _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO other VALUES (nextval('t_id_seq'))", token);
+    }
+
+    /// <summary>
+    /// After its server restarts, a node draws from a block its grantor granted once the grantor has answered its first
+    /// exchange, which says back the node's start, and which a statement waiting to draw makes at once, rather than after
+    /// an exchange interval, or two.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task RestartedNodesDrawAfterOneExchange()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token, "worf.sequence_range_exchange_interval = '1min'");
+        await using TestNode nodeB = await StartNodeAsync("node_b", token, "worf.sequence_range_exchange_interval = '1min'");
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100)", token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+        await InsertAsync(nodeB, 10, token);
+
+        foreach (bool waiting in new[] { false, true })
+        {
+            await nodeB.StopAsync("fast", token);
+            await nodeB.StartServerAsync(token);
+
+            // The first time, node_b's exchange worker exchanges as it starts; the second, its first exchange has ended
+            // once the insert comes, which then makes the next.
+            if (waiting)
+            {
+                Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE backend_type LIKE 'worf exchange%')", token), "node_b's exchange worker");
+                await Task.Delay(TimeSpan.FromSeconds(3), token);
+            }
+
+            Stopwatch drawing = Stopwatch.StartNew();
+            await InsertAsync(nodeB, 10, token);
+            Assert.IsLessThan(TimeSpan.FromSeconds(15), drawing.Elapsed, $"node_b's first insert after its restart, {(waiting ? "after" : "with")} its first exchange");
+        }
+    }
+
+    /// <summary>
     /// A call that runs out of time on its own just as its watcher cancels it takes the cancel before it goes on, so that
     /// the cancel fails no later call, nor the report of the call's own failure. On Linux and macOS, where the exchange
     /// worker can be stopped past the call's time, which has the watcher cancel it as the call ends on its own.
@@ -2768,7 +2850,8 @@ public sealed class SequenceRangeTests
     /// A switch waits for the statements that hold the sequence's switch gate, as for a lock, and statements waiting for
     /// the switch wait for it, however long, rather than fail: a multi-row insert ON CONFLICT DO NOTHING waiting for a
     /// key another transaction holds draws its later rows from the bounds it then has, a COPY FROM STDIN paused for its
-    /// client and a statement in pg_sleep hold the switch up until they go on, and a cycle through the gate, an insert
+    /// client and a statement in pg_sleep hold the switch up until they go on, though not the range row, which the switch
+    /// takes only once it has the gate, and a cycle through the gate, an insert
     /// waiting for the key of a transaction that then waits for the switch, is a deadlock the detector ends, with one of
     /// the two failing with 40P01 and the other going on.
     /// </summary>
@@ -2843,6 +2926,18 @@ public sealed class SequenceRangeTests
                 Assert.IsTrue(await WaitingAtDoorAsync(writer), "the rows past the block's end waiting for the switch during the COPY");
                 await Task.Delay(TimeSpan.FromSeconds(3), token);
                 Assert.IsFalse(past.IsCompleted, "the rows past the block's end, waiting for the paused COPY");
+
+                // The switch waits for the COPY without the range row, which exchanges and the range worker take meanwhile.
+                bool free = false;
+                for (int i = 0; i < 30 && !free; i++)
+                {
+                    free = await node.SafePsqlAsync(Database,
+                        "SELECT count(*) = 1 FROM (SELECT 1 FROM worf.sequence_range WHERE seqoid = 'k_id_seq'::regclass FOR NO KEY UPDATE SKIP LOCKED) r", token) == "t";
+                    await Task.Delay(TimeSpan.FromMilliseconds(100), token);
+                }
+
+                Assert.IsTrue(free, "the range row, while the switch waits for the paused COPY");
+                Assert.IsFalse(past.IsCompleted, "the rows past the block's end, still waiting for the paused COPY");
                 await copy.WriteAsync("11\n");
             }
 
@@ -4208,8 +4303,9 @@ public sealed class SequenceRangeTests
     /// <summary>
     /// Requests to reset that node_a, node_b's grantor, makes up as a fence's lift asks, naming no block node_b holds
     /// from it, reset node_b's sequence no more often than any neighbor's requests do, however many come and though
-    /// node_b draws between them. One that names a block node_b holds from node_a resets it at once, and the same request
-    /// again, once node_b has given the block up, doesn't.
+    /// node_b draws between them. One that names a block node_b holds from node_a resets it at once, in a window of the
+    /// lifts' own, and the same request again, once node_b has given the block up, doesn't, nor do ones that name the
+    /// blocks node_b got since.
     /// </summary>
     private static async Task LiftsResetOnlyAsTheyNameHeldBlocksAsync(TestNode nodeA, TestNode nodeB, string nodeAId, string slot, CancellationToken token)
     {
@@ -4248,6 +4344,22 @@ public sealed class SequenceRangeTests
         _ = await nodeB.SafePsqlAsync(Database,
             $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{Lift("FFFFFFFF/00000011", $"\"{heldBlock}\"")}')", token);
         Assert.AreEqual(1, nodeB.ReadLog()[lifting..].Split(Lifted).Length - 1, "node_b's resets on the same lift again, once it gave the block up");
+
+        // Lifts that name the blocks node_b got since, as its answers list them, reset it no more often than other
+        // requests do: the lifts' window began with the reset above.
+        for (int i = 0; i < 3; i++)
+        {
+            await InsertAsync(nodeB, 20, token);
+            string fresh = await nodeB.SafePsqlAsync(Database, $"""
+                SELECT block_id FROM worf.sequence_range_block
+                WHERE seqoid = 't_id_seq'::regclass AND from_node = {nodeAId} AND state <> 'abandoned' ORDER BY received_at DESC LIMIT 1
+                """, token);
+            Assert.AreNotEqual("", fresh, "a block node_b got since");
+            _ = await nodeB.SafePsqlAsync(Database,
+                $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{Lift($"FFFFFFFF/0000002{i}", $"\"{fresh}\"")}')", token);
+        }
+
+        Assert.AreEqual(1, nodeB.ReadLog()[lifting..].Split(Lifted).Length - 1, "node_b's resets on lifts that name the blocks it got since");
     }
 
     /// <summary>
