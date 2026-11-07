@@ -371,7 +371,6 @@ internal static partial class SequenceRangeGuard
     /// <param name="written">The tables it writes to.</param>
     internal static unsafe void StartStatement(QueryDesc* queryDesc, List<uint> written)
     {
-        WaitForNamedGrantors(queryDesc->plannedstmt);
         GateStatement(queryDesc, written);
         PlannedStmt* statement = queryDesc->plannedstmt;
         if (queryDesc->snapshot is null || statement is null || statement->hasModifyingCTE)
@@ -602,32 +601,50 @@ internal static partial class SequenceRangeGuard
     }
 
     /// <summary>
-    /// Waits, before any statement whose plan names a managed sequence other than as a table it reads, as one that calls
-    /// nextval on it, or inserts through a default that draws from it, does, until this server has heard from the grantor
-    /// of the sequence's active block since it started, as <see cref="WaitForGrantor"/> does for the statements that
-    /// hold the gates, so that a statement that draws outside them, as a SELECT of nextval, draws none of the block's
-    /// values meanwhile either.
+    /// Gets or sets whether the statements starting are only explained, as EXPLAIN without ANALYZE starts them, which
+    /// draws nothing.
     /// </summary>
-    private static unsafe void WaitForNamedGrantors(PlannedStmt* statement)
+    internal static bool ExplainOnly { get; set; }
+
+    /// <summary>
+    /// Waits, as a call of nextval on any sequence is about to run, as a statement's or a PL/pgSQL expression's whose
+    /// sequence may be named only as it runs, until this server has heard from the grantors of the managed sequences'
+    /// active blocks since it started, as <see cref="WaitForGrantor"/> does for the statements that hold the gates, so
+    /// that nothing draws from those blocks meanwhile. worf's own statements, which run with its search path, a
+    /// standby, a read-only transaction, an explained statement, and Snowflake node numbers, whose IDs carry their times,
+    /// don't wait.
+    /// </summary>
+    internal static void BeforeNextval()
     {
-        // The guard's own reads of the blocks are statements too, and worf's workers, whose exchanges bring the grantor's
-        // answer, draw nothing, nor does a standby. A statement that names no sequence but as a table it reads reads none
-        // of worf's tables either, so that it never waits on them.
-        if (s_namingGrantors || Worker.MyWorfWorker >= 0 || statement is null || statement->relationOids is null ||
-            NativeGlobals.creating_extension || SequenceRanges.Recovering() || !NamesSequence(statement) ||
+        bool quiet;
+        unsafe
+        {
+            quiet = NativeGlobals.creating_extension || NativeGlobals.XactReadOnly;
+        }
+
+        if (quiet || s_namingGrantors || Worker.MyWorfWorker >= 0 || ExplainOnly || SequenceRanges.Recovering() ||
             Worf.CatalogOid("sequence_range_block") == 0)
         {
             return;
         }
 
         s_namingGrantors = true;
-        bool unconfirmed = false;
+        List<uint> waiting = [];
         try
         {
             Reload();
-            foreach (uint grantor in s_grantors.Values)
+            uint snowflake = Worf.CatalogOid("snowflake_node");
+            foreach ((uint seqoid, uint grantor) in s_grantors)
             {
-                unconfirmed |= !s_confirmed.Contains(grantor);
+                if (seqoid != snowflake && !s_confirmed.Contains(grantor) && !waiting.Exists(other => s_grantors[other] == grantor))
+                {
+                    waiting.Add(seqoid);
+                }
+            }
+
+            if (waiting.Count > 0 && Worf.InPinnedSearchPath())
+            {
+                return;
             }
         }
         finally
@@ -635,65 +652,10 @@ internal static partial class SequenceRangeGuard
             s_namingGrantors = false;
         }
 
-        if (!unconfirmed)
+        foreach (uint seqoid in waiting)
         {
-            return;
+            WaitForGrantor(seqoid);
         }
-
-        // A sequence the statement reads as a table, as SELECT last_value FROM one does, isn't drawn from.
-        List* oids = statement->relationOids;
-        for (int i = 0; i < oids->length; i++)
-        {
-            uint seqoid = oids->elements[i].oid_value;
-            if (s_grantors.ContainsKey(seqoid) && NamesSequence(statement, seqoid))
-            {
-                WaitForGrantor(seqoid);
-            }
-        }
-    }
-
-    // Whether a statement's plan names a sequence other than as a table it reads, as nextval's argument does, but
-    // worf's Snowflake node numbers, whose IDs carry their times, so that a node issues them while its grantor is away.
-    private static unsafe bool NamesSequence(PlannedStmt* statement) => NamesSequence(statement, 0);
-
-    // Whether a statement's plan names a sequence, or a given one, as NamesSequence tells.
-    private static unsafe bool NamesSequence(PlannedStmt* statement, uint sequence)
-    {
-        List* oids = statement->relationOids;
-        uint snowflake = 0;
-        for (int i = 0; i < oids->length; i++)
-        {
-            uint oid = oids->elements[i].oid_value;
-            if ((sequence == 0 ? NativeMethods.get_rel_relkind(oid) == (sbyte)'S' : oid == sequence) && !ReadsAsTable(statement, oid))
-            {
-                if (snowflake == 0)
-                {
-                    snowflake = Worf.CatalogOid("snowflake_node");
-                }
-
-                if (oid != snowflake)
-                {
-                    return true;
-                }
-            }
-        }
-
-        return false;
-    }
-
-    // Whether a statement's range table holds a relation.
-    private static unsafe bool ReadsAsTable(PlannedStmt* statement, uint relid)
-    {
-        for (int i = 0; statement->rtable is not null && i < statement->rtable->length; i++)
-        {
-            RangeTblEntry* rte = (RangeTblEntry*)statement->rtable->elements[i].ptr_value;
-            if (rte->rtekind == RTEKind.RTE_RELATION && rte->relid == relid)
-            {
-                return true;
-            }
-        }
-
-        return false;
     }
 
     /// <summary>
@@ -701,7 +663,8 @@ internal static partial class SequenceRangeGuard
     /// taken in a message of the parent's since it started: a node that was away while its parent's fence lifted without
     /// its report, as when <c>worf.activate_sequence_range</c> stopped waiting for it, holds values the lift gave out
     /// again, and the parent's first message after asks it to reset, so it draws none of them. The statement lets its
-    /// gates go and waits as for a lock, until the parent answers, <c>statement_timeout</c> or a cancellation.
+    /// gates go and waits up to twice <c>worf.sequence_range_timeout</c>, as for the next block at a block's end, and
+    /// then fails, naming the parent, as an error that ends the wait first, as <c>statement_timeout</c>'s, does.
     /// </summary>
     private static void WaitForGrantor(uint seqoid)
     {
@@ -713,14 +676,32 @@ internal static partial class SequenceRangeGuard
 
         if (!SequenceRangeHeard.Confirmed(grantor))
         {
+            string sequence;
+            unsafe
+            {
+                sequence = Worf.FromServer(NativeMethods.get_rel_name(seqoid));
+            }
+
+            string parent = Elevated.Run(() => Worf.ReadScalar<string?>("SELECT node_name::text FROM worf.node WHERE node_id = $1",
+                SpiParameter.Create(grantor))) ?? grantor.ToString(CultureInfo.InvariantCulture);
+            string waitingFor = $"waiting for node {parent}, which granted sequence {sequence}'s block, to answer this server since it started";
+            using PgErrorContext context = PgErrorContext.Push(Worf.Shown(waitingFor));
             List<uint> held = LetGates();
             try
             {
+                long deadline = Worker.GetCurrentTimestamp() + (SequenceRanges.ExchangeTimeout * 2000L);
                 long woken = 0;
                 while (!SequenceRangeHeard.Confirmed(grantor))
                 {
                     // The wait makes the exchange with the grantor due, each second while it lasts.
                     long now = Worker.GetCurrentTimestamp();
+                    if (now >= deadline)
+                    {
+                        throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState,
+                            $"sequence {sequence} can't draw from the block node {parent} granted it until node {parent} answers this server, which started since",
+                            hint: $"Make sure node {parent} is up and its exchanges with this node succeed.");
+                    }
+
                     if (now - woken >= 1_000_000)
                     {
                         woken = now;

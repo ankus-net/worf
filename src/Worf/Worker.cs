@@ -19,6 +19,15 @@ internal static class Worker
     /// </summary>
     internal static PgLwLock<WorfContext, WorfWorker> WorfCtx { get; } = new("worf_context");
 
+    /// <summary>
+    /// Gets the shared table of prepared transactions whose COMMIT PREPARED wakes managers.
+    /// </summary>
+    internal static PgLwLock<WorfPreparedTable, WorfPrepared> Prepared { get; } = new("worf_prepared");
+
+    // The most prepared transactions the table holds at once; once it's full, the oldest is forgotten, and its COMMIT
+    // PREPARED leaves the managers to their next look.
+    private const int MaxPrepared = 64;
+
     private static readonly List<SignalWorkerItem> s_signalWorkers = [];
 
     private static bool s_xacthookSignalWorkers;
@@ -56,6 +65,7 @@ internal static class Worker
         PgSharedMemory.Initialize(WorfCtx, nworkers,
             () => new WorfContext { Supervisor = 0, SubscriptionsChanged = false, TotalWorkers = nworkers },
             static _ => EmptyWorker());
+        PgSharedMemory.Initialize(Prepared, MaxPrepared, static () => default, static _ => default);
     }
 
     /// <summary>
@@ -990,7 +1000,7 @@ internal static class Worker
             // no later call, nor in the stream, a copy or an applied transaction.
             if (SetCallDeadline(0) is 0 or CancellingCall && !canceled)
             {
-                _ = AwaitCancel(static () => ReadCallDeadline() == CancellingCall, ProviderTimeout * 1000L);
+                _ = AwaitCancel(static () => CancelComing(), ProviderTimeout * 1000L);
             }
         }
     }
@@ -1051,12 +1061,20 @@ internal static class Worker
     }
 
     /// <summary>
-    /// Reads the deadline of the call to a provider that this worker's slot holds.
+    /// Checks whether the manager is still to send the cancel of this worker's call that it marked: not once it has
+    /// marked it sent, nor once it has exited, which leaves the mark, so that a call whose cancel never comes waits a
+    /// second for it at most.
     /// </summary>
-    private static long ReadCallDeadline()
+    private static bool CancelComing()
     {
         using PgLwLockShareGuard<WorfContext, WorfWorker> guard = WorfCtx.Share();
-        return guard[MyWorfWorker].Worker.Apply.CallDeadline;
+        if (guard[MyWorfWorker].Worker.Apply.CallDeadline != CancellingCall)
+        {
+            return false;
+        }
+
+        int manager = guard.Read((in _, workers) => ManagerFind(workers, MyWorker.Dboid));
+        return manager >= 0 && guard[manager].Proc != 0;
     }
 
     /// <summary>
@@ -1293,6 +1311,92 @@ internal static class Worker
         if (supervisor != 0)
         {
             SetProcLatch(supervisor);
+        }
+    }
+
+    /// <summary>
+    /// Notes, as PREPARE TRANSACTION prepares a transaction that created worf here, changed its nodes or subscriptions,
+    /// or changed a database, as its workers' signals at commit say, that its COMMIT PREPARED wakes the managers, as
+    /// <see cref="PreparedWakes"/> tells, by the hash of its name, so that no other COMMIT PREPARED reads anything. The table is in
+    /// shared memory, so after a restart the managers learn of such a commit at their next look.
+    /// </summary>
+    /// <param name="hash">The hash of the transaction's name.</param>
+    internal static void NotePrepared(uint hash)
+    {
+        if (!s_xacthookSignalWorkers)
+        {
+            return;
+        }
+
+        uint dboid;
+        unsafe
+        {
+            dboid = NativeGlobals.MyDatabaseId;
+        }
+
+        using PgLwLockExclusiveGuard<WorfPreparedTable, WorfPrepared> guard = Prepared.Exclusive();
+        int slot = 0;
+        for (int i = 0; i < guard.Length; i++)
+        {
+            if (guard[i].Dboid == 0 || (guard[i].Dboid == dboid && guard[i].GidHash == hash))
+            {
+                slot = i;
+                break;
+            }
+
+            if (guard[i].PreparedAt < guard[slot].PreparedAt)
+            {
+                slot = i;
+            }
+        }
+
+        guard[slot] = new WorfPrepared { Dboid = dboid, GidHash = hash, EveryDatabase = s_forgetEveryIdleManager, PreparedAt = GetCurrentTimestamp() };
+    }
+
+    /// <summary>
+    /// Tells whether COMMIT PREPARED of a transaction wakes managers, as <see cref="NotePrepared"/> noted, and whose.
+    /// </summary>
+    /// <param name="hash">The hash of the transaction's name.</param>
+    /// <returns>Whether every database's managers wake, or only this one's, or null for none.</returns>
+    internal static bool? PreparedWakes(uint hash)
+    {
+        uint dboid;
+        unsafe
+        {
+            dboid = NativeGlobals.MyDatabaseId;
+        }
+
+        using PgLwLockShareGuard<WorfPreparedTable, WorfPrepared> guard = Prepared.Share();
+        for (int i = 0; i < guard.Length; i++)
+        {
+            if (guard[i].Dboid == dboid && guard[i].GidHash == hash)
+            {
+                return guard[i].EveryDatabase;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Forgets a prepared transaction once COMMIT PREPARED or ROLLBACK PREPARED has ended it.
+    /// </summary>
+    /// <param name="hash">The hash of the transaction's name.</param>
+    internal static void ForgetPrepared(uint hash)
+    {
+        uint dboid;
+        unsafe
+        {
+            dboid = NativeGlobals.MyDatabaseId;
+        }
+
+        using PgLwLockExclusiveGuard<WorfPreparedTable, WorfPrepared> guard = Prepared.Exclusive();
+        for (int i = 0; i < guard.Length; i++)
+        {
+            if (guard[i].Dboid == dboid && guard[i].GidHash == hash)
+            {
+                guard[i] = default;
+            }
         }
     }
 

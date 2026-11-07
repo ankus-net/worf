@@ -41,9 +41,14 @@ public sealed class DocumentationTests
             s_sequenceRanges, "a grantor's lifts (211)");
         Assert.DoesNotContain("without waiting for them, and commits at once", s_sequenceRanges, "a switch worker's wait (130/146)");
         Assert.DoesNotContain("three seconds a minute at most", s_sequenceRanges, "an unreachable neighbor's cost (294)");
+        Assert.Contains("holds up the others' calls about ten seconds in its first minute, and about three seconds a minute after that", s_sequenceRanges,
+            "an unreachable neighbor's cost (294)");
+        Assert.Contains("A forced lift's request to reset from the node's grantor", s_sequenceRanges, "a grantor's lifts (352)");
+        Assert.Contains("the grantor's lifts may reset the node 9 times in their first hour and 14 in their first day", s_sequenceRanges, "a grantor's lifts (353)");
         Assert.Contains("A switch worker waits for the gate before it locks the sequence's range row", s_sequenceRanges, "a paused gate holder (291)");
-        Assert.Contains("A statement whose plan names the sequence, as an insert through a default that draws from it or a `SELECT` of `nextval`, waits until then",
-            s_sequenceRanges, "a returning node's draws (292, 293)");
+        Assert.Contains("Until then, every call of `nextval`, on any sequence, as a call may name its sequence only as it runs", s_sequenceRanges,
+            "a returning node's draws (292, 293)");
+        Assert.Contains("Nothing else waits: reads of the sequence, `setval`, `currval`, `EXPLAIN`", s_sequenceRanges, "what doesn't wait for a grantor (351)");
         Assert.Contains("a node whose last call ran out of time, as one whose host drops connection attempts, after the others", s_sequenceRanges,
             "an unreachable neighbor (212)");
         Assert.DoesNotContain("leaves no block's values unused", s_sequenceRanges, "a COPY's switch (130)");

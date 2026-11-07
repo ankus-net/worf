@@ -2535,9 +2535,13 @@ public sealed class SequenceRangeTests
 
     /// <summary>
     /// After its server restarts, a node draws nothing from a block its grantor granted until the grantor has answered,
-    /// whatever statement would draw: a SELECT of nextval, or an insert into a table whose defaults don't draw from the
-    /// sequence, waits as an insert into the sequence's table does, here until statement_timeout while the grantor is
-    /// down, and goes on once it's back.
+    /// whatever calls nextval: a SELECT, an insert into a table whose defaults don't draw from the sequence, an insert
+    /// into the sequence's table, a PL/pgSQL assignment and RETURN, a SQL function given the name as text, nextval of a
+    /// name as text, and a SELECT that also reads the sequence. Each waits, naming the grantor, here until
+    /// statement_timeout while the grantor is down, or for twice worf.sequence_range_timeout, after which it fails
+    /// naming the grantor. What draws nothing doesn't wait: a read of the sequence or of worf.sequence_ranges,
+    /// pg_sequence_last_value, an EXPLAIN, and nextval in a read-only transaction, which fails at once. Once the grantor
+    /// is back, the node draws again.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -2551,6 +2555,10 @@ public sealed class SequenceRangeTests
             _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text); CREATE TABLE other (id bigint)", token);
         }
 
+        _ = await nodeB.SafePsqlAsync(Database, """
+            CREATE FUNCTION drawn() RETURNS bigint LANGUAGE plpgsql AS $$ BEGIN RETURN nextval('t_id_seq'); END $$;
+            CREATE FUNCTION drawn_from(name text) RETURNS bigint LANGUAGE sql AS 'SELECT nextval($1)';
+            """, token);
         await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100)", token);
         await WaitActiveAsync([nodeA, nodeB], token);
@@ -2559,18 +2567,69 @@ public sealed class SequenceRangeTests
         await nodeA.StopAsync("fast", token);
         await nodeB.StopAsync("fast", token);
         await nodeB.StartServerAsync(token);
-        foreach (string draw in new[] { "SELECT nextval('t_id_seq')", "INSERT INTO other VALUES (nextval('t_id_seq'))", "INSERT INTO t (v) VALUES ('x')" })
+        foreach (string draw in new[]
+        {
+            "SELECT nextval('t_id_seq')", "INSERT INTO other VALUES (nextval('t_id_seq'))", "INSERT INTO t (v) VALUES ('x')",
+            "DO $$ DECLARE x bigint; BEGIN x := nextval('t_id_seq'); END $$", "SELECT drawn()", "SELECT drawn_from('t_id_seq')",
+            "SELECT nextval('t_id_seq'::text)", "SELECT nextval('t_id_seq'), last_value FROM t_id_seq",
+        })
         {
             PostgresException refused = await Assert.ThrowsExactlyAsync<PostgresException>(() =>
                 nodeB.SafePsqlAsync(Database, $"SET statement_timeout = '2s'; {draw}", token), draw);
             Assert.AreEqual("57014", refused.SqlState, $"{draw}: {refused.MessageText}");
+            Assert.Contains("waiting for node node_a, which granted sequence t_id_seq's block", refused.Where ?? "", draw);
         }
 
-        // A read of the sequence as a table draws nothing, and doesn't wait.
-        _ = await nodeB.SafePsqlAsync(Database, "SET statement_timeout = '2s'; SELECT last_value FROM t_id_seq", token);
+        foreach (string reads in new[]
+        {
+            "SELECT last_value FROM t_id_seq", "SELECT count(*) FROM worf.sequence_ranges", "SELECT pg_sequence_last_value('t_id_seq')",
+            "EXPLAIN SELECT nextval('t_id_seq')",
+        })
+        {
+            _ = await nodeB.SafePsqlAsync(Database, $"SET statement_timeout = '2s'; {reads}", token);
+        }
+
+        Assert.AreEqual("25006", (await Assert.ThrowsExactlyAsync<PostgresException>(() => nodeB.SafePsqlAsync(Database,
+            "SET statement_timeout = '2s'; BEGIN READ ONLY; SELECT nextval('t_id_seq')", token))).SqlState, "nextval in a read-only transaction");
+
+        // The wait is bounded, and its failure names the grantor.
+        Stopwatch bounded = Stopwatch.StartNew();
+        PostgresException waited = await Assert.ThrowsExactlyAsync<PostgresException>(() => nodeB.SafePsqlAsync(Database, "SELECT nextval('t_id_seq')", token));
+        Assert.AreEqual("55000", waited.SqlState, waited.MessageText);
+        Assert.Contains("until node node_a answers this server", waited.MessageText);
+        Assert.IsLessThan(TimeSpan.FromSeconds(30), bounded.Elapsed, "the bounded wait");
+
         await nodeA.StartServerAsync(token);
         Assert.AreNotEqual("", await nodeB.SafePsqlAsync(Database, "SELECT nextval('t_id_seq')", token), "nextval once node_a is back");
         _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO other VALUES (nextval('t_id_seq'))", token);
+    }
+
+    /// <summary>
+    /// A node whose grantor calls it, and that calls no one, draws again after its server restarts, once the grantor's
+    /// call has come: the statements that take in the call wait for nothing.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task RestartedNodesThatOnlyAnswerDrawAgain()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        await SubscribeAsync(nodeA, "a_from_b", nodeB, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100)", token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+        await InsertAsync(nodeB, 10, token);
+
+        await nodeB.StopAsync("fast", token);
+        await nodeB.StartServerAsync(token);
+        Stopwatch drawing = Stopwatch.StartNew();
+        await InsertAsync(nodeB, 10, token);
+        Assert.IsLessThan(TimeSpan.FromSeconds(20), drawing.Elapsed, "node_b's first insert after its restart");
     }
 
     /// <summary>

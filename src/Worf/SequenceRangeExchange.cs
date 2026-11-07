@@ -1678,9 +1678,9 @@ internal static class SequenceRangeExchange
 
             // A fence's lift asks the holders of the grants it gave out again, or that overlap, to reset, which the
             // node that granted them may ask, when it names a block this node holds from it, in a window of its own, so
-            // that another reset doesn't hold it up, but no more often than other requests, as one made up may name
-            // the blocks this node's answers list; the reset gives them up. Any other request waits for
-            // SequenceRangeHeard.MayReset as well.
+            // that another reset doesn't hold it up, which starts at ten seconds and grows as the other does, as one
+            // made up may name the blocks this node's answers list; the reset gives them up. Any other request waits for
+            // SequenceRangeHeard.MayReset's other window.
             Guid[] named = entry.TryGetProperty("reset_grants", out JsonElement grants) && grants.ValueKind == JsonValueKind.Array
                 ? [.. grants.EnumerateArray().Select(grant => grant.ValueKind == JsonValueKind.String && grant.TryGetGuid(out Guid id) ? id : Guid.Empty)]
                 : [];

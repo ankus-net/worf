@@ -54,6 +54,7 @@ internal static unsafe partial class Apply
     // places; and whether the last commit found more to skip.
     private static Dictionary<long, PgException> s_exceptionSkips = [];
     private static readonly List<(uint Xid, long Action)> s_changeXids = [];
+    private static readonly HashSet<uint> s_changeRelations = [];
     private static bool s_skipsAdded;
 
     // Whether the stream passed the failed transaction without sending it again.
@@ -727,6 +728,7 @@ internal static unsafe partial class Apply
     {
         s_xactActionCounter = 1;
         s_changeXids.Clear();
+        s_changeRelations.Clear();
         s_actionName = "BEGIN";
         s_replicatedRole = null;
 
@@ -2653,6 +2655,10 @@ internal static unsafe partial class Apply
                 if (xid != 0)
                 {
                     s_changeXids.Add((xid, s_xactActionCounter));
+                    if (s_errRel is not null)
+                    {
+                        _ = s_changeRelations.Add(s_errRel.Reloid);
+                    }
                 }
             }, PgSubtransactionMode.Atomic);
         }
@@ -2685,27 +2691,45 @@ internal static unsafe partial class Apply
             actionOf[xid] = action;
         }
 
+        // Only the tables the changes wrote, and the rows they wrote, are compared with the others; a check that fails, as
+        // on a lock it can't take, leaves the commit to fail or not as it would.
         SpiParameter ours = SpiParameter.Create(actionOf.Keys.ToArray());
         Dictionary<long, List<(long Partner, PgException Conflict)>> partners = [];
-        foreach ((_, PgException conflict, string rows, string conflicts) in Sync.DeferrableConstraints(0))
+        try
         {
-            foreach (WorfRow pair in Worf.Read($"""
-                SELECT a.xmin::pg_catalog.text::pg_catalog.int8, b.xmin::pg_catalog.text::pg_catalog.int8
-                FROM {rows} a JOIN {rows} b ON (a.tableoid, a.ctid) < (b.tableoid, b.ctid) AND {conflicts}
-                WHERE a.xmin::pg_catalog.text::pg_catalog.int8 OPERATOR(pg_catalog.=) ANY ($1)
-                    OR b.xmin::pg_catalog.text::pg_catalog.int8 OPERATOR(pg_catalog.=) ANY ($1)
-                """, 0, ours))
+            PgTransaction.RunInSubtransaction(() =>
             {
-                long first = actionOf.GetValueOrDefault(pair.Get<long>(0));
-                long second = actionOf.GetValueOrDefault(pair.Get<long>(1));
-                (long later, long earlier) = first > second ? (first, second) : (second, first);
-                if (!partners.TryGetValue(later, out List<(long, PgException)>? list))
+                foreach (uint reloid in s_changeRelations)
                 {
-                    partners[later] = list = [];
-                }
+                    foreach ((_, PgException conflict, string rows, string conflicts) in Sync.DeferrableConstraints(reloid))
+                    {
+                        foreach (WorfRow pair in Worf.Read($"""
+                            SELECT a.xmin::pg_catalog.text::pg_catalog.int8, b.xmin::pg_catalog.text::pg_catalog.int8
+                            FROM {rows} b JOIN {rows} a ON (a.tableoid, a.ctid) OPERATOR(pg_catalog.<>) (b.tableoid, b.ctid) AND {conflicts}
+                            WHERE b.xmin::pg_catalog.text::pg_catalog.int8 OPERATOR(pg_catalog.=) ANY ($1)
+                            """, 0, ours))
+                        {
+                            long first = actionOf.GetValueOrDefault(pair.Get<long>(0));
+                            long second = actionOf.GetValueOrDefault(pair.Get<long>(1));
+                            (long later, long earlier) = first > second ? (first, second) : (second, first);
+                            if (!partners.TryGetValue(later, out List<(long, PgException)>? list))
+                            {
+                                partners[later] = list = [];
+                            }
 
-                list.Add((earlier, conflict));
-            }
+                            list.Add((earlier, conflict));
+                        }
+                    }
+                }
+            }, PgSubtransactionMode.Atomic);
+        }
+        catch (PgException error) when (!IsTransient(error))
+        {
+            WorfLog.Warning(new PgDiagnostic($"could not find which changes of the remote transaction conflict at commit: {error.Message}")
+            {
+                Detail = error.Detail,
+            });
+            return;
         }
 
         Dictionary<long, PgException> skips = [];

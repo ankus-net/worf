@@ -30,6 +30,9 @@ internal static unsafe class Libpq
     private static delegate* unmanaged<nint, int, int, byte*> s_getvalue;
     private static delegate* unmanaged<nint, int, int, int> s_getisnull;
     private static delegate* unmanaged<nint, void> s_clear;
+    private static delegate* unmanaged<nint, nint> s_getCancel;
+    private static delegate* unmanaged<nint, byte*, int, int> s_cancel;
+    private static delegate* unmanaged<nint, void> s_freeCancel;
 
     /// <summary>
     /// Opens a connection, as <c>PQconnectdb</c> does.
@@ -134,6 +137,30 @@ internal static unsafe class Libpq
     internal static bool IsOk(nint conn) => s_status(conn) == ConnectionOk;
 
     /// <summary>
+    /// Asks the server to cancel the command a connection runs, as <c>PQcancel</c> does, which another thread may do.
+    /// </summary>
+    /// <param name="conn">The connection.</param>
+    /// <returns>Whether the request was sent.</returns>
+    internal static bool Cancel(nint conn)
+    {
+        nint cancel = s_getCancel(conn);
+        if (cancel == 0)
+        {
+            return false;
+        }
+
+        try
+        {
+            byte* error = stackalloc byte[256];
+            return s_cancel(cancel, error, 256) != 0;
+        }
+        finally
+        {
+            s_freeCancel(cancel);
+        }
+    }
+
+    /// <summary>
     /// Closes a connection.
     /// </summary>
     /// <param name="conn">The connection.</param>
@@ -199,6 +226,9 @@ internal static unsafe class Libpq
             s_getvalue = (delegate* unmanaged<nint, int, int, byte*>)NativeLibrary.GetExport(library, "PQgetvalue");
             s_getisnull = (delegate* unmanaged<nint, int, int, int>)NativeLibrary.GetExport(library, "PQgetisnull");
             s_clear = (delegate* unmanaged<nint, void>)NativeLibrary.GetExport(library, "PQclear");
+            s_getCancel = (delegate* unmanaged<nint, nint>)NativeLibrary.GetExport(library, "PQgetCancel");
+            s_cancel = (delegate* unmanaged<nint, byte*, int, int>)NativeLibrary.GetExport(library, "PQcancel");
+            s_freeCancel = (delegate* unmanaged<nint, void>)NativeLibrary.GetExport(library, "PQfreeCancel");
             s_loaded = true;
         }
     }

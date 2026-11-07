@@ -434,28 +434,44 @@ public sealed class DdlReplicationTests
     }
 
     /// <summary>
-    /// replicate_ddl_command called inside a subtransaction, a savepoint or a PL/pgSQL block that catches errors, runs the
-    /// command there after queueing it, so decoding of the node's WAL that starts again inside the subtransaction takes
-    /// the rest of it, here an ANALYZE, whose records are invalidations: the message the command writes last gives
-    /// decoding a change to set its snapshot from, without which an assert-enabled build aborts at every restart.
+    /// DDL run in a subtransaction, however it got there, ends the subtransaction with a record decoding takes its
+    /// snapshot from, so decoding of the node's WAL that starts again inside the subtransaction takes the rest of it, here
+    /// an ANALYZE, whose records are invalidations, without which an assert-enabled build aborts at every restart:
+    /// replicate_ddl_command in a PL/pgSQL block that catches errors or in a savepoint, a PL/pgSQL block with an exception
+    /// clause that replicate_ddl_command runs, a savepoint around DDL that isn't replicated, and an index build on a
+    /// temporary table, which writes no WAL until its invalidations.
     /// </summary>
-    /// <param name="block">Whether the call runs in a PL/pgSQL block with an exception clause rather than a savepoint.</param>
+    /// <param name="shape">How the DDL runs in a subtransaction.</param>
     /// <returns>The test.</returns>
     [TestMethod]
-    [DataRow(false)]
-    [DataRow(true)]
-    public async Task DecodingStartsAgainInsideReplicatedDdl(bool block)
+    [DataRow("block around the call")]
+    [DataRow("savepoint around the call")]
+    [DataRow("block the call runs")]
+    [DataRow("savepoint, not replicated")]
+    [DataRow("temporary index build")]
+    public async Task DecodingStartsAgainInsideReplicatedDdl(string shape)
     {
         CancellationToken token = TestContext.CancellationToken;
         await using TestNode nodeA = await StartNodeAsync("node_a", token);
         _ = await nodeA.SafePsqlAsync(Database, "SET worf.enable_ddl_replication = off; CREATE TABLE u (a int); CREATE TABLE v (a int)", token);
         _ = await nodeA.SafePsqlAsync(Database, "SELECT 1 FROM pg_create_logical_replication_slot('td', 'test_decoding')", token);
         const string Command = "ALTER TABLE public.u ADD COLUMN b int; SELECT pg_catalog.pg_sleep(4); ANALYZE public.u";
-        Task queued = nodeA.SafePsqlAsync(Database, block
-            ? $"DO $$ BEGIN PERFORM worf.replicate_ddl_command('{Command}'); EXCEPTION WHEN raise_exception THEN NULL; END $$"
-            : $"BEGIN; SAVEPOINT s; SELECT worf.replicate_ddl_command('{Command}'); RELEASE s; COMMIT", token);
-        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database,
-            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE query LIKE '%replicate_ddl_command%' AND wait_event = 'PgSleep')", token),
+        const string InBlock = "DO $x$ BEGIN ALTER TABLE public.u ADD COLUMN b int; PERFORM pg_catalog.pg_sleep(4); ANALYZE public.u; EXCEPTION WHEN raise_exception THEN NULL; END $x$";
+        Task queued = nodeA.SafePsqlAsync(Database, shape switch
+        {
+            "block around the call" => $"DO $$ BEGIN PERFORM worf.replicate_ddl_command('{Command}'); EXCEPTION WHEN raise_exception THEN NULL; END $$",
+            "savepoint around the call" => $"BEGIN; SAVEPOINT s; SELECT worf.replicate_ddl_command('{Command}'); RELEASE s; COMMIT",
+            "block the call runs" => $"SELECT worf.replicate_ddl_command('{InBlock}')",
+            "savepoint, not replicated" => $"SET worf.enable_ddl_replication = off; BEGIN; SAVEPOINT s; {Command}; RELEASE s; COMMIT",
+            _ => """
+                SET worf.enable_ddl_replication = off; SET maintenance_work_mem = '1MB';
+                BEGIN; CREATE TEMPORARY TABLE tt AS SELECT g FROM generate_series(1, 3000000) g;
+                SAVEPOINT s; ALTER TABLE public.u ADD COLUMN b int; CREATE INDEX tt_g ON tt (g); RELEASE s; COMMIT
+                """,
+        }, token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, shape == "temporary index build"
+            ? "SELECT EXISTS (SELECT 1 FROM pg_stat_progress_create_index WHERE phase LIKE 'building index%')"
+            : "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE query LIKE '%pg_sleep(4)%' AND wait_event = 'PgSleep')", token),
             "node_a inside the command");
 
         // Decoding moves its restart point past the subtransaction's first record while another transaction stays open.

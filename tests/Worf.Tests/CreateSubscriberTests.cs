@@ -276,6 +276,108 @@ public sealed class CreateSubscriberTests
     }
 
     /// <summary>
+    /// A subscriber stopped, as with SIGTERM, while its subscription waits for a provider that doesn't answer, cancels
+    /// the wait and cleans up as on a failure, so that it leaves no progress for its origin's id either. Processes are
+    /// stopped with signals, which Windows lacks.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [OSCondition(OperatingSystems.Linux | OperatingSystems.OSX)]
+    public async Task StoppedSubscriberLeavesNoOriginProgress()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        using TemporaryDirectory work = new($"worf-create-subscriber-stopped-{Guid.NewGuid():N}");
+        await using TestNode provider = await TestNode.StartAsync("provider",
+            ["wal_level = logical", "max_wal_senders = 10", "max_replication_slots = 10", "track_commit_timestamp = on"], token);
+        int pgport = CreateSubscriberCommand.FreePort();
+        string port = pgport.ToString(CultureInfo.InvariantCulture);
+        string providerDsn = $"postgresql://super@127.0.0.1:{provider.Cluster.Port.ToString(CultureInfo.InvariantCulture)}/postgres";
+        string backupDir = Path.Join(work.FullName, "backupdir");
+        string command = await CreateSubscriberCommand.InstallAsync(provider.Installation, Path.Join(work.FullName, "bin"));
+        _ = await provider.SafePsqlAsync(Database, """
+            CREATE USER super SUPERUSER;
+            CREATE EXTENSION worf;
+            SELECT * FROM worf.create_node(node_name := 'test_provider', dsn := 'dbname=postgres user=super');
+            """, token);
+        string autoConf = Path.Join(provider.Cluster.DataDirectory, "postgresql.auto.conf");
+        await File.WriteAllLinesAsync(autoConf,
+            (await File.ReadAllLinesAsync(autoConf, token)).Where(static line => !line.TrimStart().StartsWith("port", StringComparison.Ordinal)),
+            token);
+        _ = await provider.SafePsqlAsync(Database, "CHECKPOINT", token);
+        string postmaster = File.ReadLines(Path.Join(provider.Cluster.DataDirectory, "postmaster.pid")).First().Trim();
+
+        ProcessStartInfo start = new(command)
+        {
+            WorkingDirectory = work.FullName,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        foreach (string argument in new[]
+        {
+            "-D", backupDir, "--subscriber-name=test_subscriber", $"--subscriber-dsn=postgresql://super@127.0.0.1:{port}/postgres",
+            $"--provider-dsn={providerDsn}", "--drop-slot-if-exists", "-v",
+            $"--hba-conf={Path.Join(AppContext.BaseDirectory, "TestFiles", "regress-pg_hba.conf")}",
+            $"--postgresql-conf={Path.Join(provider.Cluster.DataDirectory, "postgresql.conf")}",
+        })
+        {
+            start.ArgumentList.Add(argument);
+        }
+
+        start.Environment["PGPORT"] = port;
+        bool stopped = false;
+        try
+        {
+            using Process tool = Process.Start(start)!;
+            Task<string> errors = tool.StandardError.ReadToEndAsync(token);
+            string? line;
+            do
+            {
+                line = await tool.StandardOutput.ReadLineAsync(token);
+            }
+            while (line is not null && !line.StartsWith("Creating subscriber", StringComparison.Ordinal));
+
+            Assert.IsNotNull(line, "the tool creating the subscriber");
+
+            // The provider stops answering new connections, as create_subscription makes, and the tool is stopped while
+            // it waits.
+            (int paused, _, string error) = await ProcessRunner.RunAsync("kill", ["-STOP", postmaster], token);
+            Assert.AreEqual(0, paused, error);
+            stopped = true;
+            await Task.Delay(TimeSpan.FromSeconds(2), token);
+            (int signalled, _, error) = await ProcessRunner.RunAsync("kill", ["-TERM", tool.Id.ToString(CultureInfo.InvariantCulture)], token);
+            Assert.AreEqual(0, signalled, error);
+            using CancellationTokenSource exiting = CancellationTokenSource.CreateLinkedTokenSource(token);
+            exiting.CancelAfter(TimeSpan.FromSeconds(60));
+            await tool.WaitForExitAsync(exiting.Token);
+            TestContext.WriteLine(await errors);
+            Assert.AreEqual(1, tool.ExitCode, "the stopped tool's exit code");
+        }
+        finally
+        {
+            if (stopped)
+            {
+                _ = await ProcessRunner.RunAsync("kill", ["-CONT", postmaster], CancellationToken.None);
+            }
+        }
+
+        try
+        {
+            await StopAsync(provider, backupDir);
+            (int started, string startOutput) = await provider.RunProgramAsync("pg_ctl",
+                ["start", "-w", "-D", backupDir, "-o", $"-p {port}", "-l", Path.Join(work.FullName, "subscriber.log")], token);
+            Assert.AreEqual(0, started, startOutput);
+            Assert.AreEqual("1|true", await SubscriberAsync(provider, pgport, """
+                SELECT pg_catalog.pg_replication_origin_create('later')::text || '|' ||
+                    (coalesce(pg_catalog.pg_replication_origin_progress('later', false), '0/0') = '0/0')::text
+                """, token), "the id of the origin created next, and that it has no progress");
+        }
+        finally
+        {
+            await StopAsync(provider, backupDir);
+        }
+    }
+
+    /// <summary>
     /// Runs psql against the subscriber and checks that it succeeds, as <c>command_ok</c> does.
     /// </summary>
     private async Task AssertPsqlOkAsync(TestNode provider, int port, IReadOnlyList<string> arguments, string name,

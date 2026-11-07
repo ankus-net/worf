@@ -79,6 +79,7 @@ internal static unsafe partial class CopyConversion
     private static string s_heldTable = "";
     private static int[] s_heldFields = [];
     private static string s_heldCandidates = "";
+    private static string? s_heldTests;
     private static string s_heldRow = "";
     private static byte[] s_keyText = [];
     private static List<string> s_columns = [];
@@ -501,7 +502,8 @@ internal static unsafe partial class CopyConversion
             FROM ROWS FROM ({string.Join(", ", read.Select((_, j) => $"pg_catalog.unnest(${j + 1}::pg_catalog.text[])"))},
                 pg_catalog.unnest(${read.Length + 1}::pg_catalog.int4[])) AS r ({string.Join(", ", read.Select((_, j) => $"c{j}"))}, n)
             """;
-        s_heldCandidates = tests.Count == 0 ? $"({rows})" : $"(SELECT * FROM ({rows}) AS c WHERE {string.Join(" AND ", tests)})";
+        s_heldCandidates = $"({rows})";
+        s_heldTests = tests.Count == 0 ? null : string.Join(" AND ", tests);
     }
 
     /// <summary>
@@ -547,8 +549,12 @@ internal static unsafe partial class CopyConversion
             }
         }
 
-        SortedDictionary<long, PgException> refused = HeldValues.Refused(s_heldConstraints, s_heldTable, s_heldCandidates, Worf.QuoteIdentifier(s_heldRow), "true",
-            false, [.. texts.Select(keys => Worf.TextArrayParameter(s_keyText, keys)), SpiParameter.Create(Enumerable.Range(0, rows).ToArray())]);
+        SpiParameter[] parameters = [.. texts.Select(keys => Worf.TextArrayParameter(s_keyText, keys)), SpiParameter.Create(Enumerable.Range(0, rows).ToArray())];
+        long[] untested = Untested(parameters, rows);
+        string candidates = untested.Length == 0 ? s_heldCandidates
+            : $"(SELECT * FROM {s_heldCandidates} AS c WHERE NOT (c.{Worf.QuoteIdentifier(s_heldRow)} OPERATOR(pg_catalog.=) ANY (${parameters.Length + 1}::pg_catalog.int8[])))";
+        SortedDictionary<long, PgException> refused = HeldValues.Refused(s_heldConstraints, s_heldTable, candidates, Worf.QuoteIdentifier(s_heldRow), "true",
+            false, [.. parameters, SpiParameter.Create(untested)]);
         if (refused.Count == 0)
         {
             return;
@@ -570,6 +576,55 @@ internal static unsafe partial class CopyConversion
         }
 
         s_batchConverted.RemoveRange(kept, rows - kept);
+    }
+
+    /// <summary>
+    /// Finds the batch's rows that a NOT NULL column or a CHECK constraint refuses, as the condition of the batch's COPY
+    /// tests them, which COPY doesn't copy, so that they hold no key for the rows after them: all at once, or, when a
+    /// CHECK expression fails on a row, as one that divides by zero does, a row at a time, a row whose test fails
+    /// counting among them, as COPY fails it too. The tests only read, so they take no transaction ID.
+    /// </summary>
+    private static long[] Untested(SpiParameter[] parameters, int rows)
+    {
+        if (s_heldTests is not string tests)
+        {
+            return [];
+        }
+
+        string row = Worf.QuoteIdentifier(s_heldRow);
+        long[] refused = [];
+        try
+        {
+            PgTransaction.RunInSubtransaction(() => refused = [.. Worf.Read($"SELECT c.{row} FROM {s_heldCandidates} AS c WHERE NOT ({tests})", 0, parameters)
+                .Select(found => found.Get<long>(0))]);
+            return refused;
+        }
+        catch (PgException)
+        {
+            // A CHECK expression failed on a row, and the rows are tested one at a time.
+        }
+
+        List<long> each = [];
+        string one = $"SELECT 1 FROM {s_heldCandidates} AS c WHERE c.{row} OPERATOR(pg_catalog.=) ${parameters.Length + 1} AND NOT ({tests})";
+        for (long r = 0; r < rows; r++)
+        {
+            long place = r;
+            try
+            {
+                bool fails = false;
+                PgTransaction.RunInSubtransaction(() => fails = Worf.Read(one, 0, [.. parameters, SpiParameter.Create(place)]).Count > 0);
+                if (fails)
+                {
+                    each.Add(place);
+                }
+            }
+            catch (PgException)
+            {
+                each.Add(place);
+            }
+        }
+
+        return [.. each];
     }
 
     /// <summary>

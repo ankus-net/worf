@@ -1118,7 +1118,7 @@ public sealed partial class ExceptionBehaviourTests
                     """, token), "the changed rows the CHECK refused, recorded and left as they were, and row 12345, left alone");
                 TestContext.WriteLine($"merge with rows that fail alone: {merging.Elapsed.TotalSeconds:F1} s, {merged} transaction IDs");
                 Assert.IsLessThan(TimeSpan.FromSeconds(60), merging.Elapsed, "the merge of 300,000 rows with 1,000 that fail alone");
-                Assert.IsLessThan(1450L, merged, "transaction IDs the merge took for 300 rows a CHECK refused and 1,000 that fail alone");
+                Assert.IsLessThan(1150L, merged, "transaction IDs the merge took for 300 rows a CHECK refused and 1,000 that fail alone");
                 if (OperatingSystem.IsLinux())
                 {
                     long peak = await peakKb;
@@ -1432,6 +1432,28 @@ public sealed partial class ExceptionBehaviourTests
             FROM worf.exception_log WHERE table_name = 'held' AND error_sqlstate = '23505'
             """, token), "the rows copied, those held, and those recorded");
         Assert.IsLessThan(60L, used, "transaction IDs the copy took for 1,500 rows whose keys were held");
+
+        // A row whose CHECK expression fails, here dividing by zero, leaves the batch's other rows checked against the
+        // keys held: those are still left out without a transaction ID each.
+        _ = await provider.SafePsqlAsync(Database, """
+            CREATE TABLE hz (id integer PRIMARY KEY, d integer);
+            INSERT INTO hz SELECT g, CASE WHEN g = 501 THEN 0 ELSE 1 END FROM generate_series(1, 3000) g;
+            """, token);
+        _ = await subscriber.SafePsqlAsync(Database, """
+            CREATE TABLE hz (id integer PRIMARY KEY, d integer CHECK (100 / d > 0));
+            INSERT INTO hz SELECT g, 1 FROM generate_series(2, 1000, 2) g;
+            """, token);
+        before = long.Parse(await subscriber.SafePsqlAsync(Database, "SELECT pg_snapshot_xmax(pg_current_snapshot())::text", token),
+            CultureInfo.InvariantCulture);
+        _ = await provider.SafePsqlAsync(Database, "SELECT * FROM worf.replication_set_add_table('default', 'hz', synchronize_data := true)", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+            "SELECT sync_status = 'r' FROM worf.local_sync_status WHERE sync_relname = 'hz'", token), "hz's copy");
+        used = long.Parse(await subscriber.SafePsqlAsync(Database, "SELECT pg_snapshot_xmax(pg_current_snapshot())::text", token),
+            CultureInfo.InvariantCulture) - before;
+        Assert.AreEqual("2999|500", await subscriber.SafePsqlAsync(Database, """
+            SELECT (SELECT count(*) FROM hz), (SELECT count(*) FROM worf.exception_log WHERE table_name = 'hz' AND error_sqlstate = '23505')
+            """, token), "hz's rows, and those whose keys were held, recorded");
+        Assert.IsLessThan(60L, used, "transaction IDs the copy took for 500 rows whose keys were held, beside a row whose CHECK fails");
 
         // A row left out for one index holds no keys in another, as rows written one after another would: row 2 takes j
         // from row 1, so row 3's k is free. Rows that a partial unique index or an exclusion constraint refuses, whether
@@ -1928,10 +1950,24 @@ public sealed partial class ExceptionBehaviourTests
         // Under discard, a transaction whose commit fails, as one of its rows conflicts with a row here, is applied again
         // change by change with the rechecks still at commit, which finds the change that conflicts: only that change is
         // skipped and recorded, and the rows that swap apply.
+        // The replay compares only the rows the transaction wrote, with the rows of the tables they're in: neither a large
+        // table here with a deferrable key that the transaction didn't write, nor another session's temporary table,
+        // holds it up or fails it.
         await SetBehaviourAsync(subscriber, "discard", token);
         _ = await provider.SafePsqlAsync(Database, "INSERT INTO sw VALUES (21, 21)", token);
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM sw WHERE id = 21)", token), "row 21");
-        _ = await subscriber.SafePsqlAsync(Database, "INSERT INTO sw VALUES (99, 22)", token);
+        _ = await subscriber.SafePsqlAsync(Database, """
+            INSERT INTO sw VALUES (99, 22);
+            CREATE TABLE untouched (k integer UNIQUE DEFERRABLE);
+            INSERT INTO untouched SELECT g FROM generate_series(1, 20000) g;
+            ANALYZE untouched;
+            """, token);
+        await using NpgsqlConnection temporary = await subscriber.OpenAsync(Database, token);
+        await using (NpgsqlCommand create = new("CREATE TEMPORARY TABLE tt (k integer UNIQUE DEFERRABLE)", temporary))
+        {
+            _ = await create.ExecuteNonQueryAsync(token);
+        }
+
         _ = await provider.SafePsqlAsync(Database, """
             BEGIN;
             UPDATE sw SET k = 3 - k WHERE id IN (1, 2);
@@ -1939,7 +1975,9 @@ public sealed partial class ExceptionBehaviourTests
             COMMIT;
             INSERT INTO sw VALUES (5, 5);
             """, token);
+        Stopwatch replaying = Stopwatch.StartNew();
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM sw WHERE id = 5)", token), "the row after the conflict");
+        Assert.IsLessThan(TimeSpan.FromSeconds(10), replaying.Elapsed, "the replay beside the untouched table");
         Assert.AreEqual("1=2,2=1,3=3,4=4,5=5,21=21,99=22|UPDATE|21|23505", await subscriber.SafePsqlAsync(Database, """
             SELECT (SELECT string_agg(id || '=' || k, ',' ORDER BY id) FROM sw), string_agg(concat_ws('|', operation, remote_new_tuple->>'id', error_sqlstate), ',')
             FROM worf.exception_log WHERE table_name = 'sw'

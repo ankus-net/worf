@@ -30,6 +30,12 @@ internal sealed class LibpqConnection : IDisposable
         return Libpq.Exec(_conn, sql);
     }
 
+    /// <summary>
+    /// Asks the server to cancel the command the connection runs, from another thread.
+    /// </summary>
+    /// <returns>Whether the request was sent.</returns>
+    public bool Cancel() => _conn != 0 && Libpq.Cancel(_conn);
+
     /// <inheritdoc/>
     public void Dispose()
     {

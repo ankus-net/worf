@@ -1799,6 +1799,7 @@ internal static class Sync
                 string? max = Worf.ReadScalar<string?>($"SELECT max(ctid)::text FROM {MergeCopy}");
                 if (max is not null)
                 {
+                    s_rowsAlone = 8;
                     MergeParts(reloid, only + table, mergePart, row, 0, Position(max) + 1, halved);
                 }
 
@@ -1967,9 +1968,10 @@ internal static class Sync
     /// <summary>
     /// Merges the rows of a copy from one place in it up to another, in a subtransaction, and when that fails, in two
     /// parts of as many rows each, or, for a few rows, each row alone, down to the rows that fail alone, whose numbers are
-    /// kept to record, so that rows that fail close together take about a transaction ID each. A place is a row's block
-    /// and offset, as one number, so that a range takes no memory however many rows it holds, and PostgreSQL scans it as
-    /// a range of ctids.
+    /// kept to record. How few is learned as the merge goes: twice as many while most rows merged alone fail, so that
+    /// rows that fail close together take about a transaction ID each, and half as many while few do, so that rows that
+    /// fail far apart take few more. A place is a row's block and offset, as one number, so that a range takes no memory
+    /// however many rows it holds, and PostgreSQL scans it as a range of ctids.
     /// </summary>
     private static void MergeParts(uint reloid, string table, string merge, string row, long from, long to, List<(long Row, PgException Error)> skipped)
     {
@@ -1998,7 +2000,7 @@ internal static class Sync
         const string InPart = "ctid OPERATOR(pg_catalog.>=) $1::pg_catalog.tid AND ctid OPERATOR(pg_catalog.<) $2::pg_catalog.tid";
         SpiParameter[] part = [SpiParameter.Create(Tid(from)), SpiParameter.Create(Tid(to))];
         long count = Worf.ReadScalar<long>($"SELECT count(*)::pg_catalog.int8 FROM {MergeCopy} WHERE {InPart}", part);
-        if (count > 8)
+        if (count > s_rowsAlone)
         {
             long middle = Position(Worf.ReadScalar<string>(
                 $"SELECT c.ctid::pg_catalog.text FROM {MergeCopy} c WHERE {InPart} ORDER BY c.ctid OFFSET {(count / 2).ToString(CultureInfo.InvariantCulture)} LIMIT 1", part));
@@ -2014,10 +2016,14 @@ internal static class Sync
             return;
         }
 
+        int before = skipped.Count;
         foreach (long at in rows.Select(one => Position(one.Get<string>(0))))
         {
             MergeParts(reloid, table, merge, row, at, at + 1, skipped);
         }
+
+        int failures = skipped.Count - before;
+        s_rowsAlone = failures * 2 > rows.Count ? Math.Min(s_rowsAlone * 2, 4096) : failures * 4 < rows.Count ? Math.Max(s_rowsAlone / 2, 2) : s_rowsAlone;
     }
 
     /// <summary>
@@ -2227,9 +2233,10 @@ internal static class Sync
     }
 
     /// <summary>
-    /// Gets the deferrable unique and exclusion constraints of a table, or of every table for zero: each with its table,
-    /// the error a conflict in it raises, the rows it takes, as a relation of each row's table, place, xmin and keys, k0,
-    /// k1 and so on, and the condition that two such rows, a and b, conflict.
+    /// Gets the deferrable unique and exclusion constraints of a table: each with its table, the error a conflict in it
+    /// raises, the rows it takes, as a relation of each row's table, place, xmin and keys, k0, k1 and so on, and the
+    /// condition that two such rows, a and b, conflict, by equality where the keys it takes can't be null, so that the
+    /// rows join by hashing or an index rather than pair by pair.
     /// </summary>
     internal static List<(uint Table, PgException Conflict, string Rows, string Conflicts)> DeferrableConstraints(uint reloid)
     {
@@ -2244,8 +2251,7 @@ internal static class Sync
                 CASE WHEN r.relkind = 'p' THEN '' ELSE 'ONLY ' END || pg_catalog.quote_ident(rn.nspname) || '.' || pg_catalog.quote_ident(r.relname)
             FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_index i ON i.indexrelid = c.conindid
                 JOIN pg_catalog.pg_class r ON r.oid = c.conrelid JOIN pg_catalog.pg_namespace rn ON rn.oid = r.relnamespace
-            WHERE (c.conrelid = $1 OR $1 = 0) AND c.contype IN ('p', 'u', 'x') AND c.condeferrable
-                AND rn.nspname NOT IN ('pg_catalog', 'information_schema')
+            WHERE c.conrelid = $1 AND c.contype IN ('p', 'u', 'x') AND c.condeferrable
             """, 0, SpiParameter.Create(reloid)))
         {
             string name = constraint.Get<string>(0);
@@ -2265,7 +2271,7 @@ internal static class Sync
                 $"(SELECT tableoid, ctid, xmin, {string.Join(", ", keys.Select((key, k) => $"({key}) AS k{k}"))} FROM {constraint.Get<string>(7)}{where})",
                 exclusion
                     ? string.Join(" AND ", constraint.Get<string?[]>(3).Select((op, k) => $"a.k{k} {op} b.k{k}"))
-                    : string.Join(" AND ", keys.Select((_, k) => $"a.k{k} IS NOT DISTINCT FROM b.k{k}"))));
+                    : string.Join(" AND ", keys.Select((_, k) => constraint.Get<bool>(5) ? $"a.k{k} IS NOT DISTINCT FROM b.k{k}" : $"a.k{k} = b.k{k}"))));
         }
 
         return found;
@@ -2996,6 +3002,9 @@ internal static class Sync
 
     // The temporary table a merge copies the provider's rows into first.
     private const string MergeCopy = "pg_temp.worf_sync_copy";
+
+    // The most rows of a failed part of a merge that are merged each alone, rather than in halves.
+    private static int s_rowsAlone = 8;
 
     private const int NoLock = 0;
     private const int AccessShareLock = 1;

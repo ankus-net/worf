@@ -260,16 +260,20 @@ public sealed class StalledPeerTests
     /// A call apply makes to its provider that ends on its own after the manager found it overdue, but before the
     /// manager's cancel came, takes the cancel, which then fails nothing after it. The manager is held between the two by
     /// a lock on pg_proc, where its first cancel looks up the functions it calls; processes are stopped with signals,
-    /// which Windows lacks.
+    /// which Windows lacks. A manager that exits before it has sent the cancel holds the call up a second at most, rather
+    /// than for wal_receiver_timeout.
     /// </summary>
+    /// <param name="managerExits">Whether the manager is terminated while it waits, rather than let go.</param>
     /// <returns>The test.</returns>
     [TestMethod]
     [OSCondition(OperatingSystems.Linux | OperatingSystems.OSX)]
-    public async Task LateProviderCancelsFailNoLaterCall()
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task LateProviderCancelsFailNoLaterCall(bool managerExits)
     {
         CancellationToken token = TestContext.CancellationToken;
         await using TestNode provider = await StartNodeAsync("provider", token);
-        await using TestNode subscriber = await StartNodeAsync("subscriber", token);
+        await using TestNode subscriber = await StartNodeAsync("subscriber", token, managerExits ? "10s" : "2s");
         _ = await subscriber.SafePsqlAsync(Database, $"""
             SELECT worf.create_subscription(
                 subscription_name := 'sub',
@@ -308,10 +312,15 @@ public sealed class StalledPeerTests
                 await Task.Delay(TimeSpan.FromMilliseconds(50), token);
             }
 
-            // The connection then ends on its own, and the manager's cancel comes after it.
+            // The connection then ends on its own, and the manager's cancel comes after it, or the manager exits first.
             await SignalAsync("-CONT", providerPostmaster, token);
             providerStopped = false;
             await Task.Delay(TimeSpan.FromMilliseconds(300), token);
+            if (managerExits)
+            {
+                _ = await HolderAsync(holder, "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE backend_type LIKE 'worf manager%'", token);
+            }
+
             _ = await HolderAsync(holder, "COMMIT", token);
         }
         finally
@@ -322,7 +331,13 @@ public sealed class StalledPeerTests
             }
         }
 
+        Stopwatch applying = Stopwatch.StartNew();
         await AppliesAsync(provider, subscriber, 2, token);
+        if (managerExits)
+        {
+            Assert.IsLessThan(TimeSpan.FromSeconds(5), applying.Elapsed, "the next row, once the manager exited before its cancel, against wal_receiver_timeout's 10 s");
+        }
+
         Assert.DoesNotContain("canceling statement due to user request", subscriber.ReadLog()[logpos..], "the cancel failing a later call");
     }
 

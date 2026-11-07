@@ -3,6 +3,7 @@
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Globalization;
+using System.Runtime.InteropServices;
 using System.Text;
 using Worf;
 using Worf.CreateSubscriber;
@@ -18,6 +19,9 @@ VerbosityLevel verbosity = VerbosityLevel.Normal;
 
 // Die closes these.
 LibpqConnection? subscriberConn = null;
+
+// The connection whose command runs, which a stop cancels.
+LibpqConnection? running = null;
 
 // The origin the subscriber's uncommitted transaction created, whose progress its rollback leaves behind.
 (string Name, int Id)? uncommittedOrigin = null;
@@ -42,7 +46,31 @@ int pgCtlRet;
 string? extraBasebackupArgs = null;
 StringBuilder recoveryconfcontents = new();
 
-Console.CancelKeyPress += (_, _) => _ = Die("\nCanceling...\n");
+// A stop, as Ctrl-C or SIGTERM, while a command runs cancels it, so that the command fails and the tool cleans up as on
+// any failure, rolling back its transaction and clearing the progress its origin left; otherwise the tool stops at once.
+void Stop(PosixSignalContext context)
+{
+    context.Cancel = true;
+    if (running is LibpqConnection conn && conn.Cancel())
+    {
+        return;
+    }
+
+    _ = Die("\nCanceling...\n");
+}
+
+List<PosixSignalRegistration> stops = [];
+foreach (PosixSignal signal in new[] { PosixSignal.SIGINT, PosixSignal.SIGTERM, PosixSignal.SIGQUIT })
+{
+    try
+    {
+        stops.Add(PosixSignalRegistration.Create(signal, Stop));
+    }
+    catch (PlatformNotSupportedException)
+    {
+        // Windows has no SIGQUIT.
+    }
+}
 
 // check for --help
 foreach (string arg in args)
@@ -1352,7 +1380,18 @@ string EscapeLiteral(string value)
 string EscapeIdentifier(string value)
     => "\"" + value.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
 
-List<string?[]> Query(LibpqConnection conn, string sql) => conn.Query(sql);
+List<string?[]> Query(LibpqConnection conn, string sql)
+{
+    running = conn;
+    try
+    {
+        return conn.Query(sql);
+    }
+    finally
+    {
+        running = null;
+    }
+}
 
 string? QueryValue(LibpqConnection conn, string sql)
 {

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using Npgsql;
 
 namespace Worf.Tests;
 
@@ -104,14 +105,67 @@ public sealed class WorkerSlotTests
         _ = await node.SafePsqlAsync("unrelated0", "CREATE TABLE t (a int)", token);
         await Task.Delay(TimeSpan.FromSeconds(3), token);
         int before = Starts();
+
+        // Nor does it read the catalogs, as one that scans pg_db_role_setting would.
+        await using NpgsqlConnection committing = await node.OpenAsync("unrelated0", token);
+        long scansBefore = await ScansAsync(committing, token);
         for (int i = 0; i < 20; i++)
         {
-            _ = await node.SafePsqlAsync("unrelated0", $"BEGIN; INSERT INTO t VALUES ({i}); PREPARE TRANSACTION 'unrelated'; COMMIT PREPARED 'unrelated'", token);
+            await using NpgsqlCommand prepared = new($"BEGIN; INSERT INTO t VALUES ({i}); PREPARE TRANSACTION 'unrelated'; COMMIT PREPARED 'unrelated'", committing);
+            _ = await prepared.ExecuteNonQueryAsync(token);
         }
 
+        Assert.AreEqual(scansBefore, await ScansAsync(committing, token), "scans of pg_db_role_setting by 20 unrelated COMMIT PREPARED");
         await Task.Delay(TimeSpan.FromSeconds(3), token);
         Assert.AreEqual(before, Starts(), "managers started by 20 unrelated COMMIT PREPARED");
 
         int Starts() => node.ReadLog().Split('\n').Count(line => line.Contains("starting background worker process \"worf manager", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// A subscription created in a prepared transaction gets its apply worker once COMMIT PREPARED commits it, as one
+    /// committed at once does, rather than at the manager's next look.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task PreparedSubscriptionsStartTheirWorker()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode provider = await TestNode.StartAsync("provider", ["wal_level = logical", "max_wal_senders = 10", "max_replication_slots = 10"], token);
+        await using TestNode subscriber = await TestNode.StartAsync("subscriber", ["max_prepared_transactions = 2"], token);
+        foreach (TestNode node in new[] { provider, subscriber })
+        {
+            _ = await node.SafePsqlAsync(Database, $"""
+                CREATE EXTENSION worf;
+                SELECT * FROM worf.create_node(node_name := '{node.Name}', dsn := '{node.Dsn(Database, "postgres")}');
+                """, token);
+        }
+
+        _ = await subscriber.SafePsqlAsync(Database, $"""
+            BEGIN;
+            SELECT worf.create_subscription(subscription_name := 'ps', provider_dsn := '{provider.Dsn(Database, "postgres")}',
+                synchronize_structure := false, synchronize_data := false);
+            PREPARE TRANSACTION 'ps';
+            """, token);
+        await Task.Delay(TimeSpan.FromSeconds(2), token);
+        _ = await subscriber.SafePsqlAsync(Database, "COMMIT PREPARED 'ps'", token);
+        Stopwatch starting = Stopwatch.StartNew();
+        while (await subscriber.SafePsqlAsync(Database, "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE backend_type LIKE 'worf apply%')", token) != "t")
+        {
+            Assert.IsLessThan(TimeSpan.FromSeconds(3), starting.Elapsed, "the apply worker once COMMIT PREPARED committed the subscription");
+            await Task.Delay(TimeSpan.FromMilliseconds(100), token);
+        }
+    }
+
+    // How often pg_db_role_setting has been scanned whole, as the statistics show once the session's own are flushed.
+    private static async Task<long> ScansAsync(NpgsqlConnection connection, CancellationToken token)
+    {
+        await using (NpgsqlCommand flush = new("SELECT pg_stat_force_next_flush(); SELECT pg_stat_clear_snapshot()", connection))
+        {
+            _ = await flush.ExecuteNonQueryAsync(token);
+        }
+
+        await using NpgsqlCommand scans = new("SELECT seq_scan FROM pg_stat_sys_tables WHERE relname = 'pg_db_role_setting'", connection);
+        return (long)(await scans.ExecuteScalarAsync(token))!;
     }
 }

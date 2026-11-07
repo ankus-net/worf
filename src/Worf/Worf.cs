@@ -1076,39 +1076,36 @@ internal static partial class Worf
     /// decode. Decoding drops a message of another node's origin before taking a snapshot from it, so the message is
     /// written with no origin, which every provider decodes; it belongs to no table, so no publication sends it and no
     /// replica identity applies. A top-level transaction needs none, as decoding gives one that changed the catalogs a
-    /// base snapshot as it commits, and a server that writes no logical WAL needs none either.
+    /// base snapshot as it commits, nor does a subtransaction that wrote nothing, and a server that writes no logical WAL
+    /// needs none either. Every utility statement that may change the catalogs ends so in a subtransaction, as SPI runs
+    /// one, and so does worf's work that changes them otherwise; the message is written where it's called, as a
+    /// subtransaction's callbacks don't run for every subtransaction.
     /// </summary>
-    internal static void EndForDecoding()
+    internal static unsafe void EndForDecoding()
     {
-        unsafe
+        if (NativeMethods.GetCurrentTransactionNestLevel() <= 1 || NativeGlobals.wal_level < WalLevelLogical ||
+            NativeMethods.GetCurrentTransactionIdIfAny() == 0)
         {
-            if (NativeMethods.GetCurrentTransactionIdIfAny() == 0 || NativeMethods.GetCurrentTransactionNestLevel() <= 1 ||
-                NativeGlobals.wal_level < WalLevelLogical)
-            {
-                return;
-            }
+            return;
+        }
 
-            NativeMethods.CommandCounterIncrement();
-
-            // The message is the subtransaction's own record only if it is written here: an SPI statement runs in a
-            // subtransaction of its own.
-            ushort origin = ReploriginSessionOrigin;
-            ReploriginSessionOrigin = 0;
-            try
+        NativeMethods.CommandCounterIncrement();
+        ushort origin = ReploriginSessionOrigin;
+        ReploriginSessionOrigin = 0;
+        try
+        {
+            fixed (byte* prefix = "worf\0"u8)
             {
-                fixed (byte* prefix = "worf\0"u8)
-                {
 #if ANKUS_PG15 || ANKUS_PG16
-                    _ = NativeMethods.LogLogicalMessage((sbyte*)prefix, (sbyte*)prefix, 0, true);
+                _ = NativeMethods.LogLogicalMessage((sbyte*)prefix, (sbyte*)prefix, 0, true);
 #else
-                    _ = NativeMethods.LogLogicalMessage((sbyte*)prefix, (sbyte*)prefix, 0, true, false);
+                _ = NativeMethods.LogLogicalMessage((sbyte*)prefix, (sbyte*)prefix, 0, true, false);
 #endif
-                }
             }
-            finally
-            {
-                ReploriginSessionOrigin = origin;
-            }
+        }
+        finally
+        {
+            ReploriginSessionOrigin = origin;
         }
     }
 
@@ -1640,6 +1637,18 @@ internal static partial class Worf
     /// The search path worf's own SQL runs with, and its workers other than apply and sync run with.
     /// </summary>
     internal const string PinnedSearchPath = "pg_catalog, pg_temp";
+
+    /// <summary>
+    /// Checks whether the session searches the path worf's own SQL runs with, as worf's statements do.
+    /// </summary>
+    /// <returns>Whether it does.</returns>
+    internal static unsafe bool InPinnedSearchPath()
+    {
+        fixed (byte* name = ToServerCString("search_path"))
+        {
+            return FromServer(NativeMethods.GetConfigOption((sbyte*)name, false, false)) == PinnedSearchPath;
+        }
+    }
 
     /// <summary>
     /// Puts back the search path that <see cref="PinSearchPath"/> or <see cref="DefaultSearchPath"/> replaced.
