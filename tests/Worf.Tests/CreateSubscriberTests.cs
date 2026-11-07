@@ -365,6 +365,10 @@ public sealed class CreateSubscriberTests
                 if (i > 0)
                 {
                     await Task.Delay(TimeSpan.FromMilliseconds(40), token);
+                    if (tool.HasExited)
+                    {
+                        break;
+                    }
                 }
 
                 (int signalled, _, error) = await ProcessRunner.RunAsync("kill", [$"-{sent[i]}", tool.Id.ToString(CultureInfo.InvariantCulture)], token);
