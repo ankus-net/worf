@@ -371,8 +371,9 @@ public sealed class CreateSubscriberTests
                     }
                 }
 
+                // A later stop may find the tool already gone.
                 (int signalled, _, error) = await ProcessRunner.RunAsync("kill", [$"-{sent[i]}", tool.Id.ToString(CultureInfo.InvariantCulture)], token);
-                Assert.AreEqual(0, signalled, error);
+                Assert.IsTrue(signalled == 0 || i > 0, error);
             }
 
             using CancellationTokenSource exiting = CancellationTokenSource.CreateLinkedTokenSource(token);
