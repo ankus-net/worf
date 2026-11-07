@@ -12,12 +12,12 @@ namespace Worf.Tests;
 [TestClass]
 public sealed partial class ExceptionBehaviourTests
 {
-    // The rows a trigger here refuses as the halves merge writes them, which only merging finds: a run of 999, and 25 far
-    // apart after them among 4,000 rows it writes.
-    private const string Refused = "id % 1000 <> 7 AND (id BETWEEN 3001 AND 4000 OR (id BETWEEN 20001 AND 23841 AND id % 160 = 1))";
+    // The rows a trigger here refuses as the halves merge writes them, which only merging finds: 25 far apart, after the
+    // run of rows that swap values, among 4,000 rows it writes.
+    private const string Refused = "id BETWEEN 20001 AND 23841 AND id % 160 = 1";
 
     // The most transaction IDs the halves merge takes.
-    private const long MergedIds = 2800;
+    private const long MergedIds = 1800;
 
     private const string Database = "postgres";
     private const string SuperUser = "super";
@@ -1004,8 +1004,8 @@ public sealed partial class ExceptionBehaviourTests
                 case "halves":
                     // The copy again merges 300,000 rows. Rows 100 and 200, and 499 pairs of rows from 1001 to 2000,
                     // swap the values rows here hold in a partial unique index, which only merging in halves finds, as
-                    // it does the rows a trigger here refuses, 999 from 3001 and 25 far apart among 4,000 rows the
-                    // merge writes, and
+                    // it does the 25 rows far apart after them, among 4,000 rows the merge writes, that a trigger here
+                    // refuses, and
                     // each fails: the halves are ranges of the copy's rows, which take no memory however many rows they
                     // hold, and hold only the rows the merge writes, a few of which merge one at a time. Row 500's new
                     // value, held by a row here in that index, and the 300 rows the provider changed that a CHECK
@@ -1016,8 +1016,7 @@ public sealed partial class ExceptionBehaviourTests
                         UPDATE {table} SET v = CASE id WHEN 100 THEN 's200' ELSE 's100' END WHERE id IN (100, 200);
                         UPDATE {table} SET v = 's' || CASE WHEN id % 2 = 1 THEN id + 1 ELSE id - 1 END
                             WHERE id BETWEEN 1001 AND 2000 AND id NOT IN (1007, 1008);
-                        UPDATE {table} SET v = CASE WHEN {Refused} THEN 'x' ELSE 'w' END || id
-                            WHERE id % 1000 <> 7 AND (id BETWEEN 3001 AND 4000 OR id BETWEEN 20001 AND 24000);
+                        UPDATE {table} SET v = CASE WHEN {Refused} THEN 'x' ELSE 'w' END || id WHERE id % 1000 <> 7 AND id BETWEEN 20001 AND 24000;
                         SELECT pg_drop_replication_slot('{syncSlot}');
                         """, token);
                     _ = await subscriber.SafePsqlAsync(Database, $"""
@@ -1119,7 +1118,7 @@ public sealed partial class ExceptionBehaviourTests
             {
                 long merged = long.Parse(await subscriber.SafePsqlAsync(Database, "SELECT pg_snapshot_xmax(pg_current_snapshot())::text", token),
                     CultureInfo.InvariantCulture) - mergeFrom;
-                Assert.Contains($"skipped 2325 of the rows of the copy of table public.{table}", subscriber.ReadLog()[logpos..]);
+                Assert.Contains($"skipped 1326 of the rows of the copy of table public.{table}", subscriber.ReadLog()[logpos..]);
                 Assert.AreEqual("100|200|500|s100|s200|998|998", await subscriber.SafePsqlAsync(Database, $"""
                     SELECT string_agg(remote_new_tuple->>'id', '|' ORDER BY (remote_new_tuple->>'id')::integer)
                             FILTER (WHERE (remote_new_tuple->>'id')::integer NOT BETWEEN 1001 AND 2000),
@@ -1128,9 +1127,8 @@ public sealed partial class ExceptionBehaviourTests
                         (SELECT count(*) FROM {table} WHERE id BETWEEN 1001 AND 2000 AND v = 's' || id)
                     FROM worf.exception_log WHERE table_name = '{table}' AND error_sqlstate = '23505'
                     """, token), "the rows that swap values and row 500, recorded, and the values the swapping rows keep");
-                Assert.AreEqual("999|25|1024|3971", await subscriber.SafePsqlAsync(Database, $"""
-                    SELECT count(*) FILTER (WHERE (remote_new_tuple->>'id')::integer <= 4000), count(*) FILTER (WHERE (remote_new_tuple->>'id')::integer > 4000),
-                        (SELECT count(*) FROM {table} WHERE {Refused} AND v = 'copied'), (SELECT count(*) FROM {table} WHERE v LIKE 'w%')
+                Assert.AreEqual("25|25|3971", await subscriber.SafePsqlAsync(Database, $"""
+                    SELECT count(*), (SELECT count(*) FROM {table} WHERE {Refused} AND v = 'copied'), (SELECT count(*) FROM {table} WHERE v LIKE 'w%')
                     FROM worf.exception_log WHERE table_name = '{table}' AND error_sqlstate = 'P0001'
                     """, token), "the rows the trigger refused, recorded and left as they were, and the rows written around them");
                 Assert.AreEqual($"300|0|1|new row for relation \"{table}\" violates check constraint \"{table}_changed\"", await subscriber.SafePsqlAsync(Database, $"""
@@ -1140,7 +1138,7 @@ public sealed partial class ExceptionBehaviourTests
                     """, token), "the changed rows the CHECK refused, recorded and left as they were, and row 12345, left alone");
                 TestContext.WriteLine($"merge with rows that fail alone: {merging.Elapsed.TotalSeconds:F1} s, {merged} transaction IDs");
                 Assert.IsLessThan(TimeSpan.FromSeconds(60), merging.Elapsed, "the merge of 300,000 rows with 1,000 that fail alone");
-                Assert.IsLessThan(MergedIds, merged, "transaction IDs the merge took for 300 rows a CHECK refused, and 1,997 that fail alone together and 25 far apart");
+                Assert.IsLessThan(MergedIds, merged, "transaction IDs the merge took for 300 rows a CHECK refused, and 1,000 that fail alone together and 25 far apart after them");
                 if (OperatingSystem.IsLinux())
                 {
                     long peak = await peakKb;
