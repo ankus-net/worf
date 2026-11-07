@@ -1598,6 +1598,7 @@ internal static partial class Worf
     /// already that, as in worf's workers other than apply and sync.</returns>
     internal static unsafe int PinSearchPath()
     {
+        s_ownSql++;
         fixed (byte* name = ToServerCString("search_path"))
         {
             if (FromServer(NativeMethods.GetConfigOption((sbyte*)name, false, false)) == PinnedSearchPath)
@@ -1621,9 +1622,11 @@ internal static partial class Worf
     /// returns ends, so that a row filter's functions find the objects they name without a schema as pglogical's do,
     /// on a connection that otherwise searches only the system catalog.
     /// </summary>
-    /// <returns>The nest level, which the caller ends with <see cref="UnpinSearchPath"/>.</returns>
+    /// <returns>The nest level, which the caller ends with <see cref="EndDefaultSearchPath"/>.</returns>
     internal static unsafe int DefaultSearchPath()
     {
+        s_ownSqlOutside.Push(s_ownSql);
+        s_ownSql = 0;
         fixed (byte* name = ToServerCString("search_path"))
         {
             int nestLevel = NativeMethods.NewGUCNestLevel();
@@ -1639,16 +1642,26 @@ internal static partial class Worf
     internal const string PinnedSearchPath = "pg_catalog, pg_temp";
 
     /// <summary>
-    /// Checks whether the session searches the path worf's own SQL runs with, as worf's statements do.
+    /// Gets whether the running code is worf's own SQL, which <see cref="PinSearchPath"/> and <see cref="Elevated.Run"/>
+    /// run, rather than a user's, as a row filter's that <see cref="DefaultSearchPath"/> runs within it, or one a session
+    /// runs with the same search path.
     /// </summary>
-    /// <returns>Whether it does.</returns>
-    internal static unsafe bool InPinnedSearchPath()
-    {
-        fixed (byte* name = ToServerCString("search_path"))
-        {
-            return FromServer(NativeMethods.GetConfigOption((sbyte*)name, false, false)) == PinnedSearchPath;
-        }
-    }
+    internal static bool InOwnSql => s_ownSql > 0;
+
+    // How deep the running code is in worf's own SQL, and the depths a user's code it runs left.
+    private static int s_ownSql;
+    private static readonly Stack<int> s_ownSqlOutside = [];
+
+    /// <summary>
+    /// Enters worf's own SQL, as <see cref="Elevated.Run"/> does, until <see cref="LeaveOwnSql"/>.
+    /// </summary>
+    internal static void EnterOwnSql() => s_ownSql++;
+
+    /// <summary>
+    /// Leaves what <see cref="EnterOwnSql"/> entered.
+    /// </summary>
+    internal static void LeaveOwnSql() => s_ownSql--;
+
 
     /// <summary>
     /// Puts back the search path that <see cref="PinSearchPath"/> or <see cref="DefaultSearchPath"/> replaced.
@@ -1656,12 +1669,26 @@ internal static partial class Worf
     /// <param name="nestLevel">The nest level it returned.</param>
     internal static void UnpinSearchPath(int nestLevel)
     {
+        s_ownSql--;
         if (nestLevel > 0)
         {
             unsafe
             {
                 NativeMethods.AtEOXact_GUC(true, nestLevel);
             }
+        }
+    }
+
+    /// <summary>
+    /// Ends what <see cref="DefaultSearchPath"/> began.
+    /// </summary>
+    /// <param name="nestLevel">The nest level it returned.</param>
+    internal static void EndDefaultSearchPath(int nestLevel)
+    {
+        s_ownSql = s_ownSqlOutside.Pop();
+        unsafe
+        {
+            NativeMethods.AtEOXact_GUC(true, nestLevel);
         }
     }
 
@@ -2015,6 +2042,8 @@ internal static partial class Worf
             PgInterrupts.Check();
             Worker.ProcessConfigReload();
 
+            // The prepared transactions that may have given managers something to manage wake them as they end.
+            bool watchingPrepared = Worker.WakeForEndedPrepared();
             bool subscriptionsChanged;
             using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
             {
@@ -2040,7 +2069,7 @@ internal static partial class Worf
 
             // Wait for latch signal or timeout. On Windows, use a shorter timeout to ensure faster response to
             // subscription changes, as process startup and IPC can be slower than on Unix systems.
-            if (!PgBackgroundWorker.Wait(SupervisorInterval))
+            if (!PgBackgroundWorker.Wait(watchingPrepared ? Worker.PreparedWatchInterval : SupervisorInterval))
             {
                 break;
             }

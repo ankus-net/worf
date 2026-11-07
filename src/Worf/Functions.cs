@@ -1562,9 +1562,17 @@ internal static class Functions
         // run under the path the database and role set, as the WAL sender's are.
         int nestLevel = Worf.DefaultSearchPath();
         List<nint> rowFilterList = [];
-        foreach (nint rowFilter in tableinfo.RowFilter)
+        try
         {
-            rowFilterList.Add((nint)Executor.PrepareRowFilter((Node*)rowFilter));
+            foreach (nint rowFilter in tableinfo.RowFilter)
+            {
+                rowFilterList.Add((nint)Executor.PrepareRowFilter((Node*)rowFilter));
+            }
+        }
+        catch
+        {
+            Worf.EndDefaultSearchPath(nestLevel);
+            throw;
         }
 
         // Scan the table.
@@ -1602,7 +1610,7 @@ internal static class Functions
         }
         finally
         {
-            Worf.UnpinSearchPath(nestLevel);
+            Worf.EndDefaultSearchPath(nestLevel);
         }
 
         NativeMethods.pfree(values);

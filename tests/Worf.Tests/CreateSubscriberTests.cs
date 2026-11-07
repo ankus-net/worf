@@ -210,11 +210,15 @@ public sealed class CreateSubscriberTests
 
     /// <summary>
     /// A subscriber whose subscription fails to commit leaves no progress for its origin's id, which the rollback frees,
-    /// so the next origin created with that id, as a PostgreSQL subscription's, starts from nothing.
+    /// so the next origin created with that id, as a PostgreSQL subscription's, starts from nothing, whether its update
+    /// fails at once or at the commit, by a deferred trigger.
     /// </summary>
+    /// <param name="deferred">Whether the trigger that refuses the update is deferred to the commit.</param>
     /// <returns>The test.</returns>
     [TestMethod]
-    public async Task FailedSubscriberLeavesNoOriginProgress()
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task FailedSubscriberLeavesNoOriginProgress(bool deferred)
     {
         CancellationToken token = TestContext.CancellationToken;
         using TemporaryDirectory work = new($"worf-create-subscriber-failed-{Guid.NewGuid():N}");
@@ -228,7 +232,10 @@ public sealed class CreateSubscriberTests
 
         // The copy's CREATE EXTENSION worf gives its sync status a trigger that refuses the tool's update of it, in the
         // transaction that created and advanced the origin.
-        _ = await provider.SafePsqlAsync(Database, """
+        string trigger = deferred
+            ? "CREATE CONSTRAINT TRIGGER refuse AFTER UPDATE ON worf.local_sync_status DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION refuse()"
+            : "CREATE TRIGGER refuse BEFORE UPDATE ON worf.local_sync_status EXECUTE FUNCTION refuse()";
+        _ = await provider.SafePsqlAsync(Database, $$"""
             CREATE USER super SUPERUSER;
             CREATE EXTENSION worf;
             SELECT * FROM worf.create_node(node_name := 'test_provider', dsn := 'dbname=postgres user=super');
@@ -236,7 +243,7 @@ public sealed class CreateSubscriberTests
             CREATE FUNCTION add_refusal() RETURNS event_trigger LANGUAGE plpgsql AS $$
             BEGIN
                 IF to_regclass('worf.local_sync_status') IS NOT NULL THEN
-                    CREATE TRIGGER refuse BEFORE UPDATE ON worf.local_sync_status EXECUTE FUNCTION refuse();
+                    {{trigger}};
                 END IF;
             END$$;
             CREATE EVENT TRIGGER add_refusal ON ddl_command_end WHEN TAG IN ('CREATE EXTENSION') EXECUTE FUNCTION add_refusal();
@@ -277,13 +284,20 @@ public sealed class CreateSubscriberTests
 
     /// <summary>
     /// A subscriber stopped, as with SIGTERM, while its subscription waits for a provider that doesn't answer, cancels
-    /// the wait and cleans up as on a failure, so that it leaves no progress for its origin's id either. Processes are
-    /// stopped with signals, which Windows lacks.
+    /// the wait and cleans up as on a failure, stopping the server it started, a second stop waiting for that, and one
+    /// killed leaves its transaction to roll back: none leaves progress for its origin's id. A run again on the data
+    /// directory the killed one left with its server running fails, leaving the server as it was. Processes are stopped
+    /// with signals, which Windows lacks.
     /// </summary>
+    /// <param name="signals">The signals the tool gets, 40 ms apart.</param>
+    /// <param name="exitCode">The tool's exit code.</param>
     /// <returns>The test.</returns>
     [TestMethod]
     [OSCondition(OperatingSystems.Linux | OperatingSystems.OSX)]
-    public async Task StoppedSubscriberLeavesNoOriginProgress()
+    [DataRow("TERM", 1)]
+    [DataRow("TERM TERM", 1)]
+    [DataRow("KILL", 137)]
+    public async Task StoppedSubscriberLeavesNoOriginProgress(string signals, int exitCode)
     {
         CancellationToken token = TestContext.CancellationToken;
         using TemporaryDirectory work = new($"worf-create-subscriber-stopped-{Guid.NewGuid():N}");
@@ -324,6 +338,7 @@ public sealed class CreateSubscriberTests
         }
 
         start.Environment["PGPORT"] = port;
+        string[] arguments = [.. start.ArgumentList];
         bool stopped = false;
         try
         {
@@ -344,13 +359,23 @@ public sealed class CreateSubscriberTests
             Assert.AreEqual(0, paused, error);
             stopped = true;
             await Task.Delay(TimeSpan.FromSeconds(2), token);
-            (int signalled, _, error) = await ProcessRunner.RunAsync("kill", ["-TERM", tool.Id.ToString(CultureInfo.InvariantCulture)], token);
-            Assert.AreEqual(0, signalled, error);
+            string[] sent = signals.Split(' ');
+            for (int i = 0; i < sent.Length; i++)
+            {
+                if (i > 0)
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(40), token);
+                }
+
+                (int signalled, _, error) = await ProcessRunner.RunAsync("kill", [$"-{sent[i]}", tool.Id.ToString(CultureInfo.InvariantCulture)], token);
+                Assert.AreEqual(0, signalled, error);
+            }
+
             using CancellationTokenSource exiting = CancellationTokenSource.CreateLinkedTokenSource(token);
             exiting.CancelAfter(TimeSpan.FromSeconds(60));
             await tool.WaitForExitAsync(exiting.Token);
             TestContext.WriteLine(await errors);
-            Assert.AreEqual(1, tool.ExitCode, "the stopped tool's exit code");
+            Assert.AreEqual(exitCode, tool.ExitCode, "the stopped tool's exit code");
         }
         finally
         {
@@ -360,16 +385,40 @@ public sealed class CreateSubscriberTests
             }
         }
 
+        string rerun = "1|True|0|f";
         try
         {
+            (int status, string statusOutput) = await provider.RunProgramAsync("pg_ctl", ["status", "-D", backupDir], token);
+            if (exitCode == 1)
+            {
+                Assert.AreEqual(3, status, $"the server the stopped tool started, which it stops: {statusOutput}");
+            }
+            else
+            {
+                // The killed tool's transaction ends once its backend finds the tool gone, and a run again fails at once.
+                Assert.AreEqual(0, status, $"the server the killed tool started: {statusOutput}");
+                await PollSubscriberAsync(provider, pgport,
+                    "SELECT NOT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity WHERE backend_type = 'client backend' AND pid <> pg_catalog.pg_backend_pid())",
+                    "the killed tool's backend ending", token);
+                (int again, _, string againErr) = await CreateSubscriberCommand.RunAsync(command, arguments, work.FullName,
+                    new Dictionary<string, string> { ["PGPORT"] = port }, token);
+                (int running, _) = await provider.RunProgramAsync("pg_ctl", ["status", "-D", backupDir], token);
+                rerun = $"{again}|{againErr.Contains("A server is running in data directory", StringComparison.Ordinal)}|{running}";
+                if (running == 0)
+                {
+                    rerun += $"|{await SubscriberAsync(provider, pgport, "SELECT pg_catalog.pg_is_in_recovery()", token)}";
+                }
+            }
+
             await StopAsync(provider, backupDir);
             (int started, string startOutput) = await provider.RunProgramAsync("pg_ctl",
                 ["start", "-w", "-D", backupDir, "-o", $"-p {port}", "-l", Path.Join(work.FullName, "subscriber.log")], token);
             Assert.AreEqual(0, started, startOutput);
-            Assert.AreEqual("1|true", await SubscriberAsync(provider, pgport, """
-                SELECT pg_catalog.pg_replication_origin_create('later')::text || '|' ||
-                    (coalesce(pg_catalog.pg_replication_origin_progress('later', false), '0/0') = '0/0')::text
-                """, token), "the id of the origin created next, and that it has no progress");
+            string progress = await SubscriberAsync(provider, pgport, """
+                SELECT count(*) FROM pg_catalog.pg_replication_origin_status WHERE external_id IS NULL AND coalesce(remote_lsn, '0/0') <> '0/0'
+                """, token);
+            Assert.AreEqual("0, 1|True|0|f", $"{progress}, {rerun}",
+                "the freed origin ids with progress, which an origin created next would start from, and a run again's exit code, message, and the server it leaves running, out of recovery");
         }
         finally
         {

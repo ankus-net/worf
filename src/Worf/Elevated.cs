@@ -31,6 +31,7 @@ internal static unsafe class Elevated
         NativeMethods.GetUserIdAndSecContext(&userId, &secContext);
         int nestLevel = NativeMethods.NewGUCNestLevel();
         NativeMethods.SetUserIdAndSecContext(BootstrapSuperuserId, secContext | SecurityLocalUseridChange | SecurityRestrictedOperation);
+        Worf.EnterOwnSql();
         try
         {
             fixed (byte* name = Worf.ToServerCString("search_path"))
@@ -44,6 +45,7 @@ internal static unsafe class Elevated
         }
         finally
         {
+            Worf.LeaveOwnSql();
             NativeMethods.AtEOXact_GUC(true, nestLevel);
             NativeMethods.SetUserIdAndSecContext(userId, secContext);
         }

@@ -564,7 +564,7 @@ internal static unsafe partial class OutputPlugin
             }
             finally
             {
-                Worf.UnpinSearchPath(nestLevel);
+                Worf.EndDefaultSearchPath(nestLevel);
                 NativeMethods.PopActiveSnapshot();
             }
         }

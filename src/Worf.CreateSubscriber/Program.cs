@@ -24,7 +24,10 @@ LibpqConnection? subscriberConn = null;
 LibpqConnection? running = null;
 
 // The origin the subscriber's uncommitted transaction created, whose progress its rollback leaves behind.
-(string Name, int Id)? uncommittedOrigin = null;
+// Whether this run started the subscriber's server, which it then stops if it fails, and whether it is failing, which a
+// second stop, or a failure on another thread, waits out.
+bool serverStarted = false;
+int dying = 0;
 LibpqConnection? providerConn = null;
 
 string? remoteLsn;
@@ -47,7 +50,7 @@ string? extraBasebackupArgs = null;
 StringBuilder recoveryconfcontents = new();
 
 // A stop, as Ctrl-C or SIGTERM, while a command runs cancels it, so that the command fails and the tool cleans up as on
-// any failure, rolling back its transaction and clearing the progress its origin left; otherwise the tool stops at once.
+// any failure, rolling back its transaction; otherwise the tool stops at once, and a stop while it does waits for it.
 void Stop(PosixSignalContext context)
 {
     context.Cancel = true;
@@ -268,6 +271,13 @@ for (int dbnum = 0; dbnum < databaseList.Length; dbnum++)
         {
             throw Die("Subscriber data directory is not basebackup of remote node.\n");
         }
+
+        // A server running in the data directory, as one an earlier run left, is left as it is.
+        pidFile = Path.Join(dataDir, "postmaster.pid");
+        if (useExistingDataDir && GetPgpid() is long serverPid and not 0 && PostmasterIsAlive(serverPid))
+        {
+            throw Die($"A server is running in data directory \"{dataDir}\"; stop it before running this again.\n");
+        }
     }
 
     // Create replication slots on remote node.
@@ -313,6 +323,7 @@ WriteRecoveryConf(recoveryconfcontents.ToString());
 // caught up to the restore point.
 // pg_ctl passes the options to the server through a shell on Unix, which turns '' into an empty value, and directly
 // on Windows, which keeps the quotes, so the empty value is written as nothing after the equals sign.
+serverStarted = true;
 pgCtlRet = RunPgCtl(["start", "-l", LogFileName, "-o", "-c shared_preload_libraries="]);
 if (pgCtlRet != 0)
 {
@@ -350,6 +361,7 @@ WaitPostmasterShutdown();
 // start, so don't log to to special log file anymore.
 PrintMsg(VerbosityLevel.Normal, "Initializing worf on the subscriber node:\n");
 
+serverStarted = true;
 pgCtlRet = RunPgCtl(["start"]);
 if (pgCtlRet != 0)
 {
@@ -374,10 +386,14 @@ for (int dbnum = 0; dbnum < databaseList.Length; dbnum++)
     // Create the identifier which is setup with the position to which we already caught up using physical
     // replication.
     // The origin, the node and the subscription are made in one transaction, so that the subscription takes the origin
-    // as its own, and its apply worker starts only once its sync status says it needs no copy.
-    _ = Query(subscriberConn, "BEGIN");
+    // as its own, and its apply worker starts only once its sync status says it needs no copy. PostgreSQL keeps an
+    // origin's progress for its id however the transaction that created it ends, and an origin created later with the id
+    // would start from it, so the origin gets its position only from the commit, as the session's origin: what can fail
+    // runs first, deferred constraints too, and the message that sets the position commits, so that a transaction that
+    // rolls back, as when the tool is stopped or killed, leaves the id none.
+    _ = Query(subscriberConn, "BEGIN ISOLATION LEVEL READ COMMITTED");
     PrintMsg(VerbosityLevel.Verbose, $"Creating replication origin for database {db}...\n");
-    InitializeReplicationOrigin(subscriberConn, slotNames[dbnum], remoteLsn);
+    InitializeReplicationOrigin(subscriberConn, slotNames[dbnum]);
 
     // And finally add the node to the cluster.
     PrintMsg(VerbosityLevel.Normal, $"Creating subscriber {subscriberName} for database {db}...\n");
@@ -385,16 +401,21 @@ for (int dbnum = 0; dbnum < databaseList.Length; dbnum++)
 
     WorfSubscribe(subscriberConn, subscriberName, subConnstr, provConnstr, replicationSets, applyDelay,
         forceTextTransfer);
+    // The session lets the origin go in the same message, before the apply worker, which the commit starts, takes it.
+    string origin = EscapeLiteral(slotNames[dbnum]);
     try
     {
-        _ = Query(subscriberConn, "COMMIT");
+        _ = Query(subscriberConn, remoteLsn is null ? "COMMIT" : $"""
+            SET CONSTRAINTS ALL IMMEDIATE;
+            SELECT pg_replication_origin_session_setup({origin}), pg_replication_origin_xact_setup('{remoteLsn}', now());
+            COMMIT;
+            SELECT pg_replication_origin_session_reset();
+            """);
     }
     catch (LibpqException error)
     {
         throw Die($"Could not commit the subscription, status PGRES_FATAL_ERROR: {error.Message}\n");
     }
-
-    uncommittedOrigin = null;
 
     subscriberConn.Dispose();
     subscriberConn = null;
@@ -405,6 +426,7 @@ if (stop)
 {
     PrintMsg(VerbosityLevel.Normal, "Stopping the subscriber node ...\n");
     pgCtlRet = RunPgCtl(["stop"]);
+    serverStarted = false;
     if (pgCtlRet != 0)
     {
         throw Die($"Stopping postgres after successful subscribtion failed with {pgCtlRet}.");
@@ -549,21 +571,22 @@ bool TryParseOption(string[] args, ref int index, out string option, out string?
     return false;
 }
 
-// Print error and exit.
+// Print error and exit, stopping the server this run started. Once, from whichever thread fails or stops first: another
+// waits for it, as the process exits.
 // Returns nothing; the process exits. Callers throw the result so the compiler knows execution stops.
 InvalidOperationException Die(string message)
 {
-    Console.Error.Write(message);
-
-    if (subscriberConn is not null && uncommittedOrigin is (string name, int id))
+    if (Interlocked.Exchange(ref dying, 1) != 0)
     {
-        ClearRolledBackOrigin(subscriberConn, name, id);
+        Thread.Sleep(Timeout.Infinite);
     }
+
+    Console.Error.Write(message);
 
     subscriberConn?.Dispose();
     providerConn?.Dispose();
 
-    if (GetPgpid() != 0 && RunPgCtl(["stop", "-s"]) != 0)
+    if (serverStarted && GetPgpid() != 0 && RunPgCtl(["stop", "-s"]) != 0)
     {
         Console.Error.WriteLine("WARNING: postgres seems to be running, but could not be stopped");
     }
@@ -870,63 +893,17 @@ void RemoveUnwantedData(LibpqConnection conn)
     }
 }
 
-// Initialize new remote identifier to specific position.
-void InitializeReplicationOrigin(LibpqConnection conn, string originName, string? remoteLsn)
+// Initialize new remote identifier.
+void InitializeReplicationOrigin(LibpqConnection conn, string originName)
 {
     string query = $"SELECT pg_replication_origin_create({EscapeLiteral(originName)})";
     try
     {
-        uncommittedOrigin = (originName, int.Parse(QueryValue(conn, query)!, CultureInfo.InvariantCulture));
+        _ = Query(conn, query);
     }
     catch (LibpqException error)
     {
         throw Die($"Could not create replication origin \"{query}\": status PGRES_FATAL_ERROR: {error.Message}\n");
-    }
-
-    if (remoteLsn is not null)
-    {
-        query = $"SELECT pg_replication_origin_advance({EscapeLiteral(originName)}, '{remoteLsn}')";
-        try
-        {
-            _ = Query(conn, query);
-        }
-        catch (LibpqException error)
-        {
-            throw Die($"Could not advance replication origin \"{query}\": status PGRES_FATAL_ERROR: {error.Message}\n");
-        }
-    }
-}
-
-// Rolls back the transaction that created an origin and clears the progress it gave it, which stays in shared memory
-// for the freed id, through a restart, and which an origin created next with the id would start from: origins take the
-// lowest free id, so ones created in turn reach it, and dropping one clears its id's progress.
-void ClearRolledBackOrigin(LibpqConnection conn, string originName, int id)
-{
-    try
-    {
-        _ = Query(conn, "ROLLBACK");
-        List<string> created = [];
-        try
-        {
-            for (int taken = 0; taken < id;)
-            {
-                string name = $"{originName}_cleared_{created.Count}";
-                taken = int.Parse(QueryValue(conn, $"SELECT pg_replication_origin_create({EscapeLiteral(name)})")!,
-                    CultureInfo.InvariantCulture);
-                created.Add(name);
-            }
-        }
-        finally
-        {
-            foreach (string name in created)
-            {
-                _ = Query(conn, $"SELECT pg_replication_origin_drop({EscapeLiteral(name)})");
-            }
-        }
-    }
-    catch (LibpqException error)
-    {
-        Console.Error.WriteLine($"WARNING: could not clear the progress of replication origin \"{originName}\": {error.Message}");
     }
 }
 

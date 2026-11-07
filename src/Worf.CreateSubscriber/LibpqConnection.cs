@@ -5,6 +5,7 @@ namespace Worf.CreateSubscriber;
 /// </summary>
 internal sealed class LibpqConnection : IDisposable
 {
+    private readonly Lock _lock = new();
     private nint _conn;
 
     /// <summary>
@@ -34,15 +35,24 @@ internal sealed class LibpqConnection : IDisposable
     /// Asks the server to cancel the command the connection runs, from another thread.
     /// </summary>
     /// <returns>Whether the request was sent.</returns>
-    public bool Cancel() => _conn != 0 && Libpq.Cancel(_conn);
+    public bool Cancel()
+    {
+        lock (_lock)
+        {
+            return _conn != 0 && Libpq.Cancel(_conn);
+        }
+    }
 
     /// <inheritdoc/>
     public void Dispose()
     {
-        if (_conn != 0)
+        lock (_lock)
         {
-            Libpq.Finish(_conn);
-            _conn = 0;
+            if (_conn != 0)
+            {
+                Libpq.Finish(_conn);
+                _conn = 0;
+            }
         }
     }
 }

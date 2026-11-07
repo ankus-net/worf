@@ -57,6 +57,9 @@ internal static class SequenceRangeExchange
     // before that, which doubles from the check interval up to the exchange interval while nothing changes.
     private static readonly Dictionary<uint, (string What, long At, long Delay)> s_waits = [];
 
+    // The links a statement waits on whose retry it made due early, which a probe makes without giving way.
+    private static readonly HashSet<uint> s_wanted = [];
+
     // The subscriptions whose provider answered the last exchange that their slot isn't streamed yet, those whose
     // provider answered the last call that it has no such slot, and those whose last exchange failed so, logged only
     // if the next fails so too, as a subscription that is being dropped no longer has one.
@@ -347,7 +350,7 @@ internal static class SequenceRangeExchange
             SequenceRangeExchangeWorker.Yields = !s_gaveWay.Contains(sub.Id);
             if (SequenceRangeExchangeWorker.Probing != 0)
             {
-                if (SequenceRangeExchangeWorker.Yields && now - s_probedAt.GetValueOrDefault(sub.Id) < TimedOutBackoff && (othersWaited ||
+                if (SequenceRangeExchangeWorker.Yields && !s_wanted.Contains(sub.Id) && now - s_probedAt.GetValueOrDefault(sub.Id) < TimedOutBackoff && (othersWaited ||
                     PgBackgroundWorker.RunTransaction(() => Worf.ReadScalar<bool>("""
                         SELECT EXISTS (
                             SELECT 1 FROM worf.sequence_range_request
@@ -452,10 +455,11 @@ internal static class SequenceRangeExchange
                     s_probedAt[sub.Id] = now;
                 }
 
+                // The delay counts from the call's end, so that one that ran out of time waits it out too.
                 long delay = s_retries.TryGetValue(sub.Id, out (long At, long Delay) retry) ? retry.Delay * 2 : 0;
                 long least = timedOut ? Math.Min(TimedOutFirstBackoff, most) : SequenceRanges.CheckInterval * 1000L;
                 delay = Math.Min(Math.Max(delay, Math.Max(least, SequenceRanges.CheckInterval * 1000L)), Math.Max(most, SequenceRanges.CheckInterval * 1000L));
-                s_retries[sub.Id] = (now + delay, delay);
+                s_retries[sub.Id] = (Worker.GetCurrentTimestamp() + delay, delay);
                 string failure = error is PgQueryCanceledException
                     ? $"node {sub.Origin.Name} didn't answer within {SequenceRangeExchangeWorker.LastLimit.ToString(CultureInfo.InvariantCulture)} ms"
                     : error.Message;
@@ -508,6 +512,7 @@ internal static class SequenceRangeExchange
         List<(WorfSubscription Sub, string? Waiting, bool Fenced)> due = [];
         long now = Worker.GetCurrentTimestamp();
         Starting = false;
+        s_wanted.Clear();
         List<WorfSubscription> enabled = [.. WorfNode.GetNodeSubscriptions(node.Node.Id, false).Where(sub => sub.Enabled)];
 
         // The connections kept for subscriptions dropped or disabled since go.
@@ -540,10 +545,19 @@ internal static class SequenceRangeExchange
                 (!s_waits.TryGetValue(sub.Id, out (string What, long At, long Delay) wait) || wait.What != waiting || now >= wait.At);
 
             // A statement that waits to draw from a block the neighbor granted, until this server hears from it since it
-            // started, makes the exchange due, once a second at most.
+            // started, makes the exchange due, once a second at most, and a failed one's retry due half
+            // worf.sequence_range_timeout after it ended, if its delay is longer, so that the statement, which waits up
+            // to twice that, gets an exchange soon after the neighbor is back.
             bool exchanged = s_exchangedAt.TryGetValue(sub.Id, out long at);
             bool wanted = (!exchanged || now - at >= 1_000_000) && SequenceRangeHeard.Wanted(sub.Origin.Id, now - 2_000_000);
-            if (!retrying && (!exchanged || now - at >= SequenceRanges.ExchangeInterval * 1000L || s_acksWaiting.Contains(sub.Id) || asks || wanted))
+            bool cut = wanted && retrying && now >= retry.At - retry.Delay + Math.Min(retry.Delay, SequenceRanges.ExchangeTimeout * 500L);
+            if (cut)
+            {
+                _ = s_wanted.Add(sub.Id);
+            }
+
+            if ((!retrying || cut) &&
+                (!exchanged || now - at >= SequenceRanges.ExchangeInterval * 1000L || s_acksWaiting.Contains(sub.Id) || asks || wanted))
             {
                 due.Add((sub, waiting, fenced));
             }
@@ -1943,6 +1957,26 @@ internal static class SequenceRangeExchange
         if (!isOwner && seqoid == SnowflakeIds.NodeSequence() && !SequenceRanges.SnowflakeOwnerHeard(seqoid))
         {
             return false;
+        }
+
+        // Another pool holder grants from its pool only once this server has heard, since it started, from the nodes that
+        // granted it its pool blocks, as it draws from its own blocks then, since a fence's lift may have given their
+        // values out again meanwhile; the child waits, and the exchange with the grantor is made at once.
+        if (!isOwner && seqoid != SnowflakeIds.NodeSequence())
+        {
+            foreach (uint grantor in Worf.Read("""
+                SELECT DISTINCT b.from_node FROM worf.sequence_range_block b CROSS JOIN worf.local_node l
+                WHERE b.seqoid = $1 AND b.epoch = $2 AND b.kind = 'p' AND b.state = 'open' AND b.from_node <> l.node_id
+                    AND EXISTS (SELECT 1 FROM worf.node n WHERE n.node_id = b.from_node)
+                """, 0, SpiParameter.Create(seqoid), SpiParameter.Create(epoch)).Select(static pool => pool.Get<uint>(0)))
+            {
+                if (!SequenceRangeHeard.Confirmed(grantor))
+                {
+                    SequenceRangeHeard.Want(grantor);
+                    SequenceRangeExchangeWorker.Wake();
+                    return false;
+                }
+            }
         }
 
         string kind = request.TryGetProperty("kind", out JsonElement value) ? value.GetWorfString() ?? "n" : "n";

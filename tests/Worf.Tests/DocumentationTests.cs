@@ -41,14 +41,19 @@ public sealed class DocumentationTests
             s_sequenceRanges, "a grantor's lifts (211)");
         Assert.DoesNotContain("without waiting for them, and commits at once", s_sequenceRanges, "a switch worker's wait (130/146)");
         Assert.DoesNotContain("three seconds a minute at most", s_sequenceRanges, "an unreachable neighbor's cost (294)");
-        Assert.Contains("holds up the others' calls about ten seconds in its first minute, and about three seconds a minute after that", s_sequenceRanges,
+        Assert.Contains("holds up the others' calls for its first call's `worf.sequence_range_timeout`, and then about three seconds ten, twenty and forty seconds after the call before ends", s_sequenceRanges,
             "an unreachable neighbor's cost (294)");
         Assert.Contains("A forced lift's request to reset from the node's grantor", s_sequenceRanges, "a grantor's lifts (352)");
         Assert.Contains("the grantor's lifts may reset the node 9 times in their first hour and 14 in their first day", s_sequenceRanges, "a grantor's lifts (353)");
         Assert.Contains("A switch worker waits for the gate before it locks the sequence's range row", s_sequenceRanges, "a paused gate holder (291)");
-        Assert.Contains("Until then, every call of `nextval`, on any sequence, as a call may name its sequence only as it runs", s_sequenceRanges,
+        Assert.Contains("a call whose sequence its statement doesn't name, as one computed as it runs, or a PL/pgSQL expression's", s_sequenceRanges,
             "a returning node's draws (292, 293)");
-        Assert.Contains("Nothing else waits: reads of the sequence, `setval`, `currval`, `EXPLAIN`", s_sequenceRanges, "what doesn't wait for a grantor (351)");
+        Assert.Contains("Nothing else waits: `nextval` of a sequence no range manages, or of a temporary one, reads of the sequence, `setval`, `currval`, `EXPLAIN`", s_sequenceRanges,
+            "what doesn't wait for a grantor (351, 422)");
+        Assert.Contains("an `UPDATE` or a `MERGE` that sets such a column to its default", s_sequenceRanges, "an identity column's draw (421)");
+        Assert.Contains("and again half `worf.sequence_range_timeout` after each that fails", s_sequenceRanges, "a waiting statement's exchanges (423)");
+        Assert.Contains("a pool holder grants its children nothing from a pool block until the node that granted it has answered so", s_sequenceRanges,
+            "a restarted pool holder's grants (424)");
         Assert.Contains("a node whose last call ran out of time, as one whose host drops connection attempts, after the others", s_sequenceRanges,
             "an unreachable neighbor (212)");
         Assert.DoesNotContain("leaves no block's values unused", s_sequenceRanges, "a COPY's switch (130)");
@@ -75,8 +80,8 @@ public sealed class DocumentationTests
         Assert.Contains("or that changed the type of an identity column a managed sequence numbers, unless a savepoint rolled it back", s_sequenceRanges,
             "prepared column type changes (144)");
         Assert.Contains("holds up only that sequence's exchanges, which leave it out until the transaction ends", s_sequenceRanges, "prepared holders (144)");
-        Assert.Contains("after its server starts, a node draws from a block its parent granted only once a message of the parent's, made after it heard of the start and asked every reset it owes the node, has come and committed with each reset it asks taken in",
-            s_sequenceRanges, "a returning node (46, 74)");
+        Assert.Contains("after its server starts, a node draws from a block another node granted it, its parent or one that was, only once a message of that node's", s_sequenceRanges,
+            "a returning node (46, 74, 424)");
         Assert.Contains("is asked to reset once it's heard from again after the fence lifted, whatever it reports", s_sequenceRanges, "an unchanged report");
 
         string ranges = Read("src", "Worf", "SequenceRanges.cs");

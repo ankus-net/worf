@@ -581,8 +581,9 @@ internal static unsafe partial class CopyConversion
     /// <summary>
     /// Finds the batch's rows that a NOT NULL column or a CHECK constraint refuses, as the condition of the batch's COPY
     /// tests them, which COPY doesn't copy, so that they hold no key for the rows after them: all at once, or, when a
-    /// CHECK expression fails on a row, as one that divides by zero does, a row at a time, a row whose test fails
-    /// counting among them, as COPY fails it too. The tests only read, so they take no transaction ID.
+    /// CHECK expression fails on a row, as one that divides by zero does, in halves of the batch's rows, down to the
+    /// rows whose test fails, which count among them, as COPY fails them too. The tests only read, so they take no
+    /// transaction ID.
     /// </summary>
     private static long[] Untested(SpiParameter[] parameters, int rows)
     {
@@ -592,39 +593,53 @@ internal static unsafe partial class CopyConversion
         }
 
         string row = Worf.QuoteIdentifier(s_heldRow);
-        long[] refused = [];
-        try
+        string inPart = $"""
+            SELECT c.{row} FROM {s_heldCandidates} AS c
+            WHERE CASE WHEN c.{row} OPERATOR(pg_catalog.>=) ${parameters.Length + 1} AND c.{row} OPERATOR(pg_catalog.<) ${parameters.Length + 2}
+                THEN NOT ({tests}) ELSE false END
+            """;
+        List<long> refused = [];
+        bool Test(long from, long to)
         {
-            PgTransaction.RunInSubtransaction(() => refused = [.. Worf.Read($"SELECT c.{row} FROM {s_heldCandidates} AS c WHERE NOT ({tests})", 0, parameters)
-                .Select(found => found.Get<long>(0))]);
-            return refused;
-        }
-        catch (PgException)
-        {
-            // A CHECK expression failed on a row, and the rows are tested one at a time.
-        }
-
-        List<long> each = [];
-        string one = $"SELECT 1 FROM {s_heldCandidates} AS c WHERE c.{row} OPERATOR(pg_catalog.=) ${parameters.Length + 1} AND NOT ({tests})";
-        for (long r = 0; r < rows; r++)
-        {
-            long place = r;
             try
             {
-                bool fails = false;
-                PgTransaction.RunInSubtransaction(() => fails = Worf.Read(one, 0, [.. parameters, SpiParameter.Create(place)]).Count > 0);
-                if (fails)
-                {
-                    each.Add(place);
-                }
+                PgTransaction.RunInSubtransaction(() => refused.AddRange(Worf.Read(inPart, 0,
+                    [.. parameters, SpiParameter.Create(from), SpiParameter.Create(to)]).Select(found => found.Get<long>(0))));
+                return true;
             }
             catch (PgException)
             {
-                each.Add(place);
+                // A CHECK expression failed on a row of the part, which is tested in halves, or counts among the rows
+                // refused alone.
             }
+
+            if (to - from == 1)
+            {
+                refused.Add(from);
+                return false;
+            }
+
+            long middle = from + ((to - from) / 2);
+            bool whole = Test(from, middle);
+            _ = whole ? Halve(middle, to) : Test(middle, to);
+            return false;
         }
 
-        return [.. each];
+        // A part whose first half passed holds the row that failed in its second half, which is tested in halves at once.
+        bool Halve(long from, long to)
+        {
+            if (to - from == 1)
+            {
+                return Test(from, to);
+            }
+
+            long middle = from + ((to - from) / 2);
+            bool whole = Test(from, middle);
+            return whole ? Halve(middle, to) : Test(middle, to);
+        }
+
+        _ = Test(0, rows);
+        return [.. refused];
     }
 
     /// <summary>

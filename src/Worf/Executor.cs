@@ -361,22 +361,11 @@ internal static unsafe partial class Executor
         }
 
         // A statement that commits on its way, and then fails, lets its fence go as its transaction aborts.
-        // A transaction prepared after it changed worf or a database is noted as it's prepared, and COMMIT PREPARED of
-        // one noted wakes the managers once it has committed it.
-        TransactionStmtKind? twoPhase = parsetree->type == NodeTag.T_TransactionStmt &&
-            ((TransactionStmt*)parsetree)->kind is TransactionStmtKind.TRANS_STMT_PREPARE or TransactionStmtKind.TRANS_STMT_COMMIT_PREPARED or
-                TransactionStmtKind.TRANS_STMT_ROLLBACK_PREPARED
-            ? ((TransactionStmt*)parsetree)->kind
-            : null;
-        uint gid = twoPhase is null ? 0 : Worf.HashAny(Worf.ToServer(Worf.FromServer(((TransactionStmt*)parsetree)->gid)));
-        bool? committedPrepared = null;
-        if (twoPhase == TransactionStmtKind.TRANS_STMT_PREPARE)
+        // A transaction prepared after it changed worf or a database is noted as it's prepared, and the supervisor wakes
+        // the managers once it has ended.
+        if (parsetree->type == NodeTag.T_TransactionStmt && ((TransactionStmt*)parsetree)->kind == TransactionStmtKind.TRANS_STMT_PREPARE)
         {
-            Worker.NotePrepared(gid);
-        }
-        else if (twoPhase == TransactionStmtKind.TRANS_STMT_COMMIT_PREPARED)
-        {
-            committedPrepared = Worker.PreparedWakes(gid);
+            Worker.NotePrepared();
         }
 
         uint xactFlags = DdlReplication.BeginStatement(ddl is not null);
@@ -401,19 +390,11 @@ internal static unsafe partial class Executor
             }
 
             // A dropped database's workers leave their slots, which the supervisor frees; a database that worf is
-            // created in, or that ALTER DATABASE may have made one to manage, gets its manager once that commits, and
-            // one whose prepared transaction did either once COMMIT PREPARED has committed it.
+            // created in, or that ALTER DATABASE may have made one to manage, gets its manager once that commits, or,
+            // for a prepared transaction, once the supervisor finds it ended.
             if (parsetree->type == NodeTag.T_DropdbStmt)
             {
                 Worker.WakeSupervisor();
-            }
-            else if (twoPhase is TransactionStmtKind.TRANS_STMT_COMMIT_PREPARED or TransactionStmtKind.TRANS_STMT_ROLLBACK_PREPARED)
-            {
-                Worker.ForgetPrepared(gid);
-                if (committedPrepared is bool everyDatabase && twoPhase == TransactionStmtKind.TRANS_STMT_COMMIT_PREPARED)
-                {
-                    Worker.SignalPreparedCommitted(everyDatabase);
-                }
             }
             else if (parsetree->type == NodeTag.T_CreateExtensionStmt &&
                 Worf.FromServer(((CreateExtensionStmt*)parsetree)->extname) == Worf.ExtensionName)
@@ -610,6 +591,7 @@ internal static unsafe partial class Executor
         // A statement only explained draws nothing as its expressions start.
         bool explaining = SequenceRangeGuard.ExplainOnly;
         SequenceRangeGuard.ExplainOnly = (eflags & ExecFlagExplainOnly) != 0;
+        SequenceRangeGuard.StartingExpressions((nint)queryDesc->plannedstmt);
         try
         {
             if (!s_nextExecutorStartHook.IsNull)
@@ -623,6 +605,7 @@ internal static unsafe partial class Executor
         }
         finally
         {
+            SequenceRangeGuard.StartedExpressions();
             SequenceRangeGuard.ExplainOnly = explaining;
         }
     }

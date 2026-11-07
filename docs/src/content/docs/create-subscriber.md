@@ -43,3 +43,10 @@ worf_create_subscriber -D /path/to/new/datadir \
 
 `worf_create_subscriber` runs the `pg_basebackup` and `pg_ctl` beside it, so
 install it in the PostgreSQL installation's `bin` directory.
+
+A run that fails, or is stopped with Ctrl-C or `SIGTERM`, cancels what it waits
+for, rolls back, and stops the server it started. A killed run leaves its server
+running, and its transaction rolls back once the server finds it gone. The
+replication origin it creates gets its position only as its transaction
+commits, so neither leaves progress for a later origin. A run on a data
+directory whose server is running fails, and leaves the server as it is.

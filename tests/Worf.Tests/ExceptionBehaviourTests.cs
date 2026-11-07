@@ -12,6 +12,13 @@ namespace Worf.Tests;
 [TestClass]
 public sealed partial class ExceptionBehaviourTests
 {
+    // The rows a trigger here refuses as the halves merge writes them, which only merging finds: a run of 999, and 25 far
+    // apart after them among 10,000 rows it writes.
+    private const string Refused = "id % 1000 <> 7 AND (id BETWEEN 3001 AND 4000 OR (id BETWEEN 20001 AND 29601 AND id % 400 = 1))";
+
+    // The most transaction IDs the halves merge takes.
+    private const long MergedIds = 2800;
+
     private const string Database = "postgres";
     private const string SuperUser = "super";
 
@@ -858,7 +865,13 @@ public sealed partial class ExceptionBehaviourTests
             }
             else if (stop == "halves")
             {
-                _ = await subscriber.SafePsqlAsync(Database, $"CREATE UNIQUE INDEX {table}_v ON {table} (v) WHERE v <> 'copied'", token);
+                _ = await subscriber.SafePsqlAsync(Database, $$"""
+                    CREATE UNIQUE INDEX {{table}}_v ON {{table}} (v) WHERE v <> 'copied';
+                    CREATE FUNCTION {{table}}_refuse() RETURNS trigger LANGUAGE plpgsql
+                        AS $$BEGIN IF NEW.v LIKE 'x%' THEN RAISE EXCEPTION 'refused %', NEW.id; END IF; RETURN NULL; END$$;
+                    CREATE TRIGGER {{table}}_refuse AFTER INSERT OR UPDATE ON {{table}} FOR EACH ROW WHEN (NEW.v LIKE 'x%') EXECUTE FUNCTION {{table}}_refuse();
+                    ALTER TABLE {{table}} ENABLE ALWAYS TRIGGER {{table}}_refuse;
+                    """, token);
             }
 
             // A key on the subscriber references the table.
@@ -990,7 +1003,9 @@ public sealed partial class ExceptionBehaviourTests
                     break;
                 case "halves":
                     // The copy again merges 300,000 rows. Rows 100 and 200, and 499 pairs of rows from 1001 to 2000,
-                    // swap the values rows here hold in a partial unique index, which only merging in halves finds, and
+                    // swap the values rows here hold in a partial unique index, which only merging in halves finds, as
+                    // it does the rows a trigger here refuses, 999 from 3001 and 25 far apart among 10,000 rows the
+                    // merge writes, and
                     // each fails: the halves are ranges of the copy's rows, which take no memory however many rows they
                     // hold, and hold only the rows the merge writes, a few of which merge one at a time. Row 500's new
                     // value, held by a row here in that index, and the 300 rows the provider changed that a CHECK
@@ -1001,6 +1016,8 @@ public sealed partial class ExceptionBehaviourTests
                         UPDATE {table} SET v = CASE id WHEN 100 THEN 's200' ELSE 's100' END WHERE id IN (100, 200);
                         UPDATE {table} SET v = 's' || CASE WHEN id % 2 = 1 THEN id + 1 ELSE id - 1 END
                             WHERE id BETWEEN 1001 AND 2000 AND id NOT IN (1007, 1008);
+                        UPDATE {table} SET v = CASE WHEN {Refused} THEN 'x' ELSE 'w' END || id
+                            WHERE id % 1000 <> 7 AND (id BETWEEN 3001 AND 4000 OR id BETWEEN 20001 AND 30000);
                         SELECT pg_drop_replication_slot('{syncSlot}');
                         """, token);
                     _ = await subscriber.SafePsqlAsync(Database, $"""
@@ -1102,7 +1119,7 @@ public sealed partial class ExceptionBehaviourTests
             {
                 long merged = long.Parse(await subscriber.SafePsqlAsync(Database, "SELECT pg_snapshot_xmax(pg_current_snapshot())::text", token),
                     CultureInfo.InvariantCulture) - mergeFrom;
-                Assert.Contains($"skipped 1301 of the rows of the copy of table public.{table}", subscriber.ReadLog()[logpos..]);
+                Assert.Contains($"skipped 2325 of the rows of the copy of table public.{table}", subscriber.ReadLog()[logpos..]);
                 Assert.AreEqual("100|200|500|s100|s200|998|998", await subscriber.SafePsqlAsync(Database, $"""
                     SELECT string_agg(remote_new_tuple->>'id', '|' ORDER BY (remote_new_tuple->>'id')::integer)
                             FILTER (WHERE (remote_new_tuple->>'id')::integer NOT BETWEEN 1001 AND 2000),
@@ -1111,6 +1128,11 @@ public sealed partial class ExceptionBehaviourTests
                         (SELECT count(*) FROM {table} WHERE id BETWEEN 1001 AND 2000 AND v = 's' || id)
                     FROM worf.exception_log WHERE table_name = '{table}' AND error_sqlstate = '23505'
                     """, token), "the rows that swap values and row 500, recorded, and the values the swapping rows keep");
+                Assert.AreEqual("999|25|1024|9965", await subscriber.SafePsqlAsync(Database, $"""
+                    SELECT count(*) FILTER (WHERE (remote_new_tuple->>'id')::integer <= 4000), count(*) FILTER (WHERE (remote_new_tuple->>'id')::integer > 4000),
+                        (SELECT count(*) FROM {table} WHERE {Refused} AND v = 'copied'), (SELECT count(*) FROM {table} WHERE v LIKE 'w%')
+                    FROM worf.exception_log WHERE table_name = '{table}' AND error_sqlstate = 'P0001'
+                    """, token), "the rows the trigger refused, recorded and left as they were, and the rows written around them");
                 Assert.AreEqual($"300|0|1|new row for relation \"{table}\" violates check constraint \"{table}_changed\"", await subscriber.SafePsqlAsync(Database, $"""
                     SELECT count(*), (SELECT count(*) FROM {table} WHERE v = 'changed'), (SELECT count(*) FROM {table} WHERE id = 12345),
                         string_agg(DISTINCT error_message, ',')
@@ -1118,7 +1140,7 @@ public sealed partial class ExceptionBehaviourTests
                     """, token), "the changed rows the CHECK refused, recorded and left as they were, and row 12345, left alone");
                 TestContext.WriteLine($"merge with rows that fail alone: {merging.Elapsed.TotalSeconds:F1} s, {merged} transaction IDs");
                 Assert.IsLessThan(TimeSpan.FromSeconds(60), merging.Elapsed, "the merge of 300,000 rows with 1,000 that fail alone");
-                Assert.IsLessThan(1150L, merged, "transaction IDs the merge took for 300 rows a CHECK refused and 1,000 that fail alone");
+                Assert.IsLessThan(MergedIds, merged, "transaction IDs the merge took for 300 rows a CHECK refused, and 1,997 that fail alone together and 25 far apart");
                 if (OperatingSystem.IsLinux())
                 {
                     long peak = await peakKb;
@@ -1454,6 +1476,24 @@ public sealed partial class ExceptionBehaviourTests
             SELECT (SELECT count(*) FROM hz), (SELECT count(*) FROM worf.exception_log WHERE table_name = 'hz' AND error_sqlstate = '23505')
             """, token), "hz's rows, and those whose keys were held, recorded");
         Assert.IsLessThan(60L, used, "transaction IDs the copy took for 500 rows whose keys were held, beside a row whose CHECK fails");
+
+        // The batch's rows are tested in halves down to the row whose CHECK expression fails, so that a copy with such a
+        // row in every batch takes about as long as one without.
+        _ = await provider.SafePsqlAsync(Database, """
+            CREATE TABLE hzs (id integer PRIMARY KEY, d integer);
+            INSERT INTO hzs SELECT g, CASE WHEN g % 1000 = 0 THEN 0 ELSE 1 END FROM generate_series(1, 100000) g;
+            """, token);
+        _ = await subscriber.SafePsqlAsync(Database, """
+            CREATE TABLE hzs (id integer PRIMARY KEY, d integer CHECK (100 / d > 0));
+            INSERT INTO hzs VALUES (1, 1);
+            """, token);
+        Stopwatch testing = Stopwatch.StartNew();
+        _ = await provider.SafePsqlAsync(Database, "SELECT * FROM worf.replication_set_add_table('default', 'hzs', synchronize_data := true)", token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+            "SELECT sync_status = 'r' FROM worf.local_sync_status WHERE sync_relname = 'hzs'", token), "hzs's copy");
+        TestContext.WriteLine($"the copy of 100,000 rows with a row whose CHECK fails in each batch: {testing.Elapsed.TotalSeconds:F1} s");
+        Assert.AreEqual("99900", await subscriber.SafePsqlAsync(Database, "SELECT count(*) FROM hzs", token), "hzs's rows");
+        Assert.IsLessThan(TimeSpan.FromSeconds(15), testing.Elapsed, "the copy of 100,000 rows with a row whose CHECK fails in each batch");
 
         // A row left out for one index holds no keys in another, as rows written one after another would: row 2 takes j
         // from row 1, so row 3's k is free. Rows that a partial unique index or an exclusion constraint refuses, whether
@@ -1982,6 +2022,38 @@ public sealed partial class ExceptionBehaviourTests
             SELECT (SELECT string_agg(id || '=' || k, ',' ORDER BY id) FROM sw), string_agg(concat_ws('|', operation, remote_new_tuple->>'id', error_sqlstate), ',')
             FROM worf.exception_log WHERE table_name = 'sw'
             """, token), "the swapped rows, and only the change that conflicts recorded");
+
+        // Nor does a large table here whose deferrable key treats nulls as equal, which the transaction writes: its rows
+        // join by hashing too, and a key the transaction updates to null conflicts with a null one here.
+        foreach (TestNode node in new[] { provider, subscriber })
+        {
+            _ = await node.SafePsqlAsync(Database, node == provider
+                ? "CREATE TABLE snd (id integer PRIMARY KEY, k integer)"
+                : "CREATE TABLE snd (id integer PRIMARY KEY, k integer UNIQUE NULLS NOT DISTINCT DEFERRABLE)", token);
+        }
+
+        _ = await provider.SafePsqlAsync(Database, "SELECT * FROM worf.replication_set_add_table('default', 'snd')", token);
+        _ = await subscriber.SafePsqlAsync(Database, """
+            INSERT INTO snd SELECT g, g FROM generate_series(1000001, 1100000) g;
+            INSERT INTO snd VALUES (1100001, NULL);
+            ANALYZE snd;
+            """, token);
+        _ = await provider.SafePsqlAsync(Database, """
+            BEGIN;
+            INSERT INTO snd SELECT g, g FROM generate_series(1, 2000) g;
+            UPDATE snd SET k = NULL WHERE id = 5;
+            UPDATE sw SET k = 22 WHERE id = 21;
+            COMMIT;
+            INSERT INTO sw VALUES (6, 6);
+            """, token);
+        Stopwatch nulls = Stopwatch.StartNew();
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM sw WHERE id = 6)", token), "the row after the conflicts");
+        TestContext.WriteLine($"the replay beside the key whose nulls aren't distinct: {nulls.Elapsed.TotalSeconds:F1} s");
+        Assert.IsLessThan(TimeSpan.FromSeconds(3), nulls.Elapsed, "the replay of 2,000 rows into a table of 100,000 whose key's nulls aren't distinct");
+        Assert.AreEqual("102001|5|UPDATE|5|23505", await subscriber.SafePsqlAsync(Database, """
+            SELECT (SELECT count(*) FROM snd), (SELECT k FROM snd WHERE id = 5), string_agg(concat_ws('|', operation, remote_new_tuple->>'id', error_sqlstate), ',')
+            FROM worf.exception_log WHERE table_name = 'snd'
+            """, token), "the rows applied, and the update to a null key that conflicts recorded");
         await SetBehaviourAsync(subscriber, "error", token);
 
         // Under error, a copy whose rows conflict in a deferrable unique index or exclusion constraint fails with the

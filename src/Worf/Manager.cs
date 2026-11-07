@@ -50,6 +50,18 @@ internal static class Manager
         Worker.WorkerAttach(mainArg, WorfWorkerType.Manager);
         ForgetCancelling();
 
+        // The database's transactions prepared before this server started, which may give it something to manage once
+        // they commit, are noted first, so that one that commits after the look below wakes the manager again.
+        long notesSince = Worker.PreparedNotesSince;
+        long[]? restored = PgBackgroundWorker.RunTransaction(() => Worf.ReadScalar<long[]?>("""
+            SELECT pg_catalog.array_agg(transaction::text::pg_catalog.int8) FROM pg_catalog.pg_prepared_xacts
+            WHERE database = pg_catalog.current_database() AND prepared < pg_catalog.to_timestamp($1::pg_catalog.float8 / 1000000 + 946684800)
+            """, SpiParameter.Create(notesSince)));
+        if (restored is { Length: > 0 })
+        {
+            Worker.NoteRestoredPrepared(Worker.MyWorker.Dboid, [.. restored.Select(static xid => (uint)xid)]);
+        }
+
         // A database without worf, or a template that isn't a node, has nothing to manage. The manager notes when it
         // looked, so that a CREATE EXTENSION worf that commits after then, which it may not see, has the supervisor
         // start it again.
@@ -135,8 +147,19 @@ internal static class Manager
                 sleep = Math.Min(sleep, SequenceRanges.CheckInterval);
             }
 
-            // An apply worker's call to its provider is cancelled once its deadline has passed.
-            long callDeadline = WatchProviderCalls();
+            // An apply worker's call to its provider is cancelled once its deadline has passed, or at the next look, when
+            // the cancel waits too long for a lock.
+            long callDeadline;
+            try
+            {
+                callDeadline = WatchProviderCalls();
+            }
+            catch (PgException error) when (error.SqlState == LockNotAvailable)
+            {
+                GaveUpOnLock();
+                callDeadline = Worker.GetCurrentTimestamp() + 1_000_000;
+            }
+
             if (callDeadline != 0)
             {
                 sleep = Math.Clamp((callDeadline - Worker.GetCurrentTimestamp()) / 1000, 1, sleep);
@@ -177,20 +200,22 @@ internal static class Manager
     }
 
     /// <summary>
-    /// Clears the marks of the calls an earlier manager of the database was cancelling when it exited, which it may not
-    /// have sent, so that the calls that ended on their own wait for them no longer.
+    /// Takes over the cancels an earlier manager of the database was sending when it exited, which it may not have
+    /// sent: a call still running is overdue, and this manager cancels it, while one that ended waits for the cancel no
+    /// longer.
     /// </summary>
     private static void ForgetCancelling()
     {
         uint dboid = Worker.MyWorker.Dboid;
+        long now = Worker.GetCurrentTimestamp();
         using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive();
         for (int i = 0; i < guard.Length; i++)
         {
             WorfWorker worker = guard[i];
             if (worker.WorkerType is WorfWorkerType.Apply or WorfWorkerType.Sync && worker.Dboid == dboid &&
-                worker.Worker.Apply.CallDeadline == Worker.CancellingCall)
+                worker.Worker.Apply.CallDeadline is Worker.CancellingCall or Worker.EndedCancelling)
             {
-                worker.Worker.Apply.CallDeadline = 0;
+                worker.Worker.Apply.CallDeadline = worker.Worker.Apply.CallDeadline == Worker.CancellingCall ? now : 0;
                 guard[i] = worker;
             }
         }
@@ -239,13 +264,16 @@ internal static class Manager
             return next;
         }
 
-        // A call that ended on its own meanwhile waits for the cancel, and takes it, once it is marked sent.
+        // A call that ended on its own meanwhile waits for the cancel, and takes it, once it is marked sent. A cancel
+        // not sent, as when the manager gave up on a lock, is overdue again for its next look, if the call still runs.
+        List<int> sent = [];
         try
         {
             foreach (int pid in overdue)
             {
                 _ = PgBackgroundWorker.RunTransaction(() => Worf.ReadScalar<bool>(
                     "SELECT pg_catalog.pg_cancel_backend(pid) FROM pg_catalog.pg_stat_get_activity($1) WHERE pid IS NOT NULL", SpiParameter.Create(pid)));
+                sent.Add(pid);
             }
         }
         finally
@@ -254,12 +282,21 @@ internal static class Manager
             for (int i = 0; i < guard.Length; i++)
             {
                 WorfWorker worker = guard[i];
-                if (worker.WorkerType is WorfWorkerType.Apply or WorfWorkerType.Sync && worker.Dboid == dboid &&
-                    worker.Worker.Apply.CallDeadline == Worker.CancellingCall)
+                long mark = worker.Worker.Apply.CallDeadline;
+                if (worker.WorkerType is not (WorfWorkerType.Apply or WorfWorkerType.Sync) || worker.Dboid != dboid || worker.Proc == 0 ||
+                    mark is not (Worker.CancellingCall or Worker.EndedCancelling))
                 {
-                    worker.Worker.Apply.CallDeadline = 0;
-                    guard[i] = worker;
+                    continue;
                 }
+
+                int pid;
+                unsafe
+                {
+                    pid = ((PGPROC*)worker.Proc)->pid;
+                }
+
+                worker.Worker.Apply.CallDeadline = mark == Worker.CancellingCall && !sent.Contains(pid) ? now : 0;
+                guard[i] = worker;
             }
         }
 

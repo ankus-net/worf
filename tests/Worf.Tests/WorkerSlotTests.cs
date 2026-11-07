@@ -57,11 +57,15 @@ public sealed class WorkerSlotTests
 
     /// <summary>
     /// CREATE EXTENSION worf in a prepared transaction gives the database its manager once COMMIT PREPARED commits it,
-    /// though the manager that PREPARE TRANSACTION woke found nothing to manage then.
+    /// though the manager that PREPARE TRANSACTION woke found nothing to manage then, and though the server restarted
+    /// in between, rather than at the supervisor's next look minutes later.
     /// </summary>
+    /// <param name="restart">Whether the server restarts between PREPARE TRANSACTION and COMMIT PREPARED.</param>
     /// <returns>The test.</returns>
     [TestMethod]
-    public async Task PreparedExtensionsGetTheirManager()
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task PreparedExtensionsGetTheirManager(bool restart)
     {
         CancellationToken token = TestContext.CancellationToken;
         await using TestNode node = await TestNode.StartAsync("node", ["max_prepared_transactions = 2"], token);
@@ -74,7 +78,14 @@ public sealed class WorkerSlotTests
             PREPARE TRANSACTION 'extension';
             """, token);
 
-        // The manager that the prepared transaction woke finds nothing to manage yet, and exits.
+        if (restart)
+        {
+            await node.StopAsync("fast", token);
+            await node.StartServerAsync(token);
+        }
+
+        // The manager that the prepared transaction woke, or that the server started, finds nothing to manage yet, and
+        // exits.
         await Task.Delay(TimeSpan.FromSeconds(3), token);
         Assert.IsTrue(await node.PollQueryUntilAsync(Database, $"SELECT NOT ({Manager})", token), "no manager while the extension is prepared");
 
@@ -85,6 +96,8 @@ public sealed class WorkerSlotTests
             Assert.IsLessThan(TimeSpan.FromSeconds(30), starting.Elapsed, "the manager once COMMIT PREPARED committed the extension");
             await Task.Delay(TimeSpan.FromMilliseconds(200), token);
         }
+
+        TestContext.WriteLine($"the manager after {starting.Elapsed.TotalSeconds:F1} s");
     }
 
     /// <summary>
@@ -124,11 +137,14 @@ public sealed class WorkerSlotTests
 
     /// <summary>
     /// A subscription created in a prepared transaction gets its apply worker once COMMIT PREPARED commits it, as one
-    /// committed at once does, rather than at the manager's next look.
+    /// committed at once does, rather than at the manager's next look, though the server restarted in between.
     /// </summary>
+    /// <param name="restart">Whether the server restarts between PREPARE TRANSACTION and COMMIT PREPARED.</param>
     /// <returns>The test.</returns>
     [TestMethod]
-    public async Task PreparedSubscriptionsStartTheirWorker()
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task PreparedSubscriptionsStartTheirWorker(bool restart)
     {
         CancellationToken token = TestContext.CancellationToken;
         await using TestNode provider = await TestNode.StartAsync("provider", ["wal_level = logical", "max_wal_senders = 10", "max_replication_slots = 10"], token);
@@ -147,14 +163,22 @@ public sealed class WorkerSlotTests
                 synchronize_structure := false, synchronize_data := false);
             PREPARE TRANSACTION 'ps';
             """, token);
+        if (restart)
+        {
+            await subscriber.StopAsync("fast", token);
+            await subscriber.StartServerAsync(token);
+        }
+
         await Task.Delay(TimeSpan.FromSeconds(2), token);
         _ = await subscriber.SafePsqlAsync(Database, "COMMIT PREPARED 'ps'", token);
         Stopwatch starting = Stopwatch.StartNew();
         while (await subscriber.SafePsqlAsync(Database, "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE backend_type LIKE 'worf apply%')", token) != "t")
         {
-            Assert.IsLessThan(TimeSpan.FromSeconds(3), starting.Elapsed, "the apply worker once COMMIT PREPARED committed the subscription");
-            await Task.Delay(TimeSpan.FromMilliseconds(100), token);
+            Assert.IsLessThan(TimeSpan.FromSeconds(1), starting.Elapsed, "the apply worker once COMMIT PREPARED committed the subscription");
+            await Task.Delay(TimeSpan.FromMilliseconds(50), token);
         }
+
+        TestContext.WriteLine($"the apply worker after {starting.Elapsed.TotalSeconds:F2} s");
     }
 
     // How often pg_db_role_setting has been scanned whole, as the statistics show once the session's own are flushed.

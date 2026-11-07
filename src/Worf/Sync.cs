@@ -1968,63 +1968,109 @@ internal static class Sync
     /// <summary>
     /// Merges the rows of a copy from one place in it up to another, in a subtransaction, and when that fails, in two
     /// parts of as many rows each, or, for a few rows, each row alone, down to the rows that fail alone, whose numbers are
-    /// kept to record. How few is learned as the merge goes: twice as many while most rows merged alone fail, so that
-    /// rows that fail close together take about a transaction ID each, and half as many while few do, so that rows that
-    /// fail far apart take few more. A place is a row's block and offset, as one number, so that a range takes no memory
-    /// however many rows it holds, and PostgreSQL scans it as a range of ctids.
+    /// kept to record. A part whose first half merged whole holds what failed in its second half, which splits at once,
+    /// without a try of its own. How few is learned as the merge goes: twice as many while most rows merged alone fail,
+    /// so that rows that fail close together take about a transaction ID each, and half as many while few do; the rows
+    /// of a part merged alone go back to merging in halves, from the fewest, once a run of them merges, so that rows that
+    /// fail far apart, after rows that failed close together, take few more. A place is a row's block and offset, as one number,
+    /// so that a range takes no memory however many rows it holds, and PostgreSQL scans it as a range of ctids.
     /// </summary>
-    private static void MergeParts(uint reloid, string table, string merge, string row, long from, long to, List<(long Row, PgException Error)> skipped)
+    /// <returns>Whether every row of the part merged.</returns>
+    private static bool MergeParts(uint reloid, string table, string merge, string row, long from, long to, List<(long Row, PgException Error)> skipped,
+        bool failing = false)
     {
-        // The parts are merged once the failed one's error is handled, rather than within its handler, which keeps the
-        // stack the failure left until it ends.
-        PgException? failed = null;
-        try
-        {
-            PgTransaction.RunInSubtransaction(() =>
-            {
-                _ = ReplicaRechecks.Firing(reloid, () => Worf.ExecuteUnpinned(merge, SpiParameter.Create(Tid(from)), SpiParameter.Create(Tid(to))));
-                CheckDeferrableUnique(reloid, table);
-                CheckDeferrableExclusion(reloid, table);
-            }, PgSubtransactionMode.Atomic);
-        }
-        catch (PgException error) when (!Apply.IsTransient(error))
-        {
-            failed = error;
-        }
-
-        if (failed is null)
-        {
-            return;
-        }
-
+        // A part's second half, and the rest of rows merged alone, are merged in the same call, so that the rows a call
+        // read go before the next part's, however many parts the merge goes through.
         const string InPart = "ctid OPERATOR(pg_catalog.>=) $1::pg_catalog.tid AND ctid OPERATOR(pg_catalog.<) $2::pg_catalog.tid";
-        SpiParameter[] part = [SpiParameter.Create(Tid(from)), SpiParameter.Create(Tid(to))];
-        long count = Worf.ReadScalar<long>($"SELECT count(*)::pg_catalog.int8 FROM {MergeCopy} WHERE {InPart}", part);
-        if (count > s_rowsAlone)
+        bool whole = true;
+        while (true)
         {
-            long middle = Position(Worf.ReadScalar<string>(
-                $"SELECT c.ctid::pg_catalog.text FROM {MergeCopy} c WHERE {InPart} ORDER BY c.ctid OFFSET {(count / 2).ToString(CultureInfo.InvariantCulture)} LIMIT 1", part));
-            MergeParts(reloid, table, merge, row, from, middle, skipped);
-            MergeParts(reloid, table, merge, row, middle, to, skipped);
-            return;
-        }
+            SpiParameter[] part = [SpiParameter.Create(Tid(from)), SpiParameter.Create(Tid(to))];
+            long count = failing ? Worf.ReadScalar<long>($"SELECT count(*)::pg_catalog.int8 FROM {MergeCopy} WHERE {InPart}", part) : 0;
 
-        WorfRows rows = Worf.Read($"SELECT c.ctid::pg_catalog.text, c.{row} FROM {MergeCopy} c WHERE {InPart} ORDER BY c.ctid", 0, part);
-        if (rows.Count == 1)
-        {
-            skipped.Add((rows[0].Get<long>(1), failed));
-            return;
-        }
+            // The parts are merged once the failed one's error is handled, rather than within its handler, which keeps the
+            // stack the failure left until it ends. A row alone is always tried, for its error.
+            PgException? failed = null;
+            if (!failing || count <= 1)
+            {
+                long start = from;
+                try
+                {
+                    PgTransaction.RunInSubtransaction(() =>
+                    {
+                        _ = ReplicaRechecks.Firing(reloid, () => Worf.ExecuteUnpinned(merge, SpiParameter.Create(Tid(start)), SpiParameter.Create(Tid(to))));
+                        CheckDeferrableUnique(reloid, table);
+                        CheckDeferrableExclusion(reloid, table);
+                    }, PgSubtransactionMode.Atomic);
+                }
+                catch (PgException error) when (!Apply.IsTransient(error))
+                {
+                    failed = error;
+                }
 
-        int before = skipped.Count;
-        foreach (long at in rows.Select(one => Position(one.Get<string>(0))))
-        {
-            MergeParts(reloid, table, merge, row, at, at + 1, skipped);
-        }
+                if (failed is null)
+                {
+                    return whole;
+                }
 
-        int failures = skipped.Count - before;
-        s_rowsAlone = failures * 2 > rows.Count ? Math.Min(s_rowsAlone * 2, 4096) : failures * 4 < rows.Count ? Math.Max(s_rowsAlone / 2, 2) : s_rowsAlone;
+                count = Worf.ReadScalar<long>($"SELECT count(*)::pg_catalog.int8 FROM {MergeCopy} WHERE {InPart}", part);
+            }
+
+            whole = false;
+            if (count > s_rowsAlone)
+            {
+                long middle = Position(Worf.ReadScalar<string>(
+                    $"SELECT c.ctid::pg_catalog.text FROM {MergeCopy} c WHERE {InPart} ORDER BY c.ctid OFFSET {(count / 2).ToString(CultureInfo.InvariantCulture)} LIMIT 1", part));
+                failing = MergeParts(reloid, table, merge, row, from, middle, skipped);
+                from = middle;
+                continue;
+            }
+
+            long[] places;
+            {
+                WorfRows rows = Worf.Read($"SELECT c.ctid::pg_catalog.text, c.{row} FROM {MergeCopy} c WHERE {InPart} ORDER BY c.ctid", 0, part);
+                if (rows.Count == 1)
+                {
+                    skipped.Add((rows[0].Get<long>(1), failed!));
+                    return false;
+                }
+
+                places = [.. rows.Select(one => Position(one.Get<string>(0)))];
+            }
+
+            int before = skipped.Count;
+            int merged = 0;
+            int run = 0;
+            long rest = 0;
+            for (int i = 0; i < places.Length && rest == 0; i++)
+            {
+                bool alone = MergeParts(reloid, table, merge, row, places[i], places[i] + 1, skipped);
+                merged++;
+                run = alone ? run + 1 : 0;
+                if (run >= MergedRun && i + 1 < places.Length)
+                {
+                    rest = places[i + 1];
+                }
+            }
+
+            if (rest == 0)
+            {
+                AdaptRowsAlone(skipped.Count - before, merged);
+                return false;
+            }
+
+            s_rowsAlone = 2;
+            from = rest;
+            failing = false;
+        }
     }
+
+    // How many rows merged alone in a row, among few that failed, end the rows merged alone.
+    private const int MergedRun = 8;
+
+    // Twice as many rows are merged alone while most of those merged alone fail, and half as many while few do.
+    private static void AdaptRowsAlone(int failures, int merged)
+        => s_rowsAlone = failures * 2 > merged ? Math.Min(s_rowsAlone * 2, 4096) : failures * 4 < merged ? Math.Max(s_rowsAlone / 2, 2) : s_rowsAlone;
 
     /// <summary>
     /// Checks whether an error is an integrity constraint's, which a row of a copy can break when it merges: a key, a
@@ -2235,8 +2281,9 @@ internal static class Sync
     /// <summary>
     /// Gets the deferrable unique and exclusion constraints of a table: each with its table, the error a conflict in it
     /// raises, the rows it takes, as a relation of each row's table, place, xmin and keys, k0, k1 and so on, and the
-    /// condition that two such rows, a and b, conflict, by equality where the keys it takes can't be null, so that the
-    /// rows join by hashing or an index rather than pair by pair.
+    /// condition that two such rows, a and b, conflict, by equality, so that the rows join by hashing or an index rather
+    /// than pair by pair: of the keys, where the keys it takes can't be null, or of arrays of each, whose equality takes
+    /// two nulls as equal, for a unique constraint whose nulls aren't distinct.
     /// </summary>
     internal static List<(uint Table, PgException Conflict, string Rows, string Conflicts)> DeferrableConstraints(uint reloid)
     {
@@ -2271,7 +2318,9 @@ internal static class Sync
                 $"(SELECT tableoid, ctid, xmin, {string.Join(", ", keys.Select((key, k) => $"({key}) AS k{k}"))} FROM {constraint.Get<string>(7)}{where})",
                 exclusion
                     ? string.Join(" AND ", constraint.Get<string?[]>(3).Select((op, k) => $"a.k{k} {op} b.k{k}"))
-                    : string.Join(" AND ", keys.Select((_, k) => constraint.Get<bool>(5) ? $"a.k{k} IS NOT DISTINCT FROM b.k{k}" : $"a.k{k} = b.k{k}"))));
+                    : string.Join(" AND ", keys.Select((_, k) => constraint.Get<bool>(5)
+                        ? $"ARRAY[a.k{k}] OPERATOR(pg_catalog.=) ARRAY[b.k{k}]"
+                        : $"a.k{k} = b.k{k}"))));
         }
 
         return found;

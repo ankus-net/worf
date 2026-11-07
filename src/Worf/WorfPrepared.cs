@@ -1,8 +1,8 @@
 namespace Worf;
 
 /// <summary>
-/// A transaction prepared after it created worf, changed its nodes or subscriptions, or changed a database, whose
-/// COMMIT PREPARED wakes the managers that may then have something to manage.
+/// A transaction prepared after it created worf, changed its nodes or subscriptions, or changed a database, whose end
+/// wakes the managers that may then have something to manage.
 /// </summary>
 internal struct WorfPrepared
 {
@@ -12,17 +12,12 @@ internal struct WorfPrepared
     public uint Dboid;
 
     /// <summary>
-    /// The hash of its name.
+    /// Its transaction ID.
     /// </summary>
-    public uint GidHash;
+    public uint Xid;
 
     /// <summary>
-    /// Whether it changed a database, which may give every database's manager something to manage.
+    /// Whether it may have changed a database, which may give every database's manager something to manage.
     /// </summary>
     public bool EveryDatabase;
-
-    /// <summary>
-    /// When it was prepared.
-    /// </summary>
-    public long PreparedAt;
 }

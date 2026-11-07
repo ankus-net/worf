@@ -44,6 +44,13 @@ internal static partial class SequenceRangeGuard
     private static readonly List<(nint Statement, uint Subxact, List<uint> Sequences)> s_gating = [];
     private static readonly Dictionary<uint, List<uint>> s_drawnBy = [];
 
+    // The managed sequences each table's columns draw from, by column, through a default or as identity columns.
+    private static readonly Dictionary<uint, List<(short Column, uint Sequence)>> s_drawingColumns = [];
+
+    // The statements whose expressions are starting, innermost last, with the sequences their nextval calls name, once
+    // a call has looked.
+    private static readonly List<(nint Statement, (HashSet<uint> Called, bool Unnamed)? Draws)> s_starting = [];
+
     // Whether each table has the guard's triggers, which only tables numbered by a managed sequence have, as of the
     // versions of the shared and this backend's counters it was looked up at.
     private static readonly Dictionary<uint, bool> s_guarded = [];
@@ -441,10 +448,10 @@ internal static partial class SequenceRangeGuard
     private static unsafe void GateStatement(QueryDesc* queryDesc, List<uint> written)
     {
         PlannedStmt* statement = queryDesc->plannedstmt;
-        if (statement is null || written.Count == 0 ||
-            !(queryDesc->operation == CmdType.CMD_INSERT || statement->hasModifyingCTE ||
-                (queryDesc->operation == CmdType.CMD_MERGE && MergeInserts(statement))) ||
-            Worf.CatalogOid("sequence_range") == 0 || !written.Exists(Guarded))
+        bool inserts = queryDesc->operation == CmdType.CMD_INSERT || (statement is not null && statement->hasModifyingCTE) ||
+            (queryDesc->operation == CmdType.CMD_MERGE && statement is not null && MergeInserts(statement));
+        bool updates = queryDesc->operation is CmdType.CMD_UPDATE or CmdType.CMD_MERGE;
+        if (statement is null || written.Count == 0 || !(inserts || updates) || Worf.CatalogOid("sequence_range") == 0 || !written.Exists(Guarded))
         {
             return;
         }
@@ -455,9 +462,95 @@ internal static partial class SequenceRangeGuard
             return;
         }
 
-        List<uint> sequences = [.. written.SelectMany(DrawnBy)];
+        // An UPDATE, or a MERGE's, draws only as it sets a column to its default, which an identity column draws from
+        // without calling nextval, so it holds the gates of the sequences of the columns it sets.
+        List<uint> sequences = inserts ? [.. written.SelectMany(DrawnBy)] : UpdatedDrawing(statement);
+        if (sequences.Count == 0)
+        {
+            return;
+        }
+
         OpenGates((nint)queryDesc, sequences);
         WaitBeforeDrawing(sequences);
+    }
+
+    /// <summary>
+    /// Lists the managed sequences an UPDATE, or a MERGE's update actions, may draw from: those of the columns it sets
+    /// that draw from one by default or as identity columns.
+    /// </summary>
+    private static unsafe List<uint> UpdatedDrawing(PlannedStmt* statement)
+    {
+        List<uint> sequences = [];
+        if (statement->planTree is null || statement->planTree->type != NodeTag.T_ModifyTable)
+        {
+            return sequences;
+        }
+
+        ModifyTable* modify = (ModifyTable*)statement->planTree;
+        List* results = modify->resultRelations;
+        for (int i = 0; results is not null && i < results->length; i++)
+        {
+            RangeTblEntry* rte = (RangeTblEntry*)statement->rtable->elements[results->elements[i].int_value - 1].ptr_value;
+            List<(short Column, uint Sequence)> drawing = DrawingColumns(rte->relid);
+            if (drawing.Count == 0)
+            {
+                continue;
+            }
+
+            List<nint> set = [];
+            if (modify->operation == CmdType.CMD_UPDATE && modify->updateColnosLists is not null && i < modify->updateColnosLists->length)
+            {
+                set.Add((nint)modify->updateColnosLists->elements[i].ptr_value);
+            }
+
+            List* actions = modify->mergeActionLists is not null && i < modify->mergeActionLists->length
+                ? (List*)modify->mergeActionLists->elements[i].ptr_value
+                : null;
+            for (int j = 0; actions is not null && j < actions->length; j++)
+            {
+                MergeAction* action = (MergeAction*)actions->elements[j].ptr_value;
+                if (action->commandType == CmdType.CMD_UPDATE)
+                {
+                    set.Add((nint)action->updateColnos);
+                }
+            }
+
+            for (int s = 0; s < set.Count; s++)
+            {
+                List* columns = (List*)set[s];
+                for (int k = 0; columns is not null && k < columns->length; k++)
+                {
+                    int column = columns->elements[k].int_value;
+                    sequences.AddRange(drawing.Where(draw => draw.Column == column).Select(draw => draw.Sequence));
+                }
+            }
+        }
+
+        return sequences;
+    }
+
+    /// <summary>
+    /// Lists the managed sequences a table's columns draw from, by column, through their defaults or as identity
+    /// columns.
+    /// </summary>
+    private static List<(short Column, uint Sequence)> DrawingColumns(uint relid)
+    {
+        if (!s_drawingColumns.TryGetValue(relid, out List<(short Column, uint Sequence)>? drawing))
+        {
+            WorfRows used = Elevated.Run(() => Worf.Read("""
+                SELECT a.adnum, d.refobjid FROM pg_catalog.pg_attrdef a JOIN pg_catalog.pg_depend d
+                    ON d.classid = 'pg_catalog.pg_attrdef'::pg_catalog.regclass AND d.objid = a.oid AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
+                WHERE a.adrelid = $1
+                UNION
+                SELECT d.refobjsubid::pg_catalog.int2, d.objid FROM pg_catalog.pg_depend d
+                WHERE d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.refobjid = $1 AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+                    AND d.deptype = 'i'
+                """, 0, SpiParameter.Create(relid)));
+            drawing = [.. used.Select(row => (row.Get<short>(0), row.Get<uint>(1))).Where(draw => s_sequences.ContainsKey(draw.Item2))];
+            s_drawingColumns[relid] = drawing;
+        }
+
+        return drawing;
     }
 
     /// <summary>
@@ -607,12 +700,24 @@ internal static partial class SequenceRangeGuard
     internal static bool ExplainOnly { get; set; }
 
     /// <summary>
-    /// Waits, as a call of nextval on any sequence is about to run, as a statement's or a PL/pgSQL expression's whose
-    /// sequence may be named only as it runs, until this server has heard from the grantors of the managed sequences'
-    /// active blocks since it started, as <see cref="WaitForGrantor"/> does for the statements that hold the gates, so
-    /// that nothing draws from those blocks meanwhile. worf's own statements, which run with its search path, a
-    /// standby, a read-only transaction, an explained statement, and Snowflake node numbers, whose IDs carry their times,
-    /// don't wait.
+    /// Notes a statement whose expressions start, so that a call of nextval among them knows the sequences its statement
+    /// names, until <see cref="StartedExpressions"/>.
+    /// </summary>
+    /// <param name="statement">The statement's plan.</param>
+    internal static void StartingExpressions(nint statement) => s_starting.Add((statement, null));
+
+    /// <summary>
+    /// Forgets the statement <see cref="StartingExpressions"/> noted last, once its expressions have started.
+    /// </summary>
+    internal static void StartedExpressions() => s_starting.RemoveAt(s_starting.Count - 1);
+
+    /// <summary>
+    /// Waits, as a call of nextval is about to run, until this server has heard from the grantor of the managed
+    /// sequence's active block since it started, as <see cref="WaitForGrantor"/> does for the statements that hold the
+    /// gates, so that nothing draws from that block meanwhile: the sequence its statement names, or, for a call whose
+    /// sequence its statement doesn't name, as one computed as it runs or a PL/pgSQL expression's, which PL/pgSQL
+    /// evaluates without a statement, every managed sequence's. worf's own statements, a standby, a read-only
+    /// transaction, an explained statement, and Snowflake node numbers, whose IDs carry their times, don't wait.
     /// </summary>
     internal static void BeforeNextval()
     {
@@ -630,22 +735,20 @@ internal static partial class SequenceRangeGuard
 
         s_namingGrantors = true;
         List<uint> waiting = [];
+        bool unnamed;
         try
         {
             Reload();
             uint snowflake = Worf.CatalogOid("snowflake_node");
-            foreach ((uint seqoid, uint grantor) in s_grantors)
-            {
-                if (seqoid != snowflake && !s_confirmed.Contains(grantor) && !waiting.Exists(other => s_grantors[other] == grantor))
-                {
-                    waiting.Add(seqoid);
-                }
-            }
-
-            if (waiting.Count > 0 && Worf.InPinnedSearchPath())
+            List<uint> unconfirmed = [.. s_grantors.Where(entry => entry.Key != snowflake && !s_confirmed.Contains(entry.Value)).Select(entry => entry.Key)];
+            if (unconfirmed.Count == 0 || Worf.InOwnSql)
             {
                 return;
             }
+
+            (HashSet<uint> Called, bool Unnamed)? draws = StartingDraws();
+            unnamed = draws is not { Unnamed: false };
+            waiting = unnamed ? [.. unconfirmed.DistinctBy(seqoid => s_grantors[seqoid])] : [.. unconfirmed.Where(draws!.Value.Called.Contains)];
         }
         finally
         {
@@ -654,8 +757,84 @@ internal static partial class SequenceRangeGuard
 
         foreach (uint seqoid in waiting)
         {
-            WaitForGrantor(seqoid);
+            WaitForGrantor(seqoid, unnamed);
         }
+    }
+
+    /// <summary>
+    /// Finds the sequences the nextval calls of the statement whose expressions start name, once for the statement, or
+    /// null outside one.
+    /// </summary>
+    private static unsafe (HashSet<uint> Called, bool Unnamed)? StartingDraws()
+    {
+        if (s_starting.Count == 0)
+        {
+            return null;
+        }
+
+        (nint statement, (HashSet<uint> Called, bool Unnamed)? draws) = s_starting[^1];
+        if (draws is null)
+        {
+            draws = Draws((Node*)statement);
+            s_starting[^1] = (statement, draws);
+        }
+
+        return draws;
+    }
+
+    /// <summary>
+    /// Reads, from a statement's plan as text, the sequences its calls of nextval name, as each call's argument, a
+    /// constant, names one: a call whose argument isn't one, as a name computed as it runs, makes the sequences it may
+    /// draw from unnamed, as does a plan with no call, as when the call that looks is a function's the plan runs.
+    /// </summary>
+    private static unsafe (HashSet<uint> Called, bool Unnamed) Draws(Node* plan)
+    {
+        string text;
+        sbyte* written = NativeMethods.nodeToString(plan);
+        try
+        {
+            text = Worf.FromServer(written);
+        }
+        finally
+        {
+            NativeMethods.pfree(written);
+        }
+
+        const string Call = "{FUNCEXPR :funcid 1574 ";
+        const string Named = "{CONST :consttype 2205 ";
+        HashSet<uint> called = [];
+        bool unnamed = false;
+        bool calls = false;
+        for (int at = text.IndexOf(Call, StringComparison.Ordinal); at >= 0; at = text.IndexOf(Call, at + Call.Length, StringComparison.Ordinal))
+        {
+            calls = true;
+            int args = text.IndexOf(":args (", at, StringComparison.Ordinal);
+            if (args < 0 || !text.AsSpan(args + ":args (".Length).TrimStart().StartsWith(Named, StringComparison.Ordinal))
+            {
+                unnamed = true;
+                continue;
+            }
+
+            int value = text.IndexOf(":constvalue ", args, StringComparison.Ordinal);
+            int open = value < 0 ? -1 : text.IndexOf('[', value);
+            int close = open < 0 ? -1 : text.IndexOf(']', open);
+            string[] bytes = close < 0 ? [] : text[(open + 1)..close].Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (bytes.Length < 4)
+            {
+                unnamed = true;
+                continue;
+            }
+
+            uint oid = 0;
+            for (int b = 3; b >= 0; b--)
+            {
+                oid = (oid << 8) | (uint)(int.Parse(bytes[b], CultureInfo.InvariantCulture) & 0xFF);
+            }
+
+            _ = called.Add(oid);
+        }
+
+        return (called, unnamed || !calls);
     }
 
     /// <summary>
@@ -666,7 +845,7 @@ internal static partial class SequenceRangeGuard
     /// gates go and waits up to twice <c>worf.sequence_range_timeout</c>, as for the next block at a block's end, and
     /// then fails, naming the parent, as an error that ends the wait first, as <c>statement_timeout</c>'s, does.
     /// </summary>
-    private static void WaitForGrantor(uint seqoid)
+    private static void WaitForGrantor(uint seqoid, bool unnamed = false)
     {
         Reload();
         if (!s_grantors.TryGetValue(seqoid, out uint grantor) || s_confirmed.Contains(grantor))
@@ -684,7 +863,8 @@ internal static partial class SequenceRangeGuard
 
             string parent = Elevated.Run(() => Worf.ReadScalar<string?>("SELECT node_name::text FROM worf.node WHERE node_id = $1",
                 SpiParameter.Create(grantor))) ?? grantor.ToString(CultureInfo.InvariantCulture);
-            string waitingFor = $"waiting for node {parent}, which granted sequence {sequence}'s block, to answer this server since it started";
+            string waitingFor = $"waiting for node {parent}, which granted sequence {sequence}'s block, to answer this server since it started" +
+                (unnamed ? ", as worf can't tell which sequence the call of nextval draws from before it runs" : "");
             using PgErrorContext context = PgErrorContext.Push(Worf.Shown(waitingFor));
             List<uint> held = LetGates();
             try
@@ -697,9 +877,14 @@ internal static partial class SequenceRangeGuard
                     long now = Worker.GetCurrentTimestamp();
                     if (now >= deadline)
                     {
-                        throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState,
-                            $"sequence {sequence} can't draw from the block node {parent} granted it until node {parent} answers this server, which started since",
-                            hint: $"Make sure node {parent} is up and its exchanges with this node succeed.");
+                        throw unnamed
+                            ? new PgException(PgSqlStates.ObjectNotInPrerequisiteState,
+                                $"nextval can't draw until node {parent}, which granted sequence {sequence}'s block, answers this server, which started since",
+                                detail: "worf can't tell which sequence the call draws from before it runs, as for a name computed as it runs or a PL/pgSQL expression's call, so the call waits for every grantor this server hasn't heard from.",
+                                hint: $"Make sure node {parent} is up and its exchanges with this node succeed, or name the sequence in the statement.")
+                            : new PgException(PgSqlStates.ObjectNotInPrerequisiteState,
+                                $"sequence {sequence} can't draw from the block node {parent} granted it until node {parent} answers this server, which started since",
+                                hint: $"Make sure node {parent} is up and its exchanges with this node succeed.");
                     }
 
                     if (now - woken >= 1_000_000)
@@ -2157,6 +2342,7 @@ internal static partial class SequenceRangeGuard
         s_sequences.Clear();
         s_grantors.Clear();
         s_drawnBy.Clear();
+        s_drawingColumns.Clear();
         s_reservedActive.Clear();
         s_moved.Clear();
         s_reached.Clear();
@@ -2175,7 +2361,7 @@ internal static partial class SequenceRangeGuard
         WorfRows result = Elevated.Run(() => Worf.SelectCatalog("""
             SELECT r.seqoid::oid, s.seqincrement > 0, b.lo, b.hi, b.state,
                 b.node_id = l.node_id AND b.sysid = $1 AND b.timeline = $2, b.reserved,
-                CASE WHEN b.from_node = r.parent_node AND b.from_node <> l.node_id THEN b.from_node END
+                CASE WHEN b.from_node <> l.node_id AND EXISTS (SELECT 1 FROM worf.node n WHERE n.node_id = b.from_node) THEN b.from_node END
             FROM worf.sequence_range r
                 JOIN pg_catalog.pg_sequence s ON s.seqrelid = r.seqoid
                 CROSS JOIN worf.local_node l

@@ -1,7 +1,7 @@
 namespace Worf;
 
 /// <summary>
-/// The header of the shared table of prepared transactions whose COMMIT PREPARED wakes managers.
+/// The header of the shared table of prepared transactions whose end wakes managers.
 /// </summary>
 internal struct WorfPreparedTable
 {
@@ -9,4 +9,9 @@ internal struct WorfPreparedTable
     /// The number of entries in use.
     /// </summary>
     public int Used;
+
+    /// <summary>
+    /// When the table started, with this server's shared memory.
+    /// </summary>
+    public long StartedAt;
 }
