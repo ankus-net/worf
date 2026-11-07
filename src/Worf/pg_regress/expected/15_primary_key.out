@@ -260,16 +260,18 @@ BEGIN
 	END LOOP;
 END;
 $$;
-SELECT data::json->'action' as action, CASE WHEN data::json->>'action' IN ('I', 'D', 'U') THEN json_extract_path(data::json, 'relation') END as data FROM pg_logical_slot_get_changes((SELECT slot_name FROM pg_replication_slots), NULL, 1, 'min_proto_version', '1', 'max_proto_version', '1', 'startup_params_format', '1', 'proto_format', 'json', 'worf.replication_set_names', 'default,ddl_sql');
+-- Other transactions may commit in this database meanwhile, which the slot carries too: it is read up to the end of
+-- the transaction that queued the DDL the subscriber failed to apply, and then for any change left, showing only row
+-- changes.
+WITH c AS (SELECT lsn, xid::text AS xid, data::json AS d FROM pg_logical_slot_peek_changes((SELECT slot_name FROM pg_replication_slots), NULL, NULL, 'min_proto_version', '1', 'max_proto_version', '1', 'startup_params_format', '1', 'proto_format', 'json', 'worf.replication_set_names', 'default,ddl_sql')) SELECT lsn AS queued_end FROM c WHERE d->>'action' = 'C' AND xid IN (SELECT xid FROM c WHERE d->>'action' = 'I' AND d#>>'{relation,1}' = 'queue') ORDER BY lsn LIMIT 1
+\gset
+SELECT data::json->'action' as action, json_extract_path(data::json, 'relation') as data FROM pg_logical_slot_get_changes((SELECT slot_name FROM pg_replication_slots), :'queued_end', NULL, 'min_proto_version', '1', 'max_proto_version', '1', 'startup_params_format', '1', 'proto_format', 'json', 'worf.replication_set_names', 'default,ddl_sql') WHERE data::json->>'action' IN ('I', 'D', 'U');
  action |       data       
 --------+------------------
- "S"    | 
- "B"    | 
  "I"    | ["worf","queue"]
- "C"    | 
-(4 rows)
+(1 row)
 
-SELECT data::json->'action' as action, CASE WHEN data::json->>'action' IN ('I', 'D', 'U') THEN data END as data FROM pg_logical_slot_get_changes((SELECT slot_name FROM pg_replication_slots), NULL, 1, 'min_proto_version', '1', 'max_proto_version', '1', 'startup_params_format', '1', 'proto_format', 'json', 'worf.replication_set_names', 'default,ddl_sql');
+SELECT data::json->'action' as action, data FROM pg_logical_slot_get_changes((SELECT slot_name FROM pg_replication_slots), NULL, NULL, 'min_proto_version', '1', 'max_proto_version', '1', 'startup_params_format', '1', 'proto_format', 'json', 'worf.replication_set_names', 'default,ddl_sql') WHERE data::json->>'action' IN ('I', 'D', 'U');
  action | data 
 --------+------
 (0 rows)

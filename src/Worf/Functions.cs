@@ -98,7 +98,7 @@ internal static class Functions
                 // Also drop all the slots associated with the node.
                 try
                 {
-                    _ = Spi.Select("SELECT pg_catalog.pg_drop_replication_slot(slot_name)" +
+                    _ = Worf.Select("SELECT pg_catalog.pg_drop_replication_slot(slot_name)" +
                         "  FROM pg_catalog.pg_replication_slots" +
                         " WHERE plugin = 'worf'" +
                         "   AND database = current_database()" +
@@ -221,10 +221,10 @@ internal static class Functions
 
         return PgHeapTuple.Create(
             ("node_id", SpiParameter.Create(node.Node.Id)),
-            ("node_name", SpiParameter.Create(node.Node.Name)),
+            ("node_name", Worf.TextParameter(node.Node.Name)),
             ("sysid", SpiParameter.Create(sysid.ToString(CultureInfo.InvariantCulture))),
-            ("dbname", SpiParameter.Create(Spi.ExecuteScalar<string>("SELECT pg_catalog.current_database()::text"))),
-            ("replication_sets", SpiParameter.Create(ReplicationSet.StringlistToIdentifierstr(repsets.Select(static repset => repset.Name)))));
+            ("dbname", Worf.TextParameter(Worf.ReadScalar<string>("SELECT pg_catalog.current_database()::text"))),
+            ("replication_sets", Worf.TextParameter(ReplicationSet.StringlistToIdentifierstr(repsets.Select(static repset => repset.Name)))));
     }
 
     /// <summary>
@@ -269,7 +269,7 @@ internal static class Functions
 
         // Now, fetch info about remote node.
         WorfNode origin;
-        using (PgReplicationConnection conn = Worf.Connect(providerDsn, subName, "create"))
+        using (WorfConnection conn = Worf.Connect(providerDsn, subName, "create"))
         {
             (uint nodeId, string nodeName, _, _, _) = Rpc.RemoteNodeInfo(conn);
             origin = new WorfNode { Id = nodeId, Name = nodeName };
@@ -355,7 +355,38 @@ internal static class Functions
             ForceTextTransfer = forceTextTransfer,
         };
 
+        // Names that differ only in characters a slot's name can't hold, or in its end, can give the same slot, and
+        // replication origin, which two subscriptions can't share: neither can a subscription of another database of
+        // the cluster, whose replication origins this one's share, nor a replication origin left of that name, which
+        // the subscription would take as its own progress.
+        if (Worf.ReadScalar<string?>("SELECT sub_name::text FROM worf.subscription WHERE sub_slot_name = $1::name", SpiParameter.Create(sub.SlotName))
+            is string sharing)
+        {
+            throw new PgException(PgSqlStates.DuplicateObject,
+                $"subscription \"{subName}\" would use slot \"{sub.SlotName}\", which subscription \"{sharing}\" uses",
+                hint: "Choose a subscription name that differs in letters, digits or underscores.");
+        }
+
+        // An origin this transaction created is the caller's to start the subscription from, as worf_create_subscriber
+        // creates it at the position its restore point reached.
+        if (Worf.ReadScalar<uint?>("SELECT xmin::text::pg_catalog.int8::pg_catalog.oid FROM pg_catalog.pg_replication_origin WHERE roname = $1",
+            SpiParameter.Create(sub.SlotName)) is uint creator && !CreatedHere(creator))
+        {
+            throw new PgException(PgSqlStates.DuplicateObject,
+                $"subscription \"{subName}\" would use replication origin \"{sub.SlotName}\", which already exists",
+                detail: "Another database's subscription may use it, or it was left behind.",
+                hint: "Choose a subscription name that differs in letters, digits or underscores, or drop the origin with pg_replication_origin_drop if nothing uses it. An origin created in the same transaction as the subscription is taken as its own.");
+        }
+
         WorfNode.CreateSubscription(sub);
+
+        // The subscription's replication origin is made now, rather than once its worker has made the slot, so that a
+        // subscription of another database whose slot's name comes out the same, as names joined with underscores that
+        // hold underscores can, finds it and is refused, whatever the first's worker is waiting for.
+        if (PgReplicationOrigin.Find(sub.SlotName) is null)
+        {
+            _ = WorfNode.CreateOrigin(sub.SlotName, origin.Id, sub.Id);
+        }
 
         // Create synchronization status for the subscription.
         Sync.CreateLocalSyncStatus(new WorfSyncStatus
@@ -387,8 +418,13 @@ internal static class Functions
         {
             WorfLocalNode node = WorfNode.GetLocalNode(true, false)!;
 
-            // First drop the status.
+            // First drop the status, after noting the slots its tables' syncs create, which may be left on the provider.
+            List<string> syncSlotNames = Sync.SyncSlotNames(sub);
+            WorfRows recordedSyncSlots = Worf.Read("SELECT slot_name::text FROM worf.sync_slot WHERE sub_id = $1 ORDER BY 1", 0,
+                SpiParameter.Create(sub.Id));
+            string syncSlotsLeft = string.Join(", ", recordedSyncSlots.Select(row => $"\"{row.Get<string>(0)}\""));
             Sync.DropSubscriptionSyncStatus(sub.Id);
+            _ = Worf.Execute("DELETE FROM worf.sync_slot WHERE sub_id = $1", SpiParameter.Create(sub.Id));
 
             // Drop the actual subscription.
             WorfNode.DropSubscription(sub.Id);
@@ -401,12 +437,17 @@ internal static class Functions
                 return BoolDatum(true);
             }
 
-            // If the provider node record existed only for the dropped, subscription, it should be dropped as well.
+            // If the provider node record existed only for the dropped, subscription, it should be dropped as well,
+            // along with the fences its DDL kept here, since nothing would bring the DDL.
             if (WorfNode.GetNodeSubscriptions(sub.Origin.Id, true).Count == 0)
             {
+                DdlLock.ForgetOrigin(sub.Origin.Id);
                 WorfNode.DropNodeInterfaces(sub.Origin.Id);
                 WorfNode.DropNode(sub.Origin.Id);
             }
+
+            // Sequence range fences no longer wait on the provider, unless it still calls this node.
+            SequenceRanges.ForgetNeighbor(sub.Origin.Id);
 
             uint myDatabaseId;
             unsafe
@@ -414,43 +455,48 @@ internal static class Functions
                 myDatabaseId = NativeGlobals.MyDatabaseId;
             }
 
-            // Kill the apply to unlock the resources.
+            // Kill the apply and table sync workers to unlock the resources.
             using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
             {
-                int apply = guard.Read((in _, workers) => Worker.ApplyFind(workers, myDatabaseId, sub.Id));
-                Worker.WorkerKill(guard, apply);
+                foreach (int worker in RunningSubscriptionWorkers(guard, myDatabaseId, sub.Id))
+                {
+                    Worker.WorkerKill(guard, worker);
+                }
             }
 
-            // Wait for the apply to die. It looks for the request to stop between statements, so an apply that waits on
-            // a row this transaction deleted, as one that is initializing the subscription does, never sees it until
-            // its statement is cancelled. Only an apply this transaction blocks is cancelled: it can't exit before this
-            // transaction ends, so it's still there to cancel. A cancellation is no error of the data, so
-            // exception_behaviour leaves it be.
+            // Wait for them to die. They look for the request to stop between statements, so an apply that waits on a
+            // row this transaction deleted, as one that is initializing the subscription does, never sees it until its
+            // statement is cancelled. Only an apply this transaction blocks is cancelled: it can't exit before this
+            // transaction ends, so it's still there to cancel. A table sync, whose copy can wait on any session's lock,
+            // is cancelled whatever it waits for, and its cleanup drops its slot. A cancellation is no error of the
+            // data, so exception_behaviour leaves it be.
             for (int waits = 0; ; waits++)
             {
-                int pid = 0;
+                List<(int Pid, bool Sync)> pids = [];
                 using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
                 {
-                    int apply = guard.Read((in _, workers) => Worker.ApplyFind(workers, myDatabaseId, sub.Id));
-                    if (apply >= 0 && guard[apply].Proc != 0)
+                    foreach (int worker in RunningSubscriptionWorkers(guard, myDatabaseId, sub.Id))
                     {
                         unsafe
                         {
-                            pid = ((PGPROC*)guard[apply].Proc)->pid;
+                            pids.Add((((PGPROC*)guard[worker].Proc)->pid, guard[worker].WorkerType == WorfWorkerType.Sync));
                         }
                     }
                 }
 
-                if (pid == 0)
+                if (pids.Count == 0)
                 {
                     break;
                 }
 
                 if (waits > 0)
                 {
-                    _ = Elevated.Run(() => Spi.Execute(
-                        "SELECT pg_catalog.pg_cancel_backend($1) WHERE pg_catalog.pg_backend_pid() = ANY (pg_catalog.pg_blocking_pids($1))",
-                        SpiParameter.Create(pid)));
+                    foreach ((int pid, bool sync) in pids)
+                    {
+                        _ = Elevated.Run(() => Worf.Execute(
+                            "SELECT pg_catalog.pg_cancel_backend($1) WHERE $2 OR pg_catalog.pg_backend_pid() = ANY (pg_catalog.pg_blocking_pids($1))",
+                            SpiParameter.Create(pid), SpiParameter.Create(sync)));
+                    }
                 }
 
                 PgInterrupts.Check();
@@ -460,38 +506,87 @@ internal static class Functions
                 Worker.WaitLatch(OperatingSystem.IsWindows() ? 200 : 1000);
             }
 
-            // Drop the slot on remote side.
+            // Drop the slot on remote side, and those its table syncs left.
             //
+            bool shared = Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.subscription WHERE sub_slot_name = $1::name AND sub_id <> $2)",
+                SpiParameter.Create(sub.SlotName), SpiParameter.Create(sub.Id));
+            if (shared)
+            {
+                WorfLog.Warning($"subscription \"{sub.Name}\" shares slot \"{sub.SlotName}\" with another subscription, which keeps it and its replication origin");
+            }
+
             // Note, we can't fail here since we can't assume that the remote node is still reachable or even alive.
             try
             {
                 PgTransaction.RunInSubtransaction(() =>
                 {
-                    using PgReplicationConnection originConn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "cleanup");
+                    using WorfConnection originConn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "cleanup");
 
-                    // The walsender of the apply that just exited can hold the slot a moment longer, as when it is
-                    // still finishing a large transaction. Wait for it, as the apply does when it starts.
+                    // The walsenders of the workers that just exited can hold the slots a moment longer, as when one is
+                    // still finishing a large transaction. Wait for them, as the apply does when it starts.
                     long deadline = Worker.GetCurrentTimestamp() + 5000000L;
+                    List<string> syncSlots;
+                    while ((syncSlots = Sync.DropSyncSlots(originConn, syncSlotNames, new HashSet<string>())).Count > 0 &&
+                        Worker.GetCurrentTimestamp() < deadline)
+                    {
+                        PgInterrupts.Check();
+                        Worker.WaitLatch(50);
+                    }
+
+                    if (syncSlots.Count > 0)
+                    {
+                        WorfLog.Warning($"could not drop slots {string.Join(", ", syncSlots.Select(slot => $"\"{slot}\""))} on provider, you will probably have to drop them manually");
+                    }
+
                     while (Worker.GetCurrentTimestamp() < deadline && Rpc.RemoteSlotActive(originConn, sub.SlotName))
                     {
                         PgInterrupts.Check();
                         Worker.WaitLatch(50);
                     }
 
-                    Rpc.DropRemoteSlot(originConn, sub.SlotName);
+                    SequenceRangeExchange.Leave(originConn, node, sub);
+                    if (!shared)
+                    {
+                        Rpc.DropRemoteSlot(originConn, sub.SlotName);
+                    }
                 });
             }
             catch (PgException)
             {
-                PgLog.Warning($"could not drop slot \"{sub.SlotName}\" on provider, you will probably have to drop it manually");
+                WorfLog.Warning($"could not drop slot \"{sub.SlotName}\" on provider, you will probably have to drop it manually" +
+                    (syncSlotsLeft.Length == 0 ? "" : $", and those its table syncs may have left, {syncSlotsLeft}") +
+                    ". Its sequence range fences wait for this node's reports: delete this node's rows in worf.sequence_range_link there while it has no fence up, so that later ones don't, and one that is up waits until this node subscribes again and reports, or worf.activate_sequence_range naming this node stops the wait for it, which reissues any values this node holds that the provider lost");
             }
 
-            // Drop the origin tracking locally.
-            WorfNode.DropOrigins(sub.SlotName);
+            // Drop the origin tracking locally, unless another subscription made before names were told apart shares it.
+            if (!shared)
+            {
+                WorfNode.DropOrigins(sub.SlotName);
+            }
         }
 
         return BoolDatum(sub is not null);
     }
+
+    /// <summary>
+    /// Lists a subscription's apply and table sync workers that have a process. The caller holds the lock exclusively.
+    /// </summary>
+    private static List<int> RunningSubscriptionWorkers(PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard, uint dboid, uint subId)
+        => guard.Read((in _, workers) =>
+        {
+            List<int> found = Worker.SyncFindAll(workers, dboid, subId);
+            found.Add(Worker.ApplyFind(workers, dboid, subId));
+            List<int> running = [];
+            for (int i = 0; i < found.Count; i++)
+            {
+                if (found[i] >= 0 && workers[found[i]].Proc != 0)
+                {
+                    running.Add(found[i]);
+                }
+            }
+
+            return running;
+        });
 
     /// <summary>
     /// Disable subscription.
@@ -658,7 +753,7 @@ internal static class Functions
 
         // Read table list from provider.
         List<WorfRemoteRel> remoteTables;
-        using (PgReplicationConnection conn = Worf.Connect(sub.OriginIf.Dsn, subName, "sync"))
+        using (WorfConnection conn = Worf.Connect(sub.OriginIf.Dsn, subName, "sync"))
         {
             remoteTables = Rpc.GetRemoteRepsetTables(conn, sub.ReplicationSets);
         }
@@ -722,16 +817,21 @@ internal static class Functions
 
         using (PgRelation rel = PgRelation.Open(Oid(relation), PgLockMode.AccessShare))
         {
-            nspname = rel.NamespaceName;
-            relname = rel.Name;
+            unsafe
+            {
+                nspname = Worf.FromServer(NativeMethods.get_namespace_name(NativeMethods.get_rel_namespace(rel.Oid)));
+                relname = Worf.FromServer(NativeMethods.get_rel_name(rel.Oid));
+            }
 
             // Reset sync status of the table.
             WorfSyncStatus? oldsync = Sync.GetTableSyncStatus(sub.Id, nspname, relname, true);
             if (oldsync is not null)
             {
+                // A sync that keeps failing, whose worker waits to start again, starts over at once.
                 if (oldsync.Status != Sync.SyncStatusReady &&
                     oldsync.Status != Sync.SyncStatusSyncdone &&
-                    oldsync.Status != Sync.SyncStatusNone)
+                    oldsync.Status != Sync.SyncStatusNone &&
+                    SyncWorkerRuns(sub.Id, nspname, relname))
                 {
                     throw new PgException(PgSqlStates.InternalError, $"table {nspname}.{relname} is already being synchronized");
                 }
@@ -766,6 +866,24 @@ internal static class Functions
         Worker.SubscriptionChanged(sub.Id, false);
 
         return true;
+    }
+
+    /// <summary>
+    /// Checks whether a table's sync worker runs.
+    /// </summary>
+    private static bool SyncWorkerRuns(uint subId, string nspname, string relname)
+    {
+        uint dboid;
+        unsafe
+        {
+            dboid = NativeGlobals.MyDatabaseId;
+        }
+
+        byte[] serverNspname = Worf.ToServer(nspname);
+        byte[] serverRelname = Worf.ToServer(relname);
+        using PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share();
+        int worker = guard.Read((in _, workers) => Worker.SyncFind(workers, dboid, subId, serverNspname, serverRelname));
+        return worker >= 0 && guard[worker].Proc != 0;
     }
 
     /// <summary>
@@ -811,8 +929,8 @@ internal static class Functions
         string syncStatus = sync is not null ? SyncStatusToString(sync.Status) : "unknown";
 
         return PgHeapTuple.Create(
-            ("nspname", SpiParameter.Create(nspname)),
-            ("relname", SpiParameter.Create(relname)),
+            ("nspname", Worf.TextParameter(nspname)),
+            ("relname", Worf.TextParameter(relname)),
             ("status", SpiParameter.Create(syncStatus)));
     }
 
@@ -875,13 +993,13 @@ internal static class Functions
             }
 
             rows.Add(PgHeapTuple.Create(
-                ("subscription_name", SpiParameter.Create(sub.Name)),
+                ("subscription_name", Worf.TextParameter(sub.Name)),
                 ("status", SpiParameter.Create(status)),
-                ("provider_node", SpiParameter.Create(sub.Origin.Name)),
-                ("provider_dsn", SpiParameter.Create(sub.OriginIf.Dsn)),
-                ("slot_name", SpiParameter.Create(sub.SlotName)),
-                ("replication_sets", SpiParameter.Create<string[]?>(sub.ReplicationSets.Count > 0 ? [.. sub.ReplicationSets] : null)),
-                ("forward_origins", SpiParameter.Create<string[]?>(sub.ForwardOrigins.Count > 0 ? [.. sub.ForwardOrigins] : null))));
+                ("provider_node", Worf.TextParameter(sub.Origin.Name)),
+                ("provider_dsn", Worf.TextParameter(sub.OriginIf.Dsn)),
+                ("slot_name", Worf.TextParameter(sub.SlotName)),
+                ("replication_sets", Worf.TextArrayParameter(sub.ReplicationSets.Count > 0 ? [.. sub.ReplicationSets] : null)),
+                ("forward_origins", Worf.TextArrayParameter(sub.ForwardOrigins.Count > 0 ? [.. sub.ForwardOrigins] : null))));
         }
 
         return rows;
@@ -1042,7 +1160,7 @@ internal static class Functions
                 if (attnum < 0)
                 {
                     throw new PgException(PgSqlStates.SyntaxError,
-                        $"table {Spi.QuoteQualifiedIdentifier(nspname, relname)} does not have column {attname}");
+                        $"table {Worf.QuoteQualifiedIdentifier(nspname, relname)} does not have column {attname}");
                 }
 
                 idattrs = NativeMethods.bms_del_member(idattrs, attnum - ReplicationSet.FirstLowInvalidHeapAttributeNumber);
@@ -1214,6 +1332,16 @@ internal static class Functions
             _ = ReplicationSet.GetReplicationSetByName(node.Node.Id, setname, false);
         }
 
+        // Apply runs the command in its own transaction, so the command can neither end nor split the transaction.
+        List* statements = NativeMethods.raw_parser(Worf.PStrDup(command), RawParseMode.RAW_PARSE_DEFAULT);
+        for (int i = 0; statements is not null && i < statements->length; i++)
+        {
+            if (((RawStmt*)statements->elements[i].ptr_value)->stmt->type == NodeTag.T_TransactionStmt)
+            {
+                throw new PgException(PgSqlStates.InvalidTransactionTermination, "replicate_ddl_command cannot run transaction control statements");
+            }
+        }
+
         int saveNestlevel = NativeMethods.NewGUCNestLevel();
 
         // Force everything in the query to be fully qualified.
@@ -1232,15 +1360,19 @@ internal static class Functions
         uint userId = NativeMethods.GetUserId();
         Queue.QueueMessage(replicationSetList, userId, Queue.QueueCommandTypeSql, cmd.ToString());
 
-        // Execute the query locally, which the queued command replicates.
+        // Execute the query locally, which the queued command replicates, with the indexes on this node alone out of its
+        // way, as every node runs it, so that each chooses the same names and none copies or uses those indexes.
+        string role = Worf.FromServer(NativeMethods.GetUserNameFromId(userId, false));
         DdlReplication.Suppressed = true;
+        LocalIndex.Applying = true;
         try
         {
-            Apply.ExecuteSqlCommand(command, Worf.FromServer(NativeMethods.GetUserNameFromId(userId, false)), false);
+            Apply.ExecuteSqlCommand(command, role, false, applying: false);
         }
         finally
         {
             DdlReplication.Suppressed = false;
+            LocalIndex.Applying = false;
         }
 
         // Restore the GUC variables we set above.
@@ -1333,14 +1465,50 @@ internal static class Functions
 
         PgHeapTuple result = PgHeapTuple.Create(
             ("relid", SpiParameter.Create(rel->rd_id)),
-            ("nspname", SpiParameter.Create(nspname)),
-            ("relname", SpiParameter.Create(relname)),
-            ("att_list", SpiParameter.Create(attList.ToArray())),
+            ("nspname", Worf.TextParameter(nspname)),
+            ("relname", Worf.TextParameter(relname)),
+            ("att_list", Worf.TextArrayParameter([.. attList])),
             ("has_row_filter", SpiParameter.Create(tableinfo.RowFilter.Count > 0)));
 
         NativeMethods.table_close(rel, (int)PgLockMode.None);
 
         return result;
+    }
+
+    /// <summary>
+    /// Returns the type each column of a table's values are sent in, as RELATION messages name them, so that a
+    /// subscriber's initial copy converts them as replication does.
+    /// </summary>
+    [PgFunction(SetMode = PgSetMode.Materialize, Sql = """
+        CREATE FUNCTION worf.show_table_column_types(relation regclass, OUT attname text, OUT type_oid oid,
+        	OUT type_nspname text, OUT type_name text, OUT type_definition text)
+        RETURNS SETOF record STRICT STABLE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
+        """)]
+    internal static unsafe IEnumerable<PgHeapTuple?> ShowTableColumnTypes(
+        [PgSqlType("regclass", Schema = "pg_catalog")] PgDatum relation)
+    {
+        RelationData* rel = NativeMethods.table_open(Oid(relation), (int)PgLockMode.AccessShare);
+        TupleDescData* reldesc = rel->rd_att;
+        List<PgHeapTuple?> rows = [];
+        for (int i = 0; i < reldesc->natts; i++)
+        {
+            FormData_pg_attribute* att = NativeMethods.TupleDescAttr(reldesc, i);
+            if (att->attisdropped)
+            {
+                continue;
+            }
+
+            WorfRemoteType type = ProtoNative.ColumnType(att->atttypid);
+            rows.Add(PgHeapTuple.Create(
+                ("attname", Worf.TextParameter(Worf.FromServer((sbyte*)&att->attname))),
+                ("type_oid", SpiParameter.Create(type.Oid)),
+                ("type_nspname", Worf.TextParameter(type.Nspname)),
+                ("type_name", Worf.TextParameter(type.Typname)),
+                ("type_definition", Worf.TextParameter(type.Definition))));
+        }
+
+        NativeMethods.table_close(rel, (int)PgLockMode.None);
+        return rows;
     }
 
     /// <summary>
@@ -1390,7 +1558,9 @@ internal static class Functions
         EState* estate = Executor.CreateEstateForRelation(rel, false);
         ExprContext* econtext = Executor.PreparePerTupleEcontext(estate, reltupdesc);
 
-        // Prepare the row filter expression.
+        // Prepare the row filter expression. The filters are prepared, which inlines the SQL functions they call, and
+        // run under the path the database and role set, as the WAL sender's are.
+        int nestLevel = Worf.DefaultSearchPath();
         List<nint> rowFilterList = [];
         foreach (nint rowFilter in tableinfo.RowFilter)
         {
@@ -1407,25 +1577,32 @@ internal static class Functions
         ulong* values = (ulong*)NativeMethods.palloc((ulong)(reltupdesc->natts * sizeof(ulong)));
         bool* nulls = (bool*)NativeMethods.palloc((ulong)reltupdesc->natts);
 
-        HeapTupleData* htup;
-        while ((htup = NativeMethods.heap_getnext(scandesc, ScanDirection.ForwardScanDirection)) is not null)
+        try
         {
-            // Create a new version of our current HeapTuple. We can't just reuse the current one since it might be
-            // possible that not every current attribute is correctly filled (e.g when atthasmissing is true).
-            NativeMethods.heap_deform_tuple(htup, reltupdesc, values, nulls);
-            HeapTupleData* newHtup = NativeMethods.heap_form_tuple(reltupdesc, values, nulls);
-
-            if (!FilterTuple(newHtup, econtext, rowFilterList))
+            HeapTupleData* htup;
+            while ((htup = NativeMethods.heap_getnext(scandesc, ScanDirection.ForwardScanDirection)) is not null)
             {
-                continue;
+                // Create a new version of our current HeapTuple. We can't just reuse the current one since it might
+                // be possible that not every current attribute is correctly filled (e.g when atthasmissing is true).
+                NativeMethods.heap_deform_tuple(htup, reltupdesc, values, nulls);
+                HeapTupleData* newHtup = NativeMethods.heap_form_tuple(reltupdesc, values, nulls);
+
+                if (!FilterTuple(newHtup, econtext, rowFilterList))
+                {
+                    continue;
+                }
+
+                MemoryContextData* old = NativeGlobals.CurrentMemoryContext;
+                NativeGlobals.CurrentMemoryContext = (MemoryContextData*)owner.DangerousGetPointer();
+                ulong datum = NativeMethods.heap_copy_tuple_as_datum(newHtup, reltupdesc);
+                NativeGlobals.CurrentMemoryContext = old;
+
+                rows.Add(new PgAnyElement(PgDatum.DangerousCreate((nuint)datum, rel->rd_rel->reltype, owner)));
             }
-
-            MemoryContextData* old = NativeGlobals.CurrentMemoryContext;
-            NativeGlobals.CurrentMemoryContext = (MemoryContextData*)owner.DangerousGetPointer();
-            ulong datum = NativeMethods.heap_copy_tuple_as_datum(newHtup, reltupdesc);
-            NativeGlobals.CurrentMemoryContext = old;
-
-            rows.Add(new PgAnyElement(PgDatum.DangerousCreate((nuint)datum, rel->rd_rel->reltype, owner)));
+        }
+        finally
+        {
+            Worf.UnpinSearchPath(nestLevel);
         }
 
         NativeMethods.pfree(values);
@@ -1541,9 +1718,12 @@ internal static class Functions
 
     /// <summary>
     /// Generate slot name (used also for origin identifier). The current format is
-    /// <c>worf_&lt;subscriber database name&gt;_&lt;provider node name&gt;_&lt;subscription name&gt;</c>. Note that
-    /// we want to leave enough free space for 8 bytes of suffix which in practice means 9 bytes including the
-    /// underscore.
+    /// <c>worf_&lt;subscriber database name&gt;_&lt;provider node name&gt;_&lt;subscription name&gt;</c>, at most 54
+    /// bytes, which leaves room in a 63-byte name for a table sync's suffix of an underscore and 8 hex digits. The
+    /// <c>worf_</c> prefix is a byte longer than pglogical's <c>pgl_</c>, so the database's name takes 15 bytes at
+    /// most, rather than 16. A name that a slot's characters can't hold whole, as one with a capital or a hyphen, is
+    /// written with an underscore for each such character and a hash of the whole name after, as a name too long is,
+    /// so that names that differ, as those of a cluster's databases do, give slots and replication origins that differ.
     /// </summary>
     /// <param name="dbname">The subscriber's database.</param>
     /// <param name="providerNode">The provider node's name.</param>
@@ -1552,25 +1732,51 @@ internal static class Functions
     internal static string GenSlotName(string dbname, string providerNode, string subscriptionName)
     {
         List<byte> name = [.. "worf_"u8];
-        name.AddRange(Worf.ShortenHash(Worf.ToServer(dbname), 16));
+        name.AddRange(SlotNamePart(Worf.ToServer(dbname), 15));
         name.Add((byte)'_');
-        name.AddRange(Worf.ShortenHash(Worf.ToServer(providerNode), 16));
+        name.AddRange(SlotNamePart(Worf.ToServer(providerNode), 16));
         name.Add((byte)'_');
-        name.AddRange(Worf.ShortenHash(Worf.ToServer(subscriptionName), 16));
-        if (name.Count > 63)
-        {
-            name.RemoveRange(63, name.Count - 63);
-        }
+        name.AddRange(SlotNamePart(Worf.ToServer(subscriptionName), 16));
+        char[] slot = [.. name.Select(b => (char)b)];
 
-        // Replace all the invalid characters in slot name with underscore.
-        char[] slot = new char[name.Count];
-        for (int i = 0; i < name.Count; i++)
+        // A name that ends as a table sync's slot's does, an underscore and eight hex digits, would be taken for another
+        // subscription's, whose cleanup drops it, so its last character becomes an underscore.
+        if (slot.Length >= 9 && slot[^9] == '_' && Array.TrueForAll(slot[^8..], char.IsAsciiHexDigitLower))
         {
-            byte cp = name[i];
-            slot[i] = (cp >= 'a' && cp <= 'z') || (cp >= '0' && cp <= '9') || cp == '_' ? (char)cp : '_';
+            slot[^1] = '_';
         }
 
         return new string(slot);
+    }
+
+    // Whether a transaction is this one, or one of its subtransactions.
+    private static bool CreatedHere(uint xid)
+    {
+        unsafe
+        {
+            return NativeMethods.TransactionIdIsCurrentTransactionId(xid);
+        }
+    }
+
+    /// <summary>
+    /// Writes one of the names a slot's name is made of in the characters a slot's name holds, lowercase letters,
+    /// digits and underscores, in at most a number of bytes: as it is, shortened with a hash when it's too long, or
+    /// with an underscore for each other character and a hash of the whole name after. A name that's written as it
+    /// is never ends as one with a hash does, in seven hex digits after at most the bytes a hash leaves before them;
+    /// such a name is written with a hash of its own, so that it can't give the part another name's hash gives.
+    /// </summary>
+    private static byte[] SlotNamePart(byte[] part, int maxlen)
+    {
+        static bool Held(byte c) => c is (>= (byte)'a' and <= (byte)'z') or (>= (byte)'0' and <= (byte)'9') or (byte)'_';
+        static bool Hex(byte c) => c is (>= (byte)'a' and <= (byte)'f') or (>= (byte)'0' and <= (byte)'9');
+        bool hashedLike = part.Length >= 7 && part.Length <= maxlen - 1 && Array.TrueForAll(part[^7..], Hex);
+        if (Array.TrueForAll(part, Held) && !hashedLike)
+        {
+            return Worf.ShortenHash(part, maxlen);
+        }
+
+        byte[] held = [.. part.Take(maxlen - 8).Select(c => Held(c) ? c : (byte)'_')];
+        return [.. held, .. Encoding.ASCII.GetBytes(Worf.HashAny(part).ToString("x8", CultureInfo.InvariantCulture)[..7])];
     }
 
     /// <summary>
@@ -1612,13 +1818,7 @@ internal static class Functions
     /// node's block.
     /// </summary>
     private static void RejectManagedSequence(uint seqoid)
-    {
-        if (SequenceRanges.IsManaged(seqoid))
-        {
-            throw new PgException(PgSqlStates.InvalidParameterValue, "a sequence under range management can't replicate its state",
-                hint: "Range management keeps the nodes' values apart; disable it first.");
-        }
-    }
+        => SequenceRanges.RejectReplicatedState(seqoid);
 
     /// <summary>
     /// Returns a boolean as the oid that pglogical's drop_subscription returns it as.
@@ -1640,11 +1840,11 @@ internal static class Functions
         string relname = Worf.FromServer((sbyte*)&rel->rd_rel->relname);
 
         // Build fake query which includes the expression so that we can pass it to the parser.
-        string buf = $"SELECT {rowFilterStr} FROM {Spi.QuoteQualifiedIdentifier(nspname, relname)}";
+        string buf = $"SELECT {rowFilterStr} FROM {Worf.QuoteQualifiedIdentifier(nspname, relname)}";
 
         // Parse it, providing proper error context, without the position in the fake query.
         List* rawParsetreeList = null;
-        using (PgErrorContext.Push($"invalid row_filter expression \"{rowFilterStr}\""))
+        using (PgErrorContext.Push(Worf.Shown($"invalid row_filter expression \"{rowFilterStr}\"")))
         {
             try
             {
@@ -1746,17 +1946,23 @@ internal static class Functions
             }
 
             // Only add logged relations which are not system relations (catalog, toast).
-            SpiResult relations = Spi.Select(
+            WorfRows relations = Worf.Select(
                 "SELECT c.oid, c.relname::text FROM pg_catalog.pg_class c WHERE c.relnamespace = $1 AND c.relkind = $2 " +
                 "AND c.relpersistence = 'p' AND c.oid >= 16384 ORDER BY c.relname",
                 SpiParameter.Create(nspoid), SpiParameter.Create((sbyte)relkind));
 
-            foreach (SpiRow reltup in relations)
+            foreach (WorfRow reltup in relations)
             {
                 uint reloid = reltup.Get<uint>(0);
-
                 if (existingRelations.Contains(reloid))
                 {
+                    continue;
+                }
+
+                // Each node's own blocks keep a managed sequence's values apart, so its state isn't replicated.
+                if (relkind == 'S' && SequenceRanges.IsManaged(reloid))
+                {
+                    WorfLog.Notice($"sequence {Worf.QuoteQualifiedIdentifier(nspname, reltup.Get<string>(1))} is left out, since it is under sequence range management");
                     continue;
                 }
 

@@ -5,7 +5,9 @@ namespace Worf;
 /// <summary>
 /// Runs worf's own catalog work as the bootstrap superuser from hooks and triggers that run with a user's permissions,
 /// in a security-restricted operation with the search path set to <c>pg_catalog, pg_temp</c>, so the user's objects
-/// can't take part. Settings changed inside are undone when it returns.
+/// can't take part. The work must run none of the user's functions, as PostgreSQL does for a table's partition key or
+/// index expressions once it reads them, or for an event trigger: work on a user's table runs as its owner, through
+/// <see cref="TableOwner"/>. Settings changed inside are undone when it returns.
 /// </summary>
 internal static unsafe class Elevated
 {
@@ -32,7 +34,7 @@ internal static unsafe class Elevated
         try
         {
             fixed (byte* name = Worf.ToServerCString("search_path"))
-            fixed (byte* value = Worf.ToServerCString("pg_catalog, pg_temp"))
+            fixed (byte* value = Worf.ToServerCString(Worf.PinnedSearchPath))
             {
                 _ = NativeMethods.set_config_option((sbyte*)name, (sbyte*)value, GucContext.PGC_USERSET, GucSource.PGC_S_SESSION,
                     GucAction.GUC_ACTION_SAVE, true, 0, false);

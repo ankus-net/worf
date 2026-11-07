@@ -4,7 +4,6 @@ using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
-using Npgsql;
 using Worf;
 using Worf.CreateSubscriber;
 
@@ -18,8 +17,11 @@ string pidFile = "";
 VerbosityLevel verbosity = VerbosityLevel.Normal;
 
 // Die closes these.
-NpgsqlConnection? subscriberConn = null;
-NpgsqlConnection? providerConn = null;
+LibpqConnection? subscriberConn = null;
+
+// The origin the subscriber's uncommitted transaction created, whose progress its rollback leaves behind.
+(string Name, int Id)? uncommittedOrigin = null;
+LibpqConnection? providerConn = null;
 
 string? remoteLsn;
 bool stop = false;
@@ -343,6 +345,9 @@ for (int dbnum = 0; dbnum < databaseList.Length; dbnum++)
 
     // Create the identifier which is setup with the position to which we already caught up using physical
     // replication.
+    // The origin, the node and the subscription are made in one transaction, so that the subscription takes the origin
+    // as its own, and its apply worker starts only once its sync status says it needs no copy.
+    _ = Query(subscriberConn, "BEGIN");
     PrintMsg(VerbosityLevel.Verbose, $"Creating replication origin for database {db}...\n");
     InitializeReplicationOrigin(subscriberConn, slotNames[dbnum], remoteLsn);
 
@@ -352,6 +357,16 @@ for (int dbnum = 0; dbnum < databaseList.Length; dbnum++)
 
     WorfSubscribe(subscriberConn, subscriberName, subConnstr, provConnstr, replicationSets, applyDelay,
         forceTextTransfer);
+    try
+    {
+        _ = Query(subscriberConn, "COMMIT");
+    }
+    catch (LibpqException error)
+    {
+        throw Die($"Could not commit the subscription, status PGRES_FATAL_ERROR: {error.Message}\n");
+    }
+
+    uncommittedOrigin = null;
 
     subscriberConn.Dispose();
     subscriberConn = null;
@@ -512,6 +527,11 @@ InvalidOperationException Die(string message)
 {
     Console.Error.Write(message);
 
+    if (subscriberConn is not null && uncommittedOrigin is (string name, int id))
+    {
+        ClearRolledBackOrigin(subscriberConn, name, id);
+    }
+
     subscriberConn?.Dispose();
     providerConn?.Dispose();
 
@@ -534,15 +554,19 @@ void PrintMsg(VerbosityLevel level, string message)
     }
 }
 
-NpgsqlConnection Connectdb(string connstr)
+LibpqConnection Connectdb(string connstr)
 {
     try
     {
         return Libpq.Connect(connstr);
     }
-    catch (Exception error) when (error is NpgsqlException or ArgumentException)
+    catch (LibpqException error)
     {
         throw Die($"Connection to database failed: {error.Message}, connection string was: {connstr}\n");
+    }
+    catch (DllNotFoundException error)
+    {
+        throw Die($"could not load libpq: {error.Message}\n");
     }
 }
 
@@ -641,7 +665,7 @@ bool CheckDataDir(string dataDir)
 }
 
 // Initialize replication slots.
-string InitializeReplicationSlot(NpgsqlConnection conn, string dbname, string providerNodeName,
+string InitializeReplicationSlot(LibpqConnection conn, string dbname, string providerNodeName,
     string subscriptionName, bool dropSlotIfExists)
 {
     // Generate the slot name.
@@ -651,9 +675,9 @@ string InitializeReplicationSlot(NpgsqlConnection conn, string dbname, string pr
         slotName = QueryValue(conn,
             $"SELECT worf.worf_gen_slot_name({EscapeLiteral(dbname)}, {EscapeLiteral(providerNodeName)}, {EscapeLiteral(subscriptionName)})")!;
     }
-    catch (NpgsqlException error)
+    catch (LibpqException error)
     {
-        throw Die($"Could generate slot name: {ErrorMessage(error)}");
+        throw Die($"Could generate slot name: {error.Message}");
     }
 
     // Check if the current slot exists.
@@ -662,9 +686,9 @@ string InitializeReplicationSlot(NpgsqlConnection conn, string dbname, string pr
     {
         exists = Query(conn, $"SELECT 1 FROM pg_catalog.pg_replication_slots WHERE slot_name = {EscapeLiteral(slotName)}").Count > 0;
     }
-    catch (NpgsqlException error)
+    catch (LibpqException error)
     {
-        throw Die($"Could not fetch existing slot information: {ErrorMessage(error)}");
+        throw Die($"Could not fetch existing slot information: {error.Message}");
     }
 
     // Drop the existing slot when asked for it or error if it already exists.
@@ -681,9 +705,9 @@ string InitializeReplicationSlot(NpgsqlConnection conn, string dbname, string pr
         {
             _ = Query(conn, $"SELECT pg_catalog.pg_drop_replication_slot({EscapeLiteral(slotName)})");
         }
-        catch (NpgsqlException error)
+        catch (LibpqException error)
         {
-            throw Die($"Could not drop existing slot {slotName}: {ErrorMessage(error)}");
+            throw Die($"Could not drop existing slot {slotName}: {error.Message}");
         }
     }
 
@@ -692,9 +716,9 @@ string InitializeReplicationSlot(NpgsqlConnection conn, string dbname, string pr
     {
         _ = Query(conn, $"SELECT pg_create_logical_replication_slot({EscapeLiteral(slotName)}, 'worf');");
     }
-    catch (NpgsqlException error)
+    catch (LibpqException error)
     {
-        throw Die($"Could not create replication slot, status PGRES_FATAL_ERROR: {ResultErrorMessage(error)}\n");
+        throw Die($"Could not create replication slot, status PGRES_FATAL_ERROR: {error.Message}\n");
     }
 
     return slotName;
@@ -702,7 +726,7 @@ string InitializeReplicationSlot(NpgsqlConnection conn, string dbname, string pr
 
 // Read replication info about remote connection.
 // TODO: unify with worf_remote_node_info in Rpc.
-RemoteInfo GetRemoteInfo(NpgsqlConnection conn)
+RemoteInfo GetRemoteInfo(LibpqConnection conn)
 {
     if (!ExtensionExists(conn, "worf"))
     {
@@ -714,9 +738,9 @@ RemoteInfo GetRemoteInfo(NpgsqlConnection conn)
     {
         res = Query(conn, "SELECT node_id, node_name, sysid, dbname, replication_sets FROM worf.worf_node_info()");
     }
-    catch (NpgsqlException error)
+    catch (LibpqException error)
     {
-        throw Die($"could not fetch remote node info: {ErrorMessage(error)}\n");
+        throw Die($"could not fetch remote node info: {error.Message}\n");
     }
 
     // No nodes found?
@@ -735,66 +759,100 @@ RemoteInfo GetRemoteInfo(NpgsqlConnection conn)
 }
 
 // Check if extension exists.
-bool ExtensionExists(NpgsqlConnection conn, string extname)
+bool ExtensionExists(LibpqConnection conn, string extname)
 {
     try
     {
         return Query(conn, $"SELECT 1 FROM pg_catalog.pg_extension WHERE extname = {EscapeLiteral(extname)};").Count == 1;
     }
-    catch (NpgsqlException error)
+    catch (LibpqException error)
     {
-        throw Die($"Could not read extension info: {ErrorMessage(error)}\n");
+        throw Die($"Could not read extension info: {error.Message}\n");
     }
 }
 
 // Create extension.
-void InstallExtension(NpgsqlConnection conn, string extname)
+void InstallExtension(LibpqConnection conn, string extname)
 {
     try
     {
         _ = Query(conn, $"CREATE EXTENSION IF NOT EXISTS {EscapeIdentifier(extname)};");
     }
-    catch (NpgsqlException error)
+    catch (LibpqException error)
     {
-        throw Die($"Could not install {extname} extension: {ErrorMessage(error)}\n");
+        throw Die($"Could not install {extname} extension: {error.Message}\n");
     }
 }
 
 // Clean all the data that was copied from remote node but we don't want it here (currently shared security labels
 // and replication identifiers).
-void RemoveUnwantedData(NpgsqlConnection conn)
+void RemoveUnwantedData(LibpqConnection conn)
 {
     // Remove replication identifiers.
     try
     {
         _ = Query(conn, "SELECT pg_replication_origin_drop(external_id) FROM pg_replication_origin_status;");
     }
-    catch (NpgsqlException error)
+    catch (LibpqException error)
     {
-        throw Die($"Could not remove existing replication origins: {ErrorMessage(error)}\n");
+        throw Die($"Could not remove existing replication origins: {error.Message}\n");
     }
 
+    // The copy's managed sequences would go on drawing from the source node's blocks once worf is gone, so each stops
+    // first, at the value worf's quarantine reserves, which no block holds; the new node joins them again under its own
+    // identity. worf isn't loaded here, so plain SQL does it.
     try
     {
+        _ = Query(conn, """
+            DO $$
+            DECLARE
+                s record;
+                lo bigint;
+                hi bigint;
+                edge bigint;
+            BEGIN
+                IF to_regclass('worf.sequence_range') IS NULL THEN
+                    RETURN;
+                END IF;
+
+                FOR s IN
+                    SELECT r.seqoid::regclass AS seq, q.seqincrement > 0 AS ascending, q.seqtypid::regtype::text AS type
+                    FROM worf.sequence_range r JOIN pg_catalog.pg_sequence q ON q.seqrelid = r.seqoid
+                LOOP
+                    lo := CASE s.type WHEN 'smallint' THEN -32768 WHEN 'integer' THEN -2147483648 ELSE -9223372036854775808 END;
+                    hi := CASE s.type WHEN 'smallint' THEN 32767 WHEN 'integer' THEN 2147483647 ELSE 9223372036854775807 END;
+                    IF s.ascending THEN
+                        hi := lo + 1;
+                        edge := hi;
+                    ELSE
+                        lo := hi - 1;
+                        edge := lo;
+                    END IF;
+
+                    EXECUTE format('ALTER SEQUENCE %s NO CYCLE CACHE 1 MINVALUE %s MAXVALUE %s START WITH %s RESTART WITH %s', s.seq, lo, hi, edge, edge);
+                    PERFORM pg_catalog.setval(s.seq, edge, true);
+                END LOOP;
+            END$$;
+            """);
         _ = Query(conn, "DROP EXTENSION worf CASCADE;");
     }
-    catch (NpgsqlException error)
+    catch (LibpqException error)
     {
-        throw Die($"Could not clean the worf extension, status PGRES_FATAL_ERROR: {ResultErrorMessage(error)}\n");
+        throw Die($"Could not clean the worf extension, status PGRES_FATAL_ERROR: {error.Message}\n");
     }
 }
 
 // Initialize new remote identifier to specific position.
-void InitializeReplicationOrigin(NpgsqlConnection conn, string originName, string? remoteLsn)
+void InitializeReplicationOrigin(LibpqConnection conn, string originName, string? remoteLsn)
 {
     string query = $"SELECT pg_replication_origin_create({EscapeLiteral(originName)})";
     try
     {
-        _ = Query(conn, query);
+        uncommittedOrigin = (originName, int.Parse(QueryValue(conn, query)!, CultureInfo.InvariantCulture));
     }
-    catch (NpgsqlException error)
+    catch (LibpqException error)
     {
-        throw Die($"Could not create replication origin \"{query}\": status PGRES_FATAL_ERROR: {ResultErrorMessage(error)}\n");
+        throw Die($"Could not create replication origin \"{query}\": status PGRES_FATAL_ERROR: {error.Message}\n");
     }
 
     if (remoteLsn is not null)
@@ -804,27 +862,60 @@ void InitializeReplicationOrigin(NpgsqlConnection conn, string originName, strin
         {
             _ = Query(conn, query);
         }
-        catch (NpgsqlException error)
+        catch (LibpqException error)
         {
-            throw Die($"Could not advance replication origin \"{query}\": status PGRES_FATAL_ERROR: {ResultErrorMessage(error)}\n");
+            throw Die($"Could not advance replication origin \"{query}\": status PGRES_FATAL_ERROR: {error.Message}\n");
         }
     }
 }
 
+// Rolls back the transaction that created an origin and clears the progress it gave it, which stays in shared memory
+// for the freed id, through a restart, and which an origin created next with the id would start from: origins take the
+// lowest free id, so ones created in turn reach it, and dropping one clears its id's progress.
+void ClearRolledBackOrigin(LibpqConnection conn, string originName, int id)
+{
+    try
+    {
+        _ = Query(conn, "ROLLBACK");
+        List<string> created = [];
+        try
+        {
+            for (int taken = 0; taken < id;)
+            {
+                string name = $"{originName}_cleared_{created.Count}";
+                taken = int.Parse(QueryValue(conn, $"SELECT pg_replication_origin_create({EscapeLiteral(name)})")!,
+                    CultureInfo.InvariantCulture);
+                created.Add(name);
+            }
+        }
+        finally
+        {
+            foreach (string name in created)
+            {
+                _ = Query(conn, $"SELECT pg_replication_origin_drop({EscapeLiteral(name)})");
+            }
+        }
+    }
+    catch (LibpqException error)
+    {
+        Console.Error.WriteLine($"WARNING: could not clear the progress of replication origin \"{originName}\": {error.Message}");
+    }
+}
+
 // Create remote restore point which will be used to get into synchronized state through physical replay.
-string? CreateRestorePoint(NpgsqlConnection conn, string restorePointName)
+string? CreateRestorePoint(LibpqConnection conn, string restorePointName)
 {
     try
     {
         return QueryValue(conn, $"SELECT pg_create_restore_point('{restorePointName}')");
     }
-    catch (NpgsqlException error)
+    catch (LibpqException error)
     {
-        throw Die($"Could not create restore point, status PGRES_FATAL_ERROR: {ResultErrorMessage(error)}\n");
+        throw Die($"Could not create restore point, status PGRES_FATAL_ERROR: {error.Message}\n");
     }
 }
 
-void WorfSubscribe(NpgsqlConnection conn, string subscriberName, string subscriberDsn, string providerDsn,
+void WorfSubscribe(LibpqConnection conn, string subscriberName, string subscriberDsn, string providerDsn,
     string replicationSets, int applyDelay, bool forceTextTransfer)
 {
     try
@@ -832,9 +923,9 @@ void WorfSubscribe(NpgsqlConnection conn, string subscriberName, string subscrib
         _ = Query(conn,
             $"SELECT worf.create_node(node_name := {EscapeLiteral(subscriberName)}, dsn := {EscapeLiteral(subscriberDsn)});");
     }
-    catch (NpgsqlException error)
+    catch (LibpqException error)
     {
-        throw Die($"Could not create local node, status PGRES_FATAL_ERROR: {ResultErrorMessage(error)}\n");
+        throw Die($"Could not create local node, status PGRES_FATAL_ERROR: {error.Message}\n");
     }
 
     string repsets = $"{{{replicationSets}}}";
@@ -849,9 +940,9 @@ void WorfSubscribe(NpgsqlConnection conn, string subscriberName, string subscrib
             "synchronize_data := false, " +
             $"force_text_transfer := '{(forceTextTransfer ? "t" : "f")}');");
     }
-    catch (NpgsqlException error)
+    catch (LibpqException error)
     {
-        throw Die($"Could not create subscription, status PGRES_FATAL_ERROR: {ResultErrorMessage(error)}\n");
+        throw Die($"Could not create subscription, status PGRES_FATAL_ERROR: {error.Message}\n");
     }
 
     // TODO
@@ -859,9 +950,9 @@ void WorfSubscribe(NpgsqlConnection conn, string subscriberName, string subscrib
     {
         _ = Query(conn, "UPDATE worf.local_sync_status SET sync_status = 'r'");
     }
-    catch (NpgsqlException error)
+    catch (LibpqException error)
     {
-        throw Die($"Could not update subscription, status PGRES_FATAL_ERROR: {ResultErrorMessage(error)}\n");
+        throw Die($"Could not update subscription, status PGRES_FATAL_ERROR: {error.Message}\n");
     }
 }
 
@@ -1019,7 +1110,7 @@ void WaitPostmasterConnection(string connstr)
 void WaitPrimaryConnection(string connstr)
 {
     bool ispri = false;
-    NpgsqlConnection? conn = null;
+    LibpqConnection? conn = null;
 
     WaitPostmasterConnection(connstr);
 
@@ -1027,7 +1118,7 @@ void WaitPrimaryConnection(string connstr)
 
     while (!ispri)
     {
-        if (conn is null || conn.State != System.Data.ConnectionState.Open)
+        if (conn is null || !conn.IsOk)
         {
             conn?.Dispose();
             WaitPostmasterConnection(connstr);
@@ -1041,7 +1132,7 @@ void WaitPrimaryConnection(string connstr)
                 ispri = true;
             }
         }
-        catch (NpgsqlException)
+        catch (LibpqException)
         {
             // The connection broke; reconnect.
         }
@@ -1261,54 +1352,10 @@ string EscapeLiteral(string value)
 string EscapeIdentifier(string value)
     => "\"" + value.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
 
-List<string?[]> Query(NpgsqlConnection conn, string sql)
-{
-    // Read every column as text, as PQexec returns it.
-    using NpgsqlCommand command = new(sql, conn) { AllResultTypesAreUnknown = true };
-    using NpgsqlDataReader reader = command.ExecuteReader();
-    List<string?[]> rows = [];
-    while (reader.Read())
-    {
-        string?[] row = new string?[reader.FieldCount];
-        for (int i = 0; i < reader.FieldCount; i++)
-        {
-            row[i] = reader.IsDBNull(i) ? null : reader.GetString(i);
-        }
+List<string?[]> Query(LibpqConnection conn, string sql) => conn.Query(sql);
 
-        rows.Add(row);
-    }
-
-    return rows;
-}
-
-string? QueryValue(NpgsqlConnection conn, string sql)
+string? QueryValue(LibpqConnection conn, string sql)
 {
     List<string?[]> rows = Query(conn, sql);
     return rows.Count > 0 ? rows[0][0] : null;
 }
-
-// Formats an error as PQresultErrorMessage does.
-string ResultErrorMessage(NpgsqlException error)
-{
-    if (error is not PostgresException postgres)
-    {
-        return error.Message + "\n";
-    }
-
-    StringBuilder message = new();
-    message.Append(CultureInfo.InvariantCulture, $"{postgres.Severity}:  {postgres.MessageText}\n");
-    if (postgres.Detail is { } detail)
-    {
-        message.Append(CultureInfo.InvariantCulture, $"DETAIL:  {detail}\n");
-    }
-
-    if (postgres.Hint is { } hint)
-    {
-        message.Append(CultureInfo.InvariantCulture, $"HINT:  {hint}\n");
-    }
-
-    return message.ToString();
-}
-
-// Formats an error as PQerrorMessage does.
-string ErrorMessage(NpgsqlException error) => ResultErrorMessage(error);

@@ -13,12 +13,42 @@ decoding:
     max_wal_senders = 10        # one per node needed on provider node
     shared_preload_libraries = 'worf'
 
-On a subscriber, each subscription uses a replication origin, plus one for each
-other node whose changes its provider forwards with `forward_origins` `{all}`.
-They count against `max_active_replication_origins` from PostgreSQL 18, or
-`max_replication_slots` before. When none is free, worf applies a forwarded
-node's changes as its provider's, and breaks timestamp ties for them as if the
-provider wrote them.
+On a subscriber, PostgreSQL tracks each replication origin in use in one of
+`max_active_replication_origins` slots from PostgreSQL 18, or
+`max_replication_slots` before. Each subscription takes one, each table it's
+synchronizing another, and each other node whose changes its provider forwards
+with `forward_origins` `{all}` another. When one that needs a slot finds none
+free, subscriptions give up the slots of forwarded nodes' origins they no longer
+need, which slows apply, the last one a subscription applied under going too
+once its own origin has taken its progress. A forwarded node's origin keeps its
+slot for a minute after its node's changes last applied, rather than give it up
+to another forwarded node's, so that nodes whose changes take turns with fewer
+slots than they need don't drop and create an origin for each transaction. A
+forwarded node's origin that still finds none, or a subscription's own origin, or
+a table sync's, that finds none within 10 seconds, stops its apply or table sync
+with an error, which retries, as PostgreSQL's own workers do when no slot is
+free: committed under another origin, a forwarded node's transaction would count
+as that origin's node's, and come back to the node that wrote it. A subscription
+whose forwarded nodes take turns with too few slots so applies a turn each time
+it starts again, until the limit is raised. Subscriptions also
+give up the slots of every forwarded node's origin to an enabled PostgreSQL
+subscription whose origin, or a table sync's, has none while a worker of it runs
+or can start: its owner can log in, its database allows connections, and
+`max_logical_replication_workers` leaves room. They look for one every 10
+seconds, or twice `wal_retrieve_retry_interval` if that is longer, and for as
+long after giving slots up, which is the time PostgreSQL takes to start its
+worker again, no forwarded node's origin takes a slot, so that those given up
+are theirs to take. One that still has none after that, though a slot was free,
+isn't waiting for one, and they don't give theirs up for it again for 10
+minutes, then for twice as long each time, up to a day. Other users of origins
+need the limit raised. `worf.origin_writer` records the
+node and subscription each origin worf creates applies for, a row each time one
+is created or dropped, and forgets a row once a later one has superseded it for
+`vacuum_freeze_min_age` transactions, as vacuum would freeze rows written before
+then, so it holds a row for each origin id and for each creation or drop in that
+many transactions; each creation or drop locks the table for its transaction. A conflict on a row written before then, whose record is
+forgotten, takes the row to be from what its origin applies for now, as
+pglogical takes every row.
 
 If you want to handle conflict resolution with last/first update wins (see
 [Conflicts](../../conflicts/)), you can add this additional option to

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 
 namespace Worf.Tests;
@@ -52,7 +53,7 @@ public sealed class CreateSubscriberTests
 
     /// <summary>
     /// The command turns a base backup of the provider into a subscriber that keeps the provider's data and receives
-    /// its new changes.
+    /// its new changes, and rows the subscription applied take its later changes in order, rather than as conflicts.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -71,11 +72,16 @@ public sealed class CreateSubscriberTests
             "log_line_prefix = '[%m] [%p] [%d] '",
             "log_statement = 'all'",
             "worf.synchronous_commit = true",
+            "worf.sequence_range_check_interval = 100",
+            "worf.sequence_range_exchange_interval = 500",
+
+            // The subscriber takes the provider's settings, and keeps a row its subscription's changes conflict with.
+            "worf.conflict_resolution = keep_local",
         ], token);
         int providerPort = provider.Cluster.Port;
         int pgport = CreateSubscriberCommand.FreePort();
-        string providerDsn = $"postgresql://super@localhost:{providerPort.ToString(CultureInfo.InvariantCulture)}/postgres";
-        string subscriberDsn = $"postgresql://super@localhost:{pgport.ToString(CultureInfo.InvariantCulture)}/postgres";
+        string providerDsn = $"postgresql://super@127.0.0.1:{providerPort.ToString(CultureInfo.InvariantCulture)}/postgres";
+        string subscriberDsn = $"postgresql://super@127.0.0.1:{pgport.ToString(CultureInfo.InvariantCulture)}/postgres";
         string backupDir = Path.Join(work.FullName, "backupdir");
 
         string command = await CreateSubscriberCommand.InstallAsync(provider.Installation, Path.Join(work.FullName, "bin"));
@@ -103,6 +109,9 @@ public sealed class CreateSubscriberTests
             "CREATE EXTENSION IF NOT EXISTS worf VERSION '0.1.0'",
             "ALTER EXTENSION worf UPDATE",
             "SELECT * FROM worf.create_node(node_name := 'test_provider', dsn := 'dbname=postgres user=super')",
+            "CREATE TABLE ranged (id bigserial PRIMARY KEY, v text)",
+            "SELECT worf.enable_sequence_range('ranged_id_seq', participants := '{}', range_size := 100)",
+            "INSERT INTO ranged (v) SELECT 'before' FROM generate_series(1, 10)",
         ];
         foreach (string sql in setup)
         {
@@ -149,6 +158,116 @@ public sealed class CreateSubscriberTests
             await AssertPsqlOkAsync(provider, pgport, ["-c", "\\d"], "replication check 1 ", token);
             await AssertPsqlOkAsync(provider, pgport, ["-c", "SELECT * from basic_dml"], "replication check 2 ", token);
             await AssertPsqlOkAsync(provider, pgport, ["-c", "SELECT * from public.basic_dml"], "replication check 3 ", token);
+
+            // The clone gave up the provider's blocks of a managed sequence before it took a node id of its own, and its
+            // copied rows reach into the root, so it is refused until the sequence moves to a new epoch, whose root
+            // starts above them. It then draws from blocks of its own, never sharing a key with the provider.
+            await PollSubscriberAsync(provider, pgport,
+                "SELECT state = 'refused' FROM worf.sequence_ranges WHERE sequence = 'ranged_id_seq'::regclass", "the clone refused", token);
+            (int refusedExit, string refused) = await provider.RunProgramAsync("psql",
+                ["-X", "-p", pgport.ToString(CultureInfo.InvariantCulture), "-d", Database, "-c", "INSERT INTO ranged (v) VALUES ('clone')"], token);
+            Assert.AreNotEqual(0, refusedExit, refused);
+            _ = await provider.SafePsqlAsync(Database, """
+                SELECT worf.disable_sequence_range('ranged_id_seq');
+                SELECT worf.enable_sequence_range('ranged_id_seq', participants := '{test_subscriber}', range_size := 100);
+                """, token);
+            await PollSubscriberAsync(provider, pgport, """
+                SELECT r.state = 'active' AND r.epoch = 2 AND b.node_id = l.node_id
+                FROM worf.sequence_ranges r
+                    JOIN worf.sequence_range_block b ON b.seqoid = r.sequence AND b.state = 'active' AND b.lo = r.active_lo
+                    CROSS JOIN worf.local_node l
+                WHERE r.sequence = 'ranged_id_seq'::regclass
+                """, "the clone drawing from a block of its own", token);
+
+            _ = await SubscriberAsync(provider, pgport, "INSERT INTO ranged (v) SELECT 'clone' FROM generate_series(1, 20)", token);
+            _ = await provider.SafePsqlAsync(Database, "INSERT INTO ranged (v) SELECT 'provider' FROM generate_series(1, 20)", token);
+            HashSet<string> keys = [.. (await provider.SafePsqlAsync(Database, "SELECT id FROM ranged WHERE v = 'provider'", token)).Split('\n')];
+            foreach (string key in (await SubscriberAsync(provider, pgport, "SELECT id FROM ranged WHERE v = 'clone'", token)).Split('\n'))
+            {
+                Assert.DoesNotContain(key, keys, "a key the clone shares with the provider");
+            }
+
+            // The tool creates the subscription's origin without worf.
+            _ = await provider.SafePsqlAsync(Database, "UPDATE basic_dml SET data = 'updated' WHERE other = 5", token);
+            Stopwatch elapsed = Stopwatch.StartNew();
+            string updated = "";
+            while (updated != "updated" && elapsed.Elapsed < TimeSpan.FromSeconds(60))
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(100), token);
+                (_, updated) = await provider.RunProgramAsync("psql",
+                    ["-X", "-At", "-p", pgport.ToString(CultureInfo.InvariantCulture), "-d", Database, "-c", "SELECT data FROM basic_dml WHERE other = 5"],
+                    token);
+                updated = updated.Trim();
+            }
+
+            Assert.AreEqual("updated", updated, "the update of a row the subscription applied");
+        }
+        finally
+        {
+            await StopAsync(provider, backupDir);
+        }
+    }
+
+    /// <summary>
+    /// A subscriber whose subscription fails to commit leaves no progress for its origin's id, which the rollback frees,
+    /// so the next origin created with that id, as a PostgreSQL subscription's, starts from nothing.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task FailedSubscriberLeavesNoOriginProgress()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        using TemporaryDirectory work = new($"worf-create-subscriber-failed-{Guid.NewGuid():N}");
+        await using TestNode provider = await TestNode.StartAsync("provider",
+            ["wal_level = logical", "max_wal_senders = 10", "max_replication_slots = 10", "track_commit_timestamp = on"], token);
+        int pgport = CreateSubscriberCommand.FreePort();
+        string port = pgport.ToString(CultureInfo.InvariantCulture);
+        string providerDsn = $"postgresql://super@127.0.0.1:{provider.Cluster.Port.ToString(CultureInfo.InvariantCulture)}/postgres";
+        string backupDir = Path.Join(work.FullName, "backupdir");
+        string command = await CreateSubscriberCommand.InstallAsync(provider.Installation, Path.Join(work.FullName, "bin"));
+
+        // The copy's CREATE EXTENSION worf gives its sync status a trigger that refuses the tool's update of it, in the
+        // transaction that created and advanced the origin.
+        _ = await provider.SafePsqlAsync(Database, """
+            CREATE USER super SUPERUSER;
+            CREATE EXTENSION worf;
+            SELECT * FROM worf.create_node(node_name := 'test_provider', dsn := 'dbname=postgres user=super');
+            CREATE FUNCTION refuse() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION 'refused'; END$$;
+            CREATE FUNCTION add_refusal() RETURNS event_trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                IF to_regclass('worf.local_sync_status') IS NOT NULL THEN
+                    CREATE TRIGGER refuse BEFORE UPDATE ON worf.local_sync_status EXECUTE FUNCTION refuse();
+                END IF;
+            END$$;
+            CREATE EVENT TRIGGER add_refusal ON ddl_command_end WHEN TAG IN ('CREATE EXTENSION') EXECUTE FUNCTION add_refusal();
+            """, token);
+        string autoConf = Path.Join(provider.Cluster.DataDirectory, "postgresql.auto.conf");
+        await File.WriteAllLinesAsync(autoConf,
+            (await File.ReadAllLinesAsync(autoConf, token)).Where(static line => !line.TrimStart().StartsWith("port", StringComparison.Ordinal)),
+            token);
+        _ = await provider.SafePsqlAsync(Database, "CHECKPOINT", token);
+
+        try
+        {
+            (int exitCode, string stdout, string stderr) = await CreateSubscriberCommand.RunAsync(command,
+            [
+                "-D", backupDir, "--subscriber-name=test_subscriber", $"--subscriber-dsn=postgresql://super@127.0.0.1:{port}/postgres",
+                $"--provider-dsn={providerDsn}", "--drop-slot-if-exists", "-v",
+                $"--hba-conf={Path.Join(AppContext.BaseDirectory, "TestFiles", "regress-pg_hba.conf")}",
+                $"--postgresql-conf={Path.Join(provider.Cluster.DataDirectory, "postgresql.conf")}",
+            ], work.FullName, new Dictionary<string, string> { ["PGPORT"] = port }, token);
+            TestContext.WriteLine(stdout);
+            TestContext.WriteLine(stderr);
+            Assert.AreNotEqual(0, exitCode, "worf_create_subscriber with its update refused");
+            Assert.Contains("refused", stderr);
+
+            (int started, string startOutput) = await provider.RunProgramAsync("pg_ctl",
+                ["start", "-w", "-D", backupDir, "-o", $"-p {port}", "-l", Path.Join(work.FullName, "subscriber.log")], token);
+            Assert.AreEqual(0, started, startOutput);
+            Assert.AreEqual("1|true", await SubscriberAsync(provider, pgport, """
+                SELECT pg_catalog.pg_replication_origin_create('later')::text || '|' ||
+                    (coalesce(pg_catalog.pg_replication_origin_progress('later', false), '0/0') = '0/0')::text
+                """, token), "the id of the origin created next, and that it has no progress");
         }
         finally
         {
@@ -167,6 +286,31 @@ public sealed class CreateSubscriberTests
             cancellationToken);
         TestContext.WriteLine(output);
         Assert.AreEqual(0, exitCode, $"{name}: {output}");
+    }
+
+    /// <summary>
+    /// Runs a query on the subscriber until it returns <c>t</c>.
+    /// </summary>
+    private static async Task PollSubscriberAsync(TestNode provider, int port, string sql, string what, CancellationToken cancellationToken)
+    {
+        Stopwatch waited = Stopwatch.StartNew();
+        while (await SubscriberAsync(provider, port, sql, cancellationToken) != "t")
+        {
+            Assert.IsLessThan(TestNode.PollTimeout, waited.Elapsed, what);
+            await Task.Delay(TimeSpan.FromMilliseconds(100), cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// Runs SQL on the subscriber and returns its unaligned, tuples-only output.
+    /// </summary>
+    private static async Task<string> SubscriberAsync(TestNode provider, int port, string sql, CancellationToken cancellationToken)
+    {
+        (int exitCode, string output) = await provider.RunProgramAsync("psql",
+            ["-X", "-A", "-t", "-q", "-p", port.ToString(CultureInfo.InvariantCulture), "-d", Database, "-v", "ON_ERROR_STOP=1", "-c", sql],
+            cancellationToken);
+        Assert.AreEqual(0, exitCode, output);
+        return output.Trim();
     }
 
     private static async Task StopAsync(TestNode provider, string dataDirectory)

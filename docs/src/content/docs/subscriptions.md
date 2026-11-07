@@ -26,9 +26,7 @@ description: Create, alter, synchronize and drop subscriptions.
     skips its own changes when another node forwards them back
   - `apply_delay` - how much to delay replication, default is 0 seconds
   - `force_text_transfer` - force the provider to replicate all columns
-    using a text representation (which is slower, but may be used to
-    change the type of a replicated column on the subscriber), default
-    is false
+    using a text representation (which is slower), default is false
 
   The `subscription_name` is used as `application_name` by the replication
   connection. This means that it's visible in the `pg_stat_replication`
@@ -41,7 +39,8 @@ description: Create, alter, synchronize and drop subscriptions.
   schema and/or data sync.
 
 - `worf.drop_subscription(subscription_name name, ifexists bool)`
-  Disconnects the subscription and removes it from the catalog.
+  Disconnects the subscription, drops its slot on the provider and those its
+  table syncs left there, and removes it from the catalog.
 
   Parameters:
   - `subscription_name` - name of the existing subscription
@@ -89,6 +88,12 @@ description: Create, alter, synchronize and drop subscriptions.
   foreign key constraints.
   **WARNING: This function will truncate the table immediately, and only then
   begin synchronising it, so it will be empty while being synced**
+  The copy starts once apply has caught up with the provider, so it waits, and
+  logs that it does and how far apply is, while apply fails on a change. Its
+  snapshot keeps the provider from removing dead rows, so it lets the snapshot
+  go when apply gets no further for 10 s, as on such a change, and twice as
+  long each time after. Apply moving through a long transaction's changes gets
+  further.
 
   Does not block, use `worf.wait_for_table_sync_complete` to wait for
   completion.
