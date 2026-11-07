@@ -298,7 +298,7 @@ public sealed class StalledPeerTests
             _ = await subscriber.SafePsqlAsync(Database,
                 "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE backend_type LIKE 'worf apply%'", token);
             Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
-                "SELECT EXISTS (SELECT FROM pg_stat_activity WHERE backend_type LIKE 'worf apply%' AND wait_event = 'LibpqwalreceiverConnect')", token),
+                "SELECT EXISTS (SELECT FROM pg_stat_activity WHERE backend_type LIKE 'worf apply%' AND lower(wait_event) = 'libpqwalreceiverconnect')", token),
                 "the apply worker waiting for its connection");
             _ = await HolderAsync(holder, "BEGIN; LOCK TABLE pg_catalog.pg_proc IN ACCESS EXCLUSIVE MODE", token);
             Stopwatch waiting = Stopwatch.StartNew();

@@ -264,10 +264,10 @@ public sealed class CreateSubscriberTests
             (int started, string startOutput) = await provider.RunProgramAsync("pg_ctl",
                 ["start", "-w", "-D", backupDir, "-o", $"-p {port}", "-l", Path.Join(work.FullName, "subscriber.log")], token);
             Assert.AreEqual(0, started, startOutput);
-            Assert.AreEqual("1|0/0", await SubscriberAsync(provider, pgport, """
+            Assert.AreEqual("1|true", await SubscriberAsync(provider, pgport, """
                 SELECT pg_catalog.pg_replication_origin_create('later')::text || '|' ||
-                    coalesce(pg_catalog.pg_replication_origin_progress('later', false), '0/0')::text
-                """, token), "the id and the progress of the origin created next");
+                    (coalesce(pg_catalog.pg_replication_origin_progress('later', false), '0/0') = '0/0')::text
+                """, token), "the id of the origin created next, and that it has no progress");
         }
         finally
         {
