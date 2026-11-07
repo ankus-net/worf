@@ -1068,12 +1068,13 @@ internal static class Worker
     private static bool CancelComing()
     {
         using PgLwLockShareGuard<WorfContext, WorfWorker> guard = WorfCtx.Share();
-        if (guard[MyWorfWorker].Worker.Apply.CallDeadline != CancellingCall)
+        WorfWorker me = guard[MyWorfWorker];
+        if (me.Worker.Apply.CallDeadline != CancellingCall)
         {
             return false;
         }
 
-        int manager = guard.Read((in _, workers) => ManagerFind(workers, MyWorker.Dboid));
+        int manager = guard.Read((in _, workers) => ManagerFind(workers, me.Dboid));
         return manager >= 0 && guard[manager].Proc != 0;
     }
 
@@ -1334,6 +1335,7 @@ internal static class Worker
             dboid = NativeGlobals.MyDatabaseId;
         }
 
+        long now = GetCurrentTimestamp();
         using PgLwLockExclusiveGuard<WorfPreparedTable, WorfPrepared> guard = Prepared.Exclusive();
         int slot = 0;
         for (int i = 0; i < guard.Length; i++)
@@ -1350,7 +1352,7 @@ internal static class Worker
             }
         }
 
-        guard[slot] = new WorfPrepared { Dboid = dboid, GidHash = hash, EveryDatabase = s_forgetEveryIdleManager, PreparedAt = GetCurrentTimestamp() };
+        guard[slot] = new WorfPrepared { Dboid = dboid, GidHash = hash, EveryDatabase = s_forgetEveryIdleManager, PreparedAt = now };
     }
 
     /// <summary>

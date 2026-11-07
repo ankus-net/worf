@@ -333,13 +333,13 @@ public sealed class StalledPeerTests
 
         Stopwatch applying = Stopwatch.StartNew();
         await AppliesAsync(provider, subscriber, 2, token);
-        TestContext.WriteLine($"the next row after {applying.Elapsed.TotalSeconds:F1} s");
-        if (managerExits)
-        {
-            Assert.IsLessThan(TimeSpan.FromSeconds(5), applying.Elapsed, "the next row, once the manager exited before its cancel, against wal_receiver_timeout's 10 s");
-        }
-
-        Assert.DoesNotContain("canceling statement due to user request", subscriber.ReadLog()[logpos..], "the cancel failing a later call");
+        Assert.IsLessThan(TimeSpan.FromSeconds(5), applying.Elapsed, managerExits
+            ? "the next row, once the manager exited before its cancel, against wal_receiver_timeout's 10 s"
+            : "the next row, once the late cancel came");
+        string log = subscriber.ReadLog()[logpos..];
+        Assert.DoesNotContain("canceling statement due to user request", log, "the cancel failing a later call");
+        Assert.DoesNotContain(static line => line.Contains("apply worker", StringComparison.Ordinal) && line.Contains("exiting with error", StringComparison.Ordinal),
+            log.Split('\n'), "the apply worker failing as it waits for the cancel");
     }
 
     private static async Task<object?> HolderAsync(NpgsqlConnection holder, string sql, CancellationToken token)
