@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Text;
 
 namespace Worf.Tests;
 
@@ -350,16 +351,28 @@ public sealed class CreateSubscriberTests
             {
                 line = await tool.StandardOutput.ReadLineAsync(token);
             }
-            while (line is not null && !line.StartsWith("Creating worf extension for database", StringComparison.Ordinal));
+            while (line is not null && !line.StartsWith("Initializing worf on the subscriber node:", StringComparison.Ordinal));
 
-            Assert.IsNotNull(line, "the tool creating the extension on the subscriber");
+            Assert.IsNotNull(line, "the tool starting the subscriber with worf");
 
-            // The provider stops answering new connections, as create_subscription makes, before the tool, which reaches it
-            // next in create_subscription, makes one, and the tool is stopped while it waits.
+            // The provider stops answering new connections before the tool, which next reaches it in create_subscription,
+            // makes one, and the tool is stopped once its backend waits to connect there, in the transaction that made the
+            // origin, as libpq's connection wait, or worf's own, which PostgreSQL 15 shows as an extension's, shows.
             (int paused, _, string error) = await ProcessRunner.RunAsync("kill", ["-STOP", postmaster], token);
             Assert.AreEqual(0, paused, error);
             stopped = true;
-            await Task.Delay(TimeSpan.FromSeconds(2), token);
+            Stopwatch connecting = Stopwatch.StartNew();
+            while (!tool.HasExited && (!File.Exists(Path.Join(backupDir, "postmaster.pid")) || await SubscriberAsync(provider, pgport, """
+                SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity
+                    WHERE state = 'active' AND query LIKE '%worf.create_subscription%'
+                        AND (lower(wait_event) = 'libpqwalreceiverconnect' OR wait_event_type = 'Extension'))
+                """, token, true) != "t"))
+            {
+                Assert.IsLessThan(TestNode.PollTimeout, connecting.Elapsed, "the tool's backend waiting to connect to the provider");
+                await Task.Delay(TimeSpan.FromMilliseconds(100), token);
+            }
+
+            Assert.IsFalse(tool.HasExited, $"the tool, which exited before its backend waited to connect to the provider: {await errors}");
             string[] sent = signals.Split(' ');
             string toolPid = tool.Id.ToString(CultureInfo.InvariantCulture);
 
@@ -416,6 +429,10 @@ public sealed class CreateSubscriberTests
         }
 
         string rerun = exitCode == 1 ? "" : "1|True|0|f, 1|True|True|False|1";
+        string? killedProgress = null;
+        const string Progress = """
+            SELECT count(*) FROM pg_catalog.pg_replication_origin_status WHERE external_id IS NULL AND coalesce(remote_lsn, '0/0') <> '0/0'
+            """;
         try
         {
             (int status, string statusOutput) = await provider.RunProgramAsync("pg_ctl", ["status", "-D", backupDir], token);
@@ -430,6 +447,10 @@ public sealed class CreateSubscriberTests
                 await PollSubscriberAsync(provider, pgport,
                     "SELECT NOT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity WHERE backend_type = 'client backend' AND pid <> pg_catalog.pg_backend_pid())",
                     "the killed tool's backend ending", token);
+
+                // The origins' progress is read while the server runs, as shared memory holds it, which a stop that skips
+                // the shutdown checkpoint would lose unless the WAL that carries it had reached disk.
+                killedProgress = await SubscriberAsync(provider, pgport, Progress, token);
                 (int again, _, string againErr) = await CreateSubscriberCommand.RunAsync(command, arguments, work.FullName,
                     new Dictionary<string, string> { ["PGPORT"] = port }, token);
                 (int running, _) = await provider.RunProgramAsync("pg_ctl", ["status", "-D", backupDir], token);
@@ -454,9 +475,7 @@ public sealed class CreateSubscriberTests
             (int started, string startOutput) = await provider.RunProgramAsync("pg_ctl",
                 ["start", "-w", "-D", backupDir, "-o", $"-p {port}", "-l", Path.Join(work.FullName, "subscriber.log")], token);
             Assert.AreEqual(0, started, startOutput);
-            string progress = await SubscriberAsync(provider, pgport, """
-                SELECT count(*) FROM pg_catalog.pg_replication_origin_status WHERE external_id IS NULL AND coalesce(remote_lsn, '0/0') <> '0/0'
-                """, token);
+            string progress = killedProgress ?? await SubscriberAsync(provider, pgport, Progress, token);
             Assert.AreEqual($"0, {(exitCode == 1 ? "" : "1|True|0|f, 1|True|True|False|1")}", $"{progress}, {rerun}",
                 "the freed origin ids with progress, which an origin created next would start from, and after a kill, a run again's exit code, message, " +
                 "and the server it leaves running, out of recovery, and once that is stopped, a run again's exit code, message, whether it failed at once, " +
@@ -466,6 +485,222 @@ public sealed class CreateSubscriberTests
         {
             await StopAsync(provider, backupDir);
         }
+    }
+
+    /// <summary>
+    /// A subscriber stopped with SIGTERM before a subscription commits leaves its data directory as it was: stopped as it
+    /// connects to a provider that doesn't answer, it ends at once; stopped as pg_basebackup makes the data directory, it
+    /// removes what the backup wrote; stopped as the server it started catches up to the restore point, it stops the
+    /// server and takes its recovery settings, the template's too, back out, and keeps a standby.signal the data directory
+    /// had. A data directory that has run as a server of its own, out of recovery, is refused at once. Once a database's
+    /// subscription has committed, a stop waits for the run to set the other databases up. Processes are stopped with
+    /// signals, which Windows lacks.
+    /// </summary>
+    /// <param name="when">Where the run is stopped.</param>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [OSCondition(OperatingSystems.Linux | OperatingSystems.OSX)]
+    [DataRow("connect")]
+    [DataRow("basebackup")]
+    [DataRow("catchup")]
+    [DataRow("standby")]
+    [DataRow("databases")]
+    public async Task StoppedRunsLeaveTheirDataDirectoryAsItWas(string when)
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        using TemporaryDirectory work = new($"worf-create-subscriber-stop-{when}-{Guid.NewGuid():N}");
+        await using TestNode provider = await TestNode.StartAsync("provider",
+            ["wal_level = logical", "max_wal_senders = 10", "max_replication_slots = 10", "track_commit_timestamp = on"], token);
+        int pgport = CreateSubscriberCommand.FreePort();
+        string port = pgport.ToString(CultureInfo.InvariantCulture);
+        string providerPort = provider.Cluster.Port.ToString(CultureInfo.InvariantCulture);
+        string providerDsn = $"postgresql://super@127.0.0.1:{providerPort}/postgres";
+        string backupDir = Path.Join(work.FullName, "backupdir");
+        string command = await CreateSubscriberCommand.InstallAsync(provider.Installation, Path.Join(work.FullName, "bin"));
+        _ = await provider.SafePsqlAsync(Database, """
+            CREATE USER super SUPERUSER;
+            CREATE EXTENSION worf;
+            SELECT * FROM worf.create_node(node_name := 'test_provider', dsn := 'dbname=postgres user=super');
+            """, token);
+        if (when == "databases")
+        {
+            _ = await provider.SafePsqlAsync(Database, "CREATE DATABASE db2", token);
+            _ = await provider.SafePsqlAsync("db2", """
+                CREATE EXTENSION worf;
+                SELECT * FROM worf.create_node(node_name := 'test_provider_db2', dsn := 'dbname=db2 user=super');
+                """, token);
+        }
+
+        string autoConf = Path.Join(provider.Cluster.DataDirectory, "postgresql.auto.conf");
+        await File.WriteAllLinesAsync(autoConf,
+            (await File.ReadAllLinesAsync(autoConf, token)).Where(static line => !line.TrimStart().StartsWith("port", StringComparison.Ordinal)),
+            token);
+        _ = await provider.SafePsqlAsync(Database, "CHECKPOINT", token);
+        string postmaster = File.ReadLines(Path.Join(provider.Cluster.DataDirectory, "postmaster.pid")).First().Trim();
+
+        List<string> arguments =
+        [
+            "-D", backupDir, "--subscriber-name=test_subscriber", $"--subscriber-dsn=postgresql://super@127.0.0.1:{port}/postgres",
+            $"--provider-dsn={providerDsn}", "--drop-slot-if-exists", "-v",
+            $"--hba-conf={Path.Join(AppContext.BaseDirectory, "TestFiles", "regress-pg_hba.conf")}",
+            $"--postgresql-conf={Path.Join(provider.Cluster.DataDirectory, "postgresql.conf")}",
+        ];
+
+        // The settings the data directory starts with: the provider's, which pg_basebackup copies, or those its own base
+        // backup, made as a standby's, adds.
+        string before = await File.ReadAllTextAsync(autoConf, token);
+        switch (when)
+        {
+            case "basebackup":
+                arguments.Add("--extra-basebackup-args=--max-rate=32k");
+                break;
+            case "catchup":
+                string template = Path.Join(work.FullName, "recovery.conf");
+                await File.WriteAllTextAsync(template, $"# recovery template\nprimary_conninfo = 'host=127.0.0.1 port={providerPort} user=super'\n", token);
+                arguments.Add($"--recovery-conf={template}");
+                break;
+            case "standby":
+                (int backedUp, string backupOutput) = await provider.RunProgramAsync("pg_basebackup",
+                    ["-D", backupDir, "-d", providerDsn, "-X", "stream", "-R"], token);
+                Assert.AreEqual(0, backedUp, backupOutput);
+                before = await File.ReadAllTextAsync(Path.Join(backupDir, "postgresql.auto.conf"), token);
+                break;
+            case "databases":
+                arguments.Add("--databases=postgres,db2");
+                break;
+            default:
+                break;
+        }
+
+        ProcessStartInfo start = new(command) { WorkingDirectory = work.FullName, RedirectStandardOutput = true, RedirectStandardError = true };
+        foreach (string argument in arguments)
+        {
+            start.ArgumentList.Add(argument);
+        }
+
+        start.Environment["PGPORT"] = port;
+        bool paused = false;
+        try
+        {
+            if (when == "connect")
+            {
+                (int stopping, _, string stopError) = await ProcessRunner.RunAsync("kill", ["-STOP", postmaster], token);
+                Assert.AreEqual(0, stopping, stopError);
+                paused = true;
+            }
+
+            using Process tool = Process.Start(start)!;
+            Task<string> errors = tool.StandardError.ReadToEndAsync(token);
+            StringBuilder seen = new();
+            async Task SeeAsync(string text)
+            {
+                char[] buffer = new char[4096];
+                while (!seen.ToString().Contains(text, StringComparison.Ordinal))
+                {
+                    int read = await tool.StandardOutput.ReadAsync(buffer, token);
+                    Assert.AreNotEqual(0, read, $"the tool's output, which ended before \"{text}\": {seen}{await errors}");
+                    _ = seen.Append(buffer, 0, read);
+                }
+            }
+
+            switch (when)
+            {
+                case "connect":
+                    await SeeAsync("Getting information for database postgres");
+                    await Task.Delay(TimeSpan.FromSeconds(1), token);
+                    break;
+                case "basebackup":
+                    await SeeAsync("Creating base backup of the remote node");
+                    await Task.Delay(TimeSpan.FromSeconds(1), token);
+                    break;
+                case "catchup" or "standby":
+                    // The provider stops once the restore point is made, so that the server catches up to it for good.
+                    await SeeAsync("Bringing subscriber node to the restore point");
+                    (int stopping, _, string stopError) = await ProcessRunner.RunAsync("kill", ["-STOP", postmaster], token);
+                    Assert.AreEqual(0, stopping, stopError);
+                    paused = true;
+                    await SeeAsync("Waiting for PostgreSQL to become primary");
+                    break;
+                default:
+                    await SeeAsync("Creating worf extension for database db2");
+                    break;
+            }
+
+            Stopwatch ending = Stopwatch.StartNew();
+            (int signalled, _, string error) = await ProcessRunner.RunAsync("kill", ["-TERM", tool.Id.ToString(CultureInfo.InvariantCulture)], token);
+            Assert.AreEqual(0, signalled, error);
+            using CancellationTokenSource exiting = CancellationTokenSource.CreateLinkedTokenSource(token);
+            exiting.CancelAfter(TimeSpan.FromSeconds(120));
+            await tool.WaitForExitAsync(exiting.Token);
+            ending.Stop();
+            string stderr = await errors;
+            TestContext.WriteLine(seen.ToString());
+            TestContext.WriteLine(stderr);
+            Assert.AreEqual(when == "databases" ? 0 : 1, tool.ExitCode, $"the stopped tool's exit code: {stderr}");
+            switch (when)
+            {
+                case "connect":
+                    Assert.IsLessThan(TimeSpan.FromSeconds(15), ending.Elapsed, "the stop, as the tool connects to the provider that doesn't answer");
+                    Assert.IsFalse(Directory.Exists(backupDir), "the data directory, which the run hadn't made");
+                    break;
+                case "basebackup":
+                    Assert.IsFalse(Directory.Exists(backupDir), "the data directory pg_basebackup was making");
+                    break;
+                case "catchup" or "standby":
+                    Assert.AreEqual($"False|{when == "standby"}|{before}",
+                        $"{File.Exists(Path.Join(backupDir, "postmaster.pid"))}|{File.Exists(Path.Join(backupDir, "standby.signal"))}|" +
+                        await File.ReadAllTextAsync(Path.Join(backupDir, "postgresql.auto.conf"), token),
+                        "the server the run started, stopped, the data directory's standby.signal, and its settings, as they were");
+                    break;
+                default:
+                    Assert.AreEqual("1|1", $"{await SubscriberAsync(provider, pgport, "SELECT count(*) FROM worf.subscription", token)}|" +
+                        await SubscriberDatabaseAsync(provider, pgport, "db2", "SELECT count(*) FROM worf.subscription", token),
+                        "the subscriptions of both databases, though the run was stopped after the first committed");
+                    break;
+            }
+        }
+        finally
+        {
+            if (paused)
+            {
+                _ = await ProcessRunner.RunAsync("kill", ["-CONT", postmaster], CancellationToken.None);
+            }
+        }
+
+        try
+        {
+            if (when == "standby")
+            {
+                // Started without its standby.signal, the data directory comes up out of recovery, on the provider's
+                // timeline, and writes WAL the provider doesn't have, so a run on it is refused at once.
+                File.Delete(Path.Join(backupDir, "standby.signal"));
+                (int started, string startOutput) = await provider.RunProgramAsync("pg_ctl",
+                    ["start", "-w", "-D", backupDir, "-o", $"-p {port}", "-l", Path.Join(work.FullName, "subscriber.log")], token);
+                Assert.AreEqual(0, started, startOutput);
+                Assert.AreEqual("f", await SubscriberAsync(provider, pgport, "CREATE TABLE diverged (); SELECT pg_catalog.pg_is_in_recovery()", token));
+                (int stopped, string stopOutput) = await provider.RunProgramAsync("pg_ctl", ["stop", "-w", "-D", backupDir], token);
+                Assert.AreEqual(0, stopped, stopOutput);
+                Stopwatch refusing = Stopwatch.StartNew();
+                (int again, _, string againErr) = await CreateSubscriberCommand.RunAsync(command, arguments, work.FullName,
+                    new Dictionary<string, string> { ["PGPORT"] = port }, token);
+                Assert.AreEqual($"1|True|True", $"{again}|{againErr.Contains("has run as a server of its own", StringComparison.Ordinal)}|" +
+                    $"{refusing.Elapsed < TimeSpan.FromSeconds(60)}", $"a run on the data directory that ran out of recovery: {againErr}");
+            }
+        }
+        finally
+        {
+            await StopAsync(provider, backupDir);
+        }
+    }
+
+    // Runs SQL on one of the subscriber's databases and returns its unaligned, tuples-only output.
+    private static async Task<string> SubscriberDatabaseAsync(TestNode provider, int port, string database, string sql, CancellationToken cancellationToken)
+    {
+        (int exitCode, string output) = await provider.RunProgramAsync("psql",
+            ["-X", "-A", "-t", "-q", "-p", port.ToString(CultureInfo.InvariantCulture), "-d", database, "-v", "ON_ERROR_STOP=1", "-c", sql],
+            cancellationToken);
+        Assert.AreEqual(0, exitCode, output);
+        return output.Trim();
     }
 
     // The processes a process started whose command line holds a text, by their IDs, as ps lists them.
@@ -506,13 +741,19 @@ public sealed class CreateSubscriberTests
     }
 
     /// <summary>
-    /// Runs SQL on the subscriber and returns its unaligned, tuples-only output.
+    /// Runs SQL on the subscriber and returns its unaligned, tuples-only output, or, when the subscriber may not be up,
+    /// nothing for a failure.
     /// </summary>
-    private static async Task<string> SubscriberAsync(TestNode provider, int port, string sql, CancellationToken cancellationToken)
+    private static async Task<string> SubscriberAsync(TestNode provider, int port, string sql, CancellationToken cancellationToken, bool mayFail = false)
     {
         (int exitCode, string output) = await provider.RunProgramAsync("psql",
             ["-X", "-A", "-t", "-q", "-p", port.ToString(CultureInfo.InvariantCulture), "-d", Database, "-v", "ON_ERROR_STOP=1", "-c", sql],
             cancellationToken);
+        if (mayFail && exitCode != 0)
+        {
+            return "";
+        }
+
         Assert.AreEqual(0, exitCode, output);
         return output.Trim();
     }

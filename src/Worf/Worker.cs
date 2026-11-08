@@ -1346,78 +1346,66 @@ internal static class Worker
 
         if (xid != 0)
         {
-            NotePrepared(dboid, [xid], s_forgetEveryIdleManager);
+            NotePrepared(dboid, [xid], s_forgetEveryIdleManager, 0);
         }
     }
 
     /// <summary>
-    /// Notes a database's prepared transactions that its manager finds as it starts, or once a promotion has made a
-    /// standby's this server's, which may have changed worf or a database, as their locks show, and which this server's
-    /// PREPARE TRANSACTION may not have noted, as one prepared before it started, or on the primary.
+    /// Notes a database's prepared transactions that its manager finds as it starts, which may have changed worf or a
+    /// database, as their locks show, and which this server's PREPARE TRANSACTION may not have noted, as one prepared
+    /// before it started, or on a primary this server was a standby of.
     /// </summary>
     /// <param name="dboid">The database.</param>
     /// <param name="prepared">The transactions, each with whether it may have changed a database.</param>
-    internal static void NoteFoundPrepared(uint dboid, List<(uint Xid, bool EveryDatabase)> prepared)
+    /// <param name="databases">The databases' state as the manager found them, as <see cref="DatabasesState"/>
+    /// gives it.</param>
+    internal static void NoteFoundPrepared(uint dboid, List<(uint Xid, bool EveryDatabase)> prepared, long databases)
     {
         foreach (bool everyDatabase in new[] { false, true })
         {
             uint[] xids = [.. prepared.Where(one => one.EveryDatabase == everyDatabase).Select(one => one.Xid)];
             if (xids.Length > 0)
             {
-                NotePrepared(dboid, xids, everyDatabase);
+                NotePrepared(dboid, xids, everyDatabase, everyDatabase ? databases : 0);
             }
         }
     }
 
     /// <summary>
-    /// Gets how many times the managers were asked to note their databases' prepared transactions again.
+    /// Gets the state of the databases that decides which have a manager, in a transaction: which there are, which
+    /// allow connections and which are templates, as a number that changes when it does, and is never zero.
     /// </summary>
-    internal static int PreparedRescan
+    /// <returns>The state.</returns>
+    internal static unsafe long DatabasesState()
     {
-        get
+        const uint DatabaseRelationId = 1262;
+        List<(uint Oid, bool AllowConn, bool Template)> databases = [];
+        RelationData* rel = NativeMethods.table_open(DatabaseRelationId, (int)PgLockMode.AccessShare);
+        TableScanDescData* scan = NativeMethods.table_beginscan_catalog(rel, 0, null);
+        HeapTupleData* tup;
+        while ((tup = NativeMethods.heap_getnext(scan, ScanDirection.ForwardScanDirection)) is not null)
         {
-            using PgLwLockShareGuard<WorfPreparedTable, WorfPrepared> guard = Prepared.Share();
-            return guard.Header.Rescan;
-        }
-    }
-
-    /// <summary>
-    /// Asks every manager, once this server has left recovery, to note its database's prepared transactions again, as
-    /// those the standby replayed are this server's now: the running managers are woken, and those that found nothing
-    /// to manage start again.
-    /// </summary>
-    internal static void RescanPrepared()
-    {
-        using (PgLwLockExclusiveGuard<WorfPreparedTable, WorfPrepared> guard = Prepared.Exclusive())
-        {
-            WorfPreparedTable table = guard.Header;
-            table.Rescan++;
-            guard.Header = table;
+            FormData_pg_database* pgdatabase = (FormData_pg_database*)NativeMethods.GETSTRUCT(tup);
+            databases.Add((pgdatabase->oid, pgdatabase->datallowconn, pgdatabase->datistemplate));
         }
 
-        List<nint> latches = [];
-        using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = WorfCtx.Exclusive())
+        NativeMethods.table_endscan(scan);
+        NativeMethods.table_close(rel, (int)PgLockMode.AccessShare);
+
+        // FNV-1a over each database's entry, in OID order.
+        ulong hash = 14695981039346656037UL;
+        foreach ((uint oid, bool allowConn, bool template) in databases.OrderBy(database => database.Oid))
         {
-            WorfContext ctx = guard.Header;
-            ctx.SubscriptionsChanged = true;
-            guard.Header = ctx;
-            ForgetIdleManager(guard, 0);
-            for (int i = 0; i < guard.Length; i++)
+            foreach (ulong part in new[] { oid, allowConn ? 1UL : 0UL, template ? 1UL : 0UL })
             {
-                if (guard[i].WorkerType == WorfWorkerType.Manager && guard[i].Proc != 0)
-                {
-                    latches.Add(guard[i].Proc);
-                }
+                hash = (hash ^ part) * 1099511628211UL;
             }
         }
 
-        foreach (nint proc in latches)
-        {
-            SetProcLatch(proc);
-        }
+        return hash == 0 ? 1 : (long)hash;
     }
 
-    private static void NotePrepared(uint dboid, uint[] xids, bool everyDatabase)
+    private static void NotePrepared(uint dboid, uint[] xids, bool everyDatabase, long databases)
     {
         nint supervisor;
         bool full = false;
@@ -1448,7 +1436,7 @@ internal static class Worker
                     continue;
                 }
 
-                guard[free] = new WorfPrepared { Dboid = dboid, Xid = xid, EveryDatabase = everyDatabase };
+                guard[free] = new WorfPrepared { Dboid = dboid, Xid = xid, EveryDatabase = everyDatabase, Databases = databases };
                 table.Used++;
             }
 
@@ -1516,6 +1504,10 @@ internal static class Worker
             return true;
         }
 
+        // A transaction a manager found by its locks on pg_database wakes the managers only if the databases' state
+        // changed as it ended, as ALTER DATABASE may change it, and GRANT, or a read, don't.
+        long now = ended.Exists(one => one.EveryDatabase && one.Databases != 0) ? PgBackgroundWorker.RunTransaction(DatabasesState) : 0;
+
         using (PgLwLockExclusiveGuard<WorfPreparedTable, WorfPrepared> guard = Prepared.Exclusive())
         {
             WorfPreparedTable table = guard.Header;
@@ -1538,7 +1530,7 @@ internal static class Worker
             WorfContext ctx = guard.Header;
             ctx.SubscriptionsChanged = true;
             guard.Header = ctx;
-            foreach (WorfPrepared one in ended)
+            foreach (WorfPrepared one in ended.Where(one => !one.EveryDatabase || one.Databases == 0 || one.Databases != now))
             {
                 ForgetIdleManager(guard, one.EveryDatabase ? 0 : one.Dboid);
                 int manager = guard.Read((in _, workers) => ManagerFind(workers, one.Dboid));

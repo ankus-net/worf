@@ -41,15 +41,22 @@ public sealed class DocumentationTests
             s_sequenceRanges, "a grantor's lifts (211)");
         Assert.DoesNotContain("without waiting for them, and commits at once", s_sequenceRanges, "a switch worker's wait (130/146)");
         Assert.DoesNotContain("three seconds a minute at most", s_sequenceRanges, "an unreachable neighbor's cost (294)");
-        Assert.Contains("holds up the others' calls for its first call's `worf.sequence_range_timeout`, and then about three seconds ten, twenty and forty seconds after the call before ends", s_sequenceRanges,
-            "an unreachable neighbor's cost (294)");
+        Assert.Contains("holds up the others' calls for its first call's `worf.sequence_range_timeout`, and then for up to that long ten, twenty and forty seconds after the call before ends", s_sequenceRanges,
+            "an unreachable neighbor's cost (294, 660)");
+        Assert.Contains("twice as long for each such call in a row that ran out of time, up to `worf.sequence_range_timeout`, which a call made again without giving way, or that a statement waiting on the node made due, has at once",
+            s_sequenceRanges, "a slow neighbor's probes (660)");
+        Assert.Contains("which a neighbor whose own route to the owner goes through the node can't be, as a node reports no distance to its parent", s_sequenceRanges,
+            "a chain's parents (604)");
         Assert.Contains("A forced lift's request to reset from the node's grantor", s_sequenceRanges, "a grantor's lifts (352)");
         Assert.Contains("the grantor's lifts may reset the node 9 times in their first hour and 14 in their first day", s_sequenceRanges, "a grantor's lifts (353)");
         Assert.Contains("A switch worker waits for the gate before it locks the sequence's range row", s_sequenceRanges, "a paused gate holder (291)");
-        Assert.Contains("a call whose sequence none of those name, as one computed as it runs, a PL/pgSQL expression's", s_sequenceRanges,
-            "a returning node's draws (292, 293)");
-        Assert.Contains("Nothing else waits: `nextval` of a sequence no range manages, or of a temporary one, that its statement or `COPY`'s defaults name", s_sequenceRanges,
+        Assert.Contains("A call whose sequence those don't name, as one computed as it runs, one an `ALTER TABLE` that changes a column's type starts, or one code worf doesn't see into starts", s_sequenceRanges,
+            "a returning node's draws (292, 293, 422)");
+        Assert.Contains("or, within it, a PL/pgSQL expression, which PL/pgSQL starts outside a plan, as a trigger's or a function's that partition pruning calls as the plan starts", s_sequenceRanges,
+            "a returning node's PL/pgSQL draws (422, 601)");
+        Assert.Contains("Nothing else waits: `nextval` of a sequence no range manages, or of a temporary one, that those name", s_sequenceRanges,
             "what doesn't wait for a grantor (351, 422)");
+        Assert.Contains("whose failure the worker applies again later under any `worf.exception_behaviour`", s_sequenceRanges, "an applied statement's wait (420)");
         Assert.Contains("an `UPDATE` or a `MERGE` that sets a column to a value rather than its default", s_sequenceRanges, "updates that don't draw (460)");
         Assert.Contains("a statement a worf worker applies, as DDL `replicate_ddl_command` queued", s_sequenceRanges, "applied statements (420)");
         Assert.Contains("up to `worf.sequence_range_check_interval` more before the watcher cancels it", s_sequenceRanges, "a probe's time (292)");
@@ -70,7 +77,8 @@ public sealed class DocumentationTests
         foreach ((string name, string text) in new[] { ("README.md", s_readme), ("configuration.md", s_configuration) })
         {
             Assert.DoesNotContain("ran out of time waits a second at most, until one answers", text, $"a probe's time, in {name} (130)");
-            Assert.Contains("ran out of time waits a second at most, three for the connection, until one answers", text, $"a probe's time, in {name} (130)");
+            Assert.Contains("ran out of time waits a second at first, three for the connection, twice as long for each such call in a row, up to this, until one answers", text,
+                $"a probe's time, in {name} (130, 660)");
             Assert.DoesNotContain("wait up to twice this in all for the switch", text, $"how long inserts wait for a switch, in {name} (130)");
             Assert.Contains("up to twice this for each block in all while its next block is still to come, or once a worker has tried and couldn't switch it, and otherwise until it comes, as for a lock",
                 text, $"how long inserts wait for a switch, in {name} (130)");

@@ -39,6 +39,10 @@ internal static class SequenceRangeExchange
     // The subscriptions whose last probe gave way to a request on another neighbor.
     private static readonly HashSet<uint> s_gaveWay = [];
 
+    // How many probes of each subscription's provider in a row ran out of time, each of which gives the next twice as
+    // long.
+    private static readonly Dictionary<uint, int> s_probesTimedOut = [];
+
     // The sequences, with the prepared transactions holding their range rows, that this process has warned of.
     private static readonly HashSet<(uint Seqoid, string Gid)> s_preparedHolders = [];
 
@@ -363,6 +367,10 @@ internal static class SequenceRangeExchange
                 s_probedAt[sub.Id] = now;
             }
 
+            // A probe made again without giving way, or that a statement waiting on the neighbor made due, has the
+            // exchange's whole time, and any other twice as long as the last that ran out of time.
+            SequenceRangeExchangeWorker.FullProbe = !SequenceRangeExchangeWorker.Yields || s_wanted.Contains(sub.Id);
+            SequenceRangeExchangeWorker.ProbesTimedOut = s_probesTimedOut.GetValueOrDefault(sub.Id);
             try
             {
                 _ = s_noSlot.Remove(sub.Id);
@@ -385,6 +393,7 @@ internal static class SequenceRangeExchange
                 _ = s_timedOut.Remove(sub.Id);
                 _ = s_probedAt.Remove(sub.Id);
                 _ = s_gaveWay.Remove(sub.Id);
+                _ = s_probesTimedOut.Remove(sub.Id);
 
                 // An exchange that changed nothing while something waits makes the next one wait longer, up to the
                 // exchange interval, since the neighbor may not answer it for long, as when a root can't start or a
@@ -451,6 +460,11 @@ internal static class SequenceRangeExchange
                     : SequenceRanges.ExchangeInterval * 1000L;
                 if (timedOut)
                 {
+                    if (SequenceRangeExchangeWorker.Probing != 0)
+                    {
+                        s_probesTimedOut[sub.Id] = s_probesTimedOut.GetValueOrDefault(sub.Id) + 1;
+                    }
+
                     _ = s_timedOut.Add(sub.Id);
                     s_probedAt[sub.Id] = now;
                 }
@@ -490,6 +504,8 @@ internal static class SequenceRangeExchange
 
         SequenceRangeExchangeWorker.Probing = 0;
         SequenceRangeExchangeWorker.Yields = true;
+        SequenceRangeExchangeWorker.FullProbe = false;
+        SequenceRangeExchangeWorker.ProbesTimedOut = 0;
         return changed;
     }
 
@@ -669,17 +685,7 @@ internal static class SequenceRangeExchange
         WorfConnection conn = PgBackgroundWorker.RunTransaction(() => SequenceRangeExchangeWorker.Bounded(connecting: true, call: () =>
         {
             RequireReachable(sub.OriginIf.Dsn, sub.Origin.Name);
-            WorfConnection opened = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "range");
-            try
-            {
-                opened.Execute(setTimeout);
-                return opened;
-            }
-            catch
-            {
-                opened.Dispose();
-                throw;
-            }
+            return Worf.Connect(sub.OriginIf.Dsn, sub.Name, "range", setup: setTimeout);
         }));
         s_connections[sub.Id] = (conn, sub.OriginIf.Dsn, timeout, false);
         return conn;
@@ -829,17 +835,22 @@ internal static class SequenceRangeExchange
     /// <summary>
     /// Gets the furthest WAL position of the provider whose changes this node has applied through a subscription, under
     /// the subscription's origin or one of its relay origins. Replication origins record it with each commit, so it
-    /// survives a restart or crash of this node, and an idle provider never moves it.
+    /// survives a restart or crash of this node, and an idle provider never moves it. Before its first commit, a
+    /// subscription that worf_create_subscriber made has applied up to the position its sync status holds, which its
+    /// apply worker starts from.
     /// </summary>
     /// <returns>The position, or zero.</returns>
     private static ulong Applied(WorfSubscription sub)
-        => WorfNode.RelayOrigins(sub.SlotName).Select(relay => relay.Id).Append(PgReplicationOrigin.Find(sub.SlotName) ?? 0)
+    {
+        ulong applied = WorfNode.RelayOrigins(sub.SlotName).Select(relay => relay.Id).Append(PgReplicationOrigin.Find(sub.SlotName) ?? 0)
             .Where(origin => origin != 0)
             .Select(origin => PgReplicationOrigin.GetProgress(origin, false))
             .Where(progress => progress.IsValid)
             .Select(progress => progress.Value)
             .DefaultIfEmpty()
             .Max();
+        return applied != 0 ? applied : Sync.GetSubscriptionSyncStatus(sub.Id, true)?.Statuslsn ?? 0;
+    }
 
     /// <summary>
     /// Gets the WAL position a neighbor's answer can't be behind of: how far this node applied its changes, unless the
@@ -967,7 +978,10 @@ internal static class SequenceRangeExchange
         writer.WriteNumber("epoch", row.Get<int>(3));
         writer.WriteNumber("range_size", row.Get<long>(4));
         writer.WriteNumber("max_range_size", row.Get<long>(5));
-        WriteNullable(writer, "distance", row.Get<int?>(6));
+        // A neighbor that is this node's parent hears of no distance from it, as this node's route to the owner goes
+        // through the neighbor, so that the neighbor never takes this node as its own parent, as it would once it no
+        // longer heard from its own, and lengthen its route through this node in turn.
+        WriteNullable(writer, "distance", row.Get<uint?>(9) == neighbor ? null : row.Get<int?>(6));
         WriteNullable(writer, "high_water", row.Get<long?>(7));
         WriteNullable(writer, "watermark", row.Get<long?>(8));
         writer.WriteString("state", row.Get<string>(10));

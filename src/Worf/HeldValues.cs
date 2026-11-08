@@ -98,7 +98,10 @@ internal static class HeldValues
     /// <summary>
     /// Finds the rows of a copy that the constraints refuse, in the copy's order: each with the error of the first of
     /// the constraints that refuses it, as PostgreSQL would raise it. A check that fails, as on a value an index's
-    /// expression fails on, is left out, for the write to fail on.
+    /// expression fails on, is left out, for the write to fail on. The conflicts of many candidates, as a merge's, go in
+    /// a temporary table rather than this backend's memory, and are decided in the copy's order a thousand candidates at a
+    /// time, so that what's kept here grows only with the keys that rows written take, and, for a constraint compared
+    /// pair by pair, with the rows refused, rather than with every conflict.
     /// </summary>
     /// <param name="constraints">The constraints, in the order PostgreSQL checks them.</param>
     /// <param name="table">The table, qualified, after ONLY when it isn't partitioned.</param>
@@ -106,152 +109,245 @@ internal static class HeldValues
     /// table's, with each row's place in the copy in <paramref name="row"/>.</param>
     /// <param name="row">The column of each candidate's place in the copy, a bigint.</param>
     /// <param name="kept">The condition, on a row of the table as <c>t</c>, that it stays as it is.</param>
-    /// <param name="indexed">Whether the candidates are many enough that those an exclusion constraint compares with
-    /// each other other than by equality are kept in a table with an index for the comparison.</param>
+    /// <param name="many">Whether the candidates are many, as a merge's, so that their conflicts are kept in a temporary
+    /// table, and those an exclusion constraint compares with each other other than by equality in a table with an index
+    /// for the comparison.</param>
+    /// <param name="refuse">Takes the rows refused, by their places, with their errors, in the copy's order, a part at
+    /// a time.</param>
     /// <param name="parameters">The parameters the candidates' relation reads.</param>
-    /// <returns>The rows refused, by their places, with their errors.</returns>
-    internal static SortedDictionary<long, PgException> Refused(List<HeldConstraint> constraints, string table, string candidates, string row,
-        string kept, bool indexed, params SpiParameter[] parameters)
+    /// <returns>How many rows are refused.</returns>
+    internal static long Refused(List<HeldConstraint> constraints, string table, string candidates, string row,
+        string kept, bool many, Action<List<(long Row, PgException Error)>> refuse, params SpiParameter[] parameters)
     {
         RefusedChecked = 0;
-        // Each candidate's conflicts, by constraint: with a row the table keeps, with the other row's keys, and the rows
-        // whose keys are the same as its own, numbered as one, or the earlier rows its keys conflict with.
-        SortedDictionary<long, List<(int Constraint, string Key, string? Kept, long Same, List<(long Row, string Key)>? Earlier)>> conflicts = [];
-        for (int c = 0; c < constraints.Count; c++)
+
+        // Each candidate's conflicts, by constraint: with a row the table keeps, with that row's keys, the rows whose keys
+        // are the same as its own, numbered as one, or an earlier row its keys conflict with, with that row's keys.
+        const string Columns = "r, c, key, kept, same, earlier, earlier_key";
+        List<(long R, int C, string Key, string? Kept, long Same, long? Earlier, string? EarlierKey)> gathered = [];
+        if (many)
         {
-            HeldConstraint constraint = constraints[c];
-            List<string> conditions = [.. constraint.Predicate is string predicate ? [$"({predicate})"] : Array.Empty<string>()];
-            if (!constraint.NullsEqual)
-            {
-                conditions.AddRange(constraint.Compared.Select(key => $"{key} IS NOT NULL"));
-            }
-
-            string where = conditions.Count == 0 ? "" : $" WHERE {string.Join(" AND ", conditions)}";
-            string keys = $"SELECT s.{row} AS r, {string.Join(", ", constraint.Compared.Select((key, k) => $"{key} AS k{k}"))} FROM {candidates} s{where}";
-            string keyText = KeyText(constraint.Keys.Length, "b.k");
-            string inTable = $"""
-                (SELECT {KeyText(constraint.Keys.Length, null, constraint.Compared)} FROM {table} t
-                WHERE {(constraint.Predicate is string tablePredicate ? $"({tablePredicate}) AND " : "")}{constraint.Conflict(null, "b")} AND {kept} LIMIT 1)
-                """;
-            int found = c;
-            try
-            {
-                PgTransaction.RunInSubtransaction(() =>
-                {
-                    if (constraint.Orderings is string[] orderings)
-                    {
-                        // Keys compared by equality conflict when they're the same: the rows with the same keys are
-                        // numbered as one, in the order of the btree operator class the equality comes from.
-                        // Only the candidates that can conflict come back, those a row the table keeps holds the keys of
-                        // and those that share their keys, so that what's kept grows with the conflicts, not the candidates.
-                        foreach (WorfRow match in Worf.Read($"""
-                            WITH b AS MATERIALIZED ({keys})
-                            SELECT y.r, y.key, y.kept, y.same FROM (
-                                SELECT x.*, pg_catalog.count(*) OVER (PARTITION BY x.same) AS n FROM (
-                                    SELECT b.r, {keyText} AS key, {inTable} AS kept,
-                                        pg_catalog.dense_rank() OVER (ORDER BY {string.Join(", ", orderings.Select((ordering, k) => $"b.k{k} USING {ordering}"))}) AS same
-                                    FROM b) x) y
-                            WHERE y.kept IS NOT NULL OR y.n > 1
-                            """, 0, parameters))
-                        {
-                            Add(match.Get<long>(0), (found, match.Get<string>(1), match.Get<string?>(2), match.Get<long>(3), null));
-                        }
-
-                        return;
-                    }
-
-                    // Other keys are compared pair by pair, those of many candidates through an index of the constraint's
-                    // own access method and operator classes.
-                    string from = "b";
-                    string with = $"WITH b AS MATERIALIZED ({keys}) ";
-                    if (indexed)
-                    {
-                        from = "worf_held_keys";
-                        with = "";
-                        _ = Worf.Execute($"CREATE TEMPORARY TABLE worf_held_keys ON COMMIT DROP AS {keys}", parameters);
-                        _ = Worf.Execute($"CREATE INDEX ON worf_held_keys USING {Worf.QuoteIdentifier(constraint.AccessMethod)} " +
-                            $"({string.Join(", ", constraint.OperatorClasses.Select((opclass, k) => $"k{k} {opclass}"))})");
-                        _ = Worf.Execute("ANALYZE worf_held_keys");
-                    }
-
-                    foreach (WorfRow match in Worf.Read($"""
-                        {with}SELECT x.* FROM (SELECT b.r, {keyText} AS key, {inTable} AS kept, NULL::pg_catalog.int8 AS earlier, NULL::pg_catalog.text AS earlier_key FROM {from} b) x
-                        WHERE x.kept IS NOT NULL
-                        UNION ALL
-                        SELECT b.r, {keyText}, NULL, a.r, {KeyText(constraint.Keys.Length, "a.k")}
-                        FROM {from} a JOIN {from} b ON a.r OPERATOR(pg_catalog.<) b.r AND {constraint.Conflict("a", "b")}
-                        """, 0, indexed ? [] : parameters))
-                    {
-                        long candidate = match.Get<long>(0);
-                        if (match.Get<long?>(3) is long earlier)
-                        {
-                            Add(candidate, (found, match.Get<string>(1), null, 0, [(earlier, match.Get<string>(4))]));
-                        }
-                        else if (match.Get<string?>(2) is string other)
-                        {
-                            Add(candidate, (found, match.Get<string>(1), other, 0, []));
-                        }
-                    }
-
-                    if (indexed)
-                    {
-                        _ = Worf.Execute("DROP TABLE worf_held_keys");
-                        Worf.EndForDecoding();
-                    }
-                }, PgSubtransactionMode.Atomic);
-            }
-            catch (PgException error) when (!Apply.IsTransient(error))
-            {
-                foreach (List<(int Constraint, string, string?, long, List<(long, string)>?)> rowConflicts in conflicts.Values)
-                {
-                    _ = rowConflicts.RemoveAll(conflict => conflict.Constraint == found);
-                }
-            }
+            _ = Worf.Execute("""
+                CREATE TEMPORARY TABLE worf_held_conflicts (r pg_catalog.int8, c pg_catalog.int4, key pg_catalog.text, kept pg_catalog.text,
+                    same pg_catalog.int8, earlier pg_catalog.int8, earlier_key pg_catalog.text)
+                """);
         }
 
-        // In the copy's order, a row is refused by the first constraint in which a row the table keeps holds its keys,
-        // or an earlier row that's written takes them; a row written takes its keys in every constraint.
-        RefusedChecked = conflicts.Count;
-        SortedDictionary<long, PgException> refused = [];
-        Dictionary<(int Constraint, long Same), string> taken = [];
-        foreach ((long candidate, List<(int Constraint, string Key, string? Kept, long Same, List<(long Row, string Key)>? Earlier)> rowConflicts) in conflicts)
+        bool decided = false;
+        try
         {
-            foreach (IGrouping<int, (int Constraint, string Key, string? Kept, long Same, List<(long Row, string Key)>? Earlier)> byConstraint in
-                rowConflicts.GroupBy(conflict => conflict.Constraint).OrderBy(group => group.Key))
+            for (int c = 0; c < constraints.Count; c++)
             {
-                HeldConstraint constraint = constraints[byConstraint.Key];
-                (int _, string key, string? _, long same, List<(long Row, string Key)>? earlier) = byConstraint.First();
-                string? other = byConstraint.Select(conflict => conflict.Kept).FirstOrDefault(kept => kept is not null)
-                    ?? (earlier is null
-                        ? taken.GetValueOrDefault((byConstraint.Key, same))
-                        : byConstraint.SelectMany(conflict => conflict.Earlier!).Where(pair => !refused.ContainsKey(pair.Row)).Select(pair => pair.Key).FirstOrDefault());
-                if (other is not null)
+                HeldConstraint constraint = constraints[c];
+                List<string> conditions = [.. constraint.Predicate is string predicate ? [$"({predicate})"] : Array.Empty<string>()];
+                if (!constraint.NullsEqual)
                 {
-                    refused[candidate] = constraint.Error(key, other);
+                    conditions.AddRange(constraint.Compared.Select(key => $"{key} IS DISTINCT FROM NULL"));
+                }
+
+                string where = conditions.Count == 0 ? "" : $" WHERE {string.Join(" AND ", conditions)}";
+                string keys = $"SELECT s.{row} AS r, {string.Join(", ", constraint.Compared.Select((key, k) => $"{key} AS k{k}"))} FROM {candidates} s{where}";
+                string keyText = KeyText(constraint.Keys.Length, "b.k");
+                string inTable = $"""
+                    (SELECT {KeyText(constraint.Keys.Length, null, constraint.Compared)} FROM {table} t
+                    WHERE {(constraint.Predicate is string tablePredicate ? $"({tablePredicate}) AND " : "")}{constraint.Conflict(null, "b")} AND {kept} LIMIT 1)
+                    """;
+                string number = c.ToString(CultureInfo.InvariantCulture);
+                string into = many ? $"INSERT INTO pg_temp.worf_held_conflicts ({Columns}) " : "";
+
+                // A constraint whose check fails adds none of its conflicts.
+                List<(long, int, string, string?, long, long?, string?)> found = [];
+                try
+                {
+                    PgTransaction.RunInSubtransaction(() =>
+                    {
+                        found.Clear();
+                        string sql;
+                        bool bound = true;
+                        if (constraint.Orderings is string[] orderings)
+                        {
+                            // Keys compared by equality conflict when they're the same: the rows with the same keys are
+                            // numbered as one, in the order of the btree operator class the equality comes from.
+                            // Only the candidates that can conflict are kept, those a row the table keeps holds the keys
+                            // of and those that share their keys.
+                            sql = $"""
+                                WITH b AS MATERIALIZED ({keys})
+                                {into}SELECT y.r, {number}, y.key, y.kept, y.same, NULL::pg_catalog.int8, NULL::pg_catalog.text FROM (
+                                    SELECT x.*, pg_catalog.count(*) OVER (PARTITION BY x.same) AS n FROM (
+                                        SELECT b.r, {keyText} AS key, {inTable} AS kept,
+                                            pg_catalog.dense_rank() OVER (ORDER BY {string.Join(", ", orderings.Select((ordering, k) => $"b.k{k} USING {ordering}"))}) AS same
+                                        FROM b) x) y
+                                WHERE y.kept IS NOT NULL OR y.n > 1
+                                """;
+                        }
+                        else
+                        {
+                            // Other keys are compared pair by pair, those of many candidates through an index of the
+                            // constraint's own access method and operator classes.
+                            string from = "b";
+                            string with = $"WITH b AS MATERIALIZED ({keys}) ";
+                            if (many)
+                            {
+                                from = "worf_held_keys";
+                                with = "";
+                                bound = false;
+                                _ = Worf.Execute($"CREATE TEMPORARY TABLE worf_held_keys AS {keys}", parameters);
+                                _ = Worf.Execute($"CREATE INDEX ON worf_held_keys USING {Worf.QuoteIdentifier(constraint.AccessMethod)} " +
+                                    $"({string.Join(", ", constraint.OperatorClasses.Select((opclass, k) => $"k{k} {opclass}"))})");
+                                _ = Worf.Execute("ANALYZE worf_held_keys");
+                            }
+
+                            sql = $"""
+                                {with}{into}SELECT x.r, {number}, x.key, x.kept, NULL::pg_catalog.int8, NULL::pg_catalog.int8, NULL::pg_catalog.text
+                                FROM (SELECT b.r, {keyText} AS key, {inTable} AS kept FROM {from} b) x
+                                WHERE x.kept IS NOT NULL
+                                UNION ALL
+                                SELECT b.r, {number}, {keyText}, NULL, NULL, a.r, {KeyText(constraint.Keys.Length, "a.k")}
+                                FROM {from} a JOIN {from} b ON a.r OPERATOR(pg_catalog.<) b.r AND {constraint.Conflict("a", "b")}
+                                """;
+                        }
+
+                        if (many)
+                        {
+                            _ = Worf.Execute(sql, bound ? parameters : []);
+                        }
+                        else
+                        {
+                            found.AddRange(Worf.Read(sql, 0, parameters).Select(Conflict));
+                        }
+
+                        if (!bound)
+                        {
+                            _ = Worf.Execute("DROP TABLE worf_held_keys");
+                            Worf.EndForDecoding();
+                        }
+                    }, PgSubtransactionMode.Atomic);
+                }
+                catch (PgException error) when (!Apply.IsTransient(error))
+                {
+                    found.Clear();
+                }
+
+                gathered.AddRange(found);
+            }
+
+            // In the copy's order, a row is refused by the first constraint in which a row the table keeps holds its
+            // keys, or an earlier row that's written takes them; a row written takes its keys in every constraint.
+            gathered.Sort((a, b) => a.R != b.R ? a.R.CompareTo(b.R) : a.C.CompareTo(b.C));
+            RefusedChecked = many
+                ? Worf.ReadScalar<int>("SELECT pg_catalog.count(DISTINCT h.r)::pg_catalog.int4 FROM pg_temp.worf_held_conflicts h")
+                : gathered.Select(conflict => conflict.R).Distinct().Count();
+            bool pairs = constraints.Exists(constraint => constraint.Orderings is null);
+            HashSet<long> refusedRows = [];
+            Dictionary<(int Constraint, long Same), string> taken = [];
+            long refusedCount = 0;
+            for (long after = long.MinValue; ;)
+            {
+                List<(long R, int C, string Key, string? Kept, long Same, long? Earlier, string? EarlierKey)> part = many
+                    ? [.. Worf.Read($"""
+                        SELECT {Columns} FROM pg_temp.worf_held_conflicts h
+                        WHERE h.r OPERATOR(pg_catalog.>) $1 AND h.r OPERATOR(pg_catalog.<=) (SELECT max(d.r) FROM (
+                            SELECT DISTINCT n.r FROM pg_temp.worf_held_conflicts n WHERE n.r OPERATOR(pg_catalog.>) $1 ORDER BY n.r LIMIT 1000) d)
+                        ORDER BY h.r, h.c
+                        """, 0, SpiParameter.Create(after)).Select(Conflict)]
+                    : after == long.MinValue ? gathered : [];
+                if (part.Count == 0)
+                {
                     break;
                 }
-            }
 
-            if (!refused.ContainsKey(candidate))
-            {
-                foreach ((int c, string key, string? _, long same, List<(long, string)>? earlier) in rowConflicts.Where(conflict => conflict.Earlier is null))
+                List<(long Row, PgException Error)> refused = [];
+                for (int first = 0; first < part.Count;)
                 {
-                    _ = taken.TryAdd((c, same), key);
+                    long candidate = part[first].R;
+                    int end = first;
+                    while (end < part.Count && part[end].R == candidate)
+                    {
+                        end++;
+                    }
+
+                    if (Refuses(part, first, end) is PgException error)
+                    {
+                        refused.Add((candidate, error));
+                        if (pairs)
+                        {
+                            _ = refusedRows.Add(candidate);
+                        }
+                    }
+                    else
+                    {
+                        for (int i = first; i < end; i++)
+                        {
+                            if (constraints[part[i].C].Orderings is not null)
+                            {
+                                _ = taken.TryAdd((part[i].C, part[i].Same), part[i].Key);
+                            }
+                        }
+                    }
+
+                    first = end;
+                }
+
+                after = part[^1].R;
+                if (refused.Count > 0)
+                {
+                    refuse(refused);
+                    refusedCount += refused.Count;
                 }
             }
-        }
 
-        return refused;
+            decided = true;
+            return refusedCount;
 
-        void Add(long candidate, (int, string, string?, long, List<(long, string)>?) conflict)
-        {
-            if (!conflicts.TryGetValue(candidate, out List<(int, string, string?, long, List<(long, string)>?)>? list))
+            // The error of the first constraint, in the order they're checked, that refuses a candidate, from its
+            // conflicts, part[first] to part[end - 1], in the constraints' order.
+            PgException? Refuses(List<(long R, int C, string Key, string? Kept, long Same, long? Earlier, string? EarlierKey)> part, int first, int end)
             {
-                conflicts[candidate] = list = [];
-            }
+                for (int i = first; i < end;)
+                {
+                    int c = part[i].C;
+                    int next = i;
+                    while (next < end && part[next].C == c)
+                    {
+                        next++;
+                    }
 
-            list.Add(conflict);
+                    string? other = null;
+                    for (int k = i; k < next && other is null; k++)
+                    {
+                        other = part[k].Kept;
+                    }
+
+                    for (int k = i; k < next && other is null; k++)
+                    {
+                        other = constraints[c].Orderings is not null
+                            ? taken.GetValueOrDefault((c, part[k].Same))
+                            : part[k].Earlier is long earlier && !refusedRows.Contains(earlier) ? part[k].EarlierKey : null;
+                    }
+
+                    if (other is not null)
+                    {
+                        return constraints[c].Error(part[i].Key, other);
+                    }
+
+                    i = next;
+                }
+
+                return null;
+            }
         }
+        finally
+        {
+            // The table is dropped here rather than as the transaction commits, after which nothing may start a
+            // subtransaction, as a drop's hooks may; a failure leaves it to the transaction's rollback.
+            if (many && decided)
+            {
+                _ = Worf.Execute("DROP TABLE pg_temp.worf_held_conflicts");
+            }
+        }
+
+        static (long, int, string, string?, long, long?, string?) Conflict(WorfRow found)
+            => (found.Get<long>(0), found.Get<int>(1), found.Get<string>(2), found.Get<string?>(3), found.Get<long?>(4) ?? 0, found.Get<long?>(5), found.Get<string?>(6));
     }
 
     /// <summary>

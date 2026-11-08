@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Runtime.InteropServices;
 using System.Text;
 using Ankus.Postgres;
 
@@ -14,6 +15,18 @@ namespace Worf;
 internal static partial class SequenceRangeGuard
 {
     private const string CheckViolation = "23514";
+
+    /// <summary>
+    /// Gets the detail of the failure of a call of nextval that waited for its grantor too long, which an apply worker
+    /// applies again later, as it says nothing about the change's data.
+    /// </summary>
+    internal const string GrantorUnheard = "A server that restarted draws from a block its parent granted only once it has heard from the parent, which may have given the block's values out again meanwhile.";
+
+    /// <summary>
+    /// Gets the detail of the failure of a call of nextval whose sequence worf can't tell that waited for a grantor too
+    /// long, which an apply worker applies again later.
+    /// </summary>
+    internal const string UnnamedGrantorUnheard = "worf can't tell which sequence the call draws from before it runs, as for a name computed as it runs, so the call waits for every grantor this server hasn't heard from.";
 
     // SESSION_REPLICATION_ROLE_REPLICA from commands/trigger.h.
     private const int SessionReplicationRoleReplica = 1;
@@ -48,10 +61,18 @@ internal static partial class SequenceRangeGuard
     // The managed sequences each table's columns draw from, by column, through a default or as identity columns.
     private static readonly Dictionary<uint, List<(short Column, uint Sequence)>> s_drawingColumns = [];
 
-    // The statements and commands whose expressions are starting, innermost last: each with the text of the expressions
-    // it starts, the sequences their nextval calls name and how many calls there are, once a call has looked, and how
-    // many calls have looked.
-    private static readonly List<(Func<string> Text, (HashSet<uint> Called, int Calls, bool Unnamed)? Draws, int Looked)> s_starting = [];
+    // The statements and commands whose expressions are starting, innermost last.
+    private static readonly List<WorfStartingStatement> s_starting = [];
+
+    // The PL/pgSQL expression whose calls of nextval started last, which PL/pgSQL starts outside a statement, as of the
+    // transaction it started in before, with the sequences its calls name once a call has looked, and how many have.
+    private static (nint Expr, uint Lxid, (HashSet<uint> Called, int Calls, bool Unnamed)? Draws, int Looked) s_simple;
+
+    // Where PL/pgSQL finds its instrumentation plugin, which it tells the function its error context calls.
+    private static unsafe void** s_plpgsqlPlugin;
+
+    // The text of the defaults a worker's rows of a table take, by the columns the rows carry.
+    private static readonly Dictionary<(uint Relid, string Sent), string> s_defaultsText = [];
 
     // Whether each table has the guard's triggers, which only tables numbered by a managed sequence have, as of the
     // versions of the shared and this backend's counters it was looked up at.
@@ -534,7 +555,7 @@ internal static partial class SequenceRangeGuard
             return sequences;
         }
 
-        string text = PlanText((Node*)statement);
+        string text = NodeText((Node*)statement);
         (HashSet<uint> called, _, _) = Draws(text);
         return [.. sequences.Distinct().Where(seqoid => called.Contains(seqoid) ||
             text.Contains($"{{NEXTVALUEEXPR :seqid {seqoid.ToString(CultureInfo.InvariantCulture)} ", StringComparison.Ordinal))];
@@ -707,70 +728,493 @@ internal static partial class SequenceRangeGuard
     }
 
     /// <summary>
-    /// Gets or sets whether the statements starting are only explained, as EXPLAIN without ANALYZE starts them, which
-    /// draws nothing.
+    /// Finds where PL/pgSQL looks for its instrumentation plugin, and gives it one that instruments nothing when no other
+    /// library has, so that PL/pgSQL tells the plugin the function its error context calls as each of its functions
+    /// starts, which <see cref="InPlpgsql"/> finds a running function's state through.
     /// </summary>
-    internal static bool ExplainOnly { get; set; }
+    internal static unsafe void WatchPlpgsql()
+    {
+        fixed (byte* name = "PLpgSQL_plugin\0"u8)
+        {
+            s_plpgsqlPlugin = NativeMethods.find_rendezvous_variable((sbyte*)name);
+        }
+
+        if (*s_plpgsqlPlugin is null)
+        {
+            *s_plpgsqlPlugin = NativeMemory.AllocZeroed((nuint)sizeof(PLpgSQL_plugin));
+        }
+    }
 
     /// <summary>
-    /// Notes a statement whose expressions start, so that a call of nextval among them knows the sequences its statement
-    /// names, until <see cref="StartedExpressions"/>.
+    /// Notes a statement whose plan starts, so that a call of nextval among its expressions knows the sequences its
+    /// statement names, until <see cref="StartedExpressions"/>.
     /// </summary>
     /// <param name="statement">The statement's plan.</param>
-    internal static unsafe void StartingExpressions(nint statement) => s_starting.Add((() => PlanText((Node*)statement), null, 0));
+    /// <param name="explained">Whether the statement is only explained, as EXPLAIN without ANALYZE starts it, which
+    /// draws nothing.</param>
+    internal static unsafe void StartingExpressions(nint statement, bool explained)
+        => Starting(() => Draws(PlanText((Node*)statement)), explained);
 
     /// <summary>
-    /// Notes a COPY FROM, whose defaults start before its rows, so that a call of nextval among them knows the sequences
-    /// they name, until <see cref="StartedExpressions"/>.
+    /// Notes a COPY FROM, whose defaults and condition start before its rows, and the CHECK constraints of the domains of
+    /// the columns it reads with the first, so that a call of nextval among them knows the sequences they name, until
+    /// <see cref="StartedExpressions"/>.
     /// </summary>
     /// <param name="relid">The table the COPY writes.</param>
     /// <param name="columns">The columns the COPY reads, by number, or null for all of them.</param>
     /// <param name="defaults">Whether the COPY's DEFAULT option has it start every column's default.</param>
-    internal static void StartingCopy(uint relid, short[]? columns, bool defaults)
-        => s_starting.Add((() => CopyDefaultsText(relid, columns, defaults), null, 0));
+    /// <param name="condition">The text of the COPY's WHERE condition, as <see cref="CopyConditionText"/> reads it.</param>
+    internal static void StartingCopy(uint relid, short[]? columns, bool defaults, string condition = "")
+        => Starting(() => Draws(CopyDefaultsText(relid, columns, defaults) + " " + condition));
 
     /// <summary>
-    /// Forgets the statement <see cref="StartingExpressions"/> or <see cref="StartingCopy"/> noted last, once its
-    /// expressions have started.
+    /// Notes a COPY FROM that worf runs itself, as a table's sync does, as <see cref="StartingCopy(uint, short[], bool, string)"/>
+    /// does a user's.
+    /// </summary>
+    /// <param name="relation">The table the COPY writes.</param>
+    /// <param name="names">The names of the columns it reads, or null for all of them.</param>
+    internal static unsafe void StartingCopy(RelationData* relation, List* names)
+    {
+        short[]? columns = null;
+        if (names is not null)
+        {
+            List* numbers = NativeMethods.CopyGetAttnums(relation->rd_att, relation, names);
+            columns = new short[numbers is null ? 0 : numbers->length];
+            for (int i = 0; i < columns.Length; i++)
+            {
+                columns[i] = (short)numbers->elements[i].int_value;
+            }
+        }
+
+        StartingCopy(relation->rd_id, columns, false);
+    }
+
+    /// <summary>
+    /// Notes a row a worker writes, whose columns the row doesn't carry take their defaults, so that a call of nextval
+    /// among those knows the sequences they name, until <see cref="StartedExpressions"/>.
+    /// </summary>
+    /// <param name="relid">The table.</param>
+    /// <param name="sent">Whether the row carries each column, by its index.</param>
+    internal static void StartingDefaults(uint relid, bool[] sent)
+    {
+        short[] columns = [.. Enumerable.Range(0, sent.Length).Where(i => sent[i]).Select(i => (short)(i + 1))];
+        string key = string.Join(',', columns);
+        Starting(() =>
+        {
+            if (!s_defaultsText.TryGetValue((relid, key), out string? text))
+            {
+                text = CopyDefaultsText(relid, columns, false);
+                s_defaultsText[(relid, key)] = text;
+            }
+
+            return Draws(text);
+        });
+    }
+
+    /// <summary>
+    /// Notes a utility statement that starts expressions outside a plan, so that a call of nextval among them knows the
+    /// sequences they name, until <see cref="StartedExpressions"/>: ALTER TABLE, which starts the defaults of the columns
+    /// it adds and the CHECK constraints it checks rows against, ALTER DOMAIN, which starts the CHECK it checks the
+    /// domain's values against, EXECUTE, alone or explained or creating a table, which starts its parameters, and CALL,
+    /// which starts its arguments. An ALTER TABLE that changes a column's type, through an expression the catalogs don't
+    /// hold, starts no expressions it names.
+    /// </summary>
+    /// <param name="parsetree">The statement.</param>
+    /// <returns>Whether it noted the statement.</returns>
+    internal static unsafe bool StartingUtility(Node* parsetree)
+    {
+        switch (parsetree->type)
+        {
+            case NodeTag.T_AlterTableStmt:
+                AlterTableStmt* alter = (AlterTableStmt*)parsetree;
+                for (int i = 0; alter->cmds is not null && i < alter->cmds->length; i++)
+                {
+                    if (((AlterTableCmd*)alter->cmds->elements[i].ptr_value)->subtype == AlterTableType.AT_AlterColumnType)
+                    {
+                        return false;
+                    }
+                }
+
+                RangeVar* relation = alter->relation;
+                Starting(() => Draws(AlterTableText(relation)));
+                return true;
+
+            case NodeTag.T_AlterDomainStmt when ChecksDomain((AlterDomainStmt*)parsetree):
+                List* typeName = ((AlterDomainStmt*)parsetree)->typeName;
+                Starting(() => Draws(DomainChecks(NativeMethods.typenameTypeId(null, NativeMethods.makeTypeNameFromNameList(typeName)), [])));
+                return true;
+
+            case NodeTag.T_CallStmt when ((CallStmt*)parsetree)->funcexpr is not null:
+                FuncExpr* call = ((CallStmt*)parsetree)->funcexpr;
+                Starting(() => CallDraws(call));
+                return true;
+
+            default:
+                ExecuteStmt* execute = Executed(parsetree);
+                if (execute is null || execute->@params is null || Worf.CatalogOid("sequence_range_block") == 0)
+                {
+                    return false;
+                }
+
+                // EXECUTE analyzes its parameters again as it runs, so they're analyzed here first, where a call one
+                // starts, as a constant coerced to a domain whose CHECK draws, names nothing.
+                string text = Unnamed(() => ExecuteText(execute));
+                Starting(() => Draws(text));
+                return true;
+        }
+    }
+
+    /// <summary>
+    /// Notes a statement as it runs that may route rows to partitions, so that a call of nextval among the expressions it
+    /// starts then knows the sequences they name, until <see cref="StartedExpressions"/>: the RETURNING list, WITH CHECK
+    /// OPTION and ON CONFLICT expressions and MERGE actions of each partition that takes its first row, and the CHECK
+    /// constraints and trigger conditions of each table it writes its first row to, and the CHECKs that draw of the
+    /// domains its values' types are or hold, which a value converted as it runs may start.
+    /// </summary>
+    /// <param name="queryDesc">The statement.</param>
+    /// <returns>Whether it noted the statement.</returns>
+    internal static unsafe bool StartingRun(QueryDesc* queryDesc)
+    {
+        PlannedStmt* statement = queryDesc->plannedstmt;
+        List<(nint Modify, uint Root)> routing = statement is null ? [] : Routing(statement);
+        if (routing.Count == 0)
+        {
+            return false;
+        }
+
+        Starting(() => RoutedDraws(statement, routing));
+        return true;
+    }
+
+    /// <summary>
+    /// Forgets the statement noted last, once its expressions have started.
     /// </summary>
     internal static void StartedExpressions() => s_starting.RemoveAt(s_starting.Count - 1);
 
-    // The text of a plan, as nodeToString writes it, and of the CHECK constraints of the domains it coerces to, which
-    // start with it from the type cache.
-    private static unsafe string PlanText(Node* plan)
+    /// <summary>
+    /// Reads the text of a COPY FROM's WHERE condition, analyzed as COPY analyzes it, under a statement whose calls of
+    /// nextval name nothing, as a constant coerced to a domain whose CHECK draws starts one.
+    /// </summary>
+    /// <param name="relid">The table the COPY writes, which this backend has locked.</param>
+    /// <param name="condition">The condition, unanalyzed, or null.</param>
+    /// <returns>The text, or an empty one.</returns>
+    internal static unsafe string CopyConditionText(uint relid, Node* condition)
     {
-        string text;
-        sbyte* written = NativeMethods.nodeToString(plan);
+        if (condition is null || relid == 0 || Worf.CatalogOid("sequence_range_block") == 0)
+        {
+            return "";
+        }
+
+        return Unnamed(() =>
+        {
+            RelationData* relation = NativeMethods.relation_open(relid, (int)PgLockMode.AccessShare);
+            ParseState* pstate = NativeMethods.make_parsestate(null);
+            try
+            {
+                ParseNamespaceItem* item = NativeMethods.addRangeTableEntryForRelation(pstate, relation, (int)PgLockMode.AccessShare, null, false, false);
+                NativeMethods.addNSItemToQuery(pstate, item, false, true, true);
+                return WithDomainChecks(NodeText(NativeMethods.transformExpr(pstate, (Node*)NativeMethods.copyObjectImpl(condition), ParseExprKind.EXPR_KIND_COPY_WHERE)));
+            }
+            finally
+            {
+                NativeMethods.free_parsestate(pstate);
+                NativeMethods.relation_close(relation, (int)PgLockMode.None);
+            }
+        });
+    }
+
+    // Notes expressions starting, by how their calls of nextval are read, with the error context as they start.
+    private static unsafe void Starting(Func<(HashSet<uint> Called, int Calls, bool Unnamed)> draws, bool explained = false)
+        => s_starting.Add(new(draws, (nint)NativeGlobals.error_context_stack, explained));
+
+    // Runs worf's own reading of a statement's expressions, as parse analysis, under a statement whose calls of nextval,
+    // as a domain's CHECK coercing a constant starts, name nothing.
+    private static T Unnamed<T>(Func<T> read)
+    {
+        Starting(static () => ([], 0, true));
         try
         {
-            text = Worf.FromServer(written);
+            return read();
         }
         finally
         {
-            NativeMethods.pfree(written);
+            StartedExpressions();
         }
-
-        return WithDomainChecks(text);
     }
 
-    // The text of the defaults a COPY FROM starts, of the columns it doesn't read, and of the CHECK constraints of the
-    // domains they're coerced to.
-    private static string CopyDefaultsText(uint relid, short[]? columns, bool defaults)
+    // Whether an ALTER DOMAIN checks the domain's values against a CHECK, as adding or validating one does.
+    private static unsafe bool ChecksDomain(AlterDomainStmt* alter)
+#if ANKUS_PG19
+        => alter->subtype is AlterDomainType.AD_AddConstraint or AlterDomainType.AD_ValidateConstraint;
+#else
+        => alter->subtype is (sbyte)'C' or (sbyte)'V';
+#endif
+
+    // The text of the expressions an ALTER TABLE may start: the defaults of the table and its inheritors, which hold
+    // those of the columns it adds, their CHECK constraints, which hold those it adds, and the CHECKs of the domains of
+    // their columns that have no default, as one it adds coerces a null to.
+    private static unsafe string AlterTableText(RangeVar* relation)
     {
-        if (columns is null && !defaults)
+        uint relid = NativeMethods.RangeVarGetRelidExtended(relation, 0, RangeVarMissingOk, default, null);
+        if (relid == 0)
         {
             return "";
         }
 
         WorfRows started = Elevated.Run(() => Worf.Read("""
+            WITH RECURSIVE tree (relid) AS (
+                SELECT $1::pg_catalog.oid
+                UNION
+                SELECT i.inhrelid FROM pg_catalog.pg_inherits i JOIN tree t ON i.inhparent = t.relid)
+            SELECT d.adbin::pg_catalog.text FROM pg_catalog.pg_attrdef d JOIN tree t ON d.adrelid = t.relid
+            UNION ALL
+            SELECT c.conbin::pg_catalog.text FROM pg_catalog.pg_constraint c JOIN tree t ON c.conrelid = t.relid WHERE c.contype = 'c'
+            UNION ALL
+            SELECT pg_catalog.format('{COERCETODOMAIN :resulttype %s }', a.atttypid)
+            FROM pg_catalog.pg_attribute a JOIN tree t ON a.attrelid = t.relid JOIN pg_catalog.pg_type y ON y.oid = a.atttypid
+            WHERE a.attnum > 0 AND NOT a.attisdropped AND NOT a.atthasdef AND y.typtype = 'd'
+            """, 0, SpiParameter.Create(relid)));
+        return WithDomainChecks(string.Concat(started.Select(row => row.Get<string>(0) + " ")));
+    }
+
+    // The calls of nextval a CALL starts: its arguments', and, for one that leaves a parameter to its default, the
+    // defaults', which name none when they draw, as the arguments may leave any of them out.
+    private static unsafe (HashSet<uint> Called, int Calls, bool Unnamed) CallDraws(FuncExpr* call)
+    {
+        string text = NodeText((Node*)call);
+        (HashSet<uint> called, int calls, bool unnamed) = Draws(WithDomainChecks(text));
+        int given = call->args is null ? 0 : call->args->length;
+        WorfRows procedure = Elevated.Run(() => Worf.Read(
+            "SELECT p.pronargs::pg_catalog.int4, coalesce(p.proargdefaults::pg_catalog.text, '') FROM pg_catalog.pg_proc p WHERE p.oid = $1",
+            1, SpiParameter.Create(call->funcid)));
+        if (procedure.Count == 1 && (given < procedure[0].Get<int>(0) || text.Contains("{NAMEDARGEXPR ", StringComparison.Ordinal)) &&
+            procedure[0].Get<string>(1).Contains("{FUNCEXPR :funcid 1574 ", StringComparison.Ordinal))
+        {
+            unnamed = true;
+        }
+
+        return (called, calls, unnamed);
+    }
+
+    // The EXECUTE a statement runs: itself, or the one it explains or creates a table from.
+    private static unsafe ExecuteStmt* Executed(Node* parsetree)
+    {
+        Node* query = parsetree->type switch
+        {
+            NodeTag.T_ExplainStmt => ((ExplainStmt*)parsetree)->query,
+            NodeTag.T_CreateTableAsStmt => ((CreateTableAsStmt*)parsetree)->query,
+            _ => parsetree,
+        };
+        if (query is not null && query->type == NodeTag.T_Query)
+        {
+            query = ((Query*)query)->utilityStmt;
+        }
+
+        return query is not null && query->type == NodeTag.T_ExecuteStmt ? (ExecuteStmt*)query : null;
+    }
+
+    // The text of an EXECUTE's parameters, analyzed as EXECUTE analyzes them, and of the CHECKs of the domains they're
+    // coerced to.
+    private static unsafe string ExecuteText(ExecuteStmt* execute)
+    {
+        StringBuilder text = new();
+        PreparedStatement* prepared = NativeMethods.FetchPreparedStatement(execute->name, false);
+        ParseState* pstate = NativeMethods.make_parsestate(null);
+        try
+        {
+            for (int i = 0; i < execute->@params->length; i++)
+            {
+                Node* parameter = (Node*)NativeMethods.copyObjectImpl(execute->@params->elements[i].ptr_value);
+                _ = text.Append(NodeText(NativeMethods.transformExpr(pstate, parameter, ParseExprKind.EXPR_KIND_EXECUTE_PARAMETER))).Append(' ');
+                if (prepared is not null && i < prepared->plansource->num_params && NativeMethods.get_typtype(prepared->plansource->param_types[i]) == (sbyte)'d')
+                {
+                    _ = text.Append("{COERCETODOMAIN :resulttype ").Append(prepared->plansource->param_types[i].ToString(CultureInfo.InvariantCulture)).Append(" } ");
+                }
+            }
+        }
+        finally
+        {
+            NativeMethods.free_parsestate(pstate);
+        }
+
+        return WithDomainChecks(text.ToString());
+    }
+
+    // The types an expression's text names, in the fields nodeToString writes them in, whose names end in "type".
+    private static HashSet<uint> NamedTypes(string text)
+    {
+        HashSet<uint> types = [];
+        for (int at = text.IndexOf("type ", StringComparison.Ordinal); at >= 0; at = text.IndexOf("type ", at + 5, StringComparison.Ordinal))
+        {
+            int field = at;
+            while (field > 0 && char.IsAsciiLetterLower(text[field - 1]))
+            {
+                field--;
+            }
+
+            int digits = at + 5;
+            int end = digits;
+            while (end < text.Length && char.IsAsciiDigit(text[end]))
+            {
+                end++;
+            }
+
+            if (field > 0 && text[field - 1] == ':' && end > digits &&
+                uint.TryParse(text.AsSpan(digits, end - digits), NumberStyles.None, CultureInfo.InvariantCulture, out uint type))
+            {
+                _ = types.Add(type);
+            }
+        }
+
+        return types;
+    }
+
+    // The ModifyTable nodes of a plan, at its top or as its subplans, that write to a partitioned table, with its root.
+    private static unsafe List<(nint Modify, uint Root)> Routing(PlannedStmt* statement)
+    {
+        List<(nint Modify, uint Root)> routing = [];
+        for (int i = -1; i < (statement->subplans is null ? 0 : statement->subplans->length); i++)
+        {
+            Plan* plan = i < 0 ? statement->planTree : (Plan*)statement->subplans->elements[i].ptr_value;
+            if (plan is null || plan->type != NodeTag.T_ModifyTable)
+            {
+                continue;
+            }
+
+            ModifyTable* modify = (ModifyTable*)plan;
+            int index = modify->rootRelation != 0 ? (int)modify->rootRelation
+                : modify->resultRelations is not null && modify->resultRelations->length > 0 ? modify->resultRelations->elements[0].int_value : 0;
+            uint root = index > 0 && statement->rtable is not null && index <= statement->rtable->length
+                ? ((RangeTblEntry*)statement->rtable->elements[index - 1].ptr_value)->relid
+                : 0;
+            if (root != 0 && NativeMethods.get_rel_relkind(root) == (sbyte)'p')
+            {
+                routing.Add(((nint)modify, root));
+            }
+        }
+
+        return routing;
+    }
+
+    // The calls of nextval a statement that routes rows starts as it runs: those its ModifyTable nodes start for each
+    // leaf partition of their roots, those of the CHECK constraints and trigger conditions of the tables in those
+    // trees, and those of the CHECKs that draw of the domains the types its plan names are or hold.
+    private static unsafe (HashSet<uint> Called, int Calls, bool Unnamed) RoutedDraws(PlannedStmt* statement, List<(nint Modify, uint Root)> routing)
+    {
+        HashSet<uint> called = [];
+        int calls = 0;
+        bool unnamed = false;
+        foreach ((nint node, uint root) in routing)
+        {
+            ModifyTable* modify = (ModifyTable*)node;
+            (HashSet<uint> Called, int Calls, bool Unnamed) routed = Draws(WithDomainChecks(string.Join(' ', NodeText((Node*)modify->returningLists),
+                NodeText((Node*)modify->withCheckOptionLists), NodeText((Node*)modify->onConflictSet), NodeText(modify->onConflictWhere),
+                NodeText((Node*)modify->mergeActionLists))));
+            if (routed.Calls == 0)
+            {
+                continue;
+            }
+
+            WorfRows tree = Elevated.Run(() => Worf.Read("""
+                SELECT (SELECT pg_catalog.count(*) FROM pg_catalog.pg_partition_tree($1) p WHERE p.isleaf)::pg_catalog.int4,
+                    coalesce(pg_catalog.string_agg(x.expr, ' '), '')
+                FROM (
+                    SELECT c.conbin::pg_catalog.text FROM pg_catalog.pg_partition_tree($1) p JOIN pg_catalog.pg_constraint c ON c.conrelid = p.relid
+                    WHERE c.contype = 'c'
+                    UNION ALL
+                    SELECT g.tgqual::pg_catalog.text FROM pg_catalog.pg_partition_tree($1) p JOIN pg_catalog.pg_trigger g ON g.tgrelid = p.relid
+                    WHERE g.tgqual IS NOT NULL) x (expr)
+                """, 1, SpiParameter.Create(root)));
+            (HashSet<uint> Called, int Calls, bool Unnamed) checks = Draws(WithDomainChecks(tree[0].Get<string>(1)));
+            called.UnionWith(routed.Called);
+            called.UnionWith(checks.Called);
+            calls += (routed.Calls * Math.Max(tree[0].Get<int>(0), 1)) + checks.Calls;
+            unnamed |= routed.Unnamed || checks.Unnamed;
+        }
+
+        if (calls > 0)
+        {
+            long[] types = [.. NamedTypes(NodeText((Node*)statement)).Select(type => (long)type)];
+            string drawing = string.Concat(Elevated.Run(() => Worf.Read("""
+                WITH RECURSIVE r (typ) AS (
+                    SELECT pg_catalog.unnest($1::pg_catalog.int8[])::pg_catalog.oid
+                    UNION
+                    SELECT n.typ FROM r JOIN pg_catalog.pg_type t ON t.oid = r.typ
+                    CROSS JOIN LATERAL (
+                        SELECT t.typbasetype WHERE t.typtype = 'd'
+                        UNION ALL
+                        SELECT t.typelem WHERE t.typelem <> 0 AND t.typsubscript = 'pg_catalog.array_subscript_handler'::pg_catalog.regproc
+                        UNION ALL
+                        SELECT f.atttypid FROM pg_catalog.pg_attribute f
+                        WHERE t.typtype = 'c' AND f.attrelid = t.typrelid AND f.attnum > 0 AND NOT f.attisdropped
+                        UNION ALL
+                        SELECT g.rngsubtype FROM pg_catalog.pg_range g WHERE t.typtype = 'r' AND g.rngtypid = t.oid
+                        UNION ALL
+                        SELECT g.rngtypid FROM pg_catalog.pg_range g WHERE t.typtype = 'm' AND g.rngmultitypid = t.oid) n (typ))
+                SELECT c.conbin::pg_catalog.text FROM r JOIN pg_catalog.pg_constraint c ON c.contypid = r.typ
+                WHERE c.contype = 'c' AND pg_catalog.strpos(c.conbin::pg_catalog.text, '{FUNCEXPR :funcid 1574 ') > 0
+                """, 0, SpiParameter.Create(types))).Select(row => row.Get<string>(0) + " "));
+            (HashSet<uint> Called, int Calls, bool Unnamed) domains = Draws(WithDomainChecks(drawing));
+            called.UnionWith(domains.Called);
+            calls += domains.Calls;
+            unnamed |= domains.Unnamed;
+        }
+
+        return (called, calls, unnamed);
+    }
+
+    // The text of a plan, as nodeToString writes it, and of the CHECK constraints of the domains it coerces to, which
+    // start with it from the type cache.
+    private static unsafe string PlanText(Node* plan) => WithDomainChecks(NodeText(plan));
+
+    // A node's text, as nodeToString writes it.
+    private static unsafe string NodeText(Node* node)
+    {
+        sbyte* written = NativeMethods.nodeToString(node);
+        try
+        {
+            return Worf.FromServer(written);
+        }
+        finally
+        {
+            NativeMethods.pfree(written);
+        }
+    }
+
+    // The text of the defaults a COPY FROM starts, of the columns it doesn't read, and of the CHECK constraints of the
+    // domains they're coerced to, and of those of the domains the values of the columns it reads are, or hold as array
+    // elements, fields or range bounds, whose input functions start them as the first row comes.
+    private static string CopyDefaultsText(uint relid, short[]? columns, bool defaults)
+    {
+        WorfRows started = Elevated.Run(() => Worf.Read("""
+            WITH RECURSIVE r (typ, base) AS (
+                SELECT a.atttypid, false FROM pg_catalog.pg_attribute a
+                WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated = ''
+                    AND ($3 IS NULL OR a.attnum = ANY ($3::pg_catalog.int2[]))
+                UNION ALL
+                SELECT n.typ, n.base FROM r JOIN pg_catalog.pg_type t ON t.oid = r.typ
+                CROSS JOIN LATERAL (
+                    SELECT t.typbasetype, true WHERE t.typtype = 'd'
+                    UNION ALL
+                    SELECT t.typelem, false WHERE t.typtype <> 'd' AND t.typelem <> 0 AND t.typsubscript = 'pg_catalog.array_subscript_handler'::pg_catalog.regproc
+                    UNION ALL
+                    SELECT f.atttypid, false FROM pg_catalog.pg_attribute f
+                    WHERE t.typtype = 'c' AND f.attrelid = t.typrelid AND f.attnum > 0 AND NOT f.attisdropped
+                    UNION ALL
+                    SELECT g.rngsubtype, false FROM pg_catalog.pg_range g WHERE t.typtype = 'r' AND g.rngtypid = t.oid
+                    UNION ALL
+                    SELECT g.rngtypid, false FROM pg_catalog.pg_range g WHERE t.typtype = 'm' AND g.rngmultitypid = t.oid) n (typ, base))
             SELECT coalesce(d.adbin::pg_catalog.text, t.typdefaultbin::pg_catalog.text, ''),
                 CASE WHEN d.adbin IS NULL AND t.typtype = 'd' THEN pg_catalog.format('{COERCETODOMAIN :resulttype %s }', t.oid) ELSE '' END
             FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
                 LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
-            WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated = ''
+            WHERE ($2 OR $3 IS NOT NULL) AND a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated = ''
                 AND ($2 OR NOT (a.attnum = ANY ($3::pg_catalog.int2[])))
                 AND (d.adbin IS NOT NULL OR t.typdefaultbin IS NOT NULL)
-            """, 0, SpiParameter.Create(relid), SpiParameter.Create(defaults), SpiParameter.Create(columns ?? [])));
+            UNION ALL
+            SELECT pg_catalog.format('{COERCETODOMAIN :resulttype %s }', r.typ), ''
+            FROM r JOIN pg_catalog.pg_type t ON t.oid = r.typ WHERE t.typtype = 'd' AND NOT r.base
+            """, 0, SpiParameter.Create(relid), SpiParameter.Create(defaults), SpiParameter.Create(columns)));
         return WithDomainChecks(string.Concat(started.Select(row => row.Get<string>(0) + " " + row.Get<string>(1) + " ")));
     }
 
@@ -780,20 +1224,14 @@ internal static partial class SequenceRangeGuard
     {
         StringBuilder all = new(text);
         StringBuilder found = new();
+        Dictionary<uint, string> read = [];
         string pending = text;
         for (int depth = 0; depth < 8 && pending.Length > 0; depth++)
         {
             List<uint> domains = CoercedDomains(pending);
             _ = found.Clear();
-            foreach (uint domain in domains)
+            foreach (string checks in domains.Select(domain => DomainChecks(domain, read)))
             {
-                string checks = string.Concat(Elevated.Run(() => Worf.Read("""
-                    WITH RECURSIVE d (oid) AS (
-                        SELECT $1::pg_catalog.oid
-                        UNION
-                        SELECT t.typbasetype FROM pg_catalog.pg_type t JOIN d ON t.oid = d.oid WHERE t.typtype = 'd')
-                    SELECT c.conbin::pg_catalog.text FROM pg_catalog.pg_constraint c JOIN d ON c.contypid = d.oid WHERE c.contype = 'c'
-                    """, 0, SpiParameter.Create(domain))).Select(row => row.Get<string>(0) + " "));
                 _ = all.Append(' ').Append(checks);
                 _ = found.Append(checks);
             }
@@ -802,6 +1240,24 @@ internal static partial class SequenceRangeGuard
         }
 
         return all.ToString();
+    }
+
+    // The text of a domain's CHECK constraints, and of its base domains', read once for the expressions being read.
+    private static string DomainChecks(uint domain, Dictionary<uint, string> read)
+    {
+        if (!read.TryGetValue(domain, out string? checks))
+        {
+            checks = string.Concat(Elevated.Run(() => Worf.Read("""
+                WITH RECURSIVE d (oid) AS (
+                    SELECT $1::pg_catalog.oid
+                    UNION
+                    SELECT t.typbasetype FROM pg_catalog.pg_type t JOIN d ON t.oid = d.oid WHERE t.typtype = 'd')
+                SELECT c.conbin::pg_catalog.text FROM pg_catalog.pg_constraint c JOIN d ON c.contypid = d.oid WHERE c.contype = 'c'
+                """, 0, SpiParameter.Create(domain))).Select(row => row.Get<string>(0) + " "));
+            read[domain] = checks;
+        }
+
+        return checks;
     }
 
     // The domains an expression's text coerces to, once for each coercion: each CoerceToDomain's own result type, at
@@ -856,19 +1312,47 @@ internal static partial class SequenceRangeGuard
     /// <summary>
     /// Waits, as a call of nextval is about to run, until this server has heard from the grantor of the managed
     /// sequence's active block since it started, as <see cref="WaitForGrantor"/> does for the statements that hold the
-    /// gates, so that nothing draws from that block meanwhile: the sequence its statement, or COPY's defaults, name, or,
-    /// for a call whose sequence they don't name, as one computed as it runs, a PL/pgSQL expression's, which PL/pgSQL
-    /// evaluates without a statement, or a default ALTER TABLE fills a column with, every managed sequence's. A call past
-    /// the calls its statement names, as one a function the statement runs as it starts makes, is one they don't name.
-    /// worf's own statements, a standby, a read-only transaction, an explained statement, and Snowflake node numbers,
-    /// whose IDs carry their times, don't wait; a statement that a worf worker runs for a user, as DDL it applies, does.
+    /// gates, so that nothing draws from that block meanwhile: the sequence the expressions starting around it name, or,
+    /// for a call whose sequence they don't name, as one computed as it runs, every managed sequence's. Those are a
+    /// statement's plan, or, for a PL/pgSQL function running within it, the expression PL/pgSQL starts outside a plan,
+    /// or the expressions a COPY, a utility statement, a statement routing rows to partitions or a worker's row starts,
+    /// as <see cref="StartingCopy(uint, short[], bool, string)"/>, <see cref="StartingUtility"/>,
+    /// <see cref="StartingRun"/> and <see cref="StartingDefaults"/> note them. A call past the calls they name, as one
+    /// started by code they don't hold, is one they don't name. worf's own statements, a standby, a read-only
+    /// transaction, an explained statement, and Snowflake node numbers, whose IDs carry their times, don't wait; a
+    /// statement that a worf worker runs for a user, as DDL it applies, does.
     /// </summary>
     internal static void BeforeNextval()
     {
-        // Each call that starts within a statement counts against the calls it names.
-        if (s_starting.Count > 0)
+        // worf's own reading of what a statement names starts no call of the statement's.
+        if (s_namingGrantors)
         {
-            s_starting[^1] = s_starting[^1] with { Looked = s_starting[^1].Looked + 1 };
+            return;
+        }
+
+        // Each call that starts counts against the calls the expressions starting around it name.
+        bool plpgsql;
+        nint simple;
+        WorfStartingStatement? starting = null;
+        unsafe
+        {
+            plpgsql = InPlpgsql(out simple);
+            if (plpgsql && simple != 0)
+            {
+                uint lxid = ((PLpgSQL_expr*)simple)->expr_simple_lxid;
+                if (s_simple.Expr != simple || s_simple.Lxid != lxid)
+                {
+                    s_simple = (simple, lxid, null, 0);
+                }
+
+                s_simple.Looked++;
+            }
+        }
+
+        if (!plpgsql && s_starting.Count > 0)
+        {
+            starting = s_starting[^1];
+            starting.Looked++;
         }
 
         bool quiet;
@@ -877,7 +1361,7 @@ internal static partial class SequenceRangeGuard
             quiet = NativeGlobals.creating_extension || NativeGlobals.XactReadOnly;
         }
 
-        if (quiet || s_namingGrantors || ExplainOnly || SequenceRanges.Recovering() || Worf.CatalogOid("sequence_range_block") == 0)
+        if (quiet || starting is { Explained: true } || SequenceRanges.Recovering() || Worf.CatalogOid("sequence_range_block") == 0)
         {
             return;
         }
@@ -895,7 +1379,7 @@ internal static partial class SequenceRangeGuard
                 return;
             }
 
-            HashSet<uint>? called = StartingDraws();
+            HashSet<uint>? called = plpgsql ? SimpleDraws(simple) : StartingDraws(starting);
             unnamed = called is null;
             waiting = unnamed ? [.. unconfirmed.DistinctBy(seqoid => s_grantors[seqoid])] : [.. unconfirmed.Where(called!.Contains)];
         }
@@ -914,65 +1398,264 @@ internal static partial class SequenceRangeGuard
     /// Finds the sequences the nextval calls of the statement whose expressions start name, once for the statement, or
     /// null outside one, or for a call they don't name.
     /// </summary>
-    private static HashSet<uint>? StartingDraws()
+    private static HashSet<uint>? StartingDraws(WorfStartingStatement? starting)
+        => starting is null || starting.Draws.Unnamed || starting.Looked > starting.Draws.Calls ? null : starting.Draws.Called;
+
+    /// <summary>
+    /// Finds the sequences the nextval calls of the PL/pgSQL expression starting name, once for the expression as it
+    /// starts, or null for one PL/pgSQL doesn't start itself, or a call they don't name.
+    /// </summary>
+    private static unsafe HashSet<uint>? SimpleDraws(nint simple)
     {
-        if (s_starting.Count == 0)
+        if (simple == 0)
         {
             return null;
         }
 
-        (Func<string> text, (HashSet<uint> Called, int Calls, bool Unnamed)? draws, int looked) = s_starting[^1];
-        if (draws is null)
+        s_simple.Draws ??= Draws(PlanText((Node*)((PLpgSQL_expr*)simple)->expr_simple_expr));
+        return s_simple.Draws.Value.Unnamed || s_simple.Looked > s_simple.Draws.Value.Calls ? null : s_simple.Draws.Value.Called;
+    }
+
+    /// <summary>
+    /// Checks whether a PL/pgSQL function runs within the statement whose expressions started last, or with none
+    /// starting, as PostgreSQL's error context shows: PL/pgSQL calls the function it tells its instrumentation plugin of
+    /// for each of its functions running, with the function's state. When PL/pgSQL is itself starting an expression of
+    /// the function's, outside a plan, as it does a simple expression's once a transaction, it has set the function's
+    /// parameters up for the expression, which isn't running yet.
+    /// </summary>
+    /// <param name="simple">The expression PL/pgSQL is starting, or zero.</param>
+    /// <returns>Whether one runs.</returns>
+    private static unsafe bool InPlpgsql(out nint simple)
+    {
+        simple = 0;
+        PLpgSQL_plugin* plugin = s_plpgsqlPlugin is null ? null : (PLpgSQL_plugin*)*s_plpgsqlPlugin;
+        if (plugin is null || plugin->error_callback.IsNull)
         {
-            draws = Draws(text());
-            s_starting[^1] = (text, draws, looked);
+            return false;
         }
 
-        return draws.Value.Unnamed || looked > draws.Value.Calls ? null : draws.Value.Called;
+        void* callback = plugin->error_callback.DangerousGetAddress();
+        nint outer = s_starting.Count > 0 ? s_starting[^1].Context : 0;
+        for (ErrorContextCallback* context = NativeGlobals.error_context_stack; context is not null && (nint)context != outer; context = context->previous)
+        {
+            if (context->callback.DangerousGetAddress() != callback)
+            {
+                continue;
+            }
+
+            ParamListInfoData* parameters = ((PLpgSQL_execstate*)context->arg)->paramLI;
+            PLpgSQL_expr* expr = parameters is null ? null : (PLpgSQL_expr*)parameters->parserSetupArg;
+            if (expr is not null && expr->expr_simple_expr is not null && !expr->expr_simple_in_use)
+            {
+                simple = (nint)expr;
+            }
+
+            return true;
+        }
+
+        return false;
     }
 
     /// <summary>
     /// Reads, from expressions' text, as nodeToString writes them, the sequences their calls of nextval name, as each
-    /// call's argument, a constant, names one, and how many calls there are: a call whose argument isn't one, as a name
-    /// computed as it runs, makes the sequences they may draw from unnamed.
+    /// call's argument, a constant, names one, and how many calls there are. A constant name given as text, which the
+    /// call looks up as it runs, under the search path it runs with, names every managed sequence of that name in any
+    /// schema, or the schema it gives. A call whose argument isn't a constant, as a name computed as it runs, makes the
+    /// sequences they may draw from unnamed.
     /// </summary>
     private static (HashSet<uint> Called, int Calls, bool Unnamed) Draws(string text)
     {
         const string Call = "{FUNCEXPR :funcid 1574 ";
         const string Named = "{CONST :consttype 2205 ";
+        const string Looked = "{FUNCEXPR :funcid 1079 ";
+        const string Name = "{CONST :consttype 25 ";
         HashSet<uint> called = [];
         bool unnamed = false;
         int calls = 0;
         for (int at = text.IndexOf(Call, StringComparison.Ordinal); at >= 0; at = text.IndexOf(Call, at + Call.Length, StringComparison.Ordinal))
         {
             calls++;
-            int args = text.IndexOf(":args (", at, StringComparison.Ordinal);
-            if (args < 0 || !text.AsSpan(args + ":args (".Length).TrimStart().StartsWith(Named, StringComparison.Ordinal))
+            int args = Argument(text, at);
+            if (args >= 0 && string.CompareOrdinal(text, args, Named, 0, Named.Length) == 0 && ConstBytes(text, args) is { Length: >= 4 } bytes)
+            {
+                _ = called.Add((uint)(bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24)));
+            }
+            else if (args >= 0 && string.CompareOrdinal(text, args, Looked, 0, Looked.Length) == 0 && Argument(text, args) is int inner and >= 0 &&
+                string.CompareOrdinal(text, inner, Name, 0, Name.Length) == 0 && TextConst(ConstBytes(text, inner)) is string name &&
+                ManagedNamed(name) is HashSet<uint> managed)
+            {
+                called.UnionWith(managed);
+            }
+            else
             {
                 unnamed = true;
-                continue;
             }
-
-            int value = text.IndexOf(":constvalue ", args, StringComparison.Ordinal);
-            int open = value < 0 ? -1 : text.IndexOf('[', value);
-            int close = open < 0 ? -1 : text.IndexOf(']', open);
-            string[] bytes = close < 0 ? [] : text[(open + 1)..close].Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            if (bytes.Length < 4)
-            {
-                unnamed = true;
-                continue;
-            }
-
-            uint oid = 0;
-            for (int b = 3; b >= 0; b--)
-            {
-                oid = (oid << 8) | (uint)(int.Parse(bytes[b], CultureInfo.InvariantCulture) & 0xFF);
-            }
-
-            _ = called.Add(oid);
         }
 
         return (called, calls, unnamed);
+    }
+
+    // Where the first argument of the node at a position of an expression's text starts, or -1.
+    private static int Argument(string text, int node)
+    {
+        int args = text.IndexOf(":args (", node, StringComparison.Ordinal);
+        if (args < 0)
+        {
+            return -1;
+        }
+
+        int first = args + ":args (".Length;
+        while (first < text.Length && text[first] == ' ')
+        {
+            first++;
+        }
+
+        return first;
+    }
+
+    // The bytes of the value of the constant at a position of an expression's text, or null for a null one.
+    private static byte[]? ConstBytes(string text, int node)
+    {
+        int value = text.IndexOf(":constvalue ", node, StringComparison.Ordinal);
+        int open = value < 0 ? -1 : text.IndexOf('[', value);
+        int close = open < 0 ? -1 : text.IndexOf(']', open);
+        int next = text.IndexOf('{', node + 1);
+        if (close < 0 || (next >= 0 && next < open))
+        {
+            return null;
+        }
+
+        string[] bytes = text[(open + 1)..close].Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        return [.. bytes.Select(b => (byte)(int.Parse(b, CultureInfo.InvariantCulture) & 0xFF))];
+    }
+
+    // The characters of a text constant's bytes, as its varlena holds them, or null for one this can't tell, as one
+    // compressed or out of line, or whose characters aren't ASCII, which the database's encoding may give otherwise.
+    private static string? TextConst(byte[]? bytes)
+    {
+        if (bytes is null || bytes.Length < 1)
+        {
+            return null;
+        }
+
+        (int header, int length) = (bytes[0] & 0x01) == 0x01
+            ? (1, bytes[0] == 0x01 ? -1 : (bytes[0] >> 1) & 0x7F)
+            : (bytes[0] & 0x03) == 0 && bytes.Length >= 4 ? (4, (int)((uint)(bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24)) >> 2)) : (0, -1);
+        if (length < header || length > bytes.Length || bytes.AsSpan(header, length - header).ContainsAnyInRange((byte)0x80, (byte)0xFF))
+        {
+            return null;
+        }
+
+        return Encoding.ASCII.GetString(bytes, header, length - header);
+    }
+
+    // The managed sequences a name given as text may look up, in whatever schema the search path finds it, or in the
+    // schema it gives, compared without case, or null for a name nextval can't look up.
+    private static HashSet<uint>? ManagedNamed(string name)
+    {
+        List<string>? parts = NameParts(name);
+        if (parts is null || parts.Count is 0 or > 3)
+        {
+            return null;
+        }
+
+        string relname = parts[^1];
+        string? schema = parts.Count > 1 ? parts[^2] : null;
+        HashSet<uint> managed = [];
+        foreach (uint seqoid in s_sequences.Keys)
+        {
+            string? found;
+            string? foundSchema;
+            unsafe
+            {
+                sbyte* rel = NativeMethods.get_rel_name(seqoid);
+                found = rel is null ? null : Worf.FromServer(rel);
+                sbyte* nsp = rel is null ? null : NativeMethods.get_namespace_name(NativeMethods.get_rel_namespace(seqoid));
+                foundSchema = nsp is null ? null : Worf.FromServer(nsp);
+            }
+
+            if (string.Equals(found, relname, StringComparison.OrdinalIgnoreCase) &&
+                (schema is null || string.Equals(foundSchema, schema, StringComparison.OrdinalIgnoreCase)))
+            {
+                _ = managed.Add(seqoid);
+            }
+        }
+
+        return managed;
+    }
+
+    // The parts of a qualified name, as nextval splits a name given as text: by dots outside double quotes, an unquoted
+    // part folded to lower case and cut to the length of a name, or null for a name it can't split.
+    private static List<string>? NameParts(string name)
+    {
+        const int NameLength = 63;
+        List<string> parts = [];
+        StringBuilder part = new();
+        int i = 0;
+        while (true)
+        {
+            while (i < name.Length && char.IsWhiteSpace(name[i]))
+            {
+                i++;
+            }
+
+            _ = part.Clear();
+            if (i < name.Length && name[i] == '"')
+            {
+                for (i++; ; i++)
+                {
+                    if (i >= name.Length)
+                    {
+                        return null;
+                    }
+
+                    if (name[i] == '"')
+                    {
+                        if (i + 1 < name.Length && name[i + 1] == '"')
+                        {
+                            _ = part.Append('"');
+                            i++;
+                            continue;
+                        }
+
+                        i++;
+                        break;
+                    }
+
+                    _ = part.Append(name[i]);
+                }
+            }
+            else
+            {
+                for (; i < name.Length && name[i] != '.' && !char.IsWhiteSpace(name[i]); i++)
+                {
+                    _ = part.Append(char.ToLowerInvariant(name[i]));
+                }
+
+                if (part.Length == 0)
+                {
+                    return null;
+                }
+            }
+
+            parts.Add(part.Length > NameLength ? part.ToString(0, NameLength) : part.ToString());
+            while (i < name.Length && char.IsWhiteSpace(name[i]))
+            {
+                i++;
+            }
+
+            if (i == name.Length)
+            {
+                return parts;
+            }
+
+            if (name[i] != '.')
+            {
+                return null;
+            }
+
+            i++;
+        }
     }
 
     /// <summary>
@@ -1018,10 +1701,11 @@ internal static partial class SequenceRangeGuard
                         throw unnamed
                             ? new PgException(PgSqlStates.ObjectNotInPrerequisiteState,
                                 $"nextval can't draw until node {parent}, which granted sequence {sequence}'s block, answers this server, which started since",
-                                detail: "worf can't tell which sequence the call draws from before it runs, as for a name computed as it runs or a PL/pgSQL expression's call, so the call waits for every grantor this server hasn't heard from.",
+                                detail: UnnamedGrantorUnheard,
                                 hint: $"Make sure node {parent} is up and its exchanges with this node succeed, or name the sequence in the statement.")
                             : new PgException(PgSqlStates.ObjectNotInPrerequisiteState,
                                 $"sequence {sequence} can't draw from the block node {parent} granted it until node {parent} answers this server, which started since",
+                                detail: GrantorUnheard,
                                 hint: $"Make sure node {parent} is up and its exchanges with this node succeed.");
                     }
 
@@ -1162,7 +1846,8 @@ internal static partial class SequenceRangeGuard
     }
 
     /// <summary>
-    /// Lists the managed sequences a table's defaults and identity columns draw from.
+    /// Lists the managed sequences a table's defaults and identity columns draw from, a partition's identity columns
+    /// drawing from its ancestors' sequences.
     /// </summary>
     private static List<uint> DrawnBy(uint relid)
     {
@@ -1179,8 +1864,8 @@ internal static partial class SequenceRangeGuard
                 WHERE a.adrelid = $1
                 UNION
                 SELECT d.objid FROM pg_catalog.pg_depend d
-                WHERE d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.refobjid = $1 AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
-                    AND d.deptype = 'i'
+                WHERE d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+                    AND d.deptype = 'i' AND (d.refobjid = $1 OR d.refobjid IN (SELECT a.relid FROM pg_catalog.pg_partition_ancestors($1) a))
                 """, 0, SpiParameter.Create(relid)));
             sequences = [.. used.Select(row => row.Get<uint>(0)).Where(s_sequences.ContainsKey)];
             s_drawnBy[relid] = sequences;
@@ -2481,6 +3166,7 @@ internal static partial class SequenceRangeGuard
         s_grantors.Clear();
         s_drawnBy.Clear();
         s_drawingColumns.Clear();
+        s_defaultsText.Clear();
         s_reservedActive.Clear();
         s_moved.Clear();
         s_reached.Clear();

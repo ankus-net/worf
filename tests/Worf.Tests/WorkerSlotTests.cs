@@ -104,7 +104,9 @@ public sealed class WorkerSlotTests
     /// <summary>
     /// COMMIT PREPARED of a transaction that changed neither worf nor a database starts no manager, in its own database
     /// or any other, though the managers that found nothing to manage there exited, nor does it once the server
-    /// restarted after the transaction was prepared.
+    /// restarted after the transaction was prepared: an insert, a read of pg_database, ALTER ROLE ... SET, GRANT
+    /// CONNECT and COMMENT ON DATABASE, CREATE TABLE, and a read or SELECT ... FOR UPDATE of worf.node, which doesn't
+    /// keep the supervisor watching for its end either.
     /// </summary>
     /// <param name="restart">Whether the server restarts between PREPARE TRANSACTION and COMMIT PREPARED.</param>
     /// <returns>The test.</returns>
@@ -114,7 +116,7 @@ public sealed class WorkerSlotTests
     public async Task UnrelatedPreparedCommitsStartNoManager(bool restart)
     {
         CancellationToken token = TestContext.CancellationToken;
-        await using TestNode node = await TestNode.StartAsync("node", ["max_prepared_transactions = 20", "log_min_messages = debug1"], token);
+        await using TestNode node = await TestNode.StartAsync("node", ["max_prepared_transactions = 40", "log_min_messages = debug1"], token);
         for (int i = 0; i < 3; i++)
         {
             _ = await node.SafePsqlAsync(Database, $"CREATE DATABASE unrelated{i}", token);
@@ -125,13 +127,42 @@ public sealed class WorkerSlotTests
         {
             _ = await node.SafePsqlAsync("unrelated0", string.Concat(Enumerable.Range(0, 20).Select(i =>
                 $"BEGIN; INSERT INTO t VALUES ({i}); PREPARE TRANSACTION 'restored{i}';")), token);
+            _ = await node.SafePsqlAsync("unrelated0", "CREATE ROLE unrelated_role", token);
+            _ = await node.SafePsqlAsync("unrelated0", """
+                BEGIN; SELECT count(*) FROM pg_database; PREPARE TRANSACTION 'restored_read';
+                BEGIN; ALTER ROLE unrelated_role SET work_mem = '8MB'; PREPARE TRANSACTION 'restored_role';
+                BEGIN; GRANT CONNECT ON DATABASE unrelated1 TO unrelated_role; PREPARE TRANSACTION 'restored_grant';
+                BEGIN; COMMENT ON DATABASE unrelated2 IS 'unrelated'; PREPARE TRANSACTION 'restored_comment';
+                BEGIN; CREATE TABLE made (a int); PREPARE TRANSACTION 'restored_table';
+                """, token);
+            _ = await node.SafePsqlAsync(Database, "CREATE EXTENSION IF NOT EXISTS worf", token);
+            _ = await node.SafePsqlAsync(Database, """
+                BEGIN; SELECT count(*) FROM worf.node; PREPARE TRANSACTION 'restored_node';
+                BEGIN; SELECT * FROM worf.node FOR UPDATE; PREPARE TRANSACTION 'restored_node_locked';
+                """, token);
             await node.StopAsync("fast", token);
             await node.StartServerAsync(token);
             await Task.Delay(TimeSpan.FromSeconds(3), token);
             int restored = Starts();
-            _ = await node.SafePsqlAsync("unrelated0", string.Concat(Enumerable.Range(0, 20).Select(i => $"COMMIT PREPARED 'restored{i}';")), token);
+
+            // The supervisor waits for them without looking a few times a second.
+            if (OperatingSystem.IsLinux())
+            {
+                string supervisor = await node.SafePsqlAsync(Database, "SELECT pid FROM pg_stat_activity WHERE backend_type = 'worf supervisor'", token);
+                long Switches() => long.Parse(File.ReadLines($"/proc/{supervisor}/status").Single(line => line.StartsWith("voluntary_ctxt_switches:", StringComparison.Ordinal))
+                    ["voluntary_ctxt_switches:".Length..].Trim(), CultureInfo.InvariantCulture);
+                long switches = Switches();
+                await Task.Delay(TimeSpan.FromSeconds(3), token);
+                Assert.IsLessThan(10L, Switches() - switches, "the supervisor's waits in 3 s while the unrelated transactions stay prepared");
+            }
+
+            _ = await node.SafePsqlAsync("unrelated0", string.Concat(Enumerable.Range(0, 20).Select(i => $"COMMIT PREPARED 'restored{i}';")) + """
+                COMMIT PREPARED 'restored_read'; COMMIT PREPARED 'restored_role'; COMMIT PREPARED 'restored_grant'; COMMIT PREPARED 'restored_comment';
+                COMMIT PREPARED 'restored_table';
+                """, token);
+            _ = await node.SafePsqlAsync(Database, "COMMIT PREPARED 'restored_node'; COMMIT PREPARED 'restored_node_locked'", token);
             await Task.Delay(TimeSpan.FromSeconds(3), token);
-            Assert.AreEqual(restored, Starts(), "managers started by 20 unrelated COMMIT PREPARED of transactions prepared before a restart");
+            Assert.AreEqual(restored, Starts(), "managers started by unrelated COMMIT PREPARED of transactions prepared before a restart");
             return;
         }
 
@@ -152,6 +183,37 @@ public sealed class WorkerSlotTests
         Assert.AreEqual(before, Starts(), "managers started by 20 unrelated COMMIT PREPARED");
 
         int Starts() => node.ReadLog().Split('\n').Count(line => line.Contains("starting background worker process \"worf manager", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// A database's manager exits once COMMIT PREPARED of a DROP EXTENSION worf has committed, as it does after a DROP
+    /// EXTENSION committed at once, though the server restarted in between.
+    /// </summary>
+    /// <param name="restart">Whether the server restarts between PREPARE TRANSACTION and COMMIT PREPARED.</param>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task PreparedDropsStopTheirManager(bool restart)
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode node = await TestNode.StartAsync("node", ["max_prepared_transactions = 2"], token);
+        _ = await node.SafePsqlAsync(Database, "CREATE DATABASE dropping", token);
+        _ = await node.SafePsqlAsync("dropping", "CREATE EXTENSION worf", token);
+        const string Manager = "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = 'dropping' AND backend_type LIKE 'worf manager%')";
+        Assert.IsTrue(await node.PollQueryUntilAsync(Database, Manager, token), "the manager of the database with worf");
+        _ = await node.SafePsqlAsync("dropping", "BEGIN; DROP EXTENSION worf; PREPARE TRANSACTION 'dropped'", token);
+        if (restart)
+        {
+            await node.StopAsync("fast", token);
+            await node.StartServerAsync(token);
+            Assert.IsTrue(await node.PollQueryUntilAsync(Database, Manager, token), "the manager again, as worf is there until the drop commits");
+        }
+
+        _ = await node.SafePsqlAsync("dropping", "COMMIT PREPARED 'dropped'", token);
+        Stopwatch exiting = Stopwatch.StartNew();
+        Assert.IsTrue(await node.PollQueryUntilAsync(Database, $"SELECT NOT ({Manager[7..]})", token), "the manager, once the drop committed");
+        Assert.IsLessThan(TimeSpan.FromSeconds(30), exiting.Elapsed, "the manager's exit after the drop committed");
     }
 
     /// <summary>

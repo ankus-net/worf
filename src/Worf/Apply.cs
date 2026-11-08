@@ -293,6 +293,16 @@ internal static unsafe partial class Apply
 
             ushort originid = PgReplicationOrigin.Find(sub.SlotName)
                 ?? throw new PgException(PgSqlStates.UndefinedObject, $"replication origin \"{sub.SlotName}\" does not exist");
+
+            // An origin that worf_create_subscriber created has no record, and its rows would be in conflict with the
+            // subscription's later changes. It's claimed before the session takes it, as the claim waits for the lock
+            // a drop of the subscription holds while it waits for the session to let the origin go.
+            LoadStreamOrigins();
+            if (!s_streamOrigins.ContainsKey(originid))
+            {
+                s_streamOrigins[originid] = WorfNode.ClaimOrigin(sub.SlotName, sub.Origin.Id, sub.Id).SinceXid;
+            }
+
             WorfLog.Debug2($"setting up replication origin {sub.SlotName} (oid {originid})");
             PgReplicationOrigin.SetupSession(originid);
 
@@ -309,14 +319,6 @@ internal static unsafe partial class Apply
             if (startpos == 0)
             {
                 startpos = Sync.GetSubscriptionSyncStatus(sub.Id, true)?.Statuslsn ?? 0;
-            }
-
-            // An origin that worf_create_subscriber created has no record, and its rows would be in conflict with the
-            // subscription's later changes.
-            LoadStreamOrigins();
-            if (!s_streamOrigins.ContainsKey(originid))
-            {
-                s_streamOrigins[originid] = WorfNode.ClaimOrigin(sub.SlotName, sub.Origin.Id, sub.Id).SinceXid;
             }
 
             return startpos;
@@ -2769,16 +2771,18 @@ internal static unsafe partial class Apply
 
     /// <summary>
     /// Checks whether an error says nothing about the change's data, as a deadlock, a serialization failure, a lock or
-    /// statement timeout, a cancellation, a shutdown, running out of resources, a lost connection, an I/O error or a
-    /// column every value of which fails while the nodes format money differently, do, so applying the transaction
-    /// again can get past it. A value too short for its type's binary form, which fails with a protocol violation,
+    /// statement timeout, a cancellation, a shutdown, running out of resources, a lost connection, an I/O error, a
+    /// column every value of which fails while the nodes format money differently or a call of nextval that waited too
+    /// long for a grantor this server hasn't heard from since it started, do, so applying the transaction again can get
+    /// past it. A value too short for its type's binary form, which fails with a protocol violation,
     /// comes from the data, and so does any other object not in the state the change needs.
     /// </summary>
     internal static bool IsTransient(PgException error)
     {
         string state = error.SqlState;
         return state is "40000" or "40001" or "40003" or "40P01" or "55P03" or "58030" ||
-            (state == PgSqlStates.ObjectNotInPrerequisiteState && error.Detail == WorfColumnConversion.FailsUntilFormatsAgree) ||
+            (state == PgSqlStates.ObjectNotInPrerequisiteState &&
+                error.Detail is WorfColumnConversion.FailsUntilFormatsAgree or SequenceRangeGuard.GrantorUnheard or SequenceRangeGuard.UnnamedGrantorUnheard) ||
             (state.StartsWith("08", StringComparison.Ordinal) && state != "08P01") || state.StartsWith("53", StringComparison.Ordinal) ||
             state.StartsWith("57", StringComparison.Ordinal);
     }

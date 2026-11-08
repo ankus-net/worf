@@ -20,4 +20,10 @@ internal struct WorfPrepared
     /// Whether it may have changed a database, which may give every database's manager something to manage.
     /// </summary>
     public bool EveryDatabase;
+
+    /// <summary>
+    /// The databases' state as a manager found the transaction, as <see cref="Worker.DatabasesState"/> gives it, which
+    /// wakes every database's manager only if the transaction's end changed it, or zero to wake them whatever it did.
+    /// </summary>
+    public long Databases;
 }

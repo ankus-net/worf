@@ -672,6 +672,48 @@ public sealed class RelayOriginTests
         Assert.IsTrue(await subscriber.PollQueryUntilAsync("a-b", "SELECT EXISTS (SELECT FROM t WHERE id = 2)", token), "a-b's row");
     }
 
+    /// <summary>
+    /// An apply worker that claims its origin, as one does for an origin worf_create_subscriber made, of which worf has
+    /// no record, takes the origin's session only once it has claimed it, so that a drop of the subscription, which
+    /// takes the lock the claim waits for and then waits for the session to be let go, never waits on a worker that
+    /// waits on the drop. While the claim waits, another session can take the origin's session.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task ApplyWorkersClaimTheirOriginBeforeTakingItsSession()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, "{all}", token);
+        string origin = await nodeB.SafePsqlAsync(Database, "SELECT sub_slot_name FROM worf.subscription WHERE sub_name = 'b_from_a'", token);
+        _ = await nodeB.SafePsqlAsync(Database, """
+            SELECT worf.alter_subscription_disable('b_from_a');
+            DELETE FROM worf.origin_writer WHERE sub_id = (SELECT sub_id FROM worf.subscription WHERE sub_name = 'b_from_a');
+            """, token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT NOT EXISTS (SELECT 1 FROM pg_stat_activity WHERE backend_type LIKE 'worf apply%')", token),
+            "the apply worker stopped");
+
+        // A session holds the origins' catalog, so that the worker's claim waits.
+        await using NpgsqlConnection holding = await nodeB.OpenAsync(Database, token);
+        await using NpgsqlTransaction hold = await holding.BeginTransactionAsync(token);
+        await using (NpgsqlCommand command = new("LOCK TABLE pg_catalog.pg_replication_origin IN ROW SHARE MODE", holding, hold))
+        {
+            _ = await command.ExecuteNonQueryAsync(token);
+        }
+
+        _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.alter_subscription_enable('b_from_a')", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, """
+            SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+                WHERE l.relation = 'pg_catalog.pg_replication_origin'::pg_catalog.regclass AND NOT l.granted AND a.backend_type LIKE 'worf apply%')
+            """, token), "the apply worker's claim waiting");
+        bool free = await nodeB.PsqlAsync(Database,
+            $"SELECT pg_replication_origin_session_setup('{origin}'); SELECT pg_replication_origin_session_reset()", token);
+        await hold.RollbackAsync(token);
+        Assert.IsTrue(free, "the origin's session, free while the worker's claim waits");
+        Assert.IsTrue(await nodeB.PsqlAsync(Database, "SET statement_timeout = '30s'; SELECT worf.drop_subscription('b_from_a')", token), "the drop");
+    }
+
     private static async Task<TestNode> StartNodeAsync(string name, CancellationToken token, params string[] settings)
     {
         TestNode node = await TestNode.StartAsync(name,

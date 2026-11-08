@@ -1795,7 +1795,7 @@ internal static class Sync
             // a trigger's error, or for the order the merge writes them in, are found in halves, each of which takes a
             // transaction ID.
             s_heldChecked = 0;
-            List<(long Row, PgException Error)> skipped = SkipHeldValues(rel, lsn, only + table, key, operators, rest, index, row, attnamelist);
+            long skipped = SkipHeldValues(rel, lsn, only + table, key, operators, rest, index, row, attnamelist);
             if (!Merged(merge.ToString(), out _))
             {
                 List<(long Row, PgException Error)> halved = [];
@@ -1814,10 +1814,10 @@ internal static class Sync
                 }
 
                 RecordSkipped(rel, lsn, row, attnamelist, halved);
-                skipped.AddRange(halved);
+                skipped += halved.Count;
             }
 
-            WorfLog.Warning(new PgDiagnostic($"skipped {skipped.Count} of the rows of the copy of table {remoterel.Nspname}.{remoterel.Relname} as it merged into the rows it has: {error!.Message}")
+            WorfLog.Warning(new PgDiagnostic($"skipped {skipped} of the rows of the copy of table {remoterel.Nspname}.{remoterel.Relname} as it merged into the rows it has: {error!.Message}")
             {
                 Detail = error.Detail,
                 Hint = "Resynchronize the table with worf.alter_subscription_resynchronize_table to give it the provider's rows.",
@@ -1843,11 +1843,11 @@ internal static class Sync
     /// <param name="written">The condition on a row of the copy, as <c>c</c>, that the merge writes it.</param>
     /// <param name="row">The copy's column of each row's number.</param>
     /// <param name="attnames">The columns the copy's rows are recorded with.</param>
-    /// <returns>The rows skipped, by their numbers, with their errors.</returns>
-    private static List<(long Row, PgException Error)> SkipRefusedRows(WorfRelation rel, ulong lsn, HashSet<string> columns, string written, string row,
+    /// <returns>How many rows are skipped.</returns>
+    private static long SkipRefusedRows(WorfRelation rel, ulong lsn, HashSet<string> columns, string written, string row,
         List<string> attnames)
     {
-        List<(long Row, PgException Error)> skipped = [];
+        long skipped = 0;
         if (HeldValues.ChangedBeforeWritten(rel.Reloid))
         {
             return skipped;
@@ -1873,20 +1873,53 @@ internal static class Sync
             new PgException(PgSqlStates.CheckViolation, $"new row for relation \"{table}\" violates check constraint \"{check.Get<string>(0)}\""))));
         foreach ((string test, PgException error) in tests)
         {
-            WorfRows refused = Worf.Read($"SELECT c.{row} FROM {MergeCopy} c WHERE ({test}) AND {written} ORDER BY c.{row}", 0);
-            if (refused.Count == 0)
-            {
-                continue;
-            }
-
-            List<(long Row, PgException Error)> these = [.. refused.Select(found => (found.Get<long>(0), error))];
-            RecordSkipped(rel, lsn, row, attnames, these);
-            _ = Worf.Execute($"DELETE FROM {MergeCopy} c WHERE c.{row} OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.int8[])",
-                SpiParameter.Create(these.Select(skippedRow => skippedRow.Row).ToArray()));
-            skipped.AddRange(these);
+            skipped += SkipRows(rel, lsn, row, attnames, $"SELECT c.{row} FROM {MergeCopy} c WHERE ({test}) AND {written}", error);
         }
 
         return skipped;
+    }
+
+    /// <summary>
+    /// Records the rows of a table's copy that a query finds, by their numbers, as skipped for an error, and removes them
+    /// from the copy: the rows are kept in a temporary table, rather than this backend's memory, and recorded a thousand
+    /// at a time, in the copy's order.
+    /// </summary>
+    /// <returns>How many rows are skipped.</returns>
+    private static long SkipRows(WorfRelation rel, ulong lsn, string row, List<string> attnames, string rows, PgException error)
+    {
+        // The table is dropped here rather than as the transaction commits, after which nothing may start a
+        // subtransaction, as a drop's hooks may.
+        _ = Worf.Execute("CREATE TEMPORARY TABLE worf_sync_skipped (r pg_catalog.int8 PRIMARY KEY)");
+        bool recorded = false;
+        try
+        {
+            long skipped = Worf.Execute($"INSERT INTO pg_temp.worf_sync_skipped {rows}");
+            for (long after = long.MinValue; ;)
+            {
+                WorfRows part = Worf.Read("SELECT s.r FROM pg_temp.worf_sync_skipped s WHERE s.r OPERATOR(pg_catalog.>) $1 ORDER BY s.r LIMIT 1000", 0,
+                    SpiParameter.Create(after));
+                if (part.Count == 0)
+                {
+                    break;
+                }
+
+                List<(long Row, PgException Error)> these = [.. part.Select(found => (found.Get<long>(0), error))];
+                RecordSkipped(rel, lsn, row, attnames, these);
+                after = these[^1].Row;
+            }
+
+            _ = Worf.Execute($"DELETE FROM {MergeCopy} c USING pg_temp.worf_sync_skipped s WHERE c.{row} OPERATOR(pg_catalog.=) s.r");
+            recorded = true;
+            return skipped;
+        }
+        finally
+        {
+            // A failure leaves the table to the transaction's rollback.
+            if (recorded)
+            {
+                _ = Worf.Execute("DROP TABLE pg_temp.worf_sync_skipped");
+            }
+        }
     }
 
     /// <summary>
@@ -1897,8 +1930,8 @@ internal static class Sync
     /// the table's row with its key as it is, which may hold another's values in turn, so this goes on until no row is
     /// skipped.
     /// </summary>
-    /// <returns>The rows skipped, by their numbers, with their errors.</returns>
-    private static List<(long Row, PgException Error)> SkipHeldValues(WorfRelation rel, ulong lsn, string table, List<string> key,
+    /// <returns>How many rows are skipped.</returns>
+    private static long SkipHeldValues(WorfRelation rel, ulong lsn, string table, List<string> key,
         Dictionary<short, string> keyOperators, string[] rest, uint keyIndex, string row, List<string> attnames)
     {
         uint reloid = rel.Reloid;
@@ -1912,23 +1945,24 @@ internal static class Sync
         string kept = rest.Length == 0
             ? "true"
             : $"NOT EXISTS (SELECT FROM {MergeCopy} c2 WHERE {Same(reloid, key, keyOperators, "c2", "t")} AND {Differ(rest, "t", "c2", "<>")})";
-        List<(long Row, PgException Error)> all = SkipRefusedRows(rel, lsn, columns, written, row, attnames);
+        long all = SkipRefusedRows(rel, lsn, columns, written, row, attnames);
         List<HeldConstraint> constraints = HeldValues.Find(reloid, columns, keyIndex);
         while (constraints.Count > 0)
         {
-            SortedDictionary<long, PgException> refused = HeldValues.Refused(constraints, table, $"(SELECT c.* FROM {MergeCopy} c WHERE {written})", row,
-                kept, true);
+            // The rows refused are recorded, and leave the copy, a part at a time, as they're found.
+            long refused = HeldValues.Refused(constraints, table, $"(SELECT c.* FROM {MergeCopy} c WHERE {written})", row, kept, true, skipped =>
+            {
+                RecordSkipped(rel, lsn, row, attnames, skipped);
+                _ = Worf.Execute($"DELETE FROM {MergeCopy} c WHERE c.{row} OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.int8[])",
+                    SpiParameter.Create(skipped.Select(pair => pair.Row).ToArray()));
+            });
             s_heldChecked += HeldValues.RefusedChecked;
-            if (refused.Count == 0)
+            if (refused == 0)
             {
                 break;
             }
 
-            List<(long Row, PgException Error)> skipped = [.. refused.Select(pair => (pair.Key, pair.Value))];
-            RecordSkipped(rel, lsn, row, attnames, skipped);
-            _ = Worf.Execute($"DELETE FROM {MergeCopy} c WHERE c.{row} OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.int8[])",
-                SpiParameter.Create(skipped.Select(pair => pair.Row).ToArray()));
-            all.AddRange(skipped);
+            all += refused;
         }
 
         return all;
@@ -1988,16 +2022,17 @@ internal static class Sync
     /// </summary>
     /// <returns>Whether every row of the part merged.</returns>
     private static bool MergeParts(uint reloid, string table, string merge, string row, long from, long to, List<(long Row, PgException Error)> skipped,
-        bool failing = false)
+        bool failing = false, long known = -1)
     {
         // A part's second half, and the rest of rows merged alone, are merged in the same call, so that the rows a call
-        // read go before the next part's, however many parts the merge goes through.
+        // read go before the next part's, however many parts the merge goes through. How many rows a part holds is
+        // known from the part it's split from, or counted.
         const string InPart = "ctid OPERATOR(pg_catalog.>=) $1::pg_catalog.tid AND ctid OPERATOR(pg_catalog.<) $2::pg_catalog.tid";
         bool whole = true;
         while (true)
         {
             SpiParameter[] part = [SpiParameter.Create(Tid(from)), SpiParameter.Create(Tid(to))];
-            long count = failing ? Worf.ReadScalar<long>($"SELECT count(*)::pg_catalog.int8 FROM {MergeCopy} WHERE {InPart}", part) : 0;
+            long count = known >= 0 ? known : Worf.ReadScalar<long>($"SELECT count(*)::pg_catalog.int8 FROM {MergeCopy} WHERE {InPart}", part);
 
             // The parts are merged once the failed one's error is handled, rather than within its handler, which keeps the
             // stack the failure left until it ends. A row alone is always tried, for its error.
@@ -2005,6 +2040,7 @@ internal static class Sync
             if (!failing || count <= 1)
             {
                 s_partsTried++;
+                s_largestTried = Math.Max(s_largestTried, count);
                 long start = from;
                 try
                 {
@@ -2024,9 +2060,6 @@ internal static class Sync
                 {
                     return whole;
                 }
-
-                count = Worf.ReadScalar<long>($"SELECT count(*)::pg_catalog.int8 FROM {MergeCopy} WHERE {InPart}", part);
-                s_largestTried = Math.Max(s_largestTried, count);
             }
 
             whole = false;
@@ -2034,8 +2067,9 @@ internal static class Sync
             {
                 long middle = Position(Worf.ReadScalar<string>(
                     $"SELECT c.ctid::pg_catalog.text FROM {MergeCopy} c WHERE {InPart} ORDER BY c.ctid OFFSET {(count / 2).ToString(CultureInfo.InvariantCulture)} LIMIT 1", part));
-                failing = MergeParts(reloid, table, merge, row, from, middle, skipped);
+                failing = MergeParts(reloid, table, merge, row, from, middle, skipped, known: count / 2);
                 from = middle;
+                known = count - (count / 2);
                 continue;
             }
 
@@ -2057,12 +2091,13 @@ internal static class Sync
             long rest = 0;
             for (int i = 0; i < places.Length && rest == 0; i++)
             {
-                bool alone = MergeParts(reloid, table, merge, row, places[i], places[i] + 1, skipped);
+                bool alone = MergeParts(reloid, table, merge, row, places[i], places[i] + 1, skipped, known: 1);
                 merged++;
                 run = alone ? run + 1 : 0;
                 if (run >= MergedRun && i + 1 < places.Length)
                 {
                     rest = places[i + 1];
+                    known = places.Length - (i + 1);
                 }
             }
 
@@ -2293,11 +2328,12 @@ internal static class Sync
 
     /// <summary>
     /// Gets the deferrable unique and exclusion constraints of a table: each with its table, the error a conflict in it
-    /// raises, the rows it takes, as a relation of each row's table, place, xmin and keys, k0, k1 and so on, and the
-    /// condition that two such rows, a and b, conflict, by equality, so that the rows join by hashing, sorting or an index
-    /// rather than pair by pair: of the keys, where the keys it takes can't be null, or of the keys as one row value, kr,
-    /// whose equality takes two nulls as equal and a null as unequal to any value, for a unique constraint whose nulls
-    /// aren't distinct.
+    /// raises, the rows it takes, as a relation of each row's table, place, xmin and keys, k0, k1 and so on, each under
+    /// its index's collation, and the condition that two such rows, a and b, conflict, by equality, so that the rows join
+    /// by hashing, sorting or an index rather than pair by pair: of the keys, where the keys it takes can't be null, or
+    /// of the keys as one row value, kr, whose equality takes two nulls as equal and a null as unequal to any value, for
+    /// a unique constraint whose nulls aren't distinct. A key is null as a value is, rather than as a composite value
+    /// whose fields are all null is.
     /// </summary>
     internal static List<(uint Table, PgException Conflict, string Rows, string Conflicts)> DeferrableConstraints(uint reloid)
     {
@@ -2309,7 +2345,10 @@ internal static class Sync
                     FROM pg_catalog.unnest(c.conexclop) WITH ORDINALITY e (op, k)
                         JOIN pg_catalog.pg_operator o ON o.oid = e.op JOIN pg_catalog.pg_namespace n ON n.oid = o.oprnamespace),
                 pg_catalog.pg_get_expr(i.indpred, i.indrelid), i.indnullsnotdistinct, c.conrelid,
-                CASE WHEN r.relkind = 'p' THEN '' ELSE 'ONLY ' END || pg_catalog.quote_ident(rn.nspname) || '.' || pg_catalog.quote_ident(r.relname)
+                CASE WHEN r.relkind = 'p' THEN '' ELSE 'ONLY ' END || pg_catalog.quote_ident(rn.nspname) || '.' || pg_catalog.quote_ident(r.relname),
+                (SELECT pg_catalog.array_agg(coalesce((SELECT pg_catalog.format(' COLLATE %I.%I', cn.nspname, co.collname)
+                    FROM pg_catalog.pg_collation co JOIN pg_catalog.pg_namespace cn ON cn.oid = co.collnamespace WHERE co.oid = i.indcollation[k - 1]), '')
+                    ORDER BY k) FROM pg_catalog.generate_series(1, i.indnkeyatts) k)
             FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_index i ON i.indexrelid = c.conindid
                 JOIN pg_catalog.pg_class r ON r.oid = c.conrelid JOIN pg_catalog.pg_namespace rn ON rn.oid = r.relnamespace
             WHERE c.conrelid = $1 AND c.contype IN ('p', 'u', 'x') AND c.condeferrable
@@ -2317,11 +2356,12 @@ internal static class Sync
         {
             string name = constraint.Get<string>(0);
             bool exclusion = constraint.Get<bool>(1);
-            string?[] keys = constraint.Get<string?[]>(2);
+            string?[] collations = constraint.Get<string?[]>(8);
+            string[] keys = [.. constraint.Get<string?[]>(2).Select((key, k) => $"{key}{collations[k]}")];
             List<string> conditions = [.. constraint.Get<string?>(4) is string predicate ? [$"({predicate})"] : Array.Empty<string>()];
             if (!exclusion && !constraint.Get<bool>(5))
             {
-                conditions.AddRange(keys.Select(key => $"({key}) IS NOT NULL"));
+                conditions.AddRange(keys.Select(key => $"({key}) IS DISTINCT FROM NULL"));
             }
 
             string where = conditions.Count == 0 ? "" : $" WHERE {string.Join(" AND ", conditions)}";
@@ -2350,8 +2390,8 @@ internal static class Sync
     /// <summary>
     /// Fails with a unique violation when two of a table's rows hold the same values in a deferrable unique index, as
     /// the index's recheck would at the end of the statement had session_replication_role let it fire: the same values
-    /// of its columns and expressions, among the rows its predicate takes, none of them null unless the index treats
-    /// nulls as equal.
+    /// of its columns, under its collations, none of them null, as a value is rather than as a composite value whose
+    /// fields are all null is, unless the index treats nulls as equal.
     /// </summary>
     /// <param name="reloid">The table.</param>
     /// <param name="table">The table's qualified name, after ONLY when it isn't partitioned.</param>
@@ -2359,40 +2399,56 @@ internal static class Sync
     /// another row's, or null for the whole table.</param>
     private static void CheckDeferrableUnique(uint reloid, string table, (long From, long To)? part = null)
     {
+        // A part's rows hold the copy's keys when the copy has every key column, and no BEFORE ROW trigger that fires
+        // for the merge may change them first.
         string copyHolds = part is null ? "false" : $"""
-            NOT EXISTS (
-                SELECT 1 FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
-                WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.objid = i.indexrelid
-                    AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.refobjid = i.indrelid AND d.refobjsubid > 0
-                    AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute m
-                        WHERE m.attrelid = '{MergeCopy}'::pg_catalog.regclass AND m.attname = a.attname AND NOT m.attisdropped))
+            NOT EXISTS (SELECT FROM pg_catalog.pg_trigger g
+                WHERE (g.tgrelid = i.indrelid OR g.tgrelid IN (SELECT p.relid FROM pg_catalog.pg_partition_tree(i.indrelid) p))
+                    AND g.tgenabled IN ('A', 'R') AND (g.tgtype OPERATOR(pg_catalog.&) 3::pg_catalog.int2) = 3
+                    AND (g.tgtype OPERATOR(pg_catalog.&) 20::pg_catalog.int2) <> 0)
+            AND i.indexprs IS NULL AND i.indpred IS NULL
+            AND NOT EXISTS (
+                SELECT 1 FROM pg_catalog.unnest((i.indkey::pg_catalog.int2[])[0:i.indnkeyatts - 1]) k (attnum)
+                    LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+                WHERE a.attname IS NULL OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute m
+                    WHERE m.attrelid = '{MergeCopy}'::pg_catalog.regclass AND m.attname = a.attname AND NOT m.attisdropped))
             """;
         WorfRows indexes = Worf.Read($"""
             SELECT c.conname::text, i.indnkeyatts,
                 (SELECT pg_catalog.array_agg(pg_catalog.pg_get_indexdef(i.indexrelid, k, false) ORDER BY k) FROM pg_catalog.generate_series(1, i.indnkeyatts) k),
-                pg_catalog.pg_get_expr(i.indpred, i.indrelid), i.indnullsnotdistinct, {copyHolds}
+                pg_catalog.pg_get_expr(i.indpred, i.indrelid), i.indnullsnotdistinct, {copyHolds},
+                (SELECT pg_catalog.array_agg(coalesce((SELECT pg_catalog.format(' COLLATE %I.%I', cn.nspname, co.collname)
+                    FROM pg_catalog.pg_collation co JOIN pg_catalog.pg_namespace cn ON cn.oid = co.collnamespace WHERE co.oid = i.indcollation[k - 1]), '')
+                    ORDER BY k) FROM pg_catalog.generate_series(1, i.indnkeyatts) k)
             FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_index i ON i.indexrelid = c.conindid
             WHERE c.conrelid = $1 AND c.contype IN ('p', 'u') AND c.condeferrable
             """, 0, SpiParameter.Create(reloid));
         foreach (WorfRow index in indexes)
         {
-            string[] keys = [.. index.Get<string?[]>(2).Select(key => $"({key})")];
+            string?[] columns = index.Get<string?[]>(2);
+            string?[] collations = index.Get<string?[]>(6);
+            string[] keys = [.. columns.Select((key, k) => $"({key}{collations[k]})")];
+            bool nullsEqual = index.Get<bool>(4);
             List<string> conditions = [.. index.Get<string?>(3) is string predicate ? [$"({predicate})"] : Array.Empty<string>()];
-            if (!index.Get<bool>(4))
+            if (!nullsEqual)
             {
-                conditions.AddRange(keys.Select(key => $"{key} IS NOT NULL"));
+                conditions.AddRange(keys.Select(key => $"{key} IS DISTINCT FROM NULL"));
             }
 
-            // A part of a merge looks only at the keys its rows take, from the copy's columns, which the index's unique
-            // lookup finds, unless its nulls aren't distinct, or it reads a column the copy lacks.
+            // A part of a merge looks only at the keys its rows take, the copy's, which the index's unique lookup finds,
+            // unless one of them is null where nulls aren't distinct, which only the whole table's rows can tell.
             string where = conditions.Count == 0 ? "" : $" WHERE {string.Join(" AND ", conditions)}";
-            bool atPart = part is not null && !index.Get<bool>(4) && index.Get<bool>(5);
+            string[] copied = [.. columns.Select((key, k) => $"(c.{key}{collations[k]})")];
+            string inPart = part is (long first, long last)
+                ? $"c.ctid OPERATOR(pg_catalog.>=) '{Tid(first)}'::pg_catalog.tid AND c.ctid OPERATOR(pg_catalog.<) '{Tid(last)}'::pg_catalog.tid"
+                : "";
+            bool atPart = part is not null && index.Get<bool>(5) && (!nullsEqual || !Worf.ReadScalar<bool>(
+                $"SELECT EXISTS (SELECT 1 FROM {MergeCopy} c WHERE {inPart} AND ({string.Join(" OR ", copied.Select(key => $"{key} IS NOT DISTINCT FROM NULL"))}))"));
             s_keyChecksAtParts += atPart ? 1 : 0;
             s_keyChecksWhole += atPart ? 0 : 1;
-            if (atPart && part is (long from, long to))
+            if (atPart)
             {
-                string tuple = $"({string.Join(", ", keys)})";
-                where = $"{(where.Length == 0 ? " WHERE " : where + " AND ")}{tuple} IN (SELECT {string.Join(", ", keys)} FROM {MergeCopy} WHERE ctid OPERATOR(pg_catalog.>=) '{Tid(from)}'::pg_catalog.tid AND ctid OPERATOR(pg_catalog.<) '{Tid(to)}'::pg_catalog.tid{(conditions.Count == 0 ? "" : " AND " + string.Join(" AND ", conditions))})";
+                where = $"{(where.Length == 0 ? " WHERE " : where + " AND ")}({string.Join(", ", keys)}) IN (SELECT {string.Join(", ", copied)} FROM {MergeCopy} c WHERE {inPart}{string.Concat(copied.Select(key => $" AND {key} IS DISTINCT FROM NULL"))})";
             }
 
             string? duplicate = Worf.ReadScalar<string?>(
@@ -2408,7 +2464,8 @@ internal static class Sync
     /// <summary>
     /// Fails with an exclusion violation when two of a table's rows conflict in a deferrable exclusion constraint, as
     /// its recheck would at the end of the statement had session_replication_role let it fire: every key of one,
-    /// among the rows the index's predicate takes, compares true with the other's by the constraint's operator.
+    /// among the rows the index's predicate takes, compares true with the other's by the constraint's operator, under
+    /// the collation the constraint gives the key.
     /// </summary>
     /// <param name="reloid">The table.</param>
     /// <param name="table">The table's qualified name, after ONLY when it isn't partitioned.</param>
@@ -2420,7 +2477,10 @@ internal static class Sync
                 (SELECT pg_catalog.array_agg(pg_catalog.format('OPERATOR(%I.%s)', n.nspname, o.oprname) ORDER BY e.k)
                     FROM pg_catalog.unnest(c.conexclop) WITH ORDINALITY e (op, k)
                         JOIN pg_catalog.pg_operator o ON o.oid = e.op JOIN pg_catalog.pg_namespace n ON n.oid = o.oprnamespace),
-                pg_catalog.pg_get_expr(i.indpred, i.indrelid)
+                pg_catalog.pg_get_expr(i.indpred, i.indrelid),
+                (SELECT pg_catalog.array_agg(coalesce((SELECT pg_catalog.format(' COLLATE %I.%I', cn.nspname, co.collname)
+                    FROM pg_catalog.pg_collation co JOIN pg_catalog.pg_namespace cn ON cn.oid = co.collnamespace WHERE co.oid = i.indcollation[k - 1]), '')
+                    ORDER BY k) FROM pg_catalog.generate_series(1, i.indnkeyatts) k)
             FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_index i ON i.indexrelid = c.conindid
             WHERE c.conrelid = $1 AND c.contype = 'x' AND c.condeferrable
             """, 0, SpiParameter.Create(reloid));
@@ -2428,8 +2488,9 @@ internal static class Sync
         {
             string?[] keys = constraint.Get<string?[]>(1);
             string?[] operators = constraint.Get<string?[]>(2);
+            string?[] collations = constraint.Get<string?[]>(4);
             string where = constraint.Get<string?>(3) is string predicate ? $" WHERE ({predicate})" : "";
-            string rows = $"(SELECT tableoid, ctid, {string.Join(", ", keys.Select((key, k) => $"({key}) AS k{k}"))} FROM {table}{where})";
+            string rows = $"(SELECT tableoid, ctid, {string.Join(", ", keys.Select((key, k) => $"({key}{collations[k]}) AS k{k}"))} FROM {table}{where})";
             string conflicts = string.Join(" AND ", operators.Select((op, k) => $"a.k{k} {op} b.k{k}"));
             WorfRows pair = Worf.Read(
                 $"SELECT {KeyText(keys.Length, "b.k")}, {KeyText(keys.Length, "a.k")} FROM {rows} a JOIN {rows} b ON (a.tableoid, a.ctid) < (b.tableoid, b.ctid) AND {conflicts} LIMIT 1", 1);

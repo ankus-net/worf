@@ -37,7 +37,7 @@ internal sealed record HeldConstraint(string Name, bool Exclusion, string[] Keys
     {
         string mine = left is null ? key : $"{left}.k{k}";
         string compared = $"{mine} {Operators[k]} {right}.k{k}";
-        return NullsEqual ? $"({compared} OR ({mine} IS NULL AND {right}.k{k} IS NULL))" : compared;
+        return NullsEqual ? $"({compared} OR ({mine} IS NOT DISTINCT FROM NULL AND {right}.k{k} IS NOT DISTINCT FROM NULL))" : compared;
     }));
 
     /// <summary>

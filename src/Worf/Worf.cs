@@ -1735,6 +1735,7 @@ internal static partial class Worf
 
         // Init executor module
         Executor.ExecutorInit();
+        SequenceRangeGuard.WatchPlpgsql();
 
         // Run the supervisor.
         PgBackgroundWorker.Register(new PgBackgroundWorkerOptions("worf supervisor", ExtensionName, "worf_supervisor_main")
@@ -1752,9 +1753,11 @@ internal static partial class Worf
     /// <param name="connname">The name the connection's application name starts with.</param>
     /// <param name="suffix">The application name's suffix, or null.</param>
     /// <param name="options">Connection options that override the connection string's, or null.</param>
+    /// <param name="setup">Statements the session runs once connected, with the one that pins its search path, in the
+    /// same round trip, or null.</param>
     /// <returns>The connection.</returns>
-    internal static WorfConnection Connect(string connstring, string connname, string? suffix, string? options = null)
-        => ConnectBase(connstring, connname, suffix, false, options);
+    internal static WorfConnection Connect(string connstring, string connname, string? suffix, string? options = null, string? setup = null)
+        => ConnectBase(connstring, connname, suffix, false, options, setup);
 
     /// <summary>
     /// Make replication connection, ERROR on failure.
@@ -1764,7 +1767,7 @@ internal static partial class Worf
     /// <param name="suffix">The application name's suffix, or null.</param>
     /// <returns>The connection.</returns>
     internal static WorfConnection ConnectReplica(string connstring, string connname, string? suffix)
-        => ConnectBase(connstring, connname, suffix, true, null);
+        => ConnectBase(connstring, connname, suffix, true, null, null);
 
     /// <summary>
     /// Make sure the extension is up to date. Called by db manager.
@@ -2036,26 +2039,12 @@ internal static partial class Worf
         // Setup connection to pinned catalogs (we only ever read pg_database).
         PgBackgroundWorker.Connect(null, null);
 
-        // Main wait loop. A standby is watched for its promotion each second, which makes the prepared transactions it
-        // replayed this server's, for the managers to note.
-        bool recovering;
-        unsafe
-        {
-            recovering = NativeMethods.RecoveryInProgress();
-        }
-
+        // Main wait loop. The supervisor starts once recovery has finished, so the prepared transactions a standby
+        // replayed are this server's by then, for the managers to note as they start.
         while (!Worker.GotSigterm)
         {
             PgInterrupts.Check();
             Worker.ProcessConfigReload();
-            unsafe
-            {
-                if (recovering && !NativeMethods.RecoveryInProgress())
-                {
-                    recovering = false;
-                    Worker.RescanPrepared();
-                }
-            }
 
             // The prepared transactions that may have given managers something to manage wake them as they end.
             bool watchingPrepared = Worker.WakeForEndedPrepared();
@@ -2084,7 +2073,7 @@ internal static partial class Worf
 
             // Wait for latch signal or timeout. On Windows, use a shorter timeout to ensure faster response to
             // subscription changes, as process startup and IPC can be slower than on Unix systems.
-            if (!PgBackgroundWorker.Wait(watchingPrepared ? Worker.PreparedWatchInterval : recovering ? TimeSpan.FromSeconds(1) : SupervisorInterval))
+            if (!PgBackgroundWorker.Wait(watchingPrepared ? Worker.PreparedWatchInterval : SupervisorInterval))
             {
                 break;
             }
@@ -2202,7 +2191,7 @@ internal static partial class Worf
         return bytes.Length > Worker.NameDataLen - 1 ? Truncate(applicationName, Worker.NameDataLen - 1) : applicationName;
     }
 
-    private static WorfConnection ConnectBase(string connstr, string appname, string? suffix, bool replication, string? options)
+    private static WorfConnection ConnectBase(string connstr, string appname, string? suffix, bool replication, string? options, string? setup)
     {
         string s = ExtraConnectionOptions + " " + connstr;
         string applicationName = ApplicationName(appname, suffix);
@@ -2232,12 +2221,12 @@ internal static partial class Worf
         if (!inTransaction && Worker.MyWorfWorker >= 0 && Worker.MyWorker.WorkerType is WorfWorkerType.Apply or WorfWorkerType.Sync)
         {
             return Worker.WithProviderDeadline(() => described,
-                () => PgBackgroundWorker.RunTransaction(() => WithPinnedSearchPath(WorfConnection.Connect(conninfo.ToString(), applicationName, replication))));
+                () => PgBackgroundWorker.RunTransaction(() => WithPinnedSearchPath(WorfConnection.Connect(conninfo.ToString(), applicationName, replication), setup)));
         }
 
         if (!inTransaction)
         {
-            return WithPinnedSearchPath(WorfConnection.Connect(conninfo.ToString(), applicationName, replication));
+            return WithPinnedSearchPath(WorfConnection.Connect(conninfo.ToString(), applicationName, replication), setup);
         }
 
         WorfConnection? conn = null;
@@ -2262,7 +2251,7 @@ internal static partial class Worf
                 detail: $"dsn was: {s}");
         }
 
-        return WithPinnedSearchPath(conn!);
+        return WithPinnedSearchPath(conn!, setup);
     }
 
     /// <summary>
@@ -2271,9 +2260,9 @@ internal static partial class Worf
     /// owner could have them run as the connection's user. Row filters run under the path the database and role set,
     /// as pglogical's do, through <see cref="DefaultSearchPath"/>.
     /// </summary>
-    private static WorfConnection WithPinnedSearchPath(WorfConnection conn)
+    private static WorfConnection WithPinnedSearchPath(WorfConnection conn, string? setup)
     {
-        conn.Execute($"SET search_path = {PinnedSearchPath}");
+        conn.Execute(setup is null ? $"SET search_path = {PinnedSearchPath}" : $"SET search_path = {PinnedSearchPath}; {setup}");
         return conn;
     }
 

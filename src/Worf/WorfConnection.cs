@@ -358,9 +358,21 @@ internal sealed unsafe partial class WorfConnection : IDisposable
         SetCopySource(this);
         try
         {
-            CopyFromStateData* cstate = NativeMethods.BeginCopyFrom(pstate, relation, null, null, false, CopySource, attnamelist,
-                Worf.CopyFromOptions());
-            ulong rows = NativeMethods.CopyFrom(cstate);
+            CopyFromStateData* cstate;
+            ulong rows;
+
+            // The defaults of the columns the provider doesn't send name the sequences they draw from.
+            SequenceRangeGuard.StartingCopy(relation, attnamelist);
+            try
+            {
+                cstate = NativeMethods.BeginCopyFrom(pstate, relation, null, null, false, CopySource, attnamelist, Worf.CopyFromOptions());
+                rows = NativeMethods.CopyFrom(cstate);
+            }
+            finally
+            {
+                SequenceRangeGuard.StartedExpressions();
+            }
+
             NativeMethods.EndCopyFrom(cstate);
 
             // Text COPY can stop at an end-of-data line; data after it would leave the connection mid-copy.

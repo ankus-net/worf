@@ -43,7 +43,6 @@ internal static class Manager
     [PgBackgroundWorker(EntryPoint = "worf_manager_main")]
     internal static void ManagerMain(nuint mainArg)
     {
-        uint extoid = 0;
         long sleepTimer = InitialSleep;
 
         // Setup shmem.
@@ -52,24 +51,13 @@ internal static class Manager
 
         // The database's prepared transactions that may give it something to manage once they commit are noted first,
         // so that one that commits after the look below wakes the manager again.
-        s_preparedRescan = Worker.PreparedRescan;
         NoteDatabasePrepared();
 
         // A database without worf, or a template that isn't a node, has nothing to manage. The manager notes when it
         // looked, so that a CREATE EXTENSION worf that commits after then, which it may not see, has the supervisor
         // start it again.
         long lookedAt = Worker.GetCurrentTimestamp();
-        extoid = PgBackgroundWorker.RunTransaction(static () =>
-        {
-            unsafe
-            {
-                fixed (byte* name = Worf.ToServerCString(Worf.ExtensionName))
-                {
-                    return NativeMethods.get_extension_oid((sbyte*)name, true);
-                }
-            }
-        });
-        if (extoid == 0 || PgBackgroundWorker.RunTransaction(IsIdleTemplate))
+        if (!PgBackgroundWorker.RunTransaction(Installed) || PgBackgroundWorker.RunTransaction(IsIdleTemplate))
         {
             ExitIdle(lookedAt);
             return;
@@ -101,21 +89,15 @@ internal static class Manager
         {
             Worker.ProcessConfigReload();
 
-            // A promotion makes the prepared transactions the standby replayed this server's.
-            if (Worker.PreparedRescan is int rescan && rescan != s_preparedRescan)
-            {
-                s_preparedRescan = rescan;
-                NoteDatabasePrepared();
-            }
-
             // The database may have become a template since, as one is copied once it does. Then launch the apply
             // workers, and the range worker for managed sequences, and handle sequences, updating the sleep timer as
             // necessary. A lock that another session holds too long is waited for again on the next look.
             bool processedAll;
             try
             {
+                // So may worf have gone, as with a prepared DROP EXTENSION that committed since.
                 long looked = Worker.GetCurrentTimestamp();
-                if (PgBackgroundWorker.RunTransaction(IsIdleTemplate))
+                if (PgBackgroundWorker.RunTransaction(static () => IsIdleTemplate() || !Installed()))
                 {
                     ExitIdle(looked);
                     return;
@@ -180,9 +162,6 @@ internal static class Manager
         }
     }
 
-    // The rescan of prepared transactions this manager last noted for.
-    private static int s_preparedRescan;
-
     /// <summary>
     /// Notes the database's prepared transactions that may have created worf, changed its nodes or subscriptions, or
     /// changed a database, as the locks they hold show: on worf's tables, on a relation this server doesn't see, as one
@@ -191,25 +170,28 @@ internal static class Manager
     /// </summary>
     private static void NoteDatabasePrepared()
     {
-        WorfRows found = PgBackgroundWorker.RunTransaction(() => Worf.Read("""
+        // A transaction that wrote to worf's catalogs, or to pg_database, as ALTER DATABASE does, holds a lock on it
+        // stronger than a read's, or SELECT ... FOR UPDATE's, and one that created, changed or dropped an extension, as
+        // CREATE EXTENSION worf does, holds a lock on the extension, which the objects it creates depend on.
+        (WorfRows found, long databases) = PgBackgroundWorker.RunTransaction(() => (Worf.Read("""
             WITH x AS (
                 SELECT p.transaction, l.virtualtransaction
                 FROM pg_catalog.pg_prepared_xacts p
                     JOIN pg_catalog.pg_locks l ON l.locktype = 'transactionid' AND l.transactionid = p.transaction
                 WHERE p.database = pg_catalog.current_database())
-            SELECT x.transaction::pg_catalog.text::pg_catalog.int8,
-                pg_catalog.bool_or(l.locktype = 'object' OR l.relation IN ('pg_catalog.pg_database'::pg_catalog.regclass, 'pg_catalog.pg_db_role_setting'::pg_catalog.regclass))
+            SELECT x.transaction::pg_catalog.text::pg_catalog.int8, pg_catalog.bool_or(l.relation = 'pg_catalog.pg_database'::pg_catalog.regclass)
             FROM x JOIN pg_catalog.pg_locks l ON l.virtualtransaction = x.virtualtransaction
-            WHERE (l.locktype = 'relation' AND l.database = (SELECT d.oid FROM pg_catalog.pg_database d WHERE d.datname = pg_catalog.current_database())
-                    AND (l.relation IN (SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'worf')
-                        OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = l.relation)))
-                OR (l.locktype = 'relation' AND l.relation IN ('pg_catalog.pg_database'::pg_catalog.regclass, 'pg_catalog.pg_db_role_setting'::pg_catalog.regclass))
-                OR (l.locktype = 'object' AND l.classid = 'pg_catalog.pg_database'::pg_catalog.regclass)
+            WHERE (l.locktype = 'relation' AND l.mode NOT IN ('AccessShareLock', 'RowShareLock')
+                    AND (l.relation = 'pg_catalog.pg_database'::pg_catalog.regclass
+                        OR (l.database = (SELECT d.oid FROM pg_catalog.pg_database d WHERE d.datname = pg_catalog.current_database())
+                            AND l.relation IN (SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'worf'))))
+                OR (l.locktype = 'object' AND l.classid = 'pg_catalog.pg_extension'::pg_catalog.regclass
+                    AND l.database = (SELECT d.oid FROM pg_catalog.pg_database d WHERE d.datname = pg_catalog.current_database()))
             GROUP BY x.transaction
-            """, 0));
+            """, 0), Worker.DatabasesState()));
         if (found.Count > 0)
         {
-            Worker.NoteFoundPrepared(Worker.MyWorker.Dboid, [.. found.Select(static row => ((uint)row.Get<long>(0), row.Get<bool>(1)))]);
+            Worker.NoteFoundPrepared(Worker.MyWorker.Dboid, [.. found.Select(static row => ((uint)row.Get<long>(0), row.Get<bool>(1)))], databases);
         }
     }
 
@@ -356,6 +338,15 @@ internal static class Manager
     /// Checks whether this database is a template that isn't a node, which has nothing to manage, and which a manager
     /// would keep busy, while PostgreSQL copies a database only from a template nobody is connected to.
     /// </summary>
+    // Whether worf is installed in the database.
+    private static unsafe bool Installed()
+    {
+        fixed (byte* name = Worf.ToServerCString(Worf.ExtensionName))
+        {
+            return NativeMethods.get_extension_oid((sbyte*)name, true) != 0;
+        }
+    }
+
     private static bool IsIdleTemplate()
         => Worf.ReadScalar<bool>("SELECT datistemplate FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database()") &&
             WorfNode.GetLocalNode(false, true) is null;

@@ -834,8 +834,10 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
 
   Errors that don't come from the data, such as deadlocks, serialization
   failures, lock and statement timeouts, cancellations, shutdowns, running out
-  of resources, and money that a provider formats otherwise than this node, every
-  value of which fails, are retried as under `error`. Every skipped change,
+  of resources, money that a provider formats otherwise than this node, every
+  value of which fails, and a call of `nextval` that waited too long for a
+  sequence block's grantor this server hasn't heard from since it started, are
+  retried as under `error`. Every skipped change,
   including each change of a transaction skipped as a whole, and disabled
   subscriptions are recorded in `worf.exception_log`, with the error, the
   change's rows or queued DDL, and the transaction it belongs to. A value the
@@ -1045,8 +1047,10 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   as for a lock, for their statements to reach their next rows: up to twice this for each
   block in all while its next block is still to come, or once a worker has
   tried and couldn't switch it, and otherwise until it comes, as for a lock. A
-  call to a node whose last call ran out of time waits a second at most, three
-  for the connection, until one answers. The default is `10s`.
+  call to a node whose last call ran out of time waits a second at first, three
+  for the connection, twice as long for each such call in a row, up to this,
+  until one answers, and this long when it's made again without giving way, or
+  a statement waiting on the node made it due. The default is `10s`.
 
 - `worf.ddl_lock_timeout`
   How long DDL waits in all for the other nodes to hold back their writes and

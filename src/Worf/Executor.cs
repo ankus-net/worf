@@ -47,6 +47,8 @@ internal static unsafe partial class Executor
     private static object_access_hook_type s_nextObjectAccessHook;
     private static ProcessUtility_hook_type s_nextProcessUtilityHook;
     private static ExecutorStart_hook_type s_nextExecutorStartHook;
+    private static ExecutorRun_hook_type s_nextExecutorRunHook;
+    private static ExecutorEnd_hook_type s_nextExecutorFinishHook;
     private static ExecutorEnd_hook_type s_nextExecutorEndHook;
     private static amvalidate_function s_nextNeedsFmgrHook;
     private static bool s_installed;
@@ -64,6 +66,12 @@ internal static unsafe partial class Executor
 
     [PgNativeCallback(nameof(WorfExecutorStart))]
     private static partial ExecutorStart_hook_type ExecutorStartCallback { get; }
+
+    [PgNativeCallback(nameof(WorfExecutorRun))]
+    private static partial ExecutorRun_hook_type ExecutorRunCallback { get; }
+
+    [PgNativeCallback(nameof(WorfExecutorFinish))]
+    private static partial ExecutorEnd_hook_type ExecutorFinishCallback { get; }
 
     [PgNativeCallback(nameof(WorfExecutorEnd))]
     private static partial ExecutorEnd_hook_type ExecutorEndCallback { get; }
@@ -191,6 +199,12 @@ internal static unsafe partial class Executor
         // Executor start hook, which holds back writes to tables another node changes.
         s_nextExecutorStartHook = NativeGlobals.ExecutorStart_hook;
         NativeGlobals.ExecutorStart_hook = ExecutorStartCallback;
+
+        // Executor run and finish hooks, which tell the sequence range guard a statement routing rows to partitions runs.
+        s_nextExecutorRunHook = NativeGlobals.ExecutorRun_hook;
+        NativeGlobals.ExecutorRun_hook = ExecutorRunCallback;
+        s_nextExecutorFinishHook = NativeGlobals.ExecutorFinish_hook;
+        NativeGlobals.ExecutorFinish_hook = ExecutorFinishCallback;
 
         // Executor end hook, which tells the sequence range guard a statement has ended.
         s_nextExecutorEndHook = NativeGlobals.ExecutorEnd_hook;
@@ -344,6 +358,7 @@ internal static unsafe partial class Executor
         // checks the sequences for each row in a condition of its own, ahead of any it has.
         bool copying = parsetree->type == NodeTag.T_CopyStmt && ((CopyStmt*)parsetree)->is_from && ((CopyStmt*)parsetree)->relation is not null;
         uint copied = copying ? NativeMethods.RangeVarGetRelidExtended(((CopyStmt*)parsetree)->relation, 0, RangeVarMissingOk, default, null) : 0;
+        string copyCondition = copied != 0 ? SequenceRangeGuard.CopyConditionText(copied, ((CopyStmt*)parsetree)->whereClause) : "";
         Node* check = copying ? SequenceRangeGuard.CopyCondition(copied) : null;
         if (check is not null)
         {
@@ -397,8 +412,12 @@ internal static unsafe partial class Executor
         bool tracking = LocalIndex.BeginStatement(parsetree, ddl is not null);
         if (startingCopy)
         {
-            SequenceRangeGuard.StartingCopy(copied, copyRead, copyDefaults);
+            SequenceRangeGuard.StartingCopy(copied, copyRead, copyDefaults, copyCondition);
         }
+
+        // Other utility statements that start expressions outside a plan name the sequences their calls of nextval draw
+        // from too.
+        bool startingUtility = !startingCopy && SequenceRangeGuard.StartingUtility(parsetree);
 
         bool usedTemp;
         try
@@ -443,7 +462,7 @@ internal static unsafe partial class Executor
                 SequenceRangeGuard.EndCopy();
             }
 
-            if (startingCopy)
+            if (startingCopy || startingUtility)
             {
                 SequenceRangeGuard.StartedExpressions();
             }
@@ -624,9 +643,7 @@ internal static unsafe partial class Executor
         SequenceRangeGuard.StartStatement(queryDesc, written);
 
         // A statement only explained draws nothing as its expressions start.
-        bool explaining = SequenceRangeGuard.ExplainOnly;
-        SequenceRangeGuard.ExplainOnly = (eflags & ExecFlagExplainOnly) != 0;
-        SequenceRangeGuard.StartingExpressions((nint)queryDesc->plannedstmt);
+        SequenceRangeGuard.StartingExpressions((nint)queryDesc->plannedstmt, (eflags & ExecFlagExplainOnly) != 0);
         try
         {
             if (!s_nextExecutorStartHook.IsNull)
@@ -641,7 +658,66 @@ internal static unsafe partial class Executor
         finally
         {
             SequenceRangeGuard.StartedExpressions();
-            SequenceRangeGuard.ExplainOnly = explaining;
+        }
+    }
+
+#if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
+    private static void WorfExecutorRun(QueryDesc* queryDesc, ScanDirection direction, ulong count, bool executeOnce)
+#else
+    private static void WorfExecutorRun(QueryDesc* queryDesc, ScanDirection direction, ulong count)
+#endif
+    {
+        // A statement that routes rows to partitions starts expressions for each partition as it runs.
+        bool routing = SequenceRangeGuard.StartingRun(queryDesc);
+        try
+        {
+            if (!s_nextExecutorRunHook.IsNull)
+            {
+#if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
+                s_nextExecutorRunHook.Invoke(queryDesc, direction, count, executeOnce);
+#else
+                s_nextExecutorRunHook.Invoke(queryDesc, direction, count);
+#endif
+            }
+            else
+            {
+#if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
+                NativeMethods.standard_ExecutorRun(queryDesc, direction, count, executeOnce);
+#else
+                NativeMethods.standard_ExecutorRun(queryDesc, direction, count);
+#endif
+            }
+        }
+        finally
+        {
+            if (routing)
+            {
+                SequenceRangeGuard.StartedExpressions();
+            }
+        }
+    }
+
+    private static void WorfExecutorFinish(QueryDesc* queryDesc)
+    {
+        // A data-modifying WITH that the statement didn't read to its end routes the rest of its rows as it finishes.
+        bool routing = SequenceRangeGuard.StartingRun(queryDesc);
+        try
+        {
+            if (!s_nextExecutorFinishHook.IsNull)
+            {
+                s_nextExecutorFinishHook.Invoke(queryDesc);
+            }
+            else
+            {
+                NativeMethods.standard_ExecutorFinish(queryDesc);
+            }
+        }
+        finally
+        {
+            if (routing)
+            {
+                SequenceRangeGuard.StartedExpressions();
+            }
         }
     }
 

@@ -58,9 +58,10 @@ internal sealed class TestNode : IAsyncDisposable
     /// <param name="cancellationToken">Cancels startup.</param>
     /// <param name="installation">A copy of the installation the test run selects to run the node from, into which
     /// <see cref="PublicationAsync"/>'s files are installed before PostgreSQL 18, or null for the shared one.</param>
+    /// <param name="environment">Environment variables the node's server runs with, or null.</param>
     /// <returns>The node.</returns>
     public static async Task<TestNode> StartAsync(string name, IReadOnlyList<string> configuration,
-        CancellationToken cancellationToken, PostgresInstallation? installation = null)
+        CancellationToken cancellationToken, PostgresInstallation? installation = null, IReadOnlyDictionary<string, string?>? environment = null)
     {
         SharedPublication shared = await SharedAsync(cancellationToken);
 
@@ -75,6 +76,7 @@ internal sealed class TestNode : IAsyncDisposable
                 : dataDirectory,
             LogDirectory = shared.LogDirectory,
             PostgreSqlConfiguration = [.. shared.Settings, .. configuration],
+            ProcessEnvironment = environment is null ? new Dictionary<string, string?>() : new Dictionary<string, string?>(environment),
         }, cancellationToken);
         TestNode node = new(name, cluster);
         try

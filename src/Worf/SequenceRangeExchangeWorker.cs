@@ -204,18 +204,34 @@ internal static class SequenceRangeExchangeWorker
     internal static bool Yields { get; set; } = true;
 
     /// <summary>
+    /// Gets or sets whether a probe has the exchange's whole time, as one made again without giving way does, or one
+    /// a statement waiting on the neighbor made due.
+    /// </summary>
+    internal static bool FullProbe { get; set; }
+
+    /// <summary>
+    /// Gets or sets how many probes of the neighbor in a row ran out of time before this one, each of which doubles
+    /// its time, up to the exchange's.
+    /// </summary>
+    internal static int ProbesTimedOut { get; set; }
+
+    /// <summary>
     /// Gets how long, in milliseconds, the last call that started had.
     /// </summary>
     internal static int LastLimit { get; private set; }
 
     /// <summary>
     /// Gets how long, in milliseconds, a call about to start has: <c>worf.sequence_range_timeout</c>, or, as a probe,
-    /// a second, or three for the connection, which takes a few round trips more.
+    /// a second, or three for the connection, which takes a few round trips more, twice as long for each probe in a row
+    /// that ran out of time, up to the exchange's, which a probe made again without giving way, or that a waiting
+    /// statement made due, has.
     /// </summary>
     /// <param name="connecting">Whether the call makes the connection to the neighbor.</param>
     /// <returns>The limit.</returns>
     internal static int CallLimit(bool connecting)
-        => Probing != 0 ? Math.Min(SequenceRanges.ExchangeTimeout, connecting ? 3000 : 1000) : SequenceRanges.ExchangeTimeout;
+        => Probing == 0 || FullProbe
+            ? SequenceRanges.ExchangeTimeout
+            : (int)Math.Min(SequenceRanges.ExchangeTimeout, (connecting ? 3000L : 1000L) << Math.Min(ProbesTimedOut, 16));
 
     /// <summary>
     /// Makes a call to a neighbor, from the exchange worker, which its watcher cancels once it has taken longer than

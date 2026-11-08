@@ -17,16 +17,14 @@ string? dataDir = null;
 string pidFile = "";
 VerbosityLevel verbosity = VerbosityLevel.Normal;
 
-// Die closes these.
-LibpqConnection? subscriberConn = null;
-
 // The connection whose command runs, which a stop cancels, and the program that runs, which a stop ends.
 LibpqConnection? running = null;
 
-// Whether a stop came, which the main thread acts on, and whether its subscriptions are all committed, after which a stop
-// changes nothing.
+// Whether a stop came, which the main thread acts on, and whether a database's subscription has committed, after which a
+// stop waits for the run to set the other databases up, as their subscriptions can no longer all roll back.
 using ManualResetEventSlim stopped = new(false);
 bool committed = false;
+Lock committing = new();
 
 // Whether this run started the subscriber's server, which it then stops if it fails, and whether it is failing, which a
 // failure on another thread waits out.
@@ -34,10 +32,14 @@ bool serverStarted = false;
 int dying = 0;
 
 // postgresql.auto.conf as it was before this run added its recovery settings, which a run that fails before the server
-// leaves recovery puts back, with no standby.signal, so that the data directory starts as it did.
+// leaves recovery puts back, with no standby.signal unless the data directory had one, so that it starts as it did.
 string? autoConfBefore = null;
+bool hadStandbySignal = false;
 bool promoted = false;
-LibpqConnection? providerConn = null;
+
+// Whether pg_basebackup is making the data directory, which a stop meanwhile removes, and whether it was there before.
+bool backingUp = false;
+bool dataDirExisted = false;
 
 string? remoteLsn;
 bool stop = false;
@@ -59,12 +61,21 @@ string? extraBasebackupArgs = null;
 StringBuilder recoveryconfcontents = new();
 
 // A stop, as Ctrl-C or SIGTERM, cancels the command that runs, so that it fails, and the main thread, at its next step,
-// or in the wait or program it's in, cleans up as on any failure, rolling back its transaction; a stop while it does
-// changes nothing.
+// or in the wait, connection, command or program it's in, cleans up as on any failure, rolling back its transaction; a
+// stop while it does changes nothing, and neither does one once a subscription has committed, but for the run to end
+// once it has set the other databases up.
 void Stop(PosixSignalContext context)
 {
     context.Cancel = true;
-    stopped.Set();
+    lock (committing)
+    {
+        stopped.Set();
+        if (committed)
+        {
+            return;
+        }
+    }
+
     _ = running?.Cancel();
 }
 
@@ -281,7 +292,7 @@ for (int dbnum = 0; dbnum < databaseList.Length; dbnum++)
 
     // Read the remote server indetification.
     PrintMsg(VerbosityLevel.Normal, $"Getting information for database {db} ...\n");
-    providerConn = Connectdb(provConnstr);
+    using LibpqConnection providerConn = Connectdb(provConnstr);
     RemoteInfo remoteInfo = GetRemoteInfo(providerConn);
 
     // only need to do this piece once
@@ -303,11 +314,20 @@ for (int dbnum = 0; dbnum < databaseList.Length; dbnum++)
             throw Die($"A server is running in data directory \"{dataDir}\"; stop it before running this again.\n");
         }
 
-        if (useExistingDataDir && ReadTimeline(dataDir) is long timeline &&
+        (long? timeline, string? state) = useExistingDataDir ? ReadControlData(dataDir) : (null, null);
+        if (timeline is long dataTimeline &&
             long.TryParse(QueryValue(providerConn, "SELECT timeline_id FROM pg_catalog.pg_control_checkpoint()"), NumberStyles.Integer,
-                CultureInfo.InvariantCulture, out long providerTimeline) && timeline > providerTimeline)
+                CultureInfo.InvariantCulture, out long providerTimeline) && dataTimeline > providerTimeline)
         {
-            throw Die($"Data directory \"{dataDir}\" is on timeline {timeline}, past the provider's timeline {providerTimeline}, as when an earlier run promoted it, so it can't recover to the provider's restore point; make a new base backup.\n");
+            throw Die($"Data directory \"{dataDir}\" is on timeline {dataTimeline}, past the provider's timeline {providerTimeline}, as when an earlier run promoted it, so it can't recover to the provider's restore point; make a new base backup.\n");
+        }
+
+        // A data directory that ran as a server of its own, out of recovery, as one started without its standby.signal
+        // does, has written WAL the provider doesn't have, though on the provider's timeline. A base backup not yet
+        // started has its backup_label, and a standby that stopped says it was in recovery.
+        if (state is "shut down" or "shutting down" or "in production" or "in crash recovery" && !File.Exists(Path.Join(dataDir, "backup_label")))
+        {
+            throw Die($"Data directory \"{dataDir}\" has run as a server of its own, as its cluster state \"{state}\" shows, so its WAL may have left the provider's; make a new base backup.\n");
         }
     }
 
@@ -315,8 +335,6 @@ for (int dbnum = 0; dbnum < databaseList.Length; dbnum++)
     PrintMsg(VerbosityLevel.Normal, $"Creating replication slot in database {db} ...\n");
     slotNames[dbnum] = InitializeReplicationSlot(providerConn, remoteInfo.Dbname, remoteInfo.NodeName,
         subscriberName, dropSlotIfExists);
-    providerConn.Dispose();
-    providerConn = null;
 }
 
 // Create basebackup or use existing one
@@ -329,13 +347,14 @@ pidFile = Path.Join(dataDir, "postmaster.pid");
 string restorePointName = GenerateRestorePointName();
 
 PrintMsg(VerbosityLevel.Normal, $"Creating restore point \"{restorePointName}\" on remote node ...\n");
-providerConn = Connectdb(prov);
-remoteLsn = CreateRestorePoint(providerConn, restorePointName);
-providerConn.Dispose();
-providerConn = null;
+using (LibpqConnection restoreConn = Connectdb(prov))
+{
+    remoteLsn = CreateRestorePoint(restoreConn, restorePointName);
+}
 
 // Get subscriber db to consistent state (for lsn after slot creation).
 PrintMsg(VerbosityLevel.Normal, "Bringing subscriber node to the restore point ...\n");
+SaveRecoverySettings();
 if (recoveryConf is not null)
 {
     CopyConfFile(recoveryConf, "postgresql.auto.conf", true);
@@ -373,10 +392,8 @@ foreach (string subConnstr in databaseList.Select(db => GetConnstr(baseSubConnst
         throw Die("Subscriber connection string is not valid.\n");
     }
 
-    subscriberConn = Connectdb(subConnstr);
-    RemoveUnwantedData(subscriberConn);
-    subscriberConn.Dispose();
-    subscriberConn = null;
+    using LibpqConnection cleaningConn = Connectdb(subConnstr);
+    RemoveUnwantedData(cleaningConn);
 }
 
 // Stop Postgres so we can reset system id and start it with worf loaded.
@@ -408,7 +425,7 @@ for (int dbnum = 0; dbnum < databaseList.Length; dbnum++)
     string subConnstr = GetConnstr(baseSubConnstr, db);
     string provConnstr = GetConnstr(baseProvConnstr, db);
 
-    subscriberConn = Connectdb(subConnstr);
+    using LibpqConnection subscriberConn = Connectdb(subConnstr);
 
     // Create the extension.
     PrintMsg(VerbosityLevel.Verbose, $"Creating worf extension for database {db}...\n");
@@ -432,19 +449,28 @@ for (int dbnum = 0; dbnum < databaseList.Length; dbnum++)
 
     WorfSubscribe(subscriberConn, subscriberName, subConnstr, provConnstr, replicationSets, applyDelay,
         forceTextTransfer, remoteLsn);
+
+    // The commit runs to its end, which a stop meanwhile cancels or leaves done, and the run follows what it did. Once a
+    // database's subscription has committed, the others' can't roll back with it, so the run goes on to set them up.
+    CheckStop();
     try
     {
-        _ = Query(subscriberConn, "COMMIT");
+        running = subscriberConn;
+        _ = subscriberConn.Query("COMMIT");
     }
     catch (LibpqException error)
     {
         throw Die($"Could not commit the subscription, status PGRES_FATAL_ERROR: {error.Message}\n");
     }
+    finally
+    {
+        running = null;
+    }
 
-    committed = dbnum == databaseList.Length - 1;
-
-    subscriberConn.Dispose();
-    subscriberConn = null;
+    lock (committing)
+    {
+        committed = true;
+    }
 }
 
 // If user does not want the node to be running at the end, stop it.
@@ -609,8 +635,36 @@ InvalidOperationException Die(string message)
 
     Console.Error.Write(message);
 
-    subscriberConn?.Dispose();
-    providerConn?.Dispose();
+    // The connections are left to close as the process exits, as a call another thread makes on one may still run.
+    // A base backup that a stop ended is removed, so that the data directory is as it was.
+    if (backingUp)
+    {
+        try
+        {
+            if (dataDirExisted)
+            {
+                foreach (string entry in Directory.EnumerateFileSystemEntries(dataDir!))
+                {
+                    if (Directory.Exists(entry))
+                    {
+                        Directory.Delete(entry, true);
+                    }
+                    else
+                    {
+                        File.Delete(entry);
+                    }
+                }
+            }
+            else if (Directory.Exists(dataDir))
+            {
+                Directory.Delete(dataDir!, true);
+            }
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            Console.Error.WriteLine($"WARNING: could not remove the base backup made in \"{dataDir}\": {error.Message}");
+        }
+    }
 
     bool stoppedServer = true;
     if (serverStarted && GetPgpid() != 0 && RunProgramToEnd(FindOtherExecOrDie(argv0, "pg_ctl"), ["stop", "-s", "-D", dataDir!]) != 0)
@@ -625,7 +679,10 @@ InvalidOperationException Die(string message)
         try
         {
             File.WriteAllText(Path.Join(dataDir, "postgresql.auto.conf"), autoConfBefore);
-            File.Delete(Path.Join(dataDir, "standby.signal"));
+            if (!hadStandbySignal)
+            {
+                File.Delete(Path.Join(dataDir, "standby.signal"));
+            }
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException)
         {
@@ -652,7 +709,7 @@ LibpqConnection Connectdb(string connstr)
     CheckStop();
     try
     {
-        return Libpq.Connect(connstr);
+        return Interruptible(() => Libpq.Connect(connstr));
     }
     catch (LibpqException error)
     {
@@ -678,7 +735,7 @@ int RunPgCtl(IReadOnlyList<string> arg)
     }
 
     PrintMsg(VerbosityLevel.Debug, $"Running pg_ctl: {FormatCommand(execPath, arguments)}.\n");
-    return RunProgram(execPath, arguments);
+    return RunProgram(execPath, arguments, false);
 }
 
 // Run pg_basebackup to create the copy of the origin node.
@@ -699,7 +756,10 @@ void RunBasebackup(string providerConnstr, string dataDir, string? extraBaseback
     }
 
     PrintMsg(VerbosityLevel.Debug, $"Running pg_basebackup: {FormatCommand(execPath, arguments)}.\n");
-    int ret = RunProgram(execPath, arguments);
+    dataDirExisted = Directory.Exists(dataDir);
+    backingUp = true;
+    int ret = RunProgram(execPath, arguments, true);
+    backingUp = false;
 
     if (ret != 0)
     {
@@ -1080,8 +1140,9 @@ string ReadSysid(string dataDir)
     return systemIdentifier.ToString(CultureInfo.InvariantCulture);
 }
 
-// Reads the timeline of a data directory's latest checkpoint, as pg_controldata shows it, or null.
-long? ReadTimeline(string dataDir)
+// Reads the timeline of a data directory's latest checkpoint and its cluster state, as pg_controldata shows them, or
+// nulls.
+(long? Timeline, string? State) ReadControlData(string dataDir)
 {
     ProcessStartInfo start = new(FindOtherExecOrDie(argv0, "pg_controldata")) { UseShellExecute = false, RedirectStandardOutput = true };
     start.ArgumentList.Add(dataDir);
@@ -1089,16 +1150,37 @@ long? ReadTimeline(string dataDir)
     using Process process = Process.Start(start)!;
     string output = process.StandardOutput.ReadToEnd();
     process.WaitForExit();
+    long? timeline = null;
+    string? state = null;
     foreach (string line in output.Split('\n'))
     {
         if (line.StartsWith("Latest checkpoint's TimeLineID:", StringComparison.Ordinal) &&
-            long.TryParse(line["Latest checkpoint's TimeLineID:".Length..].Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out long timeline))
+            long.TryParse(line["Latest checkpoint's TimeLineID:".Length..].Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out long found))
         {
-            return timeline;
+            timeline = found;
+        }
+        else if (line.StartsWith("Database cluster state:", StringComparison.Ordinal))
+        {
+            state = line["Database cluster state:".Length..].Trim();
         }
     }
 
-    return null;
+    return (timeline, state);
+}
+
+// Keeps postgresql.auto.conf as it was before this run changes it, and whether the data directory had a standby.signal.
+void SaveRecoverySettings()
+{
+    string filename = Path.Join(dataDir, "postgresql.auto.conf");
+    try
+    {
+        autoConfBefore ??= File.Exists(filename) ? File.ReadAllText(filename) : "";
+        hadStandbySignal = File.Exists(Path.Join(dataDir, "standby.signal"));
+    }
+    catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+    {
+        throw Die($"{progname}: could not read file \"{filename}\": {error.Message}\n");
+    }
 }
 
 // Write contents of postgresql.auto.conf.
@@ -1107,7 +1189,6 @@ void WriteRecoveryConf(string contents)
     string filename = Path.Join(dataDir, "postgresql.auto.conf");
     try
     {
-        autoConfBefore ??= File.Exists(filename) ? File.ReadAllText(filename) : "";
         File.AppendAllText(filename, contents);
     }
     catch (Exception error) when (error is IOException or UnauthorizedAccessException)
@@ -1157,7 +1238,7 @@ void WaitPostmasterConnection(string connstr)
     // Now wait for Postmaster to either accept connections or die.
     while (true)
     {
-        PingStatus res = Libpq.Ping(connstr);
+        PingStatus res = Interruptible(() => Libpq.Ping(connstr));
         if (res is PingStatus.Ok or PingStatus.NoAttempt)
         {
             break;
@@ -1329,14 +1410,16 @@ string[] GetDatabaseList(string databases)
 string GenerateRestorePointName()
     => $"worf_create_subscriber_{Random.Shared.NextInt64(0, int.MaxValue):x}";
 
-// Runs a program to its end, which a stop ends early, failing the run.
-int RunProgram(string execPath, IEnumerable<string> arguments)
+// Runs a program to its end, failing the run for a stop that comes meanwhile: a program a stop ends, as pg_basebackup,
+// is ended with the processes it started, and any other runs to its end first, as pg_ctl starting or stopping the
+// server does, so that a server it started is stopped rather than left half started.
+int RunProgram(string execPath, IEnumerable<string> arguments, bool endedByStop)
 {
     CheckStop();
     using Process process = StartProgram(execPath, arguments);
     while (!process.WaitForExit(200))
     {
-        if (stopped.IsSet && !committed)
+        if (endedByStop && stopped.IsSet && !committed)
         {
             try
             {
@@ -1352,7 +1435,23 @@ int RunProgram(string execPath, IEnumerable<string> arguments)
         }
     }
 
+    CheckStop();
     return process.ExitCode;
+}
+
+// Makes a call that may wait on a server in libpq, as connecting or a command does, on another thread, so that a stop
+// before a subscription has committed fails the run at once, however long the server takes to answer, as one that
+// takes the connection and answers nothing does: the call is left to end as the process exits.
+T Interruptible<T>(Func<T> call)
+{
+    Task<T> task = Task.Run(call);
+    if (WaitHandle.WaitAny([((IAsyncResult)task).AsyncWaitHandle, stopped.WaitHandle]) == 1)
+    {
+        CheckStop();
+        task.Wait();
+    }
+
+    return task.GetAwaiter().GetResult();
 }
 
 // Runs a program to its end, whatever stops come, as the cleanup does.
@@ -1463,7 +1562,7 @@ List<string?[]> Query(LibpqConnection conn, string sql)
     running = conn;
     try
     {
-        return conn.Query(sql);
+        return Interruptible(() => conn.Query(sql));
     }
     finally
     {

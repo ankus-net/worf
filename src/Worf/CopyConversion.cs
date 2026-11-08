@@ -312,18 +312,22 @@ internal static unsafe partial class CopyConversion
     private static ulong CopyAll(ParseState* pstate, RelationData* relation, List* attnamelist)
     {
         s_failedLine = 0;
-        CopyFromStateData* cstate = NativeMethods.BeginCopyFrom(pstate, relation, null, null, false, DataSource, attnamelist,
-            Worf.CopyFromOptions());
-        s_cstate = cstate;
+
+        // The defaults of the columns the provider doesn't send name the sequences they draw from.
+        SequenceRangeGuard.StartingCopy(relation, attnamelist);
+        CopyFromStateData* cstate = null;
         ulong copied;
         try
         {
+            cstate = NativeMethods.BeginCopyFrom(pstate, relation, null, null, false, DataSource, attnamelist, Worf.CopyFromOptions());
+            s_cstate = cstate;
             copied = NativeMethods.CopyFrom(cstate);
         }
         finally
         {
             // A failure leaves it naming the row that failed.
-            s_failedLine = cstate->cur_lineno;
+            s_failedLine = cstate is null ? 0 : cstate->cur_lineno;
+            SequenceRangeGuard.StartedExpressions();
         }
 
         NativeMethods.EndCopyFrom(cstate);
@@ -553,8 +557,14 @@ internal static unsafe partial class CopyConversion
         long[] untested = Untested(parameters, rows);
         string candidates = untested.Length == 0 ? s_heldCandidates
             : $"(SELECT * FROM {s_heldCandidates} AS c WHERE NOT (c.{Worf.QuoteIdentifier(s_heldRow)} OPERATOR(pg_catalog.=) ANY (${parameters.Length + 1}::pg_catalog.int8[])))";
-        SortedDictionary<long, PgException> refused = HeldValues.Refused(s_heldConstraints, s_heldTable, candidates, Worf.QuoteIdentifier(s_heldRow), "true",
-            false, [.. parameters, SpiParameter.Create(untested)]);
+        SortedDictionary<long, PgException> refused = [];
+        _ = HeldValues.Refused(s_heldConstraints, s_heldTable, candidates, Worf.QuoteIdentifier(s_heldRow), "true", false, these =>
+        {
+            foreach ((long row, PgException error) in these)
+            {
+                refused[row] = error;
+            }
+        }, [.. parameters, SpiParameter.Create(untested)]);
         if (refused.Count == 0)
         {
             return;
@@ -1017,12 +1027,23 @@ internal static unsafe partial class CopyConversion
             {
                 try
                 {
-                    CopyFromStateData* cstate = NativeMethods.BeginCopyFrom(pstate, relation, (Node*)s_checkWhere, null, false, BatchSource,
-                        attnamelist, Worf.CopyFromOptions());
-                    s_cstate = cstate;
-                    s_copyIndex = start;
-                    s_checkSkipped.Clear();
-                    ulong rows = NativeMethods.CopyFrom(cstate);
+                    ulong rows;
+                    SequenceRangeGuard.StartingCopy(relation, attnamelist);
+                    CopyFromStateData* cstate;
+                    try
+                    {
+                        cstate = NativeMethods.BeginCopyFrom(pstate, relation, (Node*)s_checkWhere, null, false, BatchSource,
+                            attnamelist, Worf.CopyFromOptions());
+                        s_cstate = cstate;
+                        s_copyIndex = start;
+                        s_checkSkipped.Clear();
+                        rows = NativeMethods.CopyFrom(cstate);
+                    }
+                    finally
+                    {
+                        SequenceRangeGuard.StartedExpressions();
+                    }
+
                     NativeMethods.EndCopyFrom(cstate);
                     s_batchFailed.AddRange(s_checkSkipped);
                     s_checkSkipped.Clear();

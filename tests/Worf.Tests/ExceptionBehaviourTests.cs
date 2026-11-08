@@ -19,6 +19,10 @@ public sealed partial class ExceptionBehaviourTests
     // The most transaction IDs the halves merge takes.
     private const long MergedIds = 1500;
 
+    // The .NET runtime's gen0 budget for the servers whose memory is bounded, 16 MB in the bare hex digits it reads,
+    // rather than the size of the CPU's cache, which adds up to about 64 MB on some runners.
+    private static readonly Dictionary<string, string?> s_pinnedGen0 = new() { ["DOTNET_GCgen0size"] = "1000000" };
+
     private const string Database = "postgres";
     private const string SuperUser = "super";
 
@@ -700,8 +704,10 @@ public sealed partial class ExceptionBehaviourTests
     /// written here or under another origin, and those the provider has since deleted. Under transdiscard, as under
     /// discard, a row of the copy that a row here holds a unique value of, or that a CHECK constraint here refuses, is
     /// skipped and recorded under transdiscard, while the others merge and later changes arrive, those whose values rows
-    /// the table keeps hold all at once, without a transaction ID each, and a merge of 300,000 rows in halves takes the
-    /// sync worker little memory, on Linux, where /proc gives it. One cancelled before its copy
+    /// the table keeps hold all at once, without a transaction ID each, and a merge of 300,000 rows in halves, or one that
+    /// skips 60,000 rows whose values rows here hold, takes the sync worker little memory, on Linux, where /proc gives it.
+    /// A merge in halves checks a deferrable key at the parts' keys, whose nulls may not be distinct, but at the whole
+    /// table where a BEFORE trigger may change the keys, or the copy lacks a key's column. One cancelled before its copy
     /// commits copies a table without a key once, and the cleanup after it waits for a session that holds its slot, with a
     /// warning, rather than for ever. Dropping the subscription drops the slots its syncs left.
     /// </summary>
@@ -712,7 +718,7 @@ public sealed partial class ExceptionBehaviourTests
         CancellationToken token = TestContext.CancellationToken;
 
         await using TestNode provider = await StartNodeAsync("provider", token);
-        await using TestNode subscriber = await StartNodeAsync("subscriber", token);
+        await using TestNode subscriber = await StartNodeAsync("subscriber", s_pinnedGen0, token);
         foreach (TestNode node in new[] { provider, subscriber })
         {
             _ = await node.SafePsqlAsync(Database, "CREATE TABLE x (id serial PRIMARY KEY)", token);
@@ -836,7 +842,7 @@ public sealed partial class ExceptionBehaviourTests
         Assert.AreEqual("1", await subscriber.SafePsqlAsync(Database, "SELECT count(*) FROM status_wait", token), "status_wait's row");
 
         long mergeFrom = 0;
-        foreach (string stop in new[] { "resume", "drop", "zero", "lost", "conflict", "halves", "raises" })
+        foreach (string stop in new[] { "resume", "drop", "zero", "lost", "conflict", "held", "halves", "raises", "lowered", "keys" })
         {
             string table = $"stopped_{stop}";
             _ = await provider.SafePsqlAsync(Database, $"CREATE TABLE {table} (id integer PRIMARY KEY, v text)", token);
@@ -875,12 +881,42 @@ public sealed partial class ExceptionBehaviourTests
                     ALTER TABLE {table} ALTER COLUMN v SET NOT NULL;
                     """, token);
             }
+            else if (stop == "lowered")
+            {
+                // A BEFORE trigger here makes the keys a row takes in a deferrable key other than its copy's.
+                _ = await provider.SafePsqlAsync(Database, $"ALTER TABLE {table} ADD COLUMN w text", token);
+                _ = await subscriber.SafePsqlAsync(Database, $$"""
+                    ALTER TABLE {{table}} ADD COLUMN w text, ADD CONSTRAINT {{table}}_w UNIQUE (w) DEFERRABLE INITIALLY DEFERRED;
+                    CREATE FUNCTION {{table}}_lower() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN NEW.w := lower(NEW.w); RETURN NEW; END$$;
+                    CREATE TRIGGER {{table}}_lower BEFORE INSERT OR UPDATE ON {{table}} FOR EACH ROW EXECUTE FUNCTION {{table}}_lower();
+                    ALTER TABLE {{table}} ENABLE ALWAYS TRIGGER {{table}}_lower;
+                    """, token);
+            }
+            else if (stop == "keys")
+            {
+                // A deferrable key on a column only the table here has, which the copy lacks, is checked at the whole
+                // table, and a trigger here refuses three rows at the end, which only merging in halves finds, after the
+                // parts before them merged whole.
+                _ = await subscriber.SafePsqlAsync(Database, $$"""
+                    ALTER TABLE {{table}} ADD COLUMN here integer, ADD CONSTRAINT {{table}}_here UNIQUE (here) DEFERRABLE;
+                    CREATE FUNCTION {{table}}_refuse() RETURNS trigger LANGUAGE plpgsql
+                        AS $$BEGIN RAISE EXCEPTION 'refused %', NEW.id; END$$;
+                    CREATE TRIGGER {{table}}_refuse AFTER INSERT OR UPDATE ON {{table}} FOR EACH ROW WHEN (NEW.v LIKE 'x%') EXECUTE FUNCTION {{table}}_refuse();
+                    ALTER TABLE {{table}} ENABLE ALWAYS TRIGGER {{table}}_refuse;
+                    """, token);
+            }
+            else if (stop == "held")
+            {
+                _ = await subscriber.SafePsqlAsync(Database, $"CREATE UNIQUE INDEX {table}_v ON {table} (v) WHERE v <> 'copied'", token);
+            }
             else if (stop == "halves")
             {
-                // A deferrable key beside the key has each part of the merge check it, at the keys the part takes.
+                // A deferrable key beside the key has each part of the merge check it, at the keys the part takes, and so
+                // does one whose nulls aren't distinct, as one row value.
                 _ = await subscriber.SafePsqlAsync(Database, $$"""
                     CREATE UNIQUE INDEX {{table}}_v ON {{table}} (v) WHERE v <> 'copied';
                     ALTER TABLE {{table}} ADD CONSTRAINT {{table}}_d UNIQUE (id) DEFERRABLE;
+                    ALTER TABLE {{table}} ADD CONSTRAINT {{table}}_dn UNIQUE NULLS NOT DISTINCT (id) DEFERRABLE;
                     CREATE FUNCTION {{table}}_refuse() RETURNS trigger LANGUAGE plpgsql
                         AS $$BEGIN IF NEW.v LIKE 'x%' THEN RAISE EXCEPTION 'refused %', NEW.id; END IF; RETURN NULL; END$$;
                     CREATE TRIGGER {{table}}_refuse AFTER INSERT OR UPDATE ON {{table}} FOR EACH ROW WHEN (NEW.v LIKE 'x%') EXECUTE FUNCTION {{table}}_refuse();
@@ -891,7 +927,7 @@ public sealed partial class ExceptionBehaviourTests
             // A key on the subscriber references the table.
             _ = await subscriber.SafePsqlAsync(Database, $"CREATE TABLE {table}_ref (id integer REFERENCES {table} (id))", token);
 
-            _ = await provider.SafePsqlAsync(Database, $"INSERT INTO {table} SELECT g, 'copied' FROM generate_series(1, {(stop == "halves" ? 300000 : 1000)}) g", token);
+            _ = await provider.SafePsqlAsync(Database, $"INSERT INTO {table} SELECT g, 'copied' FROM generate_series(1, {stop switch { "halves" => 300000, "held" => 120000, _ => 1000 }}) g", token);
             int logpos = subscriber.ReadLog().Length;
             await using (NpgsqlConnection tableLocker = await subscriber.OpenAsync(Database, token))
             await using (NpgsqlConnection applyLocker = await subscriber.OpenAsync(Database, token))
@@ -955,6 +991,13 @@ public sealed partial class ExceptionBehaviourTests
                 {
                     _ = await subscriber.SafePsqlAsync(Database,
                         $"UPDATE {table} SET v = 's' || id WHERE id IN (100, 200) OR (id BETWEEN 1001 AND 2000 AND id NOT IN (1007, 1008))", token);
+                }
+
+                // Rows here the provider doesn't have hold the values 60,000 of the provider's rows take.
+                if (stop == "held")
+                {
+                    _ = await subscriber.SafePsqlAsync(Database,
+                        $"INSERT INTO {table} SELECT g, 'h' || (g - 899100) FROM generate_series(900101, 960100) g", token);
                 }
 
                 // The next worker catches up while the table is locked, and can't connect to the provider again once it's
@@ -1041,6 +1084,29 @@ public sealed partial class ExceptionBehaviourTests
                     mergeFrom = long.Parse(await subscriber.SafePsqlAsync(Database, "SELECT pg_snapshot_xmax(pg_current_snapshot())::text", token),
                         CultureInfo.InvariantCulture);
                     break;
+                case "lowered":
+                    // The copy again merges rows 10 and 20 with keys that the trigger makes the same, under discard, which
+                    // merging in halves skips row 20 for, as the part that writes it checks the key at the whole table.
+                    _ = await provider.SafePsqlAsync(Database, $"""
+                        UPDATE {table} SET w = CASE id WHEN 10 THEN 'DUP' ELSE 'Dup' END WHERE id IN (10, 20);
+                        SELECT pg_drop_replication_slot('{syncSlot}');
+                        """, token);
+                    await SetBehaviourAsync(subscriber, "discard", token);
+                    break;
+                case "keys":
+                    _ = await provider.SafePsqlAsync(Database, $"""
+                        UPDATE {table} SET v = CASE WHEN id IN (880, 890, 900) THEN 'x' ELSE 'w' END || id WHERE id <= 900 AND id <> 500;
+                        SELECT pg_drop_replication_slot('{syncSlot}');
+                        """, token);
+                    await SetBehaviourAsync(subscriber, "discard", token);
+                    break;
+                case "held":
+                    _ = await provider.SafePsqlAsync(Database, $"""
+                        UPDATE {table} SET v = 'h' || id WHERE id BETWEEN 1001 AND 61000;
+                        SELECT pg_drop_replication_slot('{syncSlot}');
+                        """, token);
+                    await SetBehaviourAsync(subscriber, "discard", token);
+                    break;
                 case "raises":
                     // The copy again merges row 7, whose v a trigger here fills in, which a NOT NULL check of the copy's
                     // rows would have refused, and row 700000, which the trigger refuses with an error of its own, which
@@ -1066,7 +1132,7 @@ public sealed partial class ExceptionBehaviourTests
             if (stop != "resume")
             {
                 fewest = FewestRowsAsync(subscriber, table, counting.Token);
-                if (stop == "halves" && OperatingSystem.IsLinux())
+                if (stop is "halves" or "held" && OperatingSystem.IsLinux())
                 {
                     peakKb = PeakSyncMemoryAsync(subscriber, counting.Token);
                 }
@@ -1085,6 +1151,7 @@ public sealed partial class ExceptionBehaviourTests
                 "resume" => "1000|500500|updated|f|t|here|elsewhere|1",
                 "conflict" or "raises" => $"1000|-198900|{(stop == "raises" ? "updated" : "copied")}|t|f|here|elsewhere|1",
                 "halves" => "300001|45000150600|copied|t|t|here|elsewhere|1",
+                "held" => "120001|7200060600|updated|t|t|here|elsewhere|1",
                 _ => "1001|501100|updated|t|t|here|elsewhere|1",
             },
                 await subscriber.SafePsqlAsync(Database, $"""
@@ -1176,10 +1243,54 @@ public sealed partial class ExceptionBehaviourTests
                 if (OperatingSystem.IsLinux())
                 {
                     long peak = await peakKb;
-                    // The .NET runtime sizes its gen0 budget from the CPU's cache, which adds up to about 64 MB on some
-                    // runners, so the bound allows for that; a merge that kept the rows it reads would take hundreds.
+                    // The subscriber's .NET runtime has a gen0 budget of 16 MB, rather than one sized from the CPU's cache,
+                    // so the bound allows for little garbage.
                     TestContext.WriteLine($"sync worker private memory merging in halves: {peak / 1024} MB");
-                    Assert.IsLessThan(128L * 1024, peak, "the sync worker's private memory merging 300,000 rows in halves, in kB");
+                    Assert.IsLessThan(80L * 1024, peak, "the sync worker's private memory merging 300,000 rows in halves, in kB");
+                }
+
+                await SetBehaviourAsync(subscriber, "error", token);
+            }
+
+            if (stop is "lowered" or "keys")
+            {
+                // The trigger's keys are checked at the whole table: row 20's, the same as row 10's, is skipped. A key
+                // on a column the copy lacks is checked at the whole table too, and the rows merge in parts as large as
+                // they can.
+                string log = subscriber.ReadLog()[logpos..];
+                string summary = log.Split('\n').Last(line => line.Contains($"merged the copy of table public.{table} in halves", StringComparison.Ordinal));
+                TestContext.WriteLine(summary);
+                long[] numbers = [.. new string([.. summary[summary.IndexOf("halves:", StringComparison.Ordinal)..].Select(c => char.IsAsciiDigit(c) ? c : ' ')])
+                    .Split(' ', StringSplitOptions.RemoveEmptyEntries).Select(number => long.Parse(number, CultureInfo.InvariantCulture))];
+                Assert.AreEqual(0L, numbers[4], "the deferrable key checks at the parts' keys");
+                Assert.IsGreaterThan(0L, numbers[5], "the deferrable key checks at the whole table");
+                Assert.AreEqual(stop == "lowered" ? "20|23505|dup|20=" : "880,890,900|P0001|w1|", await subscriber.SafePsqlAsync(Database, $"""
+                    SELECT string_agg(remote_new_tuple->>'id', ',' ORDER BY (remote_new_tuple->>'id')::integer), string_agg(DISTINCT error_sqlstate, ','),
+                        {(stop == "lowered" ? $"(SELECT string_agg(w, ',') FROM {table} WHERE id = 10), (SELECT string_agg(id || '=' || coalesce(w, ''), ',') FROM {table} WHERE id = 20)"
+                            : $"(SELECT v FROM {table} WHERE id = 1), ''")}
+                    FROM worf.exception_log WHERE table_name = '{table}'
+                    """, token), "the rows skipped, recorded, and those merged");
+                if (stop == "keys")
+                {
+                    Assert.IsGreaterThan(numbers[2] / 4, numbers[1], "the most rows a part the merge tried whole held, against the rows it writes");
+                }
+
+                await SetBehaviourAsync(subscriber, "error", token);
+            }
+
+            if (stop == "held")
+            {
+                // The rows whose values rows here hold are skipped and recorded, a part at a time, which takes the sync
+                // worker no more memory for each than for a part of them.
+                Assert.Contains($"skipped 60000 of the rows of the copy of table public.{table}", subscriber.ReadLog()[logpos..]);
+                Assert.AreEqual("60000|23505", await subscriber.SafePsqlAsync(Database,
+                    $"SELECT count(*), string_agg(DISTINCT error_sqlstate, ',') FROM worf.exception_log WHERE table_name = '{table}'", token),
+                    "the rows whose values rows here hold, recorded");
+                if (OperatingSystem.IsLinux())
+                {
+                    long peak = await peakKb;
+                    TestContext.WriteLine($"sync worker private memory skipping 60,000 held values: {peak / 1024} MB");
+                    Assert.IsLessThan(80L * 1024, peak, "the sync worker's private memory skipping 60,000 rows whose values rows here hold, in kB");
                 }
 
                 await SetBehaviourAsync(subscriber, "error", token);
@@ -1871,7 +1982,8 @@ public sealed partial class ExceptionBehaviourTests
     /// discard, a change that conflicts is skipped and recorded, and so is a copied row that conflicts with an earlier
     /// one. Apply waits for a transaction here that wrote a conflicting row, and constraints on expressions and with
     /// predicates hold as well. Rows that swap values, as a statement may under a constraint that is initially
-    /// immediate, apply. Under error, a copy that conflicts fails naming the keys.
+    /// immediate, apply. A composite key with a null field is a key, as the index takes it, and an exclusion constraint
+    /// compares its keys under the collation it gives them. Under error, a copy that conflicts fails naming the keys.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -1892,9 +2004,29 @@ public sealed partial class ExceptionBehaviourTests
             INSERT INTO dr VALUES (1, '[1,3)'), (2, '[2,4)'), (3, '[3,5)'), (4, '[10,12)');
             CREATE TABLE uad (id integer PRIMARY KEY, k integer[]);
             INSERT INTO uad VALUES (1, NULL), (2, '{}'), (3, '{1}'), (4, '{1}');
+            CREATE TYPE pair AS (a integer, b integer);
+            CREATE TABLE ucp (id integer PRIMARY KEY, k pair);
+            INSERT INTO ucp VALUES (1, '(1,)'), (2, '(1,)'), (3, '(2,3)');
+            CREATE TABLE ucx (id integer PRIMARY KEY, t text);
+            INSERT INTO ucx VALUES (1, 'q'), (2, 'Q'), (5, 'w');
+            CREATE TABLE ucy (id integer PRIMARY KEY, t text);
+            INSERT INTO ucy VALUES (1, 'r'), (2, 'R');
             SELECT * FROM worf.replication_set_add_all_tables('default', '{public}');
             """, token);
+
+        // A case-insensitive collation, where the server has ICU, gives the exclusion constraints collations other than
+        // their columns'.
+        bool icu = await subscriber.SafePsqlAsync(Database, "SELECT EXISTS (SELECT 1 FROM pg_collation WHERE collprovider = 'i')", token) == "t";
+        _ = await subscriber.SafePsqlAsync(Database, icu
+            ? """
+                CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+                CREATE TABLE ucx (id integer PRIMARY KEY, t text COLLATE ci, EXCLUDE USING btree (t COLLATE "C" WITH =) DEFERRABLE);
+                CREATE TABLE ucy (id integer PRIMARY KEY, t text COLLATE "C", EXCLUDE USING btree (t COLLATE ci WITH =) DEFERRABLE);
+                """
+            : "CREATE TABLE ucx (id integer PRIMARY KEY, t text); CREATE TABLE ucy (id integer PRIMARY KEY, t text)", token);
         _ = await subscriber.SafePsqlAsync(Database, """
+            CREATE TYPE pair AS (a integer, b integer);
+            CREATE TABLE ucp (id integer PRIMARY KEY, k pair UNIQUE DEFERRABLE);
             CREATE TABLE dk (id integer PRIMARY KEY, email text UNIQUE DEFERRABLE);
             CREATE TABLE dx (id integer PRIMARY KEY, r int4range, EXCLUDE USING gist (r WITH &&) DEFERRABLE INITIALLY DEFERRED);
             CREATE TABLE dr (id integer PRIMARY KEY, r int4range, EXCLUDE USING gist (r WITH &&) DEFERRABLE);
@@ -2134,6 +2266,24 @@ public sealed partial class ExceptionBehaviourTests
         Assert.AreEqual("1,2,3|4, 1,1000|0", $"{arrayCopy}, " + await subscriber.SafePsqlAsync(Database,
             "SELECT (SELECT string_agg(id::text, ',' ORDER BY id) FROM ua), (SELECT count(*) FROM worf.exception_log WHERE table_name = 'ua')", token),
             "uad's copy, a null and an empty array kept, and ua's rows, an empty array applied beside a null, and nothing recorded");
+
+        // A composite key with a null field conflicts with another just like it, in the copy and in the replay, which
+        // applies the change beside it. The exclusion constraint under "C" takes 'q' and 'Q' as different, and the one
+        // under the case-insensitive collation 'r' and 'R' as the same.
+        _ = await provider.SafePsqlAsync(Database, """
+            BEGIN; UPDATE ucp SET k = '(1,)' WHERE id = 3; INSERT INTO ucp VALUES (5, '(6,7)'); COMMIT;
+            BEGIN; UPDATE ucx SET t = 'q' WHERE id = 5; INSERT INTO ucx VALUES (6, 'W'); COMMIT;
+            BEGIN; INSERT INTO ucy VALUES (3, 'R'); INSERT INTO ucy VALUES (4, 's'); COMMIT;
+            INSERT INTO sw VALUES (9, 9);
+            """, token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM sw WHERE id = 9)", token), "the row after the composite and collated keys' transactions");
+        Assert.AreEqual(icu ? "1=(1,),3=(2,3),5=(6,7)|1=q,2=Q,5=w,6=W|1=r,4=s|COPY:ucp:2,COPY:ucy:2,INSERT:ucy:3,UPDATE:ucp:3,UPDATE:ucx:5"
+            : "1=(1,),3=(2,3),5=(6,7)|1=q,2=Q,5=q,6=W|1=r,2=R,3=R,4=s|COPY:ucp:2,UPDATE:ucp:3", await subscriber.SafePsqlAsync(Database, """
+            SELECT (SELECT string_agg(id || '=' || k, ',' ORDER BY id) FROM ucp), (SELECT string_agg(id || '=' || t, ',' ORDER BY id) FROM ucx),
+                (SELECT string_agg(id || '=' || t, ',' ORDER BY id) FROM ucy),
+                (SELECT string_agg(concat_ws(':', operation, table_name, remote_new_tuple->>'id'), ',' ORDER BY operation, table_name, remote_new_tuple->>'id')
+                    FROM worf.exception_log WHERE table_name IN ('ucp', 'ucx', 'ucy'))
+            """, token), "the composite and collated keys' rows, and the conflicts recorded");
         await SetBehaviourAsync(subscriber, "error", token);
 
         // Under error, a copy whose rows conflict in a deferrable unique index or exclusion constraint fails with the
@@ -2226,7 +2376,11 @@ public sealed partial class ExceptionBehaviourTests
             $"SELECT wal_status = 'lost' FROM pg_replication_slots WHERE slot_name = '{slot}'", token), "the subscription's slot lost");
     }
 
-    private static async Task<TestNode> StartNodeAsync(string name, CancellationToken token, params string[] settings)
+    private static Task<TestNode> StartNodeAsync(string name, CancellationToken token, params string[] settings)
+        => StartNodeAsync(name, null, token, settings);
+
+    private static async Task<TestNode> StartNodeAsync(string name, IReadOnlyDictionary<string, string?>? environment, CancellationToken token,
+        params string[] settings)
     {
         TestNode node = await TestNode.StartAsync(name,
         [
@@ -2235,7 +2389,7 @@ public sealed partial class ExceptionBehaviourTests
             "max_replication_slots = 10",
             "track_commit_timestamp = on",
             .. settings,
-        ], token);
+        ], token, environment: environment);
         try
         {
             _ = await node.SafePsqlAsync(Database, $"CREATE USER {SuperUser} SUPERUSER", token);

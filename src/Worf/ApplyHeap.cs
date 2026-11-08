@@ -68,14 +68,39 @@ internal static unsafe class ApplyHeap
         PgHeapTuple? heaprow = SetRow(row, newtup) ? null : HeapRow(rel, newtup);
 
         // Check for existing tuple with same key in any unique index containing only normal columns. This doesn't
-        // just check the replica identity index, but it'll prefer it and use it first.
-        PgFoundRow? local = heaprow is null ? writer.FindConflict(row) : writer.FindConflict(heaprow);
+        // just check the replica identity index, but it'll prefer it and use it first. The columns the row doesn't
+        // carry take their defaults as the writer fills it, and name the sequences those draw from.
+        PgFoundRow? local;
+        if (heaprow is null)
+        {
+            SequenceRangeGuard.StartingDefaults(rel.Reloid, newtup.Changed);
+            try
+            {
+                local = writer.FindConflict(row);
+            }
+            finally
+            {
+                SequenceRangeGuard.StartedExpressions();
+            }
+        }
+        else
+        {
+            local = writer.FindConflict(heaprow);
+        }
 
         if (local is null)
         {
             if (heaprow is null)
             {
-                writer.Insert(row);
+                SequenceRangeGuard.StartingDefaults(rel.Reloid, newtup.Changed);
+                try
+                {
+                    writer.Insert(row);
+                }
+                finally
+                {
+                    SequenceRangeGuard.StartedExpressions();
+                }
             }
             else
             {
