@@ -350,12 +350,12 @@ public sealed class CreateSubscriberTests
             {
                 line = await tool.StandardOutput.ReadLineAsync(token);
             }
-            while (line is not null && !line.StartsWith("Creating subscriber", StringComparison.Ordinal));
+            while (line is not null && !line.StartsWith("Creating worf extension for database", StringComparison.Ordinal));
 
-            Assert.IsNotNull(line, "the tool creating the subscriber");
+            Assert.IsNotNull(line, "the tool creating the extension on the subscriber");
 
-            // The provider stops answering new connections, as create_subscription makes, and the tool is stopped while
-            // it waits.
+            // The provider stops answering new connections, as create_subscription makes, before the tool, which reaches it
+            // next in create_subscription, makes one, and the tool is stopped while it waits.
             (int paused, _, string error) = await ProcessRunner.RunAsync("kill", ["-STOP", postmaster], token);
             Assert.AreEqual(0, paused, error);
             stopped = true;
