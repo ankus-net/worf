@@ -105,6 +105,7 @@ using Ankus.Postgres;
         epoch integer,
         state text,
         distance integer,
+        route bigint[],
         high_water bigint,
         watermark bigint,
         reset_lsn pg_lsn,

@@ -22,6 +22,12 @@ internal struct WorfPrepared
     public bool EveryDatabase;
 
     /// <summary>
+    /// Whether it may have created worf, or changed its nodes, subscriptions, table syncs or managed sequences, which may
+    /// give its own database's manager something to manage, whatever it did to the databases.
+    /// </summary>
+    public bool OwnDatabase;
+
+    /// <summary>
     /// The databases' state as a manager found the transaction, as <see cref="Worker.DatabasesState"/> gives it, which
     /// wakes every database's manager only if the transaction's end changed it, or zero to wake them whatever it did.
     /// </summary>

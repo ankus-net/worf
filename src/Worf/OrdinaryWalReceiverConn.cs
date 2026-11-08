@@ -1,12 +1,11 @@
-#if ANKUS_PG15 || ANKUS_PG16
 using System.Runtime.InteropServices;
 
 namespace Worf;
 
 /// <summary>
 /// libpqwalreceiver's WalReceiverConn, as it has kept it since PostgreSQL 10, for an ordinary connection that
-/// <see cref="WorfConnection"/> opens before PostgreSQL 17: the libpq connection, whether it's logical, and the buffer of
-/// the copy message being read.
+/// <see cref="WorfConnection"/> opens before PostgreSQL 17, or that a <see cref="WorfProbe"/> makes: the libpq connection,
+/// whether it's logical, and the buffer of the copy message being read.
 /// </summary>
 [StructLayout(LayoutKind.Sequential)]
 internal unsafe struct OrdinaryWalReceiverConn
@@ -26,4 +25,3 @@ internal unsafe struct OrdinaryWalReceiverConn
     /// </summary>
     public sbyte* RecvBuf;
 }
-#endif

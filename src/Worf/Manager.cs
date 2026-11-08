@@ -163,35 +163,43 @@ internal static class Manager
     }
 
     /// <summary>
-    /// Notes the database's prepared transactions that may have created worf, changed its nodes or subscriptions, or
-    /// changed a database, as the locks they hold show: on worf's tables, on a relation this server doesn't see, as one
-    /// they created, or on a database or its settings, which may give every database's manager something to manage.
-    /// Others, which can give the managers nothing, aren't, so that their ends wake nothing.
+    /// Notes the database's prepared transactions that may have created worf, changed its nodes, subscriptions, table
+    /// syncs or managed sequences, or changed a database, as the locks they hold show: a write's on the worf tables that
+    /// hold those, a lock on an extension, or a write's on pg_database, which may give every database's manager
+    /// something to manage. Others, which can give the managers nothing, as an explicit LOCK of a worf table, or a write
+    /// to worf's own bookkeeping, as a dropped table's columns, aren't, so that their ends wake nothing.
     /// </summary>
     private static void NoteDatabasePrepared()
     {
-        // A transaction that wrote to worf's catalogs, or to pg_database, as ALTER DATABASE does, holds a lock on it
-        // stronger than a read's, or SELECT ... FOR UPDATE's, and one that created, changed or dropped an extension, as
-        // CREATE EXTENSION worf does, holds a lock on the extension, which the objects it creates depend on.
+        // A transaction that wrote to those tables, or to pg_database, as ALTER DATABASE does, holds a row exclusive lock
+        // on it, and one that created, changed or dropped an extension, as CREATE EXTENSION worf does, holds a lock on
+        // the extension, which the objects it creates depend on. An object lock has no relation.
         (WorfRows found, long databases) = PgBackgroundWorker.RunTransaction(() => (Worf.Read("""
             WITH x AS (
                 SELECT p.transaction, l.virtualtransaction
                 FROM pg_catalog.pg_prepared_xacts p
                     JOIN pg_catalog.pg_locks l ON l.locktype = 'transactionid' AND l.transactionid = p.transaction
-                WHERE p.database = pg_catalog.current_database())
-            SELECT x.transaction::pg_catalog.text::pg_catalog.int8, pg_catalog.bool_or(l.relation = 'pg_catalog.pg_database'::pg_catalog.regclass)
+                WHERE p.database = pg_catalog.current_database()),
+            m (relid) AS (
+                SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = 'worf'
+                    AND c.relname IN ('node', 'local_node', 'node_interface', 'subscription', 'local_sync_status', 'sequence_range'))
+            SELECT x.transaction::pg_catalog.text::pg_catalog.int8,
+                coalesce(pg_catalog.bool_or(l.locktype = 'relation' AND l.relation = 'pg_catalog.pg_database'::pg_catalog.regclass), false),
+                coalesce(pg_catalog.bool_or(l.locktype = 'object' OR l.relation IN (SELECT relid FROM m)), false)
             FROM x JOIN pg_catalog.pg_locks l ON l.virtualtransaction = x.virtualtransaction
-            WHERE (l.locktype = 'relation' AND l.mode NOT IN ('AccessShareLock', 'RowShareLock')
+            WHERE (l.locktype = 'relation' AND l.mode = 'RowExclusiveLock'
                     AND (l.relation = 'pg_catalog.pg_database'::pg_catalog.regclass
                         OR (l.database = (SELECT d.oid FROM pg_catalog.pg_database d WHERE d.datname = pg_catalog.current_database())
-                            AND l.relation IN (SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'worf'))))
+                            AND l.relation IN (SELECT relid FROM m))))
                 OR (l.locktype = 'object' AND l.classid = 'pg_catalog.pg_extension'::pg_catalog.regclass
                     AND l.database = (SELECT d.oid FROM pg_catalog.pg_database d WHERE d.datname = pg_catalog.current_database()))
             GROUP BY x.transaction
             """, 0), Worker.DatabasesState()));
         if (found.Count > 0)
         {
-            Worker.NoteFoundPrepared(Worker.MyWorker.Dboid, [.. found.Select(static row => ((uint)row.Get<long>(0), row.Get<bool>(1)))], databases);
+            Worker.NoteFoundPrepared(Worker.MyWorker.Dboid,
+                [.. found.Select(static row => ((uint)row.Get<long>(0), row.Get<bool>(1), row.Get<bool>(2)))], databases);
         }
     }
 
@@ -334,10 +342,6 @@ internal static class Manager
         }
     }
 
-    /// <summary>
-    /// Checks whether this database is a template that isn't a node, which has nothing to manage, and which a manager
-    /// would keep busy, while PostgreSQL copies a database only from a template nobody is connected to.
-    /// </summary>
     // Whether worf is installed in the database.
     private static unsafe bool Installed()
     {
@@ -347,6 +351,10 @@ internal static class Manager
         }
     }
 
+    /// <summary>
+    /// Checks whether this database is a template that isn't a node, which has nothing to manage, and which a manager
+    /// would keep busy, while PostgreSQL copies a database only from a template nobody is connected to.
+    /// </summary>
     private static bool IsIdleTemplate()
         => Worf.ReadScalar<bool>("SELECT datistemplate FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database()") &&
             WorfNode.GetLocalNode(false, true) is null;

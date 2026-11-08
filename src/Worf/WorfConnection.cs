@@ -1,6 +1,4 @@
-#if ANKUS_PG15 || ANKUS_PG16
 using System.Runtime.InteropServices;
-#endif
 using Ankus.Postgres;
 #if WORF_WINDOWS
 using PgSocket = ulong;
@@ -48,6 +46,14 @@ internal sealed unsafe partial class WorfConnection : IDisposable
     /// Gets the server's version number, such as 180006 for PostgreSQL 18.6.
     /// </summary>
     internal int ServerVersion { get; }
+
+    /// <summary>
+    /// Gets what an ordinary connection sets before it runs anything else, which a logical replication connection asks
+    /// for in its startup packet: text in this database's encoding, unambiguous dates, intervals and floats, and an
+    /// always-secure search path.
+    /// </summary>
+    internal static string OrdinarySettings => "SET search_path = ''; SET client_encoding = '" + Worf.DatabaseEncodingName +
+        "'; SET datestyle = 'ISO'; SET intervalstyle = 'postgres'; SET extra_float_digits = 3";
 
     /// <summary>
     /// Gets when the last message of a streaming copy arrived, or when the copy started, as a timestamp.
@@ -136,13 +142,8 @@ internal sealed unsafe partial class WorfConnection : IDisposable
 
         if (!replication)
         {
-            // A logical replication connection asks for these in its startup packet: text in this database's
-            // encoding and unambiguous dates, intervals and floats. An ordinary connection sets them, and an
-            // always-secure search path, before it runs anything else.
-            string settings = "SET search_path = ''; SET client_encoding = '" + Worf.DatabaseEncodingName +
-                "'; SET datestyle = 'ISO'; SET intervalstyle = 'postgres'; SET extra_float_digits = 3";
             WalRcvExecResult* outcome;
-            fixed (byte* command = Worf.ToServerCString(settings))
+            fixed (byte* command = Worf.ToServerCString(OrdinarySettings))
             {
                 outcome = functions->walrcv_exec.Invoke(conn, (sbyte*)command, 0, null);
             }
@@ -658,14 +659,39 @@ internal sealed unsafe partial class WorfConnection : IDisposable
             return (WalReceiverConn*)conn;
         }
     }
+#endif
+
+    /// <summary>
+    /// Takes an ordinary connection that libpq has made and set up, as a <see cref="WorfProbe"/> makes one, handing it to
+    /// libpqwalreceiver in the layout its WalReceiverConn has kept since PostgreSQL 10, so that its query, copy and
+    /// disconnect functions run on it.
+    /// </summary>
+    /// <param name="pgconn">The libpq connection, which the connection owns from now on.</param>
+    /// <returns>The connection.</returns>
+    internal static WorfConnection FromLibpq(void* pgconn)
+    {
+        WalReceiverFunctionsType* functions = Functions;
+        OrdinaryWalReceiverConn* conn = (OrdinaryWalReceiverConn*)NativeMethods.MemoryContextAllocZero(NativeGlobals.TopMemoryContext,
+            (ulong)sizeof(OrdinaryWalReceiverConn));
+        conn->StreamConn = pgconn;
+        MemoryContextData* scratch;
+        fixed (byte* name = "worf connection\0"u8)
+        {
+            scratch = NativeMethods.AllocSetContextCreateInternal(NativeGlobals.TopMemoryContext, (sbyte*)name, 0, 1024, 8 * 1024);
+        }
+
+        return new WorfConnection((WalReceiverConn*)conn, scratch, functions->walrcv_server_version.Invoke((WalReceiverConn*)conn));
+    }
 
     /// <summary>
     /// Makes a socket of the descriptor libpq's <c>PQsocket</c> returns, as C converts it.
     /// </summary>
+    /// <param name="descriptor">The descriptor.</param>
+    /// <returns>The socket.</returns>
 #if WORF_WINDOWS
-    private static PgSocket ToSocket(int descriptor) => unchecked((PgSocket)descriptor);
+    internal static PgSocket ToSocket(int descriptor) => unchecked((PgSocket)descriptor);
 #else
-    private static PgSocket ToSocket(int descriptor) => descriptor;
+    internal static PgSocket ToSocket(int descriptor) => descriptor;
 #endif
 
     /// <summary>
@@ -673,7 +699,9 @@ internal sealed unsafe partial class WorfConnection : IDisposable
     /// libpqwalreceiver and the libraries it depends on; on Windows a module's exports exclude its dependencies, so
     /// libpq is found by name.
     /// </summary>
-    private static void* LibpqFunction(string name)
+    /// <param name="name">The function's name.</param>
+    /// <returns>Its address.</returns>
+    internal static void* LibpqFunction(string name)
     {
         void* function = null;
         if (OperatingSystem.IsWindows())
@@ -698,8 +726,6 @@ internal sealed unsafe partial class WorfConnection : IDisposable
             ? function
             : throw new PgException(PgSqlStates.UndefinedFunction, $"could not find the libpq function \"{name}\" that libpqwalreceiver uses");
     }
-
-#endif
 
     private const uint TextOid = 25;
 

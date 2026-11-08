@@ -67,7 +67,7 @@ internal static class SequenceRangeExchangeWorker
                     return;
                 }
 
-                _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(SequenceRanges.CheckInterval));
+                SequenceRangeExchange.Wait(SequenceRanges.CheckInterval);
             }
             catch (PgQueryCanceledException)
             {
@@ -82,9 +82,7 @@ internal static class SequenceRangeExchangeWorker
     /// of it that has run out of time, or any call as the watcher stops, which also tells the exchange worker to make no
     /// more, in one step with the call's start, so that none starts after the watcher's last look. A call that waits on a
     /// neighbor that never answers doesn't see the exchange worker's own stop request, so it would hold up a server's
-    /// shutdown. A probe of a neighbor whose last call ran out of time gives way as soon as a request waits on another
-    /// neighbor, which the range worker looks for right after it makes one, so that a frozen neighbor holds up no
-    /// block this node asks another for.
+    /// shutdown.
     /// </summary>
     /// <param name="stopping">Whether the watcher stops.</param>
     /// <returns>Whether the exchange worker runs.</returns>
@@ -94,28 +92,6 @@ internal static class SequenceRangeExchangeWorker
         long now = Worker.GetCurrentTimestamp();
         bool running = false;
         int overdue = 0;
-        (long Deadline, uint Node, long StartedAt) probe = default;
-        using (PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share())
-        {
-            for (int i = 0; i < guard.Length && !stopping; i++)
-            {
-                WorfExchangeWorker exchange = guard[i].Worker.Exchange;
-                if (guard[i].WorkerType == WorfWorkerType.Exchange && guard[i].Dboid == dboid && guard[i].CrashedAt == 0 &&
-                    guard[i].Proc != 0 && exchange.Deadline > now && exchange.Probing != 0)
-                {
-                    probe = (exchange.Deadline, exchange.Probing, exchange.StartedAt);
-                }
-            }
-        }
-
-        // A probe gives way to a request on another node made within the exchange timeout, which that node is about to
-        // answer, but not to one that has stayed open longer, as one the node can't answer, so that the once-a-minute probe
-        // of a neighbor doesn't give way for as long as such a request stays open.
-        bool giveWay = probe.Node != 0 && PgBackgroundWorker.RunTransaction(() => Worf.ReadScalar<bool>("""
-            SELECT EXISTS (
-                SELECT 1 FROM worf.sequence_range_request
-                WHERE state = 'open' AND parent_node <> $1 AND created_at >= least($2, pg_catalog.clock_timestamp() - $3 * interval '1 millisecond'))
-            """, SpiParameter.Create(probe.Node), SpiParameter.Create(new PgTimestampTz(probe.StartedAt)), SpiParameter.Create(SequenceRanges.ExchangeTimeout)));
         using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
         {
             for (int i = 0; i < guard.Length; i++)
@@ -128,8 +104,7 @@ internal static class SequenceRangeExchangeWorker
 
                 running = true;
                 long deadline = worker.Worker.Exchange.Deadline;
-                bool givingWay = giveWay && deadline == probe.Deadline && worker.Worker.Exchange.Probing == probe.Node;
-                if (worker.Proc != 0 && deadline > 0 && (stopping || now >= deadline || givingWay))
+                if (worker.Proc != 0 && deadline > 0 && (stopping || now >= deadline))
                 {
                     unsafe
                     {
@@ -137,7 +112,7 @@ internal static class SequenceRangeExchangeWorker
                     }
                 }
 
-                if (stopping || (deadline > 0 && now >= deadline) || givingWay)
+                if (stopping || (deadline > 0 && now >= deadline))
                 {
                     worker.Worker.Exchange.Deadline = stopping ? Stopped : Cancelling;
                     guard[i] = worker;
@@ -191,57 +166,18 @@ internal static class SequenceRangeExchangeWorker
     }
 
     /// <summary>
-    /// Gets or sets the node the calls about to be made go to, if its last call ran out of time, which they only probe
-    /// for a second at most, three for the connection, and give way to a request that waits on another node, so that a
-    /// neighbor that stays frozen holds up the calls to the others that little, until one answers in time; or zero.
-    /// </summary>
-    internal static uint Probing { get; set; }
-
-    /// <summary>
-    /// Gets or sets whether a probe gives way to a request that waits on another node. One that gave way last time
-    /// doesn't, so that a neighbor slow to answer is reached though requests on the others keep coming.
-    /// </summary>
-    internal static bool Yields { get; set; } = true;
-
-    /// <summary>
-    /// Gets or sets whether a probe has the exchange's whole time, as one made again without giving way does, or one
-    /// a statement waiting on the neighbor made due.
-    /// </summary>
-    internal static bool FullProbe { get; set; }
-
-    /// <summary>
-    /// Gets or sets how many probes of the neighbor in a row ran out of time before this one, each of which doubles
-    /// its time, up to the exchange's.
-    /// </summary>
-    internal static int ProbesTimedOut { get; set; }
-
-    /// <summary>
-    /// Gets how long, in milliseconds, the last call that started had.
+    /// Gets how long, in milliseconds, the last call that started had: <c>worf.sequence_range_timeout</c>.
     /// </summary>
     internal static int LastLimit { get; private set; }
 
     /// <summary>
-    /// Gets how long, in milliseconds, a call about to start has: <c>worf.sequence_range_timeout</c>, or, as a probe,
-    /// a second, or three for the connection, which takes a few round trips more, twice as long for each probe in a row
-    /// that ran out of time, up to the exchange's, which a probe made again without giving way, or that a waiting
-    /// statement made due, has.
-    /// </summary>
-    /// <param name="connecting">Whether the call makes the connection to the neighbor.</param>
-    /// <returns>The limit.</returns>
-    internal static int CallLimit(bool connecting)
-        => Probing == 0 || FullProbe
-            ? SequenceRanges.ExchangeTimeout
-            : (int)Math.Min(SequenceRanges.ExchangeTimeout, (connecting ? 3000L : 1000L) << Math.Min(ProbesTimedOut, 16));
-
-    /// <summary>
     /// Makes a call to a neighbor, from the exchange worker, which its watcher cancels once it has taken longer than
-    /// <c>worf.sequence_range_timeout</c>, or, as a probe, a second, or as soon as a request waits on another node.
+    /// <c>worf.sequence_range_timeout</c>.
     /// </summary>
     /// <typeparam name="T">The call's result.</typeparam>
     /// <param name="call">The call.</param>
-    /// <param name="connecting">Whether the call makes the connection to the neighbor.</param>
     /// <returns>Its result.</returns>
-    internal static T Bounded<T>(Func<T> call, bool connecting = false)
+    internal static T Bounded<T>(Func<T> call)
     {
         // A worker asked to stop makes no new call, which its stop request might not reach.
         if (Worker.GotSigterm)
@@ -249,7 +185,7 @@ internal static class SequenceRangeExchangeWorker
             throw new PgException("57P01", "the sequence range exchange worker is stopping");
         }
 
-        LastLimit = CallLimit(connecting);
+        LastLimit = SequenceRanges.ExchangeTimeout;
         long deadline = Worker.GetCurrentTimestamp() + (LastLimit * 1000L);
         _ = SetDeadline(deadline);
         bool canceled = false;
@@ -325,9 +261,6 @@ internal static class SequenceRangeExchangeWorker
         if (replaced == Cancelling && deadline == 0)
         {
             // The watcher marks the cancel sent itself.
-            worker.Worker.Exchange.Probing = 0;
-            worker.Worker.Exchange.StartedAt = 0;
-            guard[Worker.MyWorfWorker] = worker;
             return replaced;
         }
 
@@ -343,8 +276,6 @@ internal static class SequenceRangeExchangeWorker
         }
 
         worker.Worker.Exchange.Deadline = deadline;
-        worker.Worker.Exchange.Probing = deadline != 0 && Yields ? Probing : 0;
-        worker.Worker.Exchange.StartedAt = deadline != 0 ? Worker.GetCurrentTimestamp() : 0;
         guard[Worker.MyWorfWorker] = worker;
         return replaced;
     }

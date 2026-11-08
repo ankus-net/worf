@@ -59,14 +59,19 @@ public sealed class WorkerSlotTests
     /// <summary>
     /// CREATE EXTENSION worf in a prepared transaction gives the database its manager once COMMIT PREPARED commits it,
     /// though the manager that PREPARE TRANSACTION woke found nothing to manage then, and though the server restarted
-    /// in between, rather than at the supervisor's next look minutes later.
+    /// in between, rather than at the supervisor's next look minutes later, and though the transaction also altered the
+    /// database without changing which databases have a manager. Meanwhile the manager starts and exits once, rather
+    /// than failing on the transaction's lock on the extension, whose relation is null, and starting again.
     /// </summary>
     /// <param name="restart">Whether the server restarts between PREPARE TRANSACTION and COMMIT PREPARED.</param>
+    /// <param name="altersDatabase">Whether the transaction alters the database too.</param>
     /// <returns>The test.</returns>
     [TestMethod]
-    [DataRow(false)]
-    [DataRow(true)]
-    public async Task PreparedExtensionsGetTheirManager(bool restart)
+    [DataRow(false, false)]
+    [DataRow(true, false)]
+    [DataRow(false, true)]
+    [DataRow(true, true)]
+    public async Task PreparedExtensionsGetTheirManager(bool restart, bool altersDatabase)
     {
         CancellationToken token = TestContext.CancellationToken;
         await using TestNode node = await TestNode.StartAsync("node", ["max_prepared_transactions = 2"], token);
@@ -76,6 +81,7 @@ public sealed class WorkerSlotTests
             BEGIN;
             CREATE EXTENSION worf;
             SELECT * FROM worf.create_node(node_name := 'prepared', dsn := '{node.Dsn("prepared")}');
+            {(altersDatabase ? "ALTER DATABASE prepared CONNECTION LIMIT 50;" : "")}
             PREPARE TRANSACTION 'extension';
             """, token);
 
@@ -87,8 +93,13 @@ public sealed class WorkerSlotTests
 
         // The manager that the prepared transaction woke, or that the server started, finds nothing to manage yet, and
         // exits.
+        int logpos = node.ReadLog().Length;
         await Task.Delay(TimeSpan.FromSeconds(3), token);
         Assert.IsTrue(await node.PollQueryUntilAsync(Database, $"SELECT NOT ({Manager})", token), "no manager while the extension is prepared");
+        string meanwhile = node.ReadLog()[logpos..];
+        Assert.DoesNotContain("cannot be read as a non-nullable", meanwhile, "the managers' failures while the extension is prepared");
+        Assert.IsLessThan(3, meanwhile.Split('\n').Count(line => line.Contains("starting background worker process \"worf manager", StringComparison.Ordinal)),
+            "managers started in 3 s while the extension is prepared");
 
         _ = await node.SafePsqlAsync("prepared", "COMMIT PREPARED 'extension'", token);
         Stopwatch starting = Stopwatch.StartNew();
@@ -105,8 +116,9 @@ public sealed class WorkerSlotTests
     /// COMMIT PREPARED of a transaction that changed neither worf nor a database starts no manager, in its own database
     /// or any other, though the managers that found nothing to manage there exited, nor does it once the server
     /// restarted after the transaction was prepared: an insert, a read of pg_database, ALTER ROLE ... SET, GRANT
-    /// CONNECT and COMMENT ON DATABASE, CREATE TABLE, and a read or SELECT ... FOR UPDATE of worf.node, which doesn't
-    /// keep the supervisor watching for its end either.
+    /// CONNECT and COMMENT ON DATABASE, CREATE TABLE, a read or SELECT ... FOR UPDATE of worf.node, an explicit LOCK of
+    /// worf.node, and CREATE TABLE and DROP TABLE, which writes worf's record of dropped columns, which don't keep the
+    /// supervisor watching for their ends either.
     /// </summary>
     /// <param name="restart">Whether the server restarts between PREPARE TRANSACTION and COMMIT PREPARED.</param>
     /// <returns>The test.</returns>
@@ -139,7 +151,15 @@ public sealed class WorkerSlotTests
             _ = await node.SafePsqlAsync(Database, """
                 BEGIN; SELECT count(*) FROM worf.node; PREPARE TRANSACTION 'restored_node';
                 BEGIN; SELECT * FROM worf.node FOR UPDATE; PREPARE TRANSACTION 'restored_node_locked';
-                """, token);
+                """ + string.Concat(Enumerable.Range(0, 3).Select(i =>
+                $"BEGIN; CREATE TABLE dropped{i} (a int); DROP TABLE dropped{i}; PREPARE TRANSACTION 'restored_dropped{i}';")), token);
+            foreach ((string database, string mode) in new[] { ("locked0", "ACCESS EXCLUSIVE"), ("locked1", "SHARE") })
+            {
+                _ = await node.SafePsqlAsync(Database, $"CREATE DATABASE {database}", token);
+                _ = await node.SafePsqlAsync(database, "CREATE EXTENSION worf", token);
+                _ = await node.SafePsqlAsync(database, $"BEGIN; LOCK worf.node IN {mode} MODE; PREPARE TRANSACTION 'restored_lock_{database}'", token);
+            }
+
             await node.StopAsync("fast", token);
             await node.StartServerAsync(token);
             await Task.Delay(TimeSpan.FromSeconds(3), token);
@@ -160,7 +180,13 @@ public sealed class WorkerSlotTests
                 COMMIT PREPARED 'restored_read'; COMMIT PREPARED 'restored_role'; COMMIT PREPARED 'restored_grant'; COMMIT PREPARED 'restored_comment';
                 COMMIT PREPARED 'restored_table';
                 """, token);
-            _ = await node.SafePsqlAsync(Database, "COMMIT PREPARED 'restored_node'; COMMIT PREPARED 'restored_node_locked'", token);
+            _ = await node.SafePsqlAsync(Database, "COMMIT PREPARED 'restored_node'; COMMIT PREPARED 'restored_node_locked';" +
+                string.Concat(Enumerable.Range(0, 3).Select(i => $"COMMIT PREPARED 'restored_dropped{i}';")), token);
+            foreach (string database in new[] { "locked0", "locked1" })
+            {
+                _ = await node.SafePsqlAsync(database, $"COMMIT PREPARED 'restored_lock_{database}'", token);
+            }
+
             await Task.Delay(TimeSpan.FromSeconds(3), token);
             Assert.AreEqual(restored, Starts(), "managers started by unrelated COMMIT PREPARED of transactions prepared before a restart");
             return;

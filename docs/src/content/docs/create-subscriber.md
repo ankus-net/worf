@@ -47,10 +47,12 @@ install it in the PostgreSQL installation's `bin` directory.
 A run that fails, or is stopped with Ctrl-C or `SIGTERM`, cancels what it waits
 for, a connection or a command on a server that doesn't answer too, rolls back,
 and stops the server it started, putting back the data directory's settings, the
-`--recovery-conf` template's too, and keeping a `standby.signal` it had, if the
-server hadn't yet left recovery. A stop while `pg_basebackup` runs ends it, and
-removes what it wrote; one while `pg_ctl` starts or stops the server waits for
-it, and then stops the server. Once a database's subscription has committed, the
+`--recovery-conf` template's too, the `postgresql.conf` and `pg_hba.conf` it
+copied over, and keeping a `standby.signal` it had, if the server hadn't yet left
+recovery, as its cluster state shows once stopped. A stop while `pg_basebackup`
+runs ends it, and removes what it wrote, in the WAL directory `--waldir` names and
+the tablespace directories `-T` maps too, those it made with them; one while
+`pg_ctl` starts or stops the server waits for it, and then stops the server. Once a database's subscription has committed, the
 others can't roll back with it, so a stop waits for the run to set them up, and
 changes nothing. A killed run leaves its server running, and its transaction rolls
 back once the server finds it gone. The subscription keeps the position its
@@ -60,5 +62,9 @@ neither leaves progress for a later origin. A run on a data directory whose serv
 is running fails, as does one on a data directory whose timeline is past the
 provider's, as an earlier run's promotion leaves it, or that has run as a server
 of its own, out of recovery, as one started without its `standby.signal` does,
-which writes WAL the provider doesn't have; each leaves the data directory as it
-is.
+which writes WAL the provider doesn't have, or whose latest checkpoint isn't the
+one the provider's WAL holds at its position, as one that did so and stopped in
+recovery later has; each leaves the data directory as it is. The run reads that
+checkpoint record's header from the provider's `pg_wal` with
+`pg_read_binary_file`, and can't tell when the provider has removed that WAL or
+doesn't let it read it.

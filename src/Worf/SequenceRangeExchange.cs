@@ -32,16 +32,9 @@ internal static class SequenceRangeExchange
     private static readonly Dictionary<uint, (long At, long Delay)> s_retries = [];
     private static readonly HashSet<uint> s_timedOut = [];
 
-    // When each subscription's provider whose last call ran out of time was last called, which the call that ran out of
-    // time counts as.
-    private static readonly Dictionary<uint, long> s_probedAt = [];
-
-    // The subscriptions whose last probe gave way to a request on another neighbor.
-    private static readonly HashSet<uint> s_gaveWay = [];
-
-    // How many probes of each subscription's provider in a row ran out of time, each of which gives the next twice as
-    // long.
-    private static readonly Dictionary<uint, int> s_probesTimedOut = [];
+    // The probes of the providers whose last call ran out of time, which connect without the worker waiting on them, by
+    // subscription, with the provider's name and connection string.
+    private static readonly Dictionary<uint, (WorfProbe Probe, string Name, string Dsn)> s_probes = [];
 
     // The sequences, with the prepared transactions holding their range rows, that this process has warned of.
     private static readonly HashSet<(uint Seqoid, string Gid)> s_preparedHolders = [];
@@ -61,7 +54,7 @@ internal static class SequenceRangeExchange
     // before that, which doubles from the check interval up to the exchange interval while nothing changes.
     private static readonly Dictionary<uint, (string What, long At, long Delay)> s_waits = [];
 
-    // The links a statement waits on whose retry it made due early, which a probe makes without giving way.
+    // The links a statement waits on whose retry it made due early.
     private static readonly HashSet<uint> s_wanted = [];
 
     // The subscriptions whose provider answered the last exchange that their slot isn't streamed yet, those whose
@@ -326,22 +319,19 @@ internal static class SequenceRangeExchange
             s_waits.Clear();
         }
 
+        // A probe that has ended makes its neighbor's call due at once, or delays it.
+        TakeProbes();
         (WorfLocalNode Node, List<(WorfSubscription Sub, string? Waiting, bool Fenced)> Due)? links = PgBackgroundWorker.RunTransaction(DueLinks);
         if (links is not (WorfLocalNode node, List<(WorfSubscription Sub, string? Waiting, bool Fenced)> due))
         {
             return false;
         }
 
-        // A neighbor whose last call ran out of time goes last, so that the calls to the others don't wait on it, and is
-        // called only while nothing waits on the others, as a block this node asked another neighbor for, or once a
-        // minute, so that a neighbor that never answers holds up the others' calls at most three seconds a minute. A
-        // request that comes up during the call has it give way, and the call is made again in the next round without
-        // giving way, so that a neighbor that answers, though slowly, is reached while requests on the others keep
-        // coming.
-        long[] timedOutNodes = [.. due.Where(link => s_timedOut.Contains(link.Sub.Id)).Select(link => (long)link.Sub.Origin.Id)];
-        bool othersWaited = due.Exists(link => !s_timedOut.Contains(link.Sub.Id) && link.Waiting is not null);
+        // A neighbor whose last call ran out of time is probed, by a connection the worker makes without waiting on it,
+        // and called again only once it has answered, so that a neighbor that never answers holds up none of the calls
+        // to the others, which wait on it for its first call's time at most.
         bool changed = false;
-        foreach ((WorfSubscription sub, string? waiting, bool fenced) in due.OrderBy(link => s_timedOut.Contains(link.Sub.Id)))
+        foreach ((WorfSubscription sub, string? waiting, bool fenced) in due)
         {
             // A worker asked to stop makes no more calls.
             if (Worker.GotSigterm)
@@ -350,31 +340,20 @@ internal static class SequenceRangeExchange
             }
 
             long now = Worker.GetCurrentTimestamp();
-            SequenceRangeExchangeWorker.Probing = s_timedOut.Contains(sub.Id) ? sub.Origin.Id : 0;
-            SequenceRangeExchangeWorker.Yields = !s_gaveWay.Contains(sub.Id);
-            if (SequenceRangeExchangeWorker.Probing != 0)
+            if (s_timedOut.Contains(sub.Id))
             {
-                if (SequenceRangeExchangeWorker.Yields && !s_wanted.Contains(sub.Id) && now - s_probedAt.GetValueOrDefault(sub.Id) < TimedOutBackoff && (othersWaited ||
-                    PgBackgroundWorker.RunTransaction(() => Worf.ReadScalar<bool>("""
-                        SELECT EXISTS (
-                            SELECT 1 FROM worf.sequence_range_request
-                            WHERE state = 'open' AND parent_node <> ALL ($1::pg_catalog.int8[]::pg_catalog.oid[]))
-                        """, SpiParameter.Create(timedOutNodes)))))
+                if (!s_probes.ContainsKey(sub.Id))
                 {
-                    continue;
+                    StartProbe(sub, now);
                 }
 
-                s_probedAt[sub.Id] = now;
+                continue;
             }
 
-            // A probe made again without giving way, or that a statement waiting on the neighbor made due, has the
-            // exchange's whole time, and any other twice as long as the last that ran out of time.
-            SequenceRangeExchangeWorker.FullProbe = !SequenceRangeExchangeWorker.Yields || s_wanted.Contains(sub.Id);
-            SequenceRangeExchangeWorker.ProbesTimedOut = s_probesTimedOut.GetValueOrDefault(sub.Id);
             try
             {
                 _ = s_noSlot.Remove(sub.Id);
-                WorfLog.Debug2($"sequence range exchange with node {sub.Origin.Name} starting{(SequenceRangeExchangeWorker.Probing != 0 ? ", as a probe" : "")}");
+                WorfLog.Debug2($"sequence range exchange with node {sub.Origin.Name} starting");
                 (bool received, bool granted) = ExchangeWith(node, sub);
                 WorfLog.Debug2($"sequence range exchange with node {sub.Origin.Name} done");
 
@@ -390,10 +369,6 @@ internal static class SequenceRangeExchange
                 s_exchangedAt[sub.Id] = now;
                 _ = s_noSlotOnce.Remove(sub.Id);
                 _ = s_retries.Remove(sub.Id);
-                _ = s_timedOut.Remove(sub.Id);
-                _ = s_probedAt.Remove(sub.Id);
-                _ = s_gaveWay.Remove(sub.Id);
-                _ = s_probesTimedOut.Remove(sub.Id);
 
                 // An exchange that changed nothing while something waits makes the next one wait longer, up to the
                 // exchange interval, since the neighbor may not answer it for long, as when a root can't start or a
@@ -433,20 +408,6 @@ internal static class SequenceRangeExchange
                     continue;
                 }
 
-                // A probe that gave way to a request on another neighbor before its time was up is made again in the
-                // next round, without giving way, the neighbor having shown nothing new.
-                long probeLimit = SequenceRangeExchangeWorker.LastLimit * 1000L;
-                if (error is PgQueryCanceledException && SequenceRangeExchangeWorker.Probing != 0 && SequenceRangeExchangeWorker.Yields &&
-                    Worker.GetCurrentTimestamp() - now < probeLimit && s_retries.TryGetValue(sub.Id, out (long At, long Delay) unanswered))
-                {
-                    _ = s_gaveWay.Add(sub.Id);
-                    s_retries[sub.Id] = (now, unanswered.Delay);
-                    WorfLog.Debug1($"sequence range exchange with node {sub.Origin.Name} gave way to a request waiting on another node");
-                    continue;
-                }
-
-                _ = s_gaveWay.Remove(sub.Id);
-
                 // A failed exchange is tried again after a delay that doubles, up to the exchange interval, or half the
                 // exchange timeout while this node waits on the neighbor, as for a block, so that inserts waiting at a
                 // block's end, up to twice the timeout, get it soon after the neighbor is back. A call the watcher
@@ -460,13 +421,7 @@ internal static class SequenceRangeExchange
                     : SequenceRanges.ExchangeInterval * 1000L;
                 if (timedOut)
                 {
-                    if (SequenceRangeExchangeWorker.Probing != 0)
-                    {
-                        s_probesTimedOut[sub.Id] = s_probesTimedOut.GetValueOrDefault(sub.Id) + 1;
-                    }
-
                     _ = s_timedOut.Add(sub.Id);
-                    s_probedAt[sub.Id] = now;
                 }
 
                 // The delay counts from the call's end, so that one that ran out of time waits it out too.
@@ -502,11 +457,114 @@ internal static class SequenceRangeExchange
             }
         }
 
-        SequenceRangeExchangeWorker.Probing = 0;
-        SequenceRangeExchangeWorker.Yields = true;
-        SequenceRangeExchangeWorker.FullProbe = false;
-        SequenceRangeExchangeWorker.ProbesTimedOut = 0;
         return changed;
+    }
+
+    /// <summary>
+    /// Waits up to a time for the latch, or, while probes are under way, for their sockets, taking each probe on as its
+    /// socket lets it, and returns once one has ended, so that the next round calls a neighbor that answered at once.
+    /// </summary>
+    /// <param name="milliseconds">The time.</param>
+    internal static void Wait(int milliseconds)
+    {
+        if (s_probes.Count == 0)
+        {
+            _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(milliseconds));
+            return;
+        }
+
+        long until = Worker.GetCurrentTimestamp() + (milliseconds * 1000L);
+        while (!Worker.GotSigterm)
+        {
+            long now = Worker.GetCurrentTimestamp();
+            if (now >= until || s_probes.Values.Any(probe => probe.Probe.Done || now >= probe.Probe.Deadline))
+            {
+                return;
+            }
+
+            // One probe's socket is waited on at a time, for a moment while others are under way.
+            WorfProbe waited = s_probes.Values.First().Probe;
+            long left = Math.Min(until, waited.Deadline) - now;
+            if (waited.Wait(Math.Max((s_probes.Count > 1 ? Math.Min(left, 50_000L) : left) / 1000L, 1)))
+            {
+                PgInterrupts.Check();
+                return;
+            }
+
+            foreach ((WorfProbe probe, _, _) in s_probes.Values)
+            {
+                probe.Advance();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Starts a probe of a provider whose last call ran out of time, with the exchange's time. Its connection string is
+    /// read as a call's is.
+    /// </summary>
+    private static void StartProbe(WorfSubscription sub, long now)
+    {
+        Disconnect(sub.Id);
+        int timeout = SequenceRanges.ExchangeTimeout;
+        (string conninfo, string applicationName) = Worf.ConnectionString(sub.OriginIf.Dsn, sub.Name, "range");
+        string setup = Worf.SessionSetup($"SET statement_timeout = {timeout.ToString(CultureInfo.InvariantCulture)}");
+        try
+        {
+            s_probes[sub.Id] = (WorfProbe.Start(conninfo, applicationName, setup, now + (timeout * 1000L)), sub.Origin.Name, sub.OriginIf.Dsn);
+            WorfLog.Debug2($"sequence range exchange with node {sub.Origin.Name} probing");
+        }
+        catch (PgException error)
+        {
+            Probed(sub.Id, sub.Origin.Name, error.Message, false);
+        }
+    }
+
+    /// <summary>
+    /// Takes each probe as far as its socket lets it, and ends those that have answered, failed or run out of time: a
+    /// neighbor that answered is called at once, over the probe's connection, and one that didn't is probed again
+    /// after a delay that doubles from ten seconds up to a minute, or the exchange interval if that is longer.
+    /// </summary>
+    private static void TakeProbes()
+    {
+        foreach ((uint subId, (WorfProbe probe, string name, string dsn)) in s_probes.ToList())
+        {
+            probe.Advance();
+            long now = Worker.GetCurrentTimestamp();
+            if (!probe.Done && now < probe.Deadline)
+            {
+                continue;
+            }
+
+            _ = s_probes.Remove(subId);
+            if (probe.Answered)
+            {
+                s_connections[subId] = (probe.Take(), dsn, SequenceRanges.ExchangeTimeout, false);
+                _ = s_timedOut.Remove(subId);
+                _ = s_retries.Remove(subId);
+                _ = s_exchangedAt.Remove(subId);
+                WorfLog.Debug1($"sequence range exchange with node {name} answered a probe, and is called again");
+                continue;
+            }
+
+            string failure = probe.Failure ?? $"node {name} didn't answer within {SequenceRanges.ExchangeTimeout.ToString(CultureInfo.InvariantCulture)} ms";
+            probe.Dispose();
+            Probed(subId, name, failure, probe.Failure is null);
+        }
+    }
+
+    /// <summary>
+    /// Notes a probe that failed or ran out of time, which leaves its neighbor to be probed again after its delay.
+    /// </summary>
+    private static void Probed(uint subId, string name, string failure, bool timedOut)
+    {
+        long most = Math.Max(SequenceRanges.ExchangeInterval * 1000L, TimedOutBackoff);
+        long delay = s_retries.TryGetValue(subId, out (long At, long Delay) retry) ? retry.Delay * 2 : 0;
+        delay = Math.Min(Math.Max(delay, Math.Min(TimedOutFirstBackoff, most)), most);
+        s_retries[subId] = (Worker.GetCurrentTimestamp() + delay, delay);
+        WorfLog.Warning(new PgDiagnostic($"sequence range exchange with node {name} failed: {failure}")
+        {
+            Detail = timedOut ? null : "The probe of a node whose last call ran out of time failed.",
+        });
     }
 
     /// <summary>
@@ -531,10 +589,16 @@ internal static class SequenceRangeExchange
         s_wanted.Clear();
         List<WorfSubscription> enabled = [.. WorfNode.GetNodeSubscriptions(node.Node.Id, false).Where(sub => sub.Enabled)];
 
-        // The connections kept for subscriptions dropped or disabled since go.
+        // The connections kept for subscriptions dropped or disabled since go, and so do their probes.
         foreach (uint gone in s_connections.Keys.Where(id => !enabled.Exists(sub => sub.Id == id)).ToList())
         {
             Disconnect(gone);
+        }
+
+        foreach (uint gone in s_probes.Keys.Where(id => !enabled.Exists(sub => sub.Id == id)).ToList())
+        {
+            s_probes[gone].Probe.Dispose();
+            _ = s_probes.Remove(gone);
         }
 
         _ = s_noSlotOnce.RemoveWhere(id => !enabled.Exists(sub => sub.Id == id));
@@ -682,7 +746,7 @@ internal static class SequenceRangeExchange
         // The host is checked within the connection's time, so that one that drops connection attempts runs out of time as
         // one that takes them and never answers does.
         Disconnect(sub.Id);
-        WorfConnection conn = PgBackgroundWorker.RunTransaction(() => SequenceRangeExchangeWorker.Bounded(connecting: true, call: () =>
+        WorfConnection conn = PgBackgroundWorker.RunTransaction(() => SequenceRangeExchangeWorker.Bounded(() =>
         {
             RequireReachable(sub.OriginIf.Dsn, sub.Origin.Name);
             return Worf.Connect(sub.OriginIf.Dsn, sub.Name, "range", setup: setTimeout);
@@ -941,12 +1005,16 @@ internal static class SequenceRangeExchange
                 SELECT * FROM (
                     SELECT r.seqoid::oid, pg_catalog.quote_ident(n.nspname) || '.' || pg_catalog.quote_ident(c.relname) AS name, r.owner_node,
                         r.epoch, r.range_size, r.max_range_size, r.distance, r.high_water, r.watermark, r.parent_node,
-                        CASE WHEN r.fenced_at IS NOT NULL THEN 'fenced' ELSE r.state END, r.root_start, r.root_end
+                        CASE WHEN r.fenced_at IS NOT NULL THEN 'fenced' ELSE r.state END, r.root_start, r.root_end,
+                        CASE WHEN r.distance IS NULL THEN NULL WHEN r.parent_node IS NULL THEN '{}'::pg_catalog.int8[]
+                            ELSE ARRAY[r.parent_node::pg_catalog.int8] || coalesce((SELECT p.route FROM worf.sequence_range_node p
+                                WHERE p.seqoid = r.seqoid AND p.node_id = r.parent_node AND p.via_node = p.node_id), '{}') END
                     FROM worf.sequence_range r
                         JOIN pg_catalog.pg_class c ON c.oid = r.seqoid
                         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
                     UNION ALL
-                    SELECT NULL, d.name, d.owner_node, d.epoch, d.range_size, d.max_range_size, 0, NULL, d.watermark, NULL, 'disabled', d.root_start, d.root_end
+                    SELECT NULL, d.name, d.owner_node, d.epoch, d.range_size, d.max_range_size, 0, NULL, d.watermark, NULL, 'disabled', d.root_start, d.root_end,
+                        '{}'::pg_catalog.int8[]
                     FROM worf.sequence_range_dropped d
                     WHERE d.owned AND NOT EXISTS (SELECT 1 FROM worf.sequence_range r WHERE r.seqoid = pg_catalog.to_regclass(d.name))) s
                 ORDER BY name COLLATE "C"
@@ -980,8 +1048,22 @@ internal static class SequenceRangeExchange
         writer.WriteNumber("max_range_size", row.Get<long>(5));
         // A neighbor that is this node's parent hears of no distance from it, as this node's route to the owner goes
         // through the neighbor, so that the neighbor never takes this node as its own parent, as it would once it no
-        // longer heard from its own, and lengthen its route through this node in turn.
-        WriteNullable(writer, "distance", row.Get<uint?>(9) == neighbor ? null : row.Get<int?>(6));
+        // longer heard from its own, and lengthen its route through this node in turn. The others hear the route, the
+        // nodes from this node's parent to the owner, so that none takes a route that goes through itself, as one
+        // around a ring would once the owner is gone.
+        bool poisoned = row.Get<uint?>(9) == neighbor;
+        WriteNullable(writer, "distance", poisoned ? null : row.Get<int?>(6));
+        if (!poisoned && row.Get<long[]?>(13) is long[] route)
+        {
+            writer.WriteStartArray("route");
+            foreach (long hop in route)
+            {
+                writer.WriteNumberValue(hop);
+            }
+
+            writer.WriteEndArray();
+        }
+
         WriteNullable(writer, "high_water", row.Get<long?>(7));
         WriteNullable(writer, "watermark", row.Get<long?>(8));
         writer.WriteString("state", row.Get<string>(10));
@@ -1333,12 +1415,12 @@ internal static class SequenceRangeExchange
                 AND epoch IS NOT DISTINCT FROM $7 AND state IS NOT DISTINCT FROM $8 AND distance IS NOT DISTINCT FROM $9
                 AND high_water IS NOT DISTINCT FROM $10 AND watermark IS NOT DISTINCT FROM $11 AND holds IS NOT DISTINCT FROM $12
                 AND (clock IS NOT DISTINCT FROM $13 OR clock >= $13) AND ($14::pg_lsn IS NULL OR reset_done = $14::pg_lsn)
-                AND ($15::pg_lsn IS NULL OR reset_lsn IS DISTINCT FROM $15::pg_lsn)
+                AND ($15::pg_lsn IS NULL OR reset_lsn IS DISTINCT FROM $15::pg_lsn) AND route IS NOT DISTINCT FROM $16
             """, 1, seq, sender, SpiParameter.Create(root.GetProperty("node_name").GetWorfString()), SpiParameter.Create(sysid),
             SpiParameter.Create(timeline), SpiParameter.Create(call), SpiParameter.Create(epoch), SpiParameter.Create(state),
             SpiParameter.Create(Nullable32(entry, "distance")), SpiParameter.Create(Nullable(entry, "high_water")),
             SpiParameter.Create(watermark), SpiParameter.Create(Holds(entry)), SpiParameter.Create(Nullable(entry, "clock")),
-            SpiParameter.Create(Text(entry, "reset")), SpiParameter.Create(Text(entry, "reset_done")));
+            SpiParameter.Create(Text(entry, "reset")), SpiParameter.Create(Text(entry, "reset_done")), SpiParameter.Create(Route(entry)));
         if (own.Count == 0 || !Worf.TryParseLsn(own[0].Get<string?>(0) ?? "", out ulong recorded) ||
             !Worf.TryParseLsn(root.GetProperty("wal_lsn").GetWorfString() ?? "", out ulong position) ||
             position < Math.Max(Math.Max(recorded, AppliedFloor(applied, entry)),
@@ -1658,20 +1740,21 @@ internal static class SequenceRangeExchange
 
         _ = Worf.Execute("""
             INSERT INTO worf.sequence_range_node (seqoid, node_id, node_name, via_node, sysid, timeline, wal_lsn, reply_lsn, epoch, state, distance,
-                high_water, watermark, reported_at, holds, clock)
+                high_water, watermark, reported_at, holds, clock, route)
             VALUES ($1, $2, $3, $2, $4::numeric, $5, CASE WHEN $12 THEN $6::pg_lsn END, CASE WHEN NOT $12 THEN $6::pg_lsn END, $7, $8, $9, $10, $11, now(),
-                $13, $14)
+                $13, $14, $15)
             ON CONFLICT (seqoid, node_id) DO UPDATE SET node_name = excluded.node_name, via_node = excluded.via_node,
                 sysid = excluded.sysid, timeline = excluded.timeline,
                 wal_lsn = CASE WHEN $12 THEN excluded.wal_lsn ELSE sequence_range_node.wal_lsn END,
                 reply_lsn = CASE WHEN NOT $12 THEN excluded.reply_lsn ELSE sequence_range_node.reply_lsn END, epoch = excluded.epoch,
                 state = excluded.state, distance = excluded.distance, high_water = excluded.high_water, watermark = excluded.watermark,
-                reported_at = excluded.reported_at, holds = excluded.holds, clock = greatest(sequence_range_node.clock, excluded.clock)
+                reported_at = excluded.reported_at, holds = excluded.holds, clock = greatest(sequence_range_node.clock, excluded.clock),
+                route = excluded.route
             """, seq, sender, SpiParameter.Create(senderName),
             SpiParameter.Create(sysid), SpiParameter.Create(timeline), SpiParameter.Create(walLsn), SpiParameter.Create(epoch),
             SpiParameter.Create(entry.GetProperty("state").GetWorfString()), SpiParameter.Create(Nullable32(entry, "distance")),
             SpiParameter.Create(high), SpiParameter.Create(watermark), SpiParameter.Create(call), SpiParameter.Create(Holds(entry)),
-            SpiParameter.Create(Nullable(entry, "clock")));
+            SpiParameter.Create(Nullable(entry, "clock")), SpiParameter.Create(Route(entry)));
 
         // A neighbor that worf.activate_sequence_range stopped waiting for, as gone, may hold values that the fence's lift
         // gave out again, so once it's heard from again after the lift, it's asked to reset, at a WAL position of its own,
@@ -2212,7 +2295,8 @@ internal static class SequenceRangeExchange
     /// <summary>
     /// Sets this node's distance to the owner, one more than its nearest neighbor's, and its parent, that neighbor,
     /// with ties going to the lowest name. Only neighbors that still exchange count, so that a dropped link's node stops
-    /// being the parent. A request open with another parent is dropped once a new parent is found.
+    /// being the parent, and only those whose routes don't go through this node, so that no ring of nodes counts its
+    /// distances up through itself. A request open with another parent is dropped once a new parent is found.
     /// </summary>
     private static void Route(uint seqoid, WorfLocalNode node)
     {
@@ -2228,13 +2312,15 @@ internal static class SequenceRangeExchange
     }
 
     /// <summary>
-    /// Finds this node's parent, its nearest neighbor that still exchanges, and its distance to the owner.
+    /// Finds this node's parent, its nearest neighbor that still exchanges whose route to the owner doesn't go through
+    /// this node, and its distance to the owner.
     /// </summary>
     private static (uint? Parent, int? Distance) Nearest(uint seqoid, WorfLocalNode node)
     {
         WorfRows nearest = Worf.SelectCatalog("""
             SELECT n.node_id, n.distance FROM worf.sequence_range_node n JOIN worf.sequence_range r ON r.seqoid = n.seqoid AND r.epoch = n.epoch
             WHERE n.seqoid = $1 AND n.via_node = n.node_id AND n.node_id <> $2 AND n.distance IS NOT NULL AND n.distance < $3
+                AND NOT coalesce($2::pg_catalog.int8 = ANY (n.route), false)
                 AND worf.sequence_range_heard(n.node_id, true, n.reported_at, false) > now() - $4::interval
             ORDER BY n.distance, n.node_name
             LIMIT 1
@@ -2277,6 +2363,12 @@ internal static class SequenceRangeExchange
     private static long[]? Holds(JsonElement entry)
         => entry.TryGetProperty("holds", out JsonElement holds) && holds.ValueKind == JsonValueKind.Array
             ? [.. holds.EnumerateArray().Select(number => number.GetInt64())]
+            : null;
+
+    // The nodes from a neighbor's parent to the owner, as its report gives them, or null for a neighbor with no route.
+    private static long[]? Route(JsonElement entry)
+        => entry.TryGetProperty("route", out JsonElement route) && route.ValueKind == JsonValueKind.Array
+            ? [.. route.EnumerateArray().Select(hop => hop.GetInt64())]
             : null;
 
     /// <summary>

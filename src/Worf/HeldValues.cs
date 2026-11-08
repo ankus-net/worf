@@ -99,9 +99,11 @@ internal static class HeldValues
     /// Finds the rows of a copy that the constraints refuse, in the copy's order: each with the error of the first of
     /// the constraints that refuses it, as PostgreSQL would raise it. A check that fails, as on a value an index's
     /// expression fails on, is left out, for the write to fail on. The conflicts of many candidates, as a merge's, go in
-    /// a temporary table rather than this backend's memory, and are decided in the copy's order a thousand candidates at a
-    /// time, so that what's kept here grows only with the keys that rows written take, and, for a constraint compared
-    /// pair by pair, with the rows refused, rather than with every conflict.
+    /// a temporary table rather than this backend's memory, indexed by candidate, and are decided in the copy's order a
+    /// thousand candidates at a time, with the keys that rows written take, and the rows refused, in temporary tables
+    /// too, read for each part, so that what's kept here doesn't grow with the copy. A row the table keeps is looked up
+    /// for a constraint compared pair by pair by a join of the candidates' keys to the table, which the constraint's own
+    /// index serves, rather than a search for each candidate.
     /// </summary>
     /// <param name="constraints">The constraints, in the order PostgreSQL checks them.</param>
     /// <param name="table">The table, qualified, after ONLY when it isn't partitioned.</param>
@@ -120,6 +122,7 @@ internal static class HeldValues
         string kept, bool many, Action<List<(long Row, PgException Error)>> refuse, params SpiParameter[] parameters)
     {
         RefusedChecked = 0;
+        HeldMost = 0;
 
         // Each candidate's conflicts, by constraint: with a row the table keeps, with that row's keys, the rows whose keys
         // are the same as its own, numbered as one, or an earlier row its keys conflict with, with that row's keys.
@@ -129,8 +132,24 @@ internal static class HeldValues
         {
             _ = Worf.Execute("""
                 CREATE TEMPORARY TABLE worf_held_conflicts (r pg_catalog.int8, c pg_catalog.int4, key pg_catalog.text, kept pg_catalog.text,
-                    same pg_catalog.int8, earlier pg_catalog.int8, earlier_key pg_catalog.text)
+                    same pg_catalog.int8, earlier pg_catalog.int8, earlier_key pg_catalog.text);
+                CREATE TEMPORARY TABLE worf_held_taken (c pg_catalog.int4, same pg_catalog.int8, key pg_catalog.text, PRIMARY KEY (c, same));
+                CREATE TEMPORARY TABLE worf_held_refused (r pg_catalog.int8 PRIMARY KEY);
                 """);
+        }
+
+        // The candidates' keys, joined to the table, are named apart from the table's columns, which its keys and
+        // predicate read unqualified.
+        HashSet<string> tableColumns = [.. Worf.Read($"""
+            SELECT a.attname::pg_catalog.text FROM pg_catalog.pg_attribute a
+            WHERE a.attrelid = '{(table.StartsWith("ONLY ", StringComparison.Ordinal) ? table[5..] : table).Replace("'", "''", StringComparison.Ordinal)}'::pg_catalog.regclass
+                AND a.attnum > 0
+            """, 0).Select(column => column.Get<string>(0))];
+        string candidateName = FreeName(tableColumns, "worf_held_r");
+        string keyStem = "worf_held_k";
+        for (int i = 1; constraints.Exists(constraint => Enumerable.Range(0, constraint.Keys.Length).Any(k => tableColumns.Contains($"{keyStem}{k}"))); i++)
+        {
+            keyStem = string.Create(CultureInfo.InvariantCulture, $"worf_held_k{i}_");
         }
 
         bool decided = false;
@@ -197,10 +216,13 @@ internal static class HeldValues
                                 _ = Worf.Execute("ANALYZE worf_held_keys");
                             }
 
+                            string renamed = string.Join(", ", Enumerable.Range(0, constraint.Keys.Length).Select(k => $"x.k{k} AS {keyStem}{k}"));
                             sql = $"""
-                                {with}{into}SELECT x.r, {number}, x.key, x.kept, NULL::pg_catalog.int8, NULL::pg_catalog.int8, NULL::pg_catalog.text
-                                FROM (SELECT b.r, {keyText} AS key, {inTable} AS kept FROM {from} b) x
-                                WHERE x.kept IS NOT NULL
+                                {with}{into}(SELECT DISTINCT ON (b.{candidateName}) b.{candidateName}, {number}, {KeyText(constraint.Keys.Length, $"b.{keyStem}")},
+                                    {KeyText(constraint.Keys.Length, null, constraint.Compared)}, NULL::pg_catalog.int8, NULL::pg_catalog.int8, NULL::pg_catalog.text
+                                FROM (SELECT x.r AS {candidateName}, {renamed} FROM {from} x) b
+                                    JOIN {table} t ON {(constraint.Predicate is string joinPredicate ? $"({joinPredicate}) AND " : "")}{constraint.Conflict(null, "b", keyStem)} AND {kept}
+                                ORDER BY b.{candidateName})
                                 UNION ALL
                                 SELECT b.r, {number}, {keyText}, NULL, NULL, a.r, {KeyText(constraint.Keys.Length, "a.k")}
                                 FROM {from} a JOIN {from} b ON a.r OPERATOR(pg_catalog.<) b.r AND {constraint.Conflict("a", "b")}
@@ -234,12 +256,23 @@ internal static class HeldValues
             // In the copy's order, a row is refused by the first constraint in which a row the table keeps holds its
             // keys, or an earlier row that's written takes them; a row written takes its keys in every constraint.
             gathered.Sort((a, b) => a.R != b.R ? a.R.CompareTo(b.R) : a.C.CompareTo(b.C));
+            if (many)
+            {
+                _ = Worf.Execute("CREATE INDEX ON pg_temp.worf_held_conflicts (r, c); ANALYZE pg_temp.worf_held_conflicts");
+            }
+
             RefusedChecked = many
                 ? Worf.ReadScalar<int>("SELECT pg_catalog.count(DISTINCT h.r)::pg_catalog.int4 FROM pg_temp.worf_held_conflicts h")
                 : gathered.Select(conflict => conflict.R).Distinct().Count();
             bool pairs = constraints.Exists(constraint => constraint.Orderings is null);
+
+            // What the rows decided so far took and were refused, for the part being decided: all of it, for few
+            // candidates, and otherwise what the temporary tables hold of what the part's candidates conflict with, with
+            // what the part adds, which goes to them once it's decided.
             HashSet<long> refusedRows = [];
             Dictionary<(int Constraint, long Same), string> taken = [];
+            List<(int Constraint, long Same, string Key)> newlyTaken = [];
+            List<long> newlyRefused = [];
             long refusedCount = 0;
             for (long after = long.MinValue; ;)
             {
@@ -256,6 +289,34 @@ internal static class HeldValues
                     break;
                 }
 
+                if (many)
+                {
+                    taken.Clear();
+                    refusedRows.Clear();
+                    newlyTaken.Clear();
+                    newlyRefused.Clear();
+                    List<(int C, long Same)> sames = [.. part.Where(conflict => constraints[conflict.C].Orderings is not null)
+                        .Select(conflict => (conflict.C, conflict.Same)).Distinct()];
+                    if (sames.Count > 0)
+                    {
+                        foreach (WorfRow found in Worf.Read("""
+                            SELECT w.c, w.same, w.key FROM pg_temp.worf_held_taken w
+                                JOIN ROWS FROM (pg_catalog.unnest($1::pg_catalog.int4[]), pg_catalog.unnest($2::pg_catalog.int8[])) p (c, same)
+                                    ON p.c OPERATOR(pg_catalog.=) w.c AND p.same OPERATOR(pg_catalog.=) w.same
+                            """, 0, SpiParameter.Create(sames.Select(same => same.C).ToArray()), SpiParameter.Create(sames.Select(same => same.Same).ToArray())))
+                        {
+                            taken[(found.Get<int>(0), found.Get<long>(1))] = found.Get<string>(2);
+                        }
+                    }
+
+                    long[] earlier = [.. part.Where(conflict => conflict.Earlier is not null).Select(conflict => conflict.Earlier!.Value).Distinct()];
+                    if (pairs && earlier.Length > 0)
+                    {
+                        refusedRows.UnionWith(Worf.Read("SELECT w.r FROM pg_temp.worf_held_refused w WHERE w.r OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.int8[])", 0,
+                            SpiParameter.Create(earlier)).Select(found => found.Get<long>(0)));
+                    }
+                }
+
                 List<(long Row, PgException Error)> refused = [];
                 for (int first = 0; first < part.Count;)
                 {
@@ -269,18 +330,18 @@ internal static class HeldValues
                     if (Refuses(part, first, end) is PgException error)
                     {
                         refused.Add((candidate, error));
-                        if (pairs)
+                        if (pairs && refusedRows.Add(candidate))
                         {
-                            _ = refusedRows.Add(candidate);
+                            newlyRefused.Add(candidate);
                         }
                     }
                     else
                     {
                         for (int i = first; i < end; i++)
                         {
-                            if (constraints[part[i].C].Orderings is not null)
+                            if (constraints[part[i].C].Orderings is not null && taken.TryAdd((part[i].C, part[i].Same), part[i].Key))
                             {
-                                _ = taken.TryAdd((part[i].C, part[i].Same), part[i].Key);
+                                newlyTaken.Add((part[i].C, part[i].Same, part[i].Key));
                             }
                         }
                     }
@@ -289,6 +350,22 @@ internal static class HeldValues
                 }
 
                 after = part[^1].R;
+                HeldMost = Math.Max(HeldMost, taken.Count + refusedRows.Count);
+                if (many && newlyTaken.Count > 0)
+                {
+                    _ = Worf.Execute("""
+                        INSERT INTO pg_temp.worf_held_taken
+                        SELECT * FROM ROWS FROM (pg_catalog.unnest($1::pg_catalog.int4[]), pg_catalog.unnest($2::pg_catalog.int8[]), pg_catalog.unnest($3::pg_catalog.text[]))
+                        """, SpiParameter.Create(newlyTaken.Select(entry => entry.Constraint).ToArray()),
+                        SpiParameter.Create(newlyTaken.Select(entry => entry.Same).ToArray()), SpiParameter.Create(newlyTaken.Select(entry => entry.Key).ToArray()));
+                }
+
+                if (many && newlyRefused.Count > 0)
+                {
+                    _ = Worf.Execute("INSERT INTO pg_temp.worf_held_refused SELECT pg_catalog.unnest($1::pg_catalog.int8[])",
+                        SpiParameter.Create(newlyRefused.ToArray()));
+                }
+
                 if (refused.Count > 0)
                 {
                     refuse(refused);
@@ -342,7 +419,7 @@ internal static class HeldValues
             // subtransaction, as a drop's hooks may; a failure leaves it to the transaction's rollback.
             if (many && decided)
             {
-                _ = Worf.Execute("DROP TABLE pg_temp.worf_held_conflicts");
+                _ = Worf.Execute("DROP TABLE pg_temp.worf_held_conflicts, pg_temp.worf_held_taken, pg_temp.worf_held_refused");
             }
         }
 
@@ -354,6 +431,12 @@ internal static class HeldValues
     /// Gets how many candidates the last <see cref="Refused"/> kept to decide on, those that could conflict.
     /// </summary>
     internal static int RefusedChecked { get; private set; }
+
+    /// <summary>
+    /// Gets the most keys taken and rows refused that the last <see cref="Refused"/> held in this backend's memory at
+    /// once, for a part of its candidates.
+    /// </summary>
+    internal static int HeldMost { get; private set; }
 
     /// <summary>
     /// Checks whether a table, or one of its partitions, has a BEFORE ROW INSERT or UPDATE trigger that fires under

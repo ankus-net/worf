@@ -64,6 +64,14 @@ internal static partial class SequenceRangeGuard
     // The statements and commands whose expressions are starting, innermost last.
     private static readonly List<WorfStartingStatement> s_starting = [];
 
+    // The fields of the nodes of a plan that nodeToString writes a type's OID in.
+    private static readonly HashSet<string> s_typeFields =
+    [
+        "vartype", "consttype", "paramtype", "aggtype", "aggtranstype", "wintype", "funcresulttype", "opresulttype", "resulttype",
+        "array_typeid", "element_typeid", "row_typeid", "casetype", "coalescetype", "minmaxtype", "refcontainertype", "refelemtype",
+        "refrestype", "firstColType", "typeId", "typid", "msftype", "exprBaseType",
+    ];
+
     // The PL/pgSQL expression whose calls of nextval started last, which PL/pgSQL starts outside a statement, as of the
     // transaction it started in before, with the sequences its calls name once a call has looked, and how many have.
     private static (nint Expr, uint Lxid, (HashSet<uint> Called, int Calls, bool Unnamed)? Draws, int Looked) s_simple;
@@ -71,8 +79,39 @@ internal static partial class SequenceRangeGuard
     // Where PL/pgSQL finds its instrumentation plugin, which it tells the function its error context calls.
     private static unsafe void** s_plpgsqlPlugin;
 
-    // The text of the defaults a worker's rows of a table take, by the columns the rows carry.
+    // The text of the defaults a worker's rows of a table take, by the columns the rows carry, and of the CHECK
+    // constraints and trigger conditions the rows start.
     private static readonly Dictionary<(uint Relid, string Sent), string> s_defaultsText = [];
+
+    // Whether the guard hears of the changes to tables and types that the text it holds by table reads, as a default
+    // set, a partition attached or a domain's CHECK added.
+    private static bool s_watchingTables;
+
+#if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
+    // TYPEOID, the id of the catalog cache of types, which only PostgreSQL 19's bindings name.
+    private const int TypeCacheId = 80;
+#elif ANKUS_PG18
+    private const int TypeCacheId = 82;
+#endif
+
+#if ANKUS_PG15 || ANKUS_PG16
+    // Whether a write straight into a partition draws from its ancestors' identity sequences, as it does from
+    // PostgreSQL 17 on. Before, a partition has identity columns of its own only, and such a write leaves its parent's
+    // empty.
+    private const bool AncestorsIdentity = false;
+#else
+    private const bool AncestorsIdentity = true;
+#endif
+
+    [PgNativeCallback(nameof(TableInvalidated))]
+#if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
+    private static partial RelcacheCallbackFunction TableCallback { get; }
+#else
+    private static partial RelSyncCallbackFunction TableCallback { get; }
+#endif
+
+    [PgNativeCallback(nameof(TypeInvalidated))]
+    private static partial SyscacheCallbackFunction TypeCallback { get; }
 
     // Whether each table has the guard's triggers, which only tables numbered by a managed sequence have, as of the
     // versions of the shared and this backend's counters it was looked up at.
@@ -563,10 +602,12 @@ internal static partial class SequenceRangeGuard
 
     /// <summary>
     /// Lists the managed sequences a table's columns draw from, by column, through their defaults or as identity
-    /// columns, a partition's identity columns drawing from its ancestors' sequences, by name.
+    /// columns, a partition's identity columns drawing from its ancestors' sequences, by name, as an update through an
+    /// ancestor sets them to its default on every version, which the plan of an update shows.
     /// </summary>
     private static List<(short Column, uint Sequence)> DrawingColumns(uint relid)
     {
+        WatchTables();
         if (!s_drawingColumns.TryGetValue(relid, out List<(short Column, uint Sequence)>? drawing))
         {
             WorfRows used = Elevated.Run(() => Worf.Read("""
@@ -751,13 +792,14 @@ internal static partial class SequenceRangeGuard
     /// </summary>
     /// <param name="statement">The statement's plan.</param>
     /// <param name="explained">Whether the statement is only explained, as EXPLAIN without ANALYZE starts it, which
-    /// draws nothing.</param>
+    /// draws nothing, unless its start prunes partitions through an expression that may draw, which it runs.</param>
     internal static unsafe void StartingExpressions(nint statement, bool explained)
-        => Starting(() => Draws(PlanText((Node*)statement)), explained);
+        => Starting(() => Draws(PlanText((Node*)statement)), explained && !PrunesDrawing((Node*)statement));
 
     /// <summary>
-    /// Notes a COPY FROM, whose defaults and condition start before its rows, and the CHECK constraints of the domains of
-    /// the columns it reads with the first, so that a call of nextval among them knows the sequences they name, until
+    /// Notes a COPY FROM, whose defaults and condition start before its rows, the CHECK constraints of the domains of the
+    /// columns it reads with the first, and the CHECK constraints and trigger conditions of the tables it writes with the
+    /// first row each takes, so that a call of nextval among them knows the sequences they name, until
     /// <see cref="StartedExpressions"/>.
     /// </summary>
     /// <param name="relid">The table the COPY writes.</param>
@@ -765,7 +807,7 @@ internal static partial class SequenceRangeGuard
     /// <param name="defaults">Whether the COPY's DEFAULT option has it start every column's default.</param>
     /// <param name="condition">The text of the COPY's WHERE condition, as <see cref="CopyConditionText"/> reads it.</param>
     internal static void StartingCopy(uint relid, short[]? columns, bool defaults, string condition = "")
-        => Starting(() => Draws(CopyDefaultsText(relid, columns, defaults) + " " + condition));
+        => Starting(() => Draws(CopyDefaultsText(relid, columns, defaults) + " " + condition + " " + WrittenChecks([relid])));
 
     /// <summary>
     /// Notes a COPY FROM that worf runs itself, as a table's sync does, as <see cref="StartingCopy(uint, short[], bool, string)"/>
@@ -790,8 +832,9 @@ internal static partial class SequenceRangeGuard
     }
 
     /// <summary>
-    /// Notes a row a worker writes, whose columns the row doesn't carry take their defaults, so that a call of nextval
-    /// among those knows the sequences they name, until <see cref="StartedExpressions"/>.
+    /// Notes a row a worker writes, whose columns the row doesn't carry take their defaults, and which starts the
+    /// table's CHECK constraints and trigger conditions, so that a call of nextval among those knows the sequences they
+    /// name, until <see cref="StartedExpressions"/>.
     /// </summary>
     /// <param name="relid">The table.</param>
     /// <param name="sent">Whether the row carries each column, by its index.</param>
@@ -801,9 +844,10 @@ internal static partial class SequenceRangeGuard
         string key = string.Join(',', columns);
         Starting(() =>
         {
+            WatchTables();
             if (!s_defaultsText.TryGetValue((relid, key), out string? text))
             {
-                text = CopyDefaultsText(relid, columns, false);
+                text = CopyDefaultsText(relid, columns, false) + " " + WrittenChecks([relid]);
                 s_defaultsText[(relid, key)] = text;
             }
 
@@ -865,24 +909,24 @@ internal static partial class SequenceRangeGuard
     }
 
     /// <summary>
-    /// Notes a statement as it runs that may route rows to partitions, so that a call of nextval among the expressions it
-    /// starts then knows the sequences they name, until <see cref="StartedExpressions"/>: the RETURNING list, WITH CHECK
-    /// OPTION and ON CONFLICT expressions and MERGE actions of each partition that takes its first row, and the CHECK
-    /// constraints and trigger conditions of each table it writes its first row to, and the CHECKs that draw of the
-    /// domains its values' types are or hold, which a value converted as it runs may start.
+    /// Notes a statement as it runs or finishes, so that a call of nextval among the expressions it starts then knows
+    /// the sequences they name, until <see cref="StartedExpressions"/>: each row of a multi-row VALUES list, which
+    /// starts as it's read, the CHECK constraints and trigger conditions of each table it writes its first row to, the
+    /// RETURNING list, WITH CHECK OPTION and ON CONFLICT expressions and MERGE actions of each partition that takes its
+    /// first row, and the CHECKs that draw of the domains its values' types are or hold, which a value converted as it
+    /// runs may start.
     /// </summary>
     /// <param name="queryDesc">The statement.</param>
     /// <returns>Whether it noted the statement.</returns>
     internal static unsafe bool StartingRun(QueryDesc* queryDesc)
     {
         PlannedStmt* statement = queryDesc->plannedstmt;
-        List<(nint Modify, uint Root)> routing = statement is null ? [] : Routing(statement);
-        if (routing.Count == 0)
+        if (statement is null)
         {
             return false;
         }
 
-        Starting(() => RoutedDraws(statement, routing));
+        Starting(() => RunDraws(statement));
         return true;
     }
 
@@ -1040,27 +1084,30 @@ internal static partial class SequenceRangeGuard
         return WithDomainChecks(text.ToString());
     }
 
-    // The types an expression's text names, in the fields nodeToString writes them in, whose names end in "type".
+    // The types an expression's text names, in the fields nodeToString writes a type's OID in: an expression's result,
+    // a Var's, Const's or Param's type, and the types an array, row, CASE, COALESCE, subscript or subplan builds,
+    // rather than the fields whose names end in "type" that hold an enumeration's value, as a join's type.
     private static HashSet<uint> NamedTypes(string text)
     {
         HashSet<uint> types = [];
-        for (int at = text.IndexOf("type ", StringComparison.Ordinal); at >= 0; at = text.IndexOf("type ", at + 5, StringComparison.Ordinal))
+        for (int at = text.IndexOf(" :", StringComparison.Ordinal); at >= 0; at = text.IndexOf(" :", at + 2, StringComparison.Ordinal))
         {
-            int field = at;
-            while (field > 0 && char.IsAsciiLetterLower(text[field - 1]))
-            {
-                field--;
-            }
-
-            int digits = at + 5;
-            int end = digits;
-            while (end < text.Length && char.IsAsciiDigit(text[end]))
+            int name = at + 2;
+            int end = name;
+            while (end < text.Length && (char.IsAsciiLetterOrDigit(text[end]) || text[end] == '_'))
             {
                 end++;
             }
 
-            if (field > 0 && text[field - 1] == ':' && end > digits &&
-                uint.TryParse(text.AsSpan(digits, end - digits), NumberStyles.None, CultureInfo.InvariantCulture, out uint type))
+            int digits = end + 1;
+            int last = digits;
+            while (last < text.Length && char.IsAsciiDigit(text[last]))
+            {
+                last++;
+            }
+
+            if (end < text.Length && text[end] == ' ' && last > digits && s_typeFields.Contains(text[name..end]) &&
+                uint.TryParse(text.AsSpan(digits, last - digits), NumberStyles.None, CultureInfo.InvariantCulture, out uint type) && type != 0)
             {
                 _ = types.Add(type);
             }
@@ -1069,10 +1116,11 @@ internal static partial class SequenceRangeGuard
         return types;
     }
 
-    // The ModifyTable nodes of a plan, at its top or as its subplans, that write to a partitioned table, with its root.
-    private static unsafe List<(nint Modify, uint Root)> Routing(PlannedStmt* statement)
+    // The ModifyTable nodes of a plan, at its top or as its subplans, as a data-modifying WITH's, with the tables each
+    // writes and the partitioned table it routes rows into, if it does.
+    private static unsafe List<(nint Modify, List<long> Written, uint Root)> Writing(PlannedStmt* statement)
     {
-        List<(nint Modify, uint Root)> routing = [];
+        List<(nint Modify, List<long> Written, uint Root)> writing = [];
         for (int i = -1; i < (statement->subplans is null ? 0 : statement->subplans->length); i++)
         {
             Plan* plan = i < 0 ? statement->planTree : (Plan*)statement->subplans->elements[i].ptr_value;
@@ -1082,59 +1130,50 @@ internal static partial class SequenceRangeGuard
             }
 
             ModifyTable* modify = (ModifyTable*)plan;
-            int index = modify->rootRelation != 0 ? (int)modify->rootRelation
-                : modify->resultRelations is not null && modify->resultRelations->length > 0 ? modify->resultRelations->elements[0].int_value : 0;
-            uint root = index > 0 && statement->rtable is not null && index <= statement->rtable->length
-                ? ((RangeTblEntry*)statement->rtable->elements[index - 1].ptr_value)->relid
-                : 0;
-            if (root != 0 && NativeMethods.get_rel_relkind(root) == (sbyte)'p')
+            List<long> written = [];
+            for (int j = -1; j < (modify->resultRelations is null ? 0 : modify->resultRelations->length); j++)
             {
-                routing.Add(((nint)modify, root));
+                int index = j < 0 ? (int)modify->rootRelation : modify->resultRelations->elements[j].int_value;
+                if (index > 0 && statement->rtable is not null && index <= statement->rtable->length)
+                {
+                    written.Add(((RangeTblEntry*)statement->rtable->elements[index - 1].ptr_value)->relid);
+                }
             }
+
+            uint root = written.Count > 0 ? (uint)written[0] : 0;
+            writing.Add(((nint)modify, written, root != 0 && NativeMethods.get_rel_relkind(root) == (sbyte)'p' ? root : 0));
         }
 
-        return routing;
+        return writing;
     }
 
-    // The calls of nextval a statement that routes rows starts as it runs: those its ModifyTable nodes start for each
-    // leaf partition of their roots, those of the CHECK constraints and trigger conditions of the tables in those
-    // trees, and those of the CHECKs that draw of the domains the types its plan names are or hold.
-    private static unsafe (HashSet<uint> Called, int Calls, bool Unnamed) RoutedDraws(PlannedStmt* statement, List<(nint Modify, uint Root)> routing)
+    // The calls of nextval a statement starts as it runs: those of its plan, as each row of a multi-row VALUES list
+    // starts its own, those of the CHECK constraints and trigger conditions of the tables it writes and their
+    // partitions, those its ModifyTable nodes start for each leaf partition of the tables they route rows into, and
+    // those of the CHECKs that draw of the domains the types its plan names are or hold.
+    private static unsafe (HashSet<uint> Called, int Calls, bool Unnamed) RunDraws(PlannedStmt* statement)
     {
-        HashSet<uint> called = [];
-        int calls = 0;
-        bool unnamed = false;
-        foreach ((nint node, uint root) in routing)
+        string text = PlanText((Node*)statement);
+        (HashSet<uint> called, int calls, bool unnamed) = Draws(text);
+        List<(nint Modify, List<long> Written, uint Root)> writing = Writing(statement);
+        List<(HashSet<uint> Called, int Calls, bool Unnamed)> parts = [Draws(WrittenChecks([.. writing.SelectMany(write => write.Written)]))];
+        foreach ((nint node, _, uint root) in writing.Where(write => write.Root != 0))
         {
             ModifyTable* modify = (ModifyTable*)node;
             (HashSet<uint> Called, int Calls, bool Unnamed) routed = Draws(WithDomainChecks(string.Join(' ', NodeText((Node*)modify->returningLists),
                 NodeText((Node*)modify->withCheckOptionLists), NodeText((Node*)modify->onConflictSet), NodeText(modify->onConflictWhere),
                 NodeText((Node*)modify->mergeActionLists))));
-            if (routed.Calls == 0)
+            if (routed.Calls > 0)
             {
-                continue;
+                int leaves = Elevated.Run(() => Worf.ReadScalar<int>(
+                    "SELECT pg_catalog.count(*)::pg_catalog.int4 FROM pg_catalog.pg_partition_tree($1) p WHERE p.isleaf", SpiParameter.Create(root)));
+                parts.Add((routed.Called, routed.Calls * Math.Max(leaves, 1), routed.Unnamed));
             }
-
-            WorfRows tree = Elevated.Run(() => Worf.Read("""
-                SELECT (SELECT pg_catalog.count(*) FROM pg_catalog.pg_partition_tree($1) p WHERE p.isleaf)::pg_catalog.int4,
-                    coalesce(pg_catalog.string_agg(x.expr, ' '), '')
-                FROM (
-                    SELECT c.conbin::pg_catalog.text FROM pg_catalog.pg_partition_tree($1) p JOIN pg_catalog.pg_constraint c ON c.conrelid = p.relid
-                    WHERE c.contype = 'c'
-                    UNION ALL
-                    SELECT g.tgqual::pg_catalog.text FROM pg_catalog.pg_partition_tree($1) p JOIN pg_catalog.pg_trigger g ON g.tgrelid = p.relid
-                    WHERE g.tgqual IS NOT NULL) x (expr)
-                """, 1, SpiParameter.Create(root)));
-            (HashSet<uint> Called, int Calls, bool Unnamed) checks = Draws(WithDomainChecks(tree[0].Get<string>(1)));
-            called.UnionWith(routed.Called);
-            called.UnionWith(checks.Called);
-            calls += (routed.Calls * Math.Max(tree[0].Get<int>(0), 1)) + checks.Calls;
-            unnamed |= routed.Unnamed || checks.Unnamed;
         }
 
-        if (calls > 0)
+        long[] types = [.. NamedTypes(text).Select(type => (long)type)];
+        if (types.Length > 0)
         {
-            long[] types = [.. NamedTypes(NodeText((Node*)statement)).Select(type => (long)type)];
             string drawing = string.Concat(Elevated.Run(() => Worf.Read("""
                 WITH RECURSIVE r (typ) AS (
                     SELECT pg_catalog.unnest($1::pg_catalog.int8[])::pg_catalog.oid
@@ -1152,15 +1191,149 @@ internal static partial class SequenceRangeGuard
                         UNION ALL
                         SELECT g.rngtypid FROM pg_catalog.pg_range g WHERE t.typtype = 'm' AND g.rngmultitypid = t.oid) n (typ))
                 SELECT c.conbin::pg_catalog.text FROM r JOIN pg_catalog.pg_constraint c ON c.contypid = r.typ
-                WHERE c.contype = 'c' AND pg_catalog.strpos(c.conbin::pg_catalog.text, '{FUNCEXPR :funcid 1574 ') > 0
+                WHERE r.typ <> 0 AND c.contype = 'c' AND pg_catalog.strpos(c.conbin::pg_catalog.text, '{FUNCEXPR :funcid 1574 ') > 0
                 """, 0, SpiParameter.Create(types))).Select(row => row.Get<string>(0) + " "));
-            (HashSet<uint> Called, int Calls, bool Unnamed) domains = Draws(WithDomainChecks(drawing));
-            called.UnionWith(domains.Called);
-            calls += domains.Calls;
-            unnamed |= domains.Unnamed;
+            parts.Add(Draws(WithDomainChecks(drawing)));
+        }
+
+        foreach ((HashSet<uint> Called, int Calls, bool Unnamed) part in parts)
+        {
+            called.UnionWith(part.Called);
+            calls += part.Calls;
+            unnamed |= part.Unnamed;
         }
 
         return (called, calls, unnamed);
+    }
+
+    // The text of the CHECK constraints and trigger conditions of tables and their partitions, which start as each
+    // table takes its first row, with those of the domains they coerce to.
+    private static string WrittenChecks(long[] relids)
+    {
+        if (relids.Length == 0)
+        {
+            return "";
+        }
+
+        return WithDomainChecks(Elevated.Run(() => Worf.ReadScalar<string>("""
+            WITH t (relid) AS (
+                SELECT r.relid::pg_catalog.oid FROM pg_catalog.unnest($1::pg_catalog.int8[]) r (relid)
+                UNION ALL
+                SELECT p.relid FROM pg_catalog.unnest($1::pg_catalog.int8[]) r (relid)
+                    CROSS JOIN LATERAL pg_catalog.pg_partition_tree(r.relid::pg_catalog.oid) p WHERE p.level > 0)
+            SELECT coalesce(pg_catalog.string_agg(x.expr, ' '), '')
+            FROM (
+                SELECT c.conbin::pg_catalog.text FROM t JOIN pg_catalog.pg_constraint c ON c.conrelid = t.relid WHERE c.contype = 'c'
+                UNION ALL
+                SELECT g.tgqual::pg_catalog.text FROM t JOIN pg_catalog.pg_trigger g ON g.tgrelid = t.relid WHERE g.tgqual IS NOT NULL) x (expr)
+            """, SpiParameter.Create(relids))) ?? "");
+    }
+
+    // Whether a plan's partition pruning, which its start runs even when only explained, may call nextval, as a CHECK
+    // of a domain it coerces a value to does.
+    private static unsafe bool PrunesDrawing(Node* plan)
+    {
+        if (Worf.CatalogOid("sequence_range_block") == 0)
+        {
+            return false;
+        }
+
+        const string Pruning = "{PARTITIONPRUNEINFO ";
+        string text = NodeText(plan);
+        StringBuilder pruning = new();
+        for (int at = text.IndexOf(Pruning, StringComparison.Ordinal); at >= 0; at = text.IndexOf(Pruning, at + Pruning.Length, StringComparison.Ordinal))
+        {
+            _ = pruning.Append(NodeAt(text, at)).Append(' ');
+        }
+
+        if (pruning.Length == 0)
+        {
+            return false;
+        }
+
+        (_, int calls, bool unnamed) = Draws(WithDomainChecks(pruning.ToString()));
+        return calls > 0 || unnamed;
+    }
+
+    // The text of the node that starts at a position of an expression's text, to its closing brace.
+    private static string NodeAt(string text, int at)
+    {
+        int depth = 0;
+        for (int i = at; i < text.Length; i++)
+        {
+            char c = text[i];
+            if (c == '\\')
+            {
+                i++;
+            }
+            else if (c is '{' or '(')
+            {
+                depth++;
+            }
+            else if (c is '}' or ')' && --depth == 0)
+            {
+                return text[at..(i + 1)];
+            }
+        }
+
+        return text[at..];
+    }
+
+    // Registers, once, for the changes to tables and types after which the text the guard holds by table is read again.
+    private static void WatchTables()
+    {
+        if (s_watchingTables)
+        {
+            return;
+        }
+
+        unsafe
+        {
+            NativeMethods.CacheRegisterRelcacheCallback(TableCallback, 0);
+#if ANKUS_PG19
+            NativeMethods.CacheRegisterSyscacheCallback(SysCacheIdentifier.TYPEOID, TypeCallback, 0);
+#else
+            NativeMethods.CacheRegisterSyscacheCallback(TypeCacheId, TypeCallback, 0);
+#endif
+        }
+
+        s_watchingTables = true;
+    }
+
+    // Forgets what the guard holds for a changed table, or for every table, as a partition attached, which takes on its
+    // parent's triggers and identity columns, or a default set.
+    private static void TableInvalidated(ulong arg, uint relid)
+    {
+        _ = arg;
+        if (relid == 0)
+        {
+            s_drawnBy.Clear();
+            s_drawingColumns.Clear();
+            s_defaultsText.Clear();
+            s_guarded.Clear();
+            return;
+        }
+
+        _ = s_guarded.Remove(relid);
+        _ = s_drawnBy.Remove(relid);
+        _ = s_drawingColumns.Remove(relid);
+        foreach ((uint Relid, string Sent) key in s_defaultsText.Keys.Where(key => key.Relid == relid).ToList())
+        {
+            _ = s_defaultsText.Remove(key);
+        }
+    }
+
+    // Forgets the defaults' text, which holds the CHECKs of their domains, once a type changes, as a domain's CHECK.
+#if ANKUS_PG19
+    private static void TypeInvalidated(ulong arg, SysCacheIdentifier cacheid, uint hashvalue)
+#else
+    private static void TypeInvalidated(ulong arg, int cacheid, uint hashvalue)
+#endif
+    {
+        _ = arg;
+        _ = cacheid;
+        _ = hashvalue;
+        s_defaultsText.Clear();
     }
 
     // The text of a plan, as nodeToString writes it, and of the CHECK constraints of the domains it coerces to, which
@@ -1315,12 +1488,13 @@ internal static partial class SequenceRangeGuard
     /// gates, so that nothing draws from that block meanwhile: the sequence the expressions starting around it name, or,
     /// for a call whose sequence they don't name, as one computed as it runs, every managed sequence's. Those are a
     /// statement's plan, or, for a PL/pgSQL function running within it, the expression PL/pgSQL starts outside a plan,
-    /// or the expressions a COPY, a utility statement, a statement routing rows to partitions or a worker's row starts,
-    /// as <see cref="StartingCopy(uint, short[], bool, string)"/>, <see cref="StartingUtility"/>,
+    /// or the expressions a COPY, a utility statement, a statement as it runs or a worker's row starts, as
+    /// <see cref="StartingCopy(uint, short[], bool, string)"/>, <see cref="StartingUtility"/>,
     /// <see cref="StartingRun"/> and <see cref="StartingDefaults"/> note them. A call past the calls they name, as one
     /// started by code they don't hold, is one they don't name. worf's own statements, a standby, a read-only
-    /// transaction, an explained statement, and Snowflake node numbers, whose IDs carry their times, don't wait; a
-    /// statement that a worf worker runs for a user, as DDL it applies, does.
+    /// transaction, a statement only explained whose start prunes no partitions through a call, and Snowflake node
+    /// numbers, whose IDs carry their times, don't wait; a statement that a worf worker runs for a user, as DDL it
+    /// applies, does.
     /// </summary>
     internal static void BeforeNextval()
     {
@@ -1796,10 +1970,12 @@ internal static partial class SequenceRangeGuard
 
     /// <summary>
     /// Checks whether a table has the guard's triggers, from the system catalogs alone, so that a statement that writes
-    /// to a table no managed sequence numbers reads none of worf's tables.
+    /// to a table no managed sequence numbers reads none of worf's tables, as of the table's last change, as a partition
+    /// attached, which takes on the guard.
     /// </summary>
     private static bool Guarded(uint relid)
     {
+        WatchTables();
         (long, long) version = (SequenceRanges.Version.Value, SequenceRanges.LocalVersion);
         if (version != s_guardedAt)
         {
@@ -1847,7 +2023,7 @@ internal static partial class SequenceRangeGuard
 
     /// <summary>
     /// Lists the managed sequences a table's defaults and identity columns draw from, a partition's identity columns
-    /// drawing from its ancestors' sequences.
+    /// drawing from its ancestors' sequences from PostgreSQL 17 on.
     /// </summary>
     private static List<uint> DrawnBy(uint relid)
     {
@@ -1856,6 +2032,7 @@ internal static partial class SequenceRangeGuard
             return [];
         }
 
+        WatchTables();
         if (!s_drawnBy.TryGetValue(relid, out List<uint>? sequences))
         {
             WorfRows used = Elevated.Run(() => Worf.Read("""
@@ -1865,8 +2042,8 @@ internal static partial class SequenceRangeGuard
                 UNION
                 SELECT d.objid FROM pg_catalog.pg_depend d
                 WHERE d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
-                    AND d.deptype = 'i' AND (d.refobjid = $1 OR d.refobjid IN (SELECT a.relid FROM pg_catalog.pg_partition_ancestors($1) a))
-                """, 0, SpiParameter.Create(relid)));
+                    AND d.deptype = 'i' AND (d.refobjid = $1 OR $2 AND d.refobjid IN (SELECT a.relid FROM pg_catalog.pg_partition_ancestors($1) a))
+                """, 0, SpiParameter.Create(relid), SpiParameter.Create(AncestorsIdentity)));
             sequences = [.. used.Select(row => row.Get<uint>(0)).Where(s_sequences.ContainsKey)];
             s_drawnBy[relid] = sequences;
         }

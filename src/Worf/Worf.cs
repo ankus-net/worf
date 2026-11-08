@@ -2194,18 +2194,7 @@ internal static partial class Worf
     private static WorfConnection ConnectBase(string connstr, string appname, string? suffix, bool replication, string? options, string? setup)
     {
         string s = ExtraConnectionOptions + " " + connstr;
-        string applicationName = ApplicationName(appname, suffix);
-
-        // We use the connection string as the base and pass some extra options after it, which override the ones it
-        // names, as libpq's expand_dbname does.
-        StringBuilder conninfo = new(connstr);
-        conninfo.Append(" application_name=");
-        Fe.AppendConnstrValue(conninfo, applicationName);
-        conninfo.Append(" connect_timeout=30 keepalives=1 keepalives_idle=20 keepalives_interval=20 keepalives_count=5");
-        if (options is not null)
-        {
-            conninfo.Append(' ').Append(options);
-        }
+        (string conninfo, string applicationName) = ConnectionString(connstr, appname, suffix, options);
 
         bool inTransaction;
         unsafe
@@ -2221,19 +2210,19 @@ internal static partial class Worf
         if (!inTransaction && Worker.MyWorfWorker >= 0 && Worker.MyWorker.WorkerType is WorfWorkerType.Apply or WorfWorkerType.Sync)
         {
             return Worker.WithProviderDeadline(() => described,
-                () => PgBackgroundWorker.RunTransaction(() => WithPinnedSearchPath(WorfConnection.Connect(conninfo.ToString(), applicationName, replication), setup)));
+                () => PgBackgroundWorker.RunTransaction(() => WithPinnedSearchPath(WorfConnection.Connect(conninfo, applicationName, replication), setup)));
         }
 
         if (!inTransaction)
         {
-            return WithPinnedSearchPath(WorfConnection.Connect(conninfo.ToString(), applicationName, replication), setup);
+            return WithPinnedSearchPath(WorfConnection.Connect(conninfo, applicationName, replication), setup);
         }
 
         WorfConnection? conn = null;
         try
         {
             Worker.WithProviderDeadline(() => described,
-                () => PgTransaction.RunInSubtransaction(() => conn = WorfConnection.Connect(conninfo.ToString(), applicationName, replication)));
+                () => PgTransaction.RunInSubtransaction(() => conn = WorfConnection.Connect(conninfo, applicationName, replication)));
         }
         catch (PgException error) when (error.SqlState == PgSqlStates.ConnectionFailure)
         {
@@ -2253,6 +2242,39 @@ internal static partial class Worf
 
         return WithPinnedSearchPath(conn!, setup);
     }
+
+    /// <summary>
+    /// Builds the connection string worf connects with: the given one, with the application name, connection timeout,
+    /// keepalives and options after it, which override the ones it names, as libpq's expand_dbname does.
+    /// </summary>
+    /// <param name="connstr">The connection string.</param>
+    /// <param name="appname">The name the connection's application name starts with.</param>
+    /// <param name="suffix">The application name's suffix, or null.</param>
+    /// <param name="options">Connection options that override the connection string's, or null.</param>
+    /// <returns>The connection string, and the application name.</returns>
+    internal static (string Conninfo, string ApplicationName) ConnectionString(string connstr, string appname, string? suffix, string? options = null)
+    {
+        string applicationName = ApplicationName(appname, suffix);
+        StringBuilder conninfo = new(connstr);
+        conninfo.Append(" application_name=");
+        Fe.AppendConnstrValue(conninfo, applicationName);
+        conninfo.Append(" connect_timeout=30 keepalives=1 keepalives_idle=20 keepalives_interval=20 keepalives_count=5");
+        if (options is not null)
+        {
+            conninfo.Append(' ').Append(options);
+        }
+
+        return (conninfo.ToString(), applicationName);
+    }
+
+    /// <summary>
+    /// Gets what an ordinary connection worf makes runs once connected: the settings it needs, the search path it pins,
+    /// and the statements given.
+    /// </summary>
+    /// <param name="setup">The statements, or null.</param>
+    /// <returns>The statements, in one string.</returns>
+    internal static string SessionSetup(string? setup)
+        => $"{WorfConnection.OrdinarySettings}; SET search_path = {PinnedSearchPath}" + (setup is null ? "" : $"; {setup}");
 
     /// <summary>
     /// Has the session search only the system catalog and then temporary objects, so that worf's queries to the other

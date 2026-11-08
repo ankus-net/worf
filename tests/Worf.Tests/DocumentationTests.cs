@@ -34,19 +34,26 @@ public sealed class DocumentationTests
         Assert.Contains("every holder of a grant that overlaps another resets, the others as they hear from this node", s_sequenceRanges,
             "a forced lift's resets (130)");
         Assert.DoesNotContain("while one that missed a call is reached again within a minute of answering", s_sequenceRanges, "a slow neighbor (130, 125)");
-        Assert.Contains("and is made again in the next round without giving way", s_sequenceRanges, "a slow neighbor (125)");
+        Assert.DoesNotContain("and is made again in the next round without giving way", s_sequenceRanges, "a slow neighbor (125, 763)");
+        Assert.Contains("Once a probe's connection is made, the node is called over it in the next round", s_sequenceRanges, "a slow neighbor (125, 763)");
         Assert.DoesNotContain("no more than once every ten minutes for each neighbor", s_sequenceRanges, "made-up resets (130, 211)");
         Assert.DoesNotContain("so a grantor resets a node no more often than it grants it blocks", s_sequenceRanges, "a grantor's lifts (211)");
         Assert.Contains("has a limit of its own, so that another request's reset doesn't hold it up, which starts at ten seconds rather than ten minutes",
             s_sequenceRanges, "a grantor's lifts (211)");
         Assert.DoesNotContain("without waiting for them, and commits at once", s_sequenceRanges, "a switch worker's wait (130/146)");
         Assert.DoesNotContain("three seconds a minute at most", s_sequenceRanges, "an unreachable neighbor's cost (294)");
-        Assert.Contains("holds up the others' calls for its first call's `worf.sequence_range_timeout`, and then for up to that long ten, twenty and forty seconds after the call before ends", s_sequenceRanges,
-            "an unreachable neighbor's cost (294, 660)");
-        Assert.Contains("twice as long for each such call in a row that ran out of time, up to `worf.sequence_range_timeout`, which a call made again without giving way, or that a statement waiting on the node made due, has at once",
-            s_sequenceRanges, "a slow neighbor's probes (660)");
-        Assert.Contains("which a neighbor whose own route to the owner goes through the node can't be, as a node reports no distance to its parent", s_sequenceRanges,
-            "a chain's parents (604)");
+        Assert.DoesNotContain("and then for up to that long ten, twenty and forty seconds after the call before ends", s_sequenceRanges,
+            "an unreachable neighbor's cost (294, 660, 763)");
+        Assert.Contains("So a node that never answers holds up the others' calls for its first call's `worf.sequence_range_timeout` alone", s_sequenceRanges,
+            "an unreachable neighbor's cost (763)");
+        Assert.Contains("and takes it on as its socket lets it, between its calls to the other nodes and as it waits between rounds, without waiting on it",
+            s_sequenceRanges, "a frozen neighbor's probes (763)");
+        Assert.DoesNotContain("which a neighbor whose own route to the owner goes through the node can't be, as a node reports no distance to its parent", s_sequenceRanges,
+            "a ring's parents (705)");
+        Assert.Contains("and reports its route, the nodes from its parent to the owner, to its other neighbors, which take no route that goes through themselves", s_sequenceRanges,
+            "a ring's parents (604, 705)");
+        Assert.Contains("the CHECK constraints and trigger conditions of the tables a statement, a `COPY FROM` or a worf worker's row writes", s_sequenceRanges,
+            "the expressions a statement starts as it runs (422, 700)");
         Assert.Contains("A forced lift's request to reset from the node's grantor", s_sequenceRanges, "a grantor's lifts (352)");
         Assert.Contains("the grantor's lifts may reset the node 9 times in their first hour and 14 in their first day", s_sequenceRanges, "a grantor's lifts (353)");
         Assert.Contains("A switch worker waits for the gate before it locks the sequence's range row", s_sequenceRanges, "a paused gate holder (291)");
@@ -59,13 +66,13 @@ public sealed class DocumentationTests
         Assert.Contains("whose failure the worker applies again later under any `worf.exception_behaviour`", s_sequenceRanges, "an applied statement's wait (420)");
         Assert.Contains("an `UPDATE` or a `MERGE` that sets a column to a value rather than its default", s_sequenceRanges, "updates that don't draw (460)");
         Assert.Contains("a statement a worf worker applies, as DDL `replicate_ddl_command` queued", s_sequenceRanges, "applied statements (420)");
-        Assert.Contains("up to `worf.sequence_range_check_interval` more before the watcher cancels it", s_sequenceRanges, "a probe's time (292)");
+        Assert.Contains("up to `worf.sequence_range_check_interval` more before the watcher cancels it", s_sequenceRanges, "a call's time (292)");
         Assert.Contains("an `UPDATE` or a `MERGE` that sets such a column to its default", s_sequenceRanges, "an identity column's draw (421)");
         Assert.Contains("and again half `worf.sequence_range_timeout` after each that fails", s_sequenceRanges, "a waiting statement's exchanges (423)");
         Assert.Contains("a pool holder grants its children nothing from a pool block until the node that granted it has answered so", s_sequenceRanges,
             "a restarted pool holder's grants (424)");
-        Assert.Contains("a node whose last call ran out of time, as one whose host drops connection attempts, after the others", s_sequenceRanges,
-            "an unreachable neighbor (212)");
+        Assert.Contains("A node whose last call ran out of time, as one whose host drops connection attempts, is probed instead", s_sequenceRanges,
+            "an unreachable neighbor (212, 763)");
         Assert.DoesNotContain("leaves no block's values unused", s_sequenceRanges, "a COPY's switch (130)");
         Assert.Contains("A switch retires what its block has left", s_sequenceRanges, "a COPY's switch (130)");
         Assert.Contains("a statement that would draw from it waits for the switch as at the block's end, or makes it in its transaction",
@@ -76,9 +83,9 @@ public sealed class DocumentationTests
 
         foreach ((string name, string text) in new[] { ("README.md", s_readme), ("configuration.md", s_configuration) })
         {
-            Assert.DoesNotContain("ran out of time waits a second at most, until one answers", text, $"a probe's time, in {name} (130)");
-            Assert.Contains("ran out of time waits a second at first, three for the connection, twice as long for each such call in a row, up to this, until one answers", text,
-                $"a probe's time, in {name} (130, 660)");
+            Assert.DoesNotContain("ran out of time waits a second at", text, $"a probe's time, in {name} (130, 660, 763)");
+            Assert.Contains("ran out of time is probed, by a connection that has this long and that the exchange worker makes without waiting on it, until one answers", text,
+                $"a probe's time, in {name} (763)");
             Assert.DoesNotContain("wait up to twice this in all for the switch", text, $"how long inserts wait for a switch, in {name} (130)");
             Assert.Contains("up to twice this for each block in all while its next block is still to come, or once a worker has tried and couldn't switch it, and otherwise until it comes, as for a lock",
                 text, $"how long inserts wait for a switch, in {name} (130)");

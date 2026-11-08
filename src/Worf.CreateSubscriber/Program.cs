@@ -37,6 +37,15 @@ string? autoConfBefore = null;
 bool hadStandbySignal = false;
 bool promoted = false;
 
+// postgresql.conf and pg_hba.conf as they were before this run copied --postgresql-conf and --hba-conf over them, which a
+// run that fails before the server leaves recovery puts back too.
+string? postgresqlConfBefore = null;
+string? hbaConfBefore = null;
+
+// The directories pg_basebackup writes outside the data directory, the WAL's and the tablespaces' that its arguments map,
+// which a stop during the backup empties, removing those it made.
+HashSet<string> madeOutside = [];
+
 // Whether pg_basebackup is making the data directory, which a stop meanwhile removes, and whether it was there before.
 bool backingUp = false;
 bool dataDirExisted = false;
@@ -67,6 +76,7 @@ StringBuilder recoveryconfcontents = new();
 void Stop(PosixSignalContext context)
 {
     context.Cancel = true;
+    LibpqConnection? cancelling;
     lock (committing)
     {
         stopped.Set();
@@ -74,9 +84,13 @@ void Stop(PosixSignalContext context)
         {
             return;
         }
+
+        // The command running as the stop came, read before a commit can mark it committed, so that the cancel lands on
+        // no command the run starts after.
+        cancelling = running;
     }
 
-    _ = running?.Cancel();
+    _ = cancelling?.Cancel();
 }
 
 // Fails, from the main thread, once a stop has come.
@@ -314,7 +328,8 @@ for (int dbnum = 0; dbnum < databaseList.Length; dbnum++)
             throw Die($"A server is running in data directory \"{dataDir}\"; stop it before running this again.\n");
         }
 
-        (long? timeline, string? state) = useExistingDataDir ? ReadControlData(dataDir) : (null, null);
+        (long? timeline, string? state, ulong? checkpoint, long? segmentSize, long? blockSize) = useExistingDataDir
+            ? ReadControlData(dataDir) : (null, null, null, null, null);
         if (timeline is long dataTimeline &&
             long.TryParse(QueryValue(providerConn, "SELECT timeline_id FROM pg_catalog.pg_control_checkpoint()"), NumberStyles.Integer,
                 CultureInfo.InvariantCulture, out long providerTimeline) && dataTimeline > providerTimeline)
@@ -328,6 +343,16 @@ for (int dbnum = 0; dbnum < databaseList.Length; dbnum++)
         if (state is "shut down" or "shutting down" or "in production" or "in crash recovery" && !File.Exists(Path.Join(dataDir, "backup_label")))
         {
             throw Die($"Data directory \"{dataDir}\" has run as a server of its own, as its cluster state \"{state}\" shows, so its WAL may have left the provider's; make a new base backup.\n");
+        }
+
+        // So has one whose latest checkpoint isn't the provider's, though it stopped in recovery since, as one started
+        // again with its standby.signal does: a standby's restart points are at the checkpoint records it replayed, so
+        // one that only ever replayed the provider's WAL has, at its latest checkpoint, the record the provider's WAL
+        // holds there, and one that wrote WAL of its own has its own.
+        if (timeline is long checkpointTimeline && checkpoint is ulong latest && segmentSize is long segmentBytes and > 0 &&
+            blockSize is long blockBytes and > 0 && CheckpointShared(providerConn, checkpointTimeline, latest, segmentBytes, blockBytes) == false)
+        {
+            throw Die($"Data directory \"{dataDir}\"'s latest checkpoint, at {latest >> 32:X}/{latest & 0xFFFFFFFF:X}, isn't in the provider's WAL, so its WAL has left the provider's; make a new base backup.\n");
         }
     }
 
@@ -641,6 +666,7 @@ InvalidOperationException Die(string message)
     {
         try
         {
+            RemoveOutside();
             if (dataDirExisted)
             {
                 foreach (string entry in Directory.EnumerateFileSystemEntries(dataDir!))
@@ -673,15 +699,31 @@ InvalidOperationException Die(string message)
         Console.Error.WriteLine("WARNING: postgres seems to be running, but could not be stopped");
     }
 
-    // A server that never left recovery leaves the data directory as it was, without the settings this run added.
-    if (autoConfBefore is not null && !promoted && stoppedServer)
+    // A server that never left recovery leaves the data directory as it was, without the settings this run added or
+    // the configuration files it copied. The server may have left recovery before the run saw it, as when it reached
+    // the restore point just as the stop came, which its cluster state, once stopped, shows.
+    bool leftRecovery = promoted || (serverStarted && stoppedServer && ReadControlData(dataDir!).State is "shut down");
+    if (!leftRecovery && stoppedServer && !backingUp)
     {
         try
         {
-            File.WriteAllText(Path.Join(dataDir, "postgresql.auto.conf"), autoConfBefore);
-            if (!hadStandbySignal)
+            if (autoConfBefore is not null)
             {
-                File.Delete(Path.Join(dataDir, "standby.signal"));
+                File.WriteAllText(Path.Join(dataDir, "postgresql.auto.conf"), autoConfBefore);
+                if (!hadStandbySignal)
+                {
+                    File.Delete(Path.Join(dataDir, "standby.signal"));
+                }
+            }
+
+            if (postgresqlConfBefore is not null)
+            {
+                File.WriteAllText(Path.Join(dataDir, "postgresql.conf"), postgresqlConfBefore);
+            }
+
+            if (hbaConfBefore is not null)
+            {
+                File.WriteAllText(Path.Join(dataDir, "pg_hba.conf"), hbaConfBefore);
             }
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException)
@@ -757,6 +799,11 @@ void RunBasebackup(string providerConnstr, string dataDir, string? extraBaseback
 
     PrintMsg(VerbosityLevel.Debug, $"Running pg_basebackup: {FormatCommand(execPath, arguments)}.\n");
     dataDirExisted = Directory.Exists(dataDir);
+    foreach (string outside in OutsideDirectories(arguments).Where(directory => !Directory.Exists(directory)))
+    {
+        _ = madeOutside.Add(outside);
+    }
+
     backingUp = true;
     int ret = RunProgram(execPath, arguments, true);
     backingUp = false;
@@ -764,6 +811,107 @@ void RunBasebackup(string providerConnstr, string dataDir, string? extraBaseback
     if (ret != 0)
     {
         throw Die($"pg_basebackup failed with exit status {ret}, cannot continue.\n");
+    }
+}
+
+// The directories pg_basebackup's arguments have it write outside the data directory: the WAL's, as --waldir names it,
+// and the tablespaces' that -T maps, as full paths.
+IEnumerable<string> OutsideDirectories(List<string> arguments)
+{
+    for (int i = 0; i < arguments.Count; i++)
+    {
+        string argument = arguments[i];
+        string? value = null;
+        bool tablespace = false;
+        foreach ((string option, bool mapping) in new[] { ("--waldir", false), ("--xlogdir", false), ("--tablespace-mapping", true) })
+        {
+            if (argument == option && i + 1 < arguments.Count)
+            {
+                value = arguments[++i];
+                tablespace = mapping;
+            }
+            else if (argument.StartsWith(option + "=", StringComparison.Ordinal))
+            {
+                value = argument[(option.Length + 1)..];
+                tablespace = mapping;
+            }
+        }
+
+        if (value is null && argument.StartsWith("-T", StringComparison.Ordinal))
+        {
+            value = argument.Length > 2 ? argument[2..] : i + 1 < arguments.Count ? arguments[++i] : null;
+            tablespace = true;
+        }
+
+        // A mapping's new directory follows its first unescaped "=".
+        if (value is not null && tablespace)
+        {
+            int equals = -1;
+            for (int j = 0; j < value.Length && equals < 0; j++)
+            {
+                if (value[j] == '\\')
+                {
+                    j++;
+                }
+                else if (value[j] == '=')
+                {
+                    equals = j;
+                }
+            }
+
+            value = equals < 0 ? null : value[(equals + 1)..];
+        }
+
+        if (value is { Length: > 0 })
+        {
+            yield return Path.GetFullPath(value);
+        }
+    }
+}
+
+// Removes what a stopped base backup wrote outside the data directory, through the links it left there: the WAL
+// directory pg_wal links to and the tablespaces pg_tblspc links to, each emptied, or removed if the backup made it.
+void RemoveOutside()
+{
+    List<string> links = [Path.Join(dataDir, "pg_wal")];
+    string tablespaces = Path.Join(dataDir, "pg_tblspc");
+    if (Directory.Exists(tablespaces))
+    {
+        links.AddRange(Directory.EnumerateFileSystemEntries(tablespaces));
+    }
+
+    foreach (string link in links)
+    {
+        DirectoryInfo info = new(link);
+        if (!info.Exists || info.LinkTarget is not string target)
+        {
+            continue;
+        }
+
+        string full = Path.GetFullPath(target, Path.GetDirectoryName(link)!);
+        if (madeOutside.Contains(full))
+        {
+            Directory.Delete(full, true);
+            continue;
+        }
+
+        foreach (string entry in Directory.EnumerateFileSystemEntries(full))
+        {
+            if (Directory.Exists(entry) && new DirectoryInfo(entry).LinkTarget is null)
+            {
+                Directory.Delete(entry, true);
+            }
+            else
+            {
+                File.Delete(entry);
+            }
+        }
+    }
+
+    // A directory the backup made that it left no link to yet, as one it stopped in, goes too.
+    foreach (string made in madeOutside.Where(Directory.Exists))
+    {
+        Directory.Delete(made, true);
     }
 }
 
@@ -781,12 +929,28 @@ void InitializeDataDir(string dataDir, string? connstr, string? postgresqlConf, 
 
     if (postgresqlConf is not null)
     {
+        postgresqlConfBefore ??= ReadConfFile("postgresql.conf");
         CopyConfFile(postgresqlConf, "postgresql.conf", false);
     }
 
     if (pgHbaConf is not null)
     {
+        hbaConfBefore ??= ReadConfFile("pg_hba.conf");
         CopyConfFile(pgHbaConf, "pg_hba.conf", false);
+    }
+}
+
+// Reads a configuration file of the data directory, as it is before this run changes it.
+string ReadConfFile(string name)
+{
+    string filename = Path.Join(dataDir, name);
+    try
+    {
+        return File.Exists(filename) ? File.ReadAllText(filename) : "";
+    }
+    catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+    {
+        throw Die($"{progname}: could not read file \"{filename}\": {error.Message}\n");
     }
 }
 
@@ -1140,9 +1304,9 @@ string ReadSysid(string dataDir)
     return systemIdentifier.ToString(CultureInfo.InvariantCulture);
 }
 
-// Reads the timeline of a data directory's latest checkpoint and its cluster state, as pg_controldata shows them, or
-// nulls.
-(long? Timeline, string? State) ReadControlData(string dataDir)
+// Reads the timeline and position of a data directory's latest checkpoint, its cluster state, and its WAL segment and
+// block sizes, as pg_controldata shows them, or nulls.
+(long? Timeline, string? State, ulong? Checkpoint, long? SegmentSize, long? BlockSize) ReadControlData(string dataDir)
 {
     ProcessStartInfo start = new(FindOtherExecOrDie(argv0, "pg_controldata")) { UseShellExecute = false, RedirectStandardOutput = true };
     start.ArgumentList.Add(dataDir);
@@ -1152,20 +1316,88 @@ string ReadSysid(string dataDir)
     process.WaitForExit();
     long? timeline = null;
     string? state = null;
+    ulong? checkpoint = null;
+    long? segmentSize = null;
+    long? blockSize = null;
     foreach (string line in output.Split('\n'))
     {
+        string? value = line.IndexOf(':', StringComparison.Ordinal) is int colon and > 0 ? line[(colon + 1)..].Trim() : null;
         if (line.StartsWith("Latest checkpoint's TimeLineID:", StringComparison.Ordinal) &&
-            long.TryParse(line["Latest checkpoint's TimeLineID:".Length..].Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out long found))
+            long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out long found))
         {
             timeline = found;
         }
         else if (line.StartsWith("Database cluster state:", StringComparison.Ordinal))
         {
-            state = line["Database cluster state:".Length..].Trim();
+            state = value;
+        }
+        else if (line.StartsWith("Latest checkpoint location:", StringComparison.Ordinal) && value?.Split('/') is [string high, string low] &&
+            uint.TryParse(high, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out uint hi) &&
+            uint.TryParse(low, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out uint lo))
+        {
+            checkpoint = ((ulong)hi << 32) | lo;
+        }
+        else if (line.StartsWith("Bytes per WAL segment:", StringComparison.Ordinal) &&
+            long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out long segment))
+        {
+            segmentSize = segment;
+        }
+        else if (line.StartsWith("WAL block size:", StringComparison.Ordinal) &&
+            long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out long block))
+        {
+            blockSize = block;
         }
     }
 
-    return (timeline, state);
+    return (timeline, state, checkpoint, segmentSize, blockSize);
+}
+
+// Whether a data directory's latest checkpoint record is the one the provider's WAL holds at its position, by the
+// record's header, which holds its CRC, or null when the provider can't tell, as once it has removed that WAL, or when it
+// doesn't let the run read it. A checkpoint past the provider's WAL isn't the provider's.
+bool? CheckpointShared(LibpqConnection conn, long timeline, ulong checkpoint, long segmentSize, long blockSize)
+{
+    string position = string.Create(CultureInfo.InvariantCulture, $"{checkpoint >> 32:X}/{checkpoint & 0xFFFFFFFF:X}");
+    try
+    {
+        if (QueryValue(conn, $"SELECT pg_catalog.pg_current_wal_lsn() < '{position}'::pg_catalog.pg_lsn") == "t")
+        {
+            return false;
+        }
+    }
+    catch (LibpqException)
+    {
+        // A provider in recovery has no WAL position of its own to compare.
+    }
+
+    ulong segment = checkpoint / (ulong)segmentSize;
+    ulong perId = 0x100000000UL / (ulong)segmentSize;
+    string name = string.Create(CultureInfo.InvariantCulture, $"{timeline:X8}{segment / perId:X8}{segment % perId:X8}");
+    long offset = (long)(checkpoint % (ulong)segmentSize);
+    byte[] local = new byte[Math.Min(24, blockSize - (offset % blockSize))];
+    try
+    {
+        using FileStream file = File.OpenRead(Path.Join(dataDir, "pg_wal", name));
+        _ = file.Seek(offset, SeekOrigin.Begin);
+        file.ReadExactly(local);
+    }
+    catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+    {
+        return null;
+    }
+
+    string? remote;
+    try
+    {
+        remote = QueryValue(conn, string.Create(CultureInfo.InvariantCulture,
+            $"SELECT pg_catalog.encode(pg_catalog.pg_read_binary_file('pg_wal/{name}', {offset}, {local.Length}, true), 'hex')"));
+    }
+    catch (LibpqException)
+    {
+        return null;
+    }
+
+    return remote is null ? null : string.Equals(remote, Convert.ToHexStringLower(local), StringComparison.Ordinal);
 }
 
 // Keeps postgresql.auto.conf as it was before this run changes it, and whether the data directory had a standby.signal.

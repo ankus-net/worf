@@ -32,12 +32,14 @@ internal sealed record HeldConstraint(string Name, bool Exclusion, string[] Keys
     /// <param name="left">The alias of the keys of the one row, whose columns are k0, k1 and so on, or null for the
     /// relation in scope's.</param>
     /// <param name="right">The alias of the other row's keys.</param>
+    /// <param name="rightKeys">What the other row's key columns are named, before their numbers.</param>
     /// <returns>The condition.</returns>
-    internal string Conflict(string? left, string right) => string.Join(" AND ", Compared.Select((key, k) =>
+    internal string Conflict(string? left, string right, string rightKeys = "k") => string.Join(" AND ", Compared.Select((key, k) =>
     {
         string mine = left is null ? key : $"{left}.k{k}";
-        string compared = $"{mine} {Operators[k]} {right}.k{k}";
-        return NullsEqual ? $"({compared} OR ({mine} IS NOT DISTINCT FROM NULL AND {right}.k{k} IS NOT DISTINCT FROM NULL))" : compared;
+        string theirs = $"{right}.{rightKeys}{k}";
+        string compared = $"{mine} {Operators[k]} {theirs}";
+        return NullsEqual ? $"({compared} OR ({mine} IS NOT DISTINCT FROM NULL AND {theirs} IS NOT DISTINCT FROM NULL))" : compared;
     }));
 
     /// <summary>

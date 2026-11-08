@@ -1346,7 +1346,7 @@ internal static class Worker
 
         if (xid != 0)
         {
-            NotePrepared(dboid, [xid], s_forgetEveryIdleManager, 0);
+            NotePrepared(dboid, [xid], s_forgetEveryIdleManager, true, 0);
         }
     }
 
@@ -1356,18 +1356,16 @@ internal static class Worker
     /// before it started, or on a primary this server was a standby of.
     /// </summary>
     /// <param name="dboid">The database.</param>
-    /// <param name="prepared">The transactions, each with whether it may have changed a database.</param>
+    /// <param name="prepared">The transactions, each with whether it may have changed a database, and whether it may
+    /// have changed worf in its own.</param>
     /// <param name="databases">The databases' state as the manager found them, as <see cref="DatabasesState"/>
     /// gives it.</param>
-    internal static void NoteFoundPrepared(uint dboid, List<(uint Xid, bool EveryDatabase)> prepared, long databases)
+    internal static void NoteFoundPrepared(uint dboid, List<(uint Xid, bool EveryDatabase, bool OwnDatabase)> prepared, long databases)
     {
-        foreach (bool everyDatabase in new[] { false, true })
+        foreach (IGrouping<(bool EveryDatabase, bool OwnDatabase), (uint Xid, bool EveryDatabase, bool OwnDatabase)> kind in
+            prepared.GroupBy(one => (one.EveryDatabase, one.OwnDatabase)))
         {
-            uint[] xids = [.. prepared.Where(one => one.EveryDatabase == everyDatabase).Select(one => one.Xid)];
-            if (xids.Length > 0)
-            {
-                NotePrepared(dboid, xids, everyDatabase, everyDatabase ? databases : 0);
-            }
+            NotePrepared(dboid, [.. kind.Select(one => one.Xid)], kind.Key.EveryDatabase, kind.Key.OwnDatabase, kind.Key.EveryDatabase ? databases : 0);
         }
     }
 
@@ -1405,7 +1403,7 @@ internal static class Worker
         return hash == 0 ? 1 : (long)hash;
     }
 
-    private static void NotePrepared(uint dboid, uint[] xids, bool everyDatabase, long databases)
+    private static void NotePrepared(uint dboid, uint[] xids, bool everyDatabase, bool ownDatabase, long databases)
     {
         nint supervisor;
         bool full = false;
@@ -1436,7 +1434,7 @@ internal static class Worker
                     continue;
                 }
 
-                guard[free] = new WorfPrepared { Dboid = dboid, Xid = xid, EveryDatabase = everyDatabase, Databases = databases };
+                guard[free] = new WorfPrepared { Dboid = dboid, Xid = xid, EveryDatabase = everyDatabase, OwnDatabase = ownDatabase, Databases = databases };
                 table.Used++;
             }
 
@@ -1524,20 +1522,34 @@ internal static class Worker
             guard.Header = table;
         }
 
+        // One that changed worf wakes its own database's manager whatever it did to the databases, and only the ends that
+        // wake a manager have the supervisor start the managers again.
         List<nint> latches = [];
         using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = WorfCtx.Exclusive())
         {
-            WorfContext ctx = guard.Header;
-            ctx.SubscriptionsChanged = true;
-            guard.Header = ctx;
-            foreach (WorfPrepared one in ended.Where(one => !one.EveryDatabase || one.Databases == 0 || one.Databases != now))
+            bool woke = false;
+            foreach (WorfPrepared one in ended)
             {
-                ForgetIdleManager(guard, one.EveryDatabase ? 0 : one.Dboid);
+                bool every = one.EveryDatabase && (one.Databases == 0 || one.Databases != now);
+                if (!every && !one.OwnDatabase)
+                {
+                    continue;
+                }
+
+                woke = true;
+                ForgetIdleManager(guard, every ? 0 : one.Dboid);
                 int manager = guard.Read((in _, workers) => ManagerFind(workers, one.Dboid));
                 if (manager >= 0 && guard[manager].Proc != 0)
                 {
                     latches.Add(guard[manager].Proc);
                 }
+            }
+
+            if (woke)
+            {
+                WorfContext ctx = guard.Header;
+                ctx.SubscriptionsChanged = true;
+                guard.Header = ctx;
             }
         }
 

@@ -642,7 +642,7 @@ internal static unsafe partial class Executor
 
         SequenceRangeGuard.StartStatement(queryDesc, written);
 
-        // A statement only explained draws nothing as its expressions start.
+        // A statement only explained draws nothing as its expressions start, unless it prunes partitions through a call.
         SequenceRangeGuard.StartingExpressions((nint)queryDesc->plannedstmt, (eflags & ExecFlagExplainOnly) != 0);
         try
         {
@@ -667,8 +667,8 @@ internal static unsafe partial class Executor
     private static void WorfExecutorRun(QueryDesc* queryDesc, ScanDirection direction, ulong count)
 #endif
     {
-        // A statement that routes rows to partitions starts expressions for each partition as it runs.
-        bool routing = SequenceRangeGuard.StartingRun(queryDesc);
+        // A statement starts expressions as it runs, as a VALUES row's, a CHECK's or those of a partition taking a row.
+        bool starting = SequenceRangeGuard.StartingRun(queryDesc);
         try
         {
             if (!s_nextExecutorRunHook.IsNull)
@@ -690,7 +690,7 @@ internal static unsafe partial class Executor
         }
         finally
         {
-            if (routing)
+            if (starting)
             {
                 SequenceRangeGuard.StartedExpressions();
             }
@@ -699,8 +699,8 @@ internal static unsafe partial class Executor
 
     private static void WorfExecutorFinish(QueryDesc* queryDesc)
     {
-        // A data-modifying WITH that the statement didn't read to its end routes the rest of its rows as it finishes.
-        bool routing = SequenceRangeGuard.StartingRun(queryDesc);
+        // A data-modifying WITH that the statement didn't read to its end writes the rest of its rows as it finishes.
+        bool starting = SequenceRangeGuard.StartingRun(queryDesc);
         try
         {
             if (!s_nextExecutorFinishHook.IsNull)
@@ -714,7 +714,7 @@ internal static unsafe partial class Executor
         }
         finally
         {
-            if (routing)
+            if (starting)
             {
                 SequenceRangeGuard.StartedExpressions();
             }
