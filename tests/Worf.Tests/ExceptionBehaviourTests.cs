@@ -17,7 +17,7 @@ public sealed partial class ExceptionBehaviourTests
     private const string Refused = "id BETWEEN 20001 AND 23841 AND id % 160 = 1";
 
     // The most transaction IDs the halves merge takes.
-    private const long MergedIds = 1800;
+    private const long MergedIds = 1500;
 
     private const string Database = "postgres";
     private const string SuperUser = "super";
@@ -623,8 +623,14 @@ public sealed partial class ExceptionBehaviourTests
         // Apply that restarts while the table's sync worker catches up waits for the catch-up, which goes as far as the
         // worker before it had got, before it applies the table's changes after that. The provider holds the sync
         // worker back until this transaction holds the copy back, and a slow trigger holds the catch-up. The copy
-        // leaves out the bad row the subscriber's check rejects.
+        // leaves out the bad row the subscriber's check rejects. The delete applies first, so that its transaction isn't
+        // the copy's to take in; the copy, rather than the apply worker, waits on the lock; and the apply worker waits on
+        // it with the update before the lock goes, so that the catch-up, not the apply worker, applies the update.
         _ = await provider.SafePsqlAsync(Database, "DELETE FROM synced WHERE id = 2", token);
+        string deleted = await provider.SafePsqlAsync(Database, "SELECT pg_current_wal_lsn()", token);
+        string applySlot = await subscriber.SafePsqlAsync(Database, "SELECT sub_slot_name FROM worf.subscription", token);
+        Assert.IsTrue(await provider.PollQueryUntilAsync(Database,
+            $"SELECT confirmed_flush_lsn >= '{deleted}' FROM pg_replication_slots WHERE slot_name = '{applySlot}'", token), "the delete applied");
         _ = await subscriber.SafePsqlAsync(Database, """
             CREATE FUNCTION slow() RETURNS trigger LANGUAGE plpgsql AS $$
             BEGIN
@@ -656,9 +662,15 @@ public sealed partial class ExceptionBehaviourTests
             }
 
             await heldTransaction.RollbackAsync(token);
-            Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
-                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE NOT granted AND relation = 'synced'::regclass)", token), "the copy");
+            Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, """
+                SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+                    WHERE NOT l.granted AND l.relation = 'synced'::regclass AND a.backend_type LIKE 'worf sync%')
+                """, token), "the copy");
             _ = await provider.SafePsqlAsync(Database, "UPDATE synced SET v = 'slow' WHERE id = 1", token);
+            Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, """
+                SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+                    WHERE NOT l.granted AND l.relation = 'synced'::regclass AND a.backend_type LIKE 'worf apply%')
+                """, token), "the apply worker waiting with the update");
             await transaction.RollbackAsync(token);
         }
 
@@ -865,8 +877,10 @@ public sealed partial class ExceptionBehaviourTests
             }
             else if (stop == "halves")
             {
+                // A deferrable key beside the key has each part of the merge check it, at the keys the part takes.
                 _ = await subscriber.SafePsqlAsync(Database, $$"""
                     CREATE UNIQUE INDEX {{table}}_v ON {{table}} (v) WHERE v <> 'copied';
+                    ALTER TABLE {{table}} ADD CONSTRAINT {{table}}_d UNIQUE (id) DEFERRABLE;
                     CREATE FUNCTION {{table}}_refuse() RETURNS trigger LANGUAGE plpgsql
                         AS $$BEGIN IF NEW.v LIKE 'x%' THEN RAISE EXCEPTION 'refused %', NEW.id; END IF; RETURN NULL; END$$;
                     CREATE TRIGGER {{table}}_refuse AFTER INSERT OR UPDATE ON {{table}} FOR EACH ROW WHEN (NEW.v LIKE 'x%') EXECUTE FUNCTION {{table}}_refuse();
@@ -1137,13 +1151,35 @@ public sealed partial class ExceptionBehaviourTests
                     FROM worf.exception_log WHERE table_name = '{table}' AND error_sqlstate = '23514'
                     """, token), "the changed rows the CHECK refused, recorded and left as they were, and row 12345, left alone");
                 TestContext.WriteLine($"merge with rows that fail alone: {merging.Elapsed.TotalSeconds:F1} s, {merged} transaction IDs");
-                Assert.IsLessThan(TimeSpan.FromSeconds(60), merging.Elapsed, "the merge of 300,000 rows with 1,000 that fail alone");
+
+                // The merge's time, from the sync worker's log, against the copy's before it, in the same worker: the parts
+                // check the deferrable key at their own keys, rather than the table's.
+                string log = subscriber.ReadLog()[logpos..];
+                DateTime At(string text) => DateTime.Parse(log.Split('\n').Last(line => line.Contains(text, StringComparison.Ordinal))[1..24],
+                    CultureInfo.InvariantCulture);
+                TimeSpan copy = At($"merging the copy of table public.{table} into") - At($"copying table public.{table} again");
+                TimeSpan merge = At($"merged the copy of table public.{table} in halves") - At($"merging the copy of table public.{table} into");
+                TestContext.WriteLine($"the copy took {copy.TotalSeconds:F1} s and the merge {merge.TotalSeconds:F1} s");
+                Assert.IsLessThan((copy * 10) + TimeSpan.FromSeconds(40), merge, "the merge of 300,000 rows with 1,000 that fail alone, against its copy");
+
+                // The merge splits the copy at once once it has failed whole twice, and the held-value checks before keep
+                // only the rows that can conflict.
+                string summary = log.Split('\n').Last(line => line.Contains($"merged the copy of table public.{table} in halves", StringComparison.Ordinal));
+                TestContext.WriteLine(summary);
+                long[] numbers = [.. new string([.. summary[summary.IndexOf("halves:", StringComparison.Ordinal)..].Select(c => char.IsAsciiDigit(c) ? c : ' ')])
+                    .Split(' ', StringSplitOptions.RemoveEmptyEntries).Select(number => long.Parse(number, CultureInfo.InvariantCulture))];
+                Assert.IsLessThan(numbers[2], numbers[1], "the most rows a part the merge tried whole held, against the rows it writes");
+                Assert.IsLessThan(numbers[2] / 2, numbers[3], "the rows the held-value checks kept to decide on, against the rows the merge writes");
+                Assert.IsGreaterThan(0L, numbers[4], "the deferrable key checks at the parts' keys");
+                Assert.AreEqual(0L, numbers[5], "the deferrable key checks at the whole table");
                 Assert.IsLessThan(MergedIds, merged, "transaction IDs the merge took for 300 rows a CHECK refused, and 1,000 that fail alone together and 25 far apart after them");
                 if (OperatingSystem.IsLinux())
                 {
                     long peak = await peakKb;
+                    // The .NET runtime sizes its gen0 budget from the CPU's cache, which adds up to about 64 MB on some
+                    // runners, so the bound allows for that; a merge that kept the rows it reads would take hundreds.
                     TestContext.WriteLine($"sync worker private memory merging in halves: {peak / 1024} MB");
-                    Assert.IsLessThan(80L * 1024, peak, "the sync worker's private memory merging 300,000 rows in halves, in kB");
+                    Assert.IsLessThan(128L * 1024, peak, "the sync worker's private memory merging 300,000 rows in halves, in kB");
                 }
 
                 await SetBehaviourAsync(subscriber, "error", token);
@@ -1854,6 +1890,8 @@ public sealed partial class ExceptionBehaviourTests
             INSERT INTO dkj VALUES (1, 1, 1), (2, 1, 2), (3, 2, 2), (4, 3, 3), (5, 3, 4);
             INSERT INTO dd VALUES (1, 'd'), (2, 'd');
             INSERT INTO dr VALUES (1, '[1,3)'), (2, '[2,4)'), (3, '[3,5)'), (4, '[10,12)');
+            CREATE TABLE uad (id integer PRIMARY KEY, k integer[]);
+            INSERT INTO uad VALUES (1, NULL), (2, '{}'), (3, '{1}'), (4, '{1}');
             SELECT * FROM worf.replication_set_add_all_tables('default', '{public}');
             """, token);
         _ = await subscriber.SafePsqlAsync(Database, """
@@ -1862,6 +1900,7 @@ public sealed partial class ExceptionBehaviourTests
             CREATE TABLE dr (id integer PRIMARY KEY, r int4range, EXCLUDE USING gist (r WITH &&) DEFERRABLE);
             CREATE TABLE dd (id integer PRIMARY KEY, email text UNIQUE DEFERRABLE INITIALLY DEFERRED);
             CREATE TABLE dkj (id integer PRIMARY KEY, k integer UNIQUE DEFERRABLE INITIALLY DEFERRED, j integer UNIQUE DEFERRABLE INITIALLY DEFERRED);
+            CREATE TABLE uad (id integer PRIMARY KEY, k integer[] UNIQUE NULLS NOT DISTINCT DEFERRABLE INITIALLY DEFERRED);
             """, token);
         await SetBehaviourAsync(subscriber, "discard", token);
         _ = await subscriber.SafePsqlAsync(Database, $"""
@@ -1888,6 +1927,13 @@ public sealed partial class ExceptionBehaviourTests
             SELECT (SELECT string_agg(id::text, ',' ORDER BY id) FROM dd), operation, remote_new_tuple->>'id', remote_new_tuple->>'email', error_sqlstate
             FROM worf.exception_log WHERE table_name = 'dd'
             """, token), "dd's copy");
+
+        // Under a key whose nulls aren't distinct, a null and an empty array are different keys, as the index takes them;
+        // the copy's rows are checked with the replay's below.
+        string arrayCopy = await subscriber.SafePsqlAsync(Database, """
+            SELECT (SELECT string_agg(id::text, ',' ORDER BY id) FROM uad), string_agg(remote_new_tuple->>'id', ',')
+            FROM worf.exception_log WHERE table_name = 'uad'
+            """, token);
 
         // Rows that conflict in two constraints go as rows checked one after another would, whichever constraint they
         // conflict in: row 3 conflicts in j only with row 2, which goes for its conflict in k with row 1.
@@ -2067,6 +2113,27 @@ public sealed partial class ExceptionBehaviourTests
             SELECT (SELECT count(*) FROM snd), (SELECT k FROM snd WHERE id = 5), string_agg(concat_ws('|', operation, remote_new_tuple->>'id', error_sqlstate), ',')
             FROM worf.exception_log WHERE table_name = 'snd'
             """, token), "the rows applied, and the update to a null key that conflicts recorded");
+
+        // The replay takes an empty array for a key other than a null, as the index does.
+        foreach (TestNode node in new[] { provider, subscriber })
+        {
+            _ = await node.SafePsqlAsync(Database, node == provider
+                ? "CREATE TABLE ua (id integer PRIMARY KEY, k integer[])"
+                : "CREATE TABLE ua (id integer PRIMARY KEY, k integer[] UNIQUE NULLS NOT DISTINCT DEFERRABLE); INSERT INTO ua VALUES (1000, NULL)", token);
+        }
+
+        _ = await provider.SafePsqlAsync(Database, """
+            SELECT * FROM worf.replication_set_add_table('default', 'ua');
+            BEGIN;
+            INSERT INTO ua VALUES (1, '{}');
+            UPDATE sw SET k = 22 WHERE id = 21;
+            COMMIT;
+            INSERT INTO sw VALUES (8, 8);
+            """, token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM sw WHERE id = 8)", token), "the row after ua's transaction");
+        Assert.AreEqual("1,2,3|4, 1,1000|0", $"{arrayCopy}, " + await subscriber.SafePsqlAsync(Database,
+            "SELECT (SELECT string_agg(id::text, ',' ORDER BY id) FROM ua), (SELECT count(*) FROM worf.exception_log WHERE table_name = 'ua')", token),
+            "uad's copy, a null and an empty array kept, and ua's rows, an empty array applied beside a null, and nothing recorded");
         await SetBehaviourAsync(subscriber, "error", token);
 
         // Under error, a copy whose rows conflict in a deferrable unique index or exclusion constraint fails with the

@@ -45,8 +45,13 @@ worf_create_subscriber -D /path/to/new/datadir \
 install it in the PostgreSQL installation's `bin` directory.
 
 A run that fails, or is stopped with Ctrl-C or `SIGTERM`, cancels what it waits
-for, rolls back, and stops the server it started. A killed run leaves its server
+for, rolls back, and stops the server it started, putting back the data
+directory's settings if the server hadn't yet left recovery; a stop once the last
+subscription has committed changes nothing. A killed run leaves its server
 running, and its transaction rolls back once the server finds it gone. The
-replication origin it creates gets its position only as its transaction
-commits, so neither leaves progress for a later origin. A run on a data
-directory whose server is running fails, and leaves the server as it is.
+subscription keeps the position its restore point reached in the same
+transaction, which its apply worker starts from, and its replication origin gets
+progress only as the worker applies, so neither leaves progress for a later
+origin. A run on a data directory whose server is running fails, as does one on a
+data directory whose timeline is past the provider's, as an earlier run's
+promotion leaves it; both leave the data directory as it is.

@@ -50,17 +50,10 @@ internal static class Manager
         Worker.WorkerAttach(mainArg, WorfWorkerType.Manager);
         ForgetCancelling();
 
-        // The database's transactions prepared before this server started, which may give it something to manage once
-        // they commit, are noted first, so that one that commits after the look below wakes the manager again.
-        long notesSince = Worker.PreparedNotesSince;
-        long[]? restored = PgBackgroundWorker.RunTransaction(() => Worf.ReadScalar<long[]?>("""
-            SELECT pg_catalog.array_agg(transaction::text::pg_catalog.int8) FROM pg_catalog.pg_prepared_xacts
-            WHERE database = pg_catalog.current_database() AND prepared < pg_catalog.to_timestamp($1::pg_catalog.float8 / 1000000 + 946684800)
-            """, SpiParameter.Create(notesSince)));
-        if (restored is { Length: > 0 })
-        {
-            Worker.NoteRestoredPrepared(Worker.MyWorker.Dboid, [.. restored.Select(static xid => (uint)xid)]);
-        }
+        // The database's prepared transactions that may give it something to manage once they commit are noted first,
+        // so that one that commits after the look below wakes the manager again.
+        s_preparedRescan = Worker.PreparedRescan;
+        NoteDatabasePrepared();
 
         // A database without worf, or a template that isn't a node, has nothing to manage. The manager notes when it
         // looked, so that a CREATE EXTENSION worf that commits after then, which it may not see, has the supervisor
@@ -107,6 +100,13 @@ internal static class Manager
         while (!Worker.GotSigterm)
         {
             Worker.ProcessConfigReload();
+
+            // A promotion makes the prepared transactions the standby replayed this server's.
+            if (Worker.PreparedRescan is int rescan && rescan != s_preparedRescan)
+            {
+                s_preparedRescan = rescan;
+                NoteDatabasePrepared();
+            }
 
             // The database may have become a template since, as one is copied once it does. Then launch the apply
             // workers, and the range worker for managed sequences, and handle sequences, updating the sleep timer as
@@ -177,6 +177,39 @@ internal static class Manager
         if (s_watching)
         {
             _ = SequenceRangeExchangeWorker.Watch(true);
+        }
+    }
+
+    // The rescan of prepared transactions this manager last noted for.
+    private static int s_preparedRescan;
+
+    /// <summary>
+    /// Notes the database's prepared transactions that may have created worf, changed its nodes or subscriptions, or
+    /// changed a database, as the locks they hold show: on worf's tables, on a relation this server doesn't see, as one
+    /// they created, or on a database or its settings, which may give every database's manager something to manage.
+    /// Others, which can give the managers nothing, aren't, so that their ends wake nothing.
+    /// </summary>
+    private static void NoteDatabasePrepared()
+    {
+        WorfRows found = PgBackgroundWorker.RunTransaction(() => Worf.Read("""
+            WITH x AS (
+                SELECT p.transaction, l.virtualtransaction
+                FROM pg_catalog.pg_prepared_xacts p
+                    JOIN pg_catalog.pg_locks l ON l.locktype = 'transactionid' AND l.transactionid = p.transaction
+                WHERE p.database = pg_catalog.current_database())
+            SELECT x.transaction::pg_catalog.text::pg_catalog.int8,
+                pg_catalog.bool_or(l.locktype = 'object' OR l.relation IN ('pg_catalog.pg_database'::pg_catalog.regclass, 'pg_catalog.pg_db_role_setting'::pg_catalog.regclass))
+            FROM x JOIN pg_catalog.pg_locks l ON l.virtualtransaction = x.virtualtransaction
+            WHERE (l.locktype = 'relation' AND l.database = (SELECT d.oid FROM pg_catalog.pg_database d WHERE d.datname = pg_catalog.current_database())
+                    AND (l.relation IN (SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'worf')
+                        OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = l.relation)))
+                OR (l.locktype = 'relation' AND l.relation IN ('pg_catalog.pg_database'::pg_catalog.regclass, 'pg_catalog.pg_db_role_setting'::pg_catalog.regclass))
+                OR (l.locktype = 'object' AND l.classid = 'pg_catalog.pg_database'::pg_catalog.regclass)
+            GROUP BY x.transaction
+            """, 0));
+        if (found.Count > 0)
+        {
+            Worker.NoteFoundPrepared(Worker.MyWorker.Dboid, [.. found.Select(static row => ((uint)row.Get<long>(0), row.Get<bool>(1)))]);
         }
     }
 

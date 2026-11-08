@@ -113,6 +113,7 @@ internal static class HeldValues
     internal static SortedDictionary<long, PgException> Refused(List<HeldConstraint> constraints, string table, string candidates, string row,
         string kept, bool indexed, params SpiParameter[] parameters)
     {
+        RefusedChecked = 0;
         // Each candidate's conflicts, by constraint: with a row the table keeps, with the other row's keys, and the rows
         // whose keys are the same as its own, numbered as one, or the earlier rows its keys conflict with.
         SortedDictionary<long, List<(int Constraint, string Key, string? Kept, long Same, List<(long Row, string Key)>? Earlier)>> conflicts = [];
@@ -141,11 +142,16 @@ internal static class HeldValues
                     {
                         // Keys compared by equality conflict when they're the same: the rows with the same keys are
                         // numbered as one, in the order of the btree operator class the equality comes from.
+                        // Only the candidates that can conflict come back, those a row the table keeps holds the keys of
+                        // and those that share their keys, so that what's kept grows with the conflicts, not the candidates.
                         foreach (WorfRow match in Worf.Read($"""
                             WITH b AS MATERIALIZED ({keys})
-                            SELECT b.r, {keyText}, {inTable},
-                                pg_catalog.dense_rank() OVER (ORDER BY {string.Join(", ", orderings.Select((ordering, k) => $"b.k{k} USING {ordering}"))})
-                            FROM b
+                            SELECT y.r, y.key, y.kept, y.same FROM (
+                                SELECT x.*, pg_catalog.count(*) OVER (PARTITION BY x.same) AS n FROM (
+                                    SELECT b.r, {keyText} AS key, {inTable} AS kept,
+                                        pg_catalog.dense_rank() OVER (ORDER BY {string.Join(", ", orderings.Select((ordering, k) => $"b.k{k} USING {ordering}"))}) AS same
+                                    FROM b) x) y
+                            WHERE y.kept IS NOT NULL OR y.n > 1
                             """, 0, parameters))
                         {
                             Add(match.Get<long>(0), (found, match.Get<string>(1), match.Get<string?>(2), match.Get<long>(3), null));
@@ -169,7 +175,8 @@ internal static class HeldValues
                     }
 
                     foreach (WorfRow match in Worf.Read($"""
-                        {with}SELECT b.r, {keyText}, {inTable}, NULL::pg_catalog.int8, NULL::pg_catalog.text FROM {from} b
+                        {with}SELECT x.* FROM (SELECT b.r, {keyText} AS key, {inTable} AS kept, NULL::pg_catalog.int8 AS earlier, NULL::pg_catalog.text AS earlier_key FROM {from} b) x
+                        WHERE x.kept IS NOT NULL
                         UNION ALL
                         SELECT b.r, {keyText}, NULL, a.r, {KeyText(constraint.Keys.Length, "a.k")}
                         FROM {from} a JOIN {from} b ON a.r OPERATOR(pg_catalog.<) b.r AND {constraint.Conflict("a", "b")}
@@ -204,6 +211,7 @@ internal static class HeldValues
 
         // In the copy's order, a row is refused by the first constraint in which a row the table keeps holds its keys,
         // or an earlier row that's written takes them; a row written takes its keys in every constraint.
+        RefusedChecked = conflicts.Count;
         SortedDictionary<long, PgException> refused = [];
         Dictionary<(int Constraint, long Same), string> taken = [];
         foreach ((long candidate, List<(int Constraint, string Key, string? Kept, long Same, List<(long Row, string Key)>? Earlier)> rowConflicts) in conflicts)
@@ -245,6 +253,11 @@ internal static class HeldValues
             list.Add(conflict);
         }
     }
+
+    /// <summary>
+    /// Gets how many candidates the last <see cref="Refused"/> kept to decide on, those that could conflict.
+    /// </summary>
+    internal static int RefusedChecked { get; private set; }
 
     /// <summary>
     /// Checks whether a table, or one of its partitions, has a BEFORE ROW INSERT or UPDATE trigger that fires under

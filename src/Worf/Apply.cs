@@ -296,11 +296,19 @@ internal static unsafe partial class Apply
             WorfLog.Debug2($"setting up replication origin {sub.SlotName} (oid {originid})");
             PgReplicationOrigin.SetupSession(originid);
 
-            // Relayed transactions advance their relay origins instead, so start after the latest of them all.
+            // Relayed transactions advance their relay origins instead, so start after the latest of them all. An origin
+            // with no progress starts from the position the subscription's sync status holds, which worf_create_subscriber
+            // records in the transaction that creates the subscription, as the position its restore point reached, so that
+            // a run that rolls back leaves no progress behind; worf's own syncs leave it zero.
             ulong startpos = PgReplicationOrigin.GetSessionProgress(false).Value;
             foreach ((ushort relay, _) in WorfNode.RelayOrigins(sub.SlotName))
             {
                 startpos = Math.Max(startpos, PgReplicationOrigin.GetProgress(relay, false).Value);
+            }
+
+            if (startpos == 0)
+            {
+                startpos = Sync.GetSubscriptionSyncStatus(sub.Id, true)?.Statuslsn ?? 0;
             }
 
             // An origin that worf_create_subscriber created has no record, and its rows would be in conflict with the

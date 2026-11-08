@@ -1959,24 +1959,11 @@ internal static class SequenceRangeExchange
             return false;
         }
 
-        // Another pool holder grants from its pool only once this server has heard, since it started, from the nodes that
-        // granted it its pool blocks, as it draws from its own blocks then, since a fence's lift may have given their
-        // values out again meanwhile; the child waits, and the exchange with the grantor is made at once.
-        if (!isOwner && seqoid != SnowflakeIds.NodeSequence())
+        // Another pool holder grants from its pool only once this server has heard from the nodes that granted it, as
+        // PoolGrantorsHeard tells; the child waits.
+        if (!isOwner && !PoolGrantorsHeard(seqoid, epoch))
         {
-            foreach (uint grantor in Worf.Read("""
-                SELECT DISTINCT b.from_node FROM worf.sequence_range_block b CROSS JOIN worf.local_node l
-                WHERE b.seqoid = $1 AND b.epoch = $2 AND b.kind = 'p' AND b.state = 'open' AND b.from_node <> l.node_id
-                    AND EXISTS (SELECT 1 FROM worf.node n WHERE n.node_id = b.from_node)
-                """, 0, SpiParameter.Create(seqoid), SpiParameter.Create(epoch)).Select(static pool => pool.Get<uint>(0)))
-            {
-                if (!SequenceRangeHeard.Confirmed(grantor))
-                {
-                    SequenceRangeHeard.Want(grantor);
-                    SequenceRangeExchangeWorker.Wake();
-                    return false;
-                }
-            }
+            return false;
         }
 
         string kind = request.TryGetProperty("kind", out JsonElement value) ? value.GetWorfString() ?? "n" : "n";
@@ -2049,6 +2036,14 @@ internal static class SequenceRangeExchange
         long lo = request.GetProperty("lo").GetInt64();
         long hi = request.GetProperty("hi").GetInt64();
         Guid requestId = request.GetProperty("id").GetGuid();
+
+        // A pool holder grants exact values from its pool only once this server has heard from the nodes that granted
+        // it, as for any other grant; the child waits.
+        if (!isOwner && !PoolGrantorsHeard(seqoid, epoch))
+        {
+            return false;
+        }
+
         if (SequenceRanges.AllocateExact(seqoid, info, epoch, lo, hi, granteeId, granteeName, requestId, kind, isOwner) is not null)
         {
             return true;
@@ -2079,6 +2074,36 @@ internal static class SequenceRangeExchange
                 AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_request q WHERE q.seqoid = r.seqoid AND q.kind = 'f' AND q.lo = $2 AND q.hi = $3)
             """, seq, SpiParameter.Create(lo), SpiParameter.Create(hi), SpiParameter.Create(SequenceRanges.Steps(info, lo, hi)));
         return false;
+    }
+
+    /// <summary>
+    /// Checks whether this server has heard, since it started, from each node that granted this pool holder an open
+    /// pool block of a sequence, as it draws from its own blocks only then, since a fence's lift may have given their
+    /// values out again meanwhile. One it hasn't is asked at once. A Snowflake pool holder's numbers wait on the owner's
+    /// word instead.
+    /// </summary>
+    private static bool PoolGrantorsHeard(uint seqoid, int epoch)
+    {
+        if (seqoid == SnowflakeIds.NodeSequence())
+        {
+            return true;
+        }
+
+        foreach (uint grantor in Worf.Read("""
+            SELECT DISTINCT b.from_node FROM worf.sequence_range_block b CROSS JOIN worf.local_node l
+            WHERE b.seqoid = $1 AND b.epoch = $2 AND b.kind = 'p' AND b.state = 'open' AND b.from_node <> l.node_id
+                AND EXISTS (SELECT 1 FROM worf.node n WHERE n.node_id = b.from_node)
+            """, 0, SpiParameter.Create(seqoid), SpiParameter.Create(epoch)).Select(static pool => pool.Get<uint>(0)))
+        {
+            if (!SequenceRangeHeard.Confirmed(grantor))
+            {
+                SequenceRangeHeard.Want(grantor);
+                SequenceRangeExchangeWorker.Wake();
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /// <summary>

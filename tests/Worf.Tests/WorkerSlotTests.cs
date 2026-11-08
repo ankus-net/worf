@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using Npgsql;
 
 namespace Worf.Tests;
@@ -102,20 +103,38 @@ public sealed class WorkerSlotTests
 
     /// <summary>
     /// COMMIT PREPARED of a transaction that changed neither worf nor a database starts no manager, in its own database
-    /// or any other, though the managers that found nothing to manage there exited.
+    /// or any other, though the managers that found nothing to manage there exited, nor does it once the server
+    /// restarted after the transaction was prepared.
     /// </summary>
+    /// <param name="restart">Whether the server restarts between PREPARE TRANSACTION and COMMIT PREPARED.</param>
     /// <returns>The test.</returns>
     [TestMethod]
-    public async Task UnrelatedPreparedCommitsStartNoManager()
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task UnrelatedPreparedCommitsStartNoManager(bool restart)
     {
         CancellationToken token = TestContext.CancellationToken;
-        await using TestNode node = await TestNode.StartAsync("node", ["max_prepared_transactions = 2", "log_min_messages = debug1"], token);
+        await using TestNode node = await TestNode.StartAsync("node", ["max_prepared_transactions = 20", "log_min_messages = debug1"], token);
         for (int i = 0; i < 3; i++)
         {
             _ = await node.SafePsqlAsync(Database, $"CREATE DATABASE unrelated{i}", token);
         }
 
         _ = await node.SafePsqlAsync("unrelated0", "CREATE TABLE t (a int)", token);
+        if (restart)
+        {
+            _ = await node.SafePsqlAsync("unrelated0", string.Concat(Enumerable.Range(0, 20).Select(i =>
+                $"BEGIN; INSERT INTO t VALUES ({i}); PREPARE TRANSACTION 'restored{i}';")), token);
+            await node.StopAsync("fast", token);
+            await node.StartServerAsync(token);
+            await Task.Delay(TimeSpan.FromSeconds(3), token);
+            int restored = Starts();
+            _ = await node.SafePsqlAsync("unrelated0", string.Concat(Enumerable.Range(0, 20).Select(i => $"COMMIT PREPARED 'restored{i}';")), token);
+            await Task.Delay(TimeSpan.FromSeconds(3), token);
+            Assert.AreEqual(restored, Starts(), "managers started by 20 unrelated COMMIT PREPARED of transactions prepared before a restart");
+            return;
+        }
+
         await Task.Delay(TimeSpan.FromSeconds(3), token);
         int before = Starts();
 
@@ -179,6 +198,72 @@ public sealed class WorkerSlotTests
         }
 
         TestContext.WriteLine($"the apply worker after {starting.Elapsed.TotalSeconds:F2} s");
+    }
+
+    /// <summary>
+    /// CREATE EXTENSION worf, in a transaction prepared on a primary after its standby started, which the standby
+    /// replays, gives the database its manager once the promoted standby commits it, rather than at the supervisor's
+    /// next look.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task PreparedOnThePrimaryGetsItsManagerOncePromoted()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode primary = await TestNode.StartAsync("primary", ["max_prepared_transactions = 2", "wal_level = logical"], token);
+        _ = await primary.SafePsqlAsync(Database, "CREATE DATABASE prepared", token);
+        using TemporaryDirectory work = new($"worf-promoted-{Guid.NewGuid():N}");
+        string standby = Path.Join(work.FullName, "standby");
+        string port = CreateSubscriberCommand.FreePort().ToString(CultureInfo.InvariantCulture);
+        (int copied, string copyOutput) = await primary.RunProgramAsync("pg_basebackup",
+            ["-D", standby, "-R", "-X", "stream", "-c", "fast", "-p", primary.Cluster.Port.ToString(CultureInfo.InvariantCulture)], token);
+        Assert.AreEqual(0, copied, copyOutput);
+        (int started, string startOutput) = await primary.RunProgramAsync("pg_ctl",
+            ["start", "-w", "-D", standby, "-o", $"-p {port}", "-l", Path.Join(work.FullName, "standby.log")], token);
+        Assert.AreEqual(0, started, startOutput);
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(3), token);
+            _ = await primary.SafePsqlAsync("prepared", $"""
+                BEGIN;
+                CREATE EXTENSION worf;
+                SELECT * FROM worf.create_node(node_name := 'prepared', dsn := '{primary.Dsn("prepared")}');
+                PREPARE TRANSACTION 'extension';
+                """, token);
+            string prepared = await primary.SafePsqlAsync(Database, "SELECT pg_current_wal_lsn()", token);
+            Stopwatch replaying = Stopwatch.StartNew();
+            while (await StandbyAsync($"SELECT pg_last_wal_replay_lsn() >= '{prepared}'", Database) != "t")
+            {
+                Assert.IsLessThan(TimeSpan.FromSeconds(30), replaying.Elapsed, "the standby replaying the prepared transaction");
+                await Task.Delay(TimeSpan.FromMilliseconds(100), token);
+            }
+
+            (int promoted, string promoteOutput) = await primary.RunProgramAsync("pg_ctl", ["promote", "-w", "-D", standby], token);
+            Assert.AreEqual(0, promoted, promoteOutput);
+            await Task.Delay(TimeSpan.FromSeconds(3), token);
+            _ = await StandbyAsync("COMMIT PREPARED 'extension'", "prepared");
+            Stopwatch starting = Stopwatch.StartNew();
+            while (await StandbyAsync("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = 'prepared' AND backend_type LIKE 'worf manager%')",
+                Database) != "t")
+            {
+                Assert.IsLessThan(TimeSpan.FromSeconds(30), starting.Elapsed, "the manager once the promoted standby committed the extension");
+                await Task.Delay(TimeSpan.FromMilliseconds(200), token);
+            }
+
+            TestContext.WriteLine($"the manager after {starting.Elapsed.TotalSeconds:F1} s");
+        }
+        finally
+        {
+            _ = await primary.RunProgramAsync("pg_ctl", ["stop", "-m", "immediate", "-D", standby], CancellationToken.None);
+        }
+
+        async Task<string> StandbyAsync(string sql, string database)
+        {
+            (int exitCode, string output) = await primary.RunProgramAsync("psql",
+                ["-X", "-A", "-t", "-q", "-p", port, "-d", database, "-v", "ON_ERROR_STOP=1", "-c", sql], token);
+            Assert.AreEqual(0, exitCode, output);
+            return output.Trim();
+        }
     }
 
     // How often pg_db_role_setting has been scanned whole, as the statistics show once the session's own are flushed.

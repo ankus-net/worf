@@ -20,8 +20,8 @@ internal static class CreateSubscriberCommand
     public static string FileName => OperatingSystem.IsWindows() ? "worf_create_subscriber.exe" : "worf_create_subscriber";
 
     /// <summary>
-    /// Makes a directory where the command finds the installation's <c>pg_ctl</c> and <c>pg_basebackup</c> beside it,
-    /// as it does when installed in the installation's bin directory.
+    /// Makes a directory where the command finds the installation's <c>pg_ctl</c>, <c>pg_basebackup</c> and
+    /// <c>pg_controldata</c> beside it, as it does when installed in the installation's bin directory.
     /// </summary>
     /// <param name="installation">The installation.</param>
     /// <param name="directory">The directory to fill.</param>
@@ -53,7 +53,7 @@ internal static class CreateSubscriberCommand
         else
         {
             // Unix programs resolve their links to find the rest of the installation.
-            string[] programs = ["pg_ctl", "pg_basebackup"];
+            string[] programs = ["pg_ctl", "pg_basebackup", "pg_controldata"];
             foreach (string program in programs)
             {
                 File.CreateSymbolicLink(Path.Join(directory, program), Path.Join(installation.BinDirectory, program));

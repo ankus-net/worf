@@ -72,7 +72,7 @@ internal static class Worker
             prepared = Math.Max(NativeGlobals.max_prepared_xacts, 0) + NativeGlobals.MaxConnections + nworkers;
         }
 
-        PgSharedMemory.Initialize(Prepared, prepared, static () => new WorfPreparedTable { StartedAt = GetCurrentTimestamp() }, static _ => default);
+        PgSharedMemory.Initialize(Prepared, prepared, static () => default, static _ => default);
     }
 
     /// <summary>
@@ -1351,24 +1351,69 @@ internal static class Worker
     }
 
     /// <summary>
-    /// Notes the transactions of a database prepared before this server started, as its manager finds them as it
-    /// starts, which may have changed worf or a database: the notes taken as they were prepared were in shared memory.
-    /// Each wakes every database's manager as it ends.
+    /// Notes a database's prepared transactions that its manager finds as it starts, or once a promotion has made a
+    /// standby's this server's, which may have changed worf or a database, as their locks show, and which this server's
+    /// PREPARE TRANSACTION may not have noted, as one prepared before it started, or on the primary.
     /// </summary>
     /// <param name="dboid">The database.</param>
-    /// <param name="xids">The transactions.</param>
-    internal static void NoteRestoredPrepared(uint dboid, uint[] xids) => NotePrepared(dboid, xids, true);
+    /// <param name="prepared">The transactions, each with whether it may have changed a database.</param>
+    internal static void NoteFoundPrepared(uint dboid, List<(uint Xid, bool EveryDatabase)> prepared)
+    {
+        foreach (bool everyDatabase in new[] { false, true })
+        {
+            uint[] xids = [.. prepared.Where(one => one.EveryDatabase == everyDatabase).Select(one => one.Xid)];
+            if (xids.Length > 0)
+            {
+                NotePrepared(dboid, xids, everyDatabase);
+            }
+        }
+    }
 
     /// <summary>
-    /// Gets when this server's shared memory started, before which the prepared transactions it found were noted in
-    /// none of it.
+    /// Gets how many times the managers were asked to note their databases' prepared transactions again.
     /// </summary>
-    internal static long PreparedNotesSince
+    internal static int PreparedRescan
     {
         get
         {
             using PgLwLockShareGuard<WorfPreparedTable, WorfPrepared> guard = Prepared.Share();
-            return guard.Header.StartedAt;
+            return guard.Header.Rescan;
+        }
+    }
+
+    /// <summary>
+    /// Asks every manager, once this server has left recovery, to note its database's prepared transactions again, as
+    /// those the standby replayed are this server's now: the running managers are woken, and those that found nothing
+    /// to manage start again.
+    /// </summary>
+    internal static void RescanPrepared()
+    {
+        using (PgLwLockExclusiveGuard<WorfPreparedTable, WorfPrepared> guard = Prepared.Exclusive())
+        {
+            WorfPreparedTable table = guard.Header;
+            table.Rescan++;
+            guard.Header = table;
+        }
+
+        List<nint> latches = [];
+        using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = WorfCtx.Exclusive())
+        {
+            WorfContext ctx = guard.Header;
+            ctx.SubscriptionsChanged = true;
+            guard.Header = ctx;
+            ForgetIdleManager(guard, 0);
+            for (int i = 0; i < guard.Length; i++)
+            {
+                if (guard[i].WorkerType == WorfWorkerType.Manager && guard[i].Proc != 0)
+                {
+                    latches.Add(guard[i].Proc);
+                }
+            }
+        }
+
+        foreach (nint proc in latches)
+        {
+            SetProcLatch(proc);
         }
     }
 

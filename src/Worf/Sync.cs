@@ -1761,6 +1761,8 @@ internal static class Sync
             }
         }
 
+        WorfLog.Log($"merging the copy of table {remoterel.Nspname}.{remoterel.Relname} into the rows it has");
+
         // What a failed merge leads to is done once its error is handled, rather than within its handler, which keeps the
         // stack the failure left until it ends, as many more failures may come.
         if (!Merged(merge.ToString(), out PgException? error))
@@ -1792,6 +1794,7 @@ internal static class Sync
             // skipped first, all at once, and the rest merged again, so that only rows that fail for another reason, as
             // a trigger's error, or for the order the merge writes them in, are found in halves, each of which takes a
             // transaction ID.
+            s_heldChecked = 0;
             List<(long Row, PgException Error)> skipped = SkipHeldValues(rel, lsn, only + table, key, operators, rest, index, row, attnamelist);
             if (!Merged(merge.ToString(), out _))
             {
@@ -1799,8 +1802,15 @@ internal static class Sync
                 string? max = Worf.ReadScalar<string?>($"SELECT max(ctid)::text FROM {MergeCopy}");
                 if (max is not null)
                 {
+                    // The whole copy just failed to merge, so it splits at once.
                     s_rowsAlone = 8;
-                    MergeParts(reloid, only + table, mergePart, row, 0, Position(max) + 1, halved);
+                    s_partsTried = 0;
+                    s_largestTried = 0;
+                    s_keyChecksAtParts = 0;
+                    s_keyChecksWhole = 0;
+                    long writes = Worf.ReadScalar<long>($"SELECT count(*)::pg_catalog.int8 FROM {MergeCopy}");
+                    _ = MergeParts(reloid, only + table, mergePart, row, 0, Position(max) + 1, halved, true);
+                    WorfLog.Log($"merged the copy of table {remoterel.Nspname}.{remoterel.Relname} in halves: {s_partsTried} parts tried whole, the largest of {s_largestTried} rows, of the {writes} rows it writes, after the held-value checks kept {s_heldChecked} rows to decide on; {s_keyChecksAtParts} deferrable key checks at the parts' keys, {s_keyChecksWhole} at the whole table");
                 }
 
                 RecordSkipped(rel, lsn, row, attnamelist, halved);
@@ -1908,6 +1918,7 @@ internal static class Sync
         {
             SortedDictionary<long, PgException> refused = HeldValues.Refused(constraints, table, $"(SELECT c.* FROM {MergeCopy} c WHERE {written})", row,
                 kept, true);
+            s_heldChecked += HeldValues.RefusedChecked;
             if (refused.Count == 0)
             {
                 break;
@@ -1993,13 +2004,14 @@ internal static class Sync
             PgException? failed = null;
             if (!failing || count <= 1)
             {
+                s_partsTried++;
                 long start = from;
                 try
                 {
                     PgTransaction.RunInSubtransaction(() =>
                     {
                         _ = ReplicaRechecks.Firing(reloid, () => Worf.ExecuteUnpinned(merge, SpiParameter.Create(Tid(start)), SpiParameter.Create(Tid(to))));
-                        CheckDeferrableUnique(reloid, table);
+                        CheckDeferrableUnique(reloid, table, (start, to));
                         CheckDeferrableExclusion(reloid, table);
                     }, PgSubtransactionMode.Atomic);
                 }
@@ -2014,6 +2026,7 @@ internal static class Sync
                 }
 
                 count = Worf.ReadScalar<long>($"SELECT count(*)::pg_catalog.int8 FROM {MergeCopy} WHERE {InPart}", part);
+                s_largestTried = Math.Max(s_largestTried, count);
             }
 
             whole = false;
@@ -2281,9 +2294,10 @@ internal static class Sync
     /// <summary>
     /// Gets the deferrable unique and exclusion constraints of a table: each with its table, the error a conflict in it
     /// raises, the rows it takes, as a relation of each row's table, place, xmin and keys, k0, k1 and so on, and the
-    /// condition that two such rows, a and b, conflict, by equality, so that the rows join by hashing or an index rather
-    /// than pair by pair: of the keys, where the keys it takes can't be null, or of arrays of each, whose equality takes
-    /// two nulls as equal, for a unique constraint whose nulls aren't distinct.
+    /// condition that two such rows, a and b, conflict, by equality, so that the rows join by hashing, sorting or an index
+    /// rather than pair by pair: of the keys, where the keys it takes can't be null, or of the keys as one row value, kr,
+    /// whose equality takes two nulls as equal and a null as unequal to any value, for a unique constraint whose nulls
+    /// aren't distinct.
     /// </summary>
     internal static List<(uint Table, PgException Conflict, string Rows, string Conflicts)> DeferrableConstraints(uint reloid)
     {
@@ -2315,12 +2329,12 @@ internal static class Sync
                 exclusion
                     ? new PgException(PgSqlStates.ExclusionViolation, $"conflicting key value violates exclusion constraint \"{name}\"")
                     : new PgException(PgSqlStates.UniqueViolation, $"duplicate key value violates unique constraint \"{name}\""),
-                $"(SELECT tableoid, ctid, xmin, {string.Join(", ", keys.Select((key, k) => $"({key}) AS k{k}"))} FROM {constraint.Get<string>(7)}{where})",
+                $"(SELECT tableoid, ctid, xmin, {string.Join(", ", keys.Select((key, k) => $"({key}) AS k{k}"))}, ROW({string.Join(", ", keys.Select(key => $"({key})"))}) AS kr FROM {constraint.Get<string>(7)}{where})",
                 exclusion
                     ? string.Join(" AND ", constraint.Get<string?[]>(3).Select((op, k) => $"a.k{k} {op} b.k{k}"))
-                    : string.Join(" AND ", keys.Select((_, k) => constraint.Get<bool>(5)
-                        ? $"ARRAY[a.k{k}] OPERATOR(pg_catalog.=) ARRAY[b.k{k}]"
-                        : $"a.k{k} = b.k{k}"))));
+                    : constraint.Get<bool>(5)
+                        ? "a.kr OPERATOR(pg_catalog.=) b.kr"
+                        : string.Join(" AND ", keys.Select((_, k) => $"a.k{k} = b.k{k}"))));
         }
 
         return found;
@@ -2341,12 +2355,22 @@ internal static class Sync
     /// </summary>
     /// <param name="reloid">The table.</param>
     /// <param name="table">The table's qualified name, after ONLY when it isn't partitioned.</param>
-    private static void CheckDeferrableUnique(uint reloid, string table)
+    /// <param name="part">The places in the merge's copy of the part just merged, whose keys alone can have taken
+    /// another row's, or null for the whole table.</param>
+    private static void CheckDeferrableUnique(uint reloid, string table, (long From, long To)? part = null)
     {
-        WorfRows indexes = Worf.Read("""
+        string copyHolds = part is null ? "false" : $"""
+            NOT EXISTS (
+                SELECT 1 FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
+                WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.objid = i.indexrelid
+                    AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.refobjid = i.indrelid AND d.refobjsubid > 0
+                    AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute m
+                        WHERE m.attrelid = '{MergeCopy}'::pg_catalog.regclass AND m.attname = a.attname AND NOT m.attisdropped))
+            """;
+        WorfRows indexes = Worf.Read($"""
             SELECT c.conname::text, i.indnkeyatts,
                 (SELECT pg_catalog.array_agg(pg_catalog.pg_get_indexdef(i.indexrelid, k, false) ORDER BY k) FROM pg_catalog.generate_series(1, i.indnkeyatts) k),
-                pg_catalog.pg_get_expr(i.indpred, i.indrelid), i.indnullsnotdistinct
+                pg_catalog.pg_get_expr(i.indpred, i.indrelid), i.indnullsnotdistinct, {copyHolds}
             FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_index i ON i.indexrelid = c.conindid
             WHERE c.conrelid = $1 AND c.contype IN ('p', 'u') AND c.condeferrable
             """, 0, SpiParameter.Create(reloid));
@@ -2359,7 +2383,18 @@ internal static class Sync
                 conditions.AddRange(keys.Select(key => $"{key} IS NOT NULL"));
             }
 
+            // A part of a merge looks only at the keys its rows take, from the copy's columns, which the index's unique
+            // lookup finds, unless its nulls aren't distinct, or it reads a column the copy lacks.
             string where = conditions.Count == 0 ? "" : $" WHERE {string.Join(" AND ", conditions)}";
+            bool atPart = part is not null && !index.Get<bool>(4) && index.Get<bool>(5);
+            s_keyChecksAtParts += atPart ? 1 : 0;
+            s_keyChecksWhole += atPart ? 0 : 1;
+            if (atPart && part is (long from, long to))
+            {
+                string tuple = $"({string.Join(", ", keys)})";
+                where = $"{(where.Length == 0 ? " WHERE " : where + " AND ")}{tuple} IN (SELECT {string.Join(", ", keys)} FROM {MergeCopy} WHERE ctid OPERATOR(pg_catalog.>=) '{Tid(from)}'::pg_catalog.tid AND ctid OPERATOR(pg_catalog.<) '{Tid(to)}'::pg_catalog.tid{(conditions.Count == 0 ? "" : " AND " + string.Join(" AND ", conditions))})";
+            }
+
             string? duplicate = Worf.ReadScalar<string?>(
                 $"SELECT {KeyText(keys.Length, "d.k")} FROM (SELECT {string.Join(", ", keys.Select((key, k) => $"{key} AS k{k}"))} FROM {table}{where}) d GROUP BY {string.Join(", ", keys.Select((_, k) => $"d.k{k}"))} HAVING pg_catalog.count(*) > 1 LIMIT 1");
             if (duplicate is not null)
@@ -3054,6 +3089,16 @@ internal static class Sync
 
     // The most rows of a failed part of a merge that are merged each alone, rather than in halves.
     private static int s_rowsAlone = 8;
+
+    // How many parts the last merge in halves tried whole, the most rows one held, and how many rows the held-value checks
+    // before it kept to decide on.
+    private static int s_partsTried;
+    private static long s_largestTried;
+    private static int s_heldChecked;
+
+    // How many deferrable key checks looked only at the keys a part of the merge takes, and how many at the whole table.
+    private static int s_keyChecksAtParts;
+    private static int s_keyChecksWhole;
 
     private const int NoLock = 0;
     private const int AccessShareLock = 1;

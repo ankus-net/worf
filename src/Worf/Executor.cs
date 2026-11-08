@@ -343,9 +343,8 @@ internal static unsafe partial class Executor
         // A COPY FROM draws a buffer of values from a managed sequence before the guard sees the first of them, so it
         // checks the sequences for each row in a condition of its own, ahead of any it has.
         bool copying = parsetree->type == NodeTag.T_CopyStmt && ((CopyStmt*)parsetree)->is_from && ((CopyStmt*)parsetree)->relation is not null;
-        Node* check = copying
-            ? SequenceRangeGuard.CopyCondition(NativeMethods.RangeVarGetRelidExtended(((CopyStmt*)parsetree)->relation, 0, RangeVarMissingOk, default, null))
-            : null;
+        uint copied = copying ? NativeMethods.RangeVarGetRelidExtended(((CopyStmt*)parsetree)->relation, 0, RangeVarMissingOk, default, null) : 0;
+        Node* check = copying ? SequenceRangeGuard.CopyCondition(copied) : null;
         if (check is not null)
         {
             if (readOnlyTree)
@@ -368,8 +367,39 @@ internal static unsafe partial class Executor
             Worker.NotePrepared();
         }
 
+        // A COPY FROM's calls of nextval, in the defaults it starts before its rows, name the sequences they draw from.
+        bool startingCopy = copied != 0;
+        short[]? copyRead = null;
+        bool copyDefaults = false;
+        if (startingCopy)
+        {
+            CopyStmt* copy = (CopyStmt*)parsetree;
+            if (copy->attlist is not null)
+            {
+                RelationData* rel = NativeMethods.relation_open(copied, (int)PgLockMode.AccessShare);
+                List* numbers = NativeMethods.CopyGetAttnums(rel->rd_att, rel, copy->attlist);
+                copyRead = new short[numbers is null ? 0 : numbers->length];
+                for (int i = 0; i < copyRead.Length; i++)
+                {
+                    copyRead[i] = (short)numbers->elements[i].int_value;
+                }
+
+                NativeMethods.relation_close(rel, (int)PgLockMode.None);
+            }
+
+            for (int i = 0; copy->options is not null && i < copy->options->length; i++)
+            {
+                copyDefaults |= Worf.FromServer(((DefElem*)copy->options->elements[i].ptr_value)->defname) == "default";
+            }
+        }
+
         uint xactFlags = DdlReplication.BeginStatement(ddl is not null);
         bool tracking = LocalIndex.BeginStatement(parsetree, ddl is not null);
+        if (startingCopy)
+        {
+            SequenceRangeGuard.StartingCopy(copied, copyRead, copyDefaults);
+        }
+
         bool usedTemp;
         try
         {
@@ -411,6 +441,11 @@ internal static unsafe partial class Executor
             if (copying)
             {
                 SequenceRangeGuard.EndCopy();
+            }
+
+            if (startingCopy)
+            {
+                SequenceRangeGuard.StartedExpressions();
             }
 
             LocalIndex.EndStatement(tracking);

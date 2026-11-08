@@ -46,10 +46,13 @@ public sealed class DocumentationTests
         Assert.Contains("A forced lift's request to reset from the node's grantor", s_sequenceRanges, "a grantor's lifts (352)");
         Assert.Contains("the grantor's lifts may reset the node 9 times in their first hour and 14 in their first day", s_sequenceRanges, "a grantor's lifts (353)");
         Assert.Contains("A switch worker waits for the gate before it locks the sequence's range row", s_sequenceRanges, "a paused gate holder (291)");
-        Assert.Contains("a call whose sequence its statement doesn't name, as one computed as it runs, or a PL/pgSQL expression's", s_sequenceRanges,
+        Assert.Contains("a call whose sequence none of those name, as one computed as it runs, a PL/pgSQL expression's", s_sequenceRanges,
             "a returning node's draws (292, 293)");
-        Assert.Contains("Nothing else waits: `nextval` of a sequence no range manages, or of a temporary one, reads of the sequence, `setval`, `currval`, `EXPLAIN`", s_sequenceRanges,
+        Assert.Contains("Nothing else waits: `nextval` of a sequence no range manages, or of a temporary one, that its statement or `COPY`'s defaults name", s_sequenceRanges,
             "what doesn't wait for a grantor (351, 422)");
+        Assert.Contains("an `UPDATE` or a `MERGE` that sets a column to a value rather than its default", s_sequenceRanges, "updates that don't draw (460)");
+        Assert.Contains("a statement a worf worker applies, as DDL `replicate_ddl_command` queued", s_sequenceRanges, "applied statements (420)");
+        Assert.Contains("up to `worf.sequence_range_check_interval` more before the watcher cancels it", s_sequenceRanges, "a probe's time (292)");
         Assert.Contains("an `UPDATE` or a `MERGE` that sets such a column to its default", s_sequenceRanges, "an identity column's draw (421)");
         Assert.Contains("and again half `worf.sequence_range_timeout` after each that fails", s_sequenceRanges, "a waiting statement's exchanges (423)");
         Assert.Contains("a pool holder grants its children nothing from a pool block until the node that granted it has answered so", s_sequenceRanges,

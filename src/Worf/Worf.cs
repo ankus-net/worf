@@ -2036,11 +2036,26 @@ internal static partial class Worf
         // Setup connection to pinned catalogs (we only ever read pg_database).
         PgBackgroundWorker.Connect(null, null);
 
-        // Main wait loop.
+        // Main wait loop. A standby is watched for its promotion each second, which makes the prepared transactions it
+        // replayed this server's, for the managers to note.
+        bool recovering;
+        unsafe
+        {
+            recovering = NativeMethods.RecoveryInProgress();
+        }
+
         while (!Worker.GotSigterm)
         {
             PgInterrupts.Check();
             Worker.ProcessConfigReload();
+            unsafe
+            {
+                if (recovering && !NativeMethods.RecoveryInProgress())
+                {
+                    recovering = false;
+                    Worker.RescanPrepared();
+                }
+            }
 
             // The prepared transactions that may have given managers something to manage wake them as they end.
             bool watchingPrepared = Worker.WakeForEndedPrepared();
@@ -2069,7 +2084,7 @@ internal static partial class Worf
 
             // Wait for latch signal or timeout. On Windows, use a shorter timeout to ensure faster response to
             // subscription changes, as process startup and IPC can be slower than on Unix systems.
-            if (!PgBackgroundWorker.Wait(watchingPrepared ? Worker.PreparedWatchInterval : SupervisorInterval))
+            if (!PgBackgroundWorker.Wait(watchingPrepared ? Worker.PreparedWatchInterval : recovering ? TimeSpan.FromSeconds(1) : SupervisorInterval))
             {
                 break;
             }

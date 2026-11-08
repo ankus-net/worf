@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using Ankus.Postgres;
 
 namespace Worf;
@@ -47,9 +48,10 @@ internal static partial class SequenceRangeGuard
     // The managed sequences each table's columns draw from, by column, through a default or as identity columns.
     private static readonly Dictionary<uint, List<(short Column, uint Sequence)>> s_drawingColumns = [];
 
-    // The statements whose expressions are starting, innermost last, with the sequences their nextval calls name, once
-    // a call has looked.
-    private static readonly List<(nint Statement, (HashSet<uint> Called, bool Unnamed)? Draws)> s_starting = [];
+    // The statements and commands whose expressions are starting, innermost last: each with the text of the expressions
+    // it starts, the sequences their nextval calls name and how many calls there are, once a call has looked, and how
+    // many calls have looked.
+    private static readonly List<(Func<string> Text, (HashSet<uint> Called, int Calls, bool Unnamed)? Draws, int Looked)> s_starting = [];
 
     // Whether each table has the guard's triggers, which only tables numbered by a managed sequence have, as of the
     // versions of the shared and this backend's counters it was looked up at.
@@ -463,7 +465,7 @@ internal static partial class SequenceRangeGuard
         }
 
         // An UPDATE, or a MERGE's, draws only as it sets a column to its default, which an identity column draws from
-        // without calling nextval, so it holds the gates of the sequences of the columns it sets.
+        // without calling nextval, so it holds the gates of the sequences of the columns it sets that its plan draws from.
         List<uint> sequences = inserts ? [.. written.SelectMany(DrawnBy)] : UpdatedDrawing(statement);
         if (sequences.Count == 0)
         {
@@ -475,8 +477,9 @@ internal static partial class SequenceRangeGuard
     }
 
     /// <summary>
-    /// Lists the managed sequences an UPDATE, or a MERGE's update actions, may draw from: those of the columns it sets
-    /// that draw from one by default or as identity columns.
+    /// Lists the managed sequences an UPDATE, or a MERGE's update actions, draws from: those of the columns it sets that
+    /// draw from one by default or as identity columns, as a partition's draw from its ancestors', that its plan draws
+    /// from, as setting such a column to its default does, rather than to a value.
     /// </summary>
     private static unsafe List<uint> UpdatedDrawing(PlannedStmt* statement)
     {
@@ -526,12 +529,20 @@ internal static partial class SequenceRangeGuard
             }
         }
 
-        return sequences;
+        if (sequences.Count == 0)
+        {
+            return sequences;
+        }
+
+        string text = PlanText((Node*)statement);
+        (HashSet<uint> called, _, _) = Draws(text);
+        return [.. sequences.Distinct().Where(seqoid => called.Contains(seqoid) ||
+            text.Contains($"{{NEXTVALUEEXPR :seqid {seqoid.ToString(CultureInfo.InvariantCulture)} ", StringComparison.Ordinal))];
     }
 
     /// <summary>
     /// Lists the managed sequences a table's columns draw from, by column, through their defaults or as identity
-    /// columns.
+    /// columns, a partition's identity columns drawing from its ancestors' sequences, by name.
     /// </summary>
     private static List<(short Column, uint Sequence)> DrawingColumns(uint relid)
     {
@@ -542,9 +553,11 @@ internal static partial class SequenceRangeGuard
                     ON d.classid = 'pg_catalog.pg_attrdef'::pg_catalog.regclass AND d.objid = a.oid AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
                 WHERE a.adrelid = $1
                 UNION
-                SELECT d.refobjsubid::pg_catalog.int2, d.objid FROM pg_catalog.pg_depend d
-                WHERE d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.refobjid = $1 AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
-                    AND d.deptype = 'i'
+                SELECT c.attnum, d.objid FROM pg_catalog.pg_depend d
+                    JOIN pg_catalog.pg_attribute p ON p.attrelid = d.refobjid AND p.attnum = d.refobjsubid
+                    JOIN pg_catalog.pg_attribute c ON c.attrelid = $1 AND c.attname = p.attname AND NOT c.attisdropped
+                WHERE d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+                    AND d.deptype = 'i' AND (d.refobjid = $1 OR d.refobjid IN (SELECT a.relid FROM pg_catalog.pg_partition_ancestors($1) a))
                 """, 0, SpiParameter.Create(relid)));
             drawing = [.. used.Select(row => (row.Get<short>(0), row.Get<uint>(1))).Where(draw => s_sequences.ContainsKey(draw.Item2))];
             s_drawingColumns[relid] = drawing;
@@ -704,31 +717,167 @@ internal static partial class SequenceRangeGuard
     /// names, until <see cref="StartedExpressions"/>.
     /// </summary>
     /// <param name="statement">The statement's plan.</param>
-    internal static void StartingExpressions(nint statement) => s_starting.Add((statement, null));
+    internal static unsafe void StartingExpressions(nint statement) => s_starting.Add((() => PlanText((Node*)statement), null, 0));
 
     /// <summary>
-    /// Forgets the statement <see cref="StartingExpressions"/> noted last, once its expressions have started.
+    /// Notes a COPY FROM, whose defaults start before its rows, so that a call of nextval among them knows the sequences
+    /// they name, until <see cref="StartedExpressions"/>.
+    /// </summary>
+    /// <param name="relid">The table the COPY writes.</param>
+    /// <param name="columns">The columns the COPY reads, by number, or null for all of them.</param>
+    /// <param name="defaults">Whether the COPY's DEFAULT option has it start every column's default.</param>
+    internal static void StartingCopy(uint relid, short[]? columns, bool defaults)
+        => s_starting.Add((() => CopyDefaultsText(relid, columns, defaults), null, 0));
+
+    /// <summary>
+    /// Forgets the statement <see cref="StartingExpressions"/> or <see cref="StartingCopy"/> noted last, once its
+    /// expressions have started.
     /// </summary>
     internal static void StartedExpressions() => s_starting.RemoveAt(s_starting.Count - 1);
+
+    // The text of a plan, as nodeToString writes it, and of the CHECK constraints of the domains it coerces to, which
+    // start with it from the type cache.
+    private static unsafe string PlanText(Node* plan)
+    {
+        string text;
+        sbyte* written = NativeMethods.nodeToString(plan);
+        try
+        {
+            text = Worf.FromServer(written);
+        }
+        finally
+        {
+            NativeMethods.pfree(written);
+        }
+
+        return WithDomainChecks(text);
+    }
+
+    // The text of the defaults a COPY FROM starts, of the columns it doesn't read, and of the CHECK constraints of the
+    // domains they're coerced to.
+    private static string CopyDefaultsText(uint relid, short[]? columns, bool defaults)
+    {
+        if (columns is null && !defaults)
+        {
+            return "";
+        }
+
+        WorfRows started = Elevated.Run(() => Worf.Read("""
+            SELECT coalesce(d.adbin::pg_catalog.text, t.typdefaultbin::pg_catalog.text, ''),
+                CASE WHEN d.adbin IS NULL AND t.typtype = 'd' THEN pg_catalog.format('{COERCETODOMAIN :resulttype %s }', t.oid) ELSE '' END
+            FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+                LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+            WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated = ''
+                AND ($2 OR NOT (a.attnum = ANY ($3::pg_catalog.int2[])))
+                AND (d.adbin IS NOT NULL OR t.typdefaultbin IS NOT NULL)
+            """, 0, SpiParameter.Create(relid), SpiParameter.Create(defaults), SpiParameter.Create(columns ?? [])));
+        return WithDomainChecks(string.Concat(started.Select(row => row.Get<string>(0) + " " + row.Get<string>(1) + " ")));
+    }
+
+    // Adds to an expression's text the text of the CHECK constraints of each domain it coerces to, and of those
+    // domains' base domains, once for each coercion, as each starts its own, and of the domains those coerce to.
+    private static string WithDomainChecks(string text)
+    {
+        StringBuilder all = new(text);
+        StringBuilder found = new();
+        string pending = text;
+        for (int depth = 0; depth < 8 && pending.Length > 0; depth++)
+        {
+            List<uint> domains = CoercedDomains(pending);
+            _ = found.Clear();
+            foreach (uint domain in domains)
+            {
+                string checks = string.Concat(Elevated.Run(() => Worf.Read("""
+                    WITH RECURSIVE d (oid) AS (
+                        SELECT $1::pg_catalog.oid
+                        UNION
+                        SELECT t.typbasetype FROM pg_catalog.pg_type t JOIN d ON t.oid = d.oid WHERE t.typtype = 'd')
+                    SELECT c.conbin::pg_catalog.text FROM pg_catalog.pg_constraint c JOIN d ON c.contypid = d.oid WHERE c.contype = 'c'
+                    """, 0, SpiParameter.Create(domain))).Select(row => row.Get<string>(0) + " "));
+                _ = all.Append(' ').Append(checks);
+                _ = found.Append(checks);
+            }
+
+            pending = found.ToString();
+        }
+
+        return all.ToString();
+    }
+
+    // The domains an expression's text coerces to, once for each coercion: each CoerceToDomain's own result type, at
+    // its node's top level rather than its argument's.
+    private static List<uint> CoercedDomains(string text)
+    {
+        const string Coercion = "{COERCETODOMAIN ";
+        List<uint> domains = [];
+        for (int at = text.IndexOf(Coercion, StringComparison.Ordinal); at >= 0; at = text.IndexOf(Coercion, at + Coercion.Length, StringComparison.Ordinal))
+        {
+            int depth = 0;
+            for (int i = at; i < text.Length; i++)
+            {
+                char c = text[i];
+                if (c == '\\')
+                {
+                    i++;
+                }
+                else if (c is '{' or '(')
+                {
+                    depth++;
+                }
+                else if (c is '}' or ')')
+                {
+                    if (--depth == 0)
+                    {
+                        break;
+                    }
+                }
+                else if (depth == 1 && string.CompareOrdinal(text, i, " :resulttype ", 0, 13) == 0)
+                {
+                    int start = i + 13;
+                    int end = start;
+                    while (end < text.Length && char.IsAsciiDigit(text[end]))
+                    {
+                        end++;
+                    }
+
+                    if (uint.TryParse(text.AsSpan(start, end - start), NumberStyles.None, CultureInfo.InvariantCulture, out uint domain))
+                    {
+                        domains.Add(domain);
+                    }
+
+                    break;
+                }
+            }
+        }
+
+        return domains;
+    }
 
     /// <summary>
     /// Waits, as a call of nextval is about to run, until this server has heard from the grantor of the managed
     /// sequence's active block since it started, as <see cref="WaitForGrantor"/> does for the statements that hold the
-    /// gates, so that nothing draws from that block meanwhile: the sequence its statement names, or, for a call whose
-    /// sequence its statement doesn't name, as one computed as it runs or a PL/pgSQL expression's, which PL/pgSQL
-    /// evaluates without a statement, every managed sequence's. worf's own statements, a standby, a read-only
-    /// transaction, an explained statement, and Snowflake node numbers, whose IDs carry their times, don't wait.
+    /// gates, so that nothing draws from that block meanwhile: the sequence its statement, or COPY's defaults, name, or,
+    /// for a call whose sequence they don't name, as one computed as it runs, a PL/pgSQL expression's, which PL/pgSQL
+    /// evaluates without a statement, or a default ALTER TABLE fills a column with, every managed sequence's. A call past
+    /// the calls its statement names, as one a function the statement runs as it starts makes, is one they don't name.
+    /// worf's own statements, a standby, a read-only transaction, an explained statement, and Snowflake node numbers,
+    /// whose IDs carry their times, don't wait; a statement that a worf worker runs for a user, as DDL it applies, does.
     /// </summary>
     internal static void BeforeNextval()
     {
+        // Each call that starts within a statement counts against the calls it names.
+        if (s_starting.Count > 0)
+        {
+            s_starting[^1] = s_starting[^1] with { Looked = s_starting[^1].Looked + 1 };
+        }
+
         bool quiet;
         unsafe
         {
             quiet = NativeGlobals.creating_extension || NativeGlobals.XactReadOnly;
         }
 
-        if (quiet || s_namingGrantors || Worker.MyWorfWorker >= 0 || ExplainOnly || SequenceRanges.Recovering() ||
-            Worf.CatalogOid("sequence_range_block") == 0)
+        if (quiet || s_namingGrantors || ExplainOnly || SequenceRanges.Recovering() || Worf.CatalogOid("sequence_range_block") == 0)
         {
             return;
         }
@@ -746,9 +895,9 @@ internal static partial class SequenceRangeGuard
                 return;
             }
 
-            (HashSet<uint> Called, bool Unnamed)? draws = StartingDraws();
-            unnamed = draws is not { Unnamed: false };
-            waiting = unnamed ? [.. unconfirmed.DistinctBy(seqoid => s_grantors[seqoid])] : [.. unconfirmed.Where(draws!.Value.Called.Contains)];
+            HashSet<uint>? called = StartingDraws();
+            unnamed = called is null;
+            waiting = unnamed ? [.. unconfirmed.DistinctBy(seqoid => s_grantors[seqoid])] : [.. unconfirmed.Where(called!.Contains)];
         }
         finally
         {
@@ -763,51 +912,40 @@ internal static partial class SequenceRangeGuard
 
     /// <summary>
     /// Finds the sequences the nextval calls of the statement whose expressions start name, once for the statement, or
-    /// null outside one.
+    /// null outside one, or for a call they don't name.
     /// </summary>
-    private static unsafe (HashSet<uint> Called, bool Unnamed)? StartingDraws()
+    private static HashSet<uint>? StartingDraws()
     {
         if (s_starting.Count == 0)
         {
             return null;
         }
 
-        (nint statement, (HashSet<uint> Called, bool Unnamed)? draws) = s_starting[^1];
+        (Func<string> text, (HashSet<uint> Called, int Calls, bool Unnamed)? draws, int looked) = s_starting[^1];
         if (draws is null)
         {
-            draws = Draws((Node*)statement);
-            s_starting[^1] = (statement, draws);
+            draws = Draws(text());
+            s_starting[^1] = (text, draws, looked);
         }
 
-        return draws;
+        return draws.Value.Unnamed || looked > draws.Value.Calls ? null : draws.Value.Called;
     }
 
     /// <summary>
-    /// Reads, from a statement's plan as text, the sequences its calls of nextval name, as each call's argument, a
-    /// constant, names one: a call whose argument isn't one, as a name computed as it runs, makes the sequences it may
-    /// draw from unnamed, as does a plan with no call, as when the call that looks is a function's the plan runs.
+    /// Reads, from expressions' text, as nodeToString writes them, the sequences their calls of nextval name, as each
+    /// call's argument, a constant, names one, and how many calls there are: a call whose argument isn't one, as a name
+    /// computed as it runs, makes the sequences they may draw from unnamed.
     /// </summary>
-    private static unsafe (HashSet<uint> Called, bool Unnamed) Draws(Node* plan)
+    private static (HashSet<uint> Called, int Calls, bool Unnamed) Draws(string text)
     {
-        string text;
-        sbyte* written = NativeMethods.nodeToString(plan);
-        try
-        {
-            text = Worf.FromServer(written);
-        }
-        finally
-        {
-            NativeMethods.pfree(written);
-        }
-
         const string Call = "{FUNCEXPR :funcid 1574 ";
         const string Named = "{CONST :consttype 2205 ";
         HashSet<uint> called = [];
         bool unnamed = false;
-        bool calls = false;
+        int calls = 0;
         for (int at = text.IndexOf(Call, StringComparison.Ordinal); at >= 0; at = text.IndexOf(Call, at + Call.Length, StringComparison.Ordinal))
         {
-            calls = true;
+            calls++;
             int args = text.IndexOf(":args (", at, StringComparison.Ordinal);
             if (args < 0 || !text.AsSpan(args + ":args (".Length).TrimStart().StartsWith(Named, StringComparison.Ordinal))
             {
@@ -834,7 +972,7 @@ internal static partial class SequenceRangeGuard
             _ = called.Add(oid);
         }
 
-        return (called, unnamed || !calls);
+        return (called, calls, unnamed);
     }
 
     /// <summary>

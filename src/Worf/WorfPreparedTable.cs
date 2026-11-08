@@ -11,7 +11,8 @@ internal struct WorfPreparedTable
     public int Used;
 
     /// <summary>
-    /// When the table started, with this server's shared memory.
+    /// How many times the managers were asked to note their databases' prepared transactions again, as after a
+    /// promotion, which makes the transactions a standby replayed this server's.
     /// </summary>
-    public long StartedAt;
+    public int Rescan;
 }

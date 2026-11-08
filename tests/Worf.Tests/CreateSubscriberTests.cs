@@ -284,10 +284,11 @@ public sealed class CreateSubscriberTests
 
     /// <summary>
     /// A subscriber stopped, as with SIGTERM, while its subscription waits for a provider that doesn't answer, cancels
-    /// the wait and cleans up as on a failure, stopping the server it started, a second stop waiting for that, and one
-    /// killed leaves its transaction to roll back: none leaves progress for its origin's id. A run again on the data
-    /// directory the killed one left with its server running fails, leaving the server as it was. Processes are stopped
-    /// with signals, which Windows lacks.
+    /// the wait and cleans up as on a failure, stopping the server it started, a second stop, while it does, waiting for
+    /// that, and one killed leaves its transaction to roll back: none leaves progress for its origin's id. A run again on
+    /// the data directory the killed one left with its server running fails, leaving the server as it was, and so does
+    /// one once the server is stopped, at once, as the killed run promoted the data directory past the provider's
+    /// timeline. Processes are stopped with signals, which Windows lacks.
     /// </summary>
     /// <param name="signals">The signals the tool gets, 40 ms apart.</param>
     /// <param name="exitCode">The tool's exit code.</param>
@@ -360,20 +361,44 @@ public sealed class CreateSubscriberTests
             stopped = true;
             await Task.Delay(TimeSpan.FromSeconds(2), token);
             string[] sent = signals.Split(' ');
-            for (int i = 0; i < sent.Length; i++)
-            {
-                if (i > 0)
-                {
-                    await Task.Delay(TimeSpan.FromMilliseconds(40), token);
-                    if (tool.HasExited)
-                    {
-                        break;
-                    }
-                }
+            string toolPid = tool.Id.ToString(CultureInfo.InvariantCulture);
 
-                // A later stop may find the tool already gone.
-                (int signalled, _, error) = await ProcessRunner.RunAsync("kill", [$"-{sent[i]}", tool.Id.ToString(CultureInfo.InvariantCulture)], token);
-                Assert.IsTrue(signalled == 0 || i > 0, error);
+            // A second stop lands inside the cleanup: the subscriber's checkpointer is stopped, so that the pg_ctl stop
+            // the cleanup runs waits for its shutdown checkpoint, and the tool, stopped again then, waits it out.
+            string? checkpointer = null;
+            if (sent.Length > 1)
+            {
+                string subscriberPostmaster = File.ReadLines(Path.Join(backupDir, "postmaster.pid")).First().Trim();
+                checkpointer = (await ChildrenAsync(subscriberPostmaster, "checkpointer", token)).Single();
+                (int held, _, string holdError) = await ProcessRunner.RunAsync("kill", ["-STOP", checkpointer], token);
+                Assert.AreEqual(0, held, holdError);
+            }
+
+            try
+            {
+                (int signalled, _, error) = await ProcessRunner.RunAsync("kill", [$"-{sent[0]}", toolPid], token);
+                Assert.AreEqual(0, signalled, error);
+                if (checkpointer is not null)
+                {
+                    Stopwatch cleaning = Stopwatch.StartNew();
+                    while ((await ChildrenAsync(toolPid, "pg_ctl", token)).Count == 0)
+                    {
+                        Assert.IsLessThan(TimeSpan.FromSeconds(30), cleaning.Elapsed, "the tool's pg_ctl stop");
+                        await Task.Delay(TimeSpan.FromMilliseconds(50), token);
+                    }
+
+                    (signalled, _, error) = await ProcessRunner.RunAsync("kill", [$"-{sent[1]}", toolPid], token);
+                    Assert.AreEqual(0, signalled, error);
+                    await Task.Delay(TimeSpan.FromSeconds(1), token);
+                    Assert.IsFalse(tool.HasExited, "the tool, stopped again as it cleans up");
+                }
+            }
+            finally
+            {
+                if (checkpointer is not null)
+                {
+                    _ = await ProcessRunner.RunAsync("kill", ["-CONT", checkpointer], CancellationToken.None);
+                }
             }
 
             using CancellationTokenSource exiting = CancellationTokenSource.CreateLinkedTokenSource(token);
@@ -390,7 +415,7 @@ public sealed class CreateSubscriberTests
             }
         }
 
-        string rerun = "1|True|0|f";
+        string rerun = exitCode == 1 ? "" : "1|True|0|f, 1|True|True|False|1";
         try
         {
             (int status, string statusOutput) = await provider.RunProgramAsync("pg_ctl", ["status", "-D", backupDir], token);
@@ -413,6 +438,16 @@ public sealed class CreateSubscriberTests
                 {
                     rerun += $"|{await SubscriberAsync(provider, pgport, "SELECT pg_catalog.pg_is_in_recovery()", token)}";
                 }
+
+                // Once that server is stopped, a run again fails at once too, as the data directory the killed run
+                // promoted is on a timeline past the provider's, and leaves the data directory as it was.
+                await StopAsync(provider, backupDir);
+                Stopwatch refusing = Stopwatch.StartNew();
+                (int stoppedAgain, _, string stoppedErr) = await CreateSubscriberCommand.RunAsync(command, arguments, work.FullName,
+                    new Dictionary<string, string> { ["PGPORT"] = port }, token);
+                rerun += $", {stoppedAgain}|{stoppedErr.Contains("past the provider's timeline", StringComparison.Ordinal)}|{refusing.Elapsed < TimeSpan.FromSeconds(60)}|" +
+                    $"{File.Exists(Path.Join(backupDir, "standby.signal"))}|" +
+                    $"{File.ReadAllText(Path.Join(backupDir, "postgresql.auto.conf")).Split("recovery_target_name").Length - 1}";
             }
 
             await StopAsync(provider, backupDir);
@@ -422,13 +457,26 @@ public sealed class CreateSubscriberTests
             string progress = await SubscriberAsync(provider, pgport, """
                 SELECT count(*) FROM pg_catalog.pg_replication_origin_status WHERE external_id IS NULL AND coalesce(remote_lsn, '0/0') <> '0/0'
                 """, token);
-            Assert.AreEqual("0, 1|True|0|f", $"{progress}, {rerun}",
-                "the freed origin ids with progress, which an origin created next would start from, and a run again's exit code, message, and the server it leaves running, out of recovery");
+            Assert.AreEqual($"0, {(exitCode == 1 ? "" : "1|True|0|f, 1|True|True|False|1")}", $"{progress}, {rerun}",
+                "the freed origin ids with progress, which an origin created next would start from, and after a kill, a run again's exit code, message, " +
+                "and the server it leaves running, out of recovery, and once that is stopped, a run again's exit code, message, whether it failed at once, " +
+                "and the standby.signal and recovery settings it leaves");
         }
         finally
         {
             await StopAsync(provider, backupDir);
         }
+    }
+
+    // The processes a process started whose command line holds a text, by their IDs, as ps lists them.
+    private static async Task<List<string>> ChildrenAsync(string parent, string command, CancellationToken token)
+    {
+        (int exitCode, string output, string error) = await ProcessRunner.RunAsync("ps", ["-A", "-o", "pid=,ppid=,command="], token);
+        Assert.AreEqual(0, exitCode, error);
+        return [.. output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => line.Trim().Split(' ', 3, StringSplitOptions.RemoveEmptyEntries))
+            .Where(fields => fields.Length == 3 && fields[1] == parent && fields[2].Contains(command, StringComparison.Ordinal))
+            .Select(fields => fields[0])];
     }
 
     /// <summary>
