@@ -2014,12 +2014,11 @@ public sealed partial class ExceptionBehaviourTests
             SELECT * FROM worf.replication_set_add_all_tables('default', '{public}');
             """, token);
 
-        // A case-insensitive collation, where the server has ICU, gives the exclusion constraints collations other than
-        // their columns'.
-        bool icu = await subscriber.SafePsqlAsync(Database, "SELECT EXISTS (SELECT 1 FROM pg_collation WHERE collprovider = 'i')", token) == "t";
+        // A case-insensitive collation, where the server's build has ICU, gives the exclusion constraints collations other
+        // than their columns'.
+        bool icu = await subscriber.PsqlAsync(Database, "CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false)", token);
         _ = await subscriber.SafePsqlAsync(Database, icu
             ? """
-                CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
                 CREATE TABLE ucx (id integer PRIMARY KEY, t text COLLATE ci, EXCLUDE USING btree (t COLLATE "C" WITH =) DEFERRABLE);
                 CREATE TABLE ucy (id integer PRIMARY KEY, t text COLLATE "C", EXCLUDE USING btree (t COLLATE ci WITH =) DEFERRABLE);
                 """

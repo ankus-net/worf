@@ -547,16 +547,18 @@ public sealed class CreateSubscriberTests
         ];
 
         // The settings the data directory starts with: the provider's, which pg_basebackup copies, or those its own base
-        // backup, made as a standby's, adds.
+        // backup, made as a standby's, adds. The server that catches up streams from a port nothing listens on, through
+        // the recovery template, so that it never reaches the restore point.
         string before = await File.ReadAllTextAsync(autoConf, token);
+        string template = Path.Join(work.FullName, "recovery.conf");
+        await File.WriteAllTextAsync(template,
+            $"# recovery template\nprimary_conninfo = 'host=127.0.0.1 port={CreateSubscriberCommand.FreePort().ToString(CultureInfo.InvariantCulture)} user=super'\n", token);
         switch (when)
         {
             case "basebackup":
                 arguments.Add("--extra-basebackup-args=--max-rate=32k");
                 break;
             case "catchup":
-                string template = Path.Join(work.FullName, "recovery.conf");
-                await File.WriteAllTextAsync(template, $"# recovery template\nprimary_conninfo = 'host=127.0.0.1 port={providerPort} user=super'\n", token);
                 arguments.Add($"--recovery-conf={template}");
                 break;
             case "standby":
@@ -564,6 +566,7 @@ public sealed class CreateSubscriberTests
                     ["-D", backupDir, "-d", providerDsn, "-X", "stream", "-R"], token);
                 Assert.AreEqual(0, backedUp, backupOutput);
                 before = await File.ReadAllTextAsync(Path.Join(backupDir, "postgresql.auto.conf"), token);
+                arguments.Add($"--recovery-conf={template}");
                 break;
             case "databases":
                 arguments.Add("--databases=postgres,db2");
@@ -614,11 +617,6 @@ public sealed class CreateSubscriberTests
                     await Task.Delay(TimeSpan.FromSeconds(1), token);
                     break;
                 case "catchup" or "standby":
-                    // The provider stops once the restore point is made, so that the server catches up to it for good.
-                    await SeeAsync("Bringing subscriber node to the restore point");
-                    (int stopping, _, string stopError) = await ProcessRunner.RunAsync("kill", ["-STOP", postmaster], token);
-                    Assert.AreEqual(0, stopping, stopError);
-                    paused = true;
                     await SeeAsync("Waiting for PostgreSQL to become primary");
                     break;
                 default:

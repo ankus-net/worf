@@ -2468,7 +2468,8 @@ public sealed class SequenceRangeTests
     /// <summary>
     /// A provider whose host drops connection attempts holds up a node's exchanges with its other neighbors only until
     /// the first attempt runs out of time, as one that takes calls and never answers does: it's called after the others
-    /// from then on, so the node's inserts go on through small blocks from the owner without waiting on it.
+    /// from then on, so the node's inserts go on through small blocks from the owner, few waiting on it, and those for one
+    /// probe.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -2525,15 +2526,15 @@ public sealed class SequenceRangeTests
         }
 
         // Each attempt to reach node_c held up node_b's calls to node_a for 5 s, until the first counted as running out of
-        // time.
+        // time; now few inserts wait, and those for one probe, which made again without giving way has the exchange's time.
         List<double> waits = [.. nodeB.ReadLog()[timed..].Split('\n')
             .Where(line => line.Contains($": {Insert}", StringComparison.Ordinal) && line.Contains("  execute ", StringComparison.Ordinal))
             .Select(line => double.Parse(line[(line.IndexOf("duration: ", StringComparison.Ordinal) + 10)..line.IndexOf(" ms", StringComparison.Ordinal)],
                 CultureInfo.InvariantCulture))];
         waits.Sort();
         Assert.IsGreaterThan(100, waits.Count, "node_b's inserts");
-        Assert.IsLessThan(4000.0, waits[^1],
-            "node_b's slowest insert, against the 5000 ms each attempt to reach node_c took, as a probe that gave way is made again within the three seconds of its connection");
+        Assert.IsLessThan(6000.0, waits[^1], "node_b's slowest insert, which a probe of node_c made again without giving way holds up for the exchange's 5000 ms at most");
+        Assert.IsLessThan(1000.0, waits[(int)(waits.Count * 0.99)], "node_b's 99th percentile insert");
     }
 
     /// <summary>
@@ -3640,12 +3641,15 @@ public sealed class SequenceRangeTests
             _ = await node.SafePsqlAsync(Database, $"UPDATE worf.sequence_range_node SET reported_at = now() - interval '13 hours' WHERE node_id = {ownerId}", token);
         }
 
-        // Stale routes between node_b and node_c, which count upward for a while, still carry node_c's requests.
+        // node_c's route goes through node_b, which has none while it doesn't hear from node_a, so node_c's request
+        // waits for one, or reaches node_b, rather than following a route that counts upward between them.
         string restarted = await nodeB.SafePsqlAsync(Database, "SELECT now()::text", token);
         _ = await nodeC.SafePsqlAsync(Database, "SELECT worf.alter_subscription_enable('c_from_b')", token);
-        Assert.IsTrue(await nodeC.PollQueryUntilAsync(Database,
-            "SELECT EXISTS (SELECT 1 FROM worf.sequence_range_request WHERE seqoid = 'worf.snowflake_node'::regclass)", token), "node_c asking for a number");
-        await Task.Delay(TimeSpan.FromSeconds(3), token);
+        await Task.Delay(TimeSpan.FromSeconds(5), token);
+        Assert.AreEqual("t", await nodeC.SafePsqlAsync(Database, $"""
+            SELECT worf.snowflake_node() IS NULL AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_request
+                WHERE seqoid = 'worf.snowflake_node'::regclass AND parent_node <> (SELECT node_id FROM worf.node WHERE node_name = 'node_b'))
+            """, token), "node_c's number, and its requests to nodes other than node_b");
         Assert.AreEqual("0", await nodeB.SafePsqlAsync(Database, $"""
             SELECT count(*) FROM worf.sequence_range_grant
             WHERE seqoid = 'worf.snowflake_node'::regclass AND grantee_name = 'node_c' AND granted_at > '{restarted}'
