@@ -2434,6 +2434,10 @@ public sealed class SequenceRangeTests
         }, relaying.Token);
         try
         {
+            // A connection's round trips to a node a second away each way, with libpq's request for SSL, take about
+            // the test's 5 s, so node_b has worf.sequence_range_timeout's default for each.
+            _ = await nodeB.SafePsqlAsync(Database, "ALTER SYSTEM SET worf.sequence_range_timeout = '10s'", token);
+            _ = await nodeB.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
             string slowDsn = string.Join(' ', dsnParts.Select(part =>
                 part.StartsWith("port=", StringComparison.Ordinal) ? $"port={((IPEndPoint)slow.LocalEndpoint).Port}"
                 : part.StartsWith("host=", StringComparison.Ordinal) ? "host=127.0.0.1"
@@ -4981,7 +4985,8 @@ public sealed class SequenceRangeTests
 
     /// <summary>
     /// Locks a node's sequence range table, so that its neighbors' exchanges with it wait until they time out, and
-    /// returns once one waits. Closing the connection lets them go.
+    /// returns once one waits: on the table, or on the node's exchange turn, which the node's own exchange worker holds
+    /// as it waits on the table to take in a reply. Closing the connection lets them go.
     /// </summary>
     private static async Task<NpgsqlConnection> HoldExchangesAsync(TestNode node, CancellationToken token)
     {
@@ -4993,7 +4998,8 @@ public sealed class SequenceRangeTests
             Assert.IsTrue(await node.PollQueryUntilAsync(Database, """
                 SELECT EXISTS (
                     SELECT 1 FROM pg_locks l JOIN pg_stat_activity a USING (pid)
-                    WHERE l.relation = 'worf.sequence_range'::regclass AND NOT l.granted AND a.query LIKE '%sequence_range_exchange%')
+                    WHERE (l.relation = 'worf.sequence_range'::regclass OR l.locktype = 'advisory') AND NOT l.granted
+                        AND a.backend_type = 'client backend' AND a.query LIKE '%sequence_range_exchange(%')
                 """, token), $"an exchange waiting on {node.Name}");
             return connection;
         }

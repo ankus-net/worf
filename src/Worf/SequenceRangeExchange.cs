@@ -332,9 +332,9 @@ internal static class SequenceRangeExchange
             return false;
         }
 
-        // The exchanges under way go as far as they can, and those that ended are taken in; then the links due that have
+        // The exchanges under way go as far as they can, and those that ended are taken in; then the links due that had
         // none under way start theirs, one at a time with each provider, which takes this node's calls in the order of
-        // the WAL positions they carry.
+        // the WAL positions they carry. A link whose exchange ends now is due again by the delay that set, next round.
         bool changed = TakeExchanges(node);
         foreach ((WorfSubscription sub, string? waiting, bool fenced) in due.Where(link => !s_pending.ContainsKey(link.Sub.Id)))
         {
@@ -775,7 +775,7 @@ internal static class SequenceRangeExchange
 
         _ = s_noSlotOnce.RemoveWhere(id => !enabled.Exists(sub => sub.Id == id));
 
-        foreach (WorfSubscription sub in enabled)
+        foreach (WorfSubscription sub in enabled.Where(sub => !s_pending.ContainsKey(sub.Id)))
         {
             // The neighbor ties each exchange to the subscription's slot, which a new subscription makes as it starts,
             // and which its apply worker has to have streamed.
