@@ -608,6 +608,15 @@ internal static class SequenceRangeExchange
     {
         WorfSubscription sub = pending.Sub;
         TakeTurn();
+
+        // A reply that comes once the subscription is dropped or disabled, as when the provider answered only after
+        // taking in the drop's word that this node leaves its slot, is no news of a neighbor this node still links to, so
+        // it's taken in as one that never came.
+        if (!WorfNode.GetNodeSubscriptions(node.Node.Id, false).Exists(current => current.Id == sub.Id && current.Enabled))
+        {
+            return (false, false);
+        }
+
         AcknowledgeRefusals(pending.Refusals);
         using JsonDocument document = JsonDocument.Parse(reply);
         if (document.RootElement.TryGetProperty("streamed", out JsonElement streamed) && streamed.ValueKind == JsonValueKind.False)
