@@ -1948,7 +1948,8 @@ public sealed class SequenceRangeTests
             """, token)).Split('|');
 
         // Each request carries node_b's WAL position as it is then, so that node_a doesn't take an earlier one for node_b
-        // going back.
+        // going back, though a call of node_b's own may come between with a later one, at which node_a asks node_b to
+        // reset, rather than resetting itself.
         async Task<string> RequestAsync(string reset)
         {
             string[] identity = (await nodeB.SafePsqlAsync(Database,
@@ -1970,7 +1971,7 @@ public sealed class SequenceRangeTests
         _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO t (v) VALUES ('a')", token);
         asked = nodeA.ReadLog().Length;
         _ = await nodeA.SafePsqlAsync(Database, $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{await RequestAsync("0/11")}')", token);
-        Assert.DoesNotContain("asked this node to reset", nodeA.ReadLog()[asked..], "node_a's reset at node_b's next made-up request");
+        Assert.DoesNotContain("node node_b asked this node to reset", nodeA.ReadLog()[asked..], "node_a's reset at node_b's next made-up request");
         await WaitActiveAsync([nodeA, nodeB], token);
         await AssertNoSharedValuesAsync([nodeA, nodeB], token);
     }
