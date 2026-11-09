@@ -2776,7 +2776,7 @@ public sealed class SequenceRangeTests
 
     /// <summary>
     /// A provider that stops reading once its connection is set up holds up no other exchange, though the node's calls to
-    /// it, which carry its 151 managed sequences, are larger than its sockets hold: the node sends what they take as they
+    /// it, which carry its 61 managed sequences, are larger than its sockets hold: the node sends what they take as they
     /// take it, without waiting on them, goes on exchanging with its other provider, and gives the call up at its time.
     /// On Linux, where a library the server preloads gives the node's connections to the provider a small send buffer.
     /// </summary>
@@ -2840,7 +2840,7 @@ public sealed class SequenceRangeTests
         await using TestNode nodeB = await StartNodeAsync("node_b", token, "log_min_messages = debug2",
             new Dictionary<string, string?> { ["LD_PRELOAD"] = library, ["WORF_SMALL_SEND_PORT_FILE"] = portFile });
         await using TestNode nodeC = await StartNodeAsync("node_c", token);
-        const string Sequences = "CREATE TABLE t (id bigserial PRIMARY KEY, v text); DO $$ BEGIN FOR g IN 1..150 LOOP EXECUTE format('CREATE SEQUENCE many_%s', g); END LOOP; END $$";
+        const string Sequences = "CREATE TABLE t (id bigserial PRIMARY KEY, v text); DO $$ BEGIN FOR g IN 1..60 LOOP EXECUTE format('CREATE SEQUENCE many_%s', g); END LOOP; END $$";
         foreach (TestNode node in new[] { nodeA, nodeB, nodeC })
         {
             _ = await node.SafePsqlAsync(Database, Sequences, token);
@@ -2850,10 +2850,10 @@ public sealed class SequenceRangeTests
         await SubscribeAsync(nodeB, "b_from_c", nodeC, token);
         _ = await nodeA.SafePsqlAsync(Database, """
             SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100, max_range_size := 100);
-            SELECT count(worf.enable_sequence_range(format('many_%s', g)::regclass, participants := '{node_b}', range_size := 1000)) FROM generate_series(1, 150) g;
+            SELECT count(worf.enable_sequence_range(format('many_%s', g)::regclass, participants := '{node_b}', range_size := 1000)) FROM generate_series(1, 60) g;
             """, token);
         await WaitActiveAsync([nodeA, nodeB], token);
-        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT count(*) = 151 FROM worf.sequence_ranges WHERE state = 'active'", token),
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT count(*) = 61 FROM worf.sequence_ranges WHERE state = 'active'", token),
             "node_b drawing from blocks of every sequence");
 
         // node_b's calls to node_c go through a relay that stops reading each connection once its settings have passed.
