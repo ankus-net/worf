@@ -2080,9 +2080,19 @@ internal static partial class Worf
         }
     }
 
-    // How long the supervisor waits between its regular looks, shorter on Windows, where process startup and IPC are
-    // slower.
-    private static TimeSpan SupervisorInterval => TimeSpan.FromMilliseconds(OperatingSystem.IsWindows() ? 30000 : 180000);
+    /// <summary>
+    /// Gets how long the supervisor waits between its regular looks, which is also how long it leaves alone a database
+    /// whose manager found nothing to manage, in milliseconds, or 0 for its default. A setting for tests, hidden from
+    /// SHOW ALL.
+    /// </summary>
+    [PgGucInt("worf.supervisor_interval", 0, "Sets how long the supervisor waits between its regular looks at the databases.",
+        Minimum = 0, Maximum = int.MaxValue, Unit = PgGucUnit.Milliseconds, Context = PgGucContext.Sighup, Flags = PgGucOptions.NoShowAll)]
+    internal static partial int SupervisorIntervalSetting { get; }
+
+    // How long the supervisor waits between its regular looks: as set, or 3 minutes, and 30 seconds on Windows, where
+    // process startup and IPC are slower.
+    private static TimeSpan SupervisorInterval
+        => TimeSpan.FromMilliseconds(SupervisorIntervalSetting > 0 ? SupervisorIntervalSetting : OperatingSystem.IsWindows() ? 30000 : 180000);
 
     /// <summary>
     /// Lists the databases that allow connections, and frees the worker slots of those dropped. Runs in a

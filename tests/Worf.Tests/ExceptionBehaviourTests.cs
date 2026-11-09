@@ -904,8 +904,9 @@ public sealed partial class ExceptionBehaviourTests
             else if (stop == "keys")
             {
                 // A deferrable key on a column only the table here has, which the copy lacks, and which the rows here
-                // fill, is checked at the keys of the rows each part wrote, and a trigger here refuses three rows at the
-                // end, which only merging in halves finds, after the parts before them merged whole.
+                // fill, is checked at the keys of the rows each part wrote, of 18,000 of the table's 20,000, and a trigger
+                // here refuses three rows at the end, which only merging in halves finds, after the parts before them
+                // merged whole.
                 _ = await subscriber.SafePsqlAsync(Database, $$"""
                     ALTER TABLE {{table}} ADD COLUMN here integer, ADD CONSTRAINT {{table}}_here UNIQUE (here) DEFERRABLE;
                     CREATE FUNCTION {{table}}_refuse() RETURNS trigger LANGUAGE plpgsql
@@ -916,7 +917,20 @@ public sealed partial class ExceptionBehaviourTests
             }
             else if (stop == "held")
             {
-                _ = await subscriber.SafePsqlAsync(Database, $"CREATE UNIQUE INDEX {table}_v ON {table} (v) WHERE v <> 'copied'", token);
+                // A statement trigger the merge fires logs the indexes of the sync worker's temporary tables as each of
+                // its statements starts.
+                _ = await subscriber.SafePsqlAsync(Database, $$"""
+                    CREATE UNIQUE INDEX {{table}}_v ON {{table}} (v) WHERE v <> 'copied';
+                    CREATE FUNCTION {{table}}_temp_indexes() RETURNS trigger LANGUAGE plpgsql AS $$
+                    BEGIN
+                        RAISE LOG 'temp indexes: %', (SELECT coalesce(string_agg(c.relname || ' (' || pg_get_indexdef(i.indexrelid, 1, false)
+                            || coalesce(', ' || pg_get_indexdef(i.indexrelid, 2, false), '') || ')', '; ' ORDER BY 1), '')
+                            FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid WHERE c.relnamespace = pg_my_temp_schema());
+                        RETURN NULL;
+                    END $$;
+                    CREATE TRIGGER {{table}}_temp_indexes BEFORE INSERT OR UPDATE ON {{table}} FOR EACH STATEMENT EXECUTE FUNCTION {{table}}_temp_indexes();
+                    ALTER TABLE {{table}} ENABLE ALWAYS TRIGGER {{table}}_temp_indexes;
+                    """, token);
             }
             else if (stop == "halves")
             {
@@ -937,7 +951,7 @@ public sealed partial class ExceptionBehaviourTests
             _ = await subscriber.SafePsqlAsync(Database, $"CREATE TABLE {table}_ref (id integer REFERENCES {table} (id))", token);
 
             _ = await provider.SafePsqlAsync(Database,
-                $"INSERT INTO {table} SELECT g, 'copied' FROM generate_series(1, {stop switch { "halves" => 300000, "held" => 120000, "excluded" => 100000, _ => 1000 }}) g", token);
+                $"INSERT INTO {table} SELECT g, 'copied' FROM generate_series(1, {stop switch { "halves" => 300000, "held" => 120000, "excluded" => 100000, "keys" => 20000, _ => 1000 }}) g", token);
             int logpos = subscriber.ReadLog().Length;
             await using (NpgsqlConnection tableLocker = await subscriber.OpenAsync(Database, token))
             await using (NpgsqlConnection applyLocker = await subscriber.OpenAsync(Database, token))
@@ -1115,7 +1129,7 @@ public sealed partial class ExceptionBehaviourTests
                     break;
                 case "keys":
                     _ = await provider.SafePsqlAsync(Database, $"""
-                        UPDATE {table} SET v = CASE WHEN id IN (880, 890, 900) THEN 'x' ELSE 'w' END || id WHERE id <= 900 AND id <> 500;
+                        UPDATE {table} SET v = CASE WHEN id IN (17980, 17990, 18000) THEN 'x' ELSE 'w' END || id WHERE id <= 18000 AND id <> 500;
                         SELECT pg_drop_replication_slot('{syncSlot}');
                         """, token);
                     await SetBehaviourAsync(subscriber, "discard", token);
@@ -1182,6 +1196,7 @@ public sealed partial class ExceptionBehaviourTests
                 "halves" => "300001|45000150600|copied|t|t|here|elsewhere|1",
                 "held" => "120001|7200060600|updated|t|t|here|elsewhere|1",
                 "excluded" => "100001|5000050600|updated|t|t|here|elsewhere|1",
+                "keys" => "20001|200010600|updated|t|t|here|elsewhere|1",
                 _ => "1001|501100|updated|t|t|here|elsewhere|1",
             },
                 await subscriber.SafePsqlAsync(Database, $"""
@@ -1294,7 +1309,7 @@ public sealed partial class ExceptionBehaviourTests
                     .Split(' ', StringSplitOptions.RemoveEmptyEntries).Select(number => long.Parse(number, CultureInfo.InvariantCulture))];
                 Assert.AreEqual(stop == "lowered" ? "0|True" : "True|0", $"{(stop == "lowered" ? numbers[4] : numbers[4] > 0)}|{(stop == "lowered" ? numbers[5] > 0 : numbers[5])}",
                     "the deferrable key checks at the parts' keys, and at the whole table");
-                Assert.AreEqual(stop == "lowered" ? "20|23505|dup|20=" : "880,890,900|P0001|w1|", await subscriber.SafePsqlAsync(Database, $"""
+                Assert.AreEqual(stop == "lowered" ? "20|23505|dup|20=" : "17980,17990,18000|P0001|w1|", await subscriber.SafePsqlAsync(Database, $"""
                     SELECT string_agg(remote_new_tuple->>'id', ',' ORDER BY (remote_new_tuple->>'id')::integer), string_agg(DISTINCT error_sqlstate, ','),
                         {(stop == "lowered" ? $"(SELECT string_agg(w, ',') FROM {table} WHERE id = 10), (SELECT string_agg(id || '=' || coalesce(w, ''), ',') FROM {table} WHERE id = 20)"
                             : $"(SELECT v FROM {table} WHERE id = 1), ''")}
@@ -1303,6 +1318,10 @@ public sealed partial class ExceptionBehaviourTests
                 if (stop == "keys")
                 {
                     Assert.IsGreaterThan(numbers[2] / 4, numbers[1], "the most rows a part the merge tried whole held, against the rows it writes");
+
+                    // The checks find the rows each part wrote from the part's rows of the copy, rather than read every row
+                    // of the table and look each up in the copy, so they look in the copy's indexes hardly at all.
+                    Assert.IsLessThan(1000L, numbers[6], $"the times the deferrable key checks of 20,000 rows looked in the copy's indexes: {summary}");
                 }
 
                 await SetBehaviourAsync(subscriber, "error", token);
@@ -1323,13 +1342,18 @@ public sealed partial class ExceptionBehaviourTests
                 Assert.IsLessThan(5000L, long.Parse(checks[(checks.IndexOf("holding at most ", StringComparison.Ordinal) + 16)..].Split(' ')[0], CultureInfo.InvariantCulture),
                     "the keys the held-value checks held at once, for 30,000 written rows whose keys a later row shares");
 
-                // Deciding on the rows, in the copy's order, looks each up among the conflicts found, and removes those
-                // refused from the copy, by its row numbers, both through indexes, so it takes about as long as finding
-                // the conflicts, rather than three to five times as long.
-                long Milliseconds(string after) => long.Parse(checks[(checks.IndexOf(after, StringComparison.Ordinal) + after.Length)..].Split(' ')[0], CultureInfo.InvariantCulture);
-                long finding = Milliseconds(" at once, in ");
-                long deciding = Milliseconds(" finding their conflicts and ");
-                Assert.IsLessThan(finding * 3, deciding, $"the time the held-value checks took deciding on the rows, against the {finding} ms they took finding their conflicts");
+                // Deciding on the rows, in the copy's order, a part at a time, looks each part up among the conflicts found,
+                // and records and removes those refused from the copy, by its row numbers, both through indexes, rather
+                // than scanning the conflicts or the copy whole for each part.
+                long Scans(string after) => long.Parse(checks[(checks.IndexOf(after, StringComparison.Ordinal) + after.Length)..].Split(' ')[0], CultureInfo.InvariantCulture);
+                Assert.AreEqual("True|True", $"{Scans("scanned the conflicts ") < 20}|{Scans(" times and the copy ") < 20}",
+                    $"the whole scans of the conflicts and of the copy as the held-value checks decided on 118,998 rows in parts of 1,000: {checks}");
+
+                // The copy has no index on its row numbers as the merge first tries it whole, which only the skips read.
+                string[] lines = log.Split('\n');
+                int mergeStart = Array.FindIndex(lines, line => line.Contains($"merging the copy of table public.{table} into", StringComparison.Ordinal));
+                string first = lines.Skip(mergeStart).First(line => line.Contains("temp indexes:", StringComparison.Ordinal));
+                Assert.DoesNotContain("worf_row", first, "the sync worker's temporary indexes as the merge first tries the copy whole");
                 if (OperatingSystem.IsLinux())
                 {
                     long peak = await peakKb;

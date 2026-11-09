@@ -1362,6 +1362,11 @@ internal static class Worker
     /// gives it.</param>
     internal static void NoteFoundPrepared(uint dboid, List<(uint Xid, bool EveryDatabase, bool OwnDatabase)> prepared, long databases)
     {
+        if (prepared.Count > 0)
+        {
+            WorfLog.Debug1($"found {prepared.Count.ToString(CultureInfo.InvariantCulture)} prepared transactions that may change worf or the databases, whose ends the supervisor watches for");
+        }
+
         foreach (IGrouping<(bool EveryDatabase, bool OwnDatabase), (uint Xid, bool EveryDatabase, bool OwnDatabase)> kind in
             prepared.GroupBy(one => (one.EveryDatabase, one.OwnDatabase)))
         {

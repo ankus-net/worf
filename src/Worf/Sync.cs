@@ -1800,8 +1800,10 @@ internal static class Sync
             s_heldMost = 0;
             s_heldFinding = TimeSpan.Zero;
             s_heldDeciding = TimeSpan.Zero;
+            s_heldConflictScans = 0;
+            s_heldCopyScans = 0;
             long skipped = SkipHeldValues(rel, lsn, only + table, key, operators, rest, index, row, attnamelist);
-            WorfLog.Log($"the held-value checks of the copy of table {remoterel.Nspname}.{remoterel.Relname} kept {s_heldChecked} rows to decide on, holding at most {s_heldMost} of their keys at once, in {s_heldFinding.TotalMilliseconds.ToString("F0", CultureInfo.InvariantCulture)} ms finding their conflicts and {s_heldDeciding.TotalMilliseconds.ToString("F0", CultureInfo.InvariantCulture)} ms deciding");
+            WorfLog.Log($"the held-value checks of the copy of table {remoterel.Nspname}.{remoterel.Relname} kept {s_heldChecked} rows to decide on, holding at most {s_heldMost} of their keys at once, in {s_heldFinding.TotalMilliseconds.ToString("F0", CultureInfo.InvariantCulture)} ms finding their conflicts and {s_heldDeciding.TotalMilliseconds.ToString("F0", CultureInfo.InvariantCulture)} ms deciding, in which they scanned the conflicts {s_heldConflictScans.ToString(CultureInfo.InvariantCulture)} times and the copy {s_heldCopyScans.ToString(CultureInfo.InvariantCulture)} times whole");
             if (!Merged(merge.ToString(), out _))
             {
                 List<(long Row, PgException Error)> halved = [];
@@ -1813,11 +1815,12 @@ internal static class Sync
                     s_partsTried = 0;
                     s_largestTried = 0;
                     s_keyChecksAtParts = 0;
+                    s_keyCheckCopyLookups = 0;
                     s_keyChecksWhole = 0;
                     long writes = Worf.ReadScalar<long>($"SELECT count(*)::pg_catalog.int8 FROM {MergeCopy}");
                     (List<string> Key, Dictionary<short, string> Operators) wrote = (key, operators);
                     _ = MergeParts(reloid, only + table, mergePart, row, 0, Position(max) + 1, halved, wrote, true);
-                    WorfLog.Log($"merged the copy of table {remoterel.Nspname}.{remoterel.Relname} in halves: {s_partsTried} parts tried whole, the largest of {s_largestTried} rows, of the {writes} rows it writes, after the held-value checks kept {s_heldChecked} rows to decide on; {s_keyChecksAtParts} deferrable key checks at the parts' keys, {s_keyChecksWhole} at the whole table");
+                    WorfLog.Log($"merged the copy of table {remoterel.Nspname}.{remoterel.Relname} in halves: {s_partsTried} parts tried whole, the largest of {s_largestTried} rows, of the {writes} rows it writes, after the held-value checks kept {s_heldChecked} rows to decide on; {s_keyChecksAtParts} deferrable key checks at the parts' keys, {s_keyChecksWhole} at the whole table, which looked in the copy's indexes {s_keyCheckCopyLookups} times");
                 }
 
                 RecordSkipped(rel, lsn, row, attnamelist, halved);
@@ -1959,10 +1962,13 @@ internal static class Sync
             // The rows refused are recorded, and leave the copy, a part at a time, as they're found.
             long refused = HeldValues.Refused(constraints, table, $"(SELECT c.* FROM {MergeCopy} c WHERE {written})", row, kept, true, skipped =>
             {
+                long scansBefore = Worf.ReadScalar<long>(CopyScans);
                 RecordSkipped(rel, lsn, row, attnames, skipped);
                 _ = Worf.Execute($"DELETE FROM {MergeCopy} c WHERE c.{row} OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.int8[])",
                     SpiParameter.Create(skipped.Select(pair => pair.Row).ToArray()));
+                s_heldCopyScans += Worf.ReadScalar<long>(CopyScans) - scansBefore;
             });
+            s_heldConflictScans += HeldValues.ConflictScans;
             s_heldChecked += HeldValues.RefusedChecked;
             s_heldMost = Math.Max(s_heldMost, HeldValues.HeldMost);
             s_heldFinding += HeldValues.Finding;
@@ -2503,8 +2509,10 @@ internal static class Sync
             // The rows a part wrote are found through the table itself, which, under a limit, the planner may read in
             // the key index's order, looking each row up among the part's again, for a large part; without one, it
             // reads as many rows as the part takes, or the table once.
+            long lookupsBefore = atWritten ? Worf.ReadScalar<long>(CopyLookups) : 0;
             string? duplicate = Worf.ReadScalar<string?>(
                 $"SELECT {KeyText(keys.Length, "d.k")} FROM (SELECT {string.Join(", ", keys.Select((key, k) => $"{key} AS k{k}"))} FROM {table}{where}) d GROUP BY {string.Join(", ", keys.Select((_, k) => $"d.k{k}"))} HAVING pg_catalog.count(*) > 1{(atWritten ? "" : " LIMIT 1")}");
+            s_keyCheckCopyLookups += atWritten ? Worf.ReadScalar<long>(CopyLookups) - lookupsBefore : 0;
             if (duplicate is not null)
             {
                 throw new PgException(PgSqlStates.UniqueViolation, $"duplicate key value violates unique constraint \"{index.Get<string>(0)}\"",
@@ -3215,9 +3223,25 @@ internal static class Sync
     private static TimeSpan s_heldFinding;
     private static TimeSpan s_heldDeciding;
 
-    // How many deferrable key checks looked only at the keys a part of the merge takes, and how many at the whole table.
+    // How many sequential scans of the conflicts, and of the copy as the rows refused were recorded and left it, the
+    // held-value checks made as they decided, which the indexes of each spare them.
+    private static long s_heldConflictScans;
+    private static long s_heldCopyScans;
+
+    // The sequential scans of the copy this transaction has made.
+    private const string CopyScans = $"SELECT pg_catalog.pg_stat_get_xact_numscans('{MergeCopy}'::pg_catalog.regclass)";
+
+    // How many deferrable key checks looked only at the keys a part of the merge takes, and how many at the whole table,
+    // and how many times those that looked at the keys of the rows a part wrote looked in the copy's indexes.
     private static int s_keyChecksAtParts;
     private static int s_keyChecksWhole;
+    private static long s_keyCheckCopyLookups;
+
+    // The index scans of the copy's indexes this transaction has made.
+    private const string CopyLookups = $"""
+        SELECT coalesce(pg_catalog.sum(pg_catalog.pg_stat_get_xact_numscans(i.indexrelid)), 0)::pg_catalog.int8
+        FROM pg_catalog.pg_index i WHERE i.indrelid = '{MergeCopy}'::pg_catalog.regclass
+        """;
 
     private const int NoLock = 0;
     private const int AccessShareLock = 1;

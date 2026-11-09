@@ -29,6 +29,11 @@ using ManualResetEventSlim stopped = new(false);
 bool committed = false;
 Lock committing = new();
 
+// How many of the databases have their subscription committed, in the order the run sets them up, and the slots the
+// run made on the provider for each, once it has begun making them.
+int subscribedDatabases = 0;
+(string Database, string? Slot)[]? madeSlots = null;
+
 // Whether this run started the subscriber's server, which it then stops if it fails, and whether it is failing, which a
 // failure on another thread waits out.
 bool serverStarted = false;
@@ -271,6 +276,7 @@ else
 }
 
 string[] slotNames = new string[databaseList.Length];
+madeSlots = new (string Database, string? Slot)[databaseList.Length];
 
 // Check connection strings for validity before doing anything expensive.
 foreach (string db in databaseList)
@@ -369,6 +375,7 @@ for (int dbnum = 0; dbnum < databaseList.Length; dbnum++)
     PrintMsg(VerbosityLevel.Normal, $"Creating replication slot in database {db} ...\n");
     slotNames[dbnum] = InitializeReplicationSlot(providerConn, remoteInfo.Dbname, remoteInfo.NodeName,
         subscriberName, dropSlotIfExists);
+    madeSlots[dbnum] = (db, slotNames[dbnum]);
 }
 
 // Create basebackup or use existing one
@@ -504,6 +511,7 @@ for (int dbnum = 0; dbnum < databaseList.Length; dbnum++)
     lock (committing)
     {
         committed = true;
+        subscribedDatabases = dbnum + 1;
     }
 }
 
@@ -741,8 +749,40 @@ InvalidOperationException Die(string message)
         }
     }
 
+    DropUnusedSlots();
     Environment.Exit(1);
     return new InvalidOperationException(message);
+}
+
+// Drops the slots this run made on the provider for the databases it didn't subscribe, which nothing else would use, so
+// that a failed or stopped run leaves the provider as it was. A slot a walsender holds, or a provider that doesn't
+// answer within a few seconds, is left, with a warning.
+void DropUnusedSlots()
+{
+    int subscribed;
+    lock (committing)
+    {
+        subscribed = subscribedDatabases;
+    }
+
+    for (int dbnum = subscribed; dbnum < (madeSlots?.Length ?? 0); dbnum++)
+    {
+        if (madeSlots![dbnum] is not (string database, string slot) || baseProvConnstr is null ||
+            Fe.GetConnstr(baseProvConnstr, database, null, out _) is not string connstr)
+        {
+            continue;
+        }
+
+        try
+        {
+            using LibpqConnection conn = Libpq.Connect(connstr + " connect_timeout=5");
+            _ = conn.Query($"SELECT pg_catalog.pg_drop_replication_slot(slot_name) FROM pg_catalog.pg_replication_slots WHERE slot_name = {EscapeLiteral(slot)} AND NOT active");
+        }
+        catch (Exception error) when (error is LibpqException or DllNotFoundException)
+        {
+            Console.Error.WriteLine($"WARNING: could not drop replication slot \"{slot}\" on the provider: {error.Message.Trim()}");
+        }
+    }
 }
 
 // Print message to stdout and flush.
@@ -810,11 +850,12 @@ void RunBasebackup(string providerConnstr, string dataDir, string? extraBaseback
     dataDirExisted = Directory.Exists(dataDir);
     foreach (string outside in OutsideDirectories(arguments))
     {
+        // One that can't be listed is left to pg_basebackup, which refuses it.
         if (!Directory.Exists(outside))
         {
             _ = madeOutside.Add(outside);
         }
-        else if (!Directory.EnumerateFileSystemEntries(outside).Any())
+        else if (Listable(outside) is false)
         {
             _ = emptyOutside.Add(outside);
         }
@@ -882,6 +923,19 @@ IEnumerable<string> OutsideDirectories(List<string> arguments)
         {
             yield return Path.GetFullPath(value);
         }
+    }
+}
+
+// Whether a directory has entries, or null when it can't be listed.
+static bool? Listable(string directory)
+{
+    try
+    {
+        return Directory.EnumerateFileSystemEntries(directory).Any();
+    }
+    catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+    {
+        return null;
     }
 }
 
@@ -1408,14 +1462,10 @@ int? ReadClusterState(string dataDir)
 
 // Whether the provider's WAL holds, at a data directory's latest checkpoint, the checkpoint record whose redo point the
 // directory's pg_control holds: true, false with why not, as for another record there, a checkpoint past the provider's
-// WAL, or WAL the provider has removed, or null when the provider doesn't let the run read its WAL. The record's header
-// names its resource manager and kind, and its data starts with the redo point.
+// WAL, or WAL the provider has removed that the directory's own WAL doesn't stand in for, or null when the provider
+// doesn't let the run read its WAL.
 (bool Shared, string? Why)? CheckpointShared(LibpqConnection conn, long timeline, ulong checkpoint, ulong redo, long segmentSize, long blockSize)
 {
-    const int RecordHeader = 24;
-    const int ShortPageHeader = 24;
-    const int LongPageHeader = 40;
-    const byte DataShort = 255;
     string position = string.Create(CultureInfo.InvariantCulture, $"{checkpoint >> 32:X}/{checkpoint & 0xFFFFFFFF:X}");
     try
     {
@@ -1429,10 +1479,67 @@ int? ReadClusterState(string dataDir)
         // A provider in recovery has no WAL position of its own to compare.
     }
 
-    // The header, the data's two-byte short header and the redo point, across a page's header if the record crosses one.
+    bool unreadable = false;
+    byte[]? provider = CheckpointRecord(timeline, checkpoint, segmentSize, blockSize, (name, offset, length) =>
+    {
+        try
+        {
+            string? read = QueryValue(conn, string.Create(CultureInfo.InvariantCulture,
+                $"SELECT pg_catalog.encode(pg_catalog.pg_read_binary_file('pg_wal/{name}', {offset}, {length}, true), 'hex')"));
+            return read is null || read.Length != length * 2 ? null : Convert.FromHexString(read);
+        }
+        catch (LibpqException)
+        {
+            unreadable = true;
+            return null;
+        }
+    });
+    if (unreadable)
+    {
+        return null;
+    }
+
+    // The provider has removed that WAL. The data directory can't be told apart from one that left the provider's, but
+    // its own WAL may hold the checkpoint and carry its recovery from the checkpoint's redo point to WAL the provider
+    // still has, as a standby's that stopped once it caught up does; otherwise its recovery needs WAL the provider no
+    // longer has, or can't start.
+    if (provider is null)
+    {
+        byte[]? own = CheckpointRecord(timeline, checkpoint, segmentSize, blockSize, (name, offset, length) =>
+        {
+            try
+            {
+                using FileStream file = File.OpenRead(Path.Join(dataDir, "pg_wal", name));
+                byte[] bytes = new byte[length];
+                _ = file.Seek(offset, SeekOrigin.Begin);
+                file.ReadExactly(bytes);
+                return bytes;
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+            {
+                return null;
+            }
+        });
+        return own is not null && IsCheckpoint(own, redo) && OwnWalCarries(conn, timeline, redo, segmentSize) is not false
+            ? null
+            : (false, "is in WAL the provider has removed, and its own WAL doesn't carry its recovery to the WAL the provider still has");
+    }
+
+    return IsCheckpoint(provider, redo) ? (true, null) : (false, "isn't the checkpoint the provider's WAL holds there, so its WAL has left the provider's");
+}
+
+// The start of the WAL record at a position, as a read of a segment's bytes gives them: its header, its data's two-byte
+// short header and the eight bytes after, across a page's header if the record crosses one; or null when a read finds
+// nothing.
+static byte[]? CheckpointRecord(long timeline, ulong checkpoint, long segmentSize, long blockSize, Func<string, long, int, byte[]?> read)
+{
+    const int RecordHeader = 24;
+    const int ShortPageHeader = 24;
+    const int LongPageHeader = 40;
     List<byte> record = [];
     ulong at = checkpoint;
     int need = RecordHeader + 2 + sizeof(ulong);
+    ulong perId = 0x100000000UL / (ulong)segmentSize;
     while (record.Count < need)
     {
         ulong segment = at / (ulong)segmentSize;
@@ -1443,35 +1550,78 @@ int? ReadClusterState(string dataDir)
         }
 
         int length = (int)Math.Min(need - record.Count, blockSize - (offset % blockSize));
-        ulong perId = 0x100000000UL / (ulong)segmentSize;
-        string name = string.Create(CultureInfo.InvariantCulture, $"{timeline:X8}{segment / perId:X8}{segment % perId:X8}");
-        string? read;
-        try
-        {
-            read = QueryValue(conn, string.Create(CultureInfo.InvariantCulture,
-                $"SELECT pg_catalog.encode(pg_catalog.pg_read_binary_file('pg_wal/{name}', {offset}, {length}, true), 'hex')"));
-        }
-        catch (LibpqException)
+        if (read(string.Create(CultureInfo.InvariantCulture, $"{timeline:X8}{segment / perId:X8}{segment % perId:X8}"), offset, length) is not byte[] bytes)
         {
             return null;
         }
 
-        if (read is null || read.Length != length * 2)
-        {
-            return (false, "is in WAL the provider has removed, so it can't tell whether its WAL left the provider's, and its recovery may need WAL the provider no longer has");
-        }
-
-        record.AddRange(Convert.FromHexString(read));
+        record.AddRange(bytes);
         at = (segment * (ulong)segmentSize) + (ulong)offset + (ulong)length;
     }
 
-    // RM_XLOG_ID, and XLOG_CHECKPOINT_SHUTDOWN and XLOG_CHECKPOINT_ONLINE in the info's high bits.
-    byte[] bytes = [.. record];
+    return [.. record];
+}
+
+// Whether a WAL record's start is a checkpoint's with a redo point: RM_XLOG_ID, XLOG_CHECKPOINT_SHUTDOWN or
+// XLOG_CHECKPOINT_ONLINE in the info's high bits, and data whose short header comes first, which starts with the redo
+// point, in the server's byte order.
+static bool IsCheckpoint(byte[] record, ulong redo)
+{
+    const int RecordHeader = 24;
+    const byte DataShort = 255;
     ulong recordRedo = BitConverter.IsLittleEndian
-        ? BinaryPrimitives.ReadUInt64LittleEndian(bytes.AsSpan(RecordHeader + 2))
-        : BinaryPrimitives.ReadUInt64BigEndian(bytes.AsSpan(RecordHeader + 2));
-    bool shared = bytes[17] == 0 && (bytes[16] & 0xF0) is 0x00 or 0x10 && bytes[RecordHeader] == DataShort && recordRedo == redo;
-    return shared ? (true, null) : (false, "isn't the checkpoint the provider's WAL holds there, so its WAL has left the provider's");
+        ? BinaryPrimitives.ReadUInt64LittleEndian(record.AsSpan(RecordHeader + 2))
+        : BinaryPrimitives.ReadUInt64BigEndian(record.AsSpan(RecordHeader + 2));
+    return record[17] == 0 && (record[16] & 0xF0) is 0x00 or 0x10 && record[RecordHeader] == DataShort && recordRedo == redo;
+}
+
+// Whether the data directory's own WAL holds every segment from its latest checkpoint's redo point to the first the
+// provider still has, on the checkpoint's timeline, or null when the provider doesn't let the run list its WAL. A
+// segment counts once its first page's address is its own, as a file PostgreSQL renamed to a later segment's name to
+// use again isn't that segment until it's written.
+bool? OwnWalCarries(LibpqConnection conn, long timeline, ulong redo, long segmentSize)
+{
+    string? first;
+    try
+    {
+        first = QueryValue(conn, "SELECT pg_catalog.min(name) FROM pg_catalog.pg_ls_waldir() WHERE name ~ '^[0-9A-F]{24}$'");
+    }
+    catch (LibpqException)
+    {
+        return null;
+    }
+
+    ulong perId = 0x100000000UL / (ulong)segmentSize;
+    if (first is null || !ulong.TryParse(first.AsSpan(8, 8), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out ulong log) ||
+        !ulong.TryParse(first.AsSpan(16, 8), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out ulong seg))
+    {
+        return false;
+    }
+
+    ulong providerFirst = (log * perId) + seg;
+    byte[] header = new byte[16];
+    for (ulong segment = redo / (ulong)segmentSize; segment <= providerFirst; segment++)
+    {
+        try
+        {
+            using FileStream file = File.OpenRead(Path.Join(dataDir, "pg_wal",
+                string.Create(CultureInfo.InvariantCulture, $"{timeline:X8}{segment / perId:X8}{segment % perId:X8}")));
+            file.ReadExactly(header);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+
+        // XLogPageHeaderData's xlp_pageaddr follows its magic, info and timeline.
+        ulong pageAddress = BitConverter.IsLittleEndian ? BinaryPrimitives.ReadUInt64LittleEndian(header.AsSpan(8)) : BinaryPrimitives.ReadUInt64BigEndian(header.AsSpan(8));
+        if (pageAddress != segment * (ulong)segmentSize)
+        {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 // Keeps postgresql.auto.conf as it was before this run changes it, and whether the data directory had a standby.signal.
@@ -1495,6 +1645,7 @@ void WriteRecoveryConf(string contents)
     string filename = Path.Join(dataDir, "postgresql.auto.conf");
     try
     {
+        EndLine(filename);
         File.AppendAllText(filename, contents);
     }
     catch (Exception error) when (error is IOException or UnauthorizedAccessException)
@@ -1627,9 +1778,36 @@ bool FileExists(string path) => File.Exists(path) || Directory.Exists(path);
 bool IsPgDir(string path)
     => Directory.Exists(path) && File.Exists(Path.Join(dataDir, "PG_VERSION"));
 
+// Ends a file's last line, if it has one without its newline, so that what's appended starts a line of its own rather
+// than joining it, as a comment.
+static void EndLine(string filename)
+{
+    using FileStream file = new(filename, FileMode.OpenOrCreate, FileAccess.ReadWrite);
+    if (file.Length > 0)
+    {
+        _ = file.Seek(-1, SeekOrigin.End);
+        if (file.ReadByte() != '\n')
+        {
+            file.WriteByte((byte)'\n');
+        }
+    }
+}
+
 // copy one file.
 void CopyFile(string fromfile, string tofile, bool append)
 {
+    if (append)
+    {
+        try
+        {
+            EndLine(tofile);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            throw Die($"could not write to file \"{tofile}\": {error.Message}");
+        }
+    }
+
     using FileStream srcfd = OpenFile(fromfile, FileMode.Open, FileAccess.Read, $"could not open file \"{fromfile}\"");
     using FileStream dstfd = OpenFile(tofile, append ? FileMode.Append : FileMode.Create, FileAccess.Write,
         $"could not create file \"{tofile}\"");

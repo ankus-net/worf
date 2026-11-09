@@ -12,8 +12,9 @@ namespace Worf.Tests;
 /// streams toward its restore point and never reaches it, hold every connection made after the walreceiver
 /// disconnects, so that the tool's next connection to the provider waits however the test process is scheduled, and
 /// hold every query after a connection's first, so that a connection is made and set up but its calls are never
-/// answered. It keeps the text of the queries it passes. A connection that asks for SSL or GSS encryption is told the
-/// relay has none.
+/// answered, or stop reading a connection once its first query has passed, with a small receive buffer, so that a large
+/// query after it fills what the sockets hold and its client's writes wait. It keeps the text of the queries it passes. A
+/// connection that asks for SSL or GSS encryption is told the relay has none.
 /// </summary>
 internal sealed class ProviderRelay : IAsyncDisposable
 {
@@ -26,6 +27,7 @@ internal sealed class ProviderRelay : IAsyncDisposable
     private readonly bool _holdWal;
     private readonly bool _holdAfterWalreceiver;
     private readonly bool _holdCalls;
+    private readonly bool _stall;
     private readonly CancellationTokenSource _stop = new();
     private readonly CancellationTokenSource _held = new();
     private readonly List<TcpClient> _clients = [];
@@ -42,12 +44,20 @@ internal sealed class ProviderRelay : IAsyncDisposable
     /// nothing.</param>
     /// <param name="holdCalls">Whether each connection's queries after its first are held, never reaching the
     /// server.</param>
-    internal ProviderRelay(int target, bool holdWal = false, bool holdAfterWalreceiver = false, bool holdCalls = false)
+    /// <param name="stall">Whether the relay stops reading each connection once its first query has passed, with a
+    /// receive buffer of a few kilobytes.</param>
+    internal ProviderRelay(int target, bool holdWal = false, bool holdAfterWalreceiver = false, bool holdCalls = false, bool stall = false)
     {
         _target = target;
         _holdWal = holdWal;
         _holdAfterWalreceiver = holdAfterWalreceiver;
         _holdCalls = holdCalls;
+        _stall = stall;
+        if (stall)
+        {
+            _listener.Server.ReceiveBufferSize = 4096;
+        }
+
         _listener.Start();
         _accepting = AcceptAsync();
     }
@@ -217,11 +227,16 @@ internal sealed class ProviderRelay : IAsyncDisposable
         int queries = 0;
         while (true)
         {
+            if (_stall && queries > 0)
+            {
+                await Task.Delay(Timeout.Infinite, token);
+            }
+
             byte[] header = await ReadExactlyAsync(client, 5, token);
             byte[] body = await ReadExactlyAsync(client, BinaryPrimitives.ReadInt32BigEndian(header.AsSpan(1)) - 4, token);
             if (header[0] == (byte)'Q')
             {
-                if (_holdCalls && queries++ > 0)
+                if ((_holdCalls || _stall) && queries++ > 0)
                 {
                     await Task.Delay(Timeout.Infinite, token);
                 }

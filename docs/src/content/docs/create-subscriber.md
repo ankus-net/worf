@@ -65,6 +65,7 @@ of its own, out of recovery, as one started without its `standby.signal` does,
 which writes WAL the provider doesn't have, or, once it has started, whose
 latest checkpoint isn't a checkpoint record of the provider's WAL with the redo
 point its `pg_control` holds, as one that did so and stopped in recovery later
-has, or lies in WAL the provider has removed; each leaves the data directory as
-it is. The run reads that record from the provider's `pg_wal` with
+has, or lies in WAL the provider has removed while the directory's own WAL
+doesn't hold it, or doesn't reach the WAL the provider still has; each leaves
+the data directory as it is. The run reads that record from the provider's `pg_wal` with
 `pg_read_binary_file`, and can't tell when the provider doesn't let it.

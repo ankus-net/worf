@@ -172,6 +172,7 @@ internal sealed unsafe partial class WorfConnection : IDisposable
             scratch = NativeMethods.AllocSetContextCreateInternal(NativeGlobals.TopMemoryContext, (sbyte*)name, 0, 1024, 8 * 1024);
         }
 
+        WorfNotices.RouteByAddress(((OrdinaryWalReceiverConn*)conn)->StreamConn);
         return new WorfConnection(conn, scratch, functions->walrcv_server_version.Invoke(conn));
     }
 
@@ -442,6 +443,7 @@ internal sealed unsafe partial class WorfConnection : IDisposable
         WalReceiverConn* conn = Conn;
         _conn = null;
         NativeMethods.MemoryContextDelete(_scratch);
+        WorfNotices.Forget(((OrdinaryWalReceiverConn*)conn)->StreamConn);
         Functions->walrcv_disconnect.Invoke(conn);
     }
 

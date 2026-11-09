@@ -15,6 +15,9 @@ internal static class SequenceRangeExchange
     // A longer route counts as none, so stale routes stop counting upward once an owner disappears.
     private const int MaxDistance = 32;
 
+    // The Snowflake node numbers there are, more than which no node can hold.
+    private const int SnowflakeNodes = 1024;
+
     // Seconds from the Unix epoch to PostgreSQL's, 2000-01-01.
     private const double UnixToPostgres = 946_684_800;
 
@@ -453,7 +456,7 @@ internal static class SequenceRangeExchange
         pending.Probing = s_timedOut.Contains(sub.Id);
         int timeout = SequenceRanges.ExchangeTimeout;
         (string conninfo, string applicationName) = Worf.ConnectionString(sub.OriginIf.Dsn, sub.Name, "range");
-        pending.Probe = WorfProbe.Start(conninfo, applicationName, Worf.SessionSetup($"SET statement_timeout = {timeout.ToString(CultureInfo.InvariantCulture)}"),
+        pending.Probe = WorfProbe.Start(conninfo, applicationName, $"node {pending.Sub.Origin.Name}", Worf.SessionSetup($"SET statement_timeout = {timeout.ToString(CultureInfo.InvariantCulture)}"),
             Worker.GetCurrentTimestamp() + (timeout * 1000L));
         WorfLog.Debug2($"sequence range exchange with node {sub.Origin.Name} connecting{(pending.Probing ? ", as a probe" : "")}");
     }
@@ -783,6 +786,20 @@ internal static class SequenceRangeExchange
         }
 
         _ = s_noSlotOnce.RemoveWhere(id => !enabled.Exists(sub => sub.Id == id));
+
+        // A neighbor this node no longer exchanges with stays forgotten, though a reply of its came as its subscription
+        // was dropped, and was taken in after the drop forgot it, as once it waited for a range row the drop held.
+        if (Worf.CatalogOid("sequence_range_absent") != 0)
+        {
+            foreach (WorfRow stale in Worf.Read("""
+                SELECT DISTINCT n.via_node FROM worf.sequence_range_node n
+                WHERE n.via_node <> $1 AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_link k WHERE k.node_id = n.via_node)
+                    AND NOT EXISTS (SELECT 1 FROM worf.subscription s WHERE s.sub_origin = n.via_node AND s.sub_target = $1)
+                """, 0, SpiParameter.Create(node.Node.Id)))
+            {
+                SequenceRanges.ForgetNeighbor(stale.Get<uint>(0));
+            }
+        }
 
         foreach (WorfSubscription sub in enabled.Where(sub => !s_pending.ContainsKey(sub.Id)))
         {
@@ -2305,8 +2322,10 @@ internal static class SequenceRangeExchange
         WriteNullable(writer, "clock", clock);
     }
 
+    // The Snowflake node numbers a report says its node holds, or null for none, or for more than there are, which no
+    // node can hold, so that no node stores more than that.
     private static long[]? Holds(JsonElement entry)
-        => entry.TryGetProperty("holds", out JsonElement holds) && holds.ValueKind == JsonValueKind.Array
+        => entry.TryGetProperty("holds", out JsonElement holds) && holds.ValueKind == JsonValueKind.Array && holds.GetArrayLength() <= SnowflakeNodes
             ? [.. holds.EnumerateArray().Select(number => number.GetInt64())]
             : null;
 

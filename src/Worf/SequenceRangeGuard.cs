@@ -86,15 +86,22 @@ internal static partial class SequenceRangeGuard
     // constraints and trigger conditions the rows start.
     private static readonly Dictionary<(uint Relid, string Sent), string> s_defaultsText = [];
 
+    // The sequences the CHECK constraints of this database's domains draw from, and whether one of them draws from a
+    // sequence it doesn't name, read again once a type changes.
+    private static (HashSet<uint> Called, bool Unnamed)? s_domainDraws;
+
     // Whether the guard hears of the changes to tables and types that the text it holds by table reads, as a default
     // set, a partition attached or a domain's CHECK added.
     private static bool s_watchingTables;
 
 #if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
-    // TYPEOID, the id of the catalog cache of types, which only PostgreSQL 19's bindings name.
+    // TYPEOID and CONSTROID, the ids of the catalog caches of types and constraints, which only PostgreSQL 19's
+    // bindings name.
     private const int TypeCacheId = 80;
+    private const int ConstraintCacheId = 19;
 #elif ANKUS_PG18
     private const int TypeCacheId = 82;
+    private const int ConstraintCacheId = 19;
 #endif
 
     [PgNativeCallback(nameof(TableInvalidated))]
@@ -1307,7 +1314,8 @@ internal static partial class SequenceRangeGuard
         return text[at..];
     }
 
-    // Registers, once, for the changes to tables and types after which the text the guard holds by table is read again.
+    // Registers, once, for the changes to tables, types and constraints after which the text the guard holds by table,
+    // and the domains' draws, are read again.
     private static void WatchTables()
     {
         if (s_watchingTables)
@@ -1320,8 +1328,10 @@ internal static partial class SequenceRangeGuard
             NativeMethods.CacheRegisterRelcacheCallback(TableCallback, 0);
 #if ANKUS_PG19
             NativeMethods.CacheRegisterSyscacheCallback(SysCacheIdentifier.TYPEOID, TypeCallback, 0);
+            NativeMethods.CacheRegisterSyscacheCallback(SysCacheIdentifier.CONSTROID, TypeCallback, 0);
 #else
             NativeMethods.CacheRegisterSyscacheCallback(TypeCacheId, TypeCallback, 0);
+            NativeMethods.CacheRegisterSyscacheCallback(ConstraintCacheId, TypeCallback, 0);
 #endif
         }
 
@@ -1351,7 +1361,8 @@ internal static partial class SequenceRangeGuard
         }
     }
 
-    // Forgets the defaults' text, which holds the CHECKs of their domains, once a type changes, as a domain's CHECK.
+    // Forgets the defaults' text, which holds the CHECKs of their domains, and the domains' draws, once a type or a
+    // constraint changes, as a domain's CHECK.
 #if ANKUS_PG19
     private static void TypeInvalidated(ulong arg, SysCacheIdentifier cacheid, uint hashvalue)
 #else
@@ -1362,6 +1373,7 @@ internal static partial class SequenceRangeGuard
         _ = cacheid;
         _ = hashvalue;
         s_defaultsText.Clear();
+        s_domainDraws = null;
     }
 
     // The text of a plan, as nodeToString writes it, and of the CHECK constraints of the domains it coerces to, which
@@ -1581,9 +1593,16 @@ internal static partial class SequenceRangeGuard
                 return;
             }
 
+            // C code starts a call of its own as it checks a value it was given against a domain, as a function that
+            // reads a record or tests an input does, and such a call can come where a call the expressions name was
+            // counted, which starts later or never, so a call they name waits for the sequences the domains' CHECKs draw
+            // from too, after its own, or for every node when one of them doesn't name its sequence.
             HashSet<uint>? called = plpgsql ? SimpleDraws(simple) : StartingDraws(starting);
-            unnamed = called is null;
-            waiting = unnamed ? [.. unconfirmed.DistinctBy(seqoid => s_grantors[seqoid])] : [.. unconfirmed.Where(called!.Contains)];
+            (HashSet<uint> Called, bool Unnamed) domains = called is null ? ([], false) : DomainDraws();
+            unnamed = called is null || domains.Unnamed;
+            waiting = unnamed
+                ? [.. unconfirmed.DistinctBy(seqoid => s_grantors[seqoid])]
+                : [.. unconfirmed.Where(called!.Contains), .. unconfirmed.Where(seqoid => domains.Called.Contains(seqoid) && !called!.Contains(seqoid))];
         }
         finally
         {
@@ -1594,6 +1613,27 @@ internal static partial class SequenceRangeGuard
         {
             WaitForGrantor(seqoid, unnamed);
         }
+    }
+
+    /// <summary>
+    /// Finds the sequences the CHECK constraints of this database's domains draw from, which C code starts as it checks a
+    /// value against a domain, once until a type changes, and whether one of them draws from a sequence it doesn't name.
+    /// </summary>
+    private static (HashSet<uint> Called, bool Unnamed) DomainDraws()
+    {
+        WatchTables();
+        if (s_domainDraws is not (HashSet<uint>, bool) draws)
+        {
+            string checks = Elevated.Run(() => Worf.ReadScalar<string?>("""
+                SELECT pg_catalog.string_agg(c.conbin::pg_catalog.text, ' ') FROM pg_catalog.pg_constraint c
+                WHERE c.contypid <> 0 AND c.contype = 'c' AND pg_catalog.strpos(c.conbin::pg_catalog.text, '{FUNCEXPR :funcid 1574 ') > 0
+                """)) ?? "";
+            (HashSet<uint> called, _, bool unnamed) = Draws(checks);
+            draws = (called, unnamed);
+            s_domainDraws = draws;
+        }
+
+        return draws;
     }
 
     /// <summary>
@@ -2061,10 +2101,25 @@ internal static partial class SequenceRangeGuard
             return [];
         }
 
+        // Before PostgreSQL 17 a partition shares no identity column with its ancestors: an insert into it draws from
+        // its own identity column's sequence, if it has one.
+#if ANKUS_PG15 || ANKUS_PG16
+        const string Ancestors = "";
+#else
+        const string Ancestors = """
+            UNION
+            SELECT d.objid FROM pg_catalog.pg_attribute a
+                JOIN pg_catalog.pg_partition_ancestors($1) p ON p.relid <> $1
+                JOIN pg_catalog.pg_attribute pa ON pa.attrelid = p.relid AND pa.attname = a.attname AND NOT pa.attisdropped
+                JOIN pg_catalog.pg_depend d ON d.refobjid = p.relid AND d.refobjsubid = pa.attnum AND d.deptype = 'i'
+                    AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+            WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped AND a.attidentity <> ''
+            """;
+#endif
         WatchTables();
         if (!s_drawnBy.TryGetValue(relid, out List<uint>? sequences))
         {
-            WorfRows used = Elevated.Run(() => Worf.Read("""
+            WorfRows used = Elevated.Run(() => Worf.Read($"""
                 SELECT d.refobjid FROM pg_catalog.pg_attrdef a JOIN pg_catalog.pg_depend d
                     ON d.classid = 'pg_catalog.pg_attrdef'::pg_catalog.regclass AND d.objid = a.oid AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
                 WHERE a.adrelid = $1
@@ -2072,13 +2127,7 @@ internal static partial class SequenceRangeGuard
                 SELECT d.objid FROM pg_catalog.pg_depend d
                 WHERE d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
                     AND d.deptype = 'i' AND d.refobjid = $1
-                UNION
-                SELECT d.objid FROM pg_catalog.pg_attribute a
-                    JOIN pg_catalog.pg_partition_ancestors($1) p ON p.relid <> $1
-                    JOIN pg_catalog.pg_attribute pa ON pa.attrelid = p.relid AND pa.attname = a.attname AND NOT pa.attisdropped
-                    JOIN pg_catalog.pg_depend d ON d.refobjid = p.relid AND d.refobjsubid = pa.attnum AND d.deptype = 'i'
-                        AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
-                WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped AND a.attidentity <> ''
+                {Ancestors}
                 """, 0, SpiParameter.Create(relid)));
             sequences = [.. used.Select(row => row.Get<uint>(0)).Where(s_sequences.ContainsKey)];
             s_drawnBy[relid] = sequences;

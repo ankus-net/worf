@@ -190,6 +190,10 @@ public sealed class WorkerSlotTests
             await Task.Delay(TimeSpan.FromSeconds(3), token);
             Assert.AreEqual(restored, Starts(), "managers started by unrelated COMMIT PREPARED of transactions prepared before a restart");
             Assert.DoesNotContain("out of background worker slots", node.ReadLog(), "the node's log, as every database got its manager");
+
+            // No manager took one of them for a transaction that may change worf or the databases, as locked1's, which
+            // reads worf.node beside the SHARE lock, would have from its LOCK alone.
+            Assert.DoesNotContain("prepared transactions that may change worf or the databases", node.ReadLog(), "the managers' scans of the restored transactions");
             return;
         }
 
@@ -215,16 +219,16 @@ public sealed class WorkerSlotTests
     /// <summary>
     /// COMMIT PREPARED of a transaction that changed a database, but not which databases have managers, as ALTER DATABASE
     /// ... CONNECTION LIMIT does, restored after a restart, starts no manager, though it commits after the supervisor's
-    /// regular look, which the managers that found nothing to manage before don't hold back. The test runs on Windows,
-    /// where the supervisor looks every 30 seconds, rather than every 3 minutes.
+    /// regular look, which the managers that found nothing to manage before don't hold back. The supervisor looks every
+    /// 5 seconds here, rather than every 3 minutes.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
-    [OSCondition(OperatingSystems.Windows)]
     public async Task LateUnchangingCommitsStartNoManager()
     {
         CancellationToken token = TestContext.CancellationToken;
-        await using TestNode node = await TestNode.StartAsync("node", ["max_prepared_transactions = 4", "max_worker_processes = 32", "log_min_messages = debug1"], token);
+        await using TestNode node = await TestNode.StartAsync("node",
+            ["max_prepared_transactions = 4", "max_worker_processes = 32", "log_min_messages = debug1", "worf.supervisor_interval = 5000"], token);
         for (int i = 0; i < 4; i++)
         {
             _ = await node.SafePsqlAsync(Database, $"CREATE DATABASE unchanged{i}", token);
@@ -235,8 +239,9 @@ public sealed class WorkerSlotTests
         await node.StartServerAsync(token);
         Stopwatch since = Stopwatch.StartNew();
 
-        // The supervisor looks at once and again 30 seconds later; the transaction commits after that.
-        await Task.Delay(TimeSpan.FromSeconds(50), token);
+        // The supervisor looks at once, and leaves the managers that found nothing alone for 5 seconds; the transaction
+        // commits after that.
+        await Task.Delay(TimeSpan.FromSeconds(15), token);
         int before = Starts();
         _ = await node.SafePsqlAsync("unchanged0", "COMMIT PREPARED 'limit'", token);
         await Task.Delay(TimeSpan.FromSeconds(10), token);

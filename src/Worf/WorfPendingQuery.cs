@@ -8,13 +8,15 @@ using PgSocket = int;
 namespace Worf;
 
 /// <summary>
-/// A query sent on a libpq connection that the exchange worker doesn't wait on: libpq sends it at once, and the worker
-/// reads its results as the connection's socket lets it, between its other work. The query returns one text value, as
-/// a call of a function does. libpq's result values are part of its stable interface.
+/// A query sent on a libpq connection that the exchange worker doesn't wait on: libpq, in its nonblocking mode, sends
+/// what the socket takes at once, and the worker sends the rest and reads the results as the socket lets it, between its
+/// other work, so that a neighbor that stops reading holds up no other call however large the query. The query returns
+/// one text value, as a call of a function does. libpq's result values are part of its stable interface.
 /// </summary>
 internal sealed unsafe class WorfPendingQuery
 {
     private const int WlSocketReadable = 2;
+    private const int WlSocketWriteable = 4;
     private const int WlTimeout = 8;
     private const int WlExitOnPmDeath = 32;
     private const int WlLatchSet = 1;
@@ -29,6 +31,7 @@ internal sealed unsafe class WorfPendingQuery
     private const int DiagMessagePrimary = 'M';
 
     private readonly void* _conn;
+    private bool _flushing;
 
     private WorfPendingQuery(void* conn, long deadline)
     {
@@ -77,6 +80,12 @@ internal sealed unsafe class WorfPendingQuery
     {
         void* conn = connection.Libpq;
         WorfPendingQuery query = new(conn, deadline);
+        if (((delegate* unmanaged<void*, int, int>)WorfConnection.LibpqFunction("PQsetnonblocking"))(conn, 1) != 0)
+        {
+            query.Fail(null);
+            return query;
+        }
+
         fixed (byte* text = Worf.ToServerCString(sql))
         {
             if (((delegate* unmanaged<void*, sbyte*, int>)WorfConnection.LibpqFunction("PQsendQuery"))(conn, (sbyte*)text) == 0)
@@ -86,6 +95,7 @@ internal sealed unsafe class WorfPendingQuery
             }
         }
 
+        query._flushing = true;
         query.Advance();
         return query;
     }
@@ -100,10 +110,28 @@ internal sealed unsafe class WorfPendingQuery
             return;
         }
 
+        // What the socket hasn't taken of the query yet goes as it takes more; the server's answers are read meanwhile,
+        // as libpq asks.
         if (((delegate* unmanaged<void*, int>)WorfConnection.LibpqFunction("PQconsumeInput"))(_conn) == 0)
         {
             Fail(null);
             return;
+        }
+
+        if (_flushing)
+        {
+            int flushed = ((delegate* unmanaged<void*, int>)WorfConnection.LibpqFunction("PQflush"))(_conn);
+            if (flushed < 0)
+            {
+                Fail(null);
+                return;
+            }
+
+            _flushing = flushed > 0;
+            if (_flushing)
+            {
+                return;
+            }
         }
 
         var busy = (delegate* unmanaged<void*, int>)WorfConnection.LibpqFunction("PQisBusy");
@@ -115,7 +143,7 @@ internal sealed unsafe class WorfPendingQuery
             void* result = getResult(_conn);
             if (result is null)
             {
-                Done = true;
+                End();
                 return;
             }
 
@@ -152,7 +180,8 @@ internal sealed unsafe class WorfPendingQuery
     }
 
     /// <summary>
-    /// Waits up to a time for the connection's socket to have more of the results, or for the latch.
+    /// Waits up to a time for the connection's socket to take more of the query, or to have more of the results, or for
+    /// the latch.
     /// </summary>
     /// <param name="milliseconds">The time.</param>
     /// <returns>Whether the latch was set, which the wait resets.</returns>
@@ -166,8 +195,8 @@ internal sealed unsafe class WorfPendingQuery
         }
 
         PgSocket socket = WorfConnection.ToSocket(descriptor);
-        int events = NativeMethods.WaitLatchOrSocket(NativeGlobals.MyLatch, WlExitOnPmDeath | WlLatchSet | WlTimeout | WlSocketReadable, socket,
-            Math.Max(milliseconds, 0), PgWaitExtension);
+        int events = NativeMethods.WaitLatchOrSocket(NativeGlobals.MyLatch,
+            WlExitOnPmDeath | WlLatchSet | WlTimeout | WlSocketReadable | (_flushing ? WlSocketWriteable : 0), socket, Math.Max(milliseconds, 0), PgWaitExtension);
         if ((events & WlLatchSet) == 0)
         {
             return false;
@@ -182,6 +211,14 @@ internal sealed unsafe class WorfPendingQuery
     {
         Failure ??= failure ?? Worf.FromServer(((delegate* unmanaged<void*, sbyte*>)WorfConnection.LibpqFunction("PQerrorMessage"))(_conn)).TrimEnd();
         Broken = true;
+        End();
+    }
+
+    // Ends the query, leaving the connection blocking again, as its other users take it.
+    private void End()
+    {
+        _flushing = false;
+        _ = ((delegate* unmanaged<void*, int, int>)WorfConnection.LibpqFunction("PQsetnonblocking"))(_conn, 0);
         Done = true;
     }
 }
