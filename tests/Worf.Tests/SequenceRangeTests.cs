@@ -3188,7 +3188,8 @@ public sealed class SequenceRangeTests
             string where;
             try
             {
-                _ = await nodeB.SafePsqlAsync(Database, $"SET statement_timeout = '2s'; {draw}", token);
+                // A form that attaches a partition does a slow host's DDL first, so it has longer to reach the wait.
+                _ = await nodeB.SafePsqlAsync(Database, $"SET statement_timeout = '{(draw.Contains("ATTACH PARTITION", StringComparison.Ordinal) ? 5 : 2)}s'; {draw}", token);
                 problems.Add($"{draw}: drew");
                 continue;
             }
