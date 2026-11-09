@@ -41,8 +41,8 @@ worf_create_subscriber -D /path/to/new/datadir \
 | `--postgresql-conf` | Path to the new `postgresql.conf` |
 | `--recovery-conf` | Path to the template recovery configuration |
 
-`worf_create_subscriber` runs the `pg_basebackup` and `pg_ctl` beside it, so
-install it in the PostgreSQL installation's `bin` directory.
+`worf_create_subscriber` runs the `pg_basebackup`, `pg_ctl` and `pg_controldata`
+beside it, so install it in the PostgreSQL installation's `bin` directory.
 
 A run that fails, or is stopped with Ctrl-C or `SIGTERM`, cancels what it waits
 for, a connection or a command on a server that doesn't answer too, rolls back,
@@ -62,9 +62,9 @@ neither leaves progress for a later origin. A run on a data directory whose serv
 is running fails, as does one on a data directory whose timeline is past the
 provider's, as an earlier run's promotion leaves it, or that has run as a server
 of its own, out of recovery, as one started without its `standby.signal` does,
-which writes WAL the provider doesn't have, or whose latest checkpoint isn't the
-one the provider's WAL holds at its position, as one that did so and stopped in
-recovery later has; each leaves the data directory as it is. The run reads that
-checkpoint record's header from the provider's `pg_wal` with
-`pg_read_binary_file`, and can't tell when the provider has removed that WAL or
-doesn't let it read it.
+which writes WAL the provider doesn't have, or, once it has started, whose
+latest checkpoint isn't a checkpoint record of the provider's WAL with the redo
+point its `pg_control` holds, as one that did so and stopped in recovery later
+has, or lies in WAL the provider has removed; each leaves the data directory as
+it is. The run reads that record from the provider's `pg_wal` with
+`pg_read_binary_file`, and can't tell when the provider doesn't let it.

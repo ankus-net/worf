@@ -1040,16 +1040,16 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   `1min`.
 
 - `worf.sequence_range_timeout`
-  How long a sequence range exchange waits for the other node's host to
-  answer, and for each call to the other node. Inserts near the end of a block
-  wait for the switch, which a switch worker makes beside the transactions
-  drawing from the block, without waiting for them to end, though it waits,
-  as for a lock, for their statements to reach their next rows: up to twice this for each
-  block in all while its next block is still to come, or once a worker has
-  tried and couldn't switch it, and otherwise until it comes, as for a lock. A
-  node whose last call ran out of time is probed, by a connection that has this
-  long and that the exchange worker makes without waiting on it, until one
-  answers. The default is `10s`.
+  How long a sequence range exchange has to connect to the other node, and for
+  each call to it, which the exchange worker makes without waiting on either.
+  Inserts near the end of a block wait for the switch, which a switch worker
+  makes beside the transactions drawing from the block, without waiting for
+  them to end, though it waits, as for a lock, for their statements to reach
+  their next rows: up to twice this for each block in all while its next block
+  is still to come, or once a worker has tried and couldn't switch it, and
+  otherwise until it comes, as for a lock. A node whose last call ran out of
+  time is probed, by a connection that has this long, until one answers. The
+  default is `10s`.
 
 - `worf.ddl_lock_timeout`
   How long DDL waits in all for the other nodes to hold back their writes and

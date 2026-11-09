@@ -35,7 +35,7 @@ public sealed class DocumentationTests
             "a forced lift's resets (130)");
         Assert.DoesNotContain("while one that missed a call is reached again within a minute of answering", s_sequenceRanges, "a slow neighbor (130, 125)");
         Assert.DoesNotContain("and is made again in the next round without giving way", s_sequenceRanges, "a slow neighbor (125, 763)");
-        Assert.Contains("Once a probe's connection is made, the node is called over it in the next round", s_sequenceRanges, "a slow neighbor (125, 763)");
+        Assert.Contains("once a probe's connection is made, the node is called over it at once", s_sequenceRanges, "a slow neighbor (125, 763)");
         Assert.DoesNotContain("no more than once every ten minutes for each neighbor", s_sequenceRanges, "made-up resets (130, 211)");
         Assert.DoesNotContain("so a grantor resets a node no more often than it grants it blocks", s_sequenceRanges, "a grantor's lifts (211)");
         Assert.Contains("has a limit of its own, so that another request's reset doesn't hold it up, which starts at ten seconds rather than ten minutes",
@@ -44,10 +44,12 @@ public sealed class DocumentationTests
         Assert.DoesNotContain("three seconds a minute at most", s_sequenceRanges, "an unreachable neighbor's cost (294)");
         Assert.DoesNotContain("and then for up to that long ten, twenty and forty seconds after the call before ends", s_sequenceRanges,
             "an unreachable neighbor's cost (294, 660, 763)");
-        Assert.Contains("So a node that never answers holds up the others' calls for its first call's `worf.sequence_range_timeout` alone", s_sequenceRanges,
-            "an unreachable neighbor's cost (763)");
-        Assert.Contains("and takes it on as its socket lets it, between its calls to the other nodes and as it waits between rounds, without waiting on it",
-            s_sequenceRanges, "a frozen neighbor's probes (763)");
+        Assert.DoesNotContain("for its first call's `worf.sequence_range_timeout` alone", s_sequenceRanges, "an unreachable neighbor's cost (763, 804)");
+        Assert.Contains("So a node that never answers, or answers slowly, holds up no other node's calls", s_sequenceRanges,
+            "an unreachable or slow neighbor's cost (763)");
+        Assert.Contains("and takes them on as their sockets let it, between its other work and as it waits between rounds, one call at a time with each node",
+            s_sequenceRanges, "calls made without waiting (763)");
+        Assert.Contains("and the delay holds until a call is answered", s_sequenceRanges, "a probe that answers and a call that doesn't (804)");
         Assert.DoesNotContain("which a neighbor whose own route to the owner goes through the node can't be, as a node reports no distance to its parent", s_sequenceRanges,
             "a ring's parents (705)");
         Assert.Contains("and reports its route, the nodes from its parent to the owner, to its other neighbors, which take no route that goes through themselves", s_sequenceRanges,
@@ -66,12 +68,12 @@ public sealed class DocumentationTests
         Assert.Contains("whose failure the worker applies again later under any `worf.exception_behaviour`", s_sequenceRanges, "an applied statement's wait (420)");
         Assert.Contains("an `UPDATE` or a `MERGE` that sets a column to a value rather than its default", s_sequenceRanges, "updates that don't draw (460)");
         Assert.Contains("a statement a worf worker applies, as DDL `replicate_ddl_command` queued", s_sequenceRanges, "applied statements (420)");
-        Assert.Contains("up to `worf.sequence_range_check_interval` more before the watcher cancels it", s_sequenceRanges, "a call's time (292)");
+        Assert.DoesNotContain("before the watcher cancels it", s_sequenceRanges, "a call's time (292, 763)");
         Assert.Contains("an `UPDATE` or a `MERGE` that sets such a column to its default", s_sequenceRanges, "an identity column's draw (421)");
         Assert.Contains("and again half `worf.sequence_range_timeout` after each that fails", s_sequenceRanges, "a waiting statement's exchanges (423)");
         Assert.Contains("a pool holder grants its children nothing from a pool block until the node that granted it has answered so", s_sequenceRanges,
             "a restarted pool holder's grants (424)");
-        Assert.Contains("A node whose last call ran out of time, as one whose host drops connection attempts, is probed instead", s_sequenceRanges,
+        Assert.Contains("A node whose last call ran out of time, as one whose host drops connection attempts, is probed after a delay", s_sequenceRanges,
             "an unreachable neighbor (212, 763)");
         Assert.DoesNotContain("leaves no block's values unused", s_sequenceRanges, "a COPY's switch (130)");
         Assert.Contains("A switch retires what its block has left", s_sequenceRanges, "a COPY's switch (130)");
@@ -84,8 +86,8 @@ public sealed class DocumentationTests
         foreach ((string name, string text) in new[] { ("README.md", s_readme), ("configuration.md", s_configuration) })
         {
             Assert.DoesNotContain("ran out of time waits a second at", text, $"a probe's time, in {name} (130, 660, 763)");
-            Assert.Contains("ran out of time is probed, by a connection that has this long and that the exchange worker makes without waiting on it, until one answers", text,
-                $"a probe's time, in {name} (763)");
+            Assert.Contains("which the exchange worker makes without waiting on either", text, $"a call's time, in {name} (763)");
+            Assert.Contains("ran out of time is probed, by a connection that has this long, until one answers", text, $"a probe's time, in {name} (763)");
             Assert.DoesNotContain("wait up to twice this in all for the switch", text, $"how long inserts wait for a switch, in {name} (130)");
             Assert.Contains("up to twice this for each block in all while its next block is still to come, or once a worker has tried and couldn't switch it, and otherwise until it comes, as for a lock",
                 text, $"how long inserts wait for a switch, in {name} (130)");

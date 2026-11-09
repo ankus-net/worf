@@ -1,3 +1,5 @@
+using System.Net;
+using System.Net.Sockets;
 using Ankus.Postgres;
 #if WORF_WINDOWS
 using PgSocket = ulong;
@@ -8,11 +10,12 @@ using PgSocket = int;
 namespace Worf;
 
 /// <summary>
-/// A connection to a neighbor that the exchange worker makes without waiting for it, as for a neighbor whose last call
-/// ran out of time, so that a neighbor that never answers holds up none of the worker's calls to the others: libpq
-/// connects, and runs the session's setup, as the worker looks at its socket between its calls, and the connection,
-/// once the neighbor has answered, becomes the one the worker keeps for its next call. libpq's polling, status and
-/// result values are part of its stable interface.
+/// A connection to a neighbor that the exchange worker makes without waiting for it, so that a neighbor that never
+/// answers, or answers slowly, holds up none of the worker's calls to the others: the connection string's host names are
+/// looked up on another thread, libpq connects to the addresses found, and the session runs its setup, as the worker
+/// looks at the connection's socket between its other work. The connection, once the neighbor has answered, becomes
+/// the one the worker calls the neighbor over. libpq's polling, status and result values are part of its stable
+/// interface.
 /// </summary>
 internal sealed unsafe class WorfProbe : IDisposable
 {
@@ -24,27 +27,41 @@ internal sealed unsafe class WorfProbe : IDisposable
     private const int WlLatchSet = 1;
     private const uint PgWaitExtension = 0x07000000;
 
-    // PGRES_POLLING_FAILED, READING, WRITING and OK, CONNECTION_OK and CONNECTION_STARTED, and PGRES_COMMAND_OK and
-    // PGRES_TUPLES_OK.
+    // PGRES_POLLING_FAILED, READING, WRITING and OK, CONNECTION_OK, CONNECTION_BAD and CONNECTION_STARTED, and
+    // PGRES_COMMAND_OK and PGRES_TUPLES_OK.
     private const int PollingFailed = 0;
     private const int PollingReading = 1;
     private const int PollingWriting = 2;
     private const int ConnectionOk = 0;
+    private const int ConnectionBad = 1;
     private const int ConnectionStarted = 2;
     private const int CommandOk = 1;
     private const int TuplesOk = 2;
 
+    // PGINVALID_SOCKET: INVALID_SOCKET on Windows, -1 elsewhere.
+#if WORF_WINDOWS
+    private const PgSocket NoSocket = ulong.MaxValue;
+#else
+    private const PgSocket NoSocket = -1;
+#endif
+
+    private readonly string _conninfo;
+    private readonly string _applicationName;
     private readonly byte[] _setup;
+    private readonly List<(string Host, Task<IPAddress[]>? Lookup)> _hosts;
     private void* _conn;
     private int _polling = PollingWriting;
     private bool _sent;
+#if !(ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17)
     private bool _fd;
+#endif
 
-    private WorfProbe(void* conn, byte[] setup, long deadline, bool fd)
+    private WorfProbe(string conninfo, string applicationName, byte[] setup, long deadline, List<(string Host, Task<IPAddress[]>? Lookup)> hosts)
     {
-        _conn = conn;
+        _conninfo = conninfo;
+        _applicationName = applicationName;
         _setup = setup;
-        _fd = fd;
+        _hosts = hosts;
         Deadline = deadline;
     }
 
@@ -69,7 +86,8 @@ internal sealed unsafe class WorfProbe : IDisposable
     internal bool Done => Answered || Failure is not null;
 
     /// <summary>
-    /// Starts connecting.
+    /// Starts connecting: looks up the connection string's host names, if it gives no addresses, on other threads, and
+    /// connects once they're found.
     /// </summary>
     /// <param name="conninfo">The connection string.</param>
     /// <param name="applicationName">The name the server shows for the connection.</param>
@@ -78,47 +96,39 @@ internal sealed unsafe class WorfProbe : IDisposable
     /// <returns>The probe.</returns>
     internal static WorfProbe Start(string conninfo, string applicationName, string setup, long deadline)
     {
-        // From PostgreSQL 18, libpqwalreceiver counts the connections it closes against the server's external files, as
-        // it counts those it opens.
-        bool fd = false;
-#if !(ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17)
-        if (!NativeMethods.AcquireExternalFD())
+        // A host given as an address, or a socket's directory, needs no lookup; libpq looks up the others as it connects,
+        // which would hold the worker.
+        List<(string Host, Task<IPAddress[]>? Lookup)> hosts = [];
+        if (Fe.ConninfoParse(conninfo, out _) is Dictionary<string, string> options && options.GetValueOrDefault("hostaddr") is not { Length: > 0 } &&
+            options.GetValueOrDefault("host") is { Length: > 0 } names)
         {
-            throw new PgException(PgSqlStates.ConnectionFailure, "could not connect to the server: too many open files");
+            foreach (string name in names.Split(',').Select(host => host.Trim()))
+            {
+                hosts.Add((name, name.Length == 0 || name[0] is '/' or '@' || IPAddress.TryParse(name, out _) ? null : Dns.GetHostAddressesAsync(name)));
+            }
         }
 
-        fd = true;
-#endif
-        var start = (delegate* unmanaged<sbyte**, sbyte**, int, void*>)WorfConnection.LibpqFunction("PQconnectStartParams");
-        byte[] info = Worf.ToServerCString(conninfo);
-        byte[] application = Worf.ToServerCString(applicationName);
-        void* conn;
-        fixed (byte* dbname = "dbname\0"u8, fallback = "fallback_application_name\0"u8, infoAddress = info, applicationAddress = application)
-        {
-            sbyte** keys = stackalloc sbyte*[] { (sbyte*)dbname, (sbyte*)fallback, null };
-            sbyte** values = stackalloc sbyte*[] { (sbyte*)infoAddress, (sbyte*)applicationAddress, null };
-            conn = start(keys, values, 1);
-        }
-
-        if (conn is null)
-        {
-#if !(ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17)
-            NativeMethods.ReleaseExternalFD();
-#endif
-            throw new PgException(PgSqlStates.OutOfMemory, "out of memory");
-        }
-
-        WorfProbe probe = new(conn, Worf.ToServerCString(setup), deadline, fd);
+        WorfProbe probe = new(conninfo, applicationName, Worf.ToServerCString(setup), deadline, hosts);
         probe.Advance();
         return probe;
     }
 
     /// <summary>
-    /// Takes the probe as far as its socket lets it now, without waiting: connects, sends the setup, and reads its
-    /// results.
+    /// Takes the probe as far as it goes now, without waiting: looks for the host names' addresses, connects, sends the
+    /// setup, and reads its results.
     /// </summary>
     internal void Advance()
     {
+        if (_conn is null && !Done)
+        {
+            if (_hosts.Exists(host => host.Lookup is { IsCompleted: false }))
+            {
+                return;
+            }
+
+            Connect();
+        }
+
         while (_conn is not null && !Done)
         {
             if (!_sent)
@@ -134,7 +144,7 @@ internal sealed unsafe class WorfProbe : IDisposable
                     continue;
                 }
 
-                if (_polling == PollingFailed || ((delegate* unmanaged<void*, int>)WorfConnection.LibpqFunction("PQstatus"))(_conn) != ConnectionOk)
+                if (_polling == PollingFailed || Status() != ConnectionOk)
                 {
                     Failure = ErrorMessage();
                     return;
@@ -199,14 +209,31 @@ internal sealed unsafe class WorfProbe : IDisposable
     }
 
     /// <summary>
-    /// Waits up to a time for the probe's socket to be ready for its next step, or for the latch.
+    /// Waits up to a time for the probe's socket to be ready for its next step, or for the latch, or, while host names
+    /// are looked up, for a moment.
     /// </summary>
     /// <param name="milliseconds">The time.</param>
     /// <returns>Whether the latch was set, which the wait resets.</returns>
     internal bool Wait(long milliseconds)
     {
-        int flag = _sent ? WlSocketReadable : ConnectFlag();
-        int events = NativeMethods.WaitLatchOrSocket(NativeGlobals.MyLatch, WlExitOnPmDeath | WlLatchSet | WlTimeout | flag, Socket(),
+        int flag = 0;
+        PgSocket socket = NoSocket;
+        if (_conn is null)
+        {
+            milliseconds = Math.Min(milliseconds, 20);
+        }
+        else if (Socket() is PgSocket ready && ready != NoSocket)
+        {
+            flag = _sent ? WlSocketReadable : ConnectFlag();
+            socket = ready;
+        }
+        else
+        {
+            Failure ??= "the connection has no socket";
+            return false;
+        }
+
+        int events = NativeMethods.WaitLatchOrSocket(NativeGlobals.MyLatch, WlExitOnPmDeath | WlLatchSet | WlTimeout | flag, socket,
             Math.Max(milliseconds, 0), PgWaitExtension);
         if ((events & WlLatchSet) == 0)
         {
@@ -225,7 +252,9 @@ internal sealed unsafe class WorfProbe : IDisposable
     {
         void* conn = _conn;
         _conn = null;
+#if !(ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17)
         _fd = false;
+#endif
         return WorfConnection.FromLibpq(conn);
     }
 
@@ -246,22 +275,95 @@ internal sealed unsafe class WorfProbe : IDisposable
         {
             NativeMethods.ReleaseExternalFD();
         }
-#endif
+
         _fd = false;
+#endif
+    }
+
+    // Starts libpq's connection, to the addresses the host names' lookups found, which a connection that libpq finds bad
+    // at once, as for an option it doesn't know, fails.
+    private void Connect()
+    {
+        List<string> addresses = [];
+        foreach ((string host, Task<IPAddress[]>? lookup) in _hosts)
+        {
+            if (lookup is null)
+            {
+                addresses.Add(IPAddress.TryParse(host, out _) ? host : "");
+            }
+            else if (lookup.IsCompletedSuccessfully && lookup.Result.Length > 0)
+            {
+                addresses.Add(lookup.Result[0].ToString());
+            }
+            else
+            {
+                Failure = $"could not translate host name \"{host}\" to address: {(lookup.Exception?.InnerException as SocketException)?.Message ?? "no address found"}";
+                return;
+            }
+        }
+
+        // From PostgreSQL 18, libpqwalreceiver counts the connections it closes against the server's external files, as
+        // it counts those it opens.
+#if !(ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17)
+        if (!NativeMethods.AcquireExternalFD())
+        {
+            Failure = "could not connect to the server: too many open files";
+            return;
+        }
+
+        _fd = true;
+#endif
+        var start = (delegate* unmanaged<sbyte**, sbyte**, int, void*>)WorfConnection.LibpqFunction("PQconnectStartParams");
+        byte[] info = Worf.ToServerCString(_conninfo);
+        byte[] application = Worf.ToServerCString(_applicationName);
+        byte[] hostaddr = Worf.ToServerCString(string.Join(',', addresses));
+        fixed (byte* dbname = "dbname\0"u8, fallback = "fallback_application_name\0"u8, hostaddrKey = "hostaddr\0"u8, infoAddress = info,
+            applicationAddress = application, hostaddrValue = hostaddr)
+        {
+            // The addresses come after the connection string, whose host names they go with.
+            sbyte** keys = stackalloc sbyte*[] { (sbyte*)dbname, (sbyte*)fallback, addresses.Count > 0 ? (sbyte*)hostaddrKey : null, null };
+            sbyte** values = stackalloc sbyte*[] { (sbyte*)infoAddress, (sbyte*)applicationAddress, (sbyte*)hostaddrValue, null };
+            _conn = start(keys, values, 1);
+        }
+
+        if (_conn is null)
+        {
+            Failure = "out of memory";
+            return;
+        }
+
+        if (Status() == ConnectionBad)
+        {
+            Failure = ErrorMessage();
+        }
     }
 
     // What the connection waits for: to read or to write, or on Windows, while the connect itself is under way, for it
     // to finish, as Windows reports a refused connect as writable, which would fail it rather than try the next address.
     private int ConnectFlag()
         => _polling == PollingReading ? WlSocketReadable
-            : OperatingSystem.IsWindows() && ((delegate* unmanaged<void*, int>)WorfConnection.LibpqFunction("PQstatus"))(_conn) == ConnectionStarted
-                ? WlSocketConnected : WlSocketWriteable;
+            : OperatingSystem.IsWindows() && Status() == ConnectionStarted ? WlSocketConnected : WlSocketWriteable;
 
-    // Whether the socket is ready for what the probe waits for, within a time.
+    // Whether the socket is ready for what the probe waits for, now; a connection without a socket has failed.
     private bool Ready(int flag, long milliseconds)
-        => (NativeMethods.WaitLatchOrSocket(null, WlExitOnPmDeath | WlTimeout | flag, Socket(), milliseconds, PgWaitExtension) & flag) != 0;
+    {
+        PgSocket socket = Socket();
+        if (socket == NoSocket)
+        {
+            Failure ??= ErrorMessage() is { Length: > 0 } message ? message : "the connection has no socket";
+            return false;
+        }
 
-    private PgSocket Socket() => WorfConnection.ToSocket(((delegate* unmanaged<void*, int>)WorfConnection.LibpqFunction("PQsocket"))(_conn));
+        return (NativeMethods.WaitLatchOrSocket(null, WlExitOnPmDeath | WlTimeout | flag, socket, milliseconds, PgWaitExtension) & flag) != 0;
+    }
+
+    private int Status() => ((delegate* unmanaged<void*, int>)WorfConnection.LibpqFunction("PQstatus"))(_conn);
+
+    private PgSocket Socket()
+    {
+        int descriptor = ((delegate* unmanaged<void*, int>)WorfConnection.LibpqFunction("PQsocket"))(_conn);
+        return descriptor < 0 ? NoSocket : WorfConnection.ToSocket(descriptor);
+    }
 
     private string ErrorMessage()
         => Worf.FromServer(((delegate* unmanaged<void*, sbyte*>)WorfConnection.LibpqFunction("PQerrorMessage"))(_conn)).TrimEnd();

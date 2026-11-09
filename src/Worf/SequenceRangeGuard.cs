@@ -64,6 +64,9 @@ internal static partial class SequenceRangeGuard
     // The statements and commands whose expressions are starting, innermost last.
     private static readonly List<WorfStartingStatement> s_starting = [];
 
+    // How many calls of nextval each running statement's plan started as it started, by its query descriptor.
+    private static readonly Dictionary<nint, int> s_planStarted = [];
+
     // The fields of the nodes of a plan that nodeToString writes a type's OID in.
     private static readonly HashSet<string> s_typeFields =
     [
@@ -92,15 +95,6 @@ internal static partial class SequenceRangeGuard
     private const int TypeCacheId = 80;
 #elif ANKUS_PG18
     private const int TypeCacheId = 82;
-#endif
-
-#if ANKUS_PG15 || ANKUS_PG16
-    // Whether a write straight into a partition draws from its ancestors' identity sequences, as it does from
-    // PostgreSQL 17 on. Before, a partition has identity columns of its own only, and such a write leaves its parent's
-    // empty.
-    private const bool AncestorsIdentity = false;
-#else
-    private const bool AncestorsIdentity = true;
 #endif
 
     [PgNativeCallback(nameof(TableInvalidated))]
@@ -491,6 +485,7 @@ internal static partial class SequenceRangeGuard
     /// <param name="queryDesc">The statement.</param>
     internal static unsafe void EndStatement(QueryDesc* queryDesc)
     {
+        _ = s_planStarted.Remove((nint)queryDesc);
         if (s_moving.Count > 0)
         {
             _ = s_moving.RemoveAll(statement => statement.QueryDesc == (nint)queryDesc);
@@ -792,9 +787,39 @@ internal static partial class SequenceRangeGuard
     /// </summary>
     /// <param name="statement">The statement's plan.</param>
     /// <param name="explained">Whether the statement is only explained, as EXPLAIN without ANALYZE starts it, which
-    /// draws nothing, unless its start prunes partitions through an expression that may draw, which it runs.</param>
+    /// runs none of the calls it starts but those its partition pruning makes, so that only the sequences those name
+    /// are waited for.</param>
     internal static unsafe void StartingExpressions(nint statement, bool explained)
-        => Starting(() => Draws(PlanText((Node*)statement)), explained && !PrunesDrawing((Node*)statement));
+    {
+        if (!explained)
+        {
+            Starting(() => Draws(PlanText((Node*)statement)));
+            return;
+        }
+
+        if (PruningDraws((Node*)statement) is not (HashSet<uint> Called, int Calls, bool Unnamed) pruning)
+        {
+            Starting(static () => ([], 0, false), explained: true);
+            return;
+        }
+
+        Starting(() => (pruning.Called, Math.Max(Draws(PlanText((Node*)statement)).Calls, pruning.Calls), pruning.Unnamed));
+    }
+
+    /// <summary>
+    /// Notes how many calls of nextval a statement's plan started as it started, which its run doesn't start again,
+    /// and forgets the statement's start.
+    /// </summary>
+    /// <param name="queryDesc">The statement.</param>
+    internal static void StartedPlan(nint queryDesc)
+    {
+        if (s_starting.Count > 0 && s_starting[^1].Looked > 0)
+        {
+            s_planStarted[queryDesc] = s_starting[^1].Looked;
+        }
+
+        StartedExpressions();
+    }
 
     /// <summary>
     /// Notes a COPY FROM, whose defaults and condition start before its rows, the CHECK constraints of the domains of the
@@ -926,7 +951,8 @@ internal static partial class SequenceRangeGuard
             return false;
         }
 
-        Starting(() => RunDraws(statement));
+        int started = s_planStarted.GetValueOrDefault((nint)queryDesc);
+        Starting(() => RunDraws(statement, started));
         return true;
     }
 
@@ -1147,14 +1173,16 @@ internal static partial class SequenceRangeGuard
         return writing;
     }
 
-    // The calls of nextval a statement starts as it runs: those of its plan, as each row of a multi-row VALUES list
-    // starts its own, those of the CHECK constraints and trigger conditions of the tables it writes and their
-    // partitions, those its ModifyTable nodes start for each leaf partition of the tables they route rows into, and
-    // those of the CHECKs that draw of the domains the types its plan names are or hold.
-    private static unsafe (HashSet<uint> Called, int Calls, bool Unnamed) RunDraws(PlannedStmt* statement)
+    // The calls of nextval a statement starts as it runs: those of its plan its start didn't make, as each row of a
+    // multi-row VALUES list starts its own, those of the CHECK constraints and trigger conditions of the tables it
+    // writes and their partitions, those its ModifyTable nodes start for each leaf partition of the tables they route
+    // rows into, and those of the CHECKs that draw of the domains the types its plan names are or hold. A call past
+    // them, as one C code starts, names none.
+    private static unsafe (HashSet<uint> Called, int Calls, bool Unnamed) RunDraws(PlannedStmt* statement, int started)
     {
         string text = PlanText((Node*)statement);
         (HashSet<uint> called, int calls, bool unnamed) = Draws(text);
+        calls = Math.Max(calls - started, 0);
         List<(nint Modify, List<long> Written, uint Root)> writing = Writing(statement);
         List<(HashSet<uint> Called, int Calls, bool Unnamed)> parts = [Draws(WrittenChecks([.. writing.SelectMany(write => write.Written)]))];
         foreach ((nint node, _, uint root) in writing.Where(write => write.Root != 0))
@@ -1229,13 +1257,13 @@ internal static partial class SequenceRangeGuard
             """, SpiParameter.Create(relids))) ?? "");
     }
 
-    // Whether a plan's partition pruning, which its start runs even when only explained, may call nextval, as a CHECK
-    // of a domain it coerces a value to does.
-    private static unsafe bool PrunesDrawing(Node* plan)
+    // The calls of nextval a plan's partition pruning, which its start runs even when only explained, may make, as a
+    // CHECK of a domain it coerces a value to does, or null for none.
+    private static unsafe (HashSet<uint> Called, int Calls, bool Unnamed)? PruningDraws(Node* plan)
     {
         if (Worf.CatalogOid("sequence_range_block") == 0)
         {
-            return false;
+            return null;
         }
 
         const string Pruning = "{PARTITIONPRUNEINFO ";
@@ -1248,11 +1276,11 @@ internal static partial class SequenceRangeGuard
 
         if (pruning.Length == 0)
         {
-            return false;
+            return null;
         }
 
-        (_, int calls, bool unnamed) = Draws(WithDomainChecks(pruning.ToString()));
-        return calls > 0 || unnamed;
+        (HashSet<uint> Called, int Calls, bool Unnamed) draws = Draws(WithDomainChecks(pruning.ToString()));
+        return draws.Calls > 0 || draws.Unnamed ? draws : null;
     }
 
     // The text of the node that starts at a position of an expression's text, to its closing brace.
@@ -2023,7 +2051,8 @@ internal static partial class SequenceRangeGuard
 
     /// <summary>
     /// Lists the managed sequences a table's defaults and identity columns draw from, a partition's identity columns
-    /// drawing from its ancestors' sequences from PostgreSQL 17 on.
+    /// drawing from its ancestors' sequences where PostgreSQL marks them identity columns, as from PostgreSQL 17 on it
+    /// marks those of a partition it creates or attaches, though not those of a partition of a table it attaches.
     /// </summary>
     private static List<uint> DrawnBy(uint relid)
     {
@@ -2042,8 +2071,15 @@ internal static partial class SequenceRangeGuard
                 UNION
                 SELECT d.objid FROM pg_catalog.pg_depend d
                 WHERE d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
-                    AND d.deptype = 'i' AND (d.refobjid = $1 OR $2 AND d.refobjid IN (SELECT a.relid FROM pg_catalog.pg_partition_ancestors($1) a))
-                """, 0, SpiParameter.Create(relid), SpiParameter.Create(AncestorsIdentity)));
+                    AND d.deptype = 'i' AND d.refobjid = $1
+                UNION
+                SELECT d.objid FROM pg_catalog.pg_attribute a
+                    JOIN pg_catalog.pg_partition_ancestors($1) p ON p.relid <> $1
+                    JOIN pg_catalog.pg_attribute pa ON pa.attrelid = p.relid AND pa.attname = a.attname AND NOT pa.attisdropped
+                    JOIN pg_catalog.pg_depend d ON d.refobjid = p.relid AND d.refobjsubid = pa.attnum AND d.deptype = 'i'
+                        AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+                WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped AND a.attidentity <> ''
+                """, 0, SpiParameter.Create(relid)));
             sequences = [.. used.Select(row => row.Get<uint>(0)).Where(s_sequences.ContainsKey)];
             s_drawnBy[relid] = sequences;
         }

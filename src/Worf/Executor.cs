@@ -657,7 +657,7 @@ internal static unsafe partial class Executor
         }
         finally
         {
-            SequenceRangeGuard.StartedExpressions();
+            SequenceRangeGuard.StartedPlan((nint)queryDesc);
         }
     }
 

@@ -5,6 +5,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Npgsql;
 using Npgsql.Replication;
 using Npgsql.Replication.Internal;
@@ -1691,7 +1692,7 @@ public sealed class SequenceRangeTests
             SELECT worf.alter_node_add_interface('node_c', 'unreachable', 'host=192.0.2.1 port=5432 dbname=postgres');
             SELECT worf.alter_subscription_interface('x_from_c', 'unreachable');
             """, token);
-        Assert.IsTrue(await nodeA.PollLogAsync(unreachable, "exchange with node node_c failed: could not reach node node_c within 5000 ms", token),
+        Assert.IsTrue(await nodeA.PollLogAsync(unreachable, "exchange with node node_c failed: node node_c didn't answer within 5000 ms", token),
             "the exchange gave up on the unreachable host");
         Stopwatch restarted = Stopwatch.StartNew();
         _ = await nodeA.SafePsqlAsync("other",
@@ -2250,12 +2251,12 @@ public sealed class SequenceRangeTests
     }
 
     /// <summary>
-    /// A provider that takes calls but never answers holds up a node's exchanges with its other neighbors only until its
-    /// first call runs out of time: from then on it's probed by a connection the node's exchange worker makes without
-    /// waiting on it, so the node's inserts go on through small blocks from the owner, none waiting on it. Once it
-    /// answers again, though slowly, over a link whose connection takes seconds, a request that waits on it reaches it,
-    /// over the probe's connection, though a request on another node stays open and the node keeps drawing blocks from
-    /// the owner.
+    /// A provider that takes calls but never answers holds up none of a node's exchanges with its other neighbors, as the
+    /// node's exchange worker connects and calls without waiting on it, and probes it once its call has run out of time,
+    /// so the node's inserts go on through small blocks from the owner, none waiting on it. Once it answers again, though
+    /// slowly, a second away each way, a request that waits on it reaches it, over the probe's connection, though a
+    /// request on another node stays open and the node keeps drawing blocks from the owner, none of whose calls its slow
+    /// ones hold up.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -2356,8 +2357,8 @@ public sealed class SequenceRangeTests
                 CultureInfo.InvariantCulture))];
         waits.Sort();
         Assert.IsGreaterThan(100, waits.Count, "node_b's inserts");
-        Assert.IsLessThan(4000.0, waits[^1], "node_b's slowest insert, against the 5000 ms each call to node_c took");
-        Assert.IsLessThan(1000.0, waits[(int)(waits.Count * 0.99)], "node_b's 99th percentile insert");
+        Assert.IsLessThan(1000.0, waits[^1], "node_b's slowest insert, against the 5000 ms each call to node_c took");
+        Assert.IsLessThan(100.0, waits[(int)(waits.Count * 0.99)], "node_b's 99th percentile insert");
 
         // node_b runs w's root on node_a out, so that its request to node_a for another block stays open.
         await using (NpgsqlConnection writer = await nodeB.OpenAsync(Database, token))
@@ -2380,9 +2381,10 @@ public sealed class SequenceRangeTests
                 WHERE q.state = 'open' AND n.node_name = 'node_a')
             """, token), "node_b's request to node_a, open as w's root has run out");
 
-        // Once node_c answers again, over a link with 700 ms round trips, node_b's request for a block of u reaches it,
-        // though a request on node_a stays open and node_b keeps drawing blocks of t from node_a: the probe's connection,
-        // which takes a few round trips, doesn't hold up those calls, and the call to node_c goes over it.
+        // Once node_c answers again, over a link 1 s away each way, node_b's request for a block of u reaches it, though a
+        // request on node_a stays open and node_b keeps drawing blocks of t from node_a: neither the connection, which
+        // takes a few round trips, nor the calls to node_c, which take two seconds each, hold up those calls, and no
+        // insert waits a second.
         using TcpListener slow = new(IPAddress.Loopback, 0);
         slow.Start();
         string[] dsnParts = nodeCDsn.Split(' ', StringSplitOptions.RemoveEmptyEntries);
@@ -2396,7 +2398,7 @@ public sealed class SequenceRangeTests
                 int read;
                 while ((read = await from.ReadAsync(buffer, relaying.Token)) > 0)
                 {
-                    await Task.Delay(350, relaying.Token);
+                    await Task.Delay(1000, relaying.Token);
                     await to.WriteAsync(buffer.AsMemory(0, read), relaying.Token);
                 }
             }
@@ -2439,9 +2441,15 @@ public sealed class SequenceRangeTests
             _ = await nodeB.SafePsqlAsync(Database,
                 $"UPDATE worf.node_interface SET if_dsn = '{slowDsn}' WHERE if_nodeid = (SELECT node_id FROM worf.node WHERE node_name = 'node_c')", token);
             using CancellationTokenSource drawing = CancellationTokenSource.CreateLinkedTokenSource(token);
+            int slowFrom = nodeB.ReadLog().Length;
             Task draws = Task.Run(async () =>
             {
                 await using NpgsqlConnection writer = await nodeB.OpenAsync(Database, token);
+                await using (NpgsqlCommand logged = new("SET log_min_duration_statement = 0", writer))
+                {
+                    _ = await logged.ExecuteNonQueryAsync(token);
+                }
+
                 await using NpgsqlCommand insert = new(Insert, writer);
                 while (!drawing.Token.IsCancellationRequested)
                 {
@@ -2450,9 +2458,16 @@ public sealed class SequenceRangeTests
                 }
             }, token);
             bool reached = await nodeB.PollQueryUntilAsync(Database, UNext, token);
+            await Task.Delay(TimeSpan.FromSeconds(10), token);
             await drawing.CancelAsync();
             await draws;
             Assert.IsTrue(reached, "node_b's next block of u, from node_c once it answers again, while node_b draws from node_a");
+            List<double> slowWaits = [.. nodeB.ReadLog()[slowFrom..].Split('\n')
+                .Where(line => line.Contains($": {Insert}", StringComparison.Ordinal) && line.Contains("  execute ", StringComparison.Ordinal))
+                .Select(line => double.Parse(line[(line.IndexOf("duration: ", StringComparison.Ordinal) + 10)..line.IndexOf(" ms", StringComparison.Ordinal)],
+                    CultureInfo.InvariantCulture))];
+            Assert.IsGreaterThan(100, slowWaits.Count, "node_b's inserts while node_c answers slowly");
+            Assert.IsLessThan(1000.0, slowWaits.Max(), "node_b's slowest insert while node_c answers a call in two seconds");
         }
         finally
         {
@@ -2462,10 +2477,10 @@ public sealed class SequenceRangeTests
     }
 
     /// <summary>
-    /// A provider whose host drops connection attempts holds up a node's exchanges with its other neighbors only until
-    /// the first attempt runs out of time, as one that takes calls and never answers does: it's probed from then on by a
-    /// connection made without waiting on it, so the node's inserts go on through small blocks from the owner, none
-    /// waiting on it.
+    /// A provider whose host drops connection attempts holds up none of a node's exchanges with its other neighbors, as
+    /// one that takes calls and never answers doesn't: it's probed by a connection made without waiting on it, so the
+    /// node's inserts go on through small blocks from the owner, none waiting on it. A probe whose connection libpq finds
+    /// bad at once, as for a host name nothing resolves, fails, and the exchange worker goes on.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -2529,8 +2544,152 @@ public sealed class SequenceRangeTests
                 CultureInfo.InvariantCulture))];
         waits.Sort();
         Assert.IsGreaterThan(100, waits.Count, "node_b's inserts");
-        Assert.IsLessThan(4000.0, waits[^1], "node_b's slowest insert, against the 5000 ms each attempt to reach node_c took");
-        Assert.IsLessThan(1000.0, waits[(int)(waits.Count * 0.99)], "node_b's 99th percentile insert");
+        Assert.IsLessThan(1000.0, waits[^1], "node_b's slowest insert, against the 5000 ms each attempt to reach node_c took");
+        Assert.IsLessThan(100.0, waits[(int)(waits.Count * 0.99)], "node_b's 99th percentile insert");
+
+        // A connection to node_c that libpq finds bad at once, for a host name nothing resolves or an option it doesn't
+        // know, fails its probe, and the exchange worker goes on.
+        const string Worker = "SELECT pid FROM pg_stat_activity WHERE backend_type LIKE 'worf exchange%'";
+        string worker = await nodeB.SafePsqlAsync(Database, Worker, token);
+        foreach ((string dsn, string failure) in new[]
+        {
+            ($"host=nonexistent.invalid port=5432 dbname={Database} user={SuperUser}", "could not translate host name \"nonexistent.invalid\""),
+            ($"host=127.0.0.1 port=5432 dbname={Database} user={SuperUser} sslmode=bogus", "sslmode"),
+        })
+        {
+            logpos = nodeB.ReadLog().Length;
+            _ = await nodeB.SafePsqlAsync(Database,
+                $"UPDATE worf.node_interface SET if_dsn = '{dsn}' WHERE if_nodeid = (SELECT node_id FROM worf.node WHERE node_name = 'node_c')", token);
+            Assert.IsTrue(await nodeB.PollLogAsync(logpos, failure, token), $"node_b's probe of node_c failing with {failure}");
+        }
+
+        Assert.AreEqual(worker, await nodeB.SafePsqlAsync(Database, Worker, token), "node_b's exchange worker, which went on");
+        Assert.DoesNotContain("cannot wait on socket", nodeB.ReadLog(), "node_b's log");
+    }
+
+    /// <summary>
+    /// A provider that takes a connection and its settings but never answers a call holds up no other exchange, and is
+    /// called again after a delay that doubles for each such call in a row, though its probes answer.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task ProvidersThatTakeNoCallBackOff()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token, "log_min_messages = debug1");
+        await using TestNode nodeC = await StartNodeAsync("node_c", token);
+        foreach (TestNode node in new[] { nodeA, nodeB, nodeC })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        await SubscribeAsync(nodeB, "b_from_c", nodeC, token);
+        _ = await nodeA.SafePsqlAsync(Database,
+            "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100, max_range_size := 100)", token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+
+        // node_b reaches node_c through a relay that passes a connection's settings and holds its calls.
+        await using ProviderRelay relay = new(nodeC.Cluster.Port, holdCalls: true);
+        int logpos = nodeB.ReadLog().Length;
+        _ = await nodeB.SafePsqlAsync(Database, $"""
+            UPDATE worf.node_interface SET if_dsn = 'host=127.0.0.1 port={relay.Port.ToString(CultureInfo.InvariantCulture)} dbname={Database} user={SuperUser} sslmode=disable gssencmode=disable'
+            WHERE if_nodeid = (SELECT node_id FROM worf.node WHERE node_name = 'node_c')
+            """, token);
+        // node_b draws small blocks from node_a meanwhile, for 30 s at least, and no insert waits for one. The server
+        // times each insert.
+        const string Insert = "INSERT INTO t (v) VALUES ('b')";
+        string delays = "";
+        await using (NpgsqlConnection writer = await nodeB.OpenAsync(Database, token))
+        {
+            await using (NpgsqlCommand logged = new("SET log_min_duration_statement = 0", writer))
+            {
+                _ = await logged.ExecuteNonQueryAsync(token);
+            }
+
+            await using NpgsqlCommand insert = new(Insert, writer);
+            Stopwatch waiting = Stopwatch.StartNew();
+            TimeSpan looked = TimeSpan.Zero;
+            while (waiting.Elapsed < TimeSpan.FromSeconds(90) && (waiting.Elapsed < TimeSpan.FromSeconds(30) || delays.Split(',').Length < 2))
+            {
+                _ = await insert.ExecuteNonQueryAsync(token);
+                await Task.Delay(TimeSpan.FromMilliseconds(5), token);
+                if (waiting.Elapsed - looked > TimeSpan.FromSeconds(1))
+                {
+                    looked = waiting.Elapsed;
+                    delays = string.Join(',', nodeB.ReadLog()[logpos..].Split('\n')
+                        .Where(line => line.Contains("exchange with node node_c is made again in ", StringComparison.Ordinal))
+                        .Select(line => line[(line.IndexOf(" in ", StringComparison.Ordinal) + 4)..].Trim()));
+                }
+            }
+        }
+
+        string log = nodeB.ReadLog()[logpos..];
+        List<double> waits = [.. log.Split('\n')
+            .Where(line => line.Contains($": {Insert}", StringComparison.Ordinal) && line.Contains("  execute ", StringComparison.Ordinal))
+            .Select(line => double.Parse(line[(line.IndexOf("duration: ", StringComparison.Ordinal) + 10)..line.IndexOf(" ms", StringComparison.Ordinal)],
+                CultureInfo.InvariantCulture))];
+        waits.Sort();
+        Assert.IsGreaterThan(100, waits.Count, "node_b's inserts");
+        Assert.IsLessThan(1000.0, waits[^1], "node_b's slowest insert, against the 5000 ms each call to node_c held up its calls to node_a");
+        Assert.StartsWith("10000 ms,20000 ms", delays, "node_b's delays after its calls to node_c ran out of time, though its probe answered between them");
+        Assert.Contains("exchange with node node_c answered a probe", log, "node_b's probe of node_c");
+    }
+
+    /// <summary>
+    /// A neighbor that reports a route to the owner longer than any route can be has no route, so that a node keeps
+    /// nothing of it, nor passes it on.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task LongRoutesCountAsNone()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        await using TestNode nodeC = await StartNodeAsync("node_c", token);
+        TestNode[] nodes = [nodeA, nodeB, nodeC];
+        foreach (TestNode node in nodes)
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b,node_c}', range_size := 100)", token);
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        await SubscribeAsync(nodeC, "c_from_b", nodeB, token);
+        await WaitActiveAsync(nodes, token);
+
+        // node_c's calls to node_b go through a relay that keeps their text.
+        await using ProviderRelay relay = new(nodeB.Cluster.Port);
+        _ = await nodeC.SafePsqlAsync(Database, $"""
+            UPDATE worf.node_interface SET if_dsn = 'host=127.0.0.1 port={relay.Port.ToString(CultureInfo.InvariantCulture)} dbname={Database} user={SuperUser} sslmode=disable gssencmode=disable'
+            WHERE if_nodeid = (SELECT node_id FROM worf.node WHERE node_name = 'node_b')
+            """, token);
+        const string Call = "SELECT worf.sequence_range_exchange(";
+        string? call = null;
+        Stopwatch capturing = Stopwatch.StartNew();
+        while (call is null)
+        {
+            Assert.IsLessThan(TestNode.PollTimeout, capturing.Elapsed, "a call of node_c's through the relay");
+            call = relay.Queries.LastOrDefault(query => query.StartsWith(Call, StringComparison.Ordinal));
+            await Task.Delay(TimeSpan.FromMilliseconds(100), token);
+        }
+
+        // The call made again with a route of 100,000 nodes that holds neither, at a distance of one.
+        string literal = call[Call.Length..^1];
+        JsonObject message = JsonNode.Parse(literal[1..^1].Replace("''", "'", StringComparison.Ordinal))!.AsObject();
+        foreach (JsonNode? sequence in message["sequences"]!.AsArray())
+        {
+            sequence!["distance"] = 1;
+            sequence["route"] = new JsonArray([.. Enumerable.Range(0, 100000).Select(hop => (JsonNode?)(1000000 + hop))]);
+        }
+
+        _ = await nodeB.SafePsqlAsync(Database, $"{Call}'{message.ToJsonString().Replace("'", "''", StringComparison.Ordinal)}')", token, SuperUser);
+        Assert.AreEqual("t|t", await nodeB.SafePsqlAsync(Database, """
+            SELECT route IS NULL, distance IS NULL FROM worf.sequence_range_node
+            WHERE seqoid = 't_id_seq'::regclass AND node_name = 'node_c' AND via_node = node_id
+            """, token), "node_c's route and distance, as node_b keeps them");
     }
 
     /// <summary>
@@ -2544,7 +2703,8 @@ public sealed class SequenceRangeTests
     /// a multi-row VALUES list, a CHECK constraint or BEFORE trigger condition, alone or of a data-modifying WITH's table
     /// beside a partition-routing statement, a stable PL/pgSQL function a generic plan's partition pruning calls as the
     /// plan starts, explained or not, beside a call of an unmanaged sequence, and a domain's CHECK that partition pruning
-    /// coerces a value to, explained. Each waits, naming the grantor and
+    /// coerces a value to, explained. A call C code starts as a statement runs, as a domain's CHECK that a record's or
+    /// a value's input runs, waits as one whose sequence worf can't tell. Each waits, naming the grantor and
     /// the sequence, or, for a call whose sequence worf can't tell, as one a PL/pgSQL function computes the name of,
     /// saying so, here until statement_timeout while the grantor is down, or for twice worf.sequence_range_timeout,
     /// after which it fails naming the grantor. What draws nothing from those blocks doesn't wait: a read of the
@@ -2553,10 +2713,12 @@ public sealed class SequenceRangeTests
     /// parameter, a CALL's argument, a COPY's WHERE or the CHECK of the domain of a column COPY reads, a multi-row
     /// VALUES list, alone or as an INSERT's rows or defaults, a CHECK constraint of a table an INSERT or COPY writes, a
     /// BEFORE trigger's condition, or a RETURNING list of an INSERT or UPDATE of a partitioned table, beside another
-    /// table whose CHECK draws, a COPY whose defaults draw from those, ALTER TABLE adding a serial column to a temporary
+    /// table whose CHECK draws, an EXPLAIN whose pruning draws only from those, a COPY whose defaults draw from those,
+    /// ALTER TABLE adding a serial column to a temporary
     /// table, an UPDATE or a MERGE that sets such a column to a value, and nextval in a read-only transaction, which
     /// fails at once, as do, before 17, an INSERT, MERGE or COPY straight into a partition, which shares no identity
-    /// column with its parent. Once the grantor is back, the node draws again.
+    /// column with its parent, and from 17 on an insert into a partition of a table attached as a partition. Once the
+    /// grantor is back, the node draws again.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -2617,6 +2779,9 @@ public sealed class SequenceRangeTests
             CREATE DOMAIN ddk AS int CHECK (nextval('public.t_id_seq') > 0);
             CREATE FUNCTION fd(i int) RETURNS ddk LANGUAGE sql STABLE AS 'SELECT i::ddk';
             CREATE TABLE tl2 (id bigint NOT NULL, v text);
+            CREATE TABLE tlt (id bigint NOT NULL, v text) PARTITION BY LIST (v);
+            CREATE TABLE tlt1 PARTITION OF tlt FOR VALUES IN ('t');
+            CREATE DOMAIN pdk AS int CHECK (nextval('public.plain') > 0);
             """, token);
         await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
         _ = await nodeA.SafePsqlAsync(Database, """
@@ -2635,7 +2800,8 @@ public sealed class SequenceRangeTests
         await nodeA.StopAsync("fast", token);
         await nodeB.StopAsync("fast", token);
         await nodeB.StartServerAsync(token);
-        bool sharedIdentity = int.Parse(await nodeB.SafePsqlAsync(Database, "SHOW server_version_num", token), CultureInfo.InvariantCulture) >= 170000;
+        int version = int.Parse(await nodeB.SafePsqlAsync(Database, "SHOW server_version_num", token), CultureInfo.InvariantCulture);
+        bool sharedIdentity = version >= 170000;
         const string Generic = "SET plan_cache_mode = force_generic_plan; PREPARE q(int) AS";
 
         // Each form is checked, and what fails is reported together.
@@ -2666,7 +2832,14 @@ public sealed class SequenceRangeTests
             ("WITH c AS (INSERT INTO twm VALUES ('c')) INSERT INTO pq VALUES (1, 'w') RETURNING nextval('plain')", "t_id_seq"),
             ("WITH c AS (SELECT * FROM (VALUES (nextval('public.t_id_seq')), (nextval('public.t_id_seq'))) v (n)) INSERT INTO pq SELECT 1, 'r' FROM c RETURNING nextval('plain')",
                 "t_id_seq"),
-        }.Concat(sharedIdentity ? [
+            ("SELECT nextval('plain') FROM jsonb_to_record('{\"a\":1}') AS j(a ddk)", null),
+            ("SELECT nextval('plain') FROM json_to_recordset('[{\"a\":1}]') AS j(a ddk)", null),
+            ("INSERT INTO other SELECT nextval('plain') FROM jsonb_to_record('{\"a\":1}') AS j(a ddk)", null),
+            ("EXPLAIN ANALYZE SELECT nextval('plain') FROM jsonb_to_record('{\"a\":1}') AS j(a ddk)", null),
+            ("DO $$ BEGIN PERFORM nextval('plain') FROM jsonb_to_record('{\"a\":1}') AS j(a ddk); END $$", null),
+        }.Concat(version >= 160000 ? [
+            ("SELECT nextval('plain'), pg_input_is_valid('1', 'ddk')", null), ("SELECT nextval('plain'), * FROM pg_input_error_info('1', 'ddk')", null),
+        ] : []).Concat(sharedIdentity ? [
             ("INSERT INTO tp1 (v) VALUES ('x') RETURNING id", "tp_id_seq"),
             ("MERGE INTO tp1 USING (SELECT 1) s ON false WHEN NOT MATCHED THEN INSERT (v) VALUES ('m')", "tp_id_seq"),
             ($"COPY tp1 (v) FROM '{rows}'", "tp_id_seq"),
@@ -2707,6 +2880,8 @@ public sealed class SequenceRangeTests
             "INSERT INTO pq SELECT 1, 'j' FROM pp a JOIN pp b ON a.k = b.k WHERE a.k = 1 RETURNING nextval('plain')",
             "INSERT INTO tint (x, y) VALUES (1, nextval('plain')), (2, nextval('plain'))", "INSERT INTO tint (x, y) VALUES (1, DEFAULT), (2, DEFAULT)",
             "SELECT * FROM (VALUES (nextval('plain')), (nextval('plain'))) v", "INSERT INTO ckp VALUES ('x')", $"COPY ckp (v) FROM '{rows}'",
+            "EXPLAIN SELECT nextval('t_id_seq') FROM pp WHERE k = 1::pdk", "EXPLAIN INSERT INTO t (v) SELECT 'x' FROM pp WHERE k = 1::pdk",
+            $"{Generic} SELECT nextval('t_id_seq') FROM pp WHERE k = $1::pdk; EXPLAIN EXECUTE q(1)",
             "INSERT INTO tw VALUES ('x')",
             "UPDATE ti SET id = id WHERE id = (SELECT min(id) FROM ti)", "UPDATE t SET id = id WHERE id = (SELECT min(id) FROM t)",
             "UPDATE ti SET (id, v) = (id, 'w') WHERE id = (SELECT min(id) FROM ti)",
@@ -2723,12 +2898,15 @@ public sealed class SequenceRangeTests
             }
         }
 
-        // Before 17, a partition shares no identity column with its parent, and writing it straight fails at once.
-        foreach (string fails in sharedIdentity ? [] : new[]
-        {
-            "INSERT INTO tp1 (v) VALUES ('x') RETURNING id", "MERGE INTO tp1 USING (SELECT 1) s ON false WHEN NOT MATCHED THEN INSERT (v) VALUES ('m')",
-            $"COPY tp1 (v) FROM '{rows}'",
-        })
+        // Before 17, a partition shares no identity column with its parent, and writing it straight fails at once, as
+        // from 17 on does writing a partition of a table attached as a partition, which PostgreSQL gives none.
+        foreach (string fails in sharedIdentity
+            ? ["INSERT INTO tlt1 VALUES (108, 't'); ALTER TABLE tl ATTACH PARTITION tlt FOR VALUES IN ('t'); INSERT INTO tlt1 (v) VALUES ('t')"]
+            : new[]
+            {
+                "INSERT INTO tp1 (v) VALUES ('x') RETURNING id", "MERGE INTO tp1 USING (SELECT 1) s ON false WHEN NOT MATCHED THEN INSERT (v) VALUES ('m')",
+                $"COPY tp1 (v) FROM '{rows}'",
+            })
         {
             string? outcome;
             try
@@ -2876,8 +3054,12 @@ public sealed class SequenceRangeTests
         _ = await nodeB.SafePsqlAsync(Database, "UPDATE cx SET later = NULL; ALTER TABLE cx ALTER COLUMN later SET DEFAULT nextval('public.t_id_seq')", token);
         _ = await nodeC.SafePsqlAsync(Database, "INSERT INTO cx VALUES (2, 'y')", token);
 
-        _ = await nodeC.SafePsqlAsync(Database,
-            "SELECT worf.replicate_ddl_command($$INSERT INTO public.other VALUES (nextval('public.t_id_seq'))$$)", token);
+        // The statement draws only where it applies, on node_b: node_c, which manages the sequence too, as it heard of it
+        // from node_b, may have no block of it.
+        _ = await nodeC.SafePsqlAsync(Database, """
+            SELECT worf.replicate_ddl_command($$INSERT INTO public.other SELECT nextval('public.t_id_seq') FROM worf.local_node l
+                JOIN worf.node n ON n.node_id = l.node_id WHERE n.node_name = 'node_b'$$)
+            """, token);
         await Task.Delay(TimeSpan.FromSeconds(5), token);
         Assert.AreEqual($"0|2|{before}", await nodeB.SafePsqlAsync(Database,
             "SELECT (SELECT count(*) FROM other), (SELECT count(*) FROM cx), (SELECT last_value FROM t_id_seq)", token),
@@ -3117,14 +3299,13 @@ public sealed class SequenceRangeTests
     }
 
     /// <summary>
-    /// A call that runs out of time on its own just as its watcher cancels it takes the cancel before it goes on, so that
-    /// the cancel fails no later call, nor the report of the call's own failure. On Linux and macOS, where the exchange
-    /// worker can be stopped past the call's time, which has the watcher cancel it as the call ends on its own.
+    /// An exchange worker paused past a call's time fails that call once it goes on, and reports it at once, and none of
+    /// its calls to the other nodes after it. On Linux and macOS, where the exchange worker can be stopped.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
     [OSCondition(OperatingSystems.Linux | OperatingSystems.OSX)]
-    public async Task LateCancelsFailNoLaterCall()
+    public async Task PausedWorkersFailOnlyTheCallsPastTheirTime()
     {
         CancellationToken token = TestContext.CancellationToken;
         await using TestNode nodeA = await StartNodeAsync("node_a", token);
@@ -3141,8 +3322,7 @@ public sealed class SequenceRangeTests
         await WaitActiveAsync([nodeA, nodeB], token);
 
         // node_c's host drops node_b's connection attempts. The exchange worker stops while its first call waits on
-        // node_c, past the call's five seconds, so that the watcher cancels the call, which, once the worker goes on, ends
-        // at its own time limit before it takes the cancel.
+        // node_c, past the call's five seconds.
         const string Worker = "SELECT pid FROM pg_stat_activity WHERE backend_type LIKE 'worf exchange%'";
         int logpos = nodeB.ReadLog().Length;
         _ = await nodeB.SafePsqlAsync(Database,

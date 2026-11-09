@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -6,11 +7,13 @@ using System.Text;
 namespace Worf.Tests;
 
 /// <summary>
-/// A TCP relay to a provider's server, for the subscriber tool's tests, which reads each connection's startup packet: it
+/// A TCP relay to a server, for tests, which reads each connection's startup packet and the queries its client sends: it
 /// can hold the WAL that a standby's walreceiver streams once the replication handshake is through, so that the standby
-/// streams toward its restore point and never reaches it, and hold every connection made after the walreceiver
-/// disconnects, so that the tool's next connection to the provider waits however the test process is scheduled. A
-/// connection that asks for SSL or GSS encryption is told the relay has none.
+/// streams toward its restore point and never reaches it, hold every connection made after the walreceiver
+/// disconnects, so that the tool's next connection to the provider waits however the test process is scheduled, and
+/// hold every query after a connection's first, so that a connection is made and set up but its calls are never
+/// answered. It keeps the text of the queries it passes. A connection that asks for SSL or GSS encryption is told the
+/// relay has none.
 /// </summary>
 internal sealed class ProviderRelay : IAsyncDisposable
 {
@@ -22,6 +25,7 @@ internal sealed class ProviderRelay : IAsyncDisposable
     private readonly int _target;
     private readonly bool _holdWal;
     private readonly bool _holdAfterWalreceiver;
+    private readonly bool _holdCalls;
     private readonly CancellationTokenSource _stop = new();
     private readonly CancellationTokenSource _held = new();
     private readonly List<TcpClient> _clients = [];
@@ -36,11 +40,14 @@ internal sealed class ProviderRelay : IAsyncDisposable
     /// replication starts.</param>
     /// <param name="holdAfterWalreceiver">Whether every connection made after a walreceiver's ends is held, answering
     /// nothing.</param>
-    internal ProviderRelay(int target, bool holdWal, bool holdAfterWalreceiver)
+    /// <param name="holdCalls">Whether each connection's queries after its first are held, never reaching the
+    /// server.</param>
+    internal ProviderRelay(int target, bool holdWal = false, bool holdAfterWalreceiver = false, bool holdCalls = false)
     {
         _target = target;
         _holdWal = holdWal;
         _holdAfterWalreceiver = holdAfterWalreceiver;
+        _holdCalls = holdCalls;
         _listener.Start();
         _accepting = AcceptAsync();
     }
@@ -59,6 +66,11 @@ internal sealed class ProviderRelay : IAsyncDisposable
     /// Gets a task that completes once the relay holds a connection made after a walreceiver's ended.
     /// </summary>
     internal TaskCompletionSource Held { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>
+    /// Gets the text of the simple queries the relay has passed, in the order they came.
+    /// </summary>
+    internal ConcurrentQueue<string> Queries { get; } = new();
 
     /// <summary>
     /// Stops holding connections, closing those it held, and passes the ones made from now on.
@@ -181,7 +193,7 @@ internal sealed class ProviderRelay : IAsyncDisposable
                 await far.ConnectAsync(IPAddress.Loopback, _target, token);
                 NetworkStream server = far.GetStream();
                 await server.WriteAsync(startup, token);
-                Task up = PumpAsync(client, server, token);
+                Task up = walreceiver ? PumpAsync(client, server, token) : PassQueriesAsync(client, server, token);
                 Task down = walreceiver && _holdWal ? PassUntilReplicationAsync(server, client, token) : PumpAsync(server, client, token);
                 _ = await Task.WhenAny(up, down);
             }
@@ -196,6 +208,29 @@ internal sealed class ProviderRelay : IAsyncDisposable
             {
                 _holding = true;
             }
+        }
+    }
+
+    // Passes a client's messages, keeping its queries' text, and holding those after its first query when it holds calls.
+    private async Task PassQueriesAsync(NetworkStream client, NetworkStream server, CancellationToken token)
+    {
+        int queries = 0;
+        while (true)
+        {
+            byte[] header = await ReadExactlyAsync(client, 5, token);
+            byte[] body = await ReadExactlyAsync(client, BinaryPrimitives.ReadInt32BigEndian(header.AsSpan(1)) - 4, token);
+            if (header[0] == (byte)'Q')
+            {
+                if (_holdCalls && queries++ > 0)
+                {
+                    await Task.Delay(Timeout.Infinite, token);
+                }
+
+                Queries.Enqueue(Encoding.UTF8.GetString(body, 0, Math.Max(body.Length - 1, 0)));
+            }
+
+            byte[] message = [.. header, .. body];
+            await server.WriteAsync(message, token);
         }
     }
 

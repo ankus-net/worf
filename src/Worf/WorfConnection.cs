@@ -48,6 +48,12 @@ internal sealed unsafe partial class WorfConnection : IDisposable
     internal int ServerVersion { get; }
 
     /// <summary>
+    /// Gets the libpq connection of an ordinary connection, which libpqwalreceiver's WalReceiverConn holds first, in the
+    /// layout it has kept since PostgreSQL 10, for a query sent without waiting on it.
+    /// </summary>
+    internal void* Libpq => ((OrdinaryWalReceiverConn*)Conn)->StreamConn;
+
+    /// <summary>
     /// Gets what an ordinary connection sets before it runs anything else, which a logical replication connection asks
     /// for in its startup packet: text in this database's encoding, unambiguous dates, intervals and floats, and an
     /// always-secure search path.

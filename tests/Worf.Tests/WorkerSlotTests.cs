@@ -128,7 +128,7 @@ public sealed class WorkerSlotTests
     public async Task UnrelatedPreparedCommitsStartNoManager(bool restart)
     {
         CancellationToken token = TestContext.CancellationToken;
-        await using TestNode node = await TestNode.StartAsync("node", ["max_prepared_transactions = 40", "log_min_messages = debug1"], token);
+        await using TestNode node = await TestNode.StartAsync("node", ["max_prepared_transactions = 40", "log_min_messages = debug1", "max_worker_processes = 32"], token);
         for (int i = 0; i < 3; i++)
         {
             _ = await node.SafePsqlAsync(Database, $"CREATE DATABASE unrelated{i}", token);
@@ -189,6 +189,7 @@ public sealed class WorkerSlotTests
 
             await Task.Delay(TimeSpan.FromSeconds(3), token);
             Assert.AreEqual(restored, Starts(), "managers started by unrelated COMMIT PREPARED of transactions prepared before a restart");
+            Assert.DoesNotContain("out of background worker slots", node.ReadLog(), "the node's log, as every database got its manager");
             return;
         }
 
@@ -207,6 +208,38 @@ public sealed class WorkerSlotTests
         Assert.AreEqual(scansBefore, await ScansAsync(committing, token), "scans of pg_db_role_setting by 20 unrelated COMMIT PREPARED");
         await Task.Delay(TimeSpan.FromSeconds(3), token);
         Assert.AreEqual(before, Starts(), "managers started by 20 unrelated COMMIT PREPARED");
+
+        int Starts() => node.ReadLog().Split('\n').Count(line => line.Contains("starting background worker process \"worf manager", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// COMMIT PREPARED of a transaction that changed a database, but not which databases have managers, as ALTER DATABASE
+    /// ... CONNECTION LIMIT does, restored after a restart, starts no manager, though it commits after the supervisor's
+    /// regular look, which the managers that found nothing to manage before don't hold back.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task LateUnchangingCommitsStartNoManager()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode node = await TestNode.StartAsync("node", ["max_prepared_transactions = 4", "max_worker_processes = 32", "log_min_messages = debug1"], token);
+        for (int i = 0; i < 4; i++)
+        {
+            _ = await node.SafePsqlAsync(Database, $"CREATE DATABASE unchanged{i}", token);
+        }
+
+        _ = await node.SafePsqlAsync("unchanged0", "BEGIN; ALTER DATABASE unchanged1 CONNECTION LIMIT 50; PREPARE TRANSACTION 'limit'", token);
+        await node.StopAsync("fast", token);
+        await node.StartServerAsync(token);
+        Stopwatch since = Stopwatch.StartNew();
+
+        // The supervisor looks at once and again three minutes later; the transaction commits after that.
+        await Task.Delay(TimeSpan.FromSeconds(200), token);
+        int before = Starts();
+        _ = await node.SafePsqlAsync("unchanged0", "COMMIT PREPARED 'limit'", token);
+        await Task.Delay(TimeSpan.FromSeconds(10), token);
+        TestContext.WriteLine($"committed {since.Elapsed.TotalSeconds:F0} s after the restart");
+        Assert.AreEqual(before, Starts(), "managers started by a restored COMMIT PREPARED that changed no database's manager");
 
         int Starts() => node.ReadLog().Split('\n').Count(line => line.Contains("starting background worker process \"worf manager", StringComparison.Ordinal));
     }

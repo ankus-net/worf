@@ -1692,12 +1692,11 @@ internal static class Sync
         uint copyOid = Worf.ReadScalar<uint>($"SELECT '{MergeCopy}'::regclass::oid");
 
         // Each of the provider's rows is numbered in the copy's order, by which the rows the merge skips are recorded,
-        // and removed from the copy, through an index on the numbers.
+        // and removed from the copy, through an index on the numbers that only a merge that fails builds.
         WorfRows copyColumns = Worf.Read("SELECT attname::pg_catalog.text FROM pg_catalog.pg_attribute WHERE attrelid = $1 AND attnum > 0 AND NOT attisdropped",
             0, SpiParameter.Create(copyOid));
         string row = Worf.QuoteIdentifier(HeldValues.FreeName([.. copyColumns.Select(column => column.Get<string>(0))], "worf_row"));
         _ = Worf.Execute($"ALTER TABLE {MergeCopy} ADD COLUMN {row} pg_catalog.int8 GENERATED ALWAYS AS IDENTITY");
-        _ = Worf.Execute($"CREATE INDEX ON {MergeCopy} ({row})");
 
         // The columns the merge writes: the copy's, but those the table generates.
         WorfRows attributes = Worf.Read("""
@@ -1791,6 +1790,7 @@ internal static class Sync
             // for each row they check, and the halves merge no row the merge leaves as it is.
             _ = Worf.Execute($"DELETE FROM {MergeCopy} c WHERE NOT ({Written(reloid, only + table, key, operators, rest)})");
             IndexCopyKey(index);
+            _ = Worf.Execute($"CREATE INDEX ON {MergeCopy} ({row})");
 
             // The rows that a NOT NULL column, a CHECK constraint, a unique index or an exclusion constraint refuses are
             // skipped first, all at once, and the rest merged again, so that only rows that fail for another reason, as
@@ -1798,8 +1798,10 @@ internal static class Sync
             // transaction ID.
             s_heldChecked = 0;
             s_heldMost = 0;
+            s_heldFinding = TimeSpan.Zero;
+            s_heldDeciding = TimeSpan.Zero;
             long skipped = SkipHeldValues(rel, lsn, only + table, key, operators, rest, index, row, attnamelist);
-            WorfLog.Log($"the held-value checks of the copy of table {remoterel.Nspname}.{remoterel.Relname} kept {s_heldChecked} rows to decide on, holding at most {s_heldMost} of their keys at once");
+            WorfLog.Log($"the held-value checks of the copy of table {remoterel.Nspname}.{remoterel.Relname} kept {s_heldChecked} rows to decide on, holding at most {s_heldMost} of their keys at once, in {s_heldFinding.TotalMilliseconds.ToString("F0", CultureInfo.InvariantCulture)} ms finding their conflicts and {s_heldDeciding.TotalMilliseconds.ToString("F0", CultureInfo.InvariantCulture)} ms deciding");
             if (!Merged(merge.ToString(), out _))
             {
                 List<(long Row, PgException Error)> halved = [];
@@ -1813,7 +1815,7 @@ internal static class Sync
                     s_keyChecksAtParts = 0;
                     s_keyChecksWhole = 0;
                     long writes = Worf.ReadScalar<long>($"SELECT count(*)::pg_catalog.int8 FROM {MergeCopy}");
-                    string wrote = Same(reloid, key, operators, "w", "c");
+                    (List<string> Key, Dictionary<short, string> Operators) wrote = (key, operators);
                     _ = MergeParts(reloid, only + table, mergePart, row, 0, Position(max) + 1, halved, wrote, true);
                     WorfLog.Log($"merged the copy of table {remoterel.Nspname}.{remoterel.Relname} in halves: {s_partsTried} parts tried whole, the largest of {s_largestTried} rows, of the {writes} rows it writes, after the held-value checks kept {s_heldChecked} rows to decide on; {s_keyChecksAtParts} deferrable key checks at the parts' keys, {s_keyChecksWhole} at the whole table");
                 }
@@ -1963,6 +1965,8 @@ internal static class Sync
             });
             s_heldChecked += HeldValues.RefusedChecked;
             s_heldMost = Math.Max(s_heldMost, HeldValues.HeldMost);
+            s_heldFinding += HeldValues.Finding;
+            s_heldDeciding += HeldValues.Deciding;
             if (refused == 0)
             {
                 break;
@@ -2028,7 +2032,7 @@ internal static class Sync
     /// </summary>
     /// <returns>Whether every row of the part merged.</returns>
     private static bool MergeParts(uint reloid, string table, string merge, string row, long from, long to, List<(long Row, PgException Error)> skipped,
-        string wrote, bool failing = false, long known = -1)
+        (List<string> Key, Dictionary<short, string> Operators) wrote, bool failing = false, long known = -1)
     {
         // A part's second half, and the rest of rows merged alone, are merged in the same call, so that the rows a call
         // read go before the next part's, however many parts the merge goes through. How many rows a part holds is
@@ -2403,9 +2407,10 @@ internal static class Sync
     /// <param name="table">The table's qualified name, after ONLY when it isn't partitioned.</param>
     /// <param name="part">The places in the merge's copy of the part just merged, whose keys alone can have taken
     /// another row's, or null for the whole table.</param>
-    /// <param name="wrote">The condition that a row of the table, as <c>w</c>, is the one a row of the copy, as <c>c</c>,
-    /// merged into, by the merge's key, or null.</param>
-    private static void CheckDeferrableUnique(uint reloid, string table, (long From, long To)? part = null, string? wrote = null)
+    /// <param name="wrote">The merge's key, by which each row of the part's copy finds the row of the table it merged
+    /// into, with the key index's operators, or null.</param>
+    private static void CheckDeferrableUnique(uint reloid, string table, (long From, long To)? part = null,
+        (List<string> Key, Dictionary<short, string> Operators)? wrote = null)
     {
         // A part's rows hold the copy's keys when the copy has every key column, and no BEFORE ROW trigger that fires
         // for the merge may change them first; with no such trigger, the rows the part wrote, found by the merge's key,
@@ -2436,6 +2441,22 @@ internal static class Sync
             FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_index i ON i.indexrelid = c.conindid
             WHERE c.conrelid = $1 AND c.contype IN ('p', 'u') AND c.condeferrable
             """, 0, SpiParameter.Create(reloid));
+
+        // The names the part's merge keys go under, apart from the table's columns, which its keys read unqualified.
+        List<string> partNames = [];
+        if (wrote is (List<string> mergeKey, _) && indexes.Count > 0)
+        {
+            WorfRows tableColumns = Worf.Read("SELECT attname::pg_catalog.text FROM pg_catalog.pg_attribute WHERE attrelid = $1 AND attnum > 0",
+                0, SpiParameter.Create(reloid));
+            List<string> taken = [.. Enumerable.Range(0, tableColumns.Count).Select(i => tableColumns[i].Get<string>(0))];
+            for (int k = 0; k < mergeKey.Count; k++)
+            {
+                string name = HeldValues.FreeName(taken, string.Create(CultureInfo.InvariantCulture, $"worf_part_k{k}"));
+                taken.Add(name);
+                partNames.Add(Worf.QuoteIdentifier(name));
+            }
+        }
+
         foreach (WorfRow index in indexes)
         {
             string?[] columns = index.Get<string?[]>(2);
@@ -2457,8 +2478,14 @@ internal static class Sync
                 : "";
             bool atPart = part is not null && index.Get<bool>(5) && (!nullsEqual || !Worf.ReadScalar<bool>(
                 $"SELECT EXISTS (SELECT 1 FROM {MergeCopy} c WHERE {inPart} AND ({string.Join(" OR ", copied.Select(key => $"{key} IS NOT DISTINCT FROM NULL"))}))"));
-            string writtenRows = $"SELECT w.tableoid, w.ctid FROM {table} w JOIN {MergeCopy} c ON {wrote} WHERE {inPart}";
-            string writtenKeys = $"SELECT {string.Join(", ", keys)} FROM {table} WHERE (tableoid, ctid) IN ({writtenRows})";
+            // The rows a part wrote are found from the part's rows of the copy, through the merge key's index.
+            string writtenKeys = wrote is (List<string> Key, Dictionary<short, string> Operators) merged
+                ? $"""
+                    SELECT {string.Join(", ", keys)}
+                    FROM (SELECT {string.Join(", ", merged.Key.Select((column, k) => $"c.{Worf.QuoteIdentifier(column)} AS {partNames[k]}"))} FROM {MergeCopy} c WHERE {inPart}) p
+                        JOIN {table} ON {string.Join(" AND ", merged.Key.Select((column, k) => $"{Worf.QuoteIdentifier(column)} {KeyOperator(merged.Operators, reloid, column)} p.{partNames[k]}"))}
+                    """
+                : "";
             bool atWritten = part is not null && !atPart && wrote is not null && index.Get<bool>(7) && (!nullsEqual || !Worf.ReadScalar<bool>(
                 $"SELECT EXISTS (SELECT 1 FROM ({writtenKeys}) w (" + string.Join(", ", keys.Select((_, k) => $"k{k}")) + ") WHERE " +
                 string.Join(" OR ", keys.Select((_, k) => $"w.k{k} IS NOT DISTINCT FROM NULL")) + ")"));
@@ -2473,8 +2500,11 @@ internal static class Sync
                 where = $"{(where.Length == 0 ? " WHERE " : where + " AND ")}({string.Join(", ", keys)}) IN ({writtenKeys}{string.Concat(keys.Select(key => $" AND {key} IS DISTINCT FROM NULL"))})";
             }
 
+            // The rows a part wrote are found through the table itself, which, under a limit, the planner may read in
+            // the key index's order, looking each row up among the part's again, for a large part; without one, it
+            // reads as many rows as the part takes, or the table once.
             string? duplicate = Worf.ReadScalar<string?>(
-                $"SELECT {KeyText(keys.Length, "d.k")} FROM (SELECT {string.Join(", ", keys.Select((key, k) => $"{key} AS k{k}"))} FROM {table}{where}) d GROUP BY {string.Join(", ", keys.Select((_, k) => $"d.k{k}"))} HAVING pg_catalog.count(*) > 1 LIMIT 1");
+                $"SELECT {KeyText(keys.Length, "d.k")} FROM (SELECT {string.Join(", ", keys.Select((key, k) => $"{key} AS k{k}"))} FROM {table}{where}) d GROUP BY {string.Join(", ", keys.Select((_, k) => $"d.k{k}"))} HAVING pg_catalog.count(*) > 1{(atWritten ? "" : " LIMIT 1")}");
             if (duplicate is not null)
             {
                 throw new PgException(PgSqlStates.UniqueViolation, $"duplicate key value violates unique constraint \"{index.Get<string>(0)}\"",
@@ -3179,8 +3209,11 @@ internal static class Sync
     private static long s_largestTried;
     private static int s_heldChecked;
 
-    // The most keys taken and rows refused that the held-value checks held in memory at once.
+    // The most keys taken and rows refused that the held-value checks held in memory at once, and how long they took to
+    // find the candidates' conflicts and to decide on them.
     private static int s_heldMost;
+    private static TimeSpan s_heldFinding;
+    private static TimeSpan s_heldDeciding;
 
     // How many deferrable key checks looked only at the keys a part of the merge takes, and how many at the whole table.
     private static int s_keyChecksAtParts;

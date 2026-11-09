@@ -1322,6 +1322,14 @@ public sealed partial class ExceptionBehaviourTests
                 TestContext.WriteLine(checks);
                 Assert.IsLessThan(5000L, long.Parse(checks[(checks.IndexOf("holding at most ", StringComparison.Ordinal) + 16)..].Split(' ')[0], CultureInfo.InvariantCulture),
                     "the keys the held-value checks held at once, for 30,000 written rows whose keys a later row shares");
+
+                // Deciding on the rows, in the copy's order, looks each up among the conflicts found, and removes those
+                // refused from the copy, by its row numbers, both through indexes, so it takes about as long as finding
+                // the conflicts, rather than two to four times as long.
+                long Milliseconds(string after) => long.Parse(checks[(checks.IndexOf(after, StringComparison.Ordinal) + after.Length)..].Split(' ')[0], CultureInfo.InvariantCulture);
+                long finding = Milliseconds(" at once, in ");
+                long deciding = Milliseconds(" finding their conflicts and ");
+                Assert.IsLessThan(finding * 8 / 5, deciding, $"the time the held-value checks took deciding on the rows, against the {finding} ms they took finding their conflicts");
                 if (OperatingSystem.IsLinux())
                 {
                     long peak = await peakKb;

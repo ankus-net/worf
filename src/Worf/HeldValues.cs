@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 
 namespace Worf;
@@ -123,6 +124,7 @@ internal static class HeldValues
     {
         RefusedChecked = 0;
         HeldMost = 0;
+        long started = Stopwatch.GetTimestamp();
 
         // Each candidate's conflicts, by constraint: with a row the table keeps, with that row's keys, the rows whose keys
         // are the same as its own, numbered as one, or an earlier row its keys conflict with, with that row's keys.
@@ -261,6 +263,9 @@ internal static class HeldValues
                 _ = Worf.Execute("CREATE INDEX ON pg_temp.worf_held_conflicts (r, c); ANALYZE pg_temp.worf_held_conflicts");
             }
 
+            long conflictsFound = Stopwatch.GetTimestamp();
+            Finding = Stopwatch.GetElapsedTime(started, conflictsFound);
+
             RefusedChecked = many
                 ? Worf.ReadScalar<int>("SELECT pg_catalog.count(DISTINCT h.r)::pg_catalog.int4 FROM pg_temp.worf_held_conflicts h")
                 : gathered.Select(conflict => conflict.R).Distinct().Count();
@@ -374,6 +379,7 @@ internal static class HeldValues
             }
 
             decided = true;
+            Deciding = Stopwatch.GetElapsedTime(conflictsFound);
             return refusedCount;
 
             // The error of the first constraint, in the order they're checked, that refuses a candidate, from its
@@ -437,6 +443,16 @@ internal static class HeldValues
     /// once, for a part of its candidates.
     /// </summary>
     internal static int HeldMost { get; private set; }
+
+    /// <summary>
+    /// Gets how long the last <see cref="Refused"/> took to find the candidates' conflicts.
+    /// </summary>
+    internal static TimeSpan Finding { get; private set; }
+
+    /// <summary>
+    /// Gets how long the last <see cref="Refused"/> took to decide on the candidates, in the copy's order.
+    /// </summary>
+    internal static TimeSpan Deciding { get; private set; }
 
     /// <summary>
     /// Checks whether a table, or one of its partitions, has a BEFORE ROW INSERT or UPDATE trigger that fires under

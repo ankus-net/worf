@@ -1,6 +1,4 @@
 using System.Globalization;
-using System.Net;
-using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using Ankus.Postgres;
@@ -32,9 +30,11 @@ internal static class SequenceRangeExchange
     private static readonly Dictionary<uint, (long At, long Delay)> s_retries = [];
     private static readonly HashSet<uint> s_timedOut = [];
 
-    // The probes of the providers whose last call ran out of time, which connect without the worker waiting on them, by
-    // subscription, with the provider's name and connection string.
-    private static readonly Dictionary<uint, (WorfProbe Probe, string Name, string Dsn)> s_probes = [];
+    // The exchanges under way, by subscription, which the worker takes on without waiting on them.
+    private static readonly Dictionary<uint, WorfPendingExchange> s_pending = [];
+
+    // undefined_function, which a provider without the exchange function answers a call with.
+    private const string UndefinedFunction = "42883";
 
     // The sequences, with the prepared transactions holding their range rows, that this process has warned of.
     private static readonly HashSet<(uint Seqoid, string Gid)> s_preparedHolders = [];
@@ -54,8 +54,6 @@ internal static class SequenceRangeExchange
     // before that, which doubles from the check interval up to the exchange interval while nothing changes.
     private static readonly Dictionary<uint, (string What, long At, long Delay)> s_waits = [];
 
-    // The links a statement waits on whose retry it made due early.
-    private static readonly HashSet<uint> s_wanted = [];
 
     // The subscriptions whose provider answered the last exchange that their slot isn't streamed yet, those whose
     // provider answered the last call that it has no such slot, and those whose last exchange failed so, logged only
@@ -66,9 +64,8 @@ internal static class SequenceRangeExchange
 
     // The connection to each subscription's provider that this worker's exchanges go over, kept from one exchange to the
     // next, as apply keeps its own, rather than a session made and ended for each, with the connection string and the
-    // timeout it was made with, and whether the provider has the exchange function; one that fails, or a call on which
-    // the watcher cancels, is closed.
-    private static readonly Dictionary<uint, (WorfConnection Conn, string Dsn, int Timeout, bool Exchanges)> s_connections = [];
+    // timeout it was made with; one that fails, or a call that runs out of time, is closed.
+    private static readonly Dictionary<uint, (WorfConnection Conn, string Dsn, int Timeout)> s_connections = [];
 
     /// <summary>
     /// Answers a neighbor's exchange on the provider end of its subscription.
@@ -303,9 +300,13 @@ internal static class SequenceRangeExchange
 
     /// <summary>
     /// Exchanges with the provider of each enabled subscription whose turn has come, or with which something is
-    /// waiting: a request, a grant or an acknowledgement, less often while those exchanges change nothing. Each call is
-    /// a transaction of its own, committed before the next call, so that a block this node grants or receives is never
-    /// sent on, or acknowledged, before it is committed, and no row this node locks waits on another node.
+    /// waiting: a request, a grant or an acknowledgement, less often while those exchanges change nothing. The worker
+    /// waits on no provider: it starts each exchange's connection, if it keeps none for the provider, and its calls, and
+    /// takes them on as their sockets let it, this round or a later one, so that a provider that never answers, or
+    /// answers slowly, holds up none of the exchanges with the others. Each call's message is made in a transaction of
+    /// its own, and its reply taken in in another, committed before the next call, so that a block this node grants or
+    /// receives is never sent on, or acknowledged, before it is committed, and no row this node locks waits on another
+    /// node.
     /// </summary>
     /// <returns>Whether this node's blocks changed.</returns>
     internal static bool ExchangeAll()
@@ -319,155 +320,63 @@ internal static class SequenceRangeExchange
             s_waits.Clear();
         }
 
-        // A probe that has ended makes its neighbor's call due at once, or delays it.
-        TakeProbes();
+        SequenceRangeExchangeWorker.CheckWatcher();
         (WorfLocalNode Node, List<(WorfSubscription Sub, string? Waiting, bool Fenced)> Due)? links = PgBackgroundWorker.RunTransaction(DueLinks);
         if (links is not (WorfLocalNode node, List<(WorfSubscription Sub, string? Waiting, bool Fenced)> due))
         {
+            foreach (uint subId in s_pending.Keys.ToList())
+            {
+                Abandon(subId);
+            }
+
             return false;
         }
 
-        // A neighbor whose last call ran out of time is probed, by a connection the worker makes without waiting on it,
-        // and called again only once it has answered, so that a neighbor that never answers holds up none of the calls
-        // to the others, which wait on it for its first call's time at most.
-        bool changed = false;
-        foreach ((WorfSubscription sub, string? waiting, bool fenced) in due)
+        // The exchanges under way go as far as they can, and those that ended are taken in; then the links due that have
+        // none under way start theirs, one at a time with each provider, which takes this node's calls in the order of
+        // the WAL positions they carry.
+        bool changed = TakeExchanges(node);
+        foreach ((WorfSubscription sub, string? waiting, bool fenced) in due.Where(link => !s_pending.ContainsKey(link.Sub.Id)))
         {
-            // A worker asked to stop makes no more calls.
-            if (Worker.GotSigterm)
+            if (s_pending.Values.Any(other => other.Sub.Origin.Id == sub.Origin.Id))
+            {
+                continue;
+            }
+
+            // A worker asked to stop, or whose watcher stopped, starts no more exchanges.
+            if (Worker.GotSigterm || SequenceRangeExchangeWorker.Unwatched)
             {
                 break;
             }
 
-            long now = Worker.GetCurrentTimestamp();
-            if (s_timedOut.Contains(sub.Id))
+            _ = s_noSlot.Remove(sub.Id);
+            WorfPendingExchange pending = new(sub, waiting, fenced, Worker.GetCurrentTimestamp());
+            s_pending[sub.Id] = pending;
+            WorfLog.Debug2($"sequence range exchange with node {sub.Origin.Name} starting");
+            if (s_connections.TryGetValue(sub.Id, out (WorfConnection Conn, string Dsn, int Timeout) kept) && kept.Dsn == sub.OriginIf.Dsn &&
+                kept.Timeout == SequenceRanges.ExchangeTimeout)
             {
-                if (!s_probes.ContainsKey(sub.Id))
-                {
-                    StartProbe(sub, now);
-                }
-
-                continue;
+                pending.Reused = true;
+                Call(node, pending, kept.Conn);
             }
-
-            try
+            else
             {
-                _ = s_noSlot.Remove(sub.Id);
-                WorfLog.Debug2($"sequence range exchange with node {sub.Origin.Name} starting");
-                (bool received, bool granted) = ExchangeWith(node, sub);
-                WorfLog.Debug2($"sequence range exchange with node {sub.Origin.Name} done");
-
-                // A provider whose slot isn't streamed yet is asked again after a check interval.
-                if (s_notStreamed.Contains(sub.Id))
-                {
-                    s_retries[sub.Id] = (now + (SequenceRanges.CheckInterval * 1000L), SequenceRanges.CheckInterval * 1000L);
-                    WorfLog.Debug1($"sequence range exchange with node {sub.Origin.Name} waits for replication slot \"{sub.SlotName}\" to be streamed");
-                    continue;
-                }
-
-                changed |= received;
-                s_exchangedAt[sub.Id] = now;
-                _ = s_noSlotOnce.Remove(sub.Id);
-                _ = s_retries.Remove(sub.Id);
-
-                // An exchange that changed nothing while something waits makes the next one wait longer, up to the
-                // exchange interval, since the neighbor may not answer it for long, as when a root can't start or a
-                // fence waits on a node that is down, though no more than ten check intervals while the fence of the
-                // provider, or of an allocator behind it, holds, or a request waits on a pool holder.
-                if (received || granted || waiting is null)
-                {
-                    _ = s_waits.Remove(sub.Id);
-                }
-                else
-                {
-                    long delay = s_waits.TryGetValue(sub.Id, out (string What, long At, long Delay) wait) && wait.What == waiting ? wait.Delay * 2 : 0;
-                    long most = SequenceRanges.ExchangeInterval * 1000L;
-                    if (fenced)
-                    {
-                        most = Math.Min(most, FencedAskEvery * SequenceRanges.CheckInterval * 1000L);
-                    }
-
-                    delay = Math.Min(Math.Max(delay, SequenceRanges.CheckInterval * 1000L), most);
-                    s_waits[sub.Id] = (waiting, now + delay, delay);
-                }
-            }
-            catch (Exception error) when (error is PgException or PgRemoteException or PgQueryCanceledException)
-            {
-                // A call the watcher cancelled as the worker stops didn't fail, and once the watcher stops no call starts.
-                if (Worker.GotSigterm || SequenceRangeExchangeWorker.Unwatched)
-                {
-                    break;
-                }
-
-                // A cancel the watcher sent for an earlier call, which ended first, isn't this neighbor's: the exchange is
-                // made again at once.
-                if (error is PgQueryCanceledException && SequenceRangeExchangeWorker.TakeOwedCancel())
-                {
-                    s_retries[sub.Id] = (now, s_retries.GetValueOrDefault(sub.Id).Delay);
-                    WorfLog.Debug1($"sequence range exchange with node {sub.Origin.Name} met the cancel of an earlier call, and is made again");
-                    continue;
-                }
-
-                // A failed exchange is tried again after a delay that doubles, up to the exchange interval, or half the
-                // exchange timeout while this node waits on the neighbor, as for a block, so that inserts waiting at a
-                // block's end, up to twice the timeout, get it soon after the neighbor is back. A call the watcher
-                // cancelled has run out of time, which held up the calls to the other neighbors that came after it, so it
-                // backs off from ten seconds up to a minute, or the exchange interval if that is longer, whatever waits on
-                // the neighbor.
-                bool timedOut = error is PgQueryCanceledException or PgException { SqlState: PgSqlStates.QueryCanceled };
-                long most = waiting is not null && !timedOut
-                    ? Math.Min(SequenceRanges.ExchangeInterval * 1000L, SequenceRanges.ExchangeTimeout * 500L)
-                    : timedOut ? Math.Max(SequenceRanges.ExchangeInterval * 1000L, TimedOutBackoff)
-                    : SequenceRanges.ExchangeInterval * 1000L;
-                if (timedOut)
-                {
-                    _ = s_timedOut.Add(sub.Id);
-                }
-
-                // The delay counts from the call's end, so that one that ran out of time waits it out too.
-                long delay = s_retries.TryGetValue(sub.Id, out (long At, long Delay) retry) ? retry.Delay * 2 : 0;
-                long least = timedOut ? Math.Min(TimedOutFirstBackoff, most) : SequenceRanges.CheckInterval * 1000L;
-                delay = Math.Min(Math.Max(delay, Math.Max(least, SequenceRanges.CheckInterval * 1000L)), Math.Max(most, SequenceRanges.CheckInterval * 1000L));
-                s_retries[sub.Id] = (Worker.GetCurrentTimestamp() + delay, delay);
-                string failure = error is PgQueryCanceledException
-                    ? $"node {sub.Origin.Name} didn't answer within {SequenceRangeExchangeWorker.LastLimit.ToString(CultureInfo.InvariantCulture)} ms"
-                    : error.Message;
-                // While the subscription's first sync hasn't finished, its slot may not be there yet, or be made again,
-                // so a failure then is no news, and neither is the first exchange that finds the slot gone, as the
-                // subscription may be being dropped, which drops it before the drop commits.
-                PgDiagnostic diagnostic = new($"sequence range exchange with node {sub.Origin.Name} failed: {failure}")
-                {
-                    Detail = (error as PgException)?.Detail,
-                };
-                bool noSlot = s_noSlot.Contains(sub.Id);
-                if (!noSlot)
-                {
-                    _ = s_noSlotOnce.Remove(sub.Id);
-                }
-
-                if ((noSlot && s_noSlotOnce.Add(sub.Id)) ||
-                    PgBackgroundWorker.RunTransaction(() => Sync.GetSubscriptionSyncStatus(sub.Id, true) is { } sync && sync.Status != Sync.SyncStatusReady))
-                {
-                    WorfLog.Debug1(diagnostic.Message);
-                }
-                else
-                {
-                    WorfLog.Warning(diagnostic);
-                }
+                Connect(pending);
             }
         }
 
-        return changed;
+        bool took = TakeExchanges(node);
+        return changed || took;
     }
 
     /// <summary>
-    /// Waits up to a time for the latch, or, while probes are under way, for their sockets, taking each probe on as its
-    /// socket lets it, and returns once one has ended, so that the next round calls a neighbor that answered at once.
+    /// Waits up to a time for the latch, or, while exchanges are under way, for their sockets, taking each on as its
+    /// socket lets it, and returns once one has a result to take in, or has run out of time.
     /// </summary>
     /// <param name="milliseconds">The time.</param>
     internal static void Wait(int milliseconds)
     {
-        if (s_probes.Count == 0)
+        if (s_pending.Count == 0)
         {
             _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(milliseconds));
             return;
@@ -477,95 +386,360 @@ internal static class SequenceRangeExchange
         while (!Worker.GotSigterm)
         {
             long now = Worker.GetCurrentTimestamp();
-            if (now >= until || s_probes.Values.Any(probe => probe.Probe.Done || now >= probe.Probe.Deadline))
+            if (now >= until || s_pending.Values.Any(pending => Ready(pending, now)))
             {
                 return;
             }
 
-            // One probe's socket is waited on at a time, for a moment while others are under way.
-            WorfProbe waited = s_probes.Values.First().Probe;
-            long left = Math.Min(until, waited.Deadline) - now;
-            if (waited.Wait(Math.Max((s_probes.Count > 1 ? Math.Min(left, 50_000L) : left) / 1000L, 1)))
+            // One exchange's socket is waited on at a time, for a moment while others are under way.
+            WorfPendingExchange waited = s_pending.Values.First();
+            long left = Math.Min(until, Deadline(waited)) - now;
+            long slice = Math.Max((s_pending.Count > 1 ? Math.Min(left, 20_000L) : left) / 1000L, 1);
+            bool latched = waited.Query is WorfPendingQuery query ? query.Wait(slice) : waited.Probe?.Wait(slice) ?? false;
+            if (latched)
             {
                 PgInterrupts.Check();
                 return;
             }
 
-            foreach ((WorfProbe probe, _, _) in s_probes.Values)
+            foreach (WorfPendingExchange pending in s_pending.Values)
             {
-                probe.Advance();
+                pending.Probe?.Advance();
+                pending.Query?.Advance();
             }
         }
     }
 
+    // Whether an exchange under way has something to take in: a connection made or failed, a call's result, or its time
+    // run out.
+    private static bool Ready(WorfPendingExchange pending, long now)
+        => now >= Deadline(pending) || pending.Probe is { Done: true } || pending.Query is { Done: true } || (pending.Probe is null && pending.Query is null);
+
+    // When the step an exchange is at runs out of time.
+    private static long Deadline(WorfPendingExchange pending)
+        => pending.Query?.Deadline ?? pending.Probe?.Deadline ?? long.MinValue;
+
     /// <summary>
-    /// Starts a probe of a provider whose last call ran out of time, with the exchange's time. Its connection string is
-    /// read as a call's is.
+    /// Takes each exchange under way as far as it goes, and ends those that are done.
     /// </summary>
-    private static void StartProbe(WorfSubscription sub, long now)
+    /// <returns>Whether one that ended received a block.</returns>
+    private static bool TakeExchanges(WorfLocalNode node)
     {
+        List<bool> received = [.. s_pending.Values.ToList().Select(pending => TakeExchange(node, pending))];
+        return received.Contains(true);
+    }
+
+    // Takes an exchange under way as far as it goes, and ends it if it's done, returning whether it ended having received
+    // a block.
+    private static bool TakeExchange(WorfLocalNode node, WorfPendingExchange pending)
+    {
+        if (Step(node, pending) is not bool received)
+        {
+            return false;
+        }
+
+        _ = s_pending.Remove(pending.Sub.Id);
+        return received;
+    }
+
+    /// <summary>
+    /// Starts an exchange's connection to its provider, with the exchange's time, as a probe of a provider whose last call
+    /// ran out of time. Its connection string is read as a call's is.
+    /// </summary>
+    private static void Connect(WorfPendingExchange pending)
+    {
+        WorfSubscription sub = pending.Sub;
         Disconnect(sub.Id);
+        pending.Probing = s_timedOut.Contains(sub.Id);
         int timeout = SequenceRanges.ExchangeTimeout;
         (string conninfo, string applicationName) = Worf.ConnectionString(sub.OriginIf.Dsn, sub.Name, "range");
-        string setup = Worf.SessionSetup($"SET statement_timeout = {timeout.ToString(CultureInfo.InvariantCulture)}");
+        pending.Probe = WorfProbe.Start(conninfo, applicationName, Worf.SessionSetup($"SET statement_timeout = {timeout.ToString(CultureInfo.InvariantCulture)}"),
+            Worker.GetCurrentTimestamp() + (timeout * 1000L));
+        WorfLog.Debug2($"sequence range exchange with node {sub.Origin.Name} connecting{(pending.Probing ? ", as a probe" : "")}");
+    }
+
+    /// <summary>
+    /// Makes an exchange's call: this node's message, made in a transaction of its own, is sent, and the reply is taken
+    /// in once it has come. The message only reads, so that this node holds no row lock while the provider works, which
+    /// may wait on that provider's own calls to other nodes.
+    /// </summary>
+    private static void Call(WorfLocalNode node, WorfPendingExchange pending, WorfConnection conn)
+    {
+        WorfSubscription sub = pending.Sub;
         try
         {
-            s_probes[sub.Id] = (WorfProbe.Start(conninfo, applicationName, setup, now + (timeout * 1000L)), sub.Origin.Name, sub.OriginIf.Dsn);
-            WorfLog.Debug2($"sequence range exchange with node {sub.Origin.Name} probing");
+            // This node's calls carry its WAL position in order. How far this node applied the provider's changes is read
+            // before the call, so that the provider's answer, which it writes later, can't be behind it unless the
+            // provider went back.
+            (ulong applied, string message, List<Guid> refusals) = PgBackgroundWorker.RunTransaction(() =>
+            {
+                _ = Worf.Read("SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('worf.sequence_range_exchange'))", 0);
+                ulong applied = Applied(sub);
+                (string message, List<Guid> refusals) = Build(node, sub.Origin.Id, sub.SlotName);
+                return (applied, message, refusals);
+            });
+            pending.Applied = applied;
+            pending.Refusals = refusals;
+            pending.Calls++;
+            pending.Query = WorfPendingQuery.Start(conn, "SELECT worf.sequence_range_exchange(" + Worf.QuoteLiteral(message) + ")",
+                Worker.GetCurrentTimestamp() + (SequenceRanges.ExchangeTimeout * 1000L));
         }
         catch (PgException error)
         {
-            Probed(sub.Id, sub.Origin.Name, error.Message, false);
+            pending.Query = null;
+            Failed(pending, error.Message, false, error.Detail);
         }
     }
 
     /// <summary>
-    /// Takes each probe as far as its socket lets it, and ends those that have answered, failed or run out of time: a
-    /// neighbor that answered is called at once, over the probe's connection, and one that didn't is probed again
-    /// after a delay that doubles from ten seconds up to a minute, or the exchange interval if that is longer.
+    /// Takes an exchange as far as it goes now: a connection made goes on to its call, a call answered is taken in, and,
+    /// for a grant this node made from the provider's request, which goes back in a second call once this node has
+    /// committed it, makes that call. A kept connection that fails, as once the provider restarted, is made again, once,
+    /// before the exchange counts as failed.
     /// </summary>
-    private static void TakeProbes()
+    /// <returns>Null while the exchange goes on, or once it ends, whether this node received a block.</returns>
+    private static bool? Step(WorfLocalNode node, WorfPendingExchange pending)
     {
-        foreach ((uint subId, (WorfProbe probe, string name, string dsn)) in s_probes.ToList())
+        WorfSubscription sub = pending.Sub;
+        long now = Worker.GetCurrentTimestamp();
+        if (pending.Probe is WorfProbe probe)
         {
             probe.Advance();
-            long now = Worker.GetCurrentTimestamp();
             if (!probe.Done && now < probe.Deadline)
             {
-                continue;
+                return null;
             }
 
-            _ = s_probes.Remove(subId);
-            if (probe.Answered)
+            pending.Probe = null;
+            if (!probe.Answered)
             {
-                s_connections[subId] = (probe.Take(), dsn, SequenceRanges.ExchangeTimeout, false);
-                _ = s_timedOut.Remove(subId);
-                _ = s_retries.Remove(subId);
-                _ = s_exchangedAt.Remove(subId);
-                WorfLog.Debug1($"sequence range exchange with node {name} answered a probe, and is called again");
-                continue;
+                string failure = probe.Failure ?? $"node {sub.Origin.Name} didn't answer within {SequenceRanges.ExchangeTimeout.ToString(CultureInfo.InvariantCulture)} ms";
+                probe.Dispose();
+                Failed(pending, failure, probe.Failure is null, null);
+                return false;
             }
 
-            string failure = probe.Failure ?? $"node {name} didn't answer within {SequenceRanges.ExchangeTimeout.ToString(CultureInfo.InvariantCulture)} ms";
-            probe.Dispose();
-            Probed(subId, name, failure, probe.Failure is null);
+            // A provider whose last call ran out of time keeps its delay, which a call that fails again doubles.
+            WorfConnection conn = probe.Take();
+            s_connections[sub.Id] = (conn, sub.OriginIf.Dsn, SequenceRanges.ExchangeTimeout);
+            if (pending.Probing)
+            {
+                _ = s_timedOut.Remove(sub.Id);
+                WorfLog.Debug1($"sequence range exchange with node {sub.Origin.Name} answered a probe, and is called again");
+            }
+
+            Call(node, pending, conn);
         }
+
+        if (pending.Query is not WorfPendingQuery query)
+        {
+            return pending.Probe is null ? false : null;
+        }
+
+        query.Advance();
+        if (!query.Done && now < query.Deadline)
+        {
+            return null;
+        }
+
+        pending.Query = null;
+        if (!query.Done)
+        {
+            Disconnect(sub.Id);
+            Failed(pending, $"node {sub.Origin.Name} didn't answer within {SequenceRanges.ExchangeTimeout.ToString(CultureInfo.InvariantCulture)} ms", true, null);
+            return false;
+        }
+
+        if (query.Failure is string failed)
+        {
+            if (query.Broken && pending.Reused)
+            {
+                pending.Reused = false;
+                Connect(pending);
+                return null;
+            }
+
+            Disconnect(sub.Id);
+
+            // A provider without the exchange function manages no sequence.
+            if (query.SqlState == UndefinedFunction)
+            {
+                return Succeeded(pending);
+            }
+
+            Failed(pending, failed, query.SqlState == PgSqlStates.QueryCanceled, null);
+            return false;
+        }
+
+        try
+        {
+            (bool granted, bool received) = PgBackgroundWorker.RunTransaction(() => TakeReply(node, pending, query.Value ?? "{}"));
+            pending.Received |= received;
+            pending.Granted |= granted;
+            if (received)
+            {
+                _ = s_acksWaiting.Add(sub.Id);
+            }
+            else if (pending.Calls == 1)
+            {
+                _ = s_acksWaiting.Remove(sub.Id);
+            }
+
+            if (granted && pending.Calls < 2 && s_connections.TryGetValue(sub.Id, out (WorfConnection Conn, string Dsn, int Timeout) kept))
+            {
+                Call(node, pending, kept.Conn);
+                return pending.Query is null ? false : null;
+            }
+        }
+        catch (Exception error) when (error is PgException or PgRemoteException)
+        {
+            Disconnect(sub.Id);
+            Failed(pending, error.Message, false, (error as PgException)?.Detail);
+            return false;
+        }
+
+        return Succeeded(pending);
     }
 
     /// <summary>
-    /// Notes a probe that failed or ran out of time, which leaves its neighbor to be probed again after its delay.
+    /// Takes in a call's reply, in the caller's transaction, once this node's other exchanges have taken theirs in.
     /// </summary>
-    private static void Probed(uint subId, string name, string failure, bool timedOut)
+    private static (bool Granted, bool Received) TakeReply(WorfLocalNode node, WorfPendingExchange pending, string reply)
     {
-        long most = Math.Max(SequenceRanges.ExchangeInterval * 1000L, TimedOutBackoff);
-        long delay = s_retries.TryGetValue(subId, out (long At, long Delay) retry) ? retry.Delay * 2 : 0;
-        delay = Math.Min(Math.Max(delay, Math.Min(TimedOutFirstBackoff, most)), most);
-        s_retries[subId] = (Worker.GetCurrentTimestamp() + delay, delay);
-        WorfLog.Warning(new PgDiagnostic($"sequence range exchange with node {name} failed: {failure}")
+        WorfSubscription sub = pending.Sub;
+        TakeTurn();
+        AcknowledgeRefusals(pending.Refusals);
+        using JsonDocument document = JsonDocument.Parse(reply);
+        if (document.RootElement.TryGetProperty("streamed", out JsonElement streamed) && streamed.ValueKind == JsonValueKind.False)
         {
-            Detail = timedOut ? null : "The probe of a node whose last call ran out of time failed.",
-        });
+            // A provider without the slot answers so, rather than failing the call, which would log an error there too.
+            if (document.RootElement.TryGetProperty("slot", out JsonElement slot) && slot.ValueKind == JsonValueKind.False)
+            {
+                _ = s_noSlot.Add(sub.Id);
+                throw new PgException("42501", $"no worf replication slot \"{sub.SlotName}\" carries this sequence range exchange");
+            }
+
+            _ = s_notStreamed.Add(sub.Id);
+            return (false, false);
+        }
+
+        _ = s_notStreamed.Remove(sub.Id);
+        return Process(node, document.RootElement, sub.Origin.Id, sub.Origin.Name, false, pending.Applied);
     }
+
+    /// <summary>
+    /// Notes an exchange that ended well, or found a provider that manages nothing.
+    /// </summary>
+    /// <returns>Whether this node received a block.</returns>
+    private static bool Succeeded(WorfPendingExchange pending)
+    {
+        WorfSubscription sub = pending.Sub;
+        long now = pending.StartedAt;
+        WorfLog.Debug2($"sequence range exchange with node {sub.Origin.Name} done");
+
+        // A provider whose slot isn't streamed yet is asked again after a check interval.
+        if (s_notStreamed.Contains(sub.Id))
+        {
+            s_retries[sub.Id] = (Worker.GetCurrentTimestamp() + (SequenceRanges.CheckInterval * 1000L), SequenceRanges.CheckInterval * 1000L);
+            WorfLog.Debug1($"sequence range exchange with node {sub.Origin.Name} waits for replication slot \"{sub.SlotName}\" to be streamed");
+            return false;
+        }
+
+        s_exchangedAt[sub.Id] = now;
+        _ = s_noSlotOnce.Remove(sub.Id);
+        _ = s_retries.Remove(sub.Id);
+        _ = s_timedOut.Remove(sub.Id);
+
+        // An exchange that changed nothing while something waits makes the next one wait longer, up to the exchange
+        // interval, since the neighbor may not answer it for long, as when a root can't start or a fence waits on a node
+        // that is down, though no more than ten check intervals while the fence of the provider, or of an allocator behind
+        // it, holds, or a request waits on a pool holder.
+        if (pending.Received || pending.Granted || pending.Waiting is null)
+        {
+            _ = s_waits.Remove(sub.Id);
+        }
+        else
+        {
+            long delay = s_waits.TryGetValue(sub.Id, out (string What, long At, long Delay) wait) && wait.What == pending.Waiting ? wait.Delay * 2 : 0;
+            long most = SequenceRanges.ExchangeInterval * 1000L;
+            if (pending.Fenced)
+            {
+                most = Math.Min(most, FencedAskEvery * SequenceRanges.CheckInterval * 1000L);
+            }
+
+            delay = Math.Min(Math.Max(delay, SequenceRanges.CheckInterval * 1000L), most);
+            s_waits[sub.Id] = (pending.Waiting, now + delay, delay);
+        }
+
+        return pending.Received;
+    }
+
+    /// <summary>
+    /// Notes an exchange that failed, tried again after a delay that doubles, up to the exchange interval, or half the
+    /// exchange timeout while this node waits on the neighbor, as for a block, so that inserts waiting at a block's end,
+    /// up to twice the timeout, get it soon after the neighbor is back. One that ran out of time, or a probe of a
+    /// provider whose last call did, backs off from ten seconds up to a minute, or the exchange interval if that is
+    /// longer, whatever waits on the neighbor, and is probed next.
+    /// </summary>
+    private static void Failed(WorfPendingExchange pending, string failure, bool timedOut, string? detail)
+    {
+        WorfSubscription sub = pending.Sub;
+        bool slow = timedOut || pending.Probing;
+        long most = pending.Waiting is not null && !slow
+            ? Math.Min(SequenceRanges.ExchangeInterval * 1000L, SequenceRanges.ExchangeTimeout * 500L)
+            : slow ? Math.Max(SequenceRanges.ExchangeInterval * 1000L, TimedOutBackoff)
+            : SequenceRanges.ExchangeInterval * 1000L;
+        if (slow)
+        {
+            _ = s_timedOut.Add(sub.Id);
+        }
+
+        // The delay counts from the exchange's end, so that one that ran out of time waits it out too.
+        long delay = s_retries.TryGetValue(sub.Id, out (long At, long Delay) retry) ? retry.Delay * 2 : 0;
+        long least = slow ? Math.Min(TimedOutFirstBackoff, most) : SequenceRanges.CheckInterval * 1000L;
+        delay = Math.Min(Math.Max(delay, Math.Max(least, SequenceRanges.CheckInterval * 1000L)), Math.Max(most, SequenceRanges.CheckInterval * 1000L));
+        s_retries[sub.Id] = (Worker.GetCurrentTimestamp() + delay, delay);
+        WorfLog.Debug1($"sequence range exchange with node {sub.Origin.Name} is made again in {(delay / 1000).ToString(CultureInfo.InvariantCulture)} ms");
+
+        // While the subscription's first sync hasn't finished, its slot may not be there yet, or be made again, so a
+        // failure then is no news, and neither is the first exchange that finds the slot gone, as the subscription may be
+        // being dropped, which drops it before the drop commits.
+        PgDiagnostic diagnostic = new($"sequence range exchange with node {sub.Origin.Name} failed: {failure}")
+        {
+            Detail = detail ?? (pending.Probing && !timedOut ? "The probe of a node whose last call ran out of time failed." : null),
+        };
+        bool noSlot = s_noSlot.Contains(sub.Id);
+        if (!noSlot)
+        {
+            _ = s_noSlotOnce.Remove(sub.Id);
+        }
+
+        if ((noSlot && s_noSlotOnce.Add(sub.Id)) ||
+            PgBackgroundWorker.RunTransaction(() => Sync.GetSubscriptionSyncStatus(sub.Id, true) is { } sync && sync.Status != Sync.SyncStatusReady))
+        {
+            WorfLog.Debug1(diagnostic.Message);
+        }
+        else
+        {
+            WorfLog.Warning(diagnostic);
+        }
+    }
+
+    // Drops an exchange under way, and its connection.
+    private static void Abandon(uint subId)
+    {
+        if (s_pending.Remove(subId, out WorfPendingExchange? pending))
+        {
+            pending.Probe?.Dispose();
+        }
+
+        Disconnect(subId);
+    }
+
+    /// <summary>
+    /// Gets a value indicating whether exchanges are under way, whose answers the worker waits for.
+    /// </summary>
+    internal static bool Pending => s_pending.Count > 0;
 
     /// <summary>
     /// Gets whether a subscription was still making its slot at the last look at the links due, so that its first
@@ -586,7 +760,6 @@ internal static class SequenceRangeExchange
         List<(WorfSubscription Sub, string? Waiting, bool Fenced)> due = [];
         long now = Worker.GetCurrentTimestamp();
         Starting = false;
-        s_wanted.Clear();
         List<WorfSubscription> enabled = [.. WorfNode.GetNodeSubscriptions(node.Node.Id, false).Where(sub => sub.Enabled)];
 
         // The connections kept for subscriptions dropped or disabled since go, and so do their probes.
@@ -595,10 +768,9 @@ internal static class SequenceRangeExchange
             Disconnect(gone);
         }
 
-        foreach (uint gone in s_probes.Keys.Where(id => !enabled.Exists(sub => sub.Id == id)).ToList())
+        foreach (uint gone in s_pending.Keys.Where(id => !enabled.Exists(sub => sub.Id == id)).ToList())
         {
-            s_probes[gone].Probe.Dispose();
-            _ = s_probes.Remove(gone);
+            Abandon(gone);
         }
 
         _ = s_noSlotOnce.RemoveWhere(id => !enabled.Exists(sub => sub.Id == id));
@@ -631,10 +803,6 @@ internal static class SequenceRangeExchange
             bool exchanged = s_exchangedAt.TryGetValue(sub.Id, out long at);
             bool wanted = (!exchanged || now - at >= 1_000_000) && SequenceRangeHeard.Wanted(sub.Origin.Id, now - 2_000_000);
             bool cut = wanted && retrying && now >= retry.At - retry.Delay + Math.Min(retry.Delay, SequenceRanges.ExchangeTimeout * 500L);
-            if (cut)
-            {
-                _ = s_wanted.Add(sub.Id);
-            }
 
             if ((!retrying || cut) &&
                 (!exchanged || now - at >= SequenceRanges.ExchangeInterval * 1000L || s_acksWaiting.Contains(sub.Id) || asks || wanted))
@@ -647,246 +815,14 @@ internal static class SequenceRangeExchange
     }
 
     /// <summary>
-    /// Exchanges with a subscription's provider, over the connection kept from the last exchange, or a new one. The
-    /// exchange worker's watcher cancels a connection or call that takes longer than <c>worf.sequence_range_timeout</c>,
-    /// and the provider ends a call that runs that long. Each waits in a transaction, which the cancellation aborts, so
-    /// that the worker goes on. A kept connection that fails, as once the provider restarted, is made again, once, before
-    /// the exchange counts as failed.
-    /// </summary>
-    /// <returns>Whether this node received a block, and whether it granted one.</returns>
-    private static (bool Received, bool Granted) ExchangeWith(WorfLocalNode node, WorfSubscription sub)
-    {
-        bool kept = s_connections.TryGetValue(sub.Id, out (WorfConnection Conn, string Dsn, int Timeout, bool Exchanges) connection) &&
-            connection.Dsn == sub.OriginIf.Dsn;
-        try
-        {
-            return ExchangeOver(node, sub);
-        }
-        catch (Exception error) when (kept && error is PgException or PgRemoteException && error is not PgQueryCanceledException)
-        {
-            return ExchangeOver(node, sub);
-        }
-    }
-
-    /// <summary>
-    /// Exchanges with a subscription's provider over the connection kept for it, made now if there is none, and closes
-    /// the connection if the exchange fails.
-    /// </summary>
-    private static (bool Received, bool Granted) ExchangeOver(WorfLocalNode node, WorfSubscription sub)
-    {
-        try
-        {
-            WorfConnection conn = Connection(sub);
-            if (!s_connections[sub.Id].Exchanges)
-            {
-                if (!PgBackgroundWorker.RunTransaction(() => SequenceRangeExchangeWorker.Bounded(() => Rpc.RemoteFunctionExists(conn, "worf", "sequence_range_exchange", 1, null))))
-                {
-                    return (false, false);
-                }
-
-                s_connections[sub.Id] = s_connections[sub.Id] with { Exchanges = true };
-            }
-
-            bool changed = false;
-            bool gave = false;
-
-            // A grant this node makes from the provider's request goes back in a second call, after this node commits it.
-            for (int call = 0; call < 2; call++)
-            {
-                (bool granted, bool received) = PgBackgroundWorker.RunTransaction(() => Call(node, sub, conn));
-                changed |= received;
-                gave |= granted;
-                if (received)
-                {
-                    _ = s_acksWaiting.Add(sub.Id);
-                }
-                else if (call == 0)
-                {
-                    _ = s_acksWaiting.Remove(sub.Id);
-                }
-
-                if (!granted)
-                {
-                    break;
-                }
-            }
-
-            return (changed, gave);
-        }
-        catch
-        {
-            Disconnect(sub.Id);
-            throw;
-        }
-    }
-
-    /// <summary>
-    /// Gets the connection kept for a subscription's provider, setting its statement timeout again once
-    /// <c>worf.sequence_range_timeout</c> has changed, or makes one, once the provider's host is found to answer.
-    /// </summary>
-    private static WorfConnection Connection(WorfSubscription sub)
-    {
-        int timeout = SequenceRanges.ExchangeTimeout;
-        string setTimeout = $"SET statement_timeout = {timeout.ToString(CultureInfo.InvariantCulture)}";
-        if (s_connections.TryGetValue(sub.Id, out (WorfConnection Conn, string Dsn, int Timeout, bool Exchanges) kept) && kept.Dsn == sub.OriginIf.Dsn)
-        {
-            if (kept.Timeout != timeout)
-            {
-                PgBackgroundWorker.RunTransaction(() => SequenceRangeExchangeWorker.Bounded(() =>
-                {
-                    kept.Conn.Execute(setTimeout);
-                    return true;
-                }));
-                s_connections[sub.Id] = kept with { Timeout = timeout };
-            }
-
-            return kept.Conn;
-        }
-
-        // The host is checked within the connection's time, so that one that drops connection attempts runs out of time as
-        // one that takes them and never answers does.
-        Disconnect(sub.Id);
-        WorfConnection conn = PgBackgroundWorker.RunTransaction(() => SequenceRangeExchangeWorker.Bounded(() =>
-        {
-            RequireReachable(sub.OriginIf.Dsn, sub.Origin.Name);
-            return Worf.Connect(sub.OriginIf.Dsn, sub.Name, "range", setup: setTimeout);
-        }));
-        s_connections[sub.Id] = (conn, sub.OriginIf.Dsn, timeout, false);
-        return conn;
-    }
-
-    /// <summary>
     /// Closes the connection kept for a subscription's provider, if there is one.
     /// </summary>
     private static void Disconnect(uint subId)
     {
-        if (s_connections.Remove(subId, out (WorfConnection Conn, string Dsn, int Timeout, bool Exchanges) kept))
+        if (s_connections.Remove(subId, out (WorfConnection Conn, string Dsn, int Timeout) kept))
         {
             kept.Conn.Dispose();
         }
-    }
-
-    /// <summary>
-    /// Waits, no longer than the connection's call has, for a host the provider's connection string names to accept a
-    /// connection. libpq keeps no timeout of its own for the connection this backend waits for on its latch, so a host
-    /// that never answers would hold the worker, and the exchanges with every other provider, until the operating
-    /// system gives up. One that hasn't answered in time has run out of time, as a call that the watcher cancels has; one
-    /// that refused has failed. A provider reached over a local socket needs no check.
-    /// </summary>
-    private static void RequireReachable(string dsn, string nodeName)
-    {
-        if (Fe.ConninfoParse(dsn, out _) is not Dictionary<string, string> options)
-        {
-            return;
-        }
-
-        string[] hosts = (options.GetValueOrDefault("hostaddr") is { Length: > 0 } addresses ? addresses : options.GetValueOrDefault("host") ?? "")
-            .Split(',');
-        if (hosts.Any(host => host.Length == 0 || host[0] is '/' or '@'))
-        {
-            return;
-        }
-
-        string[] ports = (options.GetValueOrDefault("port") is { Length: > 0 } port ? port
-            : Environment.GetEnvironmentVariable("PGPORT") is { Length: > 0 } environment ? environment : "5432").Split(',');
-        int limit = SequenceRangeExchangeWorker.LastLimit;
-        long deadline = Worker.GetCurrentTimestamp() + (limit * 1000L);
-        for (int i = 0; i < hosts.Length; i++)
-        {
-            if (int.TryParse(ports[ports.Length == 1 ? 0 : Math.Min(i, ports.Length - 1)], NumberStyles.None, CultureInfo.InvariantCulture, out int number) &&
-                Reaches(hosts[i].Trim(), number, deadline))
-            {
-                return;
-            }
-        }
-
-        throw new PgException(Worker.GetCurrentTimestamp() >= deadline ? PgSqlStates.QueryCanceled : PgSqlStates.ConnectionFailure,
-            $"could not reach node {nodeName} within {limit.ToString(CultureInfo.InvariantCulture)} ms");
-    }
-
-    /// <summary>
-    /// Checks whether a host accepts a TCP connection on a port before a deadline.
-    /// </summary>
-    private static bool Reaches(string host, int port, long deadline)
-    {
-        IPAddress[] addresses;
-        try
-        {
-            addresses = IPAddress.TryParse(host, out IPAddress? address) ? [address] : Dns.GetHostAddresses(host);
-        }
-        catch (SocketException)
-        {
-            return false;
-        }
-
-        foreach (IPAddress address in addresses)
-        {
-            using Socket socket = new(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp) { Blocking = false };
-            bool pending;
-            try
-            {
-                socket.Connect(address, port);
-                return true;
-            }
-            catch (SocketException error)
-            {
-                pending = error.SocketErrorCode is SocketError.WouldBlock or SocketError.InProgress;
-            }
-
-            while (pending && Worker.GetCurrentTimestamp() < deadline)
-            {
-                PgInterrupts.Check();
-                if (socket.Poll(100_000, SelectMode.SelectWrite))
-                {
-                    if (socket.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Error) is 0)
-                    {
-                        return true;
-                    }
-
-                    pending = false;
-                }
-                else if (socket.Poll(0, SelectMode.SelectError))
-                {
-                    pending = false;
-                }
-            }
-        }
-
-        return false;
-    }
-
-    /// <summary>
-    /// Makes one call: sends this node's message and takes in the reply, in the caller's transaction. The message only
-    /// reads, so that this node holds no row lock while the provider works, which may wait on that provider's own
-    /// calls to other nodes.
-    /// </summary>
-    private static (bool Granted, bool Received) Call(WorfLocalNode node, WorfSubscription sub, WorfConnection conn)
-    {
-        // This node's calls carry its WAL position in order. How far this node applied the provider's changes is read
-        // before the call, so that the provider's answer, which it writes later, can't be behind it unless the provider
-        // went back.
-        _ = Worf.Read("SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('worf.sequence_range_exchange'))", 0);
-        ulong applied = Applied(sub);
-        (string message, List<Guid> refusals) = Build(node, sub.Origin.Id, sub.SlotName);
-        string reply = SequenceRangeExchangeWorker.Bounded(() => conn.Query("SELECT worf.sequence_range_exchange(" + Worf.QuoteLiteral(message) + ")", 1))[0][0] ?? "{}";
-        TakeTurn();
-        AcknowledgeRefusals(refusals);
-        using JsonDocument document = JsonDocument.Parse(reply);
-        if (document.RootElement.TryGetProperty("streamed", out JsonElement streamed) && streamed.ValueKind == JsonValueKind.False)
-        {
-            // A provider without the slot answers so, rather than failing the call, which would log an error there too.
-            if (document.RootElement.TryGetProperty("slot", out JsonElement slot) && slot.ValueKind == JsonValueKind.False)
-            {
-                _ = s_noSlot.Add(sub.Id);
-                throw new PgException("42501", $"no worf replication slot \"{sub.SlotName}\" carries this sequence range exchange");
-            }
-
-            _ = s_notStreamed.Add(sub.Id);
-            return (false, false);
-        }
-
-        _ = s_notStreamed.Remove(sub.Id);
-        return Process(node, document.RootElement, sub.Origin.Id, sub.Origin.Name, false, applied);
     }
 
     /// <summary>
@@ -1418,9 +1354,9 @@ internal static class SequenceRangeExchange
                 AND ($15::pg_lsn IS NULL OR reset_lsn IS DISTINCT FROM $15::pg_lsn) AND route IS NOT DISTINCT FROM $16
             """, 1, seq, sender, SpiParameter.Create(root.GetProperty("node_name").GetWorfString()), SpiParameter.Create(sysid),
             SpiParameter.Create(timeline), SpiParameter.Create(call), SpiParameter.Create(epoch), SpiParameter.Create(state),
-            SpiParameter.Create(Nullable32(entry, "distance")), SpiParameter.Create(Nullable(entry, "high_water")),
+            SpiParameter.Create(ReportedRoute(entry).Distance), SpiParameter.Create(Nullable(entry, "high_water")),
             SpiParameter.Create(watermark), SpiParameter.Create(Holds(entry)), SpiParameter.Create(Nullable(entry, "clock")),
-            SpiParameter.Create(Text(entry, "reset")), SpiParameter.Create(Text(entry, "reset_done")), SpiParameter.Create(Route(entry)));
+            SpiParameter.Create(Text(entry, "reset")), SpiParameter.Create(Text(entry, "reset_done")), SpiParameter.Create(ReportedRoute(entry).Route));
         if (own.Count == 0 || !Worf.TryParseLsn(own[0].Get<string?>(0) ?? "", out ulong recorded) ||
             !Worf.TryParseLsn(root.GetProperty("wal_lsn").GetWorfString() ?? "", out ulong position) ||
             position < Math.Max(Math.Max(recorded, AppliedFloor(applied, entry)),
@@ -1752,9 +1688,9 @@ internal static class SequenceRangeExchange
                 route = excluded.route
             """, seq, sender, SpiParameter.Create(senderName),
             SpiParameter.Create(sysid), SpiParameter.Create(timeline), SpiParameter.Create(walLsn), SpiParameter.Create(epoch),
-            SpiParameter.Create(entry.GetProperty("state").GetWorfString()), SpiParameter.Create(Nullable32(entry, "distance")),
+            SpiParameter.Create(entry.GetProperty("state").GetWorfString()), SpiParameter.Create(ReportedRoute(entry).Distance),
             SpiParameter.Create(high), SpiParameter.Create(watermark), SpiParameter.Create(call), SpiParameter.Create(Holds(entry)),
-            SpiParameter.Create(Nullable(entry, "clock")), SpiParameter.Create(Route(entry)));
+            SpiParameter.Create(Nullable(entry, "clock")), SpiParameter.Create(ReportedRoute(entry).Route));
 
         // A neighbor that worf.activate_sequence_range stopped waiting for, as gone, may hold values that the fence's lift
         // gave out again, so once it's heard from again after the lift, it's asked to reset, at a WAL position of its own,
@@ -2365,11 +2301,18 @@ internal static class SequenceRangeExchange
             ? [.. holds.EnumerateArray().Select(number => number.GetInt64())]
             : null;
 
-    // The nodes from a neighbor's parent to the owner, as its report gives them, or null for a neighbor with no route.
-    private static long[]? Route(JsonElement entry)
-        => entry.TryGetProperty("route", out JsonElement route) && route.ValueKind == JsonValueKind.Array
-            ? [.. route.EnumerateArray().Select(hop => hop.GetInt64())]
-            : null;
+    // A neighbor's distance to the owner, and the nodes from its parent to the owner, as its report gives them, or nulls
+    // for a neighbor with no route, or one that reports a route longer than any honest route, which counts as none, so
+    // that no node stores, or passes on, more than that.
+    private static (int? Distance, long[]? Route) ReportedRoute(JsonElement entry)
+    {
+        if (!entry.TryGetProperty("route", out JsonElement route) || route.ValueKind != JsonValueKind.Array)
+        {
+            return (Nullable32(entry, "distance"), null);
+        }
+
+        return route.GetArrayLength() > MaxDistance ? (null, null) : (Nullable32(entry, "distance"), [.. route.EnumerateArray().Select(hop => hop.GetInt64())]);
+    }
 
     /// <summary>
     /// Gets when a neighbor's server started, as the message this transaction took in from it says, once it has asked
