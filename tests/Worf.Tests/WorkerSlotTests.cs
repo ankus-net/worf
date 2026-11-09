@@ -215,10 +215,12 @@ public sealed class WorkerSlotTests
     /// <summary>
     /// COMMIT PREPARED of a transaction that changed a database, but not which databases have managers, as ALTER DATABASE
     /// ... CONNECTION LIMIT does, restored after a restart, starts no manager, though it commits after the supervisor's
-    /// regular look, which the managers that found nothing to manage before don't hold back.
+    /// regular look, which the managers that found nothing to manage before don't hold back. The test runs on Windows,
+    /// where the supervisor looks every 30 seconds, rather than every 3 minutes.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
+    [OSCondition(OperatingSystems.Windows)]
     public async Task LateUnchangingCommitsStartNoManager()
     {
         CancellationToken token = TestContext.CancellationToken;
@@ -233,8 +235,8 @@ public sealed class WorkerSlotTests
         await node.StartServerAsync(token);
         Stopwatch since = Stopwatch.StartNew();
 
-        // The supervisor looks at once and again three minutes later; the transaction commits after that.
-        await Task.Delay(TimeSpan.FromSeconds(200), token);
+        // The supervisor looks at once and again 30 seconds later; the transaction commits after that.
+        await Task.Delay(TimeSpan.FromSeconds(50), token);
         int before = Starts();
         _ = await node.SafePsqlAsync("unchanged0", "COMMIT PREPARED 'limit'", token);
         await Task.Delay(TimeSpan.FromSeconds(10), token);
