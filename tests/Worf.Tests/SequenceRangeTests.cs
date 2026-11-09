@@ -3496,11 +3496,28 @@ public sealed class SequenceRangeTests
 
         // The range worker stops while four writers draw past the block's end, for longer than twice the exchange timeout.
         // enable_sequence_range gives the sequence its blocks itself, so the worker may start a moment later.
+        // It's stopped as it waits between its rounds, holding no lightweight lock, as one of the lock manager's, which
+        // the waiting statements' reads of pg_locks would wait on past their statement_timeout.
         const string Worker = "SELECT pid FROM pg_stat_activity WHERE backend_type LIKE 'worf range%'";
         Assert.IsTrue(await node.PollQueryUntilAsync(Database, $"SELECT EXISTS ({Worker})", token), "the range worker");
         string worker = await node.SafePsqlAsync(Database, Worker, token);
-        (int stopped, _, string error) = await ProcessRunner.RunAsync("kill", ["-STOP", worker], token);
-        Assert.AreEqual(0, stopped, error);
+        string error;
+        for (int attempt = 0; ; attempt++)
+        {
+            (int stopped, _, error) = await ProcessRunner.RunAsync("kill", ["-STOP", worker], token);
+            Assert.AreEqual(0, stopped, error);
+            if (await node.SafePsqlAsync(Database, $"SELECT coalesce(wait_event_type, '') FROM pg_stat_activity WHERE pid = {worker}", token)
+                is "Extension" or "Activity" or "Timeout" or "Lock")
+            {
+                break;
+            }
+
+            (int going, _, error) = await ProcessRunner.RunAsync("kill", ["-CONT", worker], token);
+            Assert.AreEqual(0, going, error);
+            Assert.IsLessThan(200, attempt, "the range worker, stopped as it waits");
+            await Task.Delay(TimeSpan.FromMilliseconds(7), token);
+        }
+
         List<string> failures = [];
         Task writers = Task.WhenAll(Enumerable.Range(0, 4).Select(async _ =>
         {
