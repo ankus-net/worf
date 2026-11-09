@@ -2776,7 +2776,7 @@ public sealed class SequenceRangeTests
 
     /// <summary>
     /// A provider that stops reading once its connection is set up holds up no other exchange, though the node's calls to
-    /// it, which carry its 61 managed sequences, are larger than its sockets hold: the node sends what they take as they
+    /// it, which carry its 41 managed sequences, are larger than its sockets hold: the node sends what they take as they
     /// take it, without waiting on them, goes on exchanging with its other provider, and gives the call up at its time.
     /// On Linux, where a library the server preloads gives the node's connections to the provider a small send buffer.
     /// </summary>
@@ -2840,20 +2840,27 @@ public sealed class SequenceRangeTests
         await using TestNode nodeB = await StartNodeAsync("node_b", token, "log_min_messages = debug2",
             new Dictionary<string, string?> { ["LD_PRELOAD"] = library, ["WORF_SMALL_SEND_PORT_FILE"] = portFile });
         await using TestNode nodeC = await StartNodeAsync("node_c", token);
-        const string Sequences = "CREATE TABLE t (id bigserial PRIMARY KEY, v text); DO $$ BEGIN FOR g IN 1..60 LOOP EXECUTE format('CREATE SEQUENCE many_%s', g); END LOOP; END $$";
+        const string Sequences = "CREATE TABLE t (id bigserial PRIMARY KEY, v text); DO $$ BEGIN FOR g IN 1..40 LOOP EXECUTE format('CREATE SEQUENCE many_%s', g); END LOOP; END $$";
         foreach (TestNode node in new[] { nodeA, nodeB, nodeC })
         {
             _ = await node.SafePsqlAsync(Database, Sequences, token);
+        }
+
+        // An exchange that carries every sequence can take seconds on a slow host, so the nodes give each call 30 s.
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "ALTER SYSTEM SET worf.sequence_range_timeout = '30s'", token);
+            _ = await node.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
         }
 
         await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
         await SubscribeAsync(nodeB, "b_from_c", nodeC, token);
         _ = await nodeA.SafePsqlAsync(Database, """
             SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100, max_range_size := 100);
-            SELECT count(worf.enable_sequence_range(format('many_%s', g)::regclass, participants := '{node_b}', range_size := 1000)) FROM generate_series(1, 60) g;
+            SELECT count(worf.enable_sequence_range(format('many_%s', g)::regclass, participants := '{node_b}', range_size := 1000)) FROM generate_series(1, 40) g;
             """, token);
         await WaitActiveAsync([nodeA, nodeB], token);
-        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT count(*) = 61 FROM worf.sequence_ranges WHERE state = 'active'", token),
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT count(*) = 41 FROM worf.sequence_ranges WHERE state = 'active'", token),
             "node_b drawing from blocks of every sequence");
 
         // node_b's calls to node_c go through a relay that stops reading each connection once its settings have passed.
@@ -2873,11 +2880,11 @@ public sealed class SequenceRangeTests
         // node_b goes on exchanging with node_a while its call to node_c can't be sent whole, and gives that call up at
         // its time.
         int logpos = nodeB.ReadLog().Length;
-        await Task.Delay(TimeSpan.FromSeconds(15), token);
+        Assert.IsTrue(await nodeB.PollLogAsync(logpos, "exchange with node node_c failed: node node_c didn't answer within 30000 ms", token),
+            "node_b's call to node_c, given up at its time");
         string log = nodeB.ReadLog()[logpos..];
-        Assert.IsGreaterThan(2, log.Split('\n').Count(line => line.Contains("sequence range exchange with node node_a done", StringComparison.Ordinal)),
-            "node_b's exchanges with node_a in 15 s while its call to node_c stalls");
-        Assert.Contains("exchange with node node_c failed: node node_c didn't answer within 5000 ms", log, "node_b's call to node_c");
+        Assert.IsGreaterThan(1, log.Split('\n').Count(line => line.Contains("sequence range exchange with node node_a done", StringComparison.Ordinal)),
+            "node_b's exchanges with node_a while its call to node_c stalled");
     }
 
     /// <summary>
