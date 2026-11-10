@@ -1856,7 +1856,9 @@ internal static partial class SequenceRangeGuard
                 switching = [.. starting.Draws.Called.Where(seqoid => seqoid != snowflake && s_sequences.ContainsKey(seqoid) && starting.Switched.Add(seqoid))];
             }
 
-            List<uint> unconfirmed = [.. s_grantors.Where(entry => entry.Key != snowflake && !s_confirmed.Contains(entry.Value)).Select(entry => entry.Key)];
+            // The sequences whose grantors haven't answered, in the order of their OIDs, so that a statement that waits
+            // for several waits for them, and names the first, in the same order however the grantors were read.
+            List<uint> unconfirmed = [.. s_grantors.Where(entry => entry.Key != snowflake && !s_confirmed.Contains(entry.Value)).Select(entry => entry.Key).Order()];
             if (unconfirmed.Count > 0)
             {
                 HashSet<uint>? called = plpgsql ? SimpleDraws(simple) : StartingDraws(starting);
