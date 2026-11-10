@@ -59,7 +59,7 @@ public sealed class DocumentationTests
         Assert.Contains("A forced lift's request to reset from the node's grantor", s_sequenceRanges, "a grantor's lifts (352)");
         Assert.Contains("the grantor's lifts may reset the node 9 times in their first hour and 14 in their first day", s_sequenceRanges, "a grantor's lifts (353)");
         Assert.Contains("A switch worker waits for the gate before it locks the sequence's range row", s_sequenceRanges, "a paused gate holder (291)");
-        Assert.Contains("A call whose sequence those don't name, as one computed as it runs, one an `ALTER TABLE` that changes a column's type starts, or one code worf doesn't see into starts", s_sequenceRanges,
+        Assert.Contains("A call whose sequence those don't name, as one computed as it runs, one an `ALTER TABLE` that changes a column's type starts, or one a function in a procedural language other than SQL and PL/pgSQL starts", s_sequenceRanges,
             "a returning node's draws (292, 293, 422)");
         Assert.Contains("or, within it, a PL/pgSQL expression, which PL/pgSQL starts outside a plan, as a trigger's or a function's that partition pruning calls as the plan starts", s_sequenceRanges,
             "a returning node's PL/pgSQL draws (422, 601)");

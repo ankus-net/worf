@@ -5,6 +5,7 @@ using System.Text;
 using Npgsql;
 using Npgsql.Replication;
 using Npgsql.Replication.Internal;
+using NpgsqlTypes;
 
 namespace Worf.Tests;
 
@@ -644,6 +645,7 @@ public sealed class CreateSubscriberTests
             }
 
             using Process tool = Process.Start(start)!;
+            await using RunningTool running = new(tool);
             Task<string> errors = tool.StandardError.ReadToEndAsync(token);
             StringBuilder seen = new();
             async Task SeeAsync(string text)
@@ -842,9 +844,10 @@ public sealed class CreateSubscriberTests
     }
 
     /// <summary>
-    /// A run stopped before it subscribed drops only the slot it made on the provider: a slot of the name that another
-    /// run with the same subscriber name made in its place is left, with a warning, and so is the run's own slot while
-    /// a walsender streams it. Processes are stopped with signals, which Windows lacks.
+    /// A run stopped before it subscribed drops only the slot it made on the provider, as it made it: a slot of the name
+    /// that another run with the same subscriber name made in its place is left, with a warning, and so is the run's own
+    /// slot while a walsender streams it, or once a client has confirmed what it streamed from it. Processes are stopped
+    /// with signals, which Windows lacks.
     /// </summary>
     /// <param name="what">What became of the run's slot.</param>
     /// <returns>The test.</returns>
@@ -852,6 +855,7 @@ public sealed class CreateSubscriberTests
     [OSCondition(OperatingSystems.Linux | OperatingSystems.OSX)]
     [DataRow("replaced")]
     [DataRow("streamed")]
+    [DataRow("confirmed")]
     public async Task StoppedRunsDropOnlyTheSlotsTheyMade(string what)
     {
         CancellationToken token = TestContext.CancellationToken;
@@ -895,6 +899,7 @@ public sealed class CreateSubscriberTests
         try
         {
             using Process tool = Process.Start(start)!;
+            await using RunningTool running = new(tool);
             Task<string> errors = tool.StandardError.ReadToEndAsync(token);
             StringBuilder seen = new();
             char[] buffer = new char[4096];
@@ -921,6 +926,22 @@ public sealed class CreateSubscriberTests
                 streamed = messages.MoveNextAsync().AsTask();
                 Assert.IsTrue(await provider.PollQueryUntilAsync(Database, $"SELECT active FROM pg_catalog.pg_replication_slots WHERE slot_name = '{slot}'", token),
                     "the walsender streaming the run's slot");
+                if (what == "confirmed")
+                {
+                    // The client confirms a later position, and stops streaming, leaving the slot idle.
+                    string made = await provider.SafePsqlAsync(Database, $"SELECT confirmed_flush_lsn FROM pg_catalog.pg_replication_slots WHERE slot_name = '{slot}'", token);
+                    _ = await provider.SafePsqlAsync(Database, "CREATE TABLE moved (a int); INSERT INTO moved VALUES (1)", token);
+                    replication.SetReplicationStatus(NpgsqlLogSequenceNumber.Parse(await provider.SafePsqlAsync(Database, "SELECT pg_catalog.pg_current_wal_lsn()", token)));
+                    await replication.SendStatusUpdate(token);
+                    Assert.IsTrue(await provider.PollQueryUntilAsync(Database,
+                        $"SELECT confirmed_flush_lsn > '{made}' FROM pg_catalog.pg_replication_slots WHERE slot_name = '{slot}'", token), "the client's confirmation");
+                    await streaming.CancelAsync();
+                    _ = await Task.WhenAny(streamed);
+                    await replication.DisposeAsync();
+                    replication = null;
+                    Assert.IsTrue(await provider.PollQueryUntilAsync(Database, $"SELECT NOT active FROM pg_catalog.pg_replication_slots WHERE slot_name = '{slot}'", token),
+                        "the run's slot, idle once the client stopped");
+                }
             }
 
             Stopwatch ending = Stopwatch.StartNew();
@@ -934,7 +955,7 @@ public sealed class CreateSubscriberTests
             TestContext.WriteLine(stderr);
             Assert.AreEqual("1|1|True", $"{tool.ExitCode}|" +
                 await provider.SafePsqlAsync(Database, $"SELECT count(*) FROM pg_catalog.pg_replication_slots WHERE slot_name = '{slot}'", token) + "|" +
-                stderr.Contains(what == "replaced" ? $"replication slot \"{slot}\" on the provider isn't the one this run made" : $"replication slot \"{slot}\" on the provider is in use by process",
+                stderr.Contains(what == "streamed" ? $"replication slot \"{slot}\" on the provider is in use by process" : $"replication slot \"{slot}\" on the provider isn't as this run made it",
                     StringComparison.Ordinal),
                 $"the stopped run's exit code, the slot, which it left, and its warning: {stderr}");
         }
@@ -998,9 +1019,10 @@ public sealed class CreateSubscriberTests
     /// <summary>
     /// A standby made with pg_basebackup -R, caught up and stopped in recovery, is subscribed though the provider has
     /// since removed the WAL that holds its latest checkpoint, as its own WAL carries its recovery to the WAL the provider
-    /// still has and joins it there: past where the provider's WAL begins, or right up to it, as one that stopped at a
-    /// segment's end does, its own next segment never written. One that ran as a server of its own from its checkpoint,
-    /// writing WAL of its own past where the provider's begins, and stopped in recovery since, is refused.
+    /// still has, past where the provider's WAL begins, as the provider's own. One whose WAL ends right where the
+    /// provider's begins, as one that stopped at a segment's end does, its own next segment never written, is refused,
+    /// as it can't be told from one that left the provider's WAL; and so is one that ran as a server of its own from its
+    /// checkpoint, writing WAL of its own past where the provider's begins, and stopped in recovery since.
     /// </summary>
     /// <param name="when">How the standby's WAL meets the provider's.</param>
     /// <returns>The test.</returns>
@@ -1109,11 +1131,11 @@ public sealed class CreateSubscriberTests
         ];
         try
         {
-            if (when == "diverged")
+            if (when is "diverged" or "boundary")
             {
                 (int refused, string refusal) = await RefusedRunAsync(command, arguments, work.FullName, port, token);
                 Assert.AreEqual("1|True", $"{refused}|{refusal.Contains("is in WAL the provider has removed", StringComparison.Ordinal)}",
-                    $"a run on the standby that ran as a server of its own past where the provider's WAL begins: {refusal}");
+                    $"a run on the standby whose WAL {(when == "boundary" ? "ends where the provider's begins" : "left the provider's")}: {refusal}");
                 return;
             }
 

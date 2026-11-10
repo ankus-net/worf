@@ -173,11 +173,13 @@ description: Create, alter, synchronize and drop subscriptions.
 
 There is also a `postgresql.conf` parameter,
 `worf.extra_connection_options`, that may be set to assign connection
-options that apply to all connections made by worf. This can be a useful
-place to set up custom keepalive options, etc.
+options that apply to all connections made by worf, which a node's DSN
+overrides. This can be a useful place to set up custom keepalive options,
+etc. A DSN may be a connection string or a URI.
 
 worf defaults to enabling TCP keepalives to ensure that it notices
 when the upstream server disappears unexpectedly, and to a
-`connect_timeout` of 30 seconds; a node's DSN that sets these options
-keeps its own. To disable keepalives on every connection, add
-`keepalives = 0` to `worf.extra_connection_options`.
+`connect_timeout` of 30 seconds, for each option that neither the DSN,
+`worf.extra_connection_options`, a service file nor the environment
+sets. To disable keepalives on every connection, add `keepalives = 0`
+to `worf.extra_connection_options`.

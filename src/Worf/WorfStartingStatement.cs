@@ -23,6 +23,11 @@ internal sealed class WorfStartingStatement(Func<(HashSet<uint> Called, int Call
     internal int Looked { get; set; }
 
     /// <summary>
+    /// Gets the managed sequences the statement has waited for a switch of, as it holds no switch gate, once each.
+    /// </summary>
+    internal HashSet<uint> Switched { get; } = [];
+
+    /// <summary>
     /// Gets the error context as the statement started.
     /// </summary>
     internal nint Context { get; } = context;

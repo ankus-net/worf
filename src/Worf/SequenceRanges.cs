@@ -46,6 +46,8 @@ using Ankus.Postgres;
         not_before bigint
     );
 
+    CREATE INDEX sequence_range_block_seqoid ON worf.sequence_range_block (seqoid, epoch);
+
     CREATE TABLE worf.sequence_range_restore (
         name text PRIMARY KEY,
         owner_node oid NOT NULL,
@@ -80,6 +82,9 @@ using Ankus.Postgres;
         not_before bigint
     );
 
+    CREATE INDEX sequence_range_grant_seqoid ON worf.sequence_range_grant (seqoid, grantee_id);
+    CREATE INDEX sequence_range_grant_from_block ON worf.sequence_range_grant (from_block);
+
     CREATE TABLE worf.sequence_range_request (
         request_id uuid PRIMARY KEY,
         seqoid regclass NOT NULL,
@@ -92,6 +97,8 @@ using Ankus.Postgres;
         created_at timestamptz NOT NULL,
         reserved boolean NOT NULL DEFAULT false
     );
+
+    CREATE INDEX sequence_range_request_seqoid ON worf.sequence_range_request (seqoid, parent_node);
 
     CREATE TABLE worf.sequence_range_node (
         seqoid regclass NOT NULL,
@@ -122,6 +129,15 @@ using Ankus.Postgres;
         slot_name name PRIMARY KEY,
         node_id oid NOT NULL,
         role_id oid NOT NULL
+    );
+
+    CREATE TABLE worf.sequence_range_back (
+        seqoid regclass NOT NULL,
+        node_id oid NOT NULL,
+        sysid numeric(20,0) NOT NULL,
+        timeline bigint NOT NULL,
+        lsn pg_lsn NOT NULL,
+        PRIMARY KEY (seqoid, node_id)
     );
 
     CREATE TABLE worf.sequence_range_absent (
@@ -757,6 +773,7 @@ internal static unsafe partial class SequenceRanges
         _ = Worf.Execute("DELETE FROM worf.sequence_range_request WHERE seqoid::oid = ANY ($1::oid[])", seqoids);
         _ = Worf.Execute("DELETE FROM worf.sequence_range_node WHERE seqoid::oid = ANY ($1::oid[])", seqoids);
         _ = Worf.Execute("DELETE FROM worf.sequence_range_absent WHERE seqoid::oid = ANY ($1::oid[])", seqoids);
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_back WHERE seqoid::oid = ANY ($1::oid[])", seqoids);
         _ = Worf.Execute("DELETE FROM worf.sequence_range_fence_wait WHERE seqoid::oid = ANY ($1::oid[])", seqoids);
         _ = Worf.Execute("DELETE FROM worf.sequence_range WHERE seqoid::oid = ANY ($1::oid[])", seqoids);
 
@@ -789,6 +806,7 @@ internal static unsafe partial class SequenceRanges
             """, SpiParameter.Create(nodeId));
         _ = Worf.Execute("DELETE FROM worf.sequence_range_node WHERE via_node = $1", SpiParameter.Create(nodeId));
         _ = Worf.Execute("DELETE FROM worf.sequence_range_absent WHERE node_id = $1", SpiParameter.Create(nodeId));
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_back WHERE node_id = $1", SpiParameter.Create(nodeId));
     }
 
     /// <summary>

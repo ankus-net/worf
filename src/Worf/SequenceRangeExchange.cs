@@ -66,9 +66,10 @@ internal static class SequenceRangeExchange
     private static readonly HashSet<uint> s_noSlotOnce = [];
 
     // The connection to each subscription's provider that this worker's exchanges go over, kept from one exchange to the
-    // next, as apply keeps its own, rather than a session made and ended for each, with the connection string and the
-    // timeout it was made with; one that fails, or a call that runs out of time, is closed.
-    private static readonly Dictionary<uint, (WorfConnection Conn, string Dsn, int Timeout)> s_connections = [];
+    // next, as apply keeps its own, rather than a session made and ended for each, with the connection string worf built
+    // for it, worf.extra_connection_options's options too, and the timeout it was made with, so that a change to either
+    // makes it again; one that fails, or a call that runs out of time, is closed.
+    private static readonly Dictionary<uint, (WorfConnection Conn, string Conninfo, int Timeout)> s_connections = [];
 
     /// <summary>
     /// Answers a neighbor's exchange on the provider end of its subscription.
@@ -356,7 +357,8 @@ internal static class SequenceRangeExchange
             WorfPendingExchange pending = new(sub, waiting, fenced, Worker.GetCurrentTimestamp());
             s_pending[sub.Id] = pending;
             WorfLog.Debug2($"sequence range exchange with node {sub.Origin.Name} starting");
-            if (s_connections.TryGetValue(sub.Id, out (WorfConnection Conn, string Dsn, int Timeout) kept) && kept.Dsn == sub.OriginIf.Dsn &&
+            if (s_connections.TryGetValue(sub.Id, out (WorfConnection Conn, string Conninfo, int Timeout) kept) &&
+                kept.Conninfo == Worf.ConnectionString(sub.OriginIf.Dsn, sub.Name, "range").Conninfo &&
                 kept.Timeout == SequenceRanges.ExchangeTimeout)
             {
                 pending.Reused = true;
@@ -456,7 +458,7 @@ internal static class SequenceRangeExchange
         pending.Probing = s_timedOut.Contains(sub.Id);
         int timeout = SequenceRanges.ExchangeTimeout;
         (string conninfo, string applicationName) = Worf.ConnectionString(sub.OriginIf.Dsn, sub.Name, "range");
-        pending.Probe = WorfProbe.Start(conninfo, applicationName, $"node {pending.Sub.Origin.Name}", Worf.SessionSetup($"SET statement_timeout = {timeout.ToString(CultureInfo.InvariantCulture)}"),
+        pending.Probe = WorfProbe.Start(conninfo, applicationName, ($"node {pending.Sub.Origin.Name}", pending.Sub.Origin.Id), Worf.SessionSetup($"SET statement_timeout = {timeout.ToString(CultureInfo.InvariantCulture)}"),
             Worker.GetCurrentTimestamp() + (timeout * 1000L));
         WorfLog.Debug2($"sequence range exchange with node {sub.Origin.Name} connecting{(pending.Probing ? ", as a probe" : "")}");
     }
@@ -524,7 +526,7 @@ internal static class SequenceRangeExchange
 
             // A provider whose last call ran out of time keeps its delay, which a call that fails again doubles.
             WorfConnection conn = probe.Take();
-            s_connections[sub.Id] = (conn, sub.OriginIf.Dsn, SequenceRanges.ExchangeTimeout);
+            s_connections[sub.Id] = (conn, Worf.ConnectionString(sub.OriginIf.Dsn, sub.Name, "range").Conninfo, SequenceRanges.ExchangeTimeout);
             if (pending.Probing)
             {
                 _ = s_timedOut.Remove(sub.Id);
@@ -576,7 +578,16 @@ internal static class SequenceRangeExchange
 
         try
         {
-            (bool granted, bool received) = PgBackgroundWorker.RunTransaction(() => TakeReply(node, pending, query.Value ?? "{}"));
+            (bool granted, bool received) = (false, false);
+            try
+            {
+                (granted, received) = PgBackgroundWorker.RunTransaction(() => TakeReply(node, pending, query.Value ?? "{}"));
+            }
+            catch (PgException dropped) when (dropped.Message == ReplyAfterDrop)
+            {
+                WorfLog.Debug1($"sequence range exchange with node {sub.Origin.Name}: {dropped.Message}, so it's taken in as one that never came");
+            }
+
             pending.Received |= received;
             pending.Granted |= granted;
             if (received)
@@ -588,7 +599,7 @@ internal static class SequenceRangeExchange
                 _ = s_acksWaiting.Remove(sub.Id);
             }
 
-            if (granted && pending.Calls < 2 && s_connections.TryGetValue(sub.Id, out (WorfConnection Conn, string Dsn, int Timeout) kept))
+            if (granted && pending.Calls < 2 && s_connections.TryGetValue(sub.Id, out (WorfConnection Conn, string Conninfo, int Timeout) kept))
             {
                 Call(node, pending, kept.Conn);
                 return pending.Query is null ? false : null;
@@ -636,8 +647,25 @@ internal static class SequenceRangeExchange
         }
 
         _ = s_notStreamed.Remove(sub.Id);
-        return Process(node, document.RootElement, sub.Origin.Id, sub.Origin.Name, false, pending.Applied);
+        (bool Granted, bool Received) taken = Process(node, document.RootElement, sub.Origin.Id, sub.Origin.Name, false, pending.Applied);
+
+        // A drop that committed while the reply waited on the rows the drop deleted, as the reply's own write of them
+        // does, leaves the reply to roll back, so that it doesn't write them again. A reply that wrote nothing has
+        // nothing to take back.
+        unsafe
+        {
+            if (NativeMethods.GetTopTransactionIdIfAny() != 0 &&
+                Worf.Execute("SELECT 1 FROM worf.subscription WHERE sub_id = $1 AND sub_enabled", SpiParameter.Create(sub.Id)) != 1)
+            {
+                throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState, ReplyAfterDrop);
+            }
+        }
+
+        return taken;
     }
+
+    // Why a reply that came as its subscription was dropped or disabled rolls back.
+    private const string ReplyAfterDrop = "the subscription was dropped or disabled as its reply was taken in";
 
     /// <summary>
     /// Notes an exchange that ended well, or found a provider that manages nothing.
@@ -845,7 +873,7 @@ internal static class SequenceRangeExchange
     /// </summary>
     private static void Disconnect(uint subId)
     {
-        if (s_connections.Remove(subId, out (WorfConnection Conn, string Dsn, int Timeout) kept))
+        if (s_connections.Remove(subId, out (WorfConnection Conn, string Conninfo, int Timeout) kept))
         {
             kept.Conn.Dispose();
         }
@@ -928,6 +956,9 @@ internal static class SequenceRangeExchange
     /// Builds this node's message to a neighbor, with its sequences in the order of their names, which each node
     /// processes them in, so that two transactions on a node lock their rows in the same order.
     /// </summary>
+    /// <param name="node">This node.</param>
+    /// <param name="neighbor">The neighbor.</param>
+    /// <param name="slot">The slot a call names, or null for an answer.</param>
     /// <returns>The message, and the refusals it carries.</returns>
     private static (string Message, List<Guid> Refusals) Build(WorfLocalNode node, uint neighbor, string? slot)
     {
@@ -1206,13 +1237,18 @@ internal static class SequenceRangeExchange
         List<long> carriedSequences = [];
         bool undone = false;
 
-        // A call that runs out of time is rolled back whole, so the sequences it would take in past half the caller's
-        // statement_timeout are left to its next call, as one whose range row another transaction holds is, and the
-        // call keeps what it took in.
-        long? takeUntil = call ? CallTimeHalf() : null;
-        int left = 0;
+        // A call that runs out of time is rolled back whole, so the sequences it would take in past a third of the
+        // caller's statement_timeout are left to its next call, which sends them first, as one whose range row another
+        // transaction holds is, and the call keeps what it took in, with time left for its answer.
+        long? takeUntil = call ? CallTimeThird() : null;
+        List<string> left = [];
+        List<long> leftSequences = [];
+        int resumeAt = call ? SequenceRangeHeard.ResumeAt(senderId) : 0;
+        int index = -1;
+        int? cutAt = null;
         foreach (JsonElement entry in sequences.EnumerateArray())
         {
+            index++;
             uint? processed = Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(entry.GetProperty("name").GetWorfString()));
             if (processed is uint carried)
             {
@@ -1240,10 +1276,19 @@ internal static class SequenceRangeExchange
             {
                 if (!heard || !Unchanged(node, root, entry, senderId, call, applied))
                 {
-                    if (takeUntil is long until && Worker.GetCurrentTimestamp() >= until)
+                    // The sequences before where the last call was cut short, in the order of their names, which every
+                    // call keeps, are left to the call after the one that reaches the last.
+                    bool before = index < resumeAt;
+                    bool late = !before && takeUntil is long until && Worker.GetCurrentTimestamp() >= until;
+                    if (before || late)
                     {
-                        left++;
-                        undone |= Text(entry, "reset") is not null;
+                        cutAt ??= late ? index : null;
+                        left.Add(entry.GetProperty("name").GetWorfString() ?? "");
+                        if (processed is uint leftOut)
+                        {
+                            leftSequences.Add(leftOut);
+                        }
+
                         continue;
                     }
 
@@ -1289,9 +1334,14 @@ internal static class SequenceRangeExchange
             }
         }
 
-        if (left > 0)
+        if (call)
         {
-            WorfLog.Debug1($"sequence range exchange with node {senderName} left {left.ToString(CultureInfo.InvariantCulture)} sequences to its next call, as the call had taken half its time");
+            SequenceRangeHeard.RecordResumeAt(senderId, cutAt ?? 0);
+        }
+
+        if (left.Count > 0)
+        {
+            WorfLog.Debug1($"sequence range exchange with node {senderName} left {left.Count.ToString(CultureInfo.InvariantCulture)} sequences to its next call, as the call had taken a third of its time");
         }
 
         foreach (uint seqoid in absent)
@@ -1309,13 +1359,30 @@ internal static class SequenceRangeExchange
             SELECT EXISTS (SELECT 1 FROM worf.sequence_range_absent a JOIN worf.sequence_range r ON r.seqoid = a.seqoid
                 WHERE a.node_id = $1 AND a.seqoid = ANY ($2::oid[]) AND r.fenced_at IS NULL)
             """, SpiParameter.Create(senderId), SpiParameter.Create(carriedSequences.ToArray()));
-        OnCommit(senderId, asking ? null : startedAt, knowsStart && !undone);
+        // A call that left sequences out says nothing back of the neighbor's start, and confirms nothing, as those may
+        // owe the neighbor a request to reset, which only the call that takes them in can tell.
+        OnCommit(senderId, asking || left.Count > 0 ? null : startedAt, knowsStart && !undone && left.Count == 0);
 
-        // The neighbor's WAL position, once compared with the last one.
+        // The neighbor's WAL position, once compared with the last one. The sequences a call left out keep the last one,
+        // which shared memory holds until this one takes its place, so that the call that takes them in still sees the
+        // neighbor go back.
         if (Worf.TryParseLsn(root.GetProperty("wal_lsn").GetWorfString() ?? "", out ulong lsn))
         {
-            SequenceRangeHeard.RecordLsn(senderId, ulong.Parse(root.GetProperty("sysid").GetWorfString() ?? "0", CultureInfo.InvariantCulture),
-                root.GetProperty("timeline").GetInt64(), call, lsn);
+            ulong sysid = ulong.Parse(root.GetProperty("sysid").GetWorfString() ?? "0", CultureInfo.InvariantCulture);
+            long timeline = root.GetProperty("timeline").GetInt64();
+            ulong last = SequenceRangeHeard.LatestLsn(senderId, sysid, timeline, call);
+            if (call && leftSequences.Count > 0 && last > lsn)
+            {
+                _ = Worf.Execute("""
+                    INSERT INTO worf.sequence_range_back SELECT s, $2, $3::numeric, $4, $5::pg_lsn FROM pg_catalog.unnest($1::oid[]) s
+                    ON CONFLICT (seqoid, node_id) DO UPDATE SET sysid = excluded.sysid, timeline = excluded.timeline, lsn = excluded.lsn
+                        WHERE (sequence_range_back.sysid, sequence_range_back.timeline) <> (excluded.sysid, excluded.timeline)
+                            OR sequence_range_back.lsn < excluded.lsn
+                    """, SpiParameter.Create(leftSequences.ToArray()), SpiParameter.Create(senderId), SpiParameter.Create((decimal)sysid),
+                    SpiParameter.Create(timeline), SpiParameter.Create(Worf.FormatLsn(last)));
+            }
+
+            SequenceRangeHeard.RecordLsn(senderId, sysid, timeline, call, lsn);
         }
 
         // Neighbors hear of what this node learned at their next exchange, which happens now, from the exchange worker the
@@ -1333,10 +1400,10 @@ internal static class SequenceRangeExchange
     }
 
     /// <summary>
-    /// Works out when a call has taken half the time its statement_timeout gives it.
+    /// Works out when a call has taken a third of the time its statement_timeout gives it.
     /// </summary>
     /// <returns>The time, or null when it has no timeout.</returns>
-    private static long? CallTimeHalf()
+    private static long? CallTimeThird()
     {
         int timeout = Worf.ReadScalar<int>("SELECT setting::int FROM pg_catalog.pg_settings WHERE name = 'statement_timeout'");
         long started;
@@ -1345,7 +1412,7 @@ internal static class SequenceRangeExchange
             started = NativeMethods.GetCurrentStatementStartTimestamp();
         }
 
-        return timeout > 0 ? started + (timeout * 500L) : null;
+        return timeout > 0 ? started + (timeout * 1000L / 3) : null;
     }
 
     /// <summary>
@@ -1417,7 +1484,8 @@ internal static class SequenceRangeExchange
             SpiParameter.Create(ReportedRoute(entry).Distance), SpiParameter.Create(Nullable(entry, "high_water")),
             SpiParameter.Create(watermark), SpiParameter.Create(Holds(entry)), SpiParameter.Create(Nullable(entry, "clock")),
             SpiParameter.Create(Text(entry, "reset")), SpiParameter.Create(Text(entry, "reset_done")), SpiParameter.Create(ReportedRoute(entry).Route));
-        if (own.Count == 0 || !Worf.TryParseLsn(own[0].Get<string?>(0) ?? "", out ulong recorded) ||
+        if (own.Count == 0 || (call && Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range_back WHERE seqoid = $1 AND node_id = $2)", seq, sender)) ||
+            !Worf.TryParseLsn(own[0].Get<string?>(0) ?? "", out ulong recorded) ||
             !Worf.TryParseLsn(root.GetProperty("wal_lsn").GetWorfString() ?? "", out ulong position) ||
             position < Math.Max(Math.Max(recorded, AppliedFloor(applied, entry)),
                 SequenceRangeHeard.LatestLsn(senderId, ulong.Parse(sysid, CultureInfo.InvariantCulture), timeline, call)) ||
@@ -1693,13 +1761,17 @@ internal static class SequenceRangeExchange
         // neighbor sent before it. The neighbor's row is locked first, so that the position compared is the one this
         // report replaces, and none written in between is lost.
         // The position compared is the latest of the one the tables recorded, the one shared memory holds, which the
-        // tables record only once it moves by a WAL segment, and, in an answer, how far this node applied the neighbor's
-        // changes, which neither its restart nor its crash forgets, and which stays put while the neighbor is idle.
+        // tables record only once it moves by a WAL segment, the one a call that left the sequence out kept for it, and,
+        // in an answer, how far this node applied the neighbor's changes, which neither its restart nor its crash
+        // forgets, and which stays put while the neighbor is idle.
         _ = Worf.Execute("SELECT 1 FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2 FOR UPDATE", seq, sender);
         WorfRows stored = Worf.Read(
             "SELECT CASE WHEN $5 THEN wal_lsn ELSE reply_lsn END::text FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2 AND sysid = $3::numeric AND timeline = $4",
             1, seq, sender, SpiParameter.Create(sysid), SpiParameter.Create(timeline), SpiParameter.Create(call));
-        ulong latest = Math.Max(AppliedFloor(applied, entry),
+        string? kept = call ? Worf.ReadScalar<string?>(
+            "DELETE FROM worf.sequence_range_back WHERE seqoid = $1 AND node_id = $2 AND sysid = $3::numeric AND timeline = $4 RETURNING lsn::text",
+            seq, sender, SpiParameter.Create(sysid), SpiParameter.Create(timeline)) : null;
+        ulong latest = Math.Max(Math.Max(AppliedFloor(applied, entry), kept is not null && Worf.TryParseLsn(kept, out ulong left) ? left : 0),
             stored.Count > 0 ? Math.Max(Worf.TryParseLsn(stored[0].Get<string?>(0) ?? "", out ulong recorded) ? recorded : 0,
                 SequenceRangeHeard.LatestLsn(senderId, ulong.Parse(sysid, CultureInfo.InvariantCulture), timeline, call)) : 0);
         string? rolledBack = null;

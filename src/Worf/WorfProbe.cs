@@ -51,6 +51,7 @@ internal sealed unsafe class WorfProbe : IDisposable
     private readonly string _conninfo;
     private readonly string _applicationName;
     private readonly string _peer;
+    private readonly uint _peerNode;
     private readonly byte[] _setup;
     private readonly List<(string Host, Task<IPAddress[]>? Lookup)> _hosts;
     private readonly string[] _ports;
@@ -67,12 +68,12 @@ internal sealed unsafe class WorfProbe : IDisposable
     private bool _fd;
 #endif
 
-    private WorfProbe(string conninfo, string applicationName, string peer, byte[] setup, long deadline, List<(string Host, Task<IPAddress[]>? Lookup)> hosts,
+    private WorfProbe(string conninfo, string applicationName, (string Name, uint Node) peer, byte[] setup, long deadline, List<(string Host, Task<IPAddress[]>? Lookup)> hosts,
         string[] ports, long connectTimeout, bool random)
     {
         _conninfo = conninfo;
         _applicationName = applicationName;
-        _peer = peer;
+        (_peer, _peerNode) = peer;
         _setup = setup;
         _hosts = hosts;
         _ports = ports;
@@ -107,18 +108,19 @@ internal sealed unsafe class WorfProbe : IDisposable
     /// </summary>
     /// <param name="conninfo">The connection string.</param>
     /// <param name="applicationName">The name the server shows for the connection.</param>
-    /// <param name="peer">What this server's log calls the server in the notices it sends, as <c>node node_b</c>.</param>
+    /// <param name="peer">What this server's log calls the server in the notices it sends, as <c>node node_b</c>, and the
+    /// node it is.</param>
     /// <param name="setup">The statements the session runs once connected, in one round trip.</param>
     /// <param name="deadline">When the probe runs out of time, as a timestamp.</param>
     /// <returns>The probe.</returns>
-    internal static WorfProbe Start(string conninfo, string applicationName, string peer, string setup, long deadline)
+    internal static WorfProbe Start(string conninfo, string applicationName, (string Name, uint Node) peer, string setup, long deadline)
     {
         // A host given as an address, or a socket's directory, needs no lookup; libpq looks up the others as it connects,
         // which would hold the worker, those a service file or the environment gives too. Addresses the connection gives
         // stand for its hosts, as libpq takes them.
         List<(string Host, Task<IPAddress[]>? Lookup)> hosts = [];
         string[] ports = [];
-        Dictionary<string, string>? options = EffectiveOptions(conninfo, applicationName);
+        Dictionary<string, string>? options = WorfConnection.EffectiveOptions(conninfo, applicationName);
         if (options is not null)
         {
             string[] names = options.GetValueOrDefault("host") is { Length: > 0 } host ? [.. host.Split(',').Select(each => each.Trim())] : [];
@@ -172,18 +174,19 @@ internal sealed unsafe class WorfProbe : IDisposable
             {
                 if (_polling is PollingReading or PollingWriting)
                 {
-                    // An address that doesn't connect within connect_timeout gives way to the next, as libpq's own wait
-                    // for a connection does.
+                    // An address that doesn't connect within its time gives way to the next, as libpq's own wait for a
+                    // connection does with connect_timeout.
+                    Follow();
                     if (_attemptDeadline != 0 && Worker.GetCurrentTimestamp() >= _attemptDeadline)
                     {
-                        Failed(AttemptFailure("timeout expired"));
+                        TimedOut();
                         continue;
                     }
 
                     if (Socket() == NoSocket)
                     {
-                        Failed(ErrorMessage() is { Length: > 0 } message ? message : AttemptFailure("the connection has no socket"));
-                        continue;
+                        Failure = ErrorMessage() is { Length: > 0 } message ? Failures(message) : "the connection has no socket";
+                        return;
                     }
 
                     if (!Ready(ConnectFlag(), 0))
@@ -195,10 +198,12 @@ internal sealed unsafe class WorfProbe : IDisposable
                     continue;
                 }
 
+                // libpq has tried the addresses after the one it failed at as far as it would, and stopped at a server
+                // that refused the connection, as it does.
                 if (_polling == PollingFailed || Status() != ConnectionOk)
                 {
-                    Failed(ErrorMessage());
-                    continue;
+                    Failure = Failures(ErrorMessage());
+                    return;
                 }
 
                 fixed (byte* setup = _setup)
@@ -399,31 +404,34 @@ internal sealed unsafe class WorfProbe : IDisposable
         Next();
     }
 
-    // Connects to the next address, or fails with every address's failure, as libpq lists them, once none is left. A
-    // connection that libpq finds bad at once, as for an option it doesn't know, fails that address.
+    // Connects to the addresses from the next one on, which libpq tries in turn, moving on as it does: after one that
+    // doesn't take the connection, or a server that is starting or isn't of the session's attributes, but not after one
+    // that refuses the connection, as for a role it doesn't have. A connection that libpq finds bad at once, as for an
+    // option it doesn't know, fails.
     private void Next()
     {
         _attempt++;
         if (_attempts is null || _attempt >= _attempts.Count)
         {
-            Failure = _failures.Count > 0 ? string.Join('\n', _failures) : "could not connect to the server";
+            Failure = Failures(null);
             return;
         }
 
-        (string host, string address, string port) = _attempts[_attempt];
         var start = (delegate* unmanaged<sbyte**, sbyte**, int, void*>)WorfConnection.LibpqFunction("PQconnectStartParams");
+        List<(string Host, string Address, string Port)> rest = _attempts[_attempt..];
         byte[] info = Worf.ToServerCString(_conninfo);
         byte[] application = Worf.ToServerCString(_applicationName);
-        byte[] hostValue = Worf.ToServerCString(host);
-        byte[] hostaddr = Worf.ToServerCString(address);
-        byte[] portValue = Worf.ToServerCString(port);
+        byte[] hostValue = Worf.ToServerCString(string.Join(',', rest.Select(attempt => attempt.Host)));
+        byte[] hostaddr = Worf.ToServerCString(string.Join(',', rest.Select(attempt => attempt.Address)));
+        byte[] portValue = Worf.ToServerCString(string.Join(',', rest.Select(attempt => attempt.Port)));
         bool listed = _hosts.Count > 0;
         bool ported = listed && _ports.Length > 0;
         fixed (byte* dbname = "dbname\0"u8, fallback = "fallback_application_name\0"u8, hostKey = "host\0"u8, hostaddrKey = "hostaddr\0"u8,
             portKey = "port\0"u8, balanceKey = "load_balance_hosts\0"u8, balanceValue = "disable\0"u8, infoAddress = info, applicationAddress = application,
             hostAddress = hostValue, hostaddrValue = hostaddr, portAddress = portValue)
         {
-            // The host, its address and port come after the connection string, whose values they take the place of.
+            // The hosts, their addresses and ports come after the connection string, whose values they take the place
+            // of, in the order the probe has them in.
             sbyte** keys = stackalloc sbyte*[]
             {
                 (sbyte*)dbname, (sbyte*)fallback, listed ? (sbyte*)hostKey : null, listed ? (sbyte*)hostaddrKey : null, ported ? (sbyte*)portKey : null,
@@ -449,24 +457,86 @@ internal sealed unsafe class WorfProbe : IDisposable
             return;
         }
 
-        WorfNotices.Route(_conn, _peer);
+        WorfNotices.Route(_conn, _peer, _peerNode);
         _polling = PollingWriting;
-        _attemptDeadline = _connectTimeout > 0 ? Worker.GetCurrentTimestamp() + _connectTimeout : 0;
+        StartAttempt();
         if (Status() == ConnectionBad)
         {
-            Failed(ErrorMessage());
+            Failure = Failures(ErrorMessage());
         }
     }
 
-    // Gives up the address being connected to, for the reason given, and connects to the next.
-    private void Failed(string reason)
+    // Gives an address its time: the connection's connect_timeout, or with none, or a longer one, its share of what the
+    // probe has left, divided among the addresses not yet tried, so that one that never answers leaves the others time.
+    private void StartAttempt()
     {
-        _failures.Add(reason.TrimEnd());
+        long now = Worker.GetCurrentTimestamp();
+        int left = Math.Max(_attempts!.Count - _attempt, 1);
+        long share = Math.Max((Deadline - now) / left, 0);
+        _attemptDeadline = now + (_connectTimeout > 0 ? Math.Min(_connectTimeout, left > 1 ? share : _connectTimeout) : left > 1 ? share : 0);
+        if (_connectTimeout <= 0 && left == 1)
+        {
+            _attemptDeadline = 0;
+        }
+    }
+
+    // Whether libpq connects to an address now, by the host, address and port it gives: the host it names, or the
+    // address it was given as, the address it reached, where both are known, and the port, where one was given.
+    private static bool IsConnecting((string Host, string Address, string Port) attempt, string host, string address, string port)
+    {
+        if (attempt.Host != host && attempt.Address != host)
+        {
+            return false;
+        }
+
+        if (address.Length > 0 && attempt.Address.Length > 0 && attempt.Address != address)
+        {
+            return false;
+        }
+
+        return attempt.Port.Length == 0 || attempt.Port == port;
+    }
+
+    // Follows libpq as it moves on to a later address, by the host, address and port it connects to now.
+    private void Follow()
+    {
+        string host = Text("PQhost");
+        string address = Text("PQhostaddr");
+        string port = Text("PQport");
+        for (int i = _attempt; i < _attempts!.Count; i++)
+        {
+            if (IsConnecting(_attempts[i], host, address, port))
+            {
+                if (i != _attempt)
+                {
+                    _attempt = i;
+                    StartAttempt();
+                }
+
+                return;
+            }
+        }
+
+        string Text(string function)
+        {
+            sbyte* value = ((delegate* unmanaged<void*, sbyte*>)WorfConnection.LibpqFunction(function))(_conn);
+            return value is null ? "" : Worf.FromServer(value);
+        }
+    }
+
+    // Gives up the address being connected to at its time, and connects to those after it.
+    private void TimedOut()
+    {
+        _failures.Add(AttemptFailure("timeout expired"));
         WorfNotices.Forget(_conn);
         ((delegate* unmanaged<void*, void>)WorfConnection.LibpqFunction("PQfinish"))(_conn);
         _conn = null;
         Next();
     }
+
+    // The probe's failure: the names it found no address for, the addresses that ran out of time, and libpq's own.
+    private string Failures(string? last)
+        => string.Join('\n', last is null ? _failures : [.. _failures, last.TrimEnd()]) is { Length: > 0 } all ? all : "could not connect to the server";
 
     // A failure of the address being connected to, worded as libpq words its own.
     private string AttemptFailure(string reason)
@@ -474,65 +544,6 @@ internal sealed unsafe class WorfProbe : IDisposable
         (string host, string address, string port) = _attempts is not null && _attempt >= 0 && _attempt < _attempts.Count ? _attempts[_attempt] : ("", "", "");
         string at = address.Length > 0 && address != host ? $"\"{host}\" ({address})" : $"\"{host}\"";
         return port.Length > 0 ? $"connection to server at {at}, port {port} failed: {reason}" : $"connection to server at {at} failed: {reason}";
-    }
-
-    // The options libpq would connect with, from the connection string and, for those it doesn't give, a service file or
-    // the environment, or null: libpq takes them all in as it starts a connection, before it looks a host up, and stops
-    // there at the session setting, which no server takes.
-    private static Dictionary<string, string>? EffectiveOptions(string conninfo, string applicationName)
-    {
-        var start = (delegate* unmanaged<sbyte**, sbyte**, int, void*>)WorfConnection.LibpqFunction("PQconnectStartParams");
-        var finish = (delegate* unmanaged<void*, void>)WorfConnection.LibpqFunction("PQfinish");
-        byte[] info = Worf.ToServerCString(conninfo);
-        byte[] application = Worf.ToServerCString(applicationName);
-        void* conn;
-        fixed (byte* dbname = "dbname\0"u8, fallback = "fallback_application_name\0"u8, attrs = "target_session_attrs\0"u8, nothing = "worf-options\0"u8,
-            infoAddress = info, applicationAddress = application)
-        {
-            sbyte** keys = stackalloc sbyte*[] { (sbyte*)dbname, (sbyte*)fallback, (sbyte*)attrs, null };
-            sbyte** values = stackalloc sbyte*[] { (sbyte*)infoAddress, (sbyte*)applicationAddress, (sbyte*)nothing, null };
-            conn = start(keys, values, 1);
-        }
-
-        if (conn is null)
-        {
-            return null;
-        }
-
-        try
-        {
-            byte* options = (byte*)((delegate* unmanaged<void*, void*>)WorfConnection.LibpqFunction("PQconninfo"))(conn);
-            if (options is null)
-            {
-                return null;
-            }
-
-            // PQconninfoOption: its keyword, environment variable, compiled default, value, label and display character,
-            // and its display size, to a keyword of null.
-            int stride = ((6 * sizeof(nint)) + sizeof(int) + sizeof(nint) - 1) / sizeof(nint) * sizeof(nint);
-            Dictionary<string, string> found = new(StringComparer.Ordinal);
-            try
-            {
-                for (byte* option = options; *(sbyte**)option is not null; option += stride)
-                {
-                    sbyte* value = *(sbyte**)(option + (3 * sizeof(nint)));
-                    if (value is not null)
-                    {
-                        found[Worf.FromServer(*(sbyte**)option)] = Worf.FromServer(value);
-                    }
-                }
-            }
-            finally
-            {
-                ((delegate* unmanaged<void*, void>)WorfConnection.LibpqFunction("PQconninfoFree"))(options);
-            }
-
-            return found;
-        }
-        finally
-        {
-            finish(conn);
-        }
     }
 
     // What the connection waits for: to read or to write, or on Windows, while the connect itself is under way, for it

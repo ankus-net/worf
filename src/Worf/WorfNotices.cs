@@ -8,7 +8,8 @@ namespace Worf;
 /// raise them, to this server's log, naming the server, rather than libpq's default, which writes every notice to
 /// standard error without a time or process. Each connection is named as it's made: a node, when the connection is to
 /// one this process exchanges with, or the server's host and port. Notices of lower severity, as a server's debug
-/// messages are, aren't logged, and of a server's warnings, only the first ten each minute are. libpq's result fields
+/// messages are, aren't logged, and of a server's warnings, only the first ten each minute are: a node's, across every
+/// process of this server, as shared memory counts them, and another server's, in each process. libpq's result fields
 /// are part of its stable interface.
 /// </summary>
 internal static unsafe class WorfNotices
@@ -22,8 +23,8 @@ internal static unsafe class WorfNotices
     // How many of a server's notices are logged each minute.
     private const int PerMinute = 10;
 
-    // The name of each connection's server, by its libpq connection.
-    private static readonly Dictionary<nint, string> s_names = [];
+    // The name of each connection's server, and the node it is, or zero, by its libpq connection.
+    private static readonly Dictionary<nint, (string Name, uint Node)> s_names = [];
 
     // When each server's minute began, and how many of its notices were logged in it.
     private static readonly Dictionary<string, (long Began, int Logged)> s_minutes = [];
@@ -33,9 +34,10 @@ internal static unsafe class WorfNotices
     /// </summary>
     /// <param name="conn">The libpq connection.</param>
     /// <param name="name">What the log calls the server, as <c>node node_b</c>.</param>
-    internal static void Route(void* conn, string name)
+    /// <param name="node">The node the server is, or zero.</param>
+    internal static void Route(void* conn, string name, uint node = 0)
     {
-        s_names[(nint)conn] = name;
+        s_names[(nint)conn] = (name, node);
         var receiver = (delegate* unmanaged<void*, delegate* unmanaged<void*, void*, void>, void*, void*>)WorfConnection.LibpqFunction("PQsetNoticeReceiver");
         _ = receiver(conn, &Received, conn);
     }
@@ -46,9 +48,9 @@ internal static unsafe class WorfNotices
     /// <param name="conn">The libpq connection.</param>
     internal static void RouteByAddress(void* conn)
     {
-        string host = Worf.FromServer(((delegate* unmanaged<void*, sbyte*>)WorfConnection.LibpqFunction("PQhost"))(conn));
-        string port = Worf.FromServer(((delegate* unmanaged<void*, sbyte*>)WorfConnection.LibpqFunction("PQport"))(conn));
-        Route(conn, $"the server at {host}:{port}");
+        sbyte* host = ((delegate* unmanaged<void*, sbyte*>)WorfConnection.LibpqFunction("PQhost"))(conn);
+        sbyte* port = ((delegate* unmanaged<void*, sbyte*>)WorfConnection.LibpqFunction("PQport"))(conn);
+        Route(conn, host is null || port is null ? "a server" : $"the server at {Worf.FromServer(host)}:{Worf.FromServer(port)}");
     }
 
     /// <summary>
@@ -72,15 +74,21 @@ internal static unsafe class WorfNotices
             return;
         }
 
-        string name = s_names.GetValueOrDefault((nint)arg) ?? "a server";
+        (string name, uint node) = s_names.TryGetValue((nint)arg, out (string Name, uint Node) named) ? named : ("a server", 0);
         long now = Worker.GetCurrentTimestamp();
-        (long began, int logged) = s_minutes.GetValueOrDefault(name);
-        if (now - began >= 60_000_000L)
+        int logged = node != 0 ? SequenceRangeHeard.CountNotice(node, now) : -1;
+        if (logged < 0)
         {
-            (began, logged) = (now, 0);
+            (long began, int counted) = s_minutes.GetValueOrDefault(name);
+            if (now - began >= 60_000_000L)
+            {
+                (began, counted) = (now, 0);
+            }
+
+            s_minutes[name] = (began, counted + 1);
+            logged = counted;
         }
 
-        s_minutes[name] = (began, logged + 1);
         try
         {
             if (logged < PerMinute)

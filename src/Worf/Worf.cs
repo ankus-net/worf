@@ -2258,9 +2258,10 @@ internal static partial class Worf
         [("connect_timeout", "30"), ("keepalives", "1"), ("keepalives_idle", "20"), ("keepalives_interval", "20"), ("keepalives_count", "5")];
 
     /// <summary>
-    /// Builds the connection string worf connects with: the given one, with the application name after it, a connection
-    /// timeout and keepalives where it gives none of its own, and the options, which override the ones it names, as
-    /// libpq's expand_dbname does.
+    /// Builds the connection string worf connects with, as keywords, so that a URI takes options after it too: the
+    /// options of worf.extra_connection_options, the given one's, which override them, a connection timeout and
+    /// keepalives where neither those, a service file nor the environment give their own, the options given, which
+    /// override all of them, and the application name.
     /// </summary>
     /// <param name="connstr">The connection string.</param>
     /// <param name="appname">The name the connection's application name starts with.</param>
@@ -2270,23 +2271,49 @@ internal static partial class Worf
     internal static (string Conninfo, string ApplicationName) ConnectionString(string connstr, string appname, string? suffix, string? options = null)
     {
         string applicationName = ApplicationName(appname, suffix);
-        StringBuilder conninfo = new(connstr);
-        conninfo.Append(" application_name=");
-        Fe.AppendConnstrValue(conninfo, applicationName);
-
-        // worf's own settings for the connection give way to those the connection string gives.
-        Dictionary<string, string>? given = Fe.ConninfoParse(connstr, out _);
-        foreach ((string option, string value) in s_connectionDefaults.Where(setting => given is null || !given.ContainsKey(setting.Option)))
+        StringBuilder conninfo = new();
+        AppendKeywords(conninfo, ExtraConnectionOptions);
+        AppendKeywords(conninfo, connstr);
+        Dictionary<string, string>? effective = WorfConnection.EffectiveOptions(conninfo.ToString(), applicationName);
+        foreach ((string option, string value) in s_connectionDefaults.Where(setting => effective?.GetValueOrDefault(setting.Option) is not { Length: > 0 }))
         {
-            conninfo.Append(' ').Append(option).Append('=').Append(value);
+            Append(conninfo, option, value);
         }
 
         if (options is not null)
         {
-            conninfo.Append(' ').Append(options);
+            AppendKeywords(conninfo, options);
         }
 
+        Append(conninfo, "application_name", applicationName);
         return (conninfo.ToString(), applicationName);
+
+        // A connection string's options, as keywords, or the string itself when libpq can't parse it, which then fails
+        // the connection as libpq words it.
+        static void AppendKeywords(StringBuilder conninfo, string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return;
+            }
+
+            if (WorfConnection.ParseConninfo(text) is not List<(string Keyword, string Value)> parsed)
+            {
+                _ = conninfo.Append(' ').Append(text);
+                return;
+            }
+
+            foreach ((string keyword, string value) in parsed)
+            {
+                Append(conninfo, keyword, value);
+            }
+        }
+
+        static void Append(StringBuilder conninfo, string keyword, string value)
+        {
+            _ = conninfo.Append(' ').Append(keyword).Append('=');
+            Fe.AppendConnstrValue(conninfo, value);
+        }
     }
 
     /// <summary>

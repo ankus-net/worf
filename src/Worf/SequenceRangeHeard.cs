@@ -215,6 +215,71 @@ internal static class SequenceRangeHeard
     }
 
     /// <summary>
+    /// Counts a notice a node sent one of this server's processes, in the minute that began last, for every process.
+    /// </summary>
+    /// <param name="nodeId">The node.</param>
+    /// <param name="now">The time.</param>
+    /// <returns>How many notices the node sent in the minute before this one, or -1 when shared memory has no room for
+    /// the node.</returns>
+    internal static int CountNotice(uint nodeId, long now)
+    {
+        using PgLwLockExclusiveGuard<WorfHeardTable, WorfHeard> guard = Nodes.Exclusive();
+        int slot = Find(guard, nodeId, nodeId);
+        if (slot < 0)
+        {
+            return -1;
+        }
+
+        WorfHeard heard = guard[slot];
+        if (now - heard.NoticeMinute >= 60_000_000L)
+        {
+            (heard.NoticeMinute, heard.Notices) = (now, 0);
+        }
+
+        int before = heard.Notices;
+        heard.Notices++;
+        guard[slot] = heard;
+        return before;
+    }
+
+    /// <summary>
+    /// Gets where, among the sequences of a node's calls, the last call this server cut short stopped, or zero.
+    /// </summary>
+    /// <param name="nodeId">The node.</param>
+    /// <returns>The position.</returns>
+    internal static int ResumeAt(uint nodeId)
+    {
+        uint dboid = DatabaseId();
+        using PgLwLockShareGuard<WorfHeardTable, WorfHeard> guard = Nodes.Share();
+        for (int i = 0; i < guard.Length; i++)
+        {
+            if (guard[i].Dboid == dboid && guard[i].NodeId == nodeId)
+            {
+                return guard[i].ResumeAt;
+            }
+        }
+
+        return 0;
+    }
+
+    /// <summary>
+    /// Notes where, among the sequences of a node's call, the call was cut short, or zero for one that wasn't.
+    /// </summary>
+    /// <param name="nodeId">The node.</param>
+    /// <param name="position">The position.</param>
+    internal static void RecordResumeAt(uint nodeId, int position)
+    {
+        using PgLwLockExclusiveGuard<WorfHeardTable, WorfHeard> guard = Nodes.Exclusive();
+        int slot = Find(guard, nodeId, nodeId);
+        if (slot >= 0)
+        {
+            WorfHeard heard = guard[slot];
+            heard.ResumeAt = position;
+            guard[slot] = heard;
+        }
+    }
+
+    /// <summary>
     /// Gets when a node's server started, as its last message said, or zero.
     /// </summary>
     /// <param name="nodeId">The node.</param>

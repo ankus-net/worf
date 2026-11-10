@@ -87,4 +87,20 @@ internal struct WorfHeard
     /// When the node's server started, as its last message said, or zero.
     /// </summary>
     public long StartedAt;
+
+    /// <summary>
+    /// Where, among the sequences of the node's calls in the order of their names, the last call this server cut short
+    /// stopped, which the next call goes on from, or zero.
+    /// </summary>
+    public int ResumeAt;
+
+    /// <summary>
+    /// When the minute began in which this server's processes logged the notices the node sent them, or zero.
+    /// </summary>
+    public long NoticeMinute;
+
+    /// <summary>
+    /// How many notices the node sent this server's processes in that minute.
+    /// </summary>
+    public int Notices;
 }

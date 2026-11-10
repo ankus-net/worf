@@ -121,15 +121,16 @@ internal static class SequenceRangeWorker
 
                             try
                             {
-                                // A sequence that hasn't moved since a check less than a second ago, whose blocks no change
-                                // committed since has touched, which no statement waits on and no session asked to have
-                                // checked, has nothing new for the check, which still runs each second for what time alone
-                                // changes, as a fence's wait or a rate's decay.
+                                // A sequence that hasn't moved since a check less than ten check intervals ago, and at least a
+                                // second, whose blocks no change committed since has touched, which no statement waits on and
+                                // no session asked to have checked, has nothing new for the check, which still runs that often
+                                // for what time alone changes, as a fence's wait or a rate's decay.
                                 long version = SequenceRanges.Version.Value;
                                 long? position = Worf.ReadScalar<long?>("SELECT pg_catalog.pg_sequence_last_value($1)", SpiParameter.Create(seqoid));
                                 long now = Worker.GetCurrentTimestamp();
                                 if (checkedAt.TryGetValue(seqoid, out (long Version, long? Position, long Requested, long At) seen) &&
-                                    seen.Version == version && seen.Position == position && seen.Requested == requested && now - seen.At < 1_000_000 &&
+                                    seen.Version == version && seen.Position == position && seen.Requested == requested &&
+                                    now - seen.At < Math.Max(1000L, 10L * SequenceRanges.CheckInterval) * 1000L &&
                                     SequenceRangeGuard.Drawing(seqoid).Waiting == 0)
                                 {
                                     return false;

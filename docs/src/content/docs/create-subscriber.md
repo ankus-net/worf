@@ -56,8 +56,10 @@ the tablespace directories `-T` maps too, those it made with them; one while
 others can't roll back with it, so a stop waits for the run to set them up, and
 changes nothing. A failed or stopped run drops the replication slots it made on
 the provider for the databases it hadn't subscribed yet, but only the slot it
-made: one another run with the same subscriber name made in its place, or one a
-walsender streams, stays, with a warning. A killed run, or one that can't reach
+made as it made it, which the slot's confirmed position shows: one another run
+with the same subscriber name made in its place, its own once a client has
+confirmed what it streamed from it, or one a walsender streams, stays, with a
+warning. A killed run, or one that can't reach
 the provider as it cleans up, leaves its slot, which holds back the provider's
 WAL and catalog rows, and a later run with the same subscriber name fails until
 the slot is dropped, or runs with `--drop-slot-if-exists`. A killed run leaves its
@@ -72,10 +74,13 @@ which writes WAL the provider doesn't have, or, once it has started, whose
 latest checkpoint isn't a checkpoint record of the provider's WAL with the redo
 point its `pg_control` holds, as one that did so and stopped in recovery later
 has, or lies in WAL the provider has removed while the directory's own WAL
-doesn't hold it, or doesn't reach the WAL the provider still has, or doesn't join
-it there: the record the provider's first record links back to must be the
-directory's last before that point, ending there or carried on in the provider's
-first page, with a checksum that covers both parts, as a standby's is and one
-that left the provider's WAL isn't; each leaves the data directory as it is. The
+doesn't hold it, or doesn't run on into the WAL the provider still has as the
+provider's own: from the checkpoint, the directory's records must each link back
+to the one before, whole as their checksums show, and run into the provider's
+first segment, where they must be the provider's bytes up to the end of the
+first record that begins there, as a standby's are and those of one that left
+the provider's WAL aren't. A directory whose WAL ends where the provider's
+begins, or before, can't be told from one that left it, and is refused too;
+each leaves the data directory as it is. The
 run reads those records from the provider's `pg_wal` with `pg_read_binary_file`,
 and can't tell when the provider doesn't let it.
