@@ -3135,33 +3135,33 @@ public sealed class SequenceRangeTests
         CancellationToken token = TestContext.CancellationToken;
         await using TestNode nodeA = await StartNodeAsync("node_a", token, "log_min_messages = debug1");
         await using TestNode nodeB = await StartNodeAsync("node_b", token);
-        const string Sequences = "CREATE TABLE slow_on (); CREATE SEQUENCE zz_last; DO $$ BEGIN FOR g IN 1..30 LOOP EXECUTE format('CREATE SEQUENCE many_%s', lpad(g::text, 2, '0')); END LOOP; END $$";
+        const string Sequences = "CREATE TABLE slow_on (); CREATE SEQUENCE zz_last; DO $$ BEGIN FOR g IN 1..20 LOOP EXECUTE format('CREATE SEQUENCE many_%s', lpad(g::text, 2, '0')); END LOOP; END $$";
         foreach (TestNode node in new[] { nodeA, nodeB })
         {
             _ = await node.SafePsqlAsync(Database, Sequences, token);
         }
 
-        // Once it's turned on, each grant node_a makes costs it 0.25 s, so that a call makes fewer than half the 30 asked
+        // Once it's turned on, each grant node_a makes costs it 0.4 s, so that a call makes fewer than half the 20 asked
         // for, and the sequences it leaves, which ask again on the next call, are more than that call makes.
         _ = await nodeA.SafePsqlAsync(Database, """
-            CREATE FUNCTION slow_grant() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF EXISTS (SELECT FROM public.slow_on) THEN PERFORM pg_sleep(0.25); END IF; RETURN NEW; END $$;
+            CREATE FUNCTION slow_grant() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF EXISTS (SELECT FROM public.slow_on) THEN PERFORM pg_sleep(0.4); END IF; RETURN NEW; END $$;
             CREATE TRIGGER slow_grant BEFORE INSERT ON worf.sequence_range_grant FOR EACH ROW EXECUTE FUNCTION slow_grant();
             """, token);
         await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
         _ = await nodeA.SafePsqlAsync(Database,
-            "SELECT count(worf.enable_sequence_range(format('many_%s', lpad(g::text, 2, '0'))::regclass, participants := '{node_b}', range_size := 10, max_range_size := 10)) FROM generate_series(1, 30) g",
+            "SELECT count(worf.enable_sequence_range(format('many_%s', lpad(g::text, 2, '0'))::regclass, participants := '{node_b}', range_size := 10, max_range_size := 10)) FROM generate_series(1, 20) g",
             token);
-        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT count(*) = 30 FROM worf.sequence_ranges WHERE state = 'active'", token),
-            "node_b drawing from blocks of the 30 sequences");
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT count(*) = 20 FROM worf.sequence_ranges WHERE state = 'active'", token),
+            "node_b drawing from blocks of the 20 sequences");
 
-        // node_b draws each sequence's block through as soon as it has one, on a connection for each, so that every sequence
-        // asks for another on every call.
+        // node_b draws each sequence's block through soon after it has one, on a connection for each, so that every
+        // sequence asks for another on every call.
         _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO slow_on DEFAULT VALUES", token);
         using CancellationTokenSource drawing = CancellationTokenSource.CreateLinkedTokenSource(token);
         async Task DrawAsync(int sequence)
         {
             await using NpgsqlConnection connection = await nodeB.OpenAsync(Database, drawing.Token);
-            await using (NpgsqlCommand timeout = new("SET statement_timeout = '200ms'", connection))
+            await using (NpgsqlCommand timeout = new("SET statement_timeout = '100ms'", connection))
             {
                 _ = await timeout.ExecuteNonQueryAsync(drawing.Token);
             }
@@ -3176,12 +3176,12 @@ public sealed class SequenceRangeTests
                 }
                 catch (PostgresException failed) when (failed.SqlState is "57014" or "55000" or "2200H")
                 {
-                    await Task.Delay(TimeSpan.FromMilliseconds(50), drawing.Token);
+                    await Task.Delay(TimeSpan.FromMilliseconds(300), drawing.Token);
                 }
             }
         }
 
-        Task draws = Task.WhenAll(Enumerable.Range(1, 30).Select(DrawAsync));
+        Task draws = Task.WhenAll(Enumerable.Range(1, 20).Select(DrawAsync));
         try
         {
             int logpos = nodeA.ReadLog().Length;
@@ -3210,13 +3210,14 @@ public sealed class SequenceRangeTests
         CancellationToken token = TestContext.CancellationToken;
         await using TestNode nodeA = await StartNodeAsync("node_a", token, "log_min_messages = debug1");
         await using TestNode nodeB = await StartNodeAsync("node_b", token);
-        const string Tables = "CREATE TABLE slow_on (); CREATE TABLE t (id bigserial PRIMARY KEY, v text); DO $$ BEGIN FOR g IN 1..40 LOOP EXECUTE format('CREATE SEQUENCE many_%s', lpad(g::text, 2, '0')); END LOOP; END $$";
+        const string Tables = "CREATE TABLE slow_on (); CREATE TABLE t (id bigserial PRIMARY KEY, v text); DO $$ BEGIN FOR g IN 1..15 LOOP EXECUTE format('CREATE SEQUENCE many_%s', lpad(g::text, 2, '0')); END LOOP; END $$";
         foreach (TestNode node in new[] { nodeA, nodeB })
         {
             _ = await node.SafePsqlAsync(Database, Tables, token);
         }
 
-        // Once it's turned on, each report node_a takes in costs it 0.2 s, and a call's third of its 5 s takes in 8.
+        // Once it's turned on, each report node_a takes in costs it 0.2 s, and a call's third of its 5 s takes in 8 of the
+        // 16 that change, t_id_seq's, which sorts last, among those it leaves.
         _ = await nodeA.SafePsqlAsync(Database, """
             CREATE FUNCTION slow_report() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF EXISTS (SELECT FROM public.slow_on) THEN PERFORM pg_sleep(0.2); END IF; RETURN NEW; END $$;
             CREATE TRIGGER slow_report BEFORE UPDATE ON worf.sequence_range_node FOR EACH ROW EXECUTE FUNCTION slow_report();
@@ -3224,10 +3225,10 @@ public sealed class SequenceRangeTests
         await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
         _ = await nodeA.SafePsqlAsync(Database, """
             SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 1000);
-            SELECT count(worf.enable_sequence_range(format('many_%s', lpad(g::text, 2, '0'))::regclass, participants := '{node_b}', range_size := 1000)) FROM generate_series(1, 40) g;
+            SELECT count(worf.enable_sequence_range(format('many_%s', lpad(g::text, 2, '0'))::regclass, participants := '{node_b}', range_size := 1000)) FROM generate_series(1, 15) g;
             """, token);
         await WaitActiveAsync([nodeA, nodeB], token);
-        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT count(*) = 41 FROM worf.sequence_ranges WHERE state = 'active'", token),
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT count(*) = 16 FROM worf.sequence_ranges WHERE state = 'active'", token),
             "node_b drawing from blocks of every sequence");
 
         // node_b's inserts wait, failing at their time, until node_a answers it once it has started, and after a restore,

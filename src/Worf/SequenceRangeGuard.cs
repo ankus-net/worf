@@ -100,6 +100,11 @@ internal static partial class SequenceRangeGuard
     // the function, read again once a type, a constraint or a function changes.
     private static readonly Dictionary<uint, (HashSet<uint> Called, bool Unnamed)?> s_plpgsqlCasts = [];
 
+    // Whether each function a statement called may check a domain the statement doesn't name, by the function, read
+    // again once a function changes, and PostgreSQL's own functions that do, read once.
+    private static readonly Dictionary<long, bool> s_checksUnnamed = [];
+    private static HashSet<long>? s_inputCheckers;
+
     // Whether the guard hears of the changes to tables and types that the text it holds by table reads, as a default
     // set, a partition attached or a domain's CHECK added.
     private static bool s_watchingTables;
@@ -1406,6 +1411,7 @@ internal static partial class SequenceRangeGuard
         s_defaultsText.Clear();
         s_domainDraws = null;
         s_plpgsqlCasts.Clear();
+        s_checksUnnamed.Clear();
     }
 
     // The text of a plan, as nodeToString writes it, and of the CHECK constraints of the domains it coerces to, which
@@ -2120,15 +2126,44 @@ internal static partial class SequenceRangeGuard
     // do anything, worf doesn't see into, as it doesn't see C code that calls nextval itself.
     private static bool ChecksUnnamedDomains(string text)
     {
-        long[] functions = [.. CalledFunction().Matches(text).Select(call => long.Parse(call.Groups[1].ValueSpan, CultureInfo.InvariantCulture)).Distinct()];
-        return functions.Length > 0 && Elevated.Run(() => Worf.ReadScalar<bool>("""
-            SELECT EXISTS (
+        // PostgreSQL's own functions, but for pg_input_is_valid and pg_input_error_info, check only the domains a
+        // statement names, so a statement that calls none of the others, as most that draw call only nextval, reads no
+        // catalog; the others' answers are kept until a function changes.
+        s_inputCheckers ??= [.. Elevated.Run(() => Worf.Read("""
+            SELECT p.oid::pg_catalog.int8 FROM pg_catalog.pg_proc p
+            WHERE p.pronamespace = 'pg_catalog'::pg_catalog.regnamespace AND p.proname IN ('pg_input_is_valid', 'pg_input_error_info')
+            """, 0)).Select(row => row.Get<long>(0))];
+        long[] functions = [.. CalledFunction().Matches(text).Select(call => long.Parse(call.Groups[1].ValueSpan, CultureInfo.InvariantCulture)).Distinct()
+            .Where(function => function >= 16384 || s_inputCheckers.Contains(function))];
+        if (functions.Any(function => s_checksUnnamed.TryGetValue(function, out bool checks) && checks))
+        {
+            return true;
+        }
+
+        long[] unread = [.. functions.Where(function => !s_checksUnnamed.ContainsKey(function))];
+        if (unread.Length == 0)
+        {
+            return false;
+        }
+
+        WorfRows checking = Elevated.Run(() => Worf.Read("""
+            SELECT f.oid, EXISTS (
                 SELECT 1 FROM pg_catalog.pg_proc p
-                WHERE p.oid = ANY ($1::pg_catalog.int8[]::pg_catalog.oid[])
+                WHERE p.oid = f.oid::pg_catalog.oid
                     AND (p.oid >= 16384 AND p.prolang NOT IN (12, 13, 14) AND p.pronamespace <> 'worf'::pg_catalog.regnamespace
                             AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_language l WHERE l.oid = p.prolang AND l.lanname = 'plpgsql')
                         OR p.pronamespace = 'pg_catalog'::pg_catalog.regnamespace AND p.proname IN ('pg_input_is_valid', 'pg_input_error_info')))
-            """, SpiParameter.Create(functions)));
+            FROM pg_catalog.unnest($1::pg_catalog.int8[]) f (oid)
+            """, 0, SpiParameter.Create(unread)));
+        bool any = false;
+        foreach (WorfRow row in checking)
+        {
+            bool checks = row.Get<bool>(1);
+            s_checksUnnamed[row.Get<long>(0)] = checks;
+            any |= checks;
+        }
+
+        return any;
     }
 
     // Where the first argument of the node at a position of an expression's text starts, or -1.
