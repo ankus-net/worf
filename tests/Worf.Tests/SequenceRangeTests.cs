@@ -3230,12 +3230,32 @@ public sealed class SequenceRangeTests
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT count(*) = 41 FROM worf.sequence_ranges WHERE state = 'active'", token),
             "node_b drawing from blocks of every sequence");
 
-        // node_b is copied, draws 20 ids and writes enough for its WAL position to move well past the copy's, which
-        // node_a hears of, and goes back to the copy.
+        // node_b's inserts wait, failing at their time, until node_a answers it once it has started, and after a restore,
+        // until a call has taken every sequence in, and then for the block that follows the reset, failing at the end of
+        // the quarantine until it comes.
+        async Task<HashSet<string>> InsertIdsAsync(string label)
+        {
+            Stopwatch waiting = Stopwatch.StartNew();
+            while (true)
+            {
+                Assert.IsLessThan(TestNode.PollTimeout, waiting.Elapsed, $"node_b's insert {label}");
+                try
+                {
+                    return [.. (await nodeB.SafePsqlAsync(Database, $"INSERT INTO t (v) SELECT '{label}' FROM generate_series(1, 20) RETURNING id", token)).Split('\n')];
+                }
+                catch (PostgresException waited) when (waited.SqlState is "55000" or "57014" or "2200H")
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(200), token);
+                }
+            }
+        }
+
+        // node_b is copied, which restarts it, draws 20 ids and writes enough for its WAL position to move well past the
+        // copy's, which node_a hears of, and goes back to the copy.
         using TemporaryDirectory copies = new($"worf-sequence-range-slow-restore-{Guid.NewGuid():N}");
         string copy = Path.Join(copies.FullName, "node_b");
         await CopyDataAsync(nodeB, copy, token);
-        HashSet<string> before = [.. (await nodeB.SafePsqlAsync(Database, "INSERT INTO t (v) SELECT 'before' FROM generate_series(1, 20) RETURNING id", token)).Split('\n')];
+        HashSet<string> before = await InsertIdsAsync("before");
         _ = await nodeB.SafePsqlAsync(Database, "CREATE TABLE written AS SELECT g, repeat('x', 100) AS v FROM generate_series(1, 40000) g", token);
         const string HeardFromB = """
             SELECT worf.sequence_range_heard(node_id, true, '-infinity', false)::text FROM worf.sequence_range_node
@@ -3252,23 +3272,7 @@ public sealed class SequenceRangeTests
         _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO slow_on DEFAULT VALUES", token);
         int logpos = nodeA.ReadLog().Length;
         await RestoreDataAsync(nodeB, copy, token);
-
-        // node_b's inserts wait for node_a, failing at their time, until a call has taken every sequence in, and then for
-        // the block that follows the reset, failing at the end of the quarantine until it comes.
-        HashSet<string> after = [];
-        Stopwatch waiting = Stopwatch.StartNew();
-        while (after.Count == 0)
-        {
-            Assert.IsLessThan(TestNode.PollTimeout, waiting.Elapsed, "node_b's insert after the restore");
-            try
-            {
-                after = [.. (await nodeB.SafePsqlAsync(Database, "INSERT INTO t (v) SELECT 'after' FROM generate_series(1, 20) RETURNING id", token)).Split('\n')];
-            }
-            catch (PostgresException waited) when (waited.SqlState is "55000" or "57014" or "2200H")
-            {
-                await Task.Delay(TimeSpan.FromMilliseconds(200), token);
-            }
-        }
+        HashSet<string> after = await InsertIdsAsync("after");
 
         Assert.Contains("sequences to its next call", nodeA.ReadLog()[logpos..], "node_a's calls, cut short");
         Assert.AreEqual("", string.Join(",", before.Intersect(after)), "the ids node_b drew both before the restore and after it");

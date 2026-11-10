@@ -67,8 +67,9 @@ internal static class SequenceRangeExchange
 
     // The connection to each subscription's provider that this worker's exchanges go over, kept from one exchange to the
     // next, as apply keeps its own, rather than a session made and ended for each, with the connection string worf built
-    // for it, worf.extra_connection_options's options too, and the timeout it was made with, so that a change to either
-    // makes it again; one that fails, or a call that runs out of time, is closed.
+    // for it as it connected, worf.extra_connection_options's options too, and the timeout it was made with, so that a
+    // change to either, even one made while it connected, makes it again; one that fails, or a call that runs out of
+    // time, is closed.
     private static readonly Dictionary<uint, (WorfConnection Conn, string Conninfo, int Timeout)> s_connections = [];
 
     /// <summary>
@@ -458,6 +459,7 @@ internal static class SequenceRangeExchange
         pending.Probing = s_timedOut.Contains(sub.Id);
         int timeout = SequenceRanges.ExchangeTimeout;
         (string conninfo, string applicationName) = Worf.ConnectionString(sub.OriginIf.Dsn, sub.Name, "range");
+        pending.ProbedWith = (conninfo, timeout);
         pending.Probe = WorfProbe.Start(conninfo, applicationName, ($"node {pending.Sub.Origin.Name}", pending.Sub.Origin.Id), Worf.SessionSetup($"SET statement_timeout = {timeout.ToString(CultureInfo.InvariantCulture)}"),
             Worker.GetCurrentTimestamp() + (timeout * 1000L));
         WorfLog.Debug2($"sequence range exchange with node {sub.Origin.Name} connecting{(pending.Probing ? ", as a probe" : "")}");
@@ -526,7 +528,7 @@ internal static class SequenceRangeExchange
 
             // A provider whose last call ran out of time keeps its delay, which a call that fails again doubles.
             WorfConnection conn = probe.Take();
-            s_connections[sub.Id] = (conn, Worf.ConnectionString(sub.OriginIf.Dsn, sub.Name, "range").Conninfo, SequenceRanges.ExchangeTimeout);
+            s_connections[sub.Id] = (conn, pending.ProbedWith.Conninfo, pending.ProbedWith.Timeout);
             if (pending.Probing)
             {
                 _ = s_timedOut.Remove(sub.Id);

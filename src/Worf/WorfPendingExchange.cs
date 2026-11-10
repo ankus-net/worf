@@ -36,6 +36,12 @@ internal sealed class WorfPendingExchange(WorfSubscription sub, string? waiting,
     internal WorfProbe? Probe { get; set; }
 
     /// <summary>
+    /// Gets or sets the connection string the probe connects with, and the exchange's timeout as it started, which the
+    /// connection is kept with once it's made.
+    /// </summary>
+    internal (string Conninfo, int Timeout) ProbedWith { get; set; }
+
+    /// <summary>
     /// Gets or sets the call under way, or null.
     /// </summary>
     internal WorfPendingQuery? Query { get; set; }
