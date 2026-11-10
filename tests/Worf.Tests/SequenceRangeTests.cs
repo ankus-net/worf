@@ -2971,7 +2971,7 @@ public sealed class SequenceRangeTests
     /// it, which carry its 151 managed sequences, are larger than its sockets hold: the node sends what they take as they
     /// take it, without waiting on them, goes on exchanging with its other provider, and gives the call up at its time.
     /// The owner starts all 151 roots with each call given 5 s, and the calls, over 85 KB, carry nothing after their
-    /// message. The stalled call has 30 s, which spans several of a slow host's exchanges with the other provider. The
+    /// message. The stalled call has 15 s, which spans several of a slow host's exchanges with the other provider. The
     /// test runs alone, as starting 151 roots on a host whose cores other tests' clusters share takes minutes.
     /// On Linux, where a library the server preloads gives the node's connections to the provider a small send buffer.
     /// </summary>
@@ -3052,9 +3052,9 @@ public sealed class SequenceRangeTests
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT count(*) = 151 FROM worf.sequence_ranges WHERE state = 'active'", token),
             "node_b drawing from blocks of every sequence");
 
-        // A slow host's exchanges with node_a, carrying 151 sequences, take seconds, so node_b gives each call 30 s from
-        // now, which a stalled call to node_c spans several of.
-        _ = await nodeB.SafePsqlAsync(Database, "ALTER SYSTEM SET worf.sequence_range_timeout = '30s'", token);
+        // node_b gives each call 15 s from now, which a stalled call to node_c spans several exchanges with node_a of,
+        // though each carries 151 sequences.
+        _ = await nodeB.SafePsqlAsync(Database, "ALTER SYSTEM SET worf.sequence_range_timeout = '15s'", token);
         _ = await nodeB.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
 
         // node_b's calls to node_c go through a relay that stops reading each connection once its settings have passed.
@@ -3073,7 +3073,7 @@ public sealed class SequenceRangeTests
 
         // node_b goes on exchanging with node_a while its call to node_c can't be sent whole, and gives that call up at
         // its time.
-        const string GivenUp = "exchange with node node_c failed: node node_c didn't answer within 30000 ms";
+        const string GivenUp = "exchange with node node_c failed: node node_c didn't answer within 15000 ms";
         int logpos = nodeB.ReadLog().Length;
         Assert.IsTrue(await nodeB.PollLogAsync(logpos, GivenUp, token), "node_b's call to node_c, given up at its time");
         string log = nodeB.ReadLog()[logpos..];

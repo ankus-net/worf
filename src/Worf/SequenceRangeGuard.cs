@@ -101,9 +101,11 @@ internal static partial class SequenceRangeGuard
     private static readonly Dictionary<uint, (HashSet<uint> Called, bool Unnamed)?> s_plpgsqlCasts = [];
 
     // Whether each function a statement called may check a domain the statement doesn't name, by the function, read
-    // again once a function changes, and PostgreSQL's own functions that do, read once.
+    // again once a function changes.
     private static readonly Dictionary<long, bool> s_checksUnnamed = [];
-    private static HashSet<long>? s_inputCheckers;
+
+    // pg_input_is_valid and pg_input_error_info, by their OIDs in PostgreSQL's catalog since 16, which added them.
+    private static readonly HashSet<long> s_inputCheckers = [6210, 6211];
 
     // Whether the guard hears of the changes to tables and types that the text it holds by table reads, as a default
     // set, a partition attached or a domain's CHECK added.
@@ -2129,10 +2131,6 @@ internal static partial class SequenceRangeGuard
         // PostgreSQL's own functions, but for pg_input_is_valid and pg_input_error_info, check only the domains a
         // statement names, so a statement that calls none of the others, as most that draw call only nextval, reads no
         // catalog; the others' answers are kept until a function changes.
-        s_inputCheckers ??= [.. Elevated.Run(() => Worf.Read("""
-            SELECT p.oid::pg_catalog.int8 FROM pg_catalog.pg_proc p
-            WHERE p.pronamespace = 'pg_catalog'::pg_catalog.regnamespace AND p.proname IN ('pg_input_is_valid', 'pg_input_error_info')
-            """, 0)).Select(row => row.Get<long>(0))];
         long[] functions = [.. CalledFunction().Matches(text).Select(call => long.Parse(call.Groups[1].ValueSpan, CultureInfo.InvariantCulture)).Distinct()
             .Where(function => function >= 16384 || s_inputCheckers.Contains(function))];
         if (functions.Any(function => s_checksUnnamed.TryGetValue(function, out bool checks) && checks))
