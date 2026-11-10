@@ -1205,6 +1205,12 @@ internal static class SequenceRangeExchange
         HashSet<uint> absent = [.. Enumerable.Range(0, fencedOn.Count).Select(i => fencedOn[i].Get<uint>(0))];
         List<long> carriedSequences = [];
         bool undone = false;
+
+        // A call that runs out of time is rolled back whole, so the sequences it would take in past half the caller's
+        // statement_timeout are left to its next call, as one whose range row another transaction holds is, and the
+        // call keeps what it took in.
+        long? takeUntil = call ? CallTimeHalf() : null;
+        int left = 0;
         foreach (JsonElement entry in sequences.EnumerateArray())
         {
             uint? processed = Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(entry.GetProperty("name").GetWorfString()));
@@ -1234,6 +1240,13 @@ internal static class SequenceRangeExchange
             {
                 if (!heard || !Unchanged(node, root, entry, senderId, call, applied))
                 {
+                    if (takeUntil is long until && Worker.GetCurrentTimestamp() >= until)
+                    {
+                        left++;
+                        undone |= Text(entry, "reset") is not null;
+                        continue;
+                    }
+
                     PgTransaction.RunInSubtransaction(() =>
                     {
                         (bool g, bool r, bool l) = ProcessSequence(node, root, entry, senderId, senderName, call, applied);
@@ -1276,6 +1289,11 @@ internal static class SequenceRangeExchange
             }
         }
 
+        if (left > 0)
+        {
+            WorfLog.Debug1($"sequence range exchange with node {senderName} left {left.ToString(CultureInfo.InvariantCulture)} sequences to its next call, as the call had taken half its time");
+        }
+
         foreach (uint seqoid in absent)
         {
             _ = Worf.Execute("""
@@ -1312,6 +1330,22 @@ internal static class SequenceRangeExchange
         }
 
         return (granted, received);
+    }
+
+    /// <summary>
+    /// Works out when a call has taken half the time its statement_timeout gives it.
+    /// </summary>
+    /// <returns>The time, or null when it has no timeout.</returns>
+    private static long? CallTimeHalf()
+    {
+        int timeout = Worf.ReadScalar<int>("SELECT setting::int FROM pg_catalog.pg_settings WHERE name = 'statement_timeout'");
+        long started;
+        unsafe
+        {
+            started = NativeMethods.GetCurrentStatementStartTimestamp();
+        }
+
+        return timeout > 0 ? started + (timeout * 500L) : null;
     }
 
     /// <summary>

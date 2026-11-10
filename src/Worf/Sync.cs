@@ -1801,9 +1801,10 @@ internal static class Sync
             s_heldFinding = TimeSpan.Zero;
             s_heldDeciding = TimeSpan.Zero;
             s_heldConflictScans = 0;
+            s_heldConflictRows = 0;
             s_heldCopyScans = 0;
             long skipped = SkipHeldValues(rel, lsn, only + table, key, operators, rest, index, row, attnamelist);
-            WorfLog.Log($"the held-value checks of the copy of table {remoterel.Nspname}.{remoterel.Relname} kept {s_heldChecked} rows to decide on, holding at most {s_heldMost} of their keys at once, in {s_heldFinding.TotalMilliseconds.ToString("F0", CultureInfo.InvariantCulture)} ms finding their conflicts and {s_heldDeciding.TotalMilliseconds.ToString("F0", CultureInfo.InvariantCulture)} ms deciding, in which they scanned the conflicts {s_heldConflictScans.ToString(CultureInfo.InvariantCulture)} times and the copy {s_heldCopyScans.ToString(CultureInfo.InvariantCulture)} times whole");
+            WorfLog.Log($"the held-value checks of the copy of table {remoterel.Nspname}.{remoterel.Relname} kept {s_heldChecked} rows to decide on, holding at most {s_heldMost} of their keys at once, in {s_heldFinding.TotalMilliseconds.ToString("F0", CultureInfo.InvariantCulture)} ms finding their conflicts and {s_heldDeciding.TotalMilliseconds.ToString("F0", CultureInfo.InvariantCulture)} ms deciding, in which they scanned the conflicts {s_heldConflictScans.ToString(CultureInfo.InvariantCulture)} times whole, reading {s_heldConflictRows.ToString(CultureInfo.InvariantCulture)} of their rows in all, and the copy {s_heldCopyScans.ToString(CultureInfo.InvariantCulture)} times whole");
             if (!Merged(merge.ToString(), out _))
             {
                 List<(long Row, PgException Error)> halved = [];
@@ -1820,7 +1821,7 @@ internal static class Sync
                     long writes = Worf.ReadScalar<long>($"SELECT count(*)::pg_catalog.int8 FROM {MergeCopy}");
                     (List<string> Key, Dictionary<short, string> Operators) wrote = (key, operators);
                     _ = MergeParts(reloid, only + table, mergePart, row, 0, Position(max) + 1, halved, wrote, true);
-                    WorfLog.Log($"merged the copy of table {remoterel.Nspname}.{remoterel.Relname} in halves: {s_partsTried} parts tried whole, the largest of {s_largestTried} rows, of the {writes} rows it writes, after the held-value checks kept {s_heldChecked} rows to decide on; {s_keyChecksAtParts} deferrable key checks at the parts' keys, {s_keyChecksWhole} at the whole table, which looked in the copy's indexes {s_keyCheckCopyLookups} times");
+                    WorfLog.Log($"merged the copy of table {remoterel.Nspname}.{remoterel.Relname} in halves: {s_partsTried} parts tried whole, the largest of {s_largestTried} rows, of the {writes} rows it writes, after the held-value checks kept {s_heldChecked} rows to decide on; {s_keyChecksAtParts} deferrable key checks at the parts' keys, which looked in the copy's indexes {s_keyCheckCopyLookups} times, and {s_keyChecksWhole} at the whole table");
                 }
 
                 RecordSkipped(rel, lsn, row, attnamelist, halved);
@@ -1969,6 +1970,7 @@ internal static class Sync
                 s_heldCopyScans += Worf.ReadScalar<long>(CopyScans) - scansBefore;
             });
             s_heldConflictScans += HeldValues.ConflictScans;
+            s_heldConflictRows += HeldValues.ConflictRows;
             s_heldChecked += HeldValues.RefusedChecked;
             s_heldMost = Math.Max(s_heldMost, HeldValues.HeldMost);
             s_heldFinding += HeldValues.Finding;
@@ -3226,6 +3228,9 @@ internal static class Sync
     // How many sequential scans of the conflicts, and of the copy as the rows refused were recorded and left it, the
     // held-value checks made as they decided, which the indexes of each spare them.
     private static long s_heldConflictScans;
+
+    // The rows the held-value checks read from their conflicts as they decided, through any scan.
+    private static long s_heldConflictRows;
     private static long s_heldCopyScans;
 
     // The sequential scans of the copy this transaction has made.

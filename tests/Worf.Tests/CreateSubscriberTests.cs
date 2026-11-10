@@ -2,6 +2,9 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.Versioning;
 using System.Text;
+using Npgsql;
+using Npgsql.Replication;
+using Npgsql.Replication.Internal;
 
 namespace Worf.Tests;
 
@@ -488,7 +491,7 @@ public sealed class CreateSubscriberTests
     /// too; stopped as the server it started catches up to the restore point, through a recovery template, with no
     /// pg_controldata beside it, or streaming from the provider as the run's own settings have it, it stops the server
     /// and takes its recovery settings, the template's too, back out, though postgresql.auto.conf ended in a comment
-    /// without a newline, puts back the postgresql.conf and pg_hba.conf it copied over and postgresql.auto.conf, byte for
+    /// without a newline, as the template did, after each of which the next starts a line of its own, puts back the postgresql.conf and pg_hba.conf it copied over and postgresql.auto.conf, byte for
     /// byte, and keeps a standby.signal the data directory had; stopped just as the server it started leaves recovery,
     /// before the run sees it, it keeps them, as the server's cluster state shows. A run stopped before it subscribed
     /// leaves no slot it made on the provider. A data directory that has run as a server of its own, out
@@ -567,12 +570,12 @@ public sealed class CreateSubscriberTests
         }
 
         // The provider's configuration files, which pg_basebackup copies, hold a comment in Latin-1, which the run puts
-        // back as it was; in the streaming row, postgresql.auto.conf's ends it without a newline, after which the
-        // settings the run adds start a line of their own.
+        // back as it was; in the streaming and catchup rows, postgresql.auto.conf's ends it without a newline, after
+        // which the recovery template and the settings the run adds start lines of their own.
         foreach (string conf in new[] { "postgresql.conf", "pg_hba.conf", "postgresql.auto.conf" })
         {
             await using FileStream appending = new(Path.Join(provider.Cluster.DataDirectory, conf), FileMode.Append);
-            byte[] comment = [0x0A, (byte)'#', (byte)' ', (byte)'c', (byte)'a', (byte)'f', 0xE9, .. conf == "postgresql.auto.conf" && when == "streaming" ? Array.Empty<byte>() : [0x0A]];
+            byte[] comment = [0x0A, (byte)'#', (byte)' ', (byte)'c', (byte)'a', (byte)'f', 0xE9, .. conf == "postgresql.auto.conf" && when is "streaming" or "catchup" ? Array.Empty<byte>() : [0x0A]];
             await appending.WriteAsync(comment, token);
         }
 
@@ -596,7 +599,7 @@ public sealed class CreateSubscriberTests
         string confsBefore = await ConfBytesAsync(provider.Cluster.DataDirectory, token);
         string template = Path.Join(work.FullName, "recovery.conf");
         await File.WriteAllTextAsync(template,
-            $"# recovery template\nprimary_conninfo = 'host=127.0.0.1 port={CreateSubscriberCommand.FreePort().ToString(CultureInfo.InvariantCulture)} user=super'\n", token);
+            $"# recovery template\nprimary_conninfo = 'host=127.0.0.1 port={CreateSubscriberCommand.FreePort().ToString(CultureInfo.InvariantCulture)} user=super'", token);
         switch (when)
         {
             case "basebackup":
@@ -675,6 +678,15 @@ public sealed class CreateSubscriberTests
                     break;
                 case "catchup" or "standby":
                     await SeeAsync("Waiting for PostgreSQL to become primary");
+                    if (when == "catchup")
+                    {
+                        // The template, which ends without a newline, starts a line of its own after the comment that
+                        // ended without one, and so do the settings the run adds after it.
+                        string recovering = await File.ReadAllTextAsync(Path.Join(backupDir, "postgresql.auto.conf"), token);
+                        Assert.IsTrue(recovering.Contains("\n# recovery template\n", StringComparison.Ordinal) && recovering.Contains("user=super'\n", StringComparison.Ordinal),
+                            $"the recovery template and the run's settings, each on lines of their own: {recovering}");
+                    }
+
                     break;
                 case "promoted":
                     // The run is stopped as soon as the server it started logs its promotion, before the run, which looks
@@ -829,45 +841,127 @@ public sealed class CreateSubscriberTests
         }
     }
 
-    // A data directory's postgresql.conf and pg_hba.conf, byte for byte.
-    private static async Task<string> ConfBytesAsync(string dataDir, CancellationToken token)
-        => Convert.ToHexString(await File.ReadAllBytesAsync(Path.Join(dataDir, "postgresql.conf"), token)) + "|" +
-            Convert.ToHexString(await File.ReadAllBytesAsync(Path.Join(dataDir, "pg_hba.conf"), token));
-
     /// <summary>
-    /// A standby made with pg_basebackup -R, caught up and stopped in recovery, is subscribed though the provider has
-    /// since removed the WAL that holds its latest checkpoint, as its own WAL carries its recovery to the WAL the provider
-    /// still has.
+    /// A run stopped before it subscribed drops only the slot it made on the provider: a slot of the name that another
+    /// run with the same subscriber name made in its place is left, with a warning, and so is the run's own slot while
+    /// a walsender streams it. Processes are stopped with signals, which Windows lacks.
     /// </summary>
+    /// <param name="what">What became of the run's slot.</param>
     /// <returns>The test.</returns>
     [TestMethod]
-    public async Task StandbysWhoseOwnWalReachesTheProvidersAreSubscribed()
+    [OSCondition(OperatingSystems.Linux | OperatingSystems.OSX)]
+    [DataRow("replaced")]
+    [DataRow("streamed")]
+    public async Task StoppedRunsDropOnlyTheSlotsTheyMade(string what)
     {
         CancellationToken token = TestContext.CancellationToken;
-        using TemporaryDirectory work = new($"worf-create-subscriber-standby-{Guid.NewGuid():N}");
+        using TemporaryDirectory work = new($"worf-create-subscriber-slot-{what}-{Guid.NewGuid():N}");
         await using TestNode provider = await TestNode.StartAsync("provider",
-            ["wal_level = logical", "max_wal_senders = 10", "max_replication_slots = 10", "track_commit_timestamp = on", "wal_keep_size = '32MB'"], token);
+            ["wal_level = logical", "max_wal_senders = 10", "max_replication_slots = 10", "track_commit_timestamp = on"], token);
         int pgport = CreateSubscriberCommand.FreePort();
         string port = pgport.ToString(CultureInfo.InvariantCulture);
-        string providerDsn = $"postgresql://super@127.0.0.1:{provider.Cluster.Port.ToString(CultureInfo.InvariantCulture)}/postgres";
         string backupDir = Path.Join(work.FullName, "backupdir");
         string command = await CreateSubscriberCommand.InstallAsync(provider.Installation, Path.Join(work.FullName, "bin"));
         _ = await provider.SafePsqlAsync(Database, """
             CREATE USER super SUPERUSER;
             CREATE EXTENSION worf;
             SELECT * FROM worf.create_node(node_name := 'test_provider', dsn := 'dbname=postgres user=super');
-            CREATE TABLE kept AS SELECT g AS id FROM generate_series(1, 1000) g;
-            CHECKPOINT;
             """, token);
         string autoConf = Path.Join(provider.Cluster.DataDirectory, "postgresql.auto.conf");
         await File.WriteAllLinesAsync(autoConf,
             (await File.ReadAllLinesAsync(autoConf, token)).Where(static line => !line.TrimStart().StartsWith("port", StringComparison.Ordinal)), token);
-        (int backedUp, string backupOutput) = await provider.RunProgramAsync("pg_basebackup", ["-D", backupDir, "-d", providerDsn, "-X", "stream", "-R"], token);
-        Assert.AreEqual(0, backedUp, backupOutput);
+        _ = await provider.SafePsqlAsync(Database, "CHECKPOINT", token);
 
-        // The standby streams segments that hold no checkpoint, catches up and stops in recovery, keeping its own WAL
-        // since its latest checkpoint, the base backup's.
-        (int started, string startOutput) = await provider.RunProgramAsync("pg_ctl", ["start", "-w", "-D", backupDir, "-o", $"-p {port}", "-l", Path.Join(work.FullName, "standby.log")], token);
+        // The run's server catches up from a port nothing listens on, through the recovery template, so that it never
+        // reaches the restore point.
+        string template = Path.Join(work.FullName, "recovery.conf");
+        await File.WriteAllTextAsync(template,
+            $"primary_conninfo = 'host=127.0.0.1 port={CreateSubscriberCommand.FreePort().ToString(CultureInfo.InvariantCulture)} user=super'\n", token);
+        ProcessStartInfo start = new(command) { WorkingDirectory = work.FullName, RedirectStandardOutput = true, RedirectStandardError = true };
+        foreach (string argument in new[]
+        {
+            "-D", backupDir, "--subscriber-name=test_subscriber", $"--subscriber-dsn=postgresql://super@127.0.0.1:{port}/postgres",
+            $"--provider-dsn=postgresql://super@127.0.0.1:{provider.Cluster.Port.ToString(CultureInfo.InvariantCulture)}/postgres", "--drop-slot-if-exists", "-v",
+            $"--hba-conf={Path.Join(AppContext.BaseDirectory, "TestFiles", "regress-pg_hba.conf")}", $"--recovery-conf={template}",
+        })
+        {
+            start.ArgumentList.Add(argument);
+        }
+
+        start.Environment["PGPORT"] = port;
+        using CancellationTokenSource streaming = CancellationTokenSource.CreateLinkedTokenSource(token);
+        LogicalReplicationConnection? replication = null;
+        Task<bool>? streamed = null;
+        try
+        {
+            using Process tool = Process.Start(start)!;
+            Task<string> errors = tool.StandardError.ReadToEndAsync(token);
+            StringBuilder seen = new();
+            char[] buffer = new char[4096];
+            while (!seen.ToString().Contains("Waiting for PostgreSQL to become primary", StringComparison.Ordinal))
+            {
+                int read = await tool.StandardOutput.ReadAsync(buffer, token);
+                Assert.AreNotEqual(0, read, $"the tool's output, which ended before its server caught up: {seen}{await errors}");
+                _ = seen.Append(buffer, 0, read);
+            }
+
+            string slot = await provider.SafePsqlAsync(Database, "SELECT slot_name FROM pg_catalog.pg_replication_slots WHERE slot_type = 'logical'", token);
+            if (what == "replaced")
+            {
+                // Another run with the subscriber's name drops the slot and makes its own in its place.
+                _ = await provider.SafePsqlAsync(Database, $"SELECT pg_catalog.pg_drop_replication_slot('{slot}'); SELECT pg_catalog.pg_create_logical_replication_slot('{slot}', 'worf')", token);
+            }
+            else
+            {
+                NpgsqlConnectionStringBuilder super = new() { Host = "127.0.0.1", Port = provider.Cluster.Port, Database = Database, Username = "super" };
+                replication = new(super.ConnectionString);
+                await replication.Open(token);
+                IAsyncEnumerator<XLogDataMessage> messages = replication.StartLogicalReplication(new WorfReplicationSlot(slot), streaming.Token,
+                    options: [new("min_proto_version", "1"), new("max_proto_version", "1"), new("startup_params_format", "1")]).GetAsyncEnumerator(streaming.Token);
+                streamed = messages.MoveNextAsync().AsTask();
+                Assert.IsTrue(await provider.PollQueryUntilAsync(Database, $"SELECT active FROM pg_catalog.pg_replication_slots WHERE slot_name = '{slot}'", token),
+                    "the walsender streaming the run's slot");
+            }
+
+            Stopwatch ending = Stopwatch.StartNew();
+            (int signalled, _, string error) = await ProcessRunner.RunAsync("kill", ["-TERM", tool.Id.ToString(CultureInfo.InvariantCulture)], token);
+            Assert.AreEqual(0, signalled, error);
+            using CancellationTokenSource exiting = CancellationTokenSource.CreateLinkedTokenSource(token);
+            exiting.CancelAfter(TimeSpan.FromSeconds(120));
+            await tool.WaitForExitAsync(exiting.Token);
+            string stderr = await errors;
+            TestContext.WriteLine($"stopped after {ending.Elapsed.TotalSeconds:F1} s: {seen}{await tool.StandardOutput.ReadToEndAsync(token)}");
+            TestContext.WriteLine(stderr);
+            Assert.AreEqual("1|1|True", $"{tool.ExitCode}|" +
+                await provider.SafePsqlAsync(Database, $"SELECT count(*) FROM pg_catalog.pg_replication_slots WHERE slot_name = '{slot}'", token) + "|" +
+                stderr.Contains(what == "replaced" ? $"replication slot \"{slot}\" on the provider isn't the one this run made" : $"replication slot \"{slot}\" on the provider is in use by process",
+                    StringComparison.Ordinal),
+                $"the stopped run's exit code, the slot, which it left, and its warning: {stderr}");
+        }
+        finally
+        {
+            // The stream ends, cancelled, before its connection closes.
+            await streaming.CancelAsync();
+            if (streamed is not null)
+            {
+                _ = await Task.WhenAny(streamed);
+            }
+
+            if (replication is not null)
+            {
+                await replication.DisposeAsync();
+            }
+
+            await StopAsync(provider, backupDir);
+        }
+    }
+
+    // Starts a standby made from the provider, has the provider switch WAL four times with a row in each segment, and
+    // stops the standby once it has replayed them, returning where the provider's WAL stood.
+    private static async Task<string> CatchUpStandbyAsync(TestNode provider, string backupDir, int pgport, string standbyLog, CancellationToken token)
+    {
+        (int started, string startOutput) = await provider.RunProgramAsync("pg_ctl",
+            ["start", "-w", "-D", backupDir, "-o", $"-p {pgport.ToString(CultureInfo.InvariantCulture)}", "-l", standbyLog], token);
         Assert.AreEqual(0, started, startOutput);
         for (int i = 0; i < 4; i++)
         {
@@ -884,8 +978,114 @@ public sealed class CreateSubscriberTests
 
         (int stopped, string stopOutput) = await provider.RunProgramAsync("pg_ctl", ["stop", "-w", "-D", backupDir], token);
         Assert.AreEqual(0, stopped, stopOutput);
+        return caughtUp;
+    }
+
+    // Has the provider switch WAL a number of times, with a row in each segment, so that each switch moves it.
+    private static async Task SwitchWalAsync(TestNode provider, int switches, CancellationToken token)
+    {
+        for (int i = 0; i < switches; i++)
+        {
+            _ = await provider.SafePsqlAsync(Database, "INSERT INTO pad VALUES (1); SELECT pg_catalog.pg_switch_wal()", token);
+        }
+    }
+
+    // A data directory's postgresql.conf and pg_hba.conf, byte for byte.
+    private static async Task<string> ConfBytesAsync(string dataDir, CancellationToken token)
+        => Convert.ToHexString(await File.ReadAllBytesAsync(Path.Join(dataDir, "postgresql.conf"), token)) + "|" +
+            Convert.ToHexString(await File.ReadAllBytesAsync(Path.Join(dataDir, "pg_hba.conf"), token));
+
+    /// <summary>
+    /// A standby made with pg_basebackup -R, caught up and stopped in recovery, is subscribed though the provider has
+    /// since removed the WAL that holds its latest checkpoint, as its own WAL carries its recovery to the WAL the provider
+    /// still has and joins it there: past where the provider's WAL begins, or right up to it, as one that stopped at a
+    /// segment's end does, its own next segment never written. One that ran as a server of its own from its checkpoint,
+    /// writing WAL of its own past where the provider's begins, and stopped in recovery since, is refused.
+    /// </summary>
+    /// <param name="when">How the standby's WAL meets the provider's.</param>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [DataRow("overlap")]
+    [DataRow("boundary")]
+    [DataRow("diverged")]
+    public async Task StandbysWhoseOwnWalReachesTheProvidersAreSubscribed(string when)
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        using TemporaryDirectory work = new($"worf-create-subscriber-standby-{when}-{Guid.NewGuid():N}");
+        await using TestNode provider = await TestNode.StartAsync("provider",
+            ["wal_level = logical", "max_wal_senders = 10", "max_replication_slots = 10", "track_commit_timestamp = on", "wal_keep_size = '32MB'"], token);
+        int pgport = CreateSubscriberCommand.FreePort();
+        string port = pgport.ToString(CultureInfo.InvariantCulture);
+        string providerDsn = $"postgresql://super@127.0.0.1:{provider.Cluster.Port.ToString(CultureInfo.InvariantCulture)}/postgres";
+        string backupDir = Path.Join(work.FullName, "backupdir");
+        string command = await CreateSubscriberCommand.InstallAsync(provider.Installation, Path.Join(work.FullName, "bin"));
+        _ = await provider.SafePsqlAsync(Database, """
+            CREATE USER super SUPERUSER;
+            CREATE EXTENSION worf;
+            SELECT * FROM worf.create_node(node_name := 'test_provider', dsn := 'dbname=postgres user=super');
+            CREATE TABLE kept AS SELECT g AS id FROM generate_series(1, 1000) g;
+            CREATE TABLE pad (i int);
+            CHECKPOINT;
+            """, token);
+        string autoConf = Path.Join(provider.Cluster.DataDirectory, "postgresql.auto.conf");
+        await File.WriteAllLinesAsync(autoConf,
+            (await File.ReadAllLinesAsync(autoConf, token)).Where(static line => !line.TrimStart().StartsWith("port", StringComparison.Ordinal)), token);
+        (int backedUp, string backupOutput) = await provider.RunProgramAsync("pg_basebackup", ["-D", backupDir, "-d", providerDsn, "-X", "stream", "-R"], token);
+        Assert.AreEqual(0, backedUp, backupOutput);
+
+        // The standby streams segments that hold no checkpoint, catches up and stops in recovery, keeping its own WAL
+        // since its latest checkpoint, the base backup's.
+        string standbyLog = Path.Join(work.FullName, "standby.log");
+        string caughtUp = await CatchUpStandbyAsync(provider, backupDir, pgport, standbyLog, token);
+        int started;
+        string startOutput;
+        int stopped;
+        string stopOutput;
+
+        // The segment the provider's last switch began, where the standby's WAL ends at the boundary, and where the
+        // provider's WAL begins in that row.
+        string boundary = await provider.SafePsqlAsync(Database, $"SELECT pg_catalog.pg_walfile_name('{caughtUp}'::pg_catalog.pg_lsn + 1)", token);
+        int switches = 0;
+        switch (when)
+        {
+            case "boundary":
+                // The standby's WAL ends where the segment begins, as its own files of that segment and later never were.
+                foreach (string file in Directory.EnumerateFiles(Path.Join(backupDir, "pg_wal")).Where(file =>
+                    Path.GetFileName(file) is { Length: 24 } name && string.CompareOrdinal(name, boundary) >= 0))
+                {
+                    File.Delete(file);
+                }
+
+                switches = 2;
+                break;
+            case "diverged":
+                // Started without its standby.signal, the standby runs as a server of its own on the provider's timeline:
+                // it checkpoints, then writes WAL of its own over several segments, stops at once, and stops in recovery
+                // after starting again with its standby.signal, keeping that checkpoint as its latest.
+                File.Delete(Path.Join(backupDir, "standby.signal"));
+                (started, startOutput) = await provider.RunProgramAsync("pg_ctl", ["start", "-w", "-D", backupDir, "-o", $"-p {port}", "-l", standbyLog], token);
+                Assert.AreEqual(0, started, startOutput);
+                _ = await SubscriberAsync(provider, pgport, "CHECKPOINT", token);
+                for (int i = 0; i < 6; i++)
+                {
+                    _ = await SubscriberAsync(provider, pgport, "CREATE TABLE IF NOT EXISTS own (i int); INSERT INTO own VALUES (1); SELECT pg_catalog.pg_switch_wal()", token);
+                }
+
+                (stopped, stopOutput) = await provider.RunProgramAsync("pg_ctl", ["stop", "-w", "-m", "immediate", "-D", backupDir], token);
+                Assert.AreEqual(0, stopped, stopOutput);
+                await File.WriteAllTextAsync(Path.Join(backupDir, "standby.signal"), "", token);
+                (started, startOutput) = await provider.RunProgramAsync("pg_ctl", ["start", "-w", "-D", backupDir, "-o", $"-p {port}", "-l", standbyLog], token);
+                Assert.AreEqual(0, started, startOutput);
+                (stopped, stopOutput) = await provider.RunProgramAsync("pg_ctl", ["stop", "-w", "-D", backupDir], token);
+                Assert.AreEqual(0, stopped, stopOutput);
+                switches = 3;
+                break;
+            default:
+                break;
+        }
 
         // The provider then removes the WAL that holds the standby's checkpoint, keeping two segments behind its own.
+        await SwitchWalAsync(provider, switches, token);
         string checkpointSegment = await provider.SafePsqlAsync(Database,
             "SELECT pg_catalog.pg_walfile_name(checkpoint_lsn) FROM pg_catalog.pg_control_checkpoint()", token);
         _ = await provider.SafePsqlAsync(Database, "CHECKPOINT", token);
@@ -895,15 +1095,30 @@ public sealed class CreateSubscriberTests
         Assert.AreEqual("f", await provider.SafePsqlAsync(Database,
             $"SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_ls_waldir() WHERE name = pg_catalog.pg_walfile_name('{standbyCheckpoint}'))", token),
             $"the provider's WAL that holds the standby's checkpoint, {standbyCheckpoint}, after the provider's own at {checkpointSegment}");
+        if (when == "boundary")
+        {
+            Assert.AreEqual(boundary, await provider.SafePsqlAsync(Database, "SELECT pg_catalog.min(name) FROM pg_catalog.pg_ls_waldir() WHERE name ~ '^[0-9A-F]{24}$'", token),
+                "the provider's first segment, which begins where the standby's WAL ends");
+        }
 
-        (int exitCode, string stdout, string stderr) = await CreateSubscriberCommand.RunAsync(command,
+        List<string> arguments =
         [
             "-D", backupDir, "--subscriber-name=test_subscriber", $"--subscriber-dsn=postgresql://super@127.0.0.1:{port}/postgres",
             $"--provider-dsn={providerDsn}", "--drop-slot-if-exists", "-v",
             $"--hba-conf={Path.Join(AppContext.BaseDirectory, "TestFiles", "regress-pg_hba.conf")}",
-        ], work.FullName, new Dictionary<string, string> { ["PGPORT"] = port }, token);
+        ];
         try
         {
+            if (when == "diverged")
+            {
+                (int refused, string refusal) = await RefusedRunAsync(command, arguments, work.FullName, port, token);
+                Assert.AreEqual("1|True", $"{refused}|{refusal.Contains("is in WAL the provider has removed", StringComparison.Ordinal)}",
+                    $"a run on the standby that ran as a server of its own past where the provider's WAL begins: {refusal}");
+                return;
+            }
+
+            (int exitCode, string stdout, string stderr) = await CreateSubscriberCommand.RunAsync(command, arguments, work.FullName,
+                new Dictionary<string, string> { ["PGPORT"] = port }, token);
             Assert.AreEqual(0, exitCode, $"the run on the standby: {stdout}{stderr}");
             Assert.AreEqual("1004|1", $"{await SubscriberAsync(provider, pgport, "SELECT count(*) FROM kept", token)}|" +
                 await SubscriberAsync(provider, pgport, "SELECT count(*) FROM worf.subscription", token), "the subscriber's rows and subscription");

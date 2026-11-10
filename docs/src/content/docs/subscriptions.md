@@ -177,5 +177,7 @@ options that apply to all connections made by worf. This can be a useful
 place to set up custom keepalive options, etc.
 
 worf defaults to enabling TCP keepalives to ensure that it notices
-when the upstream server disappears unexpectedly. To disable them add
+when the upstream server disappears unexpectedly, and to a
+`connect_timeout` of 30 seconds; a node's DSN that sets these options
+keeps its own. To disable keepalives on every connection, add
 `keepalives = 0` to `worf.extra_connection_options`.

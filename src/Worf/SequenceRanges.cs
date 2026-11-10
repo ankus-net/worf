@@ -1168,15 +1168,19 @@ internal static unsafe partial class SequenceRanges
     /// restored to before the grant gives up its free values up to the highest watermark those neighbors report, and
     /// never issues them again. A Snowflake node number carries its times and needs no such care.
     /// </summary>
+    /// <remarks>
+    /// Only the sequence's own node rows are read, through their key, so that a call that activates many sequences takes
+    /// time in proportion to them.
+    /// </remarks>
     private static bool Confirmed(uint seqoid, SequenceInfo info, Guid block)
         => seqoid == SnowflakeIds.NodeSequence() || Worf.ReadScalar<bool>($"""
             WITH b AS (
                 SELECT b.seqoid, b.lo, b.hi, b.from_node, r.owner_node, r.epoch, l.node_id AS local_id
                 FROM worf.sequence_range_block b JOIN worf.sequence_range r ON r.seqoid = b.seqoid CROSS JOIN worf.local_node l
-                WHERE b.block_id = $1),
+                WHERE b.block_id = $1 AND b.seqoid = $3),
             touching AS (
                 SELECT n.watermark FROM worf.sequence_range_node n JOIN b ON n.seqoid = b.seqoid
-                WHERE n.via_node = n.node_id AND n.node_id <> b.local_id AND n.epoch = b.epoch
+                WHERE n.seqoid = $3 AND n.via_node = n.node_id AND n.node_id <> b.local_id AND n.epoch = b.epoch
                     AND (worf.sequence_range_heard(n.node_id, true, n.reported_at, true) > now() - $2::interval
                         OR EXISTS (
                             SELECT 1 FROM worf.sequence_range_link k JOIN pg_catalog.pg_replication_slots s ON s.slot_name = k.slot_name
@@ -1184,7 +1188,7 @@ internal static unsafe partial class SequenceRanges
             SELECT b.from_node IS DISTINCT FROM b.local_id OR b.owner_node <> b.local_id OR NOT EXISTS (SELECT 1 FROM touching)
                 OR EXISTS (SELECT 1 FROM touching WHERE watermark {(info.Ascending ? ">= b.hi" : "<= b.lo")})
             FROM b
-            """, SpiParameter.Create(block), SpiParameter.Create(StaleAfter()));
+            """, SpiParameter.Create(block), SpiParameter.Create(StaleAfter()), SpiParameter.Create(seqoid));
 
     /// <summary>
     /// Checks whether the owner's root has a free span for its next block, without locking it.
@@ -2118,9 +2122,15 @@ internal static unsafe partial class SequenceRanges
     {
         uint typid = NativeMethods.typenameTypeId(null, NativeMethods.makeTypeNameFromNameList(typeName));
         WorfRows managed = Elevated.Run(() => Worf.SelectCatalog("SELECT r.seqoid::oid FROM worf.sequence_range r WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = r.seqoid)"));
-        return Worf.ReadScalar<string?>("SELECT typdefaultbin::text FROM pg_catalog.pg_type WHERE oid = $1", SpiParameter.Create(typid)) is string expression &&
-            Enumerable.Range(0, managed.Count).Any(i => MayDrawFrom((Node*)NativeMethods.stringToNode(Worf.PStrDup(expression)), managed[i].Get<uint>(0),
-                Worf.ReadScalar<uint>("SELECT typnamespace FROM pg_catalog.pg_type WHERE oid = $1", SpiParameter.Create(typid))).Draws);
+        if (Worf.ReadScalar<string?>("SELECT typdefaultbin::text FROM pg_catalog.pg_type WHERE oid = $1", SpiParameter.Create(typid)) is not string expression)
+        {
+            return false;
+        }
+
+        List<(bool Unknown, uint Oid, string? Name)> calls = [];
+        NextvalCalls((Node*)NativeMethods.stringToNode(Worf.PStrDup(expression)), calls);
+        uint schema = Worf.ReadScalar<uint>("SELECT typnamespace FROM pg_catalog.pg_type WHERE oid = $1", SpiParameter.Create(typid));
+        return Enumerable.Range(0, managed.Count).Any(i => MayDrawFrom(calls, managed[i].Get<uint>(0), schema).Draws);
     }
 
     private static bool AnyManaged()
@@ -2176,8 +2186,8 @@ internal static unsafe partial class SequenceRanges
         return Elevated.Run(() =>
         {
             WorfRows managed = Worf.Select("SELECT r.seqoid::oid FROM worf.sequence_range r WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = r.seqoid)");
-            return Enumerable.Range(0, managed.Count)
-                .Any(i => UsingColumns(managed[i].Get<uint>(0)).Exists(c => c.Relid == relid && c.Column == column));
+            return UsingColumnsNamed([.. Enumerable.Range(0, managed.Count).Select(i => managed[i].Get<uint>(0))]).Values
+                .Any(columns => columns.Exists(c => c.Relid == relid && c.Column == column));
         });
     }
 
@@ -2210,52 +2220,80 @@ internal static unsafe partial class SequenceRanges
     /// sequence, when it names it as text.
     /// </summary>
     private static List<(uint Relid, string Column, uint TypeOid, string? Name)> UsingColumnsNamed(uint seqoid)
+        => UsingColumnsNamed([seqoid])[seqoid];
+
+    /// <summary>
+    /// Lists the columns that use each of some sequences, as <see cref="UsingColumnsNamed(uint)"/> does for one, from one
+    /// read of the catalogs, so that the time it takes doesn't grow with the sequences' number times the defaults'.
+    /// </summary>
+    private static Dictionary<uint, List<(uint Relid, string Column, uint TypeOid, string? Name)>> UsingColumnsNamed(IReadOnlyCollection<uint> seqoids)
     {
+        // A row of sequence 0 is a default that calls nextval, which may use any of them.
         WorfRows result = Worf.SelectCatalog("""
-            WITH RECURSIVE domains (typid, expr) AS (
-                SELECT d.objid, t.typdefaultbin::text FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_type t ON t.oid = d.objid
+            WITH RECURSIVE domains (typid, expr, seqoid) AS (
+                SELECT d.objid, t.typdefaultbin::text, d.refobjid FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_type t ON t.oid = d.objid
                 WHERE d.classid = 'pg_catalog.pg_type'::regclass AND d.refclassid = 'pg_catalog.pg_class'::regclass
-                    AND d.refobjid = $1 AND d.deptype = 'n'
+                    AND d.refobjid = ANY ($1::oid[]) AND d.deptype = 'n'
                 UNION
-                SELECT t.oid, t.typdefaultbin::text FROM pg_catalog.pg_type t
+                SELECT t.oid, t.typdefaultbin::text, 0::oid FROM pg_catalog.pg_type t
                 WHERE t.typtype = 'd' AND t.typdefaultbin::text LIKE '%:funcid 1574 %'
                 UNION
-                SELECT t.oid, d.expr FROM pg_catalog.pg_type t JOIN domains d ON t.typbasetype = d.typid
+                SELECT t.oid, d.expr, d.seqoid FROM pg_catalog.pg_type t JOIN domains d ON t.typbasetype = d.typid
                 WHERE t.typtype = 'd' AND t.typdefaultbin IS NULL)
-            SELECT DISTINCT a.attrelid, a.attname::text, a.atttypid, u.expr
+            SELECT DISTINCT u.seqoid, a.attrelid, a.attnum, a.attname::text, a.atttypid, u.expr
             FROM (
-                SELECT d.refobjid AS relid, d.refobjsubid AS attnum, NULL::text AS expr
+                SELECT d.objid AS seqoid, d.refobjid AS relid, d.refobjsubid AS attnum, NULL::text AS expr
                 FROM pg_catalog.pg_depend d
-                WHERE d.classid = 'pg_catalog.pg_class'::regclass AND d.objid = $1
+                WHERE d.classid = 'pg_catalog.pg_class'::regclass AND d.objid = ANY ($1::oid[])
                     AND d.refclassid = 'pg_catalog.pg_class'::regclass AND d.deptype IN ('a', 'i') AND d.refobjsubid > 0
                 UNION
-                SELECT ad.adrelid, ad.adnum, ad.adbin::text
+                SELECT d.refobjid, ad.adrelid, ad.adnum, ad.adbin::text
                 FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_attrdef ad ON ad.oid = d.objid
                 WHERE d.classid = 'pg_catalog.pg_attrdef'::regclass AND d.refclassid = 'pg_catalog.pg_class'::regclass
-                    AND d.refobjid = $1
+                    AND d.refobjid = ANY ($1::oid[])
                 UNION
-                SELECT ad.adrelid, ad.adnum, ad.adbin::text
+                SELECT 0, ad.adrelid, ad.adnum, ad.adbin::text
                 FROM pg_catalog.pg_attrdef ad WHERE ad.adbin::text LIKE '%:funcid 1574 %'
                 UNION
-                SELECT a.attrelid, a.attnum, d.expr
+                SELECT d.seqoid, a.attrelid, a.attnum, d.expr
                 FROM domains d JOIN pg_catalog.pg_attribute a ON a.atttypid = d.typid
                 WHERE a.attnum > 0 AND NOT a.atthasdef
             ) u
             JOIN pg_catalog.pg_attribute a ON a.attrelid = u.relid AND a.attnum = u.attnum
             JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
             WHERE c.relkind IN ('r', 'p') AND NOT a.attisdropped
-            """, SpiParameter.Create(seqoid));
-        List<(uint Relid, string Column, uint TypeOid, string? Name)> columns = [];
+            ORDER BY 1, 2, 3, 6
+            """, SpiParameter.Create(seqoids.Select(seqoid => (long)seqoid).ToArray()));
+        Dictionary<uint, List<(uint Relid, string Column, uint TypeOid, string? Name)>> columns = [];
+        foreach (uint seqoid in seqoids)
+        {
+            columns[seqoid] = [];
+        }
+
+        // Each default is read once, for the calls of nextval it makes.
+        Dictionary<string, List<(bool Unknown, uint Oid, string? Name)>> calls = [];
         for (int i = 0; i < result.Count; i++)
         {
-            (bool draws, string? name) = result[i].Get<string?>(3) is string expression
-                ? MayDrawFrom((Node*)NativeMethods.stringToNode(Worf.PStrDup(expression)), seqoid, NativeMethods.get_rel_namespace(result[i].Get<uint>(0)))
-                : (true, null);
-            (uint Relid, string Column, uint TypeOid, string? Name) column = (result[i].Get<uint>(0), result[i].Get<string>(1),
-                NativeMethods.getBaseType(result[i].Get<uint>(2)), name);
-            if (draws && !columns.Contains(column))
+            uint seqoid = result[i].Get<uint>(0);
+            uint relid = result[i].Get<uint>(1);
+            List<(bool Unknown, uint Oid, string? Name)>? made = null;
+            if (result[i].Get<string?>(5) is string expression && !calls.TryGetValue(expression, out made))
             {
-                columns.Add(column);
+                made = [];
+                NextvalCalls((Node*)NativeMethods.stringToNode(Worf.PStrDup(expression)), made);
+                calls[expression] = made;
+            }
+
+            uint schema = NativeMethods.get_rel_namespace(relid);
+            foreach (uint target in seqoid == 0 ? columns.Keys.ToList() : [seqoid])
+            {
+                (bool draws, string? name) = made is null ? (true, null) : MayDrawFrom(made, target, schema);
+                (uint Relid, string Column, uint TypeOid, string? Name) column = (relid, result[i].Get<string>(3),
+                    NativeMethods.getBaseType(result[i].Get<uint>(4)), name);
+                if (draws && !columns[target].Contains(column))
+                {
+                    columns[target].Add(column);
+                }
             }
         }
 
@@ -2263,40 +2301,58 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
-    /// Checks whether an expression may call nextval of a sequence: it calls nextval of it as a regclass constant, or of a
-    /// name that may resolve to it, or of a sequence it names in a way this check can't tell, or holds a kind of node
-    /// this check doesn't look into.
+    /// Checks whether an expression, from the calls of nextval <see cref="NextvalCalls"/> lists, may call nextval of a
+    /// sequence: it calls nextval of it as a regclass constant, or of a name that may resolve to it, or of a sequence it
+    /// names in a way this check can't tell, or holds a kind of node this check doesn't look into.
     /// </summary>
     /// <returns>Whether it may, and the name it gives the sequence as text, if it does.</returns>
-    private static (bool Draws, string? Name) MayDrawFrom(Node* node, uint seqoid, uint schema)
+    private static (bool Draws, string? Name) MayDrawFrom(List<(bool Unknown, uint Oid, string? Name)> calls, uint seqoid, uint schema)
     {
-        if (node is null)
+        foreach ((bool unknown, uint oid, string? name) in calls)
         {
-            return (false, null);
-        }
+            if (unknown)
+            {
+                return (true, null);
+            }
 
-        if (node->type == NodeTag.T_FuncExpr && ((FuncExpr*)node)->funcid == NextvalOid)
-        {
-            (uint oid, string? name) = NextvalTarget((FuncExpr*)node);
-            return name is not null ? (NameMatches(name, seqoid, schema), name) : (oid == 0 || oid == seqoid, null);
-        }
-
-        List<nint> children = [];
-        if (!Children(node, children))
-        {
-            return (true, null);
-        }
-
-        foreach (nint child in children)
-        {
-            (bool draws, string? name) = MayDrawFrom((Node*)child, seqoid, schema);
-            if (draws)
+            if (name is not null ? NameMatches(name, seqoid, schema) : oid == 0 || oid == seqoid)
             {
                 return (true, name);
             }
         }
 
         return (false, null);
+    }
+
+    /// <summary>
+    /// Lists, in order, the calls of nextval an expression makes, each with the sequence it names, as
+    /// <see cref="NextvalTarget"/> reads it, and a node of a kind this check doesn't look into, which may make any.
+    /// </summary>
+    private static void NextvalCalls(Node* node, List<(bool Unknown, uint Oid, string? Name)> calls)
+    {
+        if (node is null)
+        {
+            return;
+        }
+
+        if (node->type == NodeTag.T_FuncExpr && ((FuncExpr*)node)->funcid == NextvalOid)
+        {
+            (uint oid, string? name) = NextvalTarget((FuncExpr*)node);
+            calls.Add((false, oid, name));
+            return;
+        }
+
+        List<nint> children = [];
+        if (!Children(node, children))
+        {
+            calls.Add((true, 0, null));
+            return;
+        }
+
+        foreach (nint child in children)
+        {
+            NextvalCalls((Node*)child, calls);
+        }
     }
 
     /// <summary>
@@ -4966,10 +5022,11 @@ internal static unsafe partial class SequenceRanges
 
         Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>> uses = [];
         WorfRows managed = Elevated.Run(() => Worf.SelectCatalog("SELECT r.seqoid::oid FROM worf.sequence_range r WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = r.seqoid) ORDER BY r.seqoid"));
-        for (int i = 0; i < managed.Count; i++)
+        uint[] managedSeqs = [.. Enumerable.Range(0, managed.Count).Select(i => managed[i].Get<uint>(0))];
+        Dictionary<uint, List<(uint Relid, string Column, uint TypeOid, string? Name)>> drawing = UsingColumnsNamed(managedSeqs);
+        foreach (uint managedSeq in managedSeqs)
         {
-            uint managedSeq = managed[i].Get<uint>(0);
-            foreach ((uint relid, string column, uint typeOid, string? name) in UsingColumnsNamed(managedSeq).Where(entry => members.ContainsKey(entry.Relid)))
+            foreach ((uint relid, string column, uint typeOid, string? name) in drawing[managedSeq].Where(entry => members.ContainsKey(entry.Relid)))
             {
                 RequireCheckable(relid, column, typeOid, managedSeq);
                 if (!uses.TryGetValue(relid, out Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>? columns))

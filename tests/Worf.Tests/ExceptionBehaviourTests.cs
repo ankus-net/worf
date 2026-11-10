@@ -1283,7 +1283,7 @@ public sealed partial class ExceptionBehaviourTests
                 Assert.IsLessThan(numbers[2], numbers[1], "the most rows a part the merge tried whole held, against the rows it writes");
                 Assert.IsLessThan(numbers[2] / 2, numbers[3], "the rows the held-value checks kept to decide on, against the rows the merge writes");
                 Assert.IsGreaterThan(0L, numbers[4], "the deferrable key checks at the parts' keys");
-                Assert.AreEqual(0L, numbers[5], "the deferrable key checks at the whole table");
+                Assert.AreEqual(0L, numbers[6], "the deferrable key checks at the whole table");
                 Assert.IsLessThan(MergedIds, merged, "transaction IDs the merge took for 300 rows a CHECK refused, and 1,000 that fail alone together and 25 far apart after them");
                 if (OperatingSystem.IsLinux())
                 {
@@ -1307,7 +1307,7 @@ public sealed partial class ExceptionBehaviourTests
                 TestContext.WriteLine(summary);
                 long[] numbers = [.. new string([.. summary[summary.IndexOf("halves:", StringComparison.Ordinal)..].Select(c => char.IsAsciiDigit(c) ? c : ' ')])
                     .Split(' ', StringSplitOptions.RemoveEmptyEntries).Select(number => long.Parse(number, CultureInfo.InvariantCulture))];
-                Assert.AreEqual(stop == "lowered" ? "0|True" : "True|0", $"{(stop == "lowered" ? numbers[4] : numbers[4] > 0)}|{(stop == "lowered" ? numbers[5] > 0 : numbers[5])}",
+                Assert.AreEqual(stop == "lowered" ? "0|True" : "True|0", $"{(stop == "lowered" ? numbers[4] : numbers[4] > 0)}|{(stop == "lowered" ? numbers[6] > 0 : numbers[6])}",
                     "the deferrable key checks at the parts' keys, and at the whole table");
                 Assert.AreEqual(stop == "lowered" ? "20|23505|dup|20=" : "17980,17990,18000|P0001|w1|", await subscriber.SafePsqlAsync(Database, $"""
                     SELECT string_agg(remote_new_tuple->>'id', ',' ORDER BY (remote_new_tuple->>'id')::integer), string_agg(DISTINCT error_sqlstate, ','),
@@ -1321,7 +1321,7 @@ public sealed partial class ExceptionBehaviourTests
 
                     // The checks find the rows each part wrote from the part's rows of the copy, rather than read every row
                     // of the table and look each up in the copy, so they look in the copy's indexes hardly at all.
-                    Assert.IsLessThan(1000L, numbers[6], $"the times the deferrable key checks of 20,000 rows looked in the copy's indexes: {summary}");
+                    Assert.IsLessThan(1000L, numbers[5], $"the times the deferrable key checks of 20,000 rows looked in the copy's indexes: {summary}");
                 }
 
                 await SetBehaviourAsync(subscriber, "error", token);
@@ -1344,10 +1344,10 @@ public sealed partial class ExceptionBehaviourTests
 
                 // Deciding on the rows, in the copy's order, a part at a time, looks each part up among the conflicts found,
                 // and records and removes those refused from the copy, by its row numbers, both through indexes, rather
-                // than scanning the conflicts or the copy whole for each part.
+                // than scanning the conflicts or the copy whole for each part, or reading the conflicts left for each.
                 long Scans(string after) => long.Parse(checks[(checks.IndexOf(after, StringComparison.Ordinal) + after.Length)..].Split(' ')[0], CultureInfo.InvariantCulture);
-                Assert.AreEqual("True|True", $"{Scans("scanned the conflicts ") < 20}|{Scans(" times and the copy ") < 20}",
-                    $"the whole scans of the conflicts and of the copy as the held-value checks decided on 118,998 rows in parts of 1,000: {checks}");
+                Assert.AreEqual("True|True|True", $"{Scans("scanned the conflicts ") < 20}|{Scans("and the copy ") < 20}|{Scans("reading ") < 2_000_000}",
+                    $"the whole scans of the conflicts and of the copy, and the conflicts' rows read, as the held-value checks decided on 118,998 rows in parts of 1,000: {checks}");
 
                 // The copy has no index on its row numbers as the merge first tries it whole, which only the skips read.
                 string[] lines = log.Split('\n');

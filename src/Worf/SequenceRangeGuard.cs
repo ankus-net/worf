@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using Ankus.Postgres;
 
 namespace Worf;
@@ -75,6 +76,10 @@ internal static partial class SequenceRangeGuard
         "refrestype", "firstColType", "typeId", "typid", "msftype", "exprBaseType",
     ];
 
+    // The fields that nodeToString writes a list of types' OIDs in, as a function's column definition list's, whose
+    // input a record function runs, or a table function's columns'.
+    private static readonly HashSet<string> s_typeListFields = ["funccoltypes", "coltypes", "colTypes"];
+
     // The PL/pgSQL expression whose calls of nextval started last, which PL/pgSQL starts outside a statement, as of the
     // transaction it started in before, with the sequences its calls name once a call has looked, and how many have.
     private static (nint Expr, uint Lxid, (HashSet<uint> Called, int Calls, bool Unnamed)? Draws, int Looked) s_simple;
@@ -87,21 +92,24 @@ internal static partial class SequenceRangeGuard
     private static readonly Dictionary<(uint Relid, string Sent), string> s_defaultsText = [];
 
     // The sequences the CHECK constraints of this database's domains draw from, and whether one of them draws from a
-    // sequence it doesn't name, read again once a type changes.
-    private static (HashSet<uint> Called, bool Unnamed)? s_domainDraws;
+    // sequence it doesn't name, under the search path they were read with, which the SQL functions they inline look
+    // names up under, read again once a type, a constraint or a function changes.
+    private static (HashSet<uint> Called, bool Unnamed, string Path)? s_domainDraws;
 
     // Whether the guard hears of the changes to tables and types that the text it holds by table reads, as a default
     // set, a partition attached or a domain's CHECK added.
     private static bool s_watchingTables;
 
 #if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
-    // TYPEOID and CONSTROID, the ids of the catalog caches of types and constraints, which only PostgreSQL 19's
-    // bindings name.
+    // TYPEOID, CONSTROID and PROCOID, the ids of the catalog caches of types, constraints and functions, which only
+    // PostgreSQL 19's bindings name.
     private const int TypeCacheId = 80;
     private const int ConstraintCacheId = 19;
+    private const int ProcedureCacheId = 45;
 #elif ANKUS_PG18
     private const int TypeCacheId = 82;
     private const int ConstraintCacheId = 19;
+    private const int ProcedureCacheId = 47;
 #endif
 
     [PgNativeCallback(nameof(TableInvalidated))]
@@ -917,7 +925,7 @@ internal static partial class SequenceRangeGuard
 
             case NodeTag.T_AlterDomainStmt when ChecksDomain((AlterDomainStmt*)parsetree):
                 List* typeName = ((AlterDomainStmt*)parsetree)->typeName;
-                Starting(() => Draws(DomainChecks(NativeMethods.typenameTypeId(null, NativeMethods.makeTypeNameFromNameList(typeName)), [])));
+                Starting(() => Draws(WithDomainChecks(DomainChecks(NativeMethods.typenameTypeId(null, NativeMethods.makeTypeNameFromNameList(typeName)), []))));
                 return true;
 
             case NodeTag.T_CallStmt when ((CallStmt*)parsetree)->funcexpr is not null:
@@ -1065,7 +1073,7 @@ internal static partial class SequenceRangeGuard
             "SELECT p.pronargs::pg_catalog.int4, coalesce(p.proargdefaults::pg_catalog.text, '') FROM pg_catalog.pg_proc p WHERE p.oid = $1",
             1, SpiParameter.Create(call->funcid)));
         if (procedure.Count == 1 && (given < procedure[0].Get<int>(0) || text.Contains("{NAMEDARGEXPR ", StringComparison.Ordinal)) &&
-            procedure[0].Get<string>(1).Contains("{FUNCEXPR :funcid 1574 ", StringComparison.Ordinal))
+            Draws(WithDomainChecks(procedure[0].Get<string>(1))) is { Calls: > 0 } or { Unnamed: true })
         {
             unnamed = true;
         }
@@ -1119,7 +1127,8 @@ internal static partial class SequenceRangeGuard
 
     // The types an expression's text names, in the fields nodeToString writes a type's OID in: an expression's result,
     // a Var's, Const's or Param's type, and the types an array, row, CASE, COALESCE, subscript or subplan builds,
-    // rather than the fields whose names end in "type" that hold an enumeration's value, as a join's type.
+    // rather than the fields whose names end in "type" that hold an enumeration's value, as a join's type, and in the
+    // fields it writes a list of them in, as a function's column definition list's.
     private static HashSet<uint> NamedTypes(string text)
     {
         HashSet<uint> types = [];
@@ -1130,6 +1139,15 @@ internal static partial class SequenceRangeGuard
             while (end < text.Length && (char.IsAsciiLetterOrDigit(text[end]) || text[end] == '_'))
             {
                 end++;
+            }
+
+            if (end + 3 < text.Length && string.CompareOrdinal(text, end, " (o ", 0, 4) == 0 && s_typeListFields.Contains(text[name..end]))
+            {
+                int close = text.IndexOf(')', end);
+                types.UnionWith(text[(end + 4)..(close < 0 ? text.Length : close)].Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                    .Select(listed => uint.TryParse(listed, NumberStyles.None, CultureInfo.InvariantCulture, out uint listedType) ? listedType : 0)
+                    .Where(listedType => listedType != 0));
+                continue;
             }
 
             int digits = end + 1;
@@ -1209,7 +1227,7 @@ internal static partial class SequenceRangeGuard
         long[] types = [.. NamedTypes(text).Select(type => (long)type)];
         if (types.Length > 0)
         {
-            string drawing = string.Concat(Elevated.Run(() => Worf.Read("""
+            string drawing = string.Concat(Elevated.Run(() => Worf.Read($"""
                 WITH RECURSIVE r (typ) AS (
                     SELECT pg_catalog.unnest($1::pg_catalog.int8[])::pg_catalog.oid
                     UNION
@@ -1226,7 +1244,7 @@ internal static partial class SequenceRangeGuard
                         UNION ALL
                         SELECT g.rngtypid FROM pg_catalog.pg_range g WHERE t.typtype = 'm' AND g.rngmultitypid = t.oid) n (typ))
                 SELECT c.conbin::pg_catalog.text FROM r JOIN pg_catalog.pg_constraint c ON c.contypid = r.typ
-                WHERE r.typ <> 0 AND c.contype = 'c' AND pg_catalog.strpos(c.conbin::pg_catalog.text, '{FUNCEXPR :funcid 1574 ') > 0
+                WHERE r.typ <> 0 AND c.contype = 'c' AND c.conbin::pg_catalog.text ~ '{MayDrawPattern}'
                 """, 0, SpiParameter.Create(types))).Select(row => row.Get<string>(0) + " "));
             parts.Add(Draws(WithDomainChecks(drawing)));
         }
@@ -1242,7 +1260,8 @@ internal static partial class SequenceRangeGuard
     }
 
     // The text of the CHECK constraints and trigger conditions of tables and their partitions, which start as each
-    // table takes its first row, with those of the domains they coerce to.
+    // table takes its first row, with those of the domains they coerce to, and the calls of the tables' trigger
+    // functions, which may check values against domains.
     private static string WrittenChecks(long[] relids)
     {
         if (relids.Length == 0)
@@ -1260,7 +1279,9 @@ internal static partial class SequenceRangeGuard
             FROM (
                 SELECT c.conbin::pg_catalog.text FROM t JOIN pg_catalog.pg_constraint c ON c.conrelid = t.relid WHERE c.contype = 'c'
                 UNION ALL
-                SELECT g.tgqual::pg_catalog.text FROM t JOIN pg_catalog.pg_trigger g ON g.tgrelid = t.relid WHERE g.tgqual IS NOT NULL) x (expr)
+                SELECT g.tgqual::pg_catalog.text FROM t JOIN pg_catalog.pg_trigger g ON g.tgrelid = t.relid WHERE g.tgqual IS NOT NULL
+                UNION ALL
+                SELECT pg_catalog.format('{TRIGGER :funcid %s }', g.tgfoid) FROM t JOIN pg_catalog.pg_trigger g ON g.tgrelid = t.relid) x (expr)
             """, SpiParameter.Create(relids))) ?? "");
     }
 
@@ -1329,9 +1350,11 @@ internal static partial class SequenceRangeGuard
 #if ANKUS_PG19
             NativeMethods.CacheRegisterSyscacheCallback(SysCacheIdentifier.TYPEOID, TypeCallback, 0);
             NativeMethods.CacheRegisterSyscacheCallback(SysCacheIdentifier.CONSTROID, TypeCallback, 0);
+            NativeMethods.CacheRegisterSyscacheCallback(SysCacheIdentifier.PROCOID, TypeCallback, 0);
 #else
             NativeMethods.CacheRegisterSyscacheCallback(TypeCacheId, TypeCallback, 0);
             NativeMethods.CacheRegisterSyscacheCallback(ConstraintCacheId, TypeCallback, 0);
+            NativeMethods.CacheRegisterSyscacheCallback(ProcedureCacheId, TypeCallback, 0);
 #endif
         }
 
@@ -1361,8 +1384,8 @@ internal static partial class SequenceRangeGuard
         }
     }
 
-    // Forgets the defaults' text, which holds the CHECKs of their domains, and the domains' draws, once a type or a
-    // constraint changes, as a domain's CHECK.
+    // Forgets the defaults' text, which holds the CHECKs of their domains and the bodies of the SQL functions they
+    // inline, and the domains' draws, once a type, a constraint or a function changes, as a domain's CHECK.
 #if ANKUS_PG19
     private static void TypeInvalidated(ulong arg, SysCacheIdentifier cacheid, uint hashvalue)
 #else
@@ -1377,8 +1400,8 @@ internal static partial class SequenceRangeGuard
     }
 
     // The text of a plan, as nodeToString writes it, and of the CHECK constraints of the domains it coerces to, which
-    // start with it from the type cache.
-    private static unsafe string PlanText(Node* plan) => WithDomainChecks(NodeText(plan));
+    // start with it from the type cache. The planner has inlined the SQL functions the plan's own expressions call.
+    private static unsafe string PlanText(Node* plan) => WithDomainChecks(NodeText(plan), planned: true);
 
     // A node's text, as nodeToString writes it.
     private static unsafe string NodeText(Node* node)
@@ -1432,18 +1455,29 @@ internal static partial class SequenceRangeGuard
     }
 
     // Adds to an expression's text the text of the CHECK constraints of each domain it coerces to, and of those
-    // domains' base domains, once for each coercion, as each starts its own, and of the domains those coerce to.
-    private static string WithDomainChecks(string text)
+    // domains' base domains, once for each coercion, as each starts its own, and of the domains those coerce to, with
+    // the bodies of the SQL functions each of those texts calls that the planner inlines as the expression starts, and
+    // of those the bodies call in turn. A plan's own text has its functions inlined already.
+    private static string WithDomainChecks(string text, bool planned = false)
     {
         StringBuilder all = new(text);
         StringBuilder found = new();
         Dictionary<uint, string> read = [];
+        Dictionary<string, string?> inlined = [];
         string pending = text;
-        for (int depth = 0; depth < 8 && pending.Length > 0; depth++)
+        for (int depth = 0; depth < 8 && pending.Length > 0 && all.Length < 4 << 20; depth++)
         {
-            List<uint> domains = CoercedDomains(pending);
             _ = found.Clear();
-            foreach (string checks in domains.Select(domain => DomainChecks(domain, read)))
+            if (!planned || depth > 0)
+            {
+                foreach (string body in InlinedBodies(pending, inlined))
+                {
+                    _ = all.Append(' ').Append(body);
+                    _ = found.Append(body).Append(' ');
+                }
+            }
+
+            foreach (string checks in CoercedDomains(pending).Select(domain => DomainChecks(domain, read)))
             {
                 _ = all.Append(' ').Append(checks);
                 _ = found.Append(checks);
@@ -1453,6 +1487,145 @@ internal static partial class SequenceRangeGuard
         }
 
         return all.ToString();
+    }
+
+    // The bodies of the SQL functions an expression's text calls, as functions or through operators, that the planner
+    // inlines, once for each call, as each call's expression starts the body's own. PostgreSQL's own functions draw
+    // nothing.
+    private static List<string> InlinedBodies(string text, Dictionary<string, string?> inlined)
+    {
+        List<(uint Function, int At)> calls = [];
+        foreach (Match call in UserFunctionCall().Matches(text))
+        {
+            calls.Add((uint.Parse(call.Groups[1].ValueSpan, CultureInfo.InvariantCulture), call.Index));
+        }
+
+        if (calls.Count == 0)
+        {
+            return [];
+        }
+
+        // The functions the planner may inline: SQL ones that run with no settings or rights of their own and return one
+        // value of a known type, with their bodies, and whether a body may call a volatile function where the function
+        // says it doesn't, which the planner won't inline.
+        WorfRows candidates = Elevated.Run(() => Worf.Read("""
+            SELECT p.oid, p.prosqlbody::pg_catalog.text, p.provolatile = 'v'
+            FROM pg_catalog.pg_proc p
+            WHERE p.oid = ANY ($1::pg_catalog.int8[]::pg_catalog.oid[]) AND p.prolang = 14 AND p.prokind = 'f' AND NOT p.prosecdef
+                AND NOT p.proretset AND p.prorettype <> 'pg_catalog.record'::pg_catalog.regtype AND p.proconfig IS NULL
+            """, 0, SpiParameter.Create(calls.Select(call => (long)call.Function).Distinct().ToArray())));
+        Dictionary<uint, (string? SqlBody, bool Volatile)> inlinable = [];
+        for (int i = 0; i < candidates.Count; i++)
+        {
+            inlinable[candidates[i].Get<uint>(0)] = (candidates[i].Get<string?>(1), candidates[i].Get<bool>(2));
+        }
+
+        List<string> bodies = [];
+        foreach ((uint function, int at) in calls.Where(call => inlinable.ContainsKey(call.Function)))
+        {
+            string call = NodeAt(text, at);
+            if (!inlined.TryGetValue(call, out string? body))
+            {
+                body = InlinedBody(function, call, inlinable[function].SqlBody);
+                if (body is not null && !inlinable[function].Volatile && NextvalCall().IsMatch(body))
+                {
+                    body = null;
+                }
+
+                inlined[call] = body;
+            }
+
+            if (body is not null)
+            {
+                bodies.Add(body);
+            }
+        }
+
+        return bodies;
+    }
+
+    // A call, as a function or through an operator, of a function that isn't PostgreSQL's own.
+    [GeneratedRegex(@"\{(?:FUNCEXPR :funcid|OPEXPR :opno [0-9]+ :opfuncid) ([1-9][0-9]{4,}) ", RegexOptions.CultureInvariant)]
+    private static partial Regex UserFunctionCall();
+
+    // The text of the expression a SQL function's body gives, which the planner puts in place of a call of it, read as
+    // the planner reads it, for the call whose text is given, or null when the planner keeps the call: when the body is
+    // no single SELECT of one expression from nothing. A body worf can't read, which the planner would fail on as it
+    // inlines it, is taken as a call of nextval that names nothing.
+    private static string? InlinedBody(uint function, string call, string? sqlBody)
+    {
+        string? body = null;
+        try
+        {
+            PgTransaction.RunInSubtransaction(() => body = InlinedExpression(function, call, sqlBody));
+        }
+        catch (PgException)
+        {
+            body = "{FUNCEXPR :funcid 1574 :args ({UNREAD})}";
+        }
+
+        return body;
+    }
+
+    // Reads a SQL function's body as InlinedBody does.
+    private static unsafe string? InlinedExpression(uint function, string call, string? sqlBody)
+    {
+        Query* query;
+        if (sqlBody is not null)
+        {
+            Node* stored = (Node*)NativeMethods.stringToNode(Worf.PStrDup(sqlBody));
+            List* statements = stored->type == NodeTag.T_List ? (List*)((List*)stored)->elements[0].ptr_value : NativeMethods.lappend(null, stored);
+            if (statements is null || statements->length != 1)
+            {
+                return null;
+            }
+
+            query = (Query*)statements->elements[0].ptr_value;
+        }
+        else
+        {
+#if ANKUS_PG19
+            HeapTupleData* tuple = NativeMethods.SearchSysCache1(SysCacheIdentifier.PROCOID, function);
+#else
+            HeapTupleData* tuple = NativeMethods.SearchSysCache1(ProcedureCacheId, function);
+#endif
+            if (tuple is null)
+            {
+                return null;
+            }
+
+            try
+            {
+                string source = Elevated.Run(() => Worf.ReadScalar<string>("SELECT p.prosrc FROM pg_catalog.pg_proc p WHERE p.oid = $1", SpiParameter.Create(function))) ?? "";
+                sbyte* text = Worf.PStrDup(source);
+                List* raw = NativeMethods.pg_parse_query(text);
+                if (raw is null || raw->length != 1)
+                {
+                    return null;
+                }
+
+                Node* expression = (Node*)NativeMethods.stringToNode(Worf.PStrDup(call));
+                uint collation = expression->type == NodeTag.T_FuncExpr ? ((FuncExpr*)expression)->inputcollid : ((OpExpr*)expression)->inputcollid;
+                SQLFunctionParseInfo* parameters = NativeMethods.prepare_sql_fn_parse_info(tuple, expression, collation);
+                ParseState* pstate = NativeMethods.make_parsestate(null);
+                pstate->p_sourcetext = text;
+                NativeMethods.sql_fn_parser_setup(pstate, parameters);
+                query = NativeMethods.transformTopLevelStmt(pstate, (RawStmt*)raw->elements[0].ptr_value);
+                NativeMethods.free_parsestate(pstate);
+            }
+            finally
+            {
+                NativeMethods.ReleaseSysCache(tuple);
+            }
+        }
+
+        bool single = query is not null && query->type == NodeTag.T_Query && query->commandType == CmdType.CMD_SELECT && !query->hasAggs &&
+            !query->hasWindowFuncs && !query->hasTargetSRFs && !query->hasSubLinks && query->cteList is null && query->rtable is null &&
+            (query->jointree is null || (query->jointree->fromlist is null && query->jointree->quals is null)) && query->groupClause is null &&
+            query->groupingSets is null && query->havingQual is null && query->windowClause is null && query->distinctClause is null &&
+            query->sortClause is null && query->limitOffset is null && query->limitCount is null && query->setOperations is null &&
+            query->targetList is not null && query->targetList->length == 1;
+        return single ? NodeText((Node*)((TargetEntry*)query->targetList->elements[0].ptr_value)->expr) : null;
     }
 
     // The text of a domain's CHECK constraints, and of its base domains', read once for the expressions being read.
@@ -1593,16 +1766,9 @@ internal static partial class SequenceRangeGuard
                 return;
             }
 
-            // C code starts a call of its own as it checks a value it was given against a domain, as a function that
-            // reads a record or tests an input does, and such a call can come where a call the expressions name was
-            // counted, which starts later or never, so a call they name waits for the sequences the domains' CHECKs draw
-            // from too, after its own, or for every node when one of them doesn't name its sequence.
             HashSet<uint>? called = plpgsql ? SimpleDraws(simple) : StartingDraws(starting);
-            (HashSet<uint> Called, bool Unnamed) domains = called is null ? ([], false) : DomainDraws();
-            unnamed = called is null || domains.Unnamed;
-            waiting = unnamed
-                ? [.. unconfirmed.DistinctBy(seqoid => s_grantors[seqoid])]
-                : [.. unconfirmed.Where(called!.Contains), .. unconfirmed.Where(seqoid => domains.Called.Contains(seqoid) && !called!.Contains(seqoid))];
+            unnamed = called is null;
+            waiting = unnamed ? [.. unconfirmed.DistinctBy(seqoid => s_grantors[seqoid])] : [.. unconfirmed.Where(called!.Contains)];
         }
         finally
         {
@@ -1616,25 +1782,31 @@ internal static partial class SequenceRangeGuard
     }
 
     /// <summary>
-    /// Finds the sequences the CHECK constraints of this database's domains draw from, which C code starts as it checks a
-    /// value against a domain, once until a type changes, and whether one of them draws from a sequence it doesn't name.
+    /// Finds the sequences the CHECK constraints of this database's domains draw from, with the SQL functions they
+    /// inline, which C code starts as it checks a value against a domain, once until a type, a constraint or a function
+    /// changes, or the search path does, and whether one of them draws from a sequence it doesn't name.
     /// </summary>
     private static (HashSet<uint> Called, bool Unnamed) DomainDraws()
     {
         WatchTables();
-        if (s_domainDraws is not (HashSet<uint>, bool) draws)
+        string path = Worf.ReadScalar<string>("SELECT pg_catalog.current_setting('search_path')") ?? "";
+        if (s_domainDraws is not (HashSet<uint> Called, bool Unnamed, string Path) draws || draws.Path != path)
         {
-            string checks = Elevated.Run(() => Worf.ReadScalar<string?>("""
+            string checks = Elevated.Run(() => Worf.ReadScalar<string?>($"""
                 SELECT pg_catalog.string_agg(c.conbin::pg_catalog.text, ' ') FROM pg_catalog.pg_constraint c
-                WHERE c.contypid <> 0 AND c.contype = 'c' AND pg_catalog.strpos(c.conbin::pg_catalog.text, '{FUNCEXPR :funcid 1574 ') > 0
+                WHERE c.contypid <> 0 AND c.contype = 'c' AND c.conbin::pg_catalog.text ~ '{MayDrawPattern}'
                 """)) ?? "";
-            (HashSet<uint> called, _, bool unnamed) = Draws(checks);
-            draws = (called, unnamed);
+            (HashSet<uint> called, _, bool unnamed) = Draws(WithDomainChecks(checks), unnamedDomains: false);
+            draws = (called, unnamed, path);
             s_domainDraws = draws;
         }
 
-        return draws;
+        return (draws.Called, draws.Unnamed);
     }
+
+    // A pattern for the text of an expression that may call nextval: one that calls it, or calls a function that isn't
+    // PostgreSQL's own, as a SQL function the planner inlines may.
+    private const string MayDrawPattern = ":(op)?funcid (1574|[1-9][0-9]{4,}) ";
 
     /// <summary>
     /// Finds the sequences the nextval calls of the statement whose expressions start name, once for the statement, or
@@ -1700,21 +1872,25 @@ internal static partial class SequenceRangeGuard
 
     /// <summary>
     /// Reads, from expressions' text, as nodeToString writes them, the sequences their calls of nextval name, as each
-    /// call's argument, a constant, names one, and how many calls there are. A constant name given as text, which the
-    /// call looks up as it runs, under the search path it runs with, names every managed sequence of that name in any
-    /// schema, or the schema it gives. A call whose argument isn't a constant, as a name computed as it runs, makes the
-    /// sequences they may draw from unnamed.
+    /// call's argument, a constant, names one, and how many calls there are, as a function or through an operator. A
+    /// constant name given as text, which the call looks up as it runs, under the search path it runs with, names every
+    /// managed sequence of that name in any schema, or the schema it gives. A call whose argument isn't a constant, as a
+    /// name computed as it runs, makes the sequences they may draw from unnamed. Expressions that call a function that
+    /// may check a value against a domain they don't name, whose CHECK's calls of nextval C code starts where a call they
+    /// name was counted, name the sequences every domain's CHECK draws from too, or none when one of those doesn't name
+    /// its sequence.
     /// </summary>
-    private static (HashSet<uint> Called, int Calls, bool Unnamed) Draws(string text)
+    /// <param name="text">The expressions' text.</param>
+    /// <param name="unnamedDomains">Whether to read the draws of domains the expressions don't name.</param>
+    private static (HashSet<uint> Called, int Calls, bool Unnamed) Draws(string text, bool unnamedDomains = true)
     {
-        const string Call = "{FUNCEXPR :funcid 1574 ";
         const string Named = "{CONST :consttype 2205 ";
         const string Looked = "{FUNCEXPR :funcid 1079 ";
         const string Name = "{CONST :consttype 25 ";
         HashSet<uint> called = [];
         bool unnamed = false;
         int calls = 0;
-        for (int at = text.IndexOf(Call, StringComparison.Ordinal); at >= 0; at = text.IndexOf(Call, at + Call.Length, StringComparison.Ordinal))
+        foreach (int at in NextvalCall().Matches(text).Select(call => call.Index))
         {
             calls++;
             int args = Argument(text, at);
@@ -1734,7 +1910,39 @@ internal static partial class SequenceRangeGuard
             }
         }
 
+        if (unnamedDomains && ChecksUnnamedDomains(text))
+        {
+            (HashSet<uint> domainCalled, bool domainUnnamed) = DomainDraws();
+            called.UnionWith(domainCalled);
+            unnamed |= domainUnnamed;
+        }
+
         return (called, calls, unnamed);
+    }
+
+    // A call of nextval in an expression's text, as a function or through an operator.
+    [GeneratedRegex(@"\{FUNCEXPR :funcid 1574 |\{OPEXPR :opno [0-9]+ :opfuncid 1574 ", RegexOptions.CultureInvariant)]
+    private static partial Regex NextvalCall();
+
+    // A function an expression's text calls, as a function, an operator, an aggregate or a window function.
+    [GeneratedRegex(":(?:funcid|opfuncid|aggfnoid|winfnoid) ([0-9]+) ", RegexOptions.CultureInvariant)]
+    private static partial Regex CalledFunction();
+
+    // Whether an expression's text calls a function that may check a value against a domain the text doesn't name:
+    // one of PostgreSQL's that takes the type by name, as pg_input_is_valid does, or one that a library or a procedural
+    // language other than SQL and PL/pgSQL runs, outside worf. The statements a SQL function runs, when it isn't inlined,
+    // are read as they start, and PL/pgSQL's own checks as it makes them.
+    private static bool ChecksUnnamedDomains(string text)
+    {
+        long[] functions = [.. CalledFunction().Matches(text).Select(call => long.Parse(call.Groups[1].ValueSpan, CultureInfo.InvariantCulture)).Distinct()];
+        return functions.Length > 0 && Elevated.Run(() => Worf.ReadScalar<bool>("""
+            SELECT EXISTS (
+                SELECT 1 FROM pg_catalog.pg_proc p
+                WHERE p.oid = ANY ($1::pg_catalog.int8[]::pg_catalog.oid[])
+                    AND (p.oid >= 16384 AND p.prolang <> 14 AND p.pronamespace <> 'worf'::pg_catalog.regnamespace
+                            AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_language l WHERE l.oid = p.prolang AND l.lanname = 'plpgsql')
+                        OR p.pronamespace = 'pg_catalog'::pg_catalog.regnamespace AND p.proname IN ('pg_input_is_valid', 'pg_input_error_info')))
+            """, SpiParameter.Create(functions)));
     }
 
     // Where the first argument of the node at a position of an expression's text starts, or -1.

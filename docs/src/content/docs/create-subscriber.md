@@ -54,8 +54,14 @@ runs ends it, and removes what it wrote, in the WAL directory `--waldir` names a
 the tablespace directories `-T` maps too, those it made with them; one while
 `pg_ctl` starts or stops the server waits for it, and then stops the server. Once a database's subscription has committed, the
 others can't roll back with it, so a stop waits for the run to set them up, and
-changes nothing. A killed run leaves its server running, and its transaction rolls
-back once the server finds it gone. The subscription keeps the position its
+changes nothing. A failed or stopped run drops the replication slots it made on
+the provider for the databases it hadn't subscribed yet, but only the slot it
+made: one another run with the same subscriber name made in its place, or one a
+walsender streams, stays, with a warning. A killed run, or one that can't reach
+the provider as it cleans up, leaves its slot, which holds back the provider's
+WAL and catalog rows, and a later run with the same subscriber name fails until
+the slot is dropped, or runs with `--drop-slot-if-exists`. A killed run leaves its
+server running, and its transaction rolls back once the server finds it gone. The subscription keeps the position its
 restore point reached in the same transaction, which its apply worker starts
 from, and its replication origin gets progress only as the worker applies, so
 neither leaves progress for a later origin. A run on a data directory whose server
@@ -66,6 +72,10 @@ which writes WAL the provider doesn't have, or, once it has started, whose
 latest checkpoint isn't a checkpoint record of the provider's WAL with the redo
 point its `pg_control` holds, as one that did so and stopped in recovery later
 has, or lies in WAL the provider has removed while the directory's own WAL
-doesn't hold it, or doesn't reach the WAL the provider still has; each leaves
-the data directory as it is. The run reads that record from the provider's `pg_wal` with
-`pg_read_binary_file`, and can't tell when the provider doesn't let it.
+doesn't hold it, or doesn't reach the WAL the provider still has, or doesn't join
+it there: the record the provider's first record links back to must be the
+directory's last before that point, ending there or carried on in the provider's
+first page, with a checksum that covers both parts, as a standby's is and one
+that left the provider's WAL isn't; each leaves the data directory as it is. The
+run reads those records from the provider's `pg_wal` with `pg_read_binary_file`,
+and can't tell when the provider doesn't let it.

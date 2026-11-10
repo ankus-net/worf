@@ -3,6 +3,7 @@
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Globalization;
+using System.Numerics;
 using System.Runtime.InteropServices;
 using System.Text;
 using Worf;
@@ -32,7 +33,7 @@ Lock committing = new();
 // How many of the databases have their subscription committed, in the order the run sets them up, and the slots the
 // run made on the provider for each, once it has begun making them.
 int subscribedDatabases = 0;
-(string Database, string? Slot)[]? madeSlots = null;
+(string Database, string? Slot, string? Lsn)[]? madeSlots = null;
 
 // Whether this run started the subscriber's server, which it then stops if it fails, and whether it is failing, which a
 // failure on another thread waits out.
@@ -276,7 +277,7 @@ else
 }
 
 string[] slotNames = new string[databaseList.Length];
-madeSlots = new (string Database, string? Slot)[databaseList.Length];
+madeSlots = new (string Database, string? Slot, string? Lsn)[databaseList.Length];
 
 // Check connection strings for validity before doing anything expensive.
 foreach (string db in databaseList)
@@ -373,9 +374,9 @@ for (int dbnum = 0; dbnum < databaseList.Length; dbnum++)
 
     // Create replication slots on remote node.
     PrintMsg(VerbosityLevel.Normal, $"Creating replication slot in database {db} ...\n");
-    slotNames[dbnum] = InitializeReplicationSlot(providerConn, remoteInfo.Dbname, remoteInfo.NodeName,
+    (slotNames[dbnum], string madeAt) = InitializeReplicationSlot(providerConn, remoteInfo.Dbname, remoteInfo.NodeName,
         subscriberName, dropSlotIfExists);
-    madeSlots[dbnum] = (db, slotNames[dbnum]);
+    madeSlots[dbnum] = (db, slotNames[dbnum], madeAt);
 }
 
 // Create basebackup or use existing one
@@ -755,8 +756,9 @@ InvalidOperationException Die(string message)
 }
 
 // Drops the slots this run made on the provider for the databases it didn't subscribe, which nothing else would use, so
-// that a failed or stopped run leaves the provider as it was. A slot a walsender holds, or a provider that doesn't
-// answer within a few seconds, is left, with a warning.
+// that a failed or stopped run leaves the provider as it was. A slot of the name that isn't the one this run made, as
+// one a later run with the same subscriber name made in its place, a slot a walsender holds, or a provider that
+// doesn't answer within a few seconds, is left, with a warning.
 void DropUnusedSlots()
 {
     int subscribed;
@@ -767,7 +769,7 @@ void DropUnusedSlots()
 
     for (int dbnum = subscribed; dbnum < (madeSlots?.Length ?? 0); dbnum++)
     {
-        if (madeSlots![dbnum] is not (string database, string slot) || baseProvConnstr is null ||
+        if (madeSlots![dbnum] is not (string database, string slot, string lsn) || baseProvConnstr is null ||
             Fe.GetConnstr(baseProvConnstr, database, null, out _) is not string connstr)
         {
             continue;
@@ -776,7 +778,20 @@ void DropUnusedSlots()
         try
         {
             using LibpqConnection conn = Libpq.Connect(connstr + " connect_timeout=5");
-            _ = conn.Query($"SELECT pg_catalog.pg_drop_replication_slot(slot_name) FROM pg_catalog.pg_replication_slots WHERE slot_name = {EscapeLiteral(slot)} AND NOT active");
+            string made = $"slot_name = {EscapeLiteral(slot)} AND confirmed_flush_lsn = {EscapeLiteral(lsn)}::pg_catalog.pg_lsn";
+            List<string?[]> found = conn.Query($"""
+                SELECT (SELECT active_pid FROM pg_catalog.pg_replication_slots WHERE {made} AND active),
+                    EXISTS (SELECT 1 FROM pg_catalog.pg_replication_slots WHERE slot_name = {EscapeLiteral(slot)} AND NOT ({made})),
+                    (SELECT count(pg_catalog.pg_drop_replication_slot(slot_name)) FROM pg_catalog.pg_replication_slots WHERE {made} AND NOT active)
+                """);
+            if (found[0][0] is string pid)
+            {
+                Console.Error.WriteLine($"WARNING: replication slot \"{slot}\" on the provider is in use by process {pid}, so it's left there; drop it with pg_drop_replication_slot once nothing uses it");
+            }
+            else if (found[0][1] == "t")
+            {
+                Console.Error.WriteLine($"WARNING: replication slot \"{slot}\" on the provider isn't the one this run made, as one another run with the same subscriber name made in its place may be, so it's left there");
+            }
         }
         catch (Exception error) when (error is LibpqException or DllNotFoundException)
         {
@@ -1063,8 +1078,9 @@ bool CheckDataDir(string dataDir)
     return true;
 }
 
-// Initialize replication slots.
-string InitializeReplicationSlot(LibpqConnection conn, string dbname, string providerNodeName,
+// Initialize replication slots: the slot's name, and the LSN its creation returned, which its confirmed_flush_lsn holds
+// until a subscriber has consumed from it, as a slot another run makes later can't.
+(string Slot, string Lsn) InitializeReplicationSlot(LibpqConnection conn, string dbname, string providerNodeName,
     string subscriptionName, bool dropSlotIfExists)
 {
     // Generate the slot name.
@@ -1111,16 +1127,17 @@ string InitializeReplicationSlot(LibpqConnection conn, string dbname, string pro
     }
 
     // And finally, create the slot.
+    string lsn;
     try
     {
-        _ = Query(conn, $"SELECT pg_create_logical_replication_slot({EscapeLiteral(slotName)}, 'worf');");
+        lsn = QueryValue(conn, $"SELECT lsn FROM pg_create_logical_replication_slot({EscapeLiteral(slotName)}, 'worf');") ?? "";
     }
     catch (LibpqException error)
     {
         throw Die($"Could not create replication slot, status PGRES_FATAL_ERROR: {error.Message}\n");
     }
 
-    return slotName;
+    return (slotName, lsn);
 }
 
 // Read replication info about remote connection.
@@ -1520,9 +1537,9 @@ int? ReadClusterState(string dataDir)
                 return null;
             }
         });
-        return own is not null && IsCheckpoint(own, redo) && OwnWalCarries(conn, timeline, redo, segmentSize) is not false
+        return own is not null && IsCheckpoint(own, redo) && OwnWalCarries(conn, timeline, redo, segmentSize, blockSize) is not false
             ? null
-            : (false, "is in WAL the provider has removed, and its own WAL doesn't carry its recovery to the WAL the provider still has");
+            : (false, "is in WAL the provider has removed, and its own WAL doesn't reach and join the WAL the provider still has");
     }
 
     return IsCheckpoint(provider, redo) ? (true, null) : (false, "isn't the checkpoint the provider's WAL holds there, so its WAL has left the provider's");
@@ -1575,16 +1592,26 @@ static bool IsCheckpoint(byte[] record, ulong redo)
     return record[17] == 0 && (record[16] & 0xF0) is 0x00 or 0x10 && record[RecordHeader] == DataShort && recordRedo == redo;
 }
 
-// Whether the data directory's own WAL holds every segment from its latest checkpoint's redo point to the first the
-// provider still has, on the checkpoint's timeline, or null when the provider doesn't let the run list its WAL. A
-// segment counts once its first page's address is its own, as a file PostgreSQL renamed to a later segment's name to
-// use again isn't that segment until it's written.
-bool? OwnWalCarries(LibpqConnection conn, long timeline, ulong redo, long segmentSize)
+// Whether the data directory's own WAL carries its recovery from its latest checkpoint's redo point to the WAL the
+// provider still has, on the checkpoint's timeline, or null when the provider doesn't let the run read its WAL. The
+// directory holds every page from the redo point's segment to the provider's first segment, each at its own address,
+// as a file PostgreSQL renamed to a later segment's name to use again isn't that segment until it's written; and its
+// WAL joins the provider's where the provider's begins: the record the provider's first record there links back to is
+// in the directory, and ends there, or runs on into the provider's first page, which carries the rest of it, and its
+// checksum covers both parts. A data directory whose WAL left the provider's, as one that ran as a server of its own,
+// left it at its latest checkpoint or before, as such a server checkpoints as it leaves recovery, so no record of its
+// own joins the provider's WAL.
+bool? OwnWalCarries(LibpqConnection conn, long timeline, ulong redo, long segmentSize, long blockSize)
 {
+    const int RecordHeader = 24;
+    const int LongPageHeader = 40;
+    const ushort FirstIsContinued = 0x0001;
+    const ushort FirstIsOverwrite = 0x0008;
     string? first;
     try
     {
-        first = QueryValue(conn, "SELECT pg_catalog.min(name) FROM pg_catalog.pg_ls_waldir() WHERE name ~ '^[0-9A-F]{24}$'");
+        first = QueryValue(conn, string.Create(CultureInfo.InvariantCulture,
+            $"SELECT pg_catalog.min(name) FROM pg_catalog.pg_ls_waldir() WHERE name ~ '^{timeline:X8}[0-9A-F]{{16}}$'"));
     }
     catch (LibpqException)
     {
@@ -1598,30 +1625,176 @@ bool? OwnWalCarries(LibpqConnection conn, long timeline, ulong redo, long segmen
         return false;
     }
 
-    ulong providerFirst = (log * perId) + seg;
-    byte[] header = new byte[16];
-    for (ulong segment = redo / (ulong)segmentSize; segment <= providerFirst; segment++)
+    ulong providerStart = ((log * perId) + seg) * (ulong)segmentSize;
+    if (redo >= providerStart)
     {
-        try
-        {
-            using FileStream file = File.OpenRead(Path.Join(dataDir, "pg_wal",
-                string.Create(CultureInfo.InvariantCulture, $"{timeline:X8}{segment / perId:X8}{segment % perId:X8}")));
-            file.ReadExactly(header);
-        }
-        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
-        {
-            return false;
-        }
+        return false;
+    }
 
-        // XLogPageHeaderData's xlp_pageaddr follows its magic, info and timeline.
-        ulong pageAddress = BitConverter.IsLittleEndian ? BinaryPrimitives.ReadUInt64LittleEndian(header.AsSpan(8)) : BinaryPrimitives.ReadUInt64BigEndian(header.AsSpan(8));
-        if (pageAddress != segment * (ulong)segmentSize)
+    // The directory's segments from the redo point's to the one before the provider's first, each written, as its
+    // first page's address shows; WAL is written in order, so each segment before a written one was written whole, and
+    // the last one's end is read below. A WAL switch leaves the rest of its segment's pages without headers.
+    for (ulong segment = redo / (ulong)segmentSize; segment < providerStart / (ulong)segmentSize; segment++)
+    {
+        if (OwnWal(segment * (ulong)segmentSize, 16) is not byte[] header || Read64(header, 8) != segment * (ulong)segmentSize)
         {
             return false;
         }
     }
 
-    return true;
+    // The provider's first page, which carries the rest of the record before it, if it began before, and then the
+    // record that links back to it.
+    bool unreadable = false;
+    byte[]? ProviderWal(ulong at, int length)
+    {
+        try
+        {
+            string? read = QueryValue(conn, string.Create(CultureInfo.InvariantCulture,
+                $"SELECT pg_catalog.encode(pg_catalog.pg_read_binary_file('pg_wal/{SegmentName(at)}', {(long)(at % (ulong)segmentSize)}, {length}, true), 'hex')"));
+            return read is null || read.Length != length * 2 ? null : Convert.FromHexString(read);
+        }
+        catch (LibpqException)
+        {
+            unreadable = true;
+            return null;
+        }
+    }
+
+    byte[]? firstPage = ProviderWal(providerStart, LongPageHeader);
+    if (unreadable)
+    {
+        return null;
+    }
+
+    if (firstPage is null || Read64(firstPage, 8) != providerStart)
+    {
+        return false;
+    }
+
+    ushort info = BitConverter.IsLittleEndian ? BinaryPrimitives.ReadUInt16LittleEndian(firstPage.AsSpan(2)) : BinaryPrimitives.ReadUInt16BigEndian(firstPage.AsSpan(2));
+    uint carried = Read32(firstPage, 16);
+    if ((info & FirstIsOverwrite) != 0 || ((info & FirstIsContinued) != 0) != (carried > 0) || carried > segmentSize)
+    {
+        return false;
+    }
+
+    if (Stream(ProviderWal, providerStart, (int)carried) is not (byte[] rest, ulong restEnd) ||
+        Stream(ProviderWal, (restEnd + 7) & ~7UL, RecordHeader) is not (byte[] next, _))
+    {
+        return unreadable ? null : false;
+    }
+
+    // The record the provider's first one links back to, in the directory: it ends where the provider's first page
+    // begins, padded to an 8-byte boundary, or with the rest of its segment, as a WAL switch does, or runs on into that
+    // page, and its checksum covers its data, then its header to the checksum.
+    ulong linked = Read64(next, 8);
+    if (linked < redo / (ulong)segmentSize * (ulong)segmentSize || linked >= providerStart || Usable(linked, providerStart) is not int have ||
+        have < RecordHeader || have > segmentSize || Stream(OwnWal, linked, RecordHeader) is not (byte[] head, _))
+    {
+        return false;
+    }
+
+    uint total = Read32(head, 0);
+    bool switched = head[17] == 0 && (head[16] & 0xF0) == 0x40;
+    bool joined = carried > 0 ? (ulong)have + carried == total : switched ? total <= have : ((total + 7UL) & ~7UL) == (ulong)have;
+    if (!joined || total < RecordHeader || Stream(OwnWal, linked, carried > 0 ? have : (int)total) is not (byte[] ours, _))
+    {
+        return false;
+    }
+
+    byte[] data = carried > 0 ? [.. ours.AsSpan(RecordHeader), .. rest] : ours[RecordHeader..(int)total];
+    uint crc = 0xFFFFFFFF;
+    foreach (byte b in data)
+    {
+        crc = BitOperations.Crc32C(crc, b);
+    }
+
+    for (int i = 0; i < 20; i++)
+    {
+        crc = BitOperations.Crc32C(crc, ours[i]);
+    }
+
+    return (crc ^ 0xFFFFFFFF) == Read32(ours, 20);
+
+    // The directory's own WAL at a position.
+    byte[]? OwnWal(ulong at, int length)
+    {
+        try
+        {
+            using FileStream file = File.OpenRead(Path.Join(dataDir, "pg_wal", SegmentName(at)));
+            byte[] bytes = new byte[length];
+            _ = file.Seek((long)(at % (ulong)segmentSize), SeekOrigin.Begin);
+            file.ReadExactly(bytes);
+            return bytes;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    string SegmentName(ulong at)
+    {
+        ulong segment = at / (ulong)segmentSize;
+        return string.Create(CultureInfo.InvariantCulture, $"{timeline:X8}{segment / perId:X8}{segment % perId:X8}");
+    }
+
+    // The number of WAL bytes from one position to another, past the page headers between them.
+    int? Usable(ulong from, ulong to)
+    {
+        long count = 0;
+        for (ulong at = from; at < to;)
+        {
+            ulong pageEnd = ((at / (ulong)blockSize) + 1) * (ulong)blockSize;
+            if (at % (ulong)blockSize == 0)
+            {
+                at += at % (ulong)segmentSize == 0 ? LongPageHeader : 24UL;
+                continue;
+            }
+
+            count += (long)(Math.Min(pageEnd, to) - at);
+            at = Math.Min(pageEnd, to);
+        }
+
+        return count > int.MaxValue ? null : (int)count;
+    }
+
+    // A number of WAL bytes from a position, past the page headers, each of which must give its page's own address, and
+    // where they end.
+    (byte[] Bytes, ulong End)? Stream(Func<ulong, int, byte[]?> read, ulong at, int length)
+    {
+        List<byte> bytes = new(length);
+        while (bytes.Count < length)
+        {
+            if (at % (ulong)blockSize == 0)
+            {
+                if (read(at, 16) is not byte[] header || Read64(header, 8) != at)
+                {
+                    return null;
+                }
+
+                at += at % (ulong)segmentSize == 0 ? LongPageHeader : 24UL;
+                continue;
+            }
+
+            int take = (int)Math.Min((ulong)(length - bytes.Count), (((at / (ulong)blockSize) + 1) * (ulong)blockSize) - at);
+            if (read(at, take) is not byte[] chunk)
+            {
+                return null;
+            }
+
+            bytes.AddRange(chunk);
+            at += (ulong)take;
+        }
+
+        return ([.. bytes], at);
+    }
+
+    static ulong Read64(byte[] bytes, int at)
+        => BitConverter.IsLittleEndian ? BinaryPrimitives.ReadUInt64LittleEndian(bytes.AsSpan(at)) : BinaryPrimitives.ReadUInt64BigEndian(bytes.AsSpan(at));
+
+    static uint Read32(byte[] bytes, int at)
+        => BitConverter.IsLittleEndian ? BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(at)) : BinaryPrimitives.ReadUInt32BigEndian(bytes.AsSpan(at));
 }
 
 // Keeps postgresql.auto.conf as it was before this run changes it, and whether the data directory had a standby.signal.

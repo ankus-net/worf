@@ -265,8 +265,11 @@ internal static class HeldValues
 
             long conflictsFound = Stopwatch.GetTimestamp();
             Finding = Stopwatch.GetElapsedTime(started, conflictsFound);
-            const string ConflictScansSql = "SELECT pg_catalog.pg_stat_get_xact_numscans('pg_temp.worf_held_conflicts'::pg_catalog.regclass)";
-            long conflictScansAt = many ? Worf.ReadScalar<long>(ConflictScansSql) : 0;
+            const string ConflictScansSql = """
+                SELECT pg_catalog.pg_stat_get_xact_numscans(c.oid), pg_catalog.pg_stat_get_xact_tuples_returned(c.oid) OPERATOR(pg_catalog.+) pg_catalog.pg_stat_get_xact_tuples_fetched(c.oid)
+                FROM (SELECT 'pg_temp.worf_held_conflicts'::pg_catalog.regclass::pg_catalog.oid) c (oid)
+                """;
+            (long scansAt, long rowsAt) = many ? ConflictReads() : (0, 0);
 
             RefusedChecked = many
                 ? Worf.ReadScalar<int>("SELECT pg_catalog.count(DISTINCT h.r)::pg_catalog.int4 FROM pg_temp.worf_held_conflicts h")
@@ -382,8 +385,17 @@ internal static class HeldValues
 
             decided = true;
             Deciding = Stopwatch.GetElapsedTime(conflictsFound);
-            ConflictScans = many ? Worf.ReadScalar<long>(ConflictScansSql) - conflictScansAt : 0;
+            (long scans, long rows) = many ? ConflictReads() : (0, 0);
+            ConflictScans = scans - scansAt;
+            ConflictRows = rows - rowsAt;
             return refusedCount;
+
+            // How many times the conflicts were scanned whole, and how many of their rows any scan read, so far.
+            static (long Scans, long Rows) ConflictReads()
+            {
+                WorfRows reads = Worf.Read(ConflictScansSql, 1);
+                return (reads[0].Get<long>(0), reads[0].Get<long>(1));
+            }
 
             // The error of the first constraint, in the order they're checked, that refuses a candidate, from its
             // conflicts, part[first] to part[end - 1], in the constraints' order.
@@ -462,6 +474,12 @@ internal static class HeldValues
     /// them, a part at a time, which their index spares it.
     /// </summary>
     internal static long ConflictScans { get; private set; }
+
+    /// <summary>
+    /// Gets how many rows the last decision read from the conflicts, through any scan, as a bitmap scan reads every
+    /// remaining conflict for each part when the conflicts' statistics are missing.
+    /// </summary>
+    internal static long ConflictRows { get; private set; }
 
     /// <summary>
     /// Checks whether a table, or one of its partitions, has a BEFORE ROW INSERT or UPDATE trigger that fires under
