@@ -77,6 +77,11 @@ internal static class SequenceRangeExchange
     // again without the check, so that an idle neighbor's messages don't read every sequence's rows.
     private static readonly Dictionary<(uint Sender, string Name), WorfUnchangedEntry> s_unchanged = [];
 
+    // The version of the ranges as this process took in each neighbor's last message, so that a message that comes
+    // while the ranges change, as the sequences of most of them do, is checked in full, without reading what the checks
+    // depend on first.
+    private static readonly Dictionary<uint, long> s_takenInAt = [];
+
     /// <summary>
     /// Answers a neighbor's exchange on the provider end of its subscription.
     /// </summary>
@@ -1322,10 +1327,10 @@ internal static class SequenceRangeExchange
         int? cutAt = null;
         int takenIn = 0;
         string key = UnchangedKey(node, root, call);
-        Dictionary<int, WorfEntryFingerprint>? fingerprints = heard &&
-            sequences.EnumerateArray().Any(entry => s_unchanged.ContainsKey((senderId, entry.GetProperty("name").GetWorfString() ?? "")))
-            ? Fingerprints(node, senderId, [.. sequences.EnumerateArray()], call)
-            : null;
+        long version = SequenceRanges.Version.Value;
+        bool quiet = s_takenInAt.TryGetValue(senderId, out long takenInAt) && takenInAt == version;
+        s_takenInAt[senderId] = version;
+        Dictionary<int, WorfEntryFingerprint>? fingerprints = heard && quiet ? Fingerprints(node, senderId, [.. sequences.EnumerateArray()], call) : null;
         foreach (JsonElement entry in sequences.EnumerateArray())
         {
             index++;
@@ -1361,7 +1366,8 @@ internal static class SequenceRangeExchange
                 // keeps, are left to the call after the one that reaches the last, unread. A call that has taken a third of
                 // its time leaves the rest once it has taken one in, so that each call gets past where the last stopped.
                 // Once a call is cut, the rest is left too, unread.
-                bool changed = !before && same is null && (!heard || !CheckUnchanged(node, root, entry, senderId, call, applied, key));
+                bool changed = !before && same is null &&
+                    (!heard || !CheckUnchanged(node, root, entry, senderId, call, applied, key, fingerprints?.GetValueOrDefault(index)));
                 bool late = changed && takenIn > 0 && takeUntil is long until && Worker.GetCurrentTimestamp() >= until;
                 if (before || late)
                 {
@@ -1723,22 +1729,23 @@ internal static class SequenceRangeExchange
             : null;
 
     // Checks a neighbor's report of a sequence, as Unchanged does, and keeps one found to change nothing with what the
-    // check read, as it began, unless that may change by itself: a report that asks for blocks or grants any, which the
-    // check reads more for, one with a watermark beyond this node's own, which the check bounds by the sequence's
-    // ledger, or that relays a report of a node the tables have none of, or a report whose time runs out within
-    // seconds, or a range row a prepared transaction holds.
-    private static bool CheckUnchanged(WorfLocalNode node, JsonElement root, JsonElement entry, uint senderId, bool call, ulong applied, string key)
+    // check depends on as the message's take-in began, so that anything that changed since, as the check ran too, makes
+    // the next message's check run in full, unless that may change by itself: a report that asks for blocks or grants
+    // any, which the check reads more for, one with a watermark beyond this node's own, which the check bounds by the
+    // sequence's ledger, or that relays a report of a node the tables have none of, or a report whose time runs out
+    // within seconds, or a range row a prepared transaction holds.
+    private static bool CheckUnchanged(WorfLocalNode node, JsonElement root, JsonElement entry, uint senderId, bool call, ulong applied, string key,
+        WorfEntryFingerprint? read)
     {
         string name = entry.GetProperty("name").GetWorfString() ?? "";
         _ = s_unchanged.Remove((senderId, name));
-        bool simple = entry.GetProperty("requests").GetArrayLength() == 0 && entry.GetProperty("grants").GetArrayLength() == 0;
-        WorfEntryFingerprint? read = simple && Fingerprints(node, senderId, [entry], call).TryGetValue(0, out WorfEntryFingerprint? found) ? found : null;
         if (!Unchanged(node, root, entry, senderId, call, applied))
         {
             return false;
         }
 
-        if (read is { Steady: true })
+        bool simple = entry.GetProperty("requests").GetArrayLength() == 0 && entry.GetProperty("grants").GetArrayLength() == 0;
+        if (simple && read is { Steady: true })
         {
             bool covered(long? mark) => mark is not long value || (read.Watermark is long own && (read.Ascending ? value <= own : value >= own));
             List<(uint Node, JsonElement Report)> relayed = [.. Relayed(entry, node, senderId)];
