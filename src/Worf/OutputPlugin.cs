@@ -39,6 +39,9 @@ internal static unsafe partial class OutputPlugin
     [PgNativeCallback(nameof(PgDecodeOriginFilter))]
     private static partial OutputPluginCallbacks_filter_by_origin_cbCallback OriginFilterCallback { get; }
 
+    [PgNativeCallback(nameof(PgDecodeMessage))]
+    private static partial OutputPluginCallbacks_message_cbCallback MessageCallback { get; }
+
     [PgNativeCallback(nameof(PgDecodeShutdown))]
     private static partial OutputPluginCallbacks_shutdown_cbCallback ShutdownCallback { get; }
 
@@ -62,6 +65,31 @@ internal static unsafe partial class OutputPlugin
         cb->commit_cb = CommitCallback;
         cb->filter_by_origin_cb = OriginFilterCallback;
         cb->shutdown_cb = ShutdownCallback;
+        cb->message_cb = MessageCallback;
+    }
+
+    /// <summary>
+    /// Sends the subscriber the word the sequence range code writes, as an owner that granted itself a block a neighbor
+    /// must hear of does, to call this node now; other messages aren't sent.
+    /// </summary>
+    private static void PgDecodeMessage(LogicalDecodingContext* ctx, ReorderBufferTXN* txn, ulong messageLsn, bool transactional, sbyte* prefix,
+        ulong messageSize, sbyte* message)
+    {
+        _ = txn;
+        _ = messageLsn;
+        _ = transactional;
+        _ = messageSize;
+        _ = message;
+        if (Worf.FromServer(prefix) != "worf_sequence_range")
+        {
+            return;
+        }
+
+        WorfLog.Debug2("sending the subscriber a word to call this node about sequence ranges");
+
+        NativeMethods.OutputPluginPrepareWrite(ctx, true);
+        NativeMethods.pq_sendbyte(ctx->@out, (byte)'W');
+        NativeMethods.OutputPluginWrite(ctx, true);
     }
 
     private static bool CheckBinaryCompatibility(WorfOutputData data)

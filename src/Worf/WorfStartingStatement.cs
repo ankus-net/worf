@@ -8,14 +8,23 @@ namespace Worf;
 /// <param name="draws">Reads the calls: the sequences they name, how many there are, and whether one names none.</param>
 /// <param name="context">The error context, as <c>error_context_stack</c> holds it.</param>
 /// <param name="explained">Whether the statement is only explained, as EXPLAIN without ANALYZE starts it.</param>
-internal sealed class WorfStartingStatement(Func<(HashSet<uint> Called, int Calls, bool Unnamed)> draws, nint context, bool explained)
+/// <param name="text">Reads the statement's own text, as the client sent it, or null when it has none or has
+/// parameters, whose values a plan may hold.</param>
+internal sealed class WorfStartingStatement(Func<(HashSet<uint> Called, int Calls, bool Unnamed)> draws, nint context, bool explained,
+    Func<string?>? text = null)
 {
     private (HashSet<uint> Called, int Calls, bool Unnamed)? _draws;
+    private string? _text;
 
     /// <summary>
     /// Gets the calls of nextval the expressions make.
     /// </summary>
     internal (HashSet<uint> Called, int Calls, bool Unnamed) Draws => _draws ??= draws();
+
+    /// <summary>
+    /// Gets the statement's own text, or null.
+    /// </summary>
+    internal string? Text => _text ??= text?.Invoke();
 
     /// <summary>
     /// Gets or sets how many of the calls have started.

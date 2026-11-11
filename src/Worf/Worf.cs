@@ -2220,7 +2220,7 @@ internal static partial class Worf
         if (!inTransaction && Worker.MyWorfWorker >= 0 && Worker.MyWorker.WorkerType is WorfWorkerType.Apply or WorfWorkerType.Sync)
         {
             return Worker.WithProviderDeadline(() => described,
-                () => PgBackgroundWorker.RunTransaction(() => WithPinnedSearchPath(WorfConnection.Connect(conninfo, applicationName, replication), setup)));
+                () => PgBackgroundWorker.RunTransaction(() => WithPinnedSearchPath(WorfConnection.Connect(conninfo, applicationName, replication, NodeOf(connstr)), setup)));
         }
 
         if (!inTransaction)
@@ -2232,7 +2232,7 @@ internal static partial class Worf
         try
         {
             Worker.WithProviderDeadline(() => described,
-                () => PgTransaction.RunInSubtransaction(() => conn = WorfConnection.Connect(conninfo, applicationName, replication)));
+                () => PgTransaction.RunInSubtransaction(() => conn = WorfConnection.Connect(conninfo, applicationName, replication, NodeOf(connstr))));
         }
         catch (PgException error) when (error.SqlState == PgSqlStates.ConnectionFailure)
         {
@@ -2252,6 +2252,14 @@ internal static partial class Worf
 
         return WithPinnedSearchPath(conn!, setup);
     }
+
+    // The node whose interface a connection string is, whose name the log gives its notices and against which they count,
+    // or none; read in a transaction.
+    private static (string Name, uint Id) NodeOf(string dsn)
+        => CatalogOid("node_interface") == 0 ? default
+            : Elevated.Run(() => Read("""
+                SELECT n.node_name::pg_catalog.text, i.if_nodeid FROM worf.node_interface i JOIN worf.node n ON n.node_id = i.if_nodeid WHERE i.if_dsn = $1 LIMIT 1
+                """, 1, SpiParameter.Create(dsn))) is [WorfRow row] ? (row.Get<string>(0), row.Get<uint>(1)) : default;
 
     // The settings worf connects with unless the connection string gives its own: a time to connect, and keepalives.
     private static readonly (string Option, string Value)[] s_connectionDefaults =

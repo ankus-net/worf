@@ -72,6 +72,11 @@ internal static class SequenceRangeExchange
     // time, is closed.
     private static readonly Dictionary<uint, (WorfConnection Conn, string Conninfo, int Timeout)> s_connections = [];
 
+    // The reports of each neighbor's sequences that this process last found would change nothing, by the neighbor and the
+    // sequence's name, which the same report in a later message, while what the check read is as it was, is taken as
+    // again without the check, so that an idle neighbor's messages don't read every sequence's rows.
+    private static readonly Dictionary<(uint Sender, string Name), WorfUnchangedEntry> s_unchanged = [];
+
     /// <summary>
     /// Answers a neighbor's exchange on the provider end of its subscription.
     /// </summary>
@@ -129,9 +134,13 @@ internal static class SequenceRangeExchange
             return "{}";
         }
 
-        // Backends reload their blocks, which an activation or a grant may have changed, once this commits.
-        _ = Process(node, root, senderId, root.GetProperty("node_name").GetWorfString() ?? "", true);
-        SequenceRanges.ChangedOnCommit();
+        // Backends reload their blocks, which an activation or a grant may have changed, once this commits, unless the call
+        // took in no sequence's change.
+        if (Process(node, root, senderId, root.GetProperty("node_name").GetWorfString() ?? "", true).Changed)
+        {
+            SequenceRanges.ChangedOnCommit();
+        }
+
         (string reply, List<Guid> refusals) = Build(node, senderId, null);
         AcknowledgeRefusals(refusals);
         return reply;
@@ -649,7 +658,8 @@ internal static class SequenceRangeExchange
         }
 
         _ = s_notStreamed.Remove(sub.Id);
-        (bool Granted, bool Received) taken = Process(node, document.RootElement, sub.Origin.Id, sub.Origin.Name, false, pending.Applied);
+        (bool granted, bool received, _) = Process(node, document.RootElement, sub.Origin.Id, sub.Origin.Name, false, pending.Applied);
+        (bool Granted, bool Received) taken = (granted, received);
 
         // A drop that committed while the reply waited on the rows the drop deleted, as the reply's own write of them
         // does, leaves the reply to roll back, so that it doesn't write them again. A reply that wrote nothing has
@@ -855,9 +865,12 @@ internal static class SequenceRangeExchange
             // A statement that waits to draw from a block the neighbor granted, until this server hears from it since it
             // started, makes the exchange due, once a second at most, and a failed one's retry due half
             // worf.sequence_range_timeout after it ended, if its delay is longer, so that the statement, which waits up
-            // to twice that, gets an exchange soon after the neighbor is back.
+            // to twice that, gets an exchange soon after the neighbor is back; and so does the neighbor's word, over its
+            // replication stream, to call it, as an owner that granted itself a block sends.
             bool exchanged = s_exchangedAt.TryGetValue(sub.Id, out long at);
-            bool wanted = (!exchanged || now - at >= 1_000_000) && SequenceRangeHeard.Wanted(sub.Origin.Id, now - 2_000_000);
+            bool spaced = !exchanged || now - at >= 1_000_000;
+            bool calledFor = exchanged && SequenceRangeHeard.CalledFor(sub.Origin.Id, at);
+            bool wanted = spaced && (SequenceRangeHeard.Wanted(sub.Origin.Id, now - 2_000_000) || calledFor);
             bool cut = wanted && retrying && now >= retry.At - retry.Delay + Math.Min(retry.Delay, SequenceRanges.ExchangeTimeout * 500L);
 
             if ((!retrying || cut) &&
@@ -993,6 +1006,10 @@ internal static class SequenceRangeExchange
             // this server makes from now on was made knowing it's back.
             writer.WriteNumber("started_at", SequenceRangeHeard.Started);
             writer.WriteNumber("heard_started_at", PendingStart(neighbor) ?? SequenceRangeHeard.StartedOf(neighbor));
+            if (SequenceRangeHeard.StartLsn is ulong startLsn and not ulong.MaxValue)
+            {
+                writer.WriteString("start_lsn", Worf.FormatLsn(startLsn));
+            }
 
             writer.WriteStartArray("sequences");
             // An epoch this node owned of a sequence it dropped goes out as disabled, with nothing else.
@@ -1014,9 +1031,10 @@ internal static class SequenceRangeExchange
                     WHERE d.owned AND NOT EXISTS (SELECT 1 FROM worf.sequence_range r WHERE r.seqoid = pg_catalog.to_regclass(d.name))) s
                 ORDER BY name COLLATE "C"
                 """);
+            WorfNeighborRows parts = Parts(sequences, neighbor);
             for (int i = 0; i < sequences.Count; i++)
             {
-                WriteSequence(writer, sequences[i], neighbor, refusals);
+                WriteSequence(writer, sequences[i], neighbor, refusals, parts);
             }
 
             writer.WriteEndArray();
@@ -1027,9 +1045,79 @@ internal static class SequenceRangeExchange
     }
 
     /// <summary>
+    /// Reads what this node's message to a neighbor gives of its managed sequences besides their range rows, each part
+    /// for every sequence in one statement, rather than a statement for each sequence: the neighbor's reports, the blocks
+    /// this node holds from the neighbor, its open requests, every node's report, the grants the neighbor hasn't
+    /// acknowledged, and the blocks of each sequence's epoch this node holds from the neighbor, each in an order of its
+    /// own, so that a sequence's part reads the same while its rows are as they were.
+    /// </summary>
+    private static WorfNeighborRows Parts(WorfRows sequences, uint neighbor)
+    {
+        List<long> managed = [];
+        List<int> epochs = [];
+        for (int i = 0; i < sequences.Count; i++)
+        {
+            if (sequences[i].Get<uint?>(0) is uint seqoid)
+            {
+                managed.Add(seqoid);
+                epochs.Add(sequences[i].Get<int>(3));
+            }
+        }
+
+        if (managed.Count == 0)
+        {
+            return new WorfNeighborRows();
+        }
+
+        WorfNeighborRows parts = new() { Snowflake = SnowflakeIds.NodeSequence() };
+
+        SpiParameter seqs = SpiParameter.Create(managed.ToArray());
+        SpiParameter peer = SpiParameter.Create(neighbor);
+        WorfRows neighborRows = Worf.SelectCatalog("""
+            SELECT reset_lsn::text, reset_done::text, state = 'fenced', checked_start, seqoid::oid
+            FROM worf.sequence_range_node WHERE seqoid = ANY ($1::pg_catalog.oid[]) AND node_id = $2
+            """, seqs, peer);
+        parts.Add("neighbor", neighborRows, 4);
+        long[] fenced = [.. neighborRows.Where(row => row.Get<bool?>(2) == true).Select(row => (long)row.Get<uint>(4))];
+        parts.Add("held", Worf.SelectCatalog("""
+            SELECT block_id, kind::text, lo, hi, state = 'abandoned', seqoid::oid FROM worf.sequence_range_block
+            WHERE seqoid = ANY ($1::pg_catalog.oid[]) AND from_node = $2 AND kind IN ('n', 'p', 'i')
+                AND (seqoid::pg_catalog.oid = ANY ($3::pg_catalog.oid[]) OR state = 'abandoned' AND retired_at > now() - interval '10 minutes')
+            ORDER BY seqoid, block_id
+            """, seqs, peer, SpiParameter.Create(fenced)), 5);
+        parts.Add("requests", Worf.SelectCatalog("""
+            SELECT request_id, size, kind::text, lo, hi, seqoid::oid FROM worf.sequence_range_request
+            WHERE seqoid = ANY ($1::pg_catalog.oid[]) AND parent_node = $2 AND state = 'open'
+            ORDER BY seqoid, request_id
+            """, seqs, peer), 5);
+        parts.Add("reports", Worf.SelectCatalog("""
+            SELECT n.node_id, n.node_name::text, n.high_water, n.watermark, n.epoch,
+                CASE WHEN n.node_id <> l.node_id THEN n.state WHEN r.fenced_at IS NOT NULL THEN 'fenced' ELSE r.state END,
+                extract(epoch FROM CASE WHEN n.node_id = l.node_id THEN now() ELSE worf.sequence_range_heard(n.node_id, false, n.reported_at, false) END)::float8,
+                n.node_id = l.node_id, n.holds, n.clock, n.seqoid::oid
+            FROM worf.sequence_range_node n JOIN worf.sequence_range r ON r.seqoid = n.seqoid CROSS JOIN worf.local_node l
+            WHERE n.seqoid = ANY ($1::pg_catalog.oid[]) AND n.node_id <> $2
+            ORDER BY n.seqoid, n.node_id
+            """, seqs, peer), 10);
+        parts.Add("grants", Worf.SelectCatalog("""
+            SELECT grant_id, request_id, lo, hi, kind::text, not_before, seqoid::oid FROM worf.sequence_range_grant
+            WHERE seqoid = ANY ($1::pg_catalog.oid[]) AND grantee_id = $2 AND state = 'sent'
+            ORDER BY seqoid, grant_id
+            """, seqs, peer), 6);
+        parts.Add("acks", Worf.SelectCatalog("""
+            SELECT b.block_id, b.seqoid::oid
+            FROM ROWS FROM (pg_catalog.unnest($1::pg_catalog.oid[]), pg_catalog.unnest($3::pg_catalog.int4[])) AS s (seqoid, epoch)
+                JOIN worf.sequence_range_block b ON b.seqoid = s.seqoid AND b.epoch = s.epoch
+            WHERE b.from_node = $2 AND b.kind IN ('n', 'p', 'i') AND b.state IN ('next', 'active', 'open', 'imported')
+            ORDER BY b.seqoid, b.block_id
+            """, seqs, peer, SpiParameter.Create(epochs.ToArray())), 1);
+        return parts;
+    }
+
+    /// <summary>
     /// Writes one managed sequence's part of this node's message to a neighbor.
     /// </summary>
-    private static void WriteSequence(Utf8JsonWriter writer, WorfRow row, uint neighbor, List<Guid> refusals)
+    private static void WriteSequence(Utf8JsonWriter writer, WorfRow row, uint neighbor, List<Guid> refusals, WorfNeighborRows parts)
     {
         uint? managed = row.Get<uint?>(0);
         uint seqoid = managed ?? 0;
@@ -1079,7 +1167,7 @@ internal static class SequenceRangeExchange
             return;
         }
 
-        bool snowflake = seqoid == SnowflakeIds.NodeSequence();
+        bool snowflake = seqoid == parts.Snowflake;
         if (snowflake)
         {
             WriteHolds(writer, OwnHolds(seqoid), SnowflakeIds.ReservedClock());
@@ -1087,13 +1175,15 @@ internal static class SequenceRangeExchange
 
 
         // A reset this node asks of the neighbor, whose WAL position moved backwards, and one it honored.
-        WorfRows neighborRow = Worf.SelectCatalog(
-            "SELECT reset_lsn::text, reset_done::text, state = 'fenced' FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2",
-            seq, peer);
+        IReadOnlyList<WorfRow> neighborRow = parts["neighbor", seqoid];
         bool neighborFenced = neighborRow.Count > 0 && neighborRow[0].Get<bool?>(2) == true;
         string? askedReset = neighborRow.Count > 0 ? neighborRow[0].Get<string?>(0) : null;
         WriteNullable(writer, "reset", askedReset);
         WriteNullable(writer, "reset_done", neighborRow.Count > 0 ? neighborRow[0].Get<string?>(1) : null);
+
+        // The neighbor's start, once this node has checked its report of the sequence since then, which lets it draw from
+        // the sequence's blocks this node granted.
+        WriteNullable(writer, "checked_start", neighborRow.Count > 0 ? neighborRow[0].Get<long?>(3) : null);
 
         // A fence's lift names the grants this node made the neighbor that it hasn't heard the neighbor give up, of which
         // the neighbor must hold one for the lift to reset it at once.
@@ -1107,11 +1197,7 @@ internal static class SequenceRangeExchange
         // The blocks this node holds from the neighbor: every one while the neighbor is a fenced allocator, so
         // that it can rebuild its ledger, and otherwise those abandoned lately, which it marks so.
         writer.WriteBoolean("held_complete", neighborFenced);
-        WriteArray(writer, "held", Worf.SelectCatalog("""
-            SELECT block_id, kind::text, lo, hi, state = 'abandoned' FROM worf.sequence_range_block
-            WHERE seqoid = $1 AND from_node = $2 AND kind IN ('n', 'p', 'i')
-                AND ($3 OR state = 'abandoned' AND retired_at > now() - interval '10 minutes')
-            """, seq, peer, SpiParameter.Create(neighborFenced)), held =>
+        WriteArray(writer, "held", parts["held", seqoid], held =>
         {
             writer.WriteStartObject();
             writer.WriteString("id", held.Get<Guid>(0));
@@ -1123,9 +1209,7 @@ internal static class SequenceRangeExchange
         });
 
         // The open requests, for a node block or a pool block, when the neighbor is this node's parent.
-        WriteArray(writer, "requests", Worf.SelectCatalog(
-            "SELECT request_id, size, kind::text, lo, hi FROM worf.sequence_range_request WHERE seqoid = $1 AND parent_node = $2 AND state = 'open' AND $3",
-            seq, peer, SpiParameter.Create(row.Get<uint?>(9) == neighbor)), request =>
+        WriteArray(writer, "requests", row.Get<uint?>(9) == neighbor ? parts["requests", seqoid] : [], request =>
         {
             writer.WriteStartObject();
             writer.WriteString("id", request.Get<Guid>(0));
@@ -1138,14 +1222,7 @@ internal static class SequenceRangeExchange
 
         // Every node this node has heard from, so that reports reach the owner hop by hop, each with when its node
         // made it, so that a node that stopped reporting ages out everywhere rather than being relayed back and forth.
-        WriteArray(writer, "reports", Worf.SelectCatalog("""
-            SELECT n.node_id, n.node_name::text, n.high_water, n.watermark, n.epoch,
-                CASE WHEN n.node_id <> l.node_id THEN n.state WHEN r.fenced_at IS NOT NULL THEN 'fenced' ELSE r.state END,
-                extract(epoch FROM CASE WHEN n.node_id = l.node_id THEN now() ELSE worf.sequence_range_heard(n.node_id, false, n.reported_at, false) END)::float8,
-                n.node_id = l.node_id, n.holds, n.clock
-            FROM worf.sequence_range_node n JOIN worf.sequence_range r ON r.seqoid = n.seqoid CROSS JOIN worf.local_node l
-            WHERE n.seqoid = $1 AND n.node_id <> $2
-            """, seq, peer), report =>
+        WriteArray(writer, "reports", parts["reports", seqoid], report =>
         {
             writer.WriteStartObject();
             writer.WriteNumber("node_id", report.Get<uint>(0));
@@ -1165,9 +1242,7 @@ internal static class SequenceRangeExchange
         });
 
         // Grants for the neighbor that it hasn't acknowledged.
-        WriteArray(writer, "grants", Worf.SelectCatalog(
-            "SELECT grant_id, request_id, lo, hi, kind::text, not_before FROM worf.sequence_range_grant WHERE seqoid = $1 AND grantee_id = $2 AND state = 'sent'",
-            seq, peer), grant =>
+        WriteArray(writer, "grants", parts["grants", seqoid], grant =>
         {
             writer.WriteStartObject();
             writer.WriteString("id", grant.Get<Guid>(0));
@@ -1185,14 +1260,11 @@ internal static class SequenceRangeExchange
 
         // The blocks this node holds of the epoch, which the neighbor's ledger has a record of unless it went back, while
         // an earlier epoch's root, as one whose sequence its owner dropped, may have none.
-        WriteArray(writer, "acks", Worf.SelectCatalog("""
-            SELECT block_id FROM worf.sequence_range_block
-            WHERE seqoid = $1 AND from_node = $2 AND kind IN ('n', 'p', 'i') AND state IN ('next', 'active', 'open', 'imported') AND epoch = $3
-            """, seq, peer, SpiParameter.Create(row.Get<int>(3))), received => writer.WriteStringValue(received.Get<Guid>(0)));
+        WriteArray(writer, "acks", parts["acks", seqoid], received => writer.WriteStringValue(received.Get<Guid>(0)));
         writer.WriteEndObject();
     }
 
-    private static void WriteArray(Utf8JsonWriter writer, string name, WorfRows rows, Action<WorfRow> write)
+    private static void WriteArray(Utf8JsonWriter writer, string name, IReadOnlyList<WorfRow> rows, Action<WorfRow> write)
     {
         writer.WriteStartArray(name);
         for (int i = 0; i < rows.Count; i++)
@@ -1214,7 +1286,7 @@ internal static class SequenceRangeExchange
     /// <param name="call">Whether the neighbor called this node, rather than answered its call.</param>
     /// <param name="applied">How far this node applied the neighbor's changes before its call, or zero.</param>
     /// <returns>Whether this node granted the neighbor a block, and whether it received one.</returns>
-    private static (bool Granted, bool Received) Process(WorfLocalNode node, JsonElement root, uint senderId, string senderName, bool call,
+    private static (bool Granted, bool Received, bool Changed) Process(WorfLocalNode node, JsonElement root, uint senderId, string senderName, bool call,
         ulong applied = 0)
     {
         bool granted = false;
@@ -1230,7 +1302,7 @@ internal static class SequenceRangeExchange
         if (!root.TryGetProperty("sequences", out JsonElement sequences))
         {
             OnCommit(senderId, startedAt, knowsStart);
-            return (false, false);
+            return (false, false, false);
         }
 
         // A sequence this node is fenced on that the neighbor's message doesn't carry has no block on the neighbor.
@@ -1248,10 +1320,19 @@ internal static class SequenceRangeExchange
         int resumeAt = call ? SequenceRangeHeard.ResumeAt(senderId) : 0;
         int index = -1;
         int? cutAt = null;
+        int takenIn = 0;
+        string key = UnchangedKey(node, root, call);
+        Dictionary<int, WorfEntryFingerprint>? fingerprints = heard &&
+            sequences.EnumerateArray().Any(entry => s_unchanged.ContainsKey((senderId, entry.GetProperty("name").GetWorfString() ?? "")))
+            ? Fingerprints(node, senderId, [.. sequences.EnumerateArray()], call)
+            : null;
         foreach (JsonElement entry in sequences.EnumerateArray())
         {
             index++;
-            uint? processed = Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(entry.GetProperty("name").GetWorfString()));
+            bool before = index < resumeAt || cutAt is not null;
+            WorfUnchangedEntry? same = !before && fingerprints is not null ? StillUnchanged(node, root, entry, index, senderId, call, applied, key, fingerprints) : null;
+            uint? processed = same is not null ? same.Seqoid
+                : Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(entry.GetProperty("name").GetWorfString()));
             if (processed is uint carried)
             {
                 carriedSequences.Add(carried);
@@ -1260,7 +1341,7 @@ internal static class SequenceRangeExchange
 
             // A sequence whose range row a prepared transaction holds, which it may hold across restarts, is left out, so
             // that the exchange doesn't wait on it while the other sequences' blocks wait on the exchange.
-            if (processed is uint locked && PreparedHolder(locked) is string gid)
+            if (same is null && processed is uint locked && PreparedHolder(locked) is string gid)
             {
                 if (s_preparedHolders.Add((locked, gid)))
                 {
@@ -1276,24 +1357,27 @@ internal static class SequenceRangeExchange
 
             try
             {
-                if (!heard || !Unchanged(node, root, entry, senderId, call, applied))
+                // The sequences before where the last call was cut short, in the order of their names, which every call
+                // keeps, are left to the call after the one that reaches the last, unread. A call that has taken a third of
+                // its time leaves the rest once it has taken one in, so that each call gets past where the last stopped.
+                // Once a call is cut, the rest is left too, unread.
+                bool changed = !before && same is null && (!heard || !CheckUnchanged(node, root, entry, senderId, call, applied, key));
+                bool late = changed && takenIn > 0 && takeUntil is long until && Worker.GetCurrentTimestamp() >= until;
+                if (before || late)
                 {
-                    // The sequences before where the last call was cut short, in the order of their names, which every
-                    // call keeps, are left to the call after the one that reaches the last.
-                    bool before = index < resumeAt;
-                    bool late = !before && takeUntil is long until && Worker.GetCurrentTimestamp() >= until;
-                    if (before || late)
+                    cutAt ??= late ? index : null;
+                    left.Add(entry.GetProperty("name").GetWorfString() ?? "");
+                    if (processed is uint leftOut)
                     {
-                        cutAt ??= late ? index : null;
-                        left.Add(entry.GetProperty("name").GetWorfString() ?? "");
-                        if (processed is uint leftOut)
-                        {
-                            leftSequences.Add(leftOut);
-                        }
-
-                        continue;
+                        leftSequences.Add(leftOut);
                     }
 
+                    continue;
+                }
+
+                if (changed)
+                {
+                    _ = s_unchanged.Remove((senderId, entry.GetProperty("name").GetWorfString() ?? ""));
                     PgTransaction.RunInSubtransaction(() =>
                     {
                         (bool g, bool r, bool l) = ProcessSequence(node, root, entry, senderId, senderName, call, applied);
@@ -1301,6 +1385,7 @@ internal static class SequenceRangeExchange
                         received |= r;
                         learned |= l;
                     });
+                    takenIn++;
                 }
 
                 // The reports the neighbor relays, each as of when its node made it, once taken in.
@@ -1384,7 +1469,9 @@ internal static class SequenceRangeExchange
                     SpiParameter.Create(timeline), SpiParameter.Create(Worf.FormatLsn(last)));
             }
 
-            SequenceRangeHeard.RecordLsn(senderId, sysid, timeline, call, lsn);
+            // Shared memory holds it only once this commits, so that a call that fails after taking sequences in leaves the
+            // last one for the next call to compare with.
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, () => SequenceRangeHeard.RecordLsn(senderId, sysid, timeline, call, lsn));
         }
 
         // Neighbors hear of what this node learned at their next exchange, which happens now, from the exchange worker the
@@ -1398,7 +1485,7 @@ internal static class SequenceRangeExchange
             });
         }
 
-        return (granted, received);
+        return (granted, received, takenIn > 0);
     }
 
     /// <summary>
@@ -1470,7 +1557,8 @@ internal static class SequenceRangeExchange
 
         // The neighbor's own report, the resets each node asked of the other, and its WAL position at this end of the
         // conversation: not behind the last one, or the changes of its that this node applied, nor a WAL segment past the
-        // one the tables recorded.
+        // one the tables recorded; this node has checked the report since the neighbor's server started, and has taken
+        // in the neighbor's word that it checked this node's since this server started.
         string sysid = root.GetProperty("sysid").GetWorfString() ?? "";
         long timeline = root.GetProperty("timeline").GetInt64();
         WorfRows own = Worf.Read("""
@@ -1481,17 +1569,17 @@ internal static class SequenceRangeExchange
                 AND high_water IS NOT DISTINCT FROM $10 AND watermark IS NOT DISTINCT FROM $11 AND holds IS NOT DISTINCT FROM $12
                 AND (clock IS NOT DISTINCT FROM $13 OR clock >= $13) AND ($14::pg_lsn IS NULL OR reset_done = $14::pg_lsn)
                 AND ($15::pg_lsn IS NULL OR reset_lsn IS DISTINCT FROM $15::pg_lsn) AND route IS NOT DISTINCT FROM $16
+                AND checked_start IS NOT DISTINCT FROM $17 AND reported_start IS NOT DISTINCT FROM $17
+                AND ($18::bigint IS DISTINCT FROM $19 OR confirmed_start IS NOT DISTINCT FROM $19)
             """, 1, seq, sender, SpiParameter.Create(root.GetProperty("node_name").GetWorfString()), SpiParameter.Create(sysid),
             SpiParameter.Create(timeline), SpiParameter.Create(call), SpiParameter.Create(epoch), SpiParameter.Create(state),
             SpiParameter.Create(ReportedRoute(entry).Distance), SpiParameter.Create(Nullable(entry, "high_water")),
             SpiParameter.Create(watermark), SpiParameter.Create(Holds(entry)), SpiParameter.Create(Nullable(entry, "clock")),
-            SpiParameter.Create(Text(entry, "reset")), SpiParameter.Create(Text(entry, "reset_done")), SpiParameter.Create(ReportedRoute(entry).Route));
+            SpiParameter.Create(Text(entry, "reset")), SpiParameter.Create(Text(entry, "reset_done")), SpiParameter.Create(ReportedRoute(entry).Route),
+            SpiParameter.Create(root.TryGetProperty("started_at", out JsonElement started) && started.TryGetInt64(out long since) ? since : (long?)null),
+            SpiParameter.Create(Nullable(entry, "checked_start")), SpiParameter.Create(SequenceRangeHeard.Started));
         if (own.Count == 0 || (call && Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range_back WHERE seqoid = $1 AND node_id = $2)", seq, sender)) ||
-            !Worf.TryParseLsn(own[0].Get<string?>(0) ?? "", out ulong recorded) ||
-            !Worf.TryParseLsn(root.GetProperty("wal_lsn").GetWorfString() ?? "", out ulong position) ||
-            position < Math.Max(Math.Max(recorded, AppliedFloor(applied, entry)),
-                SequenceRangeHeard.LatestLsn(senderId, ulong.Parse(sysid, CultureInfo.InvariantCulture), timeline, call)) ||
-            position - recorded >= LsnRecordedEvery)
+            !WalUnmoved(own[0].Get<string?>(0), root, entry, senderId, call, applied))
         {
             return false;
         }
@@ -1550,10 +1638,11 @@ internal static class SequenceRangeExchange
         Guid[] abandoned = [.. entry.GetProperty("held").EnumerateArray().Where(block => block.GetProperty("abandoned").GetBoolean())
             .Select(block => block.GetProperty("id").GetGuid())];
         Guid[] acks = [.. entry.GetProperty("acks").EnumerateArray().Select(ack => ack.GetGuid())];
-        if (Worf.ReadScalar<bool>("""
-            SELECT EXISTS (SELECT 1 FROM worf.sequence_range_grant WHERE grant_id = ANY ($1) AND state <> 'abandoned')
-                OR EXISTS (SELECT 1 FROM worf.sequence_range_grant WHERE grant_id = ANY ($2) AND grantee_id = $3 AND state = 'sent')
-                OR EXISTS (SELECT 1 FROM unnest($2::uuid[]) a(id) WHERE NOT EXISTS (SELECT 1 FROM worf.sequence_range_grant g WHERE g.grant_id = a.id))
+        if ((abandoned.Length > 0 || acks.Length > 0) && Worf.ReadScalar<bool>("""
+            SELECT EXISTS (SELECT 1 FROM pg_catalog.unnest($1::uuid[]) a (id) JOIN worf.sequence_range_grant g ON g.grant_id = a.id WHERE g.state <> 'abandoned')
+                OR EXISTS (SELECT 1 FROM pg_catalog.unnest($2::uuid[]) a (id) JOIN worf.sequence_range_grant g ON g.grant_id = a.id
+                    WHERE g.grantee_id = $3 AND g.state = 'sent')
+                OR EXISTS (SELECT 1 FROM pg_catalog.unnest($2::uuid[]) a (id) WHERE NOT EXISTS (SELECT 1 FROM worf.sequence_range_grant g WHERE g.grant_id = a.id))
             """, SpiParameter.Create(abandoned), SpiParameter.Create(acks), sender))
         {
             return false;
@@ -1571,6 +1660,184 @@ internal static class SequenceRangeExchange
         return parent == local[0].Get<uint?>(6) && distance == local[0].Get<int?>(7) && routed == local[0].Get<string>(1) &&
             (parent is null || !Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range_request WHERE seqoid = $1 AND parent_node <> $2)",
                 seq, SpiParameter.Create(parent.Value)));
+    }
+
+    // Whether a neighbor's WAL position, as its message gives it, is less than a WAL segment past where the tables recorded
+    // it, and not behind that, the neighbor's changes this node applied, or what shared memory holds.
+    private static bool WalUnmoved(string? recorded, JsonElement root, JsonElement entry, uint senderId, bool call, ulong applied)
+        => Worf.TryParseLsn(recorded ?? "", out ulong at) && Worf.TryParseLsn(root.GetProperty("wal_lsn").GetWorfString() ?? "", out ulong position) &&
+            position >= Math.Max(Math.Max(at, AppliedFloor(applied, entry)), SequenceRangeHeard.LatestLsn(senderId,
+                ulong.Parse(root.GetProperty("sysid").GetWorfString() ?? "", CultureInfo.InvariantCulture), root.GetProperty("timeline").GetInt64(), call)) &&
+            position - at < LsnRecordedEvery;
+
+    // What a check of a neighbor's report of a sequence depends on besides the report, the rows it reads and its reports'
+    // times: this node, whether the neighbor called it, the neighbor's server as the message gives it, this server's
+    // start and timeline, and how long a report takes to count as old.
+    private static string UnchangedKey(WorfLocalNode node, JsonElement root, bool call)
+        => string.Create(CultureInfo.InvariantCulture, $"""
+            {node.Node.Id}|{call}|{SequenceRangeHeard.Started}|{SequenceRanges.Timeline()}|{SequenceRanges.StaleAfter()}|{root.GetProperty("node_name").GetWorfString()}|{root.GetProperty("sysid").GetWorfString()}|{root.GetProperty("timeline").GetInt64()}|{(root.TryGetProperty("started_at", out JsonElement started) ? started.GetRawText() : "")}
+            """);
+
+    // A neighbor's report of a sequence as a check of it reads it: all of it but its reports of itself and of this node,
+    // which the check passes over, and the first of which says when the neighbor made it.
+    private static string EntryText(JsonElement entry, WorfLocalNode node, uint senderId)
+    {
+        StringBuilder text = new();
+        foreach (JsonProperty property in entry.EnumerateObject())
+        {
+            _ = text.Append(property.Name).Append('=');
+            if (property.NameEquals("reports"))
+            {
+                foreach ((_, JsonElement report) in Relayed(entry, node, senderId))
+                {
+                    _ = text.Append(report.GetRawText()).Append(',');
+                }
+            }
+            else
+            {
+                _ = text.Append(property.Value.GetRawText());
+            }
+
+            _ = text.Append(';');
+        }
+
+        return text.ToString();
+    }
+
+    // The nodes whose reports a neighbor's report of a sequence relays, besides this node's and its own.
+    private static IEnumerable<(uint Node, JsonElement Report)> Relayed(JsonElement entry, WorfLocalNode node, uint senderId)
+        => entry.TryGetProperty("reports", out JsonElement reports)
+            ? reports.EnumerateArray().Select(report => (Node: report.GetProperty("node_id").GetUInt32(), Report: report))
+                .Where(report => report.Node != node.Node.Id && report.Node != senderId)
+            : [];
+
+    // A report of a sequence found to change nothing before, which the neighbor's message gives again as it was, while
+    // what checking it read is as it was, and steady, the nodes it relays reports of still have room in shared memory,
+    // and the neighbor's WAL position is still where the tables recorded it; or null.
+    private static WorfUnchangedEntry? StillUnchanged(WorfLocalNode node, JsonElement root, JsonElement entry, int index, uint senderId, bool call, ulong applied,
+        string key, Dictionary<int, WorfEntryFingerprint> fingerprints)
+        => s_unchanged.TryGetValue((senderId, entry.GetProperty("name").GetWorfString() ?? ""), out WorfUnchangedEntry? same) && same.Key == key &&
+            fingerprints.TryGetValue(index, out WorfEntryFingerprint? read) && read.Steady && read.Seqoid == same.Seqoid && read.Fingerprint == same.Fingerprint &&
+            same.Entry == EntryText(entry, node, senderId) && same.Relayed.All(SequenceRangeHeard.Holds) && WalUnmoved(same.Recorded, root, entry, senderId, call, applied)
+            ? same
+            : null;
+
+    // Checks a neighbor's report of a sequence, as Unchanged does, and keeps one found to change nothing with what the
+    // check read, as it began, unless that may change by itself: a report that asks for blocks or grants any, which the
+    // check reads more for, one with a watermark beyond this node's own, which the check bounds by the sequence's
+    // ledger, or that relays a report of a node the tables have none of, or a report whose time runs out within
+    // seconds, or a range row a prepared transaction holds.
+    private static bool CheckUnchanged(WorfLocalNode node, JsonElement root, JsonElement entry, uint senderId, bool call, ulong applied, string key)
+    {
+        string name = entry.GetProperty("name").GetWorfString() ?? "";
+        _ = s_unchanged.Remove((senderId, name));
+        bool simple = entry.GetProperty("requests").GetArrayLength() == 0 && entry.GetProperty("grants").GetArrayLength() == 0;
+        WorfEntryFingerprint? read = simple && Fingerprints(node, senderId, [entry], call).TryGetValue(0, out WorfEntryFingerprint? found) ? found : null;
+        if (!Unchanged(node, root, entry, senderId, call, applied))
+        {
+            return false;
+        }
+
+        if (read is { Steady: true })
+        {
+            bool covered(long? mark) => mark is not long value || (read.Watermark is long own && (read.Ascending ? value <= own : value >= own));
+            List<(uint Node, JsonElement Report)> relayed = [.. Relayed(entry, node, senderId)];
+            if (covered(Nullable(entry, "watermark")) && relayed.All(report => read.Nodes.Contains(report.Node) && covered(Nullable(report.Report, "watermark"))))
+            {
+                s_unchanged[(senderId, name)] = new WorfUnchangedEntry(EntryText(entry, node, senderId), key, read.Seqoid, read.Fingerprint, read.Recorded,
+                    [.. relayed.Select(report => report.Node)]);
+            }
+        }
+
+        return true;
+    }
+
+    // What checks of a neighbor's reports of sequences read, by each report's place in the list, in one statement: the
+    // versions of the rows the checks read, the grants the reports acknowledge or give up among them, whether a prepared
+    // transaction holds the range row, which nodes' reports are still new, and those the reports relay as of when the
+    // neighbor's node made them, the sequence's watermark and direction, the WAL position the tables recorded of the
+    // neighbor, and whether a report's time runs out soon.
+    private static Dictionary<int, WorfEntryFingerprint> Fingerprints(WorfLocalNode node, uint senderId, List<JsonElement> entries, bool call)
+    {
+        List<int> places = [];
+        List<long> nodes = [];
+        List<double> times = [];
+        List<bool> timed = [];
+        List<int> granted = [];
+        List<Guid> grants = [];
+        for (int i = 0; i < entries.Count; i++)
+        {
+            foreach (Guid grant in entries[i].GetProperty("acks").EnumerateArray().Select(ack => ack.GetGuid())
+                .Concat(entries[i].GetProperty("held").EnumerateArray().Where(block => block.GetProperty("abandoned").GetBoolean()).Select(block => block.GetProperty("id").GetGuid())))
+            {
+                granted.Add(i + 1);
+                grants.Add(grant);
+            }
+
+            foreach ((uint reported, JsonElement report) in Relayed(entries[i], node, senderId))
+            {
+                bool known = report.TryGetProperty("reported_at", out JsonElement at) && at.ValueKind == JsonValueKind.Number;
+                places.Add(i + 1);
+                nodes.Add(reported);
+                timed.Add(known);
+                times.Add(known ? at.GetDouble() : 0);
+            }
+        }
+
+        WorfRows rows = Worf.Read("""
+            SELECT e.ord::pg_catalog.int4, r.seqoid::pg_catalog.oid,
+                pg_catalog.concat_ws('|', r.xmin, r.ctid, r.xmax, s.xmin, s.ctid, c.xmin, c.ctid, ns.xmin, ns.ctid,
+                    (SELECT a.xmin::pg_catalog.text || a.ctid::pg_catalog.text FROM worf.sequence_range_absent a WHERE a.seqoid = r.seqoid AND a.node_id = $2),
+                    (SELECT b.xmin::pg_catalog.text || b.ctid::pg_catalog.text FROM worf.sequence_range_back b WHERE b.seqoid = r.seqoid AND b.node_id = $2),
+                    n.versions,
+                    (SELECT pg_catalog.string_agg(q.xmin::pg_catalog.text || q.ctid::pg_catalog.text, ',' ORDER BY q.ctid)
+                        FROM worf.sequence_range_request q WHERE q.seqoid = r.seqoid),
+                    p.fresh, g.versions),
+                (SELECT CASE WHEN $8 THEN o.wal_lsn ELSE o.reply_lsn END::pg_catalog.text FROM worf.sequence_range_node o
+                    WHERE o.seqoid = r.seqoid AND o.node_id = $2 AND o.via_node = o.node_id),
+                r.watermark, s.seqincrement > 0, coalesce(n.ids, '{}'),
+                coalesce(n.turns, 'infinity') > now() + interval '2 seconds' AND NOT coalesce(p.unsteady, false)
+                    AND NOT r.xmax = ANY (ARRAY(SELECT x.transaction FROM pg_catalog.pg_prepared_xacts x))
+            FROM pg_catalog.unnest($1::pg_catalog.text[]) WITH ORDINALITY e (name, ord)
+                JOIN worf.sequence_range r ON r.seqoid = pg_catalog.to_regclass(e.name)
+                JOIN pg_catalog.pg_sequence s ON s.seqrelid = r.seqoid
+                JOIN pg_catalog.pg_class c ON c.oid = r.seqoid
+                JOIN pg_catalog.pg_namespace ns ON ns.oid = c.relnamespace
+                CROSS JOIN LATERAL (
+                    SELECT pg_catalog.string_agg(pg_catalog.concat_ws(':', d.node_id, d.xmin, d.ctid, h.at > now() - $3::interval, h.at >= now() - $3::interval), ','
+                            ORDER BY d.node_id) AS versions,
+                        pg_catalog.array_agg(d.node_id::pg_catalog.int8 ORDER BY d.node_id) AS ids,
+                        pg_catalog.min(h.at + $3::interval) FILTER (WHERE h.at >= now() - $3::interval) AS turns
+                    FROM worf.sequence_range_node d CROSS JOIN LATERAL (SELECT worf.sequence_range_heard(d.node_id, true, d.reported_at, false) AS at) h
+                    WHERE d.seqoid = r.seqoid) n
+                LEFT JOIN (
+                    SELECT t.ord, pg_catalog.string_agg(pg_catalog.concat_ws(':', t.node_id,
+                            least(coalesce(CASE WHEN t.timed THEN pg_catalog.to_timestamp(t.reported_at) END, now()), now())
+                                <= worf.sequence_range_heard(d.node_id, false, d.reported_at, false)), ',' ORDER BY t.node_id) AS fresh,
+                        pg_catalog.bool_or(NOT t.timed OR pg_catalog.to_timestamp(t.reported_at) > now()) AS unsteady
+                    FROM ROWS FROM (pg_catalog.unnest($4::pg_catalog.int4[]), pg_catalog.unnest($5::pg_catalog.int8[]), pg_catalog.unnest($6::pg_catalog.float8[]),
+                            pg_catalog.unnest($7::pg_catalog.bool[])) AS t (ord, node_id, reported_at, timed)
+                        LEFT JOIN worf.sequence_range_node d
+                            ON d.seqoid = pg_catalog.to_regclass(($1::pg_catalog.text[])[t.ord]) AND d.node_id = t.node_id::pg_catalog.oid
+                    GROUP BY t.ord) p ON p.ord = e.ord
+                LEFT JOIN (
+                    SELECT t.ord, pg_catalog.string_agg(t.id::pg_catalog.text || ':' || coalesce(k.xmin::pg_catalog.text || k.ctid::pg_catalog.text, ''), ','
+                            ORDER BY t.id) AS versions
+                    FROM ROWS FROM (pg_catalog.unnest($9::pg_catalog.int4[]), pg_catalog.unnest($10::pg_catalog.uuid[])) AS t (ord, id)
+                        LEFT JOIN worf.sequence_range_grant k ON k.grant_id = t.id
+                    GROUP BY t.ord) g ON g.ord = e.ord
+            """, 0, SpiParameter.Create(entries.Select(entry => entry.GetProperty("name").GetWorfString() ?? "").ToArray()), SpiParameter.Create(senderId),
+            SpiParameter.Create(SequenceRanges.StaleAfter()), SpiParameter.Create(places.ToArray()), SpiParameter.Create(nodes.ToArray()),
+            SpiParameter.Create(times.ToArray()), SpiParameter.Create(timed.ToArray()), SpiParameter.Create(call), SpiParameter.Create(granted.ToArray()),
+            SpiParameter.Create(grants.ToArray()));
+        Dictionary<int, WorfEntryFingerprint> found = [];
+        foreach (WorfRow row in rows)
+        {
+            found[row.Get<int>(0) - 1] = new WorfEntryFingerprint(row.Get<uint>(1), row.Get<string>(2), row.Get<string?>(3), row.Get<long?>(4), row.Get<bool>(5),
+                [.. row.Get<long[]>(6).Select(id => (uint)id)], row.Get<bool>(7));
+        }
+
+        return found;
     }
 
     /// <summary>
@@ -1747,6 +2014,10 @@ internal static class SequenceRangeExchange
         string sysid = root.GetProperty("sysid").GetWorfString() ?? "";
         long timeline = root.GetProperty("timeline").GetInt64();
         string walLsn = root.GetProperty("wal_lsn").GetWorfString() ?? "0/0";
+        long? senderStart = root.TryGetProperty("started_at", out JsonElement senderStarted) && senderStarted.TryGetInt64(out long startedSince)
+            ? startedSince : null;
+        ulong? senderStartLsn = root.TryGetProperty("start_lsn", out JsonElement startLsnText) && startLsnText.ValueKind == JsonValueKind.String &&
+            Worf.TryParseLsn(startLsnText.GetString() ?? "", out ulong startedFrom) ? startedFrom : null;
 
         // The root's start, once the owner has started it, reaches every node, so that each allocator refuses a node
         // that joins with values reaching into it.
@@ -1767,19 +2038,43 @@ internal static class SequenceRangeExchange
         // in an answer, how far this node applied the neighbor's changes, which neither its restart nor its crash
         // forgets, and which stays put while the neighbor is idle.
         _ = Worf.Execute("SELECT 1 FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2 FOR UPDATE", seq, sender);
-        WorfRows stored = Worf.Read(
-            "SELECT CASE WHEN $5 THEN wal_lsn ELSE reply_lsn END::text FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2 AND sysid = $3::numeric AND timeline = $4",
-            1, seq, sender, SpiParameter.Create(sysid), SpiParameter.Create(timeline), SpiParameter.Create(call));
-        string? kept = call ? Worf.ReadScalar<string?>(
-            "DELETE FROM worf.sequence_range_back WHERE seqoid = $1 AND node_id = $2 AND sysid = $3::numeric AND timeline = $4 RETURNING lsn::text",
-            seq, sender, SpiParameter.Create(sysid), SpiParameter.Create(timeline)) : null;
+        WorfRows stored = Worf.Read("""
+            SELECT CASE WHEN $5 THEN wal_lsn ELSE reply_lsn END::text, reported_start
+            FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2 AND sysid = $3::numeric AND timeline = $4
+            """, 1, seq, sender, SpiParameter.Create(sysid), SpiParameter.Create(timeline), SpiParameter.Create(call));
+        // A position kept from another system or timeline of the neighbor's compares with nothing it reports now, and goes.
+        string? kept = null;
+        if (call)
+        {
+            _ = Worf.Execute("DELETE FROM worf.sequence_range_back WHERE seqoid = $1 AND node_id = $2 AND (sysid <> $3::numeric OR timeline <> $4)",
+                seq, sender, SpiParameter.Create(sysid), SpiParameter.Create(timeline));
+            kept = Worf.ReadScalar<string?>(
+                "DELETE FROM worf.sequence_range_back WHERE seqoid = $1 AND node_id = $2 AND sysid = $3::numeric AND timeline = $4 RETURNING lsn::text",
+                seq, sender, SpiParameter.Create(sysid), SpiParameter.Create(timeline));
+        }
+
         ulong latest = Math.Max(Math.Max(AppliedFloor(applied, entry), kept is not null && Worf.TryParseLsn(kept, out ulong left) ? left : 0),
             stored.Count > 0 ? Math.Max(Worf.TryParseLsn(stored[0].Get<string?>(0) ?? "", out ulong recorded) ? recorded : 0,
                 SequenceRangeHeard.LatestLsn(senderId, ulong.Parse(sysid, CultureInfo.InvariantCulture), timeline, call)) : 0);
         string? rolledBack = null;
+        string backTo = walLsn;
         if (Worf.TryParseLsn(walLsn, out ulong position) && latest > position)
         {
             rolledBack = Worf.FormatLsn(latest);
+        }
+
+        // A neighbor whose server started from a WAL position before one it reported for the sequence under an earlier
+        // start went back as it started, as one restored from a backup does, though its own WAL may since have passed the
+        // position it reported.
+        else if (stored.Count > 0 && stored[0].Get<long?>(1) is long reportedStart && senderStart is long currentStart && reportedStart != currentStart &&
+            senderStartLsn is ulong startLsn && Worf.TryParseLsn(stored[0].Get<string?>(0) ?? "", out ulong reportedLsn) && reportedLsn > startLsn)
+        {
+            rolledBack = Worf.FormatLsn(reportedLsn);
+            backTo = Worf.FormatLsn(startLsn);
+        }
+
+        if (rolledBack is not null)
+        {
             _ = Worf.Execute("UPDATE worf.sequence_range_node SET reset_lsn = $3::pg_lsn WHERE seqoid = $1 AND node_id = $2", seq, sender,
                 SpiParameter.Create(rolledBack));
         }
@@ -1796,7 +2091,7 @@ internal static class SequenceRangeExchange
         }
         else if (rolledBack is not null)
         {
-            WorfLog.Warning($"sequence {info.Name}: node {senderName}'s WAL position moved back from {rolledBack} to {walLsn}, so it must reset its blocks");
+            WorfLog.Warning($"sequence {info.Name}: node {senderName}'s WAL position moved back from {rolledBack} to {backTo}, so it must reset its blocks");
         }
 
         // Until it resets, a neighbor that went back may answer from a ledger that lost grants, and ask again for blocks
@@ -1808,23 +2103,34 @@ internal static class SequenceRangeExchange
             _ = Worf.Execute("DELETE FROM worf.sequence_range_request WHERE seqoid = $1 AND parent_node = $2", seq, sender);
         }
 
+        // A neighbor's word that it checked this node's report since this server started confirms the sequence's blocks
+        // it granted, which backends read again once this commits.
+        if (Nullable(entry, "checked_start") == SequenceRangeHeard.Started && !Worf.ReadScalar<bool>(
+            "SELECT EXISTS (SELECT 1 FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2 AND confirmed_start = $3)",
+            seq, sender, SpiParameter.Create(SequenceRangeHeard.Started)))
+        {
+            SequenceRanges.ChangedOnCommit();
+        }
+
         _ = Worf.Execute("""
             INSERT INTO worf.sequence_range_node (seqoid, node_id, node_name, via_node, sysid, timeline, wal_lsn, reply_lsn, epoch, state, distance,
-                high_water, watermark, reported_at, holds, clock, route)
+                high_water, watermark, reported_at, holds, clock, route, reported_start, confirmed_start)
             VALUES ($1, $2, $3, $2, $4::numeric, $5, CASE WHEN $12 THEN $6::pg_lsn END, CASE WHEN NOT $12 THEN $6::pg_lsn END, $7, $8, $9, $10, $11, now(),
-                $13, $14, $15)
+                $13, $14, $15, $16, $17)
             ON CONFLICT (seqoid, node_id) DO UPDATE SET node_name = excluded.node_name, via_node = excluded.via_node,
                 sysid = excluded.sysid, timeline = excluded.timeline,
                 wal_lsn = CASE WHEN $12 THEN excluded.wal_lsn ELSE sequence_range_node.wal_lsn END,
                 reply_lsn = CASE WHEN NOT $12 THEN excluded.reply_lsn ELSE sequence_range_node.reply_lsn END, epoch = excluded.epoch,
                 state = excluded.state, distance = excluded.distance, high_water = excluded.high_water, watermark = excluded.watermark,
                 reported_at = excluded.reported_at, holds = excluded.holds, clock = greatest(sequence_range_node.clock, excluded.clock),
-                route = excluded.route
+                route = excluded.route, reported_start = excluded.reported_start,
+                confirmed_start = coalesce(excluded.confirmed_start, sequence_range_node.confirmed_start)
             """, seq, sender, SpiParameter.Create(senderName),
             SpiParameter.Create(sysid), SpiParameter.Create(timeline), SpiParameter.Create(walLsn), SpiParameter.Create(epoch),
             SpiParameter.Create(entry.GetProperty("state").GetWorfString()), SpiParameter.Create(ReportedRoute(entry).Distance),
             SpiParameter.Create(high), SpiParameter.Create(watermark), SpiParameter.Create(call), SpiParameter.Create(Holds(entry)),
-            SpiParameter.Create(Nullable(entry, "clock")), SpiParameter.Create(ReportedRoute(entry).Route));
+            SpiParameter.Create(Nullable(entry, "clock")), SpiParameter.Create(ReportedRoute(entry).Route), SpiParameter.Create(senderStart),
+            SpiParameter.Create(Nullable(entry, "checked_start") == SequenceRangeHeard.Started ? SequenceRangeHeard.Started : (long?)null));
 
         // A neighbor that worf.activate_sequence_range stopped waiting for, as gone, may hold values that the fence's lift
         // gave out again, so once it's heard from again after the lift, it's asked to reset, at a WAL position of its own,
@@ -1876,7 +2182,8 @@ internal static class SequenceRangeExchange
                 _ = Worf.Execute("UPDATE worf.sequence_range_node SET reset_done = $3::pg_lsn WHERE seqoid = $1 AND node_id = $2", seq, sender,
                     SpiParameter.Create(reset));
             }
-            else if (SequenceRangeHeard.MayReset(senderId, fromGrantor) is long window && Worf.Execute("""
+            else if ((UnconfirmedFrom(seq, sender) ? Worker.GetCurrentTimestamp() : SequenceRangeHeard.MayReset(senderId, fromGrantor)) is long window &&
+                Worf.Execute("""
                 UPDATE worf.sequence_range_node SET reset_done = $3::pg_lsn, reset_at = pg_catalog.clock_timestamp()
                 WHERE seqoid = $1 AND node_id = $2 AND (reset_at IS NULL OR reset_at < $4)
                 """, seq, sender, SpiParameter.Create(reset), SpiParameter.Create(new PgTimestampTz(window))) > 0)
@@ -2072,6 +2379,17 @@ internal static class SequenceRangeExchange
             SequenceRanges.ActivateWhenReported(seqoid, node);
         }
 
+        // This node has checked the neighbor's report of the sequence since the neighbor's server started, unless it found
+        // the neighbor went back, or still asks it to reset, which its messages say back for the sequence, so that the
+        // neighbor draws from the sequence's blocks again.
+        if (senderStart is long checkedStart)
+        {
+            _ = Worf.Execute("""
+                UPDATE worf.sequence_range_node SET checked_start = CASE WHEN $4 OR reset_lsn IS NOT NULL THEN NULL ELSE $3 END
+                WHERE seqoid = $1 AND node_id = $2 AND checked_start IS DISTINCT FROM CASE WHEN $4 OR reset_lsn IS NOT NULL THEN NULL ELSE $3 END
+                """, seq, sender, SpiParameter.Create(checkedStart), SpiParameter.Create(wentBack));
+        }
+
         // An answer that changed nothing is noted in shared memory alone, and one that did here, under the range row's lock,
         // which this transaction takes for each sequence in turn, in the order every exchange takes them.
         if (!call)
@@ -2176,7 +2494,7 @@ internal static class SequenceRangeExchange
     private static bool Overlaps(uint seqoid, Guid id, long lo, long hi)
         => Worf.SelectCatalog("""
             SELECT 1 FROM worf.sequence_range_block
-            WHERE seqoid = $1 AND kind IN ('n', 'p', 'i') AND lo <= $3 AND $2 <= hi AND block_id <> $4
+            WHERE numrange(lo, hi, '[]') && numrange($2, $3, '[]') AND seqoid = $1 AND kind IN ('n', 'p', 'i') AND block_id <> $4
                 AND (seqoid <> 'worf.snowflake_node'::regclass OR state IN ('next', 'active') OR state = 'abandoned' AND retired_at > now() - $5::interval)
             LIMIT 1
             """, SpiParameter.Create(seqoid), SpiParameter.Create(lo), SpiParameter.Create(hi), SpiParameter.Create(id),
@@ -2495,6 +2813,17 @@ internal static class SequenceRangeExchange
 
         s_onCommit.Add((senderId, startedAt, confirmed));
     }
+
+    /// <summary>
+    /// Checks whether a neighbor is the parent that grants this node a sequence's blocks and hasn't said it checked this
+    /// node's report of the sequence since this server started, so that the node draws nothing from the sequence until
+    /// it has: a request to reset from it is taken at once, whatever the window, as it gives up only blocks the node
+    /// hasn't drawn from since it started.
+    /// </summary>
+    private static bool UnconfirmedFrom(SpiParameter seq, SpiParameter sender) => Worf.ReadScalar<bool>("""
+        SELECT EXISTS (SELECT 1 FROM worf.sequence_range r WHERE r.seqoid = $1 AND r.parent_node = $2)
+            AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_node n WHERE n.seqoid = $1 AND n.node_id = $2 AND n.confirmed_start = $3)
+        """, seq, sender, SpiParameter.Create(SequenceRangeHeard.Started));
 
     /// <summary>
     /// Gets the prepared transaction that holds a sequence's range row, as one that locked or updated it, or null.

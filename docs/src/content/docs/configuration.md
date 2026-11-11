@@ -270,9 +270,12 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   connect as. The default is `on`.
 
 - `worf.sequence_range_check_interval`
-  How often the range worker checks each managed sequence, switching it to
-  its next block when the active one runs low. A session that passes half a
-  block, or reaches its last twentieth, wakes it at once. The default is `1s`.
+  How often the range worker looks at each managed sequence, switching it to
+  its next block when the active one runs low. A sequence that hasn't moved,
+  whose blocks no committed change has touched, and that no statement waits
+  on, is checked in full only every ten intervals, and at least a second
+  apart. A session that passes half a block, or reaches its last twentieth,
+  wakes it at once. The default is `1s`.
 
 - `worf.sequence_range_exchange_interval`
   How often each node exchanges sequence range reports with its neighbors

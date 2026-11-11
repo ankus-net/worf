@@ -2588,6 +2588,17 @@ internal static unsafe partial class Apply
                     HandleStartup(&s);
                     break;
 
+                // The provider's word to call it now about sequence ranges, as an owner that granted itself a block sends.
+                case 'W':
+                    if (MySubscription is WorfSubscription sub)
+                    {
+                        WorfLog.Debug2($"node {sub.Origin.Name} asked this node to call it about sequence ranges");
+                        SequenceRangeHeard.CallFor(sub.Origin.Id);
+                        SequenceRangeExchangeWorker.Wake();
+                    }
+
+                    break;
+
                 default:
                     throw new PgException(PgSqlStates.InternalError, $"unknown action of type {action}");
             }

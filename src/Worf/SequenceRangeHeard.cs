@@ -198,6 +198,40 @@ internal static class SequenceRangeHeard
     }
 
     /// <summary>
+    /// Gets the WAL position this server started from, as the checkpoint it started from, or the one that ended its
+    /// recovery, gives it, read once, or <see cref="ulong.MaxValue"/> when a later checkpoint took that one's place before
+    /// it was read. A neighbor that heard of a later position from this node before it started knows from it that the
+    /// node went back.
+    /// </summary>
+    internal static ulong StartLsn
+    {
+        get
+        {
+            using (PgLwLockShareGuard<WorfHeardTable, WorfHeard> shared = Nodes.Share())
+            {
+                if (shared.Header.StartLsn != 0)
+                {
+                    return shared.Header.StartLsn;
+                }
+            }
+
+            WorfRows checkpoint = Worf.Read("SELECT redo_lsn::text, checkpoint_time <= $1 FROM pg_catalog.pg_control_checkpoint()", 1,
+                SpiParameter.Create(new PgTimestampTz(Started + 60_000_000L)));
+            ulong lsn = checkpoint.Count > 0 && checkpoint[0].Get<bool>(1) && Worf.TryParseLsn(checkpoint[0].Get<string?>(0) ?? "", out ulong redo)
+                ? redo : ulong.MaxValue;
+            using PgLwLockExclusiveGuard<WorfHeardTable, WorfHeard> guard = Nodes.Exclusive();
+            if (guard.Header.StartLsn == 0)
+            {
+                WorfHeardTable header = guard.Header;
+                header.StartLsn = lsn;
+                guard.Header = header;
+            }
+
+            return guard.Header.StartLsn;
+        }
+    }
+
+    /// <summary>
     /// Records when a node's server started, as its message says.
     /// </summary>
     /// <param name="nodeId">The node.</param>
@@ -331,6 +365,43 @@ internal static class SequenceRangeHeard
             heard.WantedAt = Worker.GetCurrentTimestamp();
             guard[slot] = heard;
         }
+    }
+
+    /// <summary>
+    /// Notes that a node, this server's provider, asked this server to call it, which makes the exchange with it due.
+    /// </summary>
+    /// <param name="nodeId">The node.</param>
+    internal static void CallFor(uint nodeId)
+    {
+        using PgLwLockExclusiveGuard<WorfHeardTable, WorfHeard> guard = Nodes.Exclusive();
+        int slot = Find(guard, nodeId, nodeId);
+        if (slot >= 0)
+        {
+            WorfHeard heard = guard[slot];
+            heard.CallForAt = Worker.GetCurrentTimestamp();
+            guard[slot] = heard;
+        }
+    }
+
+    /// <summary>
+    /// Checks whether a node asked this server to call it since a time.
+    /// </summary>
+    /// <param name="nodeId">The node.</param>
+    /// <param name="since">The time.</param>
+    /// <returns>Whether it did.</returns>
+    internal static bool CalledFor(uint nodeId, long since)
+    {
+        uint dboid = DatabaseId();
+        using PgLwLockShareGuard<WorfHeardTable, WorfHeard> guard = Nodes.Share();
+        for (int i = 0; i < guard.Length; i++)
+        {
+            if (guard[i].Dboid == dboid && guard[i].NodeId == nodeId)
+            {
+                return guard[i].CallForAt >= since;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>

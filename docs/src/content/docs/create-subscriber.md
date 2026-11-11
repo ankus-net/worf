@@ -42,7 +42,9 @@ worf_create_subscriber -D /path/to/new/datadir \
 | `--recovery-conf` | Path to the template recovery configuration |
 
 `worf_create_subscriber` runs the `pg_basebackup`, `pg_ctl` and `pg_controldata`
-beside it, so install it in the PostgreSQL installation's `bin` directory.
+beside it, so install it in the PostgreSQL installation's `bin` directory. The
+server a run leaves running writes its log to `worf_subscriber.log` in the data
+directory.
 
 A run that fails, or is stopped with Ctrl-C or `SIGTERM`, cancels what it waits
 for, a connection or a command on a server that doesn't answer too, rolls back,
@@ -67,20 +69,18 @@ server running, and its transaction rolls back once the server finds it gone. Th
 restore point reached in the same transaction, which its apply worker starts
 from, and its replication origin gets progress only as the worker applies, so
 neither leaves progress for a later origin. A run on a data directory whose server
-is running fails, as does one on a data directory whose timeline is past the
-provider's, as an earlier run's promotion leaves it, or that has run as a server
-of its own, out of recovery, as one started without its `standby.signal` does,
-which writes WAL the provider doesn't have, or, once it has started, whose
-latest checkpoint isn't a checkpoint record of the provider's WAL with the redo
-point its `pg_control` holds, as one that did so and stopped in recovery later
-has, or lies in WAL the provider has removed while the directory's own WAL
-doesn't hold it, or doesn't run on into the WAL the provider still has as the
-provider's own: from the checkpoint, the directory's records must each link back
-to the one before, whole as their checksums show, and run into the provider's
-first segment, where they must be the provider's bytes up to the end of the
-first record that begins there, as a standby's are and those of one that left
-the provider's WAL aren't. A directory whose WAL ends where the provider's
-begins, or before, can't be told from one that left it, and is refused too;
-each leaves the data directory as it is. The
-run reads those records from the provider's `pg_wal` with `pg_read_binary_file`,
-and can't tell when the provider doesn't let it.
+is running fails, as does one whose WAL isn't the provider's, which leaves the
+data directory as it is. The run lists the WAL the provider still has with
+`pg_ls_waldir`, and requires the directory's timeline history files to be the
+provider's, its WAL on a timeline the provider has left to end by the
+provider's switch from that timeline, which an earlier run's promotion, or a
+server started without its `standby.signal`, writes past, and, from its latest
+checkpoint's redo point on, its records to each link back to the one before, whole as their checksums
+show, and every byte of its WAL that the provider still has too to be the
+provider's, as a standby's are and those of one that left the provider's WAL
+aren't. A directory whose WAL shares none with what the provider still has, as
+one whose WAL ends where the provider's begins, can't be told from one that
+left it, and is refused too, with a hint to keep the provider's WAL from a
+standby's position with a physical replication slot, as `pg_basebackup -C -S`
+makes, or `wal_keep_size`. The run reads the provider's WAL with
+`pg_read_binary_file`, and can't tell when the provider doesn't let it.

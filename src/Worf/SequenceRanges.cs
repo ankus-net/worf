@@ -47,6 +47,7 @@ using Ankus.Postgres;
     );
 
     CREATE INDEX sequence_range_block_seqoid ON worf.sequence_range_block (seqoid, epoch);
+    CREATE INDEX sequence_range_block_span ON worf.sequence_range_block USING gist (numrange(lo, hi, '[]'));
 
     CREATE TABLE worf.sequence_range_restore (
         name text PRIMARY KEY,
@@ -83,6 +84,7 @@ using Ankus.Postgres;
     );
 
     CREATE INDEX sequence_range_grant_seqoid ON worf.sequence_range_grant (seqoid, grantee_id);
+    CREATE INDEX sequence_range_grant_span ON worf.sequence_range_grant USING gist (numrange(lo, hi, '[]'));
     CREATE INDEX sequence_range_grant_from_block ON worf.sequence_range_grant (from_block);
 
     CREATE TABLE worf.sequence_range_request (
@@ -122,6 +124,9 @@ using Ankus.Postgres;
         holds bigint[],
         clock bigint,
         reported_at timestamptz NOT NULL,
+        checked_start bigint,
+        confirmed_start bigint,
+        reported_start bigint,
         PRIMARY KEY (seqoid, node_id)
     );
 
@@ -1568,7 +1573,7 @@ internal static unsafe partial class SequenceRanges
                 AlterTableType.AT_ColumnDefault => name is not null && ColumnUsesManaged(relid, name) && (cmd->def is null || HasDefault(relid, name)),
                 AlterTableType.AT_AddIdentity or AlterTableType.AT_SetIdentity or AlterTableType.AT_DropIdentity =>
                     name is not null && ColumnUsesManaged(relid, name),
-                AlterTableType.AT_DisableTrig or AlterTableType.AT_EnableReplicaTrig => name is not null && IsGuardName(name),
+                AlterTableType.AT_DisableTrig or AlterTableType.AT_EnableReplicaTrig or AlterTableType.AT_EnableTrig => name is not null && IsGuardName(name),
                 AlterTableType.AT_DisableTrigAll or AlterTableType.AT_DisableTrigUser => IsGuarded(relid),
 
                 // A table's sequences follow it to unlogged.
@@ -1815,8 +1820,38 @@ internal static unsafe partial class SequenceRanges
     /// <param name="parsetree">The statement, before it runs.</param>
     /// <returns>Whether to skip it.</returns>
     internal static bool SkipsDumpedGuard(Node* parsetree)
-        => parsetree->type == NodeTag.T_CreateTrigStmt && IsGuardName(Worf.FromServer(((CreateTrigStmt*)parsetree)->trigname)) &&
-            (DdlReplication.Restoring() || IsGuardFunction(((CreateTrigStmt*)parsetree)->funcname));
+        => (parsetree->type == NodeTag.T_CreateTrigStmt && IsGuardName(Worf.FromServer(((CreateTrigStmt*)parsetree)->trigname)) &&
+                (DdlReplication.Restoring() || IsGuardFunction(((CreateTrigStmt*)parsetree)->funcname))) ||
+            EnablesGuardsAlways(parsetree);
+
+    /// <summary>
+    /// Checks whether a statement only has guards fire in every session, as a dump of a table with them has it, which
+    /// worf's guards already do, so that a restore whose guard was skipped doesn't fail on it.
+    /// </summary>
+    private static bool EnablesGuardsAlways(Node* parsetree)
+    {
+        if (parsetree->type != NodeTag.T_AlterTableStmt)
+        {
+            return false;
+        }
+
+        List* cmds = ((AlterTableStmt*)parsetree)->cmds;
+        if (cmds is null || cmds->length == 0)
+        {
+            return false;
+        }
+
+        for (int i = 0; i < cmds->length; i++)
+        {
+            AlterTableCmd* cmd = (AlterTableCmd*)cmds->elements[i].ptr_value;
+            if (cmd->subtype != AlterTableType.AT_EnableAlwaysTrig || cmd->name is null || !IsGuardName(Worf.FromServer(cmd->name)))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
 
     /// <summary>
     /// Checks whether a trigger's function is the guard's.
@@ -2851,6 +2886,24 @@ internal static unsafe partial class SequenceRanges
         ObjectAddress created = TableOwner.Run(relid, () => NativeMethods.CreateTrigger(trigger, text, relid, 0, 0, 0, function, 0, (Node*)when, false, false));
         NativeMethods.recordDependencyOnExpr(&created, (Node*)when, (List*)rtable, DependencyType.DEPENDENCY_NORMAL);
         NativeMethods.CommandCounterIncrement();
+
+        // The trigger fires in every session, as ENABLE ALWAYS has it, so that rows another subscription's apply writes,
+        // with session_replication_role replica, are checked too.
+        RelationData* table = NativeMethods.table_open(relid, (int)PgLockMode.ShareRowExclusive);
+        try
+        {
+#if ANKUS_PG15
+            NativeMethods.EnableDisableTrigger(table, trigger->trigname, (sbyte)'A', false, (int)PgLockMode.ShareRowExclusive);
+#else
+            NativeMethods.EnableDisableTrigger(table, trigger->trigname, 0, (sbyte)'A', false, true, (int)PgLockMode.ShareRowExclusive);
+#endif
+        }
+        finally
+        {
+            NativeMethods.table_close(table, (int)PgLockMode.None);
+        }
+
+        NativeMethods.CommandCounterIncrement();
     }
 
     /// <summary>
@@ -3230,7 +3283,7 @@ internal static unsafe partial class SequenceRanges
         WorfRows overlap = Worf.SelectCatalog("""
             SELECT a.grantee_name::text, a.lo, a.hi, b.grantee_name::text, b.lo, b.hi, a.grantee_id, b.grantee_id
             FROM worf.sequence_range_grant a JOIN worf.sequence_range_grant b
-                ON b.seqoid = a.seqoid AND a.grant_id < b.grant_id AND a.lo <= b.hi AND b.lo <= a.hi
+                ON b.seqoid = a.seqoid AND a.grant_id < b.grant_id AND numrange(b.lo, b.hi, '[]') && numrange(a.lo, a.hi, '[]')
             WHERE a.seqoid = $1 AND a.kind <> 'x' AND b.kind <> 'x' AND a.state NOT IN ('unclaimed', 'overlapped') AND b.state NOT IN ('unclaimed', 'overlapped')
                 AND (a.seqoid <> 'worf.snowflake_node'::regclass OR a.state <> 'abandoned' AND b.state <> 'abandoned')
             LIMIT 1
@@ -3257,7 +3310,7 @@ internal static unsafe partial class SequenceRanges
                 WHERE g.seqoid = $1 AND g.kind <> 'x' AND g.state NOT IN ('unclaimed', 'overlapped') AND EXISTS (
                     SELECT 1 FROM worf.sequence_range_grant o
                     WHERE o.seqoid = g.seqoid AND o.grant_id <> g.grant_id AND o.kind <> 'x' AND o.state NOT IN ('unclaimed', 'overlapped')
-                        AND g.lo <= o.hi AND o.lo <= g.hi
+                        AND numrange(o.lo, o.hi, '[]') && numrange(g.lo, g.hi, '[]')
                         AND (g.seqoid <> 'worf.snowflake_node'::regclass OR g.state <> 'abandoned' AND o.state <> 'abandoned'))
                 """, seq);
             WorfLog.Warning(holders.Count > 2
@@ -3283,7 +3336,7 @@ internal static unsafe partial class SequenceRanges
                 WHERE a.seqoid = $1 AND a.kind <> 'x' AND a.state NOT IN ('unclaimed', 'overlapped') AND EXISTS (
                     SELECT 1 FROM worf.sequence_range_grant b
                     WHERE b.seqoid = a.seqoid AND b.grant_id <> a.grant_id AND b.kind <> 'x' AND b.state NOT IN ('unclaimed', 'overlapped')
-                        AND a.lo <= b.hi AND b.lo <= a.hi)
+                        AND numrange(b.lo, b.hi, '[]') && numrange(a.lo, a.hi, '[]'))
                 """, seq);
         }
 
@@ -4406,7 +4459,27 @@ internal static unsafe partial class SequenceRanges
             WHERE g.grant_id = $1 AND b.block_id = g.grant_id
             """, SpiParameter.Create(grant));
         _ = Worf.Execute("UPDATE worf.sequence_range_grant SET state = 'acknowledged' WHERE grant_id = $1", SpiParameter.Create(grant));
+
+        // The owner draws from the block only once a neighbor has heard of it, which its subscribers hear of when they
+        // next call, so they're told to call now, as the transaction commits.
+        WakeSubscribers();
         return true;
+    }
+
+    /// <summary>
+    /// Writes a message, as the transaction commits, that worf's output plugin sends this node's subscribers as a word to
+    /// call this node now, rather than at their next exchange interval.
+    /// </summary>
+    internal static void WakeSubscribers()
+    {
+        fixed (byte* prefix = "worf_sequence_range\0"u8)
+        {
+#if ANKUS_PG15 || ANKUS_PG16
+            _ = NativeMethods.LogLogicalMessage((sbyte*)prefix, (sbyte*)prefix, 0, true);
+#else
+            _ = NativeMethods.LogLogicalMessage((sbyte*)prefix, (sbyte*)prefix, 0, true, false);
+#endif
+        }
     }
 
     /// <summary>
@@ -4856,7 +4929,7 @@ internal static unsafe partial class SequenceRanges
         // Only worf creates a trigger with the guard's function, so one with another, as a trigger with the guard's name
         // that predates worf has, or one that doesn't fire, is no guard.
         WorfRows existing = Worf.Read("""
-            SELECT tgrelid::oid, tgname::text, encode(tgargs, 'hex'), tgfoid = $3 AND tgenabled IN ('O', 'A')
+            SELECT tgrelid::oid, tgname::text, encode(tgargs, 'hex'), tgfoid = $3 AND tgenabled = 'A'
             FROM pg_catalog.pg_trigger WHERE tgrelid = ANY ($1::oid[]) AND tgname = ANY ($2) AND tgparentid = 0
             """, 0, SpiParameter.Create(members.Keys.Select(member => (long)member).ToArray()), SpiParameter.Create(s_guardNames),
             SpiParameter.Create(GuardFunction()));

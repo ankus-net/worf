@@ -7,10 +7,10 @@ namespace Worf;
 /// Writes the warnings, and the errors, that the servers this process connects to send as notices, as their functions
 /// raise them, to this server's log, naming the server, rather than libpq's default, which writes every notice to
 /// standard error without a time or process. Each connection is named as it's made: a node, when the connection is to
-/// one this process exchanges with, or the server's host and port. Notices of lower severity, as a server's debug
-/// messages are, aren't logged, and of a server's warnings, only the first ten each minute are: a node's, across every
-/// process of this server, as shared memory counts them, and another server's, in each process. libpq's result fields
-/// are part of its stable interface.
+/// one this process exchanges with, replicates from or syncs from, or the server's host and port. Notices of lower severity, as a server's debug
+/// messages are, aren't logged, and of a server's warnings, only the first ten each minute are: a node's, whether its
+/// exchanges, apply or sync send them, across every process of this server, as shared memory counts them, and another
+/// server's, in each process. libpq's result fields are part of its stable interface.
 /// </summary>
 internal static unsafe class WorfNotices
 {

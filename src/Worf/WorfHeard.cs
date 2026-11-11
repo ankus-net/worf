@@ -84,6 +84,11 @@ internal struct WorfHeard
     public long WantedAt;
 
     /// <summary>
+    /// When the node, as a provider, last asked this server to call it, as an owner that granted itself a block does.
+    /// </summary>
+    public long CallForAt;
+
+    /// <summary>
     /// When the node's server started, as its last message said, or zero.
     /// </summary>
     public long StartedAt;

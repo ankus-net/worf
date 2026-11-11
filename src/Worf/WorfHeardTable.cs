@@ -9,4 +9,9 @@ internal struct WorfHeardTable
     /// When the table was set up, at server start: what this server heard before isn't in it.
     /// </summary>
     public long Since;
+
+    /// <summary>
+    /// The WAL position this server started from, once read, or zero.
+    /// </summary>
+    public ulong StartLsn;
 }

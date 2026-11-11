@@ -110,8 +110,10 @@ internal sealed unsafe partial class WorfConnection : IDisposable
     /// <param name="conninfo">A libpq connection string naming the server and database.</param>
     /// <param name="applicationName">The name the server shows for the connection.</param>
     /// <param name="replication">Whether to connect for logical replication, rather than for SQL and copies.</param>
+    /// <param name="node">The node the server is, whose name the log gives its notices and against which they count, or
+    /// none.</param>
     /// <returns>The open connection.</returns>
-    internal static WorfConnection Connect(string conninfo, string applicationName, bool replication)
+    internal static WorfConnection Connect(string conninfo, string applicationName, bool replication, (string Name, uint Id) node = default)
     {
         byte[] info = Worf.ToServerCString(conninfo);
         byte[] application = Worf.ToServerCString(applicationName);
@@ -125,7 +127,7 @@ internal sealed unsafe partial class WorfConnection : IDisposable
         {
             fixed (byte* infoAddress = info, applicationAddress = application)
             {
-                conn = ConnectLibpq((sbyte*)infoAddress, (sbyte*)applicationAddress, replication, &failure);
+                conn = ConnectLibpq((sbyte*)infoAddress, (sbyte*)applicationAddress, replication, node, &failure);
             }
         }
         finally
@@ -166,7 +168,11 @@ internal sealed unsafe partial class WorfConnection : IDisposable
             scratch = NativeMethods.AllocSetContextCreateInternal(NativeGlobals.TopMemoryContext, (sbyte*)name, 0, 1024, 8 * 1024);
         }
 
-        WorfNotices.RouteByAddress(((OrdinaryWalReceiverConn*)conn)->StreamConn);
+        if (node.Id == 0)
+        {
+            WorfNotices.RouteByAddress(((OrdinaryWalReceiverConn*)conn)->StreamConn);
+        }
+
         return new WorfConnection(conn, scratch, functions->walrcv_server_version.Invoke(conn));
     }
 
@@ -591,104 +597,36 @@ internal sealed unsafe partial class WorfConnection : IDisposable
     /// hands the connection to libpqwalreceiver in the layout its WalReceiverConn has kept since PostgreSQL 10, so that
     /// its query, copy and disconnect functions run on it. worf connects itself, rather than through walrcv_connect, so
     /// that the notices the server sends as the connection logs in, as warnings of a setting that can't apply, go to this
-    /// server's log as the rest do, rather than bare to standard error; and before PostgreSQL 17, libpqwalreceiver
-    /// connects only for replication. A logical replication connection asks for this database's encoding and settings
-    /// that make the values it gets unambiguous, and searches no schema, as libpqwalreceiver's do. libpq's polling and
-    /// status values are part of its stable interface.
+    /// server's log as the rest do, rather than bare to standard error; so that each address gets the connection's
+    /// connect_timeout, which libpq's own polling doesn't keep, and a host name that is slow to look up holds up none
+    /// after it, as <see cref="WorfProbe"/> connects; and as before PostgreSQL 17, libpqwalreceiver connects only for
+    /// replication. A logical replication connection asks for this database's encoding and settings that make the values
+    /// it gets unambiguous, after the connection string's own options, and searches no schema, as libpqwalreceiver's do.
     /// </summary>
-    private static WalReceiverConn* ConnectLibpq(sbyte* conninfo, sbyte* application, bool replication, sbyte** failure)
+    private static WalReceiverConn* ConnectLibpq(sbyte* conninfo, sbyte* application, bool replication, (string Name, uint Id) node, sbyte** failure)
     {
-        var start = (delegate* unmanaged<sbyte**, sbyte**, int, void*>)LibpqFunction("PQconnectStartParams");
-        var connectPoll = (delegate* unmanaged<void*, int>)LibpqFunction("PQconnectPoll");
-        var socket = (delegate* unmanaged<void*, int>)LibpqFunction("PQsocket");
-        var status = (delegate* unmanaged<void*, int>)LibpqFunction("PQstatus");
-        var errorMessage = (delegate* unmanaged<void*, sbyte*>)LibpqFunction("PQerrorMessage");
-        var finish = (delegate* unmanaged<void*, void>)LibpqFunction("PQfinish");
-
-        // From PostgreSQL 18, libpqwalreceiver counts the connections it closes against the server's external files, as
-        // it counts those it opens.
-#if !(ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17)
-        if (!NativeMethods.AcquireExternalFD())
-        {
-            *failure = Worf.PStrDup("could not connect to the server: too many open files");
-            return null;
-        }
-#endif
+        // A logical replication connection runs SQL, so it searches no schema whose owner could have it run their code.
         void* pgconn;
-        byte[] encoding = Worf.ToServerCString(Worf.DatabaseEncodingName);
-        fixed (byte* dbname = "dbname\0"u8, fallback = "fallback_application_name\0"u8, replicationKey = "replication\0"u8, logical = "database\0"u8,
-            encodingKey = "client_encoding\0"u8, optionsKey = "options\0"u8, options = "-c datestyle=ISO -c intervalstyle=postgres -c extra_float_digits=3\0"u8,
-            encodingValue = encoding)
+        using (WorfProbe probe = WorfProbe.Start(Worf.FromServer(conninfo), Worf.FromServer(application), (node.Id == 0 ? "a server" : $"node {node.Name}", node.Id),
+            replication ? "SELECT pg_catalog.set_config('search_path', '', false);" : "", long.MaxValue, replication, (WaitLibpqConnect, WaitLibpqReceive)))
         {
-            sbyte** keys = stackalloc sbyte*[]
+            while (!probe.Done)
             {
-                (sbyte*)dbname, (sbyte*)fallback, replication ? (sbyte*)replicationKey : null, (sbyte*)encodingKey, (sbyte*)optionsKey, null,
-            };
-            sbyte** values = stackalloc sbyte*[]
-            {
-                conninfo, application, (sbyte*)logical, (sbyte*)encodingValue, (sbyte*)options, null,
-            };
-            pgconn = start(keys, values, 1);
-        }
-
-        if (pgconn is null)
-        {
-#if !(ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17)
-            NativeMethods.ReleaseExternalFD();
-#endif
-            throw new PgException(PgSqlStates.OutOfMemory, "out of memory");
-        }
-
-        WorfNotices.RouteByAddress(pgconn);
-        try
-        {
-            // PGRES_POLLING_FAILED is 0, READING 1, WRITING 2 and OK 3; libpq starts as if it were writing.
-            int state = 2;
-            while (state is 1 or 2)
-            {
-                int ioFlag = state == 1 ? WlSocketReadable : WlSocketWriteable;
-
-                // As libpqwalreceiver does, wait for the connect itself while it is CONNECTION_STARTED, 2: Windows reports a
-                // refused connect as writable, so libpq would fail on that socket instead of trying the host's next
-                // address.
-                if (OperatingSystem.IsWindows() && state == 2 && status(pgconn) == 2)
+                if (probe.Wait(1000))
                 {
-                    ioFlag = WlSocketConnected;
-                }
-
-                int events = NativeMethods.WaitLatchOrSocket(NativeGlobals.MyLatch, WlExitOnPmDeath | WlLatchSet | ioFlag, ToSocket(socket(pgconn)), 0,
-                    WaitLibpqConnect);
-                if ((events & WlLatchSet) != 0)
-                {
-                    NativeMethods.ResetLatch(NativeGlobals.MyLatch);
                     PgInterrupts.Check();
                 }
 
-                if ((events & ioFlag) != 0)
-                {
-                    state = connectPoll(pgconn);
-                }
+                probe.Advance();
             }
 
-            // CONNECTION_OK is 0.
-            if (status(pgconn) != 0)
+            if (probe.Failure is string failed)
             {
-                *failure = NativeMethods.pchomp(errorMessage(pgconn));
-                Close(pgconn);
+                *failure = Worf.PStrDup(failed);
                 return null;
             }
 
-            // A logical replication connection runs SQL, so it searches no schema whose owner could have it run their code.
-            if (replication && !SearchNoSchema(pgconn, failure))
-            {
-                Close(pgconn);
-                return null;
-            }
-        }
-        catch
-        {
-            Close(pgconn);
-            throw;
+            pgconn = probe.TakeLibpq();
         }
 
         OrdinaryWalReceiverConn* conn = (OrdinaryWalReceiverConn*)NativeMethods.MemoryContextAllocZero(NativeGlobals.TopMemoryContext,
@@ -696,79 +634,6 @@ internal sealed unsafe partial class WorfConnection : IDisposable
         conn->StreamConn = pgconn;
         conn->Logical = replication;
         return (WalReceiverConn*)conn;
-
-        // Closes a connection that failed, and gives back its count against the external files.
-        void Close(void* failed)
-        {
-            WorfNotices.Forget(failed);
-            finish(failed);
-#if !(ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17)
-            NativeMethods.ReleaseExternalFD();
-#endif
-        }
-    }
-
-    /// <summary>
-    /// Has a new connection's session search no schema, as libpqwalreceiver's ALWAYS_SECURE_SEARCH_PATH_SQL does, waiting
-    /// for the answer on the latch, so that interrupts stay served.
-    /// </summary>
-    /// <returns>Whether the session took it, or false with the failure set.</returns>
-    private static bool SearchNoSchema(void* pgconn, sbyte** failure)
-    {
-        var sendQuery = (delegate* unmanaged<void*, sbyte*, int>)LibpqFunction("PQsendQuery");
-        var consumeInput = (delegate* unmanaged<void*, int>)LibpqFunction("PQconsumeInput");
-        var isBusy = (delegate* unmanaged<void*, int>)LibpqFunction("PQisBusy");
-        var getResult = (delegate* unmanaged<void*, void*>)LibpqFunction("PQgetResult");
-        var resultStatus = (delegate* unmanaged<void*, int>)LibpqFunction("PQresultStatus");
-        var clear = (delegate* unmanaged<void*, void>)LibpqFunction("PQclear");
-        var socket = (delegate* unmanaged<void*, int>)LibpqFunction("PQsocket");
-        var errorMessage = (delegate* unmanaged<void*, sbyte*>)LibpqFunction("PQerrorMessage");
-        fixed (byte* query = "SELECT pg_catalog.set_config('search_path', '', false);\0"u8)
-        {
-            if (sendQuery(pgconn, (sbyte*)query) == 0)
-            {
-                *failure = NativeMethods.pchomp(errorMessage(pgconn));
-                return false;
-            }
-        }
-
-        bool good = true;
-        while (true)
-        {
-            while (isBusy(pgconn) != 0)
-            {
-                int events = NativeMethods.WaitLatchOrSocket(NativeGlobals.MyLatch, WlExitOnPmDeath | WlLatchSet | WlSocketReadable, ToSocket(socket(pgconn)), 0,
-                    WaitLibpqReceive);
-                if ((events & WlLatchSet) != 0)
-                {
-                    NativeMethods.ResetLatch(NativeGlobals.MyLatch);
-                    PgInterrupts.Check();
-                }
-
-                if (consumeInput(pgconn) == 0)
-                {
-                    *failure = NativeMethods.pchomp(errorMessage(pgconn));
-                    return false;
-                }
-            }
-
-            void* result = getResult(pgconn);
-            if (result is null)
-            {
-                break;
-            }
-
-            // PGRES_TUPLES_OK is 2.
-            good &= resultStatus(result) == 2;
-            clear(result);
-        }
-
-        if (!good)
-        {
-            *failure = Worf.PStrDup("could not clear search path: " + Worf.FromServer(NativeMethods.pchomp(errorMessage(pgconn))));
-        }
-
-        return good;
     }
 
     /// <summary>

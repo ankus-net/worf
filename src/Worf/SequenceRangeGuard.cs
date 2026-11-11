@@ -97,15 +97,23 @@ internal static partial class SequenceRangeGuard
     private static (HashSet<uint> Called, bool Unnamed, string Path)? s_domainDraws;
 
     // The sequences the CHECKs of the domains each PL/pgSQL function coerces its variables and result to draw from, by
-    // the function, read again once a type, a constraint or a function changes.
-    private static readonly Dictionary<uint, (HashSet<uint> Called, bool Unnamed)?> s_plpgsqlCasts = [];
+    // the function as PL/pgSQL compiled it, once for each set of argument types a polymorphic function is called with,
+    // read again once a type, a constraint or a function changes.
+    private static readonly Dictionary<nint, (HashSet<uint> Called, bool Unnamed)?> s_plpgsqlCasts = [];
 
     // Whether each function a statement called may check a domain the statement doesn't name, by the function, read
     // again once a function changes.
     private static readonly Dictionary<long, bool> s_checksUnnamed = [];
 
-    // pg_input_is_valid and pg_input_error_info, by their OIDs in PostgreSQL's catalog since 16, which added them.
-    private static readonly HashSet<long> s_inputCheckers = [6210, 6211];
+    // The sequences the calls of nextval of statements name, by the statements' text and the search path, read again once
+    // a table, a type, a constraint or a function changes, or the managed sequences do.
+    private static readonly Dictionary<(string Text, string Path), HashSet<uint>> s_namedByText = [];
+    private static long s_managedSignature;
+
+    // PostgreSQL's own functions that check a value against a type a statement may give only as a value, as text or an
+    // OID, by their OIDs in its catalog, the same from 15 on: pg_input_is_valid and pg_input_error_info, which 16 added,
+    // and the input and receive functions of records, domains, arrays, ranges and multiranges.
+    private static readonly HashSet<long> s_inputCheckers = [6210, 6211, 2290, 2402, 2597, 2598, 750, 2400, 3834, 3836, 4231, 4233];
 
     // Whether the guard hears of the changes to tables and types that the text it holds by table reads, as a default
     // set, a partition attached or a domain's CHECK added.
@@ -133,9 +141,10 @@ internal static partial class SequenceRangeGuard
     [PgNativeCallback(nameof(TypeInvalidated))]
     private static partial SyscacheCallbackFunction TypeCallback { get; }
 
-    // Whether each table has the guard's triggers, which only tables numbered by a managed sequence have, as of the
-    // versions of the shared and this backend's counters it was looked up at.
-    private static readonly Dictionary<uint, bool> s_guarded = [];
+    // Whether each table has the guard's triggers, which only tables numbered by a managed sequence have, and a trigger
+    // that takes arguments, which may name a sequence it draws from, as of the versions of the shared and this backend's
+    // counters it was looked up at.
+    private static readonly Dictionary<uint, (bool Guarded, bool Argued)> s_guarded = [];
     private static (long Version, long Local) s_guardedAt = (-1, -1);
     private static bool s_gatesRegistered;
 
@@ -171,7 +180,9 @@ internal static partial class SequenceRangeGuard
     // The node that granted each sequence's active block, its parent, when another node did, and the grantors this
     // backend has seen this server hear from since it started.
     private static readonly Dictionary<uint, uint> s_grantors = [];
-    private static readonly HashSet<uint> s_confirmed = [];
+    // The sequences whose active block's grantor has said it checked this node's report of the sequence since this server
+    // started, as the tables last read hold.
+    private static readonly HashSet<uint> s_confirmedSequences = [];
 
     // Whether the guard is reading the blocks to find the grantors a statement's plan names.
     private static bool s_namingGrantors;
@@ -534,7 +545,10 @@ internal static partial class SequenceRangeGuard
         bool inserts = queryDesc->operation == CmdType.CMD_INSERT || (statement is not null && statement->hasModifyingCTE) ||
             (queryDesc->operation == CmdType.CMD_MERGE && statement is not null && MergeInserts(statement));
         bool updates = queryDesc->operation is CmdType.CMD_UPDATE or CmdType.CMD_MERGE;
-        if (statement is null || written.Count == 0 || !(inserts || updates) || Worf.CatalogOid("sequence_range") == 0 || !written.Exists(Guarded))
+        // A statement that writes only to tables neither guarded nor, for an insert, with a trigger that takes arguments,
+        // reads none of worf's tables.
+        if (statement is null || written.Count == 0 || !(inserts || updates) || Worf.CatalogOid("sequence_range") == 0 ||
+            !written.Exists(table => Triggers(table) is var triggers && (triggers.Guarded || (inserts && triggers.Argued))))
         {
             return;
         }
@@ -547,7 +561,9 @@ internal static partial class SequenceRangeGuard
 
         // An UPDATE, or a MERGE's, draws only as it sets a column to its default, which an identity column draws from
         // without calling nextval, so it holds the gates of the sequences of the columns it sets that its plan draws from.
-        List<uint> sequences = inserts ? [.. written.SelectMany(DrawnBy)] : UpdatedDrawing(statement);
+        // An insert draws from those its tables' defaults draw from, and those their triggers name, whether or not a guard
+        // checks the tables.
+        List<uint> sequences = inserts ? [.. written.SelectMany(DrawnBy)] : written.Exists(Guarded) ? UpdatedDrawing(statement) : [];
         if (sequences.Count == 0)
         {
             return;
@@ -815,11 +831,17 @@ internal static partial class SequenceRangeGuard
     /// <param name="explained">Whether the statement is only explained, as EXPLAIN without ANALYZE starts it, which
     /// runs none of the calls it starts but those its partition pruning makes, so that only the sequences those name
     /// are waited for.</param>
-    internal static unsafe void StartingExpressions(nint statement, bool explained)
+    /// <param name="source">The query string the statement came in, or zero.</param>
+    /// <param name="parameters">Whether the statement has parameters, whose values its plan may hold.</param>
+    internal static unsafe void StartingExpressions(nint statement, bool explained, nint source = 0, bool parameters = false)
     {
         if (!explained)
         {
-            Starting(() => Draws(PlanText((Node*)statement)));
+            PlannedStmt* planned = (PlannedStmt*)statement;
+            int location = planned->stmt_location;
+            int length = planned->stmt_len;
+            s_starting.Add(new(() => Draws(PlanText((Node*)statement)), (nint)NativeGlobals.error_context_stack, false,
+                source == 0 || parameters ? null : () => StatementText(source, location, length)));
             return;
         }
 
@@ -1017,6 +1039,15 @@ internal static partial class SequenceRangeGuard
                 NativeMethods.relation_close(relation, (int)PgLockMode.None);
             }
         });
+    }
+
+    // A statement's own text, as its place in the query string it came in gives it: from its location, which is -1 when
+    // unknown, for its length, which is 0 when it runs to the end.
+    private static unsafe string StatementText(nint source, int location, int length)
+    {
+        byte* start = (byte*)source + Math.Max(location, 0);
+        int bytes = length > 0 ? length : MemoryMarshal.CreateReadOnlySpanFromNullTerminated(start).Length;
+        return Encoding.Latin1.GetString(new ReadOnlySpan<byte>(start, bytes));
     }
 
     // Notes expressions starting, by how their calls of nextval are read, with the error context as they start.
@@ -1252,9 +1283,16 @@ internal static partial class SequenceRangeGuard
     }
 
     // The text of the CHECK constraints that may draw of the domains some types are or hold, as array elements, fields
-    // or range bounds.
+    // or range bounds, as the type cache holds them.
     private static string TypesDomainChecks(long[] types)
-        => types.Length == 0 ? "" : string.Concat(Elevated.Run(() => Worf.Read($"""
+    {
+        if (types.Length == 0)
+        {
+            return "";
+        }
+
+        Dictionary<uint, string> read = [];
+        return string.Concat(Elevated.Run(() => Worf.Read($"""
                 WITH RECURSIVE r (typ) AS (
                     SELECT pg_catalog.unnest($1::pg_catalog.int8[])::pg_catalog.oid
                     UNION
@@ -1270,9 +1308,10 @@ internal static partial class SequenceRangeGuard
                         SELECT g.rngsubtype FROM pg_catalog.pg_range g WHERE t.typtype = 'r' AND g.rngtypid = t.oid
                         UNION ALL
                         SELECT g.rngtypid FROM pg_catalog.pg_range g WHERE t.typtype = 'm' AND g.rngmultitypid = t.oid) n (typ))
-                SELECT c.conbin::pg_catalog.text FROM r JOIN pg_catalog.pg_constraint c ON c.contypid = r.typ
+                SELECT DISTINCT c.contypid FROM r JOIN pg_catalog.pg_constraint c ON c.contypid = r.typ
                 WHERE r.typ <> 0 AND c.contype = 'c' AND c.conbin::pg_catalog.text ~ '{MayDrawPattern}'
-                """, 0, SpiParameter.Create(types))).Select(row => row.Get<string>(0) + " "));
+                """, 0, SpiParameter.Create(types))).Select(row => DomainChecks(row.Get<uint>(0), read)));
+    }
 
     // The text of the CHECK constraints and trigger conditions of tables and their partitions, which start as each
     // table takes its first row, with those of the domains they coerce to, and the calls of the tables' trigger
@@ -1381,6 +1420,7 @@ internal static partial class SequenceRangeGuard
     private static void TableInvalidated(ulong arg, uint relid)
     {
         _ = arg;
+        s_namedByText.Clear();
         if (relid == 0)
         {
             s_drawnBy.Clear();
@@ -1414,6 +1454,7 @@ internal static partial class SequenceRangeGuard
         s_domainDraws = null;
         s_plpgsqlCasts.Clear();
         s_checksUnnamed.Clear();
+        s_namedByText.Clear();
     }
 
     // The text of a plan, as nodeToString writes it, and of the CHECK constraints of the domains it coerces to, which
@@ -1716,18 +1757,31 @@ internal static partial class SequenceRangeGuard
         return result.Append(body, from, body.Length - from).ToString();
     }
 
-    // The text of a domain's CHECK constraints, and of its base domains', read once for the expressions being read.
+    // The text of a domain's CHECK constraints, and of its base domains', read once for the expressions being read, as
+    // the type cache holds them, planned, with the SQL functions they call inlined as they were when the cache read
+    // them: the type cache keeps them until the domain or its constraints change, though a function they inlined is
+    // replaced, and checks values with them. A function the planner didn't inline runs its body as it is when called.
     private static string DomainChecks(uint domain, Dictionary<uint, string> read)
     {
         if (!read.TryGetValue(domain, out string? checks))
         {
-            checks = string.Concat(Elevated.Run(() => Worf.Read("""
-                WITH RECURSIVE d (oid) AS (
-                    SELECT $1::pg_catalog.oid
-                    UNION
-                    SELECT t.typbasetype FROM pg_catalog.pg_type t JOIN d ON t.oid = d.oid WHERE t.typtype = 'd')
-                SELECT c.conbin::pg_catalog.text FROM pg_catalog.pg_constraint c JOIN d ON c.contypid = d.oid WHERE c.contype = 'c'
-                """, 0, SpiParameter.Create(domain))).Select(row => row.Get<string>(0) + " "));
+            StringBuilder text = new();
+            unsafe
+            {
+                // The reference holds the callback its memory context runs as it's reset, so it lives in that context.
+                DomainConstraintRef* reference = (DomainConstraintRef*)NativeMethods.palloc((nuint)sizeof(DomainConstraintRef));
+                NativeMethods.InitDomainConstraintRef(domain, reference, NativeGlobals.CurrentMemoryContext, false);
+                for (int i = 0; reference->constraints is not null && i < reference->constraints->length; i++)
+                {
+                    DomainConstraintState* constraint = (DomainConstraintState*)reference->constraints->elements[i].ptr_value;
+                    if (constraint->constrainttype == DomainConstraintType.DOM_CONSTRAINT_CHECK && constraint->check_expr is not null)
+                    {
+                        _ = text.Append(NodeText((Node*)constraint->check_expr)).Append(' ');
+                    }
+                }
+            }
+
+            checks = text.ToString();
             read[domain] = checks;
         }
 
@@ -1858,15 +1912,19 @@ internal static partial class SequenceRangeGuard
             // managed sequence its expressions name, for the switch from a block that has reached its last twentieth, as
             // one that holds them does, so that statements that each draw a value don't run the block out between the
             // range worker's checks.
+            // A PL/pgSQL expression starts once a transaction, as the function runs a statement of its own; a sequence whose
+            // switch gate the statement holds waits as the gate is taken.
             uint snowflake = Worf.CatalogOid("snowflake_node");
-            if (!plpgsql && starting is not null && s_sequences.Count > 0)
+            HashSet<uint>? named = s_sequences.Count == 0 ? null : plpgsql ? SimpleNamed(simple) : starting is null ? null : StatementNamed(starting);
+            if (named is not null)
             {
-                switching = [.. starting.Draws.Called.Where(seqoid => seqoid != snowflake && s_sequences.ContainsKey(seqoid) && starting.Switched.Add(seqoid))];
+                switching = [.. named.Where(seqoid => seqoid != snowflake && s_sequences.ContainsKey(seqoid) && !s_gates.ContainsKey(seqoid) &&
+                    (plpgsql || starting!.Switched.Add(seqoid)))];
             }
 
             // The sequences whose grantors haven't answered, in the order of their OIDs, so that a statement that waits
             // for several waits for them, and names the first, in the same order however the grantors were read.
-            List<uint> unconfirmed = [.. s_grantors.Where(entry => entry.Key != snowflake && !s_confirmed.Contains(entry.Value)).Select(entry => entry.Key).Order()];
+            List<uint> unconfirmed = [.. s_grantors.Where(entry => entry.Key != snowflake && !s_confirmedSequences.Contains(entry.Key)).Select(entry => entry.Key).Order()];
             if (unconfirmed.Count > 0)
             {
                 HashSet<uint>? called = plpgsql ? SimpleDraws(simple) : StartingDraws(starting);
@@ -1907,19 +1965,29 @@ internal static partial class SequenceRangeGuard
     private static (HashSet<uint> Called, bool Unnamed) DomainDraws()
     {
         WatchTables();
-        string path = Worf.ReadScalar<string>("SELECT pg_catalog.current_setting('search_path')") ?? "";
+        string path = SearchPath();
         if (s_domainDraws is not (HashSet<uint> Called, bool Unnamed, string Path) draws || draws.Path != path)
         {
-            string checks = Elevated.Run(() => Worf.ReadScalar<string?>($"""
-                SELECT pg_catalog.string_agg(c.conbin::pg_catalog.text, ' ') FROM pg_catalog.pg_constraint c
+            Dictionary<uint, string> read = [];
+            string checks = string.Concat(Elevated.Run(() => Worf.Read($"""
+                SELECT DISTINCT c.contypid FROM pg_catalog.pg_constraint c
                 WHERE c.contypid <> 0 AND c.contype = 'c' AND c.conbin::pg_catalog.text ~ '{MayDrawPattern}'
-                """)) ?? "";
+                """, 0)).Select(row => DomainChecks(row.Get<uint>(0), read)));
             (HashSet<uint> called, _, bool unnamed) = Draws(WithDomainChecks(checks), unnamedDomains: false);
             draws = (called, unnamed, path);
             s_domainDraws = draws;
         }
 
         return (draws.Called, draws.Unnamed);
+    }
+
+    // The search path, as the session has it now.
+    private static unsafe string SearchPath()
+    {
+        fixed (byte* name = "search_path\0"u8)
+        {
+            return Worf.FromServer(NativeMethods.GetConfigOption((sbyte*)name, false, false));
+        }
     }
 
     // A pattern for the text of an expression that may call nextval: one that calls it, or calls a function that isn't
@@ -1932,6 +2000,49 @@ internal static partial class SequenceRangeGuard
     /// </summary>
     private static HashSet<uint>? StartingDraws(WorfStartingStatement? starting)
         => starting is null || starting.Draws.Unnamed || starting.Looked > starting.Draws.Calls ? null : starting.Draws.Called;
+
+    /// <summary>
+    /// Finds the sequences the calls of nextval of the statement starting name, kept by the statement's text and the
+    /// search path, unless it has parameters, until a table, a type, a constraint or a function changes, or the managed
+    /// sequences do, so that a statement run again doesn't read its plan's text again.
+    /// </summary>
+    private static HashSet<uint> StatementNamed(WorfStartingStatement starting)
+    {
+        if (starting.Text is not string text)
+        {
+            return starting.Draws.Called;
+        }
+
+        WatchTables();
+        (string Text, string Path) key = (text, SearchPath());
+        if (!s_namedByText.TryGetValue(key, out HashSet<uint>? named))
+        {
+            named = starting.Draws.Called;
+            if (s_namedByText.Count >= 1000)
+            {
+                s_namedByText.Clear();
+            }
+
+            s_namedByText[key] = named;
+        }
+
+        return named;
+    }
+
+    /// <summary>
+    /// Finds the sequences the nextval calls of the PL/pgSQL expression starting name, whether or not they name every
+    /// call's, once for the expression as it starts, or null for one PL/pgSQL doesn't start itself.
+    /// </summary>
+    private static unsafe HashSet<uint>? SimpleNamed(nint simple)
+    {
+        if (simple == 0)
+        {
+            return null;
+        }
+
+        s_simple.Draws ??= Draws(PlanText((Node*)((PLpgSQL_expr*)simple)->expr_simple_expr));
+        return s_simple.Draws.Value.Called;
+    }
 
     /// <summary>
     /// Finds the sequences the nextval calls of the PL/pgSQL expression starting name, once for the expression as it
@@ -2001,7 +2112,8 @@ internal static partial class SequenceRangeGuard
     private static unsafe (HashSet<uint> Called, bool Unnamed)? PlpgsqlCasts(nint estate)
     {
         PLpgSQL_execstate* state = (PLpgSQL_execstate*)estate;
-        uint function = state->func is null ? 0 : state->func->fn_oid;
+        nint function = (nint)state->func;
+        WatchTables();
         if (function != 0 && s_plpgsqlCasts.TryGetValue(function, out (HashSet<uint> Called, bool Unnamed)? known))
         {
             return known;
@@ -2030,7 +2142,6 @@ internal static partial class SequenceRangeGuard
             }
         }
 
-        WatchTables();
         string checks = TypesDomainChecks([.. types.Where(type => type != 0)]);
         (HashSet<uint> Called, bool Unnamed)? casts = null;
         if (checks.Length > 0)
@@ -2128,12 +2239,15 @@ internal static partial class SequenceRangeGuard
     // do anything, worf doesn't see into, as it doesn't see C code that calls nextval itself.
     private static bool ChecksUnnamedDomains(string text)
     {
-        // PostgreSQL's own functions, but for pg_input_is_valid and pg_input_error_info, check only the domains a
-        // statement names, so a statement that calls none of the others, as most that draw call only nextval, reads no
-        // catalog; the others' answers are kept until a function changes.
+        // PostgreSQL's own functions, but for those that check a value against a type given as a value, check only the
+        // domains a statement names, so a statement that calls none of the others, as most that draw call only nextval,
+        // reads no catalog. A function of a user's is asked about once, until a function changes: it may check unnamed
+        // domains as one written in a procedural language other than SQL and PL/pgSQL, whose code worf can't read, or as
+        // an internal function whose source is one of PostgreSQL's that do.
+        WatchTables();
         long[] functions = [.. CalledFunction().Matches(text).Select(call => long.Parse(call.Groups[1].ValueSpan, CultureInfo.InvariantCulture)).Distinct()
             .Where(function => function >= 16384 || s_inputCheckers.Contains(function))];
-        if (functions.Any(function => s_checksUnnamed.TryGetValue(function, out bool checks) && checks))
+        if (functions.Any(s_inputCheckers.Contains) || functions.Any(function => s_checksUnnamed.TryGetValue(function, out bool checks) && checks))
         {
             return true;
         }
@@ -2148,9 +2262,10 @@ internal static partial class SequenceRangeGuard
             SELECT f.oid, EXISTS (
                 SELECT 1 FROM pg_catalog.pg_proc p
                 WHERE p.oid = f.oid::pg_catalog.oid
-                    AND (p.oid >= 16384 AND p.prolang NOT IN (12, 13, 14) AND p.pronamespace <> 'worf'::pg_catalog.regnamespace
+                    AND (p.prolang NOT IN (12, 13, 14) AND p.pronamespace <> 'worf'::pg_catalog.regnamespace
                             AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_language l WHERE l.oid = p.prolang AND l.lanname = 'plpgsql')
-                        OR p.pronamespace = 'pg_catalog'::pg_catalog.regnamespace AND p.proname IN ('pg_input_is_valid', 'pg_input_error_info')))
+                        OR p.prolang = 12 AND p.prosrc IN ('pg_input_is_valid', 'pg_input_error_info', 'record_in', 'record_recv', 'domain_in',
+                            'domain_recv', 'array_in', 'array_recv', 'range_in', 'range_recv', 'multirange_in', 'multirange_recv')))
             FROM pg_catalog.unnest($1::pg_catalog.int8[]) f (oid)
             """, 0, SpiParameter.Create(unread)));
         bool any = false;
@@ -2359,12 +2474,11 @@ internal static partial class SequenceRangeGuard
     private static void WaitForGrantor(uint seqoid, bool unnamed = false)
     {
         Reload();
-        if (!s_grantors.TryGetValue(seqoid, out uint grantor) || s_confirmed.Contains(grantor))
+        if (!s_grantors.TryGetValue(seqoid, out uint grantor) || s_confirmedSequences.Contains(seqoid))
         {
             return;
         }
 
-        if (!SequenceRangeHeard.Confirmed(grantor))
         {
             string sequence;
             unsafe
@@ -2382,8 +2496,15 @@ internal static partial class SequenceRangeGuard
             {
                 long deadline = Worker.GetCurrentTimestamp() + (SequenceRanges.ExchangeTimeout * 2000L);
                 long woken = 0;
-                while (!SequenceRangeHeard.Confirmed(grantor))
+                while (true)
                 {
+                    Refresh();
+                    Reload();
+                    if (!s_grantors.ContainsKey(seqoid) || s_confirmedSequences.Contains(seqoid))
+                    {
+                        break;
+                    }
+
                     // The wait makes the exchange with the grantor due, each second while it lasts.
                     long now = Worker.GetCurrentTimestamp();
                     if (now >= deadline)
@@ -2415,8 +2536,6 @@ internal static partial class SequenceRangeGuard
                 TakeGates(held);
             }
         }
-
-        _ = s_confirmed.Add(grantor);
     }
 
     /// <summary>
@@ -2489,7 +2608,13 @@ internal static partial class SequenceRangeGuard
     /// to a table no managed sequence numbers reads none of worf's tables, as of the table's last change, as a partition
     /// attached, which takes on the guard.
     /// </summary>
-    private static bool Guarded(uint relid)
+    private static bool Guarded(uint relid) => Triggers(relid).Guarded;
+
+    /// <summary>
+    /// Checks, from the system catalogs alone, as <see cref="Guarded"/> does, whether a table has the guard's triggers,
+    /// and whether it has a trigger that takes arguments, which may name a sequence the trigger draws from.
+    /// </summary>
+    private static (bool Guarded, bool Argued) Triggers(uint relid)
     {
         WatchTables();
         (long, long) version = (SequenceRanges.Version.Value, SequenceRanges.LocalVersion);
@@ -2499,16 +2624,17 @@ internal static partial class SequenceRangeGuard
             s_guardedAt = version;
         }
 
-        if (!s_guarded.TryGetValue(relid, out bool guarded))
+        if (!s_guarded.TryGetValue(relid, out (bool Guarded, bool Argued) triggers))
         {
-            guarded = Elevated.Run(() => Worf.ReadScalar<bool>("""
-                SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger
-                    WHERE tgrelid = $1 AND tgfoid = 'worf.sequence_range_guard'::pg_catalog.regproc)
-                """, SpiParameter.Create(relid)));
-            s_guarded[relid] = guarded;
+            WorfRows found = Elevated.Run(() => Worf.Read("""
+                SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid = $1 AND tgfoid = 'worf.sequence_range_guard'::pg_catalog.regproc),
+                    EXISTS (SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid = $1 AND NOT tgisinternal AND tgenabled <> 'D' AND tgnargs > 0)
+                """, 1, SpiParameter.Create(relid)));
+            triggers = (found[0].Get<bool>(0), found[0].Get<bool>(1));
+            s_guarded[relid] = triggers;
         }
 
-        return guarded;
+        return triggers;
     }
 
     /// <summary>
@@ -2540,7 +2666,9 @@ internal static partial class SequenceRangeGuard
     /// <summary>
     /// Lists the managed sequences a table's defaults and identity columns draw from, a partition's identity columns
     /// drawing from its ancestors' sequences where PostgreSQL marks them identity columns, as from PostgreSQL 17 on it
-    /// marks those of a partition it creates or attaches, though not those of a partition of a table it attaches.
+    /// marks those of a partition it creates or attaches, though not those of a partition of a table it attaches; and
+    /// those its triggers name among their arguments, as contrib's autoinc names the sequence its C code draws from
+    /// with no call worf sees.
     /// </summary>
     private static List<uint> DrawnBy(uint relid)
     {
@@ -2578,6 +2706,19 @@ internal static partial class SequenceRangeGuard
                 {Ancestors}
                 """, 0, SpiParameter.Create(relid)));
             sequences = [.. used.Select(row => row.Get<uint>(0)).Where(s_sequences.ContainsKey)];
+
+            // A trigger's arguments that name a managed sequence, which its code may look up under whatever search path
+            // the statement has, stand for every managed sequence of that name.
+            WorfRows arguments = Elevated.Run(() => Worf.Read("""
+                SELECT a.arg FROM pg_catalog.pg_trigger t
+                    CROSS JOIN LATERAL pg_catalog.unnest(pg_catalog.string_to_array(pg_catalog.encode(t.tgargs, 'escape'), '\000')) a (arg)
+                WHERE t.tgrelid = $1 AND NOT t.tgisinternal AND t.tgenabled <> 'D' AND t.tgnargs > 0 AND a.arg <> ''
+                """, 0, SpiParameter.Create(relid)));
+            foreach (HashSet<uint> named in arguments.Select(argument => ManagedNamed(argument.Get<string>(0))).OfType<HashSet<uint>>())
+            {
+                sequences.AddRange(named.Where(seqoid => !sequences.Contains(seqoid)));
+            }
+
             s_drawnBy[relid] = sequences;
         }
 
@@ -3071,6 +3212,34 @@ internal static partial class SequenceRangeGuard
     /// </summary>
     private static bool Check(uint seqoid, long value, bool inserted)
     {
+        // worf's own apply and sync workers write other nodes' rows, which the guard's triggers, which fire in every
+        // session so that another apply's rows are checked, leave alone, as they did when the triggers fired only in
+        // sessions that write their own. Another session with session_replication_role replica writes what it likes, as
+        // before, but a value it drew from this node's active block, as PostgreSQL's apply of another subscription fills
+        // an identity column, waits for the block's grantor to have answered this server since it started.
+        if (Worker.MyWorfWorker >= 0 && Worker.MyWorker.WorkerType is WorfWorkerType.Apply or WorfWorkerType.Sync)
+        {
+            return false;
+        }
+
+        bool replica;
+        unsafe
+        {
+            replica = NativeGlobals.SessionReplicationRole == SessionReplicationRoleReplica;
+        }
+
+        if (replica && !SequenceRanges.Restore)
+        {
+            Reload();
+            if (s_sequences.TryGetValue(seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) held) &&
+                held.Blocks.Exists(block => block.State == "active" && value >= block.Lo && value <= block.Hi))
+            {
+                WaitForGrantor(seqoid);
+            }
+
+            return false;
+        }
+
         // A switch beside this transaction, which holds the sequence, gives it new bounds, which nextval reads from the
         // catalog as this backend last heard of them, and a switch that waits for the gate moves it before the next row.
         // The row's value is in the block switched from, so the statement checks the new block before it draws again,
@@ -3146,6 +3315,10 @@ internal static partial class SequenceRangeGuard
                     return true;
 
                 case "active":
+                    // A value drawn from the block, by code whose call of nextval worf doesn't see, as C code that calls
+                    // it itself, or PostgreSQL's apply of another subscription filling an identity column, waits for the
+                    // block's grantor to have answered this server since it started, as a statement that draws does.
+                    WaitForGrantor(seqoid);
                     bool admitted = s_reached.TryGetValue(seqoid, out long reached) && (sequence.Ascending ? reached >= value : reached <= value);
                     if (!admitted && Position(seqoid) is long position && (sequence.Ascending ? position >= value : position <= value))
                     {
@@ -3874,6 +4047,7 @@ internal static partial class SequenceRangeGuard
         ForgetBounds();
         s_sequences.Clear();
         s_grantors.Clear();
+        s_confirmedSequences.Clear();
         s_drawnBy.Clear();
         s_drawingColumns.Clear();
         s_defaultsText.Clear();
@@ -3895,13 +4069,14 @@ internal static partial class SequenceRangeGuard
         WorfRows result = Elevated.Run(() => Worf.SelectCatalog("""
             SELECT r.seqoid::oid, s.seqincrement > 0, b.lo, b.hi, b.state,
                 b.node_id = l.node_id AND b.sysid = $1 AND b.timeline = $2, b.reserved,
-                CASE WHEN b.from_node <> l.node_id AND EXISTS (SELECT 1 FROM worf.node n WHERE n.node_id = b.from_node) THEN b.from_node END
+                CASE WHEN b.from_node <> l.node_id AND EXISTS (SELECT 1 FROM worf.node n WHERE n.node_id = b.from_node) THEN b.from_node END,
+                EXISTS (SELECT 1 FROM worf.sequence_range_node c WHERE c.seqoid = r.seqoid AND c.node_id = b.from_node AND c.confirmed_start = $3)
             FROM worf.sequence_range r
                 JOIN pg_catalog.pg_sequence s ON s.seqrelid = r.seqoid
                 CROSS JOIN worf.local_node l
                 LEFT JOIN worf.sequence_range_block b ON b.seqoid = r.seqoid AND b.kind IN ('n', 'i')
                     AND b.state IN ('next', 'active', 'retired', 'imported')
-            """, SpiParameter.Create((decimal)sysid), SpiParameter.Create((long)timeline)));
+            """, SpiParameter.Create((decimal)sysid), SpiParameter.Create((long)timeline), SpiParameter.Create(SequenceRangeHeard.Started)));
         for (int i = 0; i < result.Count; i++)
         {
             WorfRow row = result[i];
@@ -3929,6 +4104,10 @@ internal static partial class SequenceRangeGuard
                 if (state == "active" && row.Get<uint?>(7) is uint grantor)
                 {
                     s_grantors[seqoid] = grantor;
+                    if (row.Get<bool>(8))
+                    {
+                        _ = s_confirmedSequences.Add(seqoid);
+                    }
                 }
             }
             else if (state is not "retired")
@@ -3942,6 +4121,14 @@ internal static partial class SequenceRangeGuard
             !sequence.Blocks.Exists(block => block.State == "active" && block.Lo == waited.Lo)).ToList())
         {
             _ = s_waited.Remove(waited);
+        }
+
+        // The sequences a statement's text names by name are the managed ones of that name, which change with them.
+        long signature = s_sequences.Keys.Aggregate(17L, (hash, seqoid) => unchecked((hash * 31) + seqoid)) ^ s_sequences.Count;
+        if (signature != s_managedSignature)
+        {
+            s_managedSignature = signature;
+            s_namedByText.Clear();
         }
 
         s_version = version;

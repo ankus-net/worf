@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using Npgsql;
@@ -213,8 +214,8 @@ public sealed class StalledPeerTests
 
     /// <summary>
     /// With wal_receiver_timeout off, a call apply makes to its provider as it starts, here a connection that a stopped
-    /// postmaster never accepts, still gives up, after a minute, rather than wait for good. Processes are stopped with
-    /// signals, which Windows lacks.
+    /// postmaster never accepts, with no connect_timeout, still gives up, after a minute, rather than wait for good.
+    /// Processes are stopped with signals, which Windows lacks.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -227,7 +228,7 @@ public sealed class StalledPeerTests
         _ = await subscriber.SafePsqlAsync(Database, $"""
             SELECT worf.create_subscription(
                 subscription_name := 'sub',
-                provider_dsn := '{provider.Dsn(Database, SuperUser)}',
+                provider_dsn := '{provider.Dsn(Database, SuperUser)} connect_timeout=0',
                 synchronize_structure := false,
                 synchronize_data := false)
             """, token);
@@ -254,6 +255,61 @@ public sealed class StalledPeerTests
         }
 
         await AppliesAsync(provider, subscriber, 2, token);
+    }
+
+    /// <summary>
+    /// Apply's replication connection keeps its connection string's options after worf's own, here one that has the
+    /// provider log the replication commands it gets, and passes a first address that drops connection attempts, as a
+    /// listener whose queue is full does, at the connection string's connect_timeout, rather than wait on it for good.
+    /// On Linux, where a listener's full queue drops attempts.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [OSCondition(OperatingSystems.Linux)]
+    public async Task ApplyConnectionsKeepTheirOptionsAndTimeouts()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode provider = await StartNodeAsync("provider", token);
+        await using TestNode subscriber = await StartNodeAsync("subscriber", token, "60s");
+        int logpos = provider.ReadLog().Length;
+        _ = await subscriber.SafePsqlAsync(Database, $"""
+            SELECT worf.create_subscription(
+                subscription_name := 'sub',
+                provider_dsn := '{provider.Dsn(Database, SuperUser)} options=''-c log_replication_commands=on''',
+                synchronize_structure := false,
+                synchronize_data := false)
+            """, token);
+        Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database,
+            "SELECT EXISTS (SELECT FROM worf.show_subscription_status() WHERE status = 'replicating')", token), "the subscription replicating");
+        await AppliesAsync(provider, subscriber, 1, token);
+        Assert.Contains("received replication command: START_REPLICATION", provider.ReadLog()[logpos..],
+            "the replication commands the provider logged, as the options of apply's connection string have it");
+
+        // The listener's one connection, which it never accepts, fills its queue, after which the system drops attempts.
+        using Socket hole = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        hole.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        hole.Listen(0);
+        using Socket queued = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        await queued.ConnectAsync(hole.LocalEndPoint!, token);
+        using Socket dropped = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        using (CancellationTokenSource quick = CancellationTokenSource.CreateLinkedTokenSource(token))
+        {
+            quick.CancelAfter(TimeSpan.FromMilliseconds(500));
+            _ = await Assert.ThrowsAsync<OperationCanceledException>(() => dropped.ConnectAsync(hole.LocalEndPoint!, quick.Token).AsTask(),
+                "an attempt to connect to the listener whose queue is full");
+        }
+
+        string holePort = ((IPEndPoint)hole.LocalEndPoint!).Port.ToString(CultureInfo.InvariantCulture);
+        string port = provider.Cluster.Port.ToString(CultureInfo.InvariantCulture);
+        _ = await subscriber.SafePsqlAsync(Database, $"""
+            UPDATE worf.node_interface
+            SET if_dsn = 'host=127.0.0.1,127.0.0.1 port={holePort},{port} connect_timeout=2 dbname={Database} user={SuperUser}'
+            WHERE if_nodeid = (SELECT node_id FROM worf.node WHERE node_name = 'provider')
+            """, token);
+        _ = await subscriber.SafePsqlAsync(Database, "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE backend_type LIKE 'worf apply%'", token);
+        Stopwatch passing = Stopwatch.StartNew();
+        await AppliesAsync(provider, subscriber, 2, token);
+        Assert.IsLessThan(TimeSpan.FromSeconds(30), passing.Elapsed, "apply's reconnection past the address that drops attempts, with connect_timeout=2");
     }
 
     /// <summary>

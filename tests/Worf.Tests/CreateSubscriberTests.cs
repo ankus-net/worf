@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Numerics;
 using System.Runtime.Versioning;
 using System.Text;
 using Npgsql;
@@ -820,7 +821,7 @@ public sealed class CreateSubscriberTests
                 (stopped, stopOutput) = await provider.RunProgramAsync("pg_ctl", ["stop", "-w", "-D", backupDir], token);
                 Assert.AreEqual(0, stopped, stopOutput);
                 (again, againErr) = await RefusedRunAsync(command, arguments, work.FullName, port, token);
-                Assert.AreEqual("1|True", $"{again}|{againErr.Contains("isn't the checkpoint the provider's WAL holds there", StringComparison.Ordinal)}",
+                Assert.AreEqual("1|True", $"{again}|{againErr.Contains("isn't the checkpoint record its own WAL holds there", StringComparison.Ordinal)}",
                     $"a run on the data directory that ran out of recovery and stopped in recovery since: {againErr}");
 
                 // Once the provider has removed the WAL that holds the data directory's latest checkpoint, a run on it is
@@ -833,7 +834,7 @@ public sealed class CreateSubscriberTests
                     CHECKPOINT;
                     """, token);
                 (again, againErr) = await RefusedRunAsync(command, arguments, work.FullName, port, token);
-                Assert.AreEqual("1|True", $"{again}|{againErr.Contains("is in WAL the provider has removed", StringComparison.Ordinal)}",
+                Assert.AreEqual("1|True", $"{again}|{againErr.Contains("isn't the checkpoint record its own WAL holds there", StringComparison.Ordinal)}",
                     $"a run on the data directory whose latest checkpoint's WAL the provider has removed: {againErr}");
             }
         }
@@ -1019,15 +1020,18 @@ public sealed class CreateSubscriberTests
     /// <summary>
     /// A standby made with pg_basebackup -R, caught up and stopped in recovery, is subscribed though the provider has
     /// since removed the WAL that holds its latest checkpoint, as its own WAL carries its recovery to the WAL the provider
-    /// still has, past where the provider's WAL begins, as the provider's own. One whose WAL ends right where the
-    /// provider's begins, as one that stopped at a segment's end does, its own next segment never written, is refused,
-    /// as it can't be told from one that left the provider's WAL; and so is one that ran as a server of its own from its
-    /// checkpoint, writing WAL of its own past where the provider's begins, and stopped in recovery since.
+    /// still has, past where the provider's WAL begins, as the provider's own; so is one whose WAL ends inside the
+    /// provider's first record there, holding only its first pages. One whose WAL ends right where the provider's
+    /// begins, as one that stopped at a segment's end does, its own next segment never written, is refused, naming what
+    /// keeps the provider's WAL from a standby's position, as it can't be told from one that left the provider's WAL; and
+    /// so is one that ran as a server of its own from its checkpoint, writing WAL of its own past where the provider's
+    /// begins, and stopped in recovery since.
     /// </summary>
     /// <param name="when">How the standby's WAL meets the provider's.</param>
     /// <returns>The test.</returns>
     [TestMethod]
     [DataRow("overlap")]
+    [DataRow("partial")]
     [DataRow("boundary")]
     [DataRow("diverged")]
     public async Task StandbysWhoseOwnWalReachesTheProvidersAreSubscribed(string when)
@@ -1070,6 +1074,38 @@ public sealed class CreateSubscriberTests
         int switches = 0;
         switch (when)
         {
+            case "partial":
+                // The provider's next segment begins with a record of 300 KB, which the standby streams, and holds only
+                // the first 128 KB of, as one that stopped while it streamed does, its segment's file zeroed past them.
+                (started, startOutput) = await provider.RunProgramAsync("pg_ctl", ["start", "-w", "-D", backupDir, "-o", $"-p {port}", "-l", standbyLog], token);
+                Assert.AreEqual(0, started, startOutput);
+                string large = (await provider.SafePsqlAsync(Database,
+                    "SELECT pg_catalog.pg_switch_wal(); SELECT pg_catalog.pg_logical_emit_message(false, 'p', pg_catalog.repeat('x', 300000))", token)).Split('\n')[^1];
+                Stopwatch streaming = Stopwatch.StartNew();
+                while (await SubscriberAsync(provider, pgport, $"SELECT pg_catalog.pg_last_wal_replay_lsn() >= '{large}'", token, mayFail: true) != "t")
+                {
+                    Assert.IsLessThan(TestNode.PollTimeout, streaming.Elapsed, "the standby replaying the large record");
+                    await Task.Delay(TimeSpan.FromMilliseconds(200), token);
+                }
+
+                (stopped, stopOutput) = await provider.RunProgramAsync("pg_ctl", ["stop", "-w", "-D", backupDir], token);
+                Assert.AreEqual(0, stopped, stopOutput);
+                boundary = await provider.SafePsqlAsync(Database, $"SELECT pg_catalog.pg_walfile_name('{large}')", token);
+                foreach (string file in Directory.EnumerateFiles(Path.Join(backupDir, "pg_wal")).Where(file =>
+                    Path.GetFileName(file) is { Length: 24 } name && string.CompareOrdinal(name, boundary) > 0))
+                {
+                    File.Delete(file);
+                }
+
+                TestContext.WriteLine((await provider.RunProgramAsync("pg_waldump", [Path.Join(backupDir, "pg_wal", boundary)], token)).Output[..2000]);
+                await using (FileStream segment = new(Path.Join(backupDir, "pg_wal", boundary), FileMode.Open, FileAccess.Write))
+                {
+                    _ = segment.Seek(128 * 1024, SeekOrigin.Begin);
+                    await segment.WriteAsync(new byte[(int)segment.Length - (128 * 1024)], token);
+                }
+
+                switches = 2;
+                break;
             case "boundary":
                 // The standby's WAL ends where the segment begins, as its own files of that segment and later never were.
                 foreach (string file in Directory.EnumerateFiles(Path.Join(backupDir, "pg_wal")).Where(file =>
@@ -1117,10 +1153,10 @@ public sealed class CreateSubscriberTests
         Assert.AreEqual("f", await provider.SafePsqlAsync(Database,
             $"SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_ls_waldir() WHERE name = pg_catalog.pg_walfile_name('{standbyCheckpoint}'))", token),
             $"the provider's WAL that holds the standby's checkpoint, {standbyCheckpoint}, after the provider's own at {checkpointSegment}");
-        if (when == "boundary")
+        if (when is "boundary" or "partial")
         {
             Assert.AreEqual(boundary, await provider.SafePsqlAsync(Database, "SELECT pg_catalog.min(name) FROM pg_catalog.pg_ls_waldir() WHERE name ~ '^[0-9A-F]{24}$'", token),
-                "the provider's first segment, which begins where the standby's WAL ends");
+                when == "boundary" ? "the provider's first segment, which begins where the standby's WAL ends" : "the provider's first segment, whose first record the standby holds part of");
         }
 
         List<string> arguments =
@@ -1134,7 +1170,7 @@ public sealed class CreateSubscriberTests
             if (when is "diverged" or "boundary")
             {
                 (int refused, string refusal) = await RefusedRunAsync(command, arguments, work.FullName, port, token);
-                Assert.AreEqual("1|True", $"{refused}|{refusal.Contains("is in WAL the provider has removed", StringComparison.Ordinal)}",
+                Assert.AreEqual("1|True", $"{refused}|{refusal.Contains(when == "boundary" ? "physical replication slot" : "make a new base backup", StringComparison.Ordinal)}",
                     $"a run on the standby whose WAL {(when == "boundary" ? "ends where the provider's begins" : "left the provider's")}: {refusal}");
                 return;
             }
@@ -1148,6 +1184,217 @@ public sealed class CreateSubscriberTests
         finally
         {
             await StopAsync(provider, backupDir);
+        }
+    }
+
+    /// <summary>
+    /// A standby whose WAL isn't the provider's, though its records follow each other, is refused wherever the two
+    /// overlap: with a record past its checkpoint rewritten while the provider still has that WAL; with one rewritten past
+    /// the first record of the provider's first segment, once the provider has removed the standby's checkpoint's WAL;
+    /// promoted after replaying a load, writing rows of its own on timeline 2, stopped before a checkpoint and stopped in
+    /// recovery since, its latest checkpoint still on timeline 1; and with its last segment's tail one that PostgreSQL
+    /// used again, holding another segment's WAL, past which the provider's WAL begins.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task StandbysWhoseWalIsntTheProvidersAreRefused()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        using TemporaryDirectory work = new($"worf-create-subscriber-refused-{Guid.NewGuid():N}");
+        await using TestNode provider = await TestNode.StartAsync("provider",
+            ["wal_level = logical", "max_wal_senders = 10", "max_replication_slots = 10", "track_commit_timestamp = on", "wal_keep_size = '32MB'"], token);
+        int pgport = CreateSubscriberCommand.FreePort();
+        string port = pgport.ToString(CultureInfo.InvariantCulture);
+        string providerDsn = $"postgresql://super@127.0.0.1:{provider.Cluster.Port.ToString(CultureInfo.InvariantCulture)}/postgres";
+        string backupDir = Path.Join(work.FullName, "backupdir");
+        string promotedDir = Path.Join(work.FullName, "promoteddir");
+        string command = await CreateSubscriberCommand.InstallAsync(provider.Installation, Path.Join(work.FullName, "bin"));
+        _ = await provider.SafePsqlAsync(Database, """
+            CREATE USER super SUPERUSER;
+            CREATE EXTENSION worf;
+            SELECT * FROM worf.create_node(node_name := 'test_provider', dsn := 'dbname=postgres user=super');
+            CREATE TABLE kept AS SELECT g AS id FROM generate_series(1, 1000) g;
+            CREATE TABLE pad (i int);
+            CREATE TABLE loaded (i int);
+            CHECKPOINT;
+            """, token);
+        string autoConf = Path.Join(provider.Cluster.DataDirectory, "postgresql.auto.conf");
+        await File.WriteAllLinesAsync(autoConf,
+            (await File.ReadAllLinesAsync(autoConf, token)).Where(static line => !line.TrimStart().StartsWith("port", StringComparison.Ordinal)), token);
+        (int backedUp, string backupOutput) = await provider.RunProgramAsync("pg_basebackup", ["-D", backupDir, "-d", providerDsn, "-X", "stream", "-R"], token);
+        Assert.AreEqual(0, backedUp, backupOutput);
+
+        // The standby streams four segments, each holding a row and, after it, a logical message, and stops in recovery.
+        string standbyLog = Path.Join(work.FullName, "standby.log");
+        (int started, string startOutput) = await provider.RunProgramAsync("pg_ctl", ["start", "-w", "-D", backupDir, "-o", $"-p {port}", "-l", standbyLog], token);
+        Assert.AreEqual(0, started, startOutput);
+        List<string> segments = [];
+        for (int i = 0; i < 4; i++)
+        {
+            segments.Add((await provider.SafePsqlAsync(Database, $"""
+                INSERT INTO kept VALUES ({1001 + i});
+                SELECT pg_catalog.pg_logical_emit_message(false, 'p', 'payload!') FROM pg_catalog.generate_series(1, 2);
+                SELECT pg_catalog.pg_walfile_name(pg_catalog.pg_logical_emit_message(false, 'p', 'payload!'));
+                """, token)).Split('\n')[^1]);
+            _ = await provider.SafePsqlAsync(Database, "SELECT pg_catalog.pg_switch_wal()", token);
+        }
+
+        await WaitReplayedAsync(provider, pgport, await provider.SafePsqlAsync(Database, "SELECT pg_catalog.pg_current_wal_lsn()", token), token);
+        (int stopped, string stopOutput) = await provider.RunProgramAsync("pg_ctl", ["stop", "-w", "-D", backupDir], token);
+        Assert.AreEqual(0, stopped, stopOutput);
+        List<string> arguments =
+        [
+            "-D", backupDir, "--subscriber-name=test_subscriber", $"--subscriber-dsn=postgresql://super@127.0.0.1:{port}/postgres",
+            $"--provider-dsn={providerDsn}", "--drop-slot-if-exists", "-v",
+            $"--hba-conf={Path.Join(AppContext.BaseDirectory, "TestFiles", "regress-pg_hba.conf")}",
+        ];
+        List<string> problems = [];
+        async Task RefusedAsync(string what, string expected, List<string> run)
+        {
+            (int refused, string refusal) = await RefusedRunAsync(command, run, work.FullName, port, token);
+            if (refused != 1 || !refusal.Contains(expected, StringComparison.Ordinal))
+            {
+                problems.Add($"{what}: exit {refused}, {refusal.Trim()}");
+            }
+        }
+
+        try
+        {
+            // The provider still has the WAL from the standby's checkpoint on, where the standby's first message differs.
+            string first = Path.Join(backupDir, "pg_wal", segments[0]);
+            byte[] kept = await RewriteMessageAsync(provider, first, token);
+            await RefusedAsync("a message rewritten where the provider still has the WAL", "isn't the provider's", arguments);
+            await File.WriteAllBytesAsync(first, kept, token);
+
+            // The provider removes the standby's checkpoint's WAL, keeping two segments behind its own, so that its first
+            // segment is the standby's third, where the standby's message after that segment's first record differs.
+            _ = await provider.SafePsqlAsync(Database, "CHECKPOINT", token);
+            Assert.AreEqual(segments[2], await provider.SafePsqlAsync(Database, "SELECT pg_catalog.min(name) FROM pg_catalog.pg_ls_waldir() WHERE name ~ '^[0-9A-F]{24}$'", token),
+                "the provider's first segment");
+            string third = Path.Join(backupDir, "pg_wal", segments[2]);
+            kept = await RewriteMessageAsync(provider, third, token);
+            await RefusedAsync("a message rewritten past the first record of the provider's first segment", "isn't the provider's", arguments);
+            await File.WriteAllBytesAsync(third, kept, token);
+
+            // A copy of the standby replays a load, is promoted, writes rows of its own and stops at once, before the
+            // checkpoint the promotion asked for has written the load out, and stops in recovery after starting again.
+            CopyDirectory(backupDir, promotedDir);
+            (started, startOutput) = await provider.RunProgramAsync("pg_ctl", ["start", "-w", "-D", promotedDir, "-o", $"-p {port}", "-l", standbyLog], token);
+            Assert.AreEqual(0, started, startOutput);
+            _ = await provider.SafePsqlAsync(Database, "INSERT INTO loaded SELECT g FROM generate_series(1, 300000) g", token);
+            try
+            {
+                await WaitReplayedAsync(provider, pgport, await provider.SafePsqlAsync(Database, "SELECT pg_catalog.pg_current_wal_lsn()", token), token);
+            }
+            catch (AssertFailedException)
+            {
+                TestContext.WriteLine(await File.ReadAllTextAsync(standbyLog, token));
+                throw;
+            }
+
+            _ = await SubscriberAsync(provider, pgport, "SELECT pg_catalog.pg_promote()", token);
+            _ = await SubscriberAsync(provider, pgport, "CREATE TABLE own (i int); INSERT INTO own SELECT g FROM generate_series(1, 25) g", token);
+            (stopped, stopOutput) = await provider.RunProgramAsync("pg_ctl", ["stop", "-w", "-m", "immediate", "-D", promotedDir], token);
+            Assert.AreEqual(0, stopped, stopOutput);
+            await File.WriteAllTextAsync(Path.Join(promotedDir, "standby.signal"), "", token);
+            (started, startOutput) = await provider.RunProgramAsync("pg_ctl", ["start", "-w", "-D", promotedDir, "-o", $"-p {port}", "-l", standbyLog], token);
+            Assert.AreEqual(0, started, startOutput);
+            (stopped, stopOutput) = await provider.RunProgramAsync("pg_ctl", ["stop", "-w", "-D", promotedDir], token);
+            Assert.AreEqual(0, stopped, stopOutput);
+            (int controlExit, string control) = await provider.RunProgramAsync("pg_controldata", [promotedDir], token);
+            Assert.AreEqual(0, controlExit, control);
+            Assert.AreEqual("1", control.Split('\n').Single(line => line.StartsWith("Latest checkpoint's TimeLineID:", StringComparison.Ordinal))
+                ["Latest checkpoint's TimeLineID:".Length..].Trim(), "the promoted copy's latest checkpoint, still on timeline 1");
+            _ = await provider.SafePsqlAsync(Database, "CHECKPOINT", token);
+            await RefusedAsync("a copy promoted to timeline 2", "timeline 2", [.. arguments.Select(argument => argument == backupDir ? promotedDir : argument)]);
+
+            // The provider's WAL then begins past the standby's, whose last segment's tail holds its first segment's WAL,
+            // as a file PostgreSQL used again does.
+            await SwitchWalAsync(provider, 3, token);
+            _ = await provider.SafePsqlAsync(Database, "CHECKPOINT", token);
+            foreach (string file in Directory.EnumerateFiles(Path.Join(backupDir, "pg_wal")).Where(file =>
+                Path.GetFileName(file) is { Length: 24 } name && string.CompareOrdinal(name, segments[3]) > 0))
+            {
+                File.Delete(file);
+            }
+
+            string last = Path.Join(backupDir, "pg_wal", segments[3]);
+            byte[] lastBytes = await File.ReadAllBytesAsync(last, token);
+            (await File.ReadAllBytesAsync(first, token)).AsSpan(16384).CopyTo(lastBytes.AsSpan(16384));
+            await File.WriteAllBytesAsync(last, lastBytes, token);
+            await RefusedAsync("a standby whose last segment's tail was used again", "physical replication slot", arguments);
+            Assert.AreEqual("", string.Join("\n", problems));
+        }
+        finally
+        {
+            await StopAsync(provider, backupDir);
+            await StopAsync(provider, promotedDir);
+        }
+    }
+
+    // Waits for the standby at a port to have replayed the provider's WAL to a position.
+    private static async Task WaitReplayedAsync(TestNode provider, int pgport, string position, CancellationToken token)
+    {
+        Stopwatch catching = Stopwatch.StartNew();
+        while (await SubscriberAsync(provider, pgport, $"SELECT pg_catalog.pg_last_wal_replay_lsn() >= '{position}'", token, mayFail: true) != "t")
+        {
+            Assert.IsLessThan(TestNode.PollTimeout, catching.Elapsed,
+                $"the standby catching up to {position}, at {await SubscriberAsync(provider, pgport, "SELECT pg_catalog.pg_last_wal_replay_lsn()", token, mayFail: true)}");
+            await Task.Delay(TimeSpan.FromMilliseconds(200), token);
+        }
+    }
+
+    // Rewrites the last byte of the first logical message in a WAL segment's file that doesn't cross a page, and its
+    // record's checksum, so that its records still follow each other but are no longer the provider's; returns the
+    // file's bytes as they were.
+    private static async Task<byte[]> RewriteMessageAsync(TestNode provider, string segment, CancellationToken token)
+    {
+        const int Page = 8192;
+        byte[] original = await File.ReadAllBytesAsync(segment, token);
+        (_, string dump) = await provider.RunProgramAsync("pg_waldump", ["--rmgr=LogicalMessage", segment], token);
+        (int offset, int total) = dump.Split('\n').Where(line => line.Contains("lsn: ", StringComparison.Ordinal))
+            .Select(line => line[(line.IndexOf("lsn: ", StringComparison.Ordinal) + 5)..line.IndexOf(',', line.IndexOf("lsn: ", StringComparison.Ordinal))])
+            .Select(lsn => (int)(uint.Parse(lsn[(lsn.IndexOf('/', StringComparison.Ordinal) + 1)..], NumberStyles.HexNumber, CultureInfo.InvariantCulture) % (uint)original.Length))
+            .Select(at => (Offset: at, Total: BitConverter.ToInt32(original, at)))
+            .FirstOrDefault(message => (message.Offset % Page) + message.Total <= Page, (Offset: -1, Total: 0));
+        Assert.IsGreaterThanOrEqualTo(0, offset, $"a logical message within its page in {segment}: {dump}");
+        byte[] rewritten = [.. original];
+        rewritten[offset + total - 1] ^= 1;
+        uint crc = Crc32C(0xFFFFFFFF, rewritten.AsSpan(offset + 24, total - 24));
+        crc = Crc32C(crc, rewritten.AsSpan(offset, 20)) ^ 0xFFFFFFFF;
+        BitConverter.GetBytes(crc).CopyTo(rewritten, offset + 20);
+        await File.WriteAllBytesAsync(segment, rewritten, token);
+        return original;
+
+        static uint Crc32C(uint crc, ReadOnlySpan<byte> data)
+        {
+            foreach (byte b in data)
+            {
+                crc = BitOperations.Crc32C(crc, b);
+            }
+
+            return crc;
+        }
+    }
+
+    // Copies a stopped server's data directory.
+    private static void CopyDirectory(string from, string to)
+    {
+        foreach (string directory in Directory.EnumerateDirectories(from, "*", SearchOption.AllDirectories))
+        {
+            _ = Directory.CreateDirectory(Path.Join(to, Path.GetRelativePath(from, directory)));
+        }
+
+        _ = Directory.CreateDirectory(to);
+        foreach (string file in Directory.EnumerateFiles(from, "*", SearchOption.AllDirectories))
+        {
+            File.Copy(file, Path.Join(to, Path.GetRelativePath(from, file)));
+        }
+
+        // The server starts only in a data directory its owner alone may enter.
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(to, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         }
     }
 

@@ -643,7 +643,8 @@ internal static unsafe partial class Executor
         SequenceRangeGuard.StartStatement(queryDesc, written);
 
         // A statement only explained draws nothing as its expressions start, unless it prunes partitions through a call.
-        SequenceRangeGuard.StartingExpressions((nint)queryDesc->plannedstmt, (eflags & ExecFlagExplainOnly) != 0);
+        SequenceRangeGuard.StartingExpressions((nint)queryDesc->plannedstmt, (eflags & ExecFlagExplainOnly) != 0, (nint)queryDesc->sourceText,
+            queryDesc->@params is not null && queryDesc->@params->numParams > 0);
         try
         {
             if (!s_nextExecutorStartHook.IsNull)
