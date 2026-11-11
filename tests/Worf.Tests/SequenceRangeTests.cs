@@ -3950,7 +3950,7 @@ public sealed class SequenceRangeTests
 
         // Each form is checked, and what fails is reported together.
         List<string> problems = [];
-        foreach ((string draw, string? sequence) in new (string, string?)[]
+        (string Draw, string? Sequence)[] forms = [.. new (string, string?)[]
         {
             ("SELECT nextval('t_id_seq')", "t_id_seq"), ("INSERT INTO other VALUES (nextval('t_id_seq'))", "t_id_seq"),
             ("INSERT INTO t (v) VALUES ('x')", "t_id_seq"), ("SELECT nextval('t_id_seq'), last_value FROM t_id_seq", "t_id_seq"),
@@ -4010,14 +4010,17 @@ public sealed class SequenceRangeTests
             ($"COPY tp1 (v) FROM '{rows}'", "tp_id_seq"),
             ("INSERT INTO tl2 VALUES (105, 'u'); ALTER TABLE tl ATTACH PARTITION tl2 FOR VALUES IN ('u', 'v'); INSERT INTO tl2 (v) VALUES ('v') RETURNING id",
                 "tl_id_seq"),
-        ] : []))
+        ] : [])];
+
+        // Each form waits out its time, so they run in four lanes at once; forms that update the same table share one, so
+        // that none waits on another's row lock rather than for node_a.
+        async Task<string?> TryAsync(string draw, string? sequence)
         {
             string where;
             try
             {
                 _ = await nodeB.SafePsqlAsync(Database, TimedLast(draw), token);
-                problems.Add($"{draw}: drew");
-                continue;
+                return $"{draw}: drew";
             }
             catch (PostgresException refused) when (refused.SqlState == "57014")
             {
@@ -4026,21 +4029,36 @@ public sealed class SequenceRangeTests
             catch (ArgumentException)
             {
                 // The statement ran, and returned a value of a type created after the connection's types were read.
-                problems.Add($"{draw}: drew");
-                continue;
+                return $"{draw}: drew";
             }
             catch (PostgresException failed)
             {
-                problems.Add($"{draw}: failed with {failed.SqlState} {failed.MessageText}, rather than wait");
-                continue;
+                return $"{draw}: failed with {failed.SqlState} {failed.MessageText}, rather than wait";
             }
 
-            if (!where.Contains(sequence is null ? "waiting for node node_a, which granted sequence" : $"waiting for node node_a, which granted sequence {sequence}'s block",
-                StringComparison.Ordinal) || where.Contains("as worf can't tell which sequence", StringComparison.Ordinal) != (sequence is null))
+            return !where.Contains(sequence is null ? "waiting for node node_a, which granted sequence" : $"waiting for node node_a, which granted sequence {sequence}'s block",
+                StringComparison.Ordinal) || where.Contains("as worf can't tell which sequence", StringComparison.Ordinal) != (sequence is null)
+                ? $"{draw}: waited {where}"
+                : null;
+        }
+
+        string?[] found = new string?[forms.Length];
+        async Task LaneAsync(int lane)
+        {
+            for (int i = 0; i < forms.Length; i++)
             {
-                problems.Add($"{draw}: waited {where}");
+                string draw = forms[i].Draw;
+                int laneOf = draw.Contains(" ti ", StringComparison.Ordinal) ? 0 : draw.Contains(" tp ", StringComparison.Ordinal) ? 1
+                    : draw.StartsWith("UPDATE t ", StringComparison.Ordinal) ? 2 : i % 4;
+                if (laneOf == lane)
+                {
+                    found[i] = await TryAsync(draw, forms[i].Sequence);
+                }
             }
         }
+
+        await Task.WhenAll(Enumerable.Range(0, 4).Select(LaneAsync));
+        problems.AddRange(found.OfType<string>());
 
         // What draws nothing from the blocks doesn't wait though domains whose CHECKs draw from them, or from a sequence
         // they don't name, exist.
