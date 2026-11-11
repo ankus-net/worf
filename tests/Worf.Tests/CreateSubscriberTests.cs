@@ -1097,7 +1097,6 @@ public sealed class CreateSubscriberTests
                     File.Delete(file);
                 }
 
-                TestContext.WriteLine((await provider.RunProgramAsync("pg_waldump", [Path.Join(backupDir, "pg_wal", boundary)], token)).Output[..2000]);
                 await using (FileStream segment = new(Path.Join(backupDir, "pg_wal", boundary), FileMode.Open, FileAccess.Write))
                 {
                     _ = segment.Seek(128 * 1024, SeekOrigin.Begin);
@@ -1351,7 +1350,8 @@ public sealed class CreateSubscriberTests
     {
         const int Page = 8192;
         byte[] original = await File.ReadAllBytesAsync(segment, token);
-        (_, string dump) = await provider.RunProgramAsync("pg_waldump", ["--rmgr=LogicalMessage", segment], token);
+        // pg_waldump splits a file's path at '/' alone, so the directory goes in --path.
+        (_, string dump) = await provider.RunProgramAsync("pg_waldump", ["--rmgr=LogicalMessage", "--path", Path.GetDirectoryName(segment)!, Path.GetFileName(segment)], token);
         (int offset, int total) = dump.Split('\n').Where(line => line.Contains("lsn: ", StringComparison.Ordinal))
             .Select(line => line[(line.IndexOf("lsn: ", StringComparison.Ordinal) + 5)..line.IndexOf(',', line.IndexOf("lsn: ", StringComparison.Ordinal))])
             .Select(lsn => (int)(uint.Parse(lsn[(lsn.IndexOf('/', StringComparison.Ordinal) + 1)..], NumberStyles.HexNumber, CultureInfo.InvariantCulture) % (uint)original.Length))
