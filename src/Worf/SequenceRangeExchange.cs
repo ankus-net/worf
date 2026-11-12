@@ -1262,11 +1262,15 @@ internal static class SequenceRangeExchange
         WriteNullable(writer, "drawn", row.Get<long?>(14));
         if (managed is null)
         {
-            // The owner dropped the sequence, and keeps no ledger to check a neighbor's report against, so the blocks it
-            // granted are drawn from without its word, as its neighbors learn from this.
+            // The owner dropped the sequence, and keeps no ledger, but goes on checking the neighbor's reports of it
+            // against the neighbor's WAL positions: the neighbor draws from the blocks it keeps once the owner has checked
+            // its report since its server started, and gives them up once the owner finds it went back since.
+            WorfRows kept = Worf.Read("SELECT reset_lsn::text, checked_start FROM worf.sequence_range_dropped_node WHERE name = $1 AND node_id = $2",
+                1, SpiParameter.Create(row.Get<string>(1)), peer);
             writer.WriteBoolean("dropped", true);
-            writer.WriteNull("reset");
+            WriteNullable(writer, "reset", kept.Count > 0 ? kept[0].Get<string?>(0) : null);
             writer.WriteNull("reset_done");
+            WriteNullable(writer, "checked_start", kept.Count > 0 ? kept[0].Get<long?>(1) : null);
             writer.WriteBoolean("held_complete", false);
             foreach (string name in new[] { "held", "requests", "reports", "grants", "acks" })
             {
@@ -1667,7 +1671,7 @@ internal static class SequenceRangeExchange
     {
         if (Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(entry.GetProperty("name").GetWorfString())) is not uint seqoid)
         {
-            return DroppedEpochFollowed(entry) is null;
+            return DroppedEpochFollowed(entry) is null && !CheckDroppedReport(root, entry, senderId, "", call, false);
         }
 
         SpiParameter seq = SpiParameter.Create(seqoid);
@@ -2112,6 +2116,72 @@ internal static class SequenceRangeExchange
     }
 
     /// <summary>
+    /// Checks a neighbor's report of a sequence this node owned and dropped, of the dropped epoch, against what it last
+    /// recorded of the neighbor's reports of it, as for a sequence it manages: a neighbor whose WAL position went back
+    /// since, as a restore takes it, on the same system and timeline or as it started, or that is on another, is asked to
+    /// reset, which gives up the blocks it keeps of the epoch, once; otherwise this node notes the neighbor's start, as
+    /// one it checked the neighbor's report since, which lets the neighbor draw from those blocks, and how far the
+    /// neighbor drew, with the WAL position of the message that tells it. With <paramref name="write"/> false, it only
+    /// finds whether it would record anything.
+    /// </summary>
+    /// <returns>Whether the record changes, or would.</returns>
+    private static bool CheckDroppedReport(JsonElement root, JsonElement entry, uint senderId, string senderName, bool call, bool write)
+    {
+        if (Worf.CatalogOid("sequence_range_dropped_node") == 0)
+        {
+            return false;
+        }
+
+        SpiParameter name = SpiParameter.Create(entry.GetProperty("name").GetWorfString());
+        SpiParameter sender = SpiParameter.Create(senderId);
+        WorfRows kept = Worf.Read("""
+            SELECT k.sysid::text, k.timeline, CASE WHEN $3 THEN k.wal_lsn ELSE k.reply_lsn END::text, k.reported_start, k.checked_start, k.drawn
+            FROM worf.sequence_range_dropped_node k JOIN worf.sequence_range_dropped d ON d.name = k.name
+            WHERE k.name = $1 AND k.node_id = $2 AND d.owned AND d.epoch = $4 AND k.reset_lsn IS NULL
+            """, 1, name, sender, SpiParameter.Create(call), SpiParameter.Create(entry.GetProperty("epoch").GetInt32()));
+        if (kept.Count == 0 || !Worf.TryParseLsn(root.GetProperty("wal_lsn").GetWorfString() ?? "", out ulong position))
+        {
+            return false;
+        }
+
+        ulong recorded = Worf.TryParseLsn(kept[0].Get<string?>(2) ?? "", out ulong at) ? at : 0;
+        long? start = SenderStart(root).Start;
+        if (kept[0].Get<string>(0) != root.GetProperty("sysid").GetWorfString() || kept[0].Get<long>(1) != root.GetProperty("timeline").GetInt64() ||
+            recorded > position || WentBackTo(recorded, kept[0].Get<long?>(3) ?? 0, root) is not null)
+        {
+            if (write)
+            {
+                _ = Worf.Execute("UPDATE worf.sequence_range_dropped_node SET reset_lsn = $3::pg_lsn WHERE name = $1 AND node_id = $2",
+                    name, sender, SpiParameter.Create(Worf.FormatLsn(Math.Max(recorded, position))));
+                WorfLog.Warning($"sequence {entry.GetProperty("name").GetWorfString()}: node {senderName}'s WAL position moved back from " +
+                    $"{Worf.FormatLsn(recorded)}, which this node recorded before it dropped the sequence, so it must give up the blocks it keeps of it");
+            }
+
+            return true;
+        }
+
+        long? drawn = Nullable(entry, "drawn");
+        bool moved = drawn is not null && drawn != kept[0].Get<long?>(5);
+        if ((start is null || start == kept[0].Get<long?>(4)) && !moved)
+        {
+            return false;
+        }
+
+        if (write)
+        {
+            _ = Worf.Execute("""
+                UPDATE worf.sequence_range_dropped_node SET checked_start = coalesce($3, checked_start), drawn = CASE WHEN $4 THEN $5 ELSE drawn END,
+                    wal_lsn = CASE WHEN $4 AND $6 THEN $7::pg_lsn ELSE wal_lsn END, reply_lsn = CASE WHEN $4 AND NOT $6 THEN $7::pg_lsn ELSE reply_lsn END,
+                    reported_start = CASE WHEN $4 THEN $3 ELSE reported_start END
+                WHERE name = $1 AND node_id = $2
+                """, name, sender, SpiParameter.Create(start), SpiParameter.Create(moved), SpiParameter.Create(drawn), SpiParameter.Create(call),
+                SpiParameter.Create(Worf.FormatLsn(position)));
+        }
+
+        return true;
+    }
+
+    /// <summary>
     /// Takes in one sequence of a neighbor's message: joins it if it exists here, records the neighbor's reports,
     /// answers its requests when this node is its parent, records grants for this node and the neighbor's
     /// acknowledgements.
@@ -2127,6 +2197,7 @@ internal static class SequenceRangeExchange
         if (found is not uint seqoid)
         {
             FollowDroppedEpoch(entry);
+            _ = CheckDroppedReport(root, entry, senderId, senderName, call, true);
             return (false, false, false);
         }
 
@@ -3058,10 +3129,8 @@ internal static class SequenceRangeExchange
         => entry.TryGetProperty(name, out JsonElement value) && value.ValueKind == JsonValueKind.String ? value.GetWorfString() : null;
 
     // The start of this server's that a neighbor's report of a sequence confirms: the one it says it checked this node's
-    // report since, or, from an owner that dropped the sequence, this server's own.
-    private static long? Confirms(JsonElement entry)
-        => entry.TryGetProperty("dropped", out JsonElement dropped) && dropped.ValueKind == JsonValueKind.True ? SequenceRangeHeard.Started
-            : Nullable(entry, "checked_start");
+    // report since, as an owner that dropped the sequence says too.
+    private static long? Confirms(JsonElement entry) => Nullable(entry, "checked_start");
 
     private static long? Nullable(JsonElement entry, string name)
         => entry.TryGetProperty(name, out JsonElement value) && value.ValueKind == JsonValueKind.Number ? value.GetInt64() : null;

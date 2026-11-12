@@ -178,6 +178,20 @@ using Ankus.Postgres;
         owned boolean NOT NULL DEFAULT true
     );
 
+    CREATE TABLE worf.sequence_range_dropped_node (
+        name text NOT NULL,
+        node_id oid NOT NULL,
+        sysid numeric(20,0) NOT NULL,
+        timeline bigint NOT NULL,
+        wal_lsn pg_lsn,
+        reply_lsn pg_lsn,
+        reported_start bigint,
+        checked_start bigint,
+        drawn bigint,
+        reset_lsn pg_lsn,
+        PRIMARY KEY (name, node_id)
+    );
+
     CREATE VIEW worf.sequence_ranges AS
         SELECT r.seqoid AS sequence, coalesce(o.node_name, ro.node_name) AS owner, r.epoch, coalesce(p.node_name, rp.node_name) AS parent,
             CASE WHEN r.fenced_at IS NOT NULL THEN 'fenced' ELSE r.state END AS state,
@@ -505,6 +519,7 @@ internal static unsafe partial class SequenceRanges
             rootStart = dropped[0].Get<long?>(2);
             end = dropped[0].Get<long>(3);
             _ = Worf.Execute("DELETE FROM worf.sequence_range_dropped WHERE name = $1", SpiParameter.Create(info.Name));
+            _ = Worf.Execute("DELETE FROM worf.sequence_range_dropped_node WHERE name = $1", SpiParameter.Create(info.Name));
         }
 
         if (existing.Count > 0)
@@ -779,6 +794,18 @@ internal static unsafe partial class SequenceRanges
                 max_range_size = excluded.max_range_size, watermark = excluded.watermark, root_start = excluded.root_start, root_end = excluded.root_end,
                 owned = excluded.owned
             """, SpiParameter.Create(seqoid));
+
+        // The owner keeps what it last recorded of each neighbor's reports of the sequence, so that it goes on checking
+        // them against the neighbors' WAL positions, as the neighbors draw from the blocks they keep.
+        SpiParameter name = SpiParameter.Create(GetInfo(seqoid).Name);
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_dropped_node WHERE name = $1", name);
+        _ = Worf.Execute("""
+            INSERT INTO worf.sequence_range_dropped_node
+            SELECT $2, n.node_id, n.sysid, n.timeline, n.wal_lsn, n.reply_lsn, n.reported_start, n.checked_start, n.drawn, NULL
+            FROM worf.sequence_range r CROSS JOIN worf.local_node l JOIN worf.sequence_range_node n ON n.seqoid = r.seqoid
+            WHERE r.seqoid = $1 AND r.owner_node = l.node_id AND n.via_node = n.node_id AND n.node_id <> l.node_id
+                AND n.sysid IS NOT NULL AND n.timeline IS NOT NULL
+            """, SpiParameter.Create(seqoid), name);
         ChangedOnCommit(seqoid);
     }
 
@@ -847,6 +874,7 @@ internal static unsafe partial class SequenceRanges
         _ = Worf.Execute("DELETE FROM worf.sequence_range_node WHERE via_node = $1", SpiParameter.Create(nodeId));
         _ = Worf.Execute("DELETE FROM worf.sequence_range_absent WHERE node_id = $1", SpiParameter.Create(nodeId));
         _ = Worf.Execute("DELETE FROM worf.sequence_range_back WHERE node_id = $1", SpiParameter.Create(nodeId));
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_dropped_node WHERE node_id = $1", SpiParameter.Create(nodeId));
     }
 
     /// <summary>

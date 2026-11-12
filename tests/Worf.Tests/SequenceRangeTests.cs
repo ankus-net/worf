@@ -4653,6 +4653,66 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// After its owner drops a sequence, a participant draws from the blocks it keeps only once the owner has checked its
+    /// report since it started: restored from a backup taken after the drop, it never draws again the values it drew
+    /// after the backup, as the owner finds its WAL position went back, and asks it to give up those blocks.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task RestoredParticipantsOfDroppedSequencesDrawNothingTwice()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE mv (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('mv_id_seq', participants := '{node_b}', range_size := 1000)", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges WHERE sequence = 'mv_id_seq'::regclass", token),
+            "node_b drawing from mv_id_seq's blocks");
+
+        // node_a drops mv, and node_b, keeping its block, is backed up whole, and draws 20 ids, which node_a hears of.
+        _ = await nodeA.SafePsqlAsync(Database, "DROP TABLE mv", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'disabled' FROM worf.sequence_ranges WHERE sequence = 'mv_id_seq'::regclass", token),
+            "node_b heard mv_id_seq's epoch end");
+        using TemporaryDirectory copies = new($"worf-sequence-range-dropped-restore-{Guid.NewGuid():N}");
+        string copy = Path.Join(copies.FullName, "node_b");
+        await BackUpDataAsync(nodeB, copy, token, wal: true);
+        HashSet<string> before = [.. (await nodeB.SafePsqlAsync(Database, "INSERT INTO mv (v) SELECT 'before' FROM generate_series(1, 20) RETURNING id", token)).Split('\n')];
+        string nodeBId = await nodeB.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
+        for (int call = 0; call < 2; call++)
+        {
+            string heard = await nodeA.SafePsqlAsync(Database, "SELECT clock_timestamp()::text", token);
+            Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, $"SELECT worf.sequence_range_heard({nodeBId}, true, '-infinity', false) > '{heard}'", token),
+                "node_a hearing from node_b after its draws");
+        }
+
+        // node_b goes back to the backup. Its inserts fail, or draw none of the ids it drew before.
+        int logpos = nodeA.ReadLog().Length;
+        await RestoreDataAsync(nodeB, copy, token);
+        Stopwatch trying = Stopwatch.StartNew();
+        while (trying.Elapsed < TimeSpan.FromSeconds(15))
+        {
+            try
+            {
+                HashSet<string> after = [.. (await nodeB.SafePsqlAsync(Database,
+                    "SET statement_timeout = '3s'; INSERT INTO mv (v) SELECT 'after' FROM generate_series(1, 20) RETURNING id", token)).Split('\n')];
+                Assert.AreEqual("", string.Join(",", before.Intersect(after)), "the ids node_b drew both before the restore and after it");
+            }
+            catch (PostgresException failed) when (failed.SqlState is "55000" or "57014" or "2200H")
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(500), token);
+            }
+        }
+
+        Assert.Contains("which this node recorded before it dropped the sequence, so it must give up the blocks it keeps of it", nodeA.ReadLog()[logpos..],
+            "node_a's word that node_b went back");
+    }
+
+    /// <summary>
     /// A fenced allocator with 20,000 grants of the sequence looks for grants that overlap in one pass over them, and again
     /// only once they change; a neighbor's calls that report the same blocks as the fence waits for another node take
     /// nothing in; and sessions that draw from another sequence wait no longer for the range worker than without a fence.
