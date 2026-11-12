@@ -1788,8 +1788,9 @@ int? ReadClusterState(string dataDir)
                 return null;
             }
 
-            // XLP_FIRST_IS_OVERWRITE_CONTRECORD.
-            if ((BitConverter.ToUInt16(pageHeader, 2) & 0x0008) != 0)
+            // XLP_FIRST_IS_OVERWRITE_CONTRECORD, which PostgreSQL 19, whose pages' magic is 0xD122, made 0x0004 as it
+            // dropped XLP_BKP_REMOVABLE.
+            if ((BitConverter.ToUInt16(pageHeader, 2) & (BitConverter.ToUInt16(pageHeader, 0) >= 0xD122 ? 0x0004 : 0x0008)) != 0)
             {
                 return page + (page % segmentBytes == 0 ? (ulong)LongPageHeader : ShortPageHeader);
             }

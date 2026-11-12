@@ -4427,7 +4427,7 @@ public sealed class SequenceRangeTests
             ("INSERT INTO ckp SELECT 'x' FROM jsonb_to_record('{\"a\":1}') AS j(a ddt) WHERE random() < 0", "ti_id_seq"),
             ("SELECT fpoly(NULL::tplain); SELECT fpoly(NULL::tdom)", "ti_id_seq"),
             ("INSERT INTO ai (v) VALUES ('x')", "ti_id_seq"),
-            ("SELECT fp6(-1, NULL::int[]); SELECT fp6(1, NULL::tdom[])", "ti_id_seq"), ("SELECT fp7(-1, NULL::int); SELECT fp7(1, NULL::ctd)", "ti_id_seq"),
+            ("SELECT fp6(-1, NULL::int[]); SELECT fp6(1, NULL::tdom[])", "ti_id_seq"),
             ("UPDATE au SET id = NULL RETURNING id", "ti_id_seq"), ("MERGE INTO au USING (SELECT 1) s ON true WHEN MATCHED THEN UPDATE SET id = 0", "ti_id_seq"),
             ("INSERT INTO pa (v) VALUES ('a') RETURNING id", "ti_id_seq"), ($"COPY pa (v) FROM '{rowsA}'", "ti_id_seq"),
             ("UPDATE pb SET k = 2, id = NULL WHERE k = 1", "ti_id_seq"),
@@ -4441,6 +4441,8 @@ public sealed class SequenceRangeTests
             ("SELECT pg_input_is_valid('1', 'ddk') FROM (VALUES (nextval('plain')), (nextval('plain'))) v(n) LIMIT 1", "t_id_seq"),
             ("SELECT nextval('plain'), pg_input_is_valid('1', 'ddk')", "t_id_seq"), ("SELECT nextval('plain'), * FROM pg_input_error_info('1', 'ddk')", "t_id_seq"),
         ] : []).Concat(sharedIdentity ? [
+            // A variable %TYPE of a composite argument, which PL/pgSQL takes from 17 on.
+            ("SELECT fp7(-1, NULL::int); SELECT fp7(1, NULL::ctd)", "ti_id_seq"),
             ("INSERT INTO tp1 (v) VALUES ('x') RETURNING id", "tp_id_seq"),
             ("MERGE INTO tp1 USING (SELECT 1) s ON false WHEN NOT MATCHED THEN INSERT (v) VALUES ('m')", "tp_id_seq"),
             ($"COPY tp1 (v) FROM '{rows}'", "tp_id_seq"),
