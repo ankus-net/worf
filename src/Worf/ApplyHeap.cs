@@ -64,6 +64,8 @@ internal static unsafe class ApplyHeap
     /// <param name="newtup">The new tuple.</param>
     internal static void ApplyHeapInsert(WorfRelation rel, WorfTupleData newtup)
     {
+        // A trigger of the table that the row fires, whose C code draws from a sequence it names, waits for its grantor.
+        SequenceRangeGuard.WritingRow(rel.Reloid, false);
         (PgRelationWriter writer, PgReplicatedRow row, _, _) = Writer(rel);
         PgHeapTuple? heaprow = SetRow(row, newtup) ? null : HeapRow(rel, newtup);
 
@@ -161,6 +163,7 @@ internal static unsafe class ApplyHeap
     /// <param name="newtup">The new tuple.</param>
     internal static void ApplyHeapUpdate(WorfRelation rel, WorfTupleData oldtup, WorfTupleData newtup)
     {
+        SequenceRangeGuard.WritingRow(rel.Reloid, true);
         (PgRelationWriter writer, PgReplicatedRow row, PgReplicatedRow key, uint replicaIndex) = Writer(rel);
         RelationData* relation = rel.Rel;
         CheckReplicaIndex(rel, replicaIndex);

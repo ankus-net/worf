@@ -2268,9 +2268,10 @@ internal static partial class SequenceRangeGuard
 
     /// <summary>
     /// Checks, as PostgreSQL looks a function up to call it, whether the fmgr hook should watch it start: a trigger
-    /// function, in a session that writes as replicas do, as PostgreSQL's and worf's apply and sync do, which start no
-    /// statement whose tables' triggers the guard reads, so that a trigger whose C code draws from a sequence it names
-    /// among its arguments, as contrib's autoinc does, waits for the sequence's grantor first.
+    /// function, in PostgreSQL's apply or table sync of a subscription, which start no statement whose tables' triggers
+    /// the guard reads, so that a trigger whose C code draws from a sequence it names among its arguments, as contrib's
+    /// autoinc does, waits for the sequence's grantor first. worf's own apply and sync check each row's table as they
+    /// write it, as <see cref="WritingRow"/> does.
     /// </summary>
     /// <param name="fnOid">The function.</param>
     /// <returns>Whether to watch it.</returns>
@@ -2278,7 +2279,8 @@ internal static partial class SequenceRangeGuard
     {
         unsafe
         {
-            if (NativeGlobals.SessionReplicationRole != SessionReplicationRoleReplica || NativeMethods.get_func_rettype(fnOid) != TriggerTypeOid)
+            if (NativeGlobals.MySubscription is null || NativeGlobals.SessionReplicationRole != SessionReplicationRoleReplica ||
+                NativeMethods.get_func_rettype(fnOid) != TriggerTypeOid)
             {
                 return false;
             }
@@ -2286,6 +2288,51 @@ internal static partial class SequenceRangeGuard
 
         _ = s_hookedTriggers.Add(fnOid);
         return true;
+    }
+
+    /// <summary>
+    /// Waits, as worf's apply or sync writes a row, for the grantors of the managed sequences named among the arguments
+    /// of the triggers of the row's table, and its partitions', that fire on its insert, or on its update, as a trigger
+    /// whose C code draws from a sequence it names, as contrib's autoinc does, enabled ALWAYS, may draw from one.
+    /// </summary>
+    /// <param name="relid">The table.</param>
+    /// <param name="update">Whether the row updates one, rather than being inserted.</param>
+    internal static void WritingRow(uint relid, bool update)
+    {
+        bool quiet;
+        unsafe
+        {
+            quiet = NativeGlobals.creating_extension || NativeGlobals.XactReadOnly;
+        }
+
+        if (quiet || s_namingGrantors || SequenceRanges.Recovering() || Worf.CatalogOid("sequence_range_block") == 0)
+        {
+            return;
+        }
+
+        List<uint> waiting = [];
+        s_namingGrantors = true;
+        try
+        {
+            Reload();
+            if (s_grantors.Count == 0 || !Triggers(relid).Argued)
+            {
+                return;
+            }
+
+            uint snowflake = Worf.CatalogOid("snowflake_node");
+            waiting = [.. ArguedBy(relid, update ? TriggerTypeUpdate | TriggerTypeInsert : TriggerTypeInsert)
+                .Where(seqoid => seqoid != snowflake && s_grantors.ContainsKey(seqoid) && !s_confirmedSequences.Contains(seqoid)).Order()];
+        }
+        finally
+        {
+            s_namingGrantors = false;
+        }
+
+        foreach (uint seqoid in waiting)
+        {
+            WaitForGrantor(seqoid);
+        }
     }
 
     /// <summary>

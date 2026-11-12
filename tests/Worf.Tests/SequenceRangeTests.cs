@@ -4797,7 +4797,8 @@ public sealed class SequenceRangeTests
     /// which leaves the transaction to be applied again rather than discarding it, and applies once the grantor has
     /// answered. A row the worker writes or a table it copies whose defaults draw from a sequence no range manages, for
     /// a column only the subscriber has, and whose CHECK constraint does too, applies at once, and a row written after
-    /// the column's default is set to draw from a managed sequence waits.
+    /// the column's default is set to draw from a managed sequence waits; so does a row of a table whose ALWAYS trigger's
+    /// C code, contrib's autoinc, draws from it.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -4821,6 +4822,24 @@ public sealed class SequenceRangeTests
             """, token);
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
             "SELECT count(*) = 2 FROM worf.show_subscription_status() WHERE status = 'replicating'", token), "node_b's subscriptions");
+
+        // node_b's copy of ac, which a subscription of its own brings, has an ALWAYS trigger whose C code, contrib's
+        // autoinc, fills a row's id from t_id_seq.
+        _ = await nodeC.SafePsqlAsync(Database, """
+            CREATE TABLE ac (k int PRIMARY KEY, id int);
+            SELECT worf.create_replication_set('acset');
+            SELECT worf.replication_set_add_table('acset', 'ac');
+            """, token);
+        _ = await nodeB.SafePsqlAsync(Database, $$"""
+            CREATE EXTENSION autoinc;
+            CREATE TABLE ac (k int PRIMARY KEY, id int);
+            CREATE TRIGGER ac_id BEFORE INSERT ON ac FOR EACH ROW EXECUTE FUNCTION autoinc(id, 'public.t_id_seq');
+            ALTER TABLE ac ENABLE ALWAYS TRIGGER ac_id;
+            SELECT worf.create_subscription(subscription_name := 'b_from_c_ac', provider_dsn := '{{nodeC.Dsn(Database, SuperUser)}}',
+                replication_sets := '{acset}', synchronize_structure := false, synchronize_data := false, forward_origins := '{}');
+            """, token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
+            "SELECT count(*) = 3 FROM worf.show_subscription_status() WHERE status = 'replicating'", token), "node_b's subscriptions, ac's too");
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100)", token);
         await WaitActiveAsync([nodeA, nodeB], token);
         await InsertAsync(nodeB, 10, token);
@@ -4843,6 +4862,13 @@ public sealed class SequenceRangeTests
             """, token), "cx copied again with node_a down");
         Assert.IsLessThan(TimeSpan.FromSeconds(20), unmanaged.Elapsed, "the row and the copy, against the 15 s between failed applies");
 
+        // A row of ac waits, as the trigger's C code would draw from t_id_seq's block.
+        int acpos = nodeB.ReadLog().Length;
+        _ = await nodeC.SafePsqlAsync(Database, "INSERT INTO ac VALUES (1, NULL)", token);
+        Assert.IsTrue(await nodeB.PollLogAsync(acpos, "sequence t_id_seq can't draw from the block node node_a granted it", token), "node_b's apply of ac's row, waiting");
+        Assert.AreEqual($"0|{before}", await nodeB.SafePsqlAsync(Database, "SELECT (SELECT count(*) FROM ac), (SELECT last_value FROM t_id_seq)", token),
+            "ac's rows, and the sequence, while node_a is down");
+
         // Once a subscriber-only column's default draws from the managed sequence, rather than the one it drew from, the
         // next row waits, though the apply worker read the defaults for a row before. The values the old default gave go
         // first, as the range's guard would refuse them.
@@ -4863,8 +4889,9 @@ public sealed class SequenceRangeTests
             "node_b's rows from the applied statement and from node_c's row whose default draws, and its sequence, before node_a answered");
 
         await nodeA.StartServerAsync(token);
-        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT (SELECT count(*) FROM other) = 1 AND (SELECT count(*) FROM cx) = 3", token),
-            "the applied statement and node_c's row once node_a is back");
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
+            "SELECT (SELECT count(*) FROM other) = 1 AND (SELECT count(*) FROM cx) = 3 AND (SELECT count(*) FROM ac WHERE id IS NOT NULL) = 1", token),
+            "the applied statement and node_c's rows once node_a is back");
         Assert.AreEqual("0", await nodeB.SafePsqlAsync(Database, "SELECT count(*) FROM worf.exception_log", token), "the transactions transdiscard discarded");
     }
 
