@@ -5695,6 +5695,69 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// A subscription dropped as the exchange worker takes in a reply from its provider doesn't deadlock with the take-in:
+    /// the take-in writes the provider's reports in the order of the sequences' names, and the drop deletes them in the
+    /// order they're stored, so the drop takes the exchanges' turn first.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task SubscriptionsDropWhileTheirRepliesAreTakenIn()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text); CREATE TABLE a (id bigserial PRIMARY KEY)", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            SELECT worf.enable_sequence_range('a_id_seq', participants := '{node_b}', range_size := 100);
+            SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100);
+            """, token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+        string nodeAId = await nodeA.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
+
+        // node_b stores its reports of node_a in the order of the sequences' oids, t_id_seq's first, as idle calls leave
+        // them.
+        _ = await nodeB.SafePsqlAsync(Database, "CLUSTER worf.sequence_range_node USING sequence_range_node_pkey", token);
+        Assert.AreEqual("t", await nodeB.SafePsqlAsync(Database, $"""
+            SELECT (SELECT ctid FROM worf.sequence_range_node WHERE seqoid = 't_id_seq'::regclass AND node_id = {nodeAId})
+                < (SELECT ctid FROM worf.sequence_range_node WHERE seqoid = 'a_id_seq'::regclass AND node_id = {nodeAId})
+            """, token), "node_b's reports of node_a, t_id_seq's stored first");
+
+        // node_a draws from both sequences, and node_b's take-in holds its report of a_id_seq, before it writes that of
+        // t_id_seq, until the test lets it go.
+        _ = await nodeB.SafePsqlAsync(Database, """
+            CREATE TABLE held ();
+            CREATE FUNCTION hold_report() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                    IF NEW.seqoid = 'public.a_id_seq'::regclass THEN
+                        WHILE EXISTS (SELECT FROM public.held) LOOP PERFORM pg_sleep(0.05); END LOOP;
+                    END IF;
+                    RETURN NEW;
+                END $$;
+            CREATE TRIGGER hold_report BEFORE INSERT OR UPDATE ON worf.sequence_range_node FOR EACH ROW EXECUTE FUNCTION hold_report();
+            INSERT INTO held DEFAULT VALUES;
+            """, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT count(nextval('a_id_seq')) + count(nextval('t_id_seq')) FROM generate_series(1, 5)", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity WHERE backend_type LIKE 'worf exchange%' AND wait_event = 'PgSleep')", token),
+            "node_b's exchange worker, holding node_a's report of a_id_seq");
+
+        // The drop starts, and the take-in goes on once it waits: a drop that deleted the report of t_id_seq and then
+        // waited for that of a_id_seq would find the take-in waiting for it in turn.
+        Task<string> dropping = nodeB.SafePsqlAsync(Database, "SELECT worf.drop_subscription('b_from_a')", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'SELECT worf.drop_subscription%')", token),
+            "the drop, waiting");
+        _ = await nodeB.SafePsqlAsync(Database, "DELETE FROM held", token);
+        _ = await dropping;
+        Assert.AreEqual("0", await nodeB.SafePsqlAsync(Database, "SELECT count(*) FROM worf.subscription", token), "node_b's subscriptions");
+    }
+
+    /// <summary>
     /// In a cascade, a node two links from the owner gets its blocks from its parent's pool block, and a node whose
     /// link to the owner is dropped finds the owner through another neighbor, which relays its reports without writing.
     /// A late joiner whose values reach into the root is refused by the pool holder it asks, one sequence's failure

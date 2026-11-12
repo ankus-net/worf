@@ -891,9 +891,10 @@ internal static class SequenceRangeExchange
     /// <summary>
     /// Waits for this node's other exchanges to finish taking in their messages, so that no two lock its ranges in
     /// different orders, as when a sequence's name names another sequence on a neighbor. A call takes its turn only once
-    /// the neighbor has answered, so that no node waits on another's turn while that node waits on its own.
+    /// the neighbor has answered, so that no node waits on another's turn while that node waits on its own. A dropped
+    /// subscription takes the turn too, before it deletes the reports a reply's take-in locks.
     /// </summary>
-    private static void TakeTurn() => _ = Worf.Read("SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('worf.sequence_range_exchange_turn'))", 0);
+    internal static void TakeTurn() => _ = Worf.Read("SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('worf.sequence_range_exchange_turn'))", 0);
 
     /// <summary>
     /// Gets the furthest WAL position of the provider whose changes this node has applied through a subscription, under
