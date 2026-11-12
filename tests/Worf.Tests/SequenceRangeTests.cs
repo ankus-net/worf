@@ -4543,6 +4543,116 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// A node's message reports a WAL position past every draw it reports, though a session draws as the message is made:
+    /// here the session holds the sequence locked until the call waits to read its last value, and draws before it lets
+    /// go, once the node is backed up, from a checkpoint after the call began, and its WAL copied. The node, restored to
+    /// the copy as its grantor restarts, which forgets what its shared memory heard, never draws again the values the
+    /// session drew.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task MessagesReportPositionsPastTheirDraws()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 1000)", token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT count(*) = 1 FROM worf.sequence_ranges WHERE state = 'active'", token),
+            "node_b drawing from a block of t_id_seq");
+
+        using TemporaryDirectory copies = new($"worf-sequence-range-position-{Guid.NewGuid():N}");
+        string copy = Path.Join(copies.FullName, "node_b");
+
+        // A session holds t_id_seq locked until node_b's call waits to read its last value, as it makes its message, which
+        // reads worf.sequence_range_dropped with it, and node_b is backed up, from a checkpoint after the call began, and
+        // its WAL copied; the session draws 40 ids, and lets go.
+        HashSet<string> before = [];
+        await using (NpgsqlConnection holder = await nodeB.OpenAsync(Database, token))
+        {
+            NpgsqlTransaction holding;
+            Stopwatch trying = Stopwatch.StartNew();
+            while (true)
+            {
+                holding = await holder.BeginTransactionAsync(token);
+                await using (NpgsqlCommand alter = new("ALTER SEQUENCE t_id_seq OWNED BY t.id", holder, holding))
+                {
+                    _ = await alter.ExecuteNonQueryAsync(token);
+                }
+
+                Stopwatch held = Stopwatch.StartNew();
+                bool reading = false;
+                while (!reading && held.Elapsed < TimeSpan.FromSeconds(3))
+                {
+                    reading = await nodeB.SafePsqlAsync(Database, """
+                        SELECT EXISTS (
+                            SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+                            WHERE NOT l.granted AND l.relation = 't_id_seq'::regclass AND a.backend_type LIKE 'worf exchange%'
+                                AND EXISTS (SELECT 1 FROM pg_locks d WHERE d.pid = l.pid AND d.relation = 'worf.sequence_range_dropped'::regclass))
+                        """, token) == "t";
+                    await Task.Delay(TimeSpan.FromMilliseconds(50), token);
+                }
+
+                if (reading)
+                {
+                    break;
+                }
+
+                await holding.RollbackAsync(token);
+                await holding.DisposeAsync();
+                Assert.IsLessThan(TimeSpan.FromSeconds(60), trying.Elapsed, "node_b's call, waiting to read t_id_seq's last value");
+            }
+
+            await BackUpDataAsync(nodeB, copy, token);
+            CopyWal(nodeB, copy);
+            await using (NpgsqlCommand draw = new("SELECT nextval('t_id_seq') FROM generate_series(1, 40)", holder, holding))
+            {
+                await using NpgsqlDataReader drawn = await draw.ExecuteReaderAsync(token);
+                while (await drawn.ReadAsync(token))
+                {
+                    _ = before.Add(drawn.GetInt64(0).ToString(CultureInfo.InvariantCulture));
+                }
+            }
+
+            await holding.CommitAsync(token);
+            await holding.DisposeAsync();
+        }
+
+        // node_a takes in the call that reports the draws, and restarts as node_b goes back to the copy.
+        long last = before.Max(id => long.Parse(id, CultureInfo.InvariantCulture));
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, string.Create(CultureInfo.InvariantCulture, $"""
+            SELECT drawn >= {last} FROM worf.sequence_range_node WHERE node_name = 'node_b' AND seqoid = 't_id_seq'::regclass AND via_node = node_id
+            """), token), "node_a's record of node_b's draws");
+        await nodeA.StopAsync("fast", token);
+        await RestoreDataAsync(nodeB, copy, token);
+        await nodeA.StartServerAsync(token);
+
+        HashSet<string> after;
+        Stopwatch waiting = Stopwatch.StartNew();
+        while (true)
+        {
+            Assert.IsLessThan(TestNode.PollTimeout, waiting.Elapsed, "node_b's insert after the restore");
+            try
+            {
+                after = [.. (await nodeB.SafePsqlAsync(Database, "INSERT INTO t (v) SELECT 'after' FROM generate_series(1, 20) RETURNING id", token)).Split('\n')];
+                break;
+            }
+            catch (PostgresException waited) when (waited.SqlState is "55000" or "57014" or "2200H")
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(200), token);
+            }
+        }
+
+        Assert.AreEqual("", string.Join(",", before.Intersect(after)), "the ids node_b drew both before the restore and after it");
+    }
+
+    /// <summary>
     /// A fenced allocator with 20,000 grants of the sequence looks for grants that overlap in one pass over them, and again
     /// only once they change; a neighbor's calls that report the same blocks as the fence waits for another node take
     /// nothing in; and sessions that draw from another sequence wait no longer for the range worker than without a fence.

@@ -1071,12 +1071,10 @@ internal static class SequenceRangeExchange
         {
             ulong sysid;
             uint timeline;
-            ulong insert;
             unsafe
             {
                 sysid = NativeMethods.GetSystemIdentifier();
                 timeline = SequenceRanges.Timeline();
-                insert = NativeMethods.GetXLogInsertRecPtr();
             }
 
             writer.WriteStartObject();
@@ -1084,7 +1082,6 @@ internal static class SequenceRangeExchange
             writer.WriteString("node_name", WorfJson.Encode(node.Node.Name));
             writer.WriteString("sysid", sysid.ToString(CultureInfo.InvariantCulture));
             writer.WriteNumber("timeline", timeline);
-            writer.WriteString("wal_lsn", Worf.FormatLsn(insert));
             if (slot is not null)
             {
                 writer.WriteString("slot", WorfJson.Encode(slot));
@@ -1129,6 +1126,14 @@ internal static class SequenceRangeExchange
                     WHERE d.owned AND NOT EXISTS (SELECT 1 FROM worf.sequence_range r WHERE r.seqoid = pg_catalog.to_regclass(d.name))) s
                 ORDER BY name COLLATE "C"
                 """);
+            // The WAL position, read once the sequences' last values are, so that it's past every draw the message reports:
+            // a draw writes its WAL before its value shows.
+            ulong insert;
+            unsafe
+            {
+                insert = NativeMethods.GetXLogInsertRecPtr();
+            }
+
             WorfNeighborRows parts = Parts(sequences, neighbor);
             for (int i = 0; i < sequences.Count; i++)
             {
@@ -1136,6 +1141,7 @@ internal static class SequenceRangeExchange
             }
 
             writer.WriteEndArray();
+            writer.WriteString("wal_lsn", Worf.FormatLsn(insert));
             writer.WriteEndObject();
         }
 
