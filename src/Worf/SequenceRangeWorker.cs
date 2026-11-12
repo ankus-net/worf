@@ -1,3 +1,4 @@
+using System.Globalization;
 using Ankus.Postgres;
 
 namespace Worf;
@@ -168,6 +169,7 @@ internal static class SequenceRangeWorker
                                 }
 
                                 checkedAt[seqoid] = (touched, position, now);
+                                WorfLog.Debug2($"sequence range worker checking sequence {seqoid.ToString(CultureInfo.InvariantCulture)} in full");
                                 SequenceRanges.LedgerNoWait = true;
                                 double rate = Rate(rates, seqoid);
                                 _ = SequenceRanges.LiftFence(seqoid, local, false);

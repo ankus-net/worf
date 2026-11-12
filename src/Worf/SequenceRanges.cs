@@ -729,7 +729,19 @@ internal static unsafe partial class SequenceRanges
                 Reset(seqoid, node, !all || seqoid != SnowflakeIds.NodeSequence());
             }
         });
-        ChangedOnCommit();
+
+        // A reset of one sequence counts as a change to it alone.
+        if (all)
+        {
+            ChangedOnCommit();
+        }
+        else
+        {
+            foreach (uint seqoid in sequences)
+            {
+                ChangedOnCommit(seqoid);
+            }
+        }
     }
 
     /// <summary>
@@ -793,6 +805,12 @@ internal static unsafe partial class SequenceRanges
         _ = Worf.Execute("DELETE FROM worf.sequence_range_back WHERE seqoid::oid = ANY ($1::oid[])", seqoids);
         _ = Worf.Execute("DELETE FROM worf.sequence_range_fence_wait WHERE seqoid::oid = ANY ($1::oid[])", seqoids);
         _ = Worf.Execute("DELETE FROM worf.sequence_range WHERE seqoid::oid = ANY ($1::oid[])", seqoids);
+
+        // Their counters of changes go too, for other sequences to take.
+        for (int i = 0; i < gone.Count; i++)
+        {
+            SequenceRangeTouches.Free(gone[i].Get<uint>(0));
+        }
 
         return true;
     }

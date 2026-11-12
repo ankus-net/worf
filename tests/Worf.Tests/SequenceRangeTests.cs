@@ -4066,6 +4066,64 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// The range worker checks in full a sequence whose ranges nothing changed only every ten check intervals, however
+    /// another sequence's ranges change: here as node_a draws through t_id_seq's blocks of ten, and resets t_id_seq, with
+    /// u_seq, which shares t_id_seq's counter of changes under a hash of 1,024 counters, idle.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task OtherSequencesChangesDontCount()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token, "log_min_messages = debug2");
+        _ = await nodeA.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+
+        // Sequences are made until one's counter would be t_id_seq's, as the hash of the database and the sequence
+        // gives it.
+        uint dboid = uint.Parse(await nodeA.SafePsqlAsync(Database, "SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database()", token), CultureInfo.InvariantCulture);
+        uint tid = uint.Parse(await nodeA.SafePsqlAsync(Database, "SELECT 't_id_seq'::regclass::oid", token), CultureInfo.InvariantCulture);
+        static ulong Slot(uint dboid, uint seqoid) => ((dboid * 2654435761UL) ^ seqoid) % 1024;
+        uint u = 0;
+        for (int round = 0; u == 0; round++)
+        {
+            Assert.IsLessThan(20, round, "a sequence that shares t_id_seq's counter");
+            string made = await nodeA.SafePsqlAsync(Database, $$"""
+                DO $$ BEGIN FOR g IN 1..512 LOOP EXECUTE format('CREATE SEQUENCE try_{{round}}_%s', g); END LOOP; END $$;
+                SELECT string_agg(c.oid::text, ',') FROM pg_catalog.pg_class c WHERE c.relname LIKE 'try\_{{round}}\_%'
+                """, token);
+            u = made.Split('\n')[^1].Split(',').Select(oid => uint.Parse(oid, CultureInfo.InvariantCulture)).FirstOrDefault(oid => Slot(dboid, oid) == Slot(dboid, tid));
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database, $$"""
+            SELECT worf.enable_sequence_range('t_id_seq', participants := '{}', range_size := 10, max_range_size := 10);
+            SELECT worf.enable_sequence_range({{u.ToString(CultureInfo.InvariantCulture)}}::regclass, participants := '{}', range_size := 100);
+            """, token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT count(*) = 2 FROM worf.sequence_ranges WHERE state = 'active'", token), "both sequences active");
+        await Task.Delay(TimeSpan.FromSeconds(2), token);
+
+        // For ten seconds node_a draws through t_id_seq's blocks, and then resets it twenty times.
+        string Checked(uint seqoid) => $"checking sequence {seqoid.ToString(CultureInfo.InvariantCulture)} in full";
+        int logpos = nodeA.ReadLog().Length;
+        Stopwatch drawing = Stopwatch.StartNew();
+        while (drawing.Elapsed < TimeSpan.FromSeconds(10))
+        {
+            _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO t (v) SELECT 'a' FROM generate_series(1, 5)", token);
+            await Task.Delay(TimeSpan.FromMilliseconds(50), token);
+        }
+
+        for (int i = 0; i < 20; i++)
+        {
+            _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.reset_sequence_range('t_id_seq')", token);
+            await Task.Delay(TimeSpan.FromMilliseconds(250), token);
+        }
+
+        string log = nodeA.ReadLog()[logpos..];
+        int own = log.Split(Checked(tid)).Length - 1;
+        int other = log.Split(Checked(u)).Length - 1;
+        Assert.IsTrue(own > 40 && other < 25, $"the full checks of t_id_seq, {own}, and of the idle sequence that shares its counter under a hash, {other}, over 15 s");
+    }
+
+    /// <summary>
     /// Calls cut short go on where the last one stopped: with every sequence asking for a block on every call, as a node
     /// that draws each small block through as soon as it has it keeps them, and each grant costing the owner time, the
     /// sequence whose name sorts last still has its root started, as the calls take the rest in turn.

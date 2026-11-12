@@ -5,14 +5,19 @@ namespace Worf;
 /// <summary>
 /// How often each managed sequence's ranges changed, or a session asked the range worker to check it, in shared memory,
 /// so that the range worker checks in full only the sequences something happened to, rather than every sequence on any
-/// change. Sequences share counters by hash, and a change that names no sequence counts for every sequence.
+/// change. Each sequence of the server has a counter of its own, which the range worker gives up as the sequence's drop
+/// commits, up to the number of counters, past which a change to a sequence without one counts for every sequence, as a
+/// change that names no sequence does.
 /// </summary>
 internal static class SequenceRangeTouches
 {
     /// <summary>
     /// The number of counters, for every database of the server.
     /// </summary>
-    internal const int MaxCounters = 1024;
+    internal const int MaxCounters = 16384;
+
+    // An entry that a dropped sequence gave up: no database, and the largest OID.
+    private const uint Freed = uint.MaxValue;
 
     // The sequences this transaction changed, which count once it commits or prepares, and whether it changed one it
     // doesn't name.
@@ -22,12 +27,12 @@ internal static class SequenceRangeTouches
     /// <summary>
     /// Gets the shared counters.
     /// </summary>
-    internal static PgLwLock<WorfTouchTable, long> Counters { get; } = new("worf_sequence_range_touches");
+    internal static PgLwLock<WorfTouchTable, WorfTouch> Counters { get; } = new("worf_sequence_range_touches");
 
     /// <summary>
     /// Sets up the shared memory.
     /// </summary>
-    internal static void ShmemInit() => PgSharedMemory.Initialize(Counters, MaxCounters, static () => default, static _ => 0L);
+    internal static void ShmemInit() => PgSharedMemory.Initialize(Counters, MaxCounters, static () => default, static _ => default);
 
     /// <summary>
     /// Counts a change to a sequence's ranges, or a request to check it, now.
@@ -35,7 +40,7 @@ internal static class SequenceRangeTouches
     /// <param name="seqoid">The sequence, or null for a change to every sequence.</param>
     internal static void Touch(uint? seqoid)
     {
-        using PgLwLockExclusiveGuard<WorfTouchTable, long> guard = Counters.Exclusive();
+        using PgLwLockExclusiveGuard<WorfTouchTable, WorfTouch> guard = Counters.Exclusive();
         Count(guard, seqoid);
     }
 
@@ -62,7 +67,7 @@ internal static class SequenceRangeTouches
     {
         if (s_allOnCommit || s_onCommit.Count > 0)
         {
-            using PgLwLockExclusiveGuard<WorfTouchTable, long> guard = Counters.Exclusive();
+            using PgLwLockExclusiveGuard<WorfTouchTable, WorfTouch> guard = Counters.Exclusive();
             if (s_allOnCommit)
             {
                 Count(guard, null);
@@ -93,16 +98,42 @@ internal static class SequenceRangeTouches
     /// <returns>The counts.</returns>
     internal static (long All, long Sequence) Touched(uint seqoid)
     {
-        using PgLwLockShareGuard<WorfTouchTable, long> guard = Counters.Share();
-        return (guard.Header.All, guard[Slot(seqoid)]);
+        using PgLwLockShareGuard<WorfTouchTable, WorfTouch> guard = Counters.Share();
+        uint dboid = DatabaseId();
+        int slot = Find(i => guard[i], dboid, seqoid, out _);
+        return (guard.Header.All, slot >= 0 ? guard[slot].Count : 0);
     }
 
-    private static void Count(PgLwLockExclusiveGuard<WorfTouchTable, long> guard, uint? seqoid)
+    /// <summary>
+    /// Gives up a dropped sequence's counter, as the range worker removes its range state.
+    /// </summary>
+    /// <param name="seqoid">The sequence, of this database.</param>
+    internal static void Free(uint seqoid)
     {
-        if (seqoid is uint one)
+        using PgLwLockExclusiveGuard<WorfTouchTable, WorfTouch> guard = Counters.Exclusive();
+        int slot = Find(i => guard[i], DatabaseId(), seqoid, out _);
+        if (slot >= 0)
         {
-            int slot = Slot(one);
-            guard[slot] = guard[slot] + 1;
+            guard[slot] = new WorfTouch { Dboid = 0, Seqoid = Freed, Count = 0 };
+        }
+    }
+
+    private static void Count(PgLwLockExclusiveGuard<WorfTouchTable, WorfTouch> guard, uint? seqoid)
+    {
+        uint dboid = DatabaseId();
+        int free = -1;
+        int slot = seqoid is uint one ? Find(i => guard[i], dboid, one, out free) : -1;
+        if (seqoid is uint taken && slot < 0 && free >= 0)
+        {
+            slot = free;
+            guard[slot] = new WorfTouch { Dboid = dboid, Seqoid = taken, Count = 0 };
+        }
+
+        if (slot >= 0)
+        {
+            WorfTouch touch = guard[slot];
+            touch.Count++;
+            guard[slot] = touch;
         }
         else
         {
@@ -112,15 +143,43 @@ internal static class SequenceRangeTouches
         }
     }
 
-    // The counter of a sequence of this database.
-    private static int Slot(uint seqoid)
+    // Finds a sequence's counter, probing from its hash's slot until an entry never taken, and the first entry it could
+    // take, free or given up, or -1 for none.
+    private static int Find(Func<int, WorfTouch> entry, uint dboid, uint seqoid, out int free)
     {
-        uint dboid;
-        unsafe
+        free = -1;
+        int start = (int)(((dboid * 2654435761UL) ^ seqoid) % MaxCounters);
+        for (int probe = 0; probe < MaxCounters; probe++)
         {
-            dboid = NativeGlobals.MyDatabaseId;
+            int slot = (start + probe) % MaxCounters;
+            WorfTouch touch = entry(slot);
+            if (touch.Dboid == dboid && touch.Seqoid == seqoid)
+            {
+                return slot;
+            }
+
+            if (touch.Dboid == 0)
+            {
+                if (free < 0)
+                {
+                    free = slot;
+                }
+
+                if (touch.Seqoid != Freed)
+                {
+                    return -1;
+                }
+            }
         }
 
-        return (int)(((dboid * 2654435761UL) ^ seqoid) % MaxCounters);
+        return -1;
+    }
+
+    private static uint DatabaseId()
+    {
+        unsafe
+        {
+            return NativeGlobals.MyDatabaseId;
+        }
     }
 }
