@@ -377,6 +377,13 @@ internal static unsafe partial class SequenceRanges
     internal static PgAtomic<long> SwitchesPending { get; } = new("worf_sequence_range_switches_pending");
 
     /// <summary>
+    /// Gets the counter that grants an owner makes itself move once they have committed, and every session sees them, so
+    /// that the range worker writes the word to the owner's subscribers to call it, which a call then answers with the
+    /// grant.
+    /// </summary>
+    internal static PgAtomic<long> WordsWanted { get; } = new("worf_sequence_range_words_wanted");
+
+    /// <summary>
     /// Sets up the shared memory.
     /// </summary>
     internal static void ShmemInit()
@@ -385,6 +392,7 @@ internal static unsafe partial class SequenceRanges
         PgSharedMemory.Initialize(ExchangeRequested, static () => 0L);
         PgSharedMemory.Initialize(CheckRequested, static () => 0L);
         PgSharedMemory.Initialize(SwitchesPending, static () => 0L);
+        PgSharedMemory.Initialize(WordsWanted, static () => 0L);
     }
 
     /// <summary>
@@ -4520,14 +4528,21 @@ internal static unsafe partial class SequenceRanges
         _ = Worf.Execute("UPDATE worf.sequence_range_grant SET state = 'acknowledged' WHERE grant_id = $1", SpiParameter.Create(grant));
 
         // The owner draws from the block only once a neighbor has heard of it, which its subscribers hear of when they
-        // next call, so they're told to call now, as the transaction commits.
-        WakeSubscribers();
+        // next call, so they're told to call now. The word goes out once the grant has committed and every session sees
+        // it, past a synchronous standby's reply: a word the transaction wrote would reach a subscriber as its commit
+        // record does, and the call it made at once could miss the grant, and count as the call the word asked for.
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () =>
+        {
+            _ = PgAtomic.Add(WordsWanted, 1L);
+            Worker.WakeRangeWorker();
+        });
         return true;
     }
 
     /// <summary>
     /// Writes a message, as the transaction commits, that worf's output plugin sends this node's subscribers as a word to
-    /// call this node now, rather than at their next exchange interval.
+    /// call this node now, rather than at their next exchange interval: the range worker writes it in a transaction of its
+    /// own, once the grants that want it have committed.
     /// </summary>
     internal static void WakeSubscribers()
     {

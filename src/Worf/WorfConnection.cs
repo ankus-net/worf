@@ -270,7 +270,9 @@ internal sealed unsafe partial class WorfConnection : IDisposable
     /// <param name="maxBytes">The most bytes of messages to hold.</param>
     /// <param name="handle">Handles a message now, returning whether it did, so that it isn't given again.</param>
     /// <param name="stop">Whether to stop waiting, as when the worker is asked to stop.</param>
-    internal void ReadAhead(TimeSpan duration, long maxBytes, ReadAheadHandler handle, Func<bool> stop)
+    /// <param name="full">Runs each second while the messages held reach <paramref name="maxBytes"/>, as the wait reads
+    /// no more then, and so handles none that come.</param>
+    internal void ReadAhead(TimeSpan duration, long maxBytes, ReadAheadHandler handle, Func<bool> stop, Action full)
     {
         long until = NativeMethods.GetCurrentTimestamp() + (long)duration.TotalMicroseconds;
         while (!stop())
@@ -283,6 +285,11 @@ internal sealed unsafe partial class WorfConnection : IDisposable
 
             if (_endedAhead || _readAheadBytes >= maxBytes)
             {
+                if (!_endedAhead)
+                {
+                    full();
+                }
+
                 int events = NativeMethods.WaitLatchOrSocket(NativeGlobals.MyLatch, WlLatchSet | WlExitOnPmDeath | WlTimeout, InvalidSocket,
                     Math.Min(remaining, 1000), PgWaitExtension);
                 if ((events & WlLatchSet) != 0)

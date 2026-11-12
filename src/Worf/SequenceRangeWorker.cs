@@ -34,10 +34,40 @@ internal static class SequenceRangeWorker
 
         // What the last tick that looked for dropped sequences and checked this node's identity saw, and when.
         (long Version, long Requested, long At) lookedAt = (-1, -1, 0);
+
+        // The words grants this node made itself want, which the worker writes in a transaction of its own once the
+        // grants have committed, at each tick and after each sequence's check.
+        long wordsWritten = SequenceRanges.WordsWanted.Value;
+        void WriteWords()
+        {
+            long wanted = SequenceRanges.WordsWanted.Value;
+            if (wanted == wordsWritten)
+            {
+                return;
+            }
+
+            wordsWritten = wanted;
+            try
+            {
+                PgBackgroundWorker.RunTransaction(static () =>
+                {
+                    if (Worf.CatalogOid("sequence_range") != 0)
+                    {
+                        SequenceRanges.WakeSubscribers();
+                    }
+                });
+            }
+            catch (PgException error)
+            {
+                WorfLog.Warning($"could not tell this node's subscribers to call it: {error.Message}");
+            }
+        }
+
         while (!Worker.GotSigterm)
         {
             PgInterrupts.Check();
             Worker.ProcessConfigReload();
+            WriteWords();
 
             long requested = SequenceRanges.CheckRequested.Value;
 
@@ -165,6 +195,7 @@ internal static class SequenceRangeWorker
 
                     SequenceRanges.HandOff(local, seqoid => rates.TryGetValue(seqoid, out (long Block, long Position, long At, double Peak, long PeakAt) last) ? last.Peak : 0);
                     SequenceRangeGuard.CountAttempt(seqoid);
+                    WriteWords();
                 }
 
                 // Snowflake IDs never pass the time reserved ahead, which backends see only once it is durable.

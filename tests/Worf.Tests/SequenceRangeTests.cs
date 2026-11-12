@@ -8,6 +8,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
+using System.Threading.Channels;
 using Npgsql;
 using Npgsql.Replication;
 using Npgsql.Replication.Internal;
@@ -3929,18 +3930,25 @@ public sealed partial class SequenceRangeTests
     /// <summary>
     /// An owner that only answers calls draws from the blocks it grants itself without waiting for its subscriber's next
     /// call, though the subscriber applies the owner's changes 40 seconds late: the subscriber hears the owner's word to
-    /// call it as it waits out the delay, and calls at once.
+    /// call it as it waits out the delay, and calls at once. The word goes out only once the grant is seen, as past a
+    /// synchronous standby's reply, which here comes half a second late, through a proxy that holds what the standby
+    /// sends, while the inserts commit locally; and a subscriber whose read-ahead of the owner's changes is full, as after 90 MB of them,
+    /// which reads no more of them and so can't hear the word, calls each second.
     /// </summary>
+    /// <param name="how">The owner as it is, with a synchronous standby that answers late, or writing 90 MB first.</param>
     /// <returns>The test.</returns>
     [TestMethod]
-    public async Task OwnersDontWaitForDelayedSubscribers()
+    [DataRow("word")]
+    [DataRow("synchronous")]
+    [DataRow("busy")]
+    public async Task OwnersDontWaitForDelayedSubscribers(string how)
     {
         CancellationToken token = TestContext.CancellationToken;
         await using TestNode nodeA = await StartNodeAsync("node_a", token, "log_min_messages = debug2");
         await using TestNode nodeB = await StartNodeAsync("node_b", token, "log_min_messages = debug2");
         foreach (TestNode node in new[] { nodeA, nodeB })
         {
-            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text); CREATE TABLE big (id bigserial PRIMARY KEY, v text)", token);
         }
 
         await SubscribeAsync(nodeB, "b_from_a", nodeA, token, applyDelay: "40s");
@@ -3952,20 +3960,109 @@ public sealed partial class SequenceRangeTests
         _ = await nodeB.SafePsqlAsync(Database, "ALTER SYSTEM SET worf.sequence_range_exchange_interval = '60s'", token);
         _ = await nodeB.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
         await Task.Delay(TimeSpan.FromSeconds(2), token);
-        await using NpgsqlConnection connection = await nodeA.OpenAsync(Database, token);
-        await using (NpgsqlCommand timeout = new("SET statement_timeout = '10s'", connection))
+
+        using TemporaryDirectory received = new($"worf-sequence-range-receivewal-{Guid.NewGuid():N}");
+        using CancellationTokenSource relaying = CancellationTokenSource.CreateLinkedTokenSource(token);
+        Process? standby = null;
+        Task relayed = Task.CompletedTask;
+        if (how == "synchronous")
         {
-            _ = await timeout.ExecuteNonQueryAsync(token);
+            // pg_receivewal, as the synchronous standby, reaches node_a through a proxy that holds each of its messages,
+            // its replies among them, for half a second.
+            TcpListener proxy = new(IPAddress.Loopback, 0);
+            proxy.Start();
+            relayed = Task.Run(async () =>
+            {
+                try
+                {
+                    using TcpClient inbound = await proxy.AcceptTcpClientAsync(relaying.Token);
+                    using TcpClient outbound = new();
+                    await outbound.ConnectAsync(IPAddress.Loopback, nodeA.Cluster.Port, relaying.Token);
+                    NetworkStream client = inbound.GetStream();
+                    NetworkStream server = outbound.GetStream();
+                    Channel<(long Due, byte[] Data)> held = Channel.CreateUnbounded<(long, byte[])>();
+                    Task down = server.CopyToAsync(client, relaying.Token);
+                    Task reading = Task.Run(async () =>
+                    {
+                        byte[] buffer = new byte[65536];
+                        for (int read; (read = await client.ReadAsync(buffer, relaying.Token)) > 0;)
+                        {
+                            await held.Writer.WriteAsync((Stopwatch.GetTimestamp() + Stopwatch.Frequency / 2, buffer[..read]), relaying.Token);
+                        }
+
+                        held.Writer.Complete();
+                    }, relaying.Token);
+                    await foreach ((long due, byte[] data) in held.Reader.ReadAllAsync(relaying.Token))
+                    {
+                        TimeSpan wait = Stopwatch.GetElapsedTime(Stopwatch.GetTimestamp(), due);
+                        if (wait > TimeSpan.Zero)
+                        {
+                            await Task.Delay(wait, relaying.Token);
+                        }
+
+                        await server.WriteAsync(data, relaying.Token);
+                    }
+
+                    await Task.WhenAll(down, reading);
+                }
+                catch (Exception relayFailed) when (relayFailed is OperationCanceledException or IOException or SocketException)
+                {
+                    // The proxy goes as the test ends.
+                }
+                finally
+                {
+                    proxy.Stop();
+                }
+            }, CancellationToken.None);
+            string proxied = $"host=127.0.0.1 port={((IPEndPoint)proxy.LocalEndpoint).Port.ToString(CultureInfo.InvariantCulture)} dbname={Database} user={SuperUser}";
+            standby = Process.Start(new ProcessStartInfo(Path.Join(nodeA.Installation.BinDirectory, "pg_receivewal"))
+            {
+                ArgumentList = { "-D", received.FullName, "--synchronous", "--no-loop", "-d", proxied },
+                RedirectStandardError = true,
+            })!;
+            _ = await nodeA.SafePsqlAsync(Database, "ALTER SYSTEM SET synchronous_standby_names = 'pg_receivewal'", token);
+            _ = await nodeA.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
+            Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database,
+                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_replication WHERE application_name = 'pg_receivewal' AND sync_state = 'sync')", token),
+                "node_a's synchronous standby");
+        }
+        else if (how == "busy")
+        {
+            _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.replication_set_add_table('default', 'big')", token);
+            _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO big (v) SELECT repeat('x', 1000) FROM generate_series(1, 90000)", token);
+            await Task.Delay(TimeSpan.FromSeconds(3), token);
         }
 
-        await using NpgsqlCommand insert = new("INSERT INTO t (v) VALUES ('a')", connection);
-        Stopwatch inserting = Stopwatch.StartNew();
-        for (int i = 0; i < 60; i++)
+        try
         {
-            _ = await insert.ExecuteNonQueryAsync(token);
-        }
+            await using NpgsqlConnection connection = await nodeA.OpenAsync(Database, token);
+            await using (NpgsqlCommand timeout = new("SET statement_timeout = '10s'; SET synchronous_commit = local", connection))
+            {
+                _ = await timeout.ExecuteNonQueryAsync(token);
+            }
 
-        Assert.IsLessThan(TimeSpan.FromSeconds(30), inserting.Elapsed, "node_a's 60 inserts, through six of its own blocks");
+            await using NpgsqlCommand insert = new("INSERT INTO t (v) VALUES ('a')", connection);
+            Stopwatch inserting = Stopwatch.StartNew();
+            for (int i = 0; i < 60; i++)
+            {
+                _ = await insert.ExecuteNonQueryAsync(token);
+            }
+
+            Assert.IsLessThan(TimeSpan.FromSeconds(30), inserting.Elapsed, "node_a's 60 inserts, through six of its own blocks");
+        }
+        finally
+        {
+            if (standby is not null)
+            {
+                _ = await nodeA.PsqlAsync(Database, "ALTER SYSTEM RESET synchronous_standby_names; SELECT pg_reload_conf()", token);
+                standby.Kill();
+                await standby.WaitForExitAsync(CancellationToken.None);
+                standby.Dispose();
+            }
+
+            await relaying.CancelAsync();
+            await relayed;
+        }
     }
 
     /// <summary>

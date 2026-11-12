@@ -751,6 +751,20 @@ internal static unsafe partial class Apply
     }
 
     /// <summary>
+    /// Has this node call the provider about sequence ranges now, as the apply worker, waiting out its delay with as much
+    /// of the provider's changes read ahead as it holds, reads no more of them, and so can't hear the provider's word to
+    /// call it, which comes after them.
+    /// </summary>
+    private static void CallProviderUnheard()
+    {
+        if (MySubscription is WorfSubscription sub)
+        {
+            SequenceRangeHeard.CallFor(sub.Origin.Id);
+            SequenceRangeExchangeWorker.Wake();
+        }
+    }
+
+    /// <summary>
     /// Handles the provider's word to call it about sequence ranges read ahead of its turn, as a CopyData message whose
     /// replication message, past its three positions and times, is a 'W'.
     /// </summary>
@@ -817,8 +831,9 @@ internal static unsafe partial class Apply
                 // The provider's word to call it about sequence ranges, as an owner that granted itself a block sends,
                 // which comes in the transactions that follow, is heard as the delay is waited out, so that the owner
                 // doesn't wait out the delay too; the rest waits its turn.
+                // Past the read-ahead's limit, the word can't come, so the provider is called each second instead.
                 (s_applyconn ?? throw new InvalidOperationException("The apply connection is not open.")).ReadAhead(
-                    TimeSpan.FromMicroseconds(sleepUsec), ReadAheadLimit, CallProviderAhead, static () => Worker.GotSigterm);
+                    TimeSpan.FromMicroseconds(sleepUsec), ReadAheadLimit, CallProviderAhead, static () => Worker.GotSigterm, CallProviderUnheard);
             }
         }
 
