@@ -709,7 +709,7 @@ internal sealed unsafe partial class WorfConnection : IDisposable
     /// <summary>
     /// Gets the options libpq would connect with, from the connection string and, for those it doesn't give, a service
     /// file or the environment: libpq takes them all in as it starts a connection, before it looks a host up, and stops
-    /// there at the session setting, which no server takes.
+    /// there at the channel binding setting, which no server takes, and which the options read here leave out.
     /// </summary>
     /// <param name="conninfo">The connection string.</param>
     /// <param name="applicationName">The name the server would show for the connection.</param>
@@ -721,7 +721,7 @@ internal sealed unsafe partial class WorfConnection : IDisposable
         byte[] info = Worf.ToServerCString(conninfo);
         byte[] application = Worf.ToServerCString(applicationName);
         void* conn;
-        fixed (byte* dbname = "dbname\0"u8, fallback = "fallback_application_name\0"u8, attrs = "target_session_attrs\0"u8, nothing = "worf-options\0"u8,
+        fixed (byte* dbname = "dbname\0"u8, fallback = "fallback_application_name\0"u8, attrs = "channel_binding\0"u8, nothing = "worf-options\0"u8,
             infoAddress = info, applicationAddress = application)
         {
             sbyte** keys = stackalloc sbyte*[] { (sbyte*)dbname, (sbyte*)fallback, (sbyte*)attrs, null };
@@ -737,7 +737,8 @@ internal sealed unsafe partial class WorfConnection : IDisposable
         try
         {
             byte* options = (byte*)((delegate* unmanaged<void*, void*>)LibpqFunction("PQconninfo"))(conn);
-            return options is null ? null : Options(options).ToDictionary(option => option.Keyword, option => option.Value, StringComparer.Ordinal);
+            return options is null ? null : Options(options).Where(option => option.Keyword != "channel_binding")
+                .ToDictionary(option => option.Keyword, option => option.Value, StringComparer.Ordinal);
         }
         finally
         {

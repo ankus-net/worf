@@ -1,6 +1,5 @@
 using System.Globalization;
 using System.Net;
-using System.Net.Sockets;
 using Ankus.Postgres;
 #if WORF_WINDOWS
 using PgSocket = ulong;
@@ -67,19 +66,22 @@ internal sealed unsafe class WorfProbe : IDisposable
     private readonly string? _options;
     private readonly (uint Connect, uint Receive) _waits;
     private readonly List<string> _failures = [];
-    private readonly List<(string Host, string Address, string Port)> _attempts = [];
+    private readonly List<(string Host, string Address, string Port, int Entry)> _attempts = [];
+    private readonly bool _preferStandby;
     private int _attempt = -1;
     private int _listedUpTo;
     private long _attemptDeadline;
     private void* _conn;
     private int _polling = PollingWriting;
     private bool _sent;
+    private bool _reached;
+    private bool _standbyOnly;
 #if !(ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17)
     private bool _fd;
 #endif
 
     private WorfProbe(string conninfo, string applicationName, (string Name, uint Node) peer, byte[] setup, long deadline, List<(string Host, Task<IPAddress[]>? Lookup)> hosts,
-        string[] ports, long connectTimeout, bool random, string? options, (uint Connect, uint Receive) waits)
+        string[] ports, long connectTimeout, bool random, bool preferStandby, string? options, (uint Connect, uint Receive) waits)
     {
         _conninfo = conninfo;
         _applicationName = applicationName;
@@ -96,6 +98,7 @@ internal sealed unsafe class WorfProbe : IDisposable
         _ports = ports;
         _connectTimeout = connectTimeout;
         _random = random;
+        _preferStandby = preferStandby;
         _options = options;
         _waits = waits;
         Deadline = deadline;
@@ -139,43 +142,61 @@ internal sealed unsafe class WorfProbe : IDisposable
         bool replication = false, (uint Connect, uint Receive)? waits = null)
     {
         // A host given as an address, or a socket's directory, needs no lookup; libpq looks up the others as it connects,
-        // which would hold the worker, those a service file or the environment gives too. Addresses the connection gives
-        // stand for its hosts, as libpq takes them.
+        // which would hold the worker, those a service file or the environment gives too, and a name whose hostaddr is
+        // empty. Addresses the connection gives stand for its hosts, as libpq takes them, and so do lists that libpq
+        // refuses for counts that don't match.
         List<(string Host, Task<IPAddress[]>? Lookup)> hosts = [];
         string[] ports = [];
+        string? refused = null;
         Dictionary<string, string>? options = WorfConnection.EffectiveOptions(conninfo, applicationName);
         if (options is not null)
         {
             string[] names = options.GetValueOrDefault("host") is { Length: > 0 } host ? [.. host.Split(',').Select(each => each.Trim())] : [];
-            if (options.GetValueOrDefault("hostaddr") is { Length: > 0 } given)
+            string[] addresses = options.GetValueOrDefault("hostaddr") is { Length: > 0 } given ? [.. given.Split(',').Select(each => each.Trim())] : [];
+            ports = options.GetValueOrDefault("port") is { Length: > 0 } port ? [.. port.Split(',').Select(each => each.Trim())] : [];
+            int count = Math.Max(addresses.Length > 0 ? addresses.Length : names.Length, 1);
+            if (names.Length > 0 && addresses.Length > 0 && names.Length != addresses.Length)
             {
-                string[] addresses = [.. given.Split(',').Select(each => each.Trim())];
-                for (int i = 0; i < addresses.Length; i++)
-                {
-                    hosts.Add((i < names.Length && names[i].Length > 0 ? names[i] + "\0" + addresses[i] : addresses[i], null));
-                }
+                refused = $"could not match {names.Length.ToString(CultureInfo.InvariantCulture)} host names to {addresses.Length.ToString(CultureInfo.InvariantCulture)} hostaddr values";
+            }
+            else if (ports.Length > 1 && ports.Length != count)
+            {
+                refused = $"could not match {ports.Length.ToString(CultureInfo.InvariantCulture)} port numbers to {count.ToString(CultureInfo.InvariantCulture)} hosts";
             }
             else
             {
-                foreach (string name in names)
+                for (int i = 0; i < Math.Max(names.Length, addresses.Length); i++)
                 {
-                    hosts.Add((name, name.Length == 0 || name[0] is '/' or '@' || IPAddress.TryParse(name, out _) ? null : Task.Run(() => Dns.GetHostAddresses(name))));
+                    string name = i < names.Length ? names[i] : "";
+                    string address = i < addresses.Length ? addresses[i] : "";
+                    hosts.Add(address.Length > 0 ? (name.Length > 0 ? name + "\0" + address : address, null)
+                        : (name, name.Length == 0 || name[0] is '/' or '@' || IPAddress.TryParse(name, out _) ? null : Task.Run(() => HostLookup.Find(name))));
                 }
             }
-
-            ports = options.GetValueOrDefault("port") is { Length: > 0 } port ? [.. port.Split(',').Select(each => each.Trim())] : [];
         }
 
-        // libpq waits at least 2 seconds for each address when connect_timeout sets a time.
+        // libpq waits at least 2 seconds for each address when connect_timeout sets a time, before PostgreSQL 17.
         long connectTimeout = options?.GetValueOrDefault("connect_timeout") is string seconds &&
-            int.TryParse(seconds, NumberStyles.Integer, CultureInfo.InvariantCulture, out int timeout) && timeout > 0 ? Math.Max(timeout, 2) * 1_000_000L : 0;
+            int.TryParse(seconds, NumberStyles.Integer, CultureInfo.InvariantCulture, out int timeout) && timeout > 0 ?
+#if ANKUS_PG15 || ANKUS_PG16
+            Math.Max(timeout, 2) * 1_000_000L : 0;
+#else
+            timeout * 1_000_000L : 0;
+#endif
         // A logical replication connection's own options come after those the connection string gives, as libpq keeps
         // only the last value of each keyword.
         string? replicationOptions = replication
             ? $"{options?.GetValueOrDefault("options")} -c datestyle=ISO -c intervalstyle=postgres -c extra_float_digits=3".TrimStart()
             : null;
         WorfProbe probe = new(conninfo, applicationName, peer, setup.Length > 0 ? Worf.ToServerCString(setup) : [], deadline, hosts, ports, connectTimeout,
-            options?.GetValueOrDefault("load_balance_hosts") == "random", replicationOptions, waits ?? (PgWaitExtension, PgWaitExtension));
+            options?.GetValueOrDefault("load_balance_hosts") == "random", options?.GetValueOrDefault("target_session_attrs") == "prefer-standby",
+            replicationOptions, waits ?? (PgWaitExtension, PgWaitExtension));
+        if (refused is not null)
+        {
+            probe.Failure = refused;
+            return probe;
+        }
+
         probe.Advance();
         return probe;
     }
@@ -210,7 +231,11 @@ internal sealed unsafe class WorfProbe : IDisposable
                 {
                     // An address that doesn't connect within its time gives way to the next, as libpq's own wait for a
                     // connection does with connect_timeout.
-                    Follow();
+                    if (Follow())
+                    {
+                        continue;
+                    }
+
                     if (_attemptDeadline != 0 && Worker.GetCurrentTimestamp() >= _attemptDeadline)
                     {
                         TimedOut();
@@ -237,7 +262,11 @@ internal sealed unsafe class WorfProbe : IDisposable
                 // addresses found since it started are tried.
                 if (_polling == PollingFailed || Status() != ConnectionOk)
                 {
-                    Follow();
+                    if (Follow())
+                    {
+                        continue;
+                    }
+
                     string refused = ErrorMessage();
                     int end = refused.IndexOf(EndOfList, StringComparison.Ordinal);
                     if (end >= 0)
@@ -425,7 +454,7 @@ internal sealed unsafe class WorfProbe : IDisposable
         if (_hosts.Count == 0 && _attempts.Count == 0)
         {
             // A connection string that names no host connects as libpq's defaults have it.
-            _attempts.Add(("", "", ""));
+            _attempts.Add(("", "", "", 0));
             return true;
         }
 
@@ -449,7 +478,7 @@ internal sealed unsafe class WorfProbe : IDisposable
             {
                 // A host given with its address, as hostaddr gives it, is the name and the address apart.
                 int split = host.IndexOf('\0', StringComparison.Ordinal);
-                _attempts.Add(split >= 0 ? (host[..split], host[(split + 1)..], port) : (host, IPAddress.TryParse(host, out _) ? host : "", port));
+                _attempts.Add(split >= 0 ? (host[..split], host[(split + 1)..], port, index) : (host, IPAddress.TryParse(host, out _) ? host : "", port, index));
             }
             else if (lookup.IsCompletedSuccessfully && lookup.Result.Length > 0)
             {
@@ -459,11 +488,11 @@ internal sealed unsafe class WorfProbe : IDisposable
                     Random.Shared.Shuffle(found);
                 }
 
-                _attempts.AddRange(found.Select(address => (host, address.ToString(), port)));
+                _attempts.AddRange(found.Select(address => (host, address.ToString(), port, index)));
             }
             else
             {
-                _failures.Add($"could not translate host name \"{host}\" to address: {(lookup.Exception?.InnerException as SocketException)?.Message ?? "no address found"}");
+                _failures.Add($"could not translate host name \"{host}\" to address: {lookup.Exception?.InnerException?.Message ?? "no address found"}");
             }
         }
 
@@ -482,6 +511,15 @@ internal sealed unsafe class WorfProbe : IDisposable
     // for an option it doesn't know, fails. With no address left while names are still looked up, it waits for them.
     private void Next()
     {
+        // A connection that prefers a standby takes one only, as libpq's first pass does, while names are still looked
+        // up, and once they're all found, goes through every address again, as libpq's own two passes from the first
+        // host, so that a standby at a name found later is taken before a server that isn't one, as libpq takes it.
+        if (_preferStandby && _standbyOnly && Unlisted() == 0)
+        {
+            _standbyOnly = false;
+            _attempt = -1;
+        }
+
         if (_attempt + 1 >= _attempts.Count)
         {
             if (!Looking())
@@ -509,13 +547,14 @@ internal sealed unsafe class WorfProbe : IDisposable
         _attempt++;
         _listedUpTo = _attempts.Count;
         bool more = Unlisted() > 0;
+        _standbyOnly |= _preferStandby && more;
         var start = (delegate* unmanaged<sbyte**, sbyte**, int, void*>)WorfConnection.LibpqFunction("PQconnectStartParams");
-        List<(string Host, string Address, string Port)> rest = _attempts[_attempt..];
+        List<(string Host, string Address, string Port, int Entry)> rest = _attempts[_attempt..];
         byte[] info = Worf.ToServerCString(_conninfo);
         byte[] application = Worf.ToServerCString(_applicationName);
         if (more)
         {
-            rest.Add((EndOfList, "", rest[^1].Port));
+            rest.Add((EndOfList, "", rest[^1].Port, -1));
         }
 
         byte[] hostValue = Worf.ToServerCString(string.Join(',', rest.Select(attempt => attempt.Host)));
@@ -528,6 +567,7 @@ internal sealed unsafe class WorfProbe : IDisposable
         bool replication = _options is not null;
         fixed (byte* dbname = "dbname\0"u8, fallback = "fallback_application_name\0"u8, hostKey = "host\0"u8, hostaddrKey = "hostaddr\0"u8,
             portKey = "port\0"u8, balanceKey = "load_balance_hosts\0"u8, balanceValue = "disable\0"u8, replicationKey = "replication\0"u8,
+            attributesKey = "target_session_attrs\0"u8, standby = "standby\0"u8,
             logical = "database\0"u8, encodingKey = "client_encoding\0"u8, optionsKey = "options\0"u8, infoAddress = info,
             applicationAddress = application, hostAddress = hostValue, hostaddrValue = hostaddr, portAddress = portValue, encodingValue = encoding,
             optionsValue = options)
@@ -549,6 +589,11 @@ internal sealed unsafe class WorfProbe : IDisposable
             if (_random)
             {
                 pairs.Add(((nint)balanceKey, (nint)balanceValue));
+            }
+
+            if (_standbyOnly)
+            {
+                pairs.Add(((nint)attributesKey, (nint)standby));
             }
 
             if (replication)
@@ -579,6 +624,7 @@ internal sealed unsafe class WorfProbe : IDisposable
 
         Route();
         _polling = PollingWriting;
+        _reached = false;
         StartAttempt();
         if (Status() == ConnectionBad)
         {
@@ -623,15 +669,16 @@ internal sealed unsafe class WorfProbe : IDisposable
     }
 
     // Whether libpq connects to an address now, by the host, address and port it gives: the host it names, or the
-    // address it was given as, the address it reached, where both are known, and the port, where one was given.
-    private static bool IsConnecting((string Host, string Address, string Port) attempt, string host, string address, string port)
+    // address it was given as, the address it reached, where both are known, without the scope of a link-local address,
+    // which libpq names by its interface, and the port, where one was given.
+    private static bool IsConnecting((string Host, string Address, string Port, int Entry) attempt, string host, string address, string port)
     {
         if (attempt.Host != host && attempt.Address != host)
         {
             return false;
         }
 
-        if (address.Length > 0 && attempt.Address.Length > 0 && attempt.Address != address)
+        if (address.Length > 0 && attempt.Address.Length > 0 && Unscoped(attempt.Address) != Unscoped(address))
         {
             return false;
         }
@@ -639,26 +686,53 @@ internal sealed unsafe class WorfProbe : IDisposable
         return attempt.Port.Length == 0 || attempt.Port == port;
     }
 
-    // Follows libpq as it moves on to a later address, by the host, address and port it connects to now.
-    private void Follow()
+    // An address without its scope.
+    private static string Unscoped(string address) => address.IndexOf('%', StringComparison.Ordinal) is int scope and >= 0 ? address[..scope] : address;
+
+    // Follows libpq as it moves on to a later address, by the host, address and port it connects to now. libpq moves on
+    // past a server it reached that is starting, or isn't of the session's attributes, to the next host, rather than to
+    // another address of the same one; since each address is a host to libpq, the probe starts libpq again at the next
+    // host itself then. Returns whether it did.
+    private bool Follow()
     {
         string host = Text("PQhost");
         string address = Text("PQhostaddr");
         string port = Text("PQport");
         for (int i = _attempt; i < _listedUpTo; i++)
         {
-            if (IsConnecting(_attempts[i], host, address, port))
+            if (!IsConnecting(_attempts[i], host, address, port))
             {
-                if (i != _attempt)
+                continue;
+            }
+
+            if (i != _attempt)
+            {
+                if (_reached && _attempts[i].Entry == _attempts[_attempt].Entry)
                 {
-                    _attempt = i;
-                    StartAttempt();
-                    Route();
+                    if (ErrorMessage() is { Length: > 0 } passed)
+                    {
+                        _failures.Add(passed);
+                    }
+
+                    Close();
+                    _attempt = _attempts.FindLastIndex(_listedUpTo - 1, _listedUpTo - _attempt, attempt => attempt.Entry == _attempts[_attempt].Entry);
+                    Next();
+                    return true;
                 }
 
-                return;
+                _attempt = i;
+                _reached = false;
+                StartAttempt();
+                Route();
             }
+
+            break;
         }
+
+        // CONNECTION_AWAITING_RESPONSE, AUTH_OK, SETENV, CHECK_WRITABLE, CONSUME, CHECK_TARGET and CHECK_STANDBY: the
+        // server answered.
+        _reached |= Status() is 4 or 5 or 6 or 9 or 10 or 12 or 13;
+        return false;
     }
 
     // A connection's host, address or port, as libpq gives it now.
@@ -683,7 +757,7 @@ internal sealed unsafe class WorfProbe : IDisposable
     // A failure of the address being connected to, worded as libpq words its own.
     private string AttemptFailure(string reason)
     {
-        (string host, string address, string port) = _attempt >= 0 && _attempt < _attempts.Count ? _attempts[_attempt] : ("", "", "");
+        (string host, string address, string port, _) = _attempt >= 0 && _attempt < _attempts.Count ? _attempts[_attempt] : ("", "", "", 0);
         string at = address.Length > 0 && address != host ? $"\"{host}\" ({address})" : $"\"{host}\"";
         return port.Length > 0 ? $"connection to server at {at}, port {port} failed: {reason}" : $"connection to server at {at} failed: {reason}";
     }
