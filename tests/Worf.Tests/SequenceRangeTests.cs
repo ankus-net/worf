@@ -1299,7 +1299,8 @@ public sealed class SequenceRangeTests
     /// <summary>
     /// Two nodes that replicate both ways insert into the same table at once with keys from the same sequence, which the
     /// first node manages: the second learns of it through the exchange, gets blocks from the first, and no key is
-    /// written on both nodes. A table on the second node that comes to use the sequence may hold the first's keys.
+    /// written on both nodes. A table on the second node that comes to use the sequence may hold the first's keys. The
+    /// second node draws from the blocks it keeps of a sequence the first dropped, after it restarts too.
     /// Idle, with or without managed sequences and Snowflake IDs, and with a sequence whose root can't start, neither
     /// node uses a transaction ID, though they go on checking and exchanging.
     /// </summary>
@@ -1488,8 +1489,8 @@ public sealed class SequenceRangeTests
                 $"{node.Name} drawing from mv_id_seq's blocks again");
         }
 
-        // Dropping a managed sequence on its owner ends its epoch, which node_b, keeping its blocks, hears of as disabled.
-        // A dump of its table restores there, the sequence unmanaged, and enabling it again starts a new epoch above the
+        // Dropping a managed sequence on its owner ends its epoch, which node_b, keeping its blocks, hears of as disabled,
+        // and draws from them again once it restarts. A dump of its table restores there, the sequence unmanaged, and enabling it again starts a new epoch above the
         // values node_b holds.
         using TemporaryDirectory dumps = new($"worf-sequence-range-dump-{Guid.NewGuid():N}");
         string dump = Path.Join(dumps.FullName, "mv.dump");
@@ -1499,6 +1500,16 @@ public sealed class SequenceRangeTests
         _ = await nodeA.SafePsqlAsync(Database, "DROP TABLE mv", token);
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'disabled' FROM worf.sequence_ranges WHERE sequence = 'mv_id_seq'::regclass", token),
             "node_b heard mv_id_seq's epoch end");
+        // node_b restarts, and draws from the blocks it kept once node_a has answered, as it does for a running epoch.
+        await nodeB.StopAsync("fast", token);
+        await nodeB.StartServerAsync(token);
+        Stopwatch kept = Stopwatch.StartNew();
+        while (!await nodeB.PsqlAsync(Database, "SET statement_timeout = '3s'; INSERT INTO mv (v) VALUES ('kept')", token))
+        {
+            Assert.IsLessThan(TimeSpan.FromSeconds(30), kept.Elapsed, "node_b drawing from mv_id_seq's kept blocks once restarted");
+            await Task.Delay(TimeSpan.FromMilliseconds(500), token);
+        }
+
         (int restored, string restoreOutput) = await nodeA.RunProgramAsync("pg_restore",
             ["-d", $"dbname={Database} options='-c worf.sequence_range_restore=on'", dump], token);
         Assert.AreEqual(0, restored, restoreOutput);
@@ -3432,27 +3443,37 @@ public sealed class SequenceRangeTests
     }
 
     /// <summary>
-    /// A restored node draws from a sequence's blocks only once its grantor has taken in its report of that sequence
-    /// since it started, and seen its WAL position move back: though the grantor is so slow that each call leaves most
-    /// sequences out, and the node's own WAL then passes the position it had before the restore; though a prepared
-    /// transaction holds the sequence's range row on the grantor, while the node draws from another sequence, which the
-    /// grantor took in; and though the grantor's calls fail after taking sequences in. So the node never draws again the
-    /// values it drew before the restore.
+    /// A node restored from a base backup taken as it ran, whose WAL ends past the last position its grantor's tables
+    /// recorded, as a snapshot of a running server's storage does, or ends where they recorded it, draws from a sequence's
+    /// blocks only once its grantor has taken in its report of that sequence since it started, and seen its WAL position
+    /// move back: though the grantor is so slow that each call leaves most sequences out, and the node's own WAL then
+    /// passes the position it had before the restore; though a prepared transaction, or an open one, holds the sequence's
+    /// range row on the grantor as the node draws, so that only the grantor's shared memory hears of the draws, and after
+    /// the restore, while the node draws from another sequence, which the grantor took in; though the grantor's calls fail
+    /// after taking sequences in, while such a transaction holds the row; and though the grantor restarts while the node is
+    /// restored, and the node writes and checkpoints before the grantor is back. The node's draws after the backup move its
+    /// report, so that the grantor records a WAL position past them. So the node never draws again the values it drew
+    /// before the restore.
     /// </summary>
-    /// <param name="how">How the grantor is held up: slow, holding the row, or failing.</param>
+    /// <param name="how">How the grantor is held up: slow, holding the row in a prepared transaction or an open one,
+    /// failing, restarted, or restarted while the node goes back to a whole backup, after which it writes nothing.</param>
     /// <returns>The test.</returns>
     [TestMethod]
     [DataRow("cut")]
     [DataRow("held")]
+    [DataRow("locked")]
     [DataRow("failing")]
+    [DataRow("restarted")]
+    [DataRow("plain")]
     public async Task RestoredNodesWaitForCallsThatTakeEverySequenceIn(string how)
     {
         CancellationToken token = TestContext.CancellationToken;
         await using TestNode nodeA = await StartNodeAsync("node_a", token, "log_min_messages = debug1\nmax_prepared_transactions = 2");
         await using TestNode nodeB = await StartNodeAsync("node_b", token);
 
-        // The calls cut short need many sequences to take in, and the held row one besides t_id_seq to draw from.
-        int extra = how switch { "cut" => 15, "held" => 1, _ => 0 };
+        // The calls cut short need many sequences to take in, the held row one besides t_id_seq to draw from, and the
+        // failing calls one to take in, which fails them, while t_id_seq is held.
+        int extra = how switch { "cut" => 15, "held" or "locked" or "failing" => 1, _ => 0 };
         string tables = string.Create(CultureInfo.InvariantCulture,
             $"CREATE TABLE slow_on (); CREATE TABLE t (id bigserial PRIMARY KEY, v text); DO $$ BEGIN FOR g IN 1..{extra} LOOP EXECUTE format('CREATE SEQUENCE many_%s', lpad(g::text, 2, '0')); END LOOP; END $$");
         foreach (TestNode node in new[] { nodeA, nodeB })
@@ -3497,33 +3518,56 @@ public sealed class SequenceRangeTests
             }
         }
 
-        // node_b is copied, which restarts it, draws 20 ids and writes enough for its WAL position to move well past the
-        // copy's, which node_a hears of, and goes back to the copy.
-        using TemporaryDirectory copies = new($"worf-sequence-range-slow-restore-{Guid.NewGuid():N}");
-        string copy = Path.Join(copies.FullName, "node_b");
-        await CopyDataAsync(nodeB, copy, token);
-        HashSet<string> before = await InsertIdsAsync("before");
-
-        // For the failing calls, node_a's tables have recorded node_b's reports since the copy restarted it, and record no
-        // more of its position as node_b writes, which only shared memory holds.
-        const string Recorded = "SELECT string_agg(wal_lsn::text, ',' ORDER BY seqoid) FROM worf.sequence_range_node WHERE node_name = 'node_b'";
-        for (string last = ""; how == "failing" && await nodeA.SafePsqlAsync(Database, Recorded, token) is string now && now != last; last = now)
-        {
-            await Task.Delay(TimeSpan.FromSeconds(3), token);
-        }
-
-        _ = await nodeB.SafePsqlAsync(Database, "CREATE TABLE written AS SELECT g, repeat('x', 100) AS v FROM generate_series(1, 30000) g", token);
+        // node_b writes, which node_a hears of, and is backed up as it runs, after which node_a's tables record its
+        // position, as the backup's segment switches move it a segment: whole for the plain row, where the position they
+        // record is where the backup's WAL ends, and otherwise its data files first, after which node_b writes on, and then
+        // its WAL, as a snapshot of its storage keeps both. node_b draws 20 ids from the block it holds, which node_a hears
+        // of, and goes back to the backup, whose WAL ends at or past every position node_a's tables recorded before the
+        // draws.
         const string HeardFromB = """
             SELECT worf.sequence_range_heard(node_id, true, '-infinity', false)::text FROM worf.sequence_range_node
             WHERE node_name = 'node_b' AND seqoid = 't_id_seq'::regclass
             """;
-        string heard = await nodeA.SafePsqlAsync(Database, "SELECT clock_timestamp()::text", token);
-        for (int call = 0; call < 2; call++)
+        async Task HearFromBAsync(string what)
         {
-            Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, $"SELECT ({HeardFromB})::timestamptz > '{heard}'", token),
-                "node_a heard node_b's WAL position past its writes");
-            heard = await nodeA.SafePsqlAsync(Database, HeardFromB, token);
+            string heard = await nodeA.SafePsqlAsync(Database, "SELECT clock_timestamp()::text", token);
+            for (int call = 0; call < 2; call++)
+            {
+                Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, $"SELECT ({HeardFromB})::timestamptz > '{heard}'", token), $"node_a hearing from node_b {what}");
+                heard = await nodeA.SafePsqlAsync(Database, HeardFromB, token);
+            }
         }
+
+        using TemporaryDirectory copies = new($"worf-sequence-range-slow-restore-{Guid.NewGuid():N}");
+        string copy = Path.Join(copies.FullName, "node_b");
+        _ = await nodeB.SafePsqlAsync(Database, "CREATE TABLE written AS SELECT g, repeat('x', 100) AS v FROM generate_series(1, 30000) g", token);
+        await HearFromBAsync("after its writes");
+        await BackUpDataAsync(nodeB, copy, token, wal: how == "plain");
+        await HearFromBAsync("past the backup");
+        if (how != "plain")
+        {
+            _ = await nodeB.SafePsqlAsync(Database, "CREATE TABLE written_more AS SELECT g, repeat('x', 100) AS v FROM generate_series(1, 200) g", token);
+            CopyWal(nodeB, copy);
+        }
+
+        // node_a holds t_id_seq's range row as node_b draws, in a prepared transaction or an open one, so that its tables
+        // record nothing of the draws, which only shared memory hears of.
+        const string LockRow = "SELECT 1 FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass FOR NO KEY UPDATE";
+        if (how is "held" or "failing")
+        {
+            _ = await nodeA.SafePsqlAsync(Database, $"BEGIN; {LockRow}; PREPARE TRANSACTION 'held_t'", token);
+        }
+
+        await using NpgsqlConnection? locker = how == "locked" ? await nodeA.OpenAsync(Database, token) : null;
+        await using NpgsqlTransaction? locking = locker is null ? null : await locker.BeginTransactionAsync(token);
+        if (locker is not null)
+        {
+            await using NpgsqlCommand lockRow = new(LockRow, locker, locking);
+            _ = await lockRow.ExecuteScalarAsync(token);
+        }
+
+        HashSet<string> before = await InsertIdsAsync("before");
+        await HearFromBAsync("after its draws");
 
         int logpos = nodeA.ReadLog().Length;
         switch (how)
@@ -3531,11 +3575,9 @@ public sealed class SequenceRangeTests
             case "cut":
                 _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO slow_on DEFAULT VALUES", token);
                 break;
-            case "held":
-                _ = await nodeA.SafePsqlAsync(Database,
-                    "BEGIN; SELECT 1 FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass FOR NO KEY UPDATE; PREPARE TRANSACTION 'held_t'", token);
+            case "held" or "locked":
                 break;
-            default:
+            case "failing":
                 // node_a's calls fail as they commit, after they have taken node_b's reports in.
                 _ = await nodeA.SafePsqlAsync(Database, """
                     CREATE TABLE fail_on ();
@@ -3546,6 +3588,9 @@ public sealed class SequenceRangeTests
                     INSERT INTO fail_on DEFAULT VALUES;
                     """, token);
                 break;
+            default:
+                await nodeA.StopAsync("fast", token);
+                break;
         }
 
         await RestoreDataAsync(nodeB, copy, token);
@@ -3554,7 +3599,7 @@ public sealed class SequenceRangeTests
             // node_b's own WAL passes the position it had before the restore before the calls take t_id_seq in.
             _ = await nodeB.SafePsqlAsync(Database, "CREATE TABLE written_again AS SELECT g, repeat('x', 100) AS v FROM generate_series(1, 60000) g", token);
         }
-        else if (how == "held")
+        else if (how is "held" or "locked")
         {
             // Another sequence, which node_a took in, is drawn from while t_id_seq's row is held.
             Stopwatch drawing = Stopwatch.StartNew();
@@ -3565,16 +3610,35 @@ public sealed class SequenceRangeTests
 
             Assert.IsFalse(await nodeB.PsqlAsync(Database, "SET statement_timeout = '3s'; INSERT INTO t (v) VALUES ('held')", token),
                 "node_b's insert into t while node_a holds t_id_seq's range row");
-            _ = await nodeA.SafePsqlAsync(Database, "COMMIT PREPARED 'held_t'", token);
+            if (locking is not null)
+            {
+                await locking.CommitAsync(token);
+            }
+            else
+            {
+                _ = await nodeA.SafePsqlAsync(Database, "COMMIT PREPARED 'held_t'", token);
+            }
         }
-        else
+        else if (how == "failing")
         {
-            // node_b's own WAL passes the positions node_a's tables recorded before the restore, but not the one node_a
-            // heard last, and node_a's calls go on failing a while.
+            // node_b's own WAL passes the positions node_a's tables recorded before the restore, and node_a's calls go on
+            // failing a while, after taking many_01 in and leaving t_id_seq out, and then the row is let go.
             _ = await nodeB.SafePsqlAsync(Database, "CREATE TABLE written_again AS SELECT g, repeat('x', 100) AS v FROM generate_series(1, 10000) g", token);
             await Task.Delay(TimeSpan.FromSeconds(5), token);
+            _ = await nodeA.SafePsqlAsync(Database, "COMMIT PREPARED 'held_t'", token);
+            await Task.Delay(TimeSpan.FromSeconds(2), token);
             _ = await nodeA.SafePsqlAsync(Database, "DELETE FROM fail_on", token);
             Assert.Contains("worf-test-failing-call", nodeB.ReadLog(), "node_b's calls to node_a, failing as node_a committed them");
+        }
+        else if (how == "restarted")
+        {
+            // node_b writes, and a checkpoint moves its redo point past its old WAL position, before node_a is back.
+            _ = await nodeB.SafePsqlAsync(Database, "CREATE TABLE written_again AS SELECT g, repeat('x', 100) AS v FROM generate_series(1, 8000) g; CHECKPOINT", token);
+            await nodeA.StartServerAsync(token);
+        }
+        else if (how == "plain")
+        {
+            await nodeA.StartServerAsync(token);
         }
 
         HashSet<string> after = await InsertIdsAsync("after");
@@ -4385,6 +4449,55 @@ public sealed class SequenceRangeTests
         _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO t (v) VALUES ('back')", token);
         TestContext.WriteLine($"node_b's insert after {drawing.Elapsed.TotalSeconds:F1} s");
         Assert.IsLessThan(TimeSpan.FromSeconds(10), drawing.Elapsed, "node_b's insert once node_a is back, against its 10 s wait");
+    }
+
+    /// <summary>
+    /// A pool holder whose server restarts grants its child nothing from a sequence's pool until its grantor has
+    /// answered for that sequence, though the grantor answers its calls while a prepared transaction holds the
+    /// sequence's range row there.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task RestartedPoolHoldersWaitForEachSequence()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token, "max_prepared_transactions = 2");
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        await using TestNode nodeC = await StartNodeAsync("node_c", token);
+        TestNode[] nodes = [nodeA, nodeB, nodeC];
+        foreach (TestNode node in nodes)
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database,
+            "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b,node_c}', range_size := 100, max_range_size := 100)", token);
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        await SubscribeAsync(nodeC, "c_from_b", nodeB, token);
+        await WaitActiveAsync(nodes, token);
+        await InsertAsync(nodeC, 1500, token);
+        Assert.AreNotEqual("0", await nodeB.SafePsqlAsync(Database,
+            "SELECT count(*) FROM worf.sequence_range_block WHERE kind = 'p' AND seqoid = 't_id_seq'::regclass AND state = 'open'", token), "node_b's pool block");
+
+        // A prepared transaction holds t_id_seq's range row on node_a, whose calls with node_b go on without it, and
+        // node_b restarts.
+        _ = await nodeA.SafePsqlAsync(Database,
+            "BEGIN; SELECT 1 FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass FOR NO KEY UPDATE; PREPARE TRANSACTION 'held_t'", token);
+        await nodeB.StopAsync("fast", token);
+        await nodeB.StartServerAsync(token);
+        string restarted = await nodeB.SafePsqlAsync(Database, "SELECT now()::text", token);
+        await Task.Delay(TimeSpan.FromSeconds(10), token);
+
+        bool drew = await nodeB.PsqlAsync(Database, "SET statement_timeout = '2s'; SELECT nextval('t_id_seq')", token);
+        _ = await nodeC.PsqlAsync(Database, "SET statement_timeout = '20s'; INSERT INTO t (v) SELECT 'c' FROM generate_series(1, 1000)", token);
+        string granted = await nodeB.SafePsqlAsync(Database,
+            $"SELECT count(*) FROM worf.sequence_range_grant WHERE seqoid = 't_id_seq'::regclass AND grantee_name = 'node_c' AND granted_at > '{restarted}'", token);
+        Assert.AreEqual("False|0", $"{drew}|{granted}", "node_b's nextval, and its grants to node_c, while node_a holds t_id_seq's range row");
+
+        _ = await nodeA.SafePsqlAsync(Database, "COMMIT PREPARED 'held_t'", token);
+        await InsertAsync(nodeB, 10, token);
+        await InsertAsync(nodeC, 300, token);
+        await AssertNoSharedValuesAsync(nodes, token);
     }
 
     /// <summary>
@@ -6467,6 +6580,24 @@ public sealed class SequenceRangeTests
     /// <summary>
     /// Copies a node's data directory while the node is stopped, as a cold backup or snapshot is taken.
     /// </summary>
+    // Backs a running node's data files up, with the WAL written as the backup ran, or without WAL, which CopyWal adds,
+    // as a snapshot of a running server's storage keeps its data files and WAL as of different moments.
+    private static async Task BackUpDataAsync(TestNode node, string target, CancellationToken token, bool wal = false)
+    {
+        (int exit, string output) = await node.RunProgramAsync("pg_basebackup",
+            ["-D", target, "-d", node.Dsn(Database, SuperUser), "-X", wal ? "stream" : "none", "-c", "fast"], token);
+        Assert.AreEqual(0, exit, output);
+    }
+
+    // Copies a running node's WAL as it is now into a backup of its data files.
+    private static void CopyWal(TestNode node, string target)
+    {
+        foreach (string file in Directory.EnumerateFiles(Path.Join(node.Cluster.DataDirectory, "pg_wal")))
+        {
+            File.Copy(file, Path.Join(target, "pg_wal", Path.GetFileName(file)), overwrite: true);
+        }
+    }
+
     private static async Task CopyDataAsync(TestNode node, string target, CancellationToken token)
     {
         await node.StopAsync("fast", token);

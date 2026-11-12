@@ -46,9 +46,20 @@ internal struct WorfHeard
     public ulong CallLsn;
 
     /// <summary>
+    /// The start, as its messages give it, of the node's server when its last call to this server carried
+    /// <see cref="CallLsn"/>, or zero.
+    /// </summary>
+    public long CallStart;
+
+    /// <summary>
     /// The WAL position the node's last answer to this server carried, or zero.
     /// </summary>
     public ulong ReplyLsn;
+
+    /// <summary>
+    /// The start of the node's server when its last answer to this server carried <see cref="ReplyLsn"/>, or zero.
+    /// </summary>
+    public long ReplyStart;
 
     /// <summary>
     /// When the node, as a neighbor, last had this server reset a sequence's blocks, or zero.
@@ -73,12 +84,6 @@ internal struct WorfHeard
     public long LiftResetEvery;
 
     /// <summary>
-    /// When a transaction that took in a message of the node's made after it heard of this server's start last
-    /// committed, or zero before one has since this server started.
-    /// </summary>
-    public long ConfirmedAt;
-
-    /// <summary>
     /// When a statement last waited for this server to hear from the node, its grantor, since it started, or zero.
     /// </summary>
     public long WantedAt;
@@ -87,11 +92,6 @@ internal struct WorfHeard
     /// When the node, as a provider, last asked this server to call it, as an owner that granted itself a block does.
     /// </summary>
     public long CallForAt;
-
-    /// <summary>
-    /// When the node's server started, as its last message said, or zero.
-    /// </summary>
-    public long StartedAt;
 
     /// <summary>
     /// Where, among the sequences of the node's calls in the order of their names, the last call this server cut short

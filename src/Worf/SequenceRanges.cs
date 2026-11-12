@@ -127,6 +127,7 @@ using Ankus.Postgres;
         checked_start bigint,
         confirmed_start bigint,
         reported_start bigint,
+        drawn bigint,
         PRIMARY KEY (seqoid, node_id)
     );
 
@@ -142,6 +143,7 @@ using Ankus.Postgres;
         sysid numeric(20,0) NOT NULL,
         timeline bigint NOT NULL,
         lsn pg_lsn NOT NULL,
+        started bigint,
         PRIMARY KEY (seqoid, node_id)
     );
 

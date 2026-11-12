@@ -74,7 +74,8 @@ internal static class SequenceRangeHeard
     /// <param name="timeline">The neighbor's timeline.</param>
     /// <param name="call">Whether the neighbor called this server, rather than answered its call.</param>
     /// <param name="lsn">The position.</param>
-    internal static void RecordLsn(uint nodeId, ulong sysid, long timeline, bool call, ulong lsn)
+    /// <param name="start">The start of the neighbor's server, as the message gave it, or zero.</param>
+    internal static void RecordLsn(uint nodeId, ulong sysid, long timeline, bool call, ulong lsn, long start)
     {
         using PgLwLockExclusiveGuard<WorfHeardTable, WorfHeard> guard = Nodes.Exclusive();
         int slot = Find(guard, nodeId, nodeId);
@@ -86,30 +87,31 @@ internal static class SequenceRangeHeard
         WorfHeard heard = guard[slot];
         if (heard.Sysid != sysid || heard.Timeline != timeline)
         {
-            (heard.Sysid, heard.Timeline, heard.CallLsn, heard.ReplyLsn) = (sysid, timeline, 0, 0);
+            (heard.Sysid, heard.Timeline, heard.CallLsn, heard.CallStart, heard.ReplyLsn, heard.ReplyStart) = (sysid, timeline, 0, 0, 0, 0);
         }
 
         if (call)
         {
-            heard.CallLsn = lsn;
+            (heard.CallLsn, heard.CallStart) = (lsn, start);
         }
         else
         {
-            heard.ReplyLsn = lsn;
+            (heard.ReplyLsn, heard.ReplyStart) = (lsn, start);
         }
 
         guard[slot] = heard;
     }
 
     /// <summary>
-    /// Gets the WAL position a neighbor's last call or answer carried, on a system and timeline.
+    /// Gets the WAL position a neighbor's last call or answer carried, on a system and timeline, and the start of its
+    /// server then.
     /// </summary>
     /// <param name="nodeId">The neighbor.</param>
     /// <param name="sysid">The system identifier.</param>
     /// <param name="timeline">The timeline.</param>
     /// <param name="call">Whether to get the position of its calls, rather than its answers.</param>
-    /// <returns>The position, or zero.</returns>
-    internal static ulong LatestLsn(uint nodeId, ulong sysid, long timeline, bool call)
+    /// <returns>The position and the start, or zeros.</returns>
+    internal static (ulong Lsn, long Start) LatestLsn(uint nodeId, ulong sysid, long timeline, bool call)
     {
         uint dboid = DatabaseId();
         using PgLwLockShareGuard<WorfHeardTable, WorfHeard> guard = Nodes.Share();
@@ -117,11 +119,11 @@ internal static class SequenceRangeHeard
         {
             if (guard[i].Dboid == dboid && guard[i].NodeId == nodeId && guard[i].Sysid == sysid && guard[i].Timeline == timeline)
             {
-                return call ? guard[i].CallLsn : guard[i].ReplyLsn;
+                return call ? (guard[i].CallLsn, guard[i].CallStart) : (guard[i].ReplyLsn, guard[i].ReplyStart);
             }
         }
 
-        return 0;
+        return (0, 0);
     }
 
     /// <summary>
@@ -198,10 +200,11 @@ internal static class SequenceRangeHeard
     }
 
     /// <summary>
-    /// Gets the WAL position this server started from, as the checkpoint it started from, or the one that ended its
-    /// recovery, gives it, read once, or <see cref="ulong.MaxValue"/> when a later checkpoint took that one's place before
-    /// it was read. A neighbor that heard of a later position from this node before it started knows from it that the
-    /// node went back.
+    /// Gets the WAL position this server started from: the redo point of the latest checkpoint as recovery finished,
+    /// which, after crash recovery or a clean shutdown, is where the WAL recovery found ends, and after archive
+    /// recovery is earlier, read once, as worf's supervisor starts, which it does as recovery finishes, or by the first
+    /// process to ask before that. A neighbor that heard of a later position from this node before it started knows from
+    /// it that the node went back, however far the node has written since.
     /// </summary>
     internal static ulong StartLsn
     {
@@ -215,15 +218,17 @@ internal static class SequenceRangeHeard
                 }
             }
 
-            WorfRows checkpoint = Worf.Read("SELECT redo_lsn::text, checkpoint_time <= $1 FROM pg_catalog.pg_control_checkpoint()", 1,
-                SpiParameter.Create(new PgTimestampTz(Started + 60_000_000L)));
-            ulong lsn = checkpoint.Count > 0 && checkpoint[0].Get<bool>(1) && Worf.TryParseLsn(checkpoint[0].Get<string?>(0) ?? "", out ulong redo)
-                ? redo : ulong.MaxValue;
+            ulong redo;
+            unsafe
+            {
+                redo = NativeMethods.GetRedoRecPtr();
+            }
+
             using PgLwLockExclusiveGuard<WorfHeardTable, WorfHeard> guard = Nodes.Exclusive();
             if (guard.Header.StartLsn == 0)
             {
                 WorfHeardTable header = guard.Header;
-                header.StartLsn = lsn;
+                header.StartLsn = redo;
                 guard.Header = header;
             }
 
@@ -232,21 +237,9 @@ internal static class SequenceRangeHeard
     }
 
     /// <summary>
-    /// Records when a node's server started, as its message says.
+    /// Reads the WAL position this server started from, as worf's supervisor starts.
     /// </summary>
-    /// <param name="nodeId">The node.</param>
-    /// <param name="startedAt">When its server started.</param>
-    internal static void RecordStarted(uint nodeId, long startedAt)
-    {
-        using PgLwLockExclusiveGuard<WorfHeardTable, WorfHeard> guard = Nodes.Exclusive();
-        int slot = Find(guard, nodeId, nodeId);
-        if (slot >= 0)
-        {
-            WorfHeard heard = guard[slot];
-            heard.StartedAt = startedAt;
-            guard[slot] = heard;
-        }
-    }
+    internal static void NoteStart() => _ = StartLsn;
 
     /// <summary>
     /// Counts a notice a node sent one of this server's processes, in the minute that began last, for every process.
@@ -314,43 +307,6 @@ internal static class SequenceRangeHeard
     }
 
     /// <summary>
-    /// Gets when a node's server started, as its last message said, or zero.
-    /// </summary>
-    /// <param name="nodeId">The node.</param>
-    /// <returns>The time.</returns>
-    internal static long StartedOf(uint nodeId)
-    {
-        uint dboid = DatabaseId();
-        using PgLwLockShareGuard<WorfHeardTable, WorfHeard> guard = Nodes.Share();
-        for (int i = 0; i < guard.Length; i++)
-        {
-            if (guard[i].Dboid == dboid && guard[i].NodeId == nodeId)
-            {
-                return guard[i].StartedAt;
-            }
-        }
-
-        return 0;
-    }
-
-    /// <summary>
-    /// Notes, as a transaction that took in a node's message commits, a message the node made once it had heard of this
-    /// server's start, that this server has heard from it since it started, and done what the message asked, as a reset.
-    /// </summary>
-    /// <param name="nodeId">The node.</param>
-    internal static void Confirm(uint nodeId)
-    {
-        using PgLwLockExclusiveGuard<WorfHeardTable, WorfHeard> guard = Nodes.Exclusive();
-        int slot = Find(guard, nodeId, nodeId);
-        if (slot >= 0)
-        {
-            WorfHeard heard = guard[slot];
-            heard.ConfirmedAt = Worker.GetCurrentTimestamp();
-            guard[slot] = heard;
-        }
-    }
-
-    /// <summary>
     /// Notes that a statement waits for this server to hear from a node, its grantor, since it started, which makes the
     /// exchange with the node due.
     /// </summary>
@@ -405,8 +361,9 @@ internal static class SequenceRangeHeard
     }
 
     /// <summary>
-    /// Checks whether a statement waits for this server to hear from a node since it started, as it did since a time,
-    /// while it hasn't yet.
+    /// Checks whether a statement waits for this server to hear from a node, its grantor, since it started, as one did
+    /// since a time, as it waits for the node's word on its sequence, which a message the node already sent may not
+    /// have carried.
     /// </summary>
     /// <param name="nodeId">The node.</param>
     /// <param name="since">The time.</param>
@@ -419,27 +376,7 @@ internal static class SequenceRangeHeard
         {
             if (guard[i].Dboid == dboid && guard[i].NodeId == nodeId)
             {
-                return guard[i].ConfirmedAt == 0 && guard[i].WantedAt >= since;
-            }
-        }
-
-        return false;
-    }
-
-    /// <summary>
-    /// Checks whether this server has taken in a node's own message, and committed it, since it started.
-    /// </summary>
-    /// <param name="nodeId">The node.</param>
-    /// <returns>Whether it has.</returns>
-    internal static bool Confirmed(uint nodeId)
-    {
-        uint dboid = DatabaseId();
-        using PgLwLockShareGuard<WorfHeardTable, WorfHeard> guard = Nodes.Share();
-        for (int i = 0; i < guard.Length; i++)
-        {
-            if (guard[i].Dboid == dboid && guard[i].NodeId == nodeId)
-            {
-                return guard[i].ConfirmedAt != 0;
+                return guard[i].WantedAt >= since;
             }
         }
 

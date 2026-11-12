@@ -44,7 +44,6 @@ internal static class SequenceRangeExchange
 
     // The neighbors whose messages the current transaction took in, with when their servers started and whether they
     // made them knowing this server was back, noted once it commits.
-    private static readonly List<(uint Sender, long? StartedAt, bool Confirmed)> s_onCommit = [];
     private const long TimedOutBackoff = 60_000_000;
     private const long TimedOutFirstBackoff = 10_000_000;
 
@@ -934,6 +933,21 @@ internal static class SequenceRangeExchange
         => Text(entry, "reset_done") is string done && Worf.TryParseLsn(done, out ulong reset) && applied <= reset ? 0 : applied;
 
     /// <summary>
+    /// Gets the start of a neighbor's server that a message gives, and the WAL position it started from.
+    /// </summary>
+    private static (long? Start, ulong? StartLsn) SenderStart(JsonElement root)
+        => (root.TryGetProperty("started_at", out JsonElement started) && started.TryGetInt64(out long since) ? since : null,
+            root.TryGetProperty("start_lsn", out JsonElement startLsn) && startLsn.ValueKind == JsonValueKind.String &&
+            Worf.TryParseLsn(startLsn.GetString() ?? "", out ulong from) ? from : null);
+
+    /// <summary>
+    /// Gets whether a WAL position heard from a neighbor under an earlier start of its server is past the position its
+    /// server started from since, as when it was restored from a backup.
+    /// </summary>
+    private static bool WentBackAsItStarted(ulong heard, long heardStart, long? senderStart, ulong? senderStartLsn)
+        => heardStart != 0 && senderStart is long start && heardStart != start && senderStartLsn is ulong startLsn && heard > startLsn;
+
+    /// <summary>
     /// Records refusals as delivered: a refusal needs no acknowledgement, since a request that lost it is sent again
     /// and refused again.
     /// </summary>
@@ -1010,11 +1024,7 @@ internal static class SequenceRangeExchange
             // When this server started, and when the neighbor's did, as it last said, which tells it that a message
             // this server makes from now on was made knowing it's back.
             writer.WriteNumber("started_at", SequenceRangeHeard.Started);
-            writer.WriteNumber("heard_started_at", PendingStart(neighbor) ?? SequenceRangeHeard.StartedOf(neighbor));
-            if (SequenceRangeHeard.StartLsn is ulong startLsn and not ulong.MaxValue)
-            {
-                writer.WriteString("start_lsn", Worf.FormatLsn(startLsn));
-            }
+            writer.WriteString("start_lsn", Worf.FormatLsn(SequenceRangeHeard.StartLsn));
 
             writer.WriteStartArray("sequences");
             // An epoch this node owned of a sequence it dropped goes out as disabled, with nothing else.
@@ -1025,13 +1035,14 @@ internal static class SequenceRangeExchange
                         CASE WHEN r.fenced_at IS NOT NULL THEN 'fenced' ELSE r.state END, r.root_start, r.root_end,
                         CASE WHEN r.distance IS NULL THEN NULL WHEN r.parent_node IS NULL THEN '{}'::pg_catalog.int8[]
                             ELSE ARRAY[r.parent_node::pg_catalog.int8] || coalesce((SELECT p.route FROM worf.sequence_range_node p
-                                WHERE p.seqoid = r.seqoid AND p.node_id = r.parent_node AND p.via_node = p.node_id), '{}') END
+                                WHERE p.seqoid = r.seqoid AND p.node_id = r.parent_node AND p.via_node = p.node_id), '{}') END,
+                        pg_catalog.pg_sequence_last_value(r.seqoid)
                     FROM worf.sequence_range r
                         JOIN pg_catalog.pg_class c ON c.oid = r.seqoid
                         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
                     UNION ALL
                     SELECT NULL, d.name, d.owner_node, d.epoch, d.range_size, d.max_range_size, 0, NULL, d.watermark, NULL, 'disabled', d.root_start, d.root_end,
-                        '{}'::pg_catalog.int8[]
+                        '{}'::pg_catalog.int8[], NULL::pg_catalog.int8
                     FROM worf.sequence_range_dropped d
                     WHERE d.owned AND NOT EXISTS (SELECT 1 FROM worf.sequence_range r WHERE r.seqoid = pg_catalog.to_regclass(d.name))) s
                 ORDER BY name COLLATE "C"
@@ -1157,8 +1168,15 @@ internal static class SequenceRangeExchange
         writer.WriteString("state", row.Get<string>(10));
         WriteNullable(writer, "root_start", row.Get<long?>(11));
         WriteNullable(writer, "root_end", row.Get<long?>(12));
+
+        // How far this node has drawn from the sequence, so that a draw changes its report, and the neighbor records the
+        // WAL position of the message that tells it, which a restore that loses the draw then starts before.
+        WriteNullable(writer, "drawn", row.Get<long?>(14));
         if (managed is null)
         {
+            // The owner dropped the sequence, and keeps no ledger to check a neighbor's report against, so the blocks it
+            // granted are drawn from without its word, as its neighbors learn from this.
+            writer.WriteBoolean("dropped", true);
             writer.WriteNull("reset");
             writer.WriteNull("reset_done");
             writer.WriteBoolean("held_complete", false);
@@ -1301,20 +1319,14 @@ internal static class SequenceRangeExchange
         // The neighbor is heard from now, in shared memory, which an exchange that changes nothing else is all it writes to,
         // unless shared memory has no room for it, and then its report is written to the tables.
         bool heard = SequenceRangeHeard.Record(senderId, senderId, Worker.GetCurrentTimestamp());
-        bool knowsStart = root.TryGetProperty("heard_started_at", out JsonElement heardStarted) && heardStarted.TryGetInt64(out long heardStartedAt) &&
-            heardStartedAt == SequenceRangeHeard.Started;
-        long? startedAt = root.TryGetProperty("started_at", out JsonElement started) && started.TryGetInt64(out long since) ? since : null;
         if (!root.TryGetProperty("sequences", out JsonElement sequences))
         {
-            OnCommit(senderId, startedAt, knowsStart);
             return (false, false, false);
         }
 
         // A sequence this node is fenced on that the neighbor's message doesn't carry has no block on the neighbor.
         WorfRows fencedOn = Worf.Read("SELECT seqoid::oid FROM worf.sequence_range WHERE fenced_at IS NOT NULL", 0);
         HashSet<uint> absent = [.. Enumerable.Range(0, fencedOn.Count).Select(i => fencedOn[i].Get<uint>(0))];
-        List<long> carriedSequences = [];
-        bool undone = false;
 
         // A call that runs out of time is rolled back whole, so the sequences it would take in past a third of the
         // caller's statement_timeout are left to its next call, which sends them first, as one whose range row another
@@ -1340,7 +1352,6 @@ internal static class SequenceRangeExchange
                 : Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(entry.GetProperty("name").GetWorfString()));
             if (processed is uint carried)
             {
-                carriedSequences.Add(carried);
                 _ = absent.Remove(carried);
             }
 
@@ -1356,7 +1367,7 @@ internal static class SequenceRangeExchange
                     });
                 }
 
-                undone |= Text(entry, "reset") is not null;
+                leftSequences.Add(locked);
                 continue;
             }
 
@@ -1409,7 +1420,11 @@ internal static class SequenceRangeExchange
             }
             catch (PgException error)
             {
-                undone |= Text(entry, "reset") is not null;
+                // A sequence not taken in keeps the neighbor's last WAL position, as one a call leaves out does.
+                if (processed is uint failed && SequenceRanges.SequenceExists(failed) && !leftSequences.Contains(failed))
+                {
+                    leftSequences.Add(failed);
+                }
 
                 // A sequence dropped here since the exchange began goes unmentioned, though one of its name was created again,
                 // and one whose range row stayed locked is taken in at a later exchange.
@@ -1444,40 +1459,32 @@ internal static class SequenceRangeExchange
                 """, SpiParameter.Create(seqoid), SpiParameter.Create(senderId));
         }
 
-        // The neighbor's start is said back only once this node has asked all it makes of the neighbor's return: a
-        // sequence left out, as one whose range row a prepared transaction holds, or whose part of the message failed,
-        // may still owe the neighbor a request to reset, after a fence's lift that stopped waiting for it. And the message
-        // counts as made knowing this server is back only if every request to reset it carries was taken in.
-        bool asking = carriedSequences.Count > 0 && Worf.ReadScalar<bool>("""
-            SELECT EXISTS (SELECT 1 FROM worf.sequence_range_absent a JOIN worf.sequence_range r ON r.seqoid = a.seqoid
-                WHERE a.node_id = $1 AND a.seqoid = ANY ($2::oid[]) AND r.fenced_at IS NULL)
-            """, SpiParameter.Create(senderId), SpiParameter.Create(carriedSequences.ToArray()));
-        // A call that left sequences out says nothing back of the neighbor's start, and confirms nothing, as those may
-        // owe the neighbor a request to reset, which only the call that takes them in can tell.
-        OnCommit(senderId, asking || left.Count > 0 ? null : startedAt, knowsStart && !undone && left.Count == 0);
-
-        // The neighbor's WAL position, once compared with the last one. The sequences a call left out keep the last one,
-        // which shared memory holds until this one takes its place, so that the call that takes them in still sees the
-        // neighbor go back.
+        // The neighbor's WAL position, once compared with the last one. The sequences a call left out, held or failed to
+        // take in keep the last one, with the start it was heard under, which shared memory holds until this one takes its
+        // place, so that the call that takes them in still sees the neighbor go back, though its WAL has passed the last
+        // position by then.
         if (Worf.TryParseLsn(root.GetProperty("wal_lsn").GetWorfString() ?? "", out ulong lsn))
         {
             ulong sysid = ulong.Parse(root.GetProperty("sysid").GetWorfString() ?? "0", CultureInfo.InvariantCulture);
             long timeline = root.GetProperty("timeline").GetInt64();
-            ulong last = SequenceRangeHeard.LatestLsn(senderId, sysid, timeline, call);
-            if (call && leftSequences.Count > 0 && last > lsn)
+            (long? senderStart, ulong? senderStartLsn) = SenderStart(root);
+            (ulong last, long lastStart) = SequenceRangeHeard.LatestLsn(senderId, sysid, timeline, call);
+            if (call && leftSequences.Count > 0 && (last > lsn || WentBackAsItStarted(last, lastStart, senderStart, senderStartLsn)))
             {
                 _ = Worf.Execute("""
-                    INSERT INTO worf.sequence_range_back SELECT s, $2, $3::numeric, $4, $5::pg_lsn FROM pg_catalog.unnest($1::oid[]) s
-                    ON CONFLICT (seqoid, node_id) DO UPDATE SET sysid = excluded.sysid, timeline = excluded.timeline, lsn = excluded.lsn
+                    INSERT INTO worf.sequence_range_back SELECT s, $2, $3::numeric, $4, $5::pg_lsn, $6 FROM pg_catalog.unnest($1::oid[]) s
+                    ON CONFLICT (seqoid, node_id) DO UPDATE SET sysid = excluded.sysid, timeline = excluded.timeline, lsn = excluded.lsn,
+                        started = excluded.started
                         WHERE (sequence_range_back.sysid, sequence_range_back.timeline) <> (excluded.sysid, excluded.timeline)
                             OR sequence_range_back.lsn < excluded.lsn
                     """, SpiParameter.Create(leftSequences.ToArray()), SpiParameter.Create(senderId), SpiParameter.Create((decimal)sysid),
-                    SpiParameter.Create(timeline), SpiParameter.Create(Worf.FormatLsn(last)));
+                    SpiParameter.Create(timeline), SpiParameter.Create(Worf.FormatLsn(last)), SpiParameter.Create(lastStart == 0 ? null : (long?)lastStart));
             }
 
             // Shared memory holds it only once this commits, so that a call that fails after taking sequences in leaves the
             // last one for the next call to compare with.
-            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, () => SequenceRangeHeard.RecordLsn(senderId, sysid, timeline, call, lsn));
+            long start = senderStart ?? 0;
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, () => SequenceRangeHeard.RecordLsn(senderId, sysid, timeline, call, lsn, start));
         }
 
         // Neighbors hear of what this node learned at their next exchange, which happens now, from the exchange worker the
@@ -1576,14 +1583,14 @@ internal static class SequenceRangeExchange
                 AND (clock IS NOT DISTINCT FROM $13 OR clock >= $13) AND ($14::pg_lsn IS NULL OR reset_done = $14::pg_lsn)
                 AND ($15::pg_lsn IS NULL OR reset_lsn IS DISTINCT FROM $15::pg_lsn) AND route IS NOT DISTINCT FROM $16
                 AND checked_start IS NOT DISTINCT FROM $17 AND reported_start IS NOT DISTINCT FROM $17
-                AND ($18::bigint IS DISTINCT FROM $19 OR confirmed_start IS NOT DISTINCT FROM $19)
+                AND ($18::bigint IS DISTINCT FROM $19 OR confirmed_start IS NOT DISTINCT FROM $19) AND drawn IS NOT DISTINCT FROM $20
             """, 1, seq, sender, SpiParameter.Create(root.GetProperty("node_name").GetWorfString()), SpiParameter.Create(sysid),
             SpiParameter.Create(timeline), SpiParameter.Create(call), SpiParameter.Create(epoch), SpiParameter.Create(state),
             SpiParameter.Create(ReportedRoute(entry).Distance), SpiParameter.Create(Nullable(entry, "high_water")),
             SpiParameter.Create(watermark), SpiParameter.Create(Holds(entry)), SpiParameter.Create(Nullable(entry, "clock")),
             SpiParameter.Create(Text(entry, "reset")), SpiParameter.Create(Text(entry, "reset_done")), SpiParameter.Create(ReportedRoute(entry).Route),
             SpiParameter.Create(root.TryGetProperty("started_at", out JsonElement started) && started.TryGetInt64(out long since) ? since : (long?)null),
-            SpiParameter.Create(Nullable(entry, "checked_start")), SpiParameter.Create(SequenceRangeHeard.Started));
+            SpiParameter.Create(Confirms(entry)), SpiParameter.Create(SequenceRangeHeard.Started), SpiParameter.Create(Nullable(entry, "drawn")));
         if (own.Count == 0 || (call && Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range_back WHERE seqoid = $1 AND node_id = $2)", seq, sender)) ||
             !WalUnmoved(own[0].Get<string?>(0), root, entry, senderId, call, applied))
         {
@@ -1673,7 +1680,7 @@ internal static class SequenceRangeExchange
     private static bool WalUnmoved(string? recorded, JsonElement root, JsonElement entry, uint senderId, bool call, ulong applied)
         => Worf.TryParseLsn(recorded ?? "", out ulong at) && Worf.TryParseLsn(root.GetProperty("wal_lsn").GetWorfString() ?? "", out ulong position) &&
             position >= Math.Max(Math.Max(at, AppliedFloor(applied, entry)), SequenceRangeHeard.LatestLsn(senderId,
-                ulong.Parse(root.GetProperty("sysid").GetWorfString() ?? "", CultureInfo.InvariantCulture), root.GetProperty("timeline").GetInt64(), call)) &&
+                ulong.Parse(root.GetProperty("sysid").GetWorfString() ?? "", CultureInfo.InvariantCulture), root.GetProperty("timeline").GetInt64(), call).Lsn) &&
             position - at < LsnRecordedEvery;
 
     // What a check of a neighbor's report of a sequence depends on besides the report, the rows it reads and its reports'
@@ -2021,10 +2028,7 @@ internal static class SequenceRangeExchange
         string sysid = root.GetProperty("sysid").GetWorfString() ?? "";
         long timeline = root.GetProperty("timeline").GetInt64();
         string walLsn = root.GetProperty("wal_lsn").GetWorfString() ?? "0/0";
-        long? senderStart = root.TryGetProperty("started_at", out JsonElement senderStarted) && senderStarted.TryGetInt64(out long startedSince)
-            ? startedSince : null;
-        ulong? senderStartLsn = root.TryGetProperty("start_lsn", out JsonElement startLsnText) && startLsnText.ValueKind == JsonValueKind.String &&
-            Worf.TryParseLsn(startLsnText.GetString() ?? "", out ulong startedFrom) ? startedFrom : null;
+        (long? senderStart, ulong? senderStartLsn) = SenderStart(root);
 
         // The root's start, once the owner has started it, reaches every node, so that each allocator refuses a node
         // that joins with values reaching into it.
@@ -2050,19 +2054,32 @@ internal static class SequenceRangeExchange
             FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2 AND sysid = $3::numeric AND timeline = $4
             """, 1, seq, sender, SpiParameter.Create(sysid), SpiParameter.Create(timeline), SpiParameter.Create(call));
         // A position kept from another system or timeline of the neighbor's compares with nothing it reports now, and goes.
-        string? kept = null;
+        ulong kept = 0;
+        long keptStart = 0;
         if (call)
         {
             _ = Worf.Execute("DELETE FROM worf.sequence_range_back WHERE seqoid = $1 AND node_id = $2 AND (sysid <> $3::numeric OR timeline <> $4)",
                 seq, sender, SpiParameter.Create(sysid), SpiParameter.Create(timeline));
-            kept = Worf.ReadScalar<string?>(
-                "DELETE FROM worf.sequence_range_back WHERE seqoid = $1 AND node_id = $2 AND sysid = $3::numeric AND timeline = $4 RETURNING lsn::text",
-                seq, sender, SpiParameter.Create(sysid), SpiParameter.Create(timeline));
+            WorfRows keptRow = Worf.Read(
+                "DELETE FROM worf.sequence_range_back WHERE seqoid = $1 AND node_id = $2 AND sysid = $3::numeric AND timeline = $4 RETURNING lsn::text, started",
+                1, seq, sender, SpiParameter.Create(sysid), SpiParameter.Create(timeline));
+            if (keptRow.Count > 0 && Worf.TryParseLsn(keptRow[0].Get<string?>(0) ?? "", out ulong left))
+            {
+                (kept, keptStart) = (left, keptRow[0].Get<long?>(1) ?? 0);
+            }
         }
 
-        ulong latest = Math.Max(Math.Max(AppliedFloor(applied, entry), kept is not null && Worf.TryParseLsn(kept, out ulong left) ? left : 0),
-            stored.Count > 0 ? Math.Max(Worf.TryParseLsn(stored[0].Get<string?>(0) ?? "", out ulong recorded) ? recorded : 0,
-                SequenceRangeHeard.LatestLsn(senderId, ulong.Parse(sysid, CultureInfo.InvariantCulture), timeline, call)) : 0);
+        ulong recorded = 0;
+        long recordedStart = 0;
+        (ulong Lsn, long Start) heardLast = (0, 0);
+        if (stored.Count > 0)
+        {
+            recorded = Worf.TryParseLsn(stored[0].Get<string?>(0) ?? "", out ulong at) ? at : 0;
+            recordedStart = stored[0].Get<long?>(1) ?? 0;
+            heardLast = SequenceRangeHeard.LatestLsn(senderId, ulong.Parse(sysid, CultureInfo.InvariantCulture), timeline, call);
+        }
+
+        ulong latest = Math.Max(Math.Max(AppliedFloor(applied, entry), kept), Math.Max(recorded, heardLast.Lsn));
         string? rolledBack = null;
         string backTo = walLsn;
         if (Worf.TryParseLsn(walLsn, out ulong position) && latest > position)
@@ -2071,10 +2088,12 @@ internal static class SequenceRangeExchange
         }
 
         // A neighbor whose server started from a WAL position before one it reported for the sequence under an earlier
-        // start went back as it started, as one restored from a backup does, though its own WAL may since have passed the
-        // position it reported.
-        else if (stored.Count > 0 && stored[0].Get<long?>(1) is long reportedStart && senderStart is long currentStart && reportedStart != currentStart &&
-            senderStartLsn is ulong startLsn && Worf.TryParseLsn(stored[0].Get<string?>(0) ?? "", out ulong reportedLsn) && reportedLsn > startLsn)
+        // start, which the tables recorded, shared memory holds, or a call that left the sequence out kept, went back as it
+        // started, as one restored from a backup does, though its own WAL may since have passed the position it reported.
+        else if (senderStartLsn is ulong startLsn &&
+            Math.Max(Math.Max(WentBackAsItStarted(recorded, recordedStart, senderStart, startLsn) ? recorded : 0,
+                WentBackAsItStarted(heardLast.Lsn, heardLast.Start, senderStart, startLsn) ? heardLast.Lsn : 0),
+                WentBackAsItStarted(kept, keptStart, senderStart, startLsn) ? kept : 0) is ulong reportedLsn and not 0)
         {
             rolledBack = Worf.FormatLsn(reportedLsn);
             backTo = Worf.FormatLsn(startLsn);
@@ -2111,8 +2130,9 @@ internal static class SequenceRangeExchange
         }
 
         // A neighbor's word that it checked this node's report since this server started confirms the sequence's blocks
-        // it granted, which backends read again once this commits.
-        if (Nullable(entry, "checked_start") == SequenceRangeHeard.Started && !Worf.ReadScalar<bool>(
+        // it granted, which backends read again once this commits, and so does an owner's word that it dropped the
+        // sequence, after which it has no ledger to check the report against.
+        if (Confirms(entry) == SequenceRangeHeard.Started && !Worf.ReadScalar<bool>(
             "SELECT EXISTS (SELECT 1 FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2 AND confirmed_start = $3)",
             seq, sender, SpiParameter.Create(SequenceRangeHeard.Started)))
         {
@@ -2121,9 +2141,9 @@ internal static class SequenceRangeExchange
 
         _ = Worf.Execute("""
             INSERT INTO worf.sequence_range_node (seqoid, node_id, node_name, via_node, sysid, timeline, wal_lsn, reply_lsn, epoch, state, distance,
-                high_water, watermark, reported_at, holds, clock, route, reported_start, confirmed_start)
+                high_water, watermark, reported_at, holds, clock, route, reported_start, confirmed_start, drawn)
             VALUES ($1, $2, $3, $2, $4::numeric, $5, CASE WHEN $12 THEN $6::pg_lsn END, CASE WHEN NOT $12 THEN $6::pg_lsn END, $7, $8, $9, $10, $11, now(),
-                $13, $14, $15, $16, $17)
+                $13, $14, $15, $16, $17, $18)
             ON CONFLICT (seqoid, node_id) DO UPDATE SET node_name = excluded.node_name, via_node = excluded.via_node,
                 sysid = excluded.sysid, timeline = excluded.timeline,
                 wal_lsn = CASE WHEN $12 THEN excluded.wal_lsn ELSE sequence_range_node.wal_lsn END,
@@ -2131,13 +2151,14 @@ internal static class SequenceRangeExchange
                 state = excluded.state, distance = excluded.distance, high_water = excluded.high_water, watermark = excluded.watermark,
                 reported_at = excluded.reported_at, holds = excluded.holds, clock = greatest(sequence_range_node.clock, excluded.clock),
                 route = excluded.route, reported_start = excluded.reported_start,
-                confirmed_start = coalesce(excluded.confirmed_start, sequence_range_node.confirmed_start)
+                confirmed_start = coalesce(excluded.confirmed_start, sequence_range_node.confirmed_start), drawn = excluded.drawn
             """, seq, sender, SpiParameter.Create(senderName),
             SpiParameter.Create(sysid), SpiParameter.Create(timeline), SpiParameter.Create(walLsn), SpiParameter.Create(epoch),
             SpiParameter.Create(entry.GetProperty("state").GetWorfString()), SpiParameter.Create(ReportedRoute(entry).Distance),
             SpiParameter.Create(high), SpiParameter.Create(watermark), SpiParameter.Create(call), SpiParameter.Create(Holds(entry)),
             SpiParameter.Create(Nullable(entry, "clock")), SpiParameter.Create(ReportedRoute(entry).Route), SpiParameter.Create(senderStart),
-            SpiParameter.Create(Nullable(entry, "checked_start") == SequenceRangeHeard.Started ? SequenceRangeHeard.Started : (long?)null));
+            SpiParameter.Create(Confirms(entry) == SequenceRangeHeard.Started ? SequenceRangeHeard.Started : (long?)null),
+            SpiParameter.Create(Nullable(entry, "drawn")));
 
         // A neighbor that worf.activate_sequence_range stopped waiting for, as gone, may hold values that the fence's lift
         // gave out again, so once it's heard from again after the lift, it's asked to reset, at a WAL position of its own,
@@ -2569,10 +2590,11 @@ internal static class SequenceRangeExchange
     }
 
     /// <summary>
-    /// Checks whether this server has heard, since it started, from each node that granted this pool holder an open
-    /// pool block of a sequence, as it draws from its own blocks only then, since a fence's lift may have given their
-    /// values out again meanwhile. One it hasn't is asked at once. A Snowflake pool holder's numbers wait on the owner's
-    /// word instead.
+    /// Checks whether each node that granted this pool holder an open pool block of a sequence has said, since this
+    /// server started, that it checked this node's report of the sequence since then, as the pool holder draws from those
+    /// blocks only then, as it does from its own, since the node may have found this one went back, or a fence's lift
+    /// may have given their values out again meanwhile. One that hasn't is asked at once. A Snowflake pool holder's
+    /// numbers wait on the owner's word instead.
     /// </summary>
     private static bool PoolGrantorsHeard(uint seqoid, int epoch)
     {
@@ -2585,14 +2607,13 @@ internal static class SequenceRangeExchange
             SELECT DISTINCT b.from_node FROM worf.sequence_range_block b CROSS JOIN worf.local_node l
             WHERE b.seqoid = $1 AND b.epoch = $2 AND b.kind = 'p' AND b.state = 'open' AND b.from_node <> l.node_id
                 AND EXISTS (SELECT 1 FROM worf.node n WHERE n.node_id = b.from_node)
-            """, 0, SpiParameter.Create(seqoid), SpiParameter.Create(epoch)).Select(static pool => pool.Get<uint>(0)))
+                AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_node c WHERE c.seqoid = b.seqoid AND c.node_id = b.from_node AND c.confirmed_start = $3)
+            """, 0, SpiParameter.Create(seqoid), SpiParameter.Create(epoch), SpiParameter.Create(SequenceRangeHeard.Started))
+            .Select(static pool => pool.Get<uint>(0)))
         {
-            if (!SequenceRangeHeard.Confirmed(grantor))
-            {
-                SequenceRangeHeard.Want(grantor);
-                SequenceRangeExchangeWorker.Wake();
-                return false;
-            }
+            SequenceRangeHeard.Want(grantor);
+            SequenceRangeExchangeWorker.Wake();
+            return false;
         }
 
         return true;
@@ -2776,52 +2797,6 @@ internal static class SequenceRangeExchange
     }
 
     /// <summary>
-    /// Gets when a neighbor's server started, as the message this transaction took in from it says, once it has asked
-    /// all it makes of the neighbor's return: the answer to that message, which goes out only if the transaction commits,
-    /// says it back, as the messages after do.
-    /// </summary>
-    /// <param name="neighbor">The neighbor.</param>
-    /// <returns>The time, or null.</returns>
-    private static long? PendingStart(uint neighbor)
-        => s_onCommit.FindLast(noted => noted.Sender == neighbor && noted.StartedAt is not null).StartedAt;
-
-    /// <summary>
-    /// Notes, once the transaction that takes in a neighbor's message commits, when the neighbor's server started, which
-    /// this server's messages say back from then on, so that one says it only once what this server made of the
-    /// neighbor's return, as a request to reset, has committed and goes out with it; and, for a message the neighbor made
-    /// knowing this server was back, that this server has heard from it since it started, with what the message asked
-    /// done. A savepoint that rolls back forgets what was noted so far.
-    /// </summary>
-    private static void OnCommit(uint senderId, long? startedAt, bool confirmed)
-    {
-        if (s_onCommit.Count == 0)
-        {
-            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () =>
-            {
-                foreach ((uint sender, long? started, bool confirmed) in s_onCommit)
-                {
-                    if (started is long at)
-                    {
-                        SequenceRangeHeard.RecordStarted(sender, at);
-                    }
-
-                    if (confirmed)
-                    {
-                        SequenceRangeHeard.Confirm(sender);
-                    }
-                }
-
-                s_onCommit.Clear();
-            });
-            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, static () => s_onCommit.Clear());
-            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, static () => s_onCommit.Clear());
-            _ = PgTransaction.RegisterSubtransactionCallback(PgSubtransactionEvent.Abort, static (_, _) => s_onCommit.Clear());
-        }
-
-        s_onCommit.Add((senderId, startedAt, confirmed));
-    }
-
-    /// <summary>
     /// Checks whether a neighbor is the parent that grants this node a sequence's blocks and hasn't said it checked this
     /// node's report of the sequence since this server started, so that the node draws nothing from the sequence until
     /// it has: a request to reset from it is taken at once, whatever the window, as it gives up only blocks the node
@@ -2894,6 +2869,12 @@ internal static class SequenceRangeExchange
 
     private static string? Text(JsonElement entry, string name)
         => entry.TryGetProperty(name, out JsonElement value) && value.ValueKind == JsonValueKind.String ? value.GetWorfString() : null;
+
+    // The start of this server's that a neighbor's report of a sequence confirms: the one it says it checked this node's
+    // report since, or, from an owner that dropped the sequence, this server's own.
+    private static long? Confirms(JsonElement entry)
+        => entry.TryGetProperty("dropped", out JsonElement dropped) && dropped.ValueKind == JsonValueKind.True ? SequenceRangeHeard.Started
+            : Nullable(entry, "checked_start");
 
     private static long? Nullable(JsonElement entry, string name)
         => entry.TryGetProperty(name, out JsonElement value) && value.ValueKind == JsonValueKind.Number ? value.GetInt64() : null;

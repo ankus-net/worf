@@ -2031,6 +2031,9 @@ internal static partial class Worf
             guard.Header = ctx;
         }
 
+        // The WAL position this server started from is read before anything else writes WAL.
+        SequenceRangeHeard.NoteStart();
+
         // Make it easy to identify our processes.
         Worker.SetConfigOption("application_name", PgBackgroundWorker.Name);
 
