@@ -40,6 +40,12 @@ internal sealed unsafe partial class WorfConnection : IDisposable
     private readonly MemoryContextData* _scratch;
     private byte[] _message = new byte[8192];
 
+    // The messages of a copy read ahead of their turn, as while apply waits out its delay, which Receive gives before it
+    // reads more, how many bytes they hold, and whether the copy ended after them.
+    private readonly Queue<byte[]> _readAhead = new();
+    private long _readAheadBytes;
+    private bool _endedAhead;
+
     private WorfConnection(WalReceiverConn* conn, MemoryContextData* scratch, int serverVersion)
     {
         _conn = conn;
@@ -238,6 +244,70 @@ internal sealed unsafe partial class WorfConnection : IDisposable
     /// <param name="message">The message, valid until the connection's next call.</param>
     /// <returns>Whether a message arrived, the wait timed out, the latch woke it, or the copy ended.</returns>
     internal PgReplicationReceiveStatus Receive(TimeSpan timeout, out ReadOnlySpan<byte> message)
+    {
+        if (_readAhead.TryDequeue(out byte[]? ahead))
+        {
+            _readAheadBytes -= ahead.Length;
+            message = ahead;
+            return PgReplicationReceiveStatus.Message;
+        }
+
+        if (_endedAhead)
+        {
+            message = default;
+            return PgReplicationReceiveStatus.Ended;
+        }
+
+        return ReceiveFromServer(timeout, out message);
+    }
+
+    /// <summary>
+    /// Waits for a while as the messages of a copy keep coming, reading them ahead of their turn: each that
+    /// <paramref name="handle"/> takes is handled now, and the rest wait for <see cref="Receive"/> in order, up to
+    /// <paramref name="maxBytes"/> of them, after which the wait reads no more.
+    /// </summary>
+    /// <param name="duration">How long to wait.</param>
+    /// <param name="maxBytes">The most bytes of messages to hold.</param>
+    /// <param name="handle">Handles a message now, returning whether it did, so that it isn't given again.</param>
+    /// <param name="stop">Whether to stop waiting, as when the worker is asked to stop.</param>
+    internal void ReadAhead(TimeSpan duration, long maxBytes, ReadAheadHandler handle, Func<bool> stop)
+    {
+        long until = NativeMethods.GetCurrentTimestamp() + (long)duration.TotalMicroseconds;
+        while (!stop())
+        {
+            int remaining = Milliseconds(NativeMethods.TimestampDifferenceMilliseconds(NativeMethods.GetCurrentTimestamp(), until));
+            if (remaining <= 0)
+            {
+                return;
+            }
+
+            if (_endedAhead || _readAheadBytes >= maxBytes)
+            {
+                int events = NativeMethods.WaitLatchOrSocket(NativeGlobals.MyLatch, WlLatchSet | WlExitOnPmDeath | WlTimeout, InvalidSocket,
+                    Math.Min(remaining, 1000), PgWaitExtension);
+                if ((events & WlLatchSet) != 0)
+                {
+                    NativeMethods.ResetLatch(NativeGlobals.MyLatch);
+                }
+
+                PgInterrupts.Check();
+                continue;
+            }
+
+            PgReplicationReceiveStatus status = ReceiveFromServer(TimeSpan.FromMilliseconds(Math.Min(remaining, 1000)), out ReadOnlySpan<byte> message);
+            if (status == PgReplicationReceiveStatus.Ended)
+            {
+                _endedAhead = true;
+            }
+            else if (status == PgReplicationReceiveStatus.Message && !handle(message))
+            {
+                _readAhead.Enqueue(message.ToArray());
+                _readAheadBytes += message.Length;
+            }
+        }
+    }
+
+    private PgReplicationReceiveStatus ReceiveFromServer(TimeSpan timeout, out ReadOnlySpan<byte> message)
     {
         long milliseconds = timeout == Timeout.InfiniteTimeSpan ? -1 : (long)timeout.TotalMilliseconds;
         ArgumentOutOfRangeException.ThrowIfLessThan(milliseconds, -1L, nameof(timeout));

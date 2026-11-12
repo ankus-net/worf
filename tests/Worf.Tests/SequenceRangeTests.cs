@@ -3238,15 +3238,16 @@ public sealed class SequenceRangeTests
 
     /// <summary>
     /// Idle calls stay cheap, and an owner doesn't wait for them. A position a call kept for a sequence of a neighbor's
-    /// other system or timeline goes once the next call takes the sequence in, after which idle calls write nothing.
-    /// Idle calls read a neighbor's grants and acknowledgements through their keys, rather than scanning every grant
-    /// the owner made, which a sequence's switches add to without end: here 20,000 grants of another sequence. Each
-    /// runs a few statements, however many sequences the nodes manage, rather than several for each: the owner reads
-    /// each part of its answer for every sequence at once, and checks what each sequence's report depends on at once,
-    /// passing over those whose reports, and all they depend on, are as they were. And an owner that only answers calls
-    /// draws from the blocks it grants itself without waiting for its neighbor's next call, though that comes only every
-    /// minute: it tells its subscribers, through its WAL, to call it as it grants itself one, so that the neighbor hears
-    /// of the block before the owner needs it; each of its inserts draws one value, and blocks hold ten.
+    /// other system or timeline goes once the next call takes the sequence in, after which idle calls write nothing. Idle
+    /// calls read a neighbor's grants and acknowledgements through their keys, rather than scanning every grant the owner
+    /// made, which a sequence's switches add to without end: here 20,000 grants of another sequence. Each runs a few
+    /// statements, however many sequences the nodes manage, rather than several for each: the owner reads each part of its
+    /// answer for every sequence at once, and checks what each sequence's report depends on at once, passing over those
+    /// whose reports, and all they depend on, are as they were, though another sequence's ranges change as the owner draws
+    /// from it. And an owner that only answers calls draws from the blocks it grants itself without waiting for its
+    /// neighbor's next call, though that comes only every minute: it tells its subscribers, through its WAL, to call it as
+    /// it grants itself one, so that the neighbor hears of the block before the owner needs it; each of its inserts draws
+    /// one value, and blocks hold ten.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -3312,29 +3313,156 @@ public sealed class SequenceRangeTests
                 coalesce(sum(calls) FILTER (WHERE NOT toplevel), 0)
             FROM pg_stat_statements
             """;
-        long fewest = long.MaxValue;
-        for (int window = 0; window < 3 && fewest >= 60; window++)
+        async Task<long> FewestStatementsAsync()
         {
-            _ = await nodeA.SafePsqlAsync(Database, "SELECT pg_stat_statements_reset()", token);
-            Stopwatch counting = Stopwatch.StartNew();
-            (long Calls, long Statements) counted = (0, 0);
-            while (counted.Calls < 6)
+            long fewest = long.MaxValue;
+            for (int window = 0; window < 3 && fewest >= 60; window++)
             {
-                Assert.IsLessThan(TestNode.PollTimeout, counting.Elapsed, $"node_b's calls to node_a, {counted.Calls} so far");
-                await Task.Delay(TimeSpan.FromSeconds(1), token);
-                string[] read = (await nodeA.SafePsqlAsync(Database, Counted, token)).Split('|');
-                counted = (long.Parse(read[0], CultureInfo.InvariantCulture), long.Parse(read[1], CultureInfo.InvariantCulture));
+                _ = await nodeA.SafePsqlAsync(Database, "SELECT pg_stat_statements_reset()", token);
+                Stopwatch counting = Stopwatch.StartNew();
+                (long Calls, long Statements) counted = (0, 0);
+                while (counted.Calls < 6)
+                {
+                    Assert.IsLessThan(TestNode.PollTimeout, counting.Elapsed, $"node_b's calls to node_a, {counted.Calls} so far");
+                    await Task.Delay(TimeSpan.FromSeconds(1), token);
+                    string[] read = (await nodeA.SafePsqlAsync(Database, Counted, token)).Split('|');
+                    counted = (long.Parse(read[0], CultureInfo.InvariantCulture), long.Parse(read[1], CultureInfo.InvariantCulture));
+                }
+
+                TestContext.WriteLine($"{counted.Calls} calls ran {counted.Statements} statements on node_a, most often:");
+                TestContext.WriteLine(await nodeA.SafePsqlAsync(Database, """
+                    SELECT string_agg(calls || ' ' || left(regexp_replace(query, '\s+', ' ', 'g'), 150), E'\n' ORDER BY calls DESC)
+                    FROM (SELECT calls, query FROM pg_stat_statements WHERE NOT toplevel ORDER BY calls DESC LIMIT 12) q
+                    """, token));
+                fewest = Math.Min(fewest, counted.Statements / counted.Calls);
             }
 
-            TestContext.WriteLine($"{counted.Calls} calls ran {counted.Statements} statements on node_a, most often:");
-            TestContext.WriteLine(await nodeA.SafePsqlAsync(Database, """
-                SELECT string_agg(calls || ' ' || left(regexp_replace(query, '\s+', ' ', 'g'), 150), E'\n' ORDER BY calls DESC)
-                FROM (SELECT calls, query FROM pg_stat_statements WHERE NOT toplevel ORDER BY calls DESC LIMIT 12) q
-                """, token));
-            fewest = Math.Min(fewest, counted.Statements / counted.Calls);
+            return fewest;
         }
 
+        long fewest = await FewestStatementsAsync();
         Assert.IsLessThan(60L, fewest, "the statements each of node_b's idle calls ran on node_a, managing 11 sequences");
+
+        // While node_a draws from t_id_seq 20 times a second, switching to a block it grants itself every half second,
+        // which changes the ranges, node_b's calls check t_id_seq in full, and pass over the other ten as before.
+        using CancellationTokenSource stopDrawing = CancellationTokenSource.CreateLinkedTokenSource(token);
+        Task drawing = Task.Run(async () =>
+        {
+            await using NpgsqlConnection busy = await nodeA.OpenAsync(Database, stopDrawing.Token);
+            await using NpgsqlCommand draw = new("INSERT INTO t (v) VALUES ('busy')", busy);
+            while (!stopDrawing.IsCancellationRequested)
+            {
+                _ = await draw.ExecuteNonQueryAsync(stopDrawing.Token);
+                await Task.Delay(TimeSpan.FromMilliseconds(50), stopDrawing.Token);
+            }
+        }, token);
+        long busiest = await FewestStatementsAsync();
+
+        // Meanwhile node_a's range worker checks t_id_seq in full at every tick, and the other ten only every second, rather
+        // than every sequence at every tick that follows a change to any of them.
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT pg_stat_statements_reset()", token);
+        await Task.Delay(TimeSpan.FromSeconds(10), token);
+        long fullChecks = long.Parse(await nodeA.SafePsqlAsync(Database,
+            "SELECT coalesce(sum(calls), 0) FROM pg_stat_statements WHERE query LIKE 'SELECT fenced_at IS NOT NULL, owner_node FROM worf.sequence_range WHERE seqoid = $1'", token),
+            CultureInfo.InvariantCulture);
+        await stopDrawing.CancelAsync();
+        try
+        {
+            await drawing;
+        }
+        catch (OperationCanceledException)
+        {
+        }
+
+        Assert.IsLessThan(60L, busiest, "the statements each of node_b's idle calls ran on node_a, as node_a drew from t_id_seq");
+        Assert.IsLessThan(450L, fullChecks, "the full checks node_a's range worker ran in 10 s at ticks of 100 ms, as it drew from t_id_seq alone of 11 sequences");
+
+        // node_a draws through six of its own blocks while node_b calls only every minute.
+        _ = await nodeB.SafePsqlAsync(Database, "ALTER SYSTEM SET worf.sequence_range_exchange_interval = '60s'", token);
+        _ = await nodeB.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
+        await Task.Delay(TimeSpan.FromSeconds(2), token);
+        await using NpgsqlConnection connection = await nodeA.OpenAsync(Database, token);
+        await using (NpgsqlCommand timeout = new("SET statement_timeout = '10s'", connection))
+        {
+            _ = await timeout.ExecuteNonQueryAsync(token);
+        }
+
+        await using NpgsqlCommand insert = new("INSERT INTO t (v) VALUES ('a')", connection);
+        Stopwatch inserting = Stopwatch.StartNew();
+        for (int i = 0; i < 60; i++)
+        {
+            _ = await insert.ExecuteNonQueryAsync(token);
+        }
+
+        Assert.IsLessThan(TimeSpan.FromSeconds(30), inserting.Elapsed, "node_a's 60 inserts, through six of its own blocks");
+    }
+
+    /// <summary>
+    /// A call that has taken a third of its time, and taken a sequence in, leaves the rest it would have to check to the
+    /// next call, unread, rather than check those whose reports change nothing.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task LateCallsLeaveTheRestUnread()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token, "log_min_messages = debug1");
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        const string Sequences = "CREATE TABLE slow_on (); DO $$ BEGIN FOR g IN 1..12 LOOP EXECUTE format('CREATE SEQUENCE many_%s', lpad(g::text, 2, '0')); END LOOP; END $$";
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, Sequences, token);
+        }
+
+        // Once it's turned on, each report node_a takes in costs it 0.6 s, against a third of node_b's 3 s calls.
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE FUNCTION slow_report() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF EXISTS (SELECT FROM public.slow_on) THEN PERFORM pg_sleep(0.6); END IF; RETURN NEW; END $$;
+            CREATE TRIGGER slow_report BEFORE UPDATE ON worf.sequence_range_node FOR EACH ROW EXECUTE FUNCTION slow_report();
+            """, token);
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database,
+            "SELECT count(worf.enable_sequence_range(format('many_%s', lpad(g::text, 2, '0'))::regclass, participants := '{node_b}', range_size := 100)) FROM generate_series(1, 12) g",
+            token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT count(*) = 12 FROM worf.sequence_ranges WHERE state = 'active'", token),
+            "node_b drawing from blocks of the 12 sequences");
+        _ = await nodeB.SafePsqlAsync(Database, "ALTER SYSTEM SET worf.sequence_range_timeout = '3s'", token);
+        _ = await nodeB.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
+        await Task.Delay(TimeSpan.FromSeconds(3), token);
+
+        // node_b's calls come to a new process on node_a, which has checked none of their reports, and node_b draws
+        // through its blocks of many_01 and many_02, which it asks for more of.
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE application_name = 'b_from_a_range'", token);
+        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO slow_on DEFAULT VALUES", token);
+        int logpos = nodeA.ReadLog().Length;
+        for (int draw = 0; draw < 5; draw++)
+        {
+            _ = await nodeB.SafePsqlAsync(Database, "SELECT count(nextval('many_01')) + count(nextval('many_02')) FROM generate_series(1, 50)", token);
+        }
+
+        Assert.IsTrue(await nodeA.PollLogAsync(logpos, "left 10 sequences to its next call", token), "node_a's late call, leaving the ten it would have had to check");
+    }
+
+    /// <summary>
+    /// An owner that only answers calls draws from the blocks it grants itself without waiting for its subscriber's next
+    /// call, though the subscriber applies the owner's changes 40 seconds late: the subscriber hears the owner's word to
+    /// call it as it waits out the delay, and calls at once.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task OwnersDontWaitForDelayedSubscribers()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token, applyDelay: "40s");
+        _ = await nodeA.SafePsqlAsync(Database,
+            "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 10, max_range_size := 10)", token);
+        await WaitActiveAsync([nodeA, nodeB], token);
 
         // node_a draws through six of its own blocks while node_b calls only every minute.
         _ = await nodeB.SafePsqlAsync(Database, "ALTER SYSTEM SET worf.sequence_range_exchange_interval = '60s'", token);
@@ -6307,7 +6435,7 @@ public sealed class SequenceRangeTests
     }
 
     private static async Task SubscribeAsync(TestNode subscriber, string name, TestNode provider, CancellationToken token,
-        string database = Database)
+        string database = Database, string applyDelay = "0")
     {
         _ = await subscriber.SafePsqlAsync(database, $$"""
             SELECT worf.create_subscription(
@@ -6315,7 +6443,8 @@ public sealed class SequenceRangeTests
                 provider_dsn := '{{provider.Dsn(Database, SuperUser)}}',
                 synchronize_structure := false,
                 synchronize_data := false,
-                forward_origins := '{}')
+                forward_origins := '{}',
+                apply_delay := '{{applyDelay}}')
             """, token);
         Assert.IsTrue(await subscriber.PollQueryUntilAsync(database, $"""
             SELECT EXISTS (

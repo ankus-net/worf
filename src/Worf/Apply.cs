@@ -619,6 +619,9 @@ internal static unsafe partial class Apply
         _ = Worf.MemoryContextSwitchTo(oldcontext);
     }
 
+    // The most bytes of the messages that follow a delayed transaction that apply reads ahead as it waits out the delay.
+    private const long ReadAheadLimit = 64L * 1024 * 1024;
+
     /// <summary>
     /// Calculates how long the apply worker waits before applying a transaction, so that it applies the delay after
     /// the transaction committed on the origin.
@@ -734,6 +737,34 @@ internal static unsafe partial class Apply
         }
     }
 
+    /// <summary>
+    /// Has this node call the provider about sequence ranges now, as the provider asked.
+    /// </summary>
+    private static void CallProvider()
+    {
+        if (MySubscription is WorfSubscription sub)
+        {
+            WorfLog.Debug2($"node {sub.Origin.Name} asked this node to call it about sequence ranges");
+            SequenceRangeHeard.CallFor(sub.Origin.Id);
+            SequenceRangeExchangeWorker.Wake();
+        }
+    }
+
+    /// <summary>
+    /// Handles the provider's word to call it about sequence ranges read ahead of its turn, as a CopyData message whose
+    /// replication message, past its three positions and times, is a 'W'.
+    /// </summary>
+    private static bool CallProviderAhead(ReadOnlySpan<byte> message)
+    {
+        if (message.Length <= 25 || message[0] != (byte)'w' || message[25] != (byte)'W')
+        {
+            return false;
+        }
+
+        CallProvider();
+        return true;
+    }
+
     private static void HandleBegin(StringInfoData* s)
     {
         s_xactActionCounter = 1;
@@ -783,7 +814,11 @@ internal static unsafe partial class Apply
                     sleepUsec += 100000;  // 100ms buffer
                 }
 
-                NativeMethods.pg_usleep(sleepUsec);
+                // The provider's word to call it about sequence ranges, as an owner that granted itself a block sends,
+                // which comes in the transactions that follow, is heard as the delay is waited out, so that the owner
+                // doesn't wait out the delay too; the rest waits its turn.
+                (s_applyconn ?? throw new InvalidOperationException("The apply connection is not open.")).ReadAhead(
+                    TimeSpan.FromMicroseconds(sleepUsec), ReadAheadLimit, CallProviderAhead, static () => Worker.GotSigterm);
             }
         }
 
@@ -2590,13 +2625,7 @@ internal static unsafe partial class Apply
 
                 // The provider's word to call it now about sequence ranges, as an owner that granted itself a block sends.
                 case 'W':
-                    if (MySubscription is WorfSubscription sub)
-                    {
-                        WorfLog.Debug2($"node {sub.Origin.Name} asked this node to call it about sequence ranges");
-                        SequenceRangeHeard.CallFor(sub.Origin.Id);
-                        SequenceRangeExchangeWorker.Wake();
-                    }
-
+                    CallProvider();
                     break;
 
                 default:
