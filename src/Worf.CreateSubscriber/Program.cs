@@ -850,7 +850,7 @@ int RunPgCtl(IReadOnlyList<string> arg)
     }
 
     PrintMsg(VerbosityLevel.Debug, $"Running pg_ctl: {FormatCommand(execPath, arguments)}.\n");
-    return RunProgram(execPath, arguments, false);
+    return RunProgram(execPath, arguments, false, relayed: true);
 }
 
 // Run pg_basebackup to create the copy of the origin node.
@@ -1507,21 +1507,33 @@ int? ReadClusterState(string dataDir)
     ulong segmentBytes = (ulong)segmentSize;
     ulong pageBytes = (ulong)blockSize;
 
-    // Where the provider's WAL ends, its timeline, and the files it keeps.
+    // Where the provider's WAL ends, which any role may read, so that a directory past it is refused whatever else the
+    // run's role may read; and the provider's timeline and the files it keeps, which only pg_monitor's members may list.
     ulong providerEnd;
+    try
+    {
+        providerEnd = ParseLsn(QueryValue(conn, """
+            SELECT coalesce(CASE WHEN pg_catalog.pg_is_in_recovery()
+                    THEN coalesce(pg_catalog.pg_last_wal_receive_lsn(), pg_catalog.pg_last_wal_replay_lsn())
+                    ELSE pg_catalog.pg_current_wal_flush_lsn() END, '0/0')::pg_catalog.text
+            """)) ?? 0;
+    }
+    catch (LibpqException)
+    {
+        return null;
+    }
+
+    if (checkpoint > providerEnd)
+    {
+        return (false, "is past the provider's WAL, so its WAL has left the provider's");
+    }
+
     long providerTimeline;
     Dictionary<string, string> providerSegments = [];
     HashSet<long> providerHistories = [];
     try
     {
-        List<string?[]> state = conn.Query("""
-            SELECT coalesce(CASE WHEN pg_catalog.pg_is_in_recovery()
-                    THEN coalesce(pg_catalog.pg_last_wal_receive_lsn(), pg_catalog.pg_last_wal_replay_lsn())
-                    ELSE pg_catalog.pg_current_wal_flush_lsn() END, '0/0')::pg_catalog.text,
-                (SELECT timeline_id FROM pg_catalog.pg_control_checkpoint())
-            """);
-        providerEnd = ParseLsn(state[0][0]) ?? 0;
-        providerTimeline = long.Parse(state[0][1] ?? "1", CultureInfo.InvariantCulture);
+        providerTimeline = long.Parse(QueryValue(conn, "SELECT timeline_id FROM pg_catalog.pg_control_checkpoint()") ?? "1", CultureInfo.InvariantCulture);
         foreach (string?[] row in conn.Query("SELECT name FROM pg_catalog.pg_ls_waldir()"))
         {
             if (row[0] is not string name)
@@ -1549,12 +1561,8 @@ int? ReadClusterState(string dataDir)
         return null;
     }
 
-    if (checkpoint > providerEnd)
-    {
-        return (false, "is past the provider's WAL, so its WAL has left the provider's");
-    }
-
-    // The directory's timelines: the latest it holds WAL or a history file of, each history file the provider's own.
+    // The directory's timeline: the latest it holds WAL of, and its history files, each the provider's own, though the
+    // directory never reached their timelines, as a standby that fetched a timeline's history it couldn't follow has.
     string walDir = Path.Join(dataDir, "pg_wal");
     List<string> names;
     try
@@ -1576,7 +1584,6 @@ int? ReadClusterState(string dataDir)
         }
         else if (WalSegments.TryParseHistory(name, out long history))
         {
-            ownTimeline = Math.Max(ownTimeline, history);
             ownHistories.Add(history);
         }
     }
@@ -1637,20 +1644,42 @@ int? ReadClusterState(string dataDir)
 
     using WalSegments own = new(walDir, names, ownTimeline, segmentSize);
 
-    // The checkpoint record, and the records that follow it, as far as they're whole.
-    if (Stream(own.Read, checkpoint, RecordHeader + 2 + sizeof(ulong)) is not (byte[] head, _) || !IsCheckpoint(head, redo) ||
-        !Record(checkpoint, 0, out bool switched, out ulong complete))
+    // The records from the checkpoint's redo point on, as far as they're whole, which recovery replays, through the
+    // checkpoint record. A record that a crash of the server that wrote it cut short, which the page after it says was
+    // overwritten, is passed over, as recovery passes over it, for the record that page begins with.
+    if (Stream(own.Read, checkpoint, RecordHeader + 2 + sizeof(ulong)) is not (byte[] head, _) || !IsCheckpoint(head, redo))
     {
         return (false, "isn't the checkpoint record its own WAL holds there, so its WAL has left the provider's");
     }
 
-    ulong previous = checkpoint;
-    bool endsSegment = switched;
-    for (ulong at = Next(complete, switched); Record(at, previous, out switched, out ulong end); at = Next(end, switched))
+    ulong previous = 0;
+    ulong complete = 0;
+    bool endsSegment = false;
+    bool throughCheckpoint = false;
+    ulong next = redo;
+    while (true)
     {
-        previous = at;
-        complete = end;
-        endsSegment = switched;
+        if (Record(next, previous, out bool switched, out ulong end))
+        {
+            throughCheckpoint |= next == checkpoint;
+            previous = next;
+            complete = end;
+            endsSegment = switched;
+            next = Next(end, switched);
+        }
+        else if (Overwritten(next) is ulong after)
+        {
+            next = after;
+        }
+        else
+        {
+            break;
+        }
+    }
+
+    if (!throughCheckpoint)
+    {
+        return (false, "isn't the checkpoint record its own WAL holds there, after whole records from its redo point, so its WAL has left the provider's");
     }
 
     if (complete > providerEnd)
@@ -1674,9 +1703,10 @@ int? ReadClusterState(string dataDir)
         held = Math.Max(held, page);
     }
 
-    // The WAL both hold, from the latest segment back, as far as the provider has it on the directory's timeline: a
-    // segment the provider removes meanwhile ends it.
-    ulong shared = Math.Min(held, providerEnd);
+    // The WAL both hold, from the latest segment back, as far as the provider has it on the directory's timeline, and,
+    // where the provider left that timeline, to where it left it, as recovery that follows the provider takes no record
+    // past there from the directory: a segment the provider removes meanwhile ends it.
+    ulong shared = Math.Min(Math.Min(held, providerEnd), leftAt ?? ulong.MaxValue);
     ulong compared = 0;
     for (ulong segment = (shared - 1) / segmentBytes; shared > redo; segment--)
     {
@@ -1739,6 +1769,33 @@ int? ReadClusterState(string dataDir)
     {
         ulong at = afterSwitch ? ((end + segmentBytes - 1) / segmentBytes * segmentBytes) : (end + 7) & ~7UL;
         return at % pageBytes == 0 ? at + (at % segmentBytes == 0 ? (ulong)LongPageHeader : ShortPageHeader) : at;
+    }
+
+    // Where the record after one that a crash cut short starts: the first of a page within the record's length whose
+    // header says the record that continued onto it was overwritten, past the header; or null when none does.
+    ulong? Overwritten(ulong at)
+    {
+        if (Stream(own.Read, at, RecordHeader) is not (byte[] header, _))
+        {
+            return null;
+        }
+
+        ulong last = at + Read32(header, 0) + ((Read32(header, 0) / (pageBytes - LongPageHeader)) + 2) * LongPageHeader;
+        for (ulong page = ((at / pageBytes) + 1) * pageBytes; page <= last; page += pageBytes)
+        {
+            if (own.Read(page, 16) is not byte[] pageHeader || Read64(pageHeader, 8) != page)
+            {
+                return null;
+            }
+
+            // XLP_FIRST_IS_OVERWRITE_CONTRECORD.
+            if ((BitConverter.ToUInt16(pageHeader, 2) & 0x0008) != 0)
+            {
+                return page + (page % segmentBytes == 0 ? (ulong)LongPageHeader : ShortPageHeader);
+            }
+        }
+
+        return null;
     }
 
     // Reads the directory's record at a position, which must link back to the one given, if one is, and be whole, as
@@ -1897,12 +1954,19 @@ void WaitPostmasterConnection(string connstr)
 
     PrintMsg(VerbosityLevel.Verbose, "Waiting for PostgreSQL to accept connections ...");
 
-    // First wait for Postmaster to come up.
+    // First wait for Postmaster to come up, which a server that stopped as it started, as one whose recovery can't
+    // reach its minimum recovery point does, never does.
+    Stopwatch coming = Stopwatch.StartNew();
     while (true)
     {
         if ((pmpid = GetPgpid()) != 0 && PostmasterIsAlive(pmpid))
         {
             break;
+        }
+
+        if (coming.Elapsed > TimeSpan.FromSeconds(30))
+        {
+            throw Die($"PostgreSQL in data directory \"{dataDir}\" stopped, or never came up. See {LogFileName}.\n");
         }
 
         Pause(TimeSpan.FromSeconds(1));
@@ -2114,10 +2178,10 @@ string GenerateRestorePointName()
 // Runs a program to its end, failing the run for a stop that comes meanwhile: a program a stop ends, as pg_basebackup,
 // is ended with the processes it started, and any other runs to its end first, as pg_ctl starting or stopping the
 // server does, so that a server it started is stopped rather than left half started.
-int RunProgram(string execPath, IEnumerable<string> arguments, bool endedByStop)
+int RunProgram(string execPath, IEnumerable<string> arguments, bool endedByStop, bool relayed = false)
 {
     CheckStop();
-    using Process process = StartProgram(execPath, arguments);
+    using Process process = StartProgram(execPath, arguments, relayed);
     while (!process.WaitForExit(200))
     {
         if (endedByStop && stopped.IsSet && !committed)
@@ -2163,15 +2227,48 @@ int RunProgramToEnd(string execPath, IEnumerable<string> arguments)
     return process.ExitCode;
 }
 
-Process StartProgram(string execPath, IEnumerable<string> arguments)
+// Starts a program, which shares the run's input and output, or, relayed, as pg_ctl is, has its own, whose output the
+// run writes as it comes: on Windows pg_ctl starts the server through cmd.exe, which takes pg_ctl's handles and stays the
+// server's parent, so that a server started with the run's own would keep the run's output open after the run ends,
+// and a caller that reads it to its end, as a shell pipe does, would wait for the server to stop. The run waits for a
+// relayed program to exit, not for the end of its output.
+Process StartProgram(string execPath, IEnumerable<string> arguments, bool relayed = false)
 {
-    ProcessStartInfo start = new(execPath) { UseShellExecute = false };
+    ProcessStartInfo start = new(execPath)
+    {
+        UseShellExecute = false,
+        RedirectStandardInput = relayed,
+        RedirectStandardOutput = relayed,
+        RedirectStandardError = relayed,
+    };
     foreach (string argument in arguments)
     {
         start.ArgumentList.Add(argument);
     }
 
-    return Process.Start(start)!;
+    Process process = Process.Start(start)!;
+    if (relayed)
+    {
+        process.StandardInput.Close();
+        process.OutputDataReceived += static (_, line) =>
+        {
+            if (line.Data is not null)
+            {
+                Console.Out.WriteLine(line.Data);
+            }
+        };
+        process.ErrorDataReceived += static (_, line) =>
+        {
+            if (line.Data is not null)
+            {
+                Console.Error.WriteLine(line.Data);
+            }
+        };
+        process.BeginOutputReadLine();
+        process.BeginErrorReadLine();
+    }
+
+    return process;
 }
 
 string FormatCommand(string execPath, IEnumerable<string> arguments)
