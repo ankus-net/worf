@@ -4485,10 +4485,115 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
-    /// A fenced allocator looks for grants that overlap, among many of the sequence's and of others over the same values,
-    /// through the index on their spans, which leads it to the sequence's alone, and looks before it locks the sequence's
-    /// range row, which it then holds only a moment, so that an exchange seldom finds the row held as the fence waits; and
-    /// it takes back the blocks a neighbor holds that it lost through the same index.
+    /// A fenced allocator with 20,000 grants of the sequence looks for grants that overlap in one pass over them, and again
+    /// only once they change; a neighbor's calls that report the same blocks as the fence waits for another node take
+    /// nothing in; and sessions that draw from another sequence wait no longer for the range worker than without a fence.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task FencesSearchTheirLedgerOnceUntilItChanges()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token, "shared_preload_libraries = 'worf,pg_stat_statements'\npg_stat_statements.track = all");
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        await using TestNode nodeC = await StartNodeAsync("node_c", token);
+        foreach (TestNode node in new[] { nodeA, nodeB, nodeC })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text); CREATE TABLE u (id bigserial PRIMARY KEY)", token);
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database, "CREATE EXTENSION pg_stat_statements", token);
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        await SubscribeAsync(nodeC, "c_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b,node_c}', range_size := 100);
+            SELECT worf.enable_sequence_range('u_id_seq', participants := '{node_b,node_c}', range_size := 10, max_range_size := 10);
+            """, token);
+        await WaitActiveAsync([nodeA, nodeB, nodeC], token);
+        await InsertAsync(nodeB, 10, token);
+        await InsertAsync(nodeC, 10, token);
+
+        // node_a granted 20,000 blocks of t_id_seq to a node long gone.
+        _ = await nodeA.SafePsqlAsync(Database, """
+            INSERT INTO worf.sequence_range_grant (grant_id, request_id, seqoid, grantee_id, grantee_name, kind, lo, hi, state, granted_at)
+            SELECT gen_random_uuid(), gen_random_uuid(), 't_id_seq'::regclass, 1, 'gone', 'n', 1000000000000 + g * 10, 1000000000000 + g * 10 + 9, 'abandoned', now()
+            FROM generate_series(1, 20000) g;
+            ANALYZE worf.sequence_range_grant;
+            """, token);
+
+        // A session on node_a inserts 60 rows into u, a row at a time, with node_a's blocks of u_id_seq ten values long.
+        async Task<TimeSpan> InsertIntoU()
+        {
+            await using NpgsqlConnection connection = await nodeA.OpenAsync(Database, token);
+            await using NpgsqlCommand insert = new("INSERT INTO u DEFAULT VALUES", connection);
+            Stopwatch inserting = Stopwatch.StartNew();
+            for (int i = 0; i < 60; i++)
+            {
+                _ = await insert.ExecuteNonQueryAsync(token);
+            }
+
+            return inserting.Elapsed;
+        }
+
+        TimeSpan unfenced = await InsertIntoU();
+
+        // node_c stops, and node_a loses its grants to node_c, and its record of node_c's reports, and resets: its fence
+        // waits for node_c, as node_b keeps calling. Edits by hand lock the range row first, as every change to a
+        // sequence's ranges does.
+        await nodeC.StopAsync("fast", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            SELECT 1 FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass FOR NO KEY UPDATE;
+            DELETE FROM worf.sequence_range_grant WHERE seqoid = 't_id_seq'::regclass AND grantee_name = 'node_c';
+            DELETE FROM worf.sequence_range_node WHERE seqoid = 't_id_seq'::regclass AND node_name = 'node_c';
+            """, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT pg_stat_statements_reset()", token);
+        Stopwatch fenced = Stopwatch.StartNew();
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.reset_sequence_range('t_id_seq')", token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, """
+            SELECT EXISTS (
+                SELECT 1 FROM worf.sequence_range_node n JOIN worf.sequence_range r ON r.seqoid = n.seqoid
+                WHERE n.seqoid = 't_id_seq'::regclass AND n.node_name = 'node_b' AND n.via_node = n.node_id AND n.held_at > r.fenced_at)
+            """, token), "node_b's report of the blocks it holds since the fence went up");
+        TimeSpan during = await InsertIntoU();
+
+        // node_b's calls over 5 s, once node_c's last report is stale, 6.5 s after it, and the statements each ran on
+        // node_a, which pg_stat_statements counts as nested in the call's.
+        await Task.Delay(TimeSpan.FromSeconds(10) - fenced.Elapsed, token);
+        const string Calls = """
+            SELECT coalesce(sum(calls) FILTER (WHERE toplevel AND query LIKE 'SELECT worf.sequence_range_exchange(%'), 0) || '|' ||
+                coalesce(sum(calls) FILTER (WHERE NOT toplevel), 0)
+            FROM pg_stat_statements
+            """;
+        long[] before = [.. (await nodeA.SafePsqlAsync(Database, Calls, token)).Split('|').Select(count => long.Parse(count, CultureInfo.InvariantCulture))];
+        await Task.Delay(TimeSpan.FromSeconds(5), token);
+        long[] after = [.. (await nodeA.SafePsqlAsync(Database, Calls, token)).Split('|').Select(count => long.Parse(count, CultureInfo.InvariantCulture))];
+        long calls = after[0] - before[0];
+        long statements = after[1] - before[1];
+
+        await Task.Delay(TimeSpan.FromSeconds(20) - fenced.Elapsed, token);
+        string[] costs = (await nodeA.SafePsqlAsync(Database, """
+            SELECT round(coalesce(sum(total_exec_time) FILTER (WHERE query LIKE '%worf.sequence_range_grant%'), 0))::bigint || '|' ||
+                (SELECT fenced_at IS NOT NULL FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass)
+            FROM pg_stat_statements
+            """, token)).Split('|');
+        long searching = long.Parse(costs[0], CultureInfo.InvariantCulture);
+        TestContext.WriteLine($"statements on grants {searching} ms; {calls} calls ran {statements} statements; u's inserts {unfenced} unfenced, {during} fenced");
+        Assert.AreEqual("true", costs[1], "node_a's fence, waiting for node_c");
+
+        // Over the 20 s from the reset, node_a spends less than 3 s in statements on its ledger of grants; node_b's calls
+        // as the fence waits run fewer than 30 statements each on node_a, as they would if each took t_id_seq in, or found
+        // the range row's version changed by each check of the fence; and the inserts take no more than twice as long,
+        // and a second, as without the fence.
+        Assert.IsLessThan(3000L, searching, "the milliseconds node_a spent in statements on its ledger of grants over the 20 s from the reset");
+        Assert.IsTrue(calls >= 3 && statements < 30 * calls, $"node_b's {calls} calls in 5 s, which ran {statements} statements on node_a");
+        Assert.IsLessThan(2 * unfenced + TimeSpan.FromSeconds(1), during, $"60 inserts into u during the fence, against {unfenced} without it");
+    }
+
+    /// <summary>
+    /// A fenced allocator looks for grants that overlap among the sequence's alone, leaving out many of other sequences'
+    /// over the same values, and looks before it locks the sequence's range row, which it holds only to lift the fence, so
+    /// that an exchange seldom finds the row held as the fence waits; and it takes back the blocks a neighbor holds that
+    /// it lost through the index on spans.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -4526,13 +4631,12 @@ public sealed partial class SequenceRangeTests
             DELETE FROM worf.sequence_range_grant WHERE seqoid = 't_id_seq'::regclass AND grantee_name = 'node_b';
             DELETE FROM worf.sequence_range_node WHERE seqoid = 't_id_seq'::regclass AND node_name = 'node_b';
             """, token);
-        const string SpanReads = "SELECT coalesce(sum(idx_tup_read), 0) FROM pg_catalog.pg_stat_all_indexes WHERE indexrelname = 'sequence_range_grant_span'";
         _ = await nodeA.SafePsqlAsync(Database, "SELECT pg_stat_statements_reset()", token);
-        long spanBefore = long.Parse(await nodeA.SafePsqlAsync(Database, SpanReads, token), CultureInfo.InvariantCulture);
+        Stopwatch fenced = Stopwatch.StartNew();
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.reset_sequence_range('t_id_seq')", token);
 
-        // As the fence waits, node_a looks for grants that overlap again and again, and t_id_seq's range row is held at
-        // fewer than a quarter of tries to lock it.
+        // As the fence waits, node_a checks it again and again, and t_id_seq's range row is held at fewer than a quarter of
+        // tries to lock it.
         int held = 0;
         int samples = 0;
         await using (NpgsqlConnection sampler = await nodeA.OpenAsync(Database, token))
@@ -4560,20 +4664,19 @@ public sealed partial class SequenceRangeTests
         Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT fenced_at IS NULL FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass", token),
             "node_a's fence, lifted");
 
-        // Each search for grants that overlap leads to each grant's overlaps through the index on spans, which holds the
-        // sequence, reading a few of its entries for each grant, rather than every sequence's grants over the same values
-        // or none, comparing each grant with every other; and each check of a block taken back reads a few buffers,
-        // rather than every grant of t_id_seq. The statistics of the index's reads come in within a second or so.
-        await Task.Delay(TimeSpan.FromSeconds(2), token);
-        long spanRead = long.Parse(await nodeA.SafePsqlAsync(Database, SpanReads, token), CultureInfo.InvariantCulture) - spanBefore;
+        // Over the fence, node_a spends less than a tenth of the time in statements on its ledger of grants, as it would if
+        // it compared each grant of t_id_seq with every other, or with every sequence's grants over the same values, at
+        // each check; and each check of a block taken back reads a few buffers, rather than every grant of t_id_seq.
         string[] costs = (await nodeA.SafePsqlAsync(Database, """
-            SELECT (SELECT sum(calls) FROM pg_stat_statements WHERE query LIKE '%sequence_range_grant a JOIN worf.sequence_range_grant b%')
-                || '|' || (SELECT sum(shared_blks_hit + shared_blks_read) / sum(calls) FROM pg_stat_statements WHERE query LIKE '%reset_lsn IS NOT NULL)%OR EXISTS%')::bigint
+            SELECT round(coalesce(sum(total_exec_time) FILTER (WHERE query LIKE '%worf.sequence_range_grant%'), 0))::bigint || '|' ||
+                (sum(shared_blks_hit + shared_blks_read) FILTER (WHERE query LIKE '%reset_lsn IS NOT NULL)%OR EXISTS%') /
+                    sum(calls) FILTER (WHERE query LIKE '%reset_lsn IS NOT NULL)%OR EXISTS%'))::bigint
+            FROM pg_stat_statements
             """, token)).Split('|');
-        long searches = long.Parse(costs[0], CultureInfo.InvariantCulture);
+        long searching = long.Parse(costs[0], CultureInfo.InvariantCulture);
         long checkedHeld = long.Parse(costs[1], CultureInfo.InvariantCulture);
-        Assert.IsTrue(searches > 0 && spanRead > 0 && spanRead < 20_000 * searches && checkedHeld < 200 && held * 4 < samples,
-            $"the entries {searches} searches for grants that overlap read through the index on spans, {spanRead}; the buffers each check of a block taken back read, {checkedHeld}; t_id_seq's range row, held at {held} of {samples} tries");
+        Assert.IsTrue(searching * 10 < fenced.ElapsedMilliseconds && checkedHeld < 200 && held * 4 < samples,
+            $"the milliseconds node_a spent in statements on its ledger of grants over the {fenced.ElapsedMilliseconds} ms of the fence, {searching}; the buffers each check of a block taken back read, {checkedHeld}; t_id_seq's range row, held at {held} of {samples} tries");
     }
 
     /// <summary>

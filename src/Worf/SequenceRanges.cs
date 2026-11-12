@@ -284,6 +284,10 @@ internal static unsafe partial class SequenceRanges
     // last value moving backwards.
     private static readonly Dictionary<uint, (Guid Block, long Position)> s_positions = [];
 
+    // The last search of each fenced sequence's ledger for grants that overlap: the grants it searched, by id and row
+    // version, the note of two that overlap, if it found any, and the changes to the sequence's ranges counted before it.
+    private static readonly Dictionary<uint, (HashSet<string> Grants, string? Overlap, (long All, long Sequence) Touched)> s_ledgerSearches = [];
+
     // When the range worker last read each sequence's tables for the furthest value they hold in its active block, where
     // the sequence was then, and the xmax and transactions in progress of a snapshot taken just before: it reads them
     // again once the sequence has moved, or a transaction whose rows the read couldn't see has ended since, one then in
@@ -3321,35 +3325,41 @@ internal static unsafe partial class SequenceRanges
         WorfRows range = Worf.SelectCatalog("SELECT fenced_at IS NOT NULL, owner_node FROM worf.sequence_range WHERE seqoid = $1", seq);
         if (range.Count == 0 || !range[0].Get<bool>(0))
         {
+            _ = s_ledgerSearches.Remove(seqoid);
             return false;
         }
 
-        // Grants that overlap are looked for before the range row is locked, as a ledger of many grants takes a while to
-        // search, and an exchange that reaches the sequence meanwhile would leave it out. Once the row is locked, as every
-        // change to a sequence's ranges locks it first, the fence is looked at again, and only the grants made or changed
-        // since the search are, unless it found grants that overlap, which a lift then looks for again in full.
-        string[] seen = Worf.ReadScalar<string[]?>("""
-            SELECT pg_catalog.array_agg(grant_id::pg_catalog.text || ':' || xmin::pg_catalog.text) FROM worf.sequence_range_grant WHERE seqoid = $1
-            """, seq) ?? [];
-        WorfRows overlap = OverlappingGrants(seq, null);
+        // Grants that overlap, or the nodes the fence waits for, keep it up, which a check finds before it locks the range
+        // row, as a ledger of many grants takes a while to search, and an exchange that reaches the sequence meanwhile
+        // would leave it out, and as a lock changes the row's version, which a neighbor's call that changes nothing
+        // checks. Once the row is locked, as every change to a sequence's ranges locks it first, before a lift, the fence
+        // is looked at again.
+        // While nodes keep it up, a check searches again only once a change committed since the last search touched the
+        // sequence's ranges, as every change to its grants does, so that the note says what keeps the fence up; a check
+        // that would lift it looks at every grant made or changed since, whatever touched it.
+        string? waiting = force ? null : FenceWaits(seq);
+        string? overlap = waiting is not null && s_ledgerSearches.TryGetValue(seqoid, out (HashSet<string>, string? Overlap, (long, long) Touched) last) &&
+            last.Touched == SequenceRangeTouches.Touched(seqoid) ? last.Overlap : SearchLedger(seqoid, seq);
+        if (!force && (overlap ?? waiting) is string kept)
+        {
+            _ = SetDetail(seqoid, kept);
+            return false;
+        }
+
         LockLedger(seqoid);
         range = Worf.SelectCatalog("SELECT fenced_at IS NOT NULL, owner_node FROM worf.sequence_range WHERE seqoid = $1", seq);
         if (range.Count == 0 || !range[0].Get<bool>(0))
         {
+            _ = s_ledgerSearches.Remove(seqoid);
             return false;
         }
 
-        if (overlap.Count == 0 || force)
-        {
-            overlap = OverlappingGrants(seq, overlap.Count == 0 ? seen : null);
-        }
-
-        if (overlap.Count > 0)
+        overlap = SearchLedger(seqoid, seq);
+        if (overlap is not null)
         {
             // Grants that overlap mean values were issued twice already, which no wait undoes, so activate_sequence_range
             // lifts the fence all the same, saying so.
-            string detail = $"grants to {overlap[0].Get<string>(0)} [{overlap[0].Get<long>(1)}, {overlap[0].Get<long>(2)}] and to " +
-                $"{overlap[0].Get<string>(3)} [{overlap[0].Get<long>(4)}, {overlap[0].Get<long>(5)}] overlap";
+            string detail = overlap;
             if (!force)
             {
                 _ = SetDetail(seqoid, detail);
@@ -3394,35 +3404,10 @@ internal static unsafe partial class SequenceRanges
                 """, seq);
         }
 
-        WorfRows? waiting = force ? null : Worf.SelectCatalog("""
-            WITH neighbors (node_id) AS (
-                SELECT node_id FROM worf.sequence_range_link
-                UNION
-                SELECT s.sub_origin FROM worf.subscription s JOIN worf.local_node l ON l.node_id = s.sub_target
-                UNION
-                SELECT node_id FROM worf.sequence_range_fence_wait WHERE seqoid = $1)
-            SELECT coalesce(o.node_name::text, (SELECT max(n.node_name::text) FROM worf.sequence_range_node n WHERE n.node_id = w.node_id),
-                w.node_id::text)
-            FROM neighbors w
-                CROSS JOIN worf.sequence_range r
-                CROSS JOIN worf.local_node l
-                LEFT JOIN worf.node o ON o.node_id = w.node_id
-            WHERE r.seqoid = $1 AND w.node_id <> l.node_id
-                AND NOT EXISTS (
-                    SELECT 1 FROM worf.sequence_range_node n
-                    WHERE n.seqoid = r.seqoid AND n.node_id = w.node_id AND n.via_node = n.node_id AND n.held_at > r.fenced_at)
-                AND NOT EXISTS (
-                    SELECT 1 FROM worf.sequence_range_absent a WHERE a.seqoid = r.seqoid AND a.node_id = w.node_id AND a.absent_at > r.fenced_at)
-            ORDER BY 1
-            """, seq);
-        if (waiting is { Count: > 0 })
+        waiting = force ? null : FenceWaits(seq);
+        if (waiting is not null)
         {
-            string detail = $"fenced until {string.Join(", ", Enumerable.Range(0, waiting.Count).Select(i => "node " + waiting[i].Get<string>(0)))} " +
-                (waiting.Count == 1 ? "reports the blocks it holds" : "report the blocks they hold") +
-                "; a node it exchanged with as the fence went up holds it until that node reports, by subscribing again if the subscriptions " +
-                "between them were dropped, or worf.activate_sequence_range naming the node stops the wait for it, as for a node gone for good, " +
-                "which reissues any values it holds that this node lost";
-            _ = SetDetail(seqoid, detail);
+            _ = SetDetail(seqoid, waiting);
             return false;
         }
 
@@ -3457,6 +3442,7 @@ internal static unsafe partial class SequenceRanges
                     """, seq);
         }
 
+        _ = s_ledgerSearches.Remove(seqoid);
         WorfLog.Log($"sequence {info.Name}: the allocator's fence lifted");
         return true;
     }
@@ -3633,19 +3619,133 @@ internal static unsafe partial class SequenceRanges
         => $"numrange({seqoid}::oid::int8 * 18446744073709551616::numeric + {lo} + 9223372036854775808, {seqoid}::oid::int8 * 18446744073709551616::numeric + {hi} + 9223372036854775808, '[]')";
 
     /// <summary>
-    /// Finds two of a sequence's grants that overlap, or, given the grants seen before, by id and row version, one made or
-    /// changed since that overlaps another.
+    /// Gets the note of the nodes a fence waits for, if any: those this node exchanges with, or that a fence's lift
+    /// before waited for, that haven't reported the blocks they hold, or that they don't manage the sequence, since the
+    /// fence went up.
     /// </summary>
-    private static WorfRows OverlappingGrants(SpiParameter seq, string[]? seen)
-        => Worf.SelectCatalog($$"""
-            SELECT a.grantee_name::text, a.lo, a.hi, b.grantee_name::text, b.lo, b.hi, a.grantee_id, b.grantee_id
-            FROM worf.sequence_range_grant a JOIN worf.sequence_range_grant b
-                ON {{Span("b")}} && {{Span("a")}} AND CASE WHEN $3 THEN a.grant_id < b.grant_id ELSE a.grant_id <> b.grant_id END
-            WHERE a.seqoid = $1 AND a.kind <> 'x' AND b.kind <> 'x' AND a.state NOT IN ('unclaimed', 'overlapped') AND b.state NOT IN ('unclaimed', 'overlapped')
-                AND (a.seqoid <> 'worf.snowflake_node'::regclass OR a.state <> 'abandoned' AND b.state <> 'abandoned')
-                AND ($3 OR a.grant_id::text || ':' || a.xmin::text NOT IN (SELECT pg_catalog.unnest($2::text[])))
-            LIMIT 1
-            """, seq, SpiParameter.Create(seen ?? []), SpiParameter.Create(seen is null));
+    private static string? FenceWaits(SpiParameter seq)
+    {
+        WorfRows waiting = Worf.SelectCatalog("""
+            WITH neighbors (node_id) AS (
+                SELECT node_id FROM worf.sequence_range_link
+                UNION
+                SELECT s.sub_origin FROM worf.subscription s JOIN worf.local_node l ON l.node_id = s.sub_target
+                UNION
+                SELECT node_id FROM worf.sequence_range_fence_wait WHERE seqoid = $1)
+            SELECT coalesce(o.node_name::text, (SELECT max(n.node_name::text) FROM worf.sequence_range_node n WHERE n.node_id = w.node_id),
+                w.node_id::text)
+            FROM neighbors w
+                CROSS JOIN worf.sequence_range r
+                CROSS JOIN worf.local_node l
+                LEFT JOIN worf.node o ON o.node_id = w.node_id
+            WHERE r.seqoid = $1 AND w.node_id <> l.node_id
+                AND NOT EXISTS (
+                    SELECT 1 FROM worf.sequence_range_node n
+                    WHERE n.seqoid = r.seqoid AND n.node_id = w.node_id AND n.via_node = n.node_id AND n.held_at > r.fenced_at)
+                AND NOT EXISTS (
+                    SELECT 1 FROM worf.sequence_range_absent a WHERE a.seqoid = r.seqoid AND a.node_id = w.node_id AND a.absent_at > r.fenced_at)
+            ORDER BY 1
+            """, seq);
+        return waiting.Count == 0 ? null
+            : $"fenced until {string.Join(", ", Enumerable.Range(0, waiting.Count).Select(i => "node " + waiting[i].Get<string>(0)))} " +
+                (waiting.Count == 1 ? "reports the blocks it holds" : "report the blocks they hold") +
+                "; a node it exchanged with as the fence went up holds it until that node reports, by subscribing again if the subscriptions " +
+                "between them were dropped, or worf.activate_sequence_range naming the node stops the wait for it, as for a node gone for good, " +
+                "which reissues any values it holds that this node lost";
+    }
+
+    /// <summary>
+    /// Looks for grants of a fenced sequence that overlap, through the search an earlier check of the fence made, which
+    /// stands for the grants it searched, by id and row version: only the grants made or changed since are looked at,
+    /// against every other, so that the ledger is searched in full only once. Grants that overlap stand while no grant
+    /// was made, changed or deleted since, and are looked for again in full otherwise.
+    /// </summary>
+    /// <returns>The note of two grants that overlap, if any.</returns>
+    private static string? SearchLedger(uint seqoid, SpiParameter seq)
+    {
+        (long All, long Sequence) touched = SequenceRangeTouches.Touched(seqoid);
+        HashSet<string> grants;
+        string? overlap;
+        if (!s_ledgerSearches.TryGetValue(seqoid, out (HashSet<string> Grants, string? Overlap, (long, long)) search))
+        {
+            (string[] found, overlap) = OverlappingGrants(seq);
+            grants = [.. found];
+        }
+        else
+        {
+            (string[] changed, long count, string? changedOverlap) = OverlappingChangedGrants(seq, search.Grants);
+            (grants, overlap) = (search.Grants, search.Overlap);
+            if (overlap is null)
+            {
+                grants.UnionWith(changed);
+                overlap = changedOverlap;
+            }
+            else if (changed.Length > 0 || count != grants.Count)
+            {
+                (string[] found, overlap) = OverlappingGrants(seq);
+                grants = [.. found];
+            }
+        }
+
+        s_ledgerSearches[seqoid] = (grants, overlap, touched);
+        return overlap;
+    }
+
+    // The grant a row of the ledger holds, by its id and row version.
+    private static string GrantVersion(string table)
+        => $"{table}.grant_id::pg_catalog.text || ':' || {table}.xmin::pg_catalog.text || {table}.ctid::pg_catalog.text";
+
+    // Whether a grant of the ledger counts in a search for grants that overlap: an abandoned block of Snowflake IDs gives
+    // up its node's number, which another node then holds.
+    private static string Counted(string table)
+        => $"{table}.kind <> 'x' AND {table}.state NOT IN ('unclaimed', 'overlapped') AND ({table}.seqoid <> 'worf.snowflake_node'::regclass OR {table}.state <> 'abandoned')";
+
+    /// <summary>
+    /// Finds two of a sequence's grants that overlap, in one pass over them in order of their spans, which an overlap
+    /// shows as a grant that starts before one before it ends, and gives the grants it searched, by id and row version.
+    /// </summary>
+    private static (string[] Grants, string? Overlap) OverlappingGrants(SpiParameter seq)
+    {
+        WorfRows found = Worf.SelectCatalog($$"""
+            WITH g AS MATERIALIZED (SELECT g.*, {{GrantVersion("g")}} AS version, {{Counted("g")}} AS counted FROM worf.sequence_range_grant g WHERE g.seqoid = $1),
+                s AS MATERIALIZED (
+                    SELECT g.grant_id, g.grantee_name, g.lo, g.hi,
+                        pg_catalog.max(g.hi) OVER (ORDER BY g.lo, g.hi, g.grant_id ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS reach
+                    FROM g WHERE g.counted),
+                b AS (SELECT * FROM s WHERE s.lo <= s.reach ORDER BY s.lo, s.hi, s.grant_id LIMIT 1)
+            SELECT (SELECT pg_catalog.array_agg(g.version) FROM g), a.grantee_name::text, a.lo, a.hi, b.grantee_name::text, b.lo, b.hi
+            FROM (SELECT 1) one
+                LEFT JOIN b ON true
+                LEFT JOIN LATERAL (SELECT * FROM s a WHERE a.grant_id <> b.grant_id AND a.lo <= b.hi AND a.hi >= b.lo ORDER BY a.lo LIMIT 1) a ON true
+            """, seq);
+        return (found[0].Get<string[]?>(0) ?? [], found[0].Get<string?>(1) is null ? null : Overlap(found[0], 1));
+    }
+
+    /// <summary>
+    /// Finds the grants made or changed since a search, those that aren't among the grants it searched, by id and row
+    /// version, and one of them that overlaps another, through the index on spans, and counts the sequence's grants.
+    /// </summary>
+    private static (string[] Changed, long Count, string? Overlap) OverlappingChangedGrants(SpiParameter seq, HashSet<string> searched)
+    {
+        WorfRows found = Worf.SelectCatalog($$"""
+            WITH g AS MATERIALIZED (SELECT g.*, {{GrantVersion("g")}} AS version FROM worf.sequence_range_grant g WHERE g.seqoid = $1),
+                a AS MATERIALIZED (SELECT * FROM g WHERE g.version NOT IN (SELECT pg_catalog.unnest($2::pg_catalog.text[])))
+            SELECT (SELECT pg_catalog.array_agg(a.version) FROM a), (SELECT pg_catalog.count(*) FROM g), o.*
+            FROM (SELECT 1) one LEFT JOIN LATERAL (
+                SELECT a.grantee_name::text, a.lo, a.hi, b.grantee_name::text, b.lo, b.hi
+                FROM a CROSS JOIN LATERAL (
+                    SELECT b.grantee_name, b.lo, b.hi FROM worf.sequence_range_grant b
+                    WHERE {{Span("b")}} && {{Span("a")}} AND b.grant_id <> a.grant_id AND {{Counted("b")}} LIMIT 1) b
+                WHERE {{Counted("a")}}
+                LIMIT 1) o ON true
+            """, seq, SpiParameter.Create(searched.ToArray()));
+        return (found[0].Get<string[]?>(0) ?? [], found[0].Get<long>(1), found[0].Get<string?>(2) is null ? null : Overlap(found[0], 2));
+    }
+
+    // The note of two grants that overlap, from a row that gives each one's holder and span from a column on.
+    private static string Overlap(WorfRow row, int at)
+        => $"grants to {row.Get<string>(at)} [{row.Get<long>(at + 1)}, {row.Get<long>(at + 2)}] and to " +
+            $"{row.Get<string>(at + 3)} [{row.Get<long>(at + 4)}, {row.Get<long>(at + 5)}] overlap";
 
     /// <summary>
     /// Locks a sequence's range row before its free spans, as an exchange that updates the row and then grants does, so

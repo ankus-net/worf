@@ -631,10 +631,11 @@ internal static class SequenceRangeExchange
 
         // A reply that comes once the subscription is dropped or disabled, as when the provider answered only after
         // taking in the drop's word that this node leaves its slot, is no news of a neighbor this node still links to, so
-        // it's taken in as one that never came; and so is one whose subscription a drop, or any change, holds, as a drop
-        // left in an open transaction does, rather than wait on the rows the drop deleted.
+        // it's taken in as one that never came; and so is one whose subscription a drop holds, as a drop left in an open
+        // transaction does, rather than wait on the rows the drop deleted. The drop's lock, which it takes before it
+        // deletes anything, is an advisory one, which, unlike a row's, uses no transaction ID.
         if (!WorfNode.GetNodeSubscriptions(node.Node.Id, false).Exists(current => current.Id == sub.Id && current.Enabled) ||
-            Worf.Query("SELECT 1 FROM worf.subscription WHERE sub_id = $1 AND sub_enabled FOR KEY SHARE SKIP LOCKED", false, 1, SpiParameter.Create(sub.Id)).Count == 0)
+            !Worf.ReadScalar<bool>($"SELECT pg_catalog.pg_try_advisory_xact_lock_shared({WorfNode.DropLockKey})", SpiParameter.Create(sub.Id)))
         {
             return (false, false);
         }
@@ -1534,16 +1535,23 @@ internal static class SequenceRangeExchange
 
             // A report that changed only in how far the neighbor drew records it, with the neighbor's WAL position past
             // the draws, so that a restore to before them shows, though this node restarts: for every such sequence in one
-            // statement, which writes only the rows that changed, and passes over those another transaction holds.
-            if (drawnSequences.Count > 0 && Worf.Execute("""
+            // statement, which writes only the rows that changed, and passes over those another transaction holds, once a
+            // read finds one, as a write uses a transaction ID however few rows it changes.
+            SpiParameter drawnOids = SpiParameter.Create(drawnSequences.ToArray());
+            SpiParameter drawnValues = SpiParameter.Create(drawnTo.ToArray());
+            if (drawnSequences.Count > 0 && Worf.ReadScalar<bool>("""
+                    SELECT EXISTS (
+                        SELECT 1 FROM worf.sequence_range_node n
+                            JOIN ROWS FROM (pg_catalog.unnest($1::pg_catalog.oid[]), pg_catalog.unnest($2::pg_catalog.int8[])) AS d (seqoid, drawn) ON n.seqoid = d.seqoid
+                        WHERE n.node_id = $3 AND n.via_node = n.node_id AND n.drawn IS DISTINCT FROM d.drawn)
+                    """, drawnOids, drawnValues, SpiParameter.Create(senderId)) && Worf.Execute("""
                     UPDATE worf.sequence_range_node n SET drawn = d.drawn,
                         wal_lsn = CASE WHEN $4 THEN $5::pg_lsn ELSE n.wal_lsn END, reply_lsn = CASE WHEN NOT $4 THEN $5::pg_lsn ELSE n.reply_lsn END
                     FROM ROWS FROM (pg_catalog.unnest($1::pg_catalog.oid[]), pg_catalog.unnest($2::pg_catalog.int8[])) AS d (seqoid, drawn)
                     WHERE n.seqoid = d.seqoid AND n.node_id = $3 AND n.via_node = n.node_id AND n.drawn IS DISTINCT FROM d.drawn
                         AND n.ctid IN (SELECT o.ctid FROM worf.sequence_range_node o JOIN ROWS FROM (pg_catalog.unnest($1::pg_catalog.oid[]), pg_catalog.unnest($2::pg_catalog.int8[])) AS e (seqoid, drawn) ON o.seqoid = e.seqoid
                             WHERE o.node_id = $3 AND o.via_node = o.node_id AND o.drawn IS DISTINCT FROM e.drawn FOR UPDATE OF o SKIP LOCKED)
-                    """, SpiParameter.Create(drawnSequences.ToArray()), SpiParameter.Create(drawnTo.ToArray()), SpiParameter.Create(senderId),
-                    SpiParameter.Create(call), SpiParameter.Create(Worf.FormatLsn(lsn))) > 0)
+                    """, drawnOids, drawnValues, SpiParameter.Create(senderId), SpiParameter.Create(call), SpiParameter.Create(Worf.FormatLsn(lsn))) > 0)
             {
                 // The reports kept as changing nothing take the rows' versions as this writes them, which the next
                 // message's check reads once this commits, and the position recorded, so that the record of a draw
@@ -1628,8 +1636,14 @@ internal static class SequenceRangeExchange
         }
 
         // A neighbor that a fence's lift stopped waiting for is asked to reset once it's heard from again, whatever it reports.
+        // A fence waits for the neighbor's report until this node has taken one in since the fence went up, which the
+        // range row's version, among those the report's check reads, then shows as its lift does.
         SequenceInfo info = SequenceRanges.GetInfo(seqoid);
-        if (local[0].Get<bool>(2) || state == "fenced" || (state == "disabled" && local[0].Get<string>(1) != "disabled") ||
+        if ((local[0].Get<bool>(2) && !Worf.ReadScalar<bool>("""
+                SELECT EXISTS (
+                    SELECT 1 FROM worf.sequence_range_node n JOIN worf.sequence_range r ON r.seqoid = n.seqoid
+                    WHERE n.seqoid = $1 AND n.node_id = $2 AND n.via_node = n.node_id AND n.held_at > r.fenced_at)
+                """, seq, sender)) || state == "fenced" || (state == "disabled" && local[0].Get<string>(1) != "disabled") ||
             Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range_absent WHERE seqoid = $1 AND node_id = $2)", seq, sender) ||
             (entry.GetProperty("requests").GetArrayLength() > 0 && local[0].Get<string>(1) != "collecting" &&
                 !Unanswerable(seqoid, info, epoch, entry.GetProperty("requests"), local[0].Get<uint>(5) == node.Node.Id)) ||
