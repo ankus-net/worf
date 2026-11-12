@@ -3579,8 +3579,8 @@ public sealed partial class SequenceRangeTests
     public async Task OwnersDontWaitForDelayedSubscribers()
     {
         CancellationToken token = TestContext.CancellationToken;
-        await using TestNode nodeA = await StartNodeAsync("node_a", token);
-        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        await using TestNode nodeA = await StartNodeAsync("node_a", token, "log_min_messages = debug2");
+        await using TestNode nodeB = await StartNodeAsync("node_b", token, "log_min_messages = debug2");
         foreach (TestNode node in new[] { nodeA, nodeB })
         {
             _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
