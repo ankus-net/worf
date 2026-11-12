@@ -1432,11 +1432,12 @@ public sealed class CreateSubscriberTests
     }
 
     /// <summary>
-    /// A standby of an old primary is subscribed to its sibling that was promoted: though the standby's WAL holds the
-    /// start of a record the old primary wrote past where the sibling left the old timeline, which recovery that follows
-    /// the sibling never replays. One that replayed past where the sibling, promoted at a restore point, left the old
-    /// timeline, and has fetched the sibling's history of the new timeline it can't follow, is refused at once, rather than
-    /// recovering to a server that can't start.
+    /// A standby of an old primary is subscribed to its sibling, promoted at a restore point the old primary wrote right
+    /// before a record of 300 KB, though the standby's WAL holds the start of that record, past where the sibling left the
+    /// old timeline, which recovery that follows the sibling never replays, and which the sibling, as one that stopped
+    /// receiving where it was promoted, doesn't hold. One that replayed past where the sibling, promoted at a restore
+    /// point, left the old timeline, and has fetched the sibling's history of the new timeline it can't follow, is refused
+    /// at once, rather than recovering to a server that can't start.
     /// </summary>
     /// <param name="when">How the standby's WAL meets where the sibling left the old timeline.</param>
     /// <returns>The test.</returns>
@@ -1491,16 +1492,39 @@ public sealed class CreateSubscriberTests
             string expected;
             if (when == "sibling")
             {
-                // Both standbys replay a row and stop; the old primary then writes a record of 300 KB and stops, and the
-                // standby's WAL is given the old primary's up to the middle of it, as one that streamed part of it has.
+                // The sibling is promoted at a restore point the old primary writes right before a record of 300 KB, with
+                // nothing between them. The standby replays a row before them and stops, and its WAL is given the old
+                // primary's up to the middle of the large record, as one that streamed part of it has.
+                await File.AppendAllTextAsync(Path.Join(siblingDir, "postgresql.auto.conf"),
+                    "recovery_target_name = 'fork'\nrecovery_target_action = 'promote'\n", token);
                 await StartAsync(siblingDir, siblingPort, siblingLog);
                 await StartAsync(standbyDir, standbyPort, standbyLog);
                 string inserted = (await primary.SafePsqlAsync(Database, "INSERT INTO kept VALUES (1001); SELECT pg_catalog.pg_current_wal_lsn()", token)).Split('\n')[^1];
-                await WaitReplayedAsync(primary, siblingPort, inserted, token);
                 await WaitReplayedAsync(primary, standbyPort, inserted, token);
-                await StopServerAsync(siblingDir);
                 await StopServerAsync(standbyDir);
-                string end = await primary.SafePsqlAsync(Database, "SELECT pg_catalog.pg_logical_emit_message(false, 'p', pg_catalog.repeat('x', 300000))", token);
+                string end = await primary.SafePsqlAsync(Database,
+                    "SELECT pg_catalog.pg_logical_emit_message(false, 'p', pg_catalog.repeat('x', 300000)) FROM (SELECT pg_catalog.pg_create_restore_point('fork')) f", token);
+                Stopwatch promoting = Stopwatch.StartNew();
+                while (await SubscriberAsync(primary, siblingPort, "SELECT pg_catalog.pg_is_in_recovery()", token, mayFail: true) != "f")
+                {
+                    Assert.IsLessThan(TestNode.PollTimeout, promoting.Elapsed, "the sibling promoted at the restore point");
+                    await Task.Delay(TimeSpan.FromMilliseconds(200), token);
+                }
+
+                // The sibling streamed past the restore point, which a sibling that stopped receiving where it was promoted
+                // hasn't: its old timeline's last segment keeps nothing past the switch.
+                string history = await File.ReadAllTextAsync(Path.Join(siblingDir, "pg_wal", "00000002.history"), token);
+                string switched = history.Split('\n').Select(line => line.Split('\t')).First(fields => fields.Length >= 2 && fields[0] == "1")[1];
+                string switchSegment = await primary.SafePsqlAsync(Database, $"SELECT pg_catalog.pg_walfile_name('{switched}')", token);
+                int switchOffset = int.Parse(await primary.SafePsqlAsync(Database,
+                    $"SELECT (('{switched}'::pg_catalog.pg_lsn - '0/0'::pg_catalog.pg_lsn) % 16777216)::int", token), CultureInfo.InvariantCulture);
+                string left = new[] { switchSegment + ".partial", switchSegment }.Select(name => Path.Join(siblingDir, "pg_wal", name)).First(File.Exists);
+                await using (FileStream oldTimeline = new(left, FileMode.Open, FileAccess.Write))
+                {
+                    _ = oldTimeline.Seek(switchOffset, SeekOrigin.Begin);
+                    await oldTimeline.WriteAsync(new byte[(int)oldTimeline.Length - switchOffset], token);
+                }
+
                 string segment = await primary.SafePsqlAsync(Database, $"SELECT pg_catalog.pg_walfile_name('{end}'::pg_catalog.pg_lsn - 150000)", token);
                 long middle = long.Parse(await primary.SafePsqlAsync(Database,
                     $"SELECT (('{end}'::pg_catalog.pg_lsn - 150000) - '0/0'::pg_catalog.pg_lsn) % 16777216", token), CultureInfo.InvariantCulture);
@@ -1510,11 +1534,6 @@ public sealed class CreateSubscriberTests
                 byte[] mine = File.Exists(ours) ? await File.ReadAllBytesAsync(ours, token) : new byte[theirs.Length];
                 theirs.AsSpan(0, (int)middle).CopyTo(mine);
                 await File.WriteAllBytesAsync(ours, mine, token);
-
-                // The sibling is promoted where its WAL ends, before the large record.
-                await StartAsync(siblingDir, siblingPort, siblingLog);
-                (int promoted, string promoteOutput) = await primary.RunProgramAsync("pg_ctl", ["promote", "-w", "-D", siblingDir], token);
-                Assert.AreEqual(0, promoted, promoteOutput);
                 expected = "subscribed";
             }
             else

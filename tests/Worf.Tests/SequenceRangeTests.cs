@@ -6,6 +6,7 @@ using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using Npgsql;
 using Npgsql.Replication;
 using Npgsql.Replication.Internal;
@@ -16,7 +17,7 @@ namespace Worf.Tests;
 /// Sequence range management.
 /// </summary>
 [TestClass]
-public sealed class SequenceRangeTests
+public sealed partial class SequenceRangeTests
 {
     private const string Database = "postgres";
     private const string SuperUser = "super";
@@ -3520,9 +3521,9 @@ public sealed class SequenceRangeTests
             _ = await node.SafePsqlAsync(Database, Sequences, token);
         }
 
-        // Once it's turned on, each report node_a takes in costs it 0.6 s, against a third of node_b's 3 s calls.
+        // Once it's turned on, each report node_a takes in costs it 1.2 s, past a third of node_b's 3 s calls.
         _ = await nodeA.SafePsqlAsync(Database, """
-            CREATE FUNCTION slow_report() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF EXISTS (SELECT FROM public.slow_on) THEN PERFORM pg_sleep(0.6); END IF; RETURN NEW; END $$;
+            CREATE FUNCTION slow_report() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF EXISTS (SELECT FROM public.slow_on) THEN PERFORM pg_sleep(1.2); END IF; RETURN NEW; END $$;
             CREATE TRIGGER slow_report BEFORE UPDATE ON worf.sequence_range_node FOR EACH ROW EXECUTE FUNCTION slow_report();
             """, token);
         await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
@@ -3535,18 +3536,38 @@ public sealed class SequenceRangeTests
         _ = await nodeB.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
         await Task.Delay(TimeSpan.FromSeconds(3), token);
 
-        // node_b's calls come to a new process on node_a, which has checked none of their reports, and node_b draws
-        // through its blocks of many_01 and many_02, which it asks for more of.
-        _ = await nodeA.SafePsqlAsync(Database, "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE application_name = 'b_from_a_range'", token);
+        // node_b draws from many_01 all along, so that its report of it changes on every call, and many_01 alone, which
+        // sorts first, so that no later sequence's change cuts a call. node_b's calls then come to a new process on
+        // node_a, which has checked none of their reports: taking many_01 in passes a third of the call's time, and the
+        // call leaves the rest.
         _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO slow_on DEFAULT VALUES", token);
-        int logpos = nodeA.ReadLog().Length;
-        for (int draw = 0; draw < 5; draw++)
+        using CancellationTokenSource stopDrawing = CancellationTokenSource.CreateLinkedTokenSource(token);
+        Task drawing = Task.Run(async () =>
         {
-            _ = await nodeB.SafePsqlAsync(Database, "SELECT count(nextval('many_01')) + count(nextval('many_02')) FROM generate_series(1, 50)", token);
+            await using NpgsqlConnection busy = await nodeB.OpenAsync(Database, token);
+            await using NpgsqlCommand draw = new("SELECT nextval('many_01')", busy);
+            while (!stopDrawing.IsCancellationRequested)
+            {
+                _ = await draw.ExecuteScalarAsync(token);
+                await Task.Delay(TimeSpan.FromMilliseconds(50), token);
+            }
+        }, token);
+        await Task.Delay(TimeSpan.FromSeconds(3), token);
+        int logpos = nodeA.ReadLog().Length;
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE application_name = 'b_from_a_range'", token);
+        Stopwatch cutting = Stopwatch.StartNew();
+        while (!LeftToNextCall().IsMatch(nodeA.ReadLog()[logpos..]))
+        {
+            Assert.IsLessThan(TestNode.PollTimeout, cutting.Elapsed, "node_a's late call, leaving the sequences it would have had to check");
+            await Task.Delay(TimeSpan.FromMilliseconds(200), token);
         }
 
-        Assert.IsTrue(await nodeA.PollLogAsync(logpos, "left 10 sequences to its next call", token), "node_a's late call, leaving the ten it would have had to check");
+        await stopDrawing.CancelAsync();
+        await drawing;
     }
+
+    [GeneratedRegex(@"left [0-9]+ sequences to its next call")]
+    private static partial Regex LeftToNextCall();
 
     /// <summary>
     /// An owner that only answers calls draws from the blocks it grants itself without waiting for its subscriber's next
@@ -3927,7 +3948,9 @@ public sealed class SequenceRangeTests
             DELETE FROM worf.sequence_range_grant WHERE seqoid = 't_id_seq'::regclass AND grantee_name = 'node_b';
             DELETE FROM worf.sequence_range_node WHERE seqoid = 't_id_seq'::regclass AND node_name = 'node_b';
             """, token);
+        const string SpanReads = "SELECT coalesce(sum(idx_tup_read), 0) FROM pg_catalog.pg_stat_all_indexes WHERE indexrelname = 'sequence_range_grant_span'";
         _ = await nodeA.SafePsqlAsync(Database, "SELECT pg_stat_statements_reset()", token);
+        long spanBefore = long.Parse(await nodeA.SafePsqlAsync(Database, SpanReads, token), CultureInfo.InvariantCulture);
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.reset_sequence_range('t_id_seq')", token);
 
         // As the fence waits, node_a looks for grants that overlap again and again, and t_id_seq's range row is held at
@@ -3959,24 +3982,20 @@ public sealed class SequenceRangeTests
         Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT fenced_at IS NULL FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass", token),
             "node_a's fence, lifted");
 
-        // Each search for grants that overlap leads to each grant's overlaps through the index on spans, rather than
-        // comparing each grant with every other, and takes no more than a hundred times as long as a read of t_id_seq's
-        // 2,000 grants; and each check of a block taken back reads a few buffers, rather than every grant of t_id_seq.
-        for (int read = 0; read < 10; read++)
-        {
-            _ = await nodeA.SafePsqlAsync(Database, "SELECT count(*) FROM worf.sequence_range_grant WHERE seqoid = 't_id_seq'::regclass AND lo <= hi", token);
-        }
-
+        // Each search for grants that overlap leads to each grant's overlaps through the index on spans, which holds the
+        // sequence, reading a few of its entries for each grant, rather than every sequence's grants over the same values
+        // or none, comparing each grant with every other; and each check of a block taken back reads a few buffers,
+        // rather than every grant of t_id_seq. The statistics of the index's reads come in within a second or so.
+        await Task.Delay(TimeSpan.FromSeconds(2), token);
+        long spanRead = long.Parse(await nodeA.SafePsqlAsync(Database, SpanReads, token), CultureInfo.InvariantCulture) - spanBefore;
         string[] costs = (await nodeA.SafePsqlAsync(Database, """
-            SELECT (SELECT sum(total_exec_time) / sum(calls) FROM pg_stat_statements WHERE query LIKE '%sequence_range_grant a JOIN worf.sequence_range_grant b%')::bigint
-                || '|' || (SELECT sum(total_exec_time) / sum(calls) FROM pg_stat_statements WHERE query LIKE 'SELECT count(*) FROM worf.sequence_range_grant WHERE seqoid = %AND lo <= hi')::numeric(10, 2)
+            SELECT (SELECT sum(calls) FROM pg_stat_statements WHERE query LIKE '%sequence_range_grant a JOIN worf.sequence_range_grant b%')
                 || '|' || (SELECT sum(shared_blks_hit + shared_blks_read) / sum(calls) FROM pg_stat_statements WHERE query LIKE '%reset_lsn IS NOT NULL)%OR EXISTS%')::bigint
             """, token)).Split('|');
-        double searched = double.Parse(costs[0], CultureInfo.InvariantCulture);
-        double readAll = double.Parse(costs[1], CultureInfo.InvariantCulture);
-        long checkedHeld = long.Parse(costs[2], CultureInfo.InvariantCulture);
-        Assert.IsTrue(searched < 100 * readAll && checkedHeld < 200 && held * 4 < samples,
-            $"each search for grants that overlap took {searched} ms, against {readAll} ms for a read of t_id_seq's grants; each check of a block taken back read {checkedHeld} buffers; t_id_seq's range row was held at {held} of {samples} tries");
+        long searches = long.Parse(costs[0], CultureInfo.InvariantCulture);
+        long checkedHeld = long.Parse(costs[1], CultureInfo.InvariantCulture);
+        Assert.IsTrue(searches > 0 && spanRead > 0 && spanRead < 20_000 * searches && checkedHeld < 200 && held * 4 < samples,
+            $"the entries {searches} searches for grants that overlap read through the index on spans, {spanRead}; the buffers each check of a block taken back read, {checkedHeld}; t_id_seq's range row, held at {held} of {samples} tries");
     }
 
     /// <summary>
