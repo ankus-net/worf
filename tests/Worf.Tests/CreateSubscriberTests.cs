@@ -59,6 +59,101 @@ public sealed class CreateSubscriberTests
     }
 
     /// <summary>
+    /// The run writes pg_ctl's output to its end, though some of it comes after pg_ctl exits, as from what pg_ctl left
+    /// running, and a server that stops as the run waits for it to take connections is named with the log it writes:
+    /// the server the run starts with worf writes worf_subscriber.log in the data directory. On Unix, where pg_ctl is
+    /// replaced with a script that does either.
+    /// </summary>
+    /// <param name="how">Whether pg_ctl's start fails and writes a line after it exits, or the server with worf stops as
+    /// pg_ctl starts it.</param>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [OSCondition(OperatingSystems.Linux | OperatingSystems.OSX)]
+    [DataRow("late")]
+    [DataRow("stopped")]
+    public async Task PgCtlsOutputAndServersLogsReachTheRun(string how)
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        using TemporaryDirectory work = new($"worf-create-subscriber-pg_ctl-{how}-{Guid.NewGuid():N}");
+        await using TestNode provider = await TestNode.StartAsync("provider",
+            ["wal_level = logical", "max_wal_senders = 10", "max_replication_slots = 10", "track_commit_timestamp = on"], token);
+        int pgport = CreateSubscriberCommand.FreePort();
+        string providerDsn = $"postgresql://super@127.0.0.1:{provider.Cluster.Port.ToString(CultureInfo.InvariantCulture)}/postgres";
+        string subscriberDsn = $"postgresql://super@127.0.0.1:{pgport.ToString(CultureInfo.InvariantCulture)}/postgres";
+        string backupDir = Path.Join(work.FullName, "backupdir");
+        foreach (string sql in new[] { "CREATE USER super SUPERUSER", "CREATE EXTENSION worf", "SELECT * FROM worf.create_node(node_name := 'test_provider', dsn := 'dbname=postgres user=super')" })
+        {
+            _ = await provider.SafePsqlAsync(Database, sql, token);
+        }
+
+        string autoConf = Path.Join(provider.Cluster.DataDirectory, "postgresql.auto.conf");
+        await File.WriteAllLinesAsync(autoConf,
+            (await File.ReadAllLinesAsync(autoConf, token)).Where(static line => !line.TrimStart().StartsWith("port", StringComparison.Ordinal)), token);
+        _ = await provider.SafePsqlAsync(Database, "CHECKPOINT", token);
+
+        // pg_ctl's start either fails and writes a line a second after it exits, or starts the server with worf, which it
+        // then stops at once; anything else is pg_ctl's own.
+        string command = await CreateSubscriberCommand.InstallAsync(provider.Installation, Path.Join(work.FullName, "bin"));
+        string pgCtl = Path.Join(work.FullName, "bin", "pg_ctl");
+        string real = Path.Join(provider.Installation.BinDirectory, "pg_ctl");
+        File.Delete(pgCtl);
+
+        // The run finds libpq beside pg_ctl's directory, as the installation's lib.
+        _ = Directory.CreateSymbolicLink(Path.Join(work.FullName, "lib"),
+            Path.Join(Path.GetDirectoryName(provider.Installation.BinDirectory.TrimEnd(Path.DirectorySeparatorChar))!, "lib"));
+        string start = how == "late"
+            ? """( sleep 1; echo "worf-test-pg_ctl late line" >&2 ) & exit 1"""
+            : $$"""case "$*" in *worf_subscriber.log*) "{{real}}" "$@" || exit $?; exec "{{real}}" stop -m immediate -D "{{backupDir}}" ;; *) exec "{{real}}" "$@" ;; esac""";
+        await File.WriteAllTextAsync(pgCtl, $$"""
+            #!/bin/sh
+            case "$1" in
+              start) {{start}} ;;
+              *) exec "{{real}}" "$@" ;;
+            esac
+
+            """, token);
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(pgCtl, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+
+        try
+        {
+            ProcessStartInfo run = new(command) { WorkingDirectory = work.FullName, RedirectStandardOutput = true, RedirectStandardError = true };
+            foreach (string argument in new[]
+            {
+                "-D", backupDir, "--subscriber-name=test_subscriber", $"--subscriber-dsn={subscriberDsn}", $"--provider-dsn={providerDsn}", "--drop-slot-if-exists",
+                $"--hba-conf={Path.Join(AppContext.BaseDirectory, "TestFiles", "regress-pg_hba.conf")}",
+                $"--postgresql-conf={Path.Join(provider.Cluster.DataDirectory, "postgresql.conf")}",
+            })
+            {
+                run.ArgumentList.Add(argument);
+            }
+
+            run.Environment["PGPORT"] = pgport.ToString(CultureInfo.InvariantCulture);
+            using Process tool = Process.Start(run)!;
+            Task<string> output = tool.StandardOutput.ReadToEndAsync(token);
+            Task<string> errors = tool.StandardError.ReadToEndAsync(token);
+            await tool.WaitForExitAsync(token);
+            string stderr = await errors;
+            _ = await output;
+            Assert.AreNotEqual(0, tool.ExitCode, stderr);
+            if (how == "late")
+            {
+                Assert.Contains("worf-test-pg_ctl late line", stderr, "the run's output, with pg_ctl's line that came after it exited");
+            }
+            else
+            {
+                Assert.Contains($"See {Path.Join(backupDir, "worf_subscriber.log")}.", stderr, "the run's output, naming the log of the server it started with worf");
+            }
+        }
+        finally
+        {
+            _ = await provider.RunProgramAsync("pg_ctl", ["stop", "-m", "immediate", "-D", backupDir], token);
+        }
+    }
+
+    /// <summary>
     /// The command turns a base backup of the provider into a subscriber that keeps the provider's data and receives
     /// its new changes, and rows the subscription applied take its later changes in order, rather than as conflicts.
     /// </summary>

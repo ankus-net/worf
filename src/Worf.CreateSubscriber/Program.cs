@@ -428,7 +428,7 @@ if (pgCtlRet != 0)
     throw Die($"Postgres startup for restore point catchup failed with {pgCtlRet}. See {LogFileName}.");
 }
 
-WaitPrimaryConnection(sub);
+WaitPrimaryConnection(sub, LogFileName);
 
 // Clean any per-node data that were copied by pg_basebackup.
 PrintMsg(VerbosityLevel.Verbose, "Removing old worf configuration ...\n");
@@ -462,10 +462,10 @@ serverStarted = true;
 pgCtlRet = RunPgCtl(["start", "-l", Path.Join(dataDir, ServerLogFileName)]);
 if (pgCtlRet != 0)
 {
-    throw Die($"Postgres restart with worf enabled failed with {pgCtlRet}.");
+    throw Die($"Postgres restart with worf enabled failed with {pgCtlRet}. See {Path.Join(dataDir, ServerLogFileName)}.");
 }
 
-WaitPostmasterConnection(baseSubConnstr);
+WaitPostmasterConnection(baseSubConnstr, Path.Join(dataDir, ServerLogFileName));
 
 for (int dbnum = 0; dbnum < databaseList.Length; dbnum++)
 {
@@ -1948,8 +1948,8 @@ void CopyConfFile(string fromfile, string tofile, bool append)
     CopyFile(fromfile, filename, append);
 }
 
-// Find the pgport and try a connection.
-void WaitPostmasterConnection(string connstr)
+// Find the pgport and try a connection, to the server that logs to the given file.
+void WaitPostmasterConnection(string connstr, string log)
 {
     long pmpid;
 
@@ -1967,7 +1967,7 @@ void WaitPostmasterConnection(string connstr)
 
         if (coming.Elapsed > TimeSpan.FromSeconds(30))
         {
-            throw Die($"PostgreSQL in data directory \"{dataDir}\" stopped, or never came up. See {LogFileName}.\n");
+            throw Die($"PostgreSQL in data directory \"{dataDir}\" stopped, or never came up. See {log}.\n");
         }
 
         Pause(TimeSpan.FromSeconds(1));
@@ -1998,13 +1998,13 @@ void WaitPostmasterConnection(string connstr)
     PrintMsg(VerbosityLevel.Verbose, "\n");
 }
 
-// Wait for PostgreSQL to leave recovery/standby mode.
-void WaitPrimaryConnection(string connstr)
+// Wait for PostgreSQL, which logs to the given file, to leave recovery/standby mode.
+void WaitPrimaryConnection(string connstr, string log)
 {
     bool ispri = false;
     LibpqConnection? conn = null;
 
-    WaitPostmasterConnection(connstr);
+    WaitPostmasterConnection(connstr, log);
 
     PrintMsg(VerbosityLevel.Verbose, "Waiting for PostgreSQL to become primary...");
 
@@ -2013,7 +2013,7 @@ void WaitPrimaryConnection(string connstr)
         if (conn is null || !conn.IsOk)
         {
             conn?.Dispose();
-            WaitPostmasterConnection(connstr);
+            WaitPostmasterConnection(connstr, log);
             conn = Connectdb(connstr);
         }
 
@@ -2182,7 +2182,8 @@ string GenerateRestorePointName()
 int RunProgram(string execPath, IEnumerable<string> arguments, bool endedByStop, bool relayed = false)
 {
     CheckStop();
-    using Process process = StartProgram(execPath, arguments, relayed);
+    (Process started, Task output) = StartProgram(execPath, arguments, relayed);
+    using Process process = started;
     while (!process.WaitForExit(200))
     {
         if (endedByStop && stopped.IsSet && !committed)
@@ -2201,6 +2202,10 @@ int RunProgram(string execPath, IEnumerable<string> arguments, bool endedByStop,
         }
     }
 
+    // A relayed program's output is written to its end, which on Unix comes as the program, and what it left running
+    // with its output, end: pg_ctl's server writes to its log. On Windows the server pg_ctl starts holds pg_ctl's output
+    // open, so what comes within a moment of the exit is written.
+    _ = output.Wait(OperatingSystem.IsWindows() ? TimeSpan.FromMilliseconds(500) : TimeSpan.FromSeconds(10));
     CheckStop();
     return process.ExitCode;
 }
@@ -2223,7 +2228,7 @@ T Interruptible<T>(Func<T> call)
 // Runs a program to its end, whatever stops come, as the cleanup does.
 int RunProgramToEnd(string execPath, IEnumerable<string> arguments)
 {
-    using Process process = StartProgram(execPath, arguments);
+    using Process process = StartProgram(execPath, arguments).Process;
     process.WaitForExit();
     return process.ExitCode;
 }
@@ -2232,9 +2237,9 @@ int RunProgramToEnd(string execPath, IEnumerable<string> arguments)
 // run writes as it comes, and on Windows inherits none of the run's: there pg_ctl starts the server through cmd.exe,
 // which takes pg_ctl's handles, and every other handle it may inherit, and stays the server's parent, so that a server
 // started with the run's would keep the run's output open after the run ends, and a caller that reads it to its end, as
-// a shell pipe does, would wait for the server to stop. The run waits for a relayed program to exit, not for the end of
-// its output.
-Process StartProgram(string execPath, IEnumerable<string> arguments, bool relayed = false)
+// a shell pipe does, would wait for the server to stop. The task returned ends with a relayed program's output, as
+// its writers close it, at once for one that isn't relayed.
+(Process Process, Task Output) StartProgram(string execPath, IEnumerable<string> arguments, bool relayed = false)
 {
     ProcessStartInfo start = new(execPath)
     {
@@ -2259,28 +2264,39 @@ Process StartProgram(string execPath, IEnumerable<string> arguments, bool relaye
         process = Process.Start(start)!;
     }
 
-    if (relayed)
+    if (!relayed)
     {
-        process.StandardInput.Close();
-        process.OutputDataReceived += static (_, line) =>
-        {
-            if (line.Data is not null)
-            {
-                Console.Out.WriteLine(line.Data);
-            }
-        };
-        process.ErrorDataReceived += static (_, line) =>
-        {
-            if (line.Data is not null)
-            {
-                Console.Error.WriteLine(line.Data);
-            }
-        };
-        process.BeginOutputReadLine();
-        process.BeginErrorReadLine();
+        return (process, Task.CompletedTask);
     }
 
-    return process;
+    TaskCompletionSource outputEnded = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    TaskCompletionSource errorsEnded = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    process.StandardInput.Close();
+    process.OutputDataReceived += (_, line) =>
+    {
+        if (line.Data is null)
+        {
+            outputEnded.TrySetResult();
+        }
+        else
+        {
+            Console.Out.WriteLine(line.Data);
+        }
+    };
+    process.ErrorDataReceived += (_, line) =>
+    {
+        if (line.Data is null)
+        {
+            errorsEnded.TrySetResult();
+        }
+        else
+        {
+            Console.Error.WriteLine(line.Data);
+        }
+    };
+    process.BeginOutputReadLine();
+    process.BeginErrorReadLine();
+    return (process, Task.WhenAll(outputEnded.Task, errorsEnded.Task));
 }
 
 string FormatCommand(string execPath, IEnumerable<string> arguments)
