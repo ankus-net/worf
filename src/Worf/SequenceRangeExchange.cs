@@ -979,11 +979,42 @@ internal static class SequenceRangeExchange
             Worf.TryParseLsn(startLsn.GetString() ?? "", out ulong from) ? from : null);
 
     /// <summary>
-    /// Gets whether a WAL position heard from a neighbor under an earlier start of its server is past the position its
-    /// server started from since, as when it was restored from a backup.
+    /// Gets the lowest WAL position a neighbor's server started from, at a start since the one under which this node heard
+    /// of a position from it, that is before that position, as when it was restored from a backup: its current start, or
+    /// one its message reports the data directory kept, after the start the position was heard under, or, if the starts
+    /// kept no longer go back that far, any later one.
     /// </summary>
-    private static bool WentBackAsItStarted(ulong heard, long heardStart, long? senderStart, ulong? senderStartLsn)
-        => heardStart != 0 && senderStart is long start && heardStart != start && senderStartLsn is ulong startLsn && heard > startLsn;
+    /// <returns>The position, or null if the neighbor didn't go back.</returns>
+    private static ulong? WentBackTo(ulong heard, long heardStart, JsonElement root)
+    {
+        (long? senderStart, ulong? senderStartLsn) = SenderStart(root);
+        if (heardStart == 0 || senderStart is not long current)
+        {
+            return null;
+        }
+
+        List<(long Since, ulong Lsn)> starts = [];
+        if (root.TryGetProperty("starts", out JsonElement kept) && kept.ValueKind == JsonValueKind.Array)
+        {
+            foreach (JsonElement start in kept.EnumerateArray())
+            {
+                if (start.ValueKind == JsonValueKind.Array && start.GetArrayLength() == 2 && start[0].TryGetInt64(out long since) && since != current &&
+                    start[1].ValueKind == JsonValueKind.String && Worf.TryParseLsn(start[1].GetString() ?? "", out ulong from))
+                {
+                    starts.Add((since, from));
+                }
+            }
+        }
+
+        int at = starts.FindLastIndex(start => start.Since == heardStart);
+        List<ulong> later = [.. (at >= 0 ? starts.Skip(at + 1) : starts.Where(start => start.Since > heardStart)).Select(start => start.Lsn)];
+        if (heardStart != current && senderStartLsn is ulong startLsn)
+        {
+            later.Add(startLsn);
+        }
+
+        return later.Where(lsn => lsn < heard).Select(lsn => (ulong?)lsn).Min();
+    }
 
     /// <summary>
     /// Records refusals as delivered: a refusal needs no acknowledgement, since a request that lost it is sent again
@@ -1063,6 +1094,19 @@ internal static class SequenceRangeExchange
             // this server makes from now on was made knowing it's back.
             writer.WriteNumber("started_at", SequenceRangeHeard.Started);
             writer.WriteString("start_lsn", Worf.FormatLsn(SequenceRangeHeard.StartLsn));
+
+            // The starts the data directory kept, each with the WAL position it started from, so that a neighbor that
+            // heard of a position under one of them knows whether this server went back at a later one.
+            writer.WriteStartArray("starts");
+            foreach ((long since, ulong from) in SequenceRangeStarts.All)
+            {
+                writer.WriteStartArray();
+                writer.WriteNumberValue(since);
+                writer.WriteStringValue(Worf.FormatLsn(from));
+                writer.WriteEndArray();
+            }
+
+            writer.WriteEndArray();
 
             writer.WriteStartArray("sequences");
             // An epoch this node owned of a sequence it dropped goes out as disabled, with nothing else.
@@ -1519,9 +1563,8 @@ internal static class SequenceRangeExchange
         {
             ulong sysid = ulong.Parse(root.GetProperty("sysid").GetWorfString() ?? "0", CultureInfo.InvariantCulture);
             long timeline = root.GetProperty("timeline").GetInt64();
-            (long? senderStart, ulong? senderStartLsn) = SenderStart(root);
             (ulong last, long lastStart) = SequenceRangeHeard.LatestLsn(senderId, sysid, timeline, call);
-            if (call && leftSequences.Count > 0 && (last > lsn || WentBackAsItStarted(last, lastStart, senderStart, senderStartLsn)))
+            if (call && leftSequences.Count > 0 && (last > lsn || WentBackTo(last, lastStart, root) is not null))
             {
                 _ = Worf.Execute("""
                     INSERT INTO worf.sequence_range_back SELECT s, $2, $3::numeric, $4, $5::pg_lsn, $6 FROM pg_catalog.unnest($1::oid[]) s
@@ -1568,7 +1611,7 @@ internal static class SequenceRangeExchange
 
             // Shared memory holds it only once this commits, so that a call that fails after taking sequences in leaves the
             // last one for the next call to compare with.
-            long start = senderStart ?? 0;
+            long start = SenderStart(root).Start ?? 0;
             _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, () => SequenceRangeHeard.RecordLsn(senderId, sysid, timeline, call, lsn, start));
         }
 
@@ -2208,14 +2251,14 @@ internal static class SequenceRangeExchange
 
         // A neighbor whose server started from a WAL position before one it reported for the sequence under an earlier
         // start, which the tables recorded, shared memory holds, or a call that left the sequence out kept, went back as it
-        // started, as one restored from a backup does, though its own WAL may since have passed the position it reported.
-        else if (senderStartLsn is ulong startLsn &&
-            Math.Max(Math.Max(WentBackAsItStarted(recorded, recordedStart, senderStart, startLsn) ? recorded : 0,
-                WentBackAsItStarted(heardLast.Lsn, heardLast.Start, senderStart, startLsn) ? heardLast.Lsn : 0),
-                WentBackAsItStarted(kept, keptStart, senderStart, startLsn) ? kept : 0) is ulong reportedLsn and not 0)
+        // started, as one restored from a backup does, though its own WAL may since have passed the position it reported,
+        // and it may have started again since.
+        else if (new (ulong Heard, long Start)[] { (recorded, recordedStart), (heardLast.Lsn, heardLast.Start), (kept, keptStart) }
+            .Select(position => (position.Heard, To: WentBackTo(position.Heard, position.Start, root)))
+            .Where(position => position.To is not null).OrderByDescending(position => position.Heard).FirstOrDefault() is (ulong reportedLsn, ulong to))
         {
             rolledBack = Worf.FormatLsn(reportedLsn);
-            backTo = Worf.FormatLsn(startLsn);
+            backTo = Worf.FormatLsn(to);
         }
 
         if (rolledBack is not null)

@@ -4285,12 +4285,14 @@ public sealed partial class SequenceRangeTests
     /// range row on the grantor as the node draws, so that only the grantor's shared memory hears of the draws, and after
     /// the restore, while the node draws from another sequence, which the grantor took in; though the grantor's calls fail
     /// after taking sequences in, while such a transaction holds the row; and though the grantor restarts while the node is
-    /// restored, and the node writes and checkpoints before the grantor is back. The node's draws after the backup move its
+    /// restored, and the node writes and checkpoints before the grantor is back, or writes and restarts once more, so
+    /// that the start it reports began past the position the grantor heard. The node's draws after the backup move its
     /// report, so that the grantor records a WAL position past them. So the node never draws again the values it drew
     /// before the restore.
     /// </summary>
     /// <param name="how">How the grantor is held up: slow, holding the row in a prepared transaction or an open one,
-    /// failing, restarted, or restarted while the node goes back to a whole backup, after which it writes nothing.</param>
+    /// failing, restarted, or restarted while the node goes back to a whole backup, after which it writes nothing, or
+    /// writes and restarts.</param>
     /// <returns>The test.</returns>
     [TestMethod]
     [DataRow("cut")]
@@ -4299,6 +4301,7 @@ public sealed partial class SequenceRangeTests
     [DataRow("failing")]
     [DataRow("restarted")]
     [DataRow("plain")]
+    [DataRow("twice")]
     public async Task RestoredNodesWaitForCallsThatTakeEverySequenceIn(string how)
     {
         CancellationToken token = TestContext.CancellationToken;
@@ -4353,11 +4356,11 @@ public sealed partial class SequenceRangeTests
         }
 
         // node_b writes, which node_a hears of, and is backed up as it runs, after which node_a's tables record its
-        // position, as the backup's segment switches move it a segment: whole for the plain row, where the position they
-        // record is where the backup's WAL ends, and otherwise its data files first, after which node_b writes on, and then
-        // its WAL, as a snapshot of its storage keeps both. node_b draws 20 ids from the block it holds, which node_a hears
-        // of, and goes back to the backup, whose WAL ends at or past every position node_a's tables recorded before the
-        // draws.
+        // position, as the backup's segment switches move it a segment: whole for the plain and twice rows, where the
+        // position they record is where the backup's WAL ends, and otherwise its data files first, after which node_b
+        // writes on, and then its WAL, as a snapshot of its storage keeps both. node_b draws 20 ids from the block it
+        // holds, which node_a hears of, and goes back to the backup, whose WAL ends at or past every position node_a's
+        // tables recorded before the draws.
         const string HeardFromB = """
             SELECT worf.sequence_range_heard(node_id, true, '-infinity', false)::text FROM worf.sequence_range_node
             WHERE node_name = 'node_b' AND seqoid = 't_id_seq'::regclass
@@ -4376,9 +4379,9 @@ public sealed partial class SequenceRangeTests
         string copy = Path.Join(copies.FullName, "node_b");
         _ = await nodeB.SafePsqlAsync(Database, "CREATE TABLE written AS SELECT g, repeat('x', 100) AS v FROM generate_series(1, 30000) g", token);
         await HearFromBAsync("after its writes");
-        await BackUpDataAsync(nodeB, copy, token, wal: how == "plain");
+        await BackUpDataAsync(nodeB, copy, token, wal: how is "plain" or "twice");
         await HearFromBAsync("past the backup");
-        if (how != "plain")
+        if (how is not ("plain" or "twice"))
         {
             _ = await nodeB.SafePsqlAsync(Database, "CREATE TABLE written_more AS SELECT g, repeat('x', 100) AS v FROM generate_series(1, 200) g", token);
             CopyWal(nodeB, copy);
@@ -4472,6 +4475,15 @@ public sealed partial class SequenceRangeTests
         }
         else if (how == "plain")
         {
+            await nodeA.StartServerAsync(token);
+        }
+        else if (how == "twice")
+        {
+            // node_b writes and restarts, so that the start it reports began past its old WAL position, before node_a is
+            // back.
+            _ = await nodeB.SafePsqlAsync(Database, "CREATE TABLE written_again AS SELECT g, repeat('x', 100) AS v FROM generate_series(1, 8000) g", token);
+            await nodeB.StopAsync("fast", token);
+            await nodeB.StartServerAsync(token);
             await nodeA.StartServerAsync(token);
         }
 
