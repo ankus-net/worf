@@ -2228,10 +2228,11 @@ int RunProgramToEnd(string execPath, IEnumerable<string> arguments)
 }
 
 // Starts a program, which shares the run's input and output, or, relayed, as pg_ctl is, has its own, whose output the
-// run writes as it comes: on Windows pg_ctl starts the server through cmd.exe, which takes pg_ctl's handles and stays the
-// server's parent, so that a server started with the run's own would keep the run's output open after the run ends,
-// and a caller that reads it to its end, as a shell pipe does, would wait for the server to stop. The run waits for a
-// relayed program to exit, not for the end of its output.
+// run writes as it comes, and on Windows inherits none of the run's: there pg_ctl starts the server through cmd.exe,
+// which takes pg_ctl's handles, and every other handle it may inherit, and stays the server's parent, so that a server
+// started with the run's would keep the run's output open after the run ends, and a caller that reads it to its end, as
+// a shell pipe does, would wait for the server to stop. The run waits for a relayed program to exit, not for the end of
+// its output.
 Process StartProgram(string execPath, IEnumerable<string> arguments, bool relayed = false)
 {
     ProcessStartInfo start = new(execPath)
@@ -2246,7 +2247,17 @@ Process StartProgram(string execPath, IEnumerable<string> arguments, bool relaye
         start.ArgumentList.Add(argument);
     }
 
-    Process process = Process.Start(start)!;
+    Process process;
+    if (relayed && OperatingSystem.IsWindows())
+    {
+        using InheritedHandles withheld = new();
+        process = Process.Start(start)!;
+    }
+    else
+    {
+        process = Process.Start(start)!;
+    }
+
     if (relayed)
     {
         process.StandardInput.Close();

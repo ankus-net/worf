@@ -139,16 +139,32 @@ public sealed class CreateSubscriberTests
 
         try
         {
-            (int exitCode, string stdout, string stderr) = await CreateSubscriberCommand.RunAsync(command,
-            [
+            // The run's output is read to its end, as a shell pipe reads it, which comes as the run exits, though the server
+            // it subscribed runs on.
+            ProcessStartInfo start = new(command) { WorkingDirectory = work.FullName, RedirectStandardOutput = true, RedirectStandardError = true };
+            foreach (string argument in new[]
+            {
                 "-D", backupDir, "--subscriber-name=test_subscriber", $"--subscriber-dsn={subscriberDsn}",
                 $"--provider-dsn={providerDsn}", "--drop-slot-if-exists", "-v",
                 $"--hba-conf={Path.Join(AppContext.BaseDirectory, "TestFiles", "regress-pg_hba.conf")}",
                 $"--postgresql-conf={Path.Join(provider.Cluster.DataDirectory, "postgresql.conf")}",
-            ], work.FullName, new Dictionary<string, string> { ["PGPORT"] = pgport.ToString(CultureInfo.InvariantCulture) }, token);
+            })
+            {
+                start.ArgumentList.Add(argument);
+            }
+
+            start.Environment["PGPORT"] = pgport.ToString(CultureInfo.InvariantCulture);
+            using Process tool = Process.Start(start)!;
+            Task<string> output = tool.StandardOutput.ReadToEndAsync(token);
+            Task<string> errors = tool.StandardError.ReadToEndAsync(token);
+            await tool.WaitForExitAsync(token);
+            Task ended = Task.WhenAll(output, errors);
+            bool read = await Task.WhenAny(ended, Task.Delay(TimeSpan.FromSeconds(30), token)) == ended;
+            string stdout = read ? await output : "";
+            string stderr = read ? await errors : "";
             TestContext.WriteLine(stdout);
             TestContext.WriteLine(stderr);
-            Assert.AreEqual(0, exitCode, "worf_create_subscriber check");
+            Assert.AreEqual("0|True", $"{tool.ExitCode}|{read}", "worf_create_subscriber check, and its output, read to its end within 30 s of its exit");
 
             await AssertPsqlOkAsync(provider, pgport, ["-c", "\\d"], "preseed check 1 ", token);
             await AssertPsqlOkAsync(provider, pgport, ["-c", "SELECT * from some_local_tbl"], "preseed check 2 ", token);
