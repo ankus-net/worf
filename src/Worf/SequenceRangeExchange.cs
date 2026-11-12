@@ -1376,6 +1376,9 @@ internal static class SequenceRangeExchange
         int? cutAt = null;
         int takenIn = 0;
         string key = UnchangedKey(node, root, call);
+        List<long> drawnSequences = [];
+        List<long> drawnTo = [];
+        List<JsonElement> drawnEntries = [];
         // What the checks depend on is read for every sequence at once, so that one whose ranges change as the others stay
         // idle, as a busy sequence's switches change them, is checked in full alone.
         Dictionary<int, WorfEntryFingerprint>? fingerprints = heard ? Fingerprints(node, senderId, [.. sequences.EnumerateArray()], call) : null;
@@ -1427,6 +1430,13 @@ internal static class SequenceRangeExchange
                     }
 
                     continue;
+                }
+
+                if (!changed && processed is uint kept && Nullable(entry, "drawn") is long drawn)
+                {
+                    drawnSequences.Add(kept);
+                    drawnTo.Add(drawn);
+                    drawnEntries.Add(entry);
                 }
 
                 if (changed)
@@ -1520,6 +1530,32 @@ internal static class SequenceRangeExchange
                             OR sequence_range_back.lsn < excluded.lsn
                     """, SpiParameter.Create(leftSequences.ToArray()), SpiParameter.Create(senderId), SpiParameter.Create((decimal)sysid),
                     SpiParameter.Create(timeline), SpiParameter.Create(Worf.FormatLsn(last)), SpiParameter.Create(lastStart == 0 ? null : (long?)lastStart));
+            }
+
+            // A report that changed only in how far the neighbor drew records it, with the neighbor's WAL position past
+            // the draws, so that a restore to before them shows, though this node restarts: for every such sequence in one
+            // statement, which writes only the rows that changed, and passes over those another transaction holds.
+            if (drawnSequences.Count > 0 && Worf.Execute("""
+                    UPDATE worf.sequence_range_node n SET drawn = d.drawn,
+                        wal_lsn = CASE WHEN $4 THEN $5::pg_lsn ELSE n.wal_lsn END, reply_lsn = CASE WHEN NOT $4 THEN $5::pg_lsn ELSE n.reply_lsn END
+                    FROM ROWS FROM (pg_catalog.unnest($1::pg_catalog.oid[]), pg_catalog.unnest($2::pg_catalog.int8[])) AS d (seqoid, drawn)
+                    WHERE n.seqoid = d.seqoid AND n.node_id = $3 AND n.via_node = n.node_id AND n.drawn IS DISTINCT FROM d.drawn
+                        AND n.ctid IN (SELECT o.ctid FROM worf.sequence_range_node o JOIN ROWS FROM (pg_catalog.unnest($1::pg_catalog.oid[]), pg_catalog.unnest($2::pg_catalog.int8[])) AS e (seqoid, drawn) ON o.seqoid = e.seqoid
+                            WHERE o.node_id = $3 AND o.via_node = o.node_id AND o.drawn IS DISTINCT FROM e.drawn FOR UPDATE OF o SKIP LOCKED)
+                    """, SpiParameter.Create(drawnSequences.ToArray()), SpiParameter.Create(drawnTo.ToArray()), SpiParameter.Create(senderId),
+                    SpiParameter.Create(call), SpiParameter.Create(Worf.FormatLsn(lsn))) > 0)
+            {
+                // The reports kept as changing nothing take the rows' versions as this writes them, which the next
+                // message's check reads once this commits, and the position recorded, so that the record of a draw
+                // leaves the next message's check cheap.
+                foreach ((int place, WorfEntryFingerprint read) in Fingerprints(node, senderId, drawnEntries, call))
+                {
+                    (uint, string) cached = (senderId, drawnEntries[place].GetProperty("name").GetWorfString() ?? "");
+                    if (s_unchanged.TryGetValue(cached, out WorfUnchangedEntry? same) && same.Seqoid == read.Seqoid && read.Steady)
+                    {
+                        s_unchanged[cached] = same with { Fingerprint = read.Fingerprint, Recorded = read.Recorded };
+                    }
+                }
             }
 
             // Shared memory holds it only once this commits, so that a call that fails after taking sequences in leaves the
@@ -1624,14 +1660,14 @@ internal static class SequenceRangeExchange
                 AND (clock IS NOT DISTINCT FROM $13 OR clock >= $13) AND ($14::pg_lsn IS NULL OR reset_done = $14::pg_lsn)
                 AND ($15::pg_lsn IS NULL OR reset_lsn IS DISTINCT FROM $15::pg_lsn) AND route IS NOT DISTINCT FROM $16
                 AND checked_start IS NOT DISTINCT FROM $17 AND reported_start IS NOT DISTINCT FROM $17
-                AND ($18::bigint IS DISTINCT FROM $19 OR confirmed_start IS NOT DISTINCT FROM $19) AND drawn IS NOT DISTINCT FROM $20
+                AND ($18::bigint IS DISTINCT FROM $19 OR confirmed_start IS NOT DISTINCT FROM $19)
             """, 1, seq, sender, SpiParameter.Create(root.GetProperty("node_name").GetWorfString()), SpiParameter.Create(sysid),
             SpiParameter.Create(timeline), SpiParameter.Create(call), SpiParameter.Create(epoch), SpiParameter.Create(state),
             SpiParameter.Create(ReportedRoute(entry).Distance), SpiParameter.Create(Nullable(entry, "high_water")),
             SpiParameter.Create(watermark), SpiParameter.Create(Holds(entry)), SpiParameter.Create(Nullable(entry, "clock")),
             SpiParameter.Create(Text(entry, "reset")), SpiParameter.Create(Text(entry, "reset_done")), SpiParameter.Create(ReportedRoute(entry).Route),
             SpiParameter.Create(root.TryGetProperty("started_at", out JsonElement started) && started.TryGetInt64(out long since) ? since : (long?)null),
-            SpiParameter.Create(Confirms(entry)), SpiParameter.Create(SequenceRangeHeard.Started), SpiParameter.Create(Nullable(entry, "drawn")));
+            SpiParameter.Create(Confirms(entry)), SpiParameter.Create(SequenceRangeHeard.Started));
         if (own.Count == 0 || (call && Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range_back WHERE seqoid = $1 AND node_id = $2)", seq, sender)) ||
             !WalUnmoved(own[0].Get<string?>(0), root, entry, senderId, call, applied))
         {
@@ -1733,11 +1769,12 @@ internal static class SequenceRangeExchange
             """);
 
     // A neighbor's report of a sequence as a check of it reads it: all of it but its reports of itself and of this node,
-    // which the check passes over, and the first of which says when the neighbor made it.
+    // which the check passes over, and the first of which says when the neighbor made it, and how far the neighbor drew,
+    // which a report otherwise unchanged records in one statement for every sequence of the message.
     private static string EntryText(JsonElement entry, WorfLocalNode node, uint senderId)
     {
         StringBuilder text = new();
-        foreach (JsonProperty property in entry.EnumerateObject())
+        foreach (JsonProperty property in entry.EnumerateObject().Where(property => !property.NameEquals("drawn")))
         {
             _ = text.Append(property.Name).Append('=');
             if (property.NameEquals("reports"))

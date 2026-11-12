@@ -4066,6 +4066,72 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// A neighbor that draws from many sequences, here twenty times a second from each of ten, makes each of its calls
+    /// record how far it drew in one statement, which uses one transaction ID, rather than take each sequence in in full.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task DrawsCostCallsOneStatement()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token, "shared_preload_libraries = 'worf,pg_stat_statements'\npg_stat_statements.track = all");
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        const string Sequences = "DO $$ BEGIN FOR g IN 1..10 LOOP EXECUTE format('CREATE SEQUENCE many_%s', lpad(g::text, 2, '0')); END LOOP; END $$";
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, Sequences, token);
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database, "CREATE EXTENSION pg_stat_statements", token);
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database,
+            "SELECT count(worf.enable_sequence_range(format('many_%s', lpad(g::text, 2, '0'))::regclass, participants := '{node_b}', range_size := 1000)) FROM generate_series(1, 10) g",
+            token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT count(*) = 10 FROM worf.sequence_ranges WHERE state = 'active' AND next_lo IS NOT NULL", token),
+            "node_b drawing from blocks of the ten sequences");
+
+        using CancellationTokenSource stopDrawing = CancellationTokenSource.CreateLinkedTokenSource(token);
+        Task drawing = Task.Run(async () =>
+        {
+            await using NpgsqlConnection busy = await nodeB.OpenAsync(Database, token);
+            await using NpgsqlCommand draw = new(string.Join("; ", Enumerable.Range(1, 10).Select(g => $"SELECT nextval('many_{g:00}')")), busy);
+            while (!stopDrawing.IsCancellationRequested)
+            {
+                _ = await draw.ExecuteNonQueryAsync(token);
+                await Task.Delay(TimeSpan.FromMilliseconds(50), token);
+            }
+        }, token);
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(3), token);
+            const string NextXid = "SELECT pg_catalog.pg_snapshot_xmax(pg_catalog.pg_current_snapshot())";
+            _ = await nodeA.SafePsqlAsync(Database, "SELECT pg_stat_statements_reset()", token);
+            long firstXid = long.Parse(await nodeA.SafePsqlAsync(Database, NextXid, token), CultureInfo.InvariantCulture);
+            await Task.Delay(TimeSpan.FromSeconds(5), token);
+            long lastXid = long.Parse(await nodeA.SafePsqlAsync(Database, NextXid, token), CultureInfo.InvariantCulture);
+            // The statements each call ran, which pg_stat_statements counts as nested in the call's.
+            string[] counts = (await nodeA.SafePsqlAsync(Database, """
+                SELECT coalesce(sum(calls) FILTER (WHERE toplevel AND query LIKE 'SELECT worf.sequence_range_exchange(%'), 0) || '|' ||
+                    coalesce(sum(calls) FILTER (WHERE NOT toplevel), 0)
+                FROM pg_stat_statements
+                """, token)).Split('|');
+            long calls = long.Parse(counts[0], CultureInfo.InvariantCulture);
+            long statements = long.Parse(counts[1], CultureInfo.InvariantCulture);
+            string often = await nodeA.SafePsqlAsync(Database, """
+                SELECT string_agg(calls || ' ' || left(regexp_replace(query, '\s+', ' ', 'g'), 150), E'\n' ORDER BY calls DESC) FROM (
+                    SELECT calls, query FROM pg_stat_statements WHERE NOT toplevel ORDER BY calls DESC LIMIT 8) s
+                """, token);
+            Assert.IsTrue(calls > 3 && lastXid - firstXid < 3 * calls && statements < 150 * calls,
+                $"node_b's {calls} calls in 5 s, which used {lastXid - firstXid} transaction IDs and ran {statements} statements on node_a, most often:\n{often}");
+        }
+        finally
+        {
+            await stopDrawing.CancelAsync();
+            await drawing;
+        }
+    }
+
+    /// <summary>
     /// The range worker checks in full a sequence whose ranges nothing changed only every ten check intervals, however
     /// another sequence's ranges change: here as node_a draws through t_id_seq's blocks of ten, and resets t_id_seq, with
     /// u_seq, which shares t_id_seq's counter of changes under a hash of 1,024 counters, idle.
