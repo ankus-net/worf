@@ -3233,7 +3233,11 @@ public sealed class SequenceRangeTests
     /// <summary>
     /// Statements that each draw one value with a SELECT of nextval, which holds no switch gate, wait for the switch from
     /// the block's last twentieth, as inserts do, rather than run the block out, on the owner and a participant alike;
-    /// so do DO blocks and calls of a PL/pgSQL function that each draw one, on the participant.
+    /// so do DO blocks and calls of a PL/pgSQL function that each draw one, on the participant, and calls of the function
+    /// within one transaction, whose expression PL/pgSQL starts only once; and so does a single SELECT that draws more
+    /// values than a block holds, row by row or within an aggregate. Statements of the same text, as SELECT
+    /// nextval('sx') under a search path of "$user", public, wait for the switch of the sequence they draw from as the role
+    /// they run as, though another role drew from its own sequence of that name with the same text in the session.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -3270,17 +3274,78 @@ public sealed class SequenceRangeTests
             Assert.HasCount(250, drawn, $"the distinct values {node.Name}'s 250 statements drew");
         }
 
-        foreach (string statement in new[] { "DO $$ BEGIN PERFORM nextval('s1'); END $$", "SELECT f_s1()" })
+        List<string> problems = [];
+        foreach (string statement in new[] { "DO $$ BEGIN PERFORM nextval('s1'); END $$", "SELECT f_s1()", "BEGIN", "SELECT nextval('s1') FROM generate_series(1, 250)",
+            "SELECT count(DISTINCT nextval('s1')) FROM generate_series(1, 250)" })
         {
             Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 's1'::regclass", token),
                 "node_b drawing from a block of s1, with the next one ready");
             await using NpgsqlConnection connection = await nodeB.OpenAsync(Database, token);
-            await using NpgsqlCommand draw = new(statement, connection);
-            for (int i = 0; i < 250; i++)
+            try
             {
-                _ = await draw.ExecuteNonQueryAsync(token);
+                if (statement == "BEGIN")
+                {
+                    // The calls of a PL/pgSQL function within one transaction.
+                    await using NpgsqlTransaction transaction = await connection.BeginTransactionAsync(token);
+                    await using NpgsqlCommand call = new("SELECT f_s1()", connection, transaction);
+                    for (int i = 0; i < 250; i++)
+                    {
+                        _ = await call.ExecuteScalarAsync(token);
+                    }
+
+                    await transaction.CommitAsync(token);
+                    continue;
+                }
+
+                await using NpgsqlCommand draw = new(statement, connection);
+                for (int i = 0; i < (statement.Contains("generate_series", StringComparison.Ordinal) ? 1 : 250); i++)
+                {
+                    _ = await draw.ExecuteNonQueryAsync(token);
+                }
+            }
+            catch (PostgresException failed)
+            {
+                problems.Add($"{statement}: {failed.SqlState} {failed.MessageText}");
             }
         }
+
+        // Two roles each have a sequence sx of their own in a schema of their name, which "$user" finds.
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE ROLE ua; CREATE ROLE ub;
+            CREATE SCHEMA ua AUTHORIZATION ua; CREATE SCHEMA ub AUTHORIZATION ub;
+            CREATE SEQUENCE ua.sx; CREATE SEQUENCE ub.sx;
+            ALTER SEQUENCE ua.sx OWNER TO ua; ALTER SEQUENCE ub.sx OWNER TO ub;
+            SELECT worf.enable_sequence_range('ua.sx', participants := '{}', range_size := 100, max_range_size := 100);
+            SELECT worf.enable_sequence_range('ub.sx', participants := '{}', range_size := 100, max_range_size := 100);
+            """, token);
+        foreach (string sx in new[] { "ua.sx", "ub.sx" })
+        {
+            Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, $"SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = '{sx}'::regclass", token),
+                $"node_a drawing from a block of {sx}, with the next one ready");
+        }
+
+        await using (NpgsqlConnection roles = await nodeA.OpenAsync(Database, token))
+        {
+            await using (NpgsqlCommand first = new("SET search_path = \"$user\", public; SET ROLE ua; SELECT nextval('sx'); SET ROLE ub", roles))
+            {
+                _ = await first.ExecuteNonQueryAsync(token);
+            }
+
+            await using NpgsqlCommand draw = new("SELECT nextval('sx')", roles);
+            try
+            {
+                for (int i = 0; i < 250; i++)
+                {
+                    _ = await draw.ExecuteScalarAsync(token);
+                }
+            }
+            catch (PostgresException failed)
+            {
+                problems.Add($"SELECT nextval('sx') as ub, after ua: {failed.SqlState} {failed.MessageText}");
+            }
+        }
+
+        Assert.AreEqual("", string.Join("\n", problems), "the draws that ran a block out");
     }
 
     /// <summary>

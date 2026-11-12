@@ -232,6 +232,21 @@ internal static partial class SequenceRangeGuard
     private static readonly List<(nint QueryDesc, uint Subxact, uint Cid)> s_moving = [];
     private static bool s_movingRegistered;
 
+    // The managed sequences this transaction's statements draw from without holding their switch gates, as a SELECT of
+    // nextval and a PL/pgSQL function's expressions do, with the rows, statements or calls left before each is checked
+    // again for the switch, and whether the transaction's end forgets them.
+    private static readonly Dictionary<uint, long> s_drawingUngated = [];
+    private static bool s_drawingRegistered;
+    private static bool s_countingDown;
+
+    // The plan nodes of the statements that draw so, with the functions that produce their rows, which the guard counts
+    // down for before each row, by the statement.
+    private static readonly Dictionary<nint, ExecProcNodeMtd> s_rowFunctions = [];
+    private static readonly Dictionary<nint, List<nint>> s_countedNodes = [];
+
+    [PgNativeCallback(nameof(CountedRow))]
+    private static partial ExecProcNodeMtd CountedRowCallback { get; }
+
     // The points in each sequence's active block, by sequence and value, at which this backend has woken the range worker.
     private static readonly HashSet<(uint Seqoid, long Mark)> s_woken = [];
 
@@ -496,6 +511,7 @@ internal static partial class SequenceRangeGuard
     /// <param name="written">The tables it writes to.</param>
     internal static unsafe void StartStatement(QueryDesc* queryDesc, List<uint> written)
     {
+        CountDownDraws();
         GateStatement(queryDesc, written);
         PlannedStmt* statement = queryDesc->plannedstmt;
         if (queryDesc->snapshot is null || statement is null || statement->hasModifyingCTE)
@@ -548,6 +564,14 @@ internal static partial class SequenceRangeGuard
     internal static unsafe void EndStatement(QueryDesc* queryDesc)
     {
         _ = s_planStarted.Remove((nint)queryDesc);
+        if (s_countedNodes.Remove((nint)queryDesc, out List<nint>? nodes))
+        {
+            foreach (nint node in nodes)
+            {
+                _ = s_rowFunctions.Remove(node);
+            }
+        }
+
         if (s_moving.Count > 0)
         {
             _ = s_moving.RemoveAll(statement => statement.QueryDesc == (nint)queryDesc);
@@ -902,7 +926,123 @@ internal static partial class SequenceRangeGuard
             s_planStarted[queryDesc] = s_starting[^1].Looked;
         }
 
+        // A statement that draws from a managed sequence without its switch gate, as a SELECT of nextval does, counts
+        // down for its sequences' checks before each row its plan's nodes produce, so that one statement that draws more
+        // values than the block has left waits for the switch, as separate statements do.
+        if (s_starting.Count > 0 && s_starting[^1].Switched.Count > 0 && !s_starting[^1].Explained)
+        {
+            unsafe
+            {
+                QueryDesc* query = (QueryDesc*)queryDesc;
+                List<nint> nodes = [];
+                CountRows(query->planstate, nodes);
+                if (nodes.Count > 0)
+                {
+                    s_countedNodes[queryDesc] = nodes;
+                }
+            }
+        }
+
         StartedExpressions();
+    }
+
+    // Has the guard count down before each row a plan node, and those under it, produce.
+    private static unsafe void CountRows(PlanState* node, List<nint> nodes)
+    {
+        if (node is null || s_rowFunctions.ContainsKey((nint)node))
+        {
+            return;
+        }
+
+        s_rowFunctions[(nint)node] = node->ExecProcNodeReal;
+        node->ExecProcNodeReal = CountedRowCallback;
+        nodes.Add((nint)node);
+        CountRows(node->lefttree, nodes);
+        CountRows(node->righttree, nodes);
+    }
+
+    // Produces a plan node's next row, after counting down for the checks of the sequences the statement draws from.
+    private static unsafe TupleTableSlot* CountedRow(PlanState* node)
+    {
+        CountDownDraws();
+        return s_rowFunctions[(nint)node].Invoke(node);
+    }
+
+    // Notes the managed sequences a statement draws from without their switch gates, after their first check, until the
+    // transaction ends.
+    private static void DrawUngated(List<uint> sequences)
+    {
+        if (!s_drawingRegistered)
+        {
+            s_drawingRegistered = true;
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, ForgetUngated);
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, ForgetUngated);
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, ForgetUngated);
+        }
+
+        foreach (uint seqoid in sequences)
+        {
+            s_drawingUngated[seqoid] = RowsUntilShort(seqoid);
+        }
+    }
+
+    private static void ForgetUngated()
+    {
+        s_drawingUngated.Clear();
+        s_drawingRegistered = false;
+    }
+
+    // Counts a row, statement or call down for each sequence drawn from without its gate, and checks it for the switch,
+    // as before its first draw, once its count runs out, which half the values left before the block's last twentieth,
+    // in the sequence's steps, sets, as other sessions may draw too.
+    private static void CountDownDraws()
+    {
+        if (s_drawingUngated.Count == 0 || s_countingDown || s_namingGrantors || Worf.InOwnSql)
+        {
+            return;
+        }
+
+        s_countingDown = true;
+        try
+        {
+            foreach (uint seqoid in s_drawingUngated.Keys.ToList())
+            {
+                if (s_drawingUngated[seqoid] > 0)
+                {
+                    s_drawingUngated[seqoid]--;
+                    continue;
+                }
+
+                if (!s_gates.ContainsKey(seqoid))
+                {
+                    WaitWhileShort(seqoid);
+                }
+
+                s_drawingUngated[seqoid] = RowsUntilShort(seqoid);
+            }
+        }
+        finally
+        {
+            s_countingDown = false;
+        }
+    }
+
+    // How many draws a sequence may take before it is checked again: half its steps left before the active block's last
+    // twentieth, or none once there.
+    private static long RowsUntilShort(uint seqoid)
+    {
+        Reload();
+        if (!s_sequences.TryGetValue(seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) sequence) ||
+            sequence.Blocks.FindIndex(block => block.State == "active") is not (int index and >= 0) || ReadPosition(seqoid) is not long position)
+        {
+            return 0;
+        }
+
+        (long lo, long hi, _) = sequence.Blocks[index];
+        decimal tail = ((decimal)hi - lo) / 20;
+        decimal left = sequence.Ascending ? hi - tail - position : position - lo - tail;
+        decimal step = Math.Max(Math.Abs((decimal)SequenceRanges.GetInfo(seqoid).Increment), 1);
+        return left <= 0 ? 0 : (long)Math.Min(left / step / 2, int.MaxValue);
     }
 
     /// <summary>
@@ -2009,6 +2149,11 @@ internal static partial class SequenceRangeGuard
         foreach (uint seqoid in switching)
         {
             WaitWhileShort(seqoid);
+        }
+
+        if (switching.Count > 0)
+        {
+            DrawUngated(switching);
         }
     }
 
