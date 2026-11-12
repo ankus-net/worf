@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Globalization;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
@@ -2615,61 +2616,7 @@ public sealed partial class SequenceRangeTests
         {
             // worf-slow.test takes 7 s to fail, worf-two.test has 127.0.0.2, where nothing listens, before 127.0.0.1, and
             // worf-delay.test and worf-late.test take 0.3 s and 1 s to find 127.0.0.1.
-            string library = await CompileAsync(work, "lookup.c", """
-                #define _GNU_SOURCE
-                #include <arpa/inet.h>
-                #include <dlfcn.h>
-                #include <netdb.h>
-                #include <stdlib.h>
-                #include <string.h>
-                #include <unistd.h>
-
-                static struct addrinfo *v4(const char *ip, const char *service, const struct addrinfo *hints)
-                {
-                    struct addrinfo *ai = calloc(1, sizeof(struct addrinfo) + sizeof(struct sockaddr_in));
-                    struct sockaddr_in *sin = (struct sockaddr_in *) (ai + 1);
-                    sin->sin_family = AF_INET;
-                    sin->sin_port = htons(service ? atoi(service) : 0);
-                    inet_pton(AF_INET, ip, &sin->sin_addr);
-                    ai->ai_family = AF_INET;
-                    ai->ai_socktype = hints && hints->ai_socktype ? hints->ai_socktype : SOCK_STREAM;
-                    ai->ai_protocol = hints ? hints->ai_protocol : 0;
-                    ai->ai_addrlen = sizeof(struct sockaddr_in);
-                    ai->ai_addr = (struct sockaddr *) sin;
-                    return ai;
-                }
-
-                int getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res)
-                {
-                    static int (*next)(const char *, const char *, const struct addrinfo *, struct addrinfo **);
-                    if (node && strcmp(node, "worf-slow.test") == 0)
-                    {
-                        sleep(7);
-                        return EAI_NONAME;
-                    }
-
-                    if (node && strcmp(node, "worf-two.test") == 0)
-                    {
-                        *res = v4("127.0.0.2", service, hints);
-                        (*res)->ai_next = v4("127.0.0.1", service, hints);
-                        return 0;
-                    }
-
-                    if (node && strcmp(node, "worf-none.test") == 0)
-                        return EAI_NONAME;
-
-                    if (node && (strcmp(node, "worf-delay.test") == 0 || strcmp(node, "worf-late.test") == 0))
-                    {
-                        usleep(strcmp(node, "worf-delay.test") == 0 ? 300000 : 1000000);
-                        *res = v4("127.0.0.1", service, hints);
-                        return 0;
-                    }
-
-                    if (!next)
-                        next = dlsym(RTLD_NEXT, "getaddrinfo");
-                    return next(node, service, hints, res);
-                }
-                """, token);
+            string library = await CompileAsync(work, "lookup.c", LookupLibrary, token);
             string services = Path.Join(work.FullName, "pg_service.conf");
             await File.WriteAllTextAsync(services, "[slowsvc]\nhost=worf-slow.test\nport=5432\n", token);
 
@@ -2908,6 +2855,173 @@ public sealed partial class SequenceRangeTests
         finally
         {
             work.Delete(true);
+        }
+    }
+
+    /// <summary>
+    /// The exchange connects to the server libpq would, from the same lists: lists whose counts libpq refuses are refused;
+    /// past a server that is in hot standby, as the session wants a read-write one, the probe goes to the next host rather
+    /// than to the name's next address; a standby found at a name still looked up is preferred, as libpq prefers it, to a
+    /// server listed before it that isn't one; the machine's own name has the addresses getaddrinfo gives it, rather than
+    /// every interface's; a name whose hostaddr is empty is looked up away from the worker, which holds up no insert; an
+    /// address that refuses gives way to one still looked up, without the call failing; and from PostgreSQL 17, an address
+    /// that never answers gives way at a connect_timeout of 1 s, where libpq waits 2 s before it. On Linux, where a library
+    /// the server preloads answers the lookups of those names.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [OSCondition(OperatingSystems.Linux)]
+    public async Task ConnectionsReachTheServerLibpqWould()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        DirectoryInfo work = Directory.CreateTempSubdirectory("worf-libpq-");
+        try
+        {
+            string library = await CompileAsync(work, "lookup.c", LookupLibrary, token);
+            await using TestNode nodeA = await StartNodeAsync("node_a", token);
+            await using TestNode nodeB = await StartNodeAsync("node_b", token, "log_min_messages = debug2", new Dictionary<string, string?> { ["LD_PRELOAD"] = library });
+            await using TestNode nodeC = await StartNodeAsync("node_c", token);
+            foreach (TestNode node in new[] { nodeA, nodeB, nodeC })
+            {
+                _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+            }
+
+            await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+            await SubscribeAsync(nodeB, "b_from_c", nodeC, token);
+            _ = await nodeA.SafePsqlAsync(Database,
+                "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100, max_range_size := 100)", token);
+            await WaitActiveAsync([nodeA, nodeB], token);
+
+            // node_c's hot standby listens at 127.0.0.2, on node_c's port.
+            string port = nodeC.Cluster.Port.ToString(CultureInfo.InvariantCulture);
+            string standbyDir = Path.Join(work.FullName, "standby");
+            (int backedUp, string backupOutput) = await nodeC.RunProgramAsync("pg_basebackup",
+                ["-D", standbyDir, "-d", nodeC.Dsn(Database, SuperUser), "-R", "-X", "stream", "-c", "fast"], token);
+            Assert.AreEqual(0, backedUp, backupOutput);
+            (int started, string startOutput) = await nodeC.RunProgramAsync("pg_ctl",
+                ["start", "-w", "-D", standbyDir, "-l", Path.Join(work.FullName, "standby.log"), "-o",
+                    $"-p {port} -c listen_addresses=127.0.0.2 -c unix_socket_directories={standbyDir} -c hot_standby=on"], token);
+            Assert.AreEqual(0, started, startOutput);
+            try
+            {
+                async Task<string> CallAsync(string dsn, string outcome)
+                {
+                    await RefuseNodeCAsync(nodeB, token);
+                    int logpos = nodeB.ReadLog().Length;
+                    _ = await nodeB.SafePsqlAsync(Database, $"""
+                        UPDATE worf.node_interface SET if_dsn = '{dsn} dbname={Database} user={SuperUser}'
+                        WHERE if_nodeid = (SELECT node_id FROM worf.node WHERE node_name = 'node_c')
+                        """, token);
+                    Assert.IsTrue(await nodeB.PollLogAsync(logpos, outcome, token), $"node_b's call to node_c over {dsn}: {outcome}");
+                    return nodeB.ReadLog()[logpos..];
+                }
+
+                // Lists whose counts libpq refuses are refused.
+                _ = await CallAsync($"host=127.0.0.1,127.0.0.1 port=1,{port},5", "could not match 3 port numbers to 2 hosts");
+                _ = await CallAsync($"host=127.0.0.1,127.0.0.1 hostaddr=127.0.0.1 port={port}", "could not match 2 host names to 1 hostaddr values");
+
+                // worf-two.test has the standby's address before node_c's. A read-write session passes the standby for the
+                // next host, of which there is none, rather than for node_c at the name's next address.
+                string readOnly = await CallAsync($"host=worf-two.test port={port} target_session_attrs=read-write", "exchange with node node_c failed");
+                Assert.Contains("session is read-only", readOnly, "node_b's call to node_c, refused at the standby");
+                Assert.DoesNotContain("exchange with node node_c done", readOnly, "node_b's calls to node_c, past the standby");
+
+                // A standby found at a name still looked up is preferred to node_c, listed before it.
+                string preferred = await CallAsync($"host=127.0.0.1,worf-standby.test port={port} target_session_attrs=prefer-standby",
+                    "exchange with node node_c failed");
+                Assert.Contains("cannot exchange sequence ranges during recovery", preferred, "node_b's call to node_c, made at the standby");
+
+                // The machine's own name has 127.0.0.3, where nothing listens, rather than the address of an interface where
+                // a listener takes connections and closes them.
+                IPAddress? own = NetworkInterface.GetAllNetworkInterfaces()
+                    .Where(each => each.OperationalStatus == OperationalStatus.Up && each.NetworkInterfaceType != NetworkInterfaceType.Loopback)
+                    .SelectMany(each => each.GetIPProperties().UnicastAddresses).Select(each => each.Address)
+                    .FirstOrDefault(address => address.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(address));
+                if (own is not null)
+                {
+                    using Socket closing = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                    closing.Bind(new IPEndPoint(own, 0));
+                    closing.Listen(16);
+                    using CancellationTokenSource stopClosing = CancellationTokenSource.CreateLinkedTokenSource(token);
+                    Task closer = Task.Run(async () =>
+                    {
+                        while (!stopClosing.IsCancellationRequested)
+                        {
+                            using Socket accepted = await closing.AcceptAsync(stopClosing.Token);
+                        }
+                    }, token);
+                    string named = await CallAsync($"host={Dns.GetHostName()} port={((IPEndPoint)closing.LocalEndPoint!).Port.ToString(CultureInfo.InvariantCulture)}",
+                        "exchange with node node_c failed");
+                    Assert.Contains("127.0.0.3", named, "node_b's call to node_c at the address getaddrinfo gives the machine's name");
+                    Assert.DoesNotContain("closed the connection", named, "node_b's call to node_c at an interface's address");
+                    await stopClosing.CancelAsync();
+                    _ = await Task.WhenAny(closer);
+                }
+
+                // An address that refuses gives way to a name still looked up, and the call doesn't fail meanwhile.
+                string waited = await CallAsync($"host=127.0.0.1,worf-delay.test port=1,{port}", "sequence range exchange with node node_c done");
+                Assert.DoesNotContain("exchange with node node_c failed", waited, "node_b's call to node_c, waiting for worf-delay.test");
+
+                // A name whose hostaddr is empty is looked up away from the worker: its lookup takes 7 s and fails, which
+                // a call has 20 s for, and node_b's inserts, which draw a block from node_a every 100 rows, wait for none of it.
+                _ = await nodeB.SafePsqlAsync(Database, "ALTER SYSTEM SET worf.sequence_range_timeout = '20s'", token);
+                _ = await nodeB.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
+                await RefuseNodeCAsync(nodeB, token);
+                int slow = nodeB.ReadLog().Length;
+                _ = await nodeB.SafePsqlAsync(Database, $"""
+                    UPDATE worf.node_interface SET if_dsn = 'host=worf-slow.test,127.0.0.1 hostaddr=,127.0.0.1 port={port} dbname={Database} user={SuperUser}'
+                    WHERE if_nodeid = (SELECT node_id FROM worf.node WHERE node_name = 'node_c')
+                    """, token);
+                await using (NpgsqlConnection writer = await nodeB.OpenAsync(Database, token))
+                {
+                    await using NpgsqlCommand insert = new("INSERT INTO t (v) VALUES ('b')", writer);
+                    Stopwatch running = Stopwatch.StartNew();
+                    TimeSpan slowest = TimeSpan.Zero;
+                    while (running.Elapsed < TimeSpan.FromSeconds(10))
+                    {
+                        Stopwatch one = Stopwatch.StartNew();
+                        _ = await insert.ExecuteNonQueryAsync(token);
+                        slowest = one.Elapsed > slowest ? one.Elapsed : slowest;
+                        await Task.Delay(TimeSpan.FromMilliseconds(10), token);
+                    }
+
+                    Assert.IsLessThan(TimeSpan.FromSeconds(1), slowest, "node_b's slowest insert, while worf-slow.test is looked up");
+                }
+
+                Assert.IsTrue(await nodeB.PollLogAsync(slow, "sequence range exchange with node node_c done", token), "node_b's call to node_c past worf-slow.test");
+
+                // An address that never answers, as a listener whose queue is full, gives way at connect_timeout, which is 1 s
+                // from PostgreSQL 17, and at least 2 s before it, as libpq has it.
+                using Socket hole = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                hole.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+                hole.Listen(0);
+                using Socket queued = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                await queued.ConnectAsync(hole.LocalEndPoint!, token);
+                string timedOut = await CallAsync($"host=127.0.0.1,127.0.0.1 port={((IPEndPoint)hole.LocalEndPoint!).Port.ToString(CultureInfo.InvariantCulture)},{port} connect_timeout=1",
+                    "sequence range exchange with node node_c done");
+                static DateTime At(string line) => DateTime.ParseExact(line[1..24], "yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture);
+                string[] lines = timedOut.Split('\n');
+                string connecting = lines.Last(line => line.Contains("exchange with node node_c connecting", StringComparison.Ordinal));
+                string done = lines.First(line => line.Contains("exchange with node node_c done", StringComparison.Ordinal));
+                TimeSpan took = At(done) - At(connecting);
+                int version = int.Parse(await nodeB.SafePsqlAsync(Database, "SHOW server_version_num", token), CultureInfo.InvariantCulture);
+                if (version >= 170000)
+                {
+                    Assert.IsLessThan(TimeSpan.FromSeconds(1.6), took, "node_b's connection to node_c past the address that never answers, with connect_timeout=1");
+                }
+                else
+                {
+                    Assert.IsGreaterThan(TimeSpan.FromSeconds(1.9), took, "node_b's connection to node_c past the address that never answers, with connect_timeout=1");
+                }
+            }
+            finally
+            {
+                _ = await nodeC.RunProgramAsync("pg_ctl", ["stop", "-w", "-m", "immediate", "-D", standbyDir], token);
+            }
+        }
+        finally
+        {
+            work.Delete(recursive: true);
         }
     }
 
@@ -3252,6 +3366,10 @@ public sealed partial class SequenceRangeTests
             _ = await node.SafePsqlAsync(Database, """
                 CREATE TABLE t (id bigserial PRIMARY KEY, v text); CREATE SEQUENCE s1;
                 CREATE FUNCTION f_s1() RETURNS bigint LANGUAGE plpgsql AS $$ BEGIN RETURN nextval('s1'); END $$;
+                CREATE FUNCTION f_loop(n int) RETURNS bigint LANGUAGE plpgsql AS $$ DECLARE x bigint; BEGIN FOR i IN 1..n LOOP x := nextval('s1'); END LOOP; RETURN x; END $$;
+                CREATE TABLE trg (id bigint, v text);
+                CREATE FUNCTION trg_id() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.id := nextval('s1'); RETURN NEW; END $$;
+                CREATE TRIGGER trg_id BEFORE INSERT ON trg FOR EACH ROW EXECUTE FUNCTION trg_id();
                 """, token);
         }
 
@@ -3275,15 +3393,46 @@ public sealed partial class SequenceRangeTests
             Assert.HasCount(250, drawn, $"the distinct values {node.Name}'s 250 statements drew");
         }
 
+        // Besides, a PL/pgSQL loop's assignment, in a function or a DO block, which PL/pgSQL starts once; an ARRAY or a
+        // scalar subquery, which runs as the statement's initPlan; three calls in each row; rows a PL/pgSQL trigger draws
+        // for, inserted from a SELECT or copied; and a statement like one that failed as it drew, which left its plan's
+        // nodes counted.
         List<string> problems = [];
         foreach (string statement in new[] { "DO $$ BEGIN PERFORM nextval('s1'); END $$", "SELECT f_s1()", "BEGIN", "SELECT nextval('s1') FROM generate_series(1, 250)",
-            "SELECT count(DISTINCT nextval('s1')) FROM generate_series(1, 250)" })
+            "SELECT count(DISTINCT nextval('s1')) FROM generate_series(1, 250)", "SELECT f_loop(250) /* generate_series */",
+            "DO $$ DECLARE x bigint; BEGIN FOR i IN 1..250 LOOP x := nextval('s1'); END LOOP; END $$ /* generate_series */",
+            "SELECT array_length(ARRAY(SELECT nextval('s1') FROM generate_series(1, 250)), 1)",
+            "SELECT (SELECT count(nextval('s1')) FROM generate_series(1, 250))", "SELECT nextval('s1'), nextval('s1'), nextval('s1') FROM generate_series(1, 100)",
+            "INSERT INTO trg (v) SELECT 'x' FROM generate_series(1, 250)", "COPY", "FAILED" })
         {
             Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 's1'::regclass", token),
                 "node_b drawing from a block of s1, with the next one ready");
             await using NpgsqlConnection connection = await nodeB.OpenAsync(Database, token);
             try
             {
+                if (statement == "COPY")
+                {
+                    // The COPY ends as its writer is disposed, leaving this block.
+                    await using TextWriter rows = await connection.BeginTextImportAsync("COPY trg (v) FROM STDIN", token);
+                    for (int i = 0; i < 250; i++)
+                    {
+                        await rows.WriteLineAsync("x");
+                    }
+
+                    continue;
+                }
+
+                if (statement == "FAILED")
+                {
+                    // The statement fails as it draws, at its 21st row, and the same one that doesn't fail runs after it.
+                    await using NpgsqlCommand failing = new("SELECT count(*) FROM (SELECT nextval('s1') n FROM generate_series(1, 250) g WHERE 1 / (g - 21) IS NOT NULL) x", connection);
+                    PostgresException divided = await Assert.ThrowsExactlyAsync<PostgresException>(() => failing.ExecuteScalarAsync(token));
+                    Assert.AreEqual("22012", divided.SqlState, divided.MessageText);
+                    await using NpgsqlCommand counting = new("SELECT count(*) FROM (SELECT nextval('s1') n FROM generate_series(1, 250) g WHERE 1 / (g + 1) IS NOT NULL) x", connection);
+                    _ = await counting.ExecuteScalarAsync(token);
+                    continue;
+                }
+
                 if (statement == "BEGIN")
                 {
                     // The calls of a PL/pgSQL function within one transaction.
@@ -4396,6 +4545,12 @@ public sealed partial class SequenceRangeTests
             CREATE TABLE ai2 (id int, v text);
             CREATE TRIGGER ai2_id BEFORE INSERT ON ai2 FOR EACH ROW EXECUTE FUNCTION autoinc(id, 'public.ti_id_seq');
             ALTER TABLE ai2 ENABLE ALWAYS TRIGGER ai2_id;
+            CREATE TABLE auu (k int PRIMARY KEY, id int, v text);
+            INSERT INTO auu VALUES (1, 1, 'a');
+            CREATE TRIGGER auu_id BEFORE UPDATE ON auu FOR EACH ROW EXECUTE FUNCTION autoinc(id, ti_id_seq);
+            CREATE TABLE apl (id int, v text);
+            CREATE TRIGGER apl_id BEFORE INSERT ON apl FOR EACH ROW EXECUTE FUNCTION autoinc(id, 'public.plain');
+            ALTER TABLE apl ENABLE ALWAYS TRIGGER apl_id;
             """, token);
         await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
         _ = await nodeA.SafePsqlAsync(Database, """
@@ -4493,12 +4648,21 @@ public sealed partial class SequenceRangeTests
             ($"COPY tp1 (v) FROM '{rows}'", "tp_id_seq"),
             ("INSERT INTO tl2 SELECT max(id), 'u' FROM tl; ALTER TABLE tl ATTACH PARTITION tl2 FOR VALUES IN ('u', 'v'); INSERT INTO tl2 (v) VALUES ('v') RETURNING id",
                 "tl_id_seq"),
-        ] : [])];
+        ] : []).Concat([
+            // An INSERT's ON CONFLICT DO UPDATE fires the update trigger, whose C code, contrib's autoinc, draws.
+            ("INSERT INTO auu VALUES (1, 5, 'b') ON CONFLICT (k) DO UPDATE SET id = NULL RETURNING id", "ti_id_seq"),
+            // A DO block whose variable is of a domain that draws, right after another DO block, whose compiled state its
+            // own may take the place of.
+            ("DO $$ DECLARE z bigint; BEGIN z := nextval('plain'); END $$; DO $$ DECLARE y tdom; BEGIN y := 1; END $$", "ti_id_seq"),
+        ])];
 
         // Each form waits out its time, so they run in four lanes at once; forms that update the same table share one, so
         // that none waits on another's row lock rather than for node_a.
         async Task<string?> TryAsync(string draw, string? sequence)
         {
+            // A form that draws and then waits draws all the same, as its sequence's position shows.
+            string position = sequence is null ? "" : $"SET lock_timeout = '2s'; SELECT last_value || '/' || is_called FROM {sequence}";
+            string before = sequence is null ? "" : (await nodeB.SafePsqlAsync(Database, position, token)).Split('\n')[^1];
             string where;
             try
             {
@@ -4517,6 +4681,11 @@ public sealed partial class SequenceRangeTests
             catch (PostgresException failed)
             {
                 return $"{draw}: failed with {failed.SqlState} {failed.MessageText}, rather than wait";
+            }
+
+            if (sequence is not null && (await nodeB.SafePsqlAsync(Database, position, token)).Split('\n')[^1] is string after && after != before)
+            {
+                return $"{draw}: drew, from {before} to {after}, and then waited";
             }
 
             return !where.Contains(sequence is null ? "waiting for node node_a, which granted sequence" : $"waiting for node node_a, which granted sequence {sequence}'s block",
@@ -4569,6 +4738,8 @@ public sealed partial class SequenceRangeTests
             "MERGE INTO ti USING (SELECT min(id) AS m FROM ti) s ON ti.id = s.m WHEN MATCHED THEN UPDATE SET id = s.m",
             "SELECT frp(1)",
             "DELETE FROM ti WHERE id = (SELECT max(id) FROM ti); UPDATE ti SET id = id + 1 WHERE id = (SELECT max(id) FROM ti)",
+            // An update of a table whose argument trigger fires only on insert.
+            "UPDATE ai SET v = 'y'",
         })
         {
             try
@@ -4756,10 +4927,11 @@ public sealed partial class SequenceRangeTests
             CREATE TABLE ti (v text); CREATE PUBLICATION native FOR TABLE ti;
             CREATE TABLE npd (v int); CREATE PUBLICATION native_npd FOR TABLE npd;
             CREATE TABLE ai2 (id int, v text); CREATE PUBLICATION native_ai2 FOR TABLE ai2;
+            CREATE TABLE apl (id int, v text); CREATE PUBLICATION native_apl FOR TABLE apl;
             """, token);
         _ = await nodeB.SafePsqlAsync(Database, "ALTER SYSTEM SET worf.sequence_range_timeout = '1s'", token);
         _ = await nodeB.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
-        foreach (string native in new[] { "native", "native_npd", "native_ai2" })
+        foreach (string native in new[] { "native", "native_npd", "native_ai2", "native_apl" })
         {
             _ = await nodeB.SafePsqlAsync("nativepub", $"SELECT pg_create_logical_replication_slot('{native}', 'pgoutput')", token);
             _ = await nodeB.SafePsqlAsync(Database,
@@ -4772,12 +4944,18 @@ public sealed partial class SequenceRangeTests
         // contrib's autoinc, draws from ti_id_seq waits for node_a.
         _ = await nodeB.SafePsqlAsync("nativepub", "INSERT INTO npd VALUES (1)", token);
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT count(*) = 1 FROM npd", token), "node_b's apply of the row of npd, whose domain draws from plain");
+
+        // So does the row of a table whose ALWAYS trigger's C code draws from plain, though the triggers of other
+        // tables that call the same function name ti_id_seq.
+        _ = await nodeB.SafePsqlAsync("nativepub", "INSERT INTO apl VALUES (NULL, 'native')", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT count(*) = 1 FROM apl WHERE id IS NOT NULL", token),
+            "node_b's apply of the row of apl, whose trigger draws from plain");
         int drawn = nodeB.ReadLog().Length;
         _ = await nodeB.SafePsqlAsync("nativepub", "INSERT INTO ai2 VALUES (NULL, 'native')", token);
         Assert.IsTrue(await nodeB.PollLogAsync(drawn, "sequence ti_id_seq can't draw from the block node node_a granted it", token),
             "node_b's apply of the row of ai2, waiting for node_a");
         Assert.AreEqual("0", await nodeB.SafePsqlAsync(Database, "SELECT count(*) FROM ai2", token), "the rows of ai2 node_b's native subscription applied while node_a was down");
-        foreach (string native in new[] { "native_npd", "native_ai2" })
+        foreach (string native in new[] { "native_npd", "native_ai2", "native_apl" })
         {
             _ = await nodeB.SafePsqlAsync(Database, $"ALTER SUBSCRIPTION {native} DISABLE", token);
             _ = await nodeB.SafePsqlAsync(Database, $"ALTER SUBSCRIPTION {native} SET (slot_name = NONE)", token);
@@ -4916,6 +5094,12 @@ public sealed partial class SequenceRangeTests
         Assert.IsTrue(await nodeB.PollLogAsync(acpos, "sequence t_id_seq can't draw from the block node node_a granted it", token), "node_b's apply of ac's row, waiting");
         Assert.AreEqual($"0|{before}", await nodeB.SafePsqlAsync(Database, "SELECT (SELECT count(*) FROM ac), (SELECT last_value FROM t_id_seq)", token),
             "ac's rows, and the sequence, while node_a is down");
+
+        // So do the rows of ac that its sync copies, which fire the trigger too.
+        _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.alter_subscription_resynchronize_table('b_from_c_ac', 'ac')", token);
+        await Task.Delay(TimeSpan.FromSeconds(8), token);
+        Assert.AreEqual($"0|{before}", await nodeB.SafePsqlAsync(Database, "SELECT (SELECT count(*) FROM ac WHERE id IS NOT NULL), (SELECT last_value FROM t_id_seq)", token),
+            "ac's rows its sync copied, and the sequence, while node_a is down");
 
         // Once a subscriber-only column's default draws from the managed sequence, rather than the one it drew from, the
         // next row waits, though the apply worker read the defaults for a row before. The values the old default gave go
@@ -7273,6 +7457,74 @@ public sealed partial class SequenceRangeTests
             }
         }
     }
+
+    // A library the server preloads that answers the lookups of test names: worf-slow.test takes 7 s to fail,
+    // worf-two.test has 127.0.0.2 before 127.0.0.1, worf-none.test has none, worf-delay.test and worf-late.test take 0.3 s
+    // and 1 s to find 127.0.0.1, worf-standby.test takes 0.3 s to find 127.0.0.2, and the machine's own name has
+    // 127.0.0.3 alone.
+    private const string LookupLibrary = """
+        #define _GNU_SOURCE
+        #include <arpa/inet.h>
+        #include <dlfcn.h>
+        #include <netdb.h>
+        #include <stdlib.h>
+        #include <string.h>
+        #include <unistd.h>
+
+        static struct addrinfo *v4(const char *ip, const char *service, const struct addrinfo *hints)
+        {
+            struct addrinfo *ai = calloc(1, sizeof(struct addrinfo) + sizeof(struct sockaddr_in));
+            struct sockaddr_in *sin = (struct sockaddr_in *) (ai + 1);
+            sin->sin_family = AF_INET;
+            sin->sin_port = htons(service ? atoi(service) : 0);
+            inet_pton(AF_INET, ip, &sin->sin_addr);
+            ai->ai_family = AF_INET;
+            ai->ai_socktype = hints && hints->ai_socktype ? hints->ai_socktype : SOCK_STREAM;
+            ai->ai_protocol = hints ? hints->ai_protocol : 0;
+            ai->ai_addrlen = sizeof(struct sockaddr_in);
+            ai->ai_addr = (struct sockaddr *) sin;
+            return ai;
+        }
+
+        int getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res)
+        {
+            static int (*next)(const char *, const char *, const struct addrinfo *, struct addrinfo **);
+            char me[256] = "";
+            gethostname(me, sizeof(me) - 1);
+            if (node && strcmp(node, "worf-slow.test") == 0)
+            {
+                sleep(7);
+                return EAI_NONAME;
+            }
+
+            if (node && strcmp(node, "worf-two.test") == 0)
+            {
+                *res = v4("127.0.0.2", service, hints);
+                (*res)->ai_next = v4("127.0.0.1", service, hints);
+                return 0;
+            }
+
+            if (node && strcmp(node, "worf-none.test") == 0)
+                return EAI_NONAME;
+
+            if (node && (strcmp(node, "worf-delay.test") == 0 || strcmp(node, "worf-late.test") == 0 || strcmp(node, "worf-standby.test") == 0))
+            {
+                usleep(strcmp(node, "worf-late.test") == 0 ? 1000000 : 300000);
+                *res = v4(strcmp(node, "worf-standby.test") == 0 ? "127.0.0.2" : "127.0.0.1", service, hints);
+                return 0;
+            }
+
+            if (node && me[0] && strcmp(node, me) == 0)
+            {
+                *res = v4("127.0.0.3", service, hints);
+                return 0;
+            }
+
+            if (!next)
+                next = dlsym(RTLD_NEXT, "getaddrinfo");
+            return next(node, service, hints, res);
+        }
+        """;
 
     /// <summary>
     /// Copies a directory as a backup takes a data directory, leaving out the files that belong to the server that ran

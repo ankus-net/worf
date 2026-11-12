@@ -61,7 +61,7 @@ internal static partial class SequenceRangeGuard
 
     // The managed sequences the triggers of each table and its partitions name among their arguments, by the table and
     // the events the triggers fire on.
-    private static readonly Dictionary<(uint Relid, int Events), List<uint>> s_arguedBy = [];
+    private static readonly Dictionary<(uint Relid, int Events, int MovedInto), List<uint>> s_arguedBy = [];
 
     // TRIGGER_TYPE_INSERT and TRIGGER_TYPE_UPDATE, the bits of pg_trigger.tgtype for the events a trigger fires on.
     private const int TriggerTypeInsert = 1 << 2;
@@ -110,7 +110,7 @@ internal static partial class SequenceRangeGuard
     // The sequences the CHECKs of the domains each PL/pgSQL function coerces its variables and result to draw from, by
     // the function as PL/pgSQL compiled it, once for each set of argument types a polymorphic function is called with,
     // read again once a type, a constraint or a function changes.
-    private static readonly Dictionary<nint, (HashSet<uint> Called, bool Unnamed)?> s_plpgsqlCasts = [];
+    private static readonly Dictionary<(nint Compiled, uint Function, uint Xmin), (HashSet<uint> Called, bool Unnamed)?> s_plpgsqlCasts = [];
 
     // Whether each function a statement called may check a domain the statement doesn't name, by the function, read
     // again once a function changes.
@@ -128,7 +128,7 @@ internal static partial class SequenceRangeGuard
     // The trigger functions the fmgr hook watches as they start in sessions that write as replicas do, and the managed
     // sequences named among the arguments of the triggers that call each, read again once a table changes.
     private static readonly HashSet<uint> s_hookedTriggers = [];
-    private static readonly Dictionary<uint, List<uint>> s_triggerArguments = [];
+    private static readonly Dictionary<(uint Function, uint Subscription), List<uint>> s_triggerArguments = [];
     private static long s_managedSignature;
 
     // PostgreSQL's own functions that check a value against a type a statement may give only as a value, as text or an
@@ -241,11 +241,16 @@ internal static partial class SequenceRangeGuard
 
     // The plan nodes of the statements that draw so, with the functions that produce their rows, which the guard counts
     // down for before each row, by the statement.
-    private static readonly Dictionary<nint, ExecProcNodeMtd> s_rowFunctions = [];
-    private static readonly Dictionary<nint, List<nint>> s_countedNodes = [];
+    private static readonly Dictionary<nint, (ExecProcNodeMtd Function, int Calls)> s_rowFunctions = [];
+    private static readonly Dictionary<nint, (uint Subxact, List<nint> Nodes)> s_countedNodes = [];
+    private static readonly Dictionary<(uint Function, uint Xmin), int> s_functionCalls = [];
+    private static bool s_countedRegistered;
 
     [PgNativeCallback(nameof(CountedRow))]
     private static partial ExecProcNodeMtd CountedRowCallback { get; }
+
+    [PgNativeCallback(nameof(PlpgsqlStatement))]
+    private static partial PLpgSQL_plugin_stmt_begCallback PlpgsqlStatementCallback { get; }
 
     // The points in each sequence's active block, by sequence and value, at which this backend has woken the range worker.
     private static readonly HashSet<(uint Seqoid, long Mark)> s_woken = [];
@@ -564,13 +569,7 @@ internal static partial class SequenceRangeGuard
     internal static unsafe void EndStatement(QueryDesc* queryDesc)
     {
         _ = s_planStarted.Remove((nint)queryDesc);
-        if (s_countedNodes.Remove((nint)queryDesc, out List<nint>? nodes))
-        {
-            foreach (nint node in nodes)
-            {
-                _ = s_rowFunctions.Remove(node);
-            }
-        }
+        ForgetCounted((nint)queryDesc);
 
         if (s_moving.Count > 0)
         {
@@ -593,7 +592,10 @@ internal static partial class SequenceRangeGuard
         PlannedStmt* statement = queryDesc->plannedstmt;
         bool inserts = queryDesc->operation == CmdType.CMD_INSERT || (statement is not null && statement->hasModifyingCTE) ||
             (queryDesc->operation == CmdType.CMD_MERGE && statement is not null && MergeInserts(statement));
-        bool updates = queryDesc->operation is CmdType.CMD_UPDATE or CmdType.CMD_MERGE;
+        // An INSERT's ON CONFLICT DO UPDATE updates the rows it conflicts with, which fires their update triggers.
+        bool upserts = queryDesc->operation == CmdType.CMD_INSERT && statement is not null && statement->planTree is not null &&
+            statement->planTree->type == NodeTag.T_ModifyTable && ((ModifyTable*)statement->planTree)->onConflictAction == OnConflictAction.ONCONFLICT_UPDATE;
+        bool updates = queryDesc->operation is CmdType.CMD_UPDATE or CmdType.CMD_MERGE || upserts;
         // A statement that writes only to tables neither guarded nor with a trigger that takes arguments, among their
         // partitions', reads none of worf's tables.
         if (statement is null || written.Count == 0 || !(inserts || updates) || Worf.CatalogOid("sequence_range") == 0 ||
@@ -616,12 +618,12 @@ internal static partial class SequenceRangeGuard
         List<uint> sequences = inserts ? [.. written.SelectMany(DrawnBy)] : [];
         if (updates)
         {
-            if (written.Exists(Guarded))
+            if (!upserts && written.Exists(Guarded))
             {
                 sequences.AddRange(UpdatedDrawing(statement));
             }
 
-            sequences.AddRange(written.SelectMany(table => ArguedBy(table, TriggerTypeUpdate | TriggerTypeInsert)));
+            sequences.AddRange(written.SelectMany(table => ArguedBy(table, TriggerTypeUpdate, upserts ? 0 : TriggerTypeInsert)));
         }
 
         if (sequences.Count == 0)
@@ -877,9 +879,12 @@ internal static partial class SequenceRangeGuard
             s_plpgsqlPlugin = NativeMethods.find_rendezvous_variable((sbyte*)name);
         }
 
+        // The plugin worf gives counts the statements PL/pgSQL starts down too.
         if (*s_plpgsqlPlugin is null)
         {
-            *s_plpgsqlPlugin = NativeMemory.AllocZeroed((nuint)sizeof(PLpgSQL_plugin));
+            PLpgSQL_plugin* plugin = (PLpgSQL_plugin*)NativeMemory.AllocZeroed((nuint)sizeof(PLpgSQL_plugin));
+            plugin->stmt_beg = PlpgsqlStatementCallback;
+            *s_plpgsqlPlugin = plugin;
         }
     }
 
@@ -929,16 +934,18 @@ internal static partial class SequenceRangeGuard
         // A statement that draws from a managed sequence without its switch gate, as a SELECT of nextval does, counts
         // down for its sequences' checks before each row its plan's nodes produce, so that one statement that draws more
         // values than the block has left waits for the switch, as separate statements do.
+        // Each row counts for as many draws as the statement has calls of nextval, as a row may call each of them once.
         if (s_starting.Count > 0 && s_starting[^1].Switched.Count > 0 && !s_starting[^1].Explained)
         {
             unsafe
             {
                 QueryDesc* query = (QueryDesc*)queryDesc;
                 List<nint> nodes = [];
-                CountRows(query->planstate, nodes);
+                CountRows(query->planstate, nodes, Math.Max(s_starting[^1].Draws.Calls, 1));
                 if (nodes.Count > 0)
                 {
-                    s_countedNodes[queryDesc] = nodes;
+                    RegisterCounted();
+                    s_countedNodes[queryDesc] = (NativeMethods.GetCurrentSubTransactionId(), nodes);
                 }
             }
         }
@@ -946,26 +953,148 @@ internal static partial class SequenceRangeGuard
         StartedExpressions();
     }
 
-    // Has the guard count down before each row a plan node, and those under it, produce.
-    private static unsafe void CountRows(PlanState* node, List<nint> nodes)
+    // Has the guard count down before each row a plan node, and those under it, produce: its children, its initPlans
+    // and subplans, as an ARRAY or scalar subquery runs, and the plans an Append, a MergeAppend or a subquery scan runs.
+    private static unsafe void CountRows(PlanState* node, List<nint> nodes, int calls)
     {
         if (node is null || s_rowFunctions.ContainsKey((nint)node))
         {
             return;
         }
 
-        s_rowFunctions[(nint)node] = node->ExecProcNodeReal;
+        s_rowFunctions[(nint)node] = (node->ExecProcNodeReal, calls);
         node->ExecProcNodeReal = CountedRowCallback;
         nodes.Add((nint)node);
-        CountRows(node->lefttree, nodes);
-        CountRows(node->righttree, nodes);
+        CountRows(node->lefttree, nodes, calls);
+        CountRows(node->righttree, nodes, calls);
+        foreach (List* subplans in new[] { node->initPlan, node->subPlan })
+        {
+            for (int i = 0; subplans is not null && i < subplans->length; i++)
+            {
+                CountRows(((SubPlanState*)subplans->elements[i].ptr_value)->planstate, nodes, calls);
+            }
+        }
+
+        switch (node->type)
+        {
+            case NodeTag.T_AppendState:
+                for (int i = 0; i < ((AppendState*)node)->as_nplans; i++)
+                {
+                    CountRows(((AppendState*)node)->appendplans[i], nodes, calls);
+                }
+
+                break;
+            case NodeTag.T_MergeAppendState:
+                for (int i = 0; i < ((MergeAppendState*)node)->ms_nplans; i++)
+                {
+                    CountRows(((MergeAppendState*)node)->mergeplans[i], nodes, calls);
+                }
+
+                break;
+            case NodeTag.T_SubqueryScanState:
+                CountRows(((SubqueryScanState*)node)->subplan, nodes, calls);
+                break;
+            default:
+                break;
+        }
     }
 
     // Produces a plan node's next row, after counting down for the checks of the sequences the statement draws from.
     private static unsafe TupleTableSlot* CountedRow(PlanState* node)
     {
-        CountDownDraws();
-        return s_rowFunctions[(nint)node].Invoke(node);
+        (ExecProcNodeMtd function, int calls) = s_rowFunctions[(nint)node];
+        CountDownDraws(calls);
+        return function.Invoke(node);
+    }
+
+    // Counts a PL/pgSQL statement down, as PL/pgSQL starts it, for as many draws as its function has calls of nextval,
+    // as a loop's assignment draws each time it runs, which starts its expression only once a transaction.
+    private static unsafe void PlpgsqlStatement(PLpgSQL_execstate* estate, PLpgSQL_stmt* stmt)
+    {
+        _ = stmt;
+        if (s_drawingUngated.Count == 0 || s_countingDown || s_namingGrantors || Worf.InOwnSql || estate is null || estate->func is null)
+        {
+            return;
+        }
+
+        if (FunctionCalls(estate->func) is int calls and > 0)
+        {
+            CountDownDraws(calls);
+        }
+    }
+
+    // How many calls of nextval a PL/pgSQL function's source has, once until it's replaced, or, for a DO block's, which
+    // has no source of its own, the statement that runs it.
+    private static unsafe int FunctionCalls(PLpgSQL_function* function)
+    {
+        if (function->fn_oid == 0)
+        {
+            return NextvalCalls(NativeGlobals.debug_query_string is null ? "" : Worf.FromServer(NativeGlobals.debug_query_string));
+        }
+
+#if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
+        (uint, uint) key = (function->fn_oid, function->fn_xmin);
+#else
+        (uint, uint) key = (function->fn_oid, function->cfunc.fn_xmin);
+#endif
+        if (!s_functionCalls.TryGetValue(key, out int calls))
+        {
+            uint oid = function->fn_oid;
+            calls = NextvalCalls(Worf.ReadScalar<string?>("SELECT prosrc FROM pg_catalog.pg_proc WHERE oid = $1", SpiParameter.Create(oid)) ?? "");
+            s_functionCalls[key] = calls;
+        }
+
+        return calls;
+    }
+
+    // How many calls of nextval a text has, as its name does.
+    private static int NextvalCalls(string text)
+    {
+        int calls = 0;
+        for (int at = text.IndexOf("nextval", StringComparison.OrdinalIgnoreCase); at >= 0; at = text.IndexOf("nextval", at + 7, StringComparison.OrdinalIgnoreCase))
+        {
+            calls++;
+        }
+
+        return calls;
+    }
+
+    // Forgets the nodes a statement counts down for, as it ends, or as the transaction or subtransaction it ran in
+    // aborts, which ends it without ExecutorEnd.
+    private static void ForgetCounted(nint queryDesc)
+    {
+        if (s_countedNodes.Remove(queryDesc, out (uint Subxact, List<nint> Nodes) counted))
+        {
+            foreach (nint node in counted.Nodes)
+            {
+                _ = s_rowFunctions.Remove(node);
+            }
+        }
+    }
+
+    private static void RegisterCounted()
+    {
+        if (s_countedRegistered)
+        {
+            return;
+        }
+
+        s_countedRegistered = true;
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, static () =>
+        {
+            s_countedNodes.Clear();
+            s_rowFunctions.Clear();
+            s_countedRegistered = false;
+        });
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () => s_countedRegistered = false);
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, static () => s_countedRegistered = false);
+        _ = PgTransaction.RegisterSubtransactionCallback(PgSubtransactionEvent.Abort, static (aborted, _) =>
+        {
+            foreach (nint queryDesc in s_countedNodes.Where(entry => entry.Value.Subxact >= aborted.Value).Select(entry => entry.Key).ToList())
+            {
+                ForgetCounted(queryDesc);
+            }
+        });
     }
 
     // Notes the managed sequences a statement draws from without their switch gates, after their first check, until the
@@ -992,10 +1121,10 @@ internal static partial class SequenceRangeGuard
         s_drawingRegistered = false;
     }
 
-    // Counts a row, statement or call down for each sequence drawn from without its gate, and checks it for the switch,
-    // as before its first draw, once its count runs out, which half the values left before the block's last twentieth,
-    // in the sequence's steps, sets, as other sessions may draw too.
-    private static void CountDownDraws()
+    // Counts a row, statement or call down, by the draws it may take, for each sequence drawn from without its gate,
+    // and checks it for the switch, as before its first draw, once its count runs out, which half the values left
+    // before the block's last twentieth, in the sequence's steps, sets, as other sessions may draw too.
+    private static void CountDownDraws(long draws = 1)
     {
         if (s_drawingUngated.Count == 0 || s_countingDown || s_namingGrantors || Worf.InOwnSql)
         {
@@ -1007,9 +1136,9 @@ internal static partial class SequenceRangeGuard
         {
             foreach (uint seqoid in s_drawingUngated.Keys.ToList())
             {
-                if (s_drawingUngated[seqoid] > 0)
+                if (s_drawingUngated[seqoid] >= draws)
                 {
-                    s_drawingUngated[seqoid]--;
+                    s_drawingUngated[seqoid] -= draws;
                     continue;
                 }
 
@@ -1077,6 +1206,9 @@ internal static partial class SequenceRangeGuard
             }
         }
 
+        // The table's triggers that its rows fire, whose C code draws from a sequence it names, wait for its grantor,
+        // as worf's apply does as it writes a row.
+        WritingRow(relation->rd_id, false);
         StartingCopy(relation->rd_id, columns, false);
     }
 
@@ -2321,7 +2453,7 @@ internal static partial class SequenceRangeGuard
             }
 
             uint snowflake = Worf.CatalogOid("snowflake_node");
-            waiting = [.. ArguedBy(relid, update ? TriggerTypeUpdate | TriggerTypeInsert : TriggerTypeInsert)
+            waiting = [.. (update ? ArguedBy(relid, TriggerTypeUpdate, TriggerTypeInsert) : ArguedBy(relid, TriggerTypeInsert))
                 .Where(seqoid => seqoid != snowflake && s_grantors.ContainsKey(seqoid) && !s_confirmedSequences.Contains(seqoid)).Order()];
         }
         finally
@@ -2337,7 +2469,8 @@ internal static partial class SequenceRangeGuard
 
     /// <summary>
     /// Waits, as a trigger function the fmgr hook watches starts, for the grantors of the managed sequences named among
-    /// the arguments of the triggers that call it, as its C code may draw from them.
+    /// the arguments of the triggers that call it and fire as the subscription applies: those enabled ALWAYS or REPLICA,
+    /// of the subscription's tables and their partitions, as its C code may draw from them.
     /// </summary>
     /// <param name="fnOid">The function.</param>
     internal static void StartingTrigger(uint fnOid)
@@ -2364,15 +2497,26 @@ internal static partial class SequenceRangeGuard
             }
 
             WatchTables();
-            if (!s_triggerArguments.TryGetValue(fnOid, out List<uint>? named))
+            uint subscription;
+            unsafe
+            {
+                subscription = NativeGlobals.MySubscription is null ? 0 : NativeGlobals.MySubscription->oid;
+            }
+
+            if (!s_triggerArguments.TryGetValue((fnOid, subscription), out List<uint>? named))
             {
                 WorfRows arguments = Elevated.Run(() => Worf.Read("""
                     SELECT DISTINCT a.arg FROM pg_catalog.pg_trigger t
                         CROSS JOIN LATERAL pg_catalog.unnest(pg_catalog.string_to_array(pg_catalog.encode(t.tgargs, 'escape'), '\000')) a (arg)
-                    WHERE t.tgfoid = $1 AND t.tgnargs > 0 AND a.arg <> ''
-                    """, 0, SpiParameter.Create(fnOid)));
+                    WHERE t.tgfoid = $1 AND t.tgnargs > 0 AND a.arg <> '' AND NOT t.tgisinternal AND t.tgenabled IN ('A', 'R')
+                        AND t.tgrelid IN (
+                            SELECT r.srrelid FROM pg_catalog.pg_subscription_rel r WHERE r.srsubid = $2
+                            UNION ALL
+                            SELECT p.relid FROM pg_catalog.pg_subscription_rel r CROSS JOIN LATERAL pg_catalog.pg_partition_tree(r.srrelid) p
+                            WHERE r.srsubid = $2)
+                    """, 0, SpiParameter.Create(fnOid), SpiParameter.Create(subscription)));
                 named = [.. arguments.Select(argument => ManagedNamed(argument.Get<string>(0))).OfType<HashSet<uint>>().SelectMany(each => each).Distinct()];
-                s_triggerArguments[fnOid] = named;
+                s_triggerArguments[(fnOid, subscription)] = named;
             }
 
             uint snowflake = Worf.CatalogOid("snowflake_node");
@@ -2489,10 +2633,19 @@ internal static partial class SequenceRangeGuard
     /// <returns>The sequences, or null when none of those domains' CHECKs draws.</returns>
     private static unsafe (HashSet<uint> Called, bool Unnamed)? PlpgsqlCasts(nint estate)
     {
+        // A function's are kept for its compiled state, of which a polymorphic function has one for each set of argument
+        // types, with its OID and the version of its catalog row, as a function compiled anew may take the place of an
+        // old one's in memory; and a DO block's, which has no OID, and whose compiled state a later one's may take the
+        // place of, aren't kept.
         PLpgSQL_execstate* state = (PLpgSQL_execstate*)estate;
-        nint function = (nint)state->func;
+        (nint Compiled, uint Function, uint Xmin)? function = state->func is null || state->func->fn_oid == 0 ? null
+#if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
+            : ((nint)state->func, state->func->fn_oid, state->func->fn_xmin);
+#else
+            : ((nint)state->func, state->func->fn_oid, state->func->cfunc.fn_xmin);
+#endif
         WatchTables();
-        if (function != 0 && s_plpgsqlCasts.TryGetValue(function, out (HashSet<uint> Called, bool Unnamed)? known))
+        if (function is (nint, uint, uint) key && s_plpgsqlCasts.TryGetValue(key, out (HashSet<uint> Called, bool Unnamed)? known))
         {
             return known;
         }
@@ -2528,9 +2681,9 @@ internal static partial class SequenceRangeGuard
             casts = (called, unnamed);
         }
 
-        if (function != 0)
+        if (function is (nint, uint, uint) kept)
         {
-            s_plpgsqlCasts[function] = casts;
+            s_plpgsqlCasts[kept] = casts;
         }
 
         return casts;
@@ -3098,23 +3251,26 @@ internal static partial class SequenceRangeGuard
     /// name among their arguments, as contrib's autoinc names the sequence its C code draws from with no call worf
     /// sees: a trigger's arguments that name a managed sequence, which its code may look up under whatever search path
     /// the statement has, stand for every managed sequence of that name. An insert routed to a partition, or a row an
-    /// update moves to one, fires the partition's triggers.
+    /// update moves to one, fires the partition's triggers, and only a partition's insert triggers fire as an update moves
+    /// a row to it: an update of a table that isn't partitioned fires no insert trigger.
     /// </summary>
     /// <param name="relid">The table.</param>
     /// <param name="events">The events, as the bits of <c>pg_trigger.tgtype</c>.</param>
-    private static List<uint> ArguedBy(uint relid, int events)
+    /// <param name="movedInto">The events of the table's partitions alone, as the insert a row an update moves fires.</param>
+    private static List<uint> ArguedBy(uint relid, int events, int movedInto = 0)
     {
         WatchTables();
-        if (!s_arguedBy.TryGetValue((relid, events), out List<uint>? sequences))
+        if (!s_arguedBy.TryGetValue((relid, events, movedInto), out List<uint>? sequences))
         {
             WorfRows arguments = Elevated.Run(() => Worf.Read("""
                 SELECT DISTINCT a.arg FROM pg_catalog.pg_trigger t
                     CROSS JOIN LATERAL pg_catalog.unnest(pg_catalog.string_to_array(pg_catalog.encode(t.tgargs, 'escape'), '\000')) a (arg)
                 WHERE t.tgrelid IN (SELECT $1 UNION ALL SELECT p.relid FROM pg_catalog.pg_partition_tree($1) p)
-                    AND NOT t.tgisinternal AND t.tgenabled <> 'D' AND t.tgnargs > 0 AND (t.tgtype & $2) <> 0 AND a.arg <> ''
-                """, 0, SpiParameter.Create(relid), SpiParameter.Create(events)));
+                    AND NOT t.tgisinternal AND t.tgenabled <> 'D' AND t.tgnargs > 0 AND a.arg <> ''
+                    AND ((t.tgtype & $2) <> 0 OR (t.tgrelid <> $1 AND (t.tgtype & $3) <> 0))
+                """, 0, SpiParameter.Create(relid), SpiParameter.Create(events), SpiParameter.Create(movedInto)));
             sequences = [.. arguments.Select(argument => ManagedNamed(argument.Get<string>(0))).OfType<HashSet<uint>>().SelectMany(named => named).Distinct()];
-            s_arguedBy[(relid, events)] = sequences;
+            s_arguedBy[(relid, events, movedInto)] = sequences;
         }
 
         return sequences;

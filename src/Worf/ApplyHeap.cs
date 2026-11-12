@@ -131,7 +131,9 @@ internal static unsafe class ApplyHeap
 
         if (apply)
         {
-            // The row found may not have the remote row's key, so it's changed through its own.
+            // The row found may not have the remote row's key, so it's changed through its own, which fires the
+            // table's update triggers.
+            SequenceRangeGuard.WritingRow(rel.Reloid, true);
             writer.Update(local.Row, Copy(relation, ModifyTuple(localtuple, relation, newtup)));
         }
     }
