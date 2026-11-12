@@ -3397,8 +3397,17 @@ public sealed partial class SequenceRangeTests
         Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT NOT EXISTS (SELECT 1 FROM worf.sequence_range_back)", token),
             "the kept position of another timeline, gone");
 
-        // The exchanges that hand out, acknowledge and hear of the next blocks change reports, and settle first, as a
-        // second without writes shows, which calls that each write never give.
+        // The exchanges that hand out, acknowledge and hear of the next blocks change reports, and settle first: node_b
+        // and node_a hold next blocks of every sequence, node_b has acknowledged its own and reports node_a's watermark
+        // of each, and a second goes without writes, which calls that each write never give.
+        const string AllNext = "SELECT count(*) = 11 FROM worf.sequence_ranges WHERE state = 'active' AND next_lo IS NOT NULL";
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, AllNext, token), "node_b's next blocks");
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, $"""
+            SELECT ({AllNext}) AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_grant WHERE state = 'sent')
+                AND NOT EXISTS (
+                    SELECT 1 FROM worf.sequence_range r JOIN worf.sequence_range_node n ON n.seqoid = r.seqoid AND n.node_id = {nodeBId}
+                    WHERE n.watermark IS DISTINCT FROM r.watermark)
+            """, token), "node_a's next blocks, and node_b's report of them");
         const string NextXid = "SELECT pg_catalog.pg_snapshot_xmax(pg_catalog.pg_current_snapshot())";
         Stopwatch settling = Stopwatch.StartNew();
         long firstXid = long.Parse(await nodeA.SafePsqlAsync(Database, NextXid, token), CultureInfo.InvariantCulture);
