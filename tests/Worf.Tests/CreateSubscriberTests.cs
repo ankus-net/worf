@@ -847,8 +847,9 @@ public sealed class CreateSubscriberTests
     /// <summary>
     /// A run stopped before it subscribed drops only the slot it made on the provider, as it made it: a slot of the name
     /// that another run with the same subscriber name made in its place is left, with a warning, and so is the run's own
-    /// slot while a walsender streams it, or once a client has confirmed what it streamed from it. Processes are stopped
-    /// with signals, which Windows lacks.
+    /// slot while a walsender streams it, or once a client has confirmed what it streamed from it, whether or not it
+    /// still streams; and a run whose memory is collected again and again, as a gen0 budget of 64 KB has it, still hears
+    /// the stop, and drops its slot. Processes are stopped with signals, which Windows lacks.
     /// </summary>
     /// <param name="what">What became of the run's slot.</param>
     /// <returns>The test.</returns>
@@ -857,6 +858,8 @@ public sealed class CreateSubscriberTests
     [DataRow("replaced")]
     [DataRow("streamed")]
     [DataRow("confirmed")]
+    [DataRow("moved")]
+    [DataRow("collected")]
     public async Task StoppedRunsDropOnlyTheSlotsTheyMade(string what)
     {
         CancellationToken token = TestContext.CancellationToken;
@@ -894,6 +897,12 @@ public sealed class CreateSubscriberTests
         }
 
         start.Environment["PGPORT"] = port;
+        if (what == "collected")
+        {
+            // A gen0 budget of 64 KB, which NativeAOT reads from the environment, collects every 64 KB the run allocates.
+            start.Environment["DOTNET_GCgen0size"] = "10000";
+        }
+
         using CancellationTokenSource streaming = CancellationTokenSource.CreateLinkedTokenSource(token);
         LogicalReplicationConnection? replication = null;
         Task<bool>? streamed = null;
@@ -912,7 +921,12 @@ public sealed class CreateSubscriberTests
             }
 
             string slot = await provider.SafePsqlAsync(Database, "SELECT slot_name FROM pg_catalog.pg_replication_slots WHERE slot_type = 'logical'", token);
-            if (what == "replaced")
+            if (what == "collected")
+            {
+                // The run waits on, allocating as it polls, and collecting as it does.
+                await Task.Delay(TimeSpan.FromSeconds(5), token);
+            }
+            else if (what == "replaced")
             {
                 // Another run with the subscriber's name drops the slot and makes its own in its place.
                 _ = await provider.SafePsqlAsync(Database, $"SELECT pg_catalog.pg_drop_replication_slot('{slot}'); SELECT pg_catalog.pg_create_logical_replication_slot('{slot}', 'worf')", token);
@@ -927,15 +941,19 @@ public sealed class CreateSubscriberTests
                 streamed = messages.MoveNextAsync().AsTask();
                 Assert.IsTrue(await provider.PollQueryUntilAsync(Database, $"SELECT active FROM pg_catalog.pg_replication_slots WHERE slot_name = '{slot}'", token),
                     "the walsender streaming the run's slot");
-                if (what == "confirmed")
+                if (what is "confirmed" or "moved")
                 {
-                    // The client confirms a later position, and stops streaming, leaving the slot idle.
+                    // The client confirms a later position, and, but in the moved row, stops streaming, leaving the slot idle.
                     string made = await provider.SafePsqlAsync(Database, $"SELECT confirmed_flush_lsn FROM pg_catalog.pg_replication_slots WHERE slot_name = '{slot}'", token);
                     _ = await provider.SafePsqlAsync(Database, "CREATE TABLE moved (a int); INSERT INTO moved VALUES (1)", token);
                     replication.SetReplicationStatus(NpgsqlLogSequenceNumber.Parse(await provider.SafePsqlAsync(Database, "SELECT pg_catalog.pg_current_wal_lsn()", token)));
                     await replication.SendStatusUpdate(token);
                     Assert.IsTrue(await provider.PollQueryUntilAsync(Database,
                         $"SELECT confirmed_flush_lsn > '{made}' FROM pg_catalog.pg_replication_slots WHERE slot_name = '{slot}'", token), "the client's confirmation");
+                }
+
+                if (what == "confirmed")
+                {
                     await streaming.CancelAsync();
                     _ = await Task.WhenAny(streamed);
                     await replication.DisposeAsync();
@@ -954,10 +972,10 @@ public sealed class CreateSubscriberTests
             string stderr = await errors;
             TestContext.WriteLine($"stopped after {ending.Elapsed.TotalSeconds:F1} s: {seen}{await tool.StandardOutput.ReadToEndAsync(token)}");
             TestContext.WriteLine(stderr);
-            Assert.AreEqual("1|1|True", $"{tool.ExitCode}|" +
+            Assert.AreEqual(what == "collected" ? "1|0|False" : "1|1|True", $"{tool.ExitCode}|" +
                 await provider.SafePsqlAsync(Database, $"SELECT count(*) FROM pg_catalog.pg_replication_slots WHERE slot_name = '{slot}'", token) + "|" +
-                stderr.Contains(what == "streamed" ? $"replication slot \"{slot}\" on the provider is in use by process" : $"replication slot \"{slot}\" on the provider isn't as this run made it",
-                    StringComparison.Ordinal),
+                (stderr.Contains(what == "streamed" ? $"replication slot \"{slot}\" on the provider is in use by process" : $"replication slot \"{slot}\" on the provider isn't as this run made it",
+                    StringComparison.Ordinal) && (what != "moved" || stderr.Contains(", and process ", StringComparison.Ordinal))),
                 $"the stopped run's exit code, the slot, which it left, and its warning: {stderr}");
         }
         finally
