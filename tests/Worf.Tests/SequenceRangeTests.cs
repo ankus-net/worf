@@ -3460,12 +3460,12 @@ public sealed class SequenceRangeTests
         using CancellationTokenSource stopDrawing = CancellationTokenSource.CreateLinkedTokenSource(token);
         Task drawing = Task.Run(async () =>
         {
-            await using NpgsqlConnection busy = await nodeA.OpenAsync(Database, stopDrawing.Token);
+            await using NpgsqlConnection busy = await nodeA.OpenAsync(Database, token);
             await using NpgsqlCommand draw = new("INSERT INTO t (v) VALUES ('busy')", busy);
             while (!stopDrawing.IsCancellationRequested)
             {
-                _ = await draw.ExecuteNonQueryAsync(stopDrawing.Token);
-                await Task.Delay(TimeSpan.FromMilliseconds(50), stopDrawing.Token);
+                _ = await draw.ExecuteNonQueryAsync(token);
+                await Task.Delay(TimeSpan.FromMilliseconds(50), token);
             }
         }, token);
         long busiest = await FewestStatementsAsync();
@@ -3478,13 +3478,7 @@ public sealed class SequenceRangeTests
             "SELECT coalesce(sum(calls), 0) FROM pg_stat_statements WHERE query LIKE 'SELECT fenced_at IS NOT NULL, owner_node FROM worf.sequence_range WHERE seqoid = $1'", token),
             CultureInfo.InvariantCulture);
         await stopDrawing.CancelAsync();
-        try
-        {
-            await drawing;
-        }
-        catch (OperationCanceledException)
-        {
-        }
+        await drawing;
 
         Assert.IsLessThan(60L, busiest, "the statements each of node_b's idle calls ran on node_a, as node_a drew from t_id_seq");
         Assert.IsLessThan(450L, fullChecks, "the full checks node_a's range worker ran in 10 s at ticks of 100 ms, as it drew from t_id_seq alone of 11 sequences");
@@ -4544,13 +4538,20 @@ public sealed class SequenceRangeTests
         // do, are refused.
         foreach (string enables in new[] { "ALTER TABLE tp1 ENABLE TRIGGER USER", "ALTER TABLE tp1 ENABLE TRIGGER ALL", "ALTER TABLE ti ENABLE TRIGGER ALL" })
         {
+            string outcome;
             try
             {
                 _ = await nodeB.SafePsqlAsync(Database, enables, token);
-                problems.Add($"{enables}: succeeded");
+                outcome = "succeeded";
             }
             catch (PostgresException refused) when (refused.SqlState == "55000")
             {
+                outcome = "refused";
+            }
+
+            if (outcome != "refused")
+            {
+                problems.Add($"{enables}: {outcome}");
             }
         }
 

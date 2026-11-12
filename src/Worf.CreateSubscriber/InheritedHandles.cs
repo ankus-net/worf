@@ -24,9 +24,8 @@ internal sealed partial class InheritedHandles : IDisposable
     /// </summary>
     internal InheritedHandles()
     {
-        foreach (int which in s_standard)
+        foreach (nint handle in s_standard.Select(GetStdHandle))
         {
-            nint handle = GetStdHandle(which);
             if (handle is 0 or -1 || !GetHandleInformation(handle, out uint flags) || (flags & Inherit) == 0)
             {
                 continue;

@@ -1369,7 +1369,7 @@ internal static class SequenceRangeExchange
                 // were. Once a call is cut, the rest is left too, unread.
                 bool late = !before && same is null && takenIn > 0 && takeUntil is long until && Worker.GetCurrentTimestamp() >= until;
                 bool changed = !before && !late && same is null &&
-                    (!heard || !CheckUnchanged(node, root, entry, senderId, call, applied, key, fingerprints?.GetValueOrDefault(index)));
+                    (fingerprints is null || !CheckUnchanged(node, root, entry, senderId, call, applied, key, fingerprints.GetValueOrDefault(index)));
                 if (before || late)
                 {
                     cutAt ??= late ? index : null;
