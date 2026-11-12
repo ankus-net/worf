@@ -47,7 +47,7 @@ using Ankus.Postgres;
     );
 
     CREATE INDEX sequence_range_block_seqoid ON worf.sequence_range_block (seqoid, epoch);
-    CREATE INDEX sequence_range_block_span ON worf.sequence_range_block USING gist (numrange(lo, hi, '[]'));
+    CREATE INDEX sequence_range_block_span ON worf.sequence_range_block USING gist ((numrange(seqoid::oid::int8 * 18446744073709551616::numeric + lo + 9223372036854775808, seqoid::oid::int8 * 18446744073709551616::numeric + hi + 9223372036854775808, '[]')));
 
     CREATE TABLE worf.sequence_range_restore (
         name text PRIMARY KEY,
@@ -84,7 +84,7 @@ using Ankus.Postgres;
     );
 
     CREATE INDEX sequence_range_grant_seqoid ON worf.sequence_range_grant (seqoid, grantee_id);
-    CREATE INDEX sequence_range_grant_span ON worf.sequence_range_grant USING gist (numrange(lo, hi, '[]'));
+    CREATE INDEX sequence_range_grant_span ON worf.sequence_range_grant USING gist ((numrange(seqoid::oid::int8 * 18446744073709551616::numeric + lo + 9223372036854775808, seqoid::oid::int8 * 18446744073709551616::numeric + hi + 9223372036854775808, '[]')));
     CREATE INDEX sequence_range_grant_from_block ON worf.sequence_range_grant (from_block);
 
     CREATE TABLE worf.sequence_range_request (
@@ -3273,8 +3273,14 @@ internal static unsafe partial class SequenceRanges
             return false;
         }
 
-        // The range row is locked before anything changes, as every change to a sequence's ranges locks it first, and
-        // the fence is looked at again under it.
+        // Grants that overlap are looked for before the range row is locked, as a ledger of many grants takes a while to
+        // search, and an exchange that reaches the sequence meanwhile would leave it out. Once the row is locked, as every
+        // change to a sequence's ranges locks it first, the fence is looked at again, and only the grants made or changed
+        // since the search are, unless it found grants that overlap, which a lift then looks for again in full.
+        string[] seen = Worf.ReadScalar<string[]?>("""
+            SELECT pg_catalog.array_agg(grant_id::pg_catalog.text || ':' || xmin::pg_catalog.text) FROM worf.sequence_range_grant WHERE seqoid = $1
+            """, seq) ?? [];
+        WorfRows overlap = OverlappingGrants(seq, null);
         LockLedger(seqoid);
         range = Worf.SelectCatalog("SELECT fenced_at IS NOT NULL, owner_node FROM worf.sequence_range WHERE seqoid = $1", seq);
         if (range.Count == 0 || !range[0].Get<bool>(0))
@@ -3282,14 +3288,11 @@ internal static unsafe partial class SequenceRanges
             return false;
         }
 
-        WorfRows overlap = Worf.SelectCatalog("""
-            SELECT a.grantee_name::text, a.lo, a.hi, b.grantee_name::text, b.lo, b.hi, a.grantee_id, b.grantee_id
-            FROM worf.sequence_range_grant a JOIN worf.sequence_range_grant b
-                ON b.seqoid = a.seqoid AND a.grant_id < b.grant_id AND numrange(b.lo, b.hi, '[]') && numrange(a.lo, a.hi, '[]')
-            WHERE a.seqoid = $1 AND a.kind <> 'x' AND b.kind <> 'x' AND a.state NOT IN ('unclaimed', 'overlapped') AND b.state NOT IN ('unclaimed', 'overlapped')
-                AND (a.seqoid <> 'worf.snowflake_node'::regclass OR a.state <> 'abandoned' AND b.state <> 'abandoned')
-            LIMIT 1
-            """, seq);
+        if (overlap.Count == 0 || force)
+        {
+            overlap = OverlappingGrants(seq, overlap.Count == 0 ? seen : null);
+        }
+
         if (overlap.Count > 0)
         {
             // Grants that overlap mean values were issued twice already, which no wait undoes, so activate_sequence_range
@@ -3307,12 +3310,11 @@ internal static unsafe partial class SequenceRanges
             // message, which asks it to reset at a
             // WAL position of its own, past any real one, so that it resets for each lift and knows why. Every grant that
             // overlaps another is then marked, so that it fences the root no more.
-            WorfRows holders = Worf.SelectCatalog("""
+            WorfRows holders = Worf.SelectCatalog($$"""
                 SELECT DISTINCT g.grantee_id FROM worf.sequence_range_grant g
                 WHERE g.seqoid = $1 AND g.kind <> 'x' AND g.state NOT IN ('unclaimed', 'overlapped') AND EXISTS (
                     SELECT 1 FROM worf.sequence_range_grant o
-                    WHERE o.seqoid = g.seqoid AND o.grant_id <> g.grant_id AND o.kind <> 'x' AND o.state NOT IN ('unclaimed', 'overlapped')
-                        AND numrange(o.lo, o.hi, '[]') && numrange(g.lo, g.hi, '[]')
+                    WHERE {{Span("o")}} && {{Span("g")}} AND o.grant_id <> g.grant_id AND o.kind <> 'x' AND o.state NOT IN ('unclaimed', 'overlapped')
                         AND (g.seqoid <> 'worf.snowflake_node'::regclass OR g.state <> 'abandoned' AND o.state <> 'abandoned'))
                 """, seq);
             WorfLog.Warning(holders.Count > 2
@@ -3333,12 +3335,11 @@ internal static unsafe partial class SequenceRanges
                 }
             }
 
-            _ = Worf.Execute("""
+            _ = Worf.Execute($$"""
                 UPDATE worf.sequence_range_grant a SET state = 'overlapped'
                 WHERE a.seqoid = $1 AND a.kind <> 'x' AND a.state NOT IN ('unclaimed', 'overlapped') AND EXISTS (
                     SELECT 1 FROM worf.sequence_range_grant b
-                    WHERE b.seqoid = a.seqoid AND b.grant_id <> a.grant_id AND b.kind <> 'x' AND b.state NOT IN ('unclaimed', 'overlapped')
-                        AND numrange(b.lo, b.hi, '[]') && numrange(a.lo, a.hi, '[]'))
+                    WHERE {{Span("b")}} && {{Span("a")}} AND b.grant_id <> a.grant_id AND b.kind <> 'x' AND b.state NOT IN ('unclaimed', 'overlapped'))
                 """, seq);
         }
 
@@ -3528,11 +3529,12 @@ internal static unsafe partial class SequenceRanges
         // allocator again on the overlap: its holder resets instead, as asked at once.
         SpiParameter seq = SpiParameter.Create(seqoid);
         SpiParameter holder = SpiParameter.Create(holderId);
-        if (Worf.ReadScalar<bool>("""
+        if (Worf.ReadScalar<bool>($$"""
             SELECT EXISTS (SELECT 1 FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2 AND reset_lsn IS NOT NULL)
                 OR EXISTS (
                     SELECT 1 FROM worf.sequence_range_grant g
-                    WHERE g.seqoid = $1 AND g.kind <> 'x' AND g.state NOT IN ('unclaimed', 'overlapped', 'abandoned') AND g.lo <= $4 AND $3 <= g.hi)
+                    WHERE g.seqoid = $1 AND g.kind <> 'x' AND g.state NOT IN ('unclaimed', 'overlapped', 'abandoned')
+                        AND {{Span("g")}} && {{Span("$1", "$3", "$4")}})
             """, seq, holder, SpiParameter.Create(lo), SpiParameter.Create(hi)))
         {
             _ = Worf.Execute("UPDATE worf.sequence_range_node SET reset_lsn = coalesce(reset_lsn, $3::pg_lsn) WHERE seqoid = $1 AND node_id = $2",
@@ -3563,6 +3565,36 @@ internal static unsafe partial class SequenceRanges
             SpiParameter.Create(seqoid), SpiParameter.Create(info.Ascending ? hi : lo));
         WorfLog.Warning($"sequence {info.Name}: node {holderName} holds block [{lo}, {hi}], which this allocator had no record of; it is back in the ledger");
     }
+
+    /// <summary>
+    /// Gets the SQL for the span of a block's or grant's values that the GiST indexes on blocks and grants hold: its
+    /// values offset by its sequence, so that no two sequences' spans overlap, and a search for the blocks or grants that
+    /// overlap values reads only the sequence's, with no test of the sequence besides, which would lead the planner to
+    /// read every block or grant of the sequence through its index for each search too.
+    /// </summary>
+    /// <param name="table">The alias of the block or grant table.</param>
+    internal static string Span(string table) => Span($"{table}.seqoid", $"{table}.lo", $"{table}.hi");
+
+    /// <summary>
+    /// Gets the SQL for the span of a sequence's values from one to another, as <see cref="Span(string)"/> gives it.
+    /// </summary>
+    internal static string Span(string seqoid, string lo, string hi)
+        => $"numrange({seqoid}::oid::int8 * 18446744073709551616::numeric + {lo} + 9223372036854775808, {seqoid}::oid::int8 * 18446744073709551616::numeric + {hi} + 9223372036854775808, '[]')";
+
+    /// <summary>
+    /// Finds two of a sequence's grants that overlap, or, given the grants seen before, by id and row version, one made or
+    /// changed since that overlaps another.
+    /// </summary>
+    private static WorfRows OverlappingGrants(SpiParameter seq, string[]? seen)
+        => Worf.SelectCatalog($$"""
+            SELECT a.grantee_name::text, a.lo, a.hi, b.grantee_name::text, b.lo, b.hi, a.grantee_id, b.grantee_id
+            FROM worf.sequence_range_grant a JOIN worf.sequence_range_grant b
+                ON {{Span("b")}} && {{Span("a")}} AND CASE WHEN $3 THEN a.grant_id < b.grant_id ELSE a.grant_id <> b.grant_id END
+            WHERE a.seqoid = $1 AND a.kind <> 'x' AND b.kind <> 'x' AND a.state NOT IN ('unclaimed', 'overlapped') AND b.state NOT IN ('unclaimed', 'overlapped')
+                AND (a.seqoid <> 'worf.snowflake_node'::regclass OR a.state <> 'abandoned' AND b.state <> 'abandoned')
+                AND ($3 OR a.grant_id::text || ':' || a.xmin::text NOT IN (SELECT pg_catalog.unnest($2::text[])))
+            LIMIT 1
+            """, seq, SpiParameter.Create(seen ?? []), SpiParameter.Create(seen is null));
 
     /// <summary>
     /// Locks a sequence's range row before its free spans, as an exchange that updates the row and then grants does, so

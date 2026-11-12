@@ -1930,8 +1930,9 @@ public sealed class SequenceRangeTests
         using (JsonDocument answer = JsonDocument.Parse(await nodeA.SafePsqlAsync(Database,
             $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{Report("")}')", token)))
         {
-            Assert.AreNotEqual(long.Parse(MadeUpStart, CultureInfo.InvariantCulture), answer.RootElement.GetProperty("heard_started_at").GetInt64(),
-                "node_a's answer, while it still owes node_b a request to reset");
+            JsonElement entry = answer.RootElement.GetProperty("sequences").EnumerateArray().Single(e => e.GetProperty("name").GetString() == "public.t_id_seq");
+            Assert.IsFalse(entry.TryGetProperty("checked_start", out JsonElement checkedStart) && checkedStart.ValueKind == JsonValueKind.Number &&
+                checkedStart.GetInt64() == long.Parse(MadeUpStart, CultureInfo.InvariantCulture), "node_a's word on t_id_seq, while it still owes node_b a request to reset");
         }
 
         _ = await nodeA.SafePsqlAsync(Database, "ROLLBACK PREPARED 'held_a'", token);
@@ -3648,6 +3649,100 @@ public sealed class SequenceRangeTests
         }
 
         Assert.AreEqual("", string.Join(",", before.Intersect(after)), "the ids node_b drew both before the restore and after it");
+    }
+
+    /// <summary>
+    /// A fenced allocator looks for grants that overlap, among many of the sequence's and of others over the same values,
+    /// through the index on their spans, which leads it to the sequence's alone, and looks before it locks the sequence's
+    /// range row, which it then holds only a moment, so that an exchange seldom finds the row held as the fence waits; and
+    /// it takes back the blocks a neighbor holds that it lost through the same index.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task FencedAllocatorsSearchOnlyTheSequencesGrants()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token, "shared_preload_libraries = 'worf,pg_stat_statements'\npg_stat_statements.track = all");
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database,
+            "CREATE EXTENSION pg_stat_statements; DO $$ BEGIN FOR g IN 1..100 LOOP EXECUTE format('CREATE SEQUENCE other_%s', g); END LOOP; END $$", token);
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100)", token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+        await InsertAsync(nodeB, 10, token);
+
+        // node_a granted 2,000 blocks of t_id_seq to a node long gone, and as many of each of 100 other sequences over the
+        // same values.
+        _ = await nodeA.SafePsqlAsync(Database, """
+            INSERT INTO worf.sequence_range_grant (grant_id, request_id, seqoid, grantee_id, grantee_name, kind, lo, hi, state, granted_at)
+            SELECT gen_random_uuid(), gen_random_uuid(), s, 1, 'gone', 'n', 1000000000000 + g * 10, 1000000000000 + g * 10 + 9, 'abandoned', now()
+            FROM (SELECT 't_id_seq'::regclass UNION ALL SELECT format('other_%s', o)::regclass FROM generate_series(1, 100) o) q (s), generate_series(1, 2000) g;
+            ANALYZE worf.sequence_range_grant;
+            """, token);
+
+        // node_b stops, and node_a loses its grants to node_b, and its record of node_b's reports, and resets: its fence
+        // waits for node_b. Edits by hand lock the range row first, as every change to a sequence's ranges does.
+        await nodeB.StopAsync("fast", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            SELECT 1 FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass FOR NO KEY UPDATE;
+            DELETE FROM worf.sequence_range_grant WHERE seqoid = 't_id_seq'::regclass AND grantee_name = 'node_b';
+            DELETE FROM worf.sequence_range_node WHERE seqoid = 't_id_seq'::regclass AND node_name = 'node_b';
+            """, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT pg_stat_statements_reset()", token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.reset_sequence_range('t_id_seq')", token);
+
+        // As the fence waits, node_a looks for grants that overlap again and again, and t_id_seq's range row is held at
+        // fewer than a quarter of tries to lock it.
+        int held = 0;
+        int samples = 0;
+        await using (NpgsqlConnection sampler = await nodeA.OpenAsync(Database, token))
+        {
+            Stopwatch sampling = Stopwatch.StartNew();
+            while (sampling.Elapsed < TimeSpan.FromSeconds(10))
+            {
+                await using NpgsqlTransaction trying = await sampler.BeginTransactionAsync(token);
+                await using NpgsqlCommand tryLock = new(
+                    "SELECT count(*) FROM (SELECT 1 FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass FOR NO KEY UPDATE SKIP LOCKED) l", sampler, trying);
+                held += (long)(await tryLock.ExecuteScalarAsync(token))! == 0 ? 1 : 0;
+                samples++;
+                await trying.RollbackAsync(token);
+                await Task.Delay(TimeSpan.FromMilliseconds(50), token);
+            }
+        }
+
+        Assert.AreEqual("t", await nodeA.SafePsqlAsync(Database, "SELECT fenced_at IS NOT NULL FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass", token),
+            "node_a's fence, waiting for node_b");
+
+        // node_b starts, and node_a takes the blocks it holds back into its ledger, and lifts the fence.
+        int lost = nodeA.ReadLog().Length;
+        await nodeB.StartServerAsync(token);
+        Assert.IsTrue(await nodeA.PollLogAsync(lost, "which this allocator had no record of; it is back in the ledger", token), "node_b's grants back in the ledger");
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT fenced_at IS NULL FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass", token),
+            "node_a's fence, lifted");
+
+        // Each search for grants that overlap leads to each grant's overlaps through the index on spans, rather than
+        // comparing each grant with every other, and takes no more than a hundred times as long as a read of t_id_seq's
+        // 2,000 grants; and each check of a block taken back reads a few buffers, rather than every grant of t_id_seq.
+        for (int read = 0; read < 10; read++)
+        {
+            _ = await nodeA.SafePsqlAsync(Database, "SELECT count(*) FROM worf.sequence_range_grant WHERE seqoid = 't_id_seq'::regclass AND lo <= hi", token);
+        }
+
+        string[] costs = (await nodeA.SafePsqlAsync(Database, """
+            SELECT (SELECT sum(total_exec_time) / sum(calls) FROM pg_stat_statements WHERE query LIKE '%sequence_range_grant a JOIN worf.sequence_range_grant b%')::bigint
+                || '|' || (SELECT sum(total_exec_time) / sum(calls) FROM pg_stat_statements WHERE query LIKE 'SELECT count(*) FROM worf.sequence_range_grant WHERE seqoid = %AND lo <= hi')::numeric(10, 2)
+                || '|' || (SELECT sum(shared_blks_hit + shared_blks_read) / sum(calls) FROM pg_stat_statements WHERE query LIKE '%reset_lsn IS NOT NULL)%OR EXISTS%')::bigint
+            """, token)).Split('|');
+        double searched = double.Parse(costs[0], CultureInfo.InvariantCulture);
+        double readAll = double.Parse(costs[1], CultureInfo.InvariantCulture);
+        long checkedHeld = long.Parse(costs[2], CultureInfo.InvariantCulture);
+        Assert.IsTrue(searched < 100 * readAll && checkedHeld < 200 && held * 4 < samples,
+            $"each search for grants that overlap took {searched} ms, against {readAll} ms for a read of t_id_seq's grants; each check of a block taken back read {checkedHeld} buffers; t_id_seq's range row was held at {held} of {samples} tries");
     }
 
     /// <summary>

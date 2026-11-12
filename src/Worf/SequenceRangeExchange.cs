@@ -2520,9 +2520,9 @@ internal static class SequenceRangeExchange
     /// within that day, counts.
     /// </summary>
     private static bool Overlaps(uint seqoid, Guid id, long lo, long hi)
-        => Worf.SelectCatalog("""
-            SELECT 1 FROM worf.sequence_range_block
-            WHERE numrange(lo, hi, '[]') && numrange($2, $3, '[]') AND seqoid = $1 AND kind IN ('n', 'p', 'i') AND block_id <> $4
+        => Worf.SelectCatalog($$"""
+            SELECT 1 FROM worf.sequence_range_block b
+            WHERE {{SequenceRanges.Span("b")}} && {{SequenceRanges.Span("$1", "$2", "$3")}} AND seqoid = $1 AND kind IN ('n', 'p', 'i') AND block_id <> $4
                 AND (seqoid <> 'worf.snowflake_node'::regclass OR state IN ('next', 'active') OR state = 'abandoned' AND retired_at > now() - $5::interval)
             LIMIT 1
             """, SpiParameter.Create(seqoid), SpiParameter.Create(lo), SpiParameter.Create(hi), SpiParameter.Create(id),
