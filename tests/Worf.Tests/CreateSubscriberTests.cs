@@ -1155,7 +1155,8 @@ public sealed class CreateSubscriberTests
     /// keeps the provider's WAL from a standby's position, as it can't be told from one that left the provider's WAL; and
     /// so is one that ran as a server of its own from its checkpoint, writing WAL of its own past where the provider's
     /// begins, and stopped in recovery since; one whose latest checkpoint is past the provider's WAL, though the run's role
-    /// on the provider may not list the provider's WAL; and, from PostgreSQL 17 on, where an online checkpoint's redo point
+    /// on the provider may not list the provider's WAL, and so is one whose checkpoint is before the provider's WAL ends,
+    /// but whose own WAL runs past it; and, from PostgreSQL 17 on, where an online checkpoint's redo point
     /// always comes before its record, one with a torn record between them, in WAL the provider has removed, from which
     /// recovery would replay.
     /// </summary>
@@ -1167,6 +1168,7 @@ public sealed class CreateSubscriberTests
     [DataRow("boundary")]
     [DataRow("diverged")]
     [DataRow("ahead")]
+    [DataRow("beyond")]
     [DataRow("torn")]
     public async Task StandbysWhoseOwnWalReachesTheProvidersAreSubscribed(string when)
     {
@@ -1271,6 +1273,37 @@ public sealed class CreateSubscriberTests
                 Assert.AreEqual(0, stopped, stopOutput);
                 switches = 3;
                 break;
+            case "beyond":
+                // The run's role may log in and replicate, read the provider's worf node and create a restore point, but
+                // not list its WAL.
+                _ = await provider.SafePsqlAsync(Database, """
+                    CREATE ROLE limited LOGIN REPLICATION;
+                    GRANT USAGE ON SCHEMA worf TO limited;
+                    GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA worf TO limited;
+                    GRANT EXECUTE ON FUNCTION pg_catalog.pg_create_restore_point(text) TO limited;
+                    """, token);
+
+                // Started without its standby.signal, the standby checkpoints as it starts; the provider's WAL then moves
+                // two segments past that, and the standby writes five of its own, with no checkpoint, before it stops in
+                // recovery after starting again with it.
+                File.Delete(Path.Join(backupDir, "standby.signal"));
+                (started, startOutput) = await provider.RunProgramAsync("pg_ctl", ["start", "-w", "-D", backupDir, "-o", $"-p {port}", "-l", standbyLog], token);
+                Assert.AreEqual(0, started, startOutput);
+                _ = await SubscriberAsync(provider, pgport, "CHECKPOINT", token);
+                await SwitchWalAsync(provider, 2, token);
+                for (int i = 0; i < 5; i++)
+                {
+                    _ = await SubscriberAsync(provider, pgport, "CREATE TABLE IF NOT EXISTS own (i int); INSERT INTO own VALUES (1); SELECT pg_catalog.pg_switch_wal()", token);
+                }
+
+                (stopped, stopOutput) = await provider.RunProgramAsync("pg_ctl", ["stop", "-w", "-m", "immediate", "-D", backupDir], token);
+                Assert.AreEqual(0, stopped, stopOutput);
+                await File.WriteAllTextAsync(Path.Join(backupDir, "standby.signal"), "", token);
+                (started, startOutput) = await provider.RunProgramAsync("pg_ctl", ["start", "-w", "-D", backupDir, "-o", $"-p {port}", "-l", standbyLog], token);
+                Assert.AreEqual(0, started, startOutput);
+                (stopped, stopOutput) = await provider.RunProgramAsync("pg_ctl", ["stop", "-w", "-D", backupDir], token);
+                Assert.AreEqual(0, stopped, stopOutput);
+                break;
             case "ahead":
                 // The run's role may log in and replicate, and read the provider's worf node, but not list its WAL.
                 _ = await provider.SafePsqlAsync(Database, """
@@ -1325,10 +1358,10 @@ public sealed class CreateSubscriberTests
         (int controlExit, string control) = await provider.RunProgramAsync("pg_controldata", [backupDir], token);
         Assert.AreEqual(0, controlExit, control);
         string standbyCheckpoint = control.Split('\n').Single(line => line.StartsWith("Latest checkpoint location:", StringComparison.Ordinal))["Latest checkpoint location:".Length..].Trim();
-        Assert.AreEqual(when == "ahead" ? "t" : "f", await provider.SafePsqlAsync(Database,
-            $"SELECT {(when == "ahead" ? $"'{standbyCheckpoint}'::pg_catalog.pg_lsn > pg_catalog.pg_current_wal_flush_lsn()" :
+        Assert.AreEqual(when is "ahead" or "beyond" ? (when == "ahead" ? "t" : "f") : "f", await provider.SafePsqlAsync(Database,
+            $"SELECT {(when is "ahead" or "beyond" ? $"'{standbyCheckpoint}'::pg_catalog.pg_lsn > pg_catalog.pg_current_wal_flush_lsn()" :
                 $"EXISTS (SELECT 1 FROM pg_catalog.pg_ls_waldir() WHERE name = pg_catalog.pg_walfile_name('{standbyCheckpoint}'))")}", token),
-            when == "ahead" ? $"the standby's checkpoint, {standbyCheckpoint}, past the provider's WAL"
+            when is "ahead" or "beyond" ? $"the standby's checkpoint, {standbyCheckpoint}, {(when == "ahead" ? "past" : "within")} the provider's WAL"
                 : $"the provider's WAL that holds the standby's checkpoint, {standbyCheckpoint}, after the provider's own at {checkpointSegment}");
         if (when is "boundary" or "partial")
         {
@@ -1344,12 +1377,13 @@ public sealed class CreateSubscriberTests
         ];
         try
         {
-            if (when == "ahead")
+            if (when is "ahead" or "beyond")
             {
                 List<string> limited = [.. arguments.Select(argument => argument == $"--provider-dsn={providerDsn}" ? $"--provider-dsn={providerDsn.Replace("super@", "limited@", StringComparison.Ordinal)}" : argument)];
                 (int refused, string refusal) = await RefusedRunAsync(command, limited, work.FullName, port, token);
-                Assert.AreEqual("1|True", $"{refused}|{refusal.Contains("is past the provider's WAL", StringComparison.Ordinal)}",
-                    $"a run on the standby whose checkpoint is past the provider's WAL, as a role that may not list it: {refusal}");
+                string reason = when == "ahead" ? "is past the provider's WAL" : "is followed by WAL past the provider's";
+                Assert.AreEqual("1|True", $"{refused}|{refusal.Contains(reason, StringComparison.Ordinal)}",
+                    $"a run on the standby whose {(when == "ahead" ? "checkpoint" : "own WAL")} is past the provider's WAL, as a role that may not list it: {refusal}");
                 return;
             }
 

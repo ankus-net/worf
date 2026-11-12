@@ -1528,7 +1528,10 @@ int? ReadClusterState(string dataDir)
         return (false, "is past the provider's WAL, so its WAL has left the provider's");
     }
 
-    long providerTimeline;
+    // A role that may not list the provider's WAL leaves the checks that need it, and the comparison, undone; the
+    // directory's own records are still checked against where the provider's WAL ends.
+    long providerTimeline = 0;
+    bool listed = true;
     Dictionary<string, string> providerSegments = [];
     HashSet<long> providerHistories = [];
     try
@@ -1558,7 +1561,7 @@ int? ReadClusterState(string dataDir)
     }
     catch (LibpqException)
     {
-        return null;
+        listed = false;
     }
 
     // The directory's timeline: the latest it holds WAL of, and its history files, each the provider's own, though the
@@ -1588,14 +1591,14 @@ int? ReadClusterState(string dataDir)
         }
     }
 
-    if (ownTimeline > providerTimeline)
+    if (listed && ownTimeline > providerTimeline)
     {
         return (false, $"is followed by WAL on timeline {ownTimeline}, which the provider hasn't reached, so its WAL has left the provider's");
     }
 
     try
     {
-        foreach (long history in ownHistories)
+        foreach (long history in listed ? ownHistories : [])
         {
             string name = string.Create(CultureInfo.InvariantCulture, $"{history:X8}.history");
             string? theirs = providerHistories.Contains(history) ? ReadProviderFile(name) : null;
@@ -1617,7 +1620,7 @@ int? ReadClusterState(string dataDir)
     // Where the provider left the directory's latest timeline, as the provider's history gives it, when the provider has
     // gone on to a later one.
     ulong? leftAt = null;
-    if (ownTimeline < providerTimeline)
+    if (listed && ownTimeline < providerTimeline)
     {
         string? history;
         try
@@ -1690,6 +1693,11 @@ int? ReadClusterState(string dataDir)
     if (leftAt is ulong left && complete > left)
     {
         return (false, $"is followed by WAL on timeline {ownTimeline} past {Lsn(left)}, where the provider left that timeline, so its WAL has left the provider's");
+    }
+
+    if (!listed)
+    {
+        return null;
     }
 
     // A record that the directory's WAL ends inside of is held as far as its pages are: each page whose next page has
