@@ -4305,6 +4305,8 @@ public sealed partial class SequenceRangeTests
     [DataRow("twice")]
     [DataRow("held stopped")]
     [DataRow("locked stopped")]
+    [DataRow("answered held")]
+    [DataRow("answered plain")]
     public async Task RestoredNodesWaitForCallsThatTakeEverySequenceIn(string how)
     {
         CancellationToken token = TestContext.CancellationToken;
@@ -5896,8 +5898,9 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
-    /// A node whose grantor calls it, and that calls no one, draws again after its server restarts, once the grantor's
-    /// call has come: the statements that take in the call wait for nothing.
+    /// A node whose grantor calls it, and that calls no one, and that has no record of the grantor in its worf.node, waits
+    /// to draw after its server restarts until the grantor's call has come, and then draws again: the statements that
+    /// take in the call wait for nothing.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -5915,12 +5918,18 @@ public sealed partial class SequenceRangeTests
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100)", token);
         await WaitActiveAsync([nodeA, nodeB], token);
         await InsertAsync(nodeB, 10, token);
+        Assert.AreEqual("0", await nodeB.SafePsqlAsync(Database, "SELECT count(*) FROM worf.node WHERE node_name = 'node_a'", token), "node_a in node_b's worf.node");
 
+        // node_b restarts while node_a is down, and draws nothing until node_a is back.
+        await nodeA.StopAsync("fast", token);
         await nodeB.StopAsync("fast", token);
         await nodeB.StartServerAsync(token);
+        Assert.IsFalse(await nodeB.PsqlAsync(Database, "SET statement_timeout = '3s'; INSERT INTO t (v) VALUES ('waiting')", token),
+            "node_b's insert after its restart, while node_a is down");
+        await nodeA.StartServerAsync(token);
         Stopwatch drawing = Stopwatch.StartNew();
         await InsertAsync(nodeB, 10, token);
-        Assert.IsLessThan(TimeSpan.FromSeconds(20), drawing.Elapsed, "node_b's first insert after its restart");
+        Assert.IsLessThan(TimeSpan.FromSeconds(20), drawing.Elapsed, "node_b's first insert after node_a is back");
     }
 
     /// <summary>

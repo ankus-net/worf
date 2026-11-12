@@ -202,8 +202,9 @@ internal static partial class SequenceRangeGuard
     private static readonly HashSet<uint> s_moved = [];
     private static long s_version = -1;
 
-    // The node that granted each sequence's active block, its parent, when another node did, and the grantors this
-    // backend has seen this server hear from since it started.
+    // The node that granted each sequence's active block, its parent, when another node did, which this node subscribes
+    // to, or which exchanges with it through a slot of this node, as one that only answers that node's calls knows it,
+    // and the grantors this backend has seen this server hear from since it started.
     private static readonly Dictionary<uint, uint> s_grantors = [];
     // The sequences whose active block's grantor has said it checked this node's report of the sequence since this server
     // started, as the tables last read hold.
@@ -3017,8 +3018,10 @@ internal static partial class SequenceRangeGuard
                 sequence = Worf.FromServer(NativeMethods.get_rel_name(seqoid));
             }
 
-            string parent = Elevated.Run(() => Worf.ReadScalar<string?>("SELECT node_name::text FROM worf.node WHERE node_id = $1",
-                SpiParameter.Create(grantor))) ?? grantor.ToString(CultureInfo.InvariantCulture);
+            string parent = Elevated.Run(() => Worf.ReadScalar<string?>("""
+                SELECT coalesce((SELECT node_name::text FROM worf.node WHERE node_id = $1),
+                    (SELECT max(node_name::text) FROM worf.sequence_range_node WHERE node_id = $1))
+                """, SpiParameter.Create(grantor))) ?? grantor.ToString(CultureInfo.InvariantCulture);
             string waitingFor = $"waiting for node {parent}, which granted sequence {sequence}'s block, to answer this server since it started" +
                 (unnamed ? ", as worf can't tell which sequence the call of nextval draws from before it runs" : "");
             using PgErrorContext context = PgErrorContext.Push(Worf.Shown(waitingFor));
@@ -4625,7 +4628,8 @@ internal static partial class SequenceRangeGuard
         WorfRows result = Elevated.Run(() => Worf.SelectCatalog("""
             SELECT r.seqoid::oid, s.seqincrement > 0, b.lo, b.hi, b.state,
                 b.node_id = l.node_id AND b.sysid = $1 AND b.timeline = $2, b.reserved,
-                CASE WHEN b.from_node <> l.node_id AND EXISTS (SELECT 1 FROM worf.node n WHERE n.node_id = b.from_node) THEN b.from_node END,
+                CASE WHEN b.from_node <> l.node_id AND (EXISTS (SELECT 1 FROM worf.node n WHERE n.node_id = b.from_node)
+                    OR EXISTS (SELECT 1 FROM worf.sequence_range_link k WHERE k.node_id = b.from_node)) THEN b.from_node END,
                 EXISTS (SELECT 1 FROM worf.sequence_range_node c WHERE c.seqoid = r.seqoid AND c.node_id = b.from_node AND c.confirmed_start = $3)
             FROM worf.sequence_range r
                 JOIN pg_catalog.pg_sequence s ON s.seqrelid = r.seqoid

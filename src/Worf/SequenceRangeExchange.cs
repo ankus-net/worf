@@ -2786,7 +2786,8 @@ internal static class SequenceRangeExchange
         foreach (uint grantor in Worf.Read("""
             SELECT DISTINCT b.from_node FROM worf.sequence_range_block b CROSS JOIN worf.local_node l
             WHERE b.seqoid = $1 AND b.epoch = $2 AND b.kind = 'p' AND b.state = 'open' AND b.from_node <> l.node_id
-                AND EXISTS (SELECT 1 FROM worf.node n WHERE n.node_id = b.from_node)
+                AND (EXISTS (SELECT 1 FROM worf.node n WHERE n.node_id = b.from_node)
+                    OR EXISTS (SELECT 1 FROM worf.sequence_range_link k WHERE k.node_id = b.from_node))
                 AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_node c WHERE c.seqoid = b.seqoid AND c.node_id = b.from_node AND c.confirmed_start = $3)
             """, 0, SpiParameter.Create(seqoid), SpiParameter.Create(epoch), SpiParameter.Create(SequenceRangeHeard.Started))
             .Select(static pool => pool.Get<uint>(0)))
