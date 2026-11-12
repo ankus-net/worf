@@ -5728,13 +5728,23 @@ public sealed partial class SequenceRangeTests
         await WaitActiveAsync([nodeA, nodeB], token);
         string nodeAId = await nodeA.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
 
-        // node_b stores its reports of node_a in the order of the sequences' oids, t_id_seq's first, as idle calls leave
-        // them.
-        _ = await nodeB.SafePsqlAsync(Database, "CLUSTER worf.sequence_range_node USING sequence_range_node_pkey", token);
-        Assert.AreEqual("t", await nodeB.SafePsqlAsync(Database, $"""
-            SELECT (SELECT ctid FROM worf.sequence_range_node WHERE seqoid = 't_id_seq'::regclass AND node_id = {nodeAId})
-                < (SELECT ctid FROM worf.sequence_range_node WHERE seqoid = 'a_id_seq'::regclass AND node_id = {nodeAId})
-            """, token), "node_b's reports of node_a, t_id_seq's stored first");
+        // node_b stores its reports of node_a in the order of the sequences' oids, t_id_seq's first, and keeps them so for
+        // two seconds, once the take-ins that settle them have passed, as idle calls leave them.
+        Stopwatch ordering = Stopwatch.StartNew();
+        while (true)
+        {
+            _ = await nodeB.SafePsqlAsync(Database, "CLUSTER worf.sequence_range_node USING sequence_range_node_pkey", token);
+            await Task.Delay(TimeSpan.FromSeconds(2), token);
+            if (await nodeB.SafePsqlAsync(Database, $"""
+                SELECT (SELECT ctid FROM worf.sequence_range_node WHERE seqoid = 't_id_seq'::regclass AND node_id = {nodeAId})
+                    < (SELECT ctid FROM worf.sequence_range_node WHERE seqoid = 'a_id_seq'::regclass AND node_id = {nodeAId})
+                """, token) == "t")
+            {
+                break;
+            }
+
+            Assert.IsLessThan(TestNode.PollTimeout, ordering.Elapsed, "node_b's reports of node_a, t_id_seq's stored first");
+        }
 
         // node_a draws from both sequences, and node_b's take-in holds its report of a_id_seq, before it writes that of
         // t_id_seq, until the test lets it go.
