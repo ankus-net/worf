@@ -3396,9 +3396,26 @@ public sealed partial class SequenceRangeTests
             """, token);
         Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT NOT EXISTS (SELECT 1 FROM worf.sequence_range_back)", token),
             "the kept position of another timeline, gone");
-        await Task.Delay(TimeSpan.FromSeconds(2), token);
+
+        // The exchanges that hand out, acknowledge and hear of the next blocks change reports, and settle first, as a
+        // second without writes shows, which calls that each write never give.
         const string NextXid = "SELECT pg_catalog.pg_snapshot_xmax(pg_catalog.pg_current_snapshot())";
+        Stopwatch settling = Stopwatch.StartNew();
         long firstXid = long.Parse(await nodeA.SafePsqlAsync(Database, NextXid, token), CultureInfo.InvariantCulture);
+        while (true)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(1), token);
+            long settled = long.Parse(await nodeA.SafePsqlAsync(Database, NextXid, token), CultureInfo.InvariantCulture);
+            if (settled - firstXid < 2)
+            {
+                firstXid = settled;
+                break;
+            }
+
+            firstXid = settled;
+            Assert.IsLessThan(TestNode.PollTimeout, settling.Elapsed, "node_a's calls, settled to a second without writes");
+        }
+
         await Task.Delay(TimeSpan.FromSeconds(3), token);
         long lastXid = long.Parse(await nodeA.SafePsqlAsync(Database, NextXid, token), CultureInfo.InvariantCulture);
         Assert.IsLessThan(3L, lastXid - firstXid, "the transaction IDs node_a's idle calls used in 3 s");
