@@ -20,7 +20,8 @@ public sealed class DdlReplicationTests
     /// <summary>
     /// DDL on either of two nodes that replicate both ways reaches the other, with its search path, and the tables it
     /// creates replicate both ways. Temporary objects stay on their node, and dropping a subscription lets go of the
-    /// fences its provider's DDL kept.
+    /// fences its provider's DDL kept. A node keeps worf while it provides a subscription, and drops it once the
+    /// subscription is dropped.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -135,11 +136,23 @@ public sealed class DdlReplicationTests
         PostgresException together = await Assert.ThrowsExactlyAsync<PostgresException>(
             () => nodeB.SafePsqlAsync(Database, "DROP EXTENSION worf, plpgsql CASCADE", token));
         Assert.AreEqual("55000", together.SqlState);
+
+        // node_b keeps worf while it provides node_a's subscription, whose walsender reads worf's tables as it decodes
+        // node_b's changes, so that a row node_b writes then reaches node_a.
+        _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO app.t VALUES (4, 'before the drop')", token);
+        PostgresException providing = await Assert.ThrowsExactlyAsync<PostgresException>(() => nodeB.SafePsqlAsync(Database, "DROP EXTENSION worf CASCADE", token));
+        Assert.AreEqual("55006", providing.SqlState, providing.MessageText);
+        Assert.Contains("provides subscriptions", providing.MessageText);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM app.t WHERE id = 4)", token), "node_b's row written before the drop it refused");
+
+        // Once node_a drops its subscription, which drops its slot on node_b, node_b drops worf, and a row it writes
+        // after leaves node_a's worf as it is.
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.drop_subscription('a_from_b')", token);
         _ = await nodeB.SafePsqlAsync(Database, "DROP EXTENSION worf CASCADE", token);
+        _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO app.t VALUES (5, 'after the drop')", token);
         _ = await nodeA.SafePsqlAsync(Database, "CREATE TABLE app.after (id integer PRIMARY KEY)", token);
-        Assert.AreEqual("1|replicating", await nodeA.SafePsqlAsync(Database, """
-            SELECT (SELECT count(*) FROM pg_extension WHERE extname = 'worf'),
-                (SELECT status FROM worf.show_subscription_status() WHERE subscription_name = 'a_from_b')
+        Assert.AreEqual("1|0", await nodeA.SafePsqlAsync(Database, """
+            SELECT (SELECT count(*) FROM pg_extension WHERE extname = 'worf'), (SELECT count(*) FROM worf.subscription)
             """, token), "node_a keeps worf");
         Assert.AreEqual("", await nodeB.SafePsqlAsync(Database, "SELECT extname FROM pg_extension WHERE extname = 'worf'", token));
     }

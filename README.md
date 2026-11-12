@@ -272,6 +272,13 @@ Nodes can be added and removed dynamically using the SQL interfaces.
   - `ifexists` - if true, error is not thrown when subscription does not exist,
     default is false
 
+A node keeps worf while it provides subscriptions: `DROP EXTENSION worf` is
+refused while worf's replication slots in the database stream its changes to
+subscribers, whose walsenders read worf's tables to decode them, the changes
+made before the drop too. Drop those subscriptions on their subscribers first,
+which drops their slots, or drop the slots with `pg_drop_replication_slot`,
+which gives up the changes their subscribers haven't received.
+
 - `worf.alter_node_add_interface(node_name name, interface_name name, dsn text)`
   Adds additional interface to a node.
 

@@ -573,12 +573,25 @@ internal static unsafe partial class Executor
                 return;
             }
 
-            // Dropping worf itself?
+            // Dropping worf itself? A node that provides subscriptions keeps worf: the walsenders that serve them read
+            // worf's tables as they decode changes, those made before the drop too, and can't once the drop has removed
+            // them, nor serve the subscriptions after it, whose slots would then keep WAL for nothing.
             if (classId == Dependency.ExtensionRelationId)
             {
                 uint extensionOid = NativeMethods.get_extension_oid(Worf.PStrDup(Worf.ExtensionName), true);
                 if (objectId == extensionOid && objectId != 0)
                 {
+                    if (!NativeGlobals.IsBinaryUpgrade &&
+                        Elevated.Run(() => Worf.ReadScalar<string?>("""
+                            SELECT pg_catalog.string_agg(pg_catalog.quote_ident(slot_name::pg_catalog.text), ', ' ORDER BY slot_name)
+                            FROM pg_catalog.pg_replication_slots WHERE plugin = 'worf' AND database = pg_catalog.current_database()
+                            """)) is string slots)
+                    {
+                        throw new PgException("55006", "worf can't be dropped while this node provides subscriptions",
+                            detail: $"Replication slots {slots} stream this database's changes to worf's subscribers.",
+                            hint: "Drop those subscriptions on their subscribers, which drops their slots, or drop the slots with pg_drop_replication_slot, which gives up the changes their subscribers haven't received.");
+                    }
+
                     s_droppingWorfObj = true;
                 }
             }
