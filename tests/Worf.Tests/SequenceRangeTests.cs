@@ -4465,7 +4465,7 @@ public sealed partial class SequenceRangeTests
             ("INSERT INTO tp1 (v) VALUES ('x') RETURNING id", "tp_id_seq"),
             ("MERGE INTO tp1 USING (SELECT 1) s ON false WHEN NOT MATCHED THEN INSERT (v) VALUES ('m')", "tp_id_seq"),
             ($"COPY tp1 (v) FROM '{rows}'", "tp_id_seq"),
-            ("INSERT INTO tl2 VALUES (105, 'u'); ALTER TABLE tl ATTACH PARTITION tl2 FOR VALUES IN ('u', 'v'); INSERT INTO tl2 (v) VALUES ('v') RETURNING id",
+            ("INSERT INTO tl2 SELECT max(id), 'u' FROM tl; ALTER TABLE tl ATTACH PARTITION tl2 FOR VALUES IN ('u', 'v'); INSERT INTO tl2 (v) VALUES ('v') RETURNING id",
                 "tl_id_seq"),
         ] : [])];
 
@@ -4668,7 +4668,7 @@ public sealed partial class SequenceRangeTests
         // 17, a partition with an identity column of its own draws from its own sequence, which the guard refuses at
         // once.
         foreach ((string fails, string state) in sharedIdentity
-            ? [("INSERT INTO tlt1 VALUES (108, 't'); ALTER TABLE tl ATTACH PARTITION tlt FOR VALUES IN ('t'); INSERT INTO tlt1 (v) VALUES ('t')", "23502")]
+            ? [("INSERT INTO tlt1 SELECT max(id), 't' FROM tl; ALTER TABLE tl ATTACH PARTITION tlt FOR VALUES IN ('t'); INSERT INTO tlt1 (v) VALUES ('t')", "23502")]
             : new[]
             {
                 ("INSERT INTO tp1 (v) VALUES ('x') RETURNING id", "23502"), ("MERGE INTO tp1 USING (SELECT 1) s ON false WHEN NOT MATCHED THEN INSERT (v) VALUES ('m')", "23502"),
