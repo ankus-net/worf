@@ -1576,7 +1576,10 @@ internal static unsafe partial class SequenceRanges
                 AlterTableType.AT_AddIdentity or AlterTableType.AT_SetIdentity or AlterTableType.AT_DropIdentity =>
                     name is not null && ColumnUsesManaged(relid, name),
                 AlterTableType.AT_DisableTrig or AlterTableType.AT_EnableReplicaTrig or AlterTableType.AT_EnableTrig => name is not null && IsGuardName(name),
-                AlterTableType.AT_DisableTrigAll or AlterTableType.AT_DisableTrigUser => IsGuarded(relid),
+                // ENABLE TRIGGER ALL and USER would have a guard, or a partition's clone of its parent's, fire only in
+                // sessions that write as origins do.
+                AlterTableType.AT_DisableTrigAll or AlterTableType.AT_DisableTrigUser or AlterTableType.AT_EnableTrigAll or AlterTableType.AT_EnableTrigUser =>
+                    IsGuarded(relid),
 
                 // A table's sequences follow it to unlogged.
                 AlterTableType.AT_SetUnLogged => OwnsManaged(relid),

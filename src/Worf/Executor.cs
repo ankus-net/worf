@@ -51,6 +51,7 @@ internal static unsafe partial class Executor
     private static ExecutorEnd_hook_type s_nextExecutorFinishHook;
     private static ExecutorEnd_hook_type s_nextExecutorEndHook;
     private static amvalidate_function s_nextNeedsFmgrHook;
+    private static fmgr_hook_type s_nextFmgrHook;
     private static bool s_installed;
 
     /// <summary>
@@ -81,6 +82,9 @@ internal static unsafe partial class Executor
 
     [PgNativeCallback(nameof(WorfNeedsFmgrHook))]
     private static partial amvalidate_function NeedsFmgrHookCallback { get; }
+
+    [PgNativeCallback(nameof(WorfFmgrHook))]
+    private static partial fmgr_hook_type FmgrHookCallback { get; }
 
     /// <summary>
     /// Creates the executor state for one relation, as a query that reads or writes it would.
@@ -214,6 +218,11 @@ internal static unsafe partial class Executor
         // the functions DDL being replicated uses.
         s_nextNeedsFmgrHook = NativeGlobals.needs_fmgr_hook;
         NativeGlobals.needs_fmgr_hook = NeedsFmgrHookCallback;
+
+        // The fmgr hook, which runs as the functions the check asked for it for start, as the trigger functions whose
+        // C code the sequence range guard can't see draw.
+        s_nextFmgrHook = NativeGlobals.fmgr_hook;
+        NativeGlobals.fmgr_hook = FmgrHookCallback;
         s_installed = true;
     }
 
@@ -742,7 +751,25 @@ internal static unsafe partial class Executor
     private static bool WorfNeedsFmgrHook(uint fnOid)
     {
         TemporaryObjectUse.NoteFunctionUse(fnOid);
-        return !s_nextNeedsFmgrHook.IsNull && s_nextNeedsFmgrHook.Invoke(fnOid);
+        bool hooked = SequenceRangeGuard.HooksTrigger(fnOid);
+        return (!s_nextNeedsFmgrHook.IsNull && s_nextNeedsFmgrHook.Invoke(fnOid)) || hooked;
+    }
+
+    /// <summary>
+    /// Runs as a function the fmgr hook check asked for the hook for starts, ends or fails, passing it on to the next
+    /// hook, which asked for it for its own functions.
+    /// </summary>
+    private static void WorfFmgrHook(FmgrHookEventType @event, FmgrInfo* flinfo, ulong* @private)
+    {
+        if (!s_nextFmgrHook.IsNull)
+        {
+            s_nextFmgrHook.Invoke(@event, flinfo, @private);
+        }
+
+        if (@event == FmgrHookEventType.FHET_START)
+        {
+            SequenceRangeGuard.StartingTrigger(flinfo->fn_oid);
+        }
     }
 
     private static void CheckWrite(RangeVar* relation, PgLockMode lockmode, RangeVarGetRelidCallback callback)

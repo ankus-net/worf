@@ -4126,40 +4126,46 @@ public sealed class SequenceRangeTests
 
     /// <summary>
     /// After its server restarts, a node draws nothing from a block its grantor granted until the grantor has answered,
-    /// whatever calls nextval: a SELECT, an insert into a table whose defaults don't draw from the sequence, an insert
-    /// into the sequence's table, a PL/pgSQL assignment and RETURN, a SQL function given the name as text, nextval of a
-    /// name as text, a SELECT that also reads the sequence, a session or a SECURITY DEFINER function whose search path is
-    /// worf's own, an UPDATE or a MERGE that sets an identity or a serial column to its default, a partitioned table's
-    /// too, an INSERT, MERGE or COPY straight into a partition whose parent's identity column draws, on 17 and later,
-    /// as into one attached in a session that wrote it before, a domain whose CHECK draws, a COPY whose default draws,
-    /// a multi-row VALUES list, a CHECK constraint or BEFORE trigger condition, alone or of a data-modifying WITH's table
-    /// beside a partition-routing statement, a stable PL/pgSQL function a generic plan's partition pruning calls as the
-    /// plan starts, explained or not, beside a call of an unmanaged sequence, and a domain's CHECK that partition pruning
-    /// coerces a value to, explained, a call through an operator, a domain's or table's CHECK that calls a SQL
-    /// function the planner inlines, written as text or with a body of its own, or through another, or given the
-    /// sequence's name as its argument, or naming the sequence without its schema, after the search path changed, and a
-    /// PL/pgSQL function's return to a domain whose CHECK draws, after its last expression named another sequence. A call C code starts
-    /// as a statement runs, as a domain's CHECK that a record's or a value's input runs, waits as one whose sequence worf
-    /// can't tell, or, where it may take the place of a call the statement names that starts later or never, for the
-    /// sequences the domains' CHECKs draw from, as every call a statement names does while it calls a function that
-    /// checks a value against a domain it names as text, as pg_input_is_valid does, though the domain's CHECK was added
-    /// in the same session. Each waits, naming the grantor and
-    /// the sequence, or, for a call whose sequence worf can't tell, as one a PL/pgSQL function computes the name of,
-    /// saying so, here until statement_timeout while the grantor is down, or for twice worf.sequence_range_timeout,
-    /// after which it fails naming the grantor. What draws nothing from those blocks doesn't wait, though domains whose
-    /// CHECKs draw from them, or from a sequence they don't name, exist: a read of the
-    /// sequence or of worf.sequence_ranges, pg_sequence_last_value, an EXPLAIN, nextval of a sequence no range manages,
-    /// by name or as text, or of a temporary one, in a statement, beside a library's C function or not, an insert into its
-    /// table, one whose other default calls such a function, a PL/pgSQL assignment, a BEFORE trigger, an EXECUTE's
-    /// parameter, a CALL's argument, a COPY's WHERE or the CHECK of the domain of a column COPY reads, a multi-row
-    /// VALUES list, alone or as an INSERT's rows or defaults, a CHECK constraint of a table an INSERT or COPY writes, a
-    /// BEFORE trigger's condition, or a RETURNING list of an INSERT or UPDATE of a partitioned table, beside another
-    /// table whose CHECK draws, an EXPLAIN whose pruning draws only from those, a COPY whose defaults draw from those,
-    /// ALTER TABLE adding a serial column to a temporary
-    /// table, an UPDATE or a MERGE that sets such a column to a value, and nextval in a read-only transaction, which
-    /// fails at once, as do, before 17, an INSERT, MERGE or COPY straight into a partition, which shares no identity
-    /// column with its parent, and from 17 on an insert into a partition of a table attached as a partition. Once the
-    /// grantor is back, the node draws again.
+    /// whatever calls nextval: a SELECT, an insert into a table whose defaults don't draw from the sequence, an insert into
+    /// the sequence's table, a PL/pgSQL assignment and RETURN, a SQL function given the name as text, nextval of a name as
+    /// text, a SELECT that also reads the sequence, a session or a SECURITY DEFINER function whose search path is worf's
+    /// own, an UPDATE or a MERGE that sets an identity or a serial column to its default, a partitioned table's too, an
+    /// INSERT, MERGE or COPY straight into a partition whose parent's identity column draws, on 17 and later, as into one
+    /// attached in a session that wrote it before, a domain whose CHECK draws, a COPY whose default draws, a multi-row
+    /// VALUES list, a CHECK constraint or BEFORE trigger condition, alone or of a data-modifying WITH's table beside a
+    /// partition-routing statement, a stable PL/pgSQL function a generic plan's partition pruning calls as the plan starts,
+    /// explained or not, beside a call of an unmanaged sequence, and a domain's CHECK that partition pruning coerces a
+    /// value to, explained, a call through an operator, a domain's or table's CHECK that calls a SQL function the planner
+    /// inlines, written as text or with a body of its own, or through another, or given the sequence's name as its
+    /// argument, or naming the sequence without its schema, after the search path changed, a PL/pgSQL function's return to
+    /// a domain whose CHECK draws, after its last expression named another sequence, and a polymorphic function's variable
+    /// of an array or composite of such a domain, called first with another type; an UPDATE or a MERGE through a trigger
+    /// whose C code draws from a sequence it names, as contrib's autoinc, and an INSERT, COPY or moving UPDATE that routes
+    /// a row to a partition with such a trigger; and, with one sequence's grantor alone answered, a call worf can't tell
+    /// the sequence of. A call C code starts as a statement runs, as a domain's CHECK that a record's or a value's input
+    /// runs, waits as one whose sequence worf can't tell, or, where it may take the place of a call the statement names
+    /// that starts later or never, for the sequences the domains' CHECKs draw from, as every call a statement names does
+    /// while it calls a function that checks a value against a domain it names as text, as pg_input_is_valid does, though
+    /// the domain's CHECK was added in the same session. Each waits, naming the grantor and the sequence, or, for a call
+    /// whose sequence worf can't tell, as one a PL/pgSQL function computes the name of, saying so, here until
+    /// statement_timeout while the grantor is down, or for twice worf.sequence_range_timeout, after which it fails naming
+    /// the grantor. What draws nothing from those blocks doesn't wait, though domains whose CHECKs draw from them, or from
+    /// a sequence they don't name, exist: a read of the sequence or of worf.sequence_ranges, pg_sequence_last_value, an
+    /// EXPLAIN, nextval of a sequence no range manages, by name or as text, or of a temporary one, in a statement, beside a
+    /// library's C function or not, an insert into its table, one whose other default calls such a function, a PL/pgSQL
+    /// assignment, a BEFORE trigger, an EXECUTE's parameter, a CALL's argument, a COPY's WHERE or the CHECK of the domain
+    /// of a column COPY reads, a multi-row VALUES list, alone or as an INSERT's rows or defaults, a CHECK constraint of a
+    /// table an INSERT or COPY writes, a BEFORE trigger's condition, or a RETURNING list of an INSERT or UPDATE of a
+    /// partitioned table, beside another table whose CHECK draws, an EXPLAIN whose pruning draws only from those, a COPY
+    /// whose defaults draw from those, ALTER TABLE adding a serial column to a temporary table, an UPDATE or a MERGE that
+    /// sets such a column to a value, a PL/pgSQL function's RETURN of a variable of a domain whose CHECK draws from a
+    /// sequence no range manages, an UPDATE that sets a value already drawn from the active block, and nextval in a read-
+    /// only transaction, which fails at once, as do, before 17, an INSERT, MERGE or COPY straight into a partition, which
+    /// shares no identity column with its parent, and from 17 on an insert into a partition of a table attached as a
+    /// partition. PostgreSQL's apply of a subscription applies a row whose domain draws from a sequence no range manages at
+    /// once, and waits for one whose table's ALWAYS trigger's C code draws. ENABLE TRIGGER USER and ALL, which would leave
+    /// guards firing only in sessions that write as origins do, are refused. Once the grantor is back, the node draws
+    /// again.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -4185,6 +4191,8 @@ public sealed class SequenceRangeTests
         using TemporaryDirectory files = new($"worf-sequence-range-copy-{Guid.NewGuid():N}");
         string rows = Path.Join(files.FullName, "rows.txt").Replace('\\', '/');
         await File.WriteAllTextAsync(rows, "x\n", token);
+        string rowsA = Path.Join(files.FullName, "rows_a.txt").Replace('\\', '/');
+        await File.WriteAllTextAsync(rowsA, "a\n", token);
         _ = await nodeB.SafePsqlAsync(Database, """
             CREATE FUNCTION drawn() RETURNS bigint LANGUAGE plpgsql AS $$ BEGIN RETURN nextval('t_id_seq'); END $$;
             CREATE FUNCTION drawn_from(name text) RETURNS bigint LANGUAGE sql AS 'SELECT nextval($1)';
@@ -4253,6 +4261,37 @@ public sealed class SequenceRangeTests
             CREATE EXTENSION autoinc;
             CREATE TABLE ai (id int, v text);
             CREATE TRIGGER ai_id BEFORE INSERT ON ai FOR EACH ROW EXECUTE FUNCTION autoinc(id, ti_id_seq);
+            CREATE FUNCTION fp6(i int, x anyelement) RETURNS int LANGUAGE plpgsql AS $$
+                DECLARE y x%TYPE; z bigint;
+                BEGIN
+                    IF i < 0 THEN z := nextval('plain'); END IF;
+                    SELECT ARRAY[CASE WHEN i < 0 THEN nextval('plain')::int ELSE 1 END] INTO y;
+                    RETURN 1;
+                END $$;
+            CREATE FUNCTION fp7(i int, x anyelement) RETURNS int LANGUAGE plpgsql AS $$
+                DECLARE y x%TYPE; z bigint;
+                BEGIN
+                    IF i < 0 THEN z := nextval('plain'); END IF;
+                    SELECT CASE WHEN i < 0 THEN nextval('plain')::int ELSE 1 END INTO y;
+                    RETURN 1;
+                END $$;
+            CREATE TYPE ctd AS (a tdom);
+            CREATE TABLE au (id int, v text);
+            INSERT INTO au VALUES (1, 'a');
+            CREATE TRIGGER au_id BEFORE INSERT OR UPDATE ON au FOR EACH ROW EXECUTE FUNCTION autoinc(id, ti_id_seq);
+            CREATE TABLE pa (id int, v text) PARTITION BY LIST (v);
+            CREATE TABLE pa1 PARTITION OF pa FOR VALUES IN ('a');
+            CREATE TRIGGER pa1_id BEFORE INSERT ON pa1 FOR EACH ROW EXECUTE FUNCTION autoinc(id, ti_id_seq);
+            CREATE TABLE pb (k int, id int, v text) PARTITION BY LIST (k);
+            CREATE TABLE pb1 PARTITION OF pb FOR VALUES IN (1);
+            CREATE TABLE pb2 PARTITION OF pb FOR VALUES IN (2);
+            CREATE TRIGGER pb2_id BEFORE INSERT ON pb2 FOR EACH ROW EXECUTE FUNCTION autoinc(id, ti_id_seq);
+            INSERT INTO pb VALUES (1, 1, 'b');
+            CREATE FUNCTION frp(i int) RETURNS pdk LANGUAGE plpgsql AS $$ BEGIN RETURN i; END $$;
+            CREATE TABLE npd (v pdk);
+            CREATE TABLE ai2 (id int, v text);
+            CREATE TRIGGER ai2_id BEFORE INSERT ON ai2 FOR EACH ROW EXECUTE FUNCTION autoinc(id, 'public.ti_id_seq');
+            ALTER TABLE ai2 ENABLE ALWAYS TRIGGER ai2_id;
             """, token);
         await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
         _ = await nodeA.SafePsqlAsync(Database, """
@@ -4329,6 +4368,10 @@ public sealed class SequenceRangeTests
             ("INSERT INTO ckp SELECT 'x' FROM jsonb_to_record('{\"a\":1}') AS j(a ddt) WHERE random() < 0", "ti_id_seq"),
             ("SELECT fpoly(NULL::tplain); SELECT fpoly(NULL::tdom)", "ti_id_seq"),
             ("INSERT INTO ai (v) VALUES ('x')", "ti_id_seq"),
+            ("SELECT fp6(-1, NULL::int[]); SELECT fp6(1, NULL::tdom[])", "ti_id_seq"), ("SELECT fp7(-1, NULL::int); SELECT fp7(1, NULL::ctd)", "ti_id_seq"),
+            ("UPDATE au SET id = NULL RETURNING id", "ti_id_seq"), ("MERGE INTO au USING (SELECT 1) s ON true WHEN MATCHED THEN UPDATE SET id = 0", "ti_id_seq"),
+            ("INSERT INTO pa (v) VALUES ('a') RETURNING id", "ti_id_seq"), ($"COPY pa (v) FROM '{rowsA}'", "ti_id_seq"),
+            ("UPDATE pb SET k = 2, id = NULL WHERE k = 1", "ti_id_seq"),
             ("SELECT record_in('(1)'::cstring, 'cdk'::regtype, -1) FROM (VALUES (nextval('plain')), (nextval('plain'))) v(n) LIMIT 1", "t_id_seq"),
             ("SELECT domain_in('1'::cstring, 'ddk'::regtype, -1) FROM (VALUES (nextval('plain')), (nextval('plain'))) v(n) LIMIT 1", "t_id_seq"),
             ("EXPLAIN SELECT 1::dsw; CREATE OR REPLACE FUNCTION fsw(i int) RETURNS int LANGUAGE sql AS 'SELECT (nextval(''plain'') > 0)::int + i'; " +
@@ -4383,7 +4426,7 @@ public sealed class SequenceRangeTests
             {
                 string draw = forms[i].Draw;
                 int laneOf = draw.Contains(" ti ", StringComparison.Ordinal) ? 0 : draw.Contains(" tp ", StringComparison.Ordinal) ? 1
-                    : draw.StartsWith("UPDATE t ", StringComparison.Ordinal) ? 2 : i % 4;
+                    : draw.StartsWith("UPDATE t ", StringComparison.Ordinal) ? 2 : draw.Contains(" au ", StringComparison.Ordinal) ? 3 : i % 4;
                 if (laneOf == lane)
                 {
                     found[i] = await TryAsync(draw, forms[i].Sequence);
@@ -4418,6 +4461,8 @@ public sealed class SequenceRangeTests
             "UPDATE ti SET id = id WHERE id = (SELECT min(id) FROM ti)", "UPDATE t SET id = id WHERE id = (SELECT min(id) FROM t)",
             "UPDATE ti SET (id, v) = (id, 'w') WHERE id = (SELECT min(id) FROM ti)",
             "MERGE INTO ti USING (SELECT min(id) AS m FROM ti) s ON ti.id = s.m WHEN MATCHED THEN UPDATE SET id = s.m",
+            "SELECT frp(1)",
+            "DELETE FROM ti WHERE id = (SELECT max(id) FROM ti); UPDATE ti SET id = id + 1 WHERE id = (SELECT max(id) FROM ti)",
         })
         {
             try
@@ -4429,6 +4474,53 @@ public sealed class SequenceRangeTests
                 problems.Add($"{reads}: failed with {failed.SqlState} {failed.MessageText} {failed.Where}");
             }
         }
+
+        // ENABLE TRIGGER USER and ALL, which would leave a partition's guards firing only in sessions that write as origins
+        // do, are refused.
+        foreach (string enables in new[] { "ALTER TABLE tp1 ENABLE TRIGGER USER", "ALTER TABLE tp1 ENABLE TRIGGER ALL", "ALTER TABLE ti ENABLE TRIGGER ALL" })
+        {
+            try
+            {
+                _ = await nodeB.SafePsqlAsync(Database, enables, token);
+                problems.Add($"{enables}: succeeded");
+            }
+            catch (PostgresException refused) when (refused.SqlState == "55000")
+            {
+            }
+        }
+
+        // A call worf can't tell the sequence of, waiting, goes on waiting for the grantors of the other sequences once
+        // node_a's word on t_id_seq alone has come, and a change to the ranges has committed, which has the waiting
+        // session read the words again.
+        // The server's start, as a node it has no record of is taken as heard from then.
+        string nodeAId = await nodeB.SafePsqlAsync(Database, "SELECT node_id FROM worf.node WHERE node_name = 'node_a'", token);
+        string started = await nodeB.SafePsqlAsync(Database,
+            "SELECT ((extract(epoch FROM worf.sequence_range_heard(0, true, '-infinity', true)) - 946684800) * 1000000)::bigint", token);
+        string Confirm(string start) => $"UPDATE worf.sequence_range_node SET confirmed_start = {start} WHERE seqoid = 't_id_seq'::regclass AND node_id = {nodeAId}";
+        const string Unnamed = "SELECT computed_draw('ti_id_seq')";
+        Task<string?> partly = Task.Run(async () =>
+        {
+            try
+            {
+                _ = await nodeB.SafePsqlAsync(Database, $"SET statement_timeout = '8s'; {Unnamed}", token);
+                return $"{Unnamed}, as t_id_seq's grantor alone answered: drew";
+            }
+            catch (PostgresException refused) when (refused.SqlState == "57014")
+            {
+                return (refused.Where ?? "").Contains("waiting for node node_a, which granted sequence ti_id_seq's block", StringComparison.Ordinal)
+                    ? null : $"{Unnamed}, as t_id_seq's grantor alone answered: waited {refused.Where}";
+            }
+        }, token);
+        await Task.Delay(TimeSpan.FromSeconds(3), token);
+        _ = await nodeB.SafePsqlAsync(Database, Confirm(started), token);
+        _ = await nodeB.SafePsqlAsync(Database, "CREATE SEQUENCE confirm_bump; SELECT worf.enable_sequence_range('confirm_bump', participants := '{}')", token);
+        if (await partly is string drewPartly)
+        {
+            problems.Add(drewPartly);
+        }
+
+        _ = await nodeB.SafePsqlAsync(Database, Confirm("NULL"), token);
+        _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.disable_sequence_range('confirm_bump'); DROP SEQUENCE confirm_bump", token);
 
         // A session that read, as it drew, that a function checks no domain it isn't given, reads it again once another
         // session makes it one that may: here an internal function's alias of pg_input_is_valid.
@@ -4463,7 +4555,7 @@ public sealed class SequenceRangeTests
 
         // The domains whose CHECKs draw go, so that a wait shows which sequence the domain added next names.
         _ = await nodeB.SafePsqlAsync(Database, """
-            DROP TYPE cdk; DROP DOMAIN dsw, tdom, tplain; DROP FUNCTION fpoly(anyelement), fsw(int);
+            DROP TYPE cdk, ctd; DROP FUNCTION fp6(int, anyelement), fp7(int, anyelement); DROP DOMAIN dsw, tdom, tplain; DROP FUNCTION fpoly(anyelement), fsw(int);
             DROP FUNCTION fd(int), fret(int); DROP DOMAIN dd, ddk, ddf, ddr, ddn, du, ddr2, ddu, ddt;
             """, token);
 
@@ -4547,13 +4639,38 @@ public sealed class SequenceRangeTests
         // column from ti_id_seq with no call worf sees, and the guard's check of each row waits for node_a all the same,
         // so no row is written meanwhile; with a timeout of a second, each wait fails after two.
         _ = await nodeB.SafePsqlAsync(Database, "CREATE DATABASE nativepub", token);
-        _ = await nodeB.SafePsqlAsync("nativepub", "CREATE TABLE ti (v text); CREATE PUBLICATION native FOR TABLE ti", token);
-        _ = await nodeB.SafePsqlAsync("nativepub", "SELECT pg_create_logical_replication_slot('native', 'pgoutput')", token);
+        _ = await nodeB.SafePsqlAsync("nativepub", """
+            CREATE TABLE ti (v text); CREATE PUBLICATION native FOR TABLE ti;
+            CREATE TABLE npd (v int); CREATE PUBLICATION native_npd FOR TABLE npd;
+            CREATE TABLE ai2 (id int, v text); CREATE PUBLICATION native_ai2 FOR TABLE ai2;
+            """, token);
         _ = await nodeB.SafePsqlAsync(Database, "ALTER SYSTEM SET worf.sequence_range_timeout = '1s'", token);
         _ = await nodeB.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
-        _ = await nodeB.SafePsqlAsync(Database,
-            $"CREATE SUBSCRIPTION native CONNECTION '{nodeB.Dsn("nativepub", SuperUser)}' PUBLICATION native WITH (copy_data = false, create_slot = false, slot_name = 'native')",
-            token);
+        foreach (string native in new[] { "native", "native_npd", "native_ai2" })
+        {
+            _ = await nodeB.SafePsqlAsync("nativepub", $"SELECT pg_create_logical_replication_slot('{native}', 'pgoutput')", token);
+            _ = await nodeB.SafePsqlAsync(Database,
+                $"CREATE SUBSCRIPTION {native} CONNECTION '{nodeB.Dsn("nativepub", SuperUser)}' PUBLICATION {native} WITH (copy_data = false, create_slot = false, slot_name = '{native}')",
+                token);
+        }
+
+        // A row of a table whose domain's CHECK draws from a sequence no range manages applies at once, as the apply
+        // draws from no sequence the subscription's tables name; and the row of a table whose ALWAYS trigger's C code,
+        // contrib's autoinc, draws from ti_id_seq waits for node_a.
+        _ = await nodeB.SafePsqlAsync("nativepub", "INSERT INTO npd VALUES (1)", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT count(*) = 1 FROM npd", token), "node_b's apply of the row of npd, whose domain draws from plain");
+        int drawn = nodeB.ReadLog().Length;
+        _ = await nodeB.SafePsqlAsync("nativepub", "INSERT INTO ai2 VALUES (NULL, 'native')", token);
+        Assert.IsTrue(await nodeB.PollLogAsync(drawn, "sequence ti_id_seq can't draw from the block node node_a granted it", token),
+            "node_b's apply of the row of ai2, waiting for node_a");
+        Assert.AreEqual("0", await nodeB.SafePsqlAsync(Database, "SELECT count(*) FROM ai2", token), "the rows of ai2 node_b's native subscription applied while node_a was down");
+        foreach (string native in new[] { "native_npd", "native_ai2" })
+        {
+            _ = await nodeB.SafePsqlAsync(Database, $"ALTER SUBSCRIPTION {native} DISABLE", token);
+            _ = await nodeB.SafePsqlAsync(Database, $"ALTER SUBSCRIPTION {native} SET (slot_name = NONE)", token);
+            _ = await nodeB.SafePsqlAsync(Database, $"DROP SUBSCRIPTION {native}", token);
+        }
+
         int applied = nodeB.ReadLog().Length;
         _ = await nodeB.SafePsqlAsync("nativepub", "INSERT INTO ti VALUES ('native'), ('native'), ('native')", token);
         Assert.IsTrue(await nodeB.PollLogAsync(applied, "sequence ti_id_seq can't draw from the block node node_a granted it", token),
