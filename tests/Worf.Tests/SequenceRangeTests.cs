@@ -2594,8 +2594,10 @@ public sealed class SequenceRangeTests
     /// node's exchanges with its other neighbors, as the node looks up the names libpq would connect to on other threads,
     /// those from a service file or the environment too; a host name with two addresses, the first refusing, is reached at
     /// the second; an address that drops connection attempts, as a listener whose queue is full does, gives way to the
-    /// next at the connection's connect_timeout, or with none, once its share of the probe's time is up; a server that
-    /// refuses the connection ends the probe, as it ends libpq's; a service file's connect_timeout holds, rather than
+    /// next at the connection's connect_timeout, or with none, once its share of the probe's time is up, a name whose
+    /// lookup still runs counting toward the share; addresses are connected to in the order of their names, as libpq
+    /// connects to them; a server that refuses the connection ends the probe, as it ends libpq's, though a later name's
+    /// lookup still runs; a service file's connect_timeout holds, rather than
     /// worf's own; a URI takes worf's options after it; worf.extra_connection_options reaches the exchange's
     /// connections, even when it's set while one is being made; a name with no address is passed over for the next; and
     /// an address is connected to as soon as it's known, while a later name's lookup runs, and as an earlier name's
@@ -2610,7 +2612,8 @@ public sealed class SequenceRangeTests
         DirectoryInfo work = Directory.CreateTempSubdirectory("worf-lookup-");
         try
         {
-            // worf-slow.test takes 7 s to fail, and worf-two.test has 127.0.0.2, where nothing listens, before 127.0.0.1.
+            // worf-slow.test takes 7 s to fail, worf-two.test has 127.0.0.2, where nothing listens, before 127.0.0.1, and
+            // worf-delay.test and worf-late.test take 0.3 s and 1 s to find 127.0.0.1.
             string library = await CompileAsync(work, "lookup.c", """
                 #define _GNU_SOURCE
                 #include <arpa/inet.h>
@@ -2653,6 +2656,13 @@ public sealed class SequenceRangeTests
 
                     if (node && strcmp(node, "worf-none.test") == 0)
                         return EAI_NONAME;
+
+                    if (node && (strcmp(node, "worf-delay.test") == 0 || strcmp(node, "worf-late.test") == 0))
+                    {
+                        usleep(strcmp(node, "worf-delay.test") == 0 ? 300000 : 1000000);
+                        *res = v4("127.0.0.1", service, hints);
+                        return 0;
+                    }
 
                     if (!next)
                         next = dlsym(RTLD_NEXT, "getaddrinfo");
@@ -2761,6 +2771,29 @@ public sealed class SequenceRangeTests
             Assert.IsTrue(await nodeB.PollLogAsync(logpos, "sequence range exchange with node node_c done", token),
                 "node_b's call to node_c past the address that drops attempts, with no connect_timeout");
 
+            // So it does when the next address comes from a name whose lookup takes 0.3 s, which counts toward the share as
+            // it runs, with the connect_timeout of 30 s worf gives.
+            await RefuseNodeCAsync(nodeB, token);
+            logpos = nodeB.ReadLog().Length;
+            _ = await nodeB.SafePsqlAsync(Database, $"""
+                UPDATE worf.node_interface
+                SET if_dsn = 'host=127.0.0.1,worf-delay.test port={((IPEndPoint)hole.LocalEndPoint!).Port.ToString(CultureInfo.InvariantCulture)},{port} dbname={Database} user={SuperUser}'
+                WHERE if_nodeid = (SELECT node_id FROM worf.node WHERE node_name = 'node_c')
+                """, token);
+            Assert.IsTrue(await nodeB.PollLogAsync(logpos, "sequence range exchange with node node_c done", token),
+                "node_b's call to node_c past the address that drops attempts, at a name whose lookup was still running");
+
+            // Addresses are connected to in the order of their names, as libpq connects to them: node_c's name, whose
+            // lookup takes 0.3 s, before node_a's address, given as it is.
+            await RefuseNodeCAsync(nodeB, token);
+            logpos = nodeB.ReadLog().Length;
+            _ = await nodeB.SafePsqlAsync(Database, $"""
+                UPDATE worf.node_interface
+                SET if_dsn = 'host=worf-delay.test,127.0.0.1 port={port},{nodeA.Cluster.Port.ToString(CultureInfo.InvariantCulture)} dbname={Database} user={SuperUser}'
+                WHERE if_nodeid = (SELECT node_id FROM worf.node WHERE node_name = 'node_c')
+                """, token);
+            Assert.IsTrue(await nodeB.PollLogAsync(logpos, "sequence range exchange with node node_c done", token), "node_b's call to node_c at its name, before node_a's address");
+
             // A server that refuses the connection, as for a role it doesn't have, ends the probe there, as libpq does,
             // rather than have it go on to the next.
             _ = await nodeC.SafePsqlAsync(Database, "CREATE ROLE onlyc LOGIN SUPERUSER", token);
@@ -2773,6 +2806,17 @@ public sealed class SequenceRangeTests
             Assert.IsTrue(await nodeB.PollLogAsync(logpos, "role \"onlyc\" does not exist", token), "node_b's call to node_c, refused by node_a");
             await Task.Delay(TimeSpan.FromSeconds(3), token);
             Assert.DoesNotContain("bound to another role", nodeB.ReadLog()[logpos..], "node_b's calls, which reached node_c as onlyc");
+
+            // So does one that refuses it while a later name's lookup, which takes 1 s, still runs.
+            logpos = nodeB.ReadLog().Length;
+            _ = await nodeB.SafePsqlAsync(Database, $"""
+                UPDATE worf.node_interface
+                SET if_dsn = 'host=127.0.0.1,worf-late.test port={nodeA.Cluster.Port.ToString(CultureInfo.InvariantCulture)},{port} dbname={Database} user=onlyc'
+                WHERE if_nodeid = (SELECT node_id FROM worf.node WHERE node_name = 'node_c')
+                """, token);
+            Assert.IsTrue(await nodeB.PollLogAsync(logpos, "role \"onlyc\" does not exist", token), "node_b's call to node_c, refused by node_a before worf-late.test is found");
+            await Task.Delay(TimeSpan.FromSeconds(4), token);
+            Assert.DoesNotContain("sequence range exchange with node node_c done", nodeB.ReadLog()[logpos..], "node_b's calls, which reached node_c past node_a's refusal");
 
             // A service file's connect_timeout holds, rather than worf's own, though each call has 60 s.
             await File.AppendAllTextAsync(services,
@@ -3028,6 +3072,9 @@ public sealed class SequenceRangeTests
         Assert.IsTrue(await nodeB.PollLogAsync(logpos, "node node_a sent more than 10 warnings within a minute", token), "the line that says node_a's warnings went unlogged");
         Assert.IsTrue(await nodeB.PollLogAsync(logpos, "sent WARNING: invalid value for parameter \"default_text_search_config\"", token),
             "the warning node_a sends node_b's connections as they log in");
+        Assert.Contains($"the server at 127.0.0.1:{nodeA.Cluster.Port.ToString(CultureInfo.InvariantCulture)} sent WARNING: invalid value for parameter", nodeB.ReadLog()[logpos..],
+            "the warning node_a sends create_subscription's connections, made before node_a is node_b's node, naming its host and port");
+        Assert.DoesNotContain("a server sent WARNING", nodeB.ReadLog()[logpos..], "warnings of a server not named");
 
         // node_b's apply and exchange workers restart three times, each time connecting to node_a again.
         Stopwatch restarting = Stopwatch.StartNew();

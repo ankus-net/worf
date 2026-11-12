@@ -48,6 +48,11 @@ internal sealed unsafe class WorfProbe : IDisposable
     private const PgSocket NoSocket = -1;
 #endif
 
+    // A host after the addresses libpq is given, while more are still to come, that it can't connect to, as a socket
+    // directory that doesn't exist, so that libpq failing there shows it went past every address it was given, as it
+    // does past addresses that don't take the connection, rather than stopped at a server that refused it.
+    private const string EndOfList = "/worf-probe-end-of-list";
+
     private readonly string _conninfo;
     private readonly string _applicationName;
     private readonly string _peer;
@@ -55,6 +60,7 @@ internal sealed unsafe class WorfProbe : IDisposable
     private readonly byte[] _setup;
     private readonly List<(string Host, Task<IPAddress[]>? Lookup)> _hosts;
     private readonly bool[] _harvested;
+    private readonly int[] _order;
     private readonly string[] _ports;
     private readonly long _connectTimeout;
     private readonly bool _random;
@@ -81,6 +87,12 @@ internal sealed unsafe class WorfProbe : IDisposable
         _setup = setup;
         _hosts = hosts;
         _harvested = new bool[hosts.Count];
+        _order = [.. Enumerable.Range(0, hosts.Count)];
+        if (random)
+        {
+            Random.Shared.Shuffle(_order);
+        }
+
         _ports = ports;
         _connectTimeout = connectTimeout;
         _random = random;
@@ -179,7 +191,12 @@ internal sealed unsafe class WorfProbe : IDisposable
             return;
         }
 
-        Harvest();
+        if (Harvest() && _conn is not null && !_sent && _attemptDeadline != 0)
+        {
+            // Addresses found since the one being connected to started share the time left with it.
+            _attemptDeadline = Math.Min(_attemptDeadline, AttemptDeadline());
+        }
+
         if (_conn is null)
         {
             Next();
@@ -221,15 +238,27 @@ internal sealed unsafe class WorfProbe : IDisposable
                 if (_polling == PollingFailed || Status() != ConnectionOk)
                 {
                     Follow();
-                    if (_attempt == _listedUpTo - 1 && (_attempts.Count > _listedUpTo || Looking()))
+                    string refused = ErrorMessage();
+                    int end = refused.IndexOf(EndOfList, StringComparison.Ordinal);
+                    if (end >= 0)
                     {
-                        _failures.Add(ErrorMessage());
+                        refused = refused[..(refused.LastIndexOf('\n', end) + 1)].TrimEnd();
+                    }
+
+                    if (Text("PQhost") == EndOfList)
+                    {
+                        if (refused.Length > 0)
+                        {
+                            _failures.Add(refused);
+                        }
+
                         Close();
+                        _attempt = _listedUpTo - 1;
                         Next();
                         continue;
                     }
 
-                    Failure = Failures(ErrorMessage());
+                    Failure = Failures(refused);
                     return;
                 }
 
@@ -388,29 +417,30 @@ internal sealed unsafe class WorfProbe : IDisposable
 #endif
     }
 
-    // Lists the addresses found so far, each with its name and port, as each name's lookup finds them, passing over a name
-    // that has none, in random order when the connection asks libpq to balance its hosts.
-    private void Harvest()
+    // Lists the addresses found so far, each with its name and port, in the order of the names, as libpq tries them, up
+    // to the first name whose lookup hasn't finished, passing over a name that has none, in random order when the
+    // connection asks libpq to balance its hosts. Returns whether it listed any.
+    private bool Harvest()
     {
         if (_hosts.Count == 0 && _attempts.Count == 0)
         {
             // A connection string that names no host connects as libpq's defaults have it.
             _attempts.Add(("", "", ""));
-            return;
+            return true;
         }
 
-        int[] order = [.. Enumerable.Range(0, _hosts.Count)];
-        if (_random)
-        {
-            Random.Shared.Shuffle(order);
-        }
-
-        foreach (int index in order)
+        int listed = _attempts.Count;
+        foreach (int index in _order)
         {
             (string host, Task<IPAddress[]>? lookup) = _hosts[index];
-            if (_harvested[index] || lookup is { IsCompleted: false })
+            if (_harvested[index])
             {
                 continue;
+            }
+
+            if (lookup is { IsCompleted: false })
+            {
+                break;
             }
 
             _harvested[index] = true;
@@ -436,10 +466,15 @@ internal sealed unsafe class WorfProbe : IDisposable
                 _failures.Add($"could not translate host name \"{host}\" to address: {(lookup.Exception?.InnerException as SocketException)?.Message ?? "no address found"}");
             }
         }
+
+        return _attempts.Count > listed;
     }
 
     // Whether a host name's lookup is still under way.
     private bool Looking() => _hosts.Exists(host => host.Lookup is { IsCompleted: false });
+
+    // The names not listed yet, as their lookups, or an earlier name's, haven't finished, which count as an address each.
+    private int Unlisted() => Array.FindAll(_harvested, harvested => !harvested).Length;
 
     // Connects to the addresses found so far from the next one on, which libpq tries in turn, moving on as it does: after
     // one that doesn't take the connection, or a server that is starting or isn't of the session's attributes, but not
@@ -473,10 +508,16 @@ internal sealed unsafe class WorfProbe : IDisposable
 #endif
         _attempt++;
         _listedUpTo = _attempts.Count;
+        bool more = Unlisted() > 0;
         var start = (delegate* unmanaged<sbyte**, sbyte**, int, void*>)WorfConnection.LibpqFunction("PQconnectStartParams");
         List<(string Host, string Address, string Port)> rest = _attempts[_attempt..];
         byte[] info = Worf.ToServerCString(_conninfo);
         byte[] application = Worf.ToServerCString(_applicationName);
+        if (more)
+        {
+            rest.Add((EndOfList, "", rest[^1].Port));
+        }
+
         byte[] hostValue = Worf.ToServerCString(string.Join(',', rest.Select(attempt => attempt.Host)));
         byte[] hostaddr = Worf.ToServerCString(string.Join(',', rest.Select(attempt => attempt.Address)));
         byte[] portValue = Worf.ToServerCString(string.Join(',', rest.Select(attempt => attempt.Port)));
@@ -536,7 +577,7 @@ internal sealed unsafe class WorfProbe : IDisposable
             return;
         }
 
-        WorfNotices.Route(_conn, _peer, _peerNode);
+        Route();
         _polling = PollingWriting;
         StartAttempt();
         if (Status() == ConnectionBad)
@@ -553,17 +594,31 @@ internal sealed unsafe class WorfProbe : IDisposable
         _conn = null;
     }
 
-    // Gives an address its time: the connection's connect_timeout, or with none, or a longer one, its share of what the
-    // probe has left, divided among the addresses not yet tried, so that one that never answers leaves the others time.
-    private void StartAttempt()
+    // Gives an address its time.
+    private void StartAttempt() => _attemptDeadline = AttemptDeadline();
+
+    // When the address being connected to gives way: at the connection's connect_timeout, or with none, or a longer one,
+    // at its share of what the probe has left, divided among the addresses not yet tried, a name not yet listed counting
+    // as one, so that one that never answers leaves the others time; or never, for the last with no connect_timeout.
+    private long AttemptDeadline()
     {
         long now = Worker.GetCurrentTimestamp();
-        int left = Math.Max(_attempts.Count - _attempt, 1);
+        int left = Math.Max(_attempts.Count - _attempt + Unlisted(), 1);
         long share = Math.Max((Deadline - now) / left, 0);
-        _attemptDeadline = now + (_connectTimeout > 0 ? Math.Min(_connectTimeout, left > 1 ? share : _connectTimeout) : left > 1 ? share : 0);
-        if (_connectTimeout <= 0 && left == 1)
+        return _connectTimeout <= 0 && left == 1 ? 0
+            : now + (_connectTimeout > 0 ? Math.Min(_connectTimeout, left > 1 ? share : _connectTimeout) : share);
+    }
+
+    // Names the server whose notices the connection gets: the node, or the host and port libpq connects to now.
+    private void Route()
+    {
+        if (_peerNode != 0)
         {
-            _attemptDeadline = 0;
+            WorfNotices.Route(_conn, _peer, _peerNode);
+        }
+        else
+        {
+            WorfNotices.RouteByAddress(_conn);
         }
     }
 
@@ -598,17 +653,19 @@ internal sealed unsafe class WorfProbe : IDisposable
                 {
                     _attempt = i;
                     StartAttempt();
+                    Route();
                 }
 
                 return;
             }
         }
+    }
 
-        string Text(string function)
-        {
-            sbyte* value = ((delegate* unmanaged<void*, sbyte*>)WorfConnection.LibpqFunction(function))(_conn);
-            return value is null ? "" : Worf.FromServer(value);
-        }
+    // A connection's host, address or port, as libpq gives it now.
+    private string Text(string function)
+    {
+        sbyte* value = ((delegate* unmanaged<void*, sbyte*>)WorfConnection.LibpqFunction(function))(_conn);
+        return value is null ? "" : Worf.FromServer(value);
     }
 
     // Gives up the address being connected to at its time, and connects to those after it.
