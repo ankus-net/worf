@@ -1731,6 +1731,7 @@ internal static partial class Worf
         SequenceRangeGuard.ShmemInit();
         SequenceRangeReservations.ShmemInit();
         SequenceRangeHeard.ShmemInit();
+        SequenceRangeTouches.ShmemInit();
         SnowflakeIds.ShmemInit();
 
         // Init executor module

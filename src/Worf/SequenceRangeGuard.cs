@@ -770,7 +770,7 @@ internal static partial class SequenceRangeGuard
             long checkedComing = Worker.GetCurrentTimestamp();
             while (true)
             {
-                _ = PgAtomic.Add(SequenceRanges.CheckRequested, 1L);
+                SequenceRanges.RequestCheck(seqoid);
                 Worker.WakeRangeWorker();
                 PgInterrupts.Check();
                 Worker.WaitLatch(50);
@@ -3370,7 +3370,7 @@ internal static partial class SequenceRangeGuard
             : null;
         if (mark is long point && s_woken.Add((seqoid, point)))
         {
-            _ = PgAtomic.Add(SequenceRanges.CheckRequested, 1L);
+            SequenceRanges.RequestCheck(seqoid);
             Worker.WakeRangeWorker();
         }
 
@@ -3511,7 +3511,7 @@ internal static partial class SequenceRangeGuard
             if (now - woken >= 100_000)
             {
                 woken = now;
-                _ = PgAtomic.Add(SequenceRanges.CheckRequested, 1L);
+                SequenceRanges.RequestCheck(seqoid);
                 Worker.WakeRangeWorker();
             }
 
@@ -3649,7 +3649,7 @@ internal static partial class SequenceRangeGuard
             if (now - woken >= 100_000)
             {
                 woken = now;
-                _ = PgAtomic.Add(SequenceRanges.CheckRequested, 1L);
+                SequenceRanges.RequestCheck(seqoid);
                 Worker.WakeRangeWorker();
             }
 

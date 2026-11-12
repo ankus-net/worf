@@ -543,7 +543,7 @@ internal static unsafe partial class SequenceRanges
             Activate(seqoid, node);
         }
 
-        ChangedOnCommit();
+        ChangedOnCommit(seqoid);
 
         // The manager starts the database's range worker.
         Worker.SubscriptionChanged(0, false);
@@ -604,7 +604,7 @@ internal static unsafe partial class SequenceRanges
             """, seq, SpiParameter.Create(nodeId));
         _ = Worf.Execute("DELETE FROM worf.sequence_range_fence_wait WHERE seqoid = $1 AND node_id = $2", seq, SpiParameter.Create(nodeId));
         _ = LiftFence(seqoid, node, false);
-        ChangedOnCommit();
+        ChangedOnCommit(seqoid);
     }
 
     /// <summary>
@@ -620,7 +620,7 @@ internal static unsafe partial class SequenceRanges
             Activate(seqoid, node);
         }
 
-        ChangedOnCommit();
+        ChangedOnCommit(seqoid);
     }
 
     /// <summary>
@@ -664,7 +664,7 @@ internal static unsafe partial class SequenceRanges
             RequireOwner(seqoid, WorfNode.GetLocalNode(true, false)!);
             Disable(seqoid);
         });
-        ChangedOnCommit();
+        ChangedOnCommit(seqoid);
     }
 
     /// <summary>
@@ -752,7 +752,7 @@ internal static unsafe partial class SequenceRanges
                 max_range_size = excluded.max_range_size, watermark = excluded.watermark, root_start = excluded.root_start, root_end = excluded.root_end,
                 owned = excluded.owned
             """, SpiParameter.Create(seqoid));
-        ChangedOnCommit();
+        ChangedOnCommit(seqoid);
     }
 
     /// <summary>
@@ -1305,7 +1305,7 @@ internal static unsafe partial class SequenceRanges
             WHERE grant_id IN (SELECT block_id FROM abandoned) AND state <> 'abandoned'
             """, seq);
         _ = Worf.Execute("UPDATE worf.sequence_range SET state = 'quarantined' WHERE seqoid = $1 AND state NOT IN ('collecting', 'disabled', 'refused')", seq);
-        ChangedOnCommit();
+        ChangedOnCommit(seqoid);
         if (Worf.ReadScalar<uint>("SELECT owner_node FROM worf.sequence_range WHERE seqoid = $1", seq) == node.Node.Id && GrantOwnBlock(seqoid, info, node, epoch) &&
             NodeBlock(seqoid, epoch, "next") is (Guid, long, long) next)
         {
@@ -2935,11 +2935,14 @@ internal static unsafe partial class SequenceRanges
 
     /// <summary>
     /// Tells backends to reload their blocks once this transaction commits, so they don't cache what it hasn't, and this
-    /// backend at once, and again if the transaction rolls back.
+    /// backend at once, and again if the transaction rolls back, and has the range worker check the sequence changed in
+    /// full, or every sequence, given none.
     /// </summary>
-    internal static void ChangedOnCommit()
+    /// <param name="seqoid">The sequence whose ranges changed, or null for a change to every sequence's.</param>
+    internal static void ChangedOnCommit(uint? seqoid = null)
     {
         LocalVersion++;
+        SequenceRangeTouches.OnCommit(seqoid);
         if (s_changedOnCommit)
         {
             return;
@@ -2949,11 +2952,13 @@ internal static unsafe partial class SequenceRanges
         _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () =>
         {
             s_changedOnCommit = false;
+            SequenceRangeTouches.Commit();
             Changed();
         });
         _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, static () =>
         {
             s_changedOnCommit = false;
+            SequenceRangeTouches.Forget();
             LocalVersion++;
         });
 
@@ -2965,8 +2970,23 @@ internal static unsafe partial class SequenceRanges
         _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, static () =>
         {
             s_changedOnCommit = false;
+            SequenceRangeTouches.Commit();
             Changed();
         });
+    }
+
+    /// <summary>
+    /// Has the range worker check a sequence in full at once, or only wakes it, given none.
+    /// </summary>
+    /// <param name="seqoid">The sequence, or null.</param>
+    internal static void RequestCheck(uint? seqoid)
+    {
+        if (seqoid is not null)
+        {
+            SequenceRangeTouches.Touch(seqoid);
+        }
+
+        _ = PgAtomic.Add(CheckRequested, 1L);
     }
 
     /// <summary>
@@ -3927,7 +3947,7 @@ internal static unsafe partial class SequenceRanges
     /// </summary>
     private static void Quarantine(SequenceInfo info)
     {
-        ChangedOnCommit();
+        ChangedOnCommit(info.Seqoid);
         (long lo, long hi) = info.Quarantine;
         string q = info.QuarantineEdge.ToString(CultureInfo.InvariantCulture);
         RunInternalDdl($"ALTER SEQUENCE {info.Name} NO CYCLE CACHE 1 MINVALUE {lo.ToString(CultureInfo.InvariantCulture)} " +
@@ -4103,7 +4123,7 @@ internal static unsafe partial class SequenceRanges
 
         // Sessions' guards reload before any nextval reaches the block, which waits for the switch's lock until then. The
         // switch is logged once it commits, unless a savepoint it's under rolls back first.
-        ChangedOnCommit();
+        ChangedOnCommit(seqoid);
         NoteSwitch($"sequence {info.Name} switched to its block [{lo}, {hi}]", null);
         return true;
     }
@@ -4348,7 +4368,7 @@ internal static unsafe partial class SequenceRanges
                 }
                 catch (PgException error) when (error.SqlState is "55P03" or "40P01")
                 {
-                    _ = PgAtomic.Add(CheckRequested, 1L);
+                    RequestCheck(seqoid);
                 }
                 finally
                 {
@@ -4690,7 +4710,7 @@ internal static unsafe partial class SequenceRanges
         // The guard admits an imported block's values.
         if (kind == 'i')
         {
-            ChangedOnCommit();
+            ChangedOnCommit(seqoid);
         }
 
         return block;

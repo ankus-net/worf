@@ -30,7 +30,7 @@ internal static class SequenceRangeWorker
 
         // What each sequence's last full check saw: the shared count of committed range changes, the sequence's position,
         // the count of requests for checks, and when.
-        Dictionary<uint, (long Version, long? Position, long Requested, long At)> checkedAt = [];
+        Dictionary<uint, ((long All, long Sequence) Touched, long? Position, long At)> checkedAt = [];
 
         // What the last tick that looked for dropped sequences and checked this node's identity saw, and when.
         (long Version, long Requested, long At) lookedAt = (-1, -1, 0);
@@ -122,21 +122,22 @@ internal static class SequenceRangeWorker
                             try
                             {
                                 // A sequence that hasn't moved since a check less than ten check intervals ago, and at least a
-                                // second, whose blocks no change committed since has touched, which no statement waits on and
+                                // second, whose ranges no change committed since has touched, which no statement waits on and
                                 // no session asked to have checked, has nothing new for the check, which still runs that often
-                                // for what time alone changes, as a fence's wait or a rate's decay.
-                                long version = SequenceRanges.Version.Value;
+                                // for what time alone changes, as a fence's wait or a rate's decay. Changes to other
+                                // sequences' ranges don't count.
+                                (long All, long Sequence) touched = SequenceRangeTouches.Touched(seqoid);
                                 long? position = Worf.ReadScalar<long?>("SELECT pg_catalog.pg_sequence_last_value($1)", SpiParameter.Create(seqoid));
                                 long now = Worker.GetCurrentTimestamp();
-                                if (checkedAt.TryGetValue(seqoid, out (long Version, long? Position, long Requested, long At) seen) &&
-                                    seen.Version == version && seen.Position == position && seen.Requested == requested &&
+                                if (checkedAt.TryGetValue(seqoid, out ((long All, long Sequence) Touched, long? Position, long At) seen) &&
+                                    seen.Touched == touched && seen.Position == position &&
                                     now - seen.At < Math.Max(1000L, 10L * SequenceRanges.CheckInterval) * 1000L &&
                                     SequenceRangeGuard.Drawing(seqoid).Waiting == 0)
                                 {
                                     return false;
                                 }
 
-                                checkedAt[seqoid] = (version, position, requested, now);
+                                checkedAt[seqoid] = (touched, position, now);
                                 SequenceRanges.LedgerNoWait = true;
                                 double rate = Rate(rates, seqoid);
                                 _ = SequenceRanges.LiftFence(seqoid, local, false);

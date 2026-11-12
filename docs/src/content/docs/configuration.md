@@ -274,8 +274,9 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   its next block when the active one runs low. A sequence that hasn't moved,
   whose blocks no committed change has touched, and that no statement waits
   on, is checked in full only every ten intervals, and at least a second
-  apart. A session that passes half a block, or reaches its last twentieth,
-  wakes it at once. The default is `1s`.
+  apart; changes to other sequences' blocks don't count. A session that
+  passes half a block, or reaches its last twentieth, wakes it at once. The
+  default is `1s`.
 
 - `worf.sequence_range_exchange_interval`
   How often each node exchanges sequence range reports with its neighbors

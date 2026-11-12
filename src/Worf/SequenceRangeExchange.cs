@@ -76,11 +76,6 @@ internal static class SequenceRangeExchange
     // again without the check, so that an idle neighbor's messages don't read every sequence's rows.
     private static readonly Dictionary<(uint Sender, string Name), WorfUnchangedEntry> s_unchanged = [];
 
-    // The version of the ranges as this process took in each neighbor's last message, so that a message that comes
-    // while the ranges change, as the sequences of most of them do, is checked in full, without reading what the checks
-    // depend on first.
-    private static readonly Dictionary<uint, long> s_takenInAt = [];
-
     /// <summary>
     /// Answers a neighbor's exchange on the provider end of its subscription.
     /// </summary>
@@ -138,12 +133,7 @@ internal static class SequenceRangeExchange
             return "{}";
         }
 
-        // Backends reload their blocks, which an activation or a grant may have changed, once this commits, unless the call
-        // took in no sequence's change.
-        if (Process(node, root, senderId, root.GetProperty("node_name").GetWorfString() ?? "", true).Changed)
-        {
-            SequenceRanges.ChangedOnCommit();
-        }
+        _ = Process(node, root, senderId, root.GetProperty("node_name").GetWorfString() ?? "", true);
 
         (string reply, List<Guid> refusals) = Build(node, senderId, null);
         AcknowledgeRefusals(refusals);
@@ -1339,10 +1329,9 @@ internal static class SequenceRangeExchange
         int? cutAt = null;
         int takenIn = 0;
         string key = UnchangedKey(node, root, call);
-        long version = SequenceRanges.Version.Value;
-        bool quiet = s_takenInAt.TryGetValue(senderId, out long takenInAt) && takenInAt == version;
-        s_takenInAt[senderId] = version;
-        Dictionary<int, WorfEntryFingerprint>? fingerprints = heard && quiet ? Fingerprints(node, senderId, [.. sequences.EnumerateArray()], call) : null;
+        // What the checks depend on is read for every sequence at once, so that one whose ranges change as the others stay
+        // idle, as a busy sequence's switches change them, is checked in full alone.
+        Dictionary<int, WorfEntryFingerprint>? fingerprints = heard ? Fingerprints(node, senderId, [.. sequences.EnumerateArray()], call) : null;
         foreach (JsonElement entry in sequences.EnumerateArray())
         {
             index++;
@@ -1375,11 +1364,12 @@ internal static class SequenceRangeExchange
             {
                 // The sequences before where the last call was cut short, in the order of their names, which every call
                 // keeps, are left to the call after the one that reaches the last, unread. A call that has taken a third of
-                // its time leaves the rest once it has taken one in, so that each call gets past where the last stopped.
-                // Once a call is cut, the rest is left too, unread.
-                bool changed = !before && same is null &&
+                // its time leaves the rest once it has taken one in, so that each call gets past where the last stopped,
+                // from the first whose report it would have to check, unread, passing over only those it finds as they
+                // were. Once a call is cut, the rest is left too, unread.
+                bool late = !before && same is null && takenIn > 0 && takeUntil is long until && Worker.GetCurrentTimestamp() >= until;
+                bool changed = !before && !late && same is null &&
                     (!heard || !CheckUnchanged(node, root, entry, senderId, call, applied, key, fingerprints?.GetValueOrDefault(index)));
-                bool late = changed && takenIn > 0 && takeUntil is long until && Worker.GetCurrentTimestamp() >= until;
                 if (before || late)
                 {
                     cutAt ??= late ? index : null;
@@ -1403,6 +1393,10 @@ internal static class SequenceRangeExchange
                         learned |= l;
                     });
                     takenIn++;
+
+                    // Backends reload their blocks, which an activation or a grant may have changed, once this commits,
+                    // and the range worker checks the sequence in full.
+                    SequenceRanges.ChangedOnCommit(processed);
                 }
 
                 // The reports the neighbor relays, each as of when its node made it, once taken in.
@@ -2136,7 +2130,7 @@ internal static class SequenceRangeExchange
             "SELECT EXISTS (SELECT 1 FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2 AND confirmed_start = $3)",
             seq, sender, SpiParameter.Create(SequenceRangeHeard.Started)))
         {
-            SequenceRanges.ChangedOnCommit();
+            SequenceRanges.ChangedOnCommit(seqoid);
         }
 
         _ = Worf.Execute("""

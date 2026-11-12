@@ -50,7 +50,7 @@ internal static class SequenceRangeExchangeWorker
                 if (SequenceRangeExchange.ExchangeAll())
                 {
                     SequenceRanges.Changed();
-                    _ = PgAtomic.Add(SequenceRanges.CheckRequested, 1L);
+                    SequenceRanges.RequestCheck(null);
                     Worker.WakeRangeWorker();
                 }
 

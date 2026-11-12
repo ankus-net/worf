@@ -49,7 +49,7 @@ internal static class SequenceRangeSwitchWorker
 
         // Backends reload their blocks once the switch is committed, and the range worker checks the sequence again.
         SequenceRanges.Changed();
-        _ = PgAtomic.Add(SequenceRanges.CheckRequested, 1L);
+        SequenceRanges.RequestCheck(seqoid);
         Worker.WakeRangeWorker();
     }
 

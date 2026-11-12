@@ -154,7 +154,7 @@ internal static class SequenceRangeReservations
         // hear of its new bounds as it draws from it.
         SequenceRangeGuard.ForgetBounds();
 
-        SequenceRanges.ChangedOnCommit();
+        SequenceRanges.ChangedOnCommit(seqoid);
     }
 
     /// <summary>
@@ -210,7 +210,7 @@ internal static class SequenceRangeReservations
             Remove(id => id == requestId);
         }
 
-        SequenceRanges.ChangedOnCommit();
+        SequenceRanges.ChangedOnCommit(seqoid);
     }
 
     /// <summary>
@@ -253,7 +253,7 @@ internal static class SequenceRangeReservations
                         WHERE seqoid = $1 AND epoch = $2 AND kind = 'n' AND state = 'active' AND lo = $3 AND hi = $4
                         """, SpiParameter.Create(reservation.Seqoid), SpiParameter.Create(range[0].Get<int>(1)), SpiParameter.Create(reservation.Lo),
                         SpiParameter.Create(reservation.Hi));
-                    SequenceRanges.ChangedOnCommit();
+                    SequenceRanges.ChangedOnCommit(reservation.Seqoid);
                 }
 
                 recorded.Add(reservation.RequestId);
