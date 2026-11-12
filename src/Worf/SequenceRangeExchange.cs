@@ -1555,25 +1555,28 @@ internal static class SequenceRangeExchange
                 """, SpiParameter.Create(seqoid), SpiParameter.Create(senderId));
         }
 
-        // The neighbor's WAL position, once compared with the last one. The sequences a call left out, held or failed to
-        // take in keep the last one, with the start it was heard under, which shared memory holds until this one takes its
-        // place, so that the call that takes them in still sees the neighbor go back, though its WAL has passed the last
-        // position by then.
+        // The neighbor's WAL position, once compared with the last one. The sequences a call or an answer left out, held
+        // or failed to take in keep, in the tables, the furthest position the neighbor's messages reached under each of
+        // its starts since the tables recorded one for them: the last one, with the start it was heard under, which shared
+        // memory holds until this one takes its place, if this one shows the neighbor went back since, and this one
+        // otherwise, which may report draws the tables never recorded. So the message that takes them in still sees the
+        // neighbor go back, though its WAL has passed the position by then, it started again since, from past the
+        // position, or this node restarted, which empties shared memory.
         if (Worf.TryParseLsn(root.GetProperty("wal_lsn").GetWorfString() ?? "", out ulong lsn))
         {
             ulong sysid = ulong.Parse(root.GetProperty("sysid").GetWorfString() ?? "0", CultureInfo.InvariantCulture);
             long timeline = root.GetProperty("timeline").GetInt64();
             (ulong last, long lastStart) = SequenceRangeHeard.LatestLsn(senderId, sysid, timeline, call);
-            if (call && leftSequences.Count > 0 && (last > lsn || WentBackTo(last, lastStart, root) is not null))
+            if (leftSequences.Count > 0)
             {
+                (ulong keep, long keepStart) = last > lsn || WentBackTo(last, lastStart, root) is not null ? (last, lastStart) : (lsn, SenderStart(root).Start ?? 0);
                 _ = Worf.Execute("""
-                    INSERT INTO worf.sequence_range_back SELECT s, $2, $3::numeric, $4, $5::pg_lsn, $6 FROM pg_catalog.unnest($1::oid[]) s
-                    ON CONFLICT (seqoid, node_id) DO UPDATE SET sysid = excluded.sysid, timeline = excluded.timeline, lsn = excluded.lsn,
-                        started = excluded.started
+                    INSERT INTO worf.sequence_range_back SELECT s, $2, $7, $3::numeric, $4, $5::pg_lsn, $6 FROM pg_catalog.unnest($1::oid[]) s
+                    ON CONFLICT (seqoid, node_id, call, started) DO UPDATE SET sysid = excluded.sysid, timeline = excluded.timeline, lsn = excluded.lsn
                         WHERE (sequence_range_back.sysid, sequence_range_back.timeline) <> (excluded.sysid, excluded.timeline)
                             OR sequence_range_back.lsn < excluded.lsn
                     """, SpiParameter.Create(leftSequences.ToArray()), SpiParameter.Create(senderId), SpiParameter.Create((decimal)sysid),
-                    SpiParameter.Create(timeline), SpiParameter.Create(Worf.FormatLsn(last)), SpiParameter.Create(lastStart == 0 ? null : (long?)lastStart));
+                    SpiParameter.Create(timeline), SpiParameter.Create(Worf.FormatLsn(keep)), SpiParameter.Create(keepStart), SpiParameter.Create(call));
             }
 
             // A report that changed only in how far the neighbor drew records it, with the neighbor's WAL position past
@@ -1725,7 +1728,7 @@ internal static class SequenceRangeExchange
             SpiParameter.Create(Text(entry, "reset")), SpiParameter.Create(Text(entry, "reset_done")), SpiParameter.Create(ReportedRoute(entry).Route),
             SpiParameter.Create(root.TryGetProperty("started_at", out JsonElement started) && started.TryGetInt64(out long since) ? since : (long?)null),
             SpiParameter.Create(Confirms(entry)), SpiParameter.Create(SequenceRangeHeard.Started));
-        if (own.Count == 0 || (call && Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range_back WHERE seqoid = $1 AND node_id = $2)", seq, sender)) ||
+        if (own.Count == 0 || Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range_back WHERE seqoid = $1 AND node_id = $2 AND call = $3)", seq, sender, SpiParameter.Create(call)) ||
             !WalUnmoved(own[0].Get<string?>(0), root, entry, senderId, call, applied))
         {
             return false;
@@ -1937,7 +1940,8 @@ internal static class SequenceRangeExchange
             SELECT e.ord::pg_catalog.int4, r.seqoid::pg_catalog.oid,
                 pg_catalog.concat_ws('|', r.xmin, r.ctid, r.xmax, s.xmin, s.ctid, c.xmin, c.ctid, ns.xmin, ns.ctid,
                     (SELECT a.xmin::pg_catalog.text || a.ctid::pg_catalog.text FROM worf.sequence_range_absent a WHERE a.seqoid = r.seqoid AND a.node_id = $2),
-                    (SELECT b.xmin::pg_catalog.text || b.ctid::pg_catalog.text FROM worf.sequence_range_back b WHERE b.seqoid = r.seqoid AND b.node_id = $2),
+                    (SELECT pg_catalog.string_agg(b.xmin::pg_catalog.text || b.ctid::pg_catalog.text, ',' ORDER BY b.ctid) FROM worf.sequence_range_back b
+                        WHERE b.seqoid = r.seqoid AND b.node_id = $2 AND b.call = $8),
                     n.versions,
                     (SELECT pg_catalog.string_agg(q.xmin::pg_catalog.text || q.ctid::pg_catalog.text, ',' ORDER BY q.ctid)
                         FROM worf.sequence_range_request q WHERE q.seqoid = r.seqoid),
@@ -2207,8 +2211,8 @@ internal static class SequenceRangeExchange
         // neighbor sent before it. The neighbor's row is locked first, so that the position compared is the one this
         // report replaces, and none written in between is lost.
         // The position compared is the latest of the one the tables recorded, the one shared memory holds, which the
-        // tables record only once it moves by a WAL segment, the one a call that left the sequence out kept for it, and,
-        // in an answer, how far this node applied the neighbor's changes, which neither its restart nor its crash
+        // tables record only once it moves by a WAL segment, the one a call or answer that left the sequence out kept for
+        // it, and, in an answer, how far this node applied the neighbor's changes, which neither its restart nor its crash
         // forgets, and which stays put while the neighbor is idle.
         _ = Worf.Execute("SELECT 1 FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2 FOR UPDATE", seq, sender);
         WorfRows stored = Worf.Read("""
@@ -2216,20 +2220,21 @@ internal static class SequenceRangeExchange
             FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2 AND sysid = $3::numeric AND timeline = $4
             """, 1, seq, sender, SpiParameter.Create(sysid), SpiParameter.Create(timeline), SpiParameter.Create(call));
         // A position kept from another system or timeline of the neighbor's compares with nothing it reports now, and goes.
-        ulong kept = 0;
-        long keptStart = 0;
-        if (call)
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_back WHERE seqoid = $1 AND node_id = $2 AND call = $5 AND (sysid <> $3::numeric OR timeline <> $4)",
+            seq, sender, SpiParameter.Create(sysid), SpiParameter.Create(timeline), SpiParameter.Create(call));
+        WorfRows keptRows = Worf.Read(
+            "DELETE FROM worf.sequence_range_back WHERE seqoid = $1 AND node_id = $2 AND call = $5 AND sysid = $3::numeric AND timeline = $4 RETURNING lsn::text, started",
+            0, seq, sender, SpiParameter.Create(sysid), SpiParameter.Create(timeline), SpiParameter.Create(call));
+        List<(ulong Heard, long Start)> keptPositions = [];
+        foreach (WorfRow keptRow in keptRows)
         {
-            _ = Worf.Execute("DELETE FROM worf.sequence_range_back WHERE seqoid = $1 AND node_id = $2 AND (sysid <> $3::numeric OR timeline <> $4)",
-                seq, sender, SpiParameter.Create(sysid), SpiParameter.Create(timeline));
-            WorfRows keptRow = Worf.Read(
-                "DELETE FROM worf.sequence_range_back WHERE seqoid = $1 AND node_id = $2 AND sysid = $3::numeric AND timeline = $4 RETURNING lsn::text, started",
-                1, seq, sender, SpiParameter.Create(sysid), SpiParameter.Create(timeline));
-            if (keptRow.Count > 0 && Worf.TryParseLsn(keptRow[0].Get<string?>(0) ?? "", out ulong left))
+            if (Worf.TryParseLsn(keptRow.Get<string?>(0) ?? "", out ulong left))
             {
-                (kept, keptStart) = (left, keptRow[0].Get<long?>(1) ?? 0);
+                keptPositions.Add((left, keptRow.Get<long>(1)));
             }
         }
+
+        ulong kept = keptPositions.Select(position => position.Heard).DefaultIfEmpty().Max();
 
         ulong recorded = 0;
         long recordedStart = 0;
@@ -2242,6 +2247,7 @@ internal static class SequenceRangeExchange
         }
 
         ulong latest = Math.Max(Math.Max(AppliedFloor(applied, entry), kept), Math.Max(recorded, heardLast.Lsn));
+        List<(ulong Heard, long Start)> heardPositions = [(recorded, recordedStart), heardLast, .. keptPositions];
         string? rolledBack = null;
         string backTo = walLsn;
         if (Worf.TryParseLsn(walLsn, out ulong position) && latest > position)
@@ -2250,11 +2256,10 @@ internal static class SequenceRangeExchange
         }
 
         // A neighbor whose server started from a WAL position before one it reported for the sequence under an earlier
-        // start, which the tables recorded, shared memory holds, or a call that left the sequence out kept, went back as it
+        // start, which the tables recorded, shared memory holds, or a message that left the sequence out kept, went back as it
         // started, as one restored from a backup does, though its own WAL may since have passed the position it reported,
         // and it may have started again since.
-        else if (new (ulong Heard, long Start)[] { (recorded, recordedStart), (heardLast.Lsn, heardLast.Start), (kept, keptStart) }
-            .Select(position => (position.Heard, To: WentBackTo(position.Heard, position.Start, root)))
+        else if (heardPositions.Select(position => (position.Heard, To: WentBackTo(position.Heard, position.Start, root)))
             .Where(position => position.To is not null).OrderByDescending(position => position.Heard).FirstOrDefault() is (ulong reportedLsn, ulong to))
         {
             rolledBack = Worf.FormatLsn(reportedLsn);

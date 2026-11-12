@@ -140,11 +140,12 @@ using Ankus.Postgres;
     CREATE TABLE worf.sequence_range_back (
         seqoid regclass NOT NULL,
         node_id oid NOT NULL,
+        call boolean NOT NULL,
         sysid numeric(20,0) NOT NULL,
         timeline bigint NOT NULL,
         lsn pg_lsn NOT NULL,
-        started bigint,
-        PRIMARY KEY (seqoid, node_id)
+        started bigint NOT NULL,
+        PRIMARY KEY (seqoid, node_id, call, started)
     );
 
     CREATE TABLE worf.sequence_range_absent (
