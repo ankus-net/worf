@@ -50,6 +50,7 @@ internal static class SequenceRangeExchange
     // When each link last exchanged, by subscription, and the links with acknowledgements to send.
     private static readonly Dictionary<uint, long> s_exchangedAt = [];
     private static readonly HashSet<uint> s_acksWaiting = [];
+    private static long? s_turnKey;
     private static long s_requested;
 
     // What each link waited on at its last exchange that changed nothing, when it next asks for that, and the delay
@@ -630,8 +631,10 @@ internal static class SequenceRangeExchange
 
         // A reply that comes once the subscription is dropped or disabled, as when the provider answered only after
         // taking in the drop's word that this node leaves its slot, is no news of a neighbor this node still links to, so
-        // it's taken in as one that never came.
-        if (!WorfNode.GetNodeSubscriptions(node.Node.Id, false).Exists(current => current.Id == sub.Id && current.Enabled))
+        // it's taken in as one that never came; and so is one whose subscription a drop, or any change, holds, as a drop
+        // left in an open transaction does, rather than wait on the rows the drop deleted.
+        if (!WorfNode.GetNodeSubscriptions(node.Node.Id, false).Exists(current => current.Id == sub.Id && current.Enabled) ||
+            Worf.Query("SELECT 1 FROM worf.subscription WHERE sub_id = $1 AND sub_enabled FOR KEY SHARE SKIP LOCKED", false, 1, SpiParameter.Create(sub.Id)).Count == 0)
         {
             return (false, false);
         }
@@ -823,15 +826,23 @@ internal static class SequenceRangeExchange
 
         // A neighbor this node no longer exchanges with stays forgotten, though a reply of its came as its subscription
         // was dropped, and was taken in after the drop forgot it, as once it waited for a range row the drop held.
+        // It deletes the neighbor's reports in the order they're stored, in the node's turn, as an exchange's take-in
+        // writes them in the order of the sequences' names.
         if (Worf.CatalogOid("sequence_range_absent") != 0)
         {
-            foreach (WorfRow stale in Worf.Read("""
+            WorfRows stale = Worf.Read("""
                 SELECT DISTINCT n.via_node FROM worf.sequence_range_node n
                 WHERE n.via_node <> $1 AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_link k WHERE k.node_id = n.via_node)
                     AND NOT EXISTS (SELECT 1 FROM worf.subscription s WHERE s.sub_origin = n.via_node AND s.sub_target = $1)
-                """, 0, SpiParameter.Create(node.Node.Id)))
+                """, 0, SpiParameter.Create(node.Node.Id));
+            if (stale.Count > 0)
             {
-                SequenceRanges.ForgetNeighbor(stale.Get<uint>(0));
+                TakeTurn();
+            }
+
+            foreach (WorfRow neighbor in stale)
+            {
+                SequenceRanges.ForgetNeighbor(neighbor.Get<uint>(0));
             }
         }
 
@@ -891,10 +902,45 @@ internal static class SequenceRangeExchange
     /// <summary>
     /// Waits for this node's other exchanges to finish taking in their messages, so that no two lock its ranges in
     /// different orders, as when a sequence's name names another sequence on a neighbor. A call takes its turn only once
-    /// the neighbor has answered, so that no node waits on another's turn while that node waits on its own. A dropped
-    /// subscription takes the turn too, before it deletes the reports a reply's take-in locks.
+    /// the neighbor has answered, so that no node waits on another's turn while that node waits on its own.
     /// </summary>
-    internal static void TakeTurn() => _ = Worf.Read("SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('worf.sequence_range_exchange_turn'))", 0);
+    private static void TakeTurn() => _ = Worf.Read("SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('worf.sequence_range_exchange_turn'))", 0);
+
+    /// <summary>
+    /// Runs work that writes the reports of several sequences, or of several nodes, in an order of its own, in this
+    /// node's turn, as an exchange takes in its messages, and lets the turn go as the work ends, rather than as the
+    /// transaction does: a dropped subscription's deletes, a forced lift's resets, which a user's transaction may hold
+    /// for long after, as the rows they wrote, which an exchange's take-in of each sequence waits for only so long.
+    /// </summary>
+    /// <param name="work">The work, which waits on no other node.</param>
+    internal static unsafe void WithTurn(Action work)
+    {
+        if (s_turnKey is not long key)
+        {
+            key = Worf.ReadScalar<int>("SELECT pg_catalog.hashtext('worf.sequence_range_exchange_turn')");
+            s_turnKey = key;
+        }
+
+        // pg_advisory_lock's lock of the same key, held for the session until it's let go here, whatever ends the work.
+        LOCKTAG turn = new()
+        {
+            locktag_field1 = NativeGlobals.MyDatabaseId,
+            locktag_field2 = (uint)((ulong)key >> 32),
+            locktag_field3 = (uint)key,
+            locktag_field4 = 1,
+            locktag_type = 10,
+            locktag_lockmethodid = 2,
+        };
+        _ = NativeMethods.LockAcquire(&turn, 7, true, false);
+        try
+        {
+            work();
+        }
+        finally
+        {
+            _ = NativeMethods.LockRelease(&turn, 7, true);
+        }
+    }
 
     /// <summary>
     /// Gets the furthest WAL position of the provider whose changes this node has applied through a subscription, under
@@ -1388,7 +1434,7 @@ internal static class SequenceRangeExchange
                     _ = s_unchanged.Remove((senderId, entry.GetProperty("name").GetWorfString() ?? ""));
                     PgTransaction.RunInSubtransaction(() =>
                     {
-                        (bool g, bool r, bool l) = ProcessSequence(node, root, entry, senderId, senderName, call, applied);
+                        (bool g, bool r, bool l) = WithLockTimeout(() => ProcessSequence(node, root, entry, senderId, senderName, call, applied));
                         granted |= g;
                         received |= r;
                         learned |= l;
@@ -1890,6 +1936,33 @@ internal static class SequenceRangeExchange
     }
 
     /// <summary>
+    /// Takes a sequence in with a lock timeout, so that a row of its that another transaction holds, as a drop of a
+    /// subscription left open does the reports it deleted, leaves the sequence to a later exchange, rather than hold up
+    /// the exchange, which holds the node's turn, and the other sequences' blocks with it.
+    /// </summary>
+    private static T WithLockTimeout<T>(Func<T> work)
+    {
+        int nestLevel;
+        unsafe
+        {
+            nestLevel = NativeMethods.NewGUCNestLevel();
+        }
+
+        try
+        {
+            _ = Worf.Execute($"SET LOCAL lock_timeout = {Math.Min(1000, SequenceRanges.ExchangeTimeout / 4).ToString(CultureInfo.InvariantCulture)}");
+            return work();
+        }
+        finally
+        {
+            unsafe
+            {
+                NativeMethods.AtEOXact_GUC(true, nestLevel);
+            }
+        }
+    }
+
+    /// <summary>
     /// Keeps the record of a managed sequence this node dropped, which a sequence created again under its name joins,
     /// up to date with a neighbor's word of its epoch: once the epoch is disabled the record goes, so that no sequence
     /// joins a disabled epoch, as no neighbor's report brings one to join, and a later epoch replaces it. It reads first,
@@ -2277,7 +2350,20 @@ internal static class SequenceRangeExchange
                     continue;
                 }
 
-                if (Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2", seq, SpiParameter.Create(reported)).Count == 0)
+                // A report whose row another transaction holds, as a drop of a subscription left open holds the reports it
+                // deleted, is passed over until a later message relays it again, rather than hold up the rest of the
+                // sequence.
+                WorfRow row = Worf.Query("""
+                    SELECT (SELECT count(*) FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2),
+                        (SELECT count(*) FROM (SELECT 1 FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2 FOR UPDATE SKIP LOCKED) l)
+                    """, false, 1, seq, SpiParameter.Create(reported))[0];
+                if (row.Get<long>(0) > row.Get<long>(1))
+                {
+                    still.Add(reported);
+                    continue;
+                }
+
+                if (row.Get<long>(0) == 0)
                 {
                     if (known >= SequenceRangeHeard.MaxNodes || relayed >= SequenceRangeHeard.MaxRelayed)
                     {

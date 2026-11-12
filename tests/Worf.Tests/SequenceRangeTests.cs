@@ -3045,6 +3045,188 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// A drop of a subscription holds no exchange up past its own deletes: left open in a transaction, or followed in
+    /// the same statement by a drop whose provider never answers, it lets the node's turn go as its deletes are done, so
+    /// that node_b's inserts, which draw a block from node_a every 100 rows, go on drawing.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [OSCondition(OperatingSystems.Linux | OperatingSystems.OSX)]
+    public async Task DropsLetTheTurnGoAsTheirDeletesEnd()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        await using TestNode nodeC = await StartNodeAsync("node_c", token);
+        await using TestNode nodeD = await StartNodeAsync("node_d", token);
+        foreach (TestNode node in new[] { nodeA, nodeB, nodeC, nodeD })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        await SubscribeAsync(nodeB, "b_from_c", nodeC, token);
+        await SubscribeAsync(nodeB, "b_from_d", nodeD, token);
+        _ = await nodeA.SafePsqlAsync(Database,
+            "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100, max_range_size := 100)", token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+
+        // node_b inserts for 12 s, each insert within 5 s.
+        async Task<List<string>> InsertAsync()
+        {
+            List<string> failed = [];
+            await using NpgsqlConnection writer = await nodeB.OpenAsync(Database, token);
+            await using (NpgsqlCommand timeout = new("SET statement_timeout = '5s'", writer))
+            {
+                _ = await timeout.ExecuteNonQueryAsync(token);
+            }
+
+            await using NpgsqlCommand insert = new("INSERT INTO t (v) VALUES ('b')", writer);
+            Stopwatch running = Stopwatch.StartNew();
+            while (running.Elapsed < TimeSpan.FromSeconds(12))
+            {
+                try
+                {
+                    _ = await insert.ExecuteNonQueryAsync(token);
+                }
+                catch (PostgresException failure)
+                {
+                    failed.Add($"{failure.SqlState} {failure.MessageText}");
+                }
+
+                await Task.Delay(TimeSpan.FromMilliseconds(5), token);
+            }
+
+            return failed;
+        }
+
+        // A drop of b_from_c left open in a transaction.
+        await using (NpgsqlConnection dropping = await nodeB.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction open = await dropping.BeginTransactionAsync(token);
+            await using (NpgsqlCommand drop = new("SELECT worf.drop_subscription('b_from_c')", dropping, open))
+            {
+                _ = await drop.ExecuteScalarAsync(token);
+            }
+
+            List<string> failed = await InsertAsync();
+            Assert.AreEqual("", string.Join("\n", failed.Distinct()), "node_b's inserts as the drop of b_from_c is left open");
+            await open.CommitAsync(token);
+        }
+
+        // A drop of b_from_d, whose provider is paused, in the statement after a drop of b_from_a's sibling, b_from_c,
+        // made again.
+        await SubscribeAsync(nodeB, "b_from_c", nodeC, token);
+        await SuspendAsync(nodeD, true, token);
+        try
+        {
+            Task<string> both = nodeB.SafePsqlAsync(Database, "SELECT worf.drop_subscription('b_from_c'), worf.drop_subscription('b_from_d')", token);
+            List<string> failed = await InsertAsync();
+            Assert.AreEqual("", string.Join("\n", failed.Distinct()), "node_b's inserts as the drop of b_from_d waits on node_d");
+            Assert.IsFalse(both.IsCompleted, "the drops, waiting on node_d");
+            await SuspendAsync(nodeD, false, token);
+            _ = await both;
+        }
+        finally
+        {
+            await SuspendAsync(nodeD, false, token);
+        }
+    }
+
+    /// <summary>
+    /// Two nodes that drop their subscriptions to each other at once, each after another drop in the same statement, each
+    /// tell the other they leave its slot, so that neither keeps a link to the other, which its fences would wait for.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task MutualDropsLeaveEachOthersSlots()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        await using TestNode nodeC = await StartNodeAsync("node_c", token);
+        foreach (TestNode node in new[] { nodeA, nodeB, nodeC })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        await SubscribeAsync(nodeA, "a_from_c", nodeC, token);
+        await SubscribeAsync(nodeB, "b_from_c", nodeC, token);
+        await SubscribeAsync(nodeA, "a_from_b", nodeB, token);
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeC.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_a,node_b}', range_size := 100)", token);
+        await WaitActiveAsync([nodeA, nodeB, nodeC], token);
+        string nodeAId = await nodeA.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
+        string nodeBId = await nodeB.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, $"SELECT EXISTS (SELECT 1 FROM worf.sequence_range_link WHERE node_id = {nodeBId})", token), "node_a's link to node_b");
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, $"SELECT EXISTS (SELECT 1 FROM worf.sequence_range_link WHERE node_id = {nodeAId})", token), "node_b's link to node_a");
+
+        Stopwatch dropping = Stopwatch.StartNew();
+        await Task.WhenAll(
+            nodeA.SafePsqlAsync(Database, "SELECT worf.drop_subscription('a_from_c'), worf.drop_subscription('a_from_b')", token),
+            nodeB.SafePsqlAsync(Database, "SELECT worf.drop_subscription('b_from_c'), worf.drop_subscription('b_from_a')", token));
+        TimeSpan took = dropping.Elapsed;
+        Assert.AreEqual("0|0", $"{await nodeA.SafePsqlAsync(Database, $"SELECT count(*) FROM worf.sequence_range_link WHERE node_id = {nodeBId}", token)}|" +
+            await nodeB.SafePsqlAsync(Database, $"SELECT count(*) FROM worf.sequence_range_link WHERE node_id = {nodeAId}", token),
+            $"the links node_a and node_b keep to each other after the drops, which took {took}");
+    }
+
+    /// <summary>
+    /// A forced lift, and the exchange worker's forgetting of a neighbor it no longer exchanges with, write reports in
+    /// orders of their own, and so wait for the node's turn, as an exchange's take-in does: here, while a session holds
+    /// it.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task LiftsAndForgettingTakeTheTurn()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100)", token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            await using NpgsqlConnection holding = await node.OpenAsync(Database, token);
+            await using (NpgsqlCommand hold = new("SELECT pg_advisory_lock(hashtext('worf.sequence_range_exchange_turn'))", holding))
+            {
+                _ = await hold.ExecuteScalarAsync(token);
+            }
+
+            if (node == nodeA)
+            {
+                // A lift on node_a, the owner, waits for the turn.
+                Task<bool> lifting = node.PsqlAsync(Database, "SELECT worf.activate_sequence_range('t_id_seq')", token);
+                await Task.Delay(TimeSpan.FromSeconds(3), token);
+                Assert.IsFalse(lifting.IsCompleted, "the lift, waiting for node_a's turn");
+                await using NpgsqlCommand release = new("SELECT pg_advisory_unlock(hashtext('worf.sequence_range_exchange_turn'))", holding);
+                _ = await release.ExecuteScalarAsync(token);
+                _ = await lifting;
+            }
+            else
+            {
+                // A neighbor node_b no longer exchanges with, of which it keeps a report, is forgotten in the turn.
+                _ = await node.SafePsqlAsync(Database,
+                    "INSERT INTO worf.sequence_range_node (seqoid, node_id, node_name, via_node, reported_at) VALUES ('t_id_seq', 424242, 'gone', 424242, now())", token);
+                await Task.Delay(TimeSpan.FromSeconds(3), token);
+                Assert.AreEqual("1", await node.SafePsqlAsync(Database, "SELECT count(*) FROM worf.sequence_range_node WHERE via_node = 424242", token),
+                    "the report of the neighbor node_b no longer exchanges with, while a session holds node_b's turn");
+                await using NpgsqlCommand release = new("SELECT pg_advisory_unlock(hashtext('worf.sequence_range_exchange_turn'))", holding);
+                _ = await release.ExecuteScalarAsync(token);
+                Assert.IsTrue(await node.PollQueryUntilAsync(Database, "SELECT NOT EXISTS (SELECT 1 FROM worf.sequence_range_node WHERE via_node = 424242)", token),
+                    "the report of the neighbor node_b no longer exchanges with, forgotten once the session lets the turn go");
+            }
+        }
+    }
+
+    /// <summary>
     /// A provider whose rows come back once its subscription is dropped, as a reply to a call does that the exchange
     /// worker takes in after the drop forgot the provider, stays forgotten: the rows go at the exchange worker's next
     /// round, and stay gone. A reply that a trigger holds up until the drop has committed, which saw the subscription as

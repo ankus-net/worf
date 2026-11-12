@@ -565,10 +565,9 @@ internal static class Functions
             // node's exchange worker is taking in locks the reports of the provider, and of the nodes it relays, in the
             // order of the sequences' names, and this deletes them in the order they're stored, so it waits for the
             // take-in to commit first, as one exchange does for another; one that comes later finds the subscription
-            // gone. The turn is taken last, after the calls to the provider above, so that no node holds its turn
-            // while it waits on another.
-            SequenceRangeExchange.TakeTurn();
-            SequenceRanges.ForgetNeighbor(sub.Origin.Id);
+            // held, or gone. The turn is taken last, after the calls to the provider above, so that no node holds its
+            // turn while it waits on another, and let go once the deletes are done, rather than as the transaction ends.
+            SequenceRangeExchange.WithTurn(() => SequenceRanges.ForgetNeighbor(sub.Origin.Id));
         }
 
         return BoolDatum(sub is not null);

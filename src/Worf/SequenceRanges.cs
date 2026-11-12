@@ -562,9 +562,11 @@ internal static unsafe partial class SequenceRanges
     {
         uint seqoid = RequireOwnedSequence(sequence);
         HoldsRangeRow("worf.activate_sequence_range");
+        // A lift that resets the holders of grants that overlap writes their reports in an order of its own, in the node's
+        // turn, which it takes before it locks anything, as an exchange does.
         if (nodeName is null || nodeName.IsNull)
         {
-            Elevated.Run(() => ActivateOrLift(seqoid));
+            Elevated.Run(() => SequenceRangeExchange.WithTurn(() => ActivateOrLift(seqoid)));
             return;
         }
 
