@@ -105,8 +105,15 @@ public sealed class DocumentationTests
         Assert.Contains("saying that it has checked the node's report of the sequence since then", s_sequenceRanges, "a returning node's wait for each sequence (1100, 1211)");
         Assert.DoesNotContain("a restarted node waits for its grantor until a call has taken every sequence in", s_sequenceRanges, "a returning node's wait (1211)");
         Assert.DoesNotContain("with time left for its answer", s_sequenceRanges, "a call's answer (1213)");
-        Assert.Contains("once a grant has committed, and reached the synchronous standbys that commits wait for, the range worker asks the nodes that subscribe to it to call it", s_sequenceRanges,
-            "an owner's own blocks (1101, 1160, 1500)");
+        Assert.Contains("once a grant has committed, and reached the synchronous standbys that commits wait for, the range worker asks the nodes that subscribe to its database to call it", s_sequenceRanges,
+            "an owner's own blocks (1101, 1160, 1500, 1702)");
+        Assert.Contains("as a notification to the connection each one's exchanges keep, and they do at once, though their replication streams are behind a large transaction or a delay",
+            s_sequenceRanges, "a word behind a large transaction (1700)");
+        Assert.Contains("so the provider doesn't end the stream at `wal_sender_timeout`", s_sequenceRanges, "a delay longer than wal_sender_timeout (1703)");
+        Assert.Contains("which the other nodes take as they next hear from the owner", s_sequenceRanges, "altered block sizes (1723)");
+        Assert.Contains("and every other node it subscribes to, or that calls it, that reports the sequence, and so may have heard of its draws", s_sequenceRanges,
+            "the neighbors a start waits for (1601, 1605)");
+        Assert.Contains("a single-user server keeps its start as its first statement runs", s_sequenceRanges, "a single-user start (1602)");
         Assert.DoesNotContain("not at all once the node has written past where they saw its WAL position", s_sequenceRanges, "a restore's notice (1100, 1211)");
         Assert.Contains("Each server keeps its last 32 starts", s_sequenceRanges, "a restore across restarts (1400)");
         Assert.DoesNotContain("as contrib's `autoinc` trigger does, isn't seen", s_sequenceRanges, "a trigger's arguments (800)");

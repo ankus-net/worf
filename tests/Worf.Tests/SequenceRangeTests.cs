@@ -2949,6 +2949,12 @@ public sealed partial class SequenceRangeTests
                 string readOnly = await CallAsync($"host=worf-two.test port={port} target_session_attrs=read-write", "exchange with node node_c failed");
                 Assert.Contains("session is read-only", readOnly, "node_b's call to node_c, refused at the standby");
                 Assert.DoesNotContain("exchange with node node_c done", readOnly, "node_b's calls to node_c, past the standby");
+                Assert.DoesNotContain("(127.0.0.1)", readOnly, "node_b's failure, naming the address libpq never tried");
+
+                // worf-first.test has node_c's address before the standby's. A connection that prefers a standby passes
+                // node_c for the next host, of which there is none, and takes node_c in its second pass, from the first
+                // host, as psql does.
+                _ = await CallAsync($"host=worf-first.test port={port} target_session_attrs=prefer-standby", "sequence range exchange with node node_c done");
 
                 // A standby found at a name still looked up is preferred to node_c, listed before it.
                 string preferred = await CallAsync($"host=127.0.0.1,worf-standby.test port={port} target_session_attrs=prefer-standby",
@@ -2981,6 +2987,14 @@ public sealed partial class SequenceRangeTests
                     await stopClosing.CancelAsync();
                     _ = await Task.WhenAny(closer);
                 }
+
+                // A lookup that takes longer than a call goes on past it, and the next call connects with what it found, as
+                // psql does once it ends.
+                _ = await CallAsync($"host=worf-later.test port={port}", "sequence range exchange with node node_c done");
+
+                // A host entry is taken with its spaces, as libpq takes it.
+                string spaced = await CallAsync($"host=''127.0.0.4, worf-delay.test'' port={port}", "exchange with node node_c failed");
+                Assert.Contains("could not translate host name \" worf-delay.test\"", spaced, "node_b's call to node_c at a host with a space");
 
                 // An address that refuses gives way to a name still looked up, and the call doesn't fail meanwhile.
                 string waited = await CallAsync($"host=127.0.0.1,worf-delay.test port=1,{port}", "sequence range exchange with node node_c done");
@@ -3395,8 +3409,9 @@ public sealed partial class SequenceRangeTests
 
     /// <summary>
     /// A forced lift, and the exchange worker's forgetting of a neighbor it no longer exchanges with, write reports in
-    /// orders of their own, and so wait for the node's turn, as an exchange's take-in does: here, while a session holds
-    /// it.
+    /// orders of their own, and so wait for the node's turn, as an exchange's take-in does: here, while a node that takes
+    /// over another's slot forgets the old node in the turn, waiting for a report the old node relayed, which a session
+    /// holds.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -3416,11 +3431,30 @@ public sealed partial class SequenceRangeTests
 
         foreach (TestNode node in new[] { nodeA, nodeB })
         {
-            await using NpgsqlConnection holding = await node.OpenAsync(Database, token);
-            await using (NpgsqlCommand hold = new("SELECT pg_advisory_lock(hashtext('worf.sequence_range_exchange_turn'))", holding))
+            // A made-up node takes over the slot turn_link, bound to another, and forgets that one in the node's turn,
+            // waiting for the report it relayed, which a session holds; each node's are their own, as node_a's reports
+            // reach node_b.
+            int old = node == nodeA ? 3000001 : 4000001;
+            _ = await node.SafePsqlAsync(Database, "SELECT pg_create_logical_replication_slot('turn_link', 'worf')", token);
+            _ = await node.SafePsqlAsync(Database, $"""
+                CREATE ROLE turn_user; GRANT USAGE ON SCHEMA worf TO turn_user; GRANT EXECUTE ON FUNCTION worf.sequence_range_exchange(text) TO turn_user;
+                INSERT INTO worf.sequence_range_link VALUES ('turn_link', {old}, 'turn_user'::regrole);
+                INSERT INTO worf.sequence_range_node (seqoid, node_id, node_name, via_node, reported_at) VALUES ('t_id_seq', {old + 1}, 'relayed', {old}, now());
+                """, token);
+            await using NpgsqlConnection holder = await node.OpenAsync(Database, token);
+            await using NpgsqlTransaction holding = await holder.BeginTransactionAsync(token);
+            await using (NpgsqlCommand hold = new($"SELECT 1 FROM worf.sequence_range_node WHERE via_node = {old} FOR UPDATE", holder, holding))
             {
-                _ = await hold.ExecuteScalarAsync(token);
+                _ = await hold.ExecuteNonQueryAsync(token);
             }
+
+            string taker = $$"""{"node_id": {{old + 2}}, "node_name": "taker", "slot": "turn_link", "sysid": "1", "timeline": 1, "wal_lsn": "0/0", "sequences": []}""";
+            Task takeover = node.SafePsqlAsync(Database, $"SET SESSION AUTHORIZATION turn_user; SELECT worf.sequence_range_exchange('{taker}')", token);
+            Assert.IsTrue(await node.PollQueryUntilAsync(Database, """
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+                    WHERE l.locktype = 'advisory' AND l.objsubid = 5 AND l.granted AND a.query LIKE '%sequence_range_exchange(%taker%')
+                """, token), $"the takeover, holding {node.Name}'s turn");
 
             if (node == nodeA)
             {
@@ -3428,8 +3462,13 @@ public sealed partial class SequenceRangeTests
                 Task<bool> lifting = node.PsqlAsync(Database, "SELECT worf.activate_sequence_range('t_id_seq')", token);
                 await Task.Delay(TimeSpan.FromSeconds(3), token);
                 Assert.IsFalse(lifting.IsCompleted, "the lift, waiting for node_a's turn");
-                await using NpgsqlCommand release = new("SELECT pg_advisory_unlock(hashtext('worf.sequence_range_exchange_turn'))", holding);
-                _ = await release.ExecuteScalarAsync(token);
+                Assert.AreEqual("t", await node.SafePsqlAsync(Database, """
+                    SELECT EXISTS (
+                        SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+                        WHERE l.locktype = 'advisory' AND l.objsubid = 5 AND NOT l.granted AND a.query LIKE '%activate_sequence_range%')
+                    """, token), "the lift, waiting for node_a's turn itself");
+                await holding.CommitAsync(token);
+                await takeover;
                 _ = await lifting;
             }
             else
@@ -3439,11 +3478,11 @@ public sealed partial class SequenceRangeTests
                     "INSERT INTO worf.sequence_range_node (seqoid, node_id, node_name, via_node, reported_at) VALUES ('t_id_seq', 424242, 'gone', 424242, now())", token);
                 await Task.Delay(TimeSpan.FromSeconds(3), token);
                 Assert.AreEqual("1", await node.SafePsqlAsync(Database, "SELECT count(*) FROM worf.sequence_range_node WHERE via_node = 424242", token),
-                    "the report of the neighbor node_b no longer exchanges with, while a session holds node_b's turn");
-                await using NpgsqlCommand release = new("SELECT pg_advisory_unlock(hashtext('worf.sequence_range_exchange_turn'))", holding);
-                _ = await release.ExecuteScalarAsync(token);
+                    "the report of the neighbor node_b no longer exchanges with, while the takeover holds node_b's turn");
+                await holding.CommitAsync(token);
+                await takeover;
                 Assert.IsTrue(await node.PollQueryUntilAsync(Database, "SELECT NOT EXISTS (SELECT 1 FROM worf.sequence_range_node WHERE via_node = 424242)", token),
-                    "the report of the neighbor node_b no longer exchanges with, forgotten once the session lets the turn go");
+                    "the report of the neighbor node_b no longer exchanges with, forgotten once the takeover lets the turn go");
             }
         }
     }
@@ -5893,7 +5932,10 @@ public sealed partial class SequenceRangeTests
 
         // The call made again with a route of 100,000 nodes that holds neither, at a distance of one, and 100,000 Snowflake
         // node numbers held.
-        string literal = call[Call.Length..^1];
+        // The call LISTENs for node_b's words after it runs.
+        const string Listen = "; LISTEN worf_sequence_range";
+        Assert.EndsWith(Listen, call, "node_c's call");
+        string literal = call[Call.Length..^(Listen.Length + 1)];
         JsonObject message = JsonNode.Parse(literal[1..^1].Replace("''", "'", StringComparison.Ordinal))!.AsObject();
         foreach (JsonNode? sequence in message["sequences"]!.AsArray())
         {
@@ -9075,7 +9117,8 @@ public sealed partial class SequenceRangeTests
     }
 
     // A library the server preloads that answers the lookups of test names: worf-slow.test takes 7 s to fail,
-    // worf-two.test has 127.0.0.2 before 127.0.0.1, worf-none.test has none, worf-delay.test and worf-late.test take 0.3 s
+    // worf-two.test has 127.0.0.2 before 127.0.0.1, worf-first.test 127.0.0.1 before 127.0.0.2, worf-later.test takes 8 s
+    // to find 127.0.0.1, worf-none.test has none, worf-delay.test and worf-late.test take 0.3 s
     // and 1 s to find 127.0.0.1, worf-standby.test takes 0.3 s to find 127.0.0.2, and the machine's own name has
     // 127.0.0.3 alone.
     private const string LookupLibrary = """
@@ -9122,6 +9165,20 @@ public sealed partial class SequenceRangeTests
 
             if (node && strcmp(node, "worf-none.test") == 0)
                 return EAI_NONAME;
+
+            if (node && strcmp(node, "worf-first.test") == 0)
+            {
+                *res = v4("127.0.0.1", service, hints);
+                (*res)->ai_next = v4("127.0.0.2", service, hints);
+                return 0;
+            }
+
+            if (node && strcmp(node, "worf-later.test") == 0)
+            {
+                sleep(8);
+                *res = v4("127.0.0.1", service, hints);
+                return 0;
+            }
 
             if (node && (strcmp(node, "worf-delay.test") == 0 || strcmp(node, "worf-late.test") == 0 || strcmp(node, "worf-standby.test") == 0))
             {
