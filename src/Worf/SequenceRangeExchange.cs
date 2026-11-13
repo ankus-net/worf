@@ -42,6 +42,12 @@ internal static class SequenceRangeExchange
     // The sequences, with the prepared transactions holding their range rows, that this process has warned of.
     private static readonly HashSet<(uint Seqoid, string Gid)> s_preparedHolders = [];
 
+    // The sequences whose range rows a wait in an exchange of this process ran out on, which later exchanges pass over at
+    // once until one takes the row, and whether a wait ran out in the message taken in now, whose other sequences are
+    // then passed over at once too.
+    private static readonly HashSet<uint> s_heldRanges = [];
+    private static bool s_rangeWaitSpent;
+
     // The neighbors whose messages the current transaction took in, with when their servers started and whether they
     // made them knowing this server was back, noted once it commits.
     private const long TimedOutBackoff = 60_000_000;
@@ -1437,6 +1443,7 @@ internal static class SequenceRangeExchange
         int index = -1;
         int? cutAt = null;
         int takenIn = 0;
+        s_rangeWaitSpent = false;
         string key = UnchangedKey(node, root, call);
         List<long> drawnSequences = [];
         List<long> drawnTo = [];
@@ -2052,10 +2059,11 @@ internal static class SequenceRangeExchange
     }
 
     /// <summary>
-    /// Takes a sequence in with a lock timeout, so that a row of its that another transaction holds, as a drop of a
-    /// subscription left open does the reports it deleted, leaves the sequence to a later exchange, rather than hold up
-    /// the exchange, which holds the node's turn, and the other sequences' blocks with it. The setting is made as SET
-    /// LOCAL makes it, without a statement, which would take a transaction ID.
+    /// Takes a sequence in with the shortest lock timeout, past its range row, so that a row of its that another
+    /// transaction holds, as a drop of a subscription left open does the reports it deleted, leaves the sequence to a
+    /// later exchange at once, rather than hold up the exchange, which holds the node's turn,
+    /// and the other sequences' blocks with it, for each such sequence and each exchange the holder stays open. The
+    /// setting is made as SET LOCAL makes it, without a statement, which would take a transaction ID.
     /// </summary>
     internal static T WithLockTimeout<T>(Func<T> work)
     {
@@ -2064,7 +2072,7 @@ internal static class SequenceRangeExchange
         {
             nestLevel = NativeMethods.NewGUCNestLevel();
             fixed (byte* name = "lock_timeout\0"u8)
-            fixed (byte* value = Worf.ToServerCString(Math.Min(1000, SequenceRanges.ExchangeTimeout / 4).ToString(CultureInfo.InvariantCulture)))
+            fixed (byte* value = "1\0"u8)
             {
                 _ = NativeMethods.set_config_option((sbyte*)name, (sbyte*)value, GucContext.PGC_USERSET, GucSource.PGC_S_SESSION,
                     GucAction.GUC_ACTION_SAVE, true, 0, false);
@@ -2217,7 +2225,10 @@ internal static class SequenceRangeExchange
 
         // The range row is locked first, as every change to the sequence's ranges does, waiting a quarter of
         // worf.sequence_range_timeout at most, up to a second, as a transaction that ran a block out holds it until it
-        // ends, so that the exchange, which holds the node's turn, goes on with the other sequences.
+        // ends, so that the exchange, which holds the node's turn, goes on with the other sequences. Once a wait has run
+        // out, the message's other held sequences, and later exchanges' for this one until one takes its row, are passed
+        // over at once, so that transactions left open over range rows, as configuration changes, cost the turn that
+        // second once, rather than for each sequence they hold at every exchange.
         int epoch = entry.GetProperty("epoch").GetInt32();
         uint owner = entry.GetProperty("owner_id").GetUInt32();
         WorfRows local;
@@ -2229,9 +2240,17 @@ internal static class SequenceRangeExchange
 
         try
         {
-            _ = Worf.Execute($"SET LOCAL lock_timeout = {Math.Min(1000, SequenceRanges.ExchangeTimeout / 4).ToString(CultureInfo.InvariantCulture)}");
+            int wait = s_rangeWaitSpent || s_heldRanges.Contains(seqoid) ? 1 : Math.Min(1000, SequenceRanges.ExchangeTimeout / 4);
+            _ = Worf.Execute($"SET LOCAL lock_timeout = {wait.ToString(CultureInfo.InvariantCulture)}");
             local = Worf.Query("SELECT owner_node, epoch, state, parent_node FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE", false, 1,
                 SpiParameter.Create(seqoid));
+            _ = s_heldRanges.Remove(seqoid);
+        }
+        catch (PgException held) when (held.SqlState == "55P03")
+        {
+            _ = s_heldRanges.Add(seqoid);
+            s_rangeWaitSpent = true;
+            throw;
         }
         finally
         {

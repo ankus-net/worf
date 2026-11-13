@@ -3090,9 +3090,10 @@ public sealed partial class SequenceRangeTests
 
     /// <summary>
     /// A node's exchange turn is held only by the work that needs it, and waits on no other session's lock, so that
-    /// node_b's inserts, which draw a block from node_a every 100 rows, go on drawing: a forced lift on node_a waits for a
-    /// configuration change or a drop left open, and for a drop under way, before it takes the turn rather than holding
-    /// it, and so doesn't deadlock with the drop; a drop canceled in the turn lets it go; sessions' own advisory locks,
+    /// node_b's inserts, which draw a block from node_a every 100 rows, go on drawing: an exchange waits for a range row
+    /// a configuration change left open holds once, rather than for each such row at every exchange; a forced lift on
+    /// node_a waits for a configuration change or a drop left open, and for a drop under way, before it takes the turn
+    /// rather than holding it, and so doesn't deadlock with the drop; a drop canceled in the turn lets it go; sessions' own advisory locks,
     /// of whatever key, are never worf's; and a drop left open whose deletes a reply's take-in would wait for, or a fence's
     /// lift in the range worker, holds up neither the turn nor the worker, so that node_a's own inserts, which switch
     /// blocks of 10, go on too.
@@ -3189,7 +3190,11 @@ public sealed partial class SequenceRangeTests
         {
             case "configuration open" or "drop open":
             {
-                await HoldAsync(how == "drop open" ? "SELECT worf.drop_subscription('a_from_c')" : "SELECT worf.alter_sequence_range('u_id_seq', range_size := 10)");
+                // A configuration change left open holds the range rows of u_id_seq and the twenty others.
+                await HoldAsync(how == "drop open" ? "SELECT worf.drop_subscription('a_from_c')" : """
+                    SELECT worf.alter_sequence_range('u_id_seq', range_size := 10);
+                    SELECT count(worf.alter_sequence_range(format('many_%s', lpad(g::text, 2, '0'))::regclass, range_size := 50)) FROM generate_series(1, 20) g
+                    """);
                 Task lift = nodeA.SafePsqlAsync(Database, Lift, token);
                 Assert.AreEqual("", await InsertAsync(nodeB, "t"), $"node_b's inserts as a lift waits beside a {how}");
                 await holding.CommitAsync(token);
