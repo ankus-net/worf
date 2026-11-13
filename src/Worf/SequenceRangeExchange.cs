@@ -2309,6 +2309,15 @@ internal static class SequenceRangeExchange
         // it, and, in an answer, how far this node applied the neighbor's changes, which neither its restart nor its crash
         // forgets, and which stays put while the neighbor is idle.
         _ = Worf.Execute("SELECT 1 FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2 FOR UPDATE", seq, sender);
+
+        // A neighbor that reports an older timeline of its system than one this node heard from it on, as the tables, a
+        // kept position or shared memory hold it, went back to a backup from before it moved on to the later timeline.
+        long laterTimeline = Math.Max(
+            ulong.TryParse(sysid, NumberStyles.None, CultureInfo.InvariantCulture, out ulong system) ? SequenceRangeHeard.HeardTimeline(senderId, system) : 0,
+            Worf.ReadScalar<long?>("""
+                SELECT greatest((SELECT max(timeline) FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2 AND sysid = $3::numeric),
+                    (SELECT max(timeline) FROM worf.sequence_range_back WHERE seqoid = $1 AND node_id = $2 AND sysid = $3::numeric))
+                """, seq, sender, SpiParameter.Create(sysid)) ?? 0);
         WorfRows stored = Worf.Read("""
             SELECT CASE WHEN $5 THEN wal_lsn ELSE reply_lsn END::text, reported_start
             FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2 AND sysid = $3::numeric AND timeline = $4
@@ -2337,7 +2346,12 @@ internal static class SequenceRangeExchange
         List<(ulong Heard, long Start)> heardPositions = [(recorded, recordedStart), heardLast, .. keptPositions];
         string? rolledBack = null;
         string backTo = walLsn;
-        if (Worf.TryParseLsn(walLsn, out ulong position) && latest > position)
+        bool olderTimeline = laterTimeline > timeline;
+        if (olderTimeline)
+        {
+            rolledBack = walLsn;
+        }
+        else if (Worf.TryParseLsn(walLsn, out ulong position) && latest > position)
         {
             rolledBack = Worf.FormatLsn(latest);
         }
@@ -2368,6 +2382,10 @@ internal static class SequenceRangeExchange
             _ = Worf.Execute("UPDATE worf.sequence_range_node SET reset_lsn = $3::pg_lsn WHERE seqoid = $1 AND node_id = $2 AND reset_lsn IS NULL", seq,
                 sender, SpiParameter.Create(walLsn));
             WorfLog.Warning($"sequence {info.Name}: node {senderName} {lost}, so it must reset its blocks");
+        }
+        else if (olderTimeline)
+        {
+            WorfLog.Warning($"sequence {info.Name}: node {senderName} went back from timeline {laterTimeline} to timeline {timeline}, so it must reset its blocks");
         }
         else if (rolledBack is not null)
         {

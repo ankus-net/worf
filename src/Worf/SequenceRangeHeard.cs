@@ -103,6 +103,27 @@ internal static class SequenceRangeHeard
     }
 
     /// <summary>
+    /// Gets the timeline of a neighbor's system that shared memory last heard it on, or zero.
+    /// </summary>
+    /// <param name="nodeId">The neighbor.</param>
+    /// <param name="sysid">The system identifier.</param>
+    /// <returns>The timeline.</returns>
+    internal static long HeardTimeline(uint nodeId, ulong sysid)
+    {
+        uint dboid = DatabaseId();
+        using PgLwLockShareGuard<WorfHeardTable, WorfHeard> guard = Nodes.Share();
+        for (int i = 0; i < guard.Length; i++)
+        {
+            if (guard[i].Dboid == dboid && guard[i].NodeId == nodeId && guard[i].Sysid == sysid)
+            {
+                return guard[i].Timeline;
+            }
+        }
+
+        return 0;
+    }
+
+    /// <summary>
     /// Gets the WAL position a neighbor's last call or answer carried, on a system and timeline, and the start of its
     /// server then.
     /// </summary>

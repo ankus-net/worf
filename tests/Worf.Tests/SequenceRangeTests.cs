@@ -4929,6 +4929,73 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// A node restored to a backup on an older timeline than one its grantor heard it on resets, though its grantor
+    /// recorded no position on that timeline past the backup: node_b is copied on timeline 1 and draws, recovers past
+    /// the draws onto timeline 2, where it resets and draws from a new block, and goes back to the copy on timeline 1.
+    /// It never draws again the values it drew after the copy.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task RestoredToOlderTimelinesDrawNothingTwice()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 1000)", token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+        await InsertAsync(nodeB, 20, token);
+
+        // node_b's inserts wait until node_a has answered it since it started, and for a new block after a reset.
+        async Task<HashSet<string>> InsertIdsAsync(string label)
+        {
+            Stopwatch waiting = Stopwatch.StartNew();
+            while (true)
+            {
+                Assert.IsLessThan(TestNode.PollTimeout, waiting.Elapsed, $"node_b's insert {label}");
+                try
+                {
+                    return [.. (await nodeB.SafePsqlAsync(Database, $"INSERT INTO t (v) SELECT '{label}' FROM generate_series(1, 20) RETURNING id", token)).Split('\n')];
+                }
+                catch (PostgresException waited) when (waited.SqlState is "55000" or "57014" or "2200H")
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(200), token);
+                }
+            }
+        }
+
+        const string HeardTimeline = "SELECT timeline FROM worf.sequence_range_node WHERE node_name = 'node_b' AND seqoid = 't_id_seq'::regclass";
+        using TemporaryDirectory copies = new($"worf-sequence-range-timeline-{Guid.NewGuid():N}");
+        string copy = Path.Join(copies.FullName, "node_b");
+        _ = await nodeB.SafePsqlAsync(Database, "ALTER SYSTEM SET wal_keep_size = '1GB'; SELECT pg_reload_conf()", token);
+        await CopyDataAsync(nodeB, copy, token);
+        HashSet<string> before = await InsertIdsAsync("before");
+        string drawnTo = await nodeB.SafePsqlAsync(Database, "SELECT pg_current_wal_lsn()", token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database,
+            $"SELECT wal_lsn >= '{drawnTo}' FROM worf.sequence_range_node WHERE node_name = 'node_b' AND seqoid = 't_id_seq'::regclass", token),
+            "node_a hearing of node_b's draws");
+
+        // node_b recovers past its draws onto timeline 2, resets as its identity changed, and draws from a new block,
+        // which node_a hears of on timeline 2.
+        await RestoreDataAsync(nodeB, copy, token, target: drawnTo);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT NOT pg_is_in_recovery()", token), "node_b recovered");
+        HashSet<string> second = await InsertIdsAsync("second");
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, $"SELECT ({HeardTimeline}) = 2", token), "node_a hearing node_b on timeline 2");
+
+        // node_b goes back to the copy on timeline 1.
+        await RestoreDataAsync(nodeB, copy, token);
+        Assert.AreEqual("00000001", await nodeB.SafePsqlAsync(Database, "SELECT substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8)", token),
+            "node_b's timeline after the restore");
+        HashSet<string> after = await InsertIdsAsync("after");
+        Assert.AreEqual("", string.Join(",", before.Union(second).Intersect(after)), "the ids node_b drew again after going back to timeline 1");
+    }
+
+    /// <summary>
     /// A node whose file of starts can't be read, or whose worf_starts.tmp is a directory, starts as usual: its supervisor
     /// keeps running and keeps the start, writing the file in place or anew, and the node's inserts go on, though a file
     /// that lost the starts before has its neighbors take the positions they heard of before as gone back.
