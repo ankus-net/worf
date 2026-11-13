@@ -4737,6 +4737,49 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// The manager's pass over replicated sequences passes over one that a session's worf.synchronize_sequence holds,
+    /// rather than wait for it holding another, which the session then synchronizes: neither waits on the other.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task SequencePassesWaitOnNoSession()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE SEQUENCE sa; CREATE SEQUENCE sb;
+            SELECT worf.replication_set_add_sequence('default', 'sa');
+            SELECT worf.replication_set_add_sequence('default', 'sb');
+            """, token);
+
+        // A session holds sb's row; both sequences then draw past half their cache, so that the next pass takes sa's row
+        // and comes to sb's.
+        await using NpgsqlConnection session = await nodeA.OpenAsync(Database, token);
+        await using NpgsqlTransaction holding = await session.BeginTransactionAsync(token);
+        await using (NpgsqlCommand first = new("SELECT worf.synchronize_sequence('sb')", session, holding))
+        {
+            _ = await first.ExecuteNonQueryAsync(token);
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT count(nextval('sa')), count(nextval('sb')) FROM generate_series(1, 600)", token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, """
+            SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid WHERE NOT l.granted AND a.backend_type LIKE 'worf manager%')
+                OR (SELECT last_value FROM worf.sequence_state WHERE seqoid = 'sa'::regclass) > (SELECT last_value FROM sa)
+            """, token), "the manager's pass, past sa");
+
+        // The session synchronizes sa, which the pass took first, and nothing deadlocks.
+        int logpos = nodeA.ReadLog().Length;
+        await using (NpgsqlCommand second = new("SET LOCAL statement_timeout = '30s'; SELECT worf.synchronize_sequence('sa')", session, holding))
+        {
+            _ = await second.ExecuteNonQueryAsync(token);
+        }
+
+        await holding.CommitAsync(token);
+        await Task.Delay(TimeSpan.FromSeconds(2), token);
+        Assert.DoesNotContain("deadlock detected", nodeA.ReadLog()[logpos..], "node_a's log");
+    }
+
+    /// <summary>
     /// A fenced allocator with 20,000 grants of the sequence looks for grants that overlap in one pass over them, and again
     /// only once they change; a neighbor's calls that report the same blocks as the fence waits for another node take
     /// nothing in; and sessions that draw from another sequence wait no longer for the range worker than without a fence.
@@ -5654,15 +5697,26 @@ public sealed partial class SequenceRangeTests
         Assert.AreEqual("", string.Join("\n", problems), "the forms that drew, or waited, wrongly");
 
         // A plan that coerces many values to a domain reads the domain's CHECK constraints once, as it names the
-        // sequences its calls of nextval draw from.
+        // sequences its calls of nextval draw from. Each insert's cost is the best of three, as one may stall on a busy
+        // host, where a read for each row would slow every one.
         string values = string.Join(", ", Enumerable.Range(1, 4000).Select(i => string.Create(CultureInfo.InvariantCulture, $"({i})")));
-        Stopwatch timing = Stopwatch.StartNew();
-        _ = await nodeB.SafePsqlAsync(Database, $"INSERT INTO tint (x) VALUES {values}", token);
-        TimeSpan uncoerced = timing.Elapsed;
-        timing.Restart();
-        _ = await nodeB.SafePsqlAsync(Database, $"INSERT INTO tpos (x) VALUES {values}", token);
-        TestContext.WriteLine($"4,000 rows: {uncoerced.TotalMilliseconds:F0} ms, coerced to a domain: {timing.Elapsed.TotalMilliseconds:F0} ms");
-        Assert.IsLessThan((uncoerced * 4) + TimeSpan.FromMilliseconds(500), timing.Elapsed, "an insert of 4,000 values coerced to a domain, against one of values that aren't");
+        async Task<TimeSpan> BestOfThree(string table)
+        {
+            TimeSpan best = TimeSpan.MaxValue;
+            for (int run = 0; run < 3; run++)
+            {
+                Stopwatch timing = Stopwatch.StartNew();
+                _ = await nodeB.SafePsqlAsync(Database, $"INSERT INTO {table} (x) VALUES {values}", token);
+                best = timing.Elapsed < best ? timing.Elapsed : best;
+            }
+
+            return best;
+        }
+
+        TimeSpan uncoerced = await BestOfThree("tint");
+        TimeSpan coerced = await BestOfThree("tpos");
+        TestContext.WriteLine($"4,000 rows: {uncoerced.TotalMilliseconds:F0} ms, coerced to a domain: {coerced.TotalMilliseconds:F0} ms");
+        Assert.IsLessThan((uncoerced * 4) + TimeSpan.FromMilliseconds(500), coerced, "an insert of 4,000 values coerced to a domain, against one of values that aren't");
 
         Assert.AreEqual("25006", (await Assert.ThrowsExactlyAsync<PostgresException>(() => nodeB.SafePsqlAsync(Database,
             "SET statement_timeout = '2s'; BEGIN READ ONLY; SELECT nextval('t_id_seq')", token))).SqlState, "nextval in a read-only transaction");

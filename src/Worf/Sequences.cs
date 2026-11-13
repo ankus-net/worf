@@ -75,7 +75,10 @@ internal static class Sequences
                     continue;
                 }
 
-                WorfRows locked = Worf.Query("SELECT cache_size, last_value FROM worf.sequence_state WHERE seqoid = $1 FOR UPDATE",
+                // A row a session holds, as worf.synchronize_sequence does, is passed over: the session brings the sequence up
+                // to date itself, and a pass that waited for it could wait on a session that waits for a row the pass holds,
+                // as one synchronizing several sequences in another order does.
+                WorfRows locked = Worf.Query("SELECT cache_size, last_value FROM worf.sequence_state WHERE seqoid = $1 FOR UPDATE SKIP LOCKED",
                     false, 0, SpiParameter.Create(seqoid));
                 if (locked.Count == 0)
                 {
