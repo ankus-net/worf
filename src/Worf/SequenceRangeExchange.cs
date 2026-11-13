@@ -2052,7 +2052,8 @@ internal static class SequenceRangeExchange
     /// <summary>
     /// Takes a sequence in with a lock timeout, so that a row of its that another transaction holds, as a drop of a
     /// subscription left open does the reports it deleted, leaves the sequence to a later exchange, rather than hold up
-    /// the exchange, which holds the node's turn, and the other sequences' blocks with it.
+    /// the exchange, which holds the node's turn, and the other sequences' blocks with it. The setting is made as SET
+    /// LOCAL makes it, without a statement, which would take a transaction ID.
     /// </summary>
     internal static T WithLockTimeout<T>(Func<T> work)
     {
@@ -2060,11 +2061,16 @@ internal static class SequenceRangeExchange
         unsafe
         {
             nestLevel = NativeMethods.NewGUCNestLevel();
+            fixed (byte* name = "lock_timeout\0"u8)
+            fixed (byte* value = Worf.ToServerCString(Math.Min(1000, SequenceRanges.ExchangeTimeout / 4).ToString(CultureInfo.InvariantCulture)))
+            {
+                _ = NativeMethods.set_config_option((sbyte*)name, (sbyte*)value, GucContext.PGC_USERSET, GucSource.PGC_S_SESSION,
+                    GucAction.GUC_ACTION_SAVE, true, 0, false);
+            }
         }
 
         try
         {
-            _ = Worf.Execute($"SET LOCAL lock_timeout = {Math.Min(1000, SequenceRanges.ExchangeTimeout / 4).ToString(CultureInfo.InvariantCulture)}");
             return work();
         }
         finally
@@ -2319,7 +2325,7 @@ internal static class SequenceRangeExchange
                     (SELECT max(timeline) FROM worf.sequence_range_back WHERE seqoid = $1 AND node_id = $2 AND sysid = $3::numeric))
                 """, seq, sender, SpiParameter.Create(sysid)) ?? 0);
         WorfRows stored = Worf.Read("""
-            SELECT CASE WHEN $5 THEN wal_lsn ELSE reply_lsn END::text, reported_start
+            SELECT CASE WHEN $5 THEN wal_lsn ELSE reply_lsn END::text, reported_start, CASE WHEN $5 THEN reply_lsn ELSE wal_lsn END::text
             FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2 AND sysid = $3::numeric AND timeline = $4
             """, 1, seq, sender, SpiParameter.Create(sysid), SpiParameter.Create(timeline), SpiParameter.Create(call));
         // A position kept from another system or timeline of the neighbor's compares with nothing it reports now, and goes.
@@ -2344,6 +2350,26 @@ internal static class SequenceRangeExchange
 
         ulong latest = Math.Max(Math.Max(AppliedFloor(applied, entry), kept), Math.Max(recorded, heardLast.Lsn));
         List<(ulong Heard, long Start)> heardPositions = [(recorded, recordedStart), heardLast, .. keptPositions];
+
+        // The neighbor's start shows a restore whichever way the position it went back past came: an answer may pass a
+        // call, so positions are compared only with those of the same way, but no start of the neighbor's can begin
+        // before a position it reported, of either way, under an earlier start, unless it went back. A draw a call carried
+        // first, which an answer then reports as it was, is recorded for the call alone. The other way's positions stay
+        // as they were until a message of that way replaces them, as when this node can't call the neighbor, so those at
+        // or before the reset the neighbor reports it made for this node count no more.
+        List<(ulong Heard, long Start)> otherWay = [];
+        if (stored.Count > 0)
+        {
+            otherWay.Add((Worf.TryParseLsn(stored[0].Get<string?>(2) ?? "", out ulong other) ? other : 0, recordedStart));
+            otherWay.Add(SequenceRangeHeard.LatestLsn(senderId, ulong.Parse(sysid, CultureInfo.InvariantCulture), timeline, !call));
+        }
+
+        otherWay.AddRange(Worf.Read(
+            "SELECT lsn::text, started FROM worf.sequence_range_back WHERE seqoid = $1 AND node_id = $2 AND call <> $5 AND sysid = $3::numeric AND timeline = $4",
+            0, seq, sender, SpiParameter.Create(sysid), SpiParameter.Create(timeline), SpiParameter.Create(call))
+            .Select(KeptPosition).OfType<(ulong Heard, long Start)>());
+        ulong resetFor = Text(entry, "reset_done") is string acknowledged && Worf.TryParseLsn(acknowledged, out ulong resetAt) ? resetAt : 0;
+        heardPositions.AddRange(otherWay.Where(position => position.Heard > resetFor));
         string? rolledBack = null;
         string backTo = walLsn;
         bool olderTimeline = laterTimeline > timeline;

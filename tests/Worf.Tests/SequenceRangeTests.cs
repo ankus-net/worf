@@ -4948,6 +4948,67 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// Nodes that subscribe to each other record a draw for whichever way first carries it: here node_a's call to node_b
+    /// carries node_b's draws, as node_b calls only each minute, and node_b, restored without its slots, so that node_a
+    /// can't call it, is checked through its own calls alone. Its start, from before the position node_a's call heard,
+    /// shows the restore, and it never draws again the values it drew after the backup.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task RestoredMutualNeighborsDrawNothingTwice()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        await SubscribeAsync(nodeA, "a_from_b", nodeB, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 1000)", token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+        await InsertAsync(nodeB, 20, token);
+
+        // node_b's inserts wait until node_a has answered it since it started, and for a new block after a reset.
+        async Task<HashSet<string>> InsertIdsAsync(string label)
+        {
+            Stopwatch waiting = Stopwatch.StartNew();
+            while (true)
+            {
+                Assert.IsLessThan(TestNode.PollTimeout, waiting.Elapsed, $"node_b's insert {label}");
+                try
+                {
+                    return [.. (await nodeB.SafePsqlAsync(Database, $"INSERT INTO t (v) SELECT '{label}' FROM generate_series(1, 20) RETURNING id", token)).Split('\n')];
+                }
+                catch (PostgresException waited) when (waited.SqlState is "55000" or "57014" or "2200H")
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(200), token);
+                }
+            }
+        }
+
+        // node_b calls node_a only each minute from now on, and is backed up whole; its draws reach node_a in node_a's
+        // calls, as their answers' positions.
+        _ = await nodeB.SafePsqlAsync(Database, "ALTER SYSTEM SET worf.sequence_range_exchange_interval = '60s'; SELECT pg_reload_conf()", token);
+        await Task.Delay(TimeSpan.FromSeconds(1), token);
+        using TemporaryDirectory copies = new($"worf-sequence-range-mutual-restore-{Guid.NewGuid():N}");
+        string copy = Path.Join(copies.FullName, "node_b");
+        await BackUpDataAsync(nodeB, copy, token, wal: true);
+        HashSet<string> before = await InsertIdsAsync("before");
+        string drawnTo = await nodeB.SafePsqlAsync(Database, "SELECT pg_current_wal_lsn()", token);
+        const string Recorded = "FROM worf.sequence_range_node WHERE node_name = 'node_b' AND seqoid = 't_id_seq'::regclass";
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, $"SELECT reply_lsn >= '{drawnTo}' {Recorded}", token), "node_a's calls, carrying node_b's draws");
+        Assert.AreEqual("t", await nodeA.SafePsqlAsync(Database, $"SELECT coalesce(wal_lsn < '{drawnTo}', true) {Recorded}", token),
+            "node_b's own calls, which haven't carried its draws");
+
+        await RestoreDataAsync(nodeB, copy, token);
+        HashSet<string> after = await InsertIdsAsync("after");
+        Assert.AreEqual("", string.Join(",", before.Intersect(after)), "the ids node_b drew both before the restore and after it");
+    }
+
+    /// <summary>
     /// A node restored to a backup on an older timeline than one its grantor heard it on resets, though its grantor
     /// recorded no position on that timeline past the backup: node_b is copied on timeline 1 and draws, recovers past
     /// the draws onto timeline 2, where it resets and draws from a new block, and goes back to the copy on timeline 1.
