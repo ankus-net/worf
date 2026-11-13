@@ -5161,14 +5161,23 @@ public sealed partial class SequenceRangeTests
     /// <summary>
     /// After its owner drops a sequence, a participant draws from the blocks it keeps only once the owner has checked its
     /// report since it started: restored from a backup taken after the drop, it never draws again the values it drew
-    /// after the backup, as the owner finds its WAL position went back, and asks it to give up those blocks.
+    /// after the backup, as the owner finds its WAL position went back, and asks it to give up those blocks. Nor does it
+    /// when it drew before the drop, while a prepared transaction held the range row on the owner, so that its calls
+    /// left the sequence out and only kept their positions, which the owner keeps with the drop, whether the transaction
+    /// ends before the restore or not.
     /// </summary>
+    /// <param name="how">The drop before the backup, or after draws while the row was held, let go before the restore or
+    /// not.</param>
     /// <returns>The test.</returns>
     [TestMethod]
-    public async Task RestoredParticipantsOfDroppedSequencesDrawNothingTwice()
+    [DataRow("dropped")]
+    [DataRow("held")]
+    [DataRow("held committed")]
+    public async Task RestoredParticipantsOfDroppedSequencesDrawNothingTwice(string how)
     {
         CancellationToken token = TestContext.CancellationToken;
-        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        bool held = how.StartsWith("held", StringComparison.Ordinal);
+        await using TestNode nodeA = await StartNodeAsync("node_a", token, "max_prepared_transactions = 2");
         await using TestNode nodeB = await StartNodeAsync("node_b", token);
         foreach (TestNode node in new[] { nodeA, nodeB })
         {
@@ -5180,10 +5189,20 @@ public sealed partial class SequenceRangeTests
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges WHERE sequence = 'mv_id_seq'::regclass", token),
             "node_b drawing from mv_id_seq's blocks");
 
-        // node_a drops mv, and node_b, keeping its block, is backed up whole, and draws 20 ids, which node_a hears of.
-        _ = await nodeA.SafePsqlAsync(Database, "DROP TABLE mv", token);
-        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'disabled' FROM worf.sequence_ranges WHERE sequence = 'mv_id_seq'::regclass", token),
-            "node_b heard mv_id_seq's epoch end");
+        // node_a drops mv, and node_b, keeping its block, is backed up whole, and draws 20 ids, which node_a hears of; or
+        // a prepared transaction holds mv_id_seq's range row on node_a first, and node_a drops mv after the draws.
+        if (held)
+        {
+            _ = await nodeA.SafePsqlAsync(Database,
+                "BEGIN; SELECT 1 FROM worf.sequence_range WHERE seqoid = 'mv_id_seq'::regclass FOR NO KEY UPDATE; PREPARE TRANSACTION 'held_mv'", token);
+        }
+        else
+        {
+            _ = await nodeA.SafePsqlAsync(Database, "DROP TABLE mv", token);
+            Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'disabled' FROM worf.sequence_ranges WHERE sequence = 'mv_id_seq'::regclass", token),
+                "node_b heard mv_id_seq's epoch end");
+        }
+
         using TemporaryDirectory copies = new($"worf-sequence-range-dropped-restore-{Guid.NewGuid():N}");
         string copy = Path.Join(copies.FullName, "node_b");
         await BackUpDataAsync(nodeB, copy, token, wal: true);
@@ -5194,6 +5213,15 @@ public sealed partial class SequenceRangeTests
             string heard = await nodeA.SafePsqlAsync(Database, "SELECT clock_timestamp()::text", token);
             Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, $"SELECT worf.sequence_range_heard({nodeBId}, true, '-infinity', false) > '{heard}'", token),
                 "node_a hearing from node_b after its draws");
+        }
+
+        if (held)
+        {
+            _ = await nodeA.SafePsqlAsync(Database, "DROP TABLE mv", token);
+            if (how == "held committed")
+            {
+                _ = await nodeA.SafePsqlAsync(Database, "COMMIT PREPARED 'held_mv'", token);
+            }
         }
 
         // node_b goes back to the backup. Its inserts fail, or draw none of the ids it drew before.
@@ -5216,6 +5244,10 @@ public sealed partial class SequenceRangeTests
 
         Assert.Contains("which this node recorded before it dropped the sequence, so it must give up the blocks it keeps of it", nodeA.ReadLog()[logpos..],
             "node_a's word that node_b went back");
+        if (how == "held")
+        {
+            _ = await nodeA.SafePsqlAsync(Database, "COMMIT PREPARED 'held_mv'", token);
+        }
     }
 
     /// <summary>

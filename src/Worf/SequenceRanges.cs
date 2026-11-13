@@ -821,6 +821,36 @@ internal static unsafe partial class SequenceRanges
             WHERE r.seqoid = $1 AND r.owner_node = l.node_id AND n.via_node = n.node_id AND n.node_id <> l.node_id
                 AND n.sysid IS NOT NULL AND n.timeline IS NOT NULL
             """, SpiParameter.Create(seqoid), name);
+
+        // It keeps too the positions calls and answers that left the sequence out kept for it, as while a transaction
+        // held its range row, and those shared memory holds, which the tables record only once they move by a segment,
+        // each the latest of its direction, on the system and timeline it recorded.
+        _ = Worf.Execute("""
+            UPDATE worf.sequence_range_dropped_node d
+            SET wal_lsn = greatest(d.wal_lsn, (SELECT max(b.lsn) FROM worf.sequence_range_back b
+                    WHERE b.seqoid = $1 AND b.node_id = d.node_id AND b.call AND b.sysid = d.sysid AND b.timeline = d.timeline)),
+                reply_lsn = greatest(d.reply_lsn, (SELECT max(b.lsn) FROM worf.sequence_range_back b
+                    WHERE b.seqoid = $1 AND b.node_id = d.node_id AND NOT b.call AND b.sysid = d.sysid AND b.timeline = d.timeline))
+            WHERE d.name = $2
+            """, SpiParameter.Create(seqoid), name);
+        WorfRows kept = Worf.Read("SELECT node_id, sysid::text, timeline FROM worf.sequence_range_dropped_node WHERE name = $1", 0, name);
+        for (int i = 0; i < kept.Count; i++)
+        {
+            uint nodeId = kept[i].Get<uint>(0);
+            ulong sysid = ulong.Parse(kept[i].Get<string>(1), CultureInfo.InvariantCulture);
+            long timeline = kept[i].Get<long>(2);
+            ulong called = SequenceRangeHeard.LatestLsn(nodeId, sysid, timeline, true).Lsn;
+            ulong answered = SequenceRangeHeard.LatestLsn(nodeId, sysid, timeline, false).Lsn;
+            if (called != 0 || answered != 0)
+            {
+                _ = Worf.Execute("""
+                    UPDATE worf.sequence_range_dropped_node
+                    SET wal_lsn = greatest(wal_lsn, nullif($3, '0/0')::pg_lsn), reply_lsn = greatest(reply_lsn, nullif($4, '0/0')::pg_lsn)
+                    WHERE name = $1 AND node_id = $2
+                    """, name, SpiParameter.Create(nodeId), SpiParameter.Create(Worf.FormatLsn(called)), SpiParameter.Create(Worf.FormatLsn(answered)));
+            }
+        }
+
         ChangedOnCommit(seqoid);
     }
 
