@@ -4596,11 +4596,17 @@ public sealed partial class SequenceRangeTests
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
             "SELECT range_size = 10 AND max_range_size = 10 AND request_size = 10 FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass", token),
             "node_b's block sizes after the owner's change");
-        await InsertAsync(nodeB, 300, token);
-        Assert.AreEqual("t", await nodeA.SafePsqlAsync(Database, $"""
-            SELECT count(*) > 0 AND max(hi - lo + 1) <= 10 FROM worf.sequence_range_grant
-            WHERE seqoid = 't_id_seq'::regclass AND grantee_id = {nodeBId} AND kind = 'n' AND granted_at > '{altered}'
-            """, token), "the blocks node_a granted node_b after the change");
+
+        // node_b uses up the blocks it held before the change, which its rate may have made larger than the old size, and
+        // draws from those node_a grants it after.
+        string after = $"FROM worf.sequence_range_grant WHERE seqoid = 't_id_seq'::regclass AND grantee_id = {nodeBId} AND kind = 'n' AND granted_at > '{altered}'";
+        for (int i = 0; i < 30 && await nodeA.SafePsqlAsync(Database, $"SELECT count(*) < 3 {after}", token) == "t"; i++)
+        {
+            await InsertAsync(nodeB, 100, token);
+        }
+
+        Assert.AreEqual("t", await nodeA.SafePsqlAsync(Database, $"SELECT count(*) >= 3 AND max(hi - lo + 1) <= 10 {after}", token),
+            "the blocks node_a granted node_b after the change");
     }
 
     /// <summary>
