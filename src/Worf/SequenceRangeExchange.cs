@@ -1007,6 +1007,10 @@ internal static class SequenceRangeExchange
         return later.Where(lsn => lsn < heard).Select(lsn => (ulong?)lsn).Min();
     }
 
+    // A position a message that left a sequence out kept, with the start it was heard under, from its back row.
+    private static (ulong Heard, long Start)? KeptPosition(WorfRow row)
+        => Worf.TryParseLsn(row.Get<string?>(0) ?? "", out ulong heard) ? (heard, row.Get<long>(1)) : null;
+
     // A start a message reports the data directory kept, as its time and the WAL position it started from, if well formed.
     private static (long Since, ulong Lsn)? KeptStart(JsonElement start)
         => start.ValueKind == JsonValueKind.Array && start.GetArrayLength() == 2 && start[0].TryGetInt64(out long since) &&
@@ -2299,9 +2303,7 @@ internal static class SequenceRangeExchange
         WorfRows keptRows = Worf.Read(
             "DELETE FROM worf.sequence_range_back WHERE seqoid = $1 AND node_id = $2 AND call = $5 AND sysid = $3::numeric AND timeline = $4 RETURNING lsn::text, started",
             0, seq, sender, SpiParameter.Create(sysid), SpiParameter.Create(timeline), SpiParameter.Create(call));
-        List<(ulong Heard, long Start)> keptPositions = [.. keptRows
-            .Select(keptRow => Worf.TryParseLsn(keptRow.Get<string?>(0) ?? "", out ulong left) ? ((ulong Heard, long Start)?)(left, keptRow.Get<long>(1)) : null)
-            .OfType<(ulong Heard, long Start)>()];
+        List<(ulong Heard, long Start)> keptPositions = [.. keptRows.Select(KeptPosition).OfType<(ulong Heard, long Start)>()];
 
         ulong kept = keptPositions.Select(position => position.Heard).DefaultIfEmpty().Max();
 
