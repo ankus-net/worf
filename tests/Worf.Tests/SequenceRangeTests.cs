@@ -3232,11 +3232,12 @@ public sealed partial class SequenceRangeTests
 
             case "advisory keys":
             {
-                // Sessions hold advisory locks of the keys of worf's turn and drop locks until 454a1ab.
+                // Sessions hold advisory locks of the keys of worf's turn, drop and message-building locks until 454a1ab.
                 await HoldAsync("SELECT pg_advisory_lock(pg_catalog.hashtext('worf.sequence_range_exchange_turn'))");
                 await using NpgsqlConnection other = await nodeB.OpenAsync(Database, token);
                 await using (NpgsqlCommand key = new("""
-                    SELECT pg_advisory_lock((pg_catalog.hashtext('worf.subscription')::int8 << 32) | sub_id::int8) FROM worf.subscription WHERE sub_name = 'b_from_a'
+                    SELECT pg_advisory_lock((pg_catalog.hashtext('worf.subscription')::int8 << 32) | sub_id::int8) FROM worf.subscription WHERE sub_name = 'b_from_a';
+                    SELECT pg_advisory_lock(pg_catalog.hashtext('worf.sequence_range_exchange'));
                     """, other))
                 {
                     _ = await key.ExecuteNonQueryAsync(token);
@@ -7941,6 +7942,42 @@ public sealed partial class SequenceRangeTests
         Assert.AreEqual($"{numbers[nodeB]}|t", await nodeB.SafePsqlAsync(Database, "SELECT worf.snowflake_node(), worf.snowflake_id() IS NOT NULL", token),
             "node_b's node number and an ID after a restart");
         await nodeA.StartServerAsync(token);
+
+        // A session's advisory lock, of whatever key, holds up no reservation of the clock, as one of
+        // hashtext('worf.snowflake_clock') did until 454a1ab: node_a issues IDs for 15 s, each within 5 s, past the 10 s
+        // its clock is reserved ahead.
+        await using (NpgsqlConnection holder = await nodeA.OpenAsync(Database, token))
+        {
+            await using (NpgsqlCommand hold = new("SELECT pg_advisory_lock(pg_catalog.hashtext('worf.snowflake_clock'))", holder))
+            {
+                _ = await hold.ExecuteNonQueryAsync(token);
+            }
+
+            await using NpgsqlConnection issuer = await nodeA.OpenAsync(Database, token);
+            await using (NpgsqlCommand timeout = new("SET statement_timeout = '5s'", issuer))
+            {
+                _ = await timeout.ExecuteNonQueryAsync(token);
+            }
+
+            List<string> failed = [];
+            await using NpgsqlCommand issue = new("SELECT worf.snowflake_id()", issuer);
+            Stopwatch issuing = Stopwatch.StartNew();
+            while (issuing.Elapsed < TimeSpan.FromSeconds(15))
+            {
+                try
+                {
+                    _ = await issue.ExecuteScalarAsync(token);
+                }
+                catch (PostgresException failure)
+                {
+                    failed.Add($"{failure.SqlState} {failure.MessageText}");
+                }
+
+                await Task.Delay(TimeSpan.FromMilliseconds(50), token);
+            }
+
+            Assert.AreEqual("", string.Join("\n", failed.Distinct()), "node_a's IDs beside a session's advisory lock");
+        }
 
         foreach (TestNode node in nodes)
         {

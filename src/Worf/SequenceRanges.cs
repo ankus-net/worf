@@ -591,20 +591,32 @@ internal static unsafe partial class SequenceRanges
         uint seqoid = RequireOwnedSequence(sequence);
         HoldsRangeRow("worf.activate_sequence_range");
         // A lift that resets the holders of grants that overlap writes their reports in an order of its own, in the node's
-        // turn. It first locks the node's configuration and the sequence's range row, as drop_subscription locks the
-        // configuration before it takes the turn, so that it waits for other sessions' locks before it holds the turn, and
-        // then waits in the turn only so long for any other row.
+        // turn. It first locks the node's configuration, as drop_subscription does before it takes the turn, so that it
+        // waits for configuration changes and drops before it holds the turn. In the turn it locks the range row and the
+        // reports as an exchange's take-in does, waiting only so long for each; one another transaction holds has it let
+        // the turn go, and try again a moment later.
         if (nodeName is null || nodeName.IsNull)
         {
             Elevated.Run(() =>
             {
                 _ = WorfNode.GetLocalNode(true, false);
-                LockLedger(seqoid);
-                SequenceRangeExchange.WithTurn(() => _ = SequenceRangeExchange.WithLockTimeout(() =>
+                while (true)
                 {
-                    ActivateOrLift(seqoid);
-                    return true;
-                }));
+                    try
+                    {
+                        PgTransaction.RunInSubtransaction(() => SequenceRangeExchange.WithTurn(() => _ = SequenceRangeExchange.WithLockTimeout(() =>
+                        {
+                            ActivateOrLift(seqoid);
+                            return true;
+                        })));
+                        return;
+                    }
+                    catch (PgException held) when (held.SqlState == "55P03")
+                    {
+                        Worker.WaitLatch(100);
+                        PgInterrupts.Check();
+                    }
+                }
             });
             return;
         }

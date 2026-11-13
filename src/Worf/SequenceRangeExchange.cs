@@ -483,7 +483,7 @@ internal static class SequenceRangeExchange
             // provider went back.
             (ulong applied, string message, List<Guid> refusals) = PgBackgroundWorker.RunTransaction(() =>
             {
-                _ = Worf.Read("SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('worf.sequence_range_exchange'))", 0);
+                WorfLocks.LockBuild();
                 ulong applied = Applied(sub);
                 (string message, List<Guid> refusals) = Build(node, sub.Origin.Id, sub.SlotName);
                 return (applied, message, refusals);
@@ -634,7 +634,7 @@ internal static class SequenceRangeExchange
         // transaction does, rather than wait on the rows the drop deleted. The drop's lock, which it takes before it
         // deletes anything, is an advisory one, which, unlike a row's, uses no transaction ID.
         if (!WorfNode.GetNodeSubscriptions(node.Node.Id, false).Exists(current => current.Id == sub.Id && current.Enabled) ||
-            !SequenceRangeLocks.TryShareDrop(sub.Id))
+            !WorfLocks.TryShareDrop(sub.Id))
         {
             return (false, false);
         }
@@ -904,7 +904,7 @@ internal static class SequenceRangeExchange
     /// different orders, as when a sequence's name names another sequence on a neighbor. A call takes its turn only once
     /// the neighbor has answered, so that no node waits on another's turn while that node waits on its own.
     /// </summary>
-    private static void TakeTurn() => SequenceRangeLocks.TakeTurn();
+    private static void TakeTurn() => WorfLocks.TakeTurn();
 
     /// <summary>
     /// Runs work that writes the reports of several sequences, or of several nodes, in an order of its own, in this
@@ -913,7 +913,7 @@ internal static class SequenceRangeExchange
     /// for long after, as the rows they wrote, which an exchange's take-in of each sequence waits for only so long.
     /// </summary>
     /// <param name="work">The work, which waits on no other node.</param>
-    internal static void WithTurn(Action work) => SequenceRangeLocks.WithTurn(work);
+    internal static void WithTurn(Action work) => WorfLocks.WithTurn(work);
 
     /// <summary>
     /// Gets the furthest WAL position of the provider whose changes this node has applied through a subscription, under

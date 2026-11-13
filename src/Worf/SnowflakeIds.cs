@@ -190,7 +190,7 @@ internal static class SnowflakeIds
             bool reserved = false;
             PgTransaction.RunInSubtransaction(() => reserved = Elevated.Run(() =>
             {
-                if (!Worf.ReadScalar<bool>("SELECT pg_catalog.pg_try_advisory_lock(pg_catalog.hashtext('worf.snowflake_clock'))"))
+                if (!WorfLocks.TryLockClock())
                 {
                     return false;
                 }
@@ -241,7 +241,7 @@ internal static class SnowflakeIds
         {
             if (locked)
             {
-                Elevated.Run(() => _ = Worf.Read("SELECT pg_catalog.pg_advisory_unlock(pg_catalog.hashtext('worf.snowflake_clock'))", 0));
+                WorfLocks.UnlockClock();
             }
         }
     }
