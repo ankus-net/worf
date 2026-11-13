@@ -2384,8 +2384,9 @@ internal static class SequenceRangeExchange
         }
 
         // A neighbor's word that it checked this node's report since this server started confirms the sequence's blocks
-        // it granted, which backends read again once this commits, and so does an owner's word that it dropped the
-        // sequence, after which it has no ledger to check the report against.
+        // it granted, which backends read again once this commits. An owner that dropped the sequence checks the report
+        // against its record of the drop, the positions it kept for this node among them, and gives the same word; that
+        // it dropped the sequence confirms nothing.
         if (Confirms(entry) == SequenceRangeHeard.Started && !Worf.ReadScalar<bool>(
             "SELECT EXISTS (SELECT 1 FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2 AND confirmed_start = $3)",
             seq, sender, SpiParameter.Create(SequenceRangeHeard.Started)))
