@@ -4158,6 +4158,19 @@ public sealed partial class SequenceRangeTests
         await drawing;
     }
 
+    // The peak resident memory of a process of the server, which runs beside the test, in kB, as Linux reports it, or 0
+    // elsewhere.
+    private static long PeakResident(int pid)
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return 0;
+        }
+
+        string line = File.ReadLines($"/proc/{pid.ToString(CultureInfo.InvariantCulture)}/status").First(line => line.StartsWith("VmHWM:", StringComparison.Ordinal));
+        return long.Parse(line["VmHWM:".Length..].Replace("kB", "", StringComparison.Ordinal).Trim(), CultureInfo.InvariantCulture);
+    }
+
     [GeneratedRegex(@"left [0-9]+ sequences to its next call")]
     private static partial Regex LeftToNextCall();
 
@@ -5985,26 +5998,42 @@ public sealed partial class SequenceRangeTests
         Assert.AreEqual("", string.Join("\n", problems), "the forms that drew, or waited, wrongly");
 
         // A plan that coerces many values to a domain reads the domain's CHECK constraints once, as it names the
-        // sequences its calls of nextval draw from. Each insert's cost is the best of three, as one may stall on a busy
-        // host, where a read for each row would slow every one.
+        // sequences its calls of nextval draw from, and adds their text once, as a CHECK that calls no nextval and no
+        // function names the same sequences however many values start it. wide's CHECK holds a 500-value array, whose
+        // text, added for each of 4,000 values, made each insert build and collect hundreds of megabytes, as the peak
+        // of the backend's resident memory shows where the server runs beside the test, on Linux. Each insert runs in a
+        // backend of its own, after one row has read the catalogs, so that neither psql's start nor the backend's counts.
         string values = string.Join(", ", Enumerable.Range(1, 4000).Select(i => string.Create(CultureInfo.InvariantCulture, $"({i})")));
-        async Task<TimeSpan> BestOfThree(string table)
+        string excluded = string.Join(",", Enumerable.Range(1, 500).Select(i => (-i).ToString(CultureInfo.InvariantCulture)));
+        _ = await nodeB.SafePsqlAsync(Database,
+            $"CREATE DOMAIN wide AS int CHECK (VALUE <> ALL ('{{{excluded}}}'::int[])); CREATE TABLE twide (x wide, y bigint DEFAULT nextval('plain'))", token);
+        async Task<(TimeSpan Elapsed, long PeakGrowth)> InsertManyAsync(string table)
         {
-            TimeSpan best = TimeSpan.MaxValue;
-            for (int run = 0; run < 3; run++)
+            await using NpgsqlConnection inserting = await nodeB.OpenAsync(Database, token);
+            await using (NpgsqlCommand first = new($"INSERT INTO {table} (x) VALUES (1)", inserting))
             {
-                Stopwatch timing = Stopwatch.StartNew();
-                _ = await nodeB.SafePsqlAsync(Database, $"INSERT INTO {table} (x) VALUES {values}", token);
-                best = timing.Elapsed < best ? timing.Elapsed : best;
+                _ = await first.ExecuteNonQueryAsync(token);
             }
 
-            return best;
+            int pid = inserting.ProcessID;
+            long before = PeakResident(pid);
+            await using NpgsqlCommand insert = new($"INSERT INTO {table} (x) VALUES {values}", inserting);
+            Stopwatch timing = Stopwatch.StartNew();
+            _ = await insert.ExecuteNonQueryAsync(token);
+            TimeSpan elapsed = timing.Elapsed;
+            return (elapsed, PeakResident(pid) - before);
         }
 
-        TimeSpan uncoerced = await BestOfThree("tint");
-        TimeSpan coerced = await BestOfThree("tpos");
-        TestContext.WriteLine($"4,000 rows: {uncoerced.TotalMilliseconds:F0} ms, coerced to a domain: {coerced.TotalMilliseconds:F0} ms");
-        Assert.IsLessThan((uncoerced * 4) + TimeSpan.FromMilliseconds(500), coerced, "an insert of 4,000 values coerced to a domain, against one of values that aren't");
+        (TimeSpan uncoerced, long uncoercedPeak) = await InsertManyAsync("tint");
+        (TimeSpan coerced, long coercedPeak) = await InsertManyAsync("tpos");
+        (TimeSpan wide, long widePeak) = await InsertManyAsync("twide");
+        TestContext.WriteLine($"4,000 rows: {uncoerced.TotalMilliseconds:F0} ms, {uncoercedPeak} kB; coerced to posint: {coerced.TotalMilliseconds:F0} ms, {coercedPeak} kB; to wide: {wide.TotalMilliseconds:F0} ms, {widePeak} kB");
+        Assert.IsLessThan((uncoerced * 4) + TimeSpan.FromSeconds(1), coerced, "an insert of 4,000 values coerced to posint, against one of values that aren't");
+        Assert.IsLessThan((uncoerced * 4) + TimeSpan.FromSeconds(1), wide, "an insert of 4,000 values coerced to wide, against one of values that aren't");
+        if (OperatingSystem.IsLinux())
+        {
+            Assert.IsLessThan(uncoercedPeak + (48 * 1024), widePeak, "the growth in kB of the peak resident memory of the backend that inserted 4,000 values coerced to wide");
+        }
 
         Assert.AreEqual("25006", (await Assert.ThrowsExactlyAsync<PostgresException>(() => nodeB.SafePsqlAsync(Database,
             "SET statement_timeout = '2s'; BEGIN READ ONLY; SELECT nextval('t_id_seq')", token))).SqlState, "nextval in a read-only transaction");

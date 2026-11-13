@@ -1834,12 +1834,18 @@ internal static partial class SequenceRangeGuard
     // Adds to an expression's text the text of the CHECK constraints of each domain it coerces to, and of those
     // domains' base domains, once for each coercion, as each starts its own, and of the domains those coerce to, with
     // the bodies of the SQL functions each of those texts calls that the planner inlines as the expression starts, and
-    // of those the bodies call in turn. A plan's own text has its functions inlined already.
+    // of those the bodies call in turn. A plan's own text has its functions inlined already. A domain whose CHECKs call
+    // no nextval, no function the planner may inline and coerce to no domain names the same sequences, through the
+    // functions it calls, however many coercions start it, so its text goes once: a multi-row VALUES list of thousands
+    // of values coerced to it would otherwise add its text thousands of times, megabytes that each backend that plans
+    // the statement builds and collects.
     private static string WithDomainChecks(string text, bool planned = false)
     {
         StringBuilder all = new(text);
         StringBuilder found = new();
         Dictionary<uint, string> read = [];
+        Dictionary<uint, bool> counted = [];
+        HashSet<uint> added = [];
         Dictionary<string, string?> inlined = [];
         string pending = text;
         for (int depth = 0; depth < 8 && pending.Length > 0 && all.Length < 4 << 20; depth++)
@@ -1854,10 +1860,20 @@ internal static partial class SequenceRangeGuard
                 }
             }
 
-            foreach (string checks in CoercedDomains(pending).Select(domain => DomainChecks(domain, read)))
+            foreach (uint domain in CoercedDomains(pending))
             {
-                _ = all.Append(' ').Append(checks);
-                _ = found.Append(checks);
+                string checks = DomainChecks(domain, read);
+                if (!counted.TryGetValue(domain, out bool counts))
+                {
+                    counts = NextvalCall().IsMatch(checks) || UserFunctionCall().IsMatch(checks) || checks.Contains("{COERCETODOMAIN ", StringComparison.Ordinal);
+                    counted[domain] = counts;
+                }
+
+                if (counts || added.Add(domain))
+                {
+                    _ = all.Append(' ').Append(checks);
+                    _ = found.Append(checks);
+                }
             }
 
             pending = found.ToString();
