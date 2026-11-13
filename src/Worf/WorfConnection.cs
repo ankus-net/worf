@@ -355,7 +355,6 @@ internal sealed unsafe partial class WorfConnection : IDisposable
     /// <param name="milliseconds">The time.</param>
     internal static void WaitForAny(IReadOnlyList<WorfConnection> connections, int milliseconds)
     {
-        var socketOf = (delegate* unmanaged<void*, int>)LibpqFunction("PQsocket");
 #if ANKUS_PG15 || ANKUS_PG16
         WaitEventSet* set = NativeMethods.CreateWaitEventSet(NativeGlobals.CurrentMemoryContext, connections.Count + 2);
 #else
@@ -365,13 +364,9 @@ internal sealed unsafe partial class WorfConnection : IDisposable
         {
             _ = NativeMethods.AddWaitEventToSet(set, WlLatchSet, InvalidSocket, NativeGlobals.MyLatch, null);
             _ = NativeMethods.AddWaitEventToSet(set, WlExitOnPmDeath, InvalidSocket, null, null);
-            foreach (WorfConnection connection in connections)
+            foreach (int descriptor in connections.Select(Descriptor).Where(descriptor => descriptor >= 0))
             {
-                int descriptor = socketOf(connection.Libpq);
-                if (descriptor >= 0)
-                {
-                    _ = NativeMethods.AddWaitEventToSet(set, WlSocketReadable, ToSocket(descriptor), null, null);
-                }
+                _ = NativeMethods.AddWaitEventToSet(set, WlSocketReadable, ToSocket(descriptor), null, null);
             }
 
             WaitEvent occurred;
@@ -385,6 +380,9 @@ internal sealed unsafe partial class WorfConnection : IDisposable
             NativeMethods.FreeWaitEventSet(set);
         }
     }
+
+    // An ordinary connection's socket, as libpq's PQsocket gives it, or -1.
+    private static int Descriptor(WorfConnection connection) => ((delegate* unmanaged<void*, int>)LibpqFunction("PQsocket"))(connection.Libpq);
 
     private PgReplicationReceiveStatus ReceiveFromServer(TimeSpan timeout, out ReadOnlySpan<byte> message)
     {
