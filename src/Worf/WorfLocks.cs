@@ -78,7 +78,7 @@ internal static class WorfLocks
     internal static unsafe bool TryShareDrop(uint subid)
     {
         LOCKTAG drop = Tag(subid, DropKey);
-        return (int)NativeMethods.LockAcquire(&drop, ShareLock, false, true) != NotAvailable;
+        return NativeMethods.LockAcquire(&drop, ShareLock, false, true) != NotAvailable;
     }
 
     /// <summary>
@@ -98,7 +98,7 @@ internal static class WorfLocks
     internal static unsafe bool TryLockClock()
     {
         LOCKTAG clock = Tag(0, ClockKey);
-        return (int)NativeMethods.LockAcquire(&clock, ExclusiveLock, true, true) != NotAvailable;
+        return NativeMethods.LockAcquire(&clock, ExclusiveLock, true, true) != NotAvailable;
     }
 
     /// <summary>
