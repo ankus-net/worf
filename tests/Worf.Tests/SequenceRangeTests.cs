@@ -5698,20 +5698,24 @@ public sealed partial class SequenceRangeTests
         long statements = after[1] - before[1];
 
         await Task.Delay(TimeSpan.FromSeconds(20) - fenced.Elapsed, token);
+        // A full search of the ledger orders every grant by where it starts, which a search of the grants changed since
+        // the last doesn't.
         string[] costs = (await nodeA.SafePsqlAsync(Database, """
             SELECT round(coalesce(sum(total_exec_time) FILTER (WHERE query LIKE '%worf.sequence_range_grant%'), 0))::bigint || '|' ||
+                coalesce(sum(calls) FILTER (WHERE query LIKE '%ROWS BETWEEN UNBOUNDED PRECEDING AND%'), 0) || '|' ||
                 (SELECT fenced_at IS NOT NULL FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass)
             FROM pg_stat_statements
             """, token)).Split('|');
         long searching = long.Parse(costs[0], CultureInfo.InvariantCulture);
-        TestContext.WriteLine($"statements on grants {searching} ms; {calls} calls ran {statements} statements; u's inserts {unfenced} unfenced, {during} fenced");
-        Assert.AreEqual("true", costs[1], "node_a's fence, waiting for node_c");
+        long fullSearches = long.Parse(costs[1], CultureInfo.InvariantCulture);
+        TestContext.WriteLine($"statements on grants {searching} ms, {fullSearches} full searches; {calls} calls ran {statements} statements; u's inserts {unfenced} unfenced, {during} fenced");
+        Assert.AreEqual("true", costs[2], "node_a's fence, waiting for node_c");
 
-        // Over the 20 s from the reset, node_a spends less than 3 s in statements on its ledger of grants; node_b's calls
-        // as the fence waits run fewer than 30 statements each on node_a, as they would if each took t_id_seq in, or found
-        // the range row's version changed by each check of the fence; and the inserts take no more than twice as long,
-        // and a second, as without the fence.
-        Assert.IsLessThan(3000L, searching, "the milliseconds node_a spent in statements on its ledger of grants over the 20 s from the reset");
+        // Over the 20 s from the reset, node_a searches its whole ledger of grants a few times at most, rather than at
+        // each of the fence's checks, ten a second; node_b's calls as the fence waits run fewer than 30 statements each on
+        // node_a, as they would if each took t_id_seq in, or found the range row's version changed by each check of the
+        // fence; and the inserts take no more than twice as long, and a second, as without the fence.
+        Assert.IsLessThan(5L, fullSearches, "node_a's full searches of its ledger of grants over the 20 s from the reset");
         Assert.IsTrue(calls >= 3 && statements < 30 * calls, $"node_b's {calls} calls in 5 s, which ran {statements} statements on node_a");
         Assert.IsLessThan(2 * unfenced + TimeSpan.FromSeconds(1), during, $"60 inserts into u during the fence, against {unfenced} without it");
     }
