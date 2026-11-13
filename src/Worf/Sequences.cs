@@ -43,6 +43,15 @@ internal static class Sequences
     /// </summary>
     private static unsafe string SequenceName(uint seqoid) => Worf.FromServer(NativeMethods.get_rel_name(seqoid));
 
+    // Takes a sequence's lock for the manager's pass, unless another session holds it.
+    private static bool LockedIfFree(uint seqoid)
+    {
+        unsafe
+        {
+            return NativeMethods.ConditionalLockRelationOid(seqoid, (int)PgLockMode.AccessShare);
+        }
+    }
+
     /// <summary>
     /// Process sequence updates.
     /// </summary>
@@ -69,8 +78,10 @@ internal static class Sequences
 
                 uint seqoid = oldseq.Get<uint>(0);
 
-                // Not enough of the sequence was consumed yet for us to care.
-                if (oldseq.Get<long>(1) >= SequenceGetLastValue(seqoid) + (SequenceReplicationMinCache / 2))
+                // Not enough of the sequence was consumed yet for us to care. A sequence whose lock another session holds,
+                // as ALTER SEQUENCE does, is passed over too: the pass holds the rows it locked earlier, which that session
+                // may wait for, as synchronize_sequence does.
+                if (!LockedIfFree(seqoid) || oldseq.Get<long>(1) >= SequenceGetLastValue(seqoid) + (SequenceReplicationMinCache / 2))
                 {
                     continue;
                 }

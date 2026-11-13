@@ -4737,12 +4737,16 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
-    /// The manager's pass over replicated sequences passes over one that a session's worf.synchronize_sequence holds,
-    /// rather than wait for it holding another, which the session then synchronizes: neither waits on the other.
+    /// The manager's pass over replicated sequences passes over one that a session holds, rather than wait for it holding
+    /// another, which the session then synchronizes: neither waits on the other. The session holds sb's row through its
+    /// worf.synchronize_sequence, or sb itself through ALTER SEQUENCE, which the pass would wait for as it reads sb.
     /// </summary>
+    /// <param name="how">How the session holds sb.</param>
     /// <returns>The test.</returns>
     [TestMethod]
-    public async Task SequencePassesWaitOnNoSession()
+    [DataRow("synchronized")]
+    [DataRow("renamed")]
+    public async Task SequencePassesWaitOnNoSession(string how)
     {
         CancellationToken token = TestContext.CancellationToken;
         await using TestNode nodeA = await StartNodeAsync("node_a", token);
@@ -4752,16 +4756,18 @@ public sealed partial class SequenceRangeTests
             SELECT worf.replication_set_add_sequence('default', 'sb');
             """, token);
 
-        // A session holds sb's row; both sequences then draw past half their cache, so that the next pass takes sa's row
-        // and comes to sb's.
+        // A session holds sb; sa, and sb unless it's renamed, then draw past half their cache, so that the next pass takes
+        // sa's row and comes to sb.
         await using NpgsqlConnection session = await nodeA.OpenAsync(Database, token);
         await using NpgsqlTransaction holding = await session.BeginTransactionAsync(token);
-        await using (NpgsqlCommand first = new("SELECT worf.synchronize_sequence('sb')", session, holding))
+        await using (NpgsqlCommand first = new(how == "renamed" ? "ALTER SEQUENCE sb RENAME TO sb_renamed" : "SELECT worf.synchronize_sequence('sb')", session, holding))
         {
             _ = await first.ExecuteNonQueryAsync(token);
         }
 
-        _ = await nodeA.SafePsqlAsync(Database, "SELECT count(nextval('sa')), count(nextval('sb')) FROM generate_series(1, 600)", token);
+        _ = await nodeA.SafePsqlAsync(Database, how == "renamed"
+            ? "SELECT count(nextval('sa')) FROM generate_series(1, 600)"
+            : "SELECT count(nextval('sa')), count(nextval('sb')) FROM generate_series(1, 600)", token);
         Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, """
             SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid WHERE NOT l.granted AND a.backend_type LIKE 'worf manager%')
                 OR (SELECT last_value FROM worf.sequence_state WHERE seqoid = 'sa'::regclass) > (SELECT last_value FROM sa)
