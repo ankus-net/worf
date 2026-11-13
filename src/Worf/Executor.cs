@@ -773,9 +773,6 @@ internal static unsafe partial class Executor
     }
 
     /// <summary>
-    /// Notes a function about to run or be inlined, asking for the fmgr hook only as the next hook does.
-    /// </summary>
-    /// <summary>
     /// Notes the start of a single-user server, where worf's supervisor doesn't run, as its first statement runs, past
     /// recovery and before the statement writes, so that a restore that starts in single-user mode, writes, and starts
     /// again past the positions its neighbors heard of shows in the starts its messages report.
@@ -789,6 +786,9 @@ internal static unsafe partial class Executor
         }
     }
 
+    /// <summary>
+    /// Notes a function about to run or be inlined, asking for the fmgr hook only as the next hook does.
+    /// </summary>
     private static bool WorfNeedsFmgrHook(uint fnOid)
     {
         TemporaryObjectUse.NoteFunctionUse(fnOid);
