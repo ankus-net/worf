@@ -319,6 +319,13 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
   How many tables other nodes' DDL can hold back on this server at once.
   Takes effect at server start. The default is `4096`.
 
+- `worf.max_sequence_range_counters`
+  How many managed sequences, over every database, have their changes counted
+  apart, so that the range worker checks in full only those that changed; past
+  it, a change to any other counts for every sequence. A dropped sequence, or
+  database, gives its counters up. Takes effect at server start. The default is
+  `16384`.
+
 - `worf.batch_inserts`
   Tells worf to use batch insert mechanism if possible. Batch mechanism
   uses PostgreSQL internal batch insert mode which is also used by `COPY`

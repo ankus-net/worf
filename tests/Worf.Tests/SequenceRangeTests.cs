@@ -5014,6 +5014,60 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// A dropped database's sequences give up their change counters as the drop commits, so that a database whose
+    /// sequences outnumber the counters, dropped, leaves the other databases' sequences counters of their own: an idle
+    /// sequence is checked in full about once a second, though another sequence switches blocks of 10 meanwhile. The
+    /// server has 64 counters.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task DroppedDatabasesGiveUpTheirCounters()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token, "log_min_messages = debug2\nworf.max_sequence_range_counters = 64");
+        _ = await nodeA.SafePsqlAsync(Database, "CREATE DATABASE big", token);
+        _ = await nodeA.SafePsqlAsync("big", $"""
+            CREATE EXTENSION worf; SELECT * FROM worf.create_node(node_name := 'node_big', dsn := '{nodeA.Dsn("big", SuperUser)}');
+            """, token);
+        _ = await nodeA.SafePsqlAsync("big", """
+            DO $$ BEGIN FOR g IN 1..80 LOOP EXECUTE format('CREATE SEQUENCE s%s', g); END LOOP; END $$
+            """, token);
+        _ = await nodeA.SafePsqlAsync("big", """
+            DO $$ BEGIN
+                FOR g IN 1..80 LOOP
+                    PERFORM worf.enable_sequence_range(format('s%s', g)::regclass, participants := '{}', range_size := 1000);
+                END LOOP;
+            END $$
+            """, token);
+        _ = await nodeA.SafePsqlAsync(Database, "DROP DATABASE big WITH (FORCE)", token);
+
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE TABLE idle (id bigserial PRIMARY KEY); CREATE TABLE busy (id bigserial PRIMARY KEY);
+            SELECT worf.enable_sequence_range('idle_id_seq', participants := '{}', range_size := 1000);
+            SELECT worf.enable_sequence_range('busy_id_seq', participants := '{}', range_size := 10, max_range_size := 10);
+            """, token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT count(*) = 2 FROM worf.sequence_ranges WHERE state = 'active'", token), "both sequences active");
+        string idle = await nodeA.SafePsqlAsync(Database, "SELECT 'idle_id_seq'::regclass::oid", token);
+        await Task.Delay(TimeSpan.FromSeconds(2), token);
+
+        // busy switches blocks of 10 for 10 s.
+        int logged = nodeA.ReadLog().Length;
+        await using (NpgsqlConnection writer = await nodeA.OpenAsync(Database, token))
+        {
+            await using NpgsqlCommand insert = new("INSERT INTO busy DEFAULT VALUES", writer);
+            Stopwatch inserting = Stopwatch.StartNew();
+            while (inserting.Elapsed < TimeSpan.FromSeconds(10))
+            {
+                _ = await insert.ExecuteNonQueryAsync(token);
+                await Task.Delay(TimeSpan.FromMilliseconds(20), token);
+            }
+        }
+
+        int full = nodeA.ReadLog()[logged..].Split('\n').Count(line => line.Contains($"checking sequence {idle} in full", StringComparison.Ordinal));
+        Assert.IsLessThan(30, full, "the idle sequence's full checks in 10 s");
+    }
+
+    /// <summary>
     /// A restored owner draws from the blocks it granted itself only once its neighbors have checked its report since it
     /// started: node_b heard of the owner's draws after its backup, and finds its WAL position went back, so the owner
     /// never draws them again.

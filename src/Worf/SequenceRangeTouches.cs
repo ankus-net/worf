@@ -6,15 +6,17 @@ namespace Worf;
 /// How often each managed sequence's ranges changed, or a session asked the range worker to check it, in shared memory,
 /// so that the range worker checks in full only the sequences something happened to, rather than every sequence on any
 /// change. Each sequence of the server has a counter of its own, which the range worker gives up as the sequence's drop
-/// commits, up to the number of counters, past which a change to a sequence without one counts for every sequence, as a
-/// change that names no sequence does.
+/// commits, and every sequence of a database as the database's drop commits, up to the number of counters, past which a
+/// change to a sequence without one counts for every sequence, as a change that names no sequence does.
 /// </summary>
-internal static class SequenceRangeTouches
+internal static partial class SequenceRangeTouches
 {
     /// <summary>
-    /// The number of counters, for every database of the server.
+    /// Gets the number of counters, for every database of the server.
     /// </summary>
-    internal const int MaxCounters = 16384;
+    [PgGucInt("worf.max_sequence_range_counters", 16384, "Sets how many managed sequences, over every database, have their changes counted apart.",
+        Minimum = 64, Maximum = 16777216, Context = PgGucContext.Postmaster)]
+    internal static partial int MaxCounters { get; }
 
     // An entry that a dropped sequence gave up: no database, and the largest OID.
     private const uint Freed = uint.MaxValue;
@@ -100,7 +102,7 @@ internal static class SequenceRangeTouches
     {
         using PgLwLockShareGuard<WorfTouchTable, WorfTouch> guard = Counters.Share();
         uint dboid = DatabaseId();
-        int slot = Find(i => guard[i], dboid, seqoid, out _);
+        int slot = Find(i => guard[i], guard.Length, dboid, seqoid, out _);
         return (guard.Header.All, slot >= 0 ? guard[slot].Count : 0);
     }
 
@@ -111,10 +113,26 @@ internal static class SequenceRangeTouches
     internal static void Free(uint seqoid)
     {
         using PgLwLockExclusiveGuard<WorfTouchTable, WorfTouch> guard = Counters.Exclusive();
-        int slot = Find(i => guard[i], DatabaseId(), seqoid, out _);
+        int slot = Find(i => guard[i], guard.Length, DatabaseId(), seqoid, out _);
         if (slot >= 0)
         {
             guard[slot] = new WorfTouch { Dboid = 0, Seqoid = Freed, Count = 0 };
+        }
+    }
+
+    /// <summary>
+    /// Gives up the counters of a dropped database's sequences, as its drop commits.
+    /// </summary>
+    /// <param name="dboid">The database.</param>
+    internal static void FreeDatabase(uint dboid)
+    {
+        using PgLwLockExclusiveGuard<WorfTouchTable, WorfTouch> guard = Counters.Exclusive();
+        for (int slot = 0; slot < guard.Length; slot++)
+        {
+            if (guard[slot].Dboid == dboid)
+            {
+                guard[slot] = new WorfTouch { Dboid = 0, Seqoid = Freed, Count = 0 };
+            }
         }
     }
 
@@ -122,7 +140,7 @@ internal static class SequenceRangeTouches
     {
         uint dboid = DatabaseId();
         int free = -1;
-        int slot = seqoid is uint one ? Find(i => guard[i], dboid, one, out free) : -1;
+        int slot = seqoid is uint one ? Find(i => guard[i], guard.Length, dboid, one, out free) : -1;
         if (seqoid is uint taken && slot < 0 && free >= 0)
         {
             slot = free;
@@ -145,13 +163,13 @@ internal static class SequenceRangeTouches
 
     // Finds a sequence's counter, probing from its hash's slot until an entry never taken, and the first entry it could
     // take, free or given up, or -1 for none.
-    private static int Find(Func<int, WorfTouch> entry, uint dboid, uint seqoid, out int free)
+    private static int Find(Func<int, WorfTouch> entry, int length, uint dboid, uint seqoid, out int free)
     {
         free = -1;
-        int start = (int)(((dboid * 2654435761UL) ^ seqoid) % MaxCounters);
-        for (int probe = 0; probe < MaxCounters; probe++)
+        int start = (int)(((dboid * 2654435761UL) ^ seqoid) % (ulong)length);
+        for (int probe = 0; probe < length; probe++)
         {
-            int slot = (start + probe) % MaxCounters;
+            int slot = (start + probe) % length;
             WorfTouch touch = entry(slot);
             if (touch.Dboid == dboid && touch.Seqoid == seqoid)
             {

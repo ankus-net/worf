@@ -45,6 +45,9 @@ internal static unsafe partial class Executor
     private static DropBehavior s_lastDropBehavior = DropBehavior.DROP_RESTRICT;
     private static bool s_droppingWorfObj;
     private static object_access_hook_type s_nextObjectAccessHook;
+    // DatabaseRelationId, the oid of pg_database.
+    private const uint DatabaseRelationId = 1262;
+
     private static ProcessUtility_hook_type s_nextProcessUtilityHook;
     private static bool s_singleUserStartNoted;
     private static ExecutorStart_hook_type s_nextExecutorStartHook;
@@ -567,6 +570,14 @@ internal static unsafe partial class Executor
             if (classId == Dependency.RelationRelationId && subId == 0)
             {
                 LocalIndex.NoteDropped(objectId, (dropflags & PerformDeletionInternal) != 0, (dropflags & PerformDeletionConcurrently) != 0);
+            }
+
+            // A dropped database's sequences give up their change counters once the drop commits, as a dropped sequence
+            // gives up its own, so that the sequences of the other databases have counters of their own.
+            if (classId == DatabaseRelationId && subId == 0)
+            {
+                uint dropped = objectId;
+                _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, () => SequenceRangeTouches.FreeDatabase(dropped));
             }
 
             // No need to check for internal deletions.
