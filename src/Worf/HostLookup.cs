@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -18,6 +19,48 @@ internal static unsafe class HostLookup
 {
     private const int SockStream = 1;
     private const int AddressFamilyInet = 2;
+
+    // Each name's latest lookup, and whether a probe has taken its outcome since it ended.
+    private static readonly Dictionary<string, (Task<IPAddress[]> Lookup, StrongBox<bool> Taken)> s_lookups = [];
+
+    /// <summary>
+    /// Starts looking a host name up away from the calling thread, or joins its lookup under way, or takes the outcome
+    /// of one that ended after the probe that started it gave up, which no probe has taken since: a lookup that takes
+    /// longer than a call has is started once, and the next call connects with what it found, as psql would once the
+    /// lookup ends, rather than start it again on each call, and leave each running.
+    /// </summary>
+    /// <param name="name">The name.</param>
+    /// <returns>The lookup.</returns>
+    internal static Task<IPAddress[]> Start(string name)
+    {
+        lock (s_lookups)
+        {
+            if (s_lookups.TryGetValue(name, out (Task<IPAddress[]> Lookup, StrongBox<bool> Taken) kept) && (!kept.Lookup.IsCompleted || !kept.Taken.Value))
+            {
+                return kept.Lookup;
+            }
+
+            Task<IPAddress[]> lookup = Task.Run(() => Find(name));
+            s_lookups[name] = (lookup, new StrongBox<bool>(false));
+            return lookup;
+        }
+    }
+
+    /// <summary>
+    /// Notes that a probe took a lookup's outcome, so that the name's next probe looks it up again.
+    /// </summary>
+    /// <param name="name">The name.</param>
+    /// <param name="lookup">The lookup.</param>
+    internal static void Took(string name, Task<IPAddress[]> lookup)
+    {
+        lock (s_lookups)
+        {
+            if (s_lookups.TryGetValue(name, out (Task<IPAddress[]> Lookup, StrongBox<bool> Taken) kept) && kept.Lookup == lookup)
+            {
+                kept.Taken.Value = true;
+            }
+        }
+    }
 
     /// <summary>
     /// Looks a host name up.

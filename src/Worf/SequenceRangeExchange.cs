@@ -507,7 +507,9 @@ internal static class SequenceRangeExchange
             pending.Applied = applied;
             pending.Refusals = refusals;
             pending.Calls++;
-            pending.Query = WorfPendingQuery.Start(conn, "LISTEN " + WordChannel + "; SELECT worf.sequence_range_exchange(" + Worf.QuoteLiteral(message) + ")",
+            // The call LISTENs for the provider's words after it has run, so that a provider that can't exchange, as a
+            // standby, says why first.
+            pending.Query = WorfPendingQuery.Start(conn, "SELECT worf.sequence_range_exchange(" + Worf.QuoteLiteral(message) + "); LISTEN " + WordChannel,
                 Worker.GetCurrentTimestamp() + (SequenceRanges.ExchangeTimeout * 1000L));
         }
         catch (PgException error)
