@@ -2085,8 +2085,9 @@ internal static partial class Worf
             guard.Header = ctx;
         }
 
-        // The WAL position this server started from is read before anything else writes WAL.
-        SequenceRangeHeard.NoteStart();
+        // The WAL position this server started from is read before anything else writes WAL. A start the file couldn't
+        // keep is noted again each time the supervisor wakes, until it does.
+        bool startKept = SequenceRangeHeard.NoteStart();
 
         // Make it easy to identify our processes.
         Worker.SetConfigOption("application_name", PgBackgroundWorker.Name);
@@ -2102,6 +2103,7 @@ internal static partial class Worf
         {
             PgInterrupts.Check();
             Worker.ProcessConfigReload();
+            startKept = startKept || SequenceRangeHeard.NoteStart();
 
             // The prepared transactions that may have given managers something to manage wake them as they end.
             bool watchingPrepared = Worker.WakeForEndedPrepared();

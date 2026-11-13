@@ -46,6 +46,7 @@ internal static unsafe partial class Executor
     private static bool s_droppingWorfObj;
     private static object_access_hook_type s_nextObjectAccessHook;
     private static ProcessUtility_hook_type s_nextProcessUtilityHook;
+    private static bool s_singleUserStartNoted;
     private static ExecutorStart_hook_type s_nextExecutorStartHook;
     private static ExecutorRun_hook_type s_nextExecutorRunHook;
     private static ExecutorEnd_hook_type s_nextExecutorFinishHook;
@@ -278,6 +279,7 @@ internal static unsafe partial class Executor
         ProcessUtilityContext context, ParamListInfoData* @params, QueryEnvironment* queryEnv, _DestReceiver* dest,
         QueryCompletion* qc)
     {
+        NoteSingleUserStart();
         Node* parsetree = pstmt->utilityStmt;
 
         // A copy of a table's index on this node alone, which CREATE TABLE ... LIKE builds as a statement of its own, is
@@ -654,6 +656,7 @@ internal static unsafe partial class Executor
 
     private static void WorfExecutorStart(QueryDesc* queryDesc, int eflags)
     {
+        NoteSingleUserStart();
         DdlLock.UnfencePending();
         List<uint> written = DdlLock.WrittenTables(queryDesc, eflags);
         if (written.Count > 0)
@@ -761,6 +764,20 @@ internal static unsafe partial class Executor
     /// <summary>
     /// Notes a function about to run or be inlined, asking for the fmgr hook only as the next hook does.
     /// </summary>
+    /// <summary>
+    /// Notes the start of a single-user server, where worf's supervisor doesn't run, as its first statement runs, past
+    /// recovery and before the statement writes, so that a restore that starts in single-user mode, writes, and starts
+    /// again past the positions its neighbors heard of shows in the starts its messages report.
+    /// </summary>
+    private static void NoteSingleUserStart()
+    {
+        if (!s_singleUserStartNoted && !NativeGlobals.IsUnderPostmaster)
+        {
+            s_singleUserStartNoted = true;
+            _ = SequenceRangeHeard.NoteStart();
+        }
+    }
+
     private static bool WorfNeedsFmgrHook(uint fnOid)
     {
         TemporaryObjectUse.NoteFunctionUse(fnOid);

@@ -237,10 +237,11 @@ internal static class SequenceRangeHeard
     }
 
     /// <summary>
-    /// Reads the WAL position this server started from, as worf's supervisor starts, and adds the start to those the
-    /// data directory keeps.
+    /// Reads the WAL position this server started from, as worf's supervisor starts, or a single-user server's first
+    /// statement runs, and adds the start to those the data directory keeps.
     /// </summary>
-    internal static void NoteStart() => SequenceRangeStarts.Note(Started, StartLsn);
+    /// <returns>Whether the data directory keeps it.</returns>
+    internal static bool NoteStart() => SequenceRangeStarts.Note(Started, StartLsn);
 
     /// <summary>
     /// Counts a notice a node sent one of this server's processes, in the minute that began last, for every process.

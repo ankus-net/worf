@@ -4641,12 +4641,16 @@ public sealed partial class SequenceRangeTests
     /// restored, and the node writes and checkpoints before the grantor is back, or writes and restarts once more, so
     /// that the start it reports began past the position the grantor heard; though the grantor restarts after the draws
     /// it held the row through, before the restore; and though the node only answers the grantor's calls, and the grantor
-    /// isn't in its worf.node. The node's draws after the backup move its report, so that the grantor records a WAL
+    /// isn't in its worf.node; and though the file of the node's starts couldn't be written as it was renamed in place at
+    /// the restore's start, or was deleted after it, or the restore first started in single-user mode, writing and
+    /// checkpointing there. The node's draws after the backup move its report, so that the grantor records a WAL
     /// position past them. So the node never draws again the values it drew before the restore.
     /// </summary>
     /// <param name="how">How the grantor is held up: slow, holding the row in a prepared transaction or an open one,
     /// failing, restarted, or restarted while the node goes back to a whole backup, after which it writes nothing, or
-    /// writes and restarts; "stopped" after the draws until the restore; "answered" as the node only answers.</param>
+    /// writes and restarts; "stopped" after the draws until the restore; "answered" as the node only answers; the twice
+    /// row with worf_starts.tmp a directory at the restore's start, worf_starts deleted after it, or the restore's first
+    /// start in single-user mode.</param>
     /// <returns>The test.</returns>
     [TestMethod]
     [DataRow("cut")]
@@ -4656,6 +4660,9 @@ public sealed partial class SequenceRangeTests
     [DataRow("restarted")]
     [DataRow("plain")]
     [DataRow("twice")]
+    [DataRow("twice tmp")]
+    [DataRow("twice deleted")]
+    [DataRow("twice single")]
     [DataRow("held stopped")]
     [DataRow("locked stopped")]
     [DataRow("answered held")]
@@ -4665,7 +4672,8 @@ public sealed partial class SequenceRangeTests
         CancellationToken token = TestContext.CancellationToken;
         bool answered = how.StartsWith("answered ", StringComparison.Ordinal);
         bool stopped = how.EndsWith(" stopped", StringComparison.Ordinal);
-        string kind = how.Replace("answered ", "", StringComparison.Ordinal).Replace(" stopped", "", StringComparison.Ordinal);
+        string variant = how.StartsWith("twice ", StringComparison.Ordinal) ? how["twice ".Length..] : "";
+        string kind = variant.Length > 0 ? "twice" : how.Replace("answered ", "", StringComparison.Ordinal).Replace(" stopped", "", StringComparison.Ordinal);
         await using TestNode nodeA = await StartNodeAsync("node_a", token, "log_min_messages = debug1\nmax_prepared_transactions = 2");
         await using TestNode nodeB = await StartNodeAsync("node_b", token);
 
@@ -4817,7 +4825,19 @@ public sealed partial class SequenceRangeTests
                 break;
         }
 
-        await RestoreDataAsync(nodeB, copy, token);
+        // The restore's start can't rename worf_starts.tmp, a directory, in place, or runs in single-user mode, writing
+        // and checkpointing there, before it starts again.
+        const string WrittenAgain = "CREATE TABLE written_again AS SELECT g, repeat('x', 100) AS v FROM generate_series(1, 8000) g";
+        if (variant == "tmp")
+        {
+            _ = Directory.CreateDirectory(Path.Join(copy, "worf_starts.tmp"));
+        }
+
+        await RestoreDataAsync(nodeB, copy, token, beforeStart: variant != "single" ? null : async () =>
+        {
+            (int exit, string output) = await nodeB.RunSingleUserAsync(Database, $"{WrittenAgain}\nCHECKPOINT\n", token);
+            Assert.AreEqual(0, exit, output);
+        });
         if (stopped)
         {
             await nodeA.StartServerAsync(token);
@@ -4879,10 +4899,23 @@ public sealed partial class SequenceRangeTests
         else if (kind == "twice")
         {
             // node_b writes and restarts, so that the start it reports began past its old WAL position, before node_a is
-            // back.
-            _ = await nodeB.SafePsqlAsync(Database, "CREATE TABLE written_again AS SELECT g, repeat('x', 100) AS v FROM generate_series(1, 8000) g", token);
-            await nodeB.StopAsync("fast", token);
-            await nodeB.StartServerAsync(token);
+            // back, with worf_starts.tmp writable again, or worf_starts deleted first.
+            if (variant == "tmp")
+            {
+                Directory.Delete(Path.Join(nodeB.Cluster.DataDirectory, "worf_starts.tmp"));
+            }
+            else if (variant == "deleted")
+            {
+                File.Delete(Path.Join(nodeB.Cluster.DataDirectory, "worf_starts"));
+            }
+
+            if (variant != "single")
+            {
+                _ = await nodeB.SafePsqlAsync(Database, WrittenAgain, token);
+                await nodeB.StopAsync("fast", token);
+                await nodeB.StartServerAsync(token);
+            }
+
             await nodeA.StartServerAsync(token);
         }
 
@@ -4893,6 +4926,59 @@ public sealed partial class SequenceRangeTests
         }
 
         Assert.AreEqual("", string.Join(",", before.Intersect(after)), "the ids node_b drew both before the restore and after it");
+    }
+
+    /// <summary>
+    /// A node whose file of starts can't be read, or whose worf_starts.tmp is a directory, starts as usual: its supervisor
+    /// keeps running and keeps the start, writing the file in place or anew, and the node's inserts go on, though a file
+    /// that lost the starts before has its neighbors take the positions they heard of before as gone back.
+    /// </summary>
+    /// <param name="how">The file mode 000, or worf_starts.tmp a directory.</param>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [OSCondition(OperatingSystems.Linux | OperatingSystems.OSX)]
+    [DataRow("unreadable")]
+    [DataRow("tmp directory")]
+    public async Task UnusableStartFilesStopNothing(string how)
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100)", token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+        await InsertAsync(nodeB, 20, token);
+
+        await nodeB.StopAsync("fast", token);
+        string starts = Path.Join(nodeB.Cluster.DataDirectory, "worf_starts");
+        if (how == "unreadable" && !OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(starts, UnixFileMode.None);
+        }
+        else if (how == "tmp directory")
+        {
+            _ = Directory.CreateDirectory(starts + ".tmp");
+        }
+
+        int logged = nodeB.ReadLog().Length;
+        await nodeB.StartServerAsync(token);
+        Stopwatch inserting = Stopwatch.StartNew();
+        await using (NpgsqlConnection connection = await nodeB.OpenAsync(Database, token))
+        {
+            await using NpgsqlCommand insert = new("SET statement_timeout = '20s'; INSERT INTO t (v) SELECT 'b' FROM generate_series(1, 200)", connection);
+            _ = await insert.ExecuteNonQueryAsync(token);
+        }
+
+        Assert.IsLessThan(TimeSpan.FromSeconds(20), inserting.Elapsed, "node_b's insert after its start");
+        Assert.DoesNotContain("\"worf supervisor\" (PID", nodeB.ReadLog()[logged..], "node_b's log, of its supervisor exiting");
+        string[] kept = await File.ReadAllLinesAsync(starts, token);
+        Assert.AreEqual("end", kept[^1], "worf_starts, whole");
+        Assert.IsGreaterThanOrEqualTo(2, kept.Length, "worf_starts, keeping the start");
     }
 
     /// <summary>
@@ -8611,7 +8697,7 @@ public sealed partial class SequenceRangeTests
     /// which promotes it onto a new timeline.
     /// </summary>
     private static async Task RestoreDataAsync(TestNode node, string source, CancellationToken token, bool running = true, bool standby = false,
-        string? target = null)
+        string? target = null, Func<Task>? beforeStart = null)
     {
         if (running)
         {
@@ -8653,6 +8739,11 @@ public sealed partial class SequenceRangeTests
             await File.WriteAllTextAsync(Path.Join(data.FullName, "recovery.signal"), "", token);
             await File.AppendAllTextAsync(Path.Join(data.FullName, "postgresql.auto.conf"),
                 $"restore_command = 'exit 1'\nrecovery_target_lsn = '{target}'\nrecovery_target_action = 'promote'\n", token);
+        }
+
+        if (beforeStart is not null)
+        {
+            await beforeStart();
         }
 
         await node.StartServerAsync(token);

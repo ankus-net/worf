@@ -403,6 +403,37 @@ internal sealed class TestNode : IAsyncDisposable
     }
 
     /// <summary>
+    /// Runs statements in a single-user server on the node's data directory, as <c>postgres --single</c> does, while the
+    /// node's server is stopped, and waits for it to exit.
+    /// </summary>
+    /// <param name="database">The database.</param>
+    /// <param name="statements">The statements, one to a line.</param>
+    /// <param name="cancellationToken">Cancels waiting for the server.</param>
+    /// <returns>The server's exit code and output.</returns>
+    public async Task<(int ExitCode, string Output)> RunSingleUserAsync(string database, string statements, CancellationToken cancellationToken)
+    {
+        ProcessStartInfo startInfo = new(ProgramPath("postgres"))
+        {
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        foreach (string argument in new[] { "--single", "-D", Cluster.DataDirectory, database })
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+
+        using Process server = Process.Start(startInfo) ?? throw new InvalidOperationException("could not start postgres --single");
+        Task<string> output = server.StandardOutput.ReadToEndAsync(cancellationToken);
+        Task<string> errors = server.StandardError.ReadToEndAsync(cancellationToken);
+        await server.StandardInput.WriteAsync(statements.AsMemory(), cancellationToken);
+        server.StandardInput.Close();
+        await server.WaitForExitAsync(cancellationToken);
+        return (server.ExitCode, await output + await errors);
+    }
+
+    /// <summary>
     /// Starts one of the installation's programs against this node.
     /// </summary>
     /// <param name="program">The program's name, such as <c>pgbench</c>.</param>
