@@ -3290,7 +3290,8 @@ public sealed partial class SequenceRangeTests
     /// <summary>
     /// A drop of a subscription holds no exchange up past its own deletes: left open in a transaction, or followed in
     /// the same statement by a drop whose provider never answers, it lets the node's turn go as its deletes are done, so
-    /// that node_b's inserts, which draw a block from node_a every 100 rows, go on drawing.
+    /// that node_b's inserts, which draw a block from node_a every 100 rows, go on drawing, and once node_b restarts,
+    /// they don't wait for the provider whose subscription the drop removes to answer.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -3358,8 +3359,15 @@ public sealed partial class SequenceRangeTests
         }
 
         // A drop of b_from_d, whose provider is paused, in the statement after a drop of b_from_a's sibling, b_from_c,
-        // made again.
+        // made again. node_c reports t_id_seq again, and then can't answer node_b's calls as node_b restarts, so that
+        // node_b's draws would wait for node_c, as a start's do for each neighbor that reports the sequence, but for the
+        // drop of b_from_c, which holds node_c's exchanges off until it ends.
         await SubscribeAsync(nodeB, "b_from_c", nodeC, token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
+            "SELECT EXISTS (SELECT 1 FROM worf.sequence_range_node WHERE node_name = 'node_c' AND seqoid = 't_id_seq'::regclass)", token), "node_c's report");
+        _ = await nodeC.SafePsqlAsync(Database, "ALTER FUNCTION worf.sequence_range_exchange(text) RENAME TO sequence_range_exchange_paused", token);
+        await nodeB.StopAsync("fast", token);
+        await nodeB.StartServerAsync(token);
         await SuspendAsync(nodeD, true, token);
         try
         {
