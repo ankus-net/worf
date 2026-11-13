@@ -469,7 +469,9 @@ public sealed class DdlReplicationTests
     /// replicate_ddl_command in a PL/pgSQL block that catches errors or in a savepoint, a PL/pgSQL block with an exception
     /// clause that replicate_ddl_command runs, a savepoint around DDL that isn't replicated, and an index build on a
     /// temporary table, which writes no WAL until its invalidations; and so does decoding in another database of the
-    /// server, as a provider's slot beside its subscriber's database decodes the subscriber's WAL too.
+    /// server, as a provider's slot beside its subscriber's database decodes the subscriber's WAL too. A prepared transaction
+    /// ends so before PREPARE TRANSACTION, as decoding that passes over the PREPARE of a two-phase slot, in the database or
+    /// in another, executes its invalidations only with a snapshot too.
     /// </summary>
     /// <param name="shape">How the DDL runs in a subtransaction, and whether the slot is in another database.</param>
     /// <returns>The test.</returns>
@@ -479,22 +481,28 @@ public sealed class DdlReplicationTests
     [DataRow("block the call runs")]
     [DataRow("savepoint, not replicated")]
     [DataRow("temporary index build")]
+    [DataRow("prepared")]
+    [DataRow("block around the call, decoded elsewhere")]
     [DataRow("savepoint around the call, decoded elsewhere")]
+    [DataRow("block the call runs, decoded elsewhere")]
     [DataRow("savepoint, not replicated, decoded elsewhere")]
+    [DataRow("temporary index build, decoded elsewhere")]
+    [DataRow("prepared, decoded elsewhere")]
     public async Task DecodingStartsAgainInsideReplicatedDdl(string shape)
     {
         CancellationToken token = TestContext.CancellationToken;
         bool elsewhere = shape.EndsWith(", decoded elsewhere", StringComparison.Ordinal);
         shape = shape.Replace(", decoded elsewhere", "", StringComparison.Ordinal);
         string decoding = elsewhere ? "decoding" : Database;
-        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        bool prepared = shape == "prepared";
+        await using TestNode nodeA = await StartNodeAsync("node_a", token, "max_prepared_transactions = 2");
         _ = await nodeA.SafePsqlAsync(Database, "SET worf.enable_ddl_replication = off; CREATE TABLE u (a int); CREATE TABLE v (a int)", token);
         if (elsewhere)
         {
             _ = await nodeA.SafePsqlAsync(Database, "CREATE DATABASE decoding", token);
         }
 
-        _ = await nodeA.SafePsqlAsync(decoding, "SELECT 1 FROM pg_create_logical_replication_slot('td', 'test_decoding')", token);
+        _ = await nodeA.SafePsqlAsync(decoding, $"SELECT 1 FROM pg_create_logical_replication_slot('td', 'test_decoding', false, {(prepared ? "true" : "false")})", token);
         const string Command = "ALTER TABLE public.u ADD COLUMN b int; SELECT pg_catalog.pg_sleep(4); ANALYZE public.u";
         const string InBlock = "DO $x$ BEGIN ALTER TABLE public.u ADD COLUMN b int; PERFORM pg_catalog.pg_sleep(4); ANALYZE public.u; EXCEPTION WHEN raise_exception THEN NULL; END $x$";
         Task queued = nodeA.SafePsqlAsync(Database, shape switch
@@ -503,6 +511,7 @@ public sealed class DdlReplicationTests
             "savepoint around the call" => $"BEGIN; SAVEPOINT s; SELECT worf.replicate_ddl_command('{Command}'); RELEASE s; COMMIT",
             "block the call runs" => $"SELECT worf.replicate_ddl_command('{InBlock}')",
             "savepoint, not replicated" => $"SET worf.enable_ddl_replication = off; BEGIN; SAVEPOINT s; {Command}; RELEASE s; COMMIT",
+            "prepared" => $"SET worf.enable_ddl_replication = off; BEGIN; {Command}; PREPARE TRANSACTION 'pq'",
             _ => """
                 SET worf.enable_ddl_replication = off; SET maintenance_work_mem = '1MB';
                 BEGIN; CREATE TEMPORARY TABLE tt AS SELECT g FROM generate_series(1, 3000000) g;
@@ -525,6 +534,11 @@ public sealed class DdlReplicationTests
         }
 
         await queued;
+        if (prepared)
+        {
+            _ = await nodeA.SafePsqlAsync(Database, "COMMIT PREPARED 'pq'", token);
+        }
+
         for (int round = 0; round < 2; round++)
         {
             _ = await nodeA.SafePsqlAsync(decoding, Decode, token);
@@ -565,7 +579,7 @@ public sealed class DdlReplicationTests
         Assert.DoesNotContain("replica identity", nodeB.ReadLog(), "node_b's log");
     }
 
-    private static async Task<TestNode> StartNodeAsync(string name, CancellationToken token)
+    private static async Task<TestNode> StartNodeAsync(string name, CancellationToken token, params string[] settings)
     {
         TestNode node = await TestNode.StartAsync(name,
         [
@@ -576,6 +590,7 @@ public sealed class DdlReplicationTests
             "worf.conflict_resolution = last_update_wins",
             "worf.enable_ddl_replication = on",
             "worf.include_ddl_repset = on",
+            .. settings,
         ], token);
         try
         {

@@ -1070,6 +1070,9 @@ internal static partial class Worf
     private const uint DependRelationId = 2608;
     private const uint RelationRelationId = 1259;
 
+    // Whether this transaction writes the change EndForDecoding writes as it's prepared.
+    private static bool s_markOnPrepare;
+
     /// <summary>
     /// Ends the work of a subtransaction that changed the catalogs with a record logical decoding takes a base snapshot
     /// from, in every database: the invalidations its last command left are logged first, as the end of a command logs
@@ -1081,21 +1084,60 @@ internal static partial class Worf
     /// any origin before it leaves out another database's or origin's changes, as it doesn't from a logical message of
     /// another database, which a slot in another database of the server, as a provider's beside its subscriber's, then
     /// aborts on. pg_depend is a catalog, so no publication or output plugin sends its changes and no replica identity
-    /// applies, and no syscache holds it, so the change adds no invalidations of its own; the row is deleted as it's
-    /// inserted, so no session ever sees it. A top-level transaction needs none, as decoding gives one that changed the
-    /// catalogs a base snapshot as it commits, nor does a subtransaction that wrote nothing, and a server that writes no
-    /// logical WAL needs none either. Every utility statement that may change the catalogs ends so in a subtransaction,
-    /// as SPI runs one, and so does worf's work that changes them otherwise; the change is written where it's called, as
-    /// a subtransaction's callbacks don't run for every subtransaction.
+    /// applies, and no syscache holds it, so the insert adds only an invalidation of catalog snapshots, which comes before
+    /// the delete; the row is deleted as it's inserted, so no session ever sees it. A top-level transaction needs none as
+    /// it commits, as decoding gives one that changed the catalogs a base snapshot then, but one that is prepared gets the
+    /// same change just before PREPARE TRANSACTION, as decoding that passes over a PREPARE executes its invalidations only
+    /// with a snapshot too. A subtransaction that wrote nothing needs none, nor does a server that writes no logical WAL.
+    /// Every utility statement that may change the catalogs ends so, as SPI runs one in a subtransaction, and so does
+    /// worf's work that changes them otherwise; the change is written where it's called, as a subtransaction's callbacks
+    /// don't run for every subtransaction.
     /// </summary>
-    internal static unsafe void EndForDecoding()
+    internal static void EndForDecoding()
     {
-        if (NativeMethods.GetCurrentTransactionNestLevel() <= 1 || NativeGlobals.wal_level < WalLevelLogical ||
-            NativeMethods.GetCurrentTransactionIdIfAny() == 0)
+        int nestLevel;
+        unsafe
         {
-            return;
+            if (NativeGlobals.wal_level < WalLevelLogical)
+            {
+                return;
+            }
+
+            nestLevel = NativeMethods.GetCurrentTransactionNestLevel();
         }
 
+        if (nestLevel > 1)
+        {
+            MarkIfWritten();
+        }
+        else if (!s_markOnPrepare)
+        {
+            s_markOnPrepare = true;
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.PrePrepare, MarkIfWritten);
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, static () => s_markOnPrepare = false);
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () => s_markOnPrepare = false);
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, static () => s_markOnPrepare = false);
+        }
+    }
+
+    // Marks the current subtransaction, or the transaction about to be prepared, for decoding, if it wrote anything.
+    private static void MarkIfWritten()
+    {
+        bool written;
+        unsafe
+        {
+            written = NativeMethods.GetCurrentTransactionIdIfAny() != 0;
+        }
+
+        if (written)
+        {
+            MarkForDecoding();
+        }
+    }
+
+    // Logs the invalidations the last command left, and inserts and deletes a row of pg_depend.
+    private static unsafe void MarkForDecoding()
+    {
         NativeMethods.CommandCounterIncrement();
         RelationData* depend = NativeMethods.table_open(DependRelationId, (int)PgLockMode.RowExclusive);
         ulong* values = stackalloc ulong[7];
