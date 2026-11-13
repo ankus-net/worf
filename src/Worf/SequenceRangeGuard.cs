@@ -21,7 +21,7 @@ internal static partial class SequenceRangeGuard
     /// Gets the detail of the failure of a call of nextval that waited for its grantor too long, which an apply worker
     /// applies again later, as it says nothing about the change's data.
     /// </summary>
-    internal const string GrantorUnheard = "A server that restarted draws from a block its parent granted only once it has heard from the parent, which may have given the block's values out again meanwhile.";
+    internal const string GrantorUnheard = "A server that restarted draws from a sequence's blocks only once the block's parent, and every other node it exchanges with that reports the sequence, has checked its report since: the parent may have given the block's values out again meanwhile, and any of them may have heard of draws a restore took back.";
 
     /// <summary>
     /// Gets the detail of the failure of a call of nextval whose sequence worf can't tell that waited for a grantor too
@@ -202,13 +202,19 @@ internal static partial class SequenceRangeGuard
     private static readonly HashSet<uint> s_moved = [];
     private static long s_version = -1;
 
-    // The node that granted each sequence's active block, its parent, when another node did, which this node subscribes
-    // to, or which exchanges with it through a slot of this node, as one that only answers that node's calls knows it,
-    // and the grantors this backend has seen this server hear from since it started.
+    // The node each sequence's draws wait for since this server started: the node that granted its active block, its
+    // parent, when another node did, until it has checked this node's report of the sequence since then, and otherwise
+    // any other node this node exchanges with directly that reports the sequence, and so may have heard of its draws,
+    // as an owner's neighbors hear of the draws from its own blocks, until it has too; each one this node subscribes to,
+    // or which exchanges with it through a slot of this node, as one that only answers that node's calls knows it.
     private static readonly Dictionary<uint, uint> s_grantors = [];
-    // The sequences whose active block's grantor has said it checked this node's report of the sequence since this server
-    // started, as the tables last read hold.
+    // The sequences whose draws wait for no node, as the tables last read hold, which the reads leave empty, as they
+    // name only nodes that haven't checked this node's report of a sequence since this server started.
     private static readonly HashSet<uint> s_confirmedSequences = [];
+
+    // The sequences whose node waited for, as a start's draws wait, is a neighbor that may have heard of their draws,
+    // rather than the grantor of their active block.
+    private static readonly HashSet<uint> s_heardBy = [];
 
     // Whether the guard is reading the blocks to find the grantors a statement's plan names.
     private static bool s_namingGrantors;
@@ -3012,10 +3018,12 @@ internal static partial class SequenceRangeGuard
     }
 
     /// <summary>
-    /// Waits, before a statement draws from a block the sequence's parent granted this node, until this server has
-    /// taken in a message of the parent's since it started: a node that was away while its parent's fence lifted without
-    /// its report, as when <c>worf.activate_sequence_range</c> stopped waiting for it, holds values the lift gave out
-    /// again, and the parent's first message after asks it to reset, so it draws none of them. The statement lets its
+    /// Waits, before a statement draws from a sequence's active block, until the block's parent, when another node
+    /// granted it, and every other node this node exchanges with directly that reports the sequence have checked this
+    /// node's report of it since this server started: a node that was away while its parent's fence lifted without its
+    /// report, as when <c>worf.activate_sequence_range</c> stopped waiting for it, holds values the lift gave out again,
+    /// and a node restored from a backup may draw again values a neighbor heard it draw, its own blocks' too, as an
+    /// owner's; the first message after from such a node asks it to reset, so it draws none of them. The statement lets its
     /// gates go and waits up to twice <c>worf.sequence_range_timeout</c>, as for the next block at a block's end, and
     /// then fails, naming the parent, as an error that ends the wait first, as <c>statement_timeout</c>'s, does.
     /// </summary>
@@ -3034,11 +3042,22 @@ internal static partial class SequenceRangeGuard
                 sequence = Worf.FromServer(NativeMethods.get_rel_name(seqoid));
             }
 
-            string parent = Elevated.Run(() => Worf.ReadScalar<string?>("""
-                SELECT coalesce((SELECT node_name::text FROM worf.node WHERE node_id = $1),
-                    (SELECT max(node_name::text) FROM worf.sequence_range_node WHERE node_id = $1))
-                """, SpiParameter.Create(grantor))) ?? grantor.ToString(CultureInfo.InvariantCulture);
-            string waitingFor = $"waiting for node {parent}, which granted sequence {sequence}'s block, to answer this server since it started" +
+            // The node waited for, its name, and why it's waited for, which change as the nodes ahead of it answer.
+            string parent = "";
+            bool heardBy = false;
+            string role = "";
+            void Describe(uint waitFor)
+            {
+                parent = Elevated.Run(() => Worf.ReadScalar<string?>("""
+                    SELECT coalesce((SELECT node_name::text FROM worf.node WHERE node_id = $1),
+                        (SELECT max(node_name::text) FROM worf.sequence_range_node WHERE node_id = $1))
+                    """, SpiParameter.Create(waitFor))) ?? waitFor.ToString(CultureInfo.InvariantCulture);
+                heardBy = s_heardBy.Contains(seqoid);
+                role = heardBy ? $"which may have heard of sequence {sequence}'s draws" : $"which granted sequence {sequence}'s block";
+            }
+
+            Describe(grantor);
+            string waitingFor = $"waiting for node {parent}, {role}, to answer this server since it started" +
                 (unnamed ? ", as worf can't tell which sequence the call of nextval draws from before it runs" : "");
             using PgErrorContext context = PgErrorContext.Push(Worf.Shown(waitingFor));
             List<uint> held = LetGates();
@@ -3050,22 +3069,31 @@ internal static partial class SequenceRangeGuard
                 {
                     Refresh();
                     Reload();
-                    if (!s_grantors.ContainsKey(seqoid) || s_confirmedSequences.Contains(seqoid))
+                    if (!s_grantors.TryGetValue(seqoid, out uint current) || s_confirmedSequences.Contains(seqoid))
                     {
                         break;
                     }
 
-                    // The wait makes the exchange with the grantor due, each second while it lasts.
+                    if (current != grantor)
+                    {
+                        grantor = current;
+                        Describe(grantor);
+                        woken = 0;
+                    }
+
+                    // The wait makes the exchange with the node waited for due, each second while it lasts.
                     long now = Worker.GetCurrentTimestamp();
                     if (now >= deadline)
                     {
                         throw unnamed
                             ? new PgException(PgSqlStates.ObjectNotInPrerequisiteState,
-                                $"nextval can't draw until node {parent}, which granted sequence {sequence}'s block, answers this server, which started since",
+                                $"nextval can't draw until node {parent}, {role}, answers this server, which started since",
                                 detail: UnnamedGrantorUnheard,
                                 hint: $"Make sure node {parent} is up and its exchanges with this node succeed, or name the sequence in the statement.")
                             : new PgException(PgSqlStates.ObjectNotInPrerequisiteState,
-                                $"sequence {sequence} can't draw from the block node {parent} granted it until node {parent} answers this server, which started since",
+                                heardBy
+                                    ? $"sequence {sequence} can't draw until node {parent}, which may have heard of its draws, answers this server, which started since"
+                                    : $"sequence {sequence} can't draw from the block node {parent} granted it until node {parent} answers this server, which started since",
                                 detail: GrantorUnheard,
                                 hint: $"Make sure node {parent} is up and its exchanges with this node succeed.");
                     }
@@ -4623,6 +4651,7 @@ internal static partial class SequenceRangeGuard
         s_sequences.Clear();
         s_grantors.Clear();
         s_confirmedSequences.Clear();
+        s_heardBy.Clear();
         s_drawnBy.Clear();
         s_drawingColumns.Clear();
         s_defaultsText.Clear();
@@ -4644,9 +4673,17 @@ internal static partial class SequenceRangeGuard
         WorfRows result = Elevated.Run(() => Worf.SelectCatalog("""
             SELECT r.seqoid::oid, s.seqincrement > 0, b.lo, b.hi, b.state,
                 b.node_id = l.node_id AND b.sysid = $1 AND b.timeline = $2, b.reserved,
-                CASE WHEN b.from_node <> l.node_id AND (EXISTS (SELECT 1 FROM worf.node n WHERE n.node_id = b.from_node)
-                    OR EXISTS (SELECT 1 FROM worf.sequence_range_link k WHERE k.node_id = b.from_node)) THEN b.from_node END,
-                EXISTS (SELECT 1 FROM worf.sequence_range_node c WHERE c.seqoid = r.seqoid AND c.node_id = b.from_node AND c.confirmed_start = $3)
+                coalesce(
+                    CASE WHEN b.from_node <> l.node_id AND (EXISTS (SELECT 1 FROM worf.node n WHERE n.node_id = b.from_node)
+                            OR EXISTS (SELECT 1 FROM worf.sequence_range_link k WHERE k.node_id = b.from_node))
+                        AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_node c WHERE c.seqoid = r.seqoid AND c.node_id = b.from_node AND c.confirmed_start = $3)
+                        THEN b.from_node END,
+                    (SELECT c.node_id FROM worf.sequence_range_node c
+                    WHERE c.seqoid = r.seqoid AND c.node_id <> l.node_id AND c.confirmed_start IS DISTINCT FROM $3
+                        AND (EXISTS (SELECT 1 FROM worf.subscription s WHERE s.sub_origin = c.node_id AND s.sub_target = l.node_id)
+                            OR EXISTS (SELECT 1 FROM worf.sequence_range_link k WHERE k.node_id = c.node_id))
+                    ORDER BY c.node_name LIMIT 1)),
+                b.from_node
             FROM worf.sequence_range r
                 JOIN pg_catalog.pg_sequence s ON s.seqrelid = r.seqoid
                 CROSS JOIN worf.local_node l
@@ -4677,12 +4714,12 @@ internal static partial class SequenceRangeGuard
                     _ = s_reservedActive.Add((seqoid, lo));
                 }
 
-                if (state == "active" && row.Get<uint?>(7) is uint grantor)
+                if (state == "active" && row.Get<uint?>(7) is uint waitFor)
                 {
-                    s_grantors[seqoid] = grantor;
-                    if (row.Get<bool>(8))
+                    s_grantors[seqoid] = waitFor;
+                    if (row.Get<uint?>(8) != waitFor)
                     {
-                        _ = s_confirmedSequences.Add(seqoid);
+                        _ = s_heardBy.Add(seqoid);
                     }
                 }
             }

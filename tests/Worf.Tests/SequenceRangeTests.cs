@@ -4947,6 +4947,111 @@ public sealed partial class SequenceRangeTests
         Assert.AreEqual("", string.Join(",", before.Intersect(after)), "the ids node_b drew both before the restore and after it");
     }
 
+    // Inserts 20 rows into t on a node, as its inserts wait until its neighbors have checked its report since it started,
+    // and for a new block after a reset, failing at their time meanwhile, and returns their ids.
+    private static async Task<HashSet<string>> InsertIdsAsync(TestNode node, string label, CancellationToken token)
+    {
+        Stopwatch waiting = Stopwatch.StartNew();
+        while (true)
+        {
+            Assert.IsLessThan(TestNode.PollTimeout, waiting.Elapsed, $"{node.Name}'s insert {label}");
+            try
+            {
+                return [.. (await node.SafePsqlAsync(Database, $"INSERT INTO t (v) SELECT '{label}' FROM generate_series(1, 20) RETURNING id", token)).Split('\n')];
+            }
+            catch (PostgresException waited) when (waited.SqlState is "55000" or "57014" or "2200H")
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(200), token);
+            }
+        }
+    }
+
+    /// <summary>
+    /// A restored owner draws from the blocks it granted itself only once its neighbors have checked its report since it
+    /// started: node_b heard of the owner's draws after its backup, and finds its WAL position went back, so the owner
+    /// never draws them again.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task RestoredOwnersDrawNothingTwice()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 1000)", token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+        _ = await InsertIdsAsync(nodeA, "first", token);
+
+        // node_a is backed up whole, with its slots, as a snapshot of its storage keeps them, and draws, which node_b
+        // hears of.
+        using TemporaryDirectory copies = new($"worf-sequence-range-owner-restore-{Guid.NewGuid():N}");
+        string copy = Path.Join(copies.FullName, "node_a");
+        await BackUpDataAsync(nodeA, copy, token, wal: true);
+        CopySlots(nodeA, copy);
+        HashSet<string> before = await InsertIdsAsync(nodeA, "before", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
+            $"SELECT drawn >= {before.Max(long.Parse)} FROM worf.sequence_range_node WHERE node_name = 'node_a' AND seqoid = 't_id_seq'::regclass", token),
+            "node_b hearing of node_a's draws");
+
+        await RestoreDataAsync(nodeA, copy, token);
+        HashSet<string> after = await InsertIdsAsync(nodeA, "after", token);
+        Assert.AreEqual("", string.Join(",", before.Intersect(after)), "the ids node_a drew both before the restore and after it");
+    }
+
+    /// <summary>
+    /// A restored node waits, before it draws, for every neighbor it exchanges with that reports the sequence, not only
+    /// its block's grantor: node_c heard of node_b's draws while node_a, the grantor, was down, and is down itself as
+    /// node_b comes back from its backup, so node_b's inserts wait for node_c, naming it, and once node_c finds node_b went
+    /// back, node_b never draws those values again.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task RestoredNodesWaitForEveryNeighborThatHeardTheirDraws()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        await using TestNode nodeC = await StartNodeAsync("node_c", token);
+        foreach (TestNode node in new[] { nodeA, nodeB, nodeC })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        await SubscribeAsync(nodeB, "b_from_c", nodeC, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b,node_c}', range_size := 1000)", token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+        _ = await InsertIdsAsync(nodeB, "first", token);
+        const string HeardOfB = "FROM worf.sequence_range_node WHERE node_name = 'node_b' AND seqoid = 't_id_seq'::regclass";
+        Assert.IsTrue(await nodeC.PollQueryUntilAsync(Database, $"SELECT EXISTS (SELECT 1 {HeardOfB})", token), "node_c hearing of node_b");
+
+        // node_b is backed up whole, and draws while node_a is down, which node_c hears of; node_c stops before the restore.
+        using TemporaryDirectory copies = new($"worf-sequence-range-neighbor-restore-{Guid.NewGuid():N}");
+        string copy = Path.Join(copies.FullName, "node_b");
+        await BackUpDataAsync(nodeB, copy, token, wal: true);
+        await nodeA.StopAsync("fast", token);
+        HashSet<string> before = await InsertIdsAsync(nodeB, "before", token);
+        Assert.IsTrue(await nodeC.PollQueryUntilAsync(Database, $"SELECT drawn >= {before.Max(long.Parse)} {HeardOfB}", token), "node_c hearing of node_b's draws");
+        await nodeC.StopAsync("fast", token);
+        await RestoreDataAsync(nodeB, copy, token);
+        await nodeA.StartServerAsync(token);
+
+        PostgresException waited = await Assert.ThrowsExactlyAsync<PostgresException>(() => nodeB.SafePsqlAsync(Database, "INSERT INTO t (v) VALUES ('waiting')", token),
+            "node_b's insert while node_c is down");
+        Assert.AreEqual("55000", waited.SqlState, waited.MessageText);
+        Assert.Contains("node node_c", waited.MessageText);
+
+        await nodeC.StartServerAsync(token);
+        HashSet<string> after = await InsertIdsAsync(nodeB, "after", token);
+        Assert.AreEqual("", string.Join(",", before.Intersect(after)), "the ids node_b drew both before the restore and after it");
+    }
+
     /// <summary>
     /// Nodes that subscribe to each other record a draw for whichever way first carries it: here node_a's call to node_b
     /// carries node_b's draws, as node_b calls only each minute, and node_b, restored without its slots, so that node_a
