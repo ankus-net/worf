@@ -2956,8 +2956,7 @@ public sealed partial class SequenceRangeTests
                 // rather than the standby's, which libpq never tries.
                 string preferring = await CallAsync($"host=worf-first.test port={port} target_session_attrs=prefer-standby", "sequence range exchange with node node_c done");
                 Assert.IsFalse(BareFailureLine().IsMatch(preferring), "node_b's calls to node_c, ending a failure with a line for an address never tried");
-                string standbyOnly = await CallAsync($"host=worf-first.test port={port} target_session_attrs=standby", "exchange with node node_c failed");
-                Assert.Contains("server is not in hot standby mode", standbyOnly, "node_b's call to node_c, refused at node_c");
+                string standbyOnly = await CallAsync($"host=worf-first.test port={port} target_session_attrs=standby", "server is not in hot standby mode");
                 Assert.DoesNotContain("cannot exchange sequence ranges during recovery", standbyOnly, "node_b's call to node_c, made at the standby libpq never tries");
 
                 // A standby found at a name still looked up is preferred to node_c, listed before it.
@@ -2997,8 +2996,7 @@ public sealed partial class SequenceRangeTests
                 _ = await CallAsync($"host=worf-later.test port={port}", "sequence range exchange with node node_c done");
 
                 // A host entry is taken with its spaces, as libpq takes it.
-                string spaced = await CallAsync($"host=''127.0.0.4, worf-delay.test'' port={port}", "exchange with node node_c failed");
-                Assert.Contains("could not translate host name \" worf-delay.test\"", spaced, "node_b's call to node_c at a host with a space");
+                _ = await CallAsync($"host=''127.0.0.4, worf-delay.test'' port={port}", "could not translate host name \" worf-delay.test\"");
 
                 // An address that refuses gives way to a name still looked up, and the call doesn't fail meanwhile.
                 string waited = await CallAsync($"host=127.0.0.1,worf-delay.test port=1,{port}", "sequence range exchange with node node_c done");
