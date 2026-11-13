@@ -4352,6 +4352,40 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// The block sizes alter_sequence_range sets on the owner reach its participants, which request blocks of them from
+    /// then on, and the owner grants none larger than its largest size, though a participant requested one before it heard.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task AlteredSizesReachParticipants()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database,
+            "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100, max_range_size := 1000)", token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+        await InsertAsync(nodeB, 250, token);
+
+        string nodeBId = await nodeB.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
+        string altered = await nodeA.SafePsqlAsync(Database, "SELECT worf.alter_sequence_range('t_id_seq', 10, 10); SELECT clock_timestamp()", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
+            "SELECT range_size = 10 AND max_range_size = 10 AND request_size = 10 FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass", token),
+            "node_b's block sizes after the owner's change");
+        await InsertAsync(nodeB, 300, token);
+        Assert.AreEqual("t", await nodeA.SafePsqlAsync(Database, $"""
+            SELECT count(*) > 0 AND max(hi - lo + 1) <= 10 FROM worf.sequence_range_grant
+            WHERE seqoid = 't_id_seq'::regclass AND grantee_id = {nodeBId} AND kind = 'n' AND granted_at > '{altered}'
+            """, token), "the blocks node_a granted node_b after the change");
+    }
+
+    /// <summary>
     /// A subscriber that waits out an apply delay longer than the provider's wal_sender_timeout keeps its stream: it
     /// answers the walsender's requests for a reply as it reads ahead, and replies each status interval, so that the
     /// walsender doesn't end the stream, here over 30 seconds of a 40-second delay with wal_sender_timeout 10 s, and the

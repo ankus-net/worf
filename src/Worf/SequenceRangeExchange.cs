@@ -2222,7 +2222,7 @@ internal static class SequenceRangeExchange
         try
         {
             _ = Worf.Execute($"SET LOCAL lock_timeout = {Math.Min(1000, SequenceRanges.ExchangeTimeout / 4).ToString(CultureInfo.InvariantCulture)}");
-            local = Worf.Query("SELECT owner_node, epoch, state FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE", false, 1,
+            local = Worf.Query("SELECT owner_node, epoch, state, parent_node FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE", false, 1,
                 SpiParameter.Create(seqoid));
         }
         finally
@@ -2260,6 +2260,17 @@ internal static class SequenceRangeExchange
             // The owner disabled the epoch, and the word spreads from node to node.
             SequenceRanges.Disable(seqoid);
             learned = true;
+        }
+
+        // The block sizes alter_sequence_range sets on the owner reach each node from the owner, or from the node it
+        // requests its blocks from, which took them from the owner, and the size it requests next stays within them.
+        if (local.Count > 0 && local[0].Get<int>(1) == epoch && owner != node.Node.Id && (senderId == owner || senderId == local[0].Get<uint?>(3)))
+        {
+            learned |= Worf.Execute("""
+                UPDATE worf.sequence_range SET range_size = $2, max_range_size = $3, request_size = least(greatest(request_size, $2), $3)
+                WHERE seqoid = $1 AND (range_size, max_range_size) IS DISTINCT FROM ($2, $3)
+                """, SpiParameter.Create(seqoid), SpiParameter.Create(entry.GetProperty("range_size").GetInt64()),
+                SpiParameter.Create(entry.GetProperty("max_range_size").GetInt64())) > 0;
         }
 
         SequenceInfo info = SequenceRanges.GetInfo(seqoid);
@@ -2701,7 +2712,7 @@ internal static class SequenceRangeExchange
 
         WorfRows range = Worf.SelectCatalog("""
             SELECT root_start, EXISTS (SELECT 1 FROM worf.sequence_range_block WHERE seqoid = $1 AND epoch = $2 AND kind = $4::"char"),
-                EXISTS (SELECT 1 FROM worf.sequence_range_grant WHERE seqoid = $1 AND grantee_id = $3 AND kind <> 'x')
+                EXISTS (SELECT 1 FROM worf.sequence_range_grant WHERE seqoid = $1 AND grantee_id = $3 AND kind <> 'x'), max_range_size
             FROM worf.sequence_range WHERE seqoid = $1
             """, SpiParameter.Create(seqoid), SpiParameter.Create(epoch), SpiParameter.Create(granteeId), SpiParameter.Create(isOwner ? "r" : "p"));
         if (!range[0].Get<bool>(1))
@@ -2735,8 +2746,16 @@ internal static class SequenceRangeExchange
             return false;
         }
 
+        // A next block is granted no larger than this node's largest size, as alter_sequence_range lowered it, though the
+        // node requested it before it heard.
         string kind = request.TryGetProperty("kind", out JsonElement value) ? value.GetWorfString() ?? "n" : "n";
-        return SequenceRanges.Allocate(seqoid, info, epoch, request.GetProperty("size").GetInt64(), granteeId, granteeName, requestId, kind[0]) is not null;
+        long size = request.GetProperty("size").GetInt64();
+        if (kind == "n")
+        {
+            size = Math.Min(size, range[0].Get<long>(3));
+        }
+
+        return SequenceRanges.Allocate(seqoid, info, epoch, size, granteeId, granteeName, requestId, kind[0]) is not null;
     }
 
     /// <summary>
