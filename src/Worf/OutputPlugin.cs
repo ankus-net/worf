@@ -9,6 +9,7 @@ namespace Worf;
 internal static unsafe partial class OutputPlugin
 {
     private const int RelmetacacheInitialSize = 128;
+    private const int AccessShareLock = 1;
 
     private static readonly Dictionary<nint, WorfOutputData> s_outputData = [];
 
@@ -302,6 +303,45 @@ internal static unsafe partial class OutputPlugin
             }
 
             RelmetacacheInit();
+        }
+        else
+        {
+            RequireInstalled();
+        }
+    }
+
+    /// <summary>
+    /// Refuses to make a slot where worf isn't installed, as for a subscription whose sync made it after worf was dropped,
+    /// which would keep WAL for a subscriber the node no longer serves. It takes worf's extension lock as DROP EXTENSION
+    /// does, but shared, before it looks: a drop that holds it, prepared too, has the slot wait and then refused, and a drop
+    /// that comes after finds the slot made and is refused.
+    /// </summary>
+    private static void RequireInstalled()
+    {
+        bool startedTx = false;
+        if (!NativeMethods.IsTransactionState())
+        {
+            NativeMethods.StartTransactionCommand();
+            startedTx = true;
+        }
+
+        uint extension = NativeMethods.get_extension_oid(Worf.PStrDup(Worf.ExtensionName), true);
+        if (extension != 0)
+        {
+            NativeMethods.LockDatabaseObject(Dependency.ExtensionRelationId, extension, 0, AccessShareLock);
+            extension = NativeMethods.get_extension_oid(Worf.PStrDup(Worf.ExtensionName), true);
+        }
+
+        if (extension == 0)
+        {
+            throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState,
+                $"worf is not installed in database \"{Worf.FromServer(NativeMethods.get_database_name(NativeGlobals.MyDatabaseId))}\"",
+                hint: "Create the extension worf and its node before subscribing to this database.");
+        }
+
+        if (startedTx)
+        {
+            NativeMethods.CommitTransactionCommand();
         }
     }
 

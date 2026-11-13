@@ -147,8 +147,30 @@ public sealed class DdlReplicationTests
 
         // Once node_a drops its subscription, which drops its slot on node_b, node_b drops worf, and a row it writes
         // after leaves node_a's worf as it is.
+        // A worf slot made as the drop runs, as a subscription's sync makes one, waits for it, and is refused once it
+        // commits, and so is one made after, so that no slot keeps WAL for a subscriber node_b no longer serves.
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.drop_subscription('a_from_b')", token);
-        _ = await nodeB.SafePsqlAsync(Database, "DROP EXTENSION worf CASCADE", token);
+        await using (NpgsqlConnection dropping = await nodeB.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction drop = await dropping.BeginTransactionAsync(token);
+            await using (NpgsqlCommand dropWorf = new("DROP EXTENSION worf CASCADE", dropping, drop))
+            {
+                _ = await dropWorf.ExecuteNonQueryAsync(token);
+            }
+
+            Task<string> during = nodeB.SafePsqlAsync(Database, "SELECT pg_create_logical_replication_slot('during', 'worf')", token);
+            Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
+                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_locks WHERE locktype = 'object' AND classid = 'pg_catalog.pg_extension'::regclass AND NOT granted)", token),
+                "the slot made during the drop, waiting for it");
+            await drop.CommitAsync(token);
+            PostgresException refused = await Assert.ThrowsExactlyAsync<PostgresException>(() => during);
+            Assert.AreEqual("55000", refused.SqlState, refused.MessageText);
+        }
+
+        PostgresException after = await Assert.ThrowsExactlyAsync<PostgresException>(
+            () => nodeB.SafePsqlAsync(Database, "SELECT pg_create_logical_replication_slot('after', 'worf')", token));
+        Assert.AreEqual("55000", after.SqlState, after.MessageText);
+        Assert.AreEqual("0", await nodeB.SafePsqlAsync(Database, "SELECT count(*) FROM pg_catalog.pg_replication_slots", token), "node_b's slots");
         _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO app.t VALUES (5, 'after the drop')", token);
         _ = await nodeA.SafePsqlAsync(Database, "CREATE TABLE app.after (id integer PRIMARY KEY)", token);
         Assert.AreEqual("1|0", await nodeA.SafePsqlAsync(Database, """
