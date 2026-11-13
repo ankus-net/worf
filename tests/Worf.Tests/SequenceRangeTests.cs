@@ -4665,12 +4665,15 @@ public sealed partial class SequenceRangeTests
     [DataRow("twice single")]
     [DataRow("held stopped")]
     [DataRow("locked stopped")]
+    [DataRow("locked stopped written")]
     [DataRow("answered held")]
     [DataRow("answered plain")]
     public async Task RestoredNodesWaitForCallsThatTakeEverySequenceIn(string how)
     {
         CancellationToken token = TestContext.CancellationToken;
         bool answered = how.StartsWith("answered ", StringComparison.Ordinal);
+        bool written = how.EndsWith(" written", StringComparison.Ordinal);
+        how = written ? how[..^" written".Length] : how;
         bool stopped = how.EndsWith(" stopped", StringComparison.Ordinal);
         string variant = how.StartsWith("twice ", StringComparison.Ordinal) ? how["twice ".Length..] : "";
         string kind = variant.Length > 0 ? "twice" : how.Replace("answered ", "", StringComparison.Ordinal).Replace(" stopped", "", StringComparison.Ordinal);
@@ -4791,7 +4794,23 @@ public sealed partial class SequenceRangeTests
             _ = await lockRow.ExecuteScalarAsync(token);
         }
 
+        // For the written row, node_b's calls fail as it draws and writes a WAL segment, so that the call that carries
+        // its draws reports the segment too, which node_a takes in in full, waiting for the row it can't take and
+        // leaving the sequence out, with only the position the call kept for it in the tables.
+        if (written)
+        {
+            _ = await nodeA.SafePsqlAsync(Database, "ALTER FUNCTION worf.sequence_range_exchange(text) RENAME TO sequence_range_exchange_paused", token);
+        }
+
         HashSet<string> before = await InsertIdsAsync("before");
+        if (written)
+        {
+            _ = await nodeB.SafePsqlAsync(Database, "CREATE TABLE written_segment AS SELECT g, repeat('x', 100) AS v FROM generate_series(1, 200000) g", token);
+            _ = await nodeA.SafePsqlAsync(Database, "ALTER FUNCTION worf.sequence_range_exchange_paused(text) RENAME TO sequence_range_exchange", token);
+            Assert.IsTrue(await nodeA.PollLogAsync(0, "left out sequence public.t_id_seq, whose range row another transaction holds", token),
+                "node_a leaving t_id_seq out of node_b's call");
+        }
+
         await HearFromBAsync("after its draws");
 
         // node_a stops and starts again only once node_b is restored, so that its shared memory forgets what node_b's
@@ -5164,28 +5183,44 @@ public sealed partial class SequenceRangeTests
     /// after the backup, as the owner finds its WAL position went back, and asks it to give up those blocks. Nor does it
     /// when it drew before the drop, while a prepared transaction held the range row on the owner, so that its calls
     /// left the sequence out and only kept their positions, which the owner keeps with the drop, whether the transaction
-    /// ends before the restore or not.
+    /// ends before the restore or not. An owner's answer to a call that was cut short before the dropped sequence, which
+    /// it left unread, tells the participant the sequence is dropped, but confirms nothing.
     /// </summary>
     /// <param name="how">The drop before the backup, or after draws while the row was held, let go before the restore or
-    /// not.</param>
+    /// not, or before the backup with the owner's calls cut short.</param>
     /// <returns>The test.</returns>
     [TestMethod]
     [DataRow("dropped")]
+    [DataRow("cut")]
     [DataRow("held")]
     [DataRow("held committed")]
     public async Task RestoredParticipantsOfDroppedSequencesDrawNothingTwice(string how)
     {
         CancellationToken token = TestContext.CancellationToken;
         bool held = how.StartsWith("held", StringComparison.Ordinal);
-        await using TestNode nodeA = await StartNodeAsync("node_a", token, "max_prepared_transactions = 2");
+        await using TestNode nodeA = await StartNodeAsync("node_a", token, "max_prepared_transactions = 2\nlog_min_messages = debug1");
         await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        int extra = how == "cut" ? 15 : 0;
         foreach (TestNode node in new[] { nodeA, nodeB })
         {
-            _ = await node.SafePsqlAsync(Database, "CREATE TABLE mv (id bigserial PRIMARY KEY, v text)", token);
+            _ = await node.SafePsqlAsync(Database, string.Create(CultureInfo.InvariantCulture,
+                $"CREATE TABLE slow_on (); CREATE TABLE mv (id bigserial PRIMARY KEY, v text); DO $$ BEGIN FOR g IN 1..{extra} LOOP EXECUTE format('CREATE SEQUENCE many_%s', lpad(g::text, 2, '0')); END LOOP; END $$"),
+                token);
         }
 
+        // Once it's turned on, each report node_a takes in costs it 0.2 s, so that a call's third of its 5 s takes in
+        // the many_ sequences' reports, which sort before mv_id_seq's, and leaves mv_id_seq's unread.
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE FUNCTION slow_report() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF EXISTS (SELECT FROM public.slow_on) THEN PERFORM pg_sleep(0.2); END IF; RETURN NEW; END $$;
+            CREATE TRIGGER slow_report BEFORE UPDATE ON worf.sequence_range_node FOR EACH ROW EXECUTE FUNCTION slow_report();
+            """, token);
         await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('mv_id_seq', participants := '{node_b}', range_size := 1000)", token);
+        _ = await nodeA.SafePsqlAsync(Database, string.Create(CultureInfo.InvariantCulture, $$"""
+            SELECT count(worf.enable_sequence_range(format('many_%s', lpad(g::text, 2, '0'))::regclass, participants := '{node_b}', range_size := 1000)) FROM generate_series(1, {{extra}}) g
+            """), token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, $"SELECT count(*) = {extra} FROM worf.sequence_ranges WHERE state = 'active' AND sequence::text LIKE 'many_%'", token),
+            "node_b drawing from the many_ sequences' blocks");
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges WHERE sequence = 'mv_id_seq'::regclass", token),
             "node_b drawing from mv_id_seq's blocks");
 
@@ -5226,6 +5261,11 @@ public sealed partial class SequenceRangeTests
 
         // node_b goes back to the backup. Its inserts fail, or draw none of the ids it drew before.
         int logpos = nodeA.ReadLog().Length;
+        if (how == "cut")
+        {
+            _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO slow_on DEFAULT VALUES", token);
+        }
+
         await RestoreDataAsync(nodeB, copy, token);
         Stopwatch trying = Stopwatch.StartNew();
         while (trying.Elapsed < TimeSpan.FromSeconds(15))
@@ -5244,6 +5284,11 @@ public sealed partial class SequenceRangeTests
 
         Assert.Contains("which this node recorded before it dropped the sequence, so it must give up the blocks it keeps of it", nodeA.ReadLog()[logpos..],
             "node_a's word that node_b went back");
+        if (how == "cut")
+        {
+            Assert.Contains("sequences to its next call", nodeA.ReadLog()[logpos..], "node_a's calls, cut short");
+        }
+
         if (how == "held")
         {
             _ = await nodeA.SafePsqlAsync(Database, "COMMIT PREPARED 'held_mv'", token);
