@@ -1045,7 +1045,7 @@ public sealed class CreateSubscriberTests
             else
             {
                 NpgsqlConnectionStringBuilder super = new() { Host = "127.0.0.1", Port = provider.Cluster.Port, Database = Database, Username = "super" };
-                replication = new(super.ConnectionString);
+                replication = new(super.ConnectionString) { WalReceiverStatusInterval = TimeSpan.FromSeconds(1) };
                 await replication.Open(token);
                 IAsyncEnumerator<XLogDataMessage> messages = replication.StartLogicalReplication(new WorfReplicationSlot(slot), streaming.Token,
                     options: [new("min_proto_version", "1"), new("max_proto_version", "1"), new("startup_params_format", "1")]).GetAsyncEnumerator(streaming.Token);
@@ -1054,7 +1054,12 @@ public sealed class CreateSubscriberTests
                     "the walsender streaming the run's slot");
                 if (what is "confirmed" or "moved")
                 {
-                    // The client confirms a later position, and, but in the moved row, stops streaming, leaving the slot idle.
+                    // The client confirms a later position, and, but in the moved row, stops streaming, leaving the slot idle,
+                    // once its first reply shows it has started, a moment after the walsender has.
+                    Assert.IsTrue(await provider.PollQueryUntilAsync(Database, $"""
+                        SELECT r.reply_time IS NOT NULL FROM pg_catalog.pg_stat_replication r
+                            JOIN pg_catalog.pg_replication_slots s ON s.active_pid = r.pid WHERE s.slot_name = '{slot}'
+                        """, token), "the client's first reply");
                     string made = await provider.SafePsqlAsync(Database, $"SELECT confirmed_flush_lsn FROM pg_catalog.pg_replication_slots WHERE slot_name = '{slot}'", token);
                     _ = await provider.SafePsqlAsync(Database, "CREATE TABLE moved (a int); INSERT INTO moved VALUES (1)", token);
                     replication.SetReplicationStatus(NpgsqlLogSequenceNumber.Parse(await provider.SafePsqlAsync(Database, "SELECT pg_catalog.pg_current_wal_lsn()", token)));
