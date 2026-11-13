@@ -5990,7 +5990,8 @@ public sealed partial class SequenceRangeTests
     /// <summary>
     /// Creating, altering and attaching tables that use no managed sequence takes about as long with 150 managed
     /// sequences as with one, as the guard reads the columns of every managed sequence at once rather than one sequence
-    /// at a time.
+    /// at a time. Each is timed once the range worker has checked the sequences just enabled, which takes a slow host
+    /// longer than the statements, and with its checks every ten minutes, so that the times are the statements'.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -6003,9 +6004,22 @@ public sealed partial class SequenceRangeTests
             CREATE TABLE parted (k int, v text, w int) PARTITION BY LIST (k);
             SELECT worf.enable_sequence_range('many_1_id_seq', participants := '{}', range_size := 1000);
             """, token);
+        _ = await nodeA.SafePsqlAsync(Database, "ALTER SYSTEM SET worf.sequence_range_check_interval = '10min'; SELECT pg_reload_conf()", token);
         int made = 0;
         async Task<TimeSpan> ChangeAsync()
         {
+            // The range worker rests, waiting on its latch, at five looks in a row.
+            int rested = 0;
+            Stopwatch resting = Stopwatch.StartNew();
+            while (rested < 5)
+            {
+                Assert.IsLessThan(TestNode.PollTimeout, resting.Elapsed, "the range worker's checks of the sequences enabled");
+                rested = await nodeA.SafePsqlAsync(Database,
+                    "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE backend_type LIKE 'worf range %' AND wait_event_type = 'Extension'", token) == "1"
+                    ? rested + 1 : 0;
+                await Task.Delay(TimeSpan.FromMilliseconds(100), token);
+            }
+
             Stopwatch timing = Stopwatch.StartNew();
             for (int i = 0; i < 5; i++, made++)
             {

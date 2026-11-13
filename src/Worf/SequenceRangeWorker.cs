@@ -118,11 +118,19 @@ internal static class SequenceRangeWorker
                 }
 
                 List<uint> toCheck = [.. sequences.Where(seqoid => !SequenceRangeSwitchWorker.Running(seqoid))];
+                HashSet<uint> resting = Resting(toCheck, checkedAt);
                 while (toCheck.Count > 0)
                 {
                     int next = Math.Max(toCheck.FindIndex(seqoid => SequenceRangeGuard.Drawing(seqoid).Waiting > 0), 0);
                     uint seqoid = toCheck[next];
                     toCheck.RemoveAt(next);
+                    if (resting.Contains(seqoid) && SequenceRangeGuard.Drawing(seqoid).Waiting == 0 && checkedAt.TryGetValue(seqoid,
+                        out ((long All, long Sequence) Touched, long? Position, long At) rested) && rested.Touched == SequenceRangeTouches.Touched(seqoid))
+                    {
+                        SequenceRangeGuard.CountAttempt(seqoid);
+                        continue;
+                    }
+
                     try
                     {
                         changed |= PgBackgroundWorker.RunTransaction(() =>
@@ -254,6 +262,71 @@ internal static class SequenceRangeWorker
         }
 
         _ = SequenceRangeExchangeWorker.Watch(true);
+    }
+
+    /// <summary>
+    /// Finds, in one transaction, the sequences that have nothing new for their checks, as each check's own transaction
+    /// would find: none of their ranges' changes committed and they haven't moved since a check less than ten check
+    /// intervals ago, and at least a second, and no statement waits on them. The tick passes over them without a
+    /// transaction each, so that a node whose many managed sequences rest takes a transaction a tick for them, rather
+    /// than one for each, as it would at every check interval while idle. A sequence that a transaction holds against
+    /// the check, or that a statement begins to wait on, or whose ranges change, during the tick, is checked as before.
+    /// </summary>
+    private static HashSet<uint> Resting(List<uint> sequences, Dictionary<uint, ((long All, long Sequence) Touched, long? Position, long At)> checkedAt)
+    {
+        long now = Worker.GetCurrentTimestamp();
+        long fresh = Math.Max(1000L, 10L * SequenceRanges.CheckInterval) * 1000L;
+        List<(uint Seqoid, long? Position)> candidates = [.. sequences
+            .Where(seqoid => SequenceRangeGuard.Drawing(seqoid).Waiting == 0)
+            .Select(seqoid => (Seqoid: seqoid, Found: checkedAt.TryGetValue(seqoid, out ((long All, long Sequence) Touched, long? Position, long At) seen), Seen: seen))
+            .Where(candidate => candidate.Found && now - candidate.Seen.At < fresh && candidate.Seen.Touched == SequenceRangeTouches.Touched(candidate.Seqoid))
+            .Select(candidate => (candidate.Seqoid, candidate.Seen.Position))];
+        if (candidates.Count == 0)
+        {
+            return [];
+        }
+
+        try
+        {
+            return PgBackgroundWorker.RunTransaction(() =>
+            {
+                HashSet<uint> resting = [];
+                foreach ((uint seqoid, long? position) in candidates)
+                {
+                    unsafe
+                    {
+                        if (!NativeMethods.ConditionalLockRelationOid(seqoid, (int)PgLockMode.RowExclusive))
+                        {
+                            continue;
+                        }
+                    }
+
+                    try
+                    {
+                        WorfRows read = Worf.Read("SELECT pg_catalog.pg_sequence_last_value(c.oid) FROM pg_catalog.pg_class c WHERE c.oid = $1", 1,
+                            SpiParameter.Create(seqoid));
+                        if (read.Count > 0 && read[0].Get<long?>(0) == position)
+                        {
+                            _ = resting.Add(seqoid);
+                        }
+                    }
+                    finally
+                    {
+                        unsafe
+                        {
+                            NativeMethods.UnlockRelationOid(seqoid, (int)PgLockMode.RowExclusive);
+                        }
+                    }
+                }
+
+                return resting;
+            });
+        }
+        catch (PgException error)
+        {
+            WorfLog.Debug2($"sequence range worker checks each sequence in a transaction of its own this tick: {error.Message}");
+            return [];
+        }
     }
 
     private static List<uint> Sequences()
