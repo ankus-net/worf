@@ -10,8 +10,9 @@ namespace Worf;
 /// <param name="explained">Whether the statement is only explained, as EXPLAIN without ANALYZE starts it.</param>
 /// <param name="text">Reads the statement's own text, as the client sent it, or null when it has none or has
 /// parameters, whose values a plan may hold.</param>
+/// <param name="running">The statement running, as a QueryDesc, whose expressions start as it runs, or zero.</param>
 internal sealed class WorfStartingStatement(Func<(HashSet<uint> Called, int Calls, bool Unnamed)> draws, nint context, bool explained,
-    Func<string?>? text = null)
+    Func<string?>? text = null, nint running = 0)
 {
     private (HashSet<uint> Called, int Calls, bool Unnamed)? _draws;
     private string? _text;
@@ -45,4 +46,10 @@ internal sealed class WorfStartingStatement(Func<(HashSet<uint> Called, int Call
     /// Gets a value indicating whether the statement is only explained.
     /// </summary>
     internal bool Explained { get; } = explained;
+
+    /// <summary>
+    /// Gets the statement running, as a QueryDesc, whose expressions start as it runs, as a VALUES row's, a CHECK's or a
+    /// trigger condition's do, or zero for one whose plan starts.
+    /// </summary>
+    internal nint Running { get; } = running;
 }

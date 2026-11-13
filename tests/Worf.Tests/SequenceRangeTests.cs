@@ -3821,6 +3821,19 @@ public sealed partial class SequenceRangeTests
                 CREATE TABLE trg (id bigint, v text);
                 CREATE FUNCTION trg_id() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.id := nextval('s1'); RETURN NEW; END $$;
                 CREATE TRIGGER trg_id BEFORE INSERT ON trg FOR EACH ROW EXECUTE FUNCTION trg_id();
+                CREATE TABLE vals (id bigint);
+                CREATE TABLE ck (v text CHECK (nextval('s1') > 0));
+                CREATE TABLE tw (v text);
+                CREATE FUNCTION passed() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+                CREATE TRIGGER tw_when BEFORE INSERT ON tw FOR EACH ROW WHEN (nextval('s1') > 0) EXECUTE FUNCTION passed();
+                CREATE FUNCTION f_sql() RETURNS bigint LANGUAGE sql AS 'SELECT nextval(''s1'')';
+                CREATE FUNCTION f_sql_loop(n int) RETURNS bigint LANGUAGE plpgsql AS $$ DECLARE x bigint; BEGIN FOR i IN 1..n LOOP x := f_sql(); END LOOP; RETURN x; END $$;
+                CREATE FUNCTION f_named_loop(n int, name text) RETURNS bigint LANGUAGE plpgsql AS $$ DECLARE x bigint; BEGIN FOR i IN 1..n LOOP x := nextval(name); END LOOP; RETURN x; END $$;
+                CREATE FUNCTION f_exec(n int) RETURNS void LANGUAGE plpgsql AS $$
+                BEGIN EXECUTE format('DO $d$ DECLARE x bigint; BEGIN FOR i IN 1..%s LOOP x := nextval(''s1''); END LOOP; END $d$', n); END $$;
+                CREATE EXTENSION autoinc;
+                CREATE TABLE ai (id int, v text);
+                CREATE TRIGGER ai_id BEFORE INSERT ON ai FOR EACH ROW EXECUTE FUNCTION autoinc(id, s1);
                 """, token);
         }
 
@@ -3846,15 +3859,23 @@ public sealed partial class SequenceRangeTests
 
         // Besides, a PL/pgSQL loop's assignment, in a function or a DO block, which PL/pgSQL starts once; an ARRAY or a
         // scalar subquery, which runs as the statement's initPlan; three calls in each row; rows a PL/pgSQL trigger draws
-        // for, inserted from a SELECT or copied; and a statement like one that failed as it drew, which left its plan's
-        // nodes counted.
+        // for, inserted from a SELECT or copied; a statement like one that failed as it drew, which left its plan's
+        // nodes counted; calls that first start as the statement runs, in a VALUES list's rows, a table's CHECK
+        // constraint and a trigger's WHEN condition; PL/pgSQL loops that draw through a SQL function, with a computed name,
+        // or in a DO block that EXECUTE runs; rows of 40 calls, more than the block's last twentieth; and rows that contrib's
+        // autoinc trigger draws for.
         List<string> problems = [];
         foreach (string statement in new[] { "DO $$ BEGIN PERFORM nextval('s1'); END $$", "SELECT f_s1()", "BEGIN", "SELECT nextval('s1') FROM generate_series(1, 250)",
             "SELECT count(DISTINCT nextval('s1')) FROM generate_series(1, 250)", "SELECT f_loop(250) /* generate_series */",
             "DO $$ DECLARE x bigint; BEGIN FOR i IN 1..250 LOOP x := nextval('s1'); END LOOP; END $$ /* generate_series */",
             "SELECT array_length(ARRAY(SELECT nextval('s1') FROM generate_series(1, 250)), 1)",
             "SELECT (SELECT count(nextval('s1')) FROM generate_series(1, 250))", "SELECT nextval('s1'), nextval('s1'), nextval('s1') FROM generate_series(1, 100)",
-            "INSERT INTO trg (v) SELECT 'x' FROM generate_series(1, 250)", "COPY", "FAILED" })
+            "INSERT INTO trg (v) SELECT 'x' FROM generate_series(1, 250)", "COPY", "FAILED",
+            $"INSERT INTO vals VALUES {string.Join(", ", Enumerable.Repeat("(nextval('s1'))", 250))} /* generate_series */",
+            "INSERT INTO ck SELECT 'x' FROM generate_series(1, 250)", "INSERT INTO tw SELECT 'x' FROM generate_series(1, 250)",
+            "SELECT f_sql_loop(250) /* generate_series */", "SELECT f_named_loop(250, 's1') /* generate_series */", "SELECT f_exec(250) /* generate_series */",
+            $"SELECT {string.Join(", ", Enumerable.Repeat("nextval('s1')", 40))} FROM generate_series(1, 6)",
+            "INSERT INTO ai (v) SELECT 'x' FROM generate_series(1, 250)" })
         {
             Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 's1'::regclass", token),
                 "node_b drawing from a block of s1, with the next one ready");
@@ -3947,6 +3968,145 @@ public sealed partial class SequenceRangeTests
         }
 
         Assert.AreEqual("", string.Join("\n", problems), "the draws that ran a block out");
+    }
+
+    /// <summary>
+    /// worf's apply waits for a grantor only for the triggers that fire as it applies, which run as a replica's: after
+    /// node_b restarts with node_a, its grantor, down, a row of x, whose autoinc trigger is enabled ORIGIN, and an update
+    /// of z, whose ALWAYS autoinc trigger fires on insert alone, apply at once, while a row of y, whose ALWAYS trigger fires
+    /// on insert, waits for node_a; and a local insert into w, whose autoinc trigger is enabled REPLICA, runs at once.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task AppliedRowsWaitOnlyForTriggersThatFire()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        await using TestNode nodeC = await StartNodeAsync("node_c", token);
+        foreach (TestNode node in new[] { nodeA, nodeB, nodeC })
+        {
+            _ = await node.SafePsqlAsync(Database, """
+                CREATE TABLE t (id bigserial PRIMARY KEY, v text);
+                CREATE TABLE x (k int PRIMARY KEY, id int); CREATE TABLE y (k int PRIMARY KEY, id int); CREATE TABLE z (k int PRIMARY KEY, id int, v text);
+                CREATE TABLE w (k int PRIMARY KEY, id int);
+                """, token);
+        }
+
+        _ = await nodeB.SafePsqlAsync(Database, """
+            CREATE EXTENSION autoinc;
+            CREATE TRIGGER x_id BEFORE INSERT ON x FOR EACH ROW EXECUTE FUNCTION autoinc(id, t_id_seq);
+            CREATE TRIGGER y_id BEFORE INSERT ON y FOR EACH ROW EXECUTE FUNCTION autoinc(id, t_id_seq);
+            ALTER TABLE y ENABLE ALWAYS TRIGGER y_id;
+            CREATE TRIGGER z_id BEFORE INSERT ON z FOR EACH ROW EXECUTE FUNCTION autoinc(id, t_id_seq);
+            ALTER TABLE z ENABLE ALWAYS TRIGGER z_id;
+            CREATE TRIGGER w_id BEFORE INSERT ON w FOR EACH ROW EXECUTE FUNCTION autoinc(id, t_id_seq);
+            ALTER TABLE w ENABLE REPLICA TRIGGER w_id;
+            """, token);
+        _ = await nodeC.SafePsqlAsync(Database, """
+            SELECT worf.replication_set_add_table('default', 'x'); SELECT worf.replication_set_add_table('default', 'y');
+            SELECT worf.replication_set_add_table('default', 'z');
+            """, token);
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        await SubscribeAsync(nodeB, "b_from_c", nodeC, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100)", token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+        _ = await nodeC.SafePsqlAsync(Database, "INSERT INTO z VALUES (1, NULL, 'before')", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT count(*) = 1 FROM z", token), "node_b's apply of z's row");
+
+        // node_a stops, and node_b restarts, so that it hasn't heard from node_a since.
+        await nodeA.StopAsync("fast", token);
+        await nodeB.StopAsync("fast", token);
+        await nodeB.StartServerAsync(token);
+        foreach (string write in new[] { "INSERT INTO x VALUES (1, NULL)", "UPDATE z SET v = 'after' WHERE k = 1", "INSERT INTO y VALUES (1, NULL)" })
+        {
+            _ = await nodeC.SafePsqlAsync(Database, write, token);
+        }
+
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT (SELECT count(*) FROM x) = 1 AND (SELECT v FROM z) = 'after'", token),
+            "node_b's apply of x's row and z's update, while node_a is down");
+        await using (NpgsqlConnection local = await nodeB.OpenAsync(Database, token))
+        {
+            await using NpgsqlCommand insert = new("SET statement_timeout = '5s'; INSERT INTO w VALUES (1, NULL)", local);
+            _ = await insert.ExecuteNonQueryAsync(token);
+        }
+
+        await Task.Delay(TimeSpan.FromSeconds(3), token);
+        Assert.AreEqual("0", await nodeB.SafePsqlAsync(Database, "SELECT count(*) FROM y", token), "the rows of y node_b applied while node_a was down");
+        await nodeA.StartServerAsync(token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT count(*) = 1 FROM y WHERE id IS NOT NULL", token), "node_b's apply of y's row once node_a is back");
+    }
+
+    /// <summary>
+    /// A PL/pgSQL statement counts down only the managed sequences its function draws from: after the transaction drew
+    /// s1, and another session drew s1 into its block's last twentieth, which can't switch as its owner is down, a loop
+    /// that draws from a sequence no range manages, and a trigger that does, run at once, rather than wait for s1's switch.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task DrawsWaitOnlyForTheirOwnSequences()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, """
+                CREATE SEQUENCE s1; CREATE SEQUENCE plain;
+                CREATE FUNCTION f_plain_loop(n int) RETURNS bigint LANGUAGE plpgsql AS $$ DECLARE x bigint; BEGIN FOR i IN 1..n LOOP x := nextval('plain'); END LOOP; RETURN x; END $$;
+                CREATE TABLE pt (id bigint, v text);
+                CREATE FUNCTION pt_id() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.id := nextval('plain'); RETURN NEW; END $$;
+                CREATE TRIGGER pt_id BEFORE INSERT ON pt FOR EACH ROW EXECUTE FUNCTION pt_id();
+                """, token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('s1', participants := '{node_b}', range_size := 100, max_range_size := 100)", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 's1'::regclass", token),
+            "node_b drawing from a block of s1, with the next one ready");
+
+        // With node_a down, a transaction on node_b draws s1, and another session then draws s1 until a draw waits for a
+        // switch that can't come, in the last block's last twentieth.
+        await nodeA.StopAsync("fast", token);
+        await using NpgsqlConnection connection = await nodeB.OpenAsync(Database, token);
+        await using NpgsqlTransaction transaction = await connection.BeginTransactionAsync(token);
+        await using (NpgsqlCommand first = new("SELECT nextval('s1')", connection, transaction))
+        {
+            _ = await first.ExecuteNonQueryAsync(token);
+        }
+
+        await using (NpgsqlConnection other = await nodeB.OpenAsync(Database, token))
+        {
+            await using (NpgsqlCommand timeout = new("SET statement_timeout = '2s'", other))
+            {
+                _ = await timeout.ExecuteNonQueryAsync(token);
+            }
+
+            await using NpgsqlCommand draw = new("SELECT nextval('s1')", other);
+            for (int i = 0; ; i++)
+            {
+                Assert.IsLessThan(300, i, "node_b's draws of s1 before one waits");
+                try
+                {
+                    _ = await draw.ExecuteScalarAsync(token);
+                }
+                catch (PostgresException waited) when (waited.SqlState == "57014")
+                {
+                    break;
+                }
+            }
+        }
+
+        // The transaction then runs the loop and the trigger, which draw from plain alone.
+        foreach (string statement in new[] { "SELECT f_plain_loop(1000)", "INSERT INTO pt (v) SELECT 'x' FROM generate_series(1, 1000)" })
+        {
+            await using NpgsqlCommand run = new($"SET LOCAL statement_timeout = '5s'; {statement}", connection, transaction);
+            Stopwatch running = Stopwatch.StartNew();
+            _ = await run.ExecuteNonQueryAsync(token);
+            Assert.IsLessThan(TimeSpan.FromSeconds(3), running.Elapsed, statement);
+        }
+
+        await transaction.CommitAsync(token);
     }
 
     /// <summary>
@@ -6289,8 +6449,11 @@ public sealed partial class SequenceRangeTests
             ("INSERT INTO tl2 SELECT max(id), 'u' FROM tl; ALTER TABLE tl ATTACH PARTITION tl2 FOR VALUES IN ('u', 'v'); INSERT INTO tl2 (v) VALUES ('v') RETURNING id",
                 "tl_id_seq"),
         ] : []).Concat([
-            // An INSERT's ON CONFLICT DO UPDATE fires the update trigger, whose C code, contrib's autoinc, draws.
+            // An INSERT's ON CONFLICT DO UPDATE fires the update trigger, whose C code, contrib's autoinc, draws, and so
+            // does one, or an UPDATE, in a data-modifying WITH.
             ("INSERT INTO auu VALUES (1, 5, 'b') ON CONFLICT (k) DO UPDATE SET id = NULL RETURNING id", "ti_id_seq"),
+            ("WITH u AS (INSERT INTO auu VALUES (1, 6, 'c') ON CONFLICT (k) DO UPDATE SET id = NULL RETURNING id) SELECT id FROM u", "ti_id_seq"),
+            ("WITH u AS (UPDATE au SET id = NULL RETURNING id) SELECT id FROM u", "ti_id_seq"),
             // A DO block whose variable is of a domain that draws, right after another DO block, whose compiled state its
             // own may take the place of.
             ("DO $$ DECLARE z bigint; BEGIN z := nextval('plain'); END $$; DO $$ DECLARE y tdom; BEGIN y := 1; END $$", "ti_id_seq"),
@@ -6341,7 +6504,8 @@ public sealed partial class SequenceRangeTests
             {
                 string draw = forms[i].Draw;
                 int laneOf = draw.Contains(" ti ", StringComparison.Ordinal) ? 0 : draw.Contains(" tp ", StringComparison.Ordinal) ? 1
-                    : draw.StartsWith("UPDATE t ", StringComparison.Ordinal) ? 2 : draw.Contains(" au ", StringComparison.Ordinal) ? 3 : i % 4;
+                    : draw.StartsWith("UPDATE t ", StringComparison.Ordinal) ? 2
+                    : draw.Contains(" au ", StringComparison.Ordinal) || draw.Contains(" auu ", StringComparison.Ordinal) ? 3 : i % 4;
                 if (laneOf == lane)
                 {
                     found[i] = await TryAsync(draw, forms[i].Sequence);
@@ -6378,8 +6542,9 @@ public sealed partial class SequenceRangeTests
             "MERGE INTO ti USING (SELECT min(id) AS m FROM ti) s ON ti.id = s.m WHEN MATCHED THEN UPDATE SET id = s.m",
             "SELECT frp(1)",
             "DELETE FROM ti WHERE id = (SELECT max(id) FROM ti); UPDATE ti SET id = id + 1 WHERE id = (SELECT max(id) FROM ti)",
-            // An update of a table whose argument trigger fires only on insert.
-            "UPDATE ai SET v = 'y'",
+            // An update of a table whose argument trigger fires only on insert, an upsert that conflicts with no row of a
+            // table whose update trigger draws, and an UPDATE of such a table that matches no row.
+            "UPDATE ai SET v = 'y'", "INSERT INTO auu VALUES (99, 5, 'n') ON CONFLICT (k) DO UPDATE SET id = NULL", "UPDATE auu SET id = NULL WHERE k = -1",
         })
         {
             try
@@ -6613,10 +6778,26 @@ public sealed partial class SequenceRangeTests
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT count(*) = 1 FROM npd", token), "node_b's apply of the row of npd, whose domain draws from plain");
 
         // So does the row of a table whose ALWAYS trigger's C code draws from plain, though the triggers of other
-        // tables that call the same function name ti_id_seq.
+        // tables that call the same function name ti_id_seq: ai3's, which no subscription writes yet.
+        _ = await nodeB.SafePsqlAsync("nativepub", "CREATE TABLE ai3 (id int, v text)", token);
+        _ = await nodeB.SafePsqlAsync(Database, """
+            CREATE TABLE ai3 (id int, v text);
+            CREATE TRIGGER ai3_id BEFORE INSERT ON ai3 FOR EACH ROW EXECUTE FUNCTION autoinc(id, 'public.ti_id_seq');
+            ALTER TABLE ai3 ENABLE ALWAYS TRIGGER ai3_id;
+            """, token);
         _ = await nodeB.SafePsqlAsync("nativepub", "INSERT INTO apl VALUES (NULL, 'native')", token);
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT count(*) = 1 FROM apl WHERE id IS NOT NULL", token),
             "node_b's apply of the row of apl, whose trigger draws from plain");
+
+        // A table REFRESH PUBLICATION adds to that subscription, ai3, whose ALWAYS trigger draws from ti_id_seq, waits for
+        // node_a, though the apply had read the subscription's tables' triggers before, and the refresh changes no table.
+        _ = await nodeB.SafePsqlAsync("nativepub", "ALTER PUBLICATION native_apl ADD TABLE ai3", token);
+        _ = await nodeB.SafePsqlAsync(Database, "ALTER SUBSCRIPTION native_apl REFRESH PUBLICATION WITH (copy_data = false)", token);
+        int refreshed = nodeB.ReadLog().Length;
+        _ = await nodeB.SafePsqlAsync("nativepub", "INSERT INTO ai3 VALUES (NULL, 'native')", token);
+        Assert.IsTrue(await nodeB.PollLogAsync(refreshed, "sequence ti_id_seq can't draw from the block node node_a granted it", token),
+            "node_b's apply of the row of ai3, which REFRESH PUBLICATION added, waiting for node_a");
+        Assert.AreEqual("0", await nodeB.SafePsqlAsync(Database, "SELECT count(*) FROM ai3", token), "the rows of ai3 node_b's native subscription applied while node_a was down");
         int drawn = nodeB.ReadLog().Length;
         _ = await nodeB.SafePsqlAsync("nativepub", "INSERT INTO ai2 VALUES (NULL, 'native')", token);
         Assert.IsTrue(await nodeB.PollLogAsync(drawn, "sequence ti_id_seq can't draw from the block node node_a granted it", token),
