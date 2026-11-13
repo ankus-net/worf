@@ -1622,11 +1622,34 @@ public sealed partial class SequenceRangeTests
         }
 
         // A node re-created under another name, with the same subscription name and role, takes over its old node's slot
-        // once the role's row is deleted, rather than being locked out by the slot's link.
+        // once the role's row is deleted, rather than being locked out by the slot's link, and forgets the old node in
+        // node_b's exchange turn, as every write of several nodes' reports does: here it waits there for a report node_c
+        // relayed, which a session holds.
+        _ = await nodeB.SafePsqlAsync(Database, $"""
+            INSERT INTO worf.sequence_range_node (seqoid, node_id, node_name, via_node, reported_at)
+            VALUES ('t_id_seq'::regclass, 2000002, 'relayed_by_c', {nodeCId}, now())
+            """, token);
         _ = await nodeB.SafePsqlAsync(Database, "DELETE FROM worf.sequence_range_role WHERE role_id = 'c_user'::regrole", token);
         _ = await nodeB.SafePsqlAsync(Database, "SELECT pg_create_logical_replication_slot('c_link', 'worf')", token);
         string recreated = $$"""{"node_id": 2000001, "node_name": "node_c_again", "slot": "c_link", "sysid": "1", "timeline": 1, "wal_lsn": "0/0", "sequences": []}""";
-        _ = await nodeB.SafePsqlAsync(Database, $"SET SESSION AUTHORIZATION c_user; SELECT worf.sequence_range_exchange('{recreated}')", token);
+        await using (NpgsqlConnection holder = await nodeB.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction holding = await holder.BeginTransactionAsync(token);
+            await using (NpgsqlCommand hold = new($"SELECT 1 FROM worf.sequence_range_node WHERE via_node = {nodeCId} FOR UPDATE", holder, holding))
+            {
+                _ = await hold.ExecuteNonQueryAsync(token);
+            }
+
+            Task takeover = nodeB.SafePsqlAsync(Database, $"SET SESSION AUTHORIZATION c_user; SELECT worf.sequence_range_exchange('{recreated}')", token);
+            Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, """
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+                    WHERE l.locktype = 'advisory' AND l.objsubid = 5 AND l.granted AND a.query LIKE '%sequence_range_exchange(%node_c_again%')
+                """, token), "the takeover, forgetting node_c in node_b's turn");
+            await holding.CommitAsync(token);
+            await takeover;
+        }
+
         Assert.AreEqual("2000001", await nodeB.SafePsqlAsync(Database, "SELECT node_id FROM worf.sequence_range_link WHERE slot_name = 'c_link'", token));
         _ = await nodeB.SafePsqlAsync(Database, "SELECT pg_drop_replication_slot('c_link')", token);
 
@@ -3046,6 +3069,199 @@ public sealed partial class SequenceRangeTests
         {
             Assert.IsLessThan(TestNode.PollTimeout, refusing.Elapsed, "node_b's call to node_c at the port that refuses it");
             await Task.Delay(TimeSpan.FromMilliseconds(100), token);
+        }
+    }
+
+    /// <summary>
+    /// A node's exchange turn is held only by the work that needs it, and waits on no other session's lock, so that
+    /// node_b's inserts, which draw a block from node_a every 100 rows, go on drawing: a forced lift on node_a waits for a
+    /// configuration change or a drop left open, and for a drop under way, before it takes the turn rather than holding
+    /// it, and so doesn't deadlock with the drop; a drop canceled in the turn lets it go; sessions' own advisory locks,
+    /// of whatever key, are never worf's; and a drop left open whose deletes a reply's take-in would wait for, or a fence's
+    /// lift in the range worker, holds up neither the turn nor the worker, so that node_a's own inserts, which switch
+    /// blocks of 10, go on too.
+    /// </summary>
+    /// <param name="how">What holds, or would hold, the turn.</param>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [OSCondition(OperatingSystems.Linux | OperatingSystems.OSX)]
+    [DataRow("configuration open")]
+    [DataRow("drop open")]
+    [DataRow("lift during drop")]
+    [DataRow("canceled drop")]
+    [DataRow("advisory keys")]
+    [DataRow("fence beside drop")]
+    public async Task TurnsWaitOnNoSession(string how)
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        await using TestNode nodeC = await StartNodeAsync("node_c", token);
+        await using TestNode nodeD = await StartNodeAsync("node_d", token);
+        const string Tables = "CREATE TABLE t (id bigserial PRIMARY KEY, v text); CREATE TABLE u (id bigserial PRIMARY KEY); "
+            + "DO $$ BEGIN FOR g IN 1..20 LOOP EXECUTE format('CREATE SEQUENCE many_%s', lpad(g::text, 2, '0')); END LOOP; END $$";
+        foreach (TestNode node in new[] { nodeA, nodeB, nodeC, nodeD })
+        {
+            _ = await node.SafePsqlAsync(Database, Tables, token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        await SubscribeAsync(nodeA, "a_from_c", nodeC, token);
+        await SubscribeAsync(nodeA, "a_from_d", nodeD, token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b,node_c,node_d}', range_size := 100, max_range_size := 100);
+            SELECT worf.enable_sequence_range('u_id_seq', participants := '{}', range_size := 10, max_range_size := 10);
+            SELECT count(worf.enable_sequence_range(format('many_%s', lpad(g::text, 2, '0'))::regclass, participants := '{node_c,node_d}', range_size := 100))
+            FROM generate_series(1, 20) g;
+            """, token);
+        await WaitActiveAsync([nodeA, nodeB, nodeC, nodeD], token);
+        string nodeCId = await nodeC.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
+
+        // node_b, or node_a into u, inserts for 12 s, each insert within 5 s.
+        async Task<string> InsertAsync(TestNode node, string table)
+        {
+            List<string> failed = [];
+            await using NpgsqlConnection writer = await node.OpenAsync(Database, token);
+            await using (NpgsqlCommand timeout = new("SET statement_timeout = '5s'", writer))
+            {
+                _ = await timeout.ExecuteNonQueryAsync(token);
+            }
+
+            await using NpgsqlCommand insert = new($"INSERT INTO {table} DEFAULT VALUES", writer);
+            Stopwatch running = Stopwatch.StartNew();
+            while (running.Elapsed < TimeSpan.FromSeconds(12))
+            {
+                try
+                {
+                    _ = await insert.ExecuteNonQueryAsync(token);
+                }
+                catch (PostgresException failure)
+                {
+                    failed.Add($"{failure.SqlState} {failure.MessageText}");
+                }
+
+                await Task.Delay(TimeSpan.FromMilliseconds(5), token);
+            }
+
+            return string.Join("\n", failed.Distinct());
+        }
+
+        const string Lift = "SELECT worf.activate_sequence_range('t_id_seq')";
+        await using NpgsqlConnection holder = await nodeA.OpenAsync(Database, token);
+        await using NpgsqlTransaction holding = await holder.BeginTransactionAsync(token);
+        async Task HoldAsync(string sql)
+        {
+            await using NpgsqlCommand hold = new(sql, holder, holding);
+            _ = await hold.ExecuteNonQueryAsync(token);
+        }
+
+        // A lift's outcome, which, as no fence is up, may be a refusal, but never a deadlock.
+        static async Task<string> OutcomeAsync(Task work)
+        {
+            try
+            {
+                await work;
+                return "done";
+            }
+            catch (PostgresException failure)
+            {
+                return failure.SqlState;
+            }
+        }
+
+        switch (how)
+        {
+            case "configuration open" or "drop open":
+            {
+                await HoldAsync(how == "drop open" ? "SELECT worf.drop_subscription('a_from_c')" : "SELECT worf.alter_sequence_range('u_id_seq', range_size := 10)");
+                Task lift = nodeA.SafePsqlAsync(Database, Lift, token);
+                Assert.AreEqual("", await InsertAsync(nodeB, "t"), $"node_b's inserts as a lift waits beside a {how}");
+                await holding.CommitAsync(token);
+                Assert.AreNotEqual("40P01", await OutcomeAsync(lift), "the lift");
+                break;
+            }
+
+            case "lift during drop":
+            {
+                // The drop holds node_a's configuration as it waits on paused node_d, when the lift starts.
+                await SuspendAsync(nodeD, true, token);
+                try
+                {
+                    Task drop = nodeA.SafePsqlAsync(Database, "SELECT worf.drop_subscription('a_from_d')", token);
+                    await Task.Delay(TimeSpan.FromSeconds(2), token);
+                    Task lift = nodeA.SafePsqlAsync(Database, Lift, token);
+                    await Task.Delay(TimeSpan.FromSeconds(2), token);
+                    await SuspendAsync(nodeD, false, token);
+                    Assert.AreEqual("done", await OutcomeAsync(drop), "the drop of a_from_d beside a lift");
+                    Assert.AreNotEqual("40P01", await OutcomeAsync(lift), "the lift beside the drop");
+                }
+                finally
+                {
+                    await SuspendAsync(nodeD, false, token);
+                }
+
+                Assert.AreEqual("", await InsertAsync(nodeB, "t"), "node_b's inserts after the drop and the lift");
+                break;
+            }
+
+            case "canceled drop":
+            {
+                // A report node_c relayed of u_id_seq, which no exchange takes in, is held as the drop forgets node_c in the
+                // turn, until statement_timeout cancels it.
+                _ = await nodeA.SafePsqlAsync(Database, $"""
+                    INSERT INTO worf.sequence_range_node (seqoid, node_id, node_name, via_node, reported_at)
+                    VALUES ('u_id_seq'::regclass, 2000002, 'relayed_by_c', {nodeCId}, now())
+                    """, token);
+                await HoldAsync($"SELECT 1 FROM worf.sequence_range_node WHERE seqoid = 'u_id_seq'::regclass AND via_node = {nodeCId} FOR UPDATE");
+                await using NpgsqlConnection dropping = await nodeA.OpenAsync(Database, token);
+                await using (NpgsqlCommand drop = new("SET statement_timeout = '3s'; SELECT worf.drop_subscription('a_from_c')", dropping))
+                {
+                    PostgresException canceled = await Assert.ThrowsExactlyAsync<PostgresException>(() => drop.ExecuteNonQueryAsync(token));
+                    Assert.AreEqual("57014", canceled.SqlState, canceled.MessageText);
+                }
+
+                await holding.CommitAsync(token);
+                await using (NpgsqlCommand locks = new("SET statement_timeout = 0; SELECT count(*) FROM pg_locks WHERE pid = pg_backend_pid() AND locktype = 'advisory'", dropping))
+                {
+                    Assert.AreEqual(0L, (long)(await locks.ExecuteScalarAsync(token))!, "the advisory locks the canceled drop's session holds");
+                }
+
+                Assert.AreEqual("", await InsertAsync(nodeB, "t"), "node_b's inserts after the canceled drop");
+                break;
+            }
+
+            case "advisory keys":
+            {
+                // Sessions hold advisory locks of the keys of worf's turn and drop locks until 454a1ab.
+                await HoldAsync("SELECT pg_advisory_lock(pg_catalog.hashtext('worf.sequence_range_exchange_turn'))");
+                await using NpgsqlConnection other = await nodeB.OpenAsync(Database, token);
+                await using (NpgsqlCommand key = new("""
+                    SELECT pg_advisory_lock((pg_catalog.hashtext('worf.subscription')::int8 << 32) | sub_id::int8) FROM worf.subscription WHERE sub_name = 'b_from_a'
+                    """, other))
+                {
+                    _ = await key.ExecuteNonQueryAsync(token);
+                }
+
+                Assert.AreEqual("", await InsertAsync(nodeB, "t"), "node_b's inserts beside sessions' advisory locks");
+                await holding.CommitAsync(token);
+                break;
+            }
+
+            default:
+            {
+                // node_a's fence on t_id_seq waits for node_d, stopped, as a drop of a_from_c is left open; once node_d is
+                // back and reports, the lift would delete node_c's wait, which the drop deleted.
+                await nodeD.StopAsync("fast", token);
+                _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.reset_sequence_range('t_id_seq')", token);
+                Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database,
+                    "SELECT detail LIKE 'fenced until node node_d reports%' FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass", token),
+                    "node_a's fence, waiting for node_d alone");
+                await HoldAsync("SELECT worf.drop_subscription('a_from_c')");
+                await nodeD.StartServerAsync(token);
+                Assert.AreEqual("", await InsertAsync(nodeA, "u"), "node_a's inserts into u, beside its fence and the drop left open");
+                await holding.CommitAsync(token);
+                break;
+            }
         }
     }
 

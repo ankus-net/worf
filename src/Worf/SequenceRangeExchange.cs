@@ -50,7 +50,6 @@ internal static class SequenceRangeExchange
     // When each link last exchanged, by subscription, and the links with acknowledgements to send.
     private static readonly Dictionary<uint, long> s_exchangedAt = [];
     private static readonly HashSet<uint> s_acksWaiting = [];
-    private static long? s_turnKey;
     private static long s_requested;
 
     // What each link waited on at its last exchange that changed nothing, when it next asks for that, and the delay
@@ -221,7 +220,7 @@ internal static class SequenceRangeExchange
             }
 
             _ = Worf.Execute("UPDATE worf.sequence_range_link SET node_id = $2 WHERE slot_name = $1", name, SpiParameter.Create(senderId));
-            SequenceRanges.ForgetNeighbor(old);
+            WithTurn(() => SequenceRanges.ForgetNeighbor(old));
             WorfLog.Log($"node {senderId} takes over replication slot \"{slot}\" from node {old}, which this node forgets");
             return true;
         }
@@ -635,7 +634,7 @@ internal static class SequenceRangeExchange
         // transaction does, rather than wait on the rows the drop deleted. The drop's lock, which it takes before it
         // deletes anything, is an advisory one, which, unlike a row's, uses no transaction ID.
         if (!WorfNode.GetNodeSubscriptions(node.Node.Id, false).Exists(current => current.Id == sub.Id && current.Enabled) ||
-            !Worf.ReadScalar<bool>($"SELECT pg_catalog.pg_try_advisory_xact_lock_shared({WorfNode.DropLockKey})", SpiParameter.Create(sub.Id)))
+            !SequenceRangeLocks.TryShareDrop(sub.Id))
         {
             return (false, false);
         }
@@ -905,7 +904,7 @@ internal static class SequenceRangeExchange
     /// different orders, as when a sequence's name names another sequence on a neighbor. A call takes its turn only once
     /// the neighbor has answered, so that no node waits on another's turn while that node waits on its own.
     /// </summary>
-    private static void TakeTurn() => _ = Worf.Read("SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('worf.sequence_range_exchange_turn'))", 0);
+    private static void TakeTurn() => SequenceRangeLocks.TakeTurn();
 
     /// <summary>
     /// Runs work that writes the reports of several sequences, or of several nodes, in an order of its own, in this
@@ -914,34 +913,7 @@ internal static class SequenceRangeExchange
     /// for long after, as the rows they wrote, which an exchange's take-in of each sequence waits for only so long.
     /// </summary>
     /// <param name="work">The work, which waits on no other node.</param>
-    internal static unsafe void WithTurn(Action work)
-    {
-        if (s_turnKey is not long key)
-        {
-            key = Worf.ReadScalar<int>("SELECT pg_catalog.hashtext('worf.sequence_range_exchange_turn')");
-            s_turnKey = key;
-        }
-
-        // pg_advisory_lock's lock of the same key, held for the session until it's let go here, whatever ends the work.
-        LOCKTAG turn = new()
-        {
-            locktag_field1 = NativeGlobals.MyDatabaseId,
-            locktag_field2 = (uint)((ulong)key >> 32),
-            locktag_field3 = (uint)key,
-            locktag_field4 = 1,
-            locktag_type = 10,
-            locktag_lockmethodid = 2,
-        };
-        _ = NativeMethods.LockAcquire(&turn, 7, true, false);
-        try
-        {
-            work();
-        }
-        finally
-        {
-            _ = NativeMethods.LockRelease(&turn, 7, true);
-        }
-    }
+    internal static void WithTurn(Action work) => SequenceRangeLocks.WithTurn(work);
 
     /// <summary>
     /// Gets the furthest WAL position of the provider whose changes this node has applied through a subscription, under
@@ -2049,7 +2021,7 @@ internal static class SequenceRangeExchange
     /// subscription left open does the reports it deleted, leaves the sequence to a later exchange, rather than hold up
     /// the exchange, which holds the node's turn, and the other sequences' blocks with it.
     /// </summary>
-    private static T WithLockTimeout<T>(Func<T> work)
+    internal static T WithLockTimeout<T>(Func<T> work)
     {
         int nestLevel;
         unsafe

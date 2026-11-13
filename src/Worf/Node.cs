@@ -499,19 +499,6 @@ internal sealed partial class WorfNode
     }
 
     /// <summary>
-    /// Gets the SQL for the key of the advisory lock a subscription's drop holds until its transaction ends, of the
-    /// subscription that the first parameter names, which an exchange's take-in of a reply through the subscription takes
-    /// shared, only when it's free.
-    /// </summary>
-    internal static string DropLockKey => "(pg_catalog.hashtext('worf.subscription')::pg_catalog.int8 << 32) | $1::pg_catalog.oid::pg_catalog.int8";
-
-    /// <summary>
-    /// Takes a subscription's drop lock, before the drop deletes anything.
-    /// </summary>
-    /// <param name="subid">The subscription.</param>
-    internal static void LockDrop(uint subid) => _ = Worf.Read($"SELECT pg_catalog.pg_advisory_xact_lock({DropLockKey})", 0, SpiParameter.Create(subid));
-
-    /// <summary>
     /// Delete the tuple from subsription catalog.
     /// </summary>
     /// <param name="subid">The subscription.</param>

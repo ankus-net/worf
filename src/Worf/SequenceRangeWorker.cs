@@ -172,7 +172,17 @@ internal static class SequenceRangeWorker
                                 WorfLog.Debug2($"sequence range worker checking sequence {seqoid.ToString(CultureInfo.InvariantCulture)} in full");
                                 SequenceRanges.LedgerNoWait = true;
                                 double rate = Rate(rates, seqoid);
-                                _ = SequenceRanges.LiftFence(seqoid, local, false);
+                                // A lift waits only so long for a row another transaction holds, as a drop left open does, and
+                                // goes with a later tick, so that the check and every other sequence's go on.
+                                try
+                                {
+                                    PgTransaction.RunInSubtransaction(() => _ = SequenceRangeExchange.WithLockTimeout(() => SequenceRanges.LiftFence(seqoid, local, false)));
+                                }
+                                catch (PgException held) when (held.SqlState == "55P03")
+                                {
+                                    WorfLog.Debug2($"sequence range worker leaves sequence {seqoid.ToString(CultureInfo.InvariantCulture)}'s fence to a later tick: {held.Message}");
+                                }
+
                                 return SequenceRanges.Check(seqoid, local, rate);
                             }
                             finally
