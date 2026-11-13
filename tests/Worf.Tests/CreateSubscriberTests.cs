@@ -1161,7 +1161,8 @@ public sealed class CreateSubscriberTests
     /// so is one that ran as a server of its own from its checkpoint, writing WAL of its own past where the provider's
     /// begins, and stopped in recovery since; one whose latest checkpoint is past the provider's WAL, though the run's role
     /// on the provider may not list the provider's WAL, and so is one whose checkpoint is before the provider's WAL ends,
-    /// but whose own WAL runs past it; and, from PostgreSQL 17 on, where an online checkpoint's redo point
+    /// but whose own WAL runs past it; and one that left the provider's WAL behind where it ends, as the run's role may
+    /// not list the provider's WAL, which leaves its WAL unchecked; and, from PostgreSQL 17 on, where an online checkpoint's redo point
     /// always comes before its record, one with a torn record between them, in WAL the provider has removed, from which
     /// recovery would replay.
     /// </summary>
@@ -1172,6 +1173,7 @@ public sealed class CreateSubscriberTests
     [DataRow("partial")]
     [DataRow("boundary")]
     [DataRow("diverged")]
+    [DataRow("diverged limited")]
     [DataRow("ahead")]
     [DataRow("beyond")]
     [DataRow("torn")]
@@ -1256,27 +1258,42 @@ public sealed class CreateSubscriberTests
 
                 switches = 2;
                 break;
-            case "diverged":
+            case "diverged" or "diverged limited":
                 // Started without its standby.signal, the standby runs as a server of its own on the provider's timeline:
-                // it checkpoints, then writes WAL of its own over several segments, stops at once, and stops in recovery
-                // after starting again with its standby.signal, keeping that checkpoint as its latest.
+                // it checkpoints, then writes WAL of its own over several segments, or one, behind where the provider's
+                // WAL ends, stops at once, and stops in recovery after starting again with its standby.signal, keeping
+                // that checkpoint as its latest. The limited row's run is as a role that may log in and replicate, read
+                // the provider's worf node and create a restore point, but not list its WAL.
+                if (when == "diverged limited")
+                {
+                    _ = await provider.SafePsqlAsync(Database, """
+                        CREATE ROLE limited LOGIN REPLICATION;
+                        GRANT USAGE ON SCHEMA worf TO limited;
+                        GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA worf TO limited;
+                        GRANT EXECUTE ON FUNCTION pg_catalog.pg_create_restore_point(text) TO limited;
+                        """, token);
+                }
+
                 File.Delete(Path.Join(backupDir, "standby.signal"));
                 (started, startOutput) = await provider.RunProgramAsync("pg_ctl", ["start", "-w", "-D", backupDir, "-o", $"-p {port}", "-l", standbyLog], token);
                 Assert.AreEqual(0, started, startOutput);
                 _ = await SubscriberAsync(provider, pgport, "CHECKPOINT", token);
-                for (int i = 0; i < 6; i++)
+                for (int i = 0; i < (when == "diverged" ? 6 : 1); i++)
                 {
                     _ = await SubscriberAsync(provider, pgport, "CREATE TABLE IF NOT EXISTS own (i int); INSERT INTO own VALUES (1); SELECT pg_catalog.pg_switch_wal()", token);
                 }
 
                 (stopped, stopOutput) = await provider.RunProgramAsync("pg_ctl", ["stop", "-w", "-m", "immediate", "-D", backupDir], token);
                 Assert.AreEqual(0, stopped, stopOutput);
+                // Behind where the provider's WAL ends, the limited row's standby would stream the provider's WAL over its own as
+                // it starts again, so it starts without a connection to the provider.
                 await File.WriteAllTextAsync(Path.Join(backupDir, "standby.signal"), "", token);
-                (started, startOutput) = await provider.RunProgramAsync("pg_ctl", ["start", "-w", "-D", backupDir, "-o", $"-p {port}", "-l", standbyLog], token);
+                (started, startOutput) = await provider.RunProgramAsync("pg_ctl",
+                    ["start", "-w", "-D", backupDir, "-o", when == "diverged" ? $"-p {port}" : $"-p {port} -c primary_conninfo=''", "-l", standbyLog], token);
                 Assert.AreEqual(0, started, startOutput);
                 (stopped, stopOutput) = await provider.RunProgramAsync("pg_ctl", ["stop", "-w", "-D", backupDir], token);
                 Assert.AreEqual(0, stopped, stopOutput);
-                switches = 3;
+                switches = when == "diverged" ? 3 : 5;
                 break;
             case "beyond":
                 // The run's role may log in and replicate, read the provider's worf node and create a restore point, but
@@ -1382,6 +1399,15 @@ public sealed class CreateSubscriberTests
         ];
         try
         {
+            if (when == "diverged limited")
+            {
+                List<string> limited = [.. arguments.Select(argument => argument == $"--provider-dsn={providerDsn}" ? $"--provider-dsn={providerDsn.Replace("super@", "limited@", StringComparison.Ordinal)}" : argument)];
+                (int refused, string refusal) = await RefusedRunAsync(command, limited, work.FullName, port, token);
+                Assert.AreEqual("1|True", $"{refused}|{refusal.Contains("can't be compared with the provider's WAL", StringComparison.Ordinal)}",
+                    $"a run on the standby whose WAL left the provider's behind where it ends, as a role that may not list it: {refusal}");
+                return;
+            }
+
             if (when is "ahead" or "beyond")
             {
                 List<string> limited = [.. arguments.Select(argument => argument == $"--provider-dsn={providerDsn}" ? $"--provider-dsn={providerDsn.Replace("super@", "limited@", StringComparison.Ordinal)}" : argument)];

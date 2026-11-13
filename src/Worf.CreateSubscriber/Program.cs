@@ -370,10 +370,12 @@ for (int dbnum = 0; dbnum < databaseList.Length; dbnum++)
         // WAL streamed over its own since takes away. A data directory that has started, whose latest checkpoint's WAL the
         // provider has removed, can't be told apart from one that left the provider's, and may need WAL the provider no
         // longer has to recover. A base backup that hasn't started yet holds the provider's checkpoint.
+        // One whose WAL can't be checked against the provider's, as when a query the check needs fails, is refused too.
         if (!File.Exists(Path.Join(dataDir, "backup_label")) && timeline is long checkpointTimeline && checkpoint is ulong latest && redo is ulong redoPoint &&
             segmentSize is long segmentBytes and > 0 && blockSize is long blockBytes and > 0 &&
-            WalJoins(providerConn, checkpointTimeline, latest, redoPoint, segmentBytes, blockBytes) is (false, string why))
+            WalJoins(providerConn, checkpointTimeline, latest, redoPoint, segmentBytes, blockBytes) is not (true, _) and var joined)
         {
+            string why = joined is (false, string reason) ? reason : "can't be checked against the provider's WAL, as a query the check needs failed there";
             throw Die($"Data directory \"{dataDir}\"'s latest checkpoint, at {latest >> 32:X}/{latest & 0xFFFFFFFF:X}, {why}; make a new base backup.\n");
         }
     }
@@ -1528,8 +1530,8 @@ int? ReadClusterState(string dataDir)
         return (false, "is past the provider's WAL, so its WAL has left the provider's");
     }
 
-    // A role that may not list the provider's WAL leaves the checks that need it, and the comparison, undone; the
-    // directory's own records are still checked against where the provider's WAL ends.
+    // A role that may not list the provider's WAL leaves the checks that need it, and the comparison, undone, and the
+    // directory is refused once its own records are checked against where the provider's WAL ends.
     long providerTimeline = 0;
     bool listed = true;
     Dictionary<string, string> providerSegments = [];
@@ -1695,9 +1697,11 @@ int? ReadClusterState(string dataDir)
         return (false, $"is followed by WAL on timeline {ownTimeline} past {Lsn(left)}, where the provider left that timeline, so its WAL has left the provider's");
     }
 
+    // A directory whose WAL can't be compared with the provider's, as the run's role may not list it, is refused, as one
+    // that left the provider's on its timeline, or on a later one, would be taken for one that didn't.
     if (!listed)
     {
-        return null;
+        return (false, "can't be compared with the provider's WAL, which the run's role may not list there, as members of pg_monitor may");
     }
 
     // A record that the directory's WAL ends inside of is held as far as its pages are: each page whose next page has
