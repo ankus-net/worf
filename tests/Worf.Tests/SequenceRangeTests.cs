@@ -2992,7 +2992,11 @@ public sealed partial class SequenceRangeTests
                 Assert.IsTrue(await nodeB.PollLogAsync(slow, "sequence range exchange with node node_c done", token), "node_b's call to node_c past worf-slow.test");
 
                 // An address that never answers, as a listener whose queue is full, gives way at connect_timeout, which is 1 s
-                // from PostgreSQL 17, and at least 2 s before it, as libpq has it.
+                // from PostgreSQL 17, and at least 2 s before it, as libpq has it: node_c logs the connection that much after
+                // node_b starts connecting, whatever the call takes after.
+                _ = await nodeC.SafePsqlAsync(Database, "ALTER SYSTEM SET log_connections = 'on'", token);
+                _ = await nodeC.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
+                int received = nodeC.ReadLog().Length;
                 using Socket hole = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
                 hole.Bind(new IPEndPoint(IPAddress.Loopback, 0));
                 hole.Listen(0);
@@ -3002,9 +3006,9 @@ public sealed partial class SequenceRangeTests
                     "sequence range exchange with node node_c done");
                 static DateTime At(string line) => DateTime.ParseExact(line[1..24], "yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture);
                 string[] lines = timedOut.Split('\n');
-                string connecting = lines.Last(line => line.Contains("exchange with node node_c connecting", StringComparison.Ordinal));
-                string done = lines.First(line => line.Contains("exchange with node node_c done", StringComparison.Ordinal));
-                TimeSpan took = At(done) - At(connecting);
+                DateTime connecting = At(lines.Last(line => line.Contains("exchange with node node_c connecting", StringComparison.Ordinal)));
+                TimeSpan took = nodeC.ReadLog()[received..].Split('\n').Where(line => line.Contains("connection received", StringComparison.Ordinal))
+                    .Select(At).First(at => at >= connecting) - connecting;
                 int version = int.Parse(await nodeB.SafePsqlAsync(Database, "SHOW server_version_num", token), CultureInfo.InvariantCulture);
                 if (version >= 170000)
                 {
@@ -3894,30 +3898,29 @@ public sealed partial class SequenceRangeTests
         _ = await nodeB.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
         await Task.Delay(TimeSpan.FromSeconds(3), token);
 
-        // node_b draws from many_01 all along, through blocks of 10, so that its report of it changes on every call, as its
-        // blocks do, and many_01 alone, which sorts first, so that no later sequence's change cuts a call. A draw alone
-        // changes no report. node_b's calls then come to a new process on node_a, which has checked none of their
-        // reports: taking many_01 in passes a third of the call's time, and the call leaves the rest. A draw that waits
-        // past its time for the next block, as node_a takes reports in slowly, is let go.
-        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.alter_sequence_range('many_01', range_size := 10, max_range_size := 10)", token);
+        // node_b resets many_01 all along, giving up its blocks and asking for new ones, so that its report of it changes on
+        // every call, and many_01 alone, which sorts first, so that no later sequence's change cuts a call; a draw alone
+        // changes no report. node_b's calls then come to a new process on node_a, which has checked none of their reports:
+        // taking many_01 in passes a third of the call's time, and the call leaves the rest. A reset that waits past its
+        // time for a range row a call holds is let go.
         _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO slow_on DEFAULT VALUES", token);
         using CancellationTokenSource stopDrawing = CancellationTokenSource.CreateLinkedTokenSource(token);
         Task drawing = Task.Run(async () =>
         {
             await using NpgsqlConnection busy = await nodeB.OpenAsync(Database, token);
-            await using NpgsqlCommand draw = new("SELECT nextval('many_01')", busy);
+            await using NpgsqlCommand reset = new("SET statement_timeout = '2s'; SELECT worf.reset_sequence_range('many_01')", busy);
             while (!stopDrawing.IsCancellationRequested)
             {
                 try
                 {
-                    _ = await draw.ExecuteScalarAsync(token);
+                    _ = await reset.ExecuteNonQueryAsync(token);
                 }
-                catch (PostgresException waited) when (waited.SqlState is "55000" or "57014" or "2200H")
+                catch (PostgresException waited) when (waited.SqlState is "55P03" or "57014")
                 {
-                    // The draw goes on with the next block.
+                    // The reset goes on at the next turn.
                 }
 
-                await Task.Delay(TimeSpan.FromMilliseconds(50), token);
+                await Task.Delay(TimeSpan.FromMilliseconds(300), token);
             }
         }, token);
         await Task.Delay(TimeSpan.FromSeconds(3), token);
