@@ -3378,9 +3378,13 @@ public sealed partial class SequenceRangeTests
             "the warning node_a sends create_subscription's connections, made before node_a is node_b's node, naming its host and port");
         Assert.DoesNotContain("a server sent WARNING", nodeB.ReadLog()[logpos..], "warnings of a server not named");
 
-        // node_b's apply and exchange workers restart three times, each time connecting to node_a again.
+        // node_b's apply and exchange workers restart three times, each time connecting to node_a again, as connections
+        // whose name, process and start differ from those before, since Windows gives a new process an ID an ended one had.
         Stopwatch restarting = Stopwatch.StartNew();
-        const string Connections = "SELECT coalesce(string_agg(pid::text, ',' ORDER BY application_name), '') FROM pg_stat_activity WHERE application_name IN ('b_from_a', 'b_from_a_range')";
+        const string Connections = """
+            SELECT coalesce(string_agg(application_name || ' ' || pid || ' ' || backend_start, ',' ORDER BY application_name), '')
+            FROM pg_stat_activity WHERE application_name IN ('b_from_a', 'b_from_a_range')
+            """;
         for (int restart = 0; restart < 3; restart++)
         {
             string[] before = (await nodeA.SafePsqlAsync(Database, Connections, token)).Split(',');
