@@ -2949,12 +2949,16 @@ public sealed partial class SequenceRangeTests
                 string readOnly = await CallAsync($"host=worf-two.test port={port} target_session_attrs=read-write", "exchange with node node_c failed");
                 Assert.Contains("session is read-only", readOnly, "node_b's call to node_c, refused at the standby");
                 Assert.DoesNotContain("exchange with node node_c done", readOnly, "node_b's calls to node_c, past the standby");
-                Assert.DoesNotContain("(127.0.0.1)", readOnly, "node_b's failure, naming the address libpq never tried");
 
                 // worf-first.test has node_c's address before the standby's. A connection that prefers a standby passes
                 // node_c for the next host, of which there is none, and takes node_c in its second pass, from the first
-                // host, as psql does.
-                _ = await CallAsync($"host=worf-first.test port={port} target_session_attrs=prefer-standby", "sequence range exchange with node node_c done");
+                // host, as psql does; one that takes a standby only fails, naming node_c's address alone, as psql does,
+                // rather than the standby's, which libpq never tries.
+                string preferring = await CallAsync($"host=worf-first.test port={port} target_session_attrs=prefer-standby", "sequence range exchange with node node_c done");
+                Assert.IsFalse(BareFailureLine().IsMatch(preferring), "node_b's calls to node_c, ending a failure with a line for an address never tried");
+                string standbyOnly = await CallAsync($"host=worf-first.test port={port} target_session_attrs=standby", "exchange with node node_c failed");
+                Assert.Contains("server is not in hot standby mode", standbyOnly, "node_b's call to node_c, refused at node_c");
+                Assert.DoesNotContain("cannot exchange sequence ranges during recovery", standbyOnly, "node_b's call to node_c, made at the standby libpq never tries");
 
                 // A standby found at a name still looked up is preferred to node_c, listed before it.
                 string preferred = await CallAsync($"host=127.0.0.1,worf-standby.test port={port} target_session_attrs=prefer-standby",
@@ -4209,6 +4213,10 @@ public sealed partial class SequenceRangeTests
         string line = File.ReadLines($"/proc/{pid.ToString(CultureInfo.InvariantCulture)}/status").First(line => line.StartsWith("VmHWM:", StringComparison.Ordinal));
         return long.Parse(line["VmHWM:".Length..].Replace("kB", "", StringComparison.Ordinal).Trim(), CultureInfo.InvariantCulture);
     }
+
+    // A line of a failure that names an address and says nothing more, as libpq begins one for the next address.
+    [GeneratedRegex("failed: *$", RegexOptions.Multiline)]
+    private static partial Regex BareFailureLine();
 
     [GeneratedRegex(@"left [0-9]+ sequences to its next call")]
     private static partial Regex LeftToNextCall();
