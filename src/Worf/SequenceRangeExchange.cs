@@ -2530,6 +2530,18 @@ internal static class SequenceRangeExchange
                 _ = Worf.Execute("UPDATE worf.sequence_range_node SET reset_done = $3::pg_lsn WHERE seqoid = $1 AND node_id = $2", seq, sender,
                     SpiParameter.Create(reset));
             }
+
+            // A rollback the neighbor saw came before this server started, so a reset this node made for the neighbor since,
+            // as for grants it heard of beyond the owner's watermark, gave up what the rollback brought back, and answers the
+            // request, which the window would otherwise leave unanswered, and the neighbor asking, and saying nothing of this
+            // server's start, until it ends. A fence's lift, which may come at any time, isn't a rollback.
+            else if (!IsLift(reset) && Worf.ReadScalar<bool>(
+                "SELECT EXISTS (SELECT 1 FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2 AND reset_at >= $3)",
+                seq, sender, SpiParameter.Create(new PgTimestampTz(SequenceRangeHeard.Started))))
+            {
+                _ = Worf.Execute("UPDATE worf.sequence_range_node SET reset_done = $3::pg_lsn WHERE seqoid = $1 AND node_id = $2", seq, sender,
+                    SpiParameter.Create(reset));
+            }
             else if ((UnconfirmedFrom(seq, sender) ? Worker.GetCurrentTimestamp() : SequenceRangeHeard.MayReset(senderId, fromGrantor)) is long window &&
                 Worf.Execute("""
                 UPDATE worf.sequence_range_node SET reset_done = $3::pg_lsn, reset_at = pg_catalog.clock_timestamp()
