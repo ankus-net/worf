@@ -3894,10 +3894,12 @@ public sealed partial class SequenceRangeTests
         _ = await nodeB.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
         await Task.Delay(TimeSpan.FromSeconds(3), token);
 
-        // node_b draws from many_01 all along, so that its report of it changes on every call, and many_01 alone, which
-        // sorts first, so that no later sequence's change cuts a call. node_b's calls then come to a new process on
-        // node_a, which has checked none of their reports: taking many_01 in passes a third of the call's time, and the
-        // call leaves the rest.
+        // node_b draws from many_01 all along, through blocks of 10, so that its report of it changes on every call, as its
+        // blocks do, and many_01 alone, which sorts first, so that no later sequence's change cuts a call. A draw alone
+        // changes no report. node_b's calls then come to a new process on node_a, which has checked none of their
+        // reports: taking many_01 in passes a third of the call's time, and the call leaves the rest. A draw that waits
+        // past its time for the next block, as node_a takes reports in slowly, is let go.
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.alter_sequence_range('many_01', range_size := 10, max_range_size := 10)", token);
         _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO slow_on DEFAULT VALUES", token);
         using CancellationTokenSource stopDrawing = CancellationTokenSource.CreateLinkedTokenSource(token);
         Task drawing = Task.Run(async () =>
@@ -3906,7 +3908,15 @@ public sealed partial class SequenceRangeTests
             await using NpgsqlCommand draw = new("SELECT nextval('many_01')", busy);
             while (!stopDrawing.IsCancellationRequested)
             {
-                _ = await draw.ExecuteScalarAsync(token);
+                try
+                {
+                    _ = await draw.ExecuteScalarAsync(token);
+                }
+                catch (PostgresException waited) when (waited.SqlState is "55000" or "57014" or "2200H")
+                {
+                    // The draw goes on with the next block.
+                }
+
                 await Task.Delay(TimeSpan.FromMilliseconds(50), token);
             }
         }, token);
@@ -4028,9 +4038,17 @@ public sealed partial class SequenceRangeTests
         using Process? standby = how == "synchronous" ? await StartStandbyAsync() : null;
         if (how == "busy")
         {
+            // node_b reads 64 MB of the 90 MB ahead, however long node_a's walsender takes to send them, and calls each
+            // second from then on, as no word reaches it past them, and its own calls come a minute apart.
             _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.replication_set_add_table('default', 'big')", token);
+            string nodeBId = await nodeB.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
             _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO big (v) SELECT repeat('x', 1000) FROM generate_series(1, 90000)", token);
-            await Task.Delay(TimeSpan.FromSeconds(3), token);
+            for (int call = 0; call < 2; call++)
+            {
+                string heard = await nodeA.SafePsqlAsync(Database, "SELECT clock_timestamp()::text", token);
+                Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, $"SELECT worf.sequence_range_heard({nodeBId}, true, '-infinity', false) > '{heard}'", token),
+                    "node_b's calls, as its read-ahead is full");
+            }
         }
 
         try
