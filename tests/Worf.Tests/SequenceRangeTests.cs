@@ -3723,8 +3723,8 @@ public sealed partial class SequenceRangeTests
         // A kept position of another timeline goes, and idle calls then write nothing.
         string nodeBId = await nodeB.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
         _ = await nodeA.SafePsqlAsync(Database, $"""
-            INSERT INTO worf.sequence_range_back (seqoid, node_id, sysid, timeline, lsn)
-            SELECT 't_id_seq'::regclass, {nodeBId}, sysid, 99, '0/1' FROM worf.sequence_range_node WHERE seqoid = 't_id_seq'::regclass AND node_id = {nodeBId}
+            INSERT INTO worf.sequence_range_back (seqoid, node_id, call, sysid, timeline, lsn, started)
+            SELECT 't_id_seq'::regclass, {nodeBId}, true, sysid, 99, '0/1', 0 FROM worf.sequence_range_node WHERE seqoid = 't_id_seq'::regclass AND node_id = {nodeBId}
             """, token);
         Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT NOT EXISTS (SELECT 1 FROM worf.sequence_range_back)", token),
             "the kept position of another timeline, gone");

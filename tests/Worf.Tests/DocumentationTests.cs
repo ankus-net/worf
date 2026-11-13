@@ -100,12 +100,15 @@ public sealed class DocumentationTests
         Assert.Contains("or that changed the type of an identity column a managed sequence numbers, unless a savepoint rolled it back", s_sequenceRanges,
             "prepared column type changes (144)");
         Assert.Contains("holds up only that sequence's exchanges, which leave it out until the transaction ends", s_sequenceRanges, "prepared holders (144)");
-        Assert.Contains("after its server starts, a node draws from a block of a sequence another node granted it, its parent or one that was, only once a message of that node's", s_sequenceRanges,
-            "a returning node (46, 74, 424)");
+        Assert.Contains("after its server starts, a node draws from a block of a sequence another node granted it, its parent or one that was, whether it subscribes to that node or only answers its calls, only once a message of that node's", s_sequenceRanges,
+            "a returning node (46, 74, 424, 1404)");
         Assert.Contains("saying that it has checked the node's report of the sequence since then", s_sequenceRanges, "a returning node's wait for each sequence (1100, 1211)");
         Assert.DoesNotContain("a restarted node waits for its grantor until a call has taken every sequence in", s_sequenceRanges, "a returning node's wait (1211)");
         Assert.DoesNotContain("with time left for its answer", s_sequenceRanges, "a call's answer (1213)");
-        Assert.Contains("as it grants one, it asks the nodes that subscribe to it to call it", s_sequenceRanges, "an owner's own blocks (1101, 1160)");
+        Assert.Contains("once a grant has committed, and reached the synchronous standbys that commits wait for, the range worker asks the nodes that subscribe to it to call it", s_sequenceRanges,
+            "an owner's own blocks (1101, 1160, 1500)");
+        Assert.DoesNotContain("not at all once the node has written past where they saw its WAL position", s_sequenceRanges, "a restore's notice (1100, 1211)");
+        Assert.Contains("Each server keeps its last 32 starts", s_sequenceRanges, "a restore across restarts (1400)");
         Assert.DoesNotContain("as contrib's `autoinc` trigger does, isn't seen", s_sequenceRanges, "a trigger's arguments (800)");
         Assert.Contains("is asked to reset once it's heard from again after the fence lifted, whatever it reports", s_sequenceRanges, "an unchanged report");
 
