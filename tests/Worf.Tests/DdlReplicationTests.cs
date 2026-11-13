@@ -381,15 +381,20 @@ public sealed class DdlReplicationTests
     /// the subtransaction's first record, takes the rest of it, here an ANALYZE, whose records are invalidations, and
     /// decodes what comes after, however often it starts again, with the column the DDL added, both where it takes every
     /// origin's changes and where it leaves out the apply's, as a provider does for a subscriber that takes no other
-    /// node's changes: the heap change apply writes last in the subtransaction gives decoding a change to set its
-    /// snapshot from either way, without which an assert-enabled build aborts, and the subtransaction's invalidations
-    /// aren't executed.
+    /// node's changes, and in another database of the server, as a provider's slot beside its subscriber's database
+    /// decodes the subscriber's WAL too: the heap change apply writes last in the subtransaction gives decoding a change to
+    /// set its snapshot from each way, without which an assert-enabled build aborts, and the subtransaction's
+    /// invalidations aren't executed.
     /// </summary>
+    /// <param name="elsewhere">Whether the slots are in another database.</param>
     /// <returns>The test.</returns>
     [TestMethod]
-    public async Task DecodingStartsAgainInsideAppliedDdl()
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task DecodingStartsAgainInsideAppliedDdl(bool elsewhere)
     {
         CancellationToken token = TestContext.CancellationToken;
+        string decoding = elsewhere ? "decoding" : Database;
         await using TestNode nodeA = await StartNodeAsync("node_a", token);
         await using TestNode nodeB = await StartNodeAsync("node_b", token);
         await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
@@ -398,7 +403,12 @@ public sealed class DdlReplicationTests
             _ = await node.SafePsqlAsync(Database, "SET worf.enable_ddl_replication = off; CREATE TABLE u (a int); CREATE TABLE v (a int)", token);
         }
 
-        _ = await nodeB.SafePsqlAsync(Database, """
+        if (elsewhere)
+        {
+            _ = await nodeB.SafePsqlAsync(Database, "CREATE DATABASE decoding", token);
+        }
+
+        _ = await nodeB.SafePsqlAsync(decoding, """
             SELECT 1 FROM pg_create_logical_replication_slot('td', 'test_decoding');
             SELECT 1 FROM pg_create_logical_replication_slot('tl', 'test_decoding');
             """, token);
@@ -412,13 +422,13 @@ public sealed class DdlReplicationTests
 
         // Decoding moves its restart point past the subtransaction's first record, while another transaction stays open:
         // decoding of every origin's changes, and decoding of this node's own alone, as a provider's walsender decodes
-        // them for a subscriber that takes no other node's changes, which leaves out the apply's records, its message too.
+        // them for a subscriber that takes no other node's changes, which leaves out the apply's records.
         const string Decode = """
             CHECKPOINT;
             SELECT count(*) FROM pg_logical_slot_get_changes('td', NULL, NULL);
             SELECT count(*) FROM pg_logical_slot_get_changes('tl', NULL, NULL, 'only-local', '1');
             """;
-        _ = await nodeB.SafePsqlAsync(Database, Decode, token);
+        _ = await nodeB.SafePsqlAsync(decoding, Decode, token);
         await using NpgsqlConnection open = await nodeB.OpenAsync(Database, token);
         await using NpgsqlTransaction held = await open.BeginTransactionAsync(token);
         await using (NpgsqlCommand insert = new("INSERT INTO v VALUES (1)", open, held))
@@ -431,11 +441,17 @@ public sealed class DdlReplicationTests
             "SELECT reltuples >= 0 FROM pg_class WHERE oid = 'public.u'::regclass AND relnatts = 2", token), "the queued SQL applied on node_b");
         for (int round = 0; round < 2; round++)
         {
-            _ = await nodeB.SafePsqlAsync(Database, Decode, token);
+            _ = await nodeB.SafePsqlAsync(decoding, Decode, token);
         }
 
         // A row written afterwards decodes with the column the queued SQL added.
         await held.CommitAsync(token);
+        if (elsewhere)
+        {
+            Assert.DoesNotContain("TRAP:", nodeB.ReadLog(), "node_b's log");
+            return;
+        }
+
         _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO u VALUES (2, 3)", token);
         Assert.AreEqual("table public.u: INSERT: a[integer]:2 b[integer]:3", await nodeB.SafePsqlAsync(Database,
             "SELECT data FROM pg_logical_slot_get_changes('td', NULL, NULL) WHERE data LIKE 'table public.u: INSERT%'", token),
@@ -452,9 +468,10 @@ public sealed class DdlReplicationTests
     /// an ANALYZE, whose records are invalidations, without which an assert-enabled build aborts at every restart:
     /// replicate_ddl_command in a PL/pgSQL block that catches errors or in a savepoint, a PL/pgSQL block with an exception
     /// clause that replicate_ddl_command runs, a savepoint around DDL that isn't replicated, and an index build on a
-    /// temporary table, which writes no WAL until its invalidations.
+    /// temporary table, which writes no WAL until its invalidations; and so does decoding in another database of the
+    /// server, as a provider's slot beside its subscriber's database decodes the subscriber's WAL too.
     /// </summary>
-    /// <param name="shape">How the DDL runs in a subtransaction.</param>
+    /// <param name="shape">How the DDL runs in a subtransaction, and whether the slot is in another database.</param>
     /// <returns>The test.</returns>
     [TestMethod]
     [DataRow("block around the call")]
@@ -462,12 +479,22 @@ public sealed class DdlReplicationTests
     [DataRow("block the call runs")]
     [DataRow("savepoint, not replicated")]
     [DataRow("temporary index build")]
+    [DataRow("savepoint around the call, decoded elsewhere")]
+    [DataRow("savepoint, not replicated, decoded elsewhere")]
     public async Task DecodingStartsAgainInsideReplicatedDdl(string shape)
     {
         CancellationToken token = TestContext.CancellationToken;
+        bool elsewhere = shape.EndsWith(", decoded elsewhere", StringComparison.Ordinal);
+        shape = shape.Replace(", decoded elsewhere", "", StringComparison.Ordinal);
+        string decoding = elsewhere ? "decoding" : Database;
         await using TestNode nodeA = await StartNodeAsync("node_a", token);
         _ = await nodeA.SafePsqlAsync(Database, "SET worf.enable_ddl_replication = off; CREATE TABLE u (a int); CREATE TABLE v (a int)", token);
-        _ = await nodeA.SafePsqlAsync(Database, "SELECT 1 FROM pg_create_logical_replication_slot('td', 'test_decoding')", token);
+        if (elsewhere)
+        {
+            _ = await nodeA.SafePsqlAsync(Database, "CREATE DATABASE decoding", token);
+        }
+
+        _ = await nodeA.SafePsqlAsync(decoding, "SELECT 1 FROM pg_create_logical_replication_slot('td', 'test_decoding')", token);
         const string Command = "ALTER TABLE public.u ADD COLUMN b int; SELECT pg_catalog.pg_sleep(4); ANALYZE public.u";
         const string InBlock = "DO $x$ BEGIN ALTER TABLE public.u ADD COLUMN b int; PERFORM pg_catalog.pg_sleep(4); ANALYZE public.u; EXCEPTION WHEN raise_exception THEN NULL; END $x$";
         Task queued = nodeA.SafePsqlAsync(Database, shape switch
@@ -489,7 +516,7 @@ public sealed class DdlReplicationTests
 
         // Decoding moves its restart point past the subtransaction's first record while another transaction stays open.
         const string Decode = "CHECKPOINT; SELECT count(*) FROM pg_logical_slot_get_changes('td', NULL, NULL)";
-        _ = await nodeA.SafePsqlAsync(Database, Decode, token);
+        _ = await nodeA.SafePsqlAsync(decoding, Decode, token);
         await using NpgsqlConnection open = await nodeA.OpenAsync(Database, token);
         await using NpgsqlTransaction held = await open.BeginTransactionAsync(token);
         await using (NpgsqlCommand insert = new("INSERT INTO v VALUES (1)", open, held))
@@ -500,21 +527,25 @@ public sealed class DdlReplicationTests
         await queued;
         for (int round = 0; round < 2; round++)
         {
-            _ = await nodeA.SafePsqlAsync(Database, Decode, token);
+            _ = await nodeA.SafePsqlAsync(decoding, Decode, token);
         }
 
         await held.CommitAsync(token);
-        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO u VALUES (2, 3)", token);
-        Assert.AreEqual("table public.u: INSERT: a[integer]:2 b[integer]:3", await nodeA.SafePsqlAsync(Database,
-            "SELECT data FROM pg_logical_slot_get_changes('td', NULL, NULL) WHERE data LIKE 'table public.u: INSERT%'", token),
-            "the row decoded after the command, with its new column");
+        if (!elsewhere)
+        {
+            _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO u VALUES (2, 3)", token);
+            Assert.AreEqual("table public.u: INSERT: a[integer]:2 b[integer]:3", await nodeA.SafePsqlAsync(Database,
+                "SELECT data FROM pg_logical_slot_get_changes('td', NULL, NULL) WHERE data LIKE 'table public.u: INSERT%'", token),
+                "the row decoded after the command, with its new column");
+        }
+
         Assert.DoesNotContain("TRAP:", nodeA.ReadLog(), "node_a's log");
     }
 
     /// <summary>
     /// A node with a publication of all its tables applies other nodes' DDL, which ends with a record decoding takes a
-    /// base snapshot from: that record belongs to no table, so the publication neither sends it nor needs a replica
-    /// identity for it.
+    /// base snapshot from: that record is a change of a catalog, which the publication neither sends nor needs a replica
+    /// identity for.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]

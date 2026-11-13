@@ -1066,20 +1066,27 @@ internal static partial class Worf
     // WAL_LEVEL_LOGICAL, which every supported version numbers 2.
     private const int WalLevelLogical = 2;
 
+    // pg_depend and pg_class, which every supported version numbers so.
+    private const uint DependRelationId = 2608;
+    private const uint RelationRelationId = 1259;
+
     /// <summary>
     /// Ends the work of a subtransaction that changed the catalogs with a record logical decoding takes a base snapshot
-    /// from: the invalidations its last command left are logged first, as the end of a command logs them, and then a
-    /// transactional logical message, so that a change is the subtransaction's last record. Decoding that starts again
-    /// inside a subtransaction takes it as a transaction of its own, and executes its invalidations only once a change
-    /// after that point has given it a base snapshot; an assert-enabled build aborts on one whose records after that
-    /// point are invalidations alone, as after an index build or ANALYZE, whose inplace updates of the catalog it doesn't
-    /// decode. Decoding drops a message of another node's origin before taking a snapshot from it, so the message is
-    /// written with no origin, which every provider decodes; it belongs to no table, so no publication sends it and no
-    /// replica identity applies. A top-level transaction needs none, as decoding gives one that changed the catalogs a
-    /// base snapshot as it commits, nor does a subtransaction that wrote nothing, and a server that writes no logical WAL
-    /// needs none either. Every utility statement that may change the catalogs ends so in a subtransaction, as SPI runs
-    /// one, and so does worf's work that changes them otherwise; the message is written where it's called, as a
-    /// subtransaction's callbacks don't run for every subtransaction.
+    /// from, in every database: the invalidations its last command left are logged first, as the end of a command logs
+    /// them, and then a row of pg_depend is inserted and deleted, so that a change is the subtransaction's last record.
+    /// Decoding that starts again inside a subtransaction takes it as a transaction of its own, and executes its
+    /// invalidations only once a change after that point has given it a base snapshot; an assert-enabled build aborts on
+    /// one whose records after that point are invalidations alone, as after an index build or ANALYZE, whose inplace
+    /// updates of the catalog it doesn't decode. Decoding takes a base snapshot from a heap change of any database and
+    /// any origin before it leaves out another database's or origin's changes, as it doesn't from a logical message of
+    /// another database, which a slot in another database of the server, as a provider's beside its subscriber's, then
+    /// aborts on. pg_depend is a catalog, so no publication or output plugin sends its changes and no replica identity
+    /// applies, and no syscache holds it, so the change adds no invalidations of its own; the row is deleted as it's
+    /// inserted, so no session ever sees it. A top-level transaction needs none, as decoding gives one that changed the
+    /// catalogs a base snapshot as it commits, nor does a subtransaction that wrote nothing, and a server that writes no
+    /// logical WAL needs none either. Every utility statement that may change the catalogs ends so in a subtransaction,
+    /// as SPI runs one, and so does worf's work that changes them otherwise; the change is written where it's called, as
+    /// a subtransaction's callbacks don't run for every subtransaction.
     /// </summary>
     internal static unsafe void EndForDecoding()
     {
@@ -1090,23 +1097,27 @@ internal static partial class Worf
         }
 
         NativeMethods.CommandCounterIncrement();
-        ushort origin = ReploriginSessionOrigin;
-        ReploriginSessionOrigin = 0;
+        RelationData* depend = NativeMethods.table_open(DependRelationId, (int)PgLockMode.RowExclusive);
+        ulong* values = stackalloc ulong[7];
+        bool* nulls = stackalloc bool[7];
+        new Span<ulong>(values, 7).Clear();
+        new Span<bool>(nulls, 7).Clear();
+        values[0] = RelationRelationId;
+        values[3] = RelationRelationId;
+        values[6] = (byte)'n';
+        HeapTupleData* row = NativeMethods.heap_form_tuple(depend->rd_att, values, nulls);
         try
         {
-            fixed (byte* prefix = "worf\0"u8)
-            {
-#if ANKUS_PG15 || ANKUS_PG16
-                _ = NativeMethods.LogLogicalMessage((sbyte*)prefix, (sbyte*)prefix, 0, true);
-#else
-                _ = NativeMethods.LogLogicalMessage((sbyte*)prefix, (sbyte*)prefix, 0, true, false);
-#endif
-            }
+            NativeMethods.CatalogTupleInsert(depend, row);
+            NativeMethods.CommandCounterIncrement();
+            NativeMethods.CatalogTupleDelete(depend, &row->t_self);
         }
         finally
         {
-            ReploriginSessionOrigin = origin;
+            NativeMethods.heap_freetuple(row);
         }
+
+        NativeMethods.table_close(depend, (int)PgLockMode.RowExclusive);
     }
 
     /// <summary>
