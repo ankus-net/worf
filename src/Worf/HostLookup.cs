@@ -14,7 +14,7 @@ namespace Worf;
 /// addrinfo's address comes before its canonical name on Linux and after it on macOS and Windows, and macOS's sockaddr
 /// starts with its length.
 /// </summary>
-internal static unsafe partial class HostLookup
+internal static unsafe class HostLookup
 {
     private const int SockStream = 1;
     private const int AddressFamilyInet = 2;
@@ -34,7 +34,10 @@ internal static unsafe partial class HostLookup
         int error;
         if (OperatingSystem.IsWindows())
         {
-            error = GetAddrInfoW(name, null, hints, &found);
+            fixed (char* text = name)
+            {
+                error = ((delegate* unmanaged<char*, char*, byte*, void**, int>)WinSock("GetAddrInfoW"))(text, null, hints, &found);
+            }
         }
         else
         {
@@ -78,7 +81,7 @@ internal static unsafe partial class HostLookup
         {
             if (OperatingSystem.IsWindows())
             {
-                FreeAddrInfoW(found);
+                ((delegate* unmanaged<void*, void>)WinSock("FreeAddrInfoW"))(found);
             }
             else
             {
@@ -105,9 +108,6 @@ internal static unsafe partial class HostLookup
     // A function the server's own symbols resolve to.
     private static nint Symbol(string name) => NativeLibrary.GetExport(NativeLibrary.GetMainProgramHandle(), name);
 
-    [LibraryImport("ws2_32", EntryPoint = "GetAddrInfoW", StringMarshalling = StringMarshalling.Utf16)]
-    private static partial int GetAddrInfoW(string node, string? service, byte* hints, void** result);
-
-    [LibraryImport("ws2_32", EntryPoint = "FreeAddrInfoW")]
-    private static partial void FreeAddrInfoW(void* result);
+    // A function of Windows's sockets library, which the server has loaded.
+    private static nint WinSock(string name) => NativeLibrary.GetExport(NativeLibrary.Load("ws2_32.dll"), name);
 }

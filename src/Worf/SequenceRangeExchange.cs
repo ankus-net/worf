@@ -993,18 +993,9 @@ internal static class SequenceRangeExchange
             return null;
         }
 
-        List<(long Since, ulong Lsn)> starts = [];
-        if (root.TryGetProperty("starts", out JsonElement kept) && kept.ValueKind == JsonValueKind.Array)
-        {
-            foreach (JsonElement start in kept.EnumerateArray())
-            {
-                if (start.ValueKind == JsonValueKind.Array && start.GetArrayLength() == 2 && start[0].TryGetInt64(out long since) && since != current &&
-                    start[1].ValueKind == JsonValueKind.String && Worf.TryParseLsn(start[1].GetString() ?? "", out ulong from))
-                {
-                    starts.Add((since, from));
-                }
-            }
-        }
+        List<(long Since, ulong Lsn)> starts = root.TryGetProperty("starts", out JsonElement kept) && kept.ValueKind == JsonValueKind.Array
+            ? [.. kept.EnumerateArray().Select(KeptStart).OfType<(long Since, ulong Lsn)>().Where(start => start.Since != current)]
+            : [];
 
         int at = starts.FindLastIndex(start => start.Since == heardStart);
         List<ulong> later = [.. (at >= 0 ? starts.Skip(at + 1) : starts.Where(start => start.Since > heardStart)).Select(start => start.Lsn)];
@@ -1015,6 +1006,11 @@ internal static class SequenceRangeExchange
 
         return later.Where(lsn => lsn < heard).Select(lsn => (ulong?)lsn).Min();
     }
+
+    // A start a message reports the data directory kept, as its time and the WAL position it started from, if well formed.
+    private static (long Since, ulong Lsn)? KeptStart(JsonElement start)
+        => start.ValueKind == JsonValueKind.Array && start.GetArrayLength() == 2 && start[0].TryGetInt64(out long since) &&
+            start[1].ValueKind == JsonValueKind.String && Worf.TryParseLsn(start[1].GetString() ?? "", out ulong from) ? (since, from) : null;
 
     /// <summary>
     /// Records refusals as delivered: a refusal needs no acknowledgement, since a request that lost it is sent again
@@ -1695,11 +1691,12 @@ internal static class SequenceRangeExchange
         // A fence waits for the neighbor's report until this node has taken one in since the fence went up, which the
         // range row's version, among those the report's check reads, then shows as its lift does.
         SequenceInfo info = SequenceRanges.GetInfo(seqoid);
-        if ((local[0].Get<bool>(2) && !Worf.ReadScalar<bool>("""
-                SELECT EXISTS (
-                    SELECT 1 FROM worf.sequence_range_node n JOIN worf.sequence_range r ON r.seqoid = n.seqoid
-                    WHERE n.seqoid = $1 AND n.node_id = $2 AND n.via_node = n.node_id AND n.held_at > r.fenced_at)
-                """, seq, sender)) || state == "fenced" || (state == "disabled" && local[0].Get<string>(1) != "disabled") ||
+        bool fenceWaits = local[0].Get<bool>(2) && !Worf.ReadScalar<bool>("""
+            SELECT EXISTS (
+                SELECT 1 FROM worf.sequence_range_node n JOIN worf.sequence_range r ON r.seqoid = n.seqoid
+                WHERE n.seqoid = $1 AND n.node_id = $2 AND n.via_node = n.node_id AND n.held_at > r.fenced_at)
+            """, seq, sender);
+        if (fenceWaits || state == "fenced" || (state == "disabled" && local[0].Get<string>(1) != "disabled") ||
             Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range_absent WHERE seqoid = $1 AND node_id = $2)", seq, sender) ||
             (entry.GetProperty("requests").GetArrayLength() > 0 && local[0].Get<string>(1) != "collecting" &&
                 !Unanswerable(seqoid, info, epoch, entry.GetProperty("requests"), local[0].Get<uint>(5) == node.Node.Id)) ||
@@ -2271,7 +2268,7 @@ internal static class SequenceRangeExchange
         string sysid = root.GetProperty("sysid").GetWorfString() ?? "";
         long timeline = root.GetProperty("timeline").GetInt64();
         string walLsn = root.GetProperty("wal_lsn").GetWorfString() ?? "0/0";
-        (long? senderStart, ulong? senderStartLsn) = SenderStart(root);
+        long? senderStart = SenderStart(root).Start;
 
         // The root's start, once the owner has started it, reaches every node, so that each allocator refuses a node
         // that joins with values reaching into it.
@@ -2302,14 +2299,9 @@ internal static class SequenceRangeExchange
         WorfRows keptRows = Worf.Read(
             "DELETE FROM worf.sequence_range_back WHERE seqoid = $1 AND node_id = $2 AND call = $5 AND sysid = $3::numeric AND timeline = $4 RETURNING lsn::text, started",
             0, seq, sender, SpiParameter.Create(sysid), SpiParameter.Create(timeline), SpiParameter.Create(call));
-        List<(ulong Heard, long Start)> keptPositions = [];
-        foreach (WorfRow keptRow in keptRows)
-        {
-            if (Worf.TryParseLsn(keptRow.Get<string?>(0) ?? "", out ulong left))
-            {
-                keptPositions.Add((left, keptRow.Get<long>(1)));
-            }
-        }
+        List<(ulong Heard, long Start)> keptPositions = [.. keptRows
+            .Select(keptRow => Worf.TryParseLsn(keptRow.Get<string?>(0) ?? "", out ulong left) ? ((ulong Heard, long Start)?)(left, keptRow.Get<long>(1)) : null)
+            .OfType<(ulong Heard, long Start)>()];
 
         ulong kept = keptPositions.Select(position => position.Heard).DefaultIfEmpty().Max();
 

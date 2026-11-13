@@ -76,17 +76,11 @@ internal static class SequenceRangeStarts
             return [];
         }
 
-        List<(long Since, ulong Lsn)> starts = [];
-        foreach (string line in lines)
-        {
-            string[] parts = line.Split(' ');
-            if (parts.Length == 2 && long.TryParse(parts[0], NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out long since) &&
-                Worf.TryParseLsn(parts[1], out ulong lsn))
-            {
-                starts.Add((since, lsn));
-            }
-        }
-
-        return [.. starts];
+        return [.. lines.Select(line => line.Split(' ')).Select(Parse).OfType<(long Since, ulong Lsn)>()];
     }
+
+    // A start of the file's, from a line's two fields, if well formed.
+    private static (long Since, ulong Lsn)? Parse(string[] parts)
+        => parts.Length == 2 && long.TryParse(parts[0], NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out long since) &&
+            Worf.TryParseLsn(parts[1], out ulong lsn) ? (since, lsn) : null;
 }

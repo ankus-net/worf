@@ -3963,13 +3963,14 @@ public sealed partial class SequenceRangeTests
 
         using TemporaryDirectory received = new($"worf-sequence-range-receivewal-{Guid.NewGuid():N}");
         using CancellationTokenSource relaying = CancellationTokenSource.CreateLinkedTokenSource(token);
-        Process? standby = null;
         Task relayed = Task.CompletedTask;
-        if (how == "synchronous")
+
+        // The listener goes once pg_receivewal has connected through it, which the standby's sync state shows.
+        async Task<Process> StartStandbyAsync()
         {
             // pg_receivewal, as the synchronous standby, reaches node_a through a proxy that holds each of its messages,
             // its replies among them, for half a second.
-            TcpListener proxy = new(IPAddress.Loopback, 0);
+            using TcpListener proxy = new(IPAddress.Loopback, 0);
             proxy.Start();
             relayed = Task.Run(async () =>
             {
@@ -4009,13 +4010,9 @@ public sealed partial class SequenceRangeTests
                 {
                     // The proxy goes as the test ends.
                 }
-                finally
-                {
-                    proxy.Stop();
-                }
             }, CancellationToken.None);
             string proxied = $"host=127.0.0.1 port={((IPEndPoint)proxy.LocalEndpoint).Port.ToString(CultureInfo.InvariantCulture)} dbname={Database} user={SuperUser}";
-            standby = Process.Start(new ProcessStartInfo(Path.Join(nodeA.Installation.BinDirectory, "pg_receivewal"))
+            Process started = Process.Start(new ProcessStartInfo(Path.Join(nodeA.Installation.BinDirectory, "pg_receivewal"))
             {
                 ArgumentList = { "-D", received.FullName, "--synchronous", "--no-loop", "-d", proxied },
                 RedirectStandardError = true,
@@ -4025,8 +4022,11 @@ public sealed partial class SequenceRangeTests
             Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database,
                 "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_replication WHERE application_name = 'pg_receivewal' AND sync_state = 'sync')", token),
                 "node_a's synchronous standby");
+            return started;
         }
-        else if (how == "busy")
+
+        using Process? standby = how == "synchronous" ? await StartStandbyAsync() : null;
+        if (how == "busy")
         {
             _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.replication_set_add_table('default', 'big')", token);
             _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO big (v) SELECT repeat('x', 1000) FROM generate_series(1, 90000)", token);
@@ -4057,7 +4057,6 @@ public sealed partial class SequenceRangeTests
                 _ = await nodeA.PsqlAsync(Database, "ALTER SYSTEM RESET synchronous_standby_names; SELECT pg_reload_conf()", token);
                 standby.Kill();
                 await standby.WaitForExitAsync(CancellationToken.None);
-                standby.Dispose();
             }
 
             await relaying.CancelAsync();
