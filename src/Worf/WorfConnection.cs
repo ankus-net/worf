@@ -272,15 +272,24 @@ internal sealed unsafe partial class WorfConnection : IDisposable
     /// <param name="stop">Whether to stop waiting, as when the worker is asked to stop.</param>
     /// <param name="full">Runs each second while the messages held reach <paramref name="maxBytes"/>, as the wait reads
     /// no more then, and so handles none that come.</param>
-    internal void ReadAhead(TimeSpan duration, long maxBytes, ReadAheadHandler handle, Func<bool> stop, Action full)
+    /// <param name="tick">Runs once a second at most while the wait reads, as to send a status reply on time.</param>
+    internal void ReadAhead(TimeSpan duration, long maxBytes, ReadAheadHandler handle, Func<bool> stop, Action full, Action tick)
     {
         long until = NativeMethods.GetCurrentTimestamp() + (long)duration.TotalMicroseconds;
+        long ticked = 0;
         while (!stop())
         {
-            int remaining = Milliseconds(NativeMethods.TimestampDifferenceMilliseconds(NativeMethods.GetCurrentTimestamp(), until));
+            long now = NativeMethods.GetCurrentTimestamp();
+            int remaining = Milliseconds(NativeMethods.TimestampDifferenceMilliseconds(now, until));
             if (remaining <= 0)
             {
                 return;
+            }
+
+            if (now - ticked >= 1_000_000)
+            {
+                ticked = now;
+                tick();
             }
 
             if (_endedAhead || _readAheadBytes >= maxBytes)
@@ -311,6 +320,69 @@ internal sealed unsafe partial class WorfConnection : IDisposable
                 _readAhead.Enqueue(message.ToArray());
                 _readAheadBytes += message.Length;
             }
+        }
+    }
+
+    /// <summary>
+    /// Reads what the server has sent on an ordinary connection that runs no query, and takes the notifications it held.
+    /// </summary>
+    /// <returns>Whether a notification came, or null if the connection failed.</returns>
+    internal bool? TakeNotifications()
+    {
+        void* conn = Libpq;
+        if (((delegate* unmanaged<void*, int>)LibpqFunction("PQconsumeInput"))(conn) == 0)
+        {
+            return null;
+        }
+
+        var notifies = (delegate* unmanaged<void*, void*>)LibpqFunction("PQnotifies");
+        var free = (delegate* unmanaged<void*, void>)LibpqFunction("PQfreemem");
+        bool any = false;
+        for (void* notification = notifies(conn); notification is not null; notification = notifies(conn))
+        {
+            free(notification);
+            any = true;
+        }
+
+        return any;
+    }
+
+    /// <summary>
+    /// Waits up to a time for the latch, which the wait resets, or for any of ordinary connections that run no query to
+    /// have something to read, as a notification.
+    /// </summary>
+    /// <param name="connections">The connections.</param>
+    /// <param name="milliseconds">The time.</param>
+    internal static void WaitForAny(IReadOnlyList<WorfConnection> connections, int milliseconds)
+    {
+        var socketOf = (delegate* unmanaged<void*, int>)LibpqFunction("PQsocket");
+#if ANKUS_PG15 || ANKUS_PG16
+        WaitEventSet* set = NativeMethods.CreateWaitEventSet(NativeGlobals.CurrentMemoryContext, connections.Count + 2);
+#else
+        WaitEventSet* set = NativeMethods.CreateWaitEventSet(null, connections.Count + 2);
+#endif
+        try
+        {
+            _ = NativeMethods.AddWaitEventToSet(set, WlLatchSet, InvalidSocket, NativeGlobals.MyLatch, null);
+            _ = NativeMethods.AddWaitEventToSet(set, WlExitOnPmDeath, InvalidSocket, null, null);
+            foreach (WorfConnection connection in connections)
+            {
+                int descriptor = socketOf(connection.Libpq);
+                if (descriptor >= 0)
+                {
+                    _ = NativeMethods.AddWaitEventToSet(set, WlSocketReadable, ToSocket(descriptor), null, null);
+                }
+            }
+
+            WaitEvent occurred;
+            if (NativeMethods.WaitEventSetWait(set, Math.Max(milliseconds, 0), &occurred, 1, PgWaitExtension) > 0 && (occurred.events & WlLatchSet) != 0)
+            {
+                NativeMethods.ResetLatch(NativeGlobals.MyLatch);
+            }
+        }
+        finally
+        {
+            NativeMethods.FreeWaitEventSet(set);
         }
     }
 

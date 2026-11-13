@@ -765,18 +765,25 @@ internal static unsafe partial class Apply
     }
 
     /// <summary>
-    /// Handles the provider's word to call it about sequence ranges read ahead of its turn, as a CopyData message whose
-    /// replication message, past its three positions and times, is a 'W'.
+    /// Handles a message read ahead of its turn: the provider's word to call it about sequence ranges, a CopyData
+    /// message whose replication message, past its three positions and times, is a 'W', which it takes; and a keepalive
+    /// that asks for a reply, which it answers with the positions of what came before the messages held, and leaves to
+    /// its turn.
     /// </summary>
-    private static bool CallProviderAhead(ReadOnlySpan<byte> message)
+    private static bool TakeAhead(ReadOnlySpan<byte> message)
     {
-        if (message.Length <= 25 || message[0] != (byte)'w' || message[25] != (byte)'W')
+        if (message.Length > 25 && message[0] == (byte)'w' && message[25] == (byte)'W')
         {
-            return false;
+            CallProvider();
+            return true;
         }
 
-        CallProvider();
-        return true;
+        if (message.Length >= 18 && message[0] == (byte)'k' && message[17] != 0)
+        {
+            _ = SendFeedback(s_applyconn!, s_lastReceived, Worker.GetCurrentTimestamp(), true);
+        }
+
+        return false;
     }
 
     private static void HandleBegin(StringInfoData* s)
@@ -830,10 +837,17 @@ internal static unsafe partial class Apply
 
                 // The provider's word to call it about sequence ranges, as an owner that granted itself a block sends,
                 // which comes in the transactions that follow, is heard as the delay is waited out, so that the owner
-                // doesn't wait out the delay too; the rest waits its turn.
-                // Past the read-ahead's limit, the word can't come, so the provider is called each second instead.
+                // doesn't wait out the delay too; the rest waits its turn. So does the provider's request for a reply,
+                // which is answered now, and a reply goes each status interval too, so that the walsender, which hears
+                // nothing else meanwhile, doesn't end the stream at wal_sender_timeout.
+                // Past the read-ahead's limit, neither can come, so the provider is called, and replied to, each second
+                // instead.
                 (s_applyconn ?? throw new InvalidOperationException("The apply connection is not open.")).ReadAhead(
-                    TimeSpan.FromMicroseconds(sleepUsec), ReadAheadLimit, CallProviderAhead, static () => Worker.GotSigterm, CallProviderUnheard);
+                    TimeSpan.FromMicroseconds(sleepUsec), ReadAheadLimit, TakeAhead, static () => Worker.GotSigterm, static () =>
+                    {
+                        CallProviderUnheard();
+                        _ = SendFeedback(s_applyconn!, s_lastReceived, Worker.GetCurrentTimestamp(), true);
+                    }, static () => SendFeedback(s_applyconn!, s_lastReceived, Worker.GetCurrentTimestamp(), false));
             }
         }
 

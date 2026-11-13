@@ -626,7 +626,20 @@ internal static class Worker
     /// <summary>
     /// Wakes this database's sequence range worker, if it runs.
     /// </summary>
-    internal static void WakeRangeWorker()
+    internal static void WakeRangeWorker() => WakeRangeWorker(false);
+
+    /// <summary>
+    /// Wakes this database's range worker, having it write a word to call this node to the subscribers of its database
+    /// alone, as a committed grant the owner made itself asks.
+    /// </summary>
+    internal static void WantWord() => WakeRangeWorker(true);
+
+    /// <summary>
+    /// Gets how many words to call this node the grants of this range worker's database have asked for.
+    /// </summary>
+    internal static long WordsWanted => MyWorker.WordsWanted;
+
+    private static void WakeRangeWorker(bool word)
     {
         uint dboid;
         unsafe
@@ -634,12 +647,29 @@ internal static class Worker
             dboid = NativeGlobals.MyDatabaseId;
         }
 
-        using PgLwLockShareGuard<WorfContext, WorfWorker> guard = WorfCtx.Share();
+        if (!word)
+        {
+            using PgLwLockShareGuard<WorfContext, WorfWorker> shared = WorfCtx.Share();
+            for (int i = 0; i < shared.Length; i++)
+            {
+                if (shared[i].WorkerType == WorfWorkerType.Range && shared[i].Dboid == dboid && shared[i].Proc != 0)
+                {
+                    SetProcLatch(shared[i].Proc);
+                }
+            }
+
+            return;
+        }
+
+        using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = WorfCtx.Exclusive();
         for (int i = 0; i < guard.Length; i++)
         {
-            if (guard[i].WorkerType == WorfWorkerType.Range && guard[i].Dboid == dboid && guard[i].Proc != 0)
+            WorfWorker worker = guard[i];
+            if (worker.WorkerType == WorfWorkerType.Range && worker.Dboid == dboid && worker.Proc != 0)
             {
-                SetProcLatch(guard[i].Proc);
+                worker.WordsWanted++;
+                guard[i] = worker;
+                SetProcLatch(worker.Proc);
             }
         }
     }

@@ -51,6 +51,12 @@ internal struct WorfWorker
     public long IdleAt;
 
     /// <summary>
+    /// For a range worker, how many words to call its node its database's grants have asked for, once committed, which it
+    /// writes, as one, when the count moves.
+    /// </summary>
+    public long WordsWanted;
+
+    /// <summary>
     /// Type-specific worker info.
     /// </summary>
     public WorfWorkerInfo Worker;

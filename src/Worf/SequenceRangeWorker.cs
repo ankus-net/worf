@@ -38,10 +38,10 @@ internal static class SequenceRangeWorker
 
         // The words grants this node made itself want, which the worker writes in a transaction of its own once the
         // grants have committed, at each tick and after each sequence's check.
-        long wordsWritten = SequenceRanges.WordsWanted.Value;
+        long wordsWritten = Worker.WordsWanted;
         void WriteWords()
         {
-            long wanted = SequenceRanges.WordsWanted.Value;
+            long wanted = Worker.WordsWanted;
             if (wanted == wordsWritten)
             {
                 return;

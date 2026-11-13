@@ -4163,18 +4163,22 @@ public sealed partial class SequenceRangeTests
 
     /// <summary>
     /// An owner that only answers calls draws from the blocks it grants itself without waiting for its subscriber's next
-    /// call, though the subscriber applies the owner's changes 40 seconds late: the subscriber hears the owner's word to
-    /// call it as it waits out the delay, and calls at once. The word goes out only once the grant is seen, as past a
-    /// synchronous standby's reply, which here comes half a second late, through a proxy that holds what the standby
-    /// sends, while the inserts commit locally; and a subscriber whose read-ahead of the owner's changes is full, as after 90 MB of them,
-    /// which reads no more of them and so can't hear the word, calls each second.
+    /// call, though the subscriber applies the owner's changes 40 seconds late, or its stream is behind a transaction it
+    /// can't apply yet: the owner's word to call it reaches the connection its exchanges keep, as a notification, and the
+    /// subscriber calls at once. The word goes out only once the grant is seen, as past a synchronous standby's reply,
+    /// which here comes half a second late, through a proxy that holds what the standby sends, while the inserts commit
+    /// locally; and the inserts start as the subscriber's read-ahead of 90 MB of the owner's changes fills up, which reads
+    /// no more of them, so that the word that comes in the stream can't reach it. A grant in one database makes only its
+    /// own database write the word: another database of the owner's that manages a sequence writes none.
     /// </summary>
-    /// <param name="how">The owner as it is, with a synchronous standby that answers late, or writing 90 MB first.</param>
+    /// <param name="how">The owner as it is, with a synchronous standby that answers late, writing 90 MB first, or with
+    /// its subscriber's apply waiting on a lock, without a delay.</param>
     /// <returns>The test.</returns>
     [TestMethod]
     [DataRow("word")]
     [DataRow("synchronous")]
     [DataRow("busy")]
+    [DataRow("behind")]
     public async Task OwnersDontWaitForDelayedSubscribers(string how)
     {
         CancellationToken token = TestContext.CancellationToken;
@@ -4185,7 +4189,7 @@ public sealed partial class SequenceRangeTests
             _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text); CREATE TABLE big (id bigserial PRIMARY KEY, v text)", token);
         }
 
-        await SubscribeAsync(nodeB, "b_from_a", nodeA, token, applyDelay: "40s");
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token, applyDelay: how == "behind" ? "0" : "40s");
         _ = await nodeA.SafePsqlAsync(Database,
             "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 10, max_range_size := 10)", token);
         await WaitActiveAsync([nodeA, nodeB], token);
@@ -4259,19 +4263,41 @@ public sealed partial class SequenceRangeTests
             return started;
         }
 
-        using Process? standby = how == "synchronous" ? await StartStandbyAsync() : null;
-        if (how == "busy")
+        // Another database of node_a's manages a sequence of its own, whose words a decoding slot there would show.
+        if (how == "word")
         {
-            // node_b reads 64 MB of the 90 MB ahead, however long node_a's walsender takes to send them, and calls each
-            // second from then on, as no word reaches it past them, and its own calls come a minute apart.
+            _ = await nodeA.SafePsqlAsync(Database, "CREATE DATABASE other", token);
+            _ = await nodeA.SafePsqlAsync("other", $"""
+                CREATE EXTENSION worf;
+                SELECT * FROM worf.create_node(node_name := 'node_x', dsn := '{nodeA.Dsn("other", SuperUser)}');
+                CREATE TABLE o (id bigserial PRIMARY KEY);
+                SELECT worf.enable_sequence_range('o_id_seq', participants := '{"{}"}', range_size := 10, max_range_size := 10);
+                """, token);
+            Assert.IsTrue(await nodeA.PollQueryUntilAsync("other", "SELECT state = 'active' FROM worf.sequence_ranges WHERE sequence = 'o_id_seq'::regclass", token),
+                "other's sequence active");
+            _ = await nodeA.SafePsqlAsync("other", "SELECT pg_create_logical_replication_slot('words', 'test_decoding')", token);
+        }
+
+        // node_b's apply waits on a lock of big, held on node_b, as it applies the first of node_a's rows of it, so that
+        // the rest of node_a's stream, the word among it, waits behind them.
+        await using NpgsqlConnection locker = await nodeB.OpenAsync(Database, token);
+        await using NpgsqlTransaction locking = await locker.BeginTransactionAsync(token);
+        using Process? standby = how == "synchronous" ? await StartStandbyAsync() : null;
+        if (how is "busy" or "behind")
+        {
             _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.replication_set_add_table('default', 'big')", token);
-            string nodeBId = await nodeB.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
-            _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO big (v) SELECT repeat('x', 1000) FROM generate_series(1, 90000)", token);
-            for (int call = 0; call < 2; call++)
+            if (how == "behind")
             {
-                string heard = await nodeA.SafePsqlAsync(Database, "SELECT clock_timestamp()::text", token);
-                Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, $"SELECT worf.sequence_range_heard({nodeBId}, true, '-infinity', false) > '{heard}'", token),
-                    "node_b's calls, as its read-ahead is full");
+                await using NpgsqlCommand lockBig = new("LOCK TABLE big IN ACCESS EXCLUSIVE MODE", locker, locking);
+                _ = await lockBig.ExecuteNonQueryAsync(token);
+                _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO big (v) VALUES ('first')", token);
+                Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
+                    "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_locks WHERE relation = 'big'::regclass AND NOT granted)", token), "node_b's apply, waiting on big");
+            }
+            else
+            {
+                // node_b reads 64 MB of the 90 MB ahead as node_a's walsender sends them, and the inserts start at once.
+                _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO big (v) SELECT repeat('x', 1000) FROM generate_series(1, 90000)", token);
             }
         }
 
@@ -4291,6 +4317,12 @@ public sealed partial class SequenceRangeTests
             }
 
             Assert.IsLessThan(TimeSpan.FromSeconds(30), inserting.Elapsed, "node_a's 60 inserts, through six of its own blocks");
+            if (how == "word")
+            {
+                Assert.AreEqual("0", await nodeA.SafePsqlAsync("other",
+                    "SELECT count(*) FROM pg_logical_slot_get_changes('words', NULL, NULL) WHERE data LIKE '%prefix: worf_sequence_range%'", token),
+                    "the words other wrote for Database's grants");
+            }
         }
         finally
         {
@@ -4304,6 +4336,39 @@ public sealed partial class SequenceRangeTests
             await relaying.CancelAsync();
             await relayed;
         }
+    }
+
+    /// <summary>
+    /// A subscriber that waits out an apply delay longer than the provider's wal_sender_timeout keeps its stream: it
+    /// answers the walsender's requests for a reply as it reads ahead, and replies each status interval, so that the
+    /// walsender doesn't end the stream, here over 30 seconds of a 40-second delay with wal_sender_timeout 10 s, and the
+    /// row comes once the delay is over.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task DelayedSubscribersKeepTheirStream()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token, "wal_sender_timeout = 10s");
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id int PRIMARY KEY)", token);
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.replication_set_add_table('default', 't')", token);
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token, applyDelay: "40s");
+        const string Walsenders = "SELECT string_agg(pid::text, ',' ORDER BY pid) FROM pg_catalog.pg_stat_replication";
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT count(*) = 1 FROM pg_catalog.pg_stat_replication", token), "node_b's stream");
+        string streaming = await nodeA.SafePsqlAsync(Database, Walsenders, token);
+        int logged = nodeA.ReadLog().Length;
+        Stopwatch delayed = Stopwatch.StartNew();
+        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO t VALUES (1)", token);
+        await Task.Delay(TimeSpan.FromSeconds(30), token);
+        Assert.AreEqual(streaming, await nodeA.SafePsqlAsync(Database, Walsenders, token), "node_a's walsender to node_b, 30 s into the delay");
+        Assert.DoesNotContain("replication timeout", nodeA.ReadLog()[logged..], "node_a's log");
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT count(*) = 1 FROM t", token), "the row, once the delay is over");
+        Assert.IsGreaterThanOrEqualTo(TimeSpan.FromSeconds(39), delayed.Elapsed, "the row's delay");
     }
 
     /// <summary>

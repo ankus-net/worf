@@ -396,13 +396,6 @@ internal static unsafe partial class SequenceRanges
     internal static PgAtomic<long> SwitchesPending { get; } = new("worf_sequence_range_switches_pending");
 
     /// <summary>
-    /// Gets the counter that grants an owner makes itself move once they have committed, and every session sees them, so
-    /// that the range worker writes the word to the owner's subscribers to call it, which a call then answers with the
-    /// grant.
-    /// </summary>
-    internal static PgAtomic<long> WordsWanted { get; } = new("worf_sequence_range_words_wanted");
-
-    /// <summary>
     /// Sets up the shared memory.
     /// </summary>
     internal static void ShmemInit()
@@ -411,7 +404,6 @@ internal static unsafe partial class SequenceRanges
         PgSharedMemory.Initialize(ExchangeRequested, static () => 0L);
         PgSharedMemory.Initialize(CheckRequested, static () => 0L);
         PgSharedMemory.Initialize(SwitchesPending, static () => 0L);
-        PgSharedMemory.Initialize(WordsWanted, static () => 0L);
     }
 
     /// <summary>
@@ -4701,21 +4693,20 @@ internal static unsafe partial class SequenceRanges
         // next call, so they're told to call now. The word goes out once the grant has committed and every session sees
         // it, past a synchronous standby's reply: a word the transaction wrote would reach a subscriber as its commit
         // record does, and the call it made at once could miss the grant, and count as the call the word asked for.
-        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () =>
-        {
-            _ = PgAtomic.Add(WordsWanted, 1L);
-            Worker.WakeRangeWorker();
-        });
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, Worker.WantWord);
         return true;
     }
 
     /// <summary>
-    /// Writes a message, as the transaction commits, that worf's output plugin sends this node's subscribers as a word to
-    /// call this node now, rather than at their next exchange interval: the range worker writes it in a transaction of its
-    /// own, once the grants that want it have committed.
+    /// Tells this database's subscribers, as the transaction commits, to call this node now, rather than at their next
+    /// exchange interval: the range worker does so in a transaction of its own, once the grants that want it have
+    /// committed. The word goes as a notification to the connections their exchanges keep, which LISTEN, so that it
+    /// reaches them at once, though the replication stream to them is behind a large transaction, and as a message that
+    /// worf's output plugin sends them, for a subscriber that keeps no connection yet.
     /// </summary>
     internal static void WakeSubscribers()
     {
+        _ = Worf.Read("SELECT pg_catalog.pg_notify('" + SequenceRangeExchange.WordChannel + "', '')", 0);
         fixed (byte* prefix = "worf_sequence_range\0"u8)
         {
 #if ANKUS_PG15 || ANKUS_PG16

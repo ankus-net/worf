@@ -71,6 +71,12 @@ internal static class SequenceRangeExchange
     // time, is closed.
     private static readonly Dictionary<uint, (WorfConnection Conn, string Conninfo, int Timeout)> s_connections = [];
 
+    /// <summary>
+    /// Gets the channel on which a node notifies the connections its subscribers' exchanges keep to call it now, which
+    /// each call LISTENs on.
+    /// </summary>
+    internal const string WordChannel = "worf_sequence_range";
+
     // The reports of each neighbor's sequences that this process last found would change nothing, by the neighbor and the
     // sequence's name, which the same report in a later message, while what the check read is as it was, is taken as
     // again without the check, so that an idle neighbor's messages don't read every sequence's rows.
@@ -385,9 +391,19 @@ internal static class SequenceRangeExchange
     /// <param name="milliseconds">The time.</param>
     internal static void Wait(int milliseconds)
     {
+        // With no exchange under way, the connections kept wait for their providers' words, which wake the worker as
+        // they come.
         if (s_pending.Count == 0)
         {
-            _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(milliseconds));
+            if (s_connections.Count == 0)
+            {
+                _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(milliseconds));
+            }
+            else
+            {
+                WorfConnection.WaitForAny([.. s_connections.Values.Select(kept => kept.Conn)], milliseconds);
+            }
+
             return;
         }
 
@@ -491,7 +507,7 @@ internal static class SequenceRangeExchange
             pending.Applied = applied;
             pending.Refusals = refusals;
             pending.Calls++;
-            pending.Query = WorfPendingQuery.Start(conn, "SELECT worf.sequence_range_exchange(" + Worf.QuoteLiteral(message) + ")",
+            pending.Query = WorfPendingQuery.Start(conn, "LISTEN " + WordChannel + "; SELECT worf.sequence_range_exchange(" + Worf.QuoteLiteral(message) + ")",
                 Worker.GetCurrentTimestamp() + (SequenceRanges.ExchangeTimeout * 1000L));
         }
         catch (PgException error)
@@ -823,6 +839,23 @@ internal static class SequenceRangeExchange
         }
 
         _ = s_noSlotOnce.RemoveWhere(id => !enabled.Exists(sub => sub.Id == id));
+
+        // A provider's word to call it that came as a notification on the connection kept for it makes the exchange due,
+        // as one over its replication stream does, which may be behind a large transaction. A kept connection that has
+        // failed is closed, and made again by the next call.
+        foreach (WorfSubscription sub in enabled.Where(sub => !s_pending.ContainsKey(sub.Id) && s_connections.ContainsKey(sub.Id)))
+        {
+            bool? heard = s_connections[sub.Id].Conn.TakeNotifications();
+            if (heard is null)
+            {
+                Disconnect(sub.Id);
+            }
+            else if (heard.Value)
+            {
+                WorfLog.Debug2($"sequence range exchange heard node {sub.Origin.Name}'s word to call it");
+                SequenceRangeHeard.CallFor(sub.Origin.Id);
+            }
+        }
 
         // A neighbor this node no longer exchanges with stays forgotten, though a reply of its came as its subscription
         // was dropped, and was taken in after the drop forgot it, as once it waited for a range row the drop held.
