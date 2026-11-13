@@ -76,7 +76,9 @@ neither leaves progress for a later origin.
 A run on a data directory whose server is running fails, as does one whose WAL
 isn't the provider's, which leaves the data directory as it is. A directory
 whose latest checkpoint is past the provider's WAL is refused whatever the run's
-role may read. The run lists the WAL the provider still has with `pg_ls_waldir`,
+role may read, and one whose WAL can't be compared with the provider's, as when
+the run's role isn't a member of `pg_monitor`, is refused once its own records
+are checked. The run lists the WAL the provider still has with `pg_ls_waldir`,
 and requires the directory's timeline history files to be the provider's, though
 the directory never reached their timelines, as a standby that fetched a history
 it couldn't follow has, its WAL on a timeline the provider has left to end by
@@ -94,4 +96,4 @@ one whose WAL ends where the provider's begins, can't be told from one that left
 it, and is refused too, with a hint to keep the provider's WAL from a standby's
 position with a physical replication slot, as `pg_basebackup -C -S` makes, or
 `wal_keep_size`. The run reads the provider's WAL with `pg_read_binary_file`,
-and can't tell when the provider doesn't let it.
+and a directory it can't check so, as when the provider doesn't let it, is refused.
