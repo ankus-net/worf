@@ -1207,8 +1207,11 @@ internal static partial class SequenceRangeGuard
         CountRows(query->planstate, nodes, calls, running: true);
         if (nodes.Count > 0)
         {
+            // A cursor's nodes, patched as a FETCH runs it in a savepoint, are its own as long as it is, so they're kept
+            // by the subtransaction it was made in, which a rollback to the savepoint leaves, rather than the FETCH's.
+            PortalData* portal = NativeGlobals.ActivePortal;
             RegisterCounted();
-            s_countedNodes[queryDesc] = (NativeMethods.GetCurrentSubTransactionId(), nodes);
+            s_countedNodes[queryDesc] = (portal is not null && portal->queryDesc == query ? portal->createSubid : NativeMethods.GetCurrentSubTransactionId(), nodes);
         }
     }
 

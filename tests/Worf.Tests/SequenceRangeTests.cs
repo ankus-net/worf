@@ -4756,6 +4756,49 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// A cursor whose rows' calls of nextval first start in a savepoint that rolls back goes on: its next FETCH, and a
+    /// PL/pgSQL block's after an exception block it fetched in, draw as the first did.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task CursorsDrawPastRolledBackSavepoints()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE SEQUENCE s1;
+            SELECT worf.enable_sequence_range('s1', participants := '{}', range_size := 100);
+            """, token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges WHERE sequence = 's1'::regclass", token),
+            "s1 active");
+        Assert.AreEqual("1\n2", await nodeA.SafePsqlAsync(Database, """
+            BEGIN;
+            DECLARE c CURSOR FOR SELECT * FROM (VALUES (nextval('s1')), (nextval('s1')), (nextval('s1')), (nextval('s1'))) v (n);
+            SAVEPOINT a;
+            FETCH 1 FROM c;
+            ROLLBACK TO SAVEPOINT a;
+            FETCH 1 FROM c;
+            COMMIT;
+            """, token), "the cursor's rows, fetched across the rolled-back savepoint");
+        _ = await nodeA.SafePsqlAsync(Database, """
+            DO $$
+            DECLARE
+                c refcursor := 'c2';
+                v bigint;
+            BEGIN
+                OPEN c FOR SELECT * FROM (VALUES (nextval('s1')), (nextval('s1')), (nextval('s1'))) v (n);
+                BEGIN
+                    FETCH c INTO v;
+                    RAISE EXCEPTION 'fetched %', v;
+                EXCEPTION WHEN raise_exception THEN
+                    NULL;
+                END;
+                FETCH c INTO v;
+            END $$
+            """, token);
+    }
+
+    /// <summary>
     /// A subscriber that waits out an apply delay longer than the provider's wal_sender_timeout keeps its stream: it
     /// answers the walsender's requests for a reply as it reads ahead, and replies each status interval, so that the
     /// walsender doesn't end the stream, here over 30 seconds of a 40-second delay with wal_sender_timeout 10 s, and the
