@@ -4666,6 +4666,54 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// A node dropped with its subscription lets the connection its exchanges kept to the provider go: the provider's
+    /// word to call it, or the end of the provider's backend, which makes the socket readable, then has the exchange
+    /// worker, which runs on while the database still has ranges, wait as before rather than wake at once over and over.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [OSCondition(OperatingSystems.Linux)]
+    public async Task DroppedNodesLetTheirKeptConnectionsGo()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database,
+            "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 10, max_range_size := 10)", token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+        await InsertAsync(nodeB, 30, token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity WHERE application_name = 'b_from_a_range')", token),
+            "node_b's kept connection to node_a");
+
+        _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.drop_subscription('b_from_a'); SELECT worf.drop_node('node_b')", token);
+
+        // node_a grants itself blocks, each with a word to call it, and ends the backend node_b's connection had.
+        await InsertAsync(nodeA, 40, token);
+        _ = await nodeA.SafePsqlAsync(Database,
+            "SELECT count(pg_catalog.pg_terminate_backend(pid)) FROM pg_catalog.pg_stat_activity WHERE application_name = 'b_from_a_range'", token);
+        await Task.Delay(TimeSpan.FromSeconds(1), token);
+
+        // The exchange worker's CPU time over three seconds, in clock ticks, of 100 a second.
+        string pid = await nodeB.SafePsqlAsync(Database, "SELECT pid FROM pg_catalog.pg_stat_activity WHERE backend_type LIKE 'worf exchange %'", token);
+        Assert.AreNotEqual("", pid, "node_b's exchange worker, which runs on while the database has ranges");
+        long Ticks()
+        {
+            string[] stat = File.ReadAllText($"/proc/{pid}/stat").Split(')')[1].Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            return long.Parse(stat[11], CultureInfo.InvariantCulture) + long.Parse(stat[12], CultureInfo.InvariantCulture);
+        }
+
+        long before = Ticks();
+        await Task.Delay(TimeSpan.FromSeconds(3), token);
+        Assert.IsLessThan(30L, Ticks() - before, "node_b's exchange worker's CPU ticks over 3 s");
+    }
+
+    /// <summary>
     /// A subscriber that waits out an apply delay longer than the provider's wal_sender_timeout keeps its stream: it
     /// answers the walsender's requests for a reply as it reads ahead, and replies each status interval, so that the
     /// walsender doesn't end the stream, here over 30 seconds of a 40-second delay with wal_sender_timeout 10 s, and the

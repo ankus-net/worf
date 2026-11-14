@@ -826,8 +826,20 @@ internal static class SequenceRangeExchange
     /// </summary>
     private static (WorfLocalNode Node, List<(WorfSubscription Sub, string? Waiting, bool Fenced)> Due)? DueLinks()
     {
+        // A node dropped since has no subscriptions left: the connections kept for them go, and so do their probes, so
+        // that a kept connection's socket, which a provider's word or its end makes readable, ends no wait at once.
         if (WorfNode.GetLocalNode(false, true) is not WorfLocalNode node)
         {
+            foreach (uint gone in s_connections.Keys.ToList())
+            {
+                Disconnect(gone);
+            }
+
+            foreach (uint gone in s_pending.Keys.ToList())
+            {
+                Abandon(gone);
+            }
+
             return null;
         }
 
