@@ -4853,6 +4853,46 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// A neighbor that drops its copy of a sequence's table, and so stops carrying the sequence, holds no restarted node's
+    /// draws up: node_c, a participant that node_b subscribes to and that calls node_a, drops t, and node_b and node_a,
+    /// each restarted with nothing restored, insert within a few seconds, rather than wait for node_c to check their
+    /// reports of a sequence it no longer has.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task NeighborsThatDropTheSequenceHoldNoStartUp()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        await using TestNode nodeC = await StartNodeAsync("node_c", token);
+        foreach (TestNode node in new[] { nodeA, nodeB, nodeC })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        await SubscribeAsync(nodeB, "b_from_c", nodeC, token);
+        await SubscribeAsync(nodeC, "c_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b,node_c}', range_size := 100)", token);
+        await WaitActiveAsync([nodeA, nodeB, nodeC], token);
+        await InsertAsync(nodeB, 10, token);
+        await InsertAsync(nodeC, 10, token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
+            "SELECT EXISTS (SELECT 1 FROM worf.sequence_range_node WHERE node_name = 'node_c' AND seqoid = 't_id_seq'::regclass)", token), "node_c's report on node_b");
+
+        _ = await nodeC.SafePsqlAsync(Database, "DROP TABLE t", token);
+        foreach (TestNode node in new[] { nodeB, nodeA })
+        {
+            await node.StopAsync("fast", token);
+            await node.StartServerAsync(token);
+            await using NpgsqlConnection writer = await node.OpenAsync(Database, token);
+            await using NpgsqlCommand insert = new("SET statement_timeout = '8s'; INSERT INTO t (v) VALUES ('after')", writer);
+            _ = await insert.ExecuteNonQueryAsync(token);
+        }
+    }
+
+    /// <summary>
     /// A subscriber that waits out an apply delay longer than the provider's wal_sender_timeout keeps its stream: it
     /// answers the walsender's requests for a reply as it reads ahead, and replies each status interval, so that the
     /// walsender doesn't end the stream, here over 30 seconds of a 40-second delay with wal_sender_timeout 10 s, and the

@@ -1452,6 +1452,7 @@ internal static class SequenceRangeExchange
         // A sequence this node is fenced on that the neighbor's message doesn't carry has no block on the neighbor.
         WorfRows fencedOn = Worf.Read("SELECT seqoid::oid FROM worf.sequence_range WHERE fenced_at IS NOT NULL", 0);
         HashSet<uint> absent = [.. Enumerable.Range(0, fencedOn.Count).Select(i => fencedOn[i].Get<uint>(0))];
+        HashSet<uint> carriedSequences = [];
 
         // A call that runs out of time is rolled back whole, so the sequences it would take in past a third of the
         // caller's statement_timeout are left to its next call, which sends them first, as one whose range row another
@@ -1481,6 +1482,7 @@ internal static class SequenceRangeExchange
             if (processed is uint carried)
             {
                 _ = absent.Remove(carried);
+                _ = carriedSequences.Add(carried);
             }
 
             // A sequence whose range row a prepared transaction holds, which it may hold across restarts, is left out, so
@@ -1598,6 +1600,28 @@ internal static class SequenceRangeExchange
             _ = Worf.Execute("""
                 INSERT INTO worf.sequence_range_absent VALUES ($1, $2, now()) ON CONFLICT (seqoid, node_id) DO UPDATE SET absent_at = excluded.absent_at
                 """, SpiParameter.Create(seqoid), SpiParameter.Create(senderId));
+        }
+
+        // A message carries every sequence its node manages, and an owner's dropped epochs, so a sequence the neighbor
+        // doesn't own and no longer carries, as once it dropped its copy, it no longer manages: its report goes, and those
+        // it relayed of the sequence, so that neither this node's start nor a fence waits for it, which has nothing left to
+        // say of this node's draws. Rows another transaction holds go with a later message.
+        SpiParameter carriedNow = SpiParameter.Create(carriedSequences.Select(seqoid => (long)seqoid).ToArray());
+        const string NoLongerCarried = """
+            FROM worf.sequence_range_node n
+            WHERE n.via_node = $1 AND NOT (n.seqoid::pg_catalog.int8 = ANY ($2))
+                AND EXISTS (SELECT 1 FROM worf.sequence_range r WHERE r.seqoid = n.seqoid AND r.owner_node IS DISTINCT FROM $1)
+            """;
+        if (Worf.ReadScalar<bool>($"SELECT EXISTS (SELECT 1 {NoLongerCarried})", SpiParameter.Create(senderId), carriedNow))
+        {
+            try
+            {
+                PgTransaction.RunInSubtransaction(() => _ = WithLockTimeout(() => Worf.Execute($"DELETE {NoLongerCarried}", SpiParameter.Create(senderId), carriedNow)));
+            }
+            catch (PgException held) when (held.SqlState == "55P03")
+            {
+                WorfLog.Debug1($"sequence range exchange with node {senderName} leaves the reports of sequences it no longer carries to a later message: {held.Message}");
+            }
         }
 
         // The neighbor's WAL position, once compared with the last one. The sequences a call or an answer left out, held
