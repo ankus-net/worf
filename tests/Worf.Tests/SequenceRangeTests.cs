@@ -9252,7 +9252,31 @@ public sealed partial class SequenceRangeTests
         // into t2 don't wait for, and t1's go on through its blocks, each switch in under a second and a half on a busy
         // runner, against the more than one and a half a switch that waited for the holders took. The server times each
         // of t1's inserts, as the test host's own clock counts the time its other tests keep it from reading the result,
-        // seconds at a time on a Windows runner.
+        // seconds at a time on a Windows runner. Each session's backend has started, and run an insert, before then, as
+        // a dozen backends that start at once take over a second each to run their first statement on a macOS runner.
+        List<NpgsqlConnection> sessions = [];
+        try
+        {
+            for (int started = 0; started < 12; started++)
+            {
+                NpgsqlConnection session = await node.OpenAsync(Database, token);
+                sessions.Add(session);
+                await using NpgsqlCommand warm = new($"{(started < 4 ? "SET log_min_duration_statement = 0; " : "")}INSERT INTO t1 (v) VALUES (0)", session);
+                _ = await warm.ExecuteNonQueryAsync(token);
+            }
+
+            await HeldPhaseAsync();
+        }
+        finally
+        {
+            foreach (NpgsqlConnection session in sessions)
+            {
+                await session.DisposeAsync();
+            }
+        }
+
+        async Task HeldPhaseAsync()
+        {
         await using NpgsqlConnection holder = await node.OpenAsync(Database, token);
         await using NpgsqlTransaction held = await holder.BeginTransactionAsync(token);
         long left = long.Parse(await node.SafePsqlAsync(Database,
@@ -9265,15 +9289,9 @@ public sealed partial class SequenceRangeTests
         const string T1Insert = "INSERT INTO t1 (v) SELECT 2 FROM generate_series(1, 10)";
         int timed = node.ReadLog().Length;
         using CancellationTokenSource holding = CancellationTokenSource.CreateLinkedTokenSource(token);
-        Task<long>[] t1Inserts = [.. Enumerable.Range(0, 4).Select(async _ =>
+        Task<long>[] t1Inserts = [.. Enumerable.Range(0, 4).Select(async i =>
         {
-            await using NpgsqlConnection connection = await node.OpenAsync(Database, token);
-            await using (NpgsqlCommand logged = new("SET log_min_duration_statement = 0", connection))
-            {
-                _ = await logged.ExecuteNonQueryAsync(token);
-            }
-
-            await using NpgsqlCommand insert = new(T1Insert, connection);
+            await using NpgsqlCommand insert = new(T1Insert, sessions[i]);
             long slowest = 0;
             while (!holding.IsCancellationRequested)
             {
@@ -9284,10 +9302,9 @@ public sealed partial class SequenceRangeTests
 
             return slowest;
         })];
-        Task[] t2Inserts = [.. Enumerable.Range(0, 8).Select(async _ =>
+        Task[] t2Inserts = [.. Enumerable.Range(4, 8).Select(async t2Session =>
         {
-            await using NpgsqlConnection connection = await node.OpenAsync(Database, token);
-            await using NpgsqlCommand insert = new("INSERT INTO t2 (v) VALUES (2)", connection);
+            await using NpgsqlCommand insert = new("INSERT INTO t2 (v) VALUES (2)", sessions[t2Session]);
             for (int i = 0; i < 20; i++)
             {
                 _ = await insert.ExecuteNonQueryAsync(token);
@@ -9307,6 +9324,7 @@ public sealed partial class SequenceRangeTests
         Assert.IsLessThan(1500.0, t1Times.Max(), $"t1's slowest insert on the server, in ms, while t2 was held; the test host saw {t1Seen}");
         Assert.AreEqual($"{left - 30 + 160}", await node.SafePsqlAsync(Database, "SELECT count(*) FROM t2", token));
         Assert.DoesNotContain("reached maximum value", node.ReadLog(), "inserts that ran a block out");
+        }
     }
 
     /// <summary>
