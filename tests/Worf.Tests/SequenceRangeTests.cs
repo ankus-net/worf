@@ -6219,7 +6219,7 @@ public sealed partial class SequenceRangeTests
         waits.Sort();
         Assert.IsGreaterThan(100, waits.Count, "node_b's inserts");
         Assert.IsLessThan(1000.0, waits[^1], "node_b's slowest insert, against the 5000 ms each call to node_c held up its calls to node_a");
-        Assert.StartsWith("10000 ms,20000 ms", delays, "node_b's delays after its calls to node_c ran out of time, though its probe answered between them");
+        Assert.StartsWith("5000 ms,10000 ms", delays, "node_b's delays after its calls to node_c ran out of time, though its probe answered between them");
         Assert.Contains("exchange with node node_c answered a probe", log, "node_b's probe of node_c");
     }
 

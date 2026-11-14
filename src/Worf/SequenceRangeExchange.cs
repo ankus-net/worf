@@ -42,8 +42,10 @@ internal static class SequenceRangeExchange
     // The sequences, with the prepared transactions holding their range rows, that this process has warned of.
     private static readonly HashSet<(uint Seqoid, string Gid)> s_preparedHolders = [];
 
-    // Whether the take-in now may wait for its range row, as the exchange holds no range row yet.
+    // Whether the take-in now may wait for its range row, as the exchange holds no range row yet, and whether a wait
+    // for one has run out in the message taken in now, after which none is waited for.
     private static bool s_rangeWaitAllowed;
+    private static bool s_rangeWaitSpent;
 
     // The neighbors whose messages the current transaction took in, with when their servers started and whether they
     // made them knowing this server was back, noted once it commits.
@@ -748,8 +750,10 @@ internal static class SequenceRangeExchange
     /// Notes an exchange that failed, tried again after a delay that doubles, up to the exchange interval, or half the
     /// exchange timeout while this node waits on the neighbor, as for a block, so that inserts waiting at a block's end,
     /// up to twice the timeout, get it soon after the neighbor is back. One that ran out of time, or a probe of a
-    /// provider whose last call did, backs off from ten seconds up to a minute, or the exchange interval if that is
-    /// longer, whatever waits on the neighbor, and is probed next.
+    /// provider whose last call did, backs off from the exchange timeout, ten seconds at most, up to a minute, or the
+    /// exchange interval if that is longer, whatever waits on the neighbor, and is probed next: a provider that restarts
+    /// as a call to it runs out of time draws only once this node has answered it since, waiting twice the timeout, so
+    /// the first retry comes within that.
     /// </summary>
     private static void Failed(WorfPendingExchange pending, string failure, bool timedOut, string? detail)
     {
@@ -766,7 +770,7 @@ internal static class SequenceRangeExchange
 
         // The delay counts from the exchange's end, so that one that ran out of time waits it out too.
         long delay = s_retries.TryGetValue(sub.Id, out (long At, long Delay) retry) ? retry.Delay * 2 : 0;
-        long least = slow ? Math.Min(TimedOutFirstBackoff, most) : SequenceRanges.CheckInterval * 1000L;
+        long least = slow ? Math.Min(Math.Min(TimedOutFirstBackoff, SequenceRanges.ExchangeTimeout * 1000L), most) : SequenceRanges.CheckInterval * 1000L;
         delay = Math.Min(Math.Max(delay, Math.Max(least, SequenceRanges.CheckInterval * 1000L)), Math.Max(most, SequenceRanges.CheckInterval * 1000L));
         s_retries[sub.Id] = (Worker.GetCurrentTimestamp() + delay, delay);
         WorfLog.Debug1($"sequence range exchange with node {sub.Origin.Name} is made again in {(delay / 1000).ToString(CultureInfo.InvariantCulture)} ms");
@@ -1443,6 +1447,7 @@ internal static class SequenceRangeExchange
         int index = -1;
         int? cutAt = null;
         int takenIn = 0;
+        s_rangeWaitSpent = false;
         string key = UnchangedKey(node, root, call);
         List<long> drawnSequences = [];
         List<long> drawnTo = [];
@@ -2237,7 +2242,8 @@ internal static class SequenceRangeExchange
         // the rows of sequences it took in, which it does until it commits, it waits for none, as a transaction holding
         // some range rows, as a configuration change of several sequences, would deadlock with it as it reaches those.
         // While a session idle in its transaction holds rows of the ranges, as a configuration change left open does, no
-        // row is waited for, so that the turn isn't held up for those at every exchange.
+        // row is waited for, so that the turn isn't held up for those at every exchange, and once a wait has run out,
+        // none is in the rest of the message, so that the turn is held up for one wait a message at most.
         int epoch = entry.GetProperty("epoch").GetInt32();
         uint owner = entry.GetProperty("owner_id").GetUInt32();
         WorfRows local;
@@ -2249,7 +2255,7 @@ internal static class SequenceRangeExchange
 
         try
         {
-            if (s_rangeWaitAllowed && !Worf.ReadScalar<bool>("""
+            if (s_rangeWaitAllowed && !s_rangeWaitSpent && !Worf.ReadScalar<bool>("""
                 SELECT EXISTS (
                     SELECT 1 FROM pg_catalog.pg_locks l JOIN pg_catalog.pg_stat_activity a ON a.pid = l.pid
                     WHERE l.locktype = 'relation' AND l.database = (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())
@@ -2261,6 +2267,11 @@ internal static class SequenceRangeExchange
 
             local = Worf.Query("SELECT owner_node, epoch, state, parent_node FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE", false, 1,
                 SpiParameter.Create(seqoid));
+        }
+        catch (PgException held) when (held.SqlState == "55P03")
+        {
+            s_rangeWaitSpent = true;
+            throw;
         }
         finally
         {
