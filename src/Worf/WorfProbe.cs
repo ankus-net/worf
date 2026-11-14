@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Net;
+using System.Net.Sockets;
 using Ankus.Postgres;
 #if WORF_WINDOWS
 using PgSocket = ulong;
@@ -361,6 +362,13 @@ internal sealed unsafe class WorfProbe : IDisposable
             if (!_sent && _attemptDeadline != 0)
             {
                 milliseconds = Math.Min(milliseconds, Math.Max((_attemptDeadline - Worker.GetCurrentTimestamp() + 999) / 1000, 0));
+            }
+
+            // Windows records a connect's end once, for the wait set that asked at the time, so one that ends between
+            // waits is seen as the probe next looks, a moment later.
+            if (flag == WlSocketConnected)
+            {
+                milliseconds = Math.Min(milliseconds, 20);
             }
         }
         else if (_sent)
@@ -759,7 +767,26 @@ internal sealed unsafe class WorfProbe : IDisposable
             return false;
         }
 
+        if (flag == WlSocketConnected)
+        {
+            return ConnectEnded(socket);
+        }
+
         return (NativeMethods.WaitLatchOrSocket(null, WlExitOnPmDeath | WlTimeout | flag, socket, milliseconds, _sent ? _waits.Receive : _waits.Connect) & flag) != 0;
+    }
+
+    // Whether a connect under way has ended, made or failed, as select() shows it each time it's asked: Windows records
+    // the end of a connect in a wait set's event once, for the set that asked for it then, and every wait makes a set of
+    // its own, so a connect refused between waits would otherwise never be seen to end.
+    private static bool ConnectEnded(PgSocket socket)
+    {
+#if WORF_WINDOWS
+        using SafeSocketHandle handle = new(unchecked((nint)socket), ownsHandle: false);
+#else
+        using SafeSocketHandle handle = new(socket, ownsHandle: false);
+#endif
+        using Socket connecting = new(handle);
+        return connecting.Poll(0, SelectMode.SelectWrite) || connecting.Poll(0, SelectMode.SelectError);
     }
 
     private int Status() => ((delegate* unmanaged<void*, int>)WorfConnection.LibpqFunction("PQstatus"))(_conn);

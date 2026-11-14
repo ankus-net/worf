@@ -258,6 +258,37 @@ public sealed class StalledPeerTests
     }
 
     /// <summary>
+    /// A connection worf makes to an address that refuses it fails as soon as the address does, which on Windows, which
+    /// tries a refused address twice more, is about two seconds, rather than at its statement's timeout: each of five
+    /// subscriptions created to a port where nothing listens fails within ten seconds. Windows records a connect's end
+    /// once, for the wait that asked then, so one that ended between waits went unseen.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task RefusedConnectionsFailAtOnce()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode subscriber = await StartNodeAsync("subscriber", token);
+        using TcpListener closed = new(IPAddress.Loopback, 0);
+        closed.Start();
+        int port = ((IPEndPoint)closed.LocalEndpoint).Port;
+        closed.Stop();
+        for (int i = 0; i < 5; i++)
+        {
+            // Npgsql gives up a session after an error of SQLSTATE XX000, as this one is.
+            await using NpgsqlConnection connection = await subscriber.OpenAsync(Database, token);
+            await using NpgsqlCommand create = new($"""
+                SET statement_timeout = '20s';
+                SELECT worf.create_subscription('refused{i}', provider_dsn := 'host=127.0.0.1 port={port.ToString(CultureInfo.InvariantCulture)} dbname={Database} user={SuperUser}')
+                """, connection) { CommandTimeout = 30 };
+            Stopwatch connecting = Stopwatch.StartNew();
+            PostgresException refused = await Assert.ThrowsExactlyAsync<PostgresException>(() => create.ExecuteNonQueryAsync(token));
+            Assert.AreNotEqual("57014", refused.SqlState, $"subscription {i}: {refused.MessageText}");
+            Assert.IsLessThan(TimeSpan.FromSeconds(10), connecting.Elapsed, $"subscription {i}'s connection to the port where nothing listens");
+        }
+    }
+
+    /// <summary>
     /// Apply's replication connection keeps its connection string's options after worf's own, here one that has the
     /// provider log the replication commands it gets, and passes a first address that drops connection attempts, as a
     /// listener whose queue is full does, at the connection string's connect_timeout, rather than wait on it for good.
