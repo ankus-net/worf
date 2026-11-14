@@ -4176,7 +4176,14 @@ public sealed partial class SequenceRangeTests
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT count(*) = 11 FROM worf.sequence_ranges WHERE state = 'active'", token),
             "node_b drawing from blocks of the 11 sequences");
 
-        // A kept position of another timeline goes, and idle calls then write nothing.
+        // node_b draws once from each, so that its idle calls report the draws, as they were.
+        _ = await nodeB.SafePsqlAsync(Database, """
+            INSERT INTO t (v) VALUES ('b');
+            SELECT count(nextval(format('many_%s', lpad(g::text, 2, '0'))::regclass)) FROM generate_series(1, 10) g;
+            """, token);
+
+        // A kept position of another timeline goes, and idle calls, which report node_b's draws as they were, then write
+        // nothing.
         string nodeBId = await nodeB.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
         _ = await nodeA.SafePsqlAsync(Database, $"""
             INSERT INTO worf.sequence_range_back (seqoid, node_id, call, sysid, timeline, lsn, started)
@@ -4203,9 +4210,8 @@ public sealed partial class SequenceRangeTests
         {
             await Task.Delay(TimeSpan.FromSeconds(1), token);
             long settled = long.Parse(await nodeA.SafePsqlAsync(Database, NextXid, token), CultureInfo.InvariantCulture);
-            if (settled - firstXid < 2)
+            if (settled == firstXid)
             {
-                firstXid = settled;
                 break;
             }
 
@@ -4213,9 +4219,9 @@ public sealed partial class SequenceRangeTests
             Assert.IsLessThan(TestNode.PollTimeout, settling.Elapsed, "node_a's calls, settled to a second without writes");
         }
 
-        await Task.Delay(TimeSpan.FromSeconds(3), token);
+        await Task.Delay(TimeSpan.FromSeconds(5), token);
         long lastXid = long.Parse(await nodeA.SafePsqlAsync(Database, NextXid, token), CultureInfo.InvariantCulture);
-        Assert.IsLessThan(3L, lastXid - firstXid, "the transaction IDs node_a's idle calls used in 3 s");
+        Assert.AreEqual(firstXid, lastXid, "the next transaction ID on node_a, after 5 s of node_b's idle calls, which use none");
         _ = await nodeA.SafePsqlAsync(Database, """
             INSERT INTO worf.sequence_range_grant (grant_id, request_id, seqoid, grantee_id, grantee_name, kind, lo, hi, state, granted_at)
             SELECT gen_random_uuid(), gen_random_uuid(), 'past'::regclass, 1, 'gone', 'n', g * 10, g * 10 + 9, 'abandoned', now()
