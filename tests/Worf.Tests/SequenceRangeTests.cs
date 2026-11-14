@@ -3312,8 +3312,7 @@ public sealed partial class SequenceRangeTests
     /// <summary>
     /// A drop of a subscription holds no exchange up past its own deletes: left open in a transaction, or followed in
     /// the same statement by a drop whose provider never answers, it lets the node's turn go as its deletes are done, so
-    /// that node_b's inserts, which draw a block from node_a every 100 rows, go on drawing, and once node_b restarts,
-    /// they don't wait for the provider whose subscription the drop removes to answer.
+    /// that node_b's inserts, which draw a block from node_a every 100 rows, go on drawing.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -3381,15 +3380,11 @@ public sealed partial class SequenceRangeTests
         }
 
         // A drop of b_from_d, whose provider is paused, in the statement after a drop of b_from_a's sibling, b_from_c,
-        // made again. node_c reports t_id_seq again, and then can't answer node_b's calls as node_b restarts, so that
-        // node_b's draws would wait for node_c, as a start's do for each neighbor that reports the sequence, but for the
-        // drop of b_from_c, which holds node_c's exchanges off until it ends.
+        // made again, once node_c has checked node_b's report since node_b started, as node_b's draws wait for it to.
         await SubscribeAsync(nodeB, "b_from_c", nodeC, token);
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
-            "SELECT EXISTS (SELECT 1 FROM worf.sequence_range_node WHERE node_name = 'node_c' AND seqoid = 't_id_seq'::regclass)", token), "node_c's report");
-        _ = await nodeC.SafePsqlAsync(Database, "ALTER FUNCTION worf.sequence_range_exchange(text) RENAME TO sequence_range_exchange_paused", token);
-        await nodeB.StopAsync("fast", token);
-        await nodeB.StartServerAsync(token);
+            "SELECT confirmed_start IS NOT NULL FROM worf.sequence_range_node WHERE node_name = 'node_c' AND seqoid = 't_id_seq'::regclass", token),
+            "node_c's check of node_b's report");
         await SuspendAsync(nodeD, true, token);
         try
         {
@@ -5583,12 +5578,16 @@ public sealed partial class SequenceRangeTests
     /// <summary>
     /// A restored node waits, before it draws, for every neighbor it exchanges with that reports the sequence, not only
     /// its block's grantor: node_c heard of node_b's draws while node_a, the grantor, was down, and is down itself as
-    /// node_b comes back from its backup, so node_b's inserts wait for node_c, naming it, and once node_c finds node_b went
-    /// back, node_b never draws those values again.
+    /// node_b comes back from its backup, so node_b's inserts wait for node_c, naming it, though a drop of node_b's
+    /// subscription to node_c is under way, which may roll back, and once node_c finds node_b went back, node_b never draws
+    /// those values again.
     /// </summary>
+    /// <param name="how">node_c down, or down with a drop of b_from_c left open, which then rolls back.</param>
     /// <returns>The test.</returns>
     [TestMethod]
-    public async Task RestoredNodesWaitForEveryNeighborThatHeardTheirDraws()
+    [DataRow("down")]
+    [DataRow("drop rolled back")]
+    public async Task RestoredNodesWaitForEveryNeighborThatHeardTheirDraws(string how)
     {
         CancellationToken token = TestContext.CancellationToken;
         await using TestNode nodeA = await StartNodeAsync("node_a", token);
@@ -5618,10 +5617,19 @@ public sealed partial class SequenceRangeTests
         await RestoreDataAsync(nodeB, copy, token);
         await nodeA.StartServerAsync(token);
 
+        await using NpgsqlConnection dropping = await nodeB.OpenAsync(Database, token);
+        await using NpgsqlTransaction open = await dropping.BeginTransactionAsync(token);
+        if (how == "drop rolled back")
+        {
+            await using NpgsqlCommand drop = new("SELECT worf.drop_subscription('b_from_c')", dropping, open);
+            _ = await drop.ExecuteScalarAsync(token);
+        }
+
         PostgresException waited = await Assert.ThrowsExactlyAsync<PostgresException>(() => nodeB.SafePsqlAsync(Database, "INSERT INTO t (v) VALUES ('waiting')", token),
-            "node_b's insert while node_c is down");
+            $"node_b's insert while node_c is {how}");
         Assert.AreEqual("55000", waited.SqlState, waited.MessageText);
         Assert.Contains("node node_c", waited.MessageText);
+        await open.RollbackAsync(token);
 
         await nodeC.StartServerAsync(token);
         HashSet<string> after = await InsertIdsAsync(nodeB, "after", token);

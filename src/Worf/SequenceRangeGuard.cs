@@ -225,11 +225,6 @@ internal static partial class SequenceRangeGuard
     // rather than the grantor of their active block.
     private static readonly HashSet<uint> s_heardBy = [];
 
-    // The subscriptions of this node whose drops were under way as the blocks were last read, whose providers a start's
-    // draws don't wait for: the drop holds their exchanges off until it ends, and once it commits the provider is no
-    // longer this node's neighbor.
-    private static long[] s_dropping = [];
-
     // Whether the guard is reading the blocks to find the grantors a statement's plan names.
     private static bool s_namingGrantors;
 
@@ -3359,13 +3354,7 @@ internal static partial class SequenceRangeGuard
                 long woken = 0;
                 while (true)
                 {
-                    // A drop of a subscription that starts as the statement waits ends the wait for its provider.
                     Refresh();
-                    if (!Dropping().SequenceEqual(s_dropping))
-                    {
-                        s_version = -1;
-                    }
-
                     Reload();
                     if (!s_grantors.TryGetValue(seqoid, out uint current) || s_confirmedSequences.Contains(seqoid))
                     {
@@ -4725,13 +4714,6 @@ internal static partial class SequenceRangeGuard
     }
 
     /// <summary>
-    /// Gets the subscriptions of this node whose drops are under way, in order.
-    /// </summary>
-    private static long[] Dropping() => [.. Elevated.Run(() => Worf.Read("""
-            SELECT s.sub_id::bigint FROM worf.subscription s JOIN worf.local_node l ON s.sub_target = l.node_id ORDER BY s.sub_id
-            """, 0).Select(row => row.Get<long>(0))).Where(subid => WorfLocks.DropUnderWay((uint)subid))];
-
-    /// <summary>
     /// Reads every sequence's bounds from the catalog again at its next nextval, as a switch committed whose
     /// invalidations this backend may not have heard yet.
     /// </summary>
@@ -4997,7 +4979,6 @@ internal static partial class SequenceRangeGuard
         s_grantors.Clear();
         s_confirmedSequences.Clear();
         s_heardBy.Clear();
-        s_dropping = Dropping();
         s_drawnBy.Clear();
         s_drawingColumns.Clear();
         s_defaultsText.Clear();
@@ -5026,7 +5007,7 @@ internal static partial class SequenceRangeGuard
                         THEN b.from_node END,
                     (SELECT c.node_id FROM worf.sequence_range_node c
                     WHERE c.seqoid = r.seqoid AND c.node_id <> l.node_id AND c.confirmed_start IS DISTINCT FROM $3
-                        AND (EXISTS (SELECT 1 FROM worf.subscription s WHERE s.sub_origin = c.node_id AND s.sub_target = l.node_id AND s.sub_id::bigint <> ALL ($4))
+                        AND (EXISTS (SELECT 1 FROM worf.subscription s WHERE s.sub_origin = c.node_id AND s.sub_target = l.node_id)
                             OR EXISTS (SELECT 1 FROM worf.sequence_range_link k WHERE k.node_id = c.node_id))
                     ORDER BY c.node_name LIMIT 1)),
                 b.from_node
@@ -5035,8 +5016,7 @@ internal static partial class SequenceRangeGuard
                 CROSS JOIN worf.local_node l
                 LEFT JOIN worf.sequence_range_block b ON b.seqoid = r.seqoid AND b.kind IN ('n', 'i')
                     AND b.state IN ('next', 'active', 'retired', 'imported')
-            """, SpiParameter.Create((decimal)sysid), SpiParameter.Create((long)timeline), SpiParameter.Create(SequenceRangeHeard.Started),
-            SpiParameter.Create(s_dropping)));
+            """, SpiParameter.Create((decimal)sysid), SpiParameter.Create((long)timeline), SpiParameter.Create(SequenceRangeHeard.Started)));
         for (int i = 0; i < result.Count; i++)
         {
             WorfRow row = result[i];

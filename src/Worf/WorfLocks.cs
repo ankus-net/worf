@@ -73,24 +73,6 @@ internal static class WorfLocks
     }
 
     /// <summary>
-    /// Checks whether a drop of a subscription holds its drop lock, which holds the subscription's exchanges off until the
-    /// drop ends, without keeping the lock.
-    /// </summary>
-    /// <param name="subid">The subscription.</param>
-    /// <returns>Whether a drop holds it.</returns>
-    internal static unsafe bool DropUnderWay(uint subid)
-    {
-        LOCKTAG drop = Tag(subid, DropKey);
-        if (NativeMethods.LockAcquire(&drop, ShareLock, false, true) == NotAvailable)
-        {
-            return true;
-        }
-
-        _ = NativeMethods.LockRelease(&drop, ShareLock, false);
-        return false;
-    }
-
-    /// <summary>
     /// Waits for this node's other exchanges to finish building their messages, which the transaction then holds until it
     /// ends.
     /// </summary>
