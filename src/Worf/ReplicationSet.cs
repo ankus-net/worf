@@ -21,6 +21,22 @@ using Ankus.Postgres;
         PRIMARY KEY(set_id, set_reloid)
     ) WITH (user_catalog_table=true);
 
+    -- The column lists and row filters of replication_set_table, in parts that are never compressed or kept out of
+    -- line, which decoding reads. Decoding reads worf's catalogs with a historic snapshot, under which PostgreSQL
+    -- reads a TOAST table in the file it had then, which REINDEX, VACUUM FULL or CLUSTER since replaces, while it
+    -- finds a table declared a catalog in its current file. The parts' column is added with its storage, so that the
+    -- table has no TOAST table.
+    CREATE TABLE worf.replication_set_table_part (
+        set_id oid NOT NULL,
+        set_reloid oid NOT NULL,
+        part_attnum smallint NOT NULL,
+        part_no integer NOT NULL,
+        PRIMARY KEY(set_id, set_reloid, part_attnum, part_no)
+    ) WITH (user_catalog_table=true);
+
+    ALTER TABLE worf.replication_set_table_part ADD COLUMN part_data bytea NOT NULL,
+        ALTER COLUMN part_data SET STORAGE PLAIN;
+
     CREATE TABLE worf.replication_set_seq (
         set_id oid NOT NULL,
         set_seqoid regclass NOT NULL,
@@ -310,7 +326,7 @@ internal static partial class ReplicationSet
             repset.Id = WorfNode.HashIds(repset.NodeId, Worf.HashAny(repset.Name));
         }
 
-        Spi.Execute("INSERT INTO worf.replication_set (set_id, set_nodeid, set_name, replicate_insert, replicate_update, " +
+        Worf.Execute("INSERT INTO worf.replication_set (set_id, set_nodeid, set_name, replicate_insert, replicate_update, " +
             "replicate_delete, replicate_truncate) VALUES ($1, $2, $3, $4, $5, $6, $7)",
             SpiParameter.Create(repset.Id), SpiParameter.Create(repset.NodeId), SpiParameter.Create(repset.Name),
             SpiParameter.Create(repset.ReplicateInsert), SpiParameter.Create(repset.ReplicateUpdate),
@@ -323,7 +339,7 @@ internal static partial class ReplicationSet
     /// <param name="repset">The set.</param>
     internal static void AlterReplicationSet(WorfRepSet repset)
     {
-        if (!Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT FROM worf.replication_set WHERE set_id = $1)",
+        if (!Worf.ReadScalar<bool>("SELECT EXISTS (SELECT FROM worf.replication_set WHERE set_id = $1)",
             SpiParameter.Create(repset.Id)))
         {
             throw new PgException(PgSqlStates.InternalError, $"replication set {repset.Id} not found");
@@ -333,11 +349,11 @@ internal static partial class ReplicationSet
         // tables without replication identity.
         if (repset.ReplicateUpdate || repset.ReplicateDelete)
         {
-            SpiResult tables = Worf.SelectCatalog("SELECT set_reloid::oid FROM worf.replication_set_table WHERE set_id = $1",
+            WorfRows tables = Worf.SelectCatalog("SELECT set_reloid::oid FROM worf.replication_set_table WHERE set_id = $1",
                 SpiParameter.Create(repset.Id));
 
             // Process every individual table in the set.
-            foreach (SpiRow table in tables)
+            foreach (WorfRow table in tables)
             {
                 using PgRelation targetrel = PgRelation.Open(table.Get<uint>(0), PgLockMode.AccessShare);
 
@@ -352,7 +368,7 @@ internal static partial class ReplicationSet
         }
 
         // Everything ok, form a new tuple.
-        Spi.Execute("UPDATE worf.replication_set SET replicate_insert = $2, replicate_update = $3, " +
+        Worf.Execute("UPDATE worf.replication_set SET replicate_insert = $2, replicate_update = $3, " +
             "replicate_delete = $4, replicate_truncate = $5 WHERE set_id = $1",
             SpiParameter.Create(repset.Id), SpiParameter.Create(repset.ReplicateInsert),
             SpiParameter.Create(repset.ReplicateUpdate), SpiParameter.Create(repset.ReplicateDelete),
@@ -365,7 +381,7 @@ internal static partial class ReplicationSet
     /// <param name="setid">The set.</param>
     internal static void DropReplicationSet(uint setid)
     {
-        uint nodeid = Spi.ExecuteScalar<uint?>("SELECT set_nodeid FROM worf.replication_set WHERE set_id = $1",
+        uint nodeid = Worf.ReadScalar<uint?>("SELECT set_nodeid FROM worf.replication_set WHERE set_id = $1",
             SpiParameter.Create(setid))
             ?? throw new PgException(PgSqlStates.InternalError, $"replication set {setid} not found");
 
@@ -374,7 +390,7 @@ internal static partial class ReplicationSet
         ReplicationSetRemoveSeqs(setid, nodeid);
 
         // Remove the tuple.
-        Spi.Execute("DELETE FROM worf.replication_set WHERE set_id = $1", SpiParameter.Create(setid));
+        Worf.Execute("DELETE FROM worf.replication_set WHERE set_id = $1", SpiParameter.Create(setid));
 
         // Cleanup.
         InvalidateRelcache(GetReplicationSetRelOid());
@@ -386,11 +402,11 @@ internal static partial class ReplicationSet
     /// <param name="nodeid">The node.</param>
     internal static void DropNodeReplicationSets(uint nodeid)
     {
-        SpiResult result = Worf.SelectCatalog("SELECT set_id, set_nodeid FROM worf.replication_set WHERE set_nodeid = $1",
+        WorfRows result = Worf.SelectCatalog("SELECT set_id, set_nodeid FROM worf.replication_set WHERE set_nodeid = $1",
             SpiParameter.Create(nodeid));
 
         // Remove matching tuples.
-        foreach (SpiRow row in result)
+        foreach (WorfRow row in result)
         {
             uint setid = row.Get<uint>(0);
 
@@ -399,7 +415,7 @@ internal static partial class ReplicationSet
             ReplicationSetRemoveSeqs(setid, row.Get<uint>(1));
 
             // Remove the repset.
-            Spi.Execute("DELETE FROM worf.replication_set WHERE set_id = $1", SpiParameter.Create(setid));
+            Worf.Execute("DELETE FROM worf.replication_set WHERE set_id = $1", SpiParameter.Create(setid));
         }
 
         // Cleanup.
@@ -413,10 +429,10 @@ internal static partial class ReplicationSet
     /// <returns>The tables.</returns>
     internal static List<uint> ReplicationSetGetTables(uint setid)
     {
-        SpiResult result = Worf.SelectCatalog("SELECT set_reloid::oid FROM worf.replication_set_table WHERE set_id = $1",
+        WorfRows result = Worf.SelectCatalog("SELECT set_reloid::oid FROM worf.replication_set_table WHERE set_id = $1",
             SpiParameter.Create(setid));
         List<uint> res = [];
-        foreach (SpiRow row in result)
+        foreach (WorfRow row in result)
         {
             res.Add(row.Get<uint>(0));
         }
@@ -431,10 +447,10 @@ internal static partial class ReplicationSet
     /// <returns>The sequences.</returns>
     internal static List<uint> ReplicationSetGetSeqs(uint setid)
     {
-        SpiResult result = Worf.SelectCatalog("SELECT set_seqoid::oid FROM worf.replication_set_seq WHERE set_id = $1",
+        WorfRows result = Worf.SelectCatalog("SELECT set_seqoid::oid FROM worf.replication_set_seq WHERE set_id = $1",
             SpiParameter.Create(setid));
         List<uint> res = [];
-        foreach (SpiRow row in result)
+        foreach (WorfRow row in result)
         {
             res.Add(row.Get<uint>(0));
         }
@@ -495,9 +511,10 @@ internal static partial class ReplicationSet
             nulls[AnumRepsetTableAttList - 1] = true;
         }
 
-        if (rowFilter is not null)
+        sbyte* rowFilterText = rowFilter is null ? null : NativeMethods.nodeToString(rowFilter);
+        if (rowFilterText is not null)
         {
-            values[AnumRepsetTableRowFilter - 1] = (ulong)NativeMethods.cstring_to_text(NativeMethods.nodeToString(rowFilter));
+            values[AnumRepsetTableRowFilter - 1] = (ulong)NativeMethods.cstring_to_text(rowFilterText);
         }
         else
         {
@@ -506,8 +523,18 @@ internal static partial class ReplicationSet
 
         HeapTupleData* tup = NativeMethods.heap_form_tuple(tupDesc, values, nulls);
 
-        // Insert the tuple to the catalog.
+        // Insert the tuple to the catalog, and the column list and row filter in the parts that decoding reads, each
+        // column's name terminated.
         NativeMethods.CatalogTupleInsert(rel, tup);
+        if (attList.Count > 0)
+        {
+            WriteParts(repset.Id, reloid, AnumRepsetTableAttList, [.. attList.SelectMany(Worf.ToServerCString)]);
+        }
+
+        if (rowFilterText is not null)
+        {
+            WriteParts(repset.Id, reloid, AnumRepsetTableRowFilter, new ReadOnlySpan<byte>(rowFilterText, Worf.StrLen(rowFilterText)).ToArray());
+        }
 
         // Cleanup.
         InvalidateRelcache(reloid);
@@ -548,13 +575,15 @@ internal static partial class ReplicationSet
             throw new PgException(PgSqlStates.InvalidParameterValue, "UNLOGGED and TEMP sequences cannot be replicated");
         }
 
+        SequenceRanges.RejectReplicatedState(seqoid);
+
         // Ensure track the state of the sequence.
         Sequences.CreateSequenceStateRecord(seqoid);
 
         NativeMethods.table_close(targetrel, (int)PgLockMode.None);
 
         // Insert the tuple to the catalog.
-        _ = Spi.Execute("INSERT INTO worf.replication_set_seq VALUES ($1, $2)",
+        _ = Worf.Execute("INSERT INTO worf.replication_set_seq VALUES ($1, $2)",
             SpiParameter.Create(repset.Id), SpiParameter.Create(seqoid));
 
         // Cleanup.
@@ -591,6 +620,7 @@ internal static partial class ReplicationSet
         if (tuple is not null)
         {
             NativeMethods.simple_heap_delete(rel, &tuple->t_self);
+            DeleteParts(setid, reloid);
         }
         else if (!fromDrop)
         {
@@ -731,7 +761,7 @@ internal static partial class ReplicationSet
                 res.Append(',');
             }
 
-            res.Append(Spi.QuoteIdentifier(str));
+            res.Append(Worf.QuoteIdentifier(str));
         }
 
         return res.ToString();
@@ -763,15 +793,16 @@ internal static partial class ReplicationSet
     private static void ReplicationSetRemoveTables(uint setid, uint nodeid)
     {
         _ = nodeid;
-        SpiResult result = Worf.SelectCatalog("SELECT ctid, set_reloid::oid FROM worf.replication_set_table WHERE set_id = $1",
+        WorfRows result = Worf.SelectCatalog("SELECT ctid, set_reloid::oid FROM worf.replication_set_table WHERE set_id = $1",
             SpiParameter.Create(setid));
 
-        foreach (SpiRow row in result)
+        foreach (WorfRow row in result)
         {
             uint reloid = row.Get<uint>(1);
 
             // Remove the tuple.
-            Spi.Execute("DELETE FROM worf.replication_set_table WHERE ctid = $1", SpiParameter.Create(row.Get<PgItemPointer>(0)));
+            Worf.Execute("DELETE FROM worf.replication_set_table WHERE ctid = $1", SpiParameter.Create(row.Get<PgItemPointer>(0)));
+            DeleteParts(setid, reloid);
             InvalidateRelcache(reloid);
 
             // Dependency cleanup.
@@ -784,15 +815,15 @@ internal static partial class ReplicationSet
     /// </summary>
     private static void ReplicationSetRemoveSeqs(uint setid, uint nodeid)
     {
-        SpiResult result = Worf.SelectCatalog("SELECT ctid, set_seqoid::oid FROM worf.replication_set_seq WHERE set_id = $1",
+        WorfRows result = Worf.SelectCatalog("SELECT ctid, set_seqoid::oid FROM worf.replication_set_seq WHERE set_id = $1",
             SpiParameter.Create(setid));
 
-        foreach (SpiRow row in result)
+        foreach (WorfRow row in result)
         {
             uint seqoid = row.Get<uint>(1);
 
             // Remove the tuple.
-            Spi.Execute("DELETE FROM worf.replication_set_seq WHERE ctid = $1", SpiParameter.Create(row.Get<PgItemPointer>(0)));
+            Worf.Execute("DELETE FROM worf.replication_set_seq WHERE ctid = $1", SpiParameter.Create(row.Get<PgItemPointer>(0)));
 
             // Make sure the SequenceHasReplicationSets sees the changes.
             if (!SequenceHasReplicationSets(nodeid, seqoid))
@@ -810,7 +841,7 @@ internal static partial class ReplicationSet
     private static bool SequenceHasReplicationSets(uint nodeid, uint seqoid)
     {
         _ = nodeid;
-        return Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT FROM worf.replication_set_seq WHERE set_seqoid = $1)",
+        return Worf.ReadScalar<bool>("SELECT EXISTS (SELECT FROM worf.replication_set_seq WHERE set_seqoid = $1)",
             SpiParameter.Create(seqoid));
     }
 
@@ -868,16 +899,24 @@ internal static partial class ReplicationSet
         TupleDescData* tableDesc = table->rd_att;
 
         // Look the table up in each of the connection's sets with the catalog's primary key, as a scan of every
-        // membership for each table makes a transaction that touches many tables quadratic.
+        // membership for each table makes a transaction that touches many tables quadratic, unless the key is in a
+        // file that's no longer its, which the scan of the catalog avoids. The key stays locked, so that it can't be
+        // built again meanwhile.
         NativeMethods.list_free(NativeMethods.RelationGetIndexList(repsetRel));
-        uint pkindex = repsetRel->rd_pkindex;
+        RelationData* pkindex = repsetRel->rd_pkindex == 0 ? null : NativeMethods.index_open(repsetRel->rd_pkindex, AccessShareLock);
+        if (pkindex is not null && !InCurrentFile(pkindex))
+        {
+            NativeMethods.index_close(pkindex, AccessShareLock);
+            pkindex = null;
+        }
+
         ScanKeyData* key = stackalloc ScanKeyData[2];
 
         foreach (WorfRepSet repset in subsReplicationSets)
         {
             NativeMethods.ScanKeyInit(&key[0], AnumRepsetTableSetid, BtEqualStrategyNumber, FOideq, repset.Id);
             NativeMethods.ScanKeyInit(&key[1], AnumRepsetTableReloid, BtEqualStrategyNumber, FOideq, reloid);
-            SysScanDescData* scan = NativeMethods.systable_beginscan(repsetRel, pkindex, true, null, 2, key);
+            SysScanDescData* scan = NativeMethods.systable_beginscan(repsetRel, pkindex is null ? 0 : pkindex->rd_id, pkindex is not null, null, 2, key);
 
             HeapTupleData* tuple;
             while ((tuple = NativeMethods.systable_getnext(scan)) is not null)
@@ -900,27 +939,32 @@ internal static partial class ReplicationSet
                     entry.ReplicateDelete = true;
                 }
 
-                // Update replicated column map.
-                ulong d = NativeMethods.heap_getattr(tuple, AnumRepsetTableAttList, repsetRelDesc, &isnull);
+                // Update replicated column map, from the parts that hold it, as the row's own value may be out of line.
+                _ = NativeMethods.heap_getattr(tuple, AnumRepsetTableAttList, repsetRelDesc, &isnull);
                 if (!isnull)
                 {
-                    string?[] attList = PgDatum.DangerousCreate((nuint)d, (uint)PgBuiltInOid.TextArrayOid, PgMemoryContext.Current).Read<string?[]>();
+                    byte[] attList = ReadParts(repset.Id, reloid, AnumRepsetTableAttList);
                     entry.AttList ??= [];
-                    foreach (string? attname in attList)
+                    for (int start = 0, end; start < attList.Length; start = end + 1)
                     {
-                        entry.AttList.Add(GetAttNumByName(tableDesc, attname!));
+                        end = Array.IndexOf(attList, (byte)0, start);
+                        entry.AttList.Add(GetAttNumByName(tableDesc, Worf.FromServer(attList.AsSpan(start, end - start))));
                     }
                 }
 
                 // Add row filter if any.
-                d = NativeMethods.heap_getattr(tuple, AnumRepsetTableRowFilter, repsetRelDesc, &isnull);
+                _ = NativeMethods.heap_getattr(tuple, AnumRepsetTableRowFilter, repsetRelDesc, &isnull);
                 if (!isnull)
                 {
+                    byte[] rowFilter = [.. ReadParts(repset.Id, reloid, AnumRepsetTableRowFilter), 0];
                     MemoryContextData* olctx = NativeGlobals.CurrentMemoryContext;
                     NativeGlobals.CurrentMemoryContext = NativeGlobals.CacheMemoryContext;
                     try
                     {
-                        entry.RowFilter.Add((nint)NativeMethods.stringToNode(NativeMethods.text_to_cstring((varlena*)d)));
+                        fixed (byte* text = rowFilter)
+                        {
+                            entry.RowFilter.Add((nint)NativeMethods.stringToNode((sbyte*)text));
+                        }
                     }
                     finally
                     {
@@ -932,10 +976,173 @@ internal static partial class ReplicationSet
             NativeMethods.systable_endscan(scan);
         }
 
+        if (pkindex is not null)
+        {
+            NativeMethods.index_close(pkindex, AccessShareLock);
+        }
+
         NativeMethods.table_close(repsetRel, (int)PgLockMode.RowExclusive);
         entry.IsValid = true;
 
         return entry;
+    }
+
+    /// <summary>
+    /// Writes a table's column list or row filter in the parts that decoding reads, each small enough to stay in its
+    /// row.
+    /// </summary>
+    private static void WriteParts(uint setid, uint reloid, short attnum, byte[] value)
+        => Elevated.Run(() => _ = Worf.Execute($$"""
+            INSERT INTO worf.replication_set_table_part
+                SELECT $1, $2, $3, n, pg_catalog.substring($4, (n - 1) * {{PartSize}} + 1, {{PartSize}})
+                FROM pg_catalog.generate_series(1, (pg_catalog.length($4) + {{PartSize - 1}}) / {{PartSize}}) n
+            """, SpiParameter.Create(setid), SpiParameter.Create(reloid), SpiParameter.Create(attnum), SpiParameter.Create(value)));
+
+    /// <summary>
+    /// Deletes the parts of a table's column list and row filter in a replication set.
+    /// </summary>
+    private static void DeleteParts(uint setid, uint reloid)
+        => Elevated.Run(() => _ = Worf.Execute("DELETE FROM worf.replication_set_table_part WHERE set_id = $1 AND set_reloid = $2",
+            SpiParameter.Create(setid), SpiParameter.Create(reloid)));
+
+    /// <summary>
+    /// Reads a table's column list or row filter in a replication set from its parts, which, unlike the value in the
+    /// catalog's row, decoding can read once the catalog is rebuilt. The parts' key is used only while it's in its
+    /// current file.
+    /// </summary>
+    private static unsafe byte[] ReadParts(uint setid, uint reloid, short attnum)
+    {
+        RelationData* rel = Worf.OpenCatalog(CatalogRepsetTablePart, AccessShareLock);
+        NativeMethods.list_free(NativeMethods.RelationGetIndexList(rel));
+        RelationData* pkindex = rel->rd_pkindex == 0 ? null : NativeMethods.index_open(rel->rd_pkindex, AccessShareLock);
+        if (pkindex is not null && !InCurrentFile(pkindex))
+        {
+            NativeMethods.index_close(pkindex, AccessShareLock);
+            pkindex = null;
+        }
+
+        ScanKeyData* key = stackalloc ScanKeyData[3];
+        NativeMethods.ScanKeyInit(&key[0], AnumRepsetTablePartSetid, BtEqualStrategyNumber, FOideq, setid);
+        NativeMethods.ScanKeyInit(&key[1], AnumRepsetTablePartReloid, BtEqualStrategyNumber, FOideq, reloid);
+        NativeMethods.ScanKeyInit(&key[2], AnumRepsetTablePartAttnum, BtEqualStrategyNumber, FInt2eq, (ulong)attnum);
+        SysScanDescData* scan = NativeMethods.systable_beginscan(rel, pkindex is null ? 0 : pkindex->rd_id, pkindex is not null, null, 3, key);
+        SortedList<int, byte[]> parts = [];
+        HeapTupleData* tuple;
+        while ((tuple = NativeMethods.systable_getnext(scan)) is not null)
+        {
+            bool isnull;
+            int partNo = (int)NativeMethods.heap_getattr(tuple, AnumRepsetTablePartNo, rel->rd_att, &isnull);
+            ulong data = NativeMethods.heap_getattr(tuple, AnumRepsetTablePartData, rel->rd_att, &isnull);
+            parts.Add(partNo, PgDatum.DangerousCreate((nuint)data, (uint)PgBuiltInOid.ByteaOid, PgMemoryContext.Current).Read<byte[]>());
+        }
+
+        NativeMethods.systable_endscan(scan);
+        if (pkindex is not null)
+        {
+            NativeMethods.index_close(pkindex, AccessShareLock);
+        }
+
+        NativeMethods.table_close(rel, AccessShareLock);
+        return [.. parts.Values.SelectMany(part => part)];
+    }
+
+    /// <summary>
+    /// Checks whether an index of one of worf's catalogs is read in its current file. Decoding reads with a historic
+    /// snapshot, under which PostgreSQL finds the current file of a catalog, and of a table declared one, but not of an
+    /// index of such a table, which it reads in the file that it had then. Once REINDEX, VACUUM FULL or CLUSTER has
+    /// built the index again in a new file, the old one is truncated, and gone after the next checkpoint.
+    /// </summary>
+    /// <param name="index">The index, open.</param>
+    /// <returns>Whether it is.</returns>
+    private static unsafe bool InCurrentFile(RelationData* index)
+    {
+        if (!NativeMethods.HistoricSnapshotActive())
+        {
+            return true;
+        }
+
+        // pg_class as it is now, as PostgreSQL reads it for a catalog's file.
+        RelationData* pgClass = NativeMethods.table_open(PgClassRelationId, AccessShareLock);
+        SnapshotData* snapshot = NativeMethods.RegisterSnapshot(NativeMethods.GetNonHistoricCatalogSnapshot(PgClassRelationId));
+        ScanKeyData key;
+        NativeMethods.ScanKeyInit(&key, AnumPgClassOid, BtEqualStrategyNumber, FOideq, index->rd_id);
+        SysScanDescData* scan = NativeMethods.systable_beginscan(pgClass, PgClassOidIndexId, true, snapshot, 1, &key);
+        HeapTupleData* tuple = NativeMethods.systable_getnext(scan);
+        bool current = tuple is not null && ((FormData_pg_class*)NativeMethods.GETSTRUCT(tuple))->relfilenode == index->rd_rel->relfilenode;
+        NativeMethods.systable_endscan(scan);
+        NativeMethods.UnregisterSnapshot(snapshot);
+        NativeMethods.table_close(pgClass, AccessShareLock);
+        return current;
+    }
+
+    /// <summary>
+    /// Reads what each of the output plugin's replication sets replicates, as the catalog snapshot sees it. While a
+    /// change is decoded, that's the historic snapshot, so the actions are the ones the set had when the change was
+    /// made.
+    /// </summary>
+    /// <param name="replicationSets">The connection's sets, whose actions are updated.</param>
+    /// <returns>Whether any set's actions changed.</returns>
+    internal static unsafe bool ReadReplicationSetActions(List<WorfRepSet> replicationSets)
+    {
+        // The catalog's key is used only while it's in its current file, as for a table's sets.
+        RelationData* rel = Worf.OpenCatalog(CatalogRepset, (int)PgLockMode.AccessShare);
+        NativeMethods.list_free(NativeMethods.RelationGetIndexList(rel));
+        RelationData* pkindex = rel->rd_pkindex == 0 ? null : NativeMethods.index_open(rel->rd_pkindex, AccessShareLock);
+        if (pkindex is not null && !InCurrentFile(pkindex))
+        {
+            NativeMethods.index_close(pkindex, AccessShareLock);
+            pkindex = null;
+        }
+
+        ScanKeyData key;
+        bool changed = false;
+
+        foreach (WorfRepSet repset in replicationSets)
+        {
+            NativeMethods.ScanKeyInit(&key, AnumRepsetId, BtEqualStrategyNumber, FOideq, repset.Id);
+            SysScanDescData* scan = NativeMethods.systable_beginscan(rel, pkindex is null ? 0 : pkindex->rd_id, pkindex is not null, null, 1, &key);
+            HeapTupleData* tuple = NativeMethods.systable_getnext(scan);
+
+            // A set created after the change replicated nothing when it was made.
+            WorfRepSet actions = tuple is null ? new WorfRepSet() : ReplicationSetFromTuple(tuple, rel->rd_att);
+            NativeMethods.systable_endscan(scan);
+
+            if (actions.ReplicateInsert != repset.ReplicateInsert || actions.ReplicateUpdate != repset.ReplicateUpdate ||
+                actions.ReplicateDelete != repset.ReplicateDelete || actions.ReplicateTruncate != repset.ReplicateTruncate)
+            {
+                repset.ReplicateInsert = actions.ReplicateInsert;
+                repset.ReplicateUpdate = actions.ReplicateUpdate;
+                repset.ReplicateDelete = actions.ReplicateDelete;
+                repset.ReplicateTruncate = actions.ReplicateTruncate;
+                changed = true;
+            }
+        }
+
+        if (pkindex is not null)
+        {
+            NativeMethods.index_close(pkindex, AccessShareLock);
+        }
+
+        NativeMethods.table_close(rel, (int)PgLockMode.AccessShare);
+
+        return changed;
+    }
+
+    /// <summary>
+    /// Makes the output plugin build every table's replication info again, as when one of its replication sets changes
+    /// what it replicates.
+    /// </summary>
+    internal static void InvalidateTableReplicationInfo()
+    {
+        if (s_repSetTableHash is null)
+        {
+            return;
+        }
+
+        foreach (WorfTableRepInfo entry in s_repSetTableHash.Values)
+        {
+            entry.IsValid = false;
+        }
     }
 
     /// <summary>
@@ -994,6 +1201,7 @@ internal static partial class ReplicationSet
     private const string CatalogRepset = "replication_set";
     private const string CatalogRepsetSeq = "replication_set_seq";
     private const string CatalogRepsetTable = "replication_set_table";
+    private const string CatalogRepsetTablePart = "replication_set_table_part";
 
     private const short AnumRepsetId = 1;
     private const short AnumRepsetNodeid = 2;
@@ -1003,7 +1211,13 @@ internal static partial class ReplicationSet
     private const short AnumRepsetSeqSeqoid = 2;
 
     private const int NoLock = 0;
+    private const int AccessShareLock = 1;
     private const int RowExclusiveLock = 3;
+
+    // pg_class, its oid column and the index on it, from catalog/pg_class_d.h.
+    private const uint PgClassRelationId = 1259;
+    private const short AnumPgClassOid = 1;
+    private const uint PgClassOidIndexId = 2662;
     private const uint FNameeq = 62;
 
     // Columns of worf.replication_set_table, and the scan key for its relation.
@@ -1012,6 +1226,15 @@ internal static partial class ReplicationSet
     private const short AnumRepsetTableAttList = 3;
     private const short AnumRepsetTableRowFilter = 4;
     private const int NattsRepsetTable = 4;
+
+    // Columns of worf.replication_set_table_part, and how many bytes each part holds at most.
+    private const short AnumRepsetTablePartSetid = 1;
+    private const short AnumRepsetTablePartReloid = 2;
+    private const short AnumRepsetTablePartAttnum = 3;
+    private const short AnumRepsetTablePartNo = 4;
+    private const short AnumRepsetTablePartData = 5;
+    private const int PartSize = 1800;
+    private const uint FInt2eq = 63;
     private const ushort BtEqualStrategyNumber = 3;
     private const uint FOideq = 184;
 
@@ -1039,10 +1262,7 @@ internal static partial class ReplicationSet
 
         if (reloid == 0)
         {
-            foreach (WorfTableRepInfo entry in s_repSetTableHash.Values)
-            {
-                entry.IsValid = false;
-            }
+            InvalidateTableReplicationInfo();
         }
         else if (s_repSetTableHash.TryGetValue(reloid, out WorfTableRepInfo? entry))
         {

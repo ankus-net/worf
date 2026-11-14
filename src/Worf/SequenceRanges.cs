@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using Ankus.Postgres;
 
 [assembly: PgSql("sequence-range-tables", """
@@ -14,6 +15,7 @@ using Ankus.Postgres;
         request_size bigint NOT NULL,
         high_water bigint,
         watermark bigint,
+        heard_watermark bigint,
         participants name[],
         pool_start bigint,
         root_start bigint,
@@ -39,8 +41,13 @@ using Ankus.Postgres;
         timeline bigint NOT NULL,
         received_at timestamptz NOT NULL,
         activated_at timestamptz,
-        retired_at timestamptz
+        retired_at timestamptz,
+        reserved boolean NOT NULL DEFAULT false,
+        not_before bigint
     );
+
+    CREATE INDEX sequence_range_block_seqoid ON worf.sequence_range_block (seqoid, epoch);
+    CREATE INDEX sequence_range_block_span ON worf.sequence_range_block USING gist ((numrange(seqoid::oid::int8 * 18446744073709551616::numeric + lo + 9223372036854775808, seqoid::oid::int8 * 18446744073709551616::numeric + hi + 9223372036854775808, '[]')));
 
     CREATE TABLE worf.sequence_range_restore (
         name text PRIMARY KEY,
@@ -56,6 +63,7 @@ using Ankus.Postgres;
         block_id uuid NOT NULL REFERENCES worf.sequence_range_block,
         lo bigint NOT NULL,
         hi bigint NOT NULL,
+        not_before bigint,
         PRIMARY KEY (block_id, lo)
     );
 
@@ -70,8 +78,14 @@ using Ankus.Postgres;
         lo bigint NOT NULL,
         hi bigint NOT NULL,
         state text NOT NULL,
-        granted_at timestamptz NOT NULL
+        granted_at timestamptz NOT NULL,
+        abandoned_at timestamptz,
+        not_before bigint
     );
+
+    CREATE INDEX sequence_range_grant_seqoid ON worf.sequence_range_grant (seqoid, grantee_id);
+    CREATE INDEX sequence_range_grant_span ON worf.sequence_range_grant USING gist ((numrange(seqoid::oid::int8 * 18446744073709551616::numeric + lo + 9223372036854775808, seqoid::oid::int8 * 18446744073709551616::numeric + hi + 9223372036854775808, '[]')));
+    CREATE INDEX sequence_range_grant_from_block ON worf.sequence_range_grant (from_block);
 
     CREATE TABLE worf.sequence_range_request (
         request_id uuid PRIMARY KEY,
@@ -82,8 +96,11 @@ using Ankus.Postgres;
         lo bigint,
         hi bigint,
         state text NOT NULL DEFAULT 'open',
-        created_at timestamptz NOT NULL
+        created_at timestamptz NOT NULL,
+        reserved boolean NOT NULL DEFAULT false
     );
+
+    CREATE INDEX sequence_range_request_seqoid ON worf.sequence_range_request (seqoid, parent_node);
 
     CREATE TABLE worf.sequence_range_node (
         seqoid regclass NOT NULL,
@@ -93,16 +110,86 @@ using Ankus.Postgres;
         sysid numeric(20,0),
         timeline bigint,
         wal_lsn pg_lsn,
+        reply_lsn pg_lsn,
         epoch integer,
         state text,
         distance integer,
+        route bigint[],
         high_water bigint,
         watermark bigint,
         reset_lsn pg_lsn,
         reset_done pg_lsn,
+        reset_at timestamptz,
         held_at timestamptz,
+        holds bigint[],
+        clock bigint,
         reported_at timestamptz NOT NULL,
+        checked_start bigint,
+        confirmed_start bigint,
+        reported_start bigint,
+        drawn bigint,
         PRIMARY KEY (seqoid, node_id)
+    );
+
+    CREATE TABLE worf.sequence_range_link (
+        slot_name name PRIMARY KEY,
+        node_id oid NOT NULL,
+        role_id oid NOT NULL
+    );
+
+    CREATE TABLE worf.sequence_range_back (
+        seqoid regclass NOT NULL,
+        node_id oid NOT NULL,
+        call boolean NOT NULL,
+        sysid numeric(20,0) NOT NULL,
+        timeline bigint NOT NULL,
+        lsn pg_lsn NOT NULL,
+        started bigint NOT NULL,
+        PRIMARY KEY (seqoid, node_id, call, started)
+    );
+
+    CREATE TABLE worf.sequence_range_absent (
+        seqoid regclass NOT NULL,
+        node_id oid NOT NULL,
+        absent_at timestamptz NOT NULL,
+        PRIMARY KEY (seqoid, node_id)
+    );
+
+    CREATE TABLE worf.sequence_range_fence_wait (
+        seqoid regclass NOT NULL,
+        node_id oid NOT NULL,
+        PRIMARY KEY (seqoid, node_id)
+    );
+
+    CREATE TABLE worf.sequence_range_role (
+        role_id oid PRIMARY KEY,
+        node_id oid NOT NULL
+    );
+
+    CREATE TABLE worf.sequence_range_dropped (
+        name text PRIMARY KEY,
+        owner_node oid NOT NULL,
+        epoch integer NOT NULL,
+        range_size bigint NOT NULL,
+        max_range_size bigint NOT NULL,
+        watermark bigint,
+        root_start bigint,
+        root_end bigint NOT NULL,
+        owned boolean NOT NULL DEFAULT true
+    );
+
+    CREATE TABLE worf.sequence_range_dropped_node (
+        name text NOT NULL,
+        node_id oid NOT NULL,
+        sysid numeric(20,0) NOT NULL,
+        timeline bigint NOT NULL,
+        wal_lsn pg_lsn,
+        reply_lsn pg_lsn,
+        reported_start bigint,
+        checked_start bigint,
+        drawn bigint,
+        reset_lsn pg_lsn,
+        PRIMARY KEY (name, node_id)
     );
 
     CREATE VIEW worf.sequence_ranges AS
@@ -111,12 +198,15 @@ using Ankus.Postgres;
             a.lo AS active_lo, a.hi AS active_hi,
             CASE
                 WHEN a.block_id IS NULL THEN NULL
+                WHEN (s.seqincrement > 0 AND l.last_value > a.hi) OR (s.seqincrement < 0 AND l.last_value < a.lo) THEN 0
                 WHEN s.seqincrement > 0 THEN
                     (a.hi - CASE WHEN l.last_value BETWEEN a.lo AND a.hi THEN l.last_value ELSE a.lo::numeric - s.seqincrement END) / s.seqincrement
                 ELSE (CASE WHEN l.last_value BETWEEN a.lo AND a.hi THEN l.last_value ELSE a.hi::numeric - s.seqincrement END - a.lo) / -s.seqincrement
             END::bigint AS values_left,
             n.lo AS next_lo, n.hi AS next_hi, r.peak_rate AS insert_rate, r.switched_at AS last_switch,
-            r.exchanged_at AS last_exchange, r.detail
+            r.exchanged_at AS last_exchange,
+            coalesce((SELECT pg_catalog.format('prepared transaction %L holds the range row, so the sequence exchanges no blocks until it ends', x.gid)
+                FROM pg_catalog.pg_prepared_xacts x WHERE x.transaction = r.xmax), r.detail) AS detail
         FROM worf.sequence_range r
             JOIN pg_catalog.pg_sequence s ON s.seqrelid = r.seqoid
             LEFT JOIN worf.node o ON o.node_id = r.owner_node
@@ -125,10 +215,14 @@ using Ankus.Postgres;
             LEFT JOIN worf.sequence_range_node rp ON rp.seqoid = r.seqoid AND rp.node_id = r.parent_node
             LEFT JOIN worf.sequence_range_block a
                 ON a.seqoid = r.seqoid AND a.epoch = r.epoch AND a.kind = 'n' AND a.state = 'active'
-            LEFT JOIN worf.sequence_range_block n
-                ON n.seqoid = r.seqoid AND n.epoch = r.epoch AND n.kind = 'n' AND n.state = 'next'
+            -- The next block is the one the sequence switches to next: one reserved for a load, or else the first received.
+            LEFT JOIN LATERAL (
+                SELECT b.lo, b.hi FROM worf.sequence_range_block b
+                WHERE b.seqoid = r.seqoid AND b.epoch = r.epoch AND b.kind = 'n' AND b.state = 'next'
+                ORDER BY b.reserved DESC, b.received_at
+                LIMIT 1) n ON true
             -- A sequence that hasn't switched to its active block yet, as while it resets, has all of the block left.
-            CROSS JOIN LATERAL (SELECT pg_catalog.pg_sequence_last_value(r.seqoid)::numeric AS last_value) l;
+            CROSS JOIN LATERAL (SELECT worf.sequence_range_position(r.seqoid)::numeric AS last_value) l;
 
     CREATE VIEW worf.sequence_range_grants AS
         SELECT g.seqoid AS sequence, g.grantee_name AS grantee, g.kind, g.lo, g.hi, g.state, g.granted_at
@@ -144,19 +238,103 @@ namespace Worf;
 internal static unsafe partial class SequenceRanges
 {
     /// <summary>
-    /// The name of the trigger that checks values written by hand.
+    /// The name of the trigger that checks the values new rows hold.
     /// </summary>
     internal const string GuardName = "worf_sequence_range_guard";
 
-    private const string CheckViolation = "23514";
+    /// <summary>
+    /// The name of the trigger that checks the values updates write.
+    /// </summary>
+    internal const string UpdateGuardName = "worf_sequence_range_guard_update";
+
+    /// <summary>
+    /// The name of a partition's own trigger that checks the values new rows hold in the columns its tree's root doesn't
+    /// number from a managed sequence.
+    /// </summary>
+    internal const string PartitionGuardName = "worf_sequence_range_partition_guard";
+
+    /// <summary>
+    /// The name of a partition's own trigger that checks the values updates write in those columns.
+    /// </summary>
+    internal const string PartitionUpdateGuardName = "worf_sequence_range_partition_guard_update";
+
     private const string SequenceLimitExceeded = "2200H";
+    private const string FeatureNotSupported = "0A000";
+
+    // Types whose values the guard reads: smallint, integer, bigint and numeric.
+    private const uint Int2Oid = 21;
+    private const uint Int4Oid = 23;
+    private const uint Int8Oid = 20;
+    private const uint NumericOid = 1700;
+
+    // nextval(regclass) and regclass(text) from utils/fmgroids.h, regclass and text.
+    private const uint NextvalOid = 1574;
+    private const uint TextRegclassOid = 1079;
+    private const uint RegclassOid = 2205;
+
+    // FirstNormalObjectId from access/transam.h, below which PostgreSQL's own objects lie, and NAMEDATALEN.
+    private const uint FirstNormalObjectId = 16384;
+    private const int NameDataLength = 64;
+
+    // TriggerRelationId from catalog/pg_trigger_d.h, and PERFORM_DELETION_INTERNAL from catalog/dependency.h.
+    private const uint TriggerRelationId = 2620;
+    private const int PerformDeletionInternal = 0x0001;
+
+    // TRIGGER_TYPE_ROW, TRIGGER_TYPE_BEFORE, TRIGGER_TYPE_INSERT and TRIGGER_TYPE_UPDATE from catalog/pg_trigger.h.
+    private const int BeforeUpdateRow = 1 | 2 | 16;
+    private const int BeforeInsertRow = 1 | 2 | 4;
+
+    private static readonly string[] s_guardNames = [GuardName, UpdateGuardName, PartitionGuardName, PartitionUpdateGuardName];
+
+    // The names a trigger's condition gives the row before and after it is written, in the order PostgreSQL adds them.
+    private static readonly string[] s_triggerAliases = ["old", "new"];
 
     private static bool s_changedOnCommit;
+
+    // The columns whose type the running ALTER TABLE changes, by table and name, with the managed sequences that checked
+    // them when the change keeps their values, as from one integer type to another without USING.
+    private static readonly Dictionary<(uint Relid, string Column), List<uint>?> s_retyped = [];
+
+    // The furthest position each sequence's active block has reached, which the range worker tracks to notice its
+    // last value moving backwards.
+    private static readonly Dictionary<uint, (Guid Block, long Position)> s_positions = [];
+
+    // The last search of each fenced sequence's ledger for grants that overlap: the grants it searched, by id and row
+    // version, the note of two that overlap, if it found any, and the changes to the sequence's ranges counted before it.
+    private static readonly Dictionary<uint, (HashSet<string> Grants, string? Overlap, (long All, long Sequence) Touched)> s_ledgerSearches = [];
+
+    // When the range worker last read each sequence's tables for the furthest value they hold in its active block, where
+    // the sequence was then, and the xmax and transactions in progress of a snapshot taken just before: it reads them
+    // again once the sequence has moved, or a transaction whose rows the read couldn't see has ended since, one then in
+    // progress or one that started after, at most once a second, so that a check stays quick while sessions draw from
+    // the block.
+    private static readonly Dictionary<uint, (Guid Block, long Position, long At, uint Xmax, uint[] InProgress)> s_readStored = [];
+
+    // The active block each sequence was noticed moving backwards in, until it leaves the block, so that a switch that
+    // can't be made while transactions hold the sequence, as the one that moved it may, is made once they let it go.
+    private static readonly Dictionary<uint, Guid> s_movedBack = [];
+
+    // An allocator gives a Snowflake node number that a node gave up back for use once a day has passed, so the old
+    // holder's IDs, which carry their times, can't meet the new holder's.
+    private static readonly TimeSpan s_snowflakeReuseAfter = TimeSpan.FromDays(1);
 
     // When a block that lasted less than an hour is followed by a bigger request, and one that lasted more than a day by
     // a smaller one.
     private static readonly TimeSpan s_growBelow = TimeSpan.FromHours(1);
     private static readonly TimeSpan s_shrinkAbove = TimeSpan.FromDays(1);
+
+    // The sequences whose switch the range worker's checks left to a switch worker, and those whose switch worker
+    // couldn't start, as every worker slot was taken, which the range worker waits for itself, briefly.
+    private static readonly Dictionary<uint, string> s_handOffs = [];
+    private static readonly HashSet<uint> s_unstarted = [];
+
+    // The subtransactions, by ID, in which this transaction switched a sequence itself, or ran a function that holds a
+    // sequence's range row until it ends, which it then can't prepare, with what it did, or whose switches are logged as
+    // it commits, so that a switch or function that rolled back to a savepoint is neither; whether their callbacks are
+    // registered; and where a switch beside the transactions that hold a sequence moves it as its transaction ends.
+    private static readonly List<(uint Subxact, string? Logged, (string Did, string Hint)? Refused)> s_switchedIn = [];
+    private static bool s_switchedInRegistered;
+    private static (uint Seqoid, long Start)? s_pendingMove;
 
     /// <summary>
     /// Gets how often the range worker checks each managed sequence.
@@ -173,6 +351,15 @@ internal static unsafe partial class SequenceRanges
     internal static partial int ExchangeTimeout { get; }
 
     /// <summary>
+    /// Gets whether this session restores rows, as other nodes wrote them or as they were before range management, so
+    /// that the guard passes any value that no managed sequence may still issue as far as this node knows. Only a
+    /// superuser, or a role granted SET on it, can claim that.
+    /// </summary>
+    [PgGucBool("worf.sequence_range_restore", false, "Lets this session write rows with values no node may still issue, as a restore of other nodes' rows needs.",
+        Context = PgGucContext.SuperuserSet)]
+    internal static partial bool Restore { get; }
+
+    /// <summary>
     /// Gets how often each node exchanges with its neighbors when nothing is waiting.
     /// </summary>
     [PgGucInt("worf.sequence_range_exchange_interval", 60000, "Sets how often each node exchanges sequence ranges with its neighbors.",
@@ -180,14 +367,15 @@ internal static unsafe partial class SequenceRanges
     internal static partial int ExchangeInterval { get; }
 
     /// <summary>
-    /// Gets or sets whether worf itself runs the DDL that managed sequences otherwise reject.
-    /// </summary>
-    internal static bool InternalDdl { get; set; }
-
-    /// <summary>
     /// Gets the counter that tells backends to reload the blocks they cache for the guard.
     /// </summary>
     internal static PgAtomic<long> Version { get; } = new("worf_sequence_range_version");
+
+    /// <summary>
+    /// Gets the counter that tells this backend to reload the blocks it caches for the guard, as when its own transaction
+    /// changed them, or rolled back such a change, and no other backend may see either.
+    /// </summary>
+    internal static long LocalVersion { get; private set; }
 
     /// <summary>
     /// Gets the counter that tells the range worker to exchange with every neighbor now, as when a backend that
@@ -196,12 +384,26 @@ internal static unsafe partial class SequenceRanges
     internal static PgAtomic<long> ExchangeRequested { get; } = new("worf_sequence_range_exchange");
 
     /// <summary>
+    /// Gets the counter that sessions move as they wake the range worker, so that one that wakes it while it waits, as on
+    /// a lock, which resets its latch, still has it check again at once.
+    /// </summary>
+    internal static PgAtomic<long> CheckRequested { get; } = new("worf_sequence_range_check");
+
+    /// <summary>
+    /// Gets the number of switches beside the transactions that hold their sequences that wait for, or hold, their
+    /// sequences' switch gates, so that a statement that holds a gate lets it go at its next row.
+    /// </summary>
+    internal static PgAtomic<long> SwitchesPending { get; } = new("worf_sequence_range_switches_pending");
+
+    /// <summary>
     /// Sets up the shared memory.
     /// </summary>
     internal static void ShmemInit()
     {
         PgSharedMemory.Initialize(Version, static () => 0L);
         PgSharedMemory.Initialize(ExchangeRequested, static () => 0L);
+        PgSharedMemory.Initialize(CheckRequested, static () => 0L);
+        PgSharedMemory.Initialize(SwitchesPending, static () => 0L);
     }
 
     /// <summary>
@@ -216,13 +418,33 @@ internal static unsafe partial class SequenceRanges
     internal static void EnableSequenceRange([PgSqlType("regclass", Schema = "pg_catalog")] PgDatum? sequence,
         string?[]? participants, long? rangeSize, long? maxRangeSize, long? poolStart, bool? force)
     {
-        // A sequence's bounds need two values at least.
+        uint seqoid = RequireOwnedSequence(sequence);
+        CheckSizes(seqoid, rangeSize, maxRangeSize);
+        HoldsRangeRow("worf.enable_sequence_range");
+        Elevated.Run(() => Enable(seqoid, participants, rangeSize, maxRangeSize, poolStart, force == true));
+    }
+
+    /// <summary>
+    /// Checks block sizes a caller asks for. A sequence's bounds need two values at least, and a block of a single value
+    /// is a Snowflake node number, which is never used up, so a node with one never asks for another.
+    /// </summary>
+    private static void CheckSizes(uint seqoid, long? rangeSize, long? maxRangeSize)
+    {
+        if (seqoid == SnowflakeIds.NodeSequence())
+        {
+            throw new PgException(PgSqlStates.InvalidParameterValue, "worf.snowflake_node hands out single node numbers",
+                hint: "Use worf.enable_snowflake.");
+        }
+
         if (rangeSize is < 2)
         {
             throw new PgException(PgSqlStates.InvalidParameterValue, "range_size must be at least 2");
         }
 
-        Enable(RequireSequence(sequence), participants, rangeSize, maxRangeSize, poolStart, force == true);
+        if (maxRangeSize is < 2)
+        {
+            throw new PgException(PgSqlStates.InvalidParameterValue, "max_range_size must be at least 2");
+        }
     }
 
     /// <summary>
@@ -272,13 +494,26 @@ internal static unsafe partial class SequenceRanges
 
         // Moving the owner starts the next epoch. Two live roots could overlap, so it waits until no neighbor has
         // reported the old owner's epoch as live within the last minute, unless forced because the old owner is gone.
-        SpiResult existing = Worf.SelectCatalog(
+        WorfRows existing = Worf.SelectCatalog(
             "SELECT epoch, state, owner_node, watermark, root_start, root_end FROM worf.sequence_range WHERE seqoid = $1",
             SpiParameter.Create(seqoid));
         int epoch = 1;
         long? watermark = null;
         long? rootStart = info.Ascending ? info.Min : info.Max;
         long end = RootEnd(info);
+        // A sequence of the name this node owned and dropped starts the next epoch, above the dropped one's grants.
+        if (existing.Count == 0 &&
+            Worf.SelectCatalog("SELECT epoch, watermark, root_start, root_end FROM worf.sequence_range_dropped WHERE name = $1 AND owned", SpiParameter.Create(info.Name))
+            is { Count: > 0 } dropped)
+        {
+            epoch = dropped[0].Get<int>(0) + 1;
+            watermark = dropped[0].Get<long?>(1);
+            rootStart = dropped[0].Get<long?>(2);
+            end = dropped[0].Get<long>(3);
+            _ = Worf.Execute("DELETE FROM worf.sequence_range_dropped WHERE name = $1", SpiParameter.Create(info.Name));
+            _ = Worf.Execute("DELETE FROM worf.sequence_range_dropped_node WHERE name = $1", SpiParameter.Create(info.Name));
+        }
+
         if (existing.Count > 0)
         {
             int current = existing[0].Get<int>(0);
@@ -289,16 +524,18 @@ internal static unsafe partial class SequenceRanges
                     hint: "Disable it with worf.disable_sequence_range first.");
             }
 
-            if (!force && Worf.SelectCatalog("""
+            // The old owner itself starts the next epoch at once: its root, the epoch's only one, stopped when it disabled.
+            if (!force && existing[0].Get<uint>(2) != node.Node.Id && Worf.SelectCatalog("""
                 SELECT 1 FROM worf.sequence_range_node
-                WHERE seqoid = $1 AND node_id <> $2 AND epoch = $3 AND state <> 'disabled' AND reported_at > now() - interval '1 minute'
+                WHERE seqoid = $1 AND node_id <> $2 AND epoch = $3 AND state <> 'disabled'
+                    AND worf.sequence_range_heard(node_id, false, reported_at, true) > now() - interval '1 minute'
                 """, SpiParameter.Create(seqoid), SpiParameter.Create(node.Node.Id), SpiParameter.Create(current)).Count > 0)
             {
                 throw new PgException(PgSqlStates.ObjectInUse, $"sequence {info.Name} is still under range management by its owner",
                     hint: "Disable it with worf.disable_sequence_range on its owner first, or pass force := true if the owner is gone for good.");
             }
 
-            epoch = Math.Max(current, Spi.ExecuteScalar<int?>("SELECT max(epoch) FROM worf.sequence_range_node WHERE seqoid = $1",
+            epoch = Math.Max(current, Worf.ReadScalar<int?>("SELECT max(epoch) FROM worf.sequence_range_node WHERE seqoid = $1",
                 SpiParameter.Create(seqoid)) ?? 0) + 1;
             watermark = existing[0].Get<long?>(3);
 
@@ -306,10 +543,10 @@ internal static unsafe partial class SequenceRanges
             rootStart = existing[0].Get<long?>(4);
             end = existing[0].Get<long>(5);
             Disable(seqoid);
-            _ = Spi.Execute("DELETE FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(seqoid));
+            _ = Worf.Execute("DELETE FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(seqoid));
         }
 
-        _ = Spi.Execute("""
+        _ = Worf.Execute("""
             INSERT INTO worf.sequence_range (seqoid, owner_node, epoch, range_size, max_range_size, state, distance,
                 request_size, participants, pool_start, root_start, root_end, watermark)
             VALUES ($1, $2, $3, $4, $5, 'collecting', 0, $4, $6::name[], $7, $8, $9, $10)
@@ -326,30 +563,109 @@ internal static unsafe partial class SequenceRanges
             Activate(seqoid, node);
         }
 
-        ChangedOnCommit();
+        ChangedOnCommit(seqoid);
 
         // The manager starts the database's range worker.
         Worker.SubscriptionChanged(0, false);
     }
 
     /// <summary>
-    /// Starts granting a sequence's values with the nodes that have reported so far.
+    /// Starts granting a sequence's values with the nodes that have reported so far, or lifts its fence. With a node
+    /// named, the fence only stops waiting for that node, as one gone for good, and lifts once it waits for no other.
     /// </summary>
     [PgFunction(Sql = """
-        CREATE FUNCTION worf.activate_sequence_range(sequence regclass)
-        RETURNS void STRICT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
+        CREATE FUNCTION worf.activate_sequence_range(sequence regclass, node_name name DEFAULT NULL)
+        RETURNS void CALLED ON NULL INPUT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
         """)]
-    internal static void ActivateSequenceRange([PgSqlType("regclass", Schema = "pg_catalog")] PgDatum sequence)
+    internal static void ActivateSequenceRange([PgSqlType("regclass", Schema = "pg_catalog")] PgDatum? sequence,
+        [PgSqlType("name", Schema = "pg_catalog")] PgDatum? nodeName)
     {
-        uint seqoid = RequireSequence(sequence);
+        uint seqoid = RequireOwnedSequence(sequence);
+        HoldsRangeRow("worf.activate_sequence_range");
+        // A lift that resets the holders of grants that overlap writes their reports in an order of its own, in the node's
+        // turn. It first locks the node's configuration, as drop_subscription does before it takes the turn, so that it
+        // waits for configuration changes and drops before it holds the turn. In the turn it locks the range row and the
+        // reports as an exchange's take-in does, waiting only so long for each; one another transaction holds has it let
+        // the turn go, and try again a moment later.
+        if (nodeName is null || nodeName.IsNull)
+        {
+            Elevated.Run(() =>
+            {
+                _ = WorfNode.GetLocalNode(true, false);
+                while (true)
+                {
+                    try
+                    {
+                        PgTransaction.RunInSubtransaction(() => SequenceRangeExchange.WithTurn(() => _ = SequenceRangeExchange.WithLockTimeout(() =>
+                        {
+                            ActivateOrLift(seqoid);
+                            return true;
+                        })));
+                        return;
+                    }
+                    catch (PgException held) when (held.SqlState == "55P03")
+                    {
+                        Worker.WaitLatch(100);
+                        PgInterrupts.Check();
+                    }
+                }
+            });
+            return;
+        }
+
+        string name = Functions.NameArg(nodeName);
+        Elevated.Run(() => StopWaitingFor(seqoid, name));
+    }
+
+    /// <summary>
+    /// Has a sequence's fence stop waiting for a node, which counts as having reported, and lifts the fence once it
+    /// waits for no other node, on the owner or on a pool holder, whose fence waits for the nodes it granted to.
+    /// </summary>
+    private static void StopWaitingFor(uint seqoid, string name)
+    {
         WorfLocalNode node = WorfNode.GetLocalNode(true, false)!;
-        RequireOwner(seqoid, node);
+        LockLedger(seqoid);
+        SpiParameter seq = SpiParameter.Create(seqoid);
+        if (!Worf.ReadScalar<bool>("SELECT fenced_at IS NOT NULL FROM worf.sequence_range WHERE seqoid = $1", seq))
+        {
+            throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState, $"sequence {GetInfo(seqoid).Name} has no fence up");
+        }
+
+        // A node is named as the range's detail names it: by its name, or by its id when this node knows no name for it.
+        if (Worf.ReadScalar<uint?>("""
+            SELECT node_id FROM worf.node WHERE node_name = $2
+            UNION
+            SELECT node_id FROM worf.sequence_range_node WHERE seqoid = $1 AND node_name = $2
+            UNION
+            SELECT node_id FROM worf.sequence_range_fence_wait WHERE seqoid = $1 AND node_id::text = $2
+            LIMIT 1
+            """, seq, SpiParameter.Create(name)) is not uint nodeId || nodeId == node.Node.Id)
+        {
+            throw new PgException(PgSqlStates.UndefinedObject, $"sequence {GetInfo(seqoid).Name} knows no node \"{name}\"");
+        }
+
+        _ = Worf.Execute("""
+            INSERT INTO worf.sequence_range_absent VALUES ($1, $2, now()) ON CONFLICT (seqoid, node_id) DO UPDATE SET absent_at = excluded.absent_at
+            """, seq, SpiParameter.Create(nodeId));
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_fence_wait WHERE seqoid = $1 AND node_id = $2", seq, SpiParameter.Create(nodeId));
+        _ = LiftFence(seqoid, node, false);
+        ChangedOnCommit(seqoid);
+    }
+
+    /// <summary>
+    /// Lifts a sequence's fence, the owner's or a pool holder's, or else, on the owner, starts granting its values with
+    /// the nodes that have reported so far.
+    /// </summary>
+    private static void ActivateOrLift(uint seqoid)
+    {
+        WorfLocalNode node = WorfNode.GetLocalNode(true, false)!;
         if (!LiftFence(seqoid, node, true))
         {
+            RequireOwner(seqoid, node);
             Activate(seqoid, node);
         }
 
-        ChangedOnCommit();
+        ChangedOnCommit(seqoid);
     }
 
     /// <summary>
@@ -363,21 +679,17 @@ internal static unsafe partial class SequenceRanges
     internal static void AlterSequenceRange([PgSqlType("regclass", Schema = "pg_catalog")] PgDatum? sequence, long? rangeSize,
         long? maxRangeSize)
     {
-        uint seqoid = RequireSequence(sequence);
-        WorfLocalNode node = WorfNode.GetLocalNode(true, false)!;
-        RequireOwner(seqoid, node);
-        if (rangeSize is <= 0)
-        {
-            throw new PgException(PgSqlStates.InvalidParameterValue, "range_size must be positive");
-        }
-
-        _ = Spi.Execute("""
+        uint seqoid = RequireOwnedSequence(sequence);
+        CheckSizes(seqoid, rangeSize, maxRangeSize);
+        HoldsRangeRow("worf.alter_sequence_range");
+        Elevated.Run(() => RequireOwner(seqoid, WorfNode.GetLocalNode(true, false)!));
+        Elevated.Run(() => _ = Worf.Execute("""
             UPDATE worf.sequence_range
             SET range_size = coalesce($2, range_size),
                 max_range_size = greatest(coalesce($3, max_range_size), coalesce($2, range_size)),
                 request_size = least(greatest(request_size, coalesce($2, range_size)), greatest(coalesce($3, max_range_size), coalesce($2, range_size)))
             WHERE seqoid = $1
-            """, SpiParameter.Create(seqoid), SpiParameter.Create(rangeSize), SpiParameter.Create(maxRangeSize));
+            """, SpiParameter.Create(seqoid), SpiParameter.Create(rangeSize), SpiParameter.Create(maxRangeSize)));
     }
 
     /// <summary>
@@ -390,15 +702,20 @@ internal static unsafe partial class SequenceRanges
         """)]
     internal static void DisableSequenceRange([PgSqlType("regclass", Schema = "pg_catalog")] PgDatum sequence)
     {
-        uint seqoid = RequireSequence(sequence);
-        WorfLocalNode node = WorfNode.GetLocalNode(true, false)!;
-        RequireOwner(seqoid, node);
-        Disable(seqoid);
-        ChangedOnCommit();
+        uint seqoid = RequireOwnedSequence(sequence);
+        HoldsRangeRow("worf.disable_sequence_range");
+        Elevated.Run(() =>
+        {
+            RequireOwner(seqoid, WorfNode.GetLocalNode(true, false)!);
+            Disable(seqoid);
+        });
+        ChangedOnCommit(seqoid);
     }
 
     /// <summary>
-    /// Abandons this node's blocks of one or every managed sequence, quarantines them and requests new blocks.
+    /// Abandons this node's blocks of one or every managed sequence, quarantines them and requests new blocks. Its
+    /// root and pool blocks grant nothing until the nodes it granted to report what they hold. Without a sequence named,
+    /// the node keeps its Snowflake node number, whose IDs carry their times and so never repeat after a rollback.
     /// </summary>
     [PgFunction(Sql = """
         CREATE FUNCTION worf.reset_sequence_range(sequence regclass DEFAULT NULL)
@@ -406,40 +723,222 @@ internal static unsafe partial class SequenceRanges
         """)]
     internal static void ResetSequenceRange([PgSqlType("regclass", Schema = "pg_catalog")] PgDatum? sequence)
     {
-        WorfLocalNode node = WorfNode.GetLocalNode(true, false)!;
-        SpiResult managed = sequence is null || sequence.IsNull
-            ? Worf.SelectCatalog("SELECT seqoid::oid FROM worf.sequence_range")
-            : Worf.SelectCatalog("SELECT seqoid::oid FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(RequireSequence(sequence)));
+        bool all = sequence is null || sequence.IsNull;
+        uint named = all ? 0 : RequireOwnedSequence(sequence);
+        HoldsRangeRow("worf.reset_sequence_range");
+
+        // The sequences go in the order of their names, as an exchange takes their range rows, so that the two never
+        // deadlock, and each is locked against a DROP as it comes, so that one dropped meanwhile is passed over.
+        WorfRows managed = Elevated.Run(() => all
+            ? Worf.SelectCatalog("""
+                SELECT r.seqoid::oid FROM worf.sequence_range r
+                    JOIN pg_catalog.pg_class c ON c.oid = r.seqoid
+                    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                ORDER BY pg_catalog.quote_ident(n.nspname) || '.' || pg_catalog.quote_ident(c.relname) COLLATE "C"
+                """)
+            : Worf.SelectCatalog("SELECT seqoid::oid FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(named)));
+        List<uint> sequences = [];
         for (int i = 0; i < managed.Count; i++)
         {
-            Reset(managed[i].Get<uint>(0), node);
+            uint seqoid = managed[i].Get<uint>(0);
+            if (all)
+            {
+                NativeMethods.LockRelationOid(seqoid, (int)PgLockMode.AccessShare);
+                if (!SequenceExists(seqoid))
+                {
+                    continue;
+                }
+
+                _ = RequireOwnedSequence(seqoid);
+            }
+
+            sequences.Add(seqoid);
         }
 
-        ChangedOnCommit();
+        Elevated.Run(() =>
+        {
+            WorfLocalNode node = WorfNode.GetLocalNode(true, false)!;
+            foreach (uint seqoid in sequences)
+            {
+                LockLedger(seqoid);
+                Reset(seqoid, node, !all || seqoid != SnowflakeIds.NodeSequence());
+            }
+        });
+
+        // A reset of one sequence counts as a change to it alone.
+        if (all)
+        {
+            ChangedOnCommit();
+        }
+        else
+        {
+            foreach (uint seqoid in sequences)
+            {
+                ChangedOnCommit(seqoid);
+            }
+        }
     }
 
     /// <summary>
-    /// Removes a dropped sequence's range state.
+    /// Notes the drop of a sequence under range management, from the DROP itself. A sequence its owner drops ends its
+    /// epoch there: the owner keeps the epoch, which it tells its neighbors is disabled, so that they keep drawing from
+    /// their blocks and ask it for no more, takes no report of it as one to join, and starts the next epoch above it once
+    /// a sequence of the same name comes under range management again. The DROP leaves the sequence's range state, whose
+    /// rows the workers lock as they work, to the range worker, which removes it once the drop has committed, so that
+    /// the DROP never waits on the workers while they wait on it.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
-    internal static void Forget(uint seqoid)
+    internal static void NoteDropped(uint seqoid)
     {
-        if (!Spi.ExecuteScalar<bool>("SELECT to_regclass('worf.sequence_range') IS NOT NULL"))
+        if (Worf.CatalogOid("sequence_range") == 0 ||
+            !Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range WHERE seqoid = $1)", SpiParameter.Create(seqoid)))
         {
             return;
         }
 
-        SpiParameter seq = SpiParameter.Create(seqoid);
-        _ = Spi.Execute("DELETE FROM worf.sequence_range_free WHERE block_id IN (SELECT block_id FROM worf.sequence_range_block WHERE seqoid = $1)", seq);
-        _ = Spi.Execute("DELETE FROM worf.sequence_range_grant WHERE seqoid = $1", seq);
-        _ = Spi.Execute("DELETE FROM worf.sequence_range_block WHERE seqoid = $1", seq);
-        _ = Spi.Execute("DELETE FROM worf.sequence_range_request WHERE seqoid = $1", seq);
-        _ = Spi.Execute("DELETE FROM worf.sequence_range_node WHERE seqoid = $1", seq);
-        if (Spi.Execute("DELETE FROM worf.sequence_range WHERE seqoid = $1", seq) > 0)
+        _ = Worf.Execute("""
+            INSERT INTO worf.sequence_range_dropped
+            SELECT pg_catalog.quote_ident(n.nspname) || '.' || pg_catalog.quote_ident(c.relname), r.owner_node, r.epoch, r.range_size, r.max_range_size,
+                r.watermark, r.root_start, r.root_end, r.owner_node = l.node_id
+            FROM worf.sequence_range r
+                JOIN pg_catalog.pg_class c ON c.oid = r.seqoid
+                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                CROSS JOIN worf.local_node l
+            WHERE r.seqoid = $1
+            ON CONFLICT (name) DO UPDATE SET owner_node = excluded.owner_node, epoch = excluded.epoch, range_size = excluded.range_size,
+                max_range_size = excluded.max_range_size, watermark = excluded.watermark, root_start = excluded.root_start, root_end = excluded.root_end,
+                owned = excluded.owned
+            """, SpiParameter.Create(seqoid));
+
+        // The owner keeps what it last recorded of each neighbor's reports of the sequence, so that it goes on checking
+        // them against the neighbors' WAL positions, as the neighbors draw from the blocks they keep.
+        SpiParameter name = SpiParameter.Create(GetInfo(seqoid).Name);
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_dropped_node WHERE name = $1", name);
+        _ = Worf.Execute("""
+            INSERT INTO worf.sequence_range_dropped_node
+            SELECT $2, n.node_id, n.sysid, n.timeline, n.wal_lsn, n.reply_lsn, n.reported_start, n.checked_start, n.drawn, NULL
+            FROM worf.sequence_range r CROSS JOIN worf.local_node l JOIN worf.sequence_range_node n ON n.seqoid = r.seqoid
+            WHERE r.seqoid = $1 AND r.owner_node = l.node_id AND n.via_node = n.node_id AND n.node_id <> l.node_id
+                AND n.sysid IS NOT NULL AND n.timeline IS NOT NULL
+            """, SpiParameter.Create(seqoid), name);
+
+        // It keeps too the positions calls and answers that left the sequence out kept for it, as while a transaction
+        // held its range row, and those shared memory holds, which the tables record only once they move by a segment,
+        // each the latest of its direction, on the system and timeline it recorded.
+        _ = Worf.Execute("""
+            UPDATE worf.sequence_range_dropped_node d
+            SET wal_lsn = greatest(d.wal_lsn, (SELECT max(b.lsn) FROM worf.sequence_range_back b
+                    WHERE b.seqoid = $1 AND b.node_id = d.node_id AND b.call AND b.sysid = d.sysid AND b.timeline = d.timeline)),
+                reply_lsn = greatest(d.reply_lsn, (SELECT max(b.lsn) FROM worf.sequence_range_back b
+                    WHERE b.seqoid = $1 AND b.node_id = d.node_id AND NOT b.call AND b.sysid = d.sysid AND b.timeline = d.timeline))
+            WHERE d.name = $2
+            """, SpiParameter.Create(seqoid), name);
+        WorfRows kept = Worf.Read("SELECT node_id, sysid::text, timeline FROM worf.sequence_range_dropped_node WHERE name = $1", 0, name);
+        for (int i = 0; i < kept.Count; i++)
         {
-            ChangedOnCommit();
+            uint nodeId = kept[i].Get<uint>(0);
+            ulong sysid = ulong.Parse(kept[i].Get<string>(1), CultureInfo.InvariantCulture);
+            long timeline = kept[i].Get<long>(2);
+            ulong called = SequenceRangeHeard.LatestLsn(nodeId, sysid, timeline, true).Lsn;
+            ulong answered = SequenceRangeHeard.LatestLsn(nodeId, sysid, timeline, false).Lsn;
+            if (called != 0 || answered != 0)
+            {
+                _ = Worf.Execute("""
+                    UPDATE worf.sequence_range_dropped_node
+                    SET wal_lsn = greatest(wal_lsn, nullif($3, '0/0')::pg_lsn), reply_lsn = greatest(reply_lsn, nullif($4, '0/0')::pg_lsn)
+                    WHERE name = $1 AND node_id = $2
+                    """, name, SpiParameter.Create(nodeId), SpiParameter.Create(Worf.FormatLsn(called)), SpiParameter.Create(Worf.FormatLsn(answered)));
+            }
         }
+
+        ChangedOnCommit(seqoid);
     }
+
+    /// <summary>
+    /// Removes the range state of the sequences whose drop has committed, from the range worker, the range rows first,
+    /// as every change to a sequence's ranges locks them, and then the rest. A tick with none to remove only reads.
+    /// </summary>
+    /// <returns>Whether it removed any.</returns>
+    internal static bool ForgetDropped()
+    {
+        if (!Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range r WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = r.seqoid))"))
+        {
+            return false;
+        }
+
+        WorfRows gone = Worf.Query("""
+            SELECT r.seqoid::oid FROM worf.sequence_range r WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = r.seqoid)
+            ORDER BY r.seqoid FOR UPDATE
+            """, false, 0);
+        SpiParameter seqoids = SpiParameter.Create(Enumerable.Range(0, gone.Count).Select(i => (long)gone[i].Get<uint>(0)).ToArray());
+        _ = Worf.Execute("""
+            DELETE FROM worf.sequence_range_free WHERE block_id IN (SELECT block_id FROM worf.sequence_range_block WHERE seqoid::oid = ANY ($1::oid[]))
+            """, seqoids);
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_grant WHERE seqoid::oid = ANY ($1::oid[])", seqoids);
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_block WHERE seqoid::oid = ANY ($1::oid[])", seqoids);
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_request WHERE seqoid::oid = ANY ($1::oid[])", seqoids);
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_node WHERE seqoid::oid = ANY ($1::oid[])", seqoids);
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_absent WHERE seqoid::oid = ANY ($1::oid[])", seqoids);
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_back WHERE seqoid::oid = ANY ($1::oid[])", seqoids);
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_fence_wait WHERE seqoid::oid = ANY ($1::oid[])", seqoids);
+        _ = Worf.Execute("DELETE FROM worf.sequence_range WHERE seqoid::oid = ANY ($1::oid[])", seqoids);
+
+        // Their counters of changes go too, for other sequences to take.
+        for (int i = 0; i < gone.Count; i++)
+        {
+            SequenceRangeTouches.Free(gone[i].Get<uint>(0));
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Forgets a node this node no longer exchanges with, as once a subscription between them is dropped, unless one
+    /// is left: its own reports and those it relayed, which other neighbors relay again if they still hear of it, and
+    /// what it said it doesn't manage, so that no fence waits on it.
+    /// </summary>
+    /// <param name="nodeId">The node.</param>
+    internal static void ForgetNeighbor(uint nodeId)
+    {
+        if (Worf.CatalogOid("sequence_range_absent") == 0 || Worf.ReadScalar<bool>("""
+            SELECT EXISTS (SELECT 1 FROM worf.sequence_range_link WHERE node_id = $1)
+                OR EXISTS (SELECT 1 FROM worf.subscription s JOIN worf.local_node l ON l.node_id = s.sub_target WHERE s.sub_origin = $1)
+            """, SpiParameter.Create(nodeId)))
+        {
+            return;
+        }
+
+        // A fence that went up while the node was a neighbor waits for its report still, unless it has reported since.
+        _ = Worf.Execute("""
+            DELETE FROM worf.sequence_range_fence_wait w USING worf.sequence_range r
+            WHERE w.node_id = $1 AND r.seqoid = w.seqoid AND (
+                EXISTS (SELECT 1 FROM worf.sequence_range_node n
+                    WHERE n.seqoid = w.seqoid AND n.node_id = w.node_id AND n.via_node = n.node_id AND n.held_at > r.fenced_at)
+                OR EXISTS (SELECT 1 FROM worf.sequence_range_absent a WHERE a.seqoid = w.seqoid AND a.node_id = w.node_id AND a.absent_at > r.fenced_at))
+            """, SpiParameter.Create(nodeId));
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_node WHERE via_node = $1", SpiParameter.Create(nodeId));
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_absent WHERE node_id = $1", SpiParameter.Create(nodeId));
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_back WHERE node_id = $1", SpiParameter.Create(nodeId));
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_dropped_node WHERE node_id = $1", SpiParameter.Create(nodeId));
+    }
+
+    /// <summary>
+    /// Records the nodes a fence that has just gone up waits for: those this node exchanges with now. Each stays in the
+    /// fence's way until its own report, whatever happens to the link or subscriptions meanwhile, as a node restored
+    /// from a backup may have granted it blocks that only its report brings back, or until
+    /// <c>activate_sequence_range</c> lifts the fence.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    private static void RecordFenceWaits(uint seqoid) => _ = Worf.Execute("""
+        INSERT INTO worf.sequence_range_fence_wait
+        SELECT $1, w.node_id FROM (
+            SELECT node_id FROM worf.sequence_range_link
+            UNION
+            SELECT s.sub_origin FROM worf.subscription s JOIN worf.local_node l ON l.node_id = s.sub_target) w
+            CROSS JOIN worf.local_node l
+        WHERE w.node_id <> l.node_id
+        ON CONFLICT DO NOTHING
+        """, SpiParameter.Create(seqoid));
 
     /// <summary>
     /// Checks whether a sequence is under range management.
@@ -450,8 +949,23 @@ internal static unsafe partial class SequenceRanges
         => Elevated.Run(() => Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(seqoid)).Count > 0);
 
     /// <summary>
+    /// Rejects replicating the state of a sequence under range management, whose setval would put it into another
+    /// node's block.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    internal static void RejectReplicatedState(uint seqoid)
+    {
+        if (IsManaged(seqoid))
+        {
+            throw new PgException(PgSqlStates.InvalidParameterValue, "a sequence under range management can't replicate its state",
+                hint: "Range management keeps the nodes' values apart; disable it first.");
+        }
+    }
+
+    /// <summary>
     /// Checks a managed sequence: switches to its next block once the active one runs low, and gets a new next block.
-    /// The range worker calls this in a transaction for each managed sequence.
+    /// The range worker calls this in a transaction for each managed sequence. A check that has nothing to change only
+    /// reads, so that an idle node uses no transaction IDs.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
     /// <param name="node">This node.</param>
@@ -459,8 +973,49 @@ internal static unsafe partial class SequenceRanges
     /// <returns>Whether anything changed, for the guard's caches.</returns>
     internal static bool Check(uint seqoid, WorfLocalNode node, double rate)
     {
-        SpiResult rows = Worf.SelectCatalog(
-            "SELECT state, epoch, owner_node, max_range_size FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(seqoid));
+        // The sequence's position is sampled once a check, before the range row is locked.
+        (Guid Block, bool Moved)? backwards = Worf.ReadScalar<int?>("SELECT epoch FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(seqoid))
+            is int sampled && seqoid != SnowflakeIds.NodeSequence() && NodeBlock(seqoid, sampled, "active") is (Guid, long, long) block
+            ? (block.Id, MovedBackwards(seqoid, GetInfo(seqoid), block))
+            : null;
+        return CheckSequence(seqoid, node, rate, backwards, false) && CheckSequence(seqoid, node, rate, backwards, true);
+    }
+
+    /// <summary>
+    /// Gets a managed sequence a next block, or asks for one, while a transaction holds the sequence against the range
+    /// worker's check, as one that switched it itself does, so that the transaction can switch to it at its block's end.
+    /// It reads nothing of the sequence's position, which only the check's lock keeps from moving under it.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    /// <param name="node">This node.</param>
+    /// <param name="rate">The sequence's peak rate in values a second.</param>
+    /// <returns>Whether anything changed, for the guard's caches.</returns>
+    internal static bool Replenish(uint seqoid, WorfLocalNode node, double rate)
+        => CheckSequence(seqoid, node, rate, null, false, false) && CheckSequence(seqoid, node, rate, null, true, false);
+
+    /// <summary>
+    /// Finds whether a check has anything to change, or changes it.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    /// <param name="node">This node.</param>
+    /// <param name="rate">The sequence's peak rate in values a second.</param>
+    /// <param name="backwards">The active block sampled, and whether the sequence moved backwards in it.</param>
+    /// <param name="apply">Whether to change it, rather than only read.</param>
+    /// <param name="switching">Whether to switch it too, rather than only get it a next block.</param>
+    /// <returns>Whether there is anything to change, or whether anything changed.</returns>
+    private static bool CheckSequence(uint seqoid, WorfLocalNode node, double rate, (Guid Block, bool Moved)? backwards, bool apply,
+        bool switching = true)
+    {
+        // The range row is locked first, as every change to a sequence's ranges locks it, so that a check and an exchange
+        // that both change the sequence take their locks in the same order. Under the range worker's check, which holds
+        // nextval's lock, a row that a transaction holds leaves the sequence for a later tick.
+        SpiParameter seq = SpiParameter.Create(seqoid);
+        if (apply)
+        {
+            LockLedger(seqoid);
+        }
+
+        WorfRows rows = Worf.Read("SELECT state, epoch, owner_node FROM worf.sequence_range WHERE seqoid = $1", 1, seq);
         if (rows.Count == 0)
         {
             return false;
@@ -476,73 +1031,515 @@ internal static unsafe partial class SequenceRanges
         }
 
         SequenceInfo info = GetInfo(seqoid);
-        (Guid Id, long Lo, long Hi)? active = NodeBlock(seqoid, epoch, "active");
-        (Guid Id, long Lo, long Hi)? next = NodeBlock(seqoid, epoch, "next");
+        bool snowflake = seqoid == SnowflakeIds.NodeSequence();
+        (Guid Id, long Lo, long Hi)? active = snowflake ? SnowflakeNumber(seqoid, "active") : NodeBlock(seqoid, epoch, "active");
+        (Guid Id, long Lo, long Hi, bool Reserved)? next = snowflake
+            ? SnowflakeNumber(seqoid, "next") is (Guid Id, long Lo, long Hi) number ? (number.Id, number.Lo, number.Hi, false) : null
+            : NextBlock(seqoid, epoch);
         bool changed = false;
 
-        if (active is null)
+        // A Snowflake node number goes when another node holds it too, or once the owner of the numbers hasn't been heard
+        // from for half the time after which it gives the number of a node that stopped reporting to another.
+        if (snowflake && active is not null && SnowflakeNumberLost(seqoid, owner, node, active.Value.Lo) is string lost)
+        {
+            if (!apply)
+            {
+                return true;
+            }
+
+            WorfLog.Warning($"Snowflake node number {active.Value.Lo}: {lost}, so this node gives it up and asks for another");
+            GiveUpSnowflakeNumber(seqoid, info, node, epoch);
+            return true;
+        }
+
+        // The owner switches to a block it granted itself only once a neighbor has heard of it, so that a rollback of the
+        // owner can't lose it.
+        if (next is not null && !Confirmed(seqoid, info, next.Value.Id))
+        {
+            next = null;
+        }
+
+        if (switching && active is null)
         {
             if (next is not null)
             {
-                changed = Switch(seqoid, info, next.Value);
+                if (!apply)
+                {
+                    return true;
+                }
+
+                // A Snowflake node number, once switched to, is the node's for good, and it asks for no other.
+                changed = Switch(seqoid, info, (next.Value.Id, next.Value.Lo, next.Value.Hi));
+                active = changed ? (next.Value.Id, next.Value.Lo, next.Value.Hi) : null;
                 next = null;
             }
         }
-        else
+        else if (switching && active is not null && !snowflake)
         {
             long left = StepsLeft(seqoid, info, active.Value);
             long size = Steps(info, active.Value.Lo, active.Value.Hi);
             // A minute of inserts, at least a twentieth of the block, but no more than half of it, so that a block
-            // smaller than a minute's use still serves most of its values while the next ones grow.
-            long margin = Math.Min(Math.Max(size / 20, (long)(rate * 60)), size / 2);
-            if (left <= margin && next is not null)
+            // smaller than a minute's use still serves most of its values while the next ones grow. A block reserved
+            // for a load is switched to at once, and so is any once the sequence moved backwards in its block, while one
+            // that is the load's is used up, whose session switches from it at its end. A switch from a block the sequence
+            // moved backwards in is left to a switch worker as at the block's end, so that inserts wait for it rather
+            // than draw again the values that rows hold.
+            long margin = Reserved(active.Value.Id) ? 0 : Math.Min(Math.Max(size / 20, (long)(rate * 60)), size / 2);
+            bool moved = backwards is (Guid sampled, true) && sampled == active.Value.Id;
+
+            // Statements that draw from the sequence wait for the switch once fewer values are left than there are of
+            // them, since each may draw one before it checks again, so the switch is needed then, or while any waits.
+            bool crowded = Crowded(seqoid, active.Value.Id, active.Value.Lo, left);
+            if (next is not null && (left <= margin || moved || crowded || next.Value.Reserved))
             {
-                changed = Switch(seqoid, info, next.Value);
-                next = null;
+                if (!apply)
+                {
+                    return true;
+                }
+
+                if (SwitchBeforeEnd(seqoid, info, (next.Value.Id, next.Value.Lo, next.Value.Hi), next.Value.Reserved,
+                    moved || crowded || left <= Math.Min(margin, size / 20)))
+                {
+                    changed = true;
+                    next = null;
+                }
+            }
+            else if (moved)
+            {
+                if (!apply)
+                {
+                    return true;
+                }
+
+                // With no next block, the sequence stops until one arrives, rather than issue its values again.
+                Quarantine(info);
+                _ = Worf.Execute("UPDATE worf.sequence_range_block SET state = 'retired', retired_at = now() WHERE block_id = $1",
+                    SpiParameter.Create(active.Value.Id));
+                _ = Worf.Execute("UPDATE worf.sequence_range SET state = 'quarantined' WHERE seqoid = $1", SpiParameter.Create(seqoid));
+                changed = true;
             }
             else if (left <= 0 && next is null && state != "exhausted")
             {
-                _ = Spi.Execute("UPDATE worf.sequence_range SET state = 'exhausted' WHERE seqoid = $1", SpiParameter.Create(seqoid));
-                PgLog.Warning($"sequence {info.Name} has used up its block and has no next block yet");
+                if (!apply)
+                {
+                    return true;
+                }
+
+                _ = Worf.Execute("UPDATE worf.sequence_range SET state = 'exhausted' WHERE seqoid = $1", SpiParameter.Create(seqoid));
+                WorfLog.Warning($"sequence {info.Name} has used up its block and has no next block yet");
             }
         }
 
-        // The owner grants its own next block from the root. Another node requests one from its parent, committed
-        // before the exchange sends it. Blocks of a single value, such as Snowflake node numbers, are never used up,
-        // so a node that has one needs no next.
-        bool single = rows[0].Get<long>(3) == 1 && active is not null;
-        if (next is null && !single && state != "disabled" && NodeBlock(seqoid, epoch, "next") is null)
+        // The owner grants its own next block from the root, and its neighbors exchange at once to hear of the new
+        // watermark. Another node requests one from its parent, committed before the exchange sends it. A Snowflake node
+        // number is never used up, so a node that has one needs no next.
+        if (next is null && !(snowflake && active is not null) && state != "disabled" &&
+            (snowflake ? SnowflakeNumber(seqoid, "next") : NodeBlock(seqoid, epoch, "next")) is null)
         {
+            // The next block holds at least two minutes of inserts at the peak rate, up to the largest size, so that a
+            // minute's margin leaves the one after it time to arrive.
+            long forRate = (long)Math.Ceiling(Math.Min(rate * 120, long.MaxValue / 2.0));
             if (owner == node.Node.Id)
             {
-                changed |= GrantOwnBlock(seqoid, info, node, epoch);
+                if (!apply)
+                {
+                    if (CanAllocate(seqoid, info, epoch))
+                    {
+                        return true;
+                    }
+                }
+                else if (GrantOwnBlock(seqoid, info, node, epoch, forRate))
+                {
+                    changed = true;
+                    _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () => _ = PgAtomic.Add(ExchangeRequested, 1L));
+                }
             }
-            else
+            else if (Worf.ReadScalar<bool>("""
+                SELECT r.parent_node IS NOT NULL AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_request q WHERE q.seqoid = r.seqoid AND q.kind = 'n')
+                FROM worf.sequence_range r WHERE r.seqoid = $1
+                """, seq))
             {
-                _ = Spi.Execute("""
+                if (!apply)
+                {
+                    return true;
+                }
+
+                _ = Worf.Execute("""
                     INSERT INTO worf.sequence_range_request (request_id, seqoid, parent_node, kind, size, created_at)
-                    SELECT gen_random_uuid(), r.seqoid, r.parent_node, 'n', r.request_size, now()
+                    SELECT gen_random_uuid(), r.seqoid, r.parent_node, 'n', greatest(r.request_size, least($2, r.max_range_size)), now()
                     FROM worf.sequence_range r
                     WHERE r.seqoid = $1 AND r.parent_node IS NOT NULL
                         AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_request q WHERE q.seqoid = r.seqoid AND q.kind = 'n')
-                    """, SpiParameter.Create(seqoid));
+                    """, seq, SpiParameter.Create(forRate));
             }
         }
 
-        return changed;
+        // A node that holds a Snowflake node number keeps when the tables record it last heard from the owner of the
+        // numbers within an hour of when shared memory does, even while it issues no IDs, so that a restart, which
+        // empties shared memory, doesn't make the owner look silent for long enough that the node gives the number up.
+        if (snowflake && active is not null && owner != node.Node.Id && Worf.ReadScalar<bool>("""
+            SELECT EXISTS (
+                SELECT 1 FROM worf.sequence_range_node n
+                WHERE n.seqoid = $1 AND n.node_id = $2 AND worf.sequence_range_heard(n.node_id, false, n.reported_at, false) > n.reported_at + interval '1 hour')
+            """, seq, SpiParameter.Create(owner)))
+        {
+            if (!apply)
+            {
+                return true;
+            }
+
+            _ = Worf.Execute("""
+                UPDATE worf.sequence_range_node n SET reported_at = worf.sequence_range_heard(n.node_id, false, n.reported_at, false)
+                WHERE n.seqoid = $1 AND n.node_id = $2 AND worf.sequence_range_heard(n.node_id, false, n.reported_at, false) > n.reported_at + interval '1 hour'
+                """, seq, SpiParameter.Create(owner));
+        }
+
+        if (snowflake && owner == node.Node.Id && ReuseSnowflakeNumbers(seqoid, epoch, apply) && !apply)
+        {
+            return true;
+        }
+
+        return apply && changed;
     }
 
     /// <summary>
-    /// Rejects DDL that would let values escape range management, except when worf itself runs it: changing a managed
-    /// sequence, granting UPDATE on one, changing the default or identity of a column that uses one, dropping,
-    /// renaming or disabling the guard, and restarting a guarded table's sequences.
+    /// Checks whether a sequence's last value moved backwards in its active block, as a <c>setval</c> by a superuser or a
+    /// member of <c>pg_write_all_data</c> moves it, so that it would issue its values again: behind where it was at the
+    /// last check, or behind a value a row holds in the block. Since the check went by, the sequence may have issued
+    /// values beyond where it was then, so once it has moved, the tables are read, at most once a second, for the
+    /// furthest value they hold in the block, through an index on each column that uses the sequence, and the sequence
+    /// then, which has passed every value a committed row holds unless it moved backwards. The guard admits a row's value
+    /// only after the row is written, so rows of transactions in progress are left to a read once they have ended: the
+    /// tables are read again once any transaction has ended since the last read, so that a <c>setval</c> in the
+    /// transaction that inserted the rows it moves behind is noticed once that commits.
+    /// </summary>
+    private static bool MovedBackwards(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) active)
+    {
+        if (s_movedBack.TryGetValue(seqoid, out Guid movedIn))
+        {
+            if (movedIn == active.Id)
+            {
+                return true;
+            }
+
+            _ = s_movedBack.Remove(seqoid);
+        }
+
+        if (LastValue(seqoid) is not long position)
+        {
+            return false;
+        }
+
+        bool sampled = s_positions.TryGetValue(seqoid, out (Guid Block, long Position) seen) && seen.Block == active.Id;
+        if (sampled && (info.Ascending ? position < seen.Position : position > seen.Position))
+        {
+            WorfLog.Warning($"sequence {info.Name}'s last value moved back from {seen.Position} to {position} in its block [{active.Lo}, {active.Hi}], so it leaves the block");
+            s_movedBack[seqoid] = active.Id;
+            return true;
+        }
+
+        // A sequence's bounds are its block's, so a last value outside the block was a switch or a quarantine. A snapshot's
+        // xmax moves past a transaction that started after the last read once that ends, and one then in progress leaves
+        // its transactions as it ends.
+        long at = Worker.GetCurrentTimestamp();
+        SnapshotData* latest = NativeMethods.GetLatestSnapshot();
+        uint xmax = latest->xmax;
+        uint[] inProgress = new uint[latest->xcnt];
+        for (int i = 0; i < inProgress.Length; i++)
+        {
+            inProgress[i] = latest->xip[i];
+        }
+
+        bool known = s_readStored.TryGetValue(seqoid, out (Guid Block, long Position, long At, uint Xmax, uint[] InProgress) last);
+        bool ended = known && (xmax != last.Xmax || Array.Exists(last.InProgress, xid => Array.IndexOf(inProgress, xid) < 0));
+        bool read = !known || last.Block != active.Id || ((position != last.Position || ended) && at - last.At >= 1_000_000);
+        if (read)
+        {
+            s_readStored[seqoid] = (active.Id, position, at, xmax, inProgress);
+        }
+
+        if (read && FurthestStored(info, active) is decimal furthest && LastValue(seqoid) is long now &&
+            now >= active.Lo && now <= active.Hi && (info.Ascending ? now < furthest : now > furthest))
+        {
+            WorfLog.Warning($"sequence {info.Name}'s last value moved back to {now}, behind the value {furthest} a row holds in its block [{active.Lo}, {active.Hi}], so it leaves the block");
+            s_movedBack[seqoid] = active.Id;
+            return true;
+        }
+
+        s_positions[seqoid] = (active.Id, position);
+        return false;
+    }
+
+    /// <summary>
+    /// Reads the furthest value the tables hold in a block, from each column that uses the sequence and leads a btree
+    /// index, whose table isn't locked against reading, so that the read is quick and waits on no DDL. A partitioned
+    /// table's partitions, which take its column's default, are read on their own. The index is read as
+    /// <see cref="StoredValues"/> does, running nothing of the user's.
+    /// </summary>
+    /// <returns>The value, or null when no row holds one.</returns>
+    private static decimal? FurthestStored(SequenceInfo info, (Guid Id, long Lo, long Hi) block)
+    {
+        decimal? furthest = null;
+        foreach ((uint relid, string column, _) in UsingColumns(info.Seqoid).Where(column => NativeMethods.get_rel_relkind(column.Relid) != (sbyte)'p'))
+        {
+            if (NativeMethods.ConditionalLockRelationOid(relid, (int)PgLockMode.AccessShare) &&
+                StoredValues.Furthest(relid, column, info.Ascending, block.Lo, block.Hi, true) is decimal value)
+            {
+                furthest = furthest is not decimal f ? value : info.Ascending ? Math.Max(f, value) : Math.Min(f, value);
+            }
+        }
+
+        return furthest;
+    }
+
+    /// <summary>
+    /// Checks whether the next block may be switched to. The owner switches to a block it granted itself only once a
+    /// neighbor in touch, which still exchanges or streams this node's changes, has reported a watermark that covers it,
+    /// or when none is in touch, so that the neighbors know of the values before they can hold rows with them: an owner
+    /// restored to before the grant gives up its free values up to the highest watermark those neighbors report, and
+    /// never issues them again. A Snowflake node number carries its times and needs no such care.
+    /// </summary>
+    /// <remarks>
+    /// Only the sequence's own node rows are read, through their key, so that a call that activates many sequences takes
+    /// time in proportion to them.
+    /// </remarks>
+    private static bool Confirmed(uint seqoid, SequenceInfo info, Guid block)
+        => seqoid == SnowflakeIds.NodeSequence() || Worf.ReadScalar<bool>($"""
+            WITH b AS (
+                SELECT b.seqoid, b.lo, b.hi, b.from_node, r.owner_node, r.epoch, l.node_id AS local_id
+                FROM worf.sequence_range_block b JOIN worf.sequence_range r ON r.seqoid = b.seqoid CROSS JOIN worf.local_node l
+                WHERE b.block_id = $1 AND b.seqoid = $3),
+            touching AS (
+                SELECT n.watermark FROM worf.sequence_range_node n JOIN b ON n.seqoid = b.seqoid
+                WHERE n.seqoid = $3 AND n.via_node = n.node_id AND n.node_id <> b.local_id AND n.epoch = b.epoch
+                    AND (worf.sequence_range_heard(n.node_id, true, n.reported_at, true) > now() - $2::interval
+                        OR EXISTS (
+                            SELECT 1 FROM worf.sequence_range_link k JOIN pg_catalog.pg_replication_slots s ON s.slot_name = k.slot_name
+                            WHERE k.node_id = n.node_id AND s.active)))
+            SELECT b.from_node IS DISTINCT FROM b.local_id OR b.owner_node <> b.local_id OR NOT EXISTS (SELECT 1 FROM touching)
+                OR EXISTS (SELECT 1 FROM touching WHERE watermark {(info.Ascending ? ">= b.hi" : "<= b.lo")})
+            FROM b
+            """, SpiParameter.Create(block), SpiParameter.Create(StaleAfter()), SpiParameter.Create(seqoid));
+
+    /// <summary>
+    /// Checks whether the owner's root has a free span for its next block, without locking it.
+    /// </summary>
+    private static bool CanAllocate(uint seqoid, SequenceInfo info, int epoch)
+    {
+        long size = Worf.ReadScalar<long>("SELECT request_size FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(seqoid));
+        return Worf.Read("""
+            SELECT 1 FROM worf.sequence_range_free f JOIN worf.sequence_range_block b ON b.block_id = f.block_id
+            WHERE b.seqoid = $1 AND b.epoch = $2 AND b.kind IN ('r', 'p') AND b.state = 'open' AND b.sysid = $3 AND b.timeline = $4
+                AND f.hi::numeric - f.lo >= $5
+            LIMIT 1
+            """, 1, SpiParameter.Create(seqoid), SpiParameter.Create(epoch), SpiParameter.Create((decimal)NativeMethods.GetSystemIdentifier()),
+            SpiParameter.Create((long)Timeline()), SpiParameter.Create(((decimal)size - 1) * Math.Abs(info.Increment))).Count > 0;
+    }
+
+    /// <summary>
+    /// Checks whether this node has heard from the owner of the Snowflake node numbers, directly or through its
+    /// neighbors, within half the time after which the owner may give the numbers of a node it hasn't heard from to
+    /// another. A pool holder that hasn't grants none of its pool's numbers, as a node stops using its own then.
+    /// </summary>
+    /// <param name="seqoid">The Snowflake sequence.</param>
+    /// <returns>Whether it has.</returns>
+    internal static bool SnowflakeOwnerHeard(uint seqoid)
+        => Worf.ReadScalar<bool>("""
+            SELECT EXISTS (
+                SELECT 1 FROM worf.sequence_range r JOIN worf.sequence_range_node n ON n.seqoid = r.seqoid AND n.node_id = r.owner_node
+                WHERE r.seqoid = $1 AND worf.sequence_range_heard(n.node_id, false, n.reported_at, false) > now() - $2::interval / 2)
+            """, SpiParameter.Create(seqoid), SpiParameter.Create(SnowflakeReuseAfter()));
+
+    /// <summary>
+    /// Finds why this node must give up its Snowflake node number: another node reports holding it too, or the owner of
+    /// the numbers, which gives the number of a node it hasn't heard from for a day to another, hasn't been heard from for
+    /// half a day. A node that went that long without word stops using the number for good, so that it doesn't take it
+    /// up again once it hears from the owner, which may have given it away.
+    /// </summary>
+    /// <returns>The reason, or null.</returns>
+    private static string? SnowflakeNumberLost(uint seqoid, uint owner, WorfLocalNode node, long number)
+    {
+        SpiParameter seq = SpiParameter.Create(seqoid);
+        SpiParameter reuse = SpiParameter.Create(SnowflakeReuseAfter());
+        if (owner != node.Node.Id && Worf.ReadScalar<bool>("""
+            SELECT EXISTS (
+                SELECT 1 FROM worf.sequence_range_node n
+                WHERE n.seqoid = $1 AND n.node_id = $2 AND worf.sequence_range_heard(n.node_id, false, n.reported_at, false) <= now() - $3::interval / 2)
+            """, seq, SpiParameter.Create(owner), reuse))
+        {
+            return "the owner of the numbers hasn't been heard from for half a day";
+        }
+
+        string? other = Worf.ReadScalar<string?>("""
+            SELECT n.node_name::text FROM worf.sequence_range_node n
+            WHERE n.seqoid = $1 AND n.node_id <> $2 AND $4 = ANY (n.holds)
+                AND worf.sequence_range_heard(n.node_id, false, n.reported_at, false) > now() - $3::interval
+            LIMIT 1
+            """, seq, SpiParameter.Create(node.Node.Id), reuse, SpiParameter.Create(number));
+        return other is null ? null : $"node {other} reports holding it too";
+    }
+
+    /// <summary>
+    /// Finds this node's Snowflake node number, or the one it is to switch to, from whichever epoch granted it: a number
+    /// stays this node's alone across epochs, since each new root starts above every number held, so a node that has one
+    /// asks for no other.
+    /// </summary>
+    private static (Guid Id, long Lo, long Hi)? SnowflakeNumber(uint seqoid, string state)
+    {
+        WorfRows result = Worf.SelectCatalog("""
+            SELECT block_id, lo, hi FROM worf.sequence_range_block
+            WHERE seqoid = $1 AND kind = 'n' AND state = $2
+            ORDER BY received_at LIMIT 1
+            """, SpiParameter.Create(seqoid), SpiParameter.Create(state));
+        return result.Count == 0 ? null : (result[0].Get<Guid>(0), result[0].Get<long>(1), result[0].Get<long>(2));
+    }
+
+    /// <summary>
+    /// Gives up this node's Snowflake node number, which it reports holding for a day, and asks for another, or takes one
+    /// from its root as the owner. Its root and pool blocks keep granting.
+    /// </summary>
+    private static void GiveUpSnowflakeNumber(uint seqoid, SequenceInfo info, WorfLocalNode node, int epoch)
+    {
+        SpiParameter seq = SpiParameter.Create(seqoid);
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_request WHERE seqoid = $1", seq);
+        _ = Worf.Execute("""
+            WITH abandoned AS (
+                UPDATE worf.sequence_range_block SET state = 'abandoned', retired_at = now()
+                WHERE seqoid = $1 AND kind = 'n' AND state IN ('next', 'active')
+                RETURNING block_id)
+            UPDATE worf.sequence_range_grant SET state = 'abandoned', abandoned_at = now()
+            WHERE grant_id IN (SELECT block_id FROM abandoned) AND state <> 'abandoned'
+            """, seq);
+        _ = Worf.Execute("UPDATE worf.sequence_range SET state = 'quarantined' WHERE seqoid = $1 AND state NOT IN ('collecting', 'disabled', 'refused')", seq);
+        ChangedOnCommit(seqoid);
+        if (Worf.ReadScalar<uint>("SELECT owner_node FROM worf.sequence_range WHERE seqoid = $1", seq) == node.Node.Id && GrantOwnBlock(seqoid, info, node, epoch) &&
+            NodeBlock(seqoid, epoch, "next") is (Guid, long, long) next)
+        {
+            _ = Switch(seqoid, info, next);
+        }
+    }
+
+    /// <summary>
+    /// Gives the root back, once it has no number left to grant, the Snowflake node numbers no node holds: numbers
+    /// below the start of a root that moved above them, and numbers given up in this epoch. A number granted to a node
+    /// is free once that node has reported to this node itself, a day after the grant, without it among the numbers it
+    /// holds, which it reports for a day after giving one up, or has reported nothing for a day, since a node gives up its
+    /// number after half a day without word from the owner. Numbers granted to a pool holder, which holds them to grant
+    /// on rather than as its own, stay its until it gives the pool block up, or has reported nothing for a day. A number
+    /// is free only once every other node has also reported to this node itself in this epoch without it, or has reported
+    /// nothing for a day. No report a neighbor relays, which this node can't check, frees a number. The numbers come back
+    /// to be used no earlier than the furthest any node has reserved its clock, up to a day ahead of this node's, so that
+    /// no ID of a number's earlier holder can repeat, and a made-up clock holds a number up for a day at most. A node that
+    /// this server hasn't heard from since it started counts as heard when it started.
+    /// </summary>
+    /// <param name="seqoid">The Snowflake sequence.</param>
+    /// <param name="epoch">Its epoch.</param>
+    /// <param name="apply">Whether to free the numbers, rather than only check for any.</param>
+    /// <returns>Whether any number is, or was, free again.</returns>
+    private static bool ReuseSnowflakeNumbers(uint seqoid, int epoch, bool apply)
+    {
+        SpiParameter seq = SpiParameter.Create(seqoid);
+        SpiParameter current = SpiParameter.Create(epoch);
+        if (Worf.ReadScalar<bool>("""
+            SELECT EXISTS (
+                SELECT 1 FROM worf.sequence_range_free f JOIN worf.sequence_range_block b ON b.block_id = f.block_id
+                WHERE b.seqoid = $1 AND b.epoch = $2 AND b.kind = 'r' AND b.state = 'open')
+            """, seq, current))
+        {
+            return false;
+        }
+
+        // Each node's report and when it was heard from are read once.
+        const string Free = """
+            WITH root AS (
+                SELECT block_id, lo, hi, received_at FROM worf.sequence_range_block
+                WHERE seqoid = $1 AND epoch = $2 AND kind = 'r' AND state = 'open'),
+            floor AS (
+                SELECT greatest(least((SELECT max(clock) FROM worf.sequence_range_node WHERE seqoid = $1), $5), $4) AS not_before),
+            nodes AS (
+                SELECT n.node_id, n.epoch, n.holds, n.via_node = n.node_id AS direct,
+                    worf.sequence_range_heard(n.node_id, false, n.reported_at, true) AS assumed,
+                    worf.sequence_range_heard(n.node_id, false, n.reported_at, false) AS heard,
+                    worf.sequence_range_heard(n.node_id, true, n.reported_at, false) AS heard_directly
+                FROM worf.sequence_range_node n CROSS JOIN worf.local_node l
+                WHERE n.seqoid = $1 AND n.node_id <> l.node_id),
+            granted AS (
+                SELECT g.lo, g.hi, CASE WHEN g.state = 'abandoned' THEN g.abandoned_at > now() - $3::interval
+                        ELSE h.assumed > now() - $3::interval
+                            AND NOT (g.kind = 'n' AND g.state = 'acknowledged' AND h.direct AND h.holds IS NOT NULL
+                                AND h.heard_directly > g.granted_at + $3::interval) END AS held,
+                    CASE WHEN g.kind = 'n' AND g.state = 'acknowledged' AND h.assumed > now() - $3::interval AND h.direct AND h.holds IS NOT NULL
+                            AND h.heard_directly > g.granted_at + $3::interval
+                        THEN h.holds END AS reported
+                FROM worf.sequence_range_grant g JOIN worf.sequence_range_block b ON b.block_id = g.from_block
+                    LEFT JOIN nodes h ON h.node_id = g.grantee_id
+                WHERE g.seqoid = $1 AND b.epoch = $2 AND g.kind <> 'x' AND g.state <> 'unclaimed'),
+            free AS (
+                SELECT root.block_id, v, floor.not_before
+                FROM root CROSS JOIN floor CROSS JOIN LATERAL generate_series(root.lo, root.hi) v
+                WHERE NOT EXISTS (SELECT 1 FROM granted g WHERE g.lo <= v AND v <= g.hi AND (g.held OR v = ANY (g.reported)))
+                    AND NOT EXISTS (
+                        SELECT 1 FROM worf.sequence_range_block o
+                        WHERE o.seqoid = $1 AND o.kind = 'n' AND o.lo = v
+                            AND (o.state IN ('next', 'active') OR o.state = 'abandoned' AND o.retired_at > now() - $3::interval))
+                    AND NOT EXISTS (
+                        SELECT 1 FROM nodes n
+                        WHERE n.assumed > now() - $3::interval
+                            AND (NOT n.direct OR n.epoch IS DISTINCT FROM $2 OR n.heard_directly <= root.received_at
+                                OR v = ANY (coalesce(n.holds, '{}')))))
+            """;
+        SpiParameter reuse = SpiParameter.Create(SnowflakeReuseAfter());
+        SpiParameter clock = SpiParameter.Create(SnowflakeIds.ReservedClock());
+        SpiParameter ahead = SpiParameter.Create(SnowflakeIds.NowMs() + (long)s_snowflakeReuseAfter.TotalMilliseconds);
+        if (!apply)
+        {
+            return Worf.ReadScalar<bool>(Free + "SELECT EXISTS (SELECT 1 FROM free)", seq, current, reuse, clock, ahead);
+        }
+
+        // A grant whose number is free again, which never reached its node, is never sent.
+        long reused = Worf.Execute(Free + """
+            , unclaimed AS (
+                UPDATE worf.sequence_range_grant g SET state = 'unclaimed'
+                FROM free WHERE g.seqoid = $1 AND g.state = 'sent' AND g.kind <> 'x' AND g.lo <= free.v AND free.v <= g.hi)
+            INSERT INTO worf.sequence_range_free SELECT block_id, v, v, not_before FROM free
+            """, seq, current, reuse, clock, ahead);
+        if (reused > 0)
+        {
+            WorfLog.Log($"Snowflake node numbers: {reused} that no node holds are free again");
+        }
+
+        return reused > 0;
+    }
+
+    /// <summary>
+    /// Gets how long a Snowflake node number a node gave up, or a node that stopped reporting, keeps its number from use.
+    /// </summary>
+    /// <returns>The time, as an interval.</returns>
+    internal static string SnowflakeReuseAfter()
+        => $"{s_snowflakeReuseAfter.TotalSeconds.ToString(CultureInfo.InvariantCulture)} seconds";
+
+    /// <summary>
+    /// Rejects DDL that would let values escape range management, except when worf itself runs it: changing, renaming,
+    /// moving or unlogging a managed sequence, granting UPDATE on one, changing the default or identity of a column that
+    /// uses one, creating, dropping, renaming or disabling the guard or making it depend on an extension, and restarting
+    /// a managed sequence through <c>TRUNCATE</c>. A table that becomes a partition gives up its own guard for its
+    /// tree's.
     /// </summary>
     /// <param name="parsetree">The statement, before it runs.</param>
     internal static void CheckDdl(Node* parsetree)
     {
-        // The restore of a subscription's structure is worf's own.
-        if (InternalDdl || parsetree->type is not (NodeTag.T_AlterSeqStmt or NodeTag.T_GrantStmt or NodeTag.T_AlterTableStmt or
-            NodeTag.T_DropStmt or NodeTag.T_RenameStmt or NodeTag.T_TruncateStmt) || !AnyManaged() || DdlReplication.Restoring())
+        if (parsetree->type == NodeTag.T_AlterTableStmt)
+        {
+            DropAttachedGuards((AlterTableStmt*)parsetree);
+        }
+
+        CheckGuardNames(parsetree);
+
+        // The restore of a subscription's structure runs under these rules too: it sets a column's default once its
+        // sequence owns the column, which a column that uses a managed sequence through its ownership alone may do.
+        if (parsetree->type is not (NodeTag.T_AlterSeqStmt or NodeTag.T_GrantStmt or NodeTag.T_AlterTableStmt or
+            NodeTag.T_DropStmt or NodeTag.T_RenameStmt or NodeTag.T_TruncateStmt or NodeTag.T_AlterDomainStmt or
+            NodeTag.T_AlterObjectSchemaStmt or NodeTag.T_AlterObjectDependsStmt) || !AnyManaged())
         {
             return;
         }
@@ -550,8 +1547,17 @@ internal static unsafe partial class SequenceRanges
         switch (parsetree->type)
         {
             case NodeTag.T_AlterSeqStmt:
-                if (!OnlyOwnedBy(((AlterSeqStmt*)parsetree)->options) && IsManaged(Resolve(((AlterSeqStmt*)parsetree)->sequence)))
+                AlterSeqStmt* alterSeq = (AlterSeqStmt*)parsetree;
+                uint altered = Resolve(alterSeq->sequence);
+                if (!OnlyOwnedBy(alterSeq->options) && IsManaged(altered))
                 {
+                    // An identity column's type change changes its sequence's type too.
+                    if (RetypedIdentity(alterSeq) is uint typeOid)
+                    {
+                        Retype(altered, typeOid);
+                        break;
+                    }
+
                     throw Rejected("ALTER SEQUENCE on a managed sequence", "Use worf.alter_sequence_range, or disable range management first.");
                 }
 
@@ -562,36 +1568,15 @@ internal static unsafe partial class SequenceRanges
                 break;
 
             case NodeTag.T_AlterTableStmt:
-                AlterTableStmt* alter = (AlterTableStmt*)parsetree;
-                uint relid = Resolve(alter->relation);
-                List* cmds = alter->cmds;
-                for (int i = 0; relid != 0 && cmds is not null && i < cmds->length; i++)
-                {
-                    AlterTableCmd* cmd = (AlterTableCmd*)cmds->elements[i].ptr_value;
-                    string? name = cmd->name is null ? null : Worf.FromServer(cmd->name);
-                    bool rejected = cmd->subtype switch
-                    {
-                        AlterTableType.AT_ColumnDefault or AlterTableType.AT_AddIdentity or AlterTableType.AT_SetIdentity or
-                            AlterTableType.AT_DropIdentity => name is not null && ColumnUsesManaged(relid, name),
-                        AlterTableType.AT_DisableTrig or AlterTableType.AT_EnableReplicaTrig or AlterTableType.AT_EnableAlwaysTrig =>
-                            name == GuardName,
-                        AlterTableType.AT_DisableTrigAll or AlterTableType.AT_DisableTrigUser => IsGuarded(relid),
-                        _ => false,
-                    };
-                    if (rejected)
-                    {
-                        throw Rejected("changing a column that uses a managed sequence, or its table's guard",
-                            "Disable range management first.");
-                    }
-                }
-
+                CheckAlterTable((AlterTableStmt*)parsetree);
                 break;
 
             case NodeTag.T_DropStmt when ((DropStmt*)parsetree)->removeType == ObjectType.OBJECT_TRIGGER:
                 List* objects = ((DropStmt*)parsetree)->objects;
                 for (int i = 0; objects is not null && i < objects->length; i++)
                 {
-                    if (Worf.FromServer(NativeMethods.NameListToString((List*)objects->elements[i].ptr_value)).EndsWith("." + GuardName, StringComparison.Ordinal))
+                    List* name = (List*)objects->elements[i].ptr_value;
+                    if (IsGuardName(NodeName(name->elements[name->length - 1].ptr_value)))
                     {
                         throw Rejected("dropping the guard of a table that uses a managed sequence", "Disable range management first.");
                     }
@@ -599,25 +1584,327 @@ internal static unsafe partial class SequenceRanges
 
                 break;
 
-            case NodeTag.T_RenameStmt when ((RenameStmt*)parsetree)->renameType == ObjectType.OBJECT_TRIGGER &&
-                Worf.FromServer(((RenameStmt*)parsetree)->subname) == GuardName:
-                throw Rejected("renaming the guard of a table that uses a managed sequence", "Disable range management first.");
+            case NodeTag.T_RenameStmt:
+                CheckRename((RenameStmt*)parsetree);
+                break;
 
-            case NodeTag.T_TruncateStmt when ((TruncateStmt*)parsetree)->restart_seqs:
-                List* relations = ((TruncateStmt*)parsetree)->relations;
-                for (int i = 0; relations is not null && i < relations->length; i++)
+            case NodeTag.T_AlterObjectSchemaStmt:
+                AlterObjectSchemaStmt* move = (AlterObjectSchemaStmt*)parsetree;
+                if (move->relation is not null && MovesManaged(Resolve(move->relation)))
                 {
-                    if (IsGuarded(Resolve((RangeVar*)relations->elements[i].ptr_value)))
-                    {
-                        throw Rejected("TRUNCATE ... RESTART IDENTITY on a table that uses a managed sequence", "Truncate it without RESTART IDENTITY.");
-                    }
+                    throw Rejected("moving a managed sequence to another schema", "Other nodes find it by its name; disable range management first.");
                 }
 
                 break;
 
+            // An extension's drop would drop the guard with it.
+            case NodeTag.T_AlterObjectDependsStmt when ((AlterObjectDependsStmt*)parsetree)->objectType == ObjectType.OBJECT_TRIGGER &&
+                !((AlterObjectDependsStmt*)parsetree)->remove:
+                List* trigger = (List*)((AlterObjectDependsStmt*)parsetree)->@object;
+                if (trigger is not null && IsGuardName(NodeName(trigger->elements[trigger->length - 1].ptr_value)))
+                {
+                    throw Rejected("making the guard of a table that uses a managed sequence depend on an extension", "Disable range management first.");
+                }
+
+                break;
+
+            case NodeTag.T_TruncateStmt when ((TruncateStmt*)parsetree)->restart_seqs:
+                CheckTruncate((TruncateStmt*)parsetree);
+                break;
+
+            // A domain's default reaches the columns of the domain that have none of their own.
+            case NodeTag.T_AlterDomainStmt when AltersDefault((AlterDomainStmt*)parsetree) &&
+                DomainUsesManaged(((AlterDomainStmt*)parsetree)->typeName):
+                throw Rejected("changing the default of a domain that uses a managed sequence", "Disable range management first.");
+
             default:
                 break;
         }
+    }
+
+    /// <summary>
+    /// Keeps the guard's names and function worf's own wherever worf is installed, whether or not it manages a sequence
+    /// yet, so that a trigger that bears them is the guard: it rejects creating a trigger with either unless the trigger
+    /// is a dumped guard, which is skipped, and renaming a trigger to or from a guard's name.
+    /// </summary>
+    private static void CheckGuardNames(Node* parsetree)
+    {
+        if (parsetree->type == NodeTag.T_CreateTrigStmt)
+        {
+            CreateTrigStmt* trigger = (CreateTrigStmt*)parsetree;
+            bool name = IsGuardName(Worf.FromServer(trigger->trigname));
+            if (!name && IsGuardFunction(trigger->funcname))
+            {
+                throw Rejected("creating a trigger with the guard's function", "worf creates the guard itself.");
+            }
+
+            if (name && !SkipsDumpedGuard(parsetree) && GuardFunction() != 0)
+            {
+                throw Rejected("creating a trigger with the guard's name", "worf creates the guard itself.");
+            }
+        }
+        else if (parsetree->type == NodeTag.T_RenameStmt && ((RenameStmt*)parsetree)->renameType == ObjectType.OBJECT_TRIGGER &&
+            (IsGuardName(Worf.FromServer(((RenameStmt*)parsetree)->subname)) || IsGuardName(Worf.FromServer(((RenameStmt*)parsetree)->newname))) &&
+            GuardFunction() != 0)
+        {
+            throw Rejected("renaming a trigger to or from the guard's name", "worf creates the guard itself.");
+        }
+    }
+
+    private static void CheckAlterTable(AlterTableStmt* alter)
+    {
+        uint relid = Resolve(alter->relation);
+        if (relid == 0)
+        {
+            return;
+        }
+
+        // ALTER SEQUENCE ... SET LOGGED or UNLOGGED comes as ALTER TABLE; an unlogged sequence restarts after a crash
+        // and issues its values again. Its owner may change, which leaves its values alone.
+        bool sequence = IsManaged(relid);
+        List* cmds = alter->cmds;
+        for (int i = 0; cmds is not null && i < cmds->length; i++)
+        {
+            AlterTableCmd* cmd = (AlterTableCmd*)cmds->elements[i].ptr_value;
+            string? name = cmd->name is null ? null : Worf.FromServer(cmd->name);
+            if (!sequence && name is not null && cmd->subtype is AlterTableType.AT_AlterColumnType or AlterTableType.AT_DropColumn)
+            {
+                DropColumnGuards(relid, name, cmd->subtype == AlterTableType.AT_AlterColumnType ? (ColumnDef*)cmd->def : null);
+            }
+
+            bool rejected = cmd->subtype switch
+            {
+                _ when sequence => cmd->subtype != AlterTableType.AT_ChangeOwner,
+
+                // A column that uses a managed sequence through its ownership alone may take a default, which must be
+                // nextval of one.
+                AlterTableType.AT_ColumnDefault => name is not null && ColumnUsesManaged(relid, name) && (cmd->def is null || HasDefault(relid, name)),
+                AlterTableType.AT_AddIdentity or AlterTableType.AT_SetIdentity or AlterTableType.AT_DropIdentity =>
+                    name is not null && ColumnUsesManaged(relid, name),
+                AlterTableType.AT_DisableTrig or AlterTableType.AT_EnableReplicaTrig or AlterTableType.AT_EnableTrig => name is not null && IsGuardName(name),
+                // ENABLE TRIGGER ALL and USER would have a guard, or a partition's clone of its parent's, fire only in
+                // sessions that write as origins do.
+                AlterTableType.AT_DisableTrigAll or AlterTableType.AT_DisableTrigUser or AlterTableType.AT_EnableTrigAll or AlterTableType.AT_EnableTrigUser =>
+                    IsGuarded(relid),
+
+                // A table's sequences follow it to unlogged.
+                AlterTableType.AT_SetUnLogged => OwnsManaged(relid),
+                _ => false,
+            };
+            if (rejected)
+            {
+                throw Rejected("changing a managed sequence, a column that uses one, or its table's guard", "Disable range management first.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Drops the guards that check a column whose type changes or that is dropped, on a table and its inheritors and
+    /// partitions, since PostgreSQL refuses either while a trigger uses the column. The statement's end puts the guards
+    /// back for the columns that still use a managed sequence. A type change that keeps the values, as from one integer
+    /// type to another without <c>USING</c>, leaves the column's rows unchecked.
+    /// </summary>
+    private static void DropColumnGuards(uint relid, string column, ColumnDef* retype)
+    {
+        List<long> tables = [];
+        List* inheritors = NativeMethods.find_all_inheritors(relid, 0, null);
+        for (int i = 0; inheritors is not null && i < inheritors->length; i++)
+        {
+            tables.Add(inheritors->elements[i].oid_value);
+        }
+
+        WorfRows guards = Worf.Read("""
+            SELECT DISTINCT t.tgrelid::oid, t.tgname::text
+            FROM pg_catalog.pg_trigger t
+                JOIN pg_catalog.pg_depend d ON d.classid = 'pg_catalog.pg_trigger'::regclass AND d.objid = t.oid
+                    AND d.refclassid = 'pg_catalog.pg_class'::regclass
+                JOIN pg_catalog.pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
+            WHERE t.tgrelid = ANY ($1::oid[]) AND t.tgname = ANY ($2) AND t.tgparentid = 0 AND a.attname = $3
+            """, 0, SpiParameter.Create(tables.ToArray()), SpiParameter.Create(s_guardNames), SpiParameter.Create(column));
+        if (retype is not null)
+        {
+            s_retyped[(relid, column)] = null;
+            if (guards.Count > 0 && retype->raw_default is null &&
+                GuardedColumns(TreeRoot(relid)).TryGetValue(column, out (uint TypeOid, List<uint> Sequences, List<string> Names) guarded) &&
+                guarded.TypeOid is Int2Oid or Int4Oid or Int8Oid)
+            {
+                s_retyped[(relid, column)] = Effective(guarded, relid);
+            }
+        }
+
+        for (int i = 0; i < guards.Count; i++)
+        {
+            DropGuardTrigger(guards[i].Get<uint>(0), guards[i].Get<string>(1));
+        }
+    }
+
+    /// <summary>
+    /// Drops the guard of a table that becomes a partition. PostgreSQL gives it its tree's guard, which can't stand beside
+    /// one of its own, and which checks its columns too.
+    /// </summary>
+    private static void DropAttachedGuards(AlterTableStmt* alter)
+    {
+        for (int i = 0; alter->cmds is not null && i < alter->cmds->length; i++)
+        {
+            AlterTableCmd* cmd = (AlterTableCmd*)alter->cmds->elements[i].ptr_value;
+            if (cmd->subtype == AlterTableType.AT_AttachPartition)
+            {
+                uint partition = Resolve(((PartitionCmd*)cmd->def)->name);
+                foreach (string guard in partition == 0 ? [] : OwnGuards(partition))
+                {
+                    DropGuardTrigger(partition, guard);
+                }
+            }
+        }
+    }
+
+    private static void CheckRename(RenameStmt* rename)
+    {
+        switch (rename->renameType)
+        {
+            // Other nodes find a managed sequence by its schema and name.
+            case ObjectType.OBJECT_SEQUENCE or ObjectType.OBJECT_TABLE or ObjectType.OBJECT_VIEW or ObjectType.OBJECT_MATVIEW or
+                ObjectType.OBJECT_FOREIGN_TABLE or ObjectType.OBJECT_INDEX when rename->relation is not null && IsManaged(Resolve(rename->relation)):
+                throw Rejected("renaming a managed sequence", "Other nodes find it by its name; disable range management first.");
+
+            case ObjectType.OBJECT_SCHEMA when Elevated.Run(() => Worf.ReadScalar<bool>("""
+                SELECT EXISTS (
+                    SELECT 1 FROM worf.sequence_range r
+                        JOIN pg_catalog.pg_class c ON c.oid = r.seqoid
+                        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = $1)
+                """, SpiParameter.Create(Worf.FromServer(rename->subname)))):
+                throw Rejected("renaming the schema of a managed sequence", "Other nodes find it by its name; disable range management first.");
+
+            default:
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Rejects <c>TRUNCATE ... RESTART IDENTITY</c> that would restart a managed sequence: one owned by a table it
+    /// names, by one of their inheritors or partitions unless it names the table with <c>ONLY</c>, or, with
+    /// <c>CASCADE</c>, by a table whose foreign keys reach them.
+    /// </summary>
+    private static void CheckTruncate(TruncateStmt* truncate)
+    {
+        List<long> only = [];
+        List<long> inherited = [];
+        List* relations = truncate->relations;
+        for (int i = 0; relations is not null && i < relations->length; i++)
+        {
+            RangeVar* relation = (RangeVar*)relations->elements[i].ptr_value;
+            uint relid = Resolve(relation);
+            if (relid != 0)
+            {
+                (relation->inh ? inherited : only).Add(relid);
+            }
+        }
+
+        if (Elevated.Run(() => Worf.ReadScalar<bool>("""
+            WITH RECURSIVE named (relid) AS (
+                SELECT unnest($2::int8[])::oid
+                UNION
+                SELECT i.inhrelid FROM pg_catalog.pg_inherits i JOIN named n ON i.inhparent = n.relid),
+            truncated (relid) AS (
+                SELECT unnest($1::int8[])::oid
+                UNION
+                SELECT relid FROM named
+                UNION
+                SELECT c.conrelid FROM pg_catalog.pg_constraint c JOIN truncated t ON c.confrelid = t.relid
+                WHERE c.contype = 'f' AND $3)
+            SELECT EXISTS (
+                SELECT 1 FROM truncated t
+                    JOIN pg_catalog.pg_depend d ON d.refclassid = 'pg_catalog.pg_class'::regclass AND d.refobjid = t.relid
+                        AND d.classid = 'pg_catalog.pg_class'::regclass AND d.deptype IN ('a', 'i')
+                    JOIN worf.sequence_range r ON r.seqoid = d.objid)
+            """, SpiParameter.Create(only.ToArray()), SpiParameter.Create(inherited.ToArray()),
+            SpiParameter.Create(truncate->behavior == DropBehavior.DROP_CASCADE))))
+        {
+            throw Rejected("TRUNCATE ... RESTART IDENTITY of a managed sequence", "Truncate without RESTART IDENTITY.");
+        }
+    }
+
+    /// <summary>
+    /// Finds the type an identity column's type change gives its sequence, through the ALTER SEQUENCE ... AS that
+    /// PostgreSQL runs for it.
+    /// </summary>
+    /// <returns>The type, or null when the statement is no such change.</returns>
+    private static uint? RetypedIdentity(AlterSeqStmt* alter)
+    {
+        List* options = alter->options;
+        return alter->for_identity && options is not null && options->length == 1 &&
+            Worf.FromServer(((DefElem*)options->elements[0].ptr_value)->defname) == "as"
+            ? NativeMethods.typenameTypeId(null, (TypeName*)((DefElem*)options->elements[0].ptr_value)->arg)
+            : null;
+    }
+
+    /// <summary>
+    /// Gets a managed sequence ready for its identity column's type change: it refuses a type that can't hold the
+    /// blocks this node draws from, and a quarantined sequence takes the new type's quarantine bounds, which the old type
+    /// holds too, since PostgreSQL refuses a type that can't hold the sequence's bounds.
+    /// </summary>
+    private static void Retype(uint seqoid, uint typeOid)
+    {
+        (long min, long max) = TypeRange(typeOid);
+        if (Worf.ReadScalar<bool>("""
+            SELECT EXISTS (SELECT 1 FROM worf.sequence_range_block WHERE seqoid = $1 AND kind = 'n' AND state IN ('next', 'active') AND (lo < $2 OR hi > $3))
+            """, SpiParameter.Create(seqoid), SpiParameter.Create(min), SpiParameter.Create(max)))
+        {
+            throw Rejected("changing the type of a managed sequence to one that can't hold its blocks", "Disable range management first.");
+        }
+
+        SequenceInfo info = GetInfo(seqoid);
+        (long oldMin, long oldMax) = TypeRange(info.TypeOid);
+        if (min >= oldMin && max <= oldMax && ActiveBlock(seqoid) is null)
+        {
+            Quarantine(new SequenceInfo(seqoid, info.Name, typeOid, info.Increment, info.Min, info.Max, info.Cycle, info.Persistence));
+        }
+    }
+
+    /// <summary>
+    /// Keeps a managed sequence within its active block, or quarantined, once its identity column's type change has
+    /// changed its type, which may move bounds that were the old type's limits to the new type's. A narrower type ends
+    /// this node's root and pool blocks where it does.
+    /// </summary>
+    private static void Retyped(uint seqoid)
+    {
+        SequenceInfo info = GetInfo(seqoid);
+        NoteSwitch(null, ($"changed the type of a column that sequence {info.Name} numbers",
+            "The change holds the sequence's range row until the transaction ends, which a prepared transaction would hold across restarts, keeping the sequence from switching or exchanging blocks."));
+        if (ActiveBlock(seqoid) is (long lo, long hi))
+        {
+            RunInternalDdl($"ALTER SEQUENCE {info.Name} MINVALUE {lo.ToString(CultureInfo.InvariantCulture)} MAXVALUE {hi.ToString(CultureInfo.InvariantCulture)}");
+        }
+        else
+        {
+            Quarantine(info);
+        }
+
+        (long min, long max) = TypeRange(info.TypeOid);
+        SpiParameter seq = SpiParameter.Create(seqoid);
+        SpiParameter low = SpiParameter.Create(min);
+        SpiParameter high = SpiParameter.Create(max);
+        _ = Worf.Execute("UPDATE worf.sequence_range SET root_end = least(greatest(root_end, $2), $3) WHERE seqoid = $1 AND root_end NOT BETWEEN $2 AND $3",
+            seq, low, high);
+        _ = Worf.Execute("""
+            DELETE FROM worf.sequence_range_free f USING worf.sequence_range_block b
+            WHERE f.block_id = b.block_id AND b.seqoid = $1 AND (f.hi < $2 OR f.lo > $3)
+            """, seq, low, high);
+        _ = Worf.Execute("""
+            UPDATE worf.sequence_range_free f SET lo = greatest(f.lo, $2), hi = least(f.hi, $3) FROM worf.sequence_range_block b
+            WHERE f.block_id = b.block_id AND b.seqoid = $1 AND (f.lo < $2 OR f.hi > $3)
+            """, seq, low, high);
+    }
+
+    /// <summary>
+    /// Finds the block a managed sequence draws from, of whichever epoch.
+    /// </summary>
+    private static (long Lo, long Hi)? ActiveBlock(uint seqoid)
+    {
+        WorfRows active = Worf.SelectCatalog("SELECT lo, hi FROM worf.sequence_range_block WHERE seqoid = $1 AND kind = 'n' AND state = 'active'",
+            SpiParameter.Create(seqoid));
+        return active.Count == 0 ? null : (active[0].Get<long>(0), active[0].Get<long>(1));
     }
 
     /// <summary>
@@ -637,23 +1924,84 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
-    /// Skips the guard that a provider's dumped structure creates, since the restore installs the guards itself.
+    /// Skips the guard that a dump creates, as a provider's dumped structure or a restored table's does, since worf
+    /// installs the guards itself, on the tables that use a managed sequence here. The restore of a subscription's
+    /// structure skips any trigger with a guard's name, as one a provider had before worf was installed there.
     /// </summary>
     /// <param name="parsetree">The statement, before it runs.</param>
     /// <returns>Whether to skip it.</returns>
     internal static bool SkipsDumpedGuard(Node* parsetree)
-        => !InternalDdl && parsetree->type == NodeTag.T_CreateTrigStmt && Worf.FromServer(((CreateTrigStmt*)parsetree)->trigname) == GuardName &&
-            DdlReplication.Restoring();
+        => (parsetree->type == NodeTag.T_CreateTrigStmt && IsGuardName(Worf.FromServer(((CreateTrigStmt*)parsetree)->trigname)) &&
+                (DdlReplication.Restoring() || IsGuardFunction(((CreateTrigStmt*)parsetree)->funcname))) ||
+            EnablesGuardsAlways(parsetree);
+
+    /// <summary>
+    /// Checks whether a statement only has guards fire in every session, as a dump of a table with them has it, which
+    /// worf's guards already do, so that a restore whose guard was skipped doesn't fail on it.
+    /// </summary>
+    private static bool EnablesGuardsAlways(Node* parsetree)
+    {
+        if (parsetree->type != NodeTag.T_AlterTableStmt)
+        {
+            return false;
+        }
+
+        List* cmds = ((AlterTableStmt*)parsetree)->cmds;
+        if (cmds is null || cmds->length == 0)
+        {
+            return false;
+        }
+
+        for (int i = 0; i < cmds->length; i++)
+        {
+            AlterTableCmd* cmd = (AlterTableCmd*)cmds->elements[i].ptr_value;
+            if (cmd->subtype != AlterTableType.AT_EnableAlwaysTrig || cmd->name is null || !IsGuardName(Worf.FromServer(cmd->name)))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Checks whether a trigger's function is the guard's.
+    /// </summary>
+    private static bool IsGuardFunction(List* funcname)
+    {
+        uint guard = GuardFunction();
+        return guard != 0 && funcname is not null && NativeMethods.LookupFuncName(funcname, 0, null, true) == guard;
+    }
+
+    /// <summary>
+    /// Finds the guard's trigger function, or 0 where worf isn't installed. It reads the catalog, so that a role without
+    /// USAGE on worf's schema finds it too.
+    /// </summary>
+    private static uint GuardFunction()
+        => Worf.ReadScalar<uint?>("""
+            SELECT p.oid FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+            WHERE n.nspname = 'worf' AND p.proname = 'sequence_range_guard' AND p.pronargs = 0
+            """) ?? 0;
 
     /// <summary>
     /// Puts managed sequences in place after DDL: the restore of a subscription's structure quarantines and joins the
-    /// provider's managed sequences as it creates them, and a table that comes to use a managed sequence gets the guard
-    /// in the same transaction.
+    /// provider's managed sequences as it creates them, and a table or partition tree that comes to use a managed
+    /// sequence, or a partition detached from a guarded tree, gets the guard in the same transaction. The rows that DDL
+    /// brings under the guard, by setting a column's default, attaching a partition or giving a managed sequence an
+    /// owning column, must hold values the guard passes, or values from before the sequence's root.
     /// </summary>
     /// <param name="parsetree">The statement, which has run.</param>
     internal static void AfterDdl(Node* parsetree)
     {
-        if (InternalDdl || parsetree->type is not (NodeTag.T_CreateSeqStmt or NodeTag.T_AlterSeqStmt or NodeTag.T_AlterTableStmt or NodeTag.T_CreateStmt))
+        // A sequence created, renamed or moved to the name of a managed one this node dropped joins its epoch.
+        if (parsetree->type is NodeTag.T_CreateSeqStmt or NodeTag.T_RenameStmt or NodeTag.T_AlterObjectSchemaStmt &&
+            Worf.CatalogOid("sequence_range_dropped") != 0)
+        {
+            Elevated.Run(SequenceRangeSync.JoinRecreated);
+        }
+
+        if (parsetree->type is not (NodeTag.T_CreateSeqStmt or NodeTag.T_AlterSeqStmt or NodeTag.T_AlterTableStmt or NodeTag.T_CreateStmt or
+            NodeTag.T_AlterDomainStmt or NodeTag.T_CreateDomainStmt or NodeTag.T_CreateTrigStmt or NodeTag.T_DropStmt))
         {
             return;
         }
@@ -674,21 +2022,197 @@ internal static unsafe partial class SequenceRanges
                 uint seqoid = Resolve(((AlterSeqStmt*)parsetree)->sequence);
                 if (seqoid != 0 && IsManaged(seqoid))
                 {
+                    // An identity column's type change changes its sequence's type before its column's, and the guard
+                    // comes back once the column has changed.
+                    if (RetypedIdentity((AlterSeqStmt*)parsetree) is not null)
+                    {
+                        Retyped(seqoid);
+                        break;
+                    }
+
+                    // Only OWNED BY changes a managed sequence outside worf's own DDL otherwise, and its column brings its
+                    // rows.
                     InstallGuards(seqoid);
+                    if (Worf.Read("""
+                        SELECT d.refobjid::oid, a.attname::text FROM pg_catalog.pg_depend d
+                            JOIN pg_catalog.pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
+                        WHERE d.classid = 'pg_catalog.pg_class'::regclass AND d.objid = $1 AND d.refclassid = 'pg_catalog.pg_class'::regclass
+                            AND d.deptype = 'a' AND d.refobjsubid > 0
+                        """, 1, SpiParameter.Create(seqoid)) is { Count: 1 } owner)
+                    {
+                        CheckColumnRows(owner[0].Get<uint>(0), owner[0].Get<string>(1), false);
+                    }
                 }
 
                 break;
 
             case NodeTag.T_AlterTableStmt:
-                InstallGuard(Resolve(((AlterTableStmt*)parsetree)->relation));
+                AlterTableStmt* alter = (AlterTableStmt*)parsetree;
+                uint relid = Resolve(alter->relation);
+                if (relid == 0)
+                {
+                    break;
+                }
+
+                // A partition tree's guard is its root's; an inheritance parent's default reaches its children.
+                if (NativeMethods.get_rel_relkind(relid) == (sbyte)'p')
+                {
+                    InstallGuard(relid);
+                }
+                else
+                {
+                    List* inheritors = NativeMethods.find_all_inheritors(relid, 0, null);
+                    for (int i = 0; inheritors is not null && i < inheritors->length; i++)
+                    {
+                        InstallGuard(inheritors->elements[i].oid_value);
+                    }
+                }
+
+                for (int i = 0; alter->cmds is not null && i < alter->cmds->length; i++)
+                {
+                    AlterTableCmd* cmd = (AlterTableCmd*)alter->cmds->elements[i].ptr_value;
+                    switch (cmd->subtype)
+                    {
+                        // PostgreSQL drops the guard a detached partition had from its tree.
+                        case AlterTableType.AT_DetachPartition or AlterTableType.AT_DetachPartitionFinalize:
+                            InstallGuard(Resolve(((PartitionCmd*)cmd->def)->name));
+                            break;
+
+                        case AlterTableType.AT_AttachPartition:
+                            CheckAttachedRows(Resolve(((PartitionCmd*)cmd->def)->name));
+                            break;
+
+                        // A column that uses a managed sequence can't change its default, so one that does now didn't.
+                        case AlterTableType.AT_ColumnDefault when cmd->name is not null:
+                            CheckColumnRows(relid, Worf.FromServer(cmd->name), alter->relation->inh);
+                            break;
+
+                        case AlterTableType.AT_AlterColumnType when cmd->name is not null:
+                            string column = Worf.FromServer(cmd->name);
+                            if (!s_retyped.Remove((relid, column), out List<uint>? kept) || kept is null ||
+                                !GuardedColumns(TreeRoot(relid)).TryGetValue(column, out (uint TypeOid, List<uint> Sequences, List<string> Names) retyped) ||
+                                !Effective(retyped, relid).TrueForAll(kept.Contains))
+                            {
+                                CheckColumnRows(relid, column, alter->relation->inh);
+                            }
+
+                            break;
+
+                        default:
+                            break;
+                    }
+                }
+
                 break;
 
             case NodeTag.T_CreateStmt:
                 InstallGuard(Resolve(((CreateStmt*)parsetree)->relation));
                 break;
 
+            // A row trigger that runs before an update, or the last one gone, changes which updates the update guard fires on.
+            case NodeTag.T_CreateTrigStmt when ((CreateTrigStmt*)parsetree)->row:
+                InstallGuard(Resolve(((CreateTrigStmt*)parsetree)->relation));
+                break;
+
+            case NodeTag.T_DropStmt when ((DropStmt*)parsetree)->removeType == ObjectType.OBJECT_TRIGGER:
+                List* objects = ((DropStmt*)parsetree)->objects;
+                for (int i = 0; objects is not null && i < objects->length; i++)
+                {
+                    List* name = (List*)NativeMethods.copyObjectImpl(objects->elements[i].ptr_value);
+                    InstallGuard(Resolve(NativeMethods.makeRangeVarFromNameList(NativeMethods.list_truncate(name, name->length - 1))));
+                }
+
+                break;
+
+            // A domain's default can't change once it uses a managed sequence, so one that does now didn't.
+            case NodeTag.T_AlterDomainStmt when AltersDefault((AlterDomainStmt*)parsetree):
+                uint domain = NativeMethods.typenameTypeId(null, NativeMethods.makeTypeNameFromNameList(((AlterDomainStmt*)parsetree)->typeName));
+                WorfRows columns = Worf.Read("""
+                    WITH RECURSIVE domains (typid) AS (
+                        SELECT $1::oid
+                        UNION
+                        SELECT t.oid FROM pg_catalog.pg_type t JOIN domains d ON t.typbasetype = d.typid
+                        WHERE t.typtype = 'd' AND t.typdefaultbin IS NULL)
+                    SELECT DISTINCT a.attrelid::oid, a.attname::text
+                    FROM domains d
+                        JOIN pg_catalog.pg_attribute a ON a.atttypid = d.typid
+                        JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+                    WHERE c.relkind IN ('r', 'p') AND a.attnum > 0 AND NOT a.attisdropped AND NOT a.atthasdef
+                    """, 0, SpiParameter.Create(domain));
+                for (int i = 0; i < columns.Count; i++)
+                {
+                    InstallGuard(columns[i].Get<uint>(0));
+                    CheckColumnRows(columns[i].Get<uint>(0), columns[i].Get<string>(1), false);
+                }
+
+                break;
+
             default:
                 break;
+        }
+    }
+
+    /// <summary>
+    /// Checks the values a table's rows hold in a column that has come under the guard, with its inheritors' and
+    /// partitions' rows when <paramref name="inherited"/> is set or it's partitioned.
+    /// </summary>
+    private static void CheckColumnRows(uint relid, string column, bool inherited)
+    {
+        if (NativeMethods.get_rel_relkind(relid) != (sbyte)'p')
+        {
+            if (GuardedColumns(relid).TryGetValue(column, out (uint TypeOid, List<uint> Sequences, List<string> Names) guarded))
+            {
+                SequenceRangeGuard.CheckRows(relid, inherited, column, Effective(guarded, relid));
+            }
+
+            return;
+        }
+
+        (Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> Root, Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>> Partitions,
+            Dictionary<uint, (uint Parent, bool Leaf)> Members) tree = TreeColumns(TreeRoot(relid));
+        foreach ((uint partition, (_, bool leaf)) in tree.Members)
+        {
+            if (leaf && Beneath(partition, relid, tree.Members) &&
+                GuardedColumns(partition, tree).TryGetValue(column, out (uint TypeOid, List<uint> Sequences, List<string> Names) guarded))
+            {
+                SequenceRangeGuard.CheckRows(partition, false, column, Effective(guarded, partition));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Checks the rows of a partition that joined a guarded tree, in each column its tree's guard checks against
+    /// sequences beyond those the partition's own guard did.
+    /// </summary>
+    private static void CheckAttachedRows(uint partition)
+    {
+        if (partition == 0)
+        {
+            return;
+        }
+
+        (Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> ownRoot,
+            Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>> ownPartitions,
+            Dictionary<uint, (uint Parent, bool Leaf)> members) = TreeColumns(partition);
+        (Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> Root, Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>> Partitions,
+            Dictionary<uint, (uint Parent, bool Leaf)> Members) tree = TreeColumns(TreeRoot(partition));
+        foreach ((uint leaf, (_, bool isLeaf)) in members)
+        {
+            if (!isLeaf)
+            {
+                continue;
+            }
+
+            Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> own = Merge(ownRoot,
+                ownPartitions.TryGetValue(leaf, out Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>? columns) ? columns : []);
+            foreach ((string column, (uint TypeOid, List<uint> Sequences, List<string> Names) use) in GuardedColumns(leaf, tree))
+            {
+                List<uint> sequences = Effective(use, leaf);
+                if (!own.TryGetValue(column, out (uint TypeOid, List<uint> Sequences, List<string> Names) before) || !sequences.TrueForAll(Effective(before, leaf).Contains))
+                {
+                    SequenceRangeGuard.CheckRows(leaf, false, column, sequences);
+                }
+            }
         }
     }
 
@@ -721,17 +2245,22 @@ internal static unsafe partial class SequenceRanges
                 managed = IsManaged(Resolve((RangeVar*)objects->elements[i].ptr_value));
             }
         }
-        else if (grant->targtype == GrantTargetType.ACL_TARGET_ALL_IN_SCHEMA && objects is not null)
+        else if (grant->targtype == GrantTargetType.ACL_TARGET_ALL_IN_SCHEMA && grant->objtype == ObjectType.OBJECT_SEQUENCE && objects is not null)
         {
-            // A schema name is a list of one name, which NameListToString joins with dots.
-            string[] schemas = Worf.FromServer(NativeMethods.NameListToString(objects)).Split('.');
-            managed = Spi.ExecuteScalar<bool>("""
+            // ALL TABLES leaves sequences out. Each schema is a name of its own.
+            string[] schemas = new string[objects->length];
+            for (int i = 0; i < objects->length; i++)
+            {
+                schemas[i] = NodeName(objects->elements[i].ptr_value);
+            }
+
+            managed = Elevated.Run(() => Worf.ReadScalar<bool>("""
                 SELECT EXISTS (
                     SELECT 1 FROM worf.sequence_range r
                         JOIN pg_catalog.pg_class c ON c.oid = r.seqoid
                         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
                     WHERE n.nspname = ANY ($1))
-                """, SpiParameter.Create(schemas));
+                """, SpiParameter.Create(schemas)));
         }
 
         if (managed)
@@ -740,22 +2269,96 @@ internal static unsafe partial class SequenceRanges
         }
     }
 
+    /// <summary>
+    /// Checks whether ALTER DOMAIN sets or drops the domain's default.
+    /// </summary>
+    private static bool AltersDefault(AlterDomainStmt* alter)
+#if ANKUS_PG19
+        => alter->subtype == AlterDomainType.AD_AlterDefault;
+#else
+        => alter->subtype == (sbyte)'T';
+#endif
+
+    /// <summary>
+    /// Checks whether a domain's default uses a managed sequence.
+    /// </summary>
+    private static bool DomainUsesManaged(List* typeName)
+    {
+        uint typid = NativeMethods.typenameTypeId(null, NativeMethods.makeTypeNameFromNameList(typeName));
+        WorfRows managed = Elevated.Run(() => Worf.SelectCatalog("SELECT r.seqoid::oid FROM worf.sequence_range r WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = r.seqoid)"));
+        if (Worf.ReadScalar<string?>("SELECT typdefaultbin::text FROM pg_catalog.pg_type WHERE oid = $1", SpiParameter.Create(typid)) is not string expression)
+        {
+            return false;
+        }
+
+        List<(bool Unknown, uint Oid, string? Name)> calls = [];
+        NextvalCalls((Node*)NativeMethods.stringToNode(Worf.PStrDup(expression)), calls);
+        uint schema = Worf.ReadScalar<uint>("SELECT typnamespace FROM pg_catalog.pg_type WHERE oid = $1", SpiParameter.Create(typid));
+        return Enumerable.Range(0, managed.Count).Any(i => MayDrawFrom(calls, managed[i].Get<uint>(0), schema).Draws);
+    }
+
     private static bool AnyManaged()
-        => Worf.CatalogOid("sequence_range") != 0 && Elevated.Run(() => Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range)"));
+        => Worf.CatalogOid("sequence_range") != 0 && Elevated.Run(() => Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range)"));
+
+    /// <summary>
+    /// Checks whether a trigger name is one of the guard's.
+    /// </summary>
+    /// <param name="name">The name.</param>
+    /// <returns>Whether it is.</returns>
+    internal static bool IsGuardName(string name) => name is GuardName or UpdateGuardName or PartitionGuardName or PartitionUpdateGuardName;
 
     private static bool IsGuarded(uint relid)
-        => relid != 0 && Spi.ExecuteScalar<bool>("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid = $1 AND tgname = $2)",
-            SpiParameter.Create(relid), SpiParameter.Create(GuardName));
+        => relid != 0 && Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid = $1 AND tgname = ANY ($2))",
+            SpiParameter.Create(relid), SpiParameter.Create(s_guardNames));
+
+    /// <summary>
+    /// Lists the guards a table has of its own, rather than from a parent it is a partition of.
+    /// </summary>
+    private static List<string> OwnGuards(uint relid)
+    {
+        WorfRows result = Worf.Read("""
+            SELECT tgname::text FROM pg_catalog.pg_trigger WHERE tgrelid = $1 AND tgname = ANY ($2) AND tgparentid = 0
+            """, 0, SpiParameter.Create(relid), SpiParameter.Create(s_guardNames));
+        List<string> guards = [];
+        for (int i = 0; i < result.Count; i++)
+        {
+            guards.Add(result[i].Get<string>(0));
+        }
+
+        return guards;
+    }
+
+    /// <summary>
+    /// Checks whether moving a relation to another schema moves a managed sequence: the sequence itself, or one its
+    /// table owns, which follows the table.
+    /// </summary>
+    private static bool MovesManaged(uint relid) => relid != 0 && (IsManaged(relid) || OwnsManaged(relid));
+
+    /// <summary>
+    /// Checks whether a table owns a managed sequence, as a serial or identity column's.
+    /// </summary>
+    private static bool OwnsManaged(uint relid)
+        => Elevated.Run(() => Worf.ReadScalar<bool>("""
+            SELECT EXISTS (
+                SELECT 1 FROM pg_catalog.pg_depend d JOIN worf.sequence_range r ON r.seqoid = d.objid
+                WHERE d.classid = 'pg_catalog.pg_class'::regclass AND d.refclassid = 'pg_catalog.pg_class'::regclass
+                    AND d.refobjid = $1 AND d.deptype IN ('a', 'i'))
+            """, SpiParameter.Create(relid)));
 
     private static bool ColumnUsesManaged(uint relid, string column)
     {
         return Elevated.Run(() =>
         {
-            SpiResult managed = Spi.Select("SELECT seqoid::oid FROM worf.sequence_range");
-            return Enumerable.Range(0, managed.Count)
-                .Any(i => UsingColumns(managed[i].Get<uint>(0)).Exists(c => c.Relid == relid && c.Column == column));
+            WorfRows managed = Worf.Select("SELECT r.seqoid::oid FROM worf.sequence_range r WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = r.seqoid)");
+            return UsingColumnsNamed([.. Enumerable.Range(0, managed.Count).Select(i => managed[i].Get<uint>(0))]).Values
+                .Any(columns => columns.Exists(c => c.Relid == relid && c.Column == column));
         });
     }
+
+    /// <summary>
+    /// Reads the name a parse tree's string node holds.
+    /// </summary>
+    private static string NodeName(void* value) => Worf.FromServer(NativeMethods.NameListToString(NativeMethods.lappend(null, value)));
 
     private static uint Resolve(RangeVar* relation)
         => relation is null ? 0 : NativeMethods.RangeVarGetRelidExtended(relation, 0, 1, default, null);
@@ -764,58 +2367,674 @@ internal static unsafe partial class SequenceRanges
         => new("55000", $"{what} is not allowed under worf's sequence range management", hint: hint);
 
     /// <summary>
-    /// Lists the columns, with their tables and types, whose default or identity uses a sequence.
+    /// Lists the columns, with their tables and the types beneath any domains, whose default or identity uses a
+    /// sequence, or which have no default of their own and take their domain's, which does. A default uses it when it may
+    /// call nextval of it, rather than only read it, as <c>currval('s')</c> does. PostgreSQL records no use of a sequence
+    /// that a default reaches through a function, or names as text, as <c>nextval('s'::text)</c> does, which it looks up
+    /// as the default runs: worf takes a default that names the sequence's relation, under any search path, as using it,
+    /// and one whose name it can't tell as using every sequence.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
     /// <returns>The columns.</returns>
     internal static List<(uint Relid, string Column, uint TypeOid)> UsingColumns(uint seqoid)
+        => [.. UsingColumnsNamed(seqoid).Select(column => (column.Relid, column.Column, column.TypeOid)).Distinct()];
+
+    /// <summary>
+    /// Lists the columns that use a sequence, as <see cref="UsingColumns"/> does, each with the name its default gives the
+    /// sequence, when it names it as text.
+    /// </summary>
+    private static List<(uint Relid, string Column, uint TypeOid, string? Name)> UsingColumnsNamed(uint seqoid)
+        => UsingColumnsNamed([seqoid])[seqoid];
+
+    /// <summary>
+    /// Lists the columns that use each of some sequences, as <see cref="UsingColumnsNamed(uint)"/> does for one, from one
+    /// read of the catalogs, so that the time it takes doesn't grow with the sequences' number times the defaults'.
+    /// </summary>
+    private static Dictionary<uint, List<(uint Relid, string Column, uint TypeOid, string? Name)>> UsingColumnsNamed(IReadOnlyCollection<uint> seqoids)
     {
-        SpiResult result = Worf.SelectCatalog("""
-            SELECT DISTINCT a.attrelid, a.attname::text, a.atttypid
+        // A row of sequence 0 is a default that calls nextval, which may use any of them.
+        WorfRows result = Worf.SelectCatalog("""
+            WITH RECURSIVE domains (typid, expr, seqoid) AS (
+                SELECT d.objid, t.typdefaultbin::text, d.refobjid FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_type t ON t.oid = d.objid
+                WHERE d.classid = 'pg_catalog.pg_type'::regclass AND d.refclassid = 'pg_catalog.pg_class'::regclass
+                    AND d.refobjid = ANY ($1::oid[]) AND d.deptype = 'n'
+                UNION
+                SELECT t.oid, t.typdefaultbin::text, 0::oid FROM pg_catalog.pg_type t
+                WHERE t.typtype = 'd' AND t.typdefaultbin::text LIKE '%:funcid 1574 %'
+                UNION
+                SELECT t.oid, d.expr, d.seqoid FROM pg_catalog.pg_type t JOIN domains d ON t.typbasetype = d.typid
+                WHERE t.typtype = 'd' AND t.typdefaultbin IS NULL)
+            SELECT DISTINCT u.seqoid, a.attrelid, a.attnum, a.attname::text, a.atttypid, u.expr
             FROM (
-                SELECT d.refobjid AS relid, d.refobjsubid AS attnum
+                SELECT d.objid AS seqoid, d.refobjid AS relid, d.refobjsubid AS attnum, NULL::text AS expr
                 FROM pg_catalog.pg_depend d
-                WHERE d.classid = 'pg_catalog.pg_class'::regclass AND d.objid = $1
+                WHERE d.classid = 'pg_catalog.pg_class'::regclass AND d.objid = ANY ($1::oid[])
                     AND d.refclassid = 'pg_catalog.pg_class'::regclass AND d.deptype IN ('a', 'i') AND d.refobjsubid > 0
                 UNION
-                SELECT ad.adrelid, ad.adnum
+                SELECT d.refobjid, ad.adrelid, ad.adnum, ad.adbin::text
                 FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_attrdef ad ON ad.oid = d.objid
                 WHERE d.classid = 'pg_catalog.pg_attrdef'::regclass AND d.refclassid = 'pg_catalog.pg_class'::regclass
-                    AND d.refobjid = $1
+                    AND d.refobjid = ANY ($1::oid[])
+                UNION
+                SELECT 0, ad.adrelid, ad.adnum, ad.adbin::text
+                FROM pg_catalog.pg_attrdef ad WHERE ad.adbin::text LIKE '%:funcid 1574 %'
+                UNION
+                SELECT d.seqoid, a.attrelid, a.attnum, d.expr
+                FROM domains d JOIN pg_catalog.pg_attribute a ON a.atttypid = d.typid
+                WHERE a.attnum > 0 AND NOT a.atthasdef
             ) u
             JOIN pg_catalog.pg_attribute a ON a.attrelid = u.relid AND a.attnum = u.attnum
             JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
             WHERE c.relkind IN ('r', 'p') AND NOT a.attisdropped
-            """, SpiParameter.Create(seqoid));
-        List<(uint Relid, string Column, uint TypeOid)> columns = [];
+            ORDER BY 1, 2, 3, 6
+            """, SpiParameter.Create(seqoids.Select(seqoid => (long)seqoid).ToArray()));
+        Dictionary<uint, List<(uint Relid, string Column, uint TypeOid, string? Name)>> columns = [];
+        foreach (uint seqoid in seqoids)
+        {
+            columns[seqoid] = [];
+        }
+
+        // Each default is read once, for the calls of nextval it makes.
+        Dictionary<string, List<(bool Unknown, uint Oid, string? Name)>> calls = [];
         for (int i = 0; i < result.Count; i++)
         {
-            columns.Add((result[i].Get<uint>(0), result[i].Get<string>(1), result[i].Get<uint>(2)));
+            uint seqoid = result[i].Get<uint>(0);
+            uint relid = result[i].Get<uint>(1);
+            List<(bool Unknown, uint Oid, string? Name)>? made = null;
+            if (result[i].Get<string?>(5) is string expression && !calls.TryGetValue(expression, out made))
+            {
+                made = [];
+                NextvalCalls((Node*)NativeMethods.stringToNode(Worf.PStrDup(expression)), made);
+                calls[expression] = made;
+            }
+
+            uint schema = NativeMethods.get_rel_namespace(relid);
+            foreach (uint target in seqoid == 0 ? columns.Keys.ToList() : [seqoid])
+            {
+                (bool draws, string? name) = made is null ? (true, null) : MayDrawFrom(made, target, schema);
+                (uint Relid, string Column, uint TypeOid, string? Name) column = (relid, result[i].Get<string>(3),
+                    NativeMethods.getBaseType(result[i].Get<uint>(4)), name);
+                if (draws && !columns[target].Contains(column))
+                {
+                    columns[target].Add(column);
+                }
+            }
         }
 
         return columns;
     }
 
     /// <summary>
-    /// Runs DDL that managed sequences otherwise reject, and that isn't replicated.
+    /// Checks whether an expression, from the calls of nextval <see cref="NextvalCalls"/> lists, may call nextval of a
+    /// sequence: it calls nextval of it as a regclass constant, or of a name that may resolve to it, or of a sequence it
+    /// names in a way this check can't tell, or holds a kind of node this check doesn't look into.
     /// </summary>
-    /// <param name="sql">The DDL.</param>
-    internal static void RunInternalDdl(string sql)
+    /// <returns>Whether it may, and the name it gives the sequence as text, if it does.</returns>
+    private static (bool Draws, string? Name) MayDrawFrom(List<(bool Unknown, uint Oid, string? Name)> calls, uint seqoid, uint schema)
     {
-        bool internalDdl = InternalDdl;
-        bool suppressed = DdlReplication.Suppressed;
-        InternalDdl = true;
-        DdlReplication.Suppressed = true;
+        foreach ((bool unknown, uint oid, string? name) in calls)
+        {
+            if (unknown)
+            {
+                return (true, null);
+            }
+
+            if (name is not null ? NameMatches(name, seqoid, schema) : oid == 0 || oid == seqoid)
+            {
+                return (true, name);
+            }
+        }
+
+        return (false, null);
+    }
+
+    /// <summary>
+    /// Lists, in order, the calls of nextval an expression makes, each with the sequence it names, as
+    /// <see cref="NextvalTarget"/> reads it, and a node of a kind this check doesn't look into, which may make any.
+    /// </summary>
+    private static void NextvalCalls(Node* node, List<(bool Unknown, uint Oid, string? Name)> calls)
+    {
+        if (node is null)
+        {
+            return;
+        }
+
+        if (node->type == NodeTag.T_FuncExpr && ((FuncExpr*)node)->funcid == NextvalOid)
+        {
+            (uint oid, string? name) = NextvalTarget((FuncExpr*)node);
+            calls.Add((false, oid, name));
+            return;
+        }
+
+        List<nint> children = [];
+        if (!Children(node, children))
+        {
+            calls.Add((true, 0, null));
+            return;
+        }
+
+        foreach (nint child in children)
+        {
+            NextvalCalls((Node*)child, calls);
+        }
+    }
+
+    /// <summary>
+    /// Reads the sequence a call of nextval names: its oid when it names it as a regclass constant, or the name it gives
+    /// as text, as a cast, a conversion or a concatenation of constant strings gives it, folded to a constant where the
+    /// expression calls only PostgreSQL's own immutable functions, which run nothing of the user's.
+    /// </summary>
+    /// <returns>The oid or the name, or neither when the call names its sequence some other way.</returns>
+    private static (uint Oid, string? Name) NextvalTarget(FuncExpr* call)
+    {
+        Node* argument = call->args is not null && call->args->length == 1 ? (Node*)call->args->elements[0].ptr_value : null;
+        while (argument is not null && argument->type == NodeTag.T_RelabelType)
+        {
+            argument = (Node*)((RelabelType*)argument)->arg;
+        }
+
+        if (argument is null)
+        {
+            return (0, null);
+        }
+
+        if (argument->type == NodeTag.T_Const && ((Const*)argument)->consttype == RegclassOid)
+        {
+            return ((Const*)argument)->constisnull ? (0, null) : ((uint)((Const*)argument)->constvalue, null);
+        }
+
+        // text's cast to regclass looks up the name, and an input conversion takes digits as an oid, as regclass does.
+        if (argument->type == NodeTag.T_FuncExpr && ((FuncExpr*)argument)->funcid == TextRegclassOid && ((FuncExpr*)argument)->args is not null &&
+            ((FuncExpr*)argument)->args->length == 1)
+        {
+            return (0, Fold((Node*)((FuncExpr*)argument)->args->elements[0].ptr_value));
+        }
+
+        if (argument->type == NodeTag.T_CoerceViaIO && ((CoerceViaIO*)argument)->resulttype == RegclassOid &&
+            Fold((Node*)((CoerceViaIO*)argument)->arg) is string text)
+        {
+            return text.Length > 0 && text.All(char.IsAsciiDigit) && uint.TryParse(text, CultureInfo.InvariantCulture, out uint oid) ? (oid, null) : (0, text);
+        }
+
+        return (0, null);
+    }
+
+    /// <summary>
+    /// Folds an expression of PostgreSQL's own types and immutable functions to a constant, and reads it as text.
+    /// </summary>
+    /// <returns>The text, or null when the expression isn't such, or is null.</returns>
+    private static string? Fold(Node* expression)
+    {
+        if (!Foldable(expression))
+        {
+            return null;
+        }
+
+        Node* folded = NativeMethods.eval_const_expressions(null, (Node*)NativeMethods.copyObjectImpl(expression));
+        if (folded->type != NodeTag.T_Const || ((Const*)folded)->constisnull)
+        {
+            return null;
+        }
+
+        uint output;
+        bool varlena;
+        NativeMethods.getTypeOutputInfo(((Const*)folded)->consttype, &output, &varlena);
+        return Worf.FromServer(NativeMethods.OidOutputFunctionCall(output, ((Const*)folded)->constvalue));
+    }
+
+    /// <summary>
+    /// Checks whether an expression holds only constants, casts and calls of PostgreSQL's own types and immutable
+    /// functions.
+    /// </summary>
+    private static bool Foldable(Node* node) => node->type switch
+    {
+        NodeTag.T_Const => ((Const*)node)->consttype < FirstNormalObjectId,
+        NodeTag.T_RelabelType => ((RelabelType*)node)->resulttype < FirstNormalObjectId && Foldable((Node*)((RelabelType*)node)->arg),
+        NodeTag.T_CollateExpr => Foldable((Node*)((CollateExpr*)node)->arg),
+        NodeTag.T_CoerceViaIO => ((CoerceViaIO*)node)->resulttype < FirstNormalObjectId &&
+            NativeMethods.exprType((Node*)((CoerceViaIO*)node)->arg) < FirstNormalObjectId && Foldable((Node*)((CoerceViaIO*)node)->arg),
+        NodeTag.T_FuncExpr => Immutable(((FuncExpr*)node)->funcid) && AllFoldable(((FuncExpr*)node)->args),
+        NodeTag.T_OpExpr => Immutable(((OpExpr*)node)->opfuncid != 0 ? ((OpExpr*)node)->opfuncid : NativeMethods.get_opcode(((OpExpr*)node)->opno)) &&
+            AllFoldable(((OpExpr*)node)->args),
+        _ => false,
+    };
+
+    private static bool AllFoldable(List* nodes)
+    {
+        for (int i = 0; nodes is not null && i < nodes->length; i++)
+        {
+            if (!Foldable((Node*)nodes->elements[i].ptr_value))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool Immutable(uint funcid) => funcid != 0 && funcid < FirstNormalObjectId && NativeMethods.func_volatile(funcid) == (sbyte)'i';
+
+    /// <summary>
+    /// Checks whether a name, as nextval looks it up in a default of a table or domain in a schema, names a sequence: it
+    /// names the sequence's relation, and its schema, or, for a name that gives none, the sequence is in the table's or
+    /// domain's schema, or that schema has nothing of the name. Whichever search path the session that writes a row has,
+    /// the name may find the sequence then, so the session that runs the DDL has no say. A table whose schema has a
+    /// sequence of the name, as another role's may, stands for that one.
+    /// </summary>
+    private static bool NameMatches(string name, uint seqoid, uint schema)
+        => QualifiedNameParts(name) is { Count: > 0 } parts && parts[^1] == Worf.FromServer(NativeMethods.get_rel_name(seqoid)) &&
+            (parts.Count == 1
+                ? NativeMethods.get_rel_namespace(seqoid) == schema || NativeMethods.get_relname_relid(Worf.PStrDup(parts[0]), schema) == 0
+                : parts[^2] == Worf.FromServer(NativeMethods.get_namespace_name(NativeMethods.get_rel_namespace(seqoid))));
+
+    /// <summary>
+    /// Finds the managed sequences a name in a default of a table or domain in a schema names.
+    /// </summary>
+    private static List<uint> Matching(string name, uint schema)
+    {
+        WorfRows managed = Elevated.Run(() => Worf.SelectCatalog("SELECT r.seqoid::oid FROM worf.sequence_range r WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = r.seqoid) ORDER BY r.seqoid"));
+        List<uint> matching = [];
+        for (int i = 0; i < managed.Count; i++)
+        {
+            if (NameMatches(name, managed[i].Get<uint>(0), schema))
+            {
+                matching.Add(managed[i].Get<uint>(0));
+            }
+        }
+
+        return matching;
+    }
+
+    /// <summary>
+    /// Splits a qualified name into its parts as PostgreSQL does for text it casts to regclass: at dots outside double
+    /// quotes, with a quoted part's doubled quotes made single and an unquoted part's ASCII letters made lower case, each
+    /// cut to the longest name.
+    /// </summary>
+    /// <returns>The parts, or none when the name isn't one.</returns>
+    private static List<string> QualifiedNameParts(string name)
+    {
+        List<string> parts = [];
+        StringBuilder part = new();
+        int i = 0;
+        while (true)
+        {
+            while (i < name.Length && char.IsWhiteSpace(name[i]))
+            {
+                i++;
+            }
+
+            _ = part.Clear();
+            if (i < name.Length && name[i] == '"')
+            {
+                for (i++; ; i++)
+                {
+                    if (i >= name.Length)
+                    {
+                        return [];
+                    }
+
+                    if (name[i] == '"')
+                    {
+                        if (i + 1 < name.Length && name[i + 1] == '"')
+                        {
+                            i++;
+                        }
+                        else
+                        {
+                            i++;
+                            break;
+                        }
+                    }
+
+                    _ = part.Append(name[i]);
+                }
+            }
+            else
+            {
+                for (; i < name.Length && name[i] != '.' && !char.IsWhiteSpace(name[i]); i++)
+                {
+                    _ = part.Append(char.IsAsciiLetterUpper(name[i]) ? char.ToLowerInvariant(name[i]) : name[i]);
+                }
+
+                if (part.Length == 0)
+                {
+                    return [];
+                }
+            }
+
+            parts.Add(Truncated(part.ToString()));
+            while (i < name.Length && char.IsWhiteSpace(name[i]))
+            {
+                i++;
+            }
+
+            if (i == name.Length)
+            {
+                return parts;
+            }
+
+            if (name[i] != '.')
+            {
+                return [];
+            }
+
+            i++;
+        }
+    }
+
+    /// <summary>
+    /// Cuts a name to the longest PostgreSQL keeps, at a whole character.
+    /// </summary>
+    private static string Truncated(string name)
+    {
+        while (Encoding.UTF8.GetByteCount(name) > NameDataLength - 1)
+        {
+            name = name[..^1];
+        }
+
+        return name;
+    }
+
+    /// <summary>
+    /// Lists an expression node's children, for the kinds of node a column default holds.
+    /// </summary>
+    /// <returns>Whether this is such a kind of node.</returns>
+    private static bool Children(Node* node, List<nint> children)
+    {
+        void Add(void* child) => children.Add((nint)child);
+        void AddAll(List* list)
+        {
+            for (int i = 0; list is not null && i < list->length; i++)
+            {
+                children.Add((nint)list->elements[i].ptr_value);
+            }
+        }
+
+        switch (node->type)
+        {
+            case NodeTag.T_List:
+                AddAll((List*)node);
+                return true;
+
+            case NodeTag.T_FuncExpr:
+                AddAll(((FuncExpr*)node)->args);
+                return true;
+
+            // A DistinctExpr and a NullIfExpr are OpExprs.
+            case NodeTag.T_OpExpr or NodeTag.T_DistinctExpr or NodeTag.T_NullIfExpr:
+                AddAll(((OpExpr*)node)->args);
+                return true;
+
+            case NodeTag.T_ScalarArrayOpExpr:
+                AddAll(((ScalarArrayOpExpr*)node)->args);
+                return true;
+
+            case NodeTag.T_BoolExpr:
+                AddAll(((BoolExpr*)node)->args);
+                return true;
+
+            case NodeTag.T_CoalesceExpr:
+                AddAll(((CoalesceExpr*)node)->args);
+                return true;
+
+            case NodeTag.T_MinMaxExpr:
+                AddAll(((MinMaxExpr*)node)->args);
+                return true;
+
+            case NodeTag.T_CaseExpr:
+                Add(((CaseExpr*)node)->arg);
+                AddAll(((CaseExpr*)node)->args);
+                Add(((CaseExpr*)node)->defresult);
+                return true;
+
+            case NodeTag.T_CaseWhen:
+                Add(((CaseWhen*)node)->expr);
+                Add(((CaseWhen*)node)->result);
+                return true;
+
+            case NodeTag.T_RelabelType:
+                Add(((RelabelType*)node)->arg);
+                return true;
+
+            case NodeTag.T_CoerceViaIO:
+                Add(((CoerceViaIO*)node)->arg);
+                return true;
+
+            case NodeTag.T_CoerceToDomain:
+                Add(((CoerceToDomain*)node)->arg);
+                return true;
+
+            case NodeTag.T_NullTest:
+                Add(((NullTest*)node)->arg);
+                return true;
+
+            case NodeTag.T_Const or NodeTag.T_SQLValueFunction:
+                return true;
+
+            default:
+                return false;
+        }
+    }
+
+    /// <summary>
+    /// Checks that the guard can read a column's values: an integer or numeric column. A column whose default only
+    /// uses the sequence, as in <c>'INV-' || nextval(...)</c>, holds values the guard can't check.
+    /// </summary>
+    private static void RequireCheckable(uint relid, string column, uint typeOid, uint seqoid)
+    {
+        if (!Checkable(typeOid))
+        {
+            throw new PgException(FeatureNotSupported,
+                $"column \"{column}\" of table {QualifiedName(relid)} uses sequence {GetInfo(seqoid).Name} but its type {Worf.FromServer(NativeMethods.format_type_be(typeOid))} can't hold its values",
+                hint: "Range management checks the values of smallint, integer, bigint and numeric columns only.");
+        }
+    }
+
+    private static bool Checkable(uint typeOid) => typeOid is Int2Oid or Int4Oid or Int8Oid or NumericOid;
+
+    /// <summary>
+    /// Checks that a column that uses managed sequences draws its values from one of them: that its default, if it has
+    /// one, is nextval of one of them, alone or cast to an integer or numeric type, as a serial column's is, named as a
+    /// regclass constant, or as text that may resolve to one. A default such as <c>nextval('s') + 1000000</c> gives
+    /// values the guard always refuses, and one whose sequence worf can't tell from its text may draw from any.
+    /// </summary>
+    private static void RequireNextval(uint relid, string column, List<uint> sequences, List<string> names)
+    {
+        WorfRows result = Worf.Read("""
+            WITH RECURSIVE chain (typid, depth) AS (
+                SELECT a.atttypid, 0 FROM pg_catalog.pg_attribute a WHERE a.attrelid = $1 AND a.attname = $2 AND NOT a.atthasdef
+                UNION ALL
+                SELECT t.typbasetype, c.depth + 1 FROM chain c JOIN pg_catalog.pg_type t ON t.oid = c.typid
+                WHERE t.typtype = 'd' AND t.typdefaultbin IS NULL)
+            SELECT d.adbin::text
+            FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+            WHERE a.attrelid = $1 AND a.attname = $2 AND a.attidentity = '' AND a.attgenerated = ''
+            UNION ALL
+            (SELECT t.typdefaultbin::text
+            FROM chain c JOIN pg_catalog.pg_type t ON t.oid = c.typid
+            WHERE t.typtype = 'd' AND t.typdefaultbin IS NOT NULL ORDER BY c.depth LIMIT 1)
+            """, 1, SpiParameter.Create(relid), SpiParameter.Create(column));
+        if (result.Count == 0)
+        {
+            return;
+        }
+
+        (bool nextval, uint drawn, string? name) = DrawsFrom(result[0].Get<string>(0));
+        if (nextval && drawn == 0 && name is null)
+        {
+            throw new PgException(FeatureNotSupported,
+                $"column \"{column}\" of table {QualifiedName(relid)} calls nextval of a sequence worf can't tell from its default, which may be a managed one",
+                hint: "Name the sequence as a regclass constant, as nextval('s') does, or as a constant string.");
+        }
+
+        if (name is not null ? !names.Contains(name) : !sequences.Contains(drawn))
+        {
+            throw new PgException(FeatureNotSupported,
+                $"column \"{column}\" of table {QualifiedName(relid)} uses sequence {(sequences.Count > 0 ? GetInfo(sequences[0]).Name : names[0])} but its default isn't nextval of it",
+                hint: "Range management checks the values of columns whose default is nextval of the sequence, alone or cast to the column's type.");
+        }
+    }
+
+    /// <summary>
+    /// Finds the sequence an expression draws from when it is nextval of a sequence, alone or cast to an integer or
+    /// numeric type, as <see cref="NextvalTarget"/> reads it.
+    /// </summary>
+    /// <returns>Whether it is nextval of a sequence, and the sequence's oid or the name it gives it.</returns>
+    private static (bool Nextval, uint Sequence, string? Name) DrawsFrom(string expression)
+    {
+        Node* node = (Node*)NativeMethods.stringToNode(Worf.PStrDup(expression));
+        while (true)
+        {
+            switch (node->type)
+            {
+                case NodeTag.T_RelabelType:
+                    node = (Node*)((RelabelType*)node)->arg;
+                    break;
+
+                case NodeTag.T_CoerceToDomain:
+                    node = (Node*)((CoerceToDomain*)node)->arg;
+                    break;
+
+                case NodeTag.T_FuncExpr when ((FuncExpr*)node)->args is not null && ((FuncExpr*)node)->args->length == 1:
+                    FuncExpr* call = (FuncExpr*)node;
+                    if (call->funcformat is CoercionForm.COERCE_IMPLICIT_CAST or CoercionForm.COERCE_EXPLICIT_CAST &&
+                        Checkable(NativeMethods.getBaseType(call->funcresulttype)))
+                    {
+                        node = (Node*)call->args->elements[0].ptr_value;
+                        break;
+                    }
+
+                    if (call->funcid != NextvalOid)
+                    {
+                        return (false, 0, null);
+                    }
+
+                    (uint oid, string? name) = NextvalTarget(call);
+                    return (true, oid, name);
+
+                default:
+                    return (false, 0, null);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Checks whether a column has a default, of its own or from its domain.
+    /// </summary>
+    private static bool HasDefault(uint relid, string column)
+        => Worf.ReadScalar<bool>("""
+            WITH RECURSIVE chain (typid) AS (
+                SELECT a.atttypid FROM pg_catalog.pg_attribute a WHERE a.attrelid = $1 AND a.attname = $2
+                UNION ALL
+                SELECT t.typbasetype FROM chain c JOIN pg_catalog.pg_type t ON t.oid = c.typid WHERE t.typtype = 'd')
+            SELECT EXISTS (
+                SELECT 1 FROM pg_catalog.pg_attribute a WHERE a.attrelid = $1 AND a.attname = $2 AND a.atthasdef)
+                OR EXISTS (SELECT 1 FROM chain c JOIN pg_catalog.pg_type t ON t.oid = c.typid WHERE t.typdefaultbin IS NOT NULL)
+            """, SpiParameter.Create(relid), SpiParameter.Create(column));
+
+    /// <summary>
+    /// Runs DDL that managed sequences otherwise reject, and that isn't replicated, on a sequence: a change of its bounds
+    /// or a revoke of UPDATE on it. It calls the command itself, as PostgreSQL does for the triggers it creates for its
+    /// own ends, so that no event trigger or other hook runs anything for it, and as worf's own, since a sequence runs
+    /// none of the user's functions.
+    /// </summary>
+    /// <param name="sql">The ALTER SEQUENCE or REVOKE.</param>
+    internal static void RunInternalDdl(string sql) => Elevated.Run(() =>
+    {
+        sbyte* text = Worf.PStrDup(sql);
+        Node* statement = ((RawStmt*)NativeMethods.raw_parser(text, RawParseMode.RAW_PARSE_DEFAULT)->elements[0].ptr_value)->stmt;
+        switch (statement->type)
+        {
+            case NodeTag.T_AlterSeqStmt:
+                ParseState* pstate = NativeMethods.make_parsestate(null);
+                pstate->p_sourcetext = text;
+                _ = NativeMethods.AlterSequence(pstate, (AlterSeqStmt*)statement);
+                break;
+
+            case NodeTag.T_GrantStmt:
+                NativeMethods.ExecuteGrantStmt((GrantStmt*)statement);
+                break;
+
+            default:
+                throw new PgException(PgSqlStates.InternalError, $"worf runs no internal DDL such as: {sql}");
+        }
+
+        NativeMethods.CommandCounterIncrement();
+    });
+
+    /// <summary>
+    /// Creates or replaces a guard trigger on a table as the table's owner, in a security-restricted operation, so that
+    /// the user's functions PostgreSQL runs for the table, as its partition key's, run as if the owner had created the
+    /// trigger, with no rights the owner lacks. It calls the command itself, so that no event trigger runs for it. The
+    /// trigger's condition, which calls worf's functions, is parsed first as worf's own, which runs nothing of the
+    /// user's, so that the owner needs no rights on worf's schema, and the trigger depends on what the condition uses,
+    /// as one whose condition PostgreSQL parses does.
+    /// </summary>
+    private static void CreateGuardTrigger(uint relid, string sql)
+    {
+        sbyte* text = Worf.PStrDup(sql);
+        CreateTrigStmt* trigger = (CreateTrigStmt*)((RawStmt*)NativeMethods.raw_parser(text, RawParseMode.RAW_PARSE_DEFAULT)->elements[0].ptr_value)->stmt;
+        (nint when, nint rtable) = Elevated.Run(() =>
+        {
+            // The lock CREATE TRIGGER takes, taken first.
+            RelationData* rel = NativeMethods.table_open(relid, (int)PgLockMode.ShareRowExclusive);
+            ParseState* pstate = NativeMethods.make_parsestate(null);
+            pstate->p_sourcetext = text;
+            foreach (string alias in s_triggerAliases)
+            {
+                ParseNamespaceItem* item = NativeMethods.addRangeTableEntryForRelation(pstate, rel, (int)PgLockMode.AccessShare,
+                    NativeMethods.makeAlias(Worf.PStrDup(alias), null), false, false);
+                NativeMethods.addNSItemToQuery(pstate, item, false, true, true);
+            }
+
+            Node* condition = NativeMethods.transformWhereClause(pstate, (Node*)NativeMethods.copyObjectImpl(trigger->whenClause),
+                ParseExprKind.EXPR_KIND_TRIGGER_WHEN, Worf.PStrDup("WHEN"));
+            NativeMethods.assign_expr_collations(pstate, condition);
+            NativeMethods.table_close(rel, (int)PgLockMode.None);
+            return ((nint)condition, (nint)pstate->p_rtable);
+        });
+        uint function = GuardFunction();
+        ObjectAddress created = TableOwner.Run(relid, () => NativeMethods.CreateTrigger(trigger, text, relid, 0, 0, 0, function, 0, (Node*)when, false, false));
+        NativeMethods.recordDependencyOnExpr(&created, (Node*)when, (List*)rtable, DependencyType.DEPENDENCY_NORMAL);
+        NativeMethods.CommandCounterIncrement();
+
+        // The trigger fires in every session, as ENABLE ALWAYS has it, so that rows another subscription's apply writes,
+        // with session_replication_role replica, are checked too.
+        RelationData* table = NativeMethods.table_open(relid, (int)PgLockMode.ShareRowExclusive);
         try
         {
-            // worf runs it for whoever's statement needs it, as when a table comes to use a managed sequence.
-            Elevated.Run(() => _ = Spi.Execute(sql));
+#if ANKUS_PG15
+            NativeMethods.EnableDisableTrigger(table, trigger->trigname, (sbyte)'A', false, (int)PgLockMode.ShareRowExclusive);
+#else
+            NativeMethods.EnableDisableTrigger(table, trigger->trigname, 0, (sbyte)'A', false, true, (int)PgLockMode.ShareRowExclusive);
+#endif
         }
         finally
         {
-            InternalDdl = internalDdl;
-            DdlReplication.Suppressed = suppressed;
+            NativeMethods.table_close(table, (int)PgLockMode.None);
         }
+
+        NativeMethods.CommandCounterIncrement();
+    }
+
+    /// <summary>
+    /// Drops a guard trigger from a table as the table's owner, as <see cref="CreateGuardTrigger"/> creates one.
+    /// </summary>
+    private static void DropGuardTrigger(uint relid, string name)
+    {
+        uint trigoid = NativeMethods.get_trigger_oid(relid, Worf.PStrDup(name), true);
+        if (trigoid == 0)
+        {
+            return;
+        }
+
+        _ = TableOwner.Run(relid, () =>
+        {
+            ObjectAddress trigger = Dependency.Address(TriggerRelationId, trigoid, 0);
+            NativeMethods.performDeletion(&trigger, DropBehavior.DROP_RESTRICT, PerformDeletionInternal);
+            return true;
+        });
+        NativeMethods.CommandCounterIncrement();
     }
 
     /// <summary>
@@ -824,10 +3043,15 @@ internal static unsafe partial class SequenceRanges
     internal static void Changed() => _ = PgAtomic.Add(Version, 1L);
 
     /// <summary>
-    /// Tells backends to reload their blocks once this transaction commits, so they don't cache what it hasn't.
+    /// Tells backends to reload their blocks once this transaction commits, so they don't cache what it hasn't, and this
+    /// backend at once, and again if the transaction rolls back, and has the range worker check the sequence changed in
+    /// full, or every sequence, given none.
     /// </summary>
-    internal static void ChangedOnCommit()
+    /// <param name="seqoid">The sequence whose ranges changed, or null for a change to every sequence's.</param>
+    internal static void ChangedOnCommit(uint? seqoid = null)
     {
+        LocalVersion++;
+        SequenceRangeTouches.OnCommit(seqoid);
         if (s_changedOnCommit)
         {
             return;
@@ -837,9 +3061,77 @@ internal static unsafe partial class SequenceRanges
         _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () =>
         {
             s_changedOnCommit = false;
+            SequenceRangeTouches.Commit();
             Changed();
         });
-        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, static () => s_changedOnCommit = false);
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, static () =>
+        {
+            s_changedOnCommit = false;
+            SequenceRangeTouches.Forget();
+            LocalVersion++;
+        });
+
+        // A savepoint that rolls back undoes the changes made under it too, as a switch, which this backend has read.
+        _ = PgTransaction.RegisterSubtransactionCallback(PgSubtransactionEvent.Abort, static (aborted, parent) => LocalVersion++);
+
+        // A prepared transaction commits later, maybe in another session, which tells nobody, so the change is told as it
+        // is prepared, and backends that read the state before it commits read it again on the next change.
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, static () =>
+        {
+            s_changedOnCommit = false;
+            SequenceRangeTouches.Commit();
+            Changed();
+        });
+    }
+
+    /// <summary>
+    /// Runs a range worker's transaction with worf's configuration table locked first, as a drop of worf locks it before
+    /// the ranges, so that the worker waits on such a drop holding none of the tables the drop waits for.
+    /// </summary>
+    /// <typeparam name="T">The result's type.</typeparam>
+    /// <param name="work">The transaction's work.</param>
+    /// <returns>The result.</returns>
+    internal static T RunWorkerTransaction<T>(Func<T> work) => PgBackgroundWorker.RunTransaction(() =>
+    {
+        LockConfiguration();
+        return work();
+    });
+
+    /// <summary>
+    /// Runs a range worker's transaction with worf's configuration table locked first, as <see cref="RunWorkerTransaction{T}"/>
+    /// does.
+    /// </summary>
+    /// <param name="work">The transaction's work.</param>
+    internal static void RunWorkerTransaction(Action work) => PgBackgroundWorker.RunTransaction(() =>
+    {
+        LockConfiguration();
+        work();
+    });
+
+    private static void LockConfiguration()
+    {
+        uint localNode = Worf.CatalogOid("local_node");
+        if (localNode != 0)
+        {
+            unsafe
+            {
+                NativeMethods.LockRelationOid(localNode, (int)PgLockMode.AccessShare);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Has the range worker check a sequence in full at once, or only wakes it, given none.
+    /// </summary>
+    /// <param name="seqoid">The sequence, or null.</param>
+    internal static void RequestCheck(uint? seqoid)
+    {
+        if (seqoid is not null)
+        {
+            SequenceRangeTouches.Touch(seqoid);
+        }
+
+        _ = PgAtomic.Add(CheckRequested, 1L);
     }
 
     /// <summary>
@@ -849,7 +3141,7 @@ internal static unsafe partial class SequenceRanges
     /// <returns>The definition.</returns>
     internal static SequenceInfo GetInfo(uint seqoid)
     {
-        SpiResult result = Worf.SelectCatalog("""
+        WorfRows result = Worf.SelectCatalog("""
             SELECT s.seqtypid, s.seqincrement, s.seqmin, s.seqmax, s.seqcycle, c.relpersistence::text,
                 pg_catalog.quote_ident(n.nspname) || '.' || pg_catalog.quote_ident(c.relname)
             FROM pg_catalog.pg_sequence s
@@ -862,7 +3154,7 @@ internal static unsafe partial class SequenceRanges
             throw new PgException(PgSqlStates.WrongObjectType, $"relation {seqoid} is not a sequence");
         }
 
-        SpiRow row = result[0];
+        WorfRow row = result[0];
         return new SequenceInfo(seqoid, row.Get<string>(6), row.Get<uint>(0), row.Get<long>(1), row.Get<long>(2), row.Get<long>(3),
             row.Get<bool>(4), row.Get<string>(5)[0]);
     }
@@ -918,9 +3210,27 @@ internal static unsafe partial class SequenceRanges
         return seqoid;
     }
 
+    /// <summary>
+    /// Checks that a function's argument is a sequence, and that the caller has the privileges of its owner, as
+    /// <c>ALTER SEQUENCE</c> needs. The functions that change its range management then do so as worf's own.
+    /// </summary>
+    /// <param name="sequence">The argument.</param>
+    /// <returns>The sequence.</returns>
+    internal static uint RequireOwnedSequence(PgDatum? sequence) => RequireOwnedSequence(RequireSequence(sequence));
+
+    /// <summary>
+    /// Checks that the caller has the privileges of a sequence's owner.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    /// <returns>The sequence.</returns>
+    internal static uint RequireOwnedSequence(uint seqoid)
+        => Worf.ReadScalar<bool>("SELECT pg_catalog.pg_has_role(relowner, 'USAGE') FROM pg_catalog.pg_class WHERE oid = $1", SpiParameter.Create(seqoid))
+            ? seqoid
+            : throw new PgException("42501", $"must be owner of sequence {GetInfo(seqoid).Name}");
+
     private static void RequireOwner(uint seqoid, WorfLocalNode node)
     {
-        SpiResult result = Worf.SelectCatalog("SELECT owner_node FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(seqoid));
+        WorfRows result = Worf.SelectCatalog("SELECT owner_node FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(seqoid));
         if (result.Count == 0)
         {
             throw new PgException(PgSqlStates.UndefinedObject, $"sequence {GetInfo(seqoid).Name} is not under range management");
@@ -940,26 +3250,38 @@ internal static unsafe partial class SequenceRanges
     private static void Join(uint seqoid, WorfLocalNode node)
     {
         // The guard's and the quarantine's locks hold off writers and nextval, so the high-water mark sees every value. A
-        // node that draws from a block of an earlier epoch keeps drawing from it, since the mark covers the block.
+        // node that draws from a block of an earlier epoch keeps drawing from it, since the mark covers the block. The
+        // last value the sequence issued is read before the quarantine moves it, under a lock that waits for the
+        // transactions that called nextval and holds off the rest.
         InstallGuards(seqoid);
         SequenceInfo info = GetInfo(seqoid);
+        long? issued = null;
         if (Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range_block WHERE seqoid = $1 AND kind = 'n' AND state = 'active'",
             SpiParameter.Create(seqoid)).Count == 0)
         {
+            NativeMethods.LockRelationOid(seqoid, (int)PgLockMode.Share);
+            issued = LastValue(seqoid);
             Quarantine(info);
         }
 
-        Report(seqoid, info, node);
+        Report(seqoid, info, node, issued);
     }
+
+    /// <summary>
+    /// Checks whether a sequence still exists, which one a concurrent drop removed doesn't.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    /// <returns>Whether it does.</returns>
+    internal static bool SequenceExists(uint seqoid) => NativeMethods.get_rel_relkind(seqoid) == (sbyte)'S';
 
     /// <summary>
     /// Records this node's high-water mark, its own report, under the sequence's epoch.
     /// </summary>
-    private static void Report(uint seqoid, SequenceInfo info, WorfLocalNode node)
+    private static void Report(uint seqoid, SequenceInfo info, WorfLocalNode node, long? issued = null)
     {
-        long? high = HighWater(info);
-        _ = Spi.Execute("UPDATE worf.sequence_range SET high_water = $2 WHERE seqoid = $1", SpiParameter.Create(seqoid), SpiParameter.Create(high));
-        _ = Spi.Execute("""
+        long? high = HighWater(info, issued);
+        _ = Worf.Execute("UPDATE worf.sequence_range SET high_water = $2 WHERE seqoid = $1", SpiParameter.Create(seqoid), SpiParameter.Create(high));
+        _ = Worf.Execute("""
             INSERT INTO worf.sequence_range_node (seqoid, node_id, node_name, via_node, distance, high_water, epoch, state, reported_at)
             SELECT $1, $2, $3, $2, 0, $4, r.epoch, r.state, now() FROM worf.sequence_range r WHERE r.seqoid = $1
             ON CONFLICT (seqoid, node_id) DO UPDATE SET high_water = excluded.high_water, epoch = excluded.epoch, state = excluded.state,
@@ -971,7 +3293,8 @@ internal static unsafe partial class SequenceRanges
     /// <summary>
     /// Takes up a newer epoch of a sequence that a neighbor reports: its owner, a high-water mark that covers this
     /// node's blocks of earlier epochs, which it keeps drawing from, and a new route. Its root and pool blocks stop
-    /// granting.
+    /// granting. Where the new epoch's root starts is unknown until its owner starts it and the word arrives, so a node
+    /// that joins through this one meanwhile isn't refused for values below where the old root started.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
     /// <param name="owner">The epoch's owner.</param>
@@ -980,30 +3303,40 @@ internal static unsafe partial class SequenceRanges
     internal static void TakeEpoch(uint seqoid, uint owner, int epoch, WorfLocalNode node)
     {
         SpiParameter seq = SpiParameter.Create(seqoid);
-        _ = Spi.Execute("UPDATE worf.sequence_range_block SET state = 'spent' WHERE seqoid = $1 AND kind IN ('r', 'p') AND state IN ('open', 'fenced')", seq);
-        _ = Spi.Execute("DELETE FROM worf.sequence_range_request WHERE seqoid = $1", seq);
-        _ = Spi.Execute("""
+        _ = Worf.Execute("UPDATE worf.sequence_range_block SET state = 'spent' WHERE seqoid = $1 AND kind IN ('r', 'p') AND state IN ('open', 'fenced')", seq);
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_request WHERE seqoid = $1", seq);
+        _ = Worf.Execute("""
             UPDATE worf.sequence_range r SET owner_node = $2, epoch = $3, parent_node = NULL, distance = NULL, fenced_at = NULL, detail = NULL,
+                heard_watermark = NULL, root_start = NULL,
                 state = CASE WHEN EXISTS (SELECT 1 FROM worf.sequence_range_block b WHERE b.seqoid = r.seqoid AND b.kind = 'n' AND b.state = 'active')
                     THEN 'active' ELSE 'quarantined' END
             WHERE seqoid = $1
             """, seq, SpiParameter.Create(owner), SpiParameter.Create(epoch));
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_fence_wait WHERE seqoid = $1", seq);
         Report(seqoid, GetInfo(seqoid), node);
-        PgLog.Log($"sequence {GetInfo(seqoid).Name} moved to epoch {epoch}");
+        WorfLog.Log($"sequence {GetInfo(seqoid).Name} moved to epoch {epoch}");
     }
 
     /// <summary>
     /// Stops granting a sequence's values on this node, as its owner or a neighbor reported. The node keeps drawing from
-    /// the blocks it holds.
+    /// the blocks it holds, and one that holds none, as one created again or refused as it joined, issues no values,
+    /// which other nodes' blocks may hold, until a new epoch takes it in.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
     internal static void Disable(uint seqoid)
     {
         SpiParameter seq = SpiParameter.Create(seqoid);
-        _ = Spi.Execute("UPDATE worf.sequence_range SET state = 'disabled', fenced_at = NULL WHERE seqoid = $1", seq);
-        _ = Spi.Execute("UPDATE worf.sequence_range_block SET state = 'spent' WHERE seqoid = $1 AND kind IN ('r', 'p') AND state IN ('open', 'fenced')", seq);
-        _ = Spi.Execute("DELETE FROM worf.sequence_range_request WHERE seqoid = $1", seq);
-        _ = Spi.Execute("UPDATE worf.sequence_range_node n SET state = 'disabled' FROM worf.local_node l WHERE n.seqoid = $1 AND n.node_id = l.node_id", seq);
+        _ = Worf.Execute("""
+            UPDATE worf.sequence_range r SET state = 'disabled', fenced_at = NULL,
+                detail = CASE WHEN NOT EXISTS (SELECT 1 FROM worf.sequence_range_block b WHERE b.seqoid = r.seqoid AND b.kind = 'n' AND b.state IN ('active', 'next'))
+                    THEN 'the epoch is disabled and this node holds no block of it; enable the sequence again on its owner, naming this node, for an epoch that gives it blocks'
+                    ELSE r.detail END
+            WHERE seqoid = $1
+            """, seq);
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_fence_wait WHERE seqoid = $1", seq);
+        _ = Worf.Execute("UPDATE worf.sequence_range_block SET state = 'spent' WHERE seqoid = $1 AND kind IN ('r', 'p') AND state IN ('open', 'fenced')", seq);
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_request WHERE seqoid = $1", seq);
+        _ = Worf.Execute("UPDATE worf.sequence_range_node n SET state = 'disabled' FROM worf.local_node l WHERE n.seqoid = $1 AND n.node_id = l.node_id", seq);
     }
 
     /// <summary>
@@ -1017,38 +3350,66 @@ internal static unsafe partial class SequenceRanges
     internal static bool CheckIdentity(WorfLocalNode node)
     {
         ulong sysid = NativeMethods.GetSystemIdentifier();
-        uint timeline = NativeMethods.GetWALInsertionTimeLine();
+        uint timeline = Timeline();
         SpiParameter id = SpiParameter.Create(node.Node.Id);
-        SpiParameter system = SpiParameter.Create(sysid.ToString(CultureInfo.InvariantCulture));
+        SpiParameter system = SpiParameter.Create((decimal)sysid);
         SpiParameter line = SpiParameter.Create((long)timeline);
         bool changed = false;
 
-        // Allocator blocks first, so that a node that resets doesn't grant itself from a root it is about to fence.
-        _ = Spi.Execute("UPDATE worf.sequence_range_block SET state = 'abandoned' WHERE kind IN ('r', 'p') AND state IN ('open', 'fenced') AND node_id <> $1", id);
-        SpiResult fenced = Spi.Query(Spi.Sql($"""
-            UPDATE worf.sequence_range_block SET state = 'fenced'
-            WHERE kind IN ('r', 'p') AND state = 'open' AND (sysid <> {sysid.ToString(CultureInfo.InvariantCulture)}::numeric OR timeline <> {(long)timeline})
-            RETURNING seqoid::oid
-            """), false, 0);
-        for (int i = 0; i < fenced.Count; i++)
+        // The range rows of the sequences whose blocks change are locked first, in the order an exchange locks them, as
+        // every change to a sequence's ranges locks its row before the rest.
+        WorfRows changing = Worf.SelectCatalog("""
+            SELECT DISTINCT b.seqoid::oid, pg_catalog.quote_ident(n.nspname) || '.' || pg_catalog.quote_ident(c.relname) COLLATE "C" AS name
+            FROM worf.sequence_range_block b
+                JOIN pg_catalog.pg_class c ON c.oid = b.seqoid
+                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE (b.kind IN ('r', 'p') AND b.state IN ('open', 'fenced') AND b.node_id <> $1)
+                OR (b.kind IN ('r', 'p') AND b.state = 'open' AND (b.sysid <> $2 OR b.timeline <> $3))
+                OR (b.kind IN ('n', 'i') AND b.state IN ('next', 'active', 'imported') AND (b.node_id <> $1 OR b.sysid <> $2 OR b.timeline <> $3))
+            ORDER BY 2
+            """, id, system, line);
+        for (int i = 0; i < changing.Count; i++)
         {
-            uint seqoid = fenced[i].Get<uint>(0);
-            if (Spi.Execute("UPDATE worf.sequence_range SET fenced_at = now() WHERE seqoid = $1 AND fenced_at IS NULL", SpiParameter.Create(seqoid)) > 0)
+            LockLedger(changing[i].Get<uint>(0));
+        }
+
+        // Allocator blocks first, so that a node that resets doesn't grant itself from a root it is about to fence. Each
+        // change is looked for first, so that a node whose identity stays writes nothing.
+        if (Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range_block WHERE kind IN ('r', 'p') AND state IN ('open', 'fenced') AND node_id <> $1)", id))
+        {
+            _ = Worf.Execute("UPDATE worf.sequence_range_block SET state = 'abandoned' WHERE kind IN ('r', 'p') AND state IN ('open', 'fenced') AND node_id <> $1", id);
+        }
+
+        if (Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range_block WHERE kind IN ('r', 'p') AND state = 'open' AND (sysid <> $1 OR timeline <> $2))",
+            system, line))
+        {
+            WorfRows fenced = Worf.Query(Spi.Sql($"""
+                UPDATE worf.sequence_range_block SET state = 'fenced'
+                WHERE kind IN ('r', 'p') AND state = 'open' AND (sysid <> {(decimal)sysid} OR timeline <> {(long)timeline})
+                RETURNING seqoid::oid
+                """), false, 0);
+            for (int i = 0; i < fenced.Count; i++)
             {
-                PgLog.Warning($"sequence {GetInfo(seqoid).Name}: this allocator's timeline or system identifier changed, so it grants nothing until every node it granted to reports");
+                uint seqoid = fenced[i].Get<uint>(0);
+                if (Worf.Execute("UPDATE worf.sequence_range SET fenced_at = now() WHERE seqoid = $1 AND fenced_at IS NULL", SpiParameter.Create(seqoid)) > 0)
+                {
+                    RecordFenceWaits(seqoid);
+                    WorfLog.Warning($"sequence {GetInfo(seqoid).Name}: this allocator's timeline or system identifier changed, so it grants nothing until every node it granted to reports");
+                }
             }
         }
 
-        SpiResult moved = Worf.SelectCatalog("""
+        WorfRows moved = Worf.SelectCatalog("""
             SELECT DISTINCT seqoid::oid FROM worf.sequence_range_block
             WHERE kind IN ('n', 'i') AND state IN ('next', 'active', 'imported')
-                AND (node_id <> $1 OR sysid <> $2::numeric OR timeline <> $3)
+                AND (node_id <> $1 OR sysid <> $2 OR timeline <> $3)
             """, id, system, line);
         for (int i = 0; i < moved.Count; i++)
         {
             uint seqoid = moved[i].Get<uint>(0);
-            PgLog.Warning($"sequence {GetInfo(seqoid).Name}: this node's identity changed, so it abandons its blocks and requests new ones");
-            Reset(seqoid, node);
+            WorfLog.Warning($"sequence {GetInfo(seqoid).Name}: this node's identity changed, so it abandons its blocks and requests new ones");
+            LockLedger(seqoid);
+            Reset(seqoid, node, true);
             changed = true;
         }
 
@@ -1056,8 +3417,13 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
-    /// Lifts an allocator's fence once every node with a grant from its fenced blocks, and on the owner every listed
-    /// participant, has exchanged since the fence began, unless two grants overlap.
+    /// Lifts an allocator's fence once every node it exchanges with has reported the blocks it holds since the fence
+    /// began, or that it doesn't manage the sequence, unless two grants overlap: every node a slot of this node was used
+    /// by, and every provider this node subscribes to, even one that is down, and one whose earlier exchanges carried no
+    /// sequence, since it may hold a grant the allocator lost, as a node that joined late its first. Only a node's own
+    /// report counts, never one a neighbor relays. A node stops counting once its subscription is dropped, or a node
+    /// that takes its subscription's name over its slot calls. The owner's root then gives up its free values up to
+    /// the highest any node has seen granted, which covers the blocks it granted itself and lost.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
     /// <param name="node">This node.</param>
@@ -1066,53 +3432,208 @@ internal static unsafe partial class SequenceRanges
     internal static bool LiftFence(uint seqoid, WorfLocalNode node, bool force)
     {
         SpiParameter seq = SpiParameter.Create(seqoid);
-        SpiResult range = Worf.SelectCatalog("SELECT fenced_at IS NOT NULL, owner_node, participants FROM worf.sequence_range WHERE seqoid = $1", seq);
+        WorfRows range = Worf.SelectCatalog("SELECT fenced_at IS NOT NULL, owner_node FROM worf.sequence_range WHERE seqoid = $1", seq);
         if (range.Count == 0 || !range[0].Get<bool>(0))
         {
+            _ = s_ledgerSearches.Remove(seqoid);
             return false;
         }
 
-        SpiResult overlap = Worf.SelectCatalog("""
-            SELECT a.grantee_name::text, a.lo, a.hi, b.grantee_name::text, b.lo, b.hi
-            FROM worf.sequence_range_grant a JOIN worf.sequence_range_grant b
-                ON b.seqoid = a.seqoid AND a.grant_id < b.grant_id AND a.lo <= b.hi AND b.lo <= a.hi
-            WHERE a.seqoid = $1 AND a.kind <> 'x' AND b.kind <> 'x'
-            LIMIT 1
-            """, seq);
-        if (overlap.Count > 0)
+        // Grants that overlap, or the nodes the fence waits for, keep it up, which a check finds before it locks the range
+        // row, as a ledger of many grants takes a while to search, and an exchange that reaches the sequence meanwhile
+        // would leave it out, and as a lock changes the row's version, which a neighbor's call that changes nothing
+        // checks. Once the row is locked, as every change to a sequence's ranges locks it first, before a lift, the fence
+        // is looked at again.
+        // While nodes keep it up, a check searches again only once a change committed since the last search touched the
+        // sequence's ranges, as every change to its grants does, so that the note says what keeps the fence up; a check
+        // that would lift it looks at every grant made or changed since, whatever touched it.
+        string? waiting = force ? null : FenceWaits(seq);
+        string? overlap = waiting is not null && s_ledgerSearches.TryGetValue(seqoid, out (HashSet<string>, string? Overlap, (long, long) Touched) last) &&
+            last.Touched == SequenceRangeTouches.Touched(seqoid) ? last.Overlap : SearchLedger(seqoid, seq);
+        if (!force && (overlap ?? waiting) is string kept)
         {
-            string detail = $"grants to {overlap[0].Get<string>(0)} [{overlap[0].Get<long>(1)}, {overlap[0].Get<long>(2)}] and to " +
-                $"{overlap[0].Get<string>(3)} [{overlap[0].Get<long>(4)}, {overlap[0].Get<long>(5)}] overlap";
-            _ = Spi.Execute("UPDATE worf.sequence_range SET detail = $2 WHERE seqoid = $1 AND detail IS DISTINCT FROM $2", seq, SpiParameter.Create(detail));
+            _ = SetDetail(seqoid, kept);
             return false;
         }
 
-        if (!force && Spi.ExecuteScalar<bool>("""
-            SELECT EXISTS (
-                SELECT 1 FROM worf.sequence_range_grant g JOIN worf.sequence_range_block b ON b.block_id = g.from_block
-                WHERE g.seqoid = $1 AND b.state = 'fenced' AND g.grantee_id <> $2 AND g.state <> 'abandoned'
-                    AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_node n
-                        WHERE n.seqoid = g.seqoid AND n.node_id = g.grantee_id AND n.held_at > r.fenced_at))
-                OR (r.owner_node = $2 AND EXISTS (
-                SELECT 1 FROM unnest(r.participants) p(name)
-                WHERE NOT EXISTS (SELECT 1 FROM worf.sequence_range_node n
-                    WHERE n.seqoid = r.seqoid AND n.node_name = p.name
-                        AND (n.held_at > r.fenced_at OR n.via_node <> n.node_id AND n.reported_at > r.fenced_at))))
-            FROM worf.sequence_range r WHERE r.seqoid = $1
-            """, seq, SpiParameter.Create(node.Node.Id)))
+        LockLedger(seqoid);
+        range = Worf.SelectCatalog("SELECT fenced_at IS NOT NULL, owner_node FROM worf.sequence_range WHERE seqoid = $1", seq);
+        if (range.Count == 0 || !range[0].Get<bool>(0))
         {
+            _ = s_ledgerSearches.Remove(seqoid);
             return false;
         }
 
-        _ = Spi.Execute("""
-            UPDATE worf.sequence_range_block SET state = 'open', sysid = $2::numeric, timeline = $3
+        overlap = SearchLedger(seqoid, seq);
+        if (overlap is not null)
+        {
+            // Grants that overlap mean values were issued twice already, which no wait undoes, so activate_sequence_range
+            // lifts the fence all the same, saying so.
+            string detail = overlap;
+            if (!force)
+            {
+                _ = SetDetail(seqoid, detail);
+                return false;
+            }
+
+            // The holders of every grant that overlaps another give up their blocks and ask for new ones, so that none
+            // issues the values they share from then on: this node at once, and another as it hears this node's next
+            // message, which asks it to reset at a
+            // WAL position of its own, past any real one, so that it resets for each lift and knows why. Every grant that
+            // overlaps another is then marked, so that it fences the root no more.
+            WorfRows holders = Worf.SelectCatalog($$"""
+                SELECT DISTINCT g.grantee_id FROM worf.sequence_range_grant g
+                WHERE g.seqoid = $1 AND g.kind <> 'x' AND g.state NOT IN ('unclaimed', 'overlapped') AND EXISTS (
+                    SELECT 1 FROM worf.sequence_range_grant o
+                    WHERE {{Span("o")}} && {{Span("g")}} AND o.grant_id <> g.grant_id AND o.kind <> 'x' AND o.state NOT IN ('unclaimed', 'overlapped')
+                        AND (g.seqoid <> 'worf.snowflake_node'::regclass OR g.state <> 'abandoned' AND o.state <> 'abandoned'))
+                """, seq);
+            WorfLog.Warning(holders.Count > 2
+                ? $"sequence {GetInfo(seqoid).Name}: {detail}, among others, so the {holders.Count} nodes that hold grants that overlap reset their blocks"
+                : $"sequence {GetInfo(seqoid).Name}: {detail}, so both nodes reset their blocks");
+            string lift = $"FFFFFFFF/{(uint)Worker.GetCurrentTimestamp():X8}";
+            foreach (uint holder in Enumerable.Range(0, holders.Count).Select(i => holders[i].Get<uint>(0)))
+            {
+                if (holder == node.Node.Id)
+                {
+                    LockLedger(seqoid);
+                    Reset(seqoid, node, false);
+                }
+                else
+                {
+                    _ = Worf.Execute("UPDATE worf.sequence_range_node SET reset_lsn = $3::pg_lsn WHERE seqoid = $1 AND node_id = $2",
+                        seq, SpiParameter.Create(holder), SpiParameter.Create(lift));
+                }
+            }
+
+            _ = Worf.Execute($$"""
+                UPDATE worf.sequence_range_grant a SET state = 'overlapped'
+                WHERE a.seqoid = $1 AND a.kind <> 'x' AND a.state NOT IN ('unclaimed', 'overlapped') AND EXISTS (
+                    SELECT 1 FROM worf.sequence_range_grant b
+                    WHERE {{Span("b")}} && {{Span("a")}} AND b.grant_id <> a.grant_id AND b.kind <> 'x' AND b.state NOT IN ('unclaimed', 'overlapped'))
+                """, seq);
+        }
+
+        waiting = force ? null : FenceWaits(seq);
+        if (waiting is not null)
+        {
+            _ = SetDetail(seqoid, waiting);
+            return false;
+        }
+
+        SequenceInfo info = GetInfo(seqoid);
+        LockLedger(seqoid);
+        _ = Worf.Execute("""
+            UPDATE worf.sequence_range_block SET state = 'open', sysid = $2, timeline = $3
             WHERE seqoid = $1 AND state = 'fenced'
-            """, seq, SpiParameter.Create(NativeMethods.GetSystemIdentifier().ToString(CultureInfo.InvariantCulture)),
-            SpiParameter.Create((long)NativeMethods.GetWALInsertionTimeLine()));
-        _ = Spi.Execute("UPDATE worf.sequence_range SET fenced_at = NULL, detail = NULL WHERE seqoid = $1", seq);
-        PgLog.Log($"sequence {GetInfo(seqoid).Name}: the allocator's fence lifted");
+            """, seq, SpiParameter.Create((decimal)NativeMethods.GetSystemIdentifier()),
+            SpiParameter.Create((long)Timeline()));
+        _ = Worf.Execute("UPDATE worf.sequence_range SET fenced_at = NULL, detail = NULL WHERE seqoid = $1", seq);
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_fence_wait WHERE seqoid = $1", seq);
+        if (range[0].Get<uint>(1) == node.Node.Id)
+        {
+            _ = Worf.Execute(info.Ascending
+                ? """
+                    DELETE FROM worf.sequence_range_free f USING worf.sequence_range_block b, worf.sequence_range r
+                    WHERE f.block_id = b.block_id AND b.seqoid = $1 AND b.kind = 'r' AND r.seqoid = $1 AND f.hi <= r.watermark
+                    """
+                : """
+                    DELETE FROM worf.sequence_range_free f USING worf.sequence_range_block b, worf.sequence_range r
+                    WHERE f.block_id = b.block_id AND b.seqoid = $1 AND b.kind = 'r' AND r.seqoid = $1 AND f.lo >= r.watermark
+                    """, seq);
+            _ = Worf.Execute(info.Ascending
+                ? """
+                    UPDATE worf.sequence_range_free f SET lo = r.watermark + 1 FROM worf.sequence_range_block b, worf.sequence_range r
+                    WHERE f.block_id = b.block_id AND b.seqoid = $1 AND b.kind = 'r' AND r.seqoid = $1 AND f.lo <= r.watermark
+                    """
+                : """
+                    UPDATE worf.sequence_range_free f SET hi = r.watermark - 1 FROM worf.sequence_range_block b, worf.sequence_range r
+                    WHERE f.block_id = b.block_id AND b.seqoid = $1 AND b.kind = 'r' AND r.seqoid = $1 AND f.hi >= r.watermark
+                    """, seq);
+        }
+
+        _ = s_ledgerSearches.Remove(seqoid);
+        WorfLog.Log($"sequence {info.Name}: the allocator's fence lifted");
         return true;
     }
+
+    /// <summary>
+    /// Bounds a watermark a neighbor reports, of its own or another node's, by what any node could have heard of
+    /// granted: no further than the root's end, and on the owner, once its root has started, no further than two of
+    /// its largest blocks beyond both its own blocks and the furthest grant its ledger holds of other nodes'. Only the
+    /// owner's own blocks, two at most at once, can lie beyond that, since every other grant's holder reports it to its
+    /// allocator. The bound leaves out the watermarks earlier reports gave, and, once the owner has taken a watermark
+    /// beyond its own and reset, its own blocks beyond that watermark that it hasn't drawn from, which it granted itself
+    /// only because of the report, so that made-up ones can't each raise the next one's bound, however many come. A
+    /// made-up watermark is taken only that far, so that a fence that lifts gives up no more of the root's values.
+    /// Before the root starts, as an owner that moved collects what the old blocks reached, nothing bounds one.
+    /// </summary>
+    internal static (long Mark, bool Bounded) BoundWatermark(uint seqoid, SequenceInfo info, long mark)
+    {
+        string furthest = info.Ascending ? "max" : "min";
+        string before = info.Ascending ? "o.lo <= r.heard_watermark" : "o.hi >= r.heard_watermark";
+        WorfRows range = Worf.SelectCatalog($"""
+            SELECT r.root_end, r.max_range_size, r.owner_node = l.node_id AND r.root_start IS NOT NULL,
+                (SELECT {furthest}({(info.Ascending ? "o.hi" : "o.lo")}) FROM worf.sequence_range_block o
+                    WHERE o.seqoid = r.seqoid AND o.epoch = r.epoch AND o.kind = 'n' AND o.node_id = l.node_id
+                        AND (r.heard_watermark IS NULL OR o.state = 'retired' OR {before})),
+                (SELECT {furthest}({(info.Ascending ? "g.hi" : "g.lo")}) FROM worf.sequence_range_block b
+                    JOIN worf.sequence_range_grant g ON g.from_block = b.block_id AND g.kind <> 'x' AND g.grantee_id <> l.node_id
+                    WHERE b.seqoid = r.seqoid AND b.epoch = r.epoch AND b.kind = 'r'),
+                r.heard_watermark IS NOT NULL AND EXISTS (
+                    SELECT 1 FROM worf.sequence_range_block o
+                    WHERE o.seqoid = r.seqoid AND o.epoch = r.epoch AND o.kind = 'n' AND o.node_id = l.node_id AND o.state = 'active'
+                        AND NOT {before}),
+                r.watermark
+            FROM worf.sequence_range r CROSS JOIN worf.local_node l
+            WHERE r.seqoid = $1
+            """, SpiParameter.Create(seqoid));
+        // A watermark no further than this node's own moves nothing, as one a neighbor heard of this node's blocks gives.
+        if (range.Count == 0 || (range[0].Get<long?>(6) is long own && (info.Ascending ? mark <= own : mark >= own)))
+        {
+            return (mark, false);
+        }
+
+        decimal limit = range[0].Get<long>(0);
+        List<decimal> known = [.. new[] { range[0].Get<long?>(3), range[0].Get<long?>(4) }.OfType<long>().Select(value => (decimal)value)];
+
+        // The active block beyond the watermark taken counts as far as the sequence has drawn from it.
+        if (range[0].Get<bool>(5) && LastValue(seqoid) is long drawn)
+        {
+            known.Add(drawn);
+        }
+
+        if (range[0].Get<bool>(2) && known.Count > 0)
+        {
+            decimal reach = 2m * range[0].Get<long>(1) * Math.Abs(info.Increment);
+            limit = info.Ascending ? Math.Min(limit, known.Max() + reach) : Math.Max(limit, known.Min() - reach);
+        }
+
+        return (info.Ascending ? mark > limit : mark < limit) ? ((long)limit, true) : (mark, false);
+    }
+
+    /// <summary>
+    /// Gets the timeline this node writes on, which its blocks record. A standby, or a node still finishing its
+    /// promotion, writes on none yet, so nothing that records or compares blocks runs there.
+    /// </summary>
+    /// <returns>The timeline.</returns>
+    internal static uint Timeline() => Recovering()
+        ? throw new PgException("25006", "cannot manage sequence ranges during recovery")
+        : NativeMethods.GetWALInsertionTimeLine();
+
+    /// <summary>
+    /// Gets whether this node is a standby, or still finishing its promotion.
+    /// </summary>
+    /// <returns>Whether recovery is in progress.</returns>
+    internal static bool Recovering() => NativeMethods.RecoveryInProgress();
+
+    /// <summary>
+    /// Gets how long a neighbor's report counts as current: a link exchanges at least once an exchange interval, so one
+    /// that hasn't in three, and a timeout, is down or gone.
+    /// </summary>
+    /// <returns>The time, as an interval.</returns>
+    internal static string StaleAfter()
+        => $"{((3L * ExchangeInterval) + ExchangeTimeout).ToString(CultureInfo.InvariantCulture)} milliseconds";
 
     /// <summary>
     /// Records a block a neighbor reports holding from this allocator: one the allocator has no record of, as when the
@@ -1132,11 +3653,13 @@ internal static unsafe partial class SequenceRanges
     internal static void RecordHeld(uint seqoid, SequenceInfo info, Guid id, char kind, long lo, long hi, bool abandoned, bool fenced,
         uint holderId, string holderName)
     {
-        if (Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range_grant WHERE grant_id = $1", SpiParameter.Create(id)).Count > 0)
+        WorfRows grant = Worf.SelectCatalog("SELECT state FROM worf.sequence_range_grant WHERE grant_id = $1", SpiParameter.Create(id));
+        if (grant.Count > 0)
         {
-            if (abandoned)
+            // The holder reports an abandoned block at each exchange for a while, which changes the grant once.
+            if (abandoned && grant[0].Get<string>(0) != "abandoned")
             {
-                _ = Spi.Execute("UPDATE worf.sequence_range_grant SET state = 'abandoned' WHERE grant_id = $1 AND state <> 'abandoned'",
+                _ = Worf.Execute("UPDATE worf.sequence_range_grant SET state = 'abandoned', abandoned_at = now() WHERE grant_id = $1 AND state <> 'abandoned'",
                     SpiParameter.Create(id));
             }
 
@@ -1148,11 +3671,29 @@ internal static unsafe partial class SequenceRanges
             return;
         }
 
-        SpiResult from = Worf.SelectCatalog("""
+        // A block whose values the ledger has granted again, as a lift that stopped waiting for its holder gave them
+        // out, or whose holder this allocator asked to reset at such a lift, isn't taken back, which would fence the
+        // allocator again on the overlap: its holder resets instead, as asked at once.
+        SpiParameter seq = SpiParameter.Create(seqoid);
+        SpiParameter holder = SpiParameter.Create(holderId);
+        if (Worf.ReadScalar<bool>($$"""
+            SELECT EXISTS (SELECT 1 FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2 AND reset_lsn IS NOT NULL)
+                OR EXISTS (
+                    SELECT 1 FROM worf.sequence_range_grant g
+                    WHERE g.seqoid = $1 AND g.kind <> 'x' AND g.state NOT IN ('unclaimed', 'overlapped', 'abandoned')
+                        AND {{Span("g")}} && {{Span("$1", "$3", "$4")}})
+            """, seq, holder, SpiParameter.Create(lo), SpiParameter.Create(hi)))
+        {
+            _ = Worf.Execute("UPDATE worf.sequence_range_node SET reset_lsn = coalesce(reset_lsn, $3::pg_lsn) WHERE seqoid = $1 AND node_id = $2",
+                seq, holder, SpiParameter.Create($"FFFFFFFE/{(uint)Worker.GetCurrentTimestamp():X8}"));
+            return;
+        }
+
+        WorfRows from = Worf.SelectCatalog("""
             SELECT block_id FROM worf.sequence_range_block
             WHERE seqoid = $1 AND kind IN ('r', 'p') AND state IN ('open', 'fenced') AND lo <= $2 AND $3 <= hi
             LIMIT 1
-            """, SpiParameter.Create(seqoid), SpiParameter.Create(lo), SpiParameter.Create(hi));
+            """, seq, SpiParameter.Create(lo), SpiParameter.Create(hi));
         if (from.Count == 0)
         {
             return;
@@ -1160,24 +3701,185 @@ internal static unsafe partial class SequenceRanges
 
         Guid block = from[0].Get<Guid>(0);
         LockLedger(seqoid);
-        _ = Spi.Execute("""
+        _ = Worf.Execute("""
             INSERT INTO worf.sequence_range_grant
-            VALUES ($1, gen_random_uuid(), $2, $3, $4, $5, $6::"char", $7, $8, $9, now())
+            VALUES ($1, gen_random_uuid(), $2, $3, $4, $5, $6::"char", $7, $8, $9, now(), CASE WHEN $9 = 'abandoned' THEN now() END)
             """, SpiParameter.Create(id), SpiParameter.Create(seqoid), SpiParameter.Create(block), SpiParameter.Create(holderId),
             SpiParameter.Create(holderName), SpiParameter.Create(kind.ToString()), SpiParameter.Create(lo), SpiParameter.Create(hi),
             SpiParameter.Create(abandoned ? "abandoned" : "acknowledged"));
         TakeFromFree(block, lo, hi);
-        _ = Spi.Execute($"UPDATE worf.sequence_range SET watermark = {(info.Ascending ? "greatest" : "least")}(coalesce(watermark, $2), $2) WHERE seqoid = $1",
+        _ = Worf.Execute($"UPDATE worf.sequence_range SET watermark = {(info.Ascending ? "greatest" : "least")}(coalesce(watermark, $2), $2) WHERE seqoid = $1",
             SpiParameter.Create(seqoid), SpiParameter.Create(info.Ascending ? hi : lo));
-        PgLog.Warning($"sequence {info.Name}: node {holderName} holds block [{lo}, {hi}], which this allocator had no record of; it is back in the ledger");
+        WorfLog.Warning($"sequence {info.Name}: node {holderName} holds block [{lo}, {hi}], which this allocator had no record of; it is back in the ledger");
     }
+
+    /// <summary>
+    /// Gets the SQL for the span of a block's or grant's values that the GiST indexes on blocks and grants hold: its
+    /// values offset by its sequence, so that no two sequences' spans overlap, and a search for the blocks or grants that
+    /// overlap values reads only the sequence's, with no test of the sequence besides, which would lead the planner to
+    /// read every block or grant of the sequence through its index for each search too.
+    /// </summary>
+    /// <param name="table">The alias of the block or grant table.</param>
+    internal static string Span(string table) => Span($"{table}.seqoid", $"{table}.lo", $"{table}.hi");
+
+    /// <summary>
+    /// Gets the SQL for the span of a sequence's values from one to another, as <see cref="Span(string)"/> gives it.
+    /// </summary>
+    internal static string Span(string seqoid, string lo, string hi)
+        => $"numrange({seqoid}::oid::int8 * 18446744073709551616::numeric + {lo} + 9223372036854775808, {seqoid}::oid::int8 * 18446744073709551616::numeric + {hi} + 9223372036854775808, '[]')";
+
+    /// <summary>
+    /// Gets the note of the nodes a fence waits for, if any: those this node exchanges with, or that a fence's lift
+    /// before waited for, that haven't reported the blocks they hold, or that they don't manage the sequence, since the
+    /// fence went up.
+    /// </summary>
+    private static string? FenceWaits(SpiParameter seq)
+    {
+        WorfRows waiting = Worf.SelectCatalog("""
+            WITH neighbors (node_id) AS (
+                SELECT node_id FROM worf.sequence_range_link
+                UNION
+                SELECT s.sub_origin FROM worf.subscription s JOIN worf.local_node l ON l.node_id = s.sub_target
+                UNION
+                SELECT node_id FROM worf.sequence_range_fence_wait WHERE seqoid = $1)
+            SELECT coalesce(o.node_name::text, (SELECT max(n.node_name::text) FROM worf.sequence_range_node n WHERE n.node_id = w.node_id),
+                w.node_id::text)
+            FROM neighbors w
+                CROSS JOIN worf.sequence_range r
+                CROSS JOIN worf.local_node l
+                LEFT JOIN worf.node o ON o.node_id = w.node_id
+            WHERE r.seqoid = $1 AND w.node_id <> l.node_id
+                AND NOT EXISTS (
+                    SELECT 1 FROM worf.sequence_range_node n
+                    WHERE n.seqoid = r.seqoid AND n.node_id = w.node_id AND n.via_node = n.node_id AND n.held_at > r.fenced_at)
+                AND NOT EXISTS (
+                    SELECT 1 FROM worf.sequence_range_absent a WHERE a.seqoid = r.seqoid AND a.node_id = w.node_id AND a.absent_at > r.fenced_at)
+            ORDER BY 1
+            """, seq);
+        return waiting.Count == 0 ? null
+            : $"fenced until {string.Join(", ", Enumerable.Range(0, waiting.Count).Select(i => "node " + waiting[i].Get<string>(0)))} " +
+                (waiting.Count == 1 ? "reports the blocks it holds" : "report the blocks they hold") +
+                "; a node it exchanged with as the fence went up holds it until that node reports, by subscribing again if the subscriptions " +
+                "between them were dropped, or worf.activate_sequence_range naming the node stops the wait for it, as for a node gone for good, " +
+                "which reissues any values it holds that this node lost";
+    }
+
+    /// <summary>
+    /// Looks for grants of a fenced sequence that overlap, through the search an earlier check of the fence made, which
+    /// stands for the grants it searched, by id and row version: only the grants made or changed since are looked at,
+    /// against every other, so that the ledger is searched in full only once. Grants that overlap stand while no grant
+    /// was made, changed or deleted since, and are looked for again in full otherwise.
+    /// </summary>
+    /// <returns>The note of two grants that overlap, if any.</returns>
+    private static string? SearchLedger(uint seqoid, SpiParameter seq)
+    {
+        (long All, long Sequence) touched = SequenceRangeTouches.Touched(seqoid);
+        HashSet<string> grants;
+        string? overlap;
+        if (!s_ledgerSearches.TryGetValue(seqoid, out (HashSet<string> Grants, string? Overlap, (long, long)) search))
+        {
+            (string[] found, overlap) = OverlappingGrants(seq);
+            grants = [.. found];
+        }
+        else
+        {
+            (string[] changed, long count, string? changedOverlap) = OverlappingChangedGrants(seq, search.Grants);
+            (grants, overlap) = (search.Grants, search.Overlap);
+            if (overlap is null)
+            {
+                grants.UnionWith(changed);
+                overlap = changedOverlap;
+            }
+            else if (changed.Length > 0 || count != grants.Count)
+            {
+                (string[] found, overlap) = OverlappingGrants(seq);
+                grants = [.. found];
+            }
+        }
+
+        s_ledgerSearches[seqoid] = (grants, overlap, touched);
+        return overlap;
+    }
+
+    // The grant a row of the ledger holds, by its id and row version.
+    private static string GrantVersion(string table)
+        => $"{table}.grant_id::pg_catalog.text || ':' || {table}.xmin::pg_catalog.text || {table}.ctid::pg_catalog.text";
+
+    // Whether a grant of the ledger counts in a search for grants that overlap: an abandoned block of Snowflake IDs gives
+    // up its node's number, which another node then holds.
+    private static string Counted(string table)
+        => $"{table}.kind <> 'x' AND {table}.state NOT IN ('unclaimed', 'overlapped') AND ({table}.seqoid <> 'worf.snowflake_node'::regclass OR {table}.state <> 'abandoned')";
+
+    /// <summary>
+    /// Finds two of a sequence's grants that overlap, in one pass over them in order of their spans, which an overlap
+    /// shows as a grant that starts before one before it ends, and gives the grants it searched, by id and row version.
+    /// </summary>
+    private static (string[] Grants, string? Overlap) OverlappingGrants(SpiParameter seq)
+    {
+        WorfRows found = Worf.SelectCatalog($$"""
+            WITH g AS MATERIALIZED (SELECT g.*, {{GrantVersion("g")}} AS version, {{Counted("g")}} AS counted FROM worf.sequence_range_grant g WHERE g.seqoid = $1),
+                s AS MATERIALIZED (
+                    SELECT g.grant_id, g.grantee_name, g.lo, g.hi,
+                        pg_catalog.max(g.hi) OVER (ORDER BY g.lo, g.hi, g.grant_id ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS reach
+                    FROM g WHERE g.counted),
+                b AS (SELECT * FROM s WHERE s.lo <= s.reach ORDER BY s.lo, s.hi, s.grant_id LIMIT 1)
+            SELECT (SELECT pg_catalog.array_agg(g.version) FROM g), a.grantee_name::text, a.lo, a.hi, b.grantee_name::text, b.lo, b.hi
+            FROM (SELECT 1) one
+                LEFT JOIN b ON true
+                LEFT JOIN LATERAL (SELECT * FROM s a WHERE a.grant_id <> b.grant_id AND a.lo <= b.hi AND a.hi >= b.lo ORDER BY a.lo LIMIT 1) a ON true
+            """, seq);
+        return (found[0].Get<string[]?>(0) ?? [], found[0].Get<string?>(1) is null ? null : Overlap(found[0], 1));
+    }
+
+    /// <summary>
+    /// Finds the grants made or changed since a search, those that aren't among the grants it searched, by id and row
+    /// version, and one of them that overlaps another, through the index on spans, and counts the sequence's grants.
+    /// </summary>
+    private static (string[] Changed, long Count, string? Overlap) OverlappingChangedGrants(SpiParameter seq, HashSet<string> searched)
+    {
+        WorfRows found = Worf.SelectCatalog($$"""
+            WITH g AS MATERIALIZED (SELECT g.*, {{GrantVersion("g")}} AS version FROM worf.sequence_range_grant g WHERE g.seqoid = $1),
+                a AS MATERIALIZED (SELECT * FROM g WHERE g.version NOT IN (SELECT pg_catalog.unnest($2::pg_catalog.text[])))
+            SELECT (SELECT pg_catalog.array_agg(a.version) FROM a), (SELECT pg_catalog.count(*) FROM g), o.*
+            FROM (SELECT 1) one LEFT JOIN LATERAL (
+                SELECT a.grantee_name::text, a.lo, a.hi, b.grantee_name::text, b.lo, b.hi
+                FROM a CROSS JOIN LATERAL (
+                    SELECT b.grantee_name, b.lo, b.hi FROM worf.sequence_range_grant b
+                    WHERE {{Span("b")}} && {{Span("a")}} AND b.grant_id <> a.grant_id AND {{Counted("b")}} LIMIT 1) b
+                WHERE {{Counted("a")}}
+                LIMIT 1) o ON true
+            """, seq, SpiParameter.Create(searched.ToArray()));
+        return (found[0].Get<string[]?>(0) ?? [], found[0].Get<long>(1), found[0].Get<string?>(2) is null ? null : Overlap(found[0], 2));
+    }
+
+    // The note of two grants that overlap, from a row that gives each one's holder and span from a column on.
+    private static string Overlap(WorfRow row, int at)
+        => $"grants to {row.Get<string>(at)} [{row.Get<long>(at + 1)}, {row.Get<long>(at + 2)}] and to " +
+            $"{row.Get<string>(at + 3)} [{row.Get<long>(at + 4)}, {row.Get<long>(at + 5)}] overlap";
 
     /// <summary>
     /// Locks a sequence's range row before its free spans, as an exchange that updates the row and then grants does, so
     /// that two allocations don't wait on each other.
     /// </summary>
-    private static void LockLedger(uint seqoid)
-        => _ = Spi.Execute("SELECT 1 FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE", SpiParameter.Create(seqoid));
+    internal static void LockLedger(uint seqoid)
+    {
+        if (!LedgerNoWait)
+        {
+            _ = Worf.Execute("SELECT 1 FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE", SpiParameter.Create(seqoid));
+        }
+        else if (Worf.Query("SELECT 1 FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE SKIP LOCKED", false, 1,
+            SpiParameter.Create(seqoid)).Count == 0 && IsManaged(seqoid))
+        {
+            throw new PgException("55P03", $"the range of sequence {seqoid} is locked");
+        }
+    }
+
+    /// <summary>
+    /// Gets or sets whether a sequence's range row is taken only when no transaction holds it, as in the range worker's
+    /// check, which holds the lock nextval takes on the sequence. A reset holds the row and waits for that lock, so the
+    /// check leaves the sequence for a later tick rather than wait.
+    /// </summary>
+    internal static bool LedgerNoWait { get; set; }
 
     /// <summary>
     /// Removes values from a block's free spans. Each span shrinks in place, or is deleted once empty, so that a
@@ -1185,7 +3887,7 @@ internal static unsafe partial class SequenceRanges
     /// </summary>
     private static void TakeFromFree(Guid block, long lo, long hi)
     {
-        SpiResult spans = Spi.Query(Spi.Sql($"SELECT lo, hi FROM worf.sequence_range_free WHERE block_id = {block} AND lo <= {hi} AND {lo} <= hi FOR UPDATE"),
+        WorfRows spans = Worf.Query(Spi.Sql($"SELECT lo, hi FROM worf.sequence_range_free WHERE block_id = {block} AND lo <= {hi} AND {lo} <= hi FOR UPDATE"),
             false, 0);
         for (int i = 0; i < spans.Count; i++)
         {
@@ -1195,19 +3897,20 @@ internal static unsafe partial class SequenceRanges
             SpiParameter start = SpiParameter.Create(spanLo);
             if (spanLo < lo)
             {
-                _ = Spi.Execute("UPDATE worf.sequence_range_free SET hi = $3 WHERE block_id = $1 AND lo = $2", id, start, SpiParameter.Create(lo - 1));
+                _ = Worf.Execute("UPDATE worf.sequence_range_free SET hi = $3 WHERE block_id = $1 AND lo = $2", id, start, SpiParameter.Create(lo - 1));
                 if (spanHi > hi)
                 {
-                    _ = Spi.Execute("INSERT INTO worf.sequence_range_free VALUES ($1, $2, $3)", id, SpiParameter.Create(hi + 1), SpiParameter.Create(spanHi));
+                    _ = Worf.Execute("INSERT INTO worf.sequence_range_free SELECT $1, $3, $4, not_before FROM worf.sequence_range_free WHERE block_id = $1 AND lo = $2",
+                        id, start, SpiParameter.Create(hi + 1), SpiParameter.Create(spanHi));
                 }
             }
             else if (spanHi > hi)
             {
-                _ = Spi.Execute("UPDATE worf.sequence_range_free SET lo = $3 WHERE block_id = $1 AND lo = $2", id, start, SpiParameter.Create(hi + 1));
+                _ = Worf.Execute("UPDATE worf.sequence_range_free SET lo = $3 WHERE block_id = $1 AND lo = $2", id, start, SpiParameter.Create(hi + 1));
             }
             else
             {
-                _ = Spi.Execute("DELETE FROM worf.sequence_range_free WHERE block_id = $1 AND lo = $2", id, start);
+                _ = Worf.Execute("DELETE FROM worf.sequence_range_free WHERE block_id = $1 AND lo = $2", id, start);
             }
         }
     }
@@ -1223,26 +3926,60 @@ internal static unsafe partial class SequenceRanges
     /// <param name="rootStart">Where the root may start, or null to take the sequence's first value here.</param>
     /// <param name="rootEnd">Where the root ends, or null to take the sequence's limits here.</param>
     /// <param name="node">This node.</param>
+    /// <param name="refuseIssued">Whether values the sequence issued here before it joins are refused once they reach into
+    /// the root: for a sequence that exists here, once the owner has started the root, rather than one created for a copy
+    /// or restore whose rows haven't arrived, or one whose owner still collects the values every node holds.</param>
     internal static void JoinFromNeighbor(uint seqoid, uint owner, int epoch, long rangeSize, long maxRangeSize, long? rootStart, long? rootEnd,
-        WorfLocalNode node)
+        WorfLocalNode node, bool refuseIssued = true)
     {
         SequenceInfo info = GetInfo(seqoid);
+
+        // A sequence that issued values here before it joins, as one renamed or moved to a managed sequence's name, is
+        // refused once they reach into a started root, as every allocator refuses such a node, so that it never draws
+        // from blocks they may already lie in. Rows other nodes wrote, which lie in their blocks, don't count.
+        long? issued = refuseIssued && rootStart is not null ? LastValue(seqoid) : null;
+        bool replicated = Worf.SelectCatalog("SELECT 1 FROM worf.replication_set_seq WHERE set_seqoid = $1", SpiParameter.Create(seqoid)).Count > 0;
         string? refused = info.Persistence != 'p' ? "the sequence is temporary or unlogged here"
             : info.Cycle ? "the sequence cycles here"
-            : Worf.SelectCatalog("SELECT 1 FROM worf.replication_set_seq WHERE set_seqoid = $1", SpiParameter.Create(seqoid)).Count > 0
+            : replicated
                 ? "the sequence is in a replication set here"
-                : null;
-        _ = Spi.Execute("""
+                : UsingColumns(seqoid).Find(column => !Checkable(column.TypeOid)) is (uint relid, string column, uint typeOid) && relid != 0
+                    ? $"column \"{column}\" of table {QualifiedName(relid)} has type {Worf.FromServer(NativeMethods.format_type_be(typeOid))} here, whose values the guard can't check"
+                    : issued is long h && rootStart is long start && (info.Ascending ? h >= start : h <= start)
+                        ? $"the sequence issued values up to {h} here before it joined, which reach into the root; disable and enable it on its owner to start a root above them"
+                        : null;
+        // The range worker and the exchange worker may both join a sequence; the first does.
+        if (Worf.Execute("""
             INSERT INTO worf.sequence_range (seqoid, owner_node, epoch, range_size, max_range_size, state, request_size, root_start, root_end, detail)
             VALUES ($1, $2, $3, $4, $5, $6, $4, $9, $7, $8)
+            ON CONFLICT (seqoid) DO NOTHING
             """, SpiParameter.Create(seqoid), SpiParameter.Create(owner), SpiParameter.Create(epoch), SpiParameter.Create(rangeSize),
             SpiParameter.Create(maxRangeSize), SpiParameter.Create(refused is null ? "quarantined" : "refused"),
             SpiParameter.Create(rootEnd ?? RootEnd(info)), SpiParameter.Create(refused),
-            SpiParameter.Create(rootStart ?? (info.Ascending ? info.Min : info.Max)));
+            SpiParameter.Create(rootStart ?? (info.Ascending ? info.Min : info.Max))) == 0)
+        {
+            return;
+        }
+
         if (refused is null)
         {
             Join(seqoid, node);
-            PgLog.Log($"sequence {info.Name} joined range management");
+            WorfLog.Log($"sequence {info.Name} joined range management");
+        }
+        else
+        {
+            // A sequence refused for its values or its columns issues no more values, which may lie in other nodes'
+            // blocks, until a new epoch takes it in.
+            bool parked = info.Persistence == 'p' && !info.Cycle && !replicated;
+            WorfLog.Warning(new PgDiagnostic($"sequence {info.Name} was refused range management: {refused}")
+            {
+                Detail = parked ? "Its nextval fails until a new epoch takes it in." : null,
+            });
+            if (parked)
+            {
+                NativeMethods.LockRelationOid(seqoid, (int)PgLockMode.Share);
+                Quarantine(info);
+            }
         }
 
         // The manager starts this database's range worker, if it hasn't one.
@@ -1250,22 +3987,56 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
-    /// Starts the root once every listed participant has reported.
+    /// Starts the root once every listed participant has reported. A root that can't start, as when a node's values
+    /// reach the end of the sequence, is noted in the range's detail, with a warning when that changes, and the owner
+    /// tries again when a report changes.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
     /// <param name="node">This node, its owner.</param>
     internal static void ActivateWhenReported(uint seqoid, WorfLocalNode node)
     {
-        bool ready = Spi.ExecuteScalar<bool>("""
+        bool ready = Worf.ReadScalar<bool>("""
             SELECT r.state = 'collecting' AND r.participants IS NOT NULL AND NOT EXISTS (
                 SELECT 1 FROM unnest(r.participants) p(name)
                 WHERE NOT EXISTS (SELECT 1 FROM worf.sequence_range_node n WHERE n.seqoid = r.seqoid AND n.node_name = p.name AND n.epoch = r.epoch))
             FROM worf.sequence_range r WHERE r.seqoid = $1
             """, SpiParameter.Create(seqoid));
-        if (ready)
+        if (!ready)
+        {
+            return;
+        }
+
+        try
         {
             Activate(seqoid, node);
         }
+        catch (PgException error) when (error.SqlState == SequenceLimitExceeded)
+        {
+            if (SetDetail(seqoid, error.Message))
+            {
+                WorfLog.Warning(error.Message);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Notes in a sequence's range why it waits, writing only when that changes, once the range row is locked, as every
+    /// change to a sequence's ranges locks it first.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    /// <param name="detail">The note.</param>
+    /// <returns>Whether it changed.</returns>
+    private static bool SetDetail(uint seqoid, string detail)
+    {
+        SpiParameter seq = SpiParameter.Create(seqoid);
+        if (Worf.ReadScalar<string?>("SELECT detail FROM worf.sequence_range WHERE seqoid = $1", seq) == detail)
+        {
+            return false;
+        }
+
+        LockLedger(seqoid);
+        _ = Worf.Execute("UPDATE worf.sequence_range SET detail = $2 WHERE seqoid = $1", seq, SpiParameter.Create(detail));
+        return true;
     }
 
     /// <summary>
@@ -1275,7 +4046,7 @@ internal static unsafe partial class SequenceRanges
     {
         SequenceInfo info = GetInfo(seqoid);
         // The root starts no lower than the sequence's own first value, or pool_start if higher.
-        SpiResult range = Worf.SelectCatalog("""
+        WorfRows range = Worf.SelectCatalog("""
             SELECT epoch, CASE WHEN $2 THEN greatest(pool_start, root_start) ELSE least(pool_start, root_start) END, root_end, state
             FROM worf.sequence_range WHERE seqoid = $1
             """, SpiParameter.Create(seqoid), SpiParameter.Create(info.Ascending));
@@ -1287,24 +4058,27 @@ internal static unsafe partial class SequenceRanges
             return;
         }
 
+        // Above every watermark too, which covers the blocks of an owner restored to before it activated.
         long? high = Worf.SelectCatalog(info.Ascending
-                ? "SELECT max(high_water) FROM worf.sequence_range_node WHERE seqoid = $1 AND epoch = $2"
-                : "SELECT min(high_water) FROM worf.sequence_range_node WHERE seqoid = $1 AND epoch = $2",
+                ? "SELECT greatest(max(high_water), max(watermark), (SELECT watermark FROM worf.sequence_range WHERE seqoid = $1)) FROM worf.sequence_range_node WHERE seqoid = $1 AND epoch = $2"
+                : "SELECT least(min(high_water), min(watermark), (SELECT watermark FROM worf.sequence_range WHERE seqoid = $1)) FROM worf.sequence_range_node WHERE seqoid = $1 AND epoch = $2",
             SpiParameter.Create(seqoid), SpiParameter.Create(epoch))[0].Get<long?>(0);
 
-        long start;
+        // The start is worked out in numeric, so that a node's values at the end of bigint don't wrap it around.
+        decimal start;
+        bool snowflake = seqoid == SnowflakeIds.NodeSequence();
         if (info.Ascending)
         {
-            start = Math.Max(Math.Max(poolStart ?? info.QuarantineEdge + 1, high is long h ? h + 1 : info.QuarantineEdge + 1),
+            start = Math.Max(Math.Max(poolStart ?? info.QuarantineEdge + 1, high is long h ? (decimal)h + 1 : info.QuarantineEdge + 1),
                 info.QuarantineEdge + 1);
-            if (start > end)
+            if (start > end && !snowflake)
             {
                 throw new PgException(SequenceLimitExceeded, $"sequence {info.Name} has no values left above {start - 1} for a root");
             }
         }
         else
         {
-            start = Math.Min(Math.Min(poolStart ?? info.QuarantineEdge - 1, high is long h ? h - 1 : info.QuarantineEdge - 1),
+            start = Math.Min(Math.Min(poolStart ?? info.QuarantineEdge - 1, high is long h ? (decimal)h - 1 : info.QuarantineEdge - 1),
                 info.QuarantineEdge - 1);
             if (start < end)
             {
@@ -1312,48 +4086,101 @@ internal static unsafe partial class SequenceRanges
             }
         }
 
-        (long lo, long hi) = info.Ascending ? (start, end) : (end, start);
-        Guid root = InsertBlock(seqoid, epoch, 'r', lo, hi, "open", null, node);
-        _ = Spi.Execute("INSERT INTO worf.sequence_range_free VALUES ($1, $2, $3)",
-            SpiParameter.Create(root), SpiParameter.Create(lo), SpiParameter.Create(hi));
-        _ = Spi.Execute("UPDATE worf.sequence_range SET state = 'quarantined' WHERE seqoid = $1", SpiParameter.Create(seqoid));
+        // A Snowflake root spans every node number, from zero, since the numbers below its start come back once no node
+        // holds them. The sequence's own bounds are its quarantine's by now.
+        (long lo, long hi) = info.Ascending ? ((long)start, end) : (end, (long)start);
+        Guid root = InsertBlock(seqoid, epoch, 'r', snowflake ? 0 : lo, hi, "open", null, node);
+        if (lo <= hi)
+        {
+            _ = Worf.Execute("INSERT INTO worf.sequence_range_free VALUES ($1, $2, $3)",
+                SpiParameter.Create(root), SpiParameter.Create(lo), SpiParameter.Create(hi));
+        }
+        // The root's start goes to the other nodes, so that each allocator refuses a node that joins later with values
+        // that reach into it.
+        _ = Worf.Execute("UPDATE worf.sequence_range SET state = 'quarantined', root_start = $2, detail = NULL WHERE seqoid = $1", SpiParameter.Create(seqoid),
+            SpiParameter.Create(info.Ascending ? lo : hi));
 
-        // The owner needs no exchange for its own blocks, so it leaves quarantine at once.
+        // The owner needs no exchange for its own blocks, so it leaves quarantine as soon as a neighbor has heard of its
+        // first, or at once when none is in touch. An owner that keeps the Snowflake number it held, as when every number
+        // is in use, keeps drawing from it.
         _ = GrantOwnBlock(seqoid, info, node, epoch);
         (Guid Id, long Lo, long Hi)? next = NodeBlock(seqoid, epoch, "next");
-        if (next is not null)
+        if (next is not null && Confirmed(seqoid, info, next.Value.Id) && Switch(seqoid, info, next.Value) && !snowflake)
         {
-            _ = Switch(seqoid, info, next.Value);
             _ = GrantOwnBlock(seqoid, info, node, epoch);
         }
+
+        _ = Worf.Execute("""
+            UPDATE worf.sequence_range r SET state = 'active'
+            WHERE r.seqoid = $1 AND r.state = 'quarantined'
+                AND EXISTS (SELECT 1 FROM worf.sequence_range_block b WHERE b.seqoid = r.seqoid AND b.kind = 'n' AND b.state = 'active')
+            """, SpiParameter.Create(seqoid));
     }
 
     /// <summary>
-    /// Abandons this node's node blocks of a sequence, quarantines it, and on the owner grants and switches to a new
-    /// block.
+    /// Resets this node's part of a sequence after a rollback or a change of identity. The node abandons its node
+    /// blocks, quarantines the sequence and requests new blocks, with new requests, since a request from before a
+    /// rollback may have been answered with a block the node already used. Its root and pool blocks grant nothing until
+    /// the nodes it granted to report what they hold, since grants made after the point it went back to are lost. A
+    /// Snowflake node number, whose IDs carry their times, is kept unless <paramref name="renew"/> says otherwise.
     /// </summary>
-    internal static void Reset(uint seqoid, WorfLocalNode node)
+    /// <param name="seqoid">The sequence, whose range row the caller has locked.</param>
+    /// <param name="node">This node.</param>
+    /// <param name="renew">Whether to give up a Snowflake node number too, as when the node's identity changed.</param>
+    internal static void Reset(uint seqoid, WorfLocalNode node, bool renew)
     {
         SequenceInfo info = GetInfo(seqoid);
-        _ = Spi.Execute("""
-            UPDATE worf.sequence_range_block SET state = 'abandoned', retired_at = now()
-            WHERE seqoid = $1 AND kind IN ('n', 'i') AND state IN ('next', 'active', 'imported')
-            """, SpiParameter.Create(seqoid));
+        SpiParameter seq = SpiParameter.Create(seqoid);
+        if (Worf.Execute("UPDATE worf.sequence_range_block SET state = 'fenced' WHERE seqoid = $1 AND kind IN ('r', 'p') AND state = 'open'", seq) > 0 &&
+            Worf.Execute("UPDATE worf.sequence_range SET fenced_at = now() WHERE seqoid = $1 AND fenced_at IS NULL", seq) > 0)
+        {
+            RecordFenceWaits(seqoid);
+            WorfLog.Warning($"sequence {info.Name}: this allocator reset, so it grants nothing until every node it granted to reports");
+        }
+
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_request WHERE seqoid = $1", seq);
+        if (seqoid == SnowflakeIds.NodeSequence() && !renew)
+        {
+            return;
+        }
+
+        // The node's own grants of the blocks it abandons are marked so, as their holders' reports mark others'.
+        _ = Worf.Execute("""
+            WITH abandoned AS (
+                UPDATE worf.sequence_range_block SET state = 'abandoned', retired_at = now()
+                WHERE seqoid = $1 AND kind IN ('n', 'i') AND state IN ('next', 'active', 'imported')
+                RETURNING block_id)
+            UPDATE worf.sequence_range_grant SET state = 'abandoned', abandoned_at = now()
+            WHERE grant_id IN (SELECT block_id FROM abandoned) AND state <> 'abandoned'
+            """, seq);
         Quarantine(info);
-        _ = Spi.Execute("UPDATE worf.sequence_range SET state = 'quarantined' WHERE seqoid = $1 AND state NOT IN ('collecting', 'disabled')",
-            SpiParameter.Create(seqoid));
-        SpiResult range = Worf.SelectCatalog("SELECT epoch, owner_node, state FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(seqoid));
+        _ = Worf.Execute("UPDATE worf.sequence_range SET state = 'quarantined' WHERE seqoid = $1 AND state NOT IN ('collecting', 'disabled', 'refused')",
+            seq);
+        WorfRows range = Worf.SelectCatalog("SELECT epoch, owner_node, state FROM worf.sequence_range WHERE seqoid = $1", seq);
         if (range[0].Get<uint>(1) == node.Node.Id && range[0].Get<string>(2) == "quarantined")
         {
             int epoch = range[0].Get<int>(0);
             _ = GrantOwnBlock(seqoid, info, node, epoch);
-            if (NodeBlock(seqoid, epoch, "next") is (Guid, long, long) next)
+            if (NodeBlock(seqoid, epoch, "next") is (Guid, long, long) next && Confirmed(seqoid, info, next.Id) && Switch(seqoid, info, next) &&
+                seqoid != SnowflakeIds.NodeSequence())
             {
-                _ = Switch(seqoid, info, next);
                 _ = GrantOwnBlock(seqoid, info, node, epoch);
             }
         }
     }
+
+    /// <summary>
+    /// Checks whether this node has started drawing from a block, or granted one to another node, since it last reset,
+    /// or has never reset.
+    /// </summary>
+    internal static bool ActedSinceReset(uint seqoid, WorfLocalNode node) => Worf.ReadScalar<bool>("""
+        WITH last AS (
+            SELECT max(retired_at) AS at FROM worf.sequence_range_block WHERE seqoid = $1 AND kind IN ('n', 'i') AND state = 'abandoned')
+        SELECT last.at IS NULL
+            OR EXISTS (SELECT 1 FROM worf.sequence_range_block b WHERE b.seqoid = $1 AND b.kind IN ('n', 'i') AND b.activated_at > last.at)
+            OR EXISTS (SELECT 1 FROM worf.sequence_range_grant g WHERE g.seqoid = $1 AND g.grantee_id <> $2 AND g.granted_at > last.at)
+        FROM last
+        """, SpiParameter.Create(seqoid), SpiParameter.Create(node.Node.Id));
 
     /// <summary>
     /// Sets a sequence's bounds so that nextval fails, at a value no root contains, keeps it at CACHE 1, and revokes
@@ -1361,23 +4188,32 @@ internal static unsafe partial class SequenceRanges
     /// </summary>
     private static void Quarantine(SequenceInfo info)
     {
+        ChangedOnCommit(info.Seqoid);
         (long lo, long hi) = info.Quarantine;
         string q = info.QuarantineEdge.ToString(CultureInfo.InvariantCulture);
         RunInternalDdl($"ALTER SEQUENCE {info.Name} NO CYCLE CACHE 1 MINVALUE {lo.ToString(CultureInfo.InvariantCulture)} " +
             $"MAXVALUE {hi.ToString(CultureInfo.InvariantCulture)} START WITH {q} RESTART WITH {q}");
-        _ = Spi.Execute("SELECT pg_catalog.setval($1::regclass, $2, true)", SpiParameter.Create(info.Seqoid),
+        _ = Worf.Execute("SELECT pg_catalog.setval($1::regclass, $2, true)", SpiParameter.Create(info.Seqoid),
             SpiParameter.Create(info.QuarantineEdge));
 
-        SpiResult grantees = Worf.SelectCatalog("""
+        foreach (string grantee in UpdateGrantees(info.Seqoid))
+        {
+            RunInternalDdl($"REVOKE UPDATE ON SEQUENCE {info.Name} FROM {grantee}");
+        }
+    }
+
+    /// <summary>
+    /// Lists the roles that may set a sequence's position, quoted, with <c>PUBLIC</c> for every role.
+    /// </summary>
+    private static List<string> UpdateGrantees(uint seqoid)
+    {
+        WorfRows grantees = Worf.SelectCatalog("""
             SELECT DISTINCT CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.quote_ident(r.rolname) END
             FROM pg_catalog.pg_class c, pg_catalog.aclexplode(coalesce(c.relacl, pg_catalog.acldefault('s', c.relowner))) a
                 LEFT JOIN pg_catalog.pg_roles r ON r.oid = a.grantee
             WHERE c.oid = $1 AND a.privilege_type = 'UPDATE'
-            """, SpiParameter.Create(info.Seqoid));
-        for (int i = 0; i < grantees.Count; i++)
-        {
-            RunInternalDdl($"REVOKE UPDATE ON SEQUENCE {info.Name} FROM {grantees[i].Get<string>(0)}");
-        }
+            """, SpiParameter.Create(seqoid));
+        return [.. Enumerable.Range(0, grantees.Count).Select(i => grantees[i].Get<string>(0))];
     }
 
     /// <summary>
@@ -1386,72 +4222,570 @@ internal static unsafe partial class SequenceRanges
     /// <param name="seqoid">The sequence.</param>
     /// <param name="info">The sequence's details.</param>
     /// <param name="block">The block.</param>
-    /// <param name="lockTimeout">How long to wait for transactions that called nextval, in milliseconds.</param>
-    /// <returns>Whether it switched; it doesn't when a transaction that called nextval holds the sequence.</returns>
-    internal static bool Switch(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) block, int lockTimeout = 200)
+    /// <param name="forLoad">Whether the block was reserved for a load.</param>
+    /// <param name="lockTimeout">How long to wait for transactions that called nextval, in milliseconds, or zero to take
+    /// the sequence's lock only when none holds it, without queueing for it.</param>
+    /// <param name="inTransaction">Whether a session's own transaction switches, which leaves the range row alone, so that
+    /// the exchanges and the range worker, which take it, don't wait for the transaction.</param>
+    /// <param name="beside">Whether the switch goes on beside the transactions that called nextval, taking only the lock
+    /// that keeps other switches and DDL off, rather than wait for them; nextval then reaches the block's start at once,
+    /// and its bounds as the switch commits, so the switch's transaction is to commit at once.</param>
+    /// <param name="needed">Tells, once the switch holds its lock, whether it's still needed, or null when it is.</param>
+    /// <returns>Whether it switched; it doesn't when a transaction that called nextval holds the sequence that long, or
+    /// another switch took the block first.</returns>
+    internal static bool Switch(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) block, bool forLoad = false, int lockTimeout = 200,
+        bool inTransaction = false, bool beside = false, Func<bool>? needed = null)
     {
+        int mode = (int)(beside ? PgLockMode.ShareUpdateExclusive : PgLockMode.ShareRowExclusive);
+        if (!inTransaction)
+        {
+            LockLedger(seqoid);
+        }
+
+        if (Worf.ReadScalar<long?>("SELECT not_before FROM worf.sequence_range_block WHERE block_id = $1", SpiParameter.Create(block.Id)) is long notBefore &&
+            SnowflakeIds.NowMs() <= notBefore)
+        {
+            return false;
+        }
+
         string lo = block.Lo.ToString(CultureInfo.InvariantCulture);
         string hi = block.Hi.ToString(CultureInfo.InvariantCulture);
-        string start = info.Ascending ? lo : hi;
-
-        // A block of one value, as a Snowflake node number, can't be a sequence's bounds, so the sequence stays
-        // quarantined and the block only marks the value as this node's.
-        if (block.Lo != block.Hi)
+        bool next = true;
+        bool walked = false;
+        double? lasted = null;
+        int nestLevel = NativeMethods.NewGUCNestLevel();
+        try
         {
-            try
+            PgTransaction.RunInSubtransaction(() =>
             {
-                PgTransaction.RunInSubtransaction(() =>
+                // A block of one value, as a Snowflake node number, can't be a sequence's bounds, so the sequence stays
+                // quarantined and the block only marks the value as this node's.
+                if (block.Lo != block.Hi)
                 {
-                    _ = Spi.Execute("SELECT pg_catalog.set_config('lock_timeout', $1, true)", SpiParameter.Create(
-                        Math.Max(lockTimeout, 1).ToString(CultureInfo.InvariantCulture)));
-                    RunInternalDdl($"ALTER SEQUENCE {info.Name} NO CYCLE CACHE 1 MINVALUE {lo} MAXVALUE {hi} START WITH {start} RESTART WITH {start}");
-                    _ = Spi.Execute("SET LOCAL lock_timeout = 0");
-                });
-            }
-            catch (PgException error) when (error.SqlState == "55P03")
+                    if (lockTimeout == 0)
+                    {
+                        next = NativeMethods.ConditionalLockRelationOid(seqoid, mode);
+                        if (!next)
+                        {
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        fixed (byte* name = Worf.ToServerCString("lock_timeout"))
+                        fixed (byte* value = Worf.ToServerCString(lockTimeout.ToString(CultureInfo.InvariantCulture)))
+                        {
+                            _ = NativeMethods.set_config_option((sbyte*)name, (sbyte*)value, GucContext.PGC_USERSET, GucSource.PGC_S_SESSION,
+                                GucAction.GUC_ACTION_SAVE, true, 0, false);
+                        }
+
+                        NativeMethods.LockRelationOid(seqoid, mode);
+                    }
+                }
+
+                // Another switch may have taken the block while this one read it or waited for the lock, or, as a
+                // session's own switch doesn't lock the range row, an exchange abandoned it. Moving the sequence into the
+                // block would then issue its values again, so this one leaves it, and the subtransaction gives the lock
+                // back.
+                // A reservation may have taken the block for a load since the caller read it, which the switch then is.
+                WorfRows nextRow = Worf.SelectCatalog("SELECT reserved FROM worf.sequence_range_block WHERE block_id = $1 AND state = 'next'",
+                    SpiParameter.Create(block.Id));
+                forLoad = forLoad || (nextRow.Count > 0 && nextRow[0].Get<bool>(0));
+                next = nextRow.Count > 0 && (needed is null || needed());
+                if (!next)
+                {
+                    throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState, "the block was taken");
+                }
+
+                lasted = Worf.ExecuteScalar<double?>("""
+                    UPDATE worf.sequence_range_block SET state = 'retired', retired_at = now()
+                    WHERE seqoid = $1 AND kind = 'n' AND state = 'active'
+                    RETURNING extract(epoch FROM now() - activated_at)::float8
+                    """, SpiParameter.Create(seqoid));
+                next = Worf.ExecuteScalar<bool?>("""
+                    UPDATE worf.sequence_range_block SET state = 'active', activated_at = CASE WHEN $2 THEN now() END
+                    WHERE block_id = $1 AND state = 'next'
+                    RETURNING true
+                    """, SpiParameter.Create(block.Id), SpiParameter.Create(!forLoad)) is true;
+                if (!next)
+                {
+                    throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState, "the block was taken");
+                }
+
+                if (block.Lo != block.Hi && !SetBounds(seqoid, info, block, beside))
+                {
+                    walked = true;
+                    next = false;
+                    throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState, "the sequence went past the block");
+                }
+
+                // The sequence's new bounds change the catalog, whose invalidations would otherwise come last.
+                Worf.EndForDecoding();
+            });
+        }
+        catch (PgException error) when (error.SqlState == "55P03" || (!next && error.SqlState == PgSqlStates.ObjectNotInPrerequisiteState))
+        {
+            if (error.SqlState == "55P03")
             {
-                return false;
+                WorfLocks.EndIfTimedOut();
             }
+
+            return false;
+        }
+        finally
+        {
+            // The wait's own lock_timeout goes, whatever the session set.
+            NativeMethods.AtEOXact_GUC(true, nestLevel);
+        }
+
+        if (walked)
+        {
+            _ = Worf.Execute("UPDATE worf.sequence_range_block SET state = 'retired', retired_at = now() WHERE block_id = $1 AND state = 'next'",
+                SpiParameter.Create(block.Id));
+            WorfLog.Warning($"sequence {info.Name} went past its next block [{lo}, {hi}] after a switch to it rolled back, so the block is retired unused");
+        }
+
+        if (!next)
+        {
+            return false;
         }
 
         // A block that lasted less than an hour makes the next request bigger, and one that lasted more than a day
-        // smaller.
-        double? lasted = Spi.ExecuteScalar<double?>("""
-            UPDATE worf.sequence_range_block SET state = 'retired', retired_at = now()
-            WHERE seqoid = $1 AND kind = 'n' AND state = 'active'
-            RETURNING extract(epoch FROM now() - activated_at)::float8
-            """, SpiParameter.Create(seqoid));
-        if (lasted is double seconds)
+        // smaller. A reservation's switch, which retires a block early, and its block, sized for a load, say nothing of
+        // how fast the sequence draws, so neither counts, and nor does a session's own switch, which leaves the range row.
+        if (!forLoad && !inTransaction && lasted is double seconds)
         {
             string resize = seconds < s_growBelow.TotalSeconds ? "least(request_size * 2, max_range_size)"
                 : seconds > s_shrinkAbove.TotalSeconds ? "greatest(request_size / 2, range_size)"
                 : "request_size";
-            _ = Spi.Execute($"UPDATE worf.sequence_range SET request_size = {resize} WHERE seqoid = $1", SpiParameter.Create(seqoid));
+            _ = Worf.Execute($"UPDATE worf.sequence_range SET request_size = {resize} WHERE seqoid = $1", SpiParameter.Create(seqoid));
         }
 
-        _ = Spi.Execute("UPDATE worf.sequence_range_block SET state = 'active', activated_at = now() WHERE block_id = $1",
-            SpiParameter.Create(block.Id));
-        _ = Spi.Execute("UPDATE worf.sequence_range SET state = 'active', switched_at = now() WHERE seqoid = $1",
-            SpiParameter.Create(seqoid));
-        PgLog.Log($"sequence {info.Name} switched to its block [{lo}, {hi}]");
+        if (!inTransaction)
+        {
+            _ = Worf.Execute("UPDATE worf.sequence_range SET state = 'active', switched_at = now(), detail = NULL WHERE seqoid = $1",
+                SpiParameter.Create(seqoid));
+        }
+
+        // Sessions' guards reload before any nextval reaches the block, which waits for the switch's lock until then. The
+        // switch is logged once it commits, unless a savepoint it's under rolls back first.
+        ChangedOnCommit(seqoid);
+        NoteSwitch($"sequence {info.Name} switched to its block [{lo}, {hi}]", null);
         return true;
     }
 
     /// <summary>
-    /// Grants the owner a next block from the start of the root's lowest free span that holds it, under a row lock,
-    /// committed with synchronous_commit on.
+    /// Refuses to prepare the transaction once a function has taken a sequence's range row in it, unless a savepoint
+    /// it ran under rolls back: a prepared transaction would hold the row across restarts, and the sequence could
+    /// neither switch nor exchange blocks until it ended.
     /// </summary>
-    private static bool GrantOwnBlock(uint seqoid, SequenceInfo info, WorfLocalNode node, int epoch)
+    /// <param name="function">The function.</param>
+    internal static void HoldsRangeRow(string function) => NoteSwitch(null, ($"ran {function}",
+        "The function holds the sequence's range row until the transaction ends, which a prepared transaction would hold across restarts, keeping the sequence from switching or exchanging blocks."));
+
+    /// <summary>
+    /// Notes a switch in the current subtransaction, to log once the transaction commits, or what the transaction can't
+    /// be prepared with, as a session's own switch, unless the subtransaction rolls back first: a subtransaction that
+    /// commits passes them to its parent.
+    /// </summary>
+    /// <param name="logged">What to log of the switch, or null.</param>
+    /// <param name="refused">What the transaction did that it can't be prepared with, and why, or null.</param>
+    private static void NoteSwitch(string? logged, (string Did, string Hint)? refused)
     {
-        long size = Worf.SelectCatalog("SELECT request_size FROM worf.sequence_range WHERE seqoid = $1", SpiParameter.Create(seqoid))[0].Get<long>(0);
+        if (!s_switchedInRegistered)
+        {
+            s_switchedInRegistered = true;
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.PrePrepare, static () =>
+            {
+                if (s_switchedIn.Find(switched => switched.Refused is not null).Refused is (string did, string hint))
+                {
+                    ForgetSwitched();
+                    throw new PgException(PgSqlStates.FeatureNotSupported, $"cannot PREPARE a transaction that {did}", hint: hint);
+                }
+            });
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () =>
+            {
+                foreach ((uint _, string? logged, _) in s_switchedIn.Where(switched => switched.Logged is not null))
+                {
+                    WorfLog.Log(logged!);
+                }
+
+                ForgetSwitched();
+            });
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, ForgetSwitched);
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, ForgetSwitched);
+            _ = PgTransaction.RegisterSubtransactionCallback(PgSubtransactionEvent.Abort,
+                static (aborted, _) => s_switchedIn.RemoveAll(switched => switched.Subxact == aborted.Value));
+            _ = PgTransaction.RegisterSubtransactionCallback(PgSubtransactionEvent.Commit, static (committed, parent) =>
+            {
+                for (int i = 0; i < s_switchedIn.Count; i++)
+                {
+                    if (s_switchedIn[i].Subxact == committed.Value)
+                    {
+                        s_switchedIn[i] = s_switchedIn[i] with { Subxact = parent.Value };
+                    }
+                }
+            });
+        }
+
+        s_switchedIn.Add((NativeMethods.GetCurrentSubTransactionId(), logged, refused));
+    }
+
+    private static void ForgetSwitched()
+    {
+        s_switchedIn.Clear();
+        s_switchedInRegistered = false;
+    }
+
+    /// <summary>
+    /// Makes a block a sequence's bounds without new storage for the sequence, as ALTER SEQUENCE ... RESTART would make:
+    /// the bounds go in its catalog row, with the transaction, and its position moves to the block's start at once, as
+    /// setval moves it, unless it is in the block already, as a switch to the block that rolled back left it. A switch
+    /// that rolls back so never makes the sequence issue a value again: until a switch commits, nextval goes on from the
+    /// block's start under the old bounds, and the next switch to the block goes on from where the sequence got to. A
+    /// position that is in neither the old bounds nor the block, but past the block, went through it that way, so the
+    /// block isn't switched to.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    /// <param name="info">The sequence's details.</param>
+    /// <param name="block">The block.</param>
+    /// <param name="atCommit">Whether the position moves only just before the transaction commits, as for a switch beside
+    /// the transactions that hold the sequence, whose nextval would otherwise reach the block before its bounds do, for
+    /// as long as the switch's transaction goes on; the switch moves it last.</param>
+    /// <returns>Whether the block became the sequence's bounds.</returns>
+    private static bool SetBounds(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) block, bool atCommit)
+    {
+        SpiParameter seq = SpiParameter.Create(seqoid);
+        long start = info.Ascending ? block.Lo : block.Hi;
+        WorfRows bounds = Worf.SelectCatalog("SELECT seqmin, seqmax FROM pg_catalog.pg_sequence WHERE seqrelid = $1", seq);
+        long? position = LastValue(seqoid);
+        bool inBlock = position >= block.Lo && position <= block.Hi;
+        bool inOld = position >= bounds[0].Get<long>(0) && position <= bounds[0].Get<long>(1);
+        if (position is long at && !inBlock && !inOld && (info.Ascending ? at > block.Hi : at < block.Lo))
+        {
+            return false;
+        }
+
+        _ = Elevated.Run(() => Worf.Execute("""
+            UPDATE pg_catalog.pg_sequence SET seqmin = $2, seqmax = $3, seqstart = $4, seqcache = 1, seqcycle = false WHERE seqrelid = $1
+            """, seq, SpiParameter.Create(block.Lo), SpiParameter.Create(block.Hi), SpiParameter.Create(start)));
+        NativeMethods.CommandCounterIncrement();
+        if (!inBlock && atCommit)
+        {
+            s_pendingMove = (seqoid, start);
+        }
+        else if (!inBlock)
+        {
+            Move(seqoid, start);
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Moves a sequence to a block's start, as <c>setval</c> does, at once.
+    /// </summary>
+    private static void Move(uint seqoid, long start)
+        => _ = Elevated.Run(() => Worf.Execute("SELECT pg_catalog.setval($1::pg_catalog.regclass, $2, false)", SpiParameter.Create(seqoid),
+            SpiParameter.Create(start)));
+
+    /// <summary>
+    /// Switches a sequence to its next block as its active one runs low. The range worker takes the sequence's lock only
+    /// when no transaction that called nextval holds it, without queueing for it, since inserts would queue behind it, and a
+    /// switch that gave up would let them all draw from the block at once, as they might near its end. Once the block
+    /// reaches its last twentieth, where inserts wait for the switch, or the next block is reserved for a load, whose
+    /// session waits for it, a switch that can't have the lock is left to a switch worker, which switches beside those
+    /// transactions, without waiting for them to end, while the range worker checks the other sequences. The switch
+    /// worker does wait, as for a lock and for as long as it takes, for the statements that hold the sequence's switch
+    /// gate to reach their next rows, which a statement that waits for another lock, or is paused within its rows, holds
+    /// up. The range worker starts it with <see cref="HandOff"/> once its check has committed, so that the switch worker
+    /// waits on no lock of the range worker's. While every worker slot is taken, the range worker switches beside them
+    /// itself, waiting a tenth of a second at most for the switch gate. A prepared transaction that holds the sequence,
+    /// which may hold it across restarts, is switched beside as any other.
+    /// </summary>
+    private static bool SwitchBeforeEnd(uint seqoid, SequenceInfo info, (Guid Id, long Lo, long Hi) next, bool forLoad, bool atEnd)
+    {
+        if (Switch(seqoid, info, next, forLoad, s_unstarted.Contains(seqoid) ? 100 : 0))
+        {
+            _ = s_unstarted.Remove(seqoid);
+            return true;
+        }
+
+        if (atEnd || forLoad)
+        {
+            s_handOffs[seqoid] = info.Name;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Switches a sequence to its next block in the transaction that runs its active block out, which holds the
+    /// sequence, as nextval leaves it held, so that no worker can switch it until the transaction ends, and the rest of
+    /// the transaction's rows take the next block's values. It switches only when no other transaction holds the
+    /// sequence, which it couldn't pass; the range worker's checks and switch workers draw no values, and its lock waits
+    /// for theirs. It holds the sequence until it ends, so that other sessions' inserts wait for it rather than run the
+    /// block out, and it can't be prepared, as a prepared transaction would hold them up across restarts. A transaction
+    /// that doesn't hold the sequence leaves the switch to the range worker.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    /// <returns>Whether it switched.</returns>
+    internal static bool SwitchInTransaction(uint seqoid) => Elevated.Run(() =>
+    {
+        SpiParameter seq = SpiParameter.Create(seqoid);
+        WorfRows rows = Worf.SelectCatalog("SELECT state, epoch FROM worf.sequence_range WHERE seqoid = $1", seq);
+        if (rows.Count == 0 || rows[0].Get<string>(0) != "active" || seqoid == SnowflakeIds.NodeSequence() || !Worf.ReadScalar<bool>("""
+            SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_locks WHERE locktype = 'relation' AND relation = $1 AND pid = pg_catalog.pg_backend_pid() AND granted)
+                AND NOT EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_locks
+                    WHERE locktype = 'relation' AND relation = $1 AND granted AND pid IS DISTINCT FROM pg_catalog.pg_backend_pid()
+                        AND pid <> ALL ($2::pg_catalog.int4[])
+                        AND database = (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())
+                        AND mode IN ('RowExclusiveLock', 'ShareUpdateExclusiveLock', 'ShareLock', 'ShareRowExclusiveLock', 'ExclusiveLock',
+                            'AccessExclusiveLock'))
+            """, seq, SpiParameter.Create(SequenceRangeGuard.Switchers())))
+        {
+            return false;
+        }
+
+        SequenceInfo info = GetInfo(seqoid);
+        if (NextBlock(seqoid, rows[0].Get<int>(1)) is not (Guid, long, long, bool) next || !Confirmed(seqoid, info, next.Id))
+        {
+            return false;
+        }
+
+        bool switched;
+        try
+        {
+            switched = Switch(seqoid, info, (next.Id, next.Lo, next.Hi), next.Reserved, 1000, true);
+        }
+        catch (PgException error) when (error.SqlState is "40P01" or "40001")
+        {
+            return false;
+        }
+
+        // The switch holds the sequence until the transaction ends, unless a savepoint it's under rolls back, which lets
+        // the lock go.
+        if (switched)
+        {
+            NoteSwitch(null, ("switched a managed sequence to its next block", "The switch holds the sequence, which a prepared transaction would hold across restarts."));
+        }
+
+        return switched;
+    });
+
+    /// <summary>
+    /// Switches each sequence that the range worker's checks left to a switch beside its holders, in a transaction of its
+    /// own, which takes a moment, and starts a switch worker for one that another switch or DDL holds up for longer than
+    /// a tenth of a second. With every worker slot taken, a sequence waits for a later check, which waits for its lock a
+    /// tenth of a second at most, so that the range worker holds up no other sequence for longer. A sequence switched
+    /// gets its next block at once, rather than at the range worker's next check of it, after every other sequence's,
+    /// so that the statements that run through its blocks wait for one switch a block.
+    /// </summary>
+    /// <param name="node">This node.</param>
+    /// <param name="peak">Each sequence's peak rate, in values a second, as the range worker last took it.</param>
+    internal static void HandOff(WorfLocalNode node, Func<uint, double> peak)
+    {
+        foreach ((uint seqoid, string name) in s_handOffs)
+        {
+            bool done;
+            try
+            {
+                done = RunWorkerTransaction(() => SwitchAtEnd(seqoid, true, MovedIn(seqoid)));
+            }
+            catch (PgException error) when (error.SqlState is "55P03" or "40P01")
+            {
+                done = false;
+            }
+
+            // The sequence gets the block after the one switched to now, unless a transaction holds it against the
+            // check, as a later check then gets it.
+            if (done)
+            {
+                _ = s_unstarted.Remove(seqoid);
+                try
+                {
+                    LedgerNoWait = true;
+                    if (RunWorkerTransaction(() => Replenish(seqoid, node, peak(seqoid))))
+                    {
+                        Changed();
+                        SequenceRangeExchangeWorker.Wake();
+                    }
+                }
+                catch (PgException error) when (error.SqlState is "55P03" or "40P01")
+                {
+                    RequestCheck(seqoid);
+                }
+                finally
+                {
+                    LedgerNoWait = false;
+                }
+
+                continue;
+            }
+
+            _ = SequenceRangeSwitchWorker.Start(seqoid, MovedIn(seqoid)) ? s_unstarted.Remove(seqoid) : s_unstarted.Add(seqoid);
+        }
+
+        s_handOffs.Clear();
+    }
+
+    /// <summary>
+    /// Finds the active block the range worker noticed a sequence moving backwards in.
+    /// </summary>
+    /// <returns>The block, or empty.</returns>
+    private static Guid MovedIn(uint seqoid) => s_movedBack.GetValueOrDefault(seqoid);
+
+    /// <summary>
+    /// Switches a sequence to its next block for the switch worker, beside the transactions that hold the sequence, as
+    /// the range worker couldn't wait for them, so that inserts go on into the next block rather than run the active one
+    /// out or wait for them. It switches only while the active block is still in its last twentieth, the sequence moved
+    /// backwards in it, statements wait for it or more draw from it than it has values left, or the next block is
+    /// reserved for a load, since a transaction that ran the block out may have switched it meanwhile.
+    /// </summary>
+    /// <param name="seqoid">The sequence.</param>
+    /// <param name="briefly">Whether the range worker switches, which waits a tenth of a second at most for the locks,
+    /// rather than the switch worker.</param>
+    /// <param name="movedIn">The active block the sequence moved backwards in, which it switches from wherever the
+    /// sequence is in it, or empty.</param>
+    /// <returns>Whether the switch is done, or false to try again.</returns>
+    internal static bool SwitchAtEnd(uint seqoid, bool briefly = false, Guid movedIn = default)
+    {
+        if (!SequenceExists(seqoid) || !IsManaged(seqoid))
+        {
+            return true;
+        }
+
+        // A switch worker waits for the gate before it locks the range row, which exchanges and the range worker wait for.
+        if (!briefly)
+        {
+            SequenceRangeGuard.AwaitGate(seqoid);
+        }
+
+        LedgerNoWait = true;
+        try
+        {
+            long until = Worker.GetCurrentTimestamp() + (briefly ? 100_000 : 1_000_000);
+            while (true)
+            {
+                try
+                {
+                    LockLedger(seqoid);
+                    break;
+                }
+                catch (PgException error) when (error.SqlState == "55P03" && Worker.GetCurrentTimestamp() < until)
+                {
+                    PgInterrupts.Check();
+                    Worker.WaitLatch(10);
+                }
+            }
+
+            WorfRows rows = Worf.Read("SELECT state, epoch FROM worf.sequence_range WHERE seqoid = $1", 1, SpiParameter.Create(seqoid));
+            if (rows.Count == 0 || rows[0].Get<string>(0) is "collecting" or "refused" || seqoid == SnowflakeIds.NodeSequence())
+            {
+                return true;
+            }
+
+            SequenceInfo info = GetInfo(seqoid);
+            int epoch = rows[0].Get<int>(1);
+            if (NodeBlock(seqoid, epoch, "active") is not (Guid, long, long) active || NextBlock(seqoid, epoch) is not (Guid, long, long, bool) next ||
+                !Confirmed(seqoid, info, next.Id))
+            {
+                return true;
+            }
+
+            // Whether the switch is still needed is told once the switch holds the lock that every switch takes, so that
+            // the block and position it reads aren't those of a switch under way, which moves the sequence first.
+            bool needed = true;
+            bool Needed()
+            {
+                long left = StepsLeft(seqoid, info, active);
+                return needed = NodeBlock(seqoid, epoch, "active")?.Id == active.Id && (next.Reserved || active.Id == movedIn ||
+                    left <= (Reserved(active.Id) ? 0 : Steps(info, active.Lo, active.Hi) / 20) || Crowded(seqoid, active.Id, active.Lo, left));
+            }
+
+            // Nextval reaches the block's start before the switch commits, so the commit doesn't wait for the disk; a
+            // later commit that writes the block's values flushes it.
+            _ = Worf.Execute("SET LOCAL synchronous_commit = off");
+            s_pendingMove = null;
+            bool switched = Switch(seqoid, info, (next.Id, next.Lo, next.Hi), next.Reserved, briefly ? 100 : ExchangeTimeout, beside: true, needed: Needed);
+
+            // The sequence moves to the block last, just before the transaction commits, so that other sessions'
+            // nextval, which takes the block's bounds as it commits, reaches the block no sooner than it must. The
+            // statements that draw from it let it move only between their rows, and draw again once they have heard
+            // of the new bounds, as the commit lets the gate go after it tells backends of them.
+            if (switched && s_pendingMove is (uint moving, long start))
+            {
+                SequenceRangeGuard.ShutGate(moving, briefly ? 100 : 1000);
+                Move(moving, start);
+            }
+
+            s_pendingMove = null;
+            return switched || !needed || NextBlock(seqoid, epoch)?.Id != next.Id;
+        }
+        finally
+        {
+            LedgerNoWait = false;
+        }
+    }
+
+    /// <summary>
+    /// Checks whether statements wait for a sequence to switch from its active block, or more statements draw from it
+    /// than the block has values left, as each may draw one before it checks again. Statements that waited for the
+    /// switch from the block before, until they next look, don't count, so that a switch doesn't bring another at once.
+    /// </summary>
+    private static bool Crowded(uint seqoid, Guid active, long activeLo, long left)
+    {
+        (int drawing, int waiting) = SequenceRangeGuard.Drawing(seqoid, activeLo);
+        return waiting > 0 || (!Reserved(active) && left < drawing);
+    }
+
+    /// <summary>
+    /// Grants the owner a next block from the start of the root's lowest free span that holds it, under a row lock,
+    /// committed with synchronous_commit on: the size requested, or <paramref name="forRate"/> up to the largest size.
+    /// </summary>
+    private static bool GrantOwnBlock(uint seqoid, SequenceInfo info, WorfLocalNode node, int epoch, long forRate = 0)
+    {
+        long size = Worf.SelectCatalog("SELECT greatest(request_size, least($2, max_range_size)) FROM worf.sequence_range WHERE seqoid = $1",
+            SpiParameter.Create(seqoid), SpiParameter.Create(forRate))[0].Get<long>(0);
         if (Allocate(seqoid, info, epoch, size, node.Node.Id, node.Node.Name, Guid.NewGuid()) is not (Guid grant, long lo, long hi))
         {
             return false;
         }
 
         _ = InsertBlock(seqoid, epoch, 'n', lo, hi, "next", node.Node.Id, node, grant);
-        _ = Spi.Execute("UPDATE worf.sequence_range_grant SET state = 'acknowledged' WHERE grant_id = $1", SpiParameter.Create(grant));
+        _ = Worf.Execute("""
+            UPDATE worf.sequence_range_block b SET not_before = g.not_before FROM worf.sequence_range_grant g
+            WHERE g.grant_id = $1 AND b.block_id = g.grant_id
+            """, SpiParameter.Create(grant));
+        _ = Worf.Execute("UPDATE worf.sequence_range_grant SET state = 'acknowledged' WHERE grant_id = $1", SpiParameter.Create(grant));
+
+        // The owner draws from the block only once a neighbor has heard of it, which its subscribers hear of when they
+        // next call, so they're told to call now. The word goes out once the grant has committed and every session sees
+        // it, past a synchronous standby's reply: a word the transaction wrote would reach a subscriber as its commit
+        // record does, and the call it made at once could miss the grant, and count as the call the word asked for.
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, Worker.WantWord);
         return true;
+    }
+
+    /// <summary>
+    /// Tells this database's subscribers, as the transaction commits, to call this node now, rather than at their next
+    /// exchange interval: the range worker does so in a transaction of its own, once the grants that want it have
+    /// committed. The word goes as a notification to the connections their exchanges keep, which LISTEN, so that it
+    /// reaches them at once, though the replication stream to them is behind a large transaction, and as a message that
+    /// worf's output plugin sends them, for a subscriber that keeps no connection yet.
+    /// </summary>
+    internal static void WakeSubscribers()
+    {
+        _ = Worf.Read("SELECT pg_catalog.pg_notify('" + SequenceRangeExchange.WordChannel + "', '')", 0);
+        fixed (byte* prefix = "worf_sequence_range\0"u8)
+        {
+#if ANKUS_PG15 || ANKUS_PG16
+            _ = NativeMethods.LogLogicalMessage((sbyte*)prefix, (sbyte*)prefix, 0, true);
+#else
+            _ = NativeMethods.LogLogicalMessage((sbyte*)prefix, (sbyte*)prefix, 0, true, false);
+#endif
+        }
     }
 
     /// <summary>
@@ -1463,7 +4797,7 @@ internal static unsafe partial class SequenceRanges
     internal static (Guid Grant, long Lo, long Hi)? Allocate(uint seqoid, SequenceInfo info, int epoch, long size, uint granteeId,
         string granteeName, Guid requestId, char kind = 'n')
     {
-        SpiResult granted = Worf.SelectCatalog("SELECT grant_id, lo, hi FROM worf.sequence_range_grant WHERE request_id = $1 AND kind <> 'x'",
+        WorfRows granted = Worf.SelectCatalog("SELECT grant_id, lo, hi FROM worf.sequence_range_grant WHERE request_id = $1 AND kind <> 'x'",
             SpiParameter.Create(requestId));
         if (granted.Count > 0)
         {
@@ -1475,11 +4809,11 @@ internal static unsafe partial class SequenceRanges
         LockLedger(seqoid);
         decimal span = ((decimal)size - 1) * Math.Abs(info.Increment);
         bool ascending = info.Ascending;
-        SpiResult free = Spi.Query(Spi.Sql($"""
-            SELECT f.block_id, f.lo, f.hi
+        WorfRows free = Worf.Query(Spi.Sql($"""
+            SELECT f.block_id, f.lo, f.hi, f.not_before
             FROM worf.sequence_range_free f JOIN worf.sequence_range_block b ON b.block_id = f.block_id
             WHERE b.seqoid = {seqoid}::oid AND b.epoch = {epoch} AND b.kind IN ('r', 'p') AND b.state = 'open'
-                AND b.sysid = {NativeMethods.GetSystemIdentifier().ToString(CultureInfo.InvariantCulture)}::numeric AND b.timeline = {(long)NativeMethods.GetWALInsertionTimeLine()}
+                AND b.sysid = {(decimal)NativeMethods.GetSystemIdentifier()} AND b.timeline = {(long)Timeline()}
                 AND f.hi::numeric - f.lo >= {span}
             ORDER BY CASE WHEN {ascending} THEN f.lo END, CASE WHEN NOT {ascending} THEN f.hi END DESC
             LIMIT 1
@@ -1500,19 +4834,37 @@ internal static unsafe partial class SequenceRanges
         TakeFromFree(from, lo, hi);
 
         Guid grant = Guid.NewGuid();
-        _ = Spi.Execute("""
+        _ = Worf.Execute("""
             INSERT INTO worf.sequence_range_grant
-            VALUES ($1, $2, $3, $4, $5, $6, $7::"char", $8, $9, 'sent', now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7::"char", $8, $9, 'sent', now(), NULL, $10)
             """, SpiParameter.Create(grant), SpiParameter.Create(requestId), SpiParameter.Create(seqoid), SpiParameter.Create(from),
             SpiParameter.Create(granteeId), SpiParameter.Create(granteeName), SpiParameter.Create(kind.ToString()), SpiParameter.Create(lo),
-            SpiParameter.Create(hi));
-        _ = Spi.Execute($"UPDATE worf.sequence_range SET watermark = {(info.Ascending ? "greatest" : "least")}(coalesce(watermark, $2), $2) WHERE seqoid = $1",
+            SpiParameter.Create(hi), SpiParameter.Create(free[0].Get<long?>(3)));
+        _ = Worf.Execute($"UPDATE worf.sequence_range SET watermark = {(info.Ascending ? "greatest" : "least")}(coalesce(watermark, $2), $2) WHERE seqoid = $1",
             SpiParameter.Create(seqoid), SpiParameter.Create(info.Ascending ? hi : lo));
 
         // A grant that a crash lost could be granted again.
-        _ = Spi.Execute("SET LOCAL synchronous_commit = on");
-        PgLog.Log($"sequence {info.Name} granted block [{lo}, {hi}] to node {granteeName}");
+        _ = Worf.Execute("SET LOCAL synchronous_commit = on");
+        WorfLog.Log($"sequence {info.Name} granted block [{lo}, {hi}] to node {granteeName}");
+        WarnWhenRootRunsLow(info, from, (decimal)hi - lo + 1);
         return (grant, lo, hi);
+    }
+
+    /// <summary>
+    /// Warns when a grant takes the root past nine tenths of its values granted.
+    /// </summary>
+    private static void WarnWhenRootRunsLow(SequenceInfo info, Guid block, decimal taken)
+    {
+        decimal? left = Worf.ReadScalar<decimal?>("""
+            SELECT l.left
+            FROM worf.sequence_range_block b
+                CROSS JOIN LATERAL (SELECT coalesce(sum(f.hi::numeric - f.lo + 1), 0) AS left FROM worf.sequence_range_free f WHERE f.block_id = b.block_id) l
+            WHERE b.block_id = $1 AND b.kind = 'r' AND l.left * 10 < b.hi::numeric - b.lo + 1 AND (l.left + $2) * 10 >= b.hi::numeric - b.lo + 1
+            """, SpiParameter.Create(block), SpiParameter.Create(taken));
+        if (left is not null)
+        {
+            WorfLog.Warning($"sequence {info.Name}'s root has granted nine tenths of its values and has {left} left; widen the sequence's type, or re-enable it with a later pool_start, before they run out");
+        }
     }
 
     /// <summary>
@@ -1534,14 +4886,14 @@ internal static unsafe partial class SequenceRanges
     internal static Guid? AllocateExact(uint seqoid, SequenceInfo info, int epoch, long lo, long hi, uint granteeId, string granteeName,
         Guid requestId, char kind, bool refuse)
     {
-        SpiResult answered = Worf.SelectCatalog("SELECT grant_id, kind::text FROM worf.sequence_range_grant WHERE request_id = $1",
+        WorfRows answered = Worf.SelectCatalog("SELECT grant_id, kind::text FROM worf.sequence_range_grant WHERE request_id = $1",
             SpiParameter.Create(requestId));
         if (answered.Count > 0)
         {
             // A refusal whose answer was lost goes out again.
             if (answered[0].Get<string>(1) == "x")
             {
-                _ = Spi.Execute("UPDATE worf.sequence_range_grant SET state = 'sent' WHERE request_id = $1", SpiParameter.Create(requestId));
+                _ = Worf.Execute("UPDATE worf.sequence_range_grant SET state = 'sent' WHERE request_id = $1", SpiParameter.Create(requestId));
                 return null;
             }
 
@@ -1549,11 +4901,11 @@ internal static unsafe partial class SequenceRanges
         }
 
         LockLedger(seqoid);
-        SpiResult free = Spi.Query(Spi.Sql($"""
+        WorfRows free = Worf.Query(Spi.Sql($"""
             SELECT f.block_id, f.lo, f.hi
             FROM worf.sequence_range_free f JOIN worf.sequence_range_block b ON b.block_id = f.block_id
             WHERE b.seqoid = {seqoid}::oid AND b.epoch = {epoch} AND b.kind IN ('r', 'p') AND b.state = 'open'
-                AND b.sysid = {NativeMethods.GetSystemIdentifier().ToString(CultureInfo.InvariantCulture)}::numeric AND b.timeline = {(long)NativeMethods.GetWALInsertionTimeLine()}
+                AND b.sysid = {(decimal)NativeMethods.GetSystemIdentifier()} AND b.timeline = {(long)Timeline()}
                 AND f.lo <= {lo} AND {hi} <= f.hi
             LIMIT 1
             FOR UPDATE OF f
@@ -1563,11 +4915,11 @@ internal static unsafe partial class SequenceRanges
         {
             if (refuse)
             {
-                _ = Spi.Execute("""
+                _ = Worf.Execute("""
                     INSERT INTO worf.sequence_range_grant VALUES ($1, $2, $3, NULL, $4, $5, 'x', $6, $7, 'sent', now())
                     """, SpiParameter.Create(grant), SpiParameter.Create(requestId), SpiParameter.Create(seqoid), SpiParameter.Create(granteeId),
                     SpiParameter.Create(granteeName), SpiParameter.Create(lo), SpiParameter.Create(hi));
-                PgLog.Log($"sequence {info.Name} refused [{lo}, {hi}] to node {granteeName}: some of those values may be in use");
+                WorfLog.Log($"sequence {info.Name} refused [{lo}, {hi}] to node {granteeName}: some of those values may be in use");
             }
 
             return null;
@@ -1575,15 +4927,16 @@ internal static unsafe partial class SequenceRanges
 
         Guid from = free[0].Get<Guid>(0);
         TakeFromFree(from, lo, hi);
-        _ = Spi.Execute("""
+        _ = Worf.Execute("""
             INSERT INTO worf.sequence_range_grant VALUES ($1, $2, $3, $4, $5, $6, $7::"char", $8, $9, 'sent', now())
             """, SpiParameter.Create(grant), SpiParameter.Create(requestId), SpiParameter.Create(seqoid), SpiParameter.Create(from),
             SpiParameter.Create(granteeId), SpiParameter.Create(granteeName), SpiParameter.Create(kind.ToString()), SpiParameter.Create(lo),
             SpiParameter.Create(hi));
-        _ = Spi.Execute($"UPDATE worf.sequence_range SET watermark = {(info.Ascending ? "greatest" : "least")}(coalesce(watermark, $2), $2) WHERE seqoid = $1",
+        _ = Worf.Execute($"UPDATE worf.sequence_range SET watermark = {(info.Ascending ? "greatest" : "least")}(coalesce(watermark, $2), $2) WHERE seqoid = $1",
             SpiParameter.Create(seqoid), SpiParameter.Create(info.Ascending ? hi : lo));
-        _ = Spi.Execute("SET LOCAL synchronous_commit = on");
-        PgLog.Log($"sequence {info.Name} granted [{lo}, {hi}] exactly to node {granteeName}");
+        _ = Worf.Execute("SET LOCAL synchronous_commit = on");
+        WorfLog.Log($"sequence {info.Name} granted [{lo}, {hi}] exactly to node {granteeName}");
+        WarnWhenRootRunsLow(info, from, (decimal)hi - lo + 1);
         return grant;
     }
 
@@ -1591,30 +4944,58 @@ internal static unsafe partial class SequenceRanges
     /// Records a block this node holds, under its identity now.
     /// </summary>
     internal static Guid InsertBlock(uint seqoid, int epoch, char kind, long lo, long hi, string state, uint? fromNode, WorfLocalNode node,
-        Guid? id = null)
+        Guid? id = null, bool reserved = false, long? notBefore = null)
     {
         ulong sysid = NativeMethods.GetSystemIdentifier();
-        uint timeline = NativeMethods.GetWALInsertionTimeLine();
+        uint timeline = Timeline();
         Guid block = id ?? Guid.NewGuid();
-        _ = Spi.Execute("""
+        _ = Worf.Execute("""
             INSERT INTO worf.sequence_range_block
-                (block_id, seqoid, epoch, kind, lo, hi, state, from_node, node_id, sysid, timeline, received_at)
-            VALUES ($1, $2, $3, $4::"char", $5, $6, $7, $8, $9, $10::numeric, $11, now())
+                (block_id, seqoid, epoch, kind, lo, hi, state, from_node, node_id, sysid, timeline, received_at, retired_at, reserved, not_before)
+            VALUES ($1, $2, $3, $4::"char", $5, $6, $7, $8, $9, $10, $11, now(), CASE WHEN $7 = 'abandoned' THEN now() END, $12, $13)
+            ON CONFLICT (block_id) DO NOTHING
             """, SpiParameter.Create(block), SpiParameter.Create(seqoid), SpiParameter.Create(epoch),
             SpiParameter.Create(kind.ToString()), SpiParameter.Create(lo), SpiParameter.Create(hi), SpiParameter.Create(state),
-            SpiParameter.Create(fromNode), SpiParameter.Create(node.Node.Id), SpiParameter.Create(sysid.ToString(CultureInfo.InvariantCulture)),
-            SpiParameter.Create((long)timeline));
+            SpiParameter.Create(fromNode), SpiParameter.Create(node.Node.Id), SpiParameter.Create((decimal)sysid),
+            SpiParameter.Create((long)timeline), SpiParameter.Create(reserved), SpiParameter.Create(notBefore));
+
+        // The guard admits an imported block's values.
+        if (kind == 'i')
+        {
+            ChangedOnCommit(seqoid);
+        }
+
         return block;
     }
 
     internal static (Guid Id, long Lo, long Hi)? NodeBlock(uint seqoid, int epoch, string state)
     {
-        SpiResult result = Worf.SelectCatalog("""
+        WorfRows result = Worf.SelectCatalog("""
             SELECT block_id, lo, hi FROM worf.sequence_range_block
             WHERE seqoid = $1 AND epoch = $2 AND kind = 'n' AND state = $3
             ORDER BY received_at LIMIT 1
             """, SpiParameter.Create(seqoid), SpiParameter.Create(epoch), SpiParameter.Create(state));
         return result.Count == 0 ? null : (result[0].Get<Guid>(0), result[0].Get<long>(1), result[0].Get<long>(2));
+    }
+
+    /// <summary>
+    /// Checks whether a block was reserved for a load.
+    /// </summary>
+    private static bool Reserved(Guid block)
+        => Worf.SelectCatalog("SELECT reserved FROM worf.sequence_range_block WHERE block_id = $1", SpiParameter.Create(block)) is { Count: > 0 } row &&
+            row[0].Get<bool>(0);
+
+    /// <summary>
+    /// Finds the next block a sequence switches to: one reserved for a load first, and otherwise the one received first.
+    /// </summary>
+    internal static (Guid Id, long Lo, long Hi, bool Reserved)? NextBlock(uint seqoid, int epoch)
+    {
+        WorfRows result = Worf.SelectCatalog("""
+            SELECT block_id, lo, hi, reserved FROM worf.sequence_range_block
+            WHERE seqoid = $1 AND epoch = $2 AND kind = 'n' AND state = 'next'
+            ORDER BY reserved DESC, received_at LIMIT 1
+            """, SpiParameter.Create(seqoid), SpiParameter.Create(epoch));
+        return result.Count == 0 ? null : (result[0].Get<Guid>(0), result[0].Get<long>(1), result[0].Get<long>(2), result[0].Get<bool>(3));
     }
 
     /// <summary>
@@ -1624,22 +5005,130 @@ internal static unsafe partial class SequenceRanges
         => (long)Math.Min(((decimal)hi - lo) / Math.Abs(info.Increment) + 1, long.MaxValue);
 
     /// <summary>
+    /// Returns the last value a managed sequence issued, as <c>worf.sequence_ranges</c> shows it, without the lock that
+    /// <c>pg_sequence_last_value</c> takes, which would hold off every switch until the reader's transaction ends, and
+    /// without waiting for a switch under way, as a session's own holds the sequence until its transaction ends: the
+    /// position is the sequence's as a SELECT from it reads it, which may already be in the block a switch that hasn't
+    /// committed moves it to.
+    /// </summary>
+    /// <param name="sequence">The sequence.</param>
+    /// <returns>The last value, or null before its first.</returns>
+    [PgFunction(Sql = """
+        CREATE FUNCTION worf.sequence_range_position(sequence regclass)
+        RETURNS bigint STRICT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
+        """)]
+    internal static long? SequenceRangePosition([PgSqlType("regclass", Schema = "pg_catalog")] PgDatum sequence)
+    {
+        uint seqoid = RequireSequence(sequence);
+
+        // As pg_sequence_last_value, it needs SELECT or USAGE on the sequence.
+        return Worf.ReadScalar<bool>("SELECT pg_catalog.has_sequence_privilege($1, 'SELECT, USAGE')", SpiParameter.Create(seqoid))
+            ? Elevated.Run(() => Worf.ReadScalar<long?>(PositionRead(seqoid)))
+            : throw new PgException("42501", $"permission denied for sequence {GetInfo(seqoid).Name}");
+    }
+
+    /// <summary>
     /// Reads the last value a sequence issued, or null before its first, from its row. pg_sequence_last_value locks
     /// the sequence as nextval does, until the transaction ends, and ALTER SEQUENCE waits on that lock, so two
-    /// transactions that each read a sequence that way and then switch it to a block deadlock. Reading the row takes
-    /// a lock that ALTER SEQUENCE doesn't wait on.
+    /// transactions that each read a sequence that way and then switch it to a block deadlock. This read holds that
+    /// lock only while it reads.
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
     /// <returns>The last value, or null.</returns>
     internal static long? LastValue(uint seqoid) => Elevated.Run(() =>
     {
-        SpiResult name = Spi.Query("""
+
+        // A switch moves the sequence's position at once, and its bounds and block as it commits, so a read in between
+        // could pair the old block with the new position, or, just after the switch commits, the new block with the old
+        // position. The read takes a lock that every switch's conflicts with, but not nextval's, which waits for a switch
+        // to finish committing, and lets it go once done, so that it holds off no switch for the rest of the
+        // transaction. It never queues for the lock, though: a switch that waits for the transactions that hold the
+        // sequence, or a reservation's transaction that holds it for a load, would hold the read up as long. Such a read
+        // goes without the lock, and is good when no switch held the lock as it read and the sequence's catalog row and
+        // file stayed the same, since a switch updates the row, and DDL that rewrites the sequence writes a new file;
+        // while a switch holds it, the read tries again soon.
+        string read = PositionRead(seqoid);
+        // A standby switches nothing, and takes no such lock.
+        if (NativeMethods.RecoveryInProgress())
+        {
+            return Worf.ReadScalar<long?>(read);
+        }
+
+        long giveUpAt = Worker.GetCurrentTimestamp() + (ExchangeTimeout * 1000L);
+        while (true)
+        {
+            if (NativeMethods.ConditionalLockRelationOid(seqoid, (int)PgLockMode.ShareUpdateExclusive))
+            {
+                try
+                {
+                    return Worf.ReadScalar<long?>(read);
+                }
+                finally
+                {
+                    NativeMethods.UnlockRelationOid(seqoid, (int)PgLockMode.ShareUpdateExclusive);
+                }
+            }
+
+            if (VersionUnlessSwitching(seqoid) is string version)
+            {
+                long? position = Worf.ReadScalar<long?>(read);
+                if (VersionUnlessSwitching(seqoid) == version)
+                {
+                    return position;
+                }
+            }
+
+            // A lock a switch takes, held as long as worf.sequence_range_timeout, belongs to something else, as DDL left
+            // open in a transaction, which the read gives up on, naming it, rather than wait for.
+            if (Worker.GetCurrentTimestamp() >= giveUpAt)
+            {
+                string holder = Worf.ReadScalar<string?>("""
+                    SELECT string_agg(l.pid || ' (' || l.mode || ')', ', ' ORDER BY l.pid) FROM pg_catalog.pg_locks l
+                    WHERE l.locktype = 'relation' AND l.database = $1 AND l.relation = $2 AND l.granted AND l.pid <> pg_catalog.pg_backend_pid()
+                        AND l.mode IN ('ShareUpdateExclusiveLock', 'ShareLock', 'ShareRowExclusiveLock', 'AccessExclusiveLock')
+                    """, SpiParameter.Create(NativeGlobals.MyDatabaseId), SpiParameter.Create(seqoid)) ?? "none now";
+                throw new PgException(PgSqlStates.ObjectInUse, $"could not read the position of sequence {GetInfo(seqoid).Name}",
+                    detail: $"Processes have held a lock on it that a switch takes for as long as worf.sequence_range_timeout: {holder}.");
+            }
+
+            // The read tries again a hundred times a second, as pg_locks takes every lock partition's lock to read them.
+            PgInterrupts.Check();
+            Worker.WaitLatch(10);
+        }
+    });
+
+    /// <summary>
+    /// Writes the query that reads a sequence's last value from its row, or null before its first, under the lock a
+    /// SELECT takes, which no switch waits for.
+    /// </summary>
+    private static string PositionRead(uint seqoid)
+    {
+        WorfRow name = Worf.Read("""
             SELECT n.nspname::text, c.relname::text FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
             WHERE c.oid = $1
-            """, false, 1, SpiParameter.Create(seqoid));
-        return Spi.ExecuteScalar<long?>("SELECT CASE WHEN is_called THEN last_value END FROM " +
-            Spi.QuoteQualifiedIdentifier(name[0].Get<string>(0), name[0].Get<string>(1)));
-    });
+            """, 1, SpiParameter.Create(seqoid))[0];
+        return "SELECT CASE WHEN is_called THEN last_value END FROM " + Worf.QuoteQualifiedIdentifier(name.Get<string>(0), name.Get<string>(1));
+    }
+
+    /// <summary>
+    /// Finds the version of a sequence's catalog row and its file, as of the latest commit, unless another transaction
+    /// holds a lock on it that a switch takes, or DDL does.
+    /// </summary>
+    private static string? VersionUnlessSwitching(uint seqoid)
+    {
+        NativeMethods.AcceptInvalidationMessages();
+        return Worf.ReadScalar<bool>("""
+            SELECT EXISTS (
+                SELECT 1 FROM pg_catalog.pg_locks
+                WHERE locktype = 'relation' AND database = $1 AND relation = $2 AND granted AND pid <> pg_catalog.pg_backend_pid()
+                    AND mode IN ('ShareUpdateExclusiveLock', 'ShareLock', 'ShareRowExclusiveLock', 'AccessExclusiveLock'))
+            """, SpiParameter.Create(NativeGlobals.MyDatabaseId), SpiParameter.Create(seqoid))
+            ? null
+            : Worf.SelectCatalog("""
+                SELECT s.xmin::text || '/' || s.ctid::text || '/' || pg_catalog.pg_relation_filenode($1)::text
+                FROM pg_catalog.pg_sequence s WHERE s.seqrelid = $1
+                """, SpiParameter.Create(seqoid)) is { Count: > 0 } row ? row[0].Get<string>(0) : null;
+    }
 
     /// <summary>
     /// Counts the values the sequence has left in its active block.
@@ -1658,9 +5147,13 @@ internal static unsafe partial class SequenceRanges
 
     /// <summary>
     /// Computes the highest value, or lowest for a descending sequence, that the sequence may have issued or its
-    /// tables hold.
+    /// tables hold. Only a stored value that the root could grant counts, since no other can meet one of its values:
+    /// NaN, an infinity, or a value past the root's end or past bigint, counts for nothing. A numeric column's values are
+    /// rounded away from the root's start.
     /// </summary>
-    private static long? HighWater(SequenceInfo info)
+    /// <param name="info">The sequence.</param>
+    /// <param name="issued">The last value the sequence issued before a quarantine moved it, if one did.</param>
+    private static long? HighWater(SequenceInfo info, long? issued)
     {
         long? high = null;
         void Take(long? value)
@@ -1671,27 +5164,39 @@ internal static unsafe partial class SequenceRanges
             }
         }
 
+        // Each table, with its inheritors and partitions, is read as StoredValues reads it, running nothing of the user's,
+        // before the sequence, whose lock a DROP of a table takes after the table's.
         SpiParameter seq = SpiParameter.Create(info.Seqoid);
         string pick = info.Ascending ? "max" : "min";
+        long end = Worf.ReadScalar<long?>("SELECT root_end FROM worf.sequence_range WHERE seqoid = $1", seq) ?? RootEnd(info);
+        foreach ((uint relid, string column, _) in UsingColumns(info.Seqoid))
+        {
+            if (StoredValues.Furthest(relid, column, info.Ascending, info.Ascending ? long.MinValue : end, info.Ascending ? end : long.MaxValue, false)
+                is decimal value)
+            {
+                Take((long)(info.Ascending ? Math.Ceiling(value) : Math.Floor(value)));
+            }
+        }
+
         // The value a quarantine reserves is never issued.
         long? last = LastValue(info.Seqoid);
         Take(last == info.QuarantineEdge ? null : last);
-        Take(Spi.ExecuteScalar<long?>("SELECT last_value FROM worf.sequence_state WHERE seqoid = $1", seq));
-        Take(Spi.ExecuteScalar<long?>("SELECT watermark FROM worf.sequence_range WHERE seqoid = $1", seq));
-        Take(Spi.ExecuteScalar<long?>("SELECT " + pick + "(" + (info.Ascending ? "hi" : "lo") +
+        Take(issued == info.QuarantineEdge ? null : issued);
+        Take(Worf.ReadScalar<long?>("SELECT last_value FROM worf.sequence_state WHERE seqoid = $1", seq));
+        Take(Worf.ReadScalar<long?>("SELECT watermark FROM worf.sequence_range WHERE seqoid = $1", seq));
+        Take(Worf.ReadScalar<long?>("SELECT " + pick + "(" + (info.Ascending ? "hi" : "lo") +
             ") FROM worf.sequence_range_block WHERE seqoid = $1 AND kind IN ('n', 'i')", seq));
-        foreach ((uint relid, string column, _) in UsingColumns(info.Seqoid))
-        {
-            Take(Spi.ExecuteScalar<long?>("SELECT " + pick + "(" + Spi.QuoteIdentifier(column) + ")::bigint FROM " +
-                Spi.QuoteQualifiedIdentifier(Worf.FromServer(NativeMethods.get_namespace_name(NativeMethods.get_rel_namespace(relid))),
-                    Worf.FromServer(NativeMethods.get_rel_name(relid)))));
-        }
 
         return high;
     }
 
-    private static string QualifiedName(uint relid)
-        => Spi.QuoteQualifiedIdentifier(Worf.FromServer(NativeMethods.get_namespace_name(NativeMethods.get_rel_namespace(relid))),
+    /// <summary>
+    /// Gets a relation's quoted, schema-qualified name.
+    /// </summary>
+    /// <param name="relid">The relation.</param>
+    /// <returns>The name.</returns>
+    internal static string QualifiedName(uint relid)
+        => Worf.QuoteQualifiedIdentifier(Worf.FromServer(NativeMethods.get_namespace_name(NativeMethods.get_rel_namespace(relid))),
             Worf.FromServer(NativeMethods.get_rel_name(relid)));
 
     /// <summary>
@@ -1699,14 +5204,21 @@ internal static unsafe partial class SequenceRanges
     /// </summary>
     private static void InstallGuards(uint seqoid)
     {
-        foreach (uint relid in UsingColumns(seqoid).Select(column => column.Relid).Distinct())
+        foreach (uint root in UsingColumns(seqoid).Select(column => TreeRoot(column.Relid)).Distinct())
         {
-            InstallGuard(relid);
+            InstallGuard(root);
         }
     }
 
     /// <summary>
-    /// Puts the guard on a table, checking each of its columns that uses a managed sequence, if it has any.
+    /// Puts the guard on a table's partition tree, or on the table itself when it's no partition. The guard is pairs of
+    /// triggers that run after each row is written, so that they see the row every BEFORE trigger left, and whose
+    /// conditions check the values: those of a new row, and those an update changes. The tree's root has a pair, which
+    /// PostgreSQL gives every partition, for the columns the root numbers from a managed sequence, and a partition has a
+    /// pair of its own for any other column that it, or a partitioned table between it and the root, numbers from one,
+    /// so that attaching it changes no other table's triggers. A value passes under any of the managed sequences its
+    /// column uses. Columns are referenced by number, so a renamed column stays checked, and the triggers' arguments
+    /// list what they check, so that a pair that checks the same is left alone and its writers aren't held up.
     /// </summary>
     private static void InstallGuard(uint relid)
     {
@@ -1715,27 +5227,296 @@ internal static unsafe partial class SequenceRanges
             return;
         }
 
-        List<string> arguments = [];
-        List<string> columns = [];
-        SpiResult managed = Worf.SelectCatalog("SELECT seqoid::oid FROM worf.sequence_range");
-        for (int i = 0; i < managed.Count; i++)
+        uint root = TreeRoot(relid);
+        (Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> rootColumns,
+            Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>> partitions,
+            Dictionary<uint, (uint Parent, bool Leaf)> members) = TreeColumns(root);
+
+        // Only worf creates a trigger with the guard's function, so one with another, as a trigger with the guard's name
+        // that predates worf has, or one that doesn't fire, is no guard.
+        WorfRows existing = Worf.Read("""
+            SELECT tgrelid::oid, tgname::text, encode(tgargs, 'hex'), tgfoid = $3 AND tgenabled = 'A'
+            FROM pg_catalog.pg_trigger WHERE tgrelid = ANY ($1::oid[]) AND tgname = ANY ($2) AND tgparentid = 0
+            """, 0, SpiParameter.Create(members.Keys.Select(member => (long)member).ToArray()), SpiParameter.Create(s_guardNames),
+            SpiParameter.Create(GuardFunction()));
+        List<(uint Relid, string Name, string Arguments, bool Ours)> triggers = [];
+        for (int i = 0; i < existing.Count; i++)
         {
-            uint managedSeq = managed[i].Get<uint>(0);
-            foreach ((_, string column, uint typeOid) in UsingColumns(managedSeq).Where(entry => entry.Relid == relid))
+            triggers.Add((existing[i].Get<uint>(0), existing[i].Get<string>(1), existing[i].Get<string>(2), existing[i].Get<bool>(3)));
+        }
+
+        // A row trigger that runs before an update may change any column, so the update guard of a table that has one, or
+        // the root's when any table of the tree does, fires on every update, and otherwise only on one that sets a column it
+        // checks. So may a partition's row trigger that runs before an insert, as an update moves a row into it, so the
+        // root's update guard fires on every update then too.
+        WorfRows before = Worf.Read("""
+            SELECT DISTINCT tgrelid::oid, (tgtype & $2) = $2 FROM pg_catalog.pg_trigger
+            WHERE tgrelid = ANY ($1::oid[]) AND ((tgtype & $2) = $2 OR (tgrelid <> $4 AND (tgtype & $3) = $3))
+            """, 0, SpiParameter.Create(members.Keys.Select(member => (long)member).ToArray()), SpiParameter.Create(BeforeUpdateRow),
+            SpiParameter.Create(BeforeInsertRow), SpiParameter.Create(root));
+        HashSet<uint> changing = [.. Enumerable.Range(0, before.Count).Where(i => before[i].Get<bool>(1)).Select(i => before[i].Get<uint>(0))];
+
+        // A moved row's insert into a partition leaves the check of the root's columns to the root's update guard, which
+        // compares the row's old and new values, but a partition's own columns are checked as a new row's.
+        InstallPair(root, GuardName, UpdateGuardName, "worf.sequence_range_check", rootColumns, before.Count > 0, triggers);
+        foreach (uint member in members.Keys)
+        {
+            InstallPair(member, PartitionGuardName, PartitionUpdateGuardName, "worf.sequence_range_check_update",
+                member != root && partitions.TryGetValue(member, out Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>? columns) ? columns : [],
+                changing.Contains(member), triggers);
+        }
+    }
+
+    /// <summary>
+    /// Puts a pair of guard triggers on a table that check columns, replacing a pair that checks others, or drops the
+    /// pair when there are none. The update guard fires on every update when <paramref name="everyUpdate"/> says that a
+    /// row trigger before it may change the columns, and otherwise only on an update that sets one of them.
+    /// </summary>
+    private static void InstallPair(uint relid, string insertName, string updateName, string insertCheck,
+        Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> columns, bool everyUpdate,
+        List<(uint Relid, string Name, string Arguments, bool Ours)> triggers)
+    {
+        List<(uint Relid, string Name, string Arguments, bool Ours)> existing = triggers.FindAll(trigger =>
+            trigger.Relid == relid && (trigger.Name == insertName || trigger.Name == updateName));
+        if (columns.Count == 0 && existing.Count == 0)
+        {
+            return;
+        }
+
+        string table = QualifiedName(relid);
+        WorfRows attributes = Worf.Read("SELECT attname::text, attnum FROM pg_catalog.pg_attribute WHERE attrelid = $1 AND attnum > 0 AND NOT attisdropped",
+            0, SpiParameter.Create(relid));
+        Dictionary<string, short> attnums = [];
+        for (int i = 0; i < attributes.Count; i++)
+        {
+            attnums[attributes[i].Get<string>(0)] = attributes[i].Get<short>(1);
+        }
+
+        // A sequence is named by its oid, which looks up nothing, and one that a default names as text by that text too,
+        // which the check looks up as the row is written, as the default looks it up, so that the value is checked under
+        // the sequence it came from, if that is managed, and otherwise, as when the name finds nothing or another
+        // sequence, under the managed sequence the name stands for.
+        uint schema = NativeMethods.get_rel_namespace(relid);
+        List<(short Attnum, string Name, string Type, List<string> Sequences)> guarded = [.. columns
+            .Select(column => (attnums[column.Key], Worf.QuoteIdentifier(column.Key), column.Value.TypeOid == NumericOid ? "numeric" : "bigint",
+                column.Value.Sequences.Select(seq => Worf.QuoteLiteral(seq.ToString(CultureInfo.InvariantCulture)) + "::regclass")
+                    .Concat(column.Value.Names.SelectMany(name => Matching(name, schema).Select(seq =>
+                        $"{Worf.QuoteLiteral(name)}, {Worf.QuoteLiteral(seq.ToString(CultureInfo.InvariantCulture))}::regclass"))).ToList()))
+            .Where(column => column.Item4.Count > 0)
+            .OrderBy(column => column.Item1)];
+        List<string> arguments = [.. columns
+            .OrderBy(column => attnums[column.Key])
+            .Select(column => $"{attnums[column.Key]}:{string.Join(",", [.. column.Value.Sequences.Select(seq => seq.ToString(CultureInfo.InvariantCulture)), .. column.Value.Names])}"),
+            .. everyUpdate ? ["every update"] : Array.Empty<string>()];
+        string encoded = Convert.ToHexStringLower(Encoding.UTF8.GetBytes(string.Concat(arguments.Select(argument => argument + "\0"))));
+        if (guarded.Count == 0 || (existing.Count == 2 && existing.TrueForAll(trigger => trigger.Arguments == encoded && trigger.Ours)))
+        {
+            // A table with no column to check keeps no pair.
+            foreach ((_, string name, _, _) in guarded.Count == 0 ? existing : [])
             {
-                columns.Add(Spi.QuoteIdentifier(column));
-                arguments.Add(Spi.QuoteLiteral(column));
-                arguments.Add(Spi.QuoteLiteral(managedSeq.ToString(CultureInfo.InvariantCulture)));
-                arguments.Add(Spi.QuoteLiteral(typeOid.ToString(CultureInfo.InvariantCulture)));
+                DropGuardTrigger(relid, name);
+            }
+
+            return;
+        }
+
+        foreach ((_, string name, _, bool ours) in existing)
+        {
+            if (!ours)
+            {
+                DropGuardTrigger(relid, name);
             }
         }
 
-        if (columns.Count > 0)
+        // An update's condition checks only a value it changes. A value that none of a column's sequences admits is
+        // checked under each, so that every one of them has its say.
+        static string Check(string check, string name, string type, List<string> sequences)
         {
-            RunInternalDdl($"""
-                CREATE OR REPLACE TRIGGER {GuardName} BEFORE INSERT OR UPDATE OF {string.Join(", ", columns)} ON {QualifiedName(relid)}
-                FOR EACH ROW EXECUTE FUNCTION worf.sequence_range_guard({string.Join(", ", arguments)})
-                """);
+            string each = string.Join(" OR ", sequences.Select(seq => $"{check}({seq}, NEW.{name}::{type})"));
+            return sequences.Count == 1
+                ? each
+                : $"(NOT ({string.Join(" OR ", sequences.Select(seq => $"worf.sequence_range_admits({seq}, NEW.{name}::{type})"))}) AND ({each}))";
         }
+
+        string function = $"worf.sequence_range_guard({string.Join(", ", arguments.Select(Worf.QuoteLiteral))})";
+        CreateGuardTrigger(relid, $"""
+            CREATE OR REPLACE TRIGGER {insertName} AFTER INSERT ON {table}
+            FOR EACH ROW WHEN ({string.Join(" OR ", guarded.Select(c => Check(insertCheck, c.Name, c.Type, c.Sequences)))})
+            EXECUTE FUNCTION {function}
+            """);
+        CreateGuardTrigger(relid, $"""
+            CREATE OR REPLACE TRIGGER {updateName} AFTER UPDATE{(everyUpdate ? "" : $" OF {string.Join(", ", guarded.Select(c => c.Name))}")} ON {table}
+            FOR EACH ROW WHEN ({string.Join(" OR ", guarded.Select(c =>
+                $"(OLD.{c.Name} IS DISTINCT FROM NEW.{c.Name} AND {Check("worf.sequence_range_check_update", c.Name, c.Type, c.Sequences)})"))})
+            EXECUTE FUNCTION {function}
+            """);
+    }
+
+    /// <summary>
+    /// Lists the managed sequences a column uses: those its defaults name by oid, and those a name a default gives as
+    /// text may resolve to.
+    /// </summary>
+    private static List<uint> Effective((uint TypeOid, List<uint> Sequences, List<string> Names) use, uint relid)
+        => [.. use.Sequences.Union(use.Names.SelectMany(name => Matching(name, NativeMethods.get_rel_namespace(relid))))];
+
+    /// <summary>
+    /// Finds the root of a table's partition tree: the table itself when it's no partition.
+    /// </summary>
+    private static uint TreeRoot(uint relid)
+        => relid == 0 ? 0 : Worf.ReadScalar<uint?>("SELECT pg_catalog.pg_partition_root($1::regclass)::oid", SpiParameter.Create(relid)) ?? relid;
+
+    /// <summary>
+    /// Lists, by name, the columns a table's rows are checked in, with their types and the managed sequences they use:
+    /// for a partitioned table, those of every partition beneath it.
+    /// </summary>
+    private static Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> GuardedColumns(uint relid)
+        => GuardedColumns(relid, TreeColumns(TreeRoot(relid)));
+
+    /// <summary>
+    /// Lists, by name, the columns a table's rows are checked in, from the columns of its tree.
+    /// </summary>
+    private static Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> GuardedColumns(uint relid,
+        (Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> Root, Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>> Partitions,
+            Dictionary<uint, (uint Parent, bool Leaf)> Members) tree)
+    {
+        Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> columns = Merge(tree.Root, []);
+        foreach ((uint partition, Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> own) in tree.Partitions)
+        {
+            if (Beneath(partition, relid, tree.Members))
+            {
+                columns = Merge(columns, own);
+            }
+        }
+
+        return columns;
+    }
+
+    /// <summary>
+    /// Lists, by name, the columns of a partition tree, or of a table that is no partition, that use a managed sequence,
+    /// with their types and the sequences they use: those the root numbers from one, each with every sequence it uses
+    /// anywhere in the tree, and for each partition beneath, the other columns that it, or a partitioned table between
+    /// it and the root, numbers from one. It also lists the tree's tables, with their parents and whether they hold
+    /// rows.
+    /// </summary>
+    private static (Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> Root,
+        Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>> Partitions,
+        Dictionary<uint, (uint Parent, bool Leaf)> Members) TreeColumns(uint root)
+    {
+        // An inheritance child is a tree of its own.
+        Dictionary<uint, (uint Parent, bool Leaf)> members = [];
+        WorfRows tree = Worf.Read("""
+            SELECT relid::oid, parentrelid::oid, isleaf FROM pg_catalog.pg_partition_tree($1::regclass) WHERE relid = $1 OR parentrelid IS NOT NULL
+            """, 0, SpiParameter.Create(root));
+        for (int i = 0; i < tree.Count; i++)
+        {
+            members[tree[i].Get<uint>(0)] = (tree[i].Get<uint?>(1) ?? 0, tree[i].Get<bool>(2));
+        }
+
+        if (!members.ContainsKey(root))
+        {
+            members[root] = (0, true);
+        }
+
+        Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>> uses = [];
+        WorfRows managed = Elevated.Run(() => Worf.SelectCatalog("SELECT r.seqoid::oid FROM worf.sequence_range r WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.oid = r.seqoid) ORDER BY r.seqoid"));
+        uint[] managedSeqs = [.. Enumerable.Range(0, managed.Count).Select(i => managed[i].Get<uint>(0))];
+        Dictionary<uint, List<(uint Relid, string Column, uint TypeOid, string? Name)>> drawing = UsingColumnsNamed(managedSeqs);
+        foreach (uint managedSeq in managedSeqs)
+        {
+            foreach ((uint relid, string column, uint typeOid, string? name) in drawing[managedSeq].Where(entry => members.ContainsKey(entry.Relid)))
+            {
+                RequireCheckable(relid, column, typeOid, managedSeq);
+                if (!uses.TryGetValue(relid, out Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>? columns))
+                {
+                    uses.Add(relid, columns = []);
+                }
+
+                uses[relid] = Merge(columns, new() { [column] = name is null ? (typeOid, [managedSeq], []) : (typeOid, [], [name]) });
+            }
+        }
+
+        foreach ((uint relid, Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> columns) in uses)
+        {
+            foreach ((string column, (_, List<uint> sequences, List<string> names)) in columns)
+            {
+                RequireNextval(relid, column, sequences, names);
+            }
+        }
+
+        // The root's columns take every sequence they use anywhere in the tree, since every partition has the root's
+        // guard.
+        Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> rootColumns = [];
+        IEnumerable<string> numbered = uses.TryGetValue(root, out Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>? numberedByRoot)
+            ? numberedByRoot.Keys
+            : [];
+        foreach (string column in numbered)
+        {
+            foreach (Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> columns in uses.Values.Where(columns => columns.ContainsKey(column)))
+            {
+                rootColumns = Merge(rootColumns, new() { [column] = columns[column] });
+            }
+        }
+
+        Dictionary<uint, Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>> partitions = [];
+        foreach ((uint relid, (_, bool leaf)) in members)
+        {
+            if (relid == root || !leaf)
+            {
+                continue;
+            }
+
+            Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> columns = [];
+            for (uint member = relid; member != root && members.TryGetValue(member, out (uint Parent, bool Leaf) entry); member = entry.Parent)
+            {
+                foreach ((string column, (uint TypeOid, List<uint> Sequences, List<string> Names) use) in
+                    uses.TryGetValue(member, out Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>? own) ? own : [])
+                {
+                    if (!rootColumns.ContainsKey(column))
+                    {
+                        columns = Merge(columns, new() { [column] = use });
+                    }
+                }
+            }
+
+            if (columns.Count > 0)
+            {
+                partitions.Add(relid, columns);
+            }
+        }
+
+        return (rootColumns, partitions, members);
+    }
+
+    /// <summary>
+    /// Joins two sets of columns, each with the sequences it uses in either.
+    /// </summary>
+    private static Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> Merge(Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> first,
+        Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> second)
+    {
+        Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> merged = [];
+        foreach ((string column, (uint typeOid, List<uint> sequences, List<string> names)) in first.Concat(second))
+        {
+            merged[column] = merged.TryGetValue(column, out (uint TypeOid, List<uint> Sequences, List<string> Names) known)
+                ? (known.TypeOid, [.. known.Sequences.Union(sequences)], [.. known.Names.Union(names)])
+                : (typeOid, [.. sequences], [.. names]);
+        }
+
+        return merged;
+    }
+
+    /// <summary>
+    /// Checks whether a table of a partition tree is another, or lies beneath it.
+    /// </summary>
+    private static bool Beneath(uint relid, uint ancestor, Dictionary<uint, (uint Parent, bool Leaf)> members)
+    {
+        for (uint member = relid; member != 0; member = members.TryGetValue(member, out (uint Parent, bool Leaf) entry) ? entry.Parent : 0)
+        {
+            if (member == ancestor)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 }

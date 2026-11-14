@@ -1,11 +1,11 @@
 {
   "sdk": {
-    "version": "10.0.400",
+    "version": "10.0.403",
     "rollForward": "latestFeature",
     "allowPrerelease": false
   },
   "msbuild-sdks": {
-    "Ankus.Sdk": "0.2.15",
+    "Ankus.Sdk": "0.2.29",
     "MSTest.Sdk": "4.5.2"
   },
   "test": {

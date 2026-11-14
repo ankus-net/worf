@@ -277,6 +277,9 @@ SELECT quote_literal(pg_current_xlog_location()) as curr_lsn
 \gset
 INSERT INTO public.not_nullcheck_tbl(id,id1,name) VALUES (1,1,'name1');
 INSERT INTO public.not_nullcheck_tbl(id,id1,name) VALUES (2,2,'name2');
+-- Other transactions may commit in this database meanwhile, which the slot carries too: the changes are read up to here.
+SELECT quote_literal(pg_current_xlog_location()) as inserted_lsn
+\gset
 SELECT worf.wait_slot_confirm_lsn(NULL, :curr_lsn);
  wait_slot_confirm_lsn 
 -----------------------
@@ -314,23 +317,12 @@ BEGIN
 	END LOOP;
 END;
 $$;
-SELECT data::json->'action' as action, CASE WHEN data::json->>'action' IN ('I', 'D', 'U') THEN data END as data FROM pg_logical_slot_get_changes((SELECT slot_name FROM pg_replication_slots), NULL, 1, 'min_proto_version', '1', 'max_proto_version', '1', 'startup_params_format', '1', 'proto_format', 'json', 'worf.replication_set_names', 'default');
+SELECT data::json->'action' as action, data FROM pg_logical_slot_get_changes((SELECT slot_name FROM pg_replication_slots), :inserted_lsn, NULL, 'min_proto_version', '1', 'max_proto_version', '1', 'startup_params_format', '1', 'proto_format', 'json', 'worf.replication_set_names', 'default') WHERE data::json->>'action' IN ('I', 'D', 'U');
  action |                                                data                                                 
 --------+-----------------------------------------------------------------------------------------------------
- "S"    | 
- "B"    | 
  "I"    | {"action":"I","relation":["public","not_nullcheck_tbl"],"newtuple":{"id":1,"id1":1,"name":"name1"}}
- "C"    | 
-(4 rows)
-
-SELECT data::json->'action' as action, CASE WHEN data::json->>'action' IN ('I', 'D', 'U') THEN data END as data FROM pg_logical_slot_get_changes((SELECT slot_name FROM pg_replication_slots), NULL, 1, 'min_proto_version', '1', 'max_proto_version', '1', 'startup_params_format', '1', 'proto_format', 'json', 'worf.replication_set_names', 'default');
- action |                                                data                                                 
---------+-----------------------------------------------------------------------------------------------------
- "S"    | 
- "B"    | 
  "I"    | {"action":"I","relation":["public","not_nullcheck_tbl"],"newtuple":{"id":2,"id1":2,"name":"name2"}}
- "C"    | 
-(4 rows)
+(2 rows)
 
 \c :subscriber_dsn
 SELECT worf.alter_subscription_enable('test_subscription', true);

@@ -8,7 +8,7 @@ CREATE EXTENSION worf;
 SELECT worf.worf_max_proto_version();
  worf_max_proto_version 
 ------------------------
-                      1
+                      2
 (1 row)
 
 SELECT worf.worf_min_proto_version();

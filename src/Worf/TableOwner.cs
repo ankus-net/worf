@@ -1,0 +1,50 @@
+using Ankus.Postgres;
+
+namespace Worf;
+
+/// <summary>
+/// Runs worf's DDL on a user's table, as the guard's triggers, as the table's owner, in a security-restricted operation
+/// with the search path set to <c>pg_catalog, pg_temp</c>, as VACUUM and ANALYZE do. The functions PostgreSQL runs for
+/// the table, as its partition key's as its partitions are read, then run as if the owner ran the DDL, with its rights
+/// alone, and can't change the session. Settings changed inside are undone when it returns.
+/// </summary>
+internal static unsafe class TableOwner
+{
+    // SECURITY_LOCAL_USERID_CHANGE and SECURITY_RESTRICTED_OPERATION from miscadmin.h.
+    private const int SecurityLocalUseridChange = 0x0001;
+    private const int SecurityRestrictedOperation = 0x0002;
+
+    /// <summary>
+    /// Runs work as a table's owner.
+    /// </summary>
+    /// <typeparam name="T">The work's result.</typeparam>
+    /// <param name="relid">The table.</param>
+    /// <param name="work">The work.</param>
+    /// <returns>Its result.</returns>
+    internal static T Run<T>(uint relid, Func<T> work)
+    {
+        uint owner = Worf.ReadScalar<uint?>("SELECT relowner FROM pg_catalog.pg_class WHERE oid = $1", SpiParameter.Create(relid))
+            ?? throw new PgException(PgSqlStates.UndefinedTable, $"relation {relid} does not exist");
+        uint userId;
+        int secContext;
+        NativeMethods.GetUserIdAndSecContext(&userId, &secContext);
+        int nestLevel = NativeMethods.NewGUCNestLevel();
+        NativeMethods.SetUserIdAndSecContext(owner, secContext | SecurityLocalUseridChange | SecurityRestrictedOperation);
+        try
+        {
+            fixed (byte* name = Worf.ToServerCString("search_path"))
+            fixed (byte* value = Worf.ToServerCString("pg_catalog, pg_temp"))
+            {
+                _ = NativeMethods.set_config_option((sbyte*)name, (sbyte*)value, GucContext.PGC_USERSET, GucSource.PGC_S_SESSION,
+                    GucAction.GUC_ACTION_SAVE, true, 0, false);
+            }
+
+            return work();
+        }
+        finally
+        {
+            NativeMethods.AtEOXact_GUC(true, nestLevel);
+            NativeMethods.SetUserIdAndSecContext(userId, secContext);
+        }
+    }
+}

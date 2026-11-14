@@ -113,14 +113,15 @@ using Ankus.Postgres;
     -- ============================================================================
 
     CREATE OR REPLACE FUNCTION worf.conflict_history_ensure_partition(
-        target_date DATE DEFAULT CURRENT_DATE
+        target_date DATE DEFAULT (now() AT TIME ZONE 'UTC')::DATE
     ) RETURNS VOID AS $$
     DECLARE
         partition_name TEXT;
         start_date DATE;
         end_date DATE;
     BEGIN
-        -- Calculate month boundaries
+        -- Calculate month boundaries. A partition holds a month in UTC, whatever the session's time zone, so that every
+        -- session agrees on where months start.
         start_date := date_trunc('month', target_date)::DATE;
         end_date := (date_trunc('month', target_date) + interval '1 month')::DATE;
 
@@ -138,14 +139,15 @@ using Ankus.Postgres;
             EXECUTE format(
                 'CREATE TABLE worf.%I PARTITION OF worf.conflict_history
                  FOR VALUES FROM (%L) TO (%L)',
-                partition_name, start_date, end_date
+                partition_name, to_char(start_date, 'YYYY-MM-DD') || ' 00:00:00+00',
+                to_char(end_date, 'YYYY-MM-DD') || ' 00:00:00+00'
             );
         END IF;
     END;
     $$ LANGUAGE plpgsql;
 
     COMMENT ON FUNCTION worf.conflict_history_ensure_partition(DATE) IS
-        'Ensures a partition exists for the specified date. Creates the partition if it does not exist.';
+        'Ensures a partition exists for the month, in UTC, of the specified date. Creates the partition if it does not exist.';
 
     CREATE OR REPLACE FUNCTION worf.conflict_history_cleanup(
         retention_days INTEGER DEFAULT 30
@@ -157,7 +159,7 @@ using Ankus.Postgres;
         partition_end_date DATE;
     BEGIN
         -- Calculate cutoff date
-        cutoff_date := CURRENT_DATE - retention_days;
+        cutoff_date := (now() AT TIME ZONE 'UTC')::DATE - retention_days;
 
         -- Find and drop old partitions
         FOR partition_rec IN
@@ -194,7 +196,7 @@ using Ankus.Postgres;
     -- Create Initial Partition for Current Month
     -- ============================================================================
 
-    SELECT worf.conflict_history_ensure_partition(CURRENT_DATE);
+    SELECT worf.conflict_history_ensure_partition();
 
     -- ============================================================================
     -- Views
@@ -305,19 +307,24 @@ internal static partial class ConflictHistory
         Context = PgGucContext.SuperuserSet)]
     internal static partial int MaxTupleSize { get; }
 
+    // The records of conflicts in the apply transaction under way, and those of transactions that committed, which have
+    // yet to be written.
+    private static readonly List<WorfConflictRecord> s_pending = [];
+    private static readonly List<WorfConflictRecord> s_committed = [];
+
     private const string InsertSql =
         "INSERT INTO worf.conflict_history (" +
         "sub_id, sub_name, conflict_type, resolution, " +
         "schema_name, table_name, index_name, " +
         "local_tuple, local_xid, local_origin, local_commit_ts, " +
         "remote_tuple, remote_origin, remote_commit_ts, remote_commit_lsn, " +
-        "has_before_triggers" +
+        "has_before_triggers, recorded_at" +
         ") VALUES (" +
         "$1, $2::name, $3, $4, " +
         "$5::name, $6::name, $7::name, " +
         "$8::jsonb, $9::text::xid, $10, $11, " +
         "$12::jsonb, $13, $14, $15, " +
-        "$16" +
+        "$16, $17" +
         ")";
 
     /// <summary>
@@ -346,49 +353,128 @@ internal static partial class ConflictHistory
             return;
         }
 
+        RelationData* relation = rel.Rel;
+        string schema = Worf.FromServer(NativeMethods.get_namespace_name(relation->rd_rel->relnamespace));
+        string table = Worf.FromServer((sbyte*)&relation->rd_rel->relname);
+        TupleDescData* tupdesc = relation->rd_att;
+        string? idxname = null;
+        if (conflictIdxOid != 0)
+        {
+            sbyte* name = NativeMethods.get_rel_name(conflictIdxOid);
+            idxname = name is null ? null : Worf.FromServer(name);
+        }
+
+        // The record is written once the apply transaction commits, in a transaction of its own, so that nothing it
+        // sets off, as a trigger's write to a table whose deferred constraint fails, can stop apply. The partition for
+        // the time recorded, which the row takes from here, is made then too, so that the two agree even across
+        // midnight. A transaction that aborts records nothing.
+        PgTimestampTz recordedAt = new(Worker.GetCurrentTimestamp());
+        if (s_pending.Count == 0)
+        {
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () =>
+            {
+                s_committed.AddRange(s_pending);
+                s_pending.Clear();
+            });
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, static () => s_pending.Clear());
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, static () => s_pending.Clear());
+        }
+
+        s_pending.Add(new WorfConflictRecord
+        {
+            Description = $"the {ConflictTypeToString(conflictType)} conflict on table {schema}.{table}",
+            RecordedAt = recordedAt,
+            SubId = sub.Id,
+            SubName = sub.Name,
+            ConflictType = ConflictTypeToString(conflictType),
+            Resolution = ResolutionToString(resolution),
+            Schema = schema,
+            Table = table,
+            IndexName = idxname,
+            LocalTuple = localtuple is not null && StoreTuples ? TupleToJson(tupdesc, localtuple, MaxTupleSize) : null,
+            LocalXid = localTupleXid != 0 ? localTupleXid.ToString(CultureInfo.InvariantCulture) : null,
+            LocalOrigin = foundLocalOrigin ? localTupleOrigin : null,
+            LocalCommitTs = foundLocalOrigin ? new PgTimestampTz(localTupleCommitTs) : null,
+            RemoteTuple = remotetuple is not null && StoreTuples ? TupleToJson(tupdesc, remotetuple, MaxTupleSize) : null,
+            RemoteOrigin = Worf.ReploriginSessionOrigin,
+            RemoteCommitTs = new PgTimestampTz(Worf.ReploriginSessionOriginTimestamp),
+            RemoteCommitLsn = Worf.ReploriginSessionOriginLsn,
+            HasBeforeTriggers = hasBeforeTriggers,
+        });
+    }
+
+    /// <summary>
+    /// Gets how many conflicts the apply transaction under way has recorded, for <see cref="ForgetPending"/>.
+    /// </summary>
+    internal static int PendingCount => s_pending.Count;
+
+    /// <summary>
+    /// Forgets the conflicts recorded by a change whose subtransaction rolled back, as their resolutions didn't happen.
+    /// </summary>
+    /// <param name="count">How many were recorded before the change.</param>
+    internal static void ForgetPending(int count) => s_pending.RemoveRange(count, s_pending.Count - count);
+
+    /// <summary>
+    /// Writes the conflicts that committed apply transactions recorded, all in one transaction, or, when that fails,
+    /// each in a transaction of its own, so that one record that fails, even as it commits, loses only itself. Apply
+    /// calls this after each transaction it commits.
+    /// </summary>
+    internal static void WriteCommitted()
+    {
+        if (s_committed.Count == 0)
+        {
+            return;
+        }
+
+        List<WorfConflictRecord> records = [.. s_committed];
+        s_committed.Clear();
         try
         {
-            PgTransaction.RunInSubtransaction(() =>
-            {
-                // Ensure partition exists for current date
-                EnsurePartitionExists();
-
-                // Get tuple descriptor for JSONB conversion
-                RelationData* relation = rel.Rel;
-                TupleDescData* tupdesc = relation->rd_att;
-
-                // Get index name if available
-                string? idxname = null;
-                if (conflictIdxOid != 0)
-                {
-                    sbyte* name = NativeMethods.get_rel_name(conflictIdxOid);
-                    idxname = name is null ? null : Worf.FromServer(name);
-                }
-
-                _ = Spi.Execute(InsertSql,
-                    SpiParameter.Create(sub.Id),
-                    SpiParameter.Create(sub.Name),
-                    SpiParameter.Create(ConflictTypeToString(conflictType)),
-                    SpiParameter.Create(ResolutionToString(resolution)),
-                    SpiParameter.Create(Worf.FromServer(NativeMethods.get_namespace_name(relation->rd_rel->relnamespace))),
-                    SpiParameter.Create(Worf.FromServer((sbyte*)&relation->rd_rel->relname)),
-                    SpiParameter.Create<string?>(idxname),
-                    SpiParameter.Create<string?>(localtuple is not null && StoreTuples ? TupleToJson(tupdesc, localtuple, MaxTupleSize) : null),
-                    SpiParameter.Create<string?>(localTupleXid != 0 ? localTupleXid.ToString(CultureInfo.InvariantCulture) : null),
-                    SpiParameter.Create<int?>(foundLocalOrigin ? localTupleOrigin : null),
-                    SpiParameter.Create<PgTimestampTz?>(foundLocalOrigin ? new PgTimestampTz(localTupleCommitTs) : null),
-                    SpiParameter.Create<string?>(remotetuple is not null && StoreTuples ? TupleToJson(tupdesc, remotetuple, MaxTupleSize) : null),
-                    SpiParameter.Create((int)Worf.ReploriginSessionOrigin),
-                    SpiParameter.Create(new PgTimestampTz(Worf.ReploriginSessionOriginTimestamp)),
-                    Worf.LsnParameter(Worf.ReploriginSessionOriginLsn),
-                    SpiParameter.Create(hasBeforeTriggers));
-            });
+            PgBackgroundWorker.RunTransaction(() => records.ForEach(Write));
         }
         catch (PgException)
         {
-            // Log the error and continue - don't abort the apply transaction
-            PgLog.Warning("conflict_history: recording failed, continuing without recording");
+            foreach (WorfConflictRecord record in records)
+            {
+                try
+                {
+                    PgBackgroundWorker.RunTransaction(() => Write(record));
+                }
+                catch (PgException error)
+                {
+                    // Recording is only observational, so apply goes on without the record.
+                    WorfLog.Warning(new PgDiagnostic($"conflict_history: recording failed for {record.Description}, continuing without recording it: " +
+                        $"{error.Message} (SQLSTATE {error.SqlState})")
+                    {
+                        Detail = error.Detail,
+                        Hint = error.Hint,
+                    });
+                }
+            }
         }
+    }
+
+    private static void Write(WorfConflictRecord record)
+    {
+        EnsurePartitionExists(record.RecordedAt);
+        _ = Worf.Execute(InsertSql,
+            SpiParameter.Create(record.SubId),
+            Worf.TextParameter(record.SubName),
+            SpiParameter.Create(record.ConflictType),
+            SpiParameter.Create(record.Resolution),
+            Worf.TextParameter(record.Schema),
+            Worf.TextParameter(record.Table),
+            Worf.TextParameter(record.IndexName),
+            Worf.TextParameter(record.LocalTuple),
+            SpiParameter.Create(record.LocalXid),
+            SpiParameter.Create(record.LocalOrigin),
+            SpiParameter.Create(record.LocalCommitTs),
+            Worf.TextParameter(record.RemoteTuple),
+            SpiParameter.Create(record.RemoteOrigin),
+            SpiParameter.Create(record.RemoteCommitTs),
+            Worf.LsnParameter(record.RemoteCommitLsn),
+            SpiParameter.Create(record.HasBeforeTriggers),
+            SpiParameter.Create(record.RecordedAt));
     }
 
     /// <summary>
@@ -462,7 +548,7 @@ internal static partial class ConflictHistory
                 byte[] bytes = Worf.ToServer(outputstr!);
                 if (bytes.Length > maxSize && outputstr != "(unchanged-toast-datum)")
                 {
-                    outputstr = Worf.FromServer(bytes.AsSpan(0, maxSize));
+                    outputstr = Worf.Truncate(outputstr!, maxSize);
                 }
 
                 Executor.EscapeJson(json, outputstr!);
@@ -474,7 +560,8 @@ internal static partial class ConflictHistory
     }
 
     /// <summary>
-    /// Ensure that a partition exists for the current date.
+    /// Ensure that a partition exists for a time, which partitions hold by its month in UTC.
     /// </summary>
-    private static void EnsurePartitionExists() => _ = Spi.Execute("SELECT worf.conflict_history_ensure_partition(CURRENT_DATE)");
+    private static void EnsurePartitionExists(PgTimestampTz time)
+        => _ = Worf.Execute("SELECT worf.conflict_history_ensure_partition(($1 AT TIME ZONE 'UTC')::date)", SpiParameter.Create(time));
 }

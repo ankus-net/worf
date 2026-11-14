@@ -122,8 +122,11 @@ public sealed partial class SyncDuringWriteTests
         Task<string> pgbenchStderr = ProcessRunner.ReadToEndAsync(pgbench.StandardError);
 
         // Polled as poll_query_until does, counting the polls. Each pgbench transaction adds a row to pgbench_history,
-        // which pgbench -i leaves empty; a client's statement shows in pg_stat_activity only while it runs, which a
-        // client that pgbench's rate keeps mostly idle may never be seen doing.
+        // which pgbench -i leaves empty. pgbench's statements show in pg_stat_activity only around its transactions,
+        // which a poll can miss every time: on Windows, pgbench's rate-limit waits and this loop's delay both end on the
+        // 15.6 ms clock tick, pgbench's clients run what came due in the first millisecond or two after a tick, and each
+        // poll's query reaches the server about the same time after one, so a run once polled 1,426 times without seeing
+        // an update.
         Stopwatch waiting = Stopwatch.StartNew();
         int polls = 0;
         TimeSpan longestPoll = TimeSpan.Zero;
@@ -140,7 +143,7 @@ public sealed partial class SyncDuringWriteTests
             }
         }
 
-        TestContext.WriteLine($"polled {polls} times in {waiting.Elapsed.TotalSeconds:F1} seconds for pgbench's updates, the longest poll taking {longestPoll.TotalSeconds:F1}");
+        TestContext.WriteLine($"polled {polls} times in {waiting.Elapsed.TotalSeconds:F1} seconds for pgbench's first transaction, the longest poll taking {longestPoll.TotalSeconds:F1}");
         if (!started)
         {
             // Say why: pgbench may have failed to start its clients.

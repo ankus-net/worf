@@ -47,4 +47,21 @@ internal struct WorfApplyWorker
     /// delay before restarting a worker that failed.
     /// </summary>
     public bool ExceptionRestartsAtOnce;
+
+    /// <summary>
+    /// Whether a table sync worker of the subscription left its slot on the provider, which the apply worker drops.
+    /// </summary>
+    public bool SyncSlotsLeft;
+
+    /// <summary>
+    /// How many times in a row the subscription's initial synchronization failed, after which the next apply worker
+    /// starts later each time.
+    /// </summary>
+    public int SyncFailures;
+
+    /// <summary>
+    /// When the call the worker is making to the provider as it starts runs out of time, after which the database's
+    /// manager cancels it, as a timestamp, or zero.
+    /// </summary>
+    public long CallDeadline;
 }

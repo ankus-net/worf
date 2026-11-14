@@ -21,17 +21,41 @@ namespace Worf;
 /// </summary>
 internal static unsafe partial class Executor
 {
-    // PERFORM_DELETION_INTERNAL from catalog/dependency.h.
+    // PERFORM_DELETION_INTERNAL and PERFORM_DELETION_CONCURRENTLY from catalog/dependency.h.
     private const int PerformDeletionInternal = 0x0001;
+
+    // EXEC_FLAG_EXPLAIN_ONLY, and nextval's OID, F_NEXTVAL.
+    private const int ExecFlagExplainOnly = 0x0001;
+    private const uint NextvalOid = 1574;
+    private const int PerformDeletionConcurrently = 0x0002;
 
     // SESSION_REPLICATION_ROLE_REPLICA from commands/trigger.h.
     private const int SessionReplicationRoleReplica = 1;
 
+    // RVR_MISSING_OK from catalog/namespace.h.
+    private const uint RangeVarMissingOk = 1;
+
+    // ACL_TRUNCATE from nodes/parsenodes.h, whose AclMode is 32 bits wide before PostgreSQL 16.
+#if ANKUS_PG15
+    private const uint AclTruncate = 1 << 4;
+#else
+    private const ulong AclTruncate = 1 << 4;
+#endif
+
     private static DropBehavior s_lastDropBehavior = DropBehavior.DROP_RESTRICT;
     private static bool s_droppingWorfObj;
     private static object_access_hook_type s_nextObjectAccessHook;
+    // DatabaseRelationId, the oid of pg_database.
+    private const uint DatabaseRelationId = 1262;
+
     private static ProcessUtility_hook_type s_nextProcessUtilityHook;
+    private static bool s_singleUserStartNoted;
     private static ExecutorStart_hook_type s_nextExecutorStartHook;
+    private static ExecutorRun_hook_type s_nextExecutorRunHook;
+    private static ExecutorEnd_hook_type s_nextExecutorFinishHook;
+    private static ExecutorEnd_hook_type s_nextExecutorEndHook;
+    private static amvalidate_function s_nextNeedsFmgrHook;
+    private static fmgr_hook_type s_nextFmgrHook;
     private static bool s_installed;
 
     /// <summary>
@@ -47,6 +71,24 @@ internal static unsafe partial class Executor
 
     [PgNativeCallback(nameof(WorfExecutorStart))]
     private static partial ExecutorStart_hook_type ExecutorStartCallback { get; }
+
+    [PgNativeCallback(nameof(WorfExecutorRun))]
+    private static partial ExecutorRun_hook_type ExecutorRunCallback { get; }
+
+    [PgNativeCallback(nameof(WorfExecutorFinish))]
+    private static partial ExecutorEnd_hook_type ExecutorFinishCallback { get; }
+
+    [PgNativeCallback(nameof(WorfExecutorEnd))]
+    private static partial ExecutorEnd_hook_type ExecutorEndCallback { get; }
+
+    [PgNativeCallback(nameof(CheckTruncatePrivilege))]
+    private static partial RangeVarGetRelidCallback TruncatePrivilegeCallback { get; }
+
+    [PgNativeCallback(nameof(WorfNeedsFmgrHook))]
+    private static partial amvalidate_function NeedsFmgrHookCallback { get; }
+
+    [PgNativeCallback(nameof(WorfFmgrHook))]
+    private static partial fmgr_hook_type FmgrHookCallback { get; }
 
     /// <summary>
     /// Creates the executor state for one relation, as a query that reads or writes it would.
@@ -165,6 +207,26 @@ internal static unsafe partial class Executor
         // Executor start hook, which holds back writes to tables another node changes.
         s_nextExecutorStartHook = NativeGlobals.ExecutorStart_hook;
         NativeGlobals.ExecutorStart_hook = ExecutorStartCallback;
+
+        // Executor run and finish hooks, which tell the sequence range guard a statement routing rows to partitions runs.
+        s_nextExecutorRunHook = NativeGlobals.ExecutorRun_hook;
+        NativeGlobals.ExecutorRun_hook = ExecutorRunCallback;
+        s_nextExecutorFinishHook = NativeGlobals.ExecutorFinish_hook;
+        NativeGlobals.ExecutorFinish_hook = ExecutorFinishCallback;
+
+        // Executor end hook, which tells the sequence range guard a statement has ended.
+        s_nextExecutorEndHook = NativeGlobals.ExecutorEnd_hook;
+        NativeGlobals.ExecutorEnd_hook = ExecutorEndCallback;
+
+        // The fmgr hook check, which PostgreSQL makes before it runs or inlines a function that isn't built in, notes
+        // the functions DDL being replicated uses.
+        s_nextNeedsFmgrHook = NativeGlobals.needs_fmgr_hook;
+        NativeGlobals.needs_fmgr_hook = NeedsFmgrHookCallback;
+
+        // The fmgr hook, which runs as the functions the check asked for it for start, as the trigger functions whose
+        // C code the sequence range guard can't see draw.
+        s_nextFmgrHook = NativeGlobals.fmgr_hook;
+        NativeGlobals.fmgr_hook = FmgrHookCallback;
         s_installed = true;
     }
 
@@ -186,7 +248,7 @@ internal static unsafe partial class Executor
             string nspname = Worf.FromServer(NativeMethods.get_namespace_name(NativeMethods.get_rel_namespace(reloid)));
             string relname = Worf.FromServer(NativeMethods.get_rel_name(reloid));
 
-            PgLog.Debug3($"truncating the table {nspname}.{relname}");
+            WorfLog.Debug3($"truncating the table {nspname}.{relname}");
 
             // It's easier to construct json manually than via Jsonb API...
             json.Clear();
@@ -205,7 +267,7 @@ internal static unsafe partial class Executor
                 foreach (WorfRepSet repset in repsets)
                 {
                     repsetNames.Add(repset.Name);
-                    PgLog.Debug1($"truncating the table {nspname}.{relname} for {repset.Name} repset");
+                    WorfLog.Debug1($"truncating the table {nspname}.{relname} for {repset.Name} repset");
                 }
 
                 // Queue the truncate for replication.
@@ -220,9 +282,24 @@ internal static unsafe partial class Executor
         ProcessUtilityContext context, ParamListInfoData* @params, QueryEnvironment* queryEnv, _DestReceiver* dest,
         QueryCompletion* qc)
     {
+        NoteSingleUserStart();
         Node* parsetree = pstmt->utilityStmt;
 
+        // A copy of a table's index on this node alone, which CREATE TABLE ... LIKE builds as a statement of its own, is
+        // left out, as the other nodes have no such index to copy.
+        if (context == ProcessUtilityContext.PROCESS_UTILITY_SUBCOMMAND && parsetree->type == NodeTag.T_IndexStmt &&
+            LocalIndex.SkipsCopy((IndexStmt*)parsetree))
+        {
+            return;
+        }
+
         s_droppingWorfObj = false;
+
+        // Whether DDL on an index replicates depends on the indexes the statements before built.
+        if (context != ProcessUtilityContext.PROCESS_UTILITY_SUBCOMMAND)
+        {
+            LocalIndex.Flush();
+        }
 
         if (parsetree->type == NodeTag.T_TruncateStmt)
         {
@@ -234,22 +311,39 @@ internal static unsafe partial class Executor
             s_lastDropBehavior = ((DropStmt*)parsetree)->behavior;
         }
 
-        // A COPY into or TRUNCATE of a table another node changes waits for the change. Each takes its table's lock
-        // first, as an INSERT does, so that it can't start writing after a fence has reported how far it waited.
-        if (parsetree->type == NodeTag.T_CopyStmt && ((CopyStmt*)parsetree)->is_from)
+        if (parsetree->type == NodeTag.T_CreatedbStmt)
         {
-            CheckWrite(((CopyStmt*)parsetree)->relation, PgLockMode.RowExclusive);
+            Manager.WakeTemplate(TemplateOf((CreatedbStmt*)parsetree));
         }
-        else if (parsetree->type == NodeTag.T_TruncateStmt)
+
+        // A COPY into or TRUNCATE of a table another node changes waits for the change, where worf is, which alone
+        // holds fences. Each takes its table's lock first, as an INSERT does, so that it can't start writing after a
+        // fence has reported how far it waited. TRUNCATE checks the privilege before it locks, as PostgreSQL does.
+        if (parsetree->type is NodeTag.T_CopyStmt or NodeTag.T_TruncateStmt && DdlLock.MayHoldFences())
         {
-            List* relations = ((TruncateStmt*)parsetree)->relations;
-            for (int i = 0; relations is not null && i < relations->length; i++)
+            if (parsetree->type == NodeTag.T_CopyStmt && ((CopyStmt*)parsetree)->is_from)
             {
-                CheckWrite((RangeVar*)relations->elements[i].ptr_value, PgLockMode.AccessExclusive);
+                CheckWrite(((CopyStmt*)parsetree)->relation, PgLockMode.RowExclusive, default);
+            }
+            else if (parsetree->type == NodeTag.T_TruncateStmt)
+            {
+                List* relations = ((TruncateStmt*)parsetree)->relations;
+                for (int i = 0; relations is not null && i < relations->length; i++)
+                {
+                    CheckWrite((RangeVar*)relations->elements[i].ptr_value, PgLockMode.AccessExclusive, TruncatePrivilegeCallback);
+                }
             }
         }
 
+        // Nor may one write to a table whose indexes on this node alone a statement under way hides.
+        LocalIndex.CheckWrite(parsetree);
+
         SequenceRanges.CheckDdl(parsetree);
+        if (parsetree->type != NodeTag.T_TransactionStmt)
+        {
+            DdlLock.UnfencePending();
+        }
+
         if (SequenceRanges.SkipsDumpedGuard(parsetree))
         {
             return;
@@ -258,8 +352,10 @@ internal static unsafe partial class Executor
         // Which objects a DROP drops is known only before it runs, and whether a statement uses temporary objects only
         // as it runs.
         string? ddl = DdlReplication.CommandToQueue(pstmt, queryString, context, out bool sessionLocal);
+        (uint Role, string Settings) ddlContext = default;
         if (ddl is not null)
         {
+            ddlContext = DdlReplication.Context();
             DdlReplication.WithSnapshot(() =>
             {
                 DdlLock.LockNodes(parsetree);
@@ -267,7 +363,76 @@ internal static unsafe partial class Executor
             });
         }
 
+        // DDL that replicates can't make other objects use an index on this node alone, and neither it nor DDL from
+        // another node chooses names or finds indexes to use by those indexes, which the other nodes don't have.
+        Dictionary<uint, (string Name, string?[] Ties)>? ties = ddl is null ? null : LocalIndex.Ties(parsetree);
+        bool isolated = LocalIndex.Isolate(parsetree, ddl is not null, context == ProcessUtilityContext.PROCESS_UTILITY_SUBCOMMAND);
+
+        // A COPY FROM draws a buffer of values from a managed sequence before the guard sees the first of them, so it
+        // checks the sequences for each row in a condition of its own, ahead of any it has.
+        bool copying = parsetree->type == NodeTag.T_CopyStmt && ((CopyStmt*)parsetree)->is_from && ((CopyStmt*)parsetree)->relation is not null;
+        uint copied = copying ? NativeMethods.RangeVarGetRelidExtended(((CopyStmt*)parsetree)->relation, 0, RangeVarMissingOk, default, null) : 0;
+        string copyCondition = copied != 0 ? SequenceRangeGuard.CopyConditionText(copied, ((CopyStmt*)parsetree)->whereClause) : "";
+        Node* check = copying ? SequenceRangeGuard.CopyCondition(copied) : null;
+        if (check is not null)
+        {
+            if (readOnlyTree)
+            {
+                pstmt = (PlannedStmt*)NativeMethods.copyObjectImpl(pstmt);
+                parsetree = pstmt->utilityStmt;
+                readOnlyTree = false;
+            }
+
+            CopyStmt* copy = (CopyStmt*)parsetree;
+            copy->whereClause = copy->whereClause is null ? check
+                : (Node*)NativeMethods.makeBoolExpr(BoolExprType.AND_EXPR, NativeMethods.lappend(NativeMethods.lappend(null, check), copy->whereClause), -1);
+        }
+
+        // A statement that commits on its way, and then fails, lets its fence go as its transaction aborts.
+        // A transaction prepared after it changed worf or a database is noted as it's prepared, and the supervisor wakes
+        // the managers once it has ended.
+        if (parsetree->type == NodeTag.T_TransactionStmt && ((TransactionStmt*)parsetree)->kind == TransactionStmtKind.TRANS_STMT_PREPARE)
+        {
+            Worker.NotePrepared();
+        }
+
+        // A COPY FROM's calls of nextval, in the defaults it starts before its rows, name the sequences they draw from.
+        bool startingCopy = copied != 0;
+        short[]? copyRead = null;
+        bool copyDefaults = false;
+        if (startingCopy)
+        {
+            CopyStmt* copy = (CopyStmt*)parsetree;
+            if (copy->attlist is not null)
+            {
+                RelationData* rel = NativeMethods.relation_open(copied, (int)PgLockMode.AccessShare);
+                List* numbers = NativeMethods.CopyGetAttnums(rel->rd_att, rel, copy->attlist);
+                copyRead = new short[numbers is null ? 0 : numbers->length];
+                for (int i = 0; i < copyRead.Length; i++)
+                {
+                    copyRead[i] = (short)numbers->elements[i].int_value;
+                }
+
+                NativeMethods.relation_close(rel, (int)PgLockMode.None);
+            }
+
+            for (int i = 0; copy->options is not null && i < copy->options->length; i++)
+            {
+                copyDefaults |= Worf.FromServer(((DefElem*)copy->options->elements[i].ptr_value)->defname) == "default";
+            }
+        }
+
         uint xactFlags = DdlReplication.BeginStatement(ddl is not null);
+        bool tracking = LocalIndex.BeginStatement(parsetree, ddl is not null);
+        if (startingCopy)
+        {
+            SequenceRangeGuard.StartingCopy(copied, copyRead, copyDefaults, copyCondition);
+        }
+
+        // Other utility statements that start expressions outside a plan name the sequences their calls of nextval draw
+        // from too.
+        bool startingUtility = !startingCopy && SequenceRangeGuard.StartingUtility(parsetree);
+
         bool usedTemp;
         try
         {
@@ -279,18 +444,70 @@ internal static unsafe partial class Executor
             {
                 NativeMethods.standard_ProcessUtility(pstmt, queryString, readOnlyTree, context, @params, queryEnv, dest, qc);
             }
+
+            // A statement that may change the catalogs, in a subtransaction, ends it with a record decoding takes a
+            // base snapshot from.
+            if (MayChangeCatalogs(parsetree->type))
+            {
+                Worf.EndForDecoding();
+            }
+
+            // A dropped database's workers leave their slots, which the supervisor frees; a database that worf is
+            // created in, or that ALTER DATABASE may have made one to manage, gets its manager once that commits, or,
+            // for a prepared transaction, once the supervisor finds it ended.
+            if (parsetree->type == NodeTag.T_DropdbStmt)
+            {
+                Worker.WakeSupervisor();
+            }
+            else if (parsetree->type == NodeTag.T_CreateExtensionStmt &&
+                Worf.FromServer(((CreateExtensionStmt*)parsetree)->extname) == Worf.ExtensionName)
+            {
+                Worker.ForgetIdleManagersAtCommit(false);
+            }
+            else if (parsetree->type is NodeTag.T_AlterDatabaseStmt or NodeTag.T_AlterDatabaseSetStmt)
+            {
+                Worker.ForgetIdleManagersAtCommit(true);
+            }
         }
         finally
         {
+            if (copying)
+            {
+                SequenceRangeGuard.EndCopy();
+            }
+
+            if (startingCopy || startingUtility)
+            {
+                SequenceRangeGuard.StartedExpressions();
+            }
+
+            LocalIndex.EndStatement(tracking);
+            LocalIndex.EndIsolation(isolated);
             usedTemp = DdlReplication.EndStatement(xactFlags, ddl is not null);
         }
 
-        // A DROP leaves out its temporary objects itself, and any other statement that used one stays on this node.
-        bool local = sessionLocal || (usedTemp && parsetree->type != NodeTag.T_DropStmt);
+        LocalIndex.Restore(isolated);
+
+        // A DROP leaves out its temporary objects itself, and any other statement that used one stays on this node, or
+        // fails when it created or changed objects that outlast the session.
+        bool local = sessionLocal || (parsetree->type != NodeTag.T_DropStmt &&
+            (ddl is null ? usedTemp : TemporaryObjectUse.UsedBy(parsetree, ddl, usedTemp)));
         if (ddl is not null && !local)
         {
-            DdlReplication.QueueDdl(ddl);
+            LocalIndex.CheckTies(ties);
+            if (tracking)
+            {
+                ddl = LocalIndex.NameBuilt(parsetree, ddl);
+            }
+
+            DdlReplication.QueueDdl(ddl, ddlContext);
+            if (tracking)
+            {
+                LocalIndex.Queued();
+            }
         }
+
+        DdlLock.EndStatement(ddl is not null && !local);
 
         if (!local)
         {
@@ -306,6 +523,24 @@ internal static unsafe partial class Executor
     }
 
     /// <summary>
+    /// Gets the template that CREATE DATABASE copies.
+    /// </summary>
+    private static string TemplateOf(CreatedbStmt* stmt)
+    {
+        List* options = stmt->options;
+        for (int i = 0; options is not null && i < options->length; i++)
+        {
+            DefElem* option = (DefElem*)options->elements[i].ptr_value;
+            if (Worf.FromServer(option->defname) == "template" && option->arg is not null)
+            {
+                return Worf.FromServer(NativeMethods.defGetString(option));
+            }
+        }
+
+        return "template1";
+    }
+
+    /// <summary>
     /// Handle object drop. Calls to dependency tracking code.
     /// </summary>
     private static void WorfObjectAccess(ObjectAccessType access, uint classId, uint objectId, int subId, void* arg)
@@ -315,10 +550,35 @@ internal static unsafe partial class Executor
             s_nextObjectAccessHook.Invoke(access, classId, objectId, subId, arg);
         }
 
+        TemporaryObjectUse.NoteObjectAccess(access, classId, objectId, subId);
+
+        // A call of nextval is about to run, as its expression starts.
+        if (access == ObjectAccessType.OAT_FUNCTION_EXECUTE && objectId == NextvalOid)
+        {
+            SequenceRangeGuard.BeforeNextval();
+        }
+
+        if (access == ObjectAccessType.OAT_POST_CREATE && classId == Dependency.RelationRelationId && subId == 0)
+        {
+            LocalIndex.NoteCreated(objectId);
+        }
+
         if (access == ObjectAccessType.OAT_DROP)
         {
             // ObjectAccessDrop holds only its dropflags.
             int dropflags = *(int*)arg;
+            if (classId == Dependency.RelationRelationId && subId == 0)
+            {
+                LocalIndex.NoteDropped(objectId, (dropflags & PerformDeletionInternal) != 0, (dropflags & PerformDeletionConcurrently) != 0);
+            }
+
+            // A dropped database's sequences give up their change counters once the drop commits, as a dropped sequence
+            // gives up its own, so that the sequences of the other databases have counters of their own.
+            if (classId == DatabaseRelationId && subId == 0)
+            {
+                uint dropped = objectId;
+                _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, () => SequenceRangeTouches.FreeDatabase(dropped));
+            }
 
             // No need to check for internal deletions.
             if ((dropflags & PerformDeletionInternal) != 0)
@@ -326,12 +586,30 @@ internal static unsafe partial class Executor
                 return;
             }
 
-            // Dropping worf itself?
+            // Dropping worf itself? A node that provides subscriptions keeps worf: the walsenders that serve them read
+            // worf's tables as they decode changes, those made before the drop too, and can't once the drop has removed
+            // them, nor serve the subscriptions after it, whose slots would then keep WAL for nothing.
             if (classId == Dependency.ExtensionRelationId)
             {
                 uint extensionOid = NativeMethods.get_extension_oid(Worf.PStrDup(Worf.ExtensionName), true);
                 if (objectId == extensionOid && objectId != 0)
                 {
+                    // worf's drop in a database gives up its sequences' change counters once it commits, as the database's
+                    // drop does.
+                    uint database = NativeGlobals.MyDatabaseId;
+                    _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, () => SequenceRangeTouches.FreeDatabase(database));
+
+                    if (!NativeGlobals.IsBinaryUpgrade &&
+                        Elevated.Run(() => Worf.ReadScalar<string?>("""
+                            SELECT pg_catalog.string_agg(pg_catalog.quote_ident(slot_name::pg_catalog.text), ', ' ORDER BY slot_name)
+                            FROM pg_catalog.pg_replication_slots WHERE plugin = 'worf' AND database = pg_catalog.current_database()
+                            """)) is string slots)
+                    {
+                        throw new PgException("55006", "worf can't be dropped while this node provides subscriptions",
+                            detail: $"Replication slots {slots} stream this database's changes to worf's subscribers.",
+                            hint: "Drop those subscriptions on their subscribers, which drops their slots, or drop the slots with pg_drop_replication_slot, which gives up the changes their subscribers haven't received.");
+                    }
+
                     s_droppingWorfObj = true;
                 }
             }
@@ -361,7 +639,7 @@ internal static unsafe partial class Executor
                 RecordDroppedColumn(objectId, subId);
                 if (subId == 0 && NativeMethods.get_rel_relkind(objectId) == (sbyte)'S')
                 {
-                    Elevated.Run(() => SequenceRanges.Forget(objectId));
+                    Elevated.Run(() => SequenceRanges.NoteDropped(objectId));
                 }
             }
 
@@ -384,26 +662,194 @@ internal static unsafe partial class Executor
         }
     }
 
+    // Whether a utility statement may change the catalogs itself, rather than control the transaction or the session,
+    // read or copy rows, or run statements of its own, which go through this hook too.
+    private static bool MayChangeCatalogs(NodeTag tag) => tag is not (NodeTag.T_TransactionStmt or NodeTag.T_VariableSetStmt or
+        NodeTag.T_VariableShowStmt or NodeTag.T_ExplainStmt or NodeTag.T_CopyStmt or NodeTag.T_PrepareStmt or NodeTag.T_ExecuteStmt or
+        NodeTag.T_DeallocateStmt or NodeTag.T_FetchStmt or NodeTag.T_ClosePortalStmt or NodeTag.T_DeclareCursorStmt or NodeTag.T_CallStmt or
+        NodeTag.T_DoStmt or NodeTag.T_NotifyStmt or NodeTag.T_ListenStmt or NodeTag.T_UnlistenStmt or NodeTag.T_CheckPointStmt or
+        NodeTag.T_LoadStmt or NodeTag.T_LockStmt or NodeTag.T_ConstraintsSetStmt);
+
     private static void WorfExecutorStart(QueryDesc* queryDesc, int eflags)
     {
-        DdlLock.CheckWrites(queryDesc, eflags);
-
-        if (!s_nextExecutorStartHook.IsNull)
+        NoteSingleUserStart();
+        DdlLock.UnfencePending();
+        List<uint> written = DdlLock.WrittenTables(queryDesc, eflags);
+        if (written.Count > 0)
         {
-            s_nextExecutorStartHook.Invoke(queryDesc, eflags);
+            DdlLock.CheckWrite(written);
+            LocalIndex.CheckWrites(written);
         }
-        else
+
+        SequenceRangeGuard.StartStatement(queryDesc, written);
+
+        // A statement only explained draws nothing as its expressions start, unless it prunes partitions through a call.
+        SequenceRangeGuard.StartingExpressions((nint)queryDesc->plannedstmt, (eflags & ExecFlagExplainOnly) != 0, (nint)queryDesc->sourceText,
+            queryDesc->@params is not null && queryDesc->@params->numParams > 0);
+        try
         {
-            NativeMethods.standard_ExecutorStart(queryDesc, eflags);
+            if (!s_nextExecutorStartHook.IsNull)
+            {
+                s_nextExecutorStartHook.Invoke(queryDesc, eflags);
+            }
+            else
+            {
+                NativeMethods.standard_ExecutorStart(queryDesc, eflags);
+            }
+        }
+        finally
+        {
+            SequenceRangeGuard.StartedPlan((nint)queryDesc);
         }
     }
 
-    private static void CheckWrite(RangeVar* relation, PgLockMode lockmode)
+#if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
+    private static void WorfExecutorRun(QueryDesc* queryDesc, ScanDirection direction, ulong count, bool executeOnce)
+#else
+    private static void WorfExecutorRun(QueryDesc* queryDesc, ScanDirection direction, ulong count)
+#endif
     {
-        uint relid = relation is null ? 0 : NativeMethods.RangeVarGetRelidExtended(relation, (int)lockmode, 1, default, null);
-        if (relid != 0)
+        // A statement starts expressions as it runs, as a VALUES row's, a CHECK's or those of a partition taking a row.
+        bool starting = SequenceRangeGuard.StartingRun(queryDesc);
+        try
         {
-            DdlLock.CheckWrite(relid);
+            if (!s_nextExecutorRunHook.IsNull)
+            {
+#if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
+                s_nextExecutorRunHook.Invoke(queryDesc, direction, count, executeOnce);
+#else
+                s_nextExecutorRunHook.Invoke(queryDesc, direction, count);
+#endif
+            }
+            else
+            {
+#if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
+                NativeMethods.standard_ExecutorRun(queryDesc, direction, count, executeOnce);
+#else
+                NativeMethods.standard_ExecutorRun(queryDesc, direction, count);
+#endif
+            }
+        }
+        finally
+        {
+            if (starting)
+            {
+                SequenceRangeGuard.StartedExpressions();
+            }
+        }
+    }
+
+    private static void WorfExecutorFinish(QueryDesc* queryDesc)
+    {
+        // A data-modifying WITH that the statement didn't read to its end writes the rest of its rows as it finishes.
+        bool starting = SequenceRangeGuard.StartingRun(queryDesc);
+        try
+        {
+            if (!s_nextExecutorFinishHook.IsNull)
+            {
+                s_nextExecutorFinishHook.Invoke(queryDesc);
+            }
+            else
+            {
+                NativeMethods.standard_ExecutorFinish(queryDesc);
+            }
+        }
+        finally
+        {
+            if (starting)
+            {
+                SequenceRangeGuard.StartedExpressions();
+            }
+        }
+    }
+
+    private static void WorfExecutorEnd(QueryDesc* queryDesc)
+    {
+        SequenceRangeGuard.EndStatement(queryDesc);
+
+        if (!s_nextExecutorEndHook.IsNull)
+        {
+            s_nextExecutorEndHook.Invoke(queryDesc);
+        }
+        else
+        {
+            NativeMethods.standard_ExecutorEnd(queryDesc);
+        }
+    }
+
+    /// <summary>
+    /// Notes the start of a single-user server, where worf's supervisor doesn't run, as its first statement runs, past
+    /// recovery and before the statement writes, so that a restore that starts in single-user mode, writes, and starts
+    /// again past the positions its neighbors heard of shows in the starts its messages report.
+    /// </summary>
+    private static void NoteSingleUserStart()
+    {
+        if (!s_singleUserStartNoted && !NativeGlobals.IsUnderPostmaster)
+        {
+            s_singleUserStartNoted = true;
+            _ = SequenceRangeHeard.NoteStart();
+        }
+    }
+
+    /// <summary>
+    /// Notes a function about to run or be inlined, asking for the fmgr hook only as the next hook does.
+    /// </summary>
+    private static bool WorfNeedsFmgrHook(uint fnOid)
+    {
+        TemporaryObjectUse.NoteFunctionUse(fnOid);
+        bool hooked = SequenceRangeGuard.HooksTrigger(fnOid);
+        return (!s_nextNeedsFmgrHook.IsNull && s_nextNeedsFmgrHook.Invoke(fnOid)) || hooked;
+    }
+
+    /// <summary>
+    /// Runs as a function the fmgr hook check asked for the hook for starts, ends or fails, passing it on to the next
+    /// hook, which asked for it for its own functions.
+    /// </summary>
+    private static void WorfFmgrHook(FmgrHookEventType @event, FmgrInfo* flinfo, ulong* @private)
+    {
+        if (!s_nextFmgrHook.IsNull)
+        {
+            s_nextFmgrHook.Invoke(@event, flinfo, @private);
+        }
+
+        if (@event == FmgrHookEventType.FHET_START)
+        {
+            SequenceRangeGuard.StartingTrigger(flinfo->fn_oid);
+        }
+    }
+
+    private static void CheckWrite(RangeVar* relation, PgLockMode lockmode, RangeVarGetRelidCallback callback)
+    {
+        uint relid = relation is null ? 0 : NativeMethods.RangeVarGetRelidExtended(relation, (int)lockmode, RangeVarMissingOk, callback, null);
+        if (relid == 0)
+        {
+            return;
+        }
+
+        // TRUNCATE without ONLY empties the tables under the table too, which it locks as PostgreSQL will.
+        List<uint> tables = [relid];
+        if (lockmode == PgLockMode.AccessExclusive && relation->inh)
+        {
+            List* inheritors = NativeMethods.find_all_inheritors(relid, (int)lockmode, null);
+            for (int i = 0; inheritors is not null && i < inheritors->length; i++)
+            {
+                tables.Add(inheritors->elements[i].oid_value);
+            }
+        }
+
+        DdlLock.CheckWrite(tables);
+    }
+
+    /// <summary>
+    /// Fails a TRUNCATE of a table the user may not truncate before the table is locked, as PostgreSQL does, so that
+    /// it doesn't queue for the lock ahead of others.
+    /// </summary>
+    private static void CheckTruncatePrivilege(RangeVar* relation, uint relId, uint oldRelId, void* arg)
+    {
+        if (relId != 0 && NativeMethods.pg_class_aclcheck(relId, NativeMethods.GetUserId(), AclTruncate) != AclResult.ACLCHECK_OK)
+        {
+            NativeMethods.aclcheck_error(AclResult.ACLCHECK_NO_PRIV, NativeMethods.get_relkind_objtype(NativeMethods.get_rel_relkind(relId)),
+                relation->relname);
         }
     }
 
@@ -433,7 +879,7 @@ internal static unsafe partial class Executor
         {
             string column = Worf.FromServer(attname);
             // worf's catalog is its own, whoever drops the column.
-            Elevated.Run(() => _ = Spi.Execute("""
+            Elevated.Run(() => _ = Worf.Execute("""
                 INSERT INTO worf.dropped_column VALUES ($1, $2::name, $3) ON CONFLICT (relid, attname) DO UPDATE SET attnum = excluded.attnum
                 """, SpiParameter.Create(relid), SpiParameter.Create(column), SpiParameter.Create((short)attnum)));
         }
@@ -443,7 +889,7 @@ internal static unsafe partial class Executor
     /// Forgets the dropped columns recorded for a table.
     /// </summary>
     private static void ForgetDroppedColumns(uint relid)
-        => Elevated.Run(() => _ = Spi.Execute("DELETE FROM worf.dropped_column WHERE relid = $1", SpiParameter.Create(relid)));
+        => Elevated.Run(() => _ = Worf.Execute("DELETE FROM worf.dropped_column WHERE relid = $1", SpiParameter.Create(relid)));
 
     /// <summary>
     /// Checks whether this database has worf's table of dropped columns, as it doesn't before worf is installed.

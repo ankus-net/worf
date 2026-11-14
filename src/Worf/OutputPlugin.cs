@@ -9,6 +9,7 @@ namespace Worf;
 internal static unsafe partial class OutputPlugin
 {
     private const int RelmetacacheInitialSize = 128;
+    private const int AccessShareLock = 1;
 
     private static readonly Dictionary<nint, WorfOutputData> s_outputData = [];
 
@@ -16,6 +17,9 @@ internal static unsafe partial class OutputPlugin
     private static readonly Dictionary<string, uint> s_originNodeIds = [];
 
     private static bool s_startupMessageSent;
+
+    // The lc_monetary this walsender last saw, against which a reload is noticed.
+    private static string? s_monetary;
 
     private static Dictionary<uint, RelMetaCacheEntry>? s_relMetaCache;
 
@@ -35,6 +39,9 @@ internal static unsafe partial class OutputPlugin
 
     [PgNativeCallback(nameof(PgDecodeOriginFilter))]
     private static partial OutputPluginCallbacks_filter_by_origin_cbCallback OriginFilterCallback { get; }
+
+    [PgNativeCallback(nameof(PgDecodeMessage))]
+    private static partial OutputPluginCallbacks_message_cbCallback MessageCallback { get; }
 
     [PgNativeCallback(nameof(PgDecodeShutdown))]
     private static partial OutputPluginCallbacks_shutdown_cbCallback ShutdownCallback { get; }
@@ -59,6 +66,31 @@ internal static unsafe partial class OutputPlugin
         cb->commit_cb = CommitCallback;
         cb->filter_by_origin_cb = OriginFilterCallback;
         cb->shutdown_cb = ShutdownCallback;
+        cb->message_cb = MessageCallback;
+    }
+
+    /// <summary>
+    /// Sends the subscriber the word the sequence range code writes, as an owner that granted itself a block a neighbor
+    /// must hear of does, to call this node now; other messages aren't sent.
+    /// </summary>
+    private static void PgDecodeMessage(LogicalDecodingContext* ctx, ReorderBufferTXN* txn, ulong messageLsn, bool transactional, sbyte* prefix,
+        ulong messageSize, sbyte* message)
+    {
+        _ = txn;
+        _ = messageLsn;
+        _ = transactional;
+        _ = messageSize;
+        _ = message;
+        if (Worf.FromServer(prefix) != "worf_sequence_range")
+        {
+            return;
+        }
+
+        WorfLog.Debug2("sending the subscriber a word to call this node about sequence ranges");
+
+        NativeMethods.OutputPluginPrepareWrite(ctx, true);
+        NativeMethods.pq_sendbyte(ctx->@out, (byte)'W');
+        NativeMethods.OutputPluginWrite(ctx, true);
     }
 
     private static bool CheckBinaryCompatibility(WorfOutputData data)
@@ -70,43 +102,43 @@ internal static unsafe partial class OutputPlugin
 
         if (data.ClientBinaryBigendianSet && data.ClientBinaryBigendian != OutputConfig.ServerBigendian)
         {
-            PgLog.Debug1("Binary mode rejected: Server and client endian mismatch");
+            WorfLog.Debug1("Binary mode rejected: Server and client endian mismatch");
             return false;
         }
 
         if (data.ClientBinarySizeofdatum != 0 && data.ClientBinarySizeofdatum != Worf.SizeofDatum)
         {
-            PgLog.Debug1("Binary mode rejected: Server and client sizeof(Datum) mismatch");
+            WorfLog.Debug1("Binary mode rejected: Server and client sizeof(Datum) mismatch");
             return false;
         }
 
         if (data.ClientBinarySizeofint != 0 && data.ClientBinarySizeofint != Worf.SizeofInt)
         {
-            PgLog.Debug1("Binary mode rejected: Server and client sizeof(int) mismatch");
+            WorfLog.Debug1("Binary mode rejected: Server and client sizeof(int) mismatch");
             return false;
         }
 
         if (data.ClientBinarySizeoflong != 0 && data.ClientBinarySizeoflong != Worf.SizeofLong)
         {
-            PgLog.Debug1("Binary mode rejected: Server and client sizeof(long) mismatch");
+            WorfLog.Debug1("Binary mode rejected: Server and client sizeof(long) mismatch");
             return false;
         }
 
         if (data.ClientBinaryFloat4byvalSet && data.ClientBinaryFloat4byval != OutputConfig.ServerFloat4Byval)
         {
-            PgLog.Debug1("Binary mode rejected: Server and client float4byval mismatch");
+            WorfLog.Debug1("Binary mode rejected: Server and client float4byval mismatch");
             return false;
         }
 
         if (data.ClientBinaryFloat8byvalSet && data.ClientBinaryFloat8byval != OutputConfig.ServerFloat8Byval)
         {
-            PgLog.Debug1("Binary mode rejected: Server and client float8byval mismatch");
+            WorfLog.Debug1("Binary mode rejected: Server and client float8byval mismatch");
             return false;
         }
 
         if (data.ClientBinaryIntdatetimesSet && data.ClientBinaryIntdatetimes != OutputConfig.ServerIntegerDatetimes)
         {
-            PgLog.Debug1("Binary mode rejected: Server and client integer datetimes mismatch");
+            WorfLog.Debug1("Binary mode rejected: Server and client integer datetimes mismatch");
             return false;
         }
 
@@ -156,6 +188,10 @@ internal static unsafe partial class OutputPlugin
             // startup message until the first change processed on the stream, in a begin callback.
             s_startupMessageSent = false;
 
+            // A set can be dropped and created again under its name, and so its ID, after a change the walsender
+            // decodes. The sets are found by name no earlier than this snapshot, so a set it saw deleted was another.
+            data.SetsSnapshot = SetsSnapshot();
+
             // Now parse the rest of the params and ERROR if we see any we don't recognise
             int paramsFormat = OutputConfig.ProcessParameters(ReadOptions(ctx->output_plugin_options), data);
 
@@ -177,6 +213,9 @@ internal static unsafe partial class OutputPlugin
                     $"client sent max_proto_version={data.ClientMaxProtoVersion} but we only support protocol {OutputProto.ProtoMinVersionNum} or higher");
             }
 
+            // An older client reads the layout of the version it knows.
+            data.ProtoVersion = Math.Min(data.ClientMaxProtoVersion, OutputProto.ProtoVersionNum);
+
             // Set correct protocol format.
             //
             // This is the output plugin protocol format, this is different from the individual fields binary vs
@@ -193,7 +232,7 @@ internal static unsafe partial class OutputPlugin
 
                 if (data.ClientNoTxinfo)
                 {
-                    PgLog.Warning("no_txinfo option ignored for protocols other than json");
+                    WorfLog.Warning("no_txinfo option ignored for protocols other than json");
                     data.ClientNoTxinfo = false;
                 }
             }
@@ -239,8 +278,10 @@ internal static unsafe partial class OutputPlugin
                 data.FieldDatumEncoding = wantedEncoding;
             }
 
-            // It's obviously not possible to send binary representation of data unless we use the binary output.
-            if (opt->output_type == OutputPluginOutputType.OUTPUT_PLUGIN_BINARY_OUTPUT && data.ClientWantInternalBasetypes)
+            // It's obviously not possible to send binary representation of data unless we use the binary output. A
+            // client reads values in the internal format only with their types, which it gets from protocol version 2.
+            if (opt->output_type == OutputPluginOutputType.OUTPUT_PLUGIN_BINARY_OUTPUT && data.ClientWantInternalBasetypes &&
+                data.ProtoVersion >= OutputProto.ColumnTypesVersionNum)
             {
                 data.AllowInternalBasetypes = CheckBinaryCompatibility(data);
             }
@@ -263,6 +304,45 @@ internal static unsafe partial class OutputPlugin
 
             RelmetacacheInit();
         }
+        else
+        {
+            RequireInstalled();
+        }
+    }
+
+    /// <summary>
+    /// Refuses to make a slot where worf isn't installed, as for a subscription whose sync made it after worf was dropped,
+    /// which would keep WAL for a subscriber the node no longer serves. It takes worf's extension lock as DROP EXTENSION
+    /// does, but shared, before it looks: a drop that holds it, prepared too, has the slot wait and then refused, and a drop
+    /// that comes after finds the slot made and is refused.
+    /// </summary>
+    private static void RequireInstalled()
+    {
+        bool startedTx = false;
+        if (!NativeMethods.IsTransactionState())
+        {
+            NativeMethods.StartTransactionCommand();
+            startedTx = true;
+        }
+
+        uint extension = NativeMethods.get_extension_oid(Worf.PStrDup(Worf.ExtensionName), true);
+        if (extension != 0)
+        {
+            NativeMethods.LockDatabaseObject(Dependency.ExtensionRelationId, extension, 0, AccessShareLock);
+            extension = NativeMethods.get_extension_oid(Worf.PStrDup(Worf.ExtensionName), true);
+        }
+
+        if (extension == 0)
+        {
+            throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState,
+                $"worf is not installed in database \"{Worf.FromServer(NativeMethods.get_database_name(NativeGlobals.MyDatabaseId))}\"",
+                hint: "Create the extension worf and its node before subscribing to this database.");
+        }
+
+        if (startedTx)
+        {
+            NativeMethods.CommitTransactionCommand();
+        }
     }
 
     /// <summary>
@@ -278,42 +358,46 @@ internal static unsafe partial class OutputPlugin
             SendStartupMessage(ctx, data, false /* can't be last message */);
         }
 
-        // If the record didn't originate locally, send origin info
-        sendReplicationOrigin &= txn->origin_id != 0;
+        data.Xid = txn->xid;
 
+        // A reload that changed lc_monetary since the startup message ends the stream, so that the subscriber hears how
+        // money is formatted again as it reconnects, rather than read its values as it was formatted before.
+        if (OutputConfig.AnnouncedMoneyFormat is string announced && OutputConfig.MoneyFormat() != announced)
+        {
+            throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState,
+                $"lc_monetary formats money as \"{OutputConfig.MoneyFormat()}\" where this walsender told the subscriber \"{announced}\"",
+                hint: "The subscriber reconnects and hears the new format.");
+        }
+
+        // If the record didn't originate locally, send origin info. An origin whose name isn't found, as one the
+        // transaction itself created, gets no ORIGIN message, rather than an empty one that the subscriber can't read:
+        // the subscriber then treats the transaction as this node's.
         WorfProtoApi api = data.Api!;
+        sbyte* origin = null;
+        sendReplicationOrigin &= txn->origin_id != 0 && api.WriteOrigin is not null &&
+            NativeMethods.replorigin_by_oid(txn->origin_id, true, &origin);
+
         NativeMethods.OutputPluginPrepareWrite(ctx, !sendReplicationOrigin);
         api.WriteBegin(ctx->@out, data, txn);
 
         if (sendReplicationOrigin)
         {
-            sbyte* origin;
-
             // Message boundary
             NativeMethods.OutputPluginWrite(ctx, false);
             NativeMethods.OutputPluginPrepareWrite(ctx, true);
 
-            // XXX: which behaviour we want here?
-            //
-            // Alternatives:
-            //  - don't send origin message if origin name not found (that's what we do now)
-            //  - throw error - that will break replication, not good
-            //  - send some special "unknown" origin
-            if (api.WriteOrigin is not null && NativeMethods.replorigin_by_oid(txn->origin_id, true, &origin))
+            // Name the node that wrote the transaction, which the subscriber resolves conflicts by. An origin no
+            // subscription owns, it treats as this node's.
+            // An origin's name fixes its node, as the slot name in it names the provider, so the node is looked up
+            // once.
+            string originName = Worf.FromServer(origin);
+            if (!s_originNodeIds.TryGetValue(originName, out uint nodeId))
             {
-                // Name the node that wrote the transaction, which the subscriber resolves conflicts by. An origin no
-                // subscription owns, it treats as this node's.
-                // An origin's name fixes its node, as the slot name in it names the provider, so the node is looked up
-                // once.
-                string originName = Worf.FromServer(origin);
-                if (!s_originNodeIds.TryGetValue(originName, out uint nodeId))
-                {
-                    nodeId = WorfNode.GetOriginNodeId(originName) ?? 0;
-                    s_originNodeIds[originName] = nodeId;
-                }
-
-                api.WriteOrigin(ctx->@out, origin, txn->origin_lsn, nodeId);
+                nodeId = WorfNode.GetOriginNodeId(originName) ?? 0;
+                s_originNodeIds[originName] = nodeId;
             }
+
+            api.WriteOrigin(ctx->@out, origin, txn->origin_lsn, nodeId);
         }
 
         NativeMethods.OutputPluginWrite(ctx, true);
@@ -334,6 +418,57 @@ internal static unsafe partial class OutputPlugin
         // them at the moment.
         RelmetacachePrune();
     }
+
+    /// <summary>
+    /// Reads what the connection's replication sets replicate when the historic snapshot has changed since they were
+    /// last read, so each change gets the actions its sets had when it was made. The catalog as it is now would apply
+    /// actions changed since to the changes a walsender decodes again when it restarts.
+    /// </summary>
+    private static void ReadReplicationSetActions(WorfOutputData data)
+    {
+        // A transaction's snapshot changes when its own catalog changes take effect, at a new command, and when another
+        // transaction's commit changes the catalogs, which grows the set of committed transactions it sees. Only a
+        // transaction that changes the catalogs sees its own changes, through a copy of the snapshot that lists its
+        // transaction IDs, so another transaction's snapshot that matches it otherwise doesn't see them. The snapshot
+        // of every other transaction is the same until a commit changes the catalogs, so the actions are read again
+        // only then.
+        SnapshotData* snapshot = NativeMethods.GetCatalogSnapshot(ReplicationSet.GetReplicationSetRelOid());
+        (uint, uint, uint, uint, uint) actionsSnapshot = (snapshot->xmin, snapshot->xmax, snapshot->xcnt, snapshot->curcid,
+            snapshot->subxcnt > 0 ? snapshot->subxip[0] : 0);
+        if (data.ActionsSnapshot == actionsSnapshot)
+        {
+            return;
+        }
+
+        // The tables' info holds the actions as they were when it was built.
+        if (ReplicationSet.ReadReplicationSetActions(data.ReplicationSets))
+        {
+            ReplicationSet.InvalidateTableReplicationInfo();
+        }
+
+        data.ActionsSnapshot = actionsSnapshot;
+    }
+
+    /// <summary>
+    /// Reads the catalog snapshot that finding the replication sets by name sees no less than.
+    /// </summary>
+    private static (uint Xmin, uint Xmax, HashSet<uint> Running) SetsSnapshot()
+    {
+        SnapshotData* snapshot = NativeMethods.GetCatalogSnapshot(ReplicationSet.GetReplicationSetRelOid());
+        HashSet<uint> running = [];
+        for (uint i = 0; i < snapshot->xcnt; i++)
+        {
+            _ = running.Add(snapshot->xip[i]);
+        }
+
+        return (snapshot->xmin, snapshot->xmax, running);
+    }
+
+    /// <summary>
+    /// Checks whether a snapshot saw a transaction that has committed as committed.
+    /// </summary>
+    private static bool SeenCommitted((uint Xmin, uint Xmax, HashSet<uint> Running) snapshot, uint xid)
+        => (int)(xid - snapshot.Xmin) < 0 || ((int)(xid - snapshot.Xmax) < 0 && !snapshot.Running.Contains(xid));
 
     private static bool WorfChangeFilter(WorfOutputData data, RelationData* relation, ReorderBufferChange* change,
         out HashSet<int>? attList)
@@ -370,6 +505,8 @@ internal static unsafe partial class OutputPlugin
                     return true;
                 }
 
+                ReadReplicationSetActions(data);
+
                 foreach (string queueSet in q.ReplicationSets ?? [])
                 {
                     foreach (WorfRepSet rs in data.ReplicationSets)
@@ -390,44 +527,23 @@ internal static unsafe partial class OutputPlugin
         {
             // Special case - replication set table.
             //
-            // We can use this to update our cached replication set info, without having to deal with cache
-            // invalidation callbacks.
-            HeapTupleData* tup;
-
-            if (change->action == ReorderBufferChangeType.REORDER_BUFFER_CHANGE_UPDATE)
-            {
-                tup = NewTuple(change);
-            }
-            else if (change->action == ReorderBufferChangeType.REORDER_BUFFER_CHANGE_DELETE)
-            {
-                tup = OldTuple(change);
-            }
-            else
+            // A change to one of our sets' actions needs nothing here, as the next change reads them under a
+            // historic snapshot that sees it.
+            if (change->action != ReorderBufferChangeType.REORDER_BUFFER_CHANGE_DELETE)
             {
                 return false;
             }
 
-            WorfRepSet replicatedSet = ReplicationSet.ReplicationSetFromTuple(tup, relation->rd_att);
+            WorfRepSet replicatedSet = ReplicationSet.ReplicationSetFromTuple(OldTuple(change), relation->rd_att);
             foreach (WorfRepSet rs in data.ReplicationSets)
             {
-                // Check if the changed repset is used by us.
-                if (rs.Id == replicatedSet.Id)
+                // Somebody deleted one of our rep sets, bail here and let reconnect logic handle any potential issues.
+                // A set deleted before the walsender found ours by name was another of that name, which ours
+                // replaced; the actions read as of each change follow the sets from one to the other.
+                if (rs.Id == replicatedSet.Id && !SeenCommitted(data.SetsSnapshot, data.Xid))
                 {
-                    // In case this was delete, somebody deleted one of our rep sets, bail here and let reconnect logic
-                    // handle any potential issues.
-                    if (change->action == ReorderBufferChangeType.REORDER_BUFFER_CHANGE_DELETE)
-                    {
-                        throw new PgException(PgSqlStates.InternalError,
-                            $"replication set \"{rs.Name}\" used by this connection was deleted, existing");
-                    }
-
-                    // This was update of our repset, update the cache.
-                    rs.ReplicateInsert = replicatedSet.ReplicateInsert;
-                    rs.ReplicateUpdate = replicatedSet.ReplicateUpdate;
-                    rs.ReplicateDelete = replicatedSet.ReplicateDelete;
-                    rs.ReplicateTruncate = replicatedSet.ReplicateTruncate;
-
-                    return false;
+                    throw new PgException(PgSqlStates.InternalError,
+                        $"replication set \"{rs.Name}\" used by this connection was deleted, existing");
                 }
             }
 
@@ -435,6 +551,7 @@ internal static unsafe partial class OutputPlugin
         }
 
         // Normal case - use replication set membership.
+        ReadReplicationSetActions(data);
         WorfTableRepInfo tblinfo = ReplicationSet.GetTableReplicationInfo(data.LocalNodeId, relation, data.ReplicationSets);
 
         // First try filter out by change type.
@@ -479,11 +596,12 @@ internal static unsafe partial class OutputPlugin
             // Skip empty changes.
             if (newtup is null && oldtup is null)
             {
-                PgLog.Debug1("worf output got empty change");
+                WorfLog.Debug1("worf output got empty change");
                 return false;
             }
 
             NativeMethods.PushActiveSnapshot(NativeMethods.GetTransactionSnapshot());
+            int nestLevel = Worf.DefaultSearchPath();
             try
             {
                 EState* estate = Executor.CreateEstateForRelation(relation, false);
@@ -514,6 +632,7 @@ internal static unsafe partial class OutputPlugin
             }
             finally
             {
+                Worf.EndDefaultSearchPath(nestLevel);
                 NativeMethods.PopActiveSnapshot();
             }
         }
@@ -529,6 +648,16 @@ internal static unsafe partial class OutputPlugin
     {
         _ = txn;
         WorfOutputData data = Data(ctx);
+
+        // A reload that changes lc_monetary in the middle of a transaction ends the stream at its next change too, as at
+        // the next transaction's start.
+        if (OutputConfig.AnnouncedMoneyFormat is string announced && OutputConfig.MonetaryChanged(ref s_monetary) &&
+            OutputConfig.MoneyFormat() != announced)
+        {
+            throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState,
+                $"lc_monetary formats money as \"{OutputConfig.MoneyFormat()}\" where this walsender told the subscriber \"{announced}\"",
+                hint: "The subscriber reconnects and hears the new format.");
+        }
 
         // Avoid leaking memory by using and resetting our own context
         PgMemoryContext.RunTransient("worf output msg context", _ =>
@@ -584,7 +713,7 @@ internal static unsafe partial class OutputPlugin
                     }
                     else
                     {
-                        PgLog.Debug1("didn't send DELETE change because of missing oldtuple");
+                        WorfLog.Debug1("didn't send DELETE change because of missing oldtuple");
                     }
 
                     break;
@@ -610,6 +739,11 @@ internal static unsafe partial class OutputPlugin
     private static void SendStartupMessage(LogicalDecodingContext* ctx, WorfOutputData data, bool lastMessage)
     {
         List<(string Key, string Value)> msg = OutputConfig.PrepareStartupMessage(data);
+
+        // A reload that changes lc_monetary is looked for from the format the message announces, so that one before the
+        // first change is found too.
+        s_monetary = null;
+        _ = OutputConfig.MonetaryChanged(ref s_monetary);
 
         NativeMethods.OutputPluginPrepareWrite(ctx, lastMessage);
         data.Api!.WriteStartupMessage(ctx->@out, msg);

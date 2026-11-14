@@ -38,12 +38,33 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
-          cache: pnpm
-          cache-dependency-path: docs/pnpm-lock.yaml
+          package-manager-cache: false
+
+      # Every run restores the pnpm store, but only main saves it: a pull request's copy could be restored only by that
+      # pull request, and every lockfile change, Dependabot's included, would add another, crowding main's out of the
+      # cache.
+      - name: Locate the pnpm store
+        id: pnpm-store
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+        working-directory: docs
+
+      - name: Restore the pnpm store
+        id: pnpm-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('docs/pnpm-lock.yaml') }}
 
       - name: Install documentation dependencies
         run: pnpm install --frozen-lockfile
         working-directory: docs
+
+      - name: Save the pnpm store
+        if: github.ref == 'refs/heads/main' && steps.pnpm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('docs/pnpm-lock.yaml') }}
 
       - name: Check the site
         run: pnpm check

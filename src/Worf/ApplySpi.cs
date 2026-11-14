@@ -36,7 +36,7 @@ internal static unsafe class ApplySpi
 
         newtup.ConvertValues(desc);
 
-        cmd.Append("INSERT INTO ").Append(Spi.QuoteQualifiedIdentifier(rel.Nspname, rel.Relname)).Append(" (");
+        cmd.Append("INSERT INTO ").Append(Worf.QuoteQualifiedIdentifier(rel.Nspname, rel.Relname)).Append(" (");
 
         for (int att = 0; att < desc->natts; att++)
         {
@@ -51,7 +51,7 @@ internal static unsafe class ApplySpi
                 continue;
             }
 
-            cmd.Append(narg > 0 ? ", " : "").Append(Spi.QuoteIdentifier(AttName(attr)));
+            cmd.Append(narg > 0 ? ", " : "").Append(Worf.QuoteIdentifier(AttName(attr)));
             narg++;
         }
 
@@ -78,7 +78,7 @@ internal static unsafe class ApplySpi
 
         cmd.Append(')');
 
-        _ = Spi.Execute(cmd.ToString(), [.. args]);
+        ExecuteComposed(rel, cmd.ToString(), args);
     }
 
     /// <summary>
@@ -100,8 +100,9 @@ internal static unsafe class ApplySpi
         newtup.ConvertValues(desc);
 
         Bitmapset* idAttrs = NativeMethods.RelationGetIndexAttrBitmap(relation, IndexAttrBitmapKind.INDEX_ATTR_BITMAP_IDENTITY_KEY);
+        Dictionary<short, string> operators = KeyOperators(relation);
 
-        cmd.Append("UPDATE ").Append(Spi.QuoteQualifiedIdentifier(rel.Nspname, rel.Relname)).Append(" SET ");
+        cmd.Append("UPDATE ").Append(Worf.QuoteQualifiedIdentifier(rel.Nspname, rel.Relname)).Append(" SET ");
 
         for (att = 0, narg = 0; att < desc->natts; att++)
         {
@@ -116,7 +117,7 @@ internal static unsafe class ApplySpi
                 continue;
             }
 
-            cmd.Append(narg > 0 ? ", " : "").Append(Spi.QuoteIdentifier(AttName(attr))).Append(" = ")
+            cmd.Append(narg > 0 ? ", " : "").Append(Worf.QuoteIdentifier(AttName(attr))).Append(" = ")
                 .Append(Spi.ParameterReference(narg + 1));
             args.Add(Arg(attr, newtup, att));
             narg++;
@@ -133,13 +134,13 @@ internal static unsafe class ApplySpi
                 continue;
             }
 
-            cmd.Append(narg > firstarg ? " AND " : " ").Append(Spi.QuoteIdentifier(AttName(attr))).Append(" = ")
-                .Append(Spi.ParameterReference(narg + 1));
+            cmd.Append(narg > firstarg ? " AND " : " ").Append(Worf.QuoteIdentifier(AttName(attr))).Append(' ')
+                .Append(KeyOperator(operators, attr->attnum)).Append(' ').Append(Spi.ParameterReference(narg + 1));
             args.Add(Arg(attr, oldtup, att));
             narg++;
         }
 
-        _ = Spi.Execute(cmd.ToString(), [.. args]);
+        ExecuteComposed(rel, cmd.ToString(), args);
     }
 
     /// <summary>
@@ -158,8 +159,9 @@ internal static unsafe class ApplySpi
         oldtup.ConvertValues(desc);
 
         Bitmapset* idAttrs = NativeMethods.RelationGetIndexAttrBitmap(relation, IndexAttrBitmapKind.INDEX_ATTR_BITMAP_IDENTITY_KEY);
+        Dictionary<short, string> operators = KeyOperators(relation);
 
-        cmd.Append("DELETE FROM ").Append(Spi.QuoteQualifiedIdentifier(rel.Nspname, rel.Relname)).Append(" WHERE");
+        cmd.Append("DELETE FROM ").Append(Worf.QuoteQualifiedIdentifier(rel.Nspname, rel.Relname)).Append(" WHERE");
 
         for (int att = 0; att < desc->natts; att++)
         {
@@ -169,14 +171,40 @@ internal static unsafe class ApplySpi
                 continue;
             }
 
-            cmd.Append(narg > 0 ? " AND " : " ").Append(Spi.QuoteIdentifier(AttName(attr))).Append(" = ")
-                .Append(Spi.ParameterReference(narg + 1));
+            cmd.Append(narg > 0 ? " AND " : " ").Append(Worf.QuoteIdentifier(AttName(attr))).Append(' ')
+                .Append(KeyOperator(operators, attr->attnum)).Append(' ').Append(Spi.ParameterReference(narg + 1));
             args.Add(Arg(attr, oldtup, att));
             narg++;
         }
 
-        _ = Spi.Execute(cmd.ToString(), [.. args]);
+        ExecuteComposed(rel, cmd.ToString(), args);
     }
+
+    /// <summary>
+    /// Runs a statement composed of quoted names, parameter references and the key's operators, which come from the
+    /// catalog, under the session's search path, for the triggers it fires.
+    /// </summary>
+    // Each statement starts a writer of the relation, whose deferrable constraints' rechecks fire for its rows, at
+    // commit as apply says.
+    private static void ExecuteComposed(WorfRelation rel, string sql, List<SpiParameter> args)
+        => _ = rel.HasRechecks ? ReplicaRechecks.Firing(rel.Reloid, () => Worf.ExecuteUnpinned(sql, [.. args]), true)
+            : Worf.ExecuteUnpinned(sql, [.. args]);
+
+    /// <summary>
+    /// Gets the equality operators of a table's replica identity index, which the statements name with their schemas, as
+    /// they run under the session's search path, for the triggers they fire.
+    /// </summary>
+    private static Dictionary<short, string> KeyOperators(RelationData* relation)
+    {
+        uint index = NativeMethods.RelationGetReplicaIndex(relation);
+        return index == 0 ? [] : Worf.KeyEqualityOperators(index);
+    }
+
+    /// <summary>
+    /// Gets the equality operator a key column's index compares it with.
+    /// </summary>
+    private static string KeyOperator(Dictionary<short, string> operators, short attnum)
+        => operators.TryGetValue(attnum, out string? op) ? op : "OPERATOR(pg_catalog.=)";
 
     /// <summary>
     /// Whether the relation's inserts may be batched. They can't through SPI, as on Windows.

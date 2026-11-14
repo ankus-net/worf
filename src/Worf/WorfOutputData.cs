@@ -51,6 +51,11 @@ internal sealed class WorfOutputData
     public uint ClientMinProtoVersion { get; set; }
 
     /// <summary>
+    /// Gets or sets the protocol version the plugin writes: the newest both it and the client support.
+    /// </summary>
+    public uint ProtoVersion { get; set; }
+
+    /// <summary>
     /// Gets or sets the encoding the client expects.
     /// </summary>
     public string? ClientExpectedEncoding { get; set; }
@@ -154,6 +159,24 @@ internal sealed class WorfOutputData
     /// Gets or sets the replication sets.
     /// </summary>
     public List<WorfRepSet> ReplicationSets { get; set; } = [];
+
+    /// <summary>
+    /// Gets or sets the historic snapshot the replication sets' actions were last read under, as its xmin, xmax,
+    /// count of committed transactions, command id and the transaction whose own changes it sees, or null to read them
+    /// at the next change.
+    /// </summary>
+    public (uint Xmin, uint Xmax, uint Xcnt, uint Curcid, uint OwnXid)? ActionsSnapshot { get; set; }
+
+    /// <summary>
+    /// Gets or sets the catalog snapshot the replication sets were found by name under, as its xmin, its xmax and the
+    /// transactions it saw running.
+    /// </summary>
+    public (uint Xmin, uint Xmax, HashSet<uint> Running) SetsSnapshot { get; set; } = (0, 0, []);
+
+    /// <summary>
+    /// Gets or sets the ID of the transaction being decoded.
+    /// </summary>
+    public uint Xid { get; set; }
 
     /// <summary>
     /// Gets or sets the only table to replicate, as schema and name, or null.

@@ -33,7 +33,7 @@ internal sealed class WorfFailedChange
     /// <summary>
     /// Gets the change's position in the transaction.
     /// </summary>
-    public uint ActionCounter { get; init; }
+    public long ActionCounter { get; init; }
 
     /// <summary>
     /// Gets what the change does, such as <c>INSERT</c> or <c>QUEUED_SQL</c>, or null.
@@ -54,4 +54,10 @@ internal sealed class WorfFailedChange
     /// Gets the queued message, such as DDL, that the change carries, or null.
     /// </summary>
     public string? QueuedMessage { get; init; }
+
+    /// <summary>
+    /// Gets the change's new row as the exception log records it, for a change no message carries, such as a row of a
+    /// table's initial copy, or null.
+    /// </summary>
+    public string? NewTuple { get; init; }
 }

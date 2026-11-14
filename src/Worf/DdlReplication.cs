@@ -39,6 +39,14 @@ internal static unsafe partial class DdlReplication
     internal static partial bool AllowDdlFromFunctions { get; }
 
     /// <summary>
+    /// Gets whether this session restores a subscription's structure. Only a superuser, or a role granted SET on it,
+    /// can claim that, since such a session's DDL isn't replicated and joins the provider's managed sequences.
+    /// </summary>
+    [PgGucBool("worf.subscription_schema_restore", false, "Marks a session that restores a subscription's structure.",
+        Context = PgGucContext.SuperuserSet, Flags = PgGucOptions.NoShowAll)]
+    internal static partial bool SubscriptionSchemaRestore { get; }
+
+    /// <summary>
     /// Gets or sets whether DDL runs for <c>replicate_ddl_command</c>, which queues it itself.
     /// </summary>
     internal static bool Suppressed { get; set; }
@@ -102,9 +110,11 @@ internal static unsafe partial class DdlReplication
                 NodeTag.T_DropRoleStmt or NodeTag.T_GrantRoleStmt or NodeTag.T_AlterSystemStmt or
                 NodeTag.T_CreateSubscriptionStmt or NodeTag.T_AlterSubscriptionStmt or NodeTag.T_DropSubscriptionStmt or
                 NodeTag.T_CreatePublicationStmt or NodeTag.T_AlterPublicationStmt => false,
-
-            // A prepared statement is the session's.
-            NodeTag.T_CreateTableAsStmt when local => false,
+            NodeTag.T_RenameStmt when IsClusterObject(((RenameStmt*)parsetree)->renameType) => false,
+            NodeTag.T_AlterOwnerStmt when IsClusterObject(((AlterOwnerStmt*)parsetree)->objectType) => false,
+            NodeTag.T_CommentStmt when IsClusterObject(((CommentStmt*)parsetree)->objtype) => false,
+            NodeTag.T_SecLabelStmt when IsClusterObject(((SecLabelStmt*)parsetree)->objtype) => false,
+            NodeTag.T_GrantStmt when IsClusterObject(((GrantStmt*)parsetree)->objtype) => false,
 
             // Each node creates, updates and drops worf itself.
             NodeTag.T_CreateExtensionStmt => !IsWorf(((CreateExtensionStmt*)parsetree)->extname),
@@ -112,15 +122,20 @@ internal static unsafe partial class DdlReplication
             NodeTag.T_AlterExtensionContentsStmt => !IsWorf(((AlterExtensionContentsStmt*)parsetree)->extname),
             NodeTag.T_DropStmt => true,
 
-            // Temporary objects are the session's, and worf's own the node's. Finishing a concurrent detach is the
-            // node's own too, since the others detached the partition at once.
-            NodeTag.T_AlterTableStmt when FinishesDetach((AlterTableStmt*)parsetree) => false,
+            // Temporary objects are the session's, and worf's own the node's.
             _ => !TargetsLocal(parsetree),
         };
 
         if (!replicated || !WithSnapshot(() => WorfNode.GetLocalNode(false, true) is not null))
         {
             return null;
+        }
+
+        // A prepared statement is the session's, and a table made from one would be on this node alone.
+        if (local)
+        {
+            throw new PgException("0A000", "cannot create a table from a prepared statement while worf.enable_ddl_replication is on",
+                hint: "The other nodes don't have the prepared statement. Create the table, and insert the statement's rows into it.");
         }
 
         int length = Worf.StrLen(queryString);
@@ -139,13 +154,28 @@ internal static unsafe partial class DdlReplication
     {
         uint flags = (uint)NativeGlobals.MyXactFlags;
         NativeGlobals.MyXactFlags = (int)(flags & ~AccessedTempNamespace);
-        if (replicated)
+        if (replicated && s_depth++ == 0)
         {
-            s_depth++;
+            TemporaryObjectUse.Begin();
         }
 
         return flags;
     }
+
+    /// <summary>
+    /// Checks whether DDL that this session runs now would replicate, as a statement's own kind allows.
+    /// </summary>
+    /// <returns>Whether it would.</returns>
+    internal static bool Replicates()
+        => EnableDdlReplication && !Suppressed && !NativeGlobals.creating_extension &&
+            NativeGlobals.SessionReplicationRole != SessionReplicationRoleReplica && !Restoring() &&
+            WithSnapshot(() => WorfNode.GetLocalNode(false, true) is not null);
+
+    /// <summary>
+    /// Gets whether DDL being replicated runs now, as when a statement that commits partway, such as
+    /// <c>CREATE INDEX CONCURRENTLY</c>, commits.
+    /// </summary>
+    internal static bool Running => s_depth > 0;
 
     /// <summary>
     /// Ends running a utility statement, which has run or failed.
@@ -169,20 +199,11 @@ internal static unsafe partial class DdlReplication
     /// Queues a DDL statement that ran, with the settings that change what it means.
     /// </summary>
     /// <param name="command">The statement.</param>
-    internal static void QueueDdl(string command)
+    /// <param name="context">The role and settings the statement started under, from <see cref="Context"/>.</param>
+    internal static void QueueDdl(string command, (uint Role, string Settings) context)
     {
-        StringBuilder json = new("{\"search_path\": ");
-        Executor.EscapeJson(json, Setting("search_path"));
-        json.Append(", \"settings\": {");
-        for (int i = 1; i < s_travelingSettings.Length; i++)
-        {
-            json.Append(i > 1 ? ", " : "");
-            Executor.EscapeJson(json, s_travelingSettings[i]);
-            json.Append(": ");
-            Executor.EscapeJson(json, Setting(s_travelingSettings[i]));
-        }
-
-        json.Append("}, \"command\": ");
+        StringBuilder json = new(context.Settings);
+        json.Append(", \"command\": ");
         Executor.EscapeJson(json, command);
 
         // DDL that locked the other nodes tells each node the fence to release and how far to apply first.
@@ -201,9 +222,30 @@ internal static unsafe partial class DdlReplication
 
         _ = WithSnapshot(() =>
         {
-            Queue.QueueMessage(["ddl_sql"], NativeMethods.GetUserId(), Queue.QueueCommandTypeDdl, json.ToString());
+            Queue.QueueMessage(["ddl_sql"], context.Role, Queue.QueueCommandTypeDdl, json.ToString());
             return true;
         });
+    }
+
+    /// <summary>
+    /// Takes the role and the settings a statement starts under, which other nodes run it under, since a function it
+    /// calls may change them as it runs.
+    /// </summary>
+    /// <returns>The role, and the settings as the queued message gives them.</returns>
+    internal static (uint Role, string Settings) Context()
+    {
+        StringBuilder json = new("{\"search_path\": ");
+        Executor.EscapeJson(json, Setting("search_path"));
+        json.Append(", \"settings\": {");
+        for (int i = 1; i < s_travelingSettings.Length; i++)
+        {
+            json.Append(i > 1 ? ", " : "");
+            Executor.EscapeJson(json, s_travelingSettings[i]);
+            json.Append(": ");
+            Executor.EscapeJson(json, Setting(s_travelingSettings[i]));
+        }
+
+        return (NativeMethods.GetUserId(), json.Append('}').ToString());
     }
 
     /// <summary>
@@ -211,7 +253,7 @@ internal static unsafe partial class DdlReplication
     /// nodes it would reach already have it.
     /// </summary>
     /// <returns>Whether it does.</returns>
-    internal static bool Restoring() => Setting("worf.subscription_schema_restore") is "true" or "on" or "1";
+    internal static bool Restoring() => SubscriptionSchemaRestore;
 
     private static string Setting(string name)
     {
@@ -252,8 +294,10 @@ internal static unsafe partial class DdlReplication
             return;
         }
 
+        // worf keeps the table in its sets for whoever's DDL created or changed it, who may have no rights on worf's
+        // schema.
         bool join = parsetree->type != NodeTag.T_AlterTableStmt || HasCommand((AlterTableStmt*)parsetree, AlterTableType.AT_SetLogged);
-        _ = WithSnapshot(() => Reconcile(reloid, join));
+        _ = WithSnapshot(() => Elevated.Run(() => Reconcile(reloid, join)));
     }
 
     private static bool Reconcile(uint reloid, bool join)
@@ -282,11 +326,11 @@ internal static unsafe partial class DdlReplication
                 if (sets.Count > 0 && IncludeDdlRepset)
                 {
                     sets.ForEach(set => ReplicationSet.ReplicationSetRemoveTable(set.Id, relid, false));
-                    PgLog.Notice($"table {name} is unlogged now, so it left its replication sets");
+                    WorfLog.Notice($"table {name} is unlogged now, so it left its replication sets");
                 }
                 else if (sets.Count > 0)
                 {
-                    PgLog.Warning($"table {name} is unlogged now, so its changes no longer replicate");
+                    WorfLog.Warning($"table {name} is unlogged now, so its changes no longer replicate");
                 }
 
                 continue;
@@ -364,7 +408,8 @@ internal static unsafe partial class DdlReplication
     }
 
     /// <summary>
-    /// Checks whether a relation is temporary, or one of worf's own.
+    /// Checks whether a relation is temporary, or one of worf's own, or an index on this node alone, which a concurrent
+    /// build or reindex that failed here left.
     /// </summary>
     private static bool StaysLocal(RangeVar* relation)
     {
@@ -389,7 +434,8 @@ internal static unsafe partial class DdlReplication
 
         uint reloid = NativeMethods.RangeVarGetRelidExtended(relation, 0, RangeVarMissingOk, default, null);
         return reloid != 0 &&
-            (NativeMethods.get_rel_persistence(reloid) == (sbyte)'t' || NativeMethods.get_rel_namespace(reloid) == WorfNamespace());
+            (NativeMethods.get_rel_persistence(reloid) == (sbyte)'t' || NativeMethods.get_rel_namespace(reloid) == WorfNamespace() ||
+                (NativeMethods.get_rel_relkind(reloid) == (sbyte)'i' && LocalIndex.Contains(reloid)));
     }
 
     /// <summary>
@@ -428,6 +474,19 @@ internal static unsafe partial class DdlReplication
                 return StaysLocal(((AlterObjectSchemaStmt*)parsetree)->relation);
             case NodeTag.T_AlterOwnerStmt:
                 return StaysLocal(((AlterOwnerStmt*)parsetree)->relation);
+            case NodeTag.T_AlterObjectDependsStmt:
+                return StaysLocal(((AlterObjectDependsStmt*)parsetree)->relation);
+            case NodeTag.T_CommentStmt:
+                CommentStmt* comment = (CommentStmt*)parsetree;
+                List* names = (List*)comment->@object;
+                return comment->objtype switch
+                {
+                    ObjectType.OBJECT_INDEX or ObjectType.OBJECT_TABLE or ObjectType.OBJECT_VIEW or ObjectType.OBJECT_MATVIEW or
+                        ObjectType.OBJECT_SEQUENCE or ObjectType.OBJECT_FOREIGN_TABLE => StaysLocal(NativeMethods.makeRangeVarFromNameList(names)),
+                    ObjectType.OBJECT_COLUMN => names->length > 1 &&
+                        StaysLocal(NativeMethods.makeRangeVarFromNameList(NativeMethods.list_truncate(NativeMethods.list_copy(names), names->length - 1))),
+                    _ => false,
+                };
             case NodeTag.T_GrantStmt:
                 GrantStmt* grant = (GrantStmt*)parsetree;
                 List* objects = grant->objects;
@@ -522,8 +581,18 @@ internal static unsafe partial class DdlReplication
                 return $"DROP {kind}{(stmt->concurrent ? " CONCURRENTLY" : "")}{(stmt->missing_ok ? " IF EXISTS" : "")} " +
                     $"{string.Join(", ", kept)}{(stmt->behavior == DropBehavior.DROP_CASCADE ? " CASCADE" : "")}";
 
+            // Any other object stays on this node when it's temporary.
             default:
-                return command;
+                int temporary = 0;
+                for (int i = 0; i < count; i++)
+                {
+                    temporary += TemporaryObjectUse.IsTemporaryTarget(stmt->removeType, (Node*)objects->elements[i].ptr_value) ? 1 : 0;
+                }
+
+                return temporary == 0 ? command
+                    : temporary == count ? null
+                    : throw new PgException("55000", "temporary objects can't be dropped together with other objects while worf.enable_ddl_replication is on",
+                        hint: "Drop them in a statement of their own.");
         }
     }
 
@@ -539,15 +608,18 @@ internal static unsafe partial class DdlReplication
     }
 
     /// <summary>
-    /// Checks whether ALTER TABLE finishes a concurrent detach.
-    /// </summary>
-    private static bool FinishesDetach(AlterTableStmt* stmt) => HasCommand(stmt, AlterTableType.AT_DetachPartitionFinalize);
-
-    /// <summary>
     /// Checks whether a name in a statement's list of names, a String node, is a given name.
     /// </summary>
     private static bool NameIs(Node* name, string expected)
         => name is not null && Worf.FromServer(NativeMethods.NameListToString(NativeMethods.lappend(null, name))) == expected;
+
+    /// <summary>
+    /// Checks whether objects of a type are the cluster's, or PostgreSQL's own replication's, rather than the
+    /// database's.
+    /// </summary>
+    private static bool IsClusterObject(ObjectType type)
+        => type is ObjectType.OBJECT_DATABASE or ObjectType.OBJECT_TABLESPACE or ObjectType.OBJECT_ROLE or
+            ObjectType.OBJECT_PARAMETER_ACL or ObjectType.OBJECT_PUBLICATION or ObjectType.OBJECT_SUBSCRIPTION;
 
     private static bool IsWorf(sbyte* name) => name is not null && Worf.FromServer(name) == Worf.ExtensionName;
 

@@ -7,6 +7,10 @@
     <RootNamespace>Worf</RootNamespace>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
+  <!-- PostgreSQL's pgsocket is a SOCKET on Windows, which the native bindings built there take. -->
+  <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
+    <DefineConstants>$(DefineConstants);WORF_WINDOWS</DefineConstants>
+  </PropertyGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="Worf.Tests" />
   </ItemGroup>
