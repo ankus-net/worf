@@ -4714,6 +4714,37 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// A participant's reservation for a load gets a block of all the values it asked for, though they are more than the
+    /// owner's largest size, which caps only next blocks: node_b, with sizes 100 and 1000, reserves 5,000 values and
+    /// loads them in its transaction from the one block.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task ParticipantsReserveWholeLoads()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database,
+            "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100, max_range_size := 1000)", token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+        _ = await nodeB.SafePsqlAsync(Database, """
+            BEGIN;
+            SELECT worf.reserve_sequence_range('t_id_seq', 5000);
+            INSERT INTO t (v) SELECT 'load' FROM generate_series(1, 5000);
+            COMMIT;
+            """, token);
+        Assert.AreEqual("5000", await nodeB.SafePsqlAsync(Database, "SELECT max(id) - min(id) + 1 FROM t WHERE v = 'load'", token),
+            "the span of node_b's load's ids, from the one block it reserved");
+    }
+
+    /// <summary>
     /// A subscriber that waits out an apply delay longer than the provider's wal_sender_timeout keeps its stream: it
     /// answers the walsender's requests for a reply as it reads ahead, and replies each status interval, so that the
     /// walsender doesn't end the stream, here over 30 seconds of a 40-second delay with wal_sender_timeout 10 s, and the

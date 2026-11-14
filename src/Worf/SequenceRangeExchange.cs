@@ -1219,7 +1219,7 @@ internal static class SequenceRangeExchange
             ORDER BY seqoid, block_id
             """, seqs, peer, SpiParameter.Create(fenced)), 5);
         parts.Add("requests", Worf.SelectCatalog("""
-            SELECT request_id, size, kind::text, lo, hi, seqoid::oid FROM worf.sequence_range_request
+            SELECT request_id, size, kind::text, lo, hi, seqoid::oid, reserved FROM worf.sequence_range_request
             WHERE seqoid = ANY ($1::pg_catalog.oid[]) AND parent_node = $2 AND state = 'open'
             ORDER BY seqoid, request_id
             """, seqs, peer), 5);
@@ -1361,6 +1361,11 @@ internal static class SequenceRangeExchange
             writer.WriteString("kind", request.Get<string>(2));
             WriteNullable(writer, "lo", request.Get<long?>(3));
             WriteNullable(writer, "hi", request.Get<long?>(4));
+            if (request.Get<bool>(6))
+            {
+                writer.WriteBoolean("reserved", true);
+            }
+
             writer.WriteEndObject();
         });
 
@@ -2858,10 +2863,12 @@ internal static class SequenceRangeExchange
         }
 
         // A next block is granted no larger than this node's largest size, as alter_sequence_range lowered it, though the
-        // node requested it before it heard.
+        // node requested it before it heard; a block reserved for a load, which a session waits for whole, is granted
+        // whole.
         string kind = request.TryGetProperty("kind", out JsonElement value) ? value.GetWorfString() ?? "n" : "n";
         long size = request.GetProperty("size").GetInt64();
-        if (kind == "n")
+        bool reserved = request.TryGetProperty("reserved", out JsonElement reservedFor) && reservedFor.ValueKind == JsonValueKind.True;
+        if (kind == "n" && !reserved)
         {
             size = Math.Min(size, range[0].Get<long>(3));
         }
