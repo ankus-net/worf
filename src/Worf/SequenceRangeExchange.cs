@@ -2258,9 +2258,10 @@ internal static class SequenceRangeExchange
         // quarter of worf.sequence_range_timeout at most, up to a second, while it holds no range row yet. Once it holds
         // the rows of sequences it took in, which it does until it commits, it waits for none, as a transaction holding
         // some range rows, as a configuration change of several sequences, would deadlock with it as it reaches those.
-        // While a session idle in its transaction holds rows of the ranges, as a configuration change left open does, no
-        // row is waited for, so that the turn isn't held up for those at every exchange, and once a wait has run out,
-        // none is in the rest of the message, so that the turn is held up for one wait a message at most.
+        // While a session idle in its transaction holds rows of the ranges, as a configuration change left open does,
+        // rather than having only read them, no row is waited for, so that the turn isn't held up for those at every
+        // exchange, and once a wait has run out, none is in the rest of the message, so that the turn is held up for one
+        // wait a message at most.
         int epoch = entry.GetProperty("epoch").GetInt32();
         uint owner = entry.GetProperty("owner_id").GetUInt32();
         WorfRows local;
@@ -2276,7 +2277,8 @@ internal static class SequenceRangeExchange
                 SELECT EXISTS (
                     SELECT 1 FROM pg_catalog.pg_locks l JOIN pg_catalog.pg_stat_activity a ON a.pid = l.pid
                     WHERE l.locktype = 'relation' AND l.database = (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())
-                        AND l.relation = 'worf.sequence_range'::pg_catalog.regclass AND l.granted AND a.state LIKE 'idle in transaction%')
+                        AND l.relation = 'worf.sequence_range'::pg_catalog.regclass AND l.granted AND l.mode <> 'AccessShareLock'
+                        AND a.state LIKE 'idle in transaction%')
                 """))
             {
                 _ = Worf.Execute($"SET LOCAL lock_timeout = {Math.Min(1000, SequenceRanges.ExchangeTimeout / 4).ToString(CultureInfo.InvariantCulture)}");

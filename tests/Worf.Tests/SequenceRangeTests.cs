@@ -4403,14 +4403,17 @@ public sealed partial class SequenceRangeTests
     /// which here comes half a second late, through a proxy that holds what the standby sends, while the inserts commit
     /// locally; and the inserts start as the subscriber's read-ahead of 90 MB of the owner's changes fills up, which reads
     /// no more of them, so that the word that comes in the stream can't reach it. A grant in one database makes only its
-    /// own database write the word: another database of the owner's that manages a sequence writes none.
+    /// own database write the word: another database of the owner's that manages a sequence writes none. A session idle
+    /// in a transaction that only read the ranges doesn't keep node_b's calls from waiting for the grants' rows.
     /// </summary>
-    /// <param name="how">The owner as it is, with a synchronous standby that answers late, writing 90 MB first, or with
-    /// its subscriber's apply waiting on a lock, without a delay.</param>
+    /// <param name="how">The owner as it is, with a synchronous standby that answers late, beside a session idle after
+    /// reading the ranges too, writing 90 MB first, or with its subscriber's apply waiting on a lock, without a
+    /// delay.</param>
     /// <returns>The test.</returns>
     [TestMethod]
     [DataRow("word")]
     [DataRow("synchronous")]
+    [DataRow("synchronous read")]
     [DataRow("busy")]
     [DataRow("behind")]
     public async Task OwnersDontWaitForDelayedSubscribers(string how)
@@ -4516,7 +4519,15 @@ public sealed partial class SequenceRangeTests
         // the rest of node_a's stream, the word among it, waits behind them.
         await using NpgsqlConnection locker = await nodeB.OpenAsync(Database, token);
         await using NpgsqlTransaction locking = await locker.BeginTransactionAsync(token);
-        using Process? standby = how == "synchronous" ? await StartStandbyAsync() : null;
+        using Process? standby = how.StartsWith("synchronous", StringComparison.Ordinal) ? await StartStandbyAsync() : null;
+        await using NpgsqlConnection reader = await nodeA.OpenAsync(Database, token);
+        await using NpgsqlTransaction reading = await reader.BeginTransactionAsync(token);
+        if (how == "synchronous read")
+        {
+            await using NpgsqlCommand read = new("SELECT count(*) FROM worf.sequence_ranges", reader, reading);
+            _ = await read.ExecuteScalarAsync(token);
+        }
+
         if (how is "busy" or "behind")
         {
             _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.replication_set_add_table('default', 'big')", token);
