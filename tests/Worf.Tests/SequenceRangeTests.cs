@@ -4068,7 +4068,8 @@ public sealed partial class SequenceRangeTests
     /// <summary>
     /// A PL/pgSQL statement counts down only the managed sequences its function draws from: after the transaction drew
     /// s1, and another session drew s1 into its block's last twentieth, which can't switch as its owner is down, a loop
-    /// that draws from a sequence no range manages, and a trigger that does, run at once, rather than wait for s1's switch.
+    /// that draws from a sequence no range manages, and a trigger that does, run at once, rather than wait for s1's switch,
+    /// and so do 100 statements that draw nothing.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -4125,7 +4126,8 @@ public sealed partial class SequenceRangeTests
             }
         }
 
-        // The transaction then runs the loop and the trigger, which draw from plain alone.
+        // The transaction then runs the loop and the trigger, which draw from plain alone, and statements that draw
+        // nothing.
         foreach (string statement in new[] { "SELECT f_plain_loop(1000)", "INSERT INTO pt (v) SELECT 'x' FROM generate_series(1, 1000)" })
         {
             await using NpgsqlCommand run = new($"SET LOCAL statement_timeout = '5s'; {statement}", connection, transaction);
@@ -4133,6 +4135,20 @@ public sealed partial class SequenceRangeTests
             _ = await run.ExecuteNonQueryAsync(token);
             Assert.IsLessThan(TimeSpan.FromSeconds(3), running.Elapsed, statement);
         }
+
+        await using (NpgsqlCommand nothing = new("SET LOCAL statement_timeout = '5s'", connection, transaction))
+        {
+            _ = await nothing.ExecuteNonQueryAsync(token);
+        }
+
+        Stopwatch selecting = Stopwatch.StartNew();
+        for (int i = 0; i < 100; i++)
+        {
+            await using NpgsqlCommand one = new("SELECT 1", connection, transaction);
+            _ = await one.ExecuteScalarAsync(token);
+        }
+
+        Assert.IsLessThan(TimeSpan.FromSeconds(3), selecting.Elapsed, "100 statements of SELECT 1 in the transaction");
 
         await transaction.CommitAsync(token);
     }

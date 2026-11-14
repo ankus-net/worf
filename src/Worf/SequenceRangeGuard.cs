@@ -546,7 +546,17 @@ internal static partial class SequenceRangeGuard
     /// <param name="written">The tables it writes to.</param>
     internal static unsafe void StartStatement(QueryDesc* queryDesc, List<uint> written)
     {
-        CountDownDraws();
+        // A statement counts down for the sequences its calls of nextval name, or every sequence the transaction draws
+        // from when one names none, and a statement with no such call, which draws nothing as it starts, for none.
+        if (s_drawingUngated.Count > 0 && queryDesc->plannedstmt is not null)
+        {
+            (HashSet<uint> called, int calls, bool unnamed) = Draws(PlanText((Node*)queryDesc->plannedstmt));
+            if (calls > 0 || unnamed)
+            {
+                CountDownDraws(1, unnamed ? null : called);
+            }
+        }
+
         GateStatement(queryDesc, written);
         PlannedStmt* statement = queryDesc->plannedstmt;
         if (queryDesc->snapshot is null || statement is null || statement->hasModifyingCTE)
