@@ -4799,6 +4799,40 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// worf's drop doesn't deadlock with its range worker, which checks the database's managed sequences as the drop
+    /// takes worf's tables, its configuration first: five times, a session draws 8 of a sequence's block of 10, so that
+    /// the worker's next check switches it, which reads the configuration, and takes the configuration's and then the
+    /// ranges' locks as the drop does, half a second apart, with no deadlock; worf is then dropped.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task WorfDropsBesideItsRangeWorker()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE TABLE busy (id bigserial PRIMARY KEY);
+            SELECT worf.enable_sequence_range('busy_id_seq', participants := '{}', range_size := 10, max_range_size := 10);
+            """, token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges", token), "busy_id_seq active");
+        int logpos = nodeA.ReadLog().Length;
+        for (int round = 0; round < 5; round++)
+        {
+            _ = await nodeA.SafePsqlAsync(Database, """
+                INSERT INTO busy SELECT FROM generate_series(1, 8);
+                BEGIN;
+                LOCK TABLE worf.local_node IN ACCESS EXCLUSIVE MODE;
+                SELECT pg_catalog.pg_sleep(0.5);
+                LOCK TABLE worf.sequence_range IN ACCESS EXCLUSIVE MODE;
+                ROLLBACK;
+                """, token);
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database, "DROP EXTENSION worf CASCADE", token);
+        Assert.DoesNotContain("deadlock detected", nodeA.ReadLog()[logpos..], "node_a's log");
+    }
+
+    /// <summary>
     /// A subscriber that waits out an apply delay longer than the provider's wal_sender_timeout keeps its stream: it
     /// answers the walsender's requests for a reply as it reads ahead, and replies each status interval, so that the
     /// walsender doesn't end the stream, here over 30 seconds of a 40-second delay with wal_sender_timeout 10 s, and the

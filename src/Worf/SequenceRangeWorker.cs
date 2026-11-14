@@ -50,7 +50,7 @@ internal static class SequenceRangeWorker
             wordsWritten = wanted;
             try
             {
-                PgBackgroundWorker.RunTransaction(static () =>
+                SequenceRanges.RunWorkerTransaction(static () =>
                 {
                     if (Worf.CatalogOid("sequence_range") != 0)
                     {
@@ -87,7 +87,7 @@ internal static class SequenceRangeWorker
             bool forgot = false;
             try
             {
-                forgot = look && PgBackgroundWorker.RunTransaction(() =>
+                forgot = look && SequenceRanges.RunWorkerTransaction(() =>
                     Worf.CatalogOid("sequence_range") != 0 && WorfNode.GetLocalNode(false, true) is not null && SequenceRanges.ForgetDropped());
             }
             catch (PgException error)
@@ -97,7 +97,7 @@ internal static class SequenceRangeWorker
 
             // Each sequence is checked in a transaction of its own, so that its locks are held no longer than its check,
             // which an exchange answered meanwhile may wait for.
-            (WorfLocalNode Node, List<uint> Sequences)? managed = PgBackgroundWorker.RunTransaction(() =>
+            (WorfLocalNode Node, List<uint> Sequences)? managed = SequenceRanges.RunWorkerTransaction(() =>
                 WorfNode.GetLocalNode(false, true) is WorfLocalNode node ? (node, Sequences()) : ((WorfLocalNode, List<uint>)?)null);
             bool changed = forgot;
             if (managed is (WorfLocalNode local, List<uint> sequences) && sequences.Count > 0)
@@ -108,7 +108,7 @@ internal static class SequenceRangeWorker
                     WorfLog.Log("sequence range worker managing sequences");
                 }
 
-                changed |= look && PgBackgroundWorker.RunTransaction(() => SequenceRanges.CheckIdentity(local));
+                changed |= look && SequenceRanges.RunWorkerTransaction(() => SequenceRanges.CheckIdentity(local));
                 // A sequence whose switch worker waits to switch it is left to that. Those that statements wait on go first,
                 // including those that statements begin to wait on during the tick, which go next, so that their switches
                 // wait for no other sequence's check, however many sequences a busy node takes long to check.
@@ -133,7 +133,7 @@ internal static class SequenceRangeWorker
 
                     try
                     {
-                        changed |= PgBackgroundWorker.RunTransaction(() =>
+                        changed |= SequenceRanges.RunWorkerTransaction(() =>
                         {
                             // The lock nextval takes keeps a switch from committing between the reads of the sequence's
                             // blocks and of its position. A sequence that a transaction holds against it waits for a later
@@ -207,7 +207,7 @@ internal static class SequenceRangeWorker
                     {
                         // A sequence dropped since the tick began, or whose range a transaction holds, goes with the next
                         // tick.
-                        if (error.SqlState != "55P03" && PgBackgroundWorker.RunTransaction(() => SequenceRanges.SequenceExists(seqoid)))
+                        if (error.SqlState != "55P03" && SequenceRanges.RunWorkerTransaction(() => SequenceRanges.SequenceExists(seqoid)))
                         {
                             WorfLog.Warning(new PgDiagnostic($"could not check managed sequence {seqoid}: {error.Message}") { Detail = error.Detail });
                         }
@@ -221,7 +221,7 @@ internal static class SequenceRangeWorker
                 // Snowflake IDs never pass the time reserved ahead, which backends see only once it is durable.
                 try
                 {
-                    PgBackgroundWorker.RunTransaction(SnowflakeIds.Reserve);
+                    SequenceRanges.RunWorkerTransaction(SnowflakeIds.Reserve);
                 }
                 catch (PgException error)
                 {
@@ -229,7 +229,7 @@ internal static class SequenceRangeWorker
                 }
 
                 // Requests are committed before the exchange worker sends them, including those that sessions handed over.
-                List<Guid> recorded = PgBackgroundWorker.RunTransaction(() => SequenceRangeReservations.Record(local));
+                List<Guid> recorded = SequenceRanges.RunWorkerTransaction(() => SequenceRangeReservations.Record(local));
                 SequenceRangeReservations.Forget(recorded);
                 changed |= recorded.Count > 0;
             }
@@ -243,7 +243,7 @@ internal static class SequenceRangeWorker
 
             // Once the database manages no sequence, this worker watches the exchange worker until it is done.
             bool exchanging = managed is not null && SequenceRangeExchangeWorker.Watch();
-            if (managed is null || (!exchanging && PgBackgroundWorker.RunTransaction(Sequences).Count == 0))
+            if (managed is null || (!exchanging && SequenceRanges.RunWorkerTransaction(Sequences).Count == 0))
             {
                 if (managedAny)
                 {
@@ -288,7 +288,7 @@ internal static class SequenceRangeWorker
 
         try
         {
-            return PgBackgroundWorker.RunTransaction(() =>
+            return SequenceRanges.RunWorkerTransaction(() =>
             {
                 HashSet<uint> resting = [];
                 foreach ((uint seqoid, long? position) in candidates)

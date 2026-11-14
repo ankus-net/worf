@@ -27,7 +27,7 @@ internal static class SequenceRangeSwitchWorker
             Worker.ProcessConfigReload();
             try
             {
-                if (PgBackgroundWorker.RunTransaction(() => SequenceRanges.SwitchAtEnd(seqoid, movedIn: movedIn)))
+                if (SequenceRanges.RunWorkerTransaction(() => SequenceRanges.SwitchAtEnd(seqoid, movedIn: movedIn)))
                 {
                     break;
                 }

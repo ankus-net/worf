@@ -3085,6 +3085,42 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
+    /// Runs a range worker's transaction with worf's configuration table locked first, as a drop of worf locks it before
+    /// the ranges, so that the worker waits on such a drop holding none of the tables the drop waits for.
+    /// </summary>
+    /// <typeparam name="T">The result's type.</typeparam>
+    /// <param name="work">The transaction's work.</param>
+    /// <returns>The result.</returns>
+    internal static T RunWorkerTransaction<T>(Func<T> work) => PgBackgroundWorker.RunTransaction(() =>
+    {
+        LockConfiguration();
+        return work();
+    });
+
+    /// <summary>
+    /// Runs a range worker's transaction with worf's configuration table locked first, as <see cref="RunWorkerTransaction{T}"/>
+    /// does.
+    /// </summary>
+    /// <param name="work">The transaction's work.</param>
+    internal static void RunWorkerTransaction(Action work) => PgBackgroundWorker.RunTransaction(() =>
+    {
+        LockConfiguration();
+        work();
+    });
+
+    private static void LockConfiguration()
+    {
+        uint localNode = Worf.CatalogOid("local_node");
+        if (localNode != 0)
+        {
+            unsafe
+            {
+                NativeMethods.LockRelationOid(localNode, (int)PgLockMode.AccessShare);
+            }
+        }
+    }
+
+    /// <summary>
     /// Has the range worker check a sequence in full at once, or only wakes it, given none.
     /// </summary>
     /// <param name="seqoid">The sequence, or null.</param>
@@ -4550,7 +4586,7 @@ internal static unsafe partial class SequenceRanges
             bool done;
             try
             {
-                done = PgBackgroundWorker.RunTransaction(() => SwitchAtEnd(seqoid, true, MovedIn(seqoid)));
+                done = RunWorkerTransaction(() => SwitchAtEnd(seqoid, true, MovedIn(seqoid)));
             }
             catch (PgException error) when (error.SqlState is "55P03" or "40P01")
             {
@@ -4565,7 +4601,7 @@ internal static unsafe partial class SequenceRanges
                 try
                 {
                     LedgerNoWait = true;
-                    if (PgBackgroundWorker.RunTransaction(() => Replenish(seqoid, node, peak(seqoid))))
+                    if (RunWorkerTransaction(() => Replenish(seqoid, node, peak(seqoid))))
                     {
                         Changed();
                         SequenceRangeExchangeWorker.Wake();
