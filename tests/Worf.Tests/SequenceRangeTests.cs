@@ -4036,7 +4036,9 @@ public sealed partial class SequenceRangeTests
     /// worf's apply waits for a grantor only for the triggers that fire as it applies, which run as a replica's: after
     /// node_b restarts with node_a, its grantor, down, a row of x, whose autoinc trigger is enabled ORIGIN, and an update
     /// of z, whose ALWAYS autoinc trigger fires on insert alone, apply at once, while a row of y, whose ALWAYS trigger fires
-    /// on insert, waits for node_a; and a local insert into w, whose autoinc trigger is enabled REPLICA, runs at once.
+    /// on insert, waits for node_a, and so does a row of u that conflicts with node_b's own and is applied as an update,
+    /// whose ALWAYS autoinc trigger fires on update alone; and a local insert into w, whose autoinc trigger is enabled
+    /// REPLICA, runs at once.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -4051,7 +4053,7 @@ public sealed partial class SequenceRangeTests
             _ = await node.SafePsqlAsync(Database, """
                 CREATE TABLE t (id bigserial PRIMARY KEY, v text);
                 CREATE TABLE x (k int PRIMARY KEY, id int); CREATE TABLE y (k int PRIMARY KEY, id int); CREATE TABLE z (k int PRIMARY KEY, id int, v text);
-                CREATE TABLE w (k int PRIMARY KEY, id int);
+                CREATE TABLE w (k int PRIMARY KEY, id int); CREATE TABLE u (k int PRIMARY KEY, id int, v text);
                 """, token);
         }
 
@@ -4064,10 +4066,13 @@ public sealed partial class SequenceRangeTests
             ALTER TABLE z ENABLE ALWAYS TRIGGER z_id;
             CREATE TRIGGER w_id BEFORE INSERT ON w FOR EACH ROW EXECUTE FUNCTION autoinc(id, t_id_seq);
             ALTER TABLE w ENABLE REPLICA TRIGGER w_id;
+            CREATE TRIGGER u_id BEFORE UPDATE ON u FOR EACH ROW EXECUTE FUNCTION autoinc(id, t_id_seq);
+            ALTER TABLE u ENABLE ALWAYS TRIGGER u_id;
+            INSERT INTO u VALUES (1, NULL, 'node_b');
             """, token);
         _ = await nodeC.SafePsqlAsync(Database, """
             SELECT worf.replication_set_add_table('default', 'x'); SELECT worf.replication_set_add_table('default', 'y');
-            SELECT worf.replication_set_add_table('default', 'z');
+            SELECT worf.replication_set_add_table('default', 'z'); SELECT worf.replication_set_add_table('default', 'u');
             """, token);
         await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
         await SubscribeAsync(nodeB, "b_from_c", nodeC, token);
@@ -4080,7 +4085,7 @@ public sealed partial class SequenceRangeTests
         await nodeA.StopAsync("fast", token);
         await nodeB.StopAsync("fast", token);
         await nodeB.StartServerAsync(token);
-        foreach (string write in new[] { "INSERT INTO x VALUES (1, NULL)", "UPDATE z SET v = 'after' WHERE k = 1", "INSERT INTO y VALUES (1, NULL)" })
+        foreach (string write in new[] { "INSERT INTO x VALUES (1, NULL)", "UPDATE z SET v = 'after' WHERE k = 1", "INSERT INTO u VALUES (1, NULL, 'node_c')", "INSERT INTO y VALUES (1, NULL)" })
         {
             _ = await nodeC.SafePsqlAsync(Database, write, token);
         }
@@ -4095,8 +4100,10 @@ public sealed partial class SequenceRangeTests
 
         await Task.Delay(TimeSpan.FromSeconds(3), token);
         Assert.AreEqual("0", await nodeB.SafePsqlAsync(Database, "SELECT count(*) FROM y", token), "the rows of y node_b applied while node_a was down");
+        Assert.AreEqual("node_b|t", await nodeB.SafePsqlAsync(Database, "SELECT v, id IS NULL FROM u", token), "u's row on node_b while node_a was down");
         await nodeA.StartServerAsync(token);
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT count(*) = 1 FROM y WHERE id IS NOT NULL", token), "node_b's apply of y's row once node_a is back");
+        Assert.AreEqual("node_c|f", await nodeB.SafePsqlAsync(Database, "SELECT v, id IS NULL FROM u", token), "u's row on node_b once node_a is back");
     }
 
     /// <summary>
