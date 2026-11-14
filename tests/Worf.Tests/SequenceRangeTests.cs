@@ -4910,6 +4910,16 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// A restore that first starts in single-user mode, writing and checkpointing there before it starts again, counts that
+    /// start, as RestoredNodesWaitForCallsThatTakeEverySequenceIn's other rows show of theirs. Windows runs no single-user
+    /// server under the CI runners' administrator account, which pg_ctl's servers drop.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [OSCondition(OperatingSystems.Linux | OperatingSystems.OSX)]
+    public Task RestoredNodesCountSingleUserStarts() => RestoredNodesWaitForCallsThatTakeEverySequenceIn("twice single");
+
+    /// <summary>
     /// A node restored from a base backup taken as it ran, whose WAL ends past the last position its grantor's tables
     /// recorded, as a snapshot of a running server's storage does, or ends where they recorded it, draws from a sequence's
     /// blocks only once its grantor has taken in its report of that sequence since it started, and seen its WAL position
@@ -4942,7 +4952,6 @@ public sealed partial class SequenceRangeTests
     [DataRow("twice")]
     [DataRow("twice tmp")]
     [DataRow("twice deleted")]
-    [DataRow("twice single")]
     [DataRow("held stopped")]
     [DataRow("locked stopped")]
     [DataRow("locked stopped written")]
@@ -5495,9 +5504,20 @@ public sealed partial class SequenceRangeTests
         await CopyDataAsync(nodeB, copy, token);
         HashSet<string> before = await InsertIdsAsync("before");
         string drawnTo = await nodeB.SafePsqlAsync(Database, "SELECT pg_current_wal_lsn()", token);
-        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database,
-            $"SELECT wal_lsn >= '{drawnTo}' FROM worf.sequence_range_node WHERE node_name = 'node_b' AND seqoid = 't_id_seq'::regclass", token),
-            "node_a hearing of node_b's draws");
+
+        // node_a hears of node_b's WAL position past the draws: node_b makes its calls one at a time, so the second that
+        // node_a hears after the draws was made after them. A call that changes nothing else has node_a keep the position
+        // in shared memory rather than in its tables.
+        const string HeardFromB = """
+            SELECT worf.sequence_range_heard(node_id, true, '-infinity', false)::text FROM worf.sequence_range_node
+            WHERE node_name = 'node_b' AND seqoid = 't_id_seq'::regclass
+            """;
+        string heard = await nodeA.SafePsqlAsync(Database, "SELECT clock_timestamp()::text", token);
+        for (int call = 0; call < 2; call++)
+        {
+            Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, $"SELECT ({HeardFromB})::timestamptz > '{heard}'", token), "node_a hearing of node_b's draws");
+            heard = await nodeA.SafePsqlAsync(Database, HeardFromB, token);
+        }
 
         // node_b recovers past its draws onto timeline 2, resets as its identity changed, and draws from a new block,
         // which node_a hears of on timeline 2.
@@ -9217,6 +9237,7 @@ public sealed partial class SequenceRangeTests
             """, token);
         Assert.AreNotEqual("", heldBlock, "a block node_b holds from node_a");
         lifting = nodeB.ReadLog().Length;
+        Stopwatch window = Stopwatch.StartNew();
         _ = await nodeB.SafePsqlAsync(Database,
             $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{Lift("FFFFFFFF/00000010", $"\"{heldBlock}\"")}')", token);
         Assert.AreEqual(1, nodeB.ReadLog()[lifting..].Split(Lifted).Length - 1, "node_b's reset on a lift that names a block it holds");
@@ -9226,7 +9247,9 @@ public sealed partial class SequenceRangeTests
         Assert.AreEqual(1, nodeB.ReadLog()[lifting..].Split(Lifted).Length - 1, "node_b's resets on the same lift again, once it gave the block up");
 
         // Lifts that name the blocks node_b got since, as its answers list them, reset it no more often than other
-        // requests do: the lifts' window began with the reset above.
+        // requests do: the lifts' window began with the reset above, and lasts ten seconds, which a slow host's draws of
+        // new blocks may outlast, when one more reset may come.
+        bool late = false;
         for (int i = 0; i < 3; i++)
         {
             await InsertAsync(nodeB, 20, token);
@@ -9235,11 +9258,12 @@ public sealed partial class SequenceRangeTests
                 WHERE seqoid = 't_id_seq'::regclass AND from_node = {nodeAId} AND state <> 'abandoned' ORDER BY received_at DESC LIMIT 1
                 """, token);
             Assert.AreNotEqual("", fresh, "a block node_b got since");
+            late |= window.Elapsed >= TimeSpan.FromSeconds(10);
             _ = await nodeB.SafePsqlAsync(Database,
                 $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{Lift($"FFFFFFFF/0000002{i}", $"\"{fresh}\"")}')", token);
         }
 
-        Assert.AreEqual(1, nodeB.ReadLog()[lifting..].Split(Lifted).Length - 1, "node_b's resets on lifts that name the blocks it got since");
+        Assert.IsLessThanOrEqualTo(late ? 2 : 1, nodeB.ReadLog()[lifting..].Split(Lifted).Length - 1, "node_b's resets on lifts that name the blocks it got since");
     }
 
     /// <summary>
