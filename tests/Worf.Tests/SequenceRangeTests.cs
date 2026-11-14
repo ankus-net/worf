@@ -3094,11 +3094,12 @@ public sealed partial class SequenceRangeTests
     /// rows a configuration change of six sequences left open holds, rather than wait on them, which would deadlock with
     /// the change as it reaches the rows the exchange took in; a forced lift on node_a waits for a configuration change or
     /// a drop left open, and for a drop under way, before it takes the turn rather than holding it, and so doesn't deadlock
-    /// with the drop; a drop canceled in the turn lets it go; sessions' own advisory locks, of whatever key, are never
-    /// worf's; and a drop left open whose deletes a reply's take-in would wait for, or a fence's lift in the range worker,
-    /// holds up neither the turn nor the worker, so that node_a's own inserts, which switch blocks of 10, go on too. The
-    /// rows run alone: their 24 servers would take most of the 32 System V shared memory segments macOS allows beside
-    /// other tests', and node_b's draws wait on how fast the exchanges of four nodes supply blocks.
+    /// with the drop; a drop canceled in the turn lets it go, and one that waits for a report another session holds lets it
+    /// go as it waits; sessions' own advisory locks, of whatever key, are never worf's; and a drop left open whose deletes
+    /// a reply's take-in would wait for, or a fence's lift in the range worker, holds up neither the turn nor the worker,
+    /// so that node_a's own inserts, which switch blocks of 10, go on too. The rows run alone: their 24 servers would take
+    /// most of the 32 System V shared memory segments macOS allows beside other tests', and node_b's draws wait on how fast
+    /// the exchanges of four nodes supply blocks.
     /// </summary>
     /// <param name="how">What holds, or would hold, the turn.</param>
     /// <returns>The test.</returns>
@@ -3109,6 +3110,7 @@ public sealed partial class SequenceRangeTests
     [DataRow("drop open")]
     [DataRow("lift during drop")]
     [DataRow("canceled drop")]
+    [DataRow("waiting drop")]
     [DataRow("advisory keys")]
     [DataRow("fence beside drop")]
     public async Task TurnsWaitOnNoSession(string how)
@@ -3230,8 +3232,8 @@ public sealed partial class SequenceRangeTests
 
             case "canceled drop":
             {
-                // A report node_c relayed of u_id_seq, which no exchange takes in, is held as the drop forgets node_c in the
-                // turn, until statement_timeout cancels it.
+                // A report node_c relayed of u_id_seq, which no exchange takes in, is held as the drop forgets node_c, which
+                // tries again until statement_timeout cancels it.
                 _ = await nodeA.SafePsqlAsync(Database, $"""
                     INSERT INTO worf.sequence_range_node (seqoid, node_id, node_name, via_node, reported_at)
                     VALUES ('u_id_seq'::regclass, 2000002, 'relayed_by_c', {nodeCId}, now())
@@ -3251,6 +3253,23 @@ public sealed partial class SequenceRangeTests
                 }
 
                 Assert.AreEqual("", await InsertAsync(nodeB, "t"), "node_b's inserts after the canceled drop");
+                break;
+            }
+
+            case "waiting drop":
+            {
+                // A report node_c relayed of u_id_seq is held as the drop forgets node_c, which waits for it, letting the
+                // turn go meanwhile, until the holder ends.
+                _ = await nodeA.SafePsqlAsync(Database, $"""
+                    INSERT INTO worf.sequence_range_node (seqoid, node_id, node_name, via_node, reported_at)
+                    VALUES ('u_id_seq'::regclass, 2000002, 'relayed_by_c', {nodeCId}, now())
+                    """, token);
+                await HoldAsync($"SELECT 1 FROM worf.sequence_range_node WHERE seqoid = 'u_id_seq'::regclass AND via_node = {nodeCId} FOR UPDATE");
+                Task<string> drop = nodeA.SafePsqlAsync(Database, "SET statement_timeout = '25s'; SELECT worf.drop_subscription('a_from_c')", token);
+                Assert.AreEqual("", await InsertAsync(nodeB, "t"), "node_b's inserts as the drop waits for the held report");
+                Assert.IsFalse(drop.IsCompleted, "the drop, waiting for the held report");
+                await holding.CommitAsync(token);
+                _ = await drop;
                 break;
             }
 

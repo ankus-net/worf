@@ -568,7 +568,27 @@ internal static class Functions
             // take-in to commit first, as one exchange does for another; one that comes later finds the subscription
             // held, or gone. The turn is taken last, after the calls to the provider above, so that no node holds its
             // turn while it waits on another, and let go once the deletes are done, rather than as the transaction ends.
-            SequenceRangeExchange.WithTurn(() => SequenceRanges.ForgetNeighbor(sub.Origin.Id));
+            // A report another session holds, as one that locked it and stays open, has the deletes wait for no more than
+            // a moment in the turn: they're tried again after a tenth of a second, the turn let go meanwhile, so that the
+            // node's exchanges go on while the drop waits.
+            uint origin = sub.Origin.Id;
+            while (true)
+            {
+                try
+                {
+                    PgTransaction.RunInSubtransaction(() => SequenceRangeExchange.WithTurn(() => _ = SequenceRangeExchange.WithLockTimeout(() =>
+                    {
+                        SequenceRanges.ForgetNeighbor(origin);
+                        return true;
+                    })));
+                    break;
+                }
+                catch (PgException held) when (held.SqlState == "55P03")
+                {
+                    Worker.WaitLatch(100);
+                    PgInterrupts.Check();
+                }
+            }
         }
 
         return BoolDatum(sub is not null);
