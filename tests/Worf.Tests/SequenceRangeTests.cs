@@ -3132,15 +3132,26 @@ public sealed partial class SequenceRangeTests
     /// <returns>The test.</returns>
     [TestMethod]
     [DoNotParallelize]
-    [OSCondition(OperatingSystems.Linux | OperatingSystems.OSX)]
     [DataRow("configuration open")]
     [DataRow("drop open")]
-    [DataRow("lift during drop")]
     [DataRow("canceled drop")]
     [DataRow("waiting drop")]
     [DataRow("advisory keys")]
     [DataRow("fence beside drop")]
-    public async Task TurnsWaitOnNoSession(string how)
+    public Task TurnsWaitOnNoSession(string how) => TurnsWaitOnNoSessionAsync(how);
+
+    /// <summary>
+    /// A forced lift on node_a waits for a drop under way, which waits on node_d, paused, before it takes the turn, rather
+    /// than holding it, and so doesn't deadlock with the drop, as <see cref="TurnsWaitOnNoSession"/> runs it, where a
+    /// process can be paused.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [DoNotParallelize]
+    [OSCondition(OperatingSystems.Linux | OperatingSystems.OSX)]
+    public Task TurnsWaitOnNoSessionBesideAPausedDrop() => TurnsWaitOnNoSessionAsync("lift during drop");
+
+    private async Task TurnsWaitOnNoSessionAsync(string how)
     {
         CancellationToken token = TestContext.CancellationToken;
         await using TestNode nodeA = await StartNodeAsync("node_a", token);
@@ -4744,13 +4755,13 @@ public sealed partial class SequenceRangeTests
 
     /// <summary>
     /// An owner's draws after it restarts wait for each node that calls it to answer since, up to twice
-    /// worf.sequence_range_timeout, here ten seconds: node_b, whose call and probe ran out of time as node_a hung before
+    /// worf.sequence_range_timeout, here ten seconds: node_b, whose calls and probe ran out of time as node_a hung before
     /// it restarted, calls it as its replication stream from node_a starts again, rather than only once its retry,
-    /// twenty seconds after the probe ran out, is due.
+    /// twenty seconds after the third ran out, is due. node_b reaches node_a through a relay, which hangs as a paused
+    /// server would.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
-    [OSCondition(OperatingSystems.Linux | OperatingSystems.OSX)]
     public async Task RestartedOwnersAskTheirCallersToCall()
     {
         CancellationToken token = TestContext.CancellationToken;
@@ -4761,29 +4772,25 @@ public sealed partial class SequenceRangeTests
             _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
         }
 
-        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        await using ProviderRelay relay = new(nodeA.Cluster.Port);
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token,
+            providerDsn: $"host=127.0.0.1 port={relay.Port.ToString(CultureInfo.InvariantCulture)} dbname={Database} user={SuperUser}");
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100)", token);
         await WaitActiveAsync([nodeA, nodeB], token);
         await InsertAsync(nodeA, 10, token);
         await InsertAsync(nodeB, 10, token);
 
-        // node_b's call and the probe after it run out of time, so that its next call waits twenty seconds.
+        // node_b's calls and the probe between them run out of time, so that its next call waits twenty seconds.
         int logpos = nodeB.ReadLog().Length;
-        await SuspendAsync(nodeA, true, token);
-        try
+        relay.Hang();
+        Stopwatch hanging = Stopwatch.StartNew();
+        while (nodeB.ReadLog()[logpos..].Split("node node_a didn't answer within 5000 ms").Length < 4)
         {
-            Stopwatch hanging = Stopwatch.StartNew();
-            while (nodeB.ReadLog()[logpos..].Split("node node_a didn't answer within 5000 ms").Length < 3)
-            {
-                Assert.IsLessThan(TestNode.PollTimeout, hanging.Elapsed, "node_b's call and probe running out of time");
-                await Task.Delay(TimeSpan.FromMilliseconds(100), token);
-            }
-        }
-        finally
-        {
-            await SuspendAsync(nodeA, false, CancellationToken.None);
+            Assert.IsLessThan(TestNode.PollTimeout, hanging.Elapsed, "node_b's call and probe running out of time");
+            await Task.Delay(TimeSpan.FromMilliseconds(100), token);
         }
 
+        relay.Pass();
         await nodeA.StopAsync("fast", token);
         await nodeA.StartServerAsync(token);
         await using NpgsqlConnection writer = await nodeA.OpenAsync(Database, token);
@@ -5997,13 +6004,21 @@ public sealed partial class SequenceRangeTests
     /// keeps running and keeps the start, writing the file in place or anew, and the node's inserts go on, though a file
     /// that lost the starts before has its neighbors take the positions they heard of before as gone back.
     /// </summary>
-    /// <param name="how">The file mode 000, or worf_starts.tmp a directory.</param>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public Task UnusableStartFilesStopNothing() => StartFileStopsNothingAsync("tmp directory");
+
+    /// <summary>
+    /// A node whose file of starts has mode 000 starts as <see cref="UnusableStartFilesStopNothing"/> has it, where files
+    /// have Unix modes.
+    /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
     [OSCondition(OperatingSystems.Linux | OperatingSystems.OSX)]
-    [DataRow("unreadable")]
-    [DataRow("tmp directory")]
-    public async Task UnusableStartFilesStopNothing(string how)
+    public Task UnreadableStartFilesStopNothing() => StartFileStopsNothingAsync("unreadable");
+
+    // Runs a node whose file of starts has mode 000, or whose worf_starts.tmp is a directory, as it starts.
+    private async Task StartFileStopsNothingAsync(string how)
     {
         CancellationToken token = TestContext.CancellationToken;
         await using TestNode nodeA = await StartNodeAsync("node_a", token);
@@ -9468,12 +9483,12 @@ public sealed partial class SequenceRangeTests
     }
 
     private static async Task SubscribeAsync(TestNode subscriber, string name, TestNode provider, CancellationToken token,
-        string database = Database, string applyDelay = "0")
+        string database = Database, string applyDelay = "0", string? providerDsn = null)
     {
         _ = await subscriber.SafePsqlAsync(database, $$"""
             SELECT worf.create_subscription(
                 subscription_name := '{{name}}',
-                provider_dsn := '{{provider.Dsn(Database, SuperUser)}}',
+                provider_dsn := '{{providerDsn ?? provider.Dsn(Database, SuperUser)}}',
                 synchronize_structure := false,
                 synchronize_data := false,
                 forward_origins := '{}',

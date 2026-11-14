@@ -13,8 +13,9 @@ namespace Worf.Tests;
 /// disconnects, so that the tool's next connection to the provider waits however the test process is scheduled, and
 /// hold every query after a connection's first, so that a connection is made and set up but its calls are never
 /// answered, or stop reading a connection once its first query has passed, with a small receive buffer, so that a large
-/// query after it fills what the sockets hold and its client's writes wait. It keeps the text of the queries it passes. A
-/// connection that asks for SSL or GSS encryption is told the relay has none.
+/// query after it fills what the sockets hold and its client's writes wait; or hang, as a server paused would, passing
+/// nothing more on the connections it has and holding new ones, until it passes again. It keeps the text of the queries it
+/// passes. A connection that asks for SSL or GSS encryption is told the relay has none.
 /// </summary>
 internal sealed class ProviderRelay : IAsyncDisposable
 {
@@ -29,7 +30,8 @@ internal sealed class ProviderRelay : IAsyncDisposable
     private readonly bool _holdCalls;
     private readonly bool _stall;
     private readonly CancellationTokenSource _stop = new();
-    private readonly CancellationTokenSource _held = new();
+    private CancellationTokenSource _held = new();
+    private CancellationTokenSource _hang = new();
     private readonly List<TcpClient> _clients = [];
     private readonly Task _accepting;
     private volatile bool _holding;
@@ -83,12 +85,26 @@ internal sealed class ProviderRelay : IAsyncDisposable
     internal ConcurrentQueue<string> Queries { get; } = new();
 
     /// <summary>
-    /// Stops holding connections, closing those it held, and passes the ones made from now on.
+    /// Stops holding connections and hanging, closing the connections it held or hung, and passes the ones made from now
+    /// on.
     /// </summary>
     internal void Pass()
     {
+        CancellationTokenSource held = _held;
+        _hang = new();
+        _held = new();
         _holding = false;
-        _held.Cancel();
+        held.Cancel();
+    }
+
+    /// <summary>
+    /// Hangs, as a server paused would: the connections it has pass nothing more, though they stay open, and those made
+    /// from now on are held, until <see cref="Pass"/> closes them all.
+    /// </summary>
+    internal void Hang()
+    {
+        _holding = true;
+        _hang.Cancel();
     }
 
     /// <inheritdoc/>
@@ -115,6 +131,7 @@ internal sealed class ProviderRelay : IAsyncDisposable
 
         _stop.Dispose();
         _held.Dispose();
+        _hang.Dispose();
     }
 
     private static async Task<byte[]> ReadExactlyAsync(NetworkStream stream, int count, CancellationToken token)
@@ -187,10 +204,12 @@ internal sealed class ProviderRelay : IAsyncDisposable
         {
             using (near)
             {
+                CancellationToken passing = _held.Token;
+                CancellationToken hanging = _hang.Token;
                 if (_holding)
                 {
                     // Held connections close once the relay passes connections again.
-                    using CancellationTokenSource held = CancellationTokenSource.CreateLinkedTokenSource(token, _held.Token);
+                    using CancellationTokenSource held = CancellationTokenSource.CreateLinkedTokenSource(token, passing);
                     _ = Held.TrySetResult();
                     await Task.Delay(Timeout.Infinite, held.Token);
                 }
@@ -203,9 +222,17 @@ internal sealed class ProviderRelay : IAsyncDisposable
                 await far.ConnectAsync(IPAddress.Loopback, _target, token);
                 NetworkStream server = far.GetStream();
                 await server.WriteAsync(startup, token);
-                Task up = walreceiver ? PumpAsync(client, server, token) : PassQueriesAsync(client, server, token);
-                Task down = walreceiver && _holdWal ? PassUntilReplicationAsync(server, client, token) : PumpAsync(server, client, token);
+
+                // A link that hangs stops passing, and stays open until the relay passes connections again.
+                using CancellationTokenSource pumping = CancellationTokenSource.CreateLinkedTokenSource(token, hanging);
+                Task up = walreceiver ? PumpAsync(client, server, pumping.Token) : PassQueriesAsync(client, server, pumping.Token);
+                Task down = walreceiver && _holdWal ? PassUntilReplicationAsync(server, client, pumping.Token) : PumpAsync(server, client, pumping.Token);
                 _ = await Task.WhenAny(up, down);
+                if (hanging.IsCancellationRequested && !token.IsCancellationRequested)
+                {
+                    using CancellationTokenSource hung = CancellationTokenSource.CreateLinkedTokenSource(token, passing);
+                    await Task.Delay(Timeout.Infinite, hung.Token);
+                }
             }
         }
         catch (Exception error) when (error is IOException or SocketException or OperationCanceledException or ObjectDisposedException or EndOfStreamException)
