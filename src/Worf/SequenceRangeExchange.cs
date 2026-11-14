@@ -1605,13 +1605,14 @@ internal static class SequenceRangeExchange
         }
 
         // A message carries every sequence its node manages, and an owner's dropped epochs, so a sequence the neighbor
-        // doesn't own and no longer carries, as once it dropped its copy, it no longer manages: its report goes, and those
-        // it relayed of the sequence, so that neither this node's start nor a fence waits for it, which has nothing left to
-        // say of this node's draws. Rows another transaction holds go with a later message.
+        // doesn't own and no longer carries, as once it dropped its copy, it no longer manages: its report goes, those it
+        // relayed of the sequence, and those other neighbors relayed of it, so that neither this node's start nor a fence
+        // waits for it, which has nothing left to say of this node's draws. Rows another transaction holds go with a later
+        // message.
         SpiParameter carriedNow = SpiParameter.Create(carriedSequences.Select(seqoid => (long)seqoid).ToArray());
         const string NoLongerCarried = """
             FROM worf.sequence_range_node n
-            WHERE n.via_node = $1 AND NOT (n.seqoid::pg_catalog.int8 = ANY ($2))
+            WHERE (n.via_node = $1 OR n.node_id = $1) AND NOT (n.seqoid::pg_catalog.int8 = ANY ($2))
                 AND EXISTS (SELECT 1 FROM worf.sequence_range r WHERE r.seqoid = n.seqoid AND r.owner_node IS DISTINCT FROM $1)
             """;
         if (Worf.ReadScalar<bool>($"SELECT EXISTS (SELECT 1 {NoLongerCarried})", SpiParameter.Create(senderId), carriedNow))
@@ -2702,6 +2703,16 @@ internal static class SequenceRangeExchange
                 if (row.Get<long>(0) > row.Get<long>(1))
                 {
                     still.Add(reported);
+                    continue;
+                }
+
+                // A report of a node this node has heard from itself since the node made it, with no report of the
+                // sequence of its own then, is one the node no longer stands by, as once it dropped the sequence, which
+                // neighbors that relay each other's copy would otherwise pass back and forth as long as they run.
+                if (row.Get<long>(0) == 0 && report.TryGetProperty("reported_at", out JsonElement made) && made.ValueKind == JsonValueKind.Number &&
+                    Worf.ReadScalar<bool>("SELECT worf.sequence_range_heard($1, true, '-infinity', false) > pg_catalog.to_timestamp($2)",
+                        SpiParameter.Create(reported), SpiParameter.Create(made.GetDouble())))
+                {
                     continue;
                 }
 

@@ -4958,7 +4958,8 @@ public sealed partial class SequenceRangeTests
     /// A neighbor that drops its copy of a sequence's table, and so stops carrying the sequence, holds no restarted node's
     /// draws up: node_c, a participant that node_b subscribes to and that calls node_a, drops t, and node_b and node_a,
     /// each restarted with nothing restored, insert within a few seconds, rather than wait for node_c to check their
-    /// reports of a sequence it no longer has.
+    /// reports of a sequence it no longer has; though node_b hears node_c's old report relayed by node_a, which node_c
+    /// can't reach as it drops t, after node_c's own message went without it, and node_a relays it until node_c is back.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -4983,9 +4984,30 @@ public sealed partial class SequenceRangeTests
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
             "SELECT EXISTS (SELECT 1 FROM worf.sequence_range_node WHERE node_name = 'node_c' AND seqoid = 't_id_seq'::regclass)", token), "node_c's report on node_b");
 
+        // node_c drops t while it can't reach node_a, which goes on relaying node_c's report to node_b after node_b took
+        // in node_c's message without t.
+        string ToNodeA(string dsn) => $"""
+            UPDATE worf.node_interface SET if_dsn = '{dsn}' WHERE if_nodeid = (SELECT node_id FROM worf.node WHERE node_name = 'node_a')
+            """;
+        int unreached = nodeC.ReadLog().Length;
+        _ = await nodeC.SafePsqlAsync(Database, ToNodeA($"host=127.0.0.1 port=1 dbname={Database} user={SuperUser}"), token);
+        Assert.IsTrue(await nodeC.PollLogAsync(unreached, "exchange with node node_a failed", token), "node_c's call to node_a, which it can't reach");
         _ = await nodeC.SafePsqlAsync(Database, "DROP TABLE t", token);
+        const string NodeCReports = "SELECT count(*) FROM worf.sequence_range_node WHERE node_name = 'node_c' AND seqoid = 't_id_seq'::regclass";
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, $"SELECT ({NodeCReports}) = 0", token), "node_b taking in node_c's message without t");
+        await Task.Delay(TimeSpan.FromSeconds(3), token);
+        Assert.AreEqual("0", await nodeB.SafePsqlAsync(Database, NodeCReports, token), "node_b's reports of node_c, after node_a relayed node_c's old one");
+        Assert.AreEqual("1", await nodeA.SafePsqlAsync(Database, NodeCReports, token), "node_a's report of node_c, while node_c can't reach it");
+
+        // node_b restarts; node_c reaches node_a again, which takes in node_c's message without t, and restarts.
         foreach (TestNode node in new[] { nodeB, nodeA })
         {
+            if (node == nodeA)
+            {
+                _ = await nodeC.SafePsqlAsync(Database, ToNodeA(nodeA.Dsn(Database, SuperUser)), token);
+                Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, $"SELECT ({NodeCReports}) = 0", token), "node_a taking in node_c's message without t");
+            }
+
             await node.StopAsync("fast", token);
             await node.StartServerAsync(token);
             await using NpgsqlConnection writer = await node.OpenAsync(Database, token);
