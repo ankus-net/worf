@@ -2463,8 +2463,9 @@ internal static partial class SequenceRangeGuard
             HashSet<uint>? named = s_sequences.Count == 0 ? null : plpgsql ? SimpleNamed(simple) : starting is null ? null : StatementNamed(starting);
 
             // A PL/pgSQL expression whose calls don't name their sequence, as one computed as it runs, may draw from
-            // any, and its function's statements count down for each.
-            if (plpgsql && simple != 0 && s_sequences.Count > 0 && s_simple.Draws is { Unnamed: true })
+            // any, and its function's statements count down for each; and so may a statement's, as a name a column holds
+            // or a parameter a generic plan leaves unknown.
+            if (s_sequences.Count > 0 && (plpgsql ? simple != 0 && s_simple.Draws is { Unnamed: true } : starting is { Draws.Unnamed: true }))
             {
                 named = [.. s_sequences.Keys];
             }

@@ -3850,6 +3850,7 @@ public sealed partial class SequenceRangeTests
                 CREATE FUNCTION trg_id() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.id := nextval('s1'); RETURN NEW; END $$;
                 CREATE TRIGGER trg_id BEFORE INSERT ON trg FOR EACH ROW EXECUTE FUNCTION trg_id();
                 CREATE TABLE vals (id bigint);
+                CREATE TABLE seqnames (n text); INSERT INTO seqnames VALUES ('s1');
                 CREATE TABLE ck (v text CHECK (nextval('s1') > 0));
                 CREATE TABLE tw (v text);
                 CREATE FUNCTION passed() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
@@ -3890,8 +3891,9 @@ public sealed partial class SequenceRangeTests
         // for, inserted from a SELECT or copied; a statement like one that failed as it drew, which left its plan's
         // nodes counted; calls that first start as the statement runs, in a VALUES list's rows, a table's CHECK
         // constraint and a trigger's WHEN condition; PL/pgSQL loops that draw through a SQL function, with a computed name,
-        // or in a DO block that EXECUTE runs; rows of 40 calls, more than the block's last twentieth; and rows that contrib's
-        // autoinc trigger draws for.
+        // or in a DO block that EXECUTE runs; rows of 40 calls, more than the block's last twentieth; rows that contrib's
+        // autoinc trigger draws for; calls whose sequence a column names; and a prepared statement whose parameter names
+        // it, under a generic plan.
         List<string> problems = [];
         foreach (string statement in new[] { "DO $$ BEGIN PERFORM nextval('s1'); END $$", "SELECT f_s1()", "BEGIN", "SELECT nextval('s1') FROM generate_series(1, 250)",
             "SELECT count(DISTINCT nextval('s1')) FROM generate_series(1, 250)", "SELECT f_loop(250) /* generate_series */",
@@ -3903,7 +3905,8 @@ public sealed partial class SequenceRangeTests
             "INSERT INTO ck SELECT 'x' FROM generate_series(1, 250)", "INSERT INTO tw SELECT 'x' FROM generate_series(1, 250)",
             "SELECT f_sql_loop(250) /* generate_series */", "SELECT f_named_loop(250, 's1') /* generate_series */", "SELECT f_exec(250) /* generate_series */",
             $"SELECT {string.Join(", ", Enumerable.Repeat("nextval('s1')", 40))} FROM generate_series(1, 6)",
-            "INSERT INTO ai (v) SELECT 'x' FROM generate_series(1, 250)" })
+            "INSERT INTO ai (v) SELECT 'x' FROM generate_series(1, 250)", "SELECT nextval(n) FROM seqnames, generate_series(1, 250)",
+            "PREPARED generic rows", "PREPARED generic", "PREPARED default" })
         {
             Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 's1'::regclass", token),
                 "node_b drawing from a block of s1, with the next one ready");
@@ -3930,6 +3933,30 @@ public sealed partial class SequenceRangeTests
                     Assert.AreEqual("22012", divided.SqlState, divided.MessageText);
                     await using NpgsqlCommand counting = new("SELECT count(*) FROM (SELECT nextval('s1') n FROM generate_series(1, 250) g WHERE 1 / (g + 1) IS NOT NULL) x", connection);
                     _ = await counting.ExecuteScalarAsync(token);
+                    continue;
+                }
+
+                if (statement.StartsWith("PREPARED ", StringComparison.Ordinal))
+                {
+                    // A prepared statement whose parameter names the sequence, under a generic plan, which leaves it unknown,
+                    // in one 250-row execution or 250 one-row ones, or under the default plan_cache_mode, which turns to the
+                    // generic plan after five.
+                    bool rows = statement.EndsWith(" rows", StringComparison.Ordinal);
+                    string mode = statement.StartsWith("PREPARED generic", StringComparison.Ordinal) ? "force_generic_plan" : "auto";
+                    await using (NpgsqlCommand prepare = new($"""
+                        SET plan_cache_mode = {mode};
+                        PREPARE named (regclass) AS SELECT nextval($1){(rows ? " FROM generate_series(1, 250)" : "")}
+                        """, connection))
+                    {
+                        _ = await prepare.ExecuteNonQueryAsync(token);
+                    }
+
+                    await using NpgsqlCommand execute = new("EXECUTE named('s1')", connection);
+                    for (int i = 0; i < (rows ? 1 : 250); i++)
+                    {
+                        _ = await execute.ExecuteNonQueryAsync(token);
+                    }
+
                     continue;
                 }
 
