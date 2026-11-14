@@ -5444,10 +5444,16 @@ public sealed partial class SequenceRangeTests
         using TemporaryDirectory copies = new($"worf-sequence-range-mutual-restore-{Guid.NewGuid():N}");
         string copy = Path.Join(copies.FullName, "node_b");
         await BackUpDataAsync(nodeB, copy, token, wal: true);
+        string drawnFrom = await nodeB.SafePsqlAsync(Database, "SELECT pg_current_wal_lsn()", token);
         HashSet<string> before = await InsertIdsAsync("before");
         string drawnTo = await nodeB.SafePsqlAsync(Database, "SELECT pg_current_wal_lsn()", token);
+
+        // node_a records the last value node_b drew, with the position of the answer that carried it, past the draws'
+        // start, as a later answer that changes nothing else is kept in shared memory only.
         const string Recorded = "FROM worf.sequence_range_node WHERE node_name = 'node_b' AND seqoid = 't_id_seq'::regclass";
-        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, $"SELECT reply_lsn >= '{drawnTo}' {Recorded}", token), "node_a's calls, carrying node_b's draws");
+        long last = before.Max(id => long.Parse(id, CultureInfo.InvariantCulture));
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, $"SELECT drawn >= {last} AND reply_lsn > '{drawnFrom}' {Recorded}", token),
+            "node_a's calls, carrying node_b's draws");
         Assert.AreEqual("t", await nodeA.SafePsqlAsync(Database, $"SELECT coalesce(wal_lsn < '{drawnTo}', true) {Recorded}", token),
             "node_b's own calls, which haven't carried its draws");
 
