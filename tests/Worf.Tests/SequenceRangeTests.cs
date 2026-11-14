@@ -4506,6 +4506,10 @@ public sealed partial class SequenceRangeTests
         return long.Parse(line["VmHWM:".Length..].Replace("kB", "", StringComparison.Ordinal).Trim(), CultureInfo.InvariantCulture);
     }
 
+    // The CPU time log_statement_stats gives a message, in seconds of user and system time.
+    [GeneratedRegex(@"!\s*([0-9.]+) s user, ([0-9.]+) s system, [0-9.]+ s elapsed")]
+    private static partial Regex StatementUsage();
+
     // A line of a failure that names an address and says nothing more, as libpq begins one for the next address.
     [GeneratedRegex("failed: *$", RegexOptions.Multiline)]
     private static partial Regex BareFailureLine();
@@ -7308,12 +7312,12 @@ public sealed partial class SequenceRangeTests
         // sequences its calls of nextval draw from, and adds their text once, as a CHECK that calls no nextval and no
         // function names the same sequences however many values start it. wide's CHECK holds a 1,500-value array, whose
         // text, added for each of 4,000 values, made each insert build and collect hundreds of megabytes, as the peak
-        // of the backend's resident memory shows where the server runs beside the test, on Linux, and its time does
-        // everywhere. Each insert runs in a backend of its own, after one row has read the catalogs, so that neither
-        // psql's start nor the backend's counts, and again in a database of node_b's without worf, which takes what
-        // PostgreSQL's own coercion takes, a VALUES row's domain CHECK made ready for each row, which worf's are compared
-        // with: under the load of the other tests, the coercion alone takes several times as long as an insert of values
-        // that aren't coerced.
+        // of the backend's resident memory shows where the server runs beside the test, on Linux, and the CPU time the
+        // backend spends on the insert, as log_statement_stats logs it, does everywhere. Each insert runs in a backend of
+        // its own, after one row has read the catalogs, so that neither psql's start nor the backend's counts, and again
+        // in a database of node_b's without worf, which takes what PostgreSQL's own coercion takes, a VALUES row's domain
+        // CHECK made ready for each row, which worf's are compared with. The time an insert takes, under the load of the
+        // other tests, varies several times over from one to the next with worf or without it, while its CPU time doesn't.
         string values = string.Join(", ", Enumerable.Range(1, 4000).Select(i => string.Create(CultureInfo.InvariantCulture, $"({i})")));
         string excluded = string.Join(",", Enumerable.Range(1, 1500).Select(i => (-i).ToString(CultureInfo.InvariantCulture)));
         string wideTables = $"CREATE DOMAIN wide AS int CHECK (VALUE <> ALL ('{{{excluded}}}'::int[])); CREATE TABLE twide (x wide, y bigint DEFAULT nextval('plain'))";
@@ -7324,35 +7328,57 @@ public sealed partial class SequenceRangeTests
             CREATE TABLE tpos (x posint, y bigint DEFAULT nextval('plain')); CREATE TABLE tint (x int, y bigint DEFAULT nextval('plain'));
             {wideTables}
             """, token);
-        async Task<(TimeSpan Elapsed, long PeakGrowth)> InsertManyAsync(string table, string database = Database)
+        async Task<(TimeSpan Elapsed, TimeSpan Cpu, long PeakGrowth)> InsertManyAsync(string table, string database = Database)
         {
             await using NpgsqlConnection inserting = await nodeB.OpenAsync(database, token);
-            await using (NpgsqlCommand first = new($"INSERT INTO {table} (x) VALUES (1)", inserting))
+            await using (NpgsqlCommand first = new($"INSERT INTO {table} (x) VALUES (1); SET log_statement_stats = on", inserting))
             {
                 _ = await first.ExecuteNonQueryAsync(token);
             }
 
             int pid = inserting.ProcessID;
             long before = PeakResident(pid);
+            int logged = nodeB.ReadLog().Length;
             await using NpgsqlCommand insert = new($"INSERT INTO {table} (x) VALUES {values}", inserting);
             Stopwatch timing = Stopwatch.StartNew();
             _ = await insert.ExecuteNonQueryAsync(token);
             TimeSpan elapsed = timing.Elapsed;
-            return (elapsed, PeakResident(pid) - before);
+
+            // The CPU time of the insert's messages, each of which logs its own.
+            string marker = string.Create(CultureInfo.InvariantCulture, $"[{pid}]");
+            Stopwatch reading = Stopwatch.StartNew();
+            while (!nodeB.ReadLog()[logged..].Contains("EXECUTE MESSAGE STATISTICS", StringComparison.Ordinal))
+            {
+                Assert.IsLessThan(TestNode.PollTimeout, reading.Elapsed, "the insert's statistics in node_b's log");
+                await Task.Delay(TimeSpan.FromMilliseconds(50), token);
+            }
+
+            double cpu = 0;
+            string[] lines = nodeB.ReadLog()[logged..].Split('\n');
+            for (int i = 0; i < lines.Length; i++)
+            {
+                if (lines[i].Contains(marker, StringComparison.Ordinal) && lines[i].Contains("MESSAGE STATISTICS", StringComparison.Ordinal) &&
+                    lines.Skip(i + 1).Select(line => StatementUsage().Match(line)).FirstOrDefault(match => match.Success) is { } usage)
+                {
+                    cpu += double.Parse(usage.Groups[1].Value, CultureInfo.InvariantCulture) + double.Parse(usage.Groups[2].Value, CultureInfo.InvariantCulture);
+                }
+            }
+
+            return (elapsed, TimeSpan.FromSeconds(cpu), PeakResident(pid) - before);
         }
 
-        (TimeSpan uncoerced, long uncoercedPeak) = await InsertManyAsync("tint");
-        (TimeSpan coerced, long coercedPeak) = await InsertManyAsync("tpos");
-        (TimeSpan wide, long widePeak) = await InsertManyAsync("twide");
-        TimeSpan ownUncoerced = (await InsertManyAsync("tint", "noworf")).Elapsed;
-        TimeSpan ownCoerced = (await InsertManyAsync("tpos", "noworf")).Elapsed;
-        TimeSpan ownWide = (await InsertManyAsync("twide", "noworf")).Elapsed;
+        (TimeSpan uncoerced, TimeSpan uncoercedCpu, long uncoercedPeak) = await InsertManyAsync("tint");
+        (TimeSpan coerced, TimeSpan coercedCpu, long coercedPeak) = await InsertManyAsync("tpos");
+        (TimeSpan wide, TimeSpan wideCpu, long widePeak) = await InsertManyAsync("twide");
+        (TimeSpan ownUncoerced, TimeSpan ownUncoercedCpu, _) = await InsertManyAsync("tint", "noworf");
+        (TimeSpan ownCoerced, TimeSpan ownCoercedCpu, _) = await InsertManyAsync("tpos", "noworf");
+        (TimeSpan ownWide, TimeSpan ownWideCpu, _) = await InsertManyAsync("twide", "noworf");
         TestContext.WriteLine($"""
-            4,000 rows: {uncoerced.TotalMilliseconds:F0} ms, {uncoercedPeak} kB; coerced to posint: {coerced.TotalMilliseconds:F0} ms, {coercedPeak} kB; to wide: {wide.TotalMilliseconds:F0} ms, {widePeak} kB
-            without worf: {ownUncoerced.TotalMilliseconds:F0} ms; coerced to posint: {ownCoerced.TotalMilliseconds:F0} ms; to wide: {ownWide.TotalMilliseconds:F0} ms
+            4,000 rows: {uncoerced.TotalMilliseconds:F0} ms, {uncoercedCpu.TotalMilliseconds:F0} ms CPU, {uncoercedPeak} kB; coerced to posint: {coerced.TotalMilliseconds:F0} ms, {coercedCpu.TotalMilliseconds:F0} ms CPU, {coercedPeak} kB; to wide: {wide.TotalMilliseconds:F0} ms, {wideCpu.TotalMilliseconds:F0} ms CPU, {widePeak} kB
+            without worf: {ownUncoerced.TotalMilliseconds:F0} ms, {ownUncoercedCpu.TotalMilliseconds:F0} ms CPU; coerced to posint: {ownCoerced.TotalMilliseconds:F0} ms, {ownCoercedCpu.TotalMilliseconds:F0} ms CPU; to wide: {ownWide.TotalMilliseconds:F0} ms, {ownWideCpu.TotalMilliseconds:F0} ms CPU
             """);
-        Assert.IsLessThan((ownCoerced * 2) + TimeSpan.FromMilliseconds(100), coerced, "an insert of 4,000 values coerced to posint, against PostgreSQL's own");
-        Assert.IsLessThan((ownWide * 2) + TimeSpan.FromMilliseconds(100), wide, "an insert of 4,000 values coerced to wide, against PostgreSQL's own");
+        Assert.IsLessThan((ownCoercedCpu * 2) + TimeSpan.FromMilliseconds(50), coercedCpu, "the CPU time of an insert of 4,000 values coerced to posint, against PostgreSQL's own");
+        Assert.IsLessThan((ownWideCpu * 2) + TimeSpan.FromMilliseconds(50), wideCpu, "the CPU time of an insert of 4,000 values coerced to wide, against PostgreSQL's own");
         if (OperatingSystem.IsLinux())
         {
             Assert.IsLessThan(uncoercedPeak + (48 * 1024), widePeak, "the growth in kB of the peak resident memory of the backend that inserted 4,000 values coerced to wide");
