@@ -77,6 +77,36 @@ internal static class WorfLocks
         _ = NativeMethods.LockRelease(&clock, ExclusiveLock, true);
     }
 
+    /// <summary>
+    /// Gets when the client's statement_timeout ends the statement, as a timestamp: as it started, which PostgreSQL arms
+    /// the timeout at, or a moment before, and statement_timeout after. A background worker, whose statements PostgreSQL
+    /// arms none for, and a statement with no timeout, have none.
+    /// </summary>
+    /// <returns>The deadline, or null.</returns>
+    internal static long? StatementDeadline()
+    {
+        unsafe
+        {
+            return NativeGlobals.MyBackendType == BackendType.B_BACKEND && NativeGlobals.StatementTimeout > 0
+                ? NativeMethods.GetCurrentStatementStartTimestamp() + (NativeGlobals.StatementTimeout * 1000L)
+                : null;
+        }
+    }
+
+    /// <summary>
+    /// Ends the statement for its statement_timeout, as a lock timeout is caught, once the timeout's time has passed. A lock
+    /// timeout and the statement's timeout that come due at the same alarm, as a timer coarser than the lock timeout's
+    /// millisecond has them, as Windows' does, end the statement with whichever was due first, and clear both, so a lock
+    /// timeout caught to go on would leave the statement running past its own timeout.
+    /// </summary>
+    internal static void EndIfTimedOut()
+    {
+        if (StatementDeadline() is long at && Worker.GetCurrentTimestamp() >= at)
+        {
+            throw new PgException(PgSqlStates.QueryCanceled, "canceling statement due to statement timeout");
+        }
+    }
+
     private static LOCKTAG Tag(uint obj, ushort key)
     {
         uint database;

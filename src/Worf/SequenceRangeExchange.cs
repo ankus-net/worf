@@ -2146,6 +2146,11 @@ internal static class SequenceRangeExchange
         {
             return work();
         }
+        catch (PgException held) when (held.SqlState == "55P03")
+        {
+            WorfLocks.EndIfTimedOut();
+            throw;
+        }
         finally
         {
             unsafe

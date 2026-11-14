@@ -3260,16 +3260,19 @@ public sealed partial class SequenceRangeTests
             case "canceled drop":
             {
                 // A report node_c relayed of u_id_seq, which no exchange takes in, is held as the drop forgets node_c, which
-                // tries again until statement_timeout cancels it.
+                // tries again until statement_timeout cancels it, as it does each of 40 times over: on Windows, whose timer
+                // has the lock timeout of a try come due with the statement's about one time in eight, PostgreSQL reports
+                // the lock timeout then.
                 _ = await nodeA.SafePsqlAsync(Database, $"""
                     INSERT INTO worf.sequence_range_node (seqoid, node_id, node_name, via_node, reported_at)
                     VALUES ('u_id_seq'::regclass, 2000002, 'relayed_by_c', {nodeCId}, now())
                     """, token);
                 await HoldAsync($"SELECT 1 FROM worf.sequence_range_node WHERE seqoid = 'u_id_seq'::regclass AND via_node = {nodeCId} FOR UPDATE");
                 await using NpgsqlConnection dropping = await nodeA.OpenAsync(Database, token);
-                await using (NpgsqlCommand drop = new("SET statement_timeout = '3s'; SELECT worf.drop_subscription('a_from_c')", dropping))
+                for (int i = 0; i < 40; i++)
                 {
-                    PostgresException canceled = await Assert.ThrowsExactlyAsync<PostgresException>(() => drop.ExecuteNonQueryAsync(token));
+                    await using NpgsqlCommand drop = new("SET statement_timeout = '400ms'; SELECT worf.drop_subscription('a_from_c')", dropping) { CommandTimeout = 10 };
+                    PostgresException canceled = await Assert.ThrowsExactlyAsync<PostgresException>(() => drop.ExecuteNonQueryAsync(token), $"drop {i}");
                     Assert.AreEqual("57014", canceled.SqlState, canceled.MessageText);
                 }
 

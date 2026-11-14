@@ -4325,6 +4325,11 @@ internal static unsafe partial class SequenceRanges
         }
         catch (PgException error) when (error.SqlState == "55P03" || (!next && error.SqlState == PgSqlStates.ObjectNotInPrerequisiteState))
         {
+            if (error.SqlState == "55P03")
+            {
+                WorfLocks.EndIfTimedOut();
+            }
+
             return false;
         }
         finally
