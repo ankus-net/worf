@@ -5389,14 +5389,40 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
-    /// A dropped database's sequences give up their change counters as the drop commits, so that a database whose
-    /// sequences outnumber the counters, dropped, leaves the other databases' sequences counters of their own: an idle
-    /// sequence is checked in full about once a second, though another sequence switches blocks of 10 meanwhile. The
-    /// server has 64 counters.
+    /// A dropped database's sequences give up their change counters as the drop commits, and so do a database's as worf's
+    /// drop there commits, so that a database whose sequences outnumber the counters, dropped or without worf, leaves the
+    /// other databases' sequences counters of their own. The server has 64 counters.
+    /// </summary>
+    /// <param name="how">The database dropped, or worf dropped there.</param>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [DataRow("database")]
+    [DataRow("worf")]
+    public async Task DroppedDatabasesGiveUpTheirCounters(string how)
+    {
+        (int full, string counted) = await IdleChecksBesideOtherDatabaseAsync(how);
+        Assert.AreEqual("t", counted, "whether the idle sequence has a counter of its own");
+        Assert.IsLessThan(30, full, "the idle sequence's full checks in 10 s");
+    }
+
+    /// <summary>
+    /// Sequences past the server's 64 counters share a count of their changes only with the few that hash with them, so
+    /// that an idle sequence with no counter of its own, as another database's 80 sequences took them all, is checked in
+    /// full about once a second, though another sequence of its database switches blocks of 10 meanwhile.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
-    public async Task DroppedDatabasesGiveUpTheirCounters()
+    public async Task SequencesPastTheCountersShareFewCounts()
+    {
+        (int full, string counted) = await IdleChecksBesideOtherDatabaseAsync("kept");
+        Assert.AreEqual("f", counted, "whether the idle sequence has a counter of its own, as the other database's sequences took them all");
+        Assert.IsLessThan(30, full, "the idle sequence's full checks in 10 s");
+    }
+
+    // Starts a node with 64 change counters and a database of 80 managed sequences, which it drops, drops worf in, or
+    // keeps, and returns how often, in 10 s, an idle sequence of the test's database is checked in full while another
+    // switches blocks of 10, and whether the idle one has a counter of its own.
+    private async Task<(int Full, string Counted)> IdleChecksBesideOtherDatabaseAsync(string how)
     {
         CancellationToken token = TestContext.CancellationToken;
         await using TestNode nodeA = await StartNodeAsync("node_a", token, "log_min_messages = debug2\nworf.max_sequence_range_counters = 64");
@@ -5414,7 +5440,17 @@ public sealed partial class SequenceRangeTests
                 END LOOP;
             END $$
             """, token);
-        _ = await nodeA.SafePsqlAsync(Database, "DROP DATABASE big WITH (FORCE)", token);
+
+        // Each of big's sequences has its counter once its range has changed.
+        await Task.Delay(TimeSpan.FromSeconds(2), token);
+        if (how == "database")
+        {
+            _ = await nodeA.SafePsqlAsync(Database, "DROP DATABASE big WITH (FORCE)", token);
+        }
+        else if (how == "worf")
+        {
+            _ = await nodeA.SafePsqlAsync("big", "DROP EXTENSION worf CASCADE", token);
+        }
 
         _ = await nodeA.SafePsqlAsync(Database, """
             CREATE TABLE idle (id bigserial PRIMARY KEY); CREATE TABLE busy (id bigserial PRIMARY KEY);
@@ -5439,7 +5475,18 @@ public sealed partial class SequenceRangeTests
         }
 
         int full = nodeA.ReadLog()[logged..].Split('\n').Count(line => line.Contains($"checking sequence {idle} in full", StringComparison.Ordinal));
-        Assert.IsLessThan(30, full, "the idle sequence's full checks in 10 s");
+        string counted;
+        try
+        {
+            counted = await nodeA.SafePsqlAsync(Database, "SELECT worf.sequence_range_counted('idle_id_seq')", token);
+        }
+        catch (PostgresException missing) when (missing.SqlState == "42883")
+        {
+            counted = "no worf.sequence_range_counted";
+        }
+
+        TestContext.WriteLine($"{how}: {full} full checks of the idle sequence in 10 s, counted apart: {counted}");
+        return (full, counted);
     }
 
     /// <summary>

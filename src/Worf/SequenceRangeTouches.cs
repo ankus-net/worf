@@ -6,8 +6,9 @@ namespace Worf;
 /// How often each managed sequence's ranges changed, or a session asked the range worker to check it, in shared memory,
 /// so that the range worker checks in full only the sequences something happened to, rather than every sequence on any
 /// change. Each sequence of the server has a counter of its own, which the range worker gives up as the sequence's drop
-/// commits, and every sequence of a database as the database's drop commits, up to the number of counters, past which a
-/// change to a sequence without one counts for every sequence, as a change that names no sequence does.
+/// commits, and every sequence of a database as the database's drop, or worf's there, commits, up to the number of
+/// counters, past which a change to a sequence without one counts for the sequences without one whose database and OID
+/// share its hash, one of 256, while a change that names no sequence counts for every sequence.
 /// </summary>
 internal static partial class SequenceRangeTouches
 {
@@ -20,6 +21,9 @@ internal static partial class SequenceRangeTouches
 
     // An entry that a dropped sequence gave up: no database, and the largest OID.
     private const uint Freed = uint.MaxValue;
+
+    // The counts of the sequences that have no counter of their own.
+    private const int OverflowCounts = 256;
 
     // The sequences this transaction changed, which count once it commits or prepares, and whether it changed one it
     // doesn't name.
@@ -103,7 +107,25 @@ internal static partial class SequenceRangeTouches
         using PgLwLockShareGuard<WorfTouchTable, WorfTouch> guard = Counters.Share();
         uint dboid = DatabaseId();
         int slot = Find(i => guard[i], guard.Length, dboid, seqoid, out _);
-        return (guard.Header.All, slot >= 0 ? guard[slot].Count : 0);
+        return (guard.Header.All, slot >= 0 ? guard[slot].Count : guard.Header.Overflow[Overflowed(dboid, seqoid)]);
+    }
+
+    /// <summary>
+    /// Returns whether a managed sequence of this database has a counter of its own, rather than sharing one with the
+    /// sequences whose database and OID hash with its own.
+    /// </summary>
+    /// <param name="sequence">The sequence.</param>
+    /// <returns>Whether it has one.</returns>
+    [PgFunction(Sql = """
+        CREATE FUNCTION worf.sequence_range_counted(sequence regclass)
+        RETURNS boolean STRICT VOLATILE LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
+        REVOKE ALL ON FUNCTION worf.sequence_range_counted(regclass) FROM public;
+        """)]
+    internal static bool SequenceRangeCounted([PgSqlType("regclass", Schema = "pg_catalog")] PgDatum sequence)
+    {
+        uint seqoid = SequenceRanges.RequireSequence(sequence);
+        using PgLwLockShareGuard<WorfTouchTable, WorfTouch> guard = Counters.Share();
+        return Find(i => guard[i], guard.Length, DatabaseId(), seqoid, out _) >= 0;
     }
 
     /// <summary>
@@ -156,10 +178,21 @@ internal static partial class SequenceRangeTouches
         else
         {
             WorfTouchTable header = guard.Header;
-            header.All++;
+            if (seqoid is uint overflowed)
+            {
+                header.Overflow[Overflowed(dboid, overflowed)]++;
+            }
+            else
+            {
+                header.All++;
+            }
+
             guard.Header = header;
         }
     }
+
+    // The count a sequence with no counter of its own shares.
+    private static int Overflowed(uint dboid, uint seqoid) => (int)(((dboid * 2654435761UL) ^ seqoid) % OverflowCounts);
 
     // Finds a sequence's counter, probing from its hash's slot until an entry never taken, and the first entry it could
     // take, free or given up, or -1 for none.

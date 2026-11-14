@@ -322,9 +322,9 @@ can be either set in `postgresql.conf` or via `ALTER SYSTEM SET`.
 - `worf.max_sequence_range_counters`
   How many managed sequences, over every database, have their changes counted
   apart, so that the range worker checks in full only those that changed; past
-  it, a change to any other counts for every sequence. A dropped sequence, or
-  database, gives its counters up. Takes effect at server start. The default is
-  `16384`.
+  it, the others share 256 counts by the hash of their database and OID. A
+  dropped sequence or database, or a database worf is dropped from, gives its
+  counters up. Takes effect at server start. The default is `16384`.
 
 - `worf.batch_inserts`
   Tells worf to use batch insert mechanism if possible. Batch mechanism

@@ -594,6 +594,11 @@ internal static unsafe partial class Executor
                 uint extensionOid = NativeMethods.get_extension_oid(Worf.PStrDup(Worf.ExtensionName), true);
                 if (objectId == extensionOid && objectId != 0)
                 {
+                    // worf's drop in a database gives up its sequences' change counters once it commits, as the database's
+                    // drop does.
+                    uint database = NativeGlobals.MyDatabaseId;
+                    _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, () => SequenceRangeTouches.FreeDatabase(database));
+
                     if (!NativeGlobals.IsBinaryUpgrade &&
                         Elevated.Run(() => Worf.ReadScalar<string?>("""
                             SELECT pg_catalog.string_agg(pg_catalog.quote_ident(slot_name::pg_catalog.text), ', ' ORDER BY slot_name)
