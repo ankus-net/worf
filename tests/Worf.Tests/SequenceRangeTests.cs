@@ -4508,17 +4508,20 @@ public sealed partial class SequenceRangeTests
     /// locally; and the inserts start as the subscriber's read-ahead of 90 MB of the owner's changes fills up, which reads
     /// no more of them, so that the word that comes in the stream can't reach it. A grant in one database makes only its
     /// own database write the word: another database of the owner's that manages a sequence writes none. A session idle
-    /// in a transaction that only read the ranges doesn't keep node_b's calls from waiting for the grants' rows.
+    /// in a transaction that only read the ranges doesn't keep node_b's calls from waiting for the grants' rows. A
+    /// subscriber whose kept connection the owner ended hears no notification until it calls again, which its read-ahead,
+    /// once full, has it do each second.
     /// </summary>
     /// <param name="how">The owner as it is, with a synchronous standby that answers late, beside a session idle after
-    /// reading the ranges too, writing 90 MB first, or with its subscriber's apply waiting on a lock, without a
-    /// delay.</param>
+    /// reading the ranges too, writing 90 MB first, with the subscriber's kept connection ended too, or with its
+    /// subscriber's apply waiting on a lock, without a delay.</param>
     /// <returns>The test.</returns>
     [TestMethod]
     [DataRow("word")]
     [DataRow("synchronous")]
     [DataRow("synchronous read")]
     [DataRow("busy")]
+    [DataRow("busy unkept")]
     [DataRow("behind")]
     public async Task OwnersDontWaitForDelayedSubscribers(string how)
     {
@@ -4632,7 +4635,7 @@ public sealed partial class SequenceRangeTests
             _ = await read.ExecuteScalarAsync(token);
         }
 
-        if (how is "busy" or "behind")
+        if (how is "busy" or "busy unkept" or "behind")
         {
             _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.replication_set_add_table('default', 'big')", token);
             if (how == "behind")
@@ -4645,8 +4648,13 @@ public sealed partial class SequenceRangeTests
             }
             else
             {
-                // node_b reads 64 MB of the 90 MB ahead as node_a's walsender sends them, and the inserts start at once.
+                // node_b reads 64 MB of the 90 MB ahead as node_a's walsender sends them, and the inserts start at once,
+                // after node_a ends the session node_b's exchanges keep, which node_b makes again only as it calls.
                 _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO big (v) SELECT repeat('x', 1000) FROM generate_series(1, 90000)", token);
+                if (how == "busy unkept")
+                {
+                    _ = await nodeA.SafePsqlAsync(Database, "SELECT count(pg_terminate_backend(pid)) FROM pg_catalog.pg_stat_activity WHERE application_name = 'b_from_a_range'", token);
+                }
             }
         }
 
