@@ -33,9 +33,8 @@ internal static class WorfLocks
     }
 
     /// <summary>
-    /// Runs work in the node's exchange turn, held for the session and let go as the work ends, rather than as the
-    /// transaction does, with interrupts held off, so that a cancel pending as the work ends, as statement_timeout's,
-    /// doesn't leave the turn held for the rest of the session.
+    /// Runs work in the node's exchange turn, held for the session and let go as the work ends, however it ends, as a
+    /// cancel such as statement_timeout's ends it, rather than as the transaction does, which a session lock outlives.
     /// </summary>
     /// <param name="work">The work.</param>
     internal static unsafe void WithTurn(Action work)
@@ -48,15 +47,7 @@ internal static class WorfLocks
         }
         finally
         {
-            NativeGlobals.InterruptHoldoffCount++;
-            try
-            {
-                _ = NativeMethods.LockRelease(&turn, ExclusiveLock, true);
-            }
-            finally
-            {
-                NativeGlobals.InterruptHoldoffCount--;
-            }
+            _ = NativeMethods.LockRelease(&turn, ExclusiveLock, true);
         }
     }
 
@@ -120,20 +111,12 @@ internal static class WorfLocks
     }
 
     /// <summary>
-    /// Lets the session's lock of the Snowflake clock's reservation go, with interrupts held off.
+    /// Lets the session's lock of the Snowflake clock's reservation go.
     /// </summary>
     internal static unsafe void UnlockClock()
     {
         LOCKTAG clock = Tag(0, ClockKey);
-        NativeGlobals.InterruptHoldoffCount++;
-        try
-        {
-            _ = NativeMethods.LockRelease(&clock, ExclusiveLock, true);
-        }
-        finally
-        {
-            NativeGlobals.InterruptHoldoffCount--;
-        }
+        _ = NativeMethods.LockRelease(&clock, ExclusiveLock, true);
     }
 
     private static LOCKTAG Tag(uint obj, ushort key)
