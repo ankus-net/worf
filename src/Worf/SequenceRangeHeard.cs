@@ -262,7 +262,31 @@ internal static class SequenceRangeHeard
     /// statement runs, and adds the start to those the data directory keeps.
     /// </summary>
     /// <returns>Whether the data directory keeps it.</returns>
-    internal static bool NoteStart() => SequenceRangeStarts.Note(Started, StartLsn);
+    internal static bool NoteStart()
+    {
+        if (!SequenceRangeStarts.Note(Started, StartLsn))
+        {
+            return false;
+        }
+
+        using PgLwLockExclusiveGuard<WorfHeardTable, WorfHeard> guard = Nodes.Exclusive();
+        WorfHeardTable header = guard.Header;
+        header.StartKept = true;
+        guard.Header = header;
+        return true;
+    }
+
+    /// <summary>
+    /// Gets whether the data directory's file of starts keeps this server's start.
+    /// </summary>
+    internal static bool StartKept
+    {
+        get
+        {
+            using PgLwLockShareGuard<WorfHeardTable, WorfHeard> guard = Nodes.Share();
+            return guard.Header.StartKept;
+        }
+    }
 
     /// <summary>
     /// Counts a notice a node sent one of this server's processes, in the minute that began last, for every process.

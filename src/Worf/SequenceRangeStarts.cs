@@ -12,12 +12,15 @@ namespace Worf;
 /// keeps stands for those it let go, with the lowest position of any of them. A start whose file is gone, can't be read,
 /// or wasn't written to its end, as when it was deleted or a crash cut a write short, lost the starts before it, which
 /// may have hidden a restore: it keeps a start just before its own at position 0, so that every neighbor that heard of a
-/// position from the node before it takes the node as gone back.
+/// position from the node before it takes the node as gone back. A start the file can't keep, as when neither it nor its
+/// temporary file can be written, leaves the file worf_starts.lost, which has the next start the file keeps count the
+/// starts before it as lost too, as that start, a restore's perhaps, isn't among them.
 /// </summary>
 internal static class SequenceRangeStarts
 {
     private const string FileName = "worf_starts";
     private const string WrittenName = "worf_starts.tmp";
+    private const string LostName = "worf_starts.lost";
     private const string End = "end";
     private const int MaxStarts = 32;
 
@@ -40,10 +43,13 @@ internal static class SequenceRangeStarts
     internal static bool Note(long since, ulong lsn)
     {
         ((long Since, ulong Lsn)[] read, bool lost) = Read();
+        bool unkept = File.Exists(LostName);
         List<(long Since, ulong Lsn)> starts = [.. read.Where(start => start.Since != since)];
-        if (lost && !starts.Exists(start => start.Lsn == 0 && start.Since == since - 1))
+        if ((lost || unkept) && !starts.Exists(start => start.Lsn == 0 && start.Since == since - 1))
         {
-            WorfLog.Warning($"file \"{FileName}\" lost the starts of this server before this one, so its neighbors take every WAL position they heard of from it before this start as gone back");
+            WorfLog.Warning(unkept
+                ? $"file \"{LostName}\" shows that file \"{FileName}\" couldn't keep a start of this server's before this one, so its neighbors take every WAL position they heard of from it before this start as gone back"
+                : $"file \"{FileName}\" lost the starts of this server before this one, so its neighbors take every WAL position they heard of from it before this start as gone back");
             starts.Add((since - 1, 0));
         }
 
@@ -60,18 +66,54 @@ internal static class SequenceRangeStarts
         string? failure = WriteRenamed(text);
         if (failure is null)
         {
+            Kept(unkept);
             return true;
         }
 
         try
         {
             WriteSynced(FileName, text);
+            Kept(unkept);
             return true;
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or NotSupportedException or System.Security.SecurityException)
         {
             WorfLog.Warning($"could not keep this server's start in file \"{FileName}\": {failure}; {error.Message}");
+            Unkept();
             return false;
+        }
+    }
+
+    // Leaves the file that shows a start wasn't kept, durably, so that the next start the file keeps counts the starts
+    // before it as lost.
+    private static unsafe void Unkept()
+    {
+        try
+        {
+            WriteSynced(LostName, "lost\n");
+            fixed (byte* directory = ".\0"u8)
+            {
+                NativeMethods.fsync_fname((sbyte*)directory, true);
+            }
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or NotSupportedException or System.Security.SecurityException)
+        {
+            WorfLog.Warning($"could not write file \"{LostName}\": {error.Message}");
+        }
+    }
+
+    // Removes the file that showed a start wasn't kept, durably, once the file of starts keeps one that counts the starts
+    // before it as lost.
+    private static unsafe void Kept(bool unkept)
+    {
+        if (!unkept)
+        {
+            return;
+        }
+
+        fixed (byte* name = Encoding.UTF8.GetBytes(LostName + "\0"))
+        {
+            _ = NativeMethods.durable_unlink((sbyte*)name, (int)PgLogLevel.Warning);
         }
     }
 

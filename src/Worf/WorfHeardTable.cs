@@ -14,4 +14,9 @@ internal struct WorfHeardTable
     /// The WAL position this server started from, once read, or zero.
     /// </summary>
     public ulong StartLsn;
+
+    /// <summary>
+    /// Whether the data directory's file of starts keeps this server's start, which draws wait for.
+    /// </summary>
+    public bool StartKept;
 }

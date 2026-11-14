@@ -230,6 +230,9 @@ internal static partial class SequenceRangeGuard
     // none, is waited for, as a start's draws wait, until such a message shows whether it reports the sequence.
     private static long[] s_complete = [];
 
+    // Whether this server's start was kept in the data directory's file of starts, as once seen it stays.
+    private static bool s_startKept;
+
     // Whether the guard is reading the blocks to find the grantors a statement's plan names.
     private static bool s_namingGrantors;
 
@@ -3310,6 +3313,52 @@ internal static partial class SequenceRangeGuard
     }
 
     /// <summary>
+    /// Waits, before a statement draws from a managed sequence, until the data directory's file of starts keeps this
+    /// server's start, which worf's supervisor notes again until it does: a later start that finds it gone, as after a
+    /// restore whose start the file couldn't keep, would take no position from before it as gone back, and so draw again
+    /// values drawn since. The statement lets its gates go and waits up to twice <c>worf.sequence_range_timeout</c>, as
+    /// for a neighbor after a start, and then fails.
+    /// </summary>
+    private static void WaitForStartKept(uint seqoid, bool unnamed)
+    {
+        if (s_startKept || (s_startKept = SequenceRangeHeard.StartKept))
+        {
+            return;
+        }
+
+        string sequence;
+        unsafe
+        {
+            sequence = Worf.FromServer(NativeMethods.get_rel_name(seqoid));
+        }
+
+        using PgErrorContext context = PgErrorContext.Push("waiting for the file worf_starts in the data directory to keep this server's start");
+        List<uint> held = LetGates();
+        try
+        {
+            long deadline = Worker.GetCurrentTimestamp() + (SequenceRanges.ExchangeTimeout * 2000L);
+            while (!(s_startKept = SequenceRangeHeard.StartKept))
+            {
+                if (Worker.GetCurrentTimestamp() >= deadline)
+                {
+                    throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState,
+                        unnamed ? "nextval can't draw until the file worf_starts in the data directory keeps this server's start"
+                            : $"sequence {sequence} can't draw until the file worf_starts in the data directory keeps this server's start",
+                        detail: "A server whose start the file doesn't keep can't tell, at its next start, whether it went back to before it, as a restored one does, and so whether it draws again values drawn since.",
+                        hint: "Make worf_starts, and worf_starts.tmp if it is there, writable by the server; worf's supervisor keeps the start as soon as it can.");
+                }
+
+                PgInterrupts.Check();
+                Worker.WaitLatch(100);
+            }
+        }
+        finally
+        {
+            TakeGates(held);
+        }
+    }
+
+    /// <summary>
     /// Waits, before a statement draws from a sequence's active block, until the block's parent, when another node
     /// granted it, and every other node this node exchanges with directly that reports the sequence have checked this
     /// node's report of it since this server started: a node that was away while its parent's fence lifted without its
@@ -3321,6 +3370,7 @@ internal static partial class SequenceRangeGuard
     /// </summary>
     private static void WaitForGrantor(uint seqoid, bool unnamed = false)
     {
+        WaitForStartKept(seqoid, unnamed);
         Reload();
         if (!s_grantors.TryGetValue(seqoid, out uint grantor) || s_confirmedSequences.Contains(seqoid))
         {

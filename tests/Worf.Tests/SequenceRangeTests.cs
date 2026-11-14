@@ -5147,6 +5147,17 @@ public sealed partial class SequenceRangeTests
     public Task RestoredNodesCountSingleUserStarts() => RestoredNodesWaitForCallsThatTakeEverySequenceIn("twice single");
 
     /// <summary>
+    /// A restore whose start neither worf_starts.tmp, a directory, nor worf_starts, at mode 000, can keep draws nothing
+    /// while it runs, and leaves worf_starts.lost, so that once both are put right while it's down, and it starts again
+    /// past the position its grantor heard, the next start counts the starts before it as lost, as
+    /// RestoredNodesWaitForCallsThatTakeEverySequenceIn's other rows show of theirs. File modes are Unix's.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [OSCondition(OperatingSystems.Linux | OperatingSystems.OSX)]
+    public Task RestoredNodesCountStartsTheirFileCouldNotKeep() => RestoredNodesWaitForCallsThatTakeEverySequenceIn("twice unkept");
+
+    /// <summary>
     /// A node restored from a base backup taken as it ran, whose WAL ends past the last position its grantor's tables
     /// recorded, as a snapshot of a running server's storage does, or ends where they recorded it, draws from a sequence's
     /// blocks only once its grantor has taken in its report of that sequence since it started, and seen its WAL position
@@ -5363,15 +5374,29 @@ public sealed partial class SequenceRangeTests
         // The restore's start can't rename worf_starts.tmp, a directory, in place, or runs in single-user mode, writing
         // and checkpointing there, before it starts again.
         const string WrittenAgain = "CREATE TABLE written_again AS SELECT g, repeat('x', 100) AS v FROM generate_series(1, 8000) g";
-        if (variant == "tmp")
+        if (variant is "tmp" or "unkept")
         {
             _ = Directory.CreateDirectory(Path.Join(copy, "worf_starts.tmp"));
         }
 
-        await RestoreDataAsync(nodeB, copy, token, beforeStart: variant != "single" ? null : async () =>
+        int restoredAt = nodeB.ReadLog().Length;
+        await RestoreDataAsync(nodeB, copy, token, beforeStart: variant switch
         {
-            (int exit, string output) = await nodeB.RunSingleUserAsync(Database, $"{WrittenAgain}\nCHECKPOINT\n", token);
-            Assert.AreEqual(0, exit, output);
+            "single" => async () =>
+            {
+                (int exit, string output) = await nodeB.RunSingleUserAsync(Database, $"{WrittenAgain}\nCHECKPOINT\n", token);
+                Assert.AreEqual(0, exit, output);
+            },
+            "unkept" => () =>
+            {
+                if (!OperatingSystem.IsWindows())
+                {
+                    File.SetUnixFileMode(Path.Join(nodeB.Cluster.DataDirectory, "worf_starts"), UnixFileMode.None);
+                }
+
+                return Task.CompletedTask;
+            },
+            _ => null,
         });
         if (stopped)
         {
@@ -5443,8 +5468,22 @@ public sealed partial class SequenceRangeTests
             {
                 File.Delete(Path.Join(nodeB.Cluster.DataDirectory, "worf_starts"));
             }
+            else if (variant == "unkept" && !OperatingSystem.IsWindows())
+            {
+                // node_b, whose start neither file keeps, draws nothing, and both are put right while it's down.
+                Assert.IsTrue(await nodeB.PollLogAsync(restoredAt, "could not keep this server's start", token), "node_b's start, unkept");
+                PostgresException unkept = await Assert.ThrowsExactlyAsync<PostgresException>(
+                    () => nodeB.SafePsqlAsync(Database, "INSERT INTO t (v) VALUES ('unkept')", token), "node_b's insert while its start is unkept");
+                Assert.AreEqual("55000", unkept.SqlState, unkept.MessageText);
+                Assert.Contains("worf_starts", unkept.MessageText);
+                _ = await nodeB.SafePsqlAsync(Database, WrittenAgain, token);
+                await nodeB.StopAsync("fast", token);
+                Directory.Delete(Path.Join(nodeB.Cluster.DataDirectory, "worf_starts.tmp"));
+                File.SetUnixFileMode(Path.Join(nodeB.Cluster.DataDirectory, "worf_starts"), UnixFileMode.UserRead | UnixFileMode.UserWrite);
+                await nodeB.StartServerAsync(token);
+            }
 
-            if (variant != "single")
+            if (variant is not ("single" or "unkept"))
             {
                 _ = await nodeB.SafePsqlAsync(Database, WrittenAgain, token);
                 await nodeB.StopAsync("fast", token);
