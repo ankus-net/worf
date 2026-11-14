@@ -1639,16 +1639,27 @@ internal static class SequenceRangeExchange
             ulong sysid = ulong.Parse(root.GetProperty("sysid").GetWorfString() ?? "0", CultureInfo.InvariantCulture);
             long timeline = root.GetProperty("timeline").GetInt64();
             (ulong last, long lastStart) = SequenceRangeHeard.LatestLsn(senderId, sysid, timeline, call);
+            // The positions are written with the take-in's lock timeout, as sequences are often left out because another
+            // transaction holds their rows, as a drop of the neighbor's subscription left open holds those it deleted, and
+            // waiting for it here would hold the node's turn; rows held so are written by a later message, while shared
+            // memory keeps the position.
             if (leftSequences.Count > 0)
             {
                 (ulong keep, long keepStart) = last > lsn || WentBackTo(last, lastStart, root) is not null ? (last, lastStart) : (lsn, SenderStart(root).Start ?? 0);
-                _ = Worf.Execute("""
-                    INSERT INTO worf.sequence_range_back SELECT s, $2, $7, $3::numeric, $4, $5::pg_lsn, $6 FROM pg_catalog.unnest($1::oid[]) s
-                    ON CONFLICT (seqoid, node_id, call, started) DO UPDATE SET sysid = excluded.sysid, timeline = excluded.timeline, lsn = excluded.lsn
-                        WHERE (sequence_range_back.sysid, sequence_range_back.timeline) <> (excluded.sysid, excluded.timeline)
-                            OR sequence_range_back.lsn < excluded.lsn
-                    """, SpiParameter.Create(leftSequences.ToArray()), SpiParameter.Create(senderId), SpiParameter.Create((decimal)sysid),
-                    SpiParameter.Create(timeline), SpiParameter.Create(Worf.FormatLsn(keep)), SpiParameter.Create(keepStart), SpiParameter.Create(call));
+                try
+                {
+                    PgTransaction.RunInSubtransaction(() => _ = WithLockTimeout(() => Worf.Execute("""
+                        INSERT INTO worf.sequence_range_back SELECT s, $2, $7, $3::numeric, $4, $5::pg_lsn, $6 FROM pg_catalog.unnest($1::oid[]) s
+                        ON CONFLICT (seqoid, node_id, call, started) DO UPDATE SET sysid = excluded.sysid, timeline = excluded.timeline, lsn = excluded.lsn
+                            WHERE (sequence_range_back.sysid, sequence_range_back.timeline) <> (excluded.sysid, excluded.timeline)
+                                OR sequence_range_back.lsn < excluded.lsn
+                        """, SpiParameter.Create(leftSequences.ToArray()), SpiParameter.Create(senderId), SpiParameter.Create((decimal)sysid),
+                        SpiParameter.Create(timeline), SpiParameter.Create(Worf.FormatLsn(keep)), SpiParameter.Create(keepStart), SpiParameter.Create(call))));
+                }
+                catch (PgException held) when (held.SqlState == "55P03")
+                {
+                    WorfLog.Debug1($"sequence range exchange with node {senderName} leaves the positions of sequences it left out to a later message: {held.Message}");
+                }
             }
 
             // A report that changed only in how far the neighbor drew records it, with the neighbor's WAL position past

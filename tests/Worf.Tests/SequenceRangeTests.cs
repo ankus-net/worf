@@ -3233,10 +3233,24 @@ public sealed partial class SequenceRangeTests
         {
             case "configuration open" or "drop open":
             {
-                // A configuration change left open holds the range rows of u_id_seq and the five others.
+                // A configuration change left open holds the range rows of u_id_seq and the five others, which node_c's
+                // answers leave out, and, deleted, the positions node_a recorded of node_c's sequences left out before,
+                // which node_a records again for those its answers leave out.
+                if (how == "configuration open")
+                {
+                    _ = await nodeA.SafePsqlAsync(Database, """
+                        INSERT INTO worf.sequence_range_back
+                        SELECT n.seqoid, n.node_id, c.call, n.sysid, n.timeline, '0/1', n.reported_start
+                        FROM worf.sequence_range_node n CROSS JOIN (VALUES (true), (false)) c (call)
+                        WHERE n.node_name = 'node_c' AND n.via_node = n.node_id AND n.sysid IS NOT NULL AND n.reported_start IS NOT NULL
+                        ON CONFLICT DO NOTHING
+                        """, token);
+                }
+
                 await HoldAsync(how == "drop open" ? "SELECT worf.drop_subscription('a_from_c')" : """
                     SELECT worf.alter_sequence_range('u_id_seq', range_size := 10);
-                    SELECT count(worf.alter_sequence_range(format('many_%s', lpad(g::text, 2, '0'))::regclass, range_size := 50)) FROM generate_series(1, 5) g
+                    SELECT count(worf.alter_sequence_range(format('many_%s', lpad(g::text, 2, '0'))::regclass, range_size := 50)) FROM generate_series(1, 5) g;
+                    DELETE FROM worf.sequence_range_back WHERE node_id = (SELECT node_id FROM worf.node WHERE node_name = 'node_c')
                     """);
                 Task lift = nodeA.SafePsqlAsync(Database, Lift, token);
                 Assert.AreEqual("", await InsertAsync(nodeB, "t"), $"node_b's inserts as a lift waits beside a {how}");
