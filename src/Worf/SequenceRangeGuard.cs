@@ -225,6 +225,11 @@ internal static partial class SequenceRangeGuard
     // rather than the grantor of their active block.
     private static readonly HashSet<uint> s_heardBy = [];
 
+    // The neighbors a message of whose this server took in whole since it started, as the blocks were last read: one
+    // this node exchanges with that has no report of a sequence, as tables restored from before it first reported have
+    // none, is waited for, as a start's draws wait, until such a message shows whether it reports the sequence.
+    private static long[] s_complete = [];
+
     // Whether the guard is reading the blocks to find the grantors a statement's plan names.
     private static bool s_namingGrantors;
 
@@ -3354,7 +3359,14 @@ internal static partial class SequenceRangeGuard
                 long woken = 0;
                 while (true)
                 {
+                    // A neighbor's message taken in whole since, which changes no table, as one that reports no such
+                    // sequence, ends the wait for it.
                     Refresh();
+                    if (!SequenceRangeHeard.CompleteSince(SequenceRangeHeard.Started).SequenceEqual(s_complete))
+                    {
+                        s_version = -1;
+                    }
+
                     Reload();
                     if (!s_grantors.TryGetValue(seqoid, out uint current) || s_confirmedSequences.Contains(seqoid))
                     {
@@ -4979,6 +4991,7 @@ internal static partial class SequenceRangeGuard
         s_grantors.Clear();
         s_confirmedSequences.Clear();
         s_heardBy.Clear();
+        s_complete = SequenceRangeHeard.CompleteSince(SequenceRangeHeard.Started);
         s_drawnBy.Clear();
         s_drawingColumns.Clear();
         s_defaultsText.Clear();
@@ -5009,14 +5022,21 @@ internal static partial class SequenceRangeGuard
                     WHERE c.seqoid = r.seqoid AND c.node_id <> l.node_id AND c.confirmed_start IS DISTINCT FROM $3
                         AND (EXISTS (SELECT 1 FROM worf.subscription s WHERE s.sub_origin = c.node_id AND s.sub_target = l.node_id)
                             OR EXISTS (SELECT 1 FROM worf.sequence_range_link k WHERE k.node_id = c.node_id))
-                    ORDER BY c.node_name LIMIT 1)),
+                    ORDER BY c.node_name LIMIT 1),
+                    (SELECT k.node_id FROM (
+                            SELECT s.sub_origin AS node_id FROM worf.subscription s WHERE s.sub_target = l.node_id
+                            UNION SELECT k.node_id FROM worf.sequence_range_link k) k
+                    WHERE k.node_id <> l.node_id AND NOT (k.node_id::pg_catalog.int8 = ANY ($4))
+                        AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_node c WHERE c.seqoid = r.seqoid AND c.node_id = k.node_id)
+                    ORDER BY k.node_id LIMIT 1)),
                 b.from_node
             FROM worf.sequence_range r
                 JOIN pg_catalog.pg_sequence s ON s.seqrelid = r.seqoid
                 CROSS JOIN worf.local_node l
                 LEFT JOIN worf.sequence_range_block b ON b.seqoid = r.seqoid AND b.kind IN ('n', 'i')
                     AND b.state IN ('next', 'active', 'retired', 'imported')
-            """, SpiParameter.Create((decimal)sysid), SpiParameter.Create((long)timeline), SpiParameter.Create(SequenceRangeHeard.Started)));
+            """, SpiParameter.Create((decimal)sysid), SpiParameter.Create((long)timeline), SpiParameter.Create(SequenceRangeHeard.Started),
+            SpiParameter.Create(s_complete)));
         for (int i = 0; i < result.Count; i++)
         {
             WorfRow row = result[i];

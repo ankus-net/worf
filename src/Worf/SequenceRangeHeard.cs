@@ -347,6 +347,45 @@ internal static class SequenceRangeHeard
     }
 
     /// <summary>
+    /// Notes that a message of a node's, which this server took in whole, committed.
+    /// </summary>
+    /// <param name="nodeId">The node.</param>
+    /// <param name="at">When.</param>
+    internal static void NoteComplete(uint nodeId, long at)
+    {
+        using PgLwLockExclusiveGuard<WorfHeardTable, WorfHeard> guard = Nodes.Exclusive();
+        int slot = Find(guard, nodeId, nodeId);
+        if (slot >= 0)
+        {
+            WorfHeard heard = guard[slot];
+            heard.CompleteAt = Math.Max(heard.CompleteAt, at);
+            guard[slot] = heard;
+        }
+    }
+
+    /// <summary>
+    /// Gets the nodes of this database a message of whose this server took in whole since a time, in order.
+    /// </summary>
+    /// <param name="since">The time.</param>
+    /// <returns>The nodes.</returns>
+    internal static long[] CompleteSince(long since)
+    {
+        uint dboid = DatabaseId();
+        using PgLwLockShareGuard<WorfHeardTable, WorfHeard> guard = Nodes.Share();
+        List<long> complete = [];
+        for (int i = 0; i < guard.Length; i++)
+        {
+            if (guard[i].Dboid == dboid && guard[i].NodeId != 0 && guard[i].CompleteAt >= since)
+            {
+                complete.Add(guard[i].NodeId);
+            }
+        }
+
+        complete.Sort();
+        return [.. complete];
+    }
+
+    /// <summary>
     /// Notes that a node, this server's provider, asked this server to call it, which makes the exchange with it due.
     /// </summary>
     /// <param name="nodeId">The node.</param>

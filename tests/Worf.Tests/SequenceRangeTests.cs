@@ -5625,14 +5625,17 @@ public sealed partial class SequenceRangeTests
     /// A restored node waits, before it draws, for every neighbor it exchanges with that reports the sequence, not only
     /// its block's grantor: node_c heard of node_b's draws while node_a, the grantor, was down, and is down itself as
     /// node_b comes back from its backup, so node_b's inserts wait for node_c, naming it, though a drop of node_b's
-    /// subscription to node_c is under way, which may roll back, and once node_c finds node_b went back, node_b never draws
-    /// those values again.
+    /// subscription to node_c is under way, which may roll back, or node_b's backup is from before node_c first reported,
+    /// so that the restored tables have no report of node_c's to wait for, and once node_c finds node_b went back, node_b
+    /// never draws those values again.
     /// </summary>
-    /// <param name="how">node_c down, or down with a drop of b_from_c left open, which then rolls back.</param>
+    /// <param name="how">node_c down, down with a drop of b_from_c left open, which then rolls back, or down after first
+    /// reporting since the backup.</param>
     /// <returns>The test.</returns>
     [TestMethod]
     [DataRow("down")]
     [DataRow("drop rolled back")]
+    [DataRow("first reported after backup")]
     public async Task RestoredNodesWaitForEveryNeighborThatHeardTheirDraws(string how)
     {
         CancellationToken token = TestContext.CancellationToken;
@@ -5644,18 +5647,46 @@ public sealed partial class SequenceRangeTests
             _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
         }
 
+        // node_c can't answer node_b's calls, and so reports nothing to it, until node_b's backup is taken, when it's to
+        // report first after the backup; node_a's root then starts without node_c's report.
+        bool late = how == "first reported after backup";
+        const string Paused = "ALTER FUNCTION worf.sequence_range_exchange(text) RENAME TO sequence_range_exchange_paused";
+        if (late)
+        {
+            _ = await nodeC.SafePsqlAsync(Database, Paused, token);
+        }
+
         await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
         await SubscribeAsync(nodeB, "b_from_c", nodeC, token);
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b,node_c}', range_size := 1000)", token);
+        if (late)
+        {
+            Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass)", token),
+                "t_id_seq's range");
+            await Task.Delay(TimeSpan.FromSeconds(2), token);
+            _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.activate_sequence_range('t_id_seq')", token);
+        }
+
         await WaitActiveAsync([nodeA, nodeB], token);
         _ = await InsertIdsAsync(nodeB, "first", token);
         const string HeardOfB = "FROM worf.sequence_range_node WHERE node_name = 'node_b' AND seqoid = 't_id_seq'::regclass";
-        Assert.IsTrue(await nodeC.PollQueryUntilAsync(Database, $"SELECT EXISTS (SELECT 1 {HeardOfB})", token), "node_c hearing of node_b");
+        if (!late)
+        {
+            Assert.IsTrue(await nodeC.PollQueryUntilAsync(Database, $"SELECT EXISTS (SELECT 1 {HeardOfB})", token), "node_c hearing of node_b");
+        }
 
         // node_b is backed up whole, and draws while node_a is down, which node_c hears of; node_c stops before the restore.
         using TemporaryDirectory copies = new($"worf-sequence-range-neighbor-restore-{Guid.NewGuid():N}");
         string copy = Path.Join(copies.FullName, "node_b");
         await BackUpDataAsync(nodeB, copy, token, wal: true);
+        if (late)
+        {
+            Assert.AreEqual("0", await nodeB.SafePsqlAsync(Database, "SELECT count(*) FROM worf.sequence_range_node WHERE node_name = 'node_c'", token),
+                "node_c's reports on node_b at the backup");
+            _ = await nodeC.SafePsqlAsync(Database, "ALTER FUNCTION worf.sequence_range_exchange_paused(text) RENAME TO sequence_range_exchange", token);
+            Assert.IsTrue(await nodeC.PollQueryUntilAsync(Database, $"SELECT EXISTS (SELECT 1 {HeardOfB})", token), "node_c hearing of node_b");
+        }
+
         await nodeA.StopAsync("fast", token);
         HashSet<string> before = await InsertIdsAsync(nodeB, "before", token);
         Assert.IsTrue(await nodeC.PollQueryUntilAsync(Database, $"SELECT drawn >= {before.Max(long.Parse)} {HeardOfB}", token), "node_c hearing of node_b's draws");

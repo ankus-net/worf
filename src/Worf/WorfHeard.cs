@@ -94,6 +94,11 @@ internal struct WorfHeard
     public long CallForAt;
 
     /// <summary>
+    /// When the node's last message that this server took in whole, leaving no sequence out, committed.
+    /// </summary>
+    public long CompleteAt;
+
+    /// <summary>
     /// Where, among the sequences of the node's calls in the order of their names, the last call this server cut short
     /// stopped, which the next call goes on from, or zero.
     /// </summary>

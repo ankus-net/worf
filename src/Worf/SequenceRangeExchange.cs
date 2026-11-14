@@ -594,9 +594,11 @@ internal static class SequenceRangeExchange
 
             Disconnect(sub.Id);
 
-            // A provider without the exchange function manages no sequence.
+            // A provider without the exchange function manages no sequence, as a whole message that carries none would
+            // show.
             if (query.SqlState == UndefinedFunction)
             {
+                SequenceRangeHeard.NoteComplete(sub.Origin.Id, Worker.GetCurrentTimestamp());
                 return Succeeded(pending);
             }
 
@@ -1696,6 +1698,14 @@ internal static class SequenceRangeExchange
                 _ = PgAtomic.Add(SequenceRanges.ExchangeRequested, 1L);
                 Worker.WakeManager();
             });
+        }
+
+        // A message taken in whole, leaving no sequence out, shows, once it commits, every sequence the neighbor reports,
+        // which a start's draws wait for, from a neighbor this node's restored tables may not know reports any.
+        if (left.Count == 0 && leftSequences.Count == 0 && cutAt is null)
+        {
+            long takenAt = Worker.GetCurrentTimestamp();
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, () => SequenceRangeHeard.NoteComplete(senderId, takenAt));
         }
 
         return (granted, received, takenIn > 0);
