@@ -15,7 +15,8 @@ namespace Worf;
 /// an apply or sync worker's, which it waits for. The host names libpq would connect to, from the connection string, a
 /// service file or the environment, are looked up on other threads, and libpq connects to each address as its name's
 /// lookup finds it, in turn, as libpq does, giving each the connection's <c>connect_timeout</c>, and passing over a name
-/// that has none; then the session runs its setup. A logical replication connection asks for this database's encoding
+/// that has none; then the session runs its setup. libpq is given one address at a time, followed by a host that
+/// can't be connected to, so that where it stops tells whether it would have gone on past the address, and to what. A logical replication connection asks for this database's encoding
 /// and settings that make the values it gets unambiguous, after any options the connection string gives, as
 /// libpqwalreceiver's do. libpq's polling, status and result values are part of its stable interface.
 /// </summary>
@@ -47,9 +48,9 @@ internal sealed unsafe class WorfProbe : IDisposable
     private const PgSocket NoSocket = -1;
 #endif
 
-    // A host after the addresses libpq is given, while more are still to come, that it can't connect to, as a socket
-    // directory that doesn't exist, so that libpq failing there shows it went past every address it was given, as it
-    // does past addresses that don't take the connection, rather than stopped at a server that refused it.
+    // A host after the address libpq is given that it can't connect to, as a socket directory that doesn't exist, so that
+    // libpq failing there shows it went past the address, as it does past one that doesn't take the connection or a
+    // server that isn't of the session's attributes, rather than stopped at a server that refused it.
     private const string EndOfList = "/worf-probe-end-of-list";
 
     private readonly string _conninfo;
@@ -69,7 +70,6 @@ internal sealed unsafe class WorfProbe : IDisposable
     private readonly List<(string Host, string Address, string Port, int Entry)> _attempts = [];
     private readonly bool _preferStandby;
     private int _attempt = -1;
-    private int _listedUpTo;
     private long _attemptDeadline;
     private void* _conn;
     private int _polling = PollingWriting;
@@ -171,7 +171,7 @@ internal sealed unsafe class WorfProbe : IDisposable
                 {
                     string name = i < names.Length ? names[i] : "";
                     string address = i < addresses.Length ? addresses[i] : "";
-                    hosts.Add(address.Length > 0 ? (name.Length > 0 ? name + "\0" + address : address, null)
+                    hosts.Add(address.Length > 0 ? (name + "\0" + address, null)
                         : (name, name.Length == 0 || name[0] is '/' or '@' || (name.Trim() == name && IPAddress.TryParse(name, out _)) ? null : HostLookup.Start(name)));
                 }
             }
@@ -233,11 +233,7 @@ internal sealed unsafe class WorfProbe : IDisposable
                 {
                     // An address that doesn't connect within its time gives way to the next, as libpq's own wait for a
                     // connection does with connect_timeout.
-                    if (Follow())
-                    {
-                        continue;
-                    }
-
+                    NoteReached();
                     if (_attemptDeadline != 0 && Worker.GetCurrentTimestamp() >= _attemptDeadline)
                     {
                         TimedOut();
@@ -264,16 +260,10 @@ internal sealed unsafe class WorfProbe : IDisposable
                     continue;
                 }
 
-                // libpq has tried the addresses after the one it failed at as far as it would, and stopped at a server
-                // that refused the connection, as it does. Once it has passed the last address it was given, the
-                // addresses found since it started are tried.
+                // libpq has failed at the address, and gone on past it, as it would to the next, or stopped at a server
+                // that refused the connection, as it does.
                 if (_polling == PollingFailed || Status() != ConnectionOk)
                 {
-                    if (Follow())
-                    {
-                        continue;
-                    }
-
                     if (GoesOn())
                     {
                         Next();
@@ -496,21 +486,22 @@ internal sealed unsafe class WorfProbe : IDisposable
     // The names not listed yet, as their lookups, or an earlier name's, haven't finished, which count as an address each.
     private int Unlisted() => Array.FindAll(_harvested, harvested => !harvested).Length;
 
-    // Connects to the addresses found so far from the next one on, which libpq tries in turn, moving on as it does: after
-    // one that doesn't take the connection, or a server that is starting or isn't of the session's attributes, but not
-    // after one that refuses the connection, as for a role it doesn't have. A connection that libpq finds bad at once, as
-    // for an option it doesn't know, fails. With no address left while names are still looked up, it waits for them.
+    // Connects to the next address found, which libpq tries, and goes on past as it would: to the name's next address
+    // after one that doesn't take the connection, and to the next name's after a server that is starting or isn't of the
+    // session's attributes, but not after one that refuses the connection, as for a role it doesn't have. A connection
+    // that libpq finds bad at once, as for an option it doesn't know, fails. With no address left while names are still
+    // looked up, it waits for them.
     private void Next()
     {
         // A connection that prefers a standby makes libpq's two passes itself: the first takes a standby only, through
         // every address, a name's found later too, and the second, once every name is found, takes any server, from the
-        // first host again, as libpq's own second pass starts there, though the probe started libpq again at a later
-        // host as it moved past a server it reached, as libpq moves past it to the next host.
+        // first host again, as libpq's own second pass starts there. With no address found at all, there is no second
+        // pass to make, as libpq has none.
         // Names are still to come until each lookup's outcome is listed, which a lookup that ends now waits for, rather
         // than the probe fail without it.
         if (_attempt + 1 >= _attempts.Count)
         {
-            if (_standbyOnly && Unlisted() == 0)
+            if (_standbyOnly && Unlisted() == 0 && _attempts.Count > 0)
             {
                 _standbyOnly = false;
                 _attempt = -1;
@@ -541,16 +532,10 @@ internal sealed unsafe class WorfProbe : IDisposable
         }
 #endif
         _attempt++;
-        _listedUpTo = _attempts.Count;
-        bool more = Unlisted() > 0;
         var start = (delegate* unmanaged<sbyte**, sbyte**, int, void*>)WorfConnection.LibpqFunction("PQconnectStartParams");
-        List<(string Host, string Address, string Port, int Entry)> rest = _attempts[_attempt..];
+        List<(string Host, string Address, string Port, int Entry)> rest = [_attempts[_attempt], (EndOfList, "", _attempts[_attempt].Port, -1)];
         byte[] info = Worf.ToServerCString(_conninfo);
         byte[] application = Worf.ToServerCString(_applicationName);
-        if (more)
-        {
-            rest.Add((EndOfList, "", rest[^1].Port, -1));
-        }
 
         byte[] hostValue = Worf.ToServerCString(string.Join(',', rest.Select(attempt => attempt.Host)));
         byte[] hostaddr = Worf.ToServerCString(string.Join(',', rest.Select(attempt => attempt.Address)));
@@ -567,8 +552,8 @@ internal sealed unsafe class WorfProbe : IDisposable
             applicationAddress = application, hostAddress = hostValue, hostaddrValue = hostaddr, portAddress = portValue, encodingValue = encoding,
             optionsValue = options)
         {
-            // The hosts, their addresses and ports come after the connection string, whose values they take the place
-            // of, in the order the probe has them in, and so do a replication connection's own options.
+            // The address, its host and port come after the connection string, whose values they take the place of,
+            // and so do a replication connection's own options.
             List<(nint Key, nint Value)> pairs = [((nint)dbname, (nint)infoAddress), ((nint)fallback, (nint)applicationAddress)];
             if (listed)
             {
@@ -627,33 +612,38 @@ internal sealed unsafe class WorfProbe : IDisposable
         }
     }
 
-    // libpq failed, as soon as it started too, as at addresses that refuse at once. Past the last address listed, those
-    // found since are tried, and past the last of all, a connection that prefers a standby makes its second pass;
-    // libpq stopped at a server that refused it is no pass's end, and the probe fails. Returns whether it goes on.
+    // libpq failed, as soon as it started too, as at an address that refuses at once. Gone on past the address, it goes
+    // to the next, or, past a server it reached, to the next name's first, as libpq moves past such a server to the next
+    // host; stopped at a server that refused it, the probe fails, as libpq does. Returns whether it goes on.
     private bool GoesOn()
     {
-        string refused = ErrorMessage();
-        int end = refused.IndexOf(EndOfList, StringComparison.Ordinal);
+        string message = ErrorMessage();
+        int end = message.IndexOf(EndOfList, StringComparison.Ordinal);
         if (end >= 0)
         {
-            refused = refused[..(refused.LastIndexOf('\n', end) + 1)].TrimEnd();
+            message = message[..(message.LastIndexOf('\n', end) + 1)].TrimEnd();
         }
 
-        if (Text("PQhost") == EndOfList ||
-            (_standbyOnly && IsConnecting(_attempts[_listedUpTo - 1], Text("PQhost"), Text("PQhostaddr"), Text("PQport"))))
+        message = Named(message);
+        if (Text("PQhost") != EndOfList)
         {
-            if (refused.Length > 0)
-            {
-                _failures.Add(refused);
-            }
-
-            Close();
-            _attempt = _listedUpTo - 1;
-            return true;
+            Failure = Failures(message.Length > 0 ? message : null);
+            return false;
         }
 
-        Failure = Failures(refused.Length > 0 ? refused : null);
-        return false;
+        if (message.Length > 0)
+        {
+            _failures.Add(message);
+        }
+
+        Close();
+        if (_reached)
+        {
+            int entry = _attempts[_attempt].Entry;
+            _attempt = _attempts.FindLastIndex(attempt => attempt.Entry == entry);
+        }
+
+        return true;
     }
 
     // Closes the connection being made, to start libpq again.
@@ -692,81 +682,38 @@ internal sealed unsafe class WorfProbe : IDisposable
         }
     }
 
-    // Whether libpq connects to an address now, by the host, address and port it gives: the host it names, or the
-    // address it was given as, the address it reached, where both are known, without the scope of a link-local address,
-    // which libpq names by its interface, and the port, where one was given.
-    private static bool IsConnecting((string Host, string Address, string Port, int Entry) attempt, string host, string address, string port)
+    // Notes whether the server at the address answered: CONNECTION_AWAITING_RESPONSE, AUTH_OK, SETENV, CHECK_WRITABLE,
+    // CONSUME, CHECK_TARGET and CHECK_STANDBY.
+    private void NoteReached() => _reached |= Status() is 4 or 5 or 6 or 9 or 10 or 12 or 13;
+
+    // libpq's message for an address a name's lookup found, which libpq names alone, as it was given it, naming the name
+    // with it, as libpq does as it looks the name up itself.
+    private string Named(string message)
     {
-        if (attempt.Host != host && attempt.Address != host)
-        {
-            return false;
-        }
-
-        if (address.Length > 0 && attempt.Address.Length > 0 && Unscoped(attempt.Address) != Unscoped(address))
-        {
-            return false;
-        }
-
-        return attempt.Port.Length == 0 || attempt.Port == port;
+        (string host, string address, _, int entry) = _attempt >= 0 && _attempt < _attempts.Count ? _attempts[_attempt] : ("", "", "", -1);
+        return LookedUp(entry) && address.Length > 0 && host != address
+            ? string.Join('\n', message.Split('\n').Select(line => NamedLine(line, host, address)))
+            : message;
     }
 
-    // An address without its scope.
-    private static string Unscoped(string address) => address.IndexOf('%', StringComparison.Ordinal) is int scope and >= 0 ? address[..scope] : address;
-
-    // Follows libpq as it moves on to a later address, by the host, address and port it connects to now. libpq moves on
-    // past a server it reached that is starting, or isn't of the session's attributes, to the next host, rather than to
-    // another address of the same one; since each address is a host to libpq, the probe starts libpq again at the next
-    // host itself then. Returns whether it did.
-    private bool Follow()
+    // A line with the first address in it that is quoted, as libpq names one, named by its name as well.
+    private static string NamedLine(string line, string host, string address)
     {
-        string host = Text("PQhost");
-        string address = Text("PQhostaddr");
-        string port = Text("PQport");
-        for (int i = _attempt; i < _listedUpTo; i++)
+        static bool Quote(char c) => !char.IsLetterOrDigit(c) && !char.IsWhiteSpace(c) && c is not ('.' or ':' or '%' or '_' or '-');
+        for (int at = line.IndexOf(address, StringComparison.Ordinal); at >= 0; at = line.IndexOf(address, at + 1, StringComparison.Ordinal))
         {
-            if (!IsConnecting(_attempts[i], host, address, port))
+            int end = at + address.Length;
+            if (at > 0 && end < line.Length && Quote(line[at - 1]) && Quote(line[end]))
             {
-                continue;
+                return string.Concat(line[..at], host, line[end..(end + 1)], " (", address, ")", line[(end + 1)..]);
             }
-
-            if (i != _attempt)
-            {
-                if (_reached && _attempts[i].Entry == _attempts[_attempt].Entry)
-                {
-                    // libpq has begun its message for the address it moved on to, which the probe doesn't try: a last
-                    // line that names it and says nothing more, which goes.
-                    string passed = ErrorMessage().TrimEnd();
-                    int lastLine = passed.LastIndexOf('\n');
-                    if (passed[(lastLine + 1)..].EndsWith("failed:", StringComparison.Ordinal))
-                    {
-                        passed = lastLine >= 0 ? passed[..lastLine].TrimEnd() : "";
-                    }
-
-                    if (passed.Length > 0)
-                    {
-                        _failures.Add(passed);
-                    }
-
-                    Close();
-                    _attempt = _attempts.FindLastIndex(_listedUpTo - 1, _listedUpTo - _attempt, attempt => attempt.Entry == _attempts[_attempt].Entry);
-                    Next();
-                    return true;
-                }
-
-                _attempt = i;
-                _reached = false;
-                StartAttempt();
-                Route();
-            }
-
-            break;
         }
 
-        // CONNECTION_AWAITING_RESPONSE, AUTH_OK, SETENV, CHECK_WRITABLE, CONSUME, CHECK_TARGET and CHECK_STANDBY: the
-        // server answered.
-        _reached |= Status() is 4 or 5 or 6 or 9 or 10 or 12 or 13;
-        return false;
+        return line;
     }
+
+    // Whether a host entry's addresses came from its name's lookup.
+    private bool LookedUp(int entry) => entry >= 0 && entry < _hosts.Count && _hosts[entry].Lookup is not null;
 
     // A connection's host, address or port, as libpq gives it now.
     private string Text(string function)
@@ -787,11 +734,12 @@ internal sealed unsafe class WorfProbe : IDisposable
     private string Failures(string? last)
         => string.Join('\n', last is null ? _failures : [.. _failures, last.TrimEnd()]) is { Length: > 0 } all ? all : "could not connect to the server";
 
-    // A failure of the address being connected to, worded as libpq words its own.
+    // A failure of the address being connected to, worded as libpq words its own: an address it was given alone, and one
+    // it found with its name.
     private string AttemptFailure(string reason)
     {
-        (string host, string address, string port, _) = _attempt >= 0 && _attempt < _attempts.Count ? _attempts[_attempt] : ("", "", "", 0);
-        string at = address.Length > 0 && address != host ? $"\"{host}\" ({address})" : $"\"{host}\"";
+        (string host, string address, string port, int entry) = _attempt >= 0 && _attempt < _attempts.Count ? _attempts[_attempt] : ("", "", "", -1);
+        string at = LookedUp(entry) && address.Length > 0 && address != host ? $"\"{host}\" ({address})" : $"\"{(address.Length > 0 ? address : host)}\"";
         return port.Length > 0 ? $"connection to server at {at}, port {port} failed: {reason}" : $"connection to server at {at} failed: {reason}";
     }
 
@@ -807,7 +755,7 @@ internal sealed unsafe class WorfProbe : IDisposable
         PgSocket socket = Socket();
         if (socket == NoSocket)
         {
-            Failure ??= ErrorMessage() is { Length: > 0 } message ? message : "the connection has no socket";
+            Failure ??= ErrorMessage() is { Length: > 0 } message ? Named(message) : "the connection has no socket";
             return false;
         }
 

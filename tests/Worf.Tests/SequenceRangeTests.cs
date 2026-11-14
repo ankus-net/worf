@@ -2885,12 +2885,15 @@ public sealed partial class SequenceRangeTests
     /// <summary>
     /// The exchange connects to the server libpq would, from the same lists: lists whose counts libpq refuses are refused;
     /// past a server that is in hot standby, as the session wants a read-write one, the probe goes to the next host rather
-    /// than to the name's next address; a standby found at a name still looked up is preferred, as libpq prefers it, to a
-    /// server listed before it that isn't one; the machine's own name has the addresses getaddrinfo gives it, rather than
-    /// every interface's; a name whose hostaddr is empty is looked up away from the worker, which holds up no insert; an
-    /// address that refuses gives way to one still looked up, without the call failing; and from PostgreSQL 17, an address
-    /// that never answers gives way at a connect_timeout of 1 s, where libpq waits 2 s before it. On Linux, where a library
-    /// the server preloads answers the lookups of those names.
+    /// than to the name's next address, which it never connects to, and names the server as psql does; a server that
+    /// refuses the connection ends a pass that takes a standby only, with no second pass; a standby found at a name still
+    /// looked up is preferred, as libpq prefers it, to a server listed before it that isn't one; the machine's own name has
+    /// the addresses getaddrinfo gives it, rather than every interface's; hostaddr entries are taken with their spaces, as
+    /// addresses; a name whose hostaddr is empty is looked up away from the worker, which holds up no insert, and so is a
+    /// name that has no address, when the connection prefers a standby; an address that refuses gives way to one still
+    /// looked up, without the call failing; and from PostgreSQL 17, an address that never answers gives way at a
+    /// connect_timeout of 1 s, where libpq waits 2 s before it. On Linux, where a library the server preloads answers the
+    /// lookups of those names.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -2924,16 +2927,16 @@ public sealed partial class SequenceRangeTests
             Assert.AreEqual(0, backedUp, backupOutput);
             (int started, string startOutput) = await nodeC.RunProgramAsync("pg_ctl",
                 ["start", "-w", "-D", standbyDir, "-l", Path.Join(work.FullName, "standby.log"), "-o",
-                    $"-p {port} -c listen_addresses=127.0.0.2 -c unix_socket_directories={standbyDir} -c hot_standby=on"], token);
+                    $"-p {port} -c listen_addresses=127.0.0.2 -c unix_socket_directories={standbyDir} -c hot_standby=on -c log_connections=on"], token);
             Assert.AreEqual(0, started, startOutput);
             try
             {
-                async Task<string> CallAsync(string dsn, string outcome)
+                async Task<string> CallAsync(string dsn, string outcome, string user = SuperUser)
                 {
                     await RefuseNodeCAsync(nodeB, token);
                     int logpos = nodeB.ReadLog().Length;
                     _ = await nodeB.SafePsqlAsync(Database, $"""
-                        UPDATE worf.node_interface SET if_dsn = '{dsn} dbname={Database} user={SuperUser}'
+                        UPDATE worf.node_interface SET if_dsn = '{dsn} dbname={Database} user={user}'
                         WHERE if_nodeid = (SELECT node_id FROM worf.node WHERE node_name = 'node_c')
                         """, token);
                     Assert.IsTrue(await nodeB.PollLogAsync(logpos, outcome, token), $"node_b's call to node_c over {dsn}: {outcome}");
@@ -2952,12 +2955,25 @@ public sealed partial class SequenceRangeTests
 
                 // worf-first.test has node_c's address before the standby's. A connection that prefers a standby passes
                 // node_c for the next host, of which there is none, and takes node_c in its second pass, from the first
-                // host, as psql does; one that takes a standby only fails, naming node_c's address alone, as psql does,
-                // rather than the standby's, which libpq never tries.
+                // host, as psql does, never connecting to the standby; one that takes a standby only fails, naming node_c's
+                // address alone, with the name, as psql does, rather than the standby's, which libpq never tries.
+                string standbyLog = Path.Join(work.FullName, "standby.log");
+                int standbyAt = File.ReadAllText(standbyLog).Length;
                 string preferring = await CallAsync($"host=worf-first.test port={port} target_session_attrs=prefer-standby", "sequence range exchange with node node_c done");
                 Assert.IsFalse(BareFailureLine().IsMatch(preferring), "node_b's calls to node_c, ending a failure with a line for an address never tried");
+                Assert.DoesNotContain("connection received", File.ReadAllText(standbyLog)[standbyAt..], "the standby's log, as node_b's call passed node_c");
                 string standbyOnly = await CallAsync($"host=worf-first.test port={port} target_session_attrs=standby", "server is not in hot standby mode");
                 Assert.DoesNotContain("cannot exchange sequence ranges during recovery", standbyOnly, "node_b's call to node_c, made at the standby libpq never tries");
+                Assert.Contains($"connection to server at \"worf-first.test\" (127.0.0.1), port {port} failed: server is not in hot standby mode", standbyOnly,
+                    "node_b's call to node_c, naming node_c as psql does");
+
+                // A server that refuses the connection, as node_a refuses a role only node_c has, ends a pass that takes a
+                // standby only, as psql's does, after node_c, which isn't one, with no second pass that logs in at node_c.
+                _ = await nodeC.SafePsqlAsync(Database, "CREATE ROLE onlyc LOGIN", token);
+                string onlyC = await CallAsync($"host=127.0.0.1,127.0.0.1 port={port},{nodeA.Cluster.Port.ToString(CultureInfo.InvariantCulture)} target_session_attrs=prefer-standby",
+                    "exchange with node node_c failed", "onlyc");
+                Assert.Contains("server is not in hot standby mode", onlyC, "node_b's call to node_c as onlyc, at node_c");
+                Assert.Contains("role \"onlyc\" does not exist", onlyC, "node_b's call to node_c as onlyc, at node_a");
 
                 // A standby found at a name still looked up is preferred to node_c, listed before it.
                 string preferred = await CallAsync($"host=127.0.0.1,worf-standby.test port={port} target_session_attrs=prefer-standby",
@@ -2995,40 +3011,51 @@ public sealed partial class SequenceRangeTests
                 // psql does once it ends.
                 _ = await CallAsync($"host=worf-later.test port={port}", "sequence range exchange with node node_c done");
 
-                // A host entry is taken with its spaces, as libpq takes it.
+                // A host entry is taken with its spaces, as libpq takes it, and so is a hostaddr entry, as an address.
                 _ = await CallAsync($"host=''127.0.0.4, worf-delay.test'' port={port}", "could not translate host name \" worf-delay.test\"");
+                _ = await CallAsync($"hostaddr=''127.0.0.1, 127.0.0.1'' port=1,{port}", "could not parse network address \" 127.0.0.1\"");
 
                 // An address that refuses gives way to a name still looked up, and the call doesn't fail meanwhile.
                 string waited = await CallAsync($"host=127.0.0.1,worf-delay.test port=1,{port}", "sequence range exchange with node node_c done");
                 Assert.DoesNotContain("exchange with node node_c failed", waited, "node_b's call to node_c, waiting for worf-delay.test");
 
                 // A name whose hostaddr is empty is looked up away from the worker: its lookup takes 7 s and fails, which
-                // a call has 20 s for, and node_b's inserts, which draw a block from node_a every 100 rows, wait for none of it.
+                // a call has 20 s for, and node_b's inserts, which draw a block from node_a every 100 rows, wait for none of it;
+                // nor do they when the connection prefers a standby and the name is all it has, which has no second pass.
                 _ = await nodeB.SafePsqlAsync(Database, "ALTER SYSTEM SET worf.sequence_range_timeout = '20s'", token);
                 _ = await nodeB.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
-                await RefuseNodeCAsync(nodeB, token);
-                int slow = nodeB.ReadLog().Length;
-                _ = await nodeB.SafePsqlAsync(Database, $"""
-                    UPDATE worf.node_interface SET if_dsn = 'host=worf-slow.test,127.0.0.1 hostaddr=,127.0.0.1 port={port} dbname={Database} user={SuperUser}'
-                    WHERE if_nodeid = (SELECT node_id FROM worf.node WHERE node_name = 'node_c')
-                    """, token);
-                await using (NpgsqlConnection writer = await nodeB.OpenAsync(Database, token))
+                foreach ((string dsn, string outcome) in new[]
                 {
-                    await using NpgsqlCommand insert = new("INSERT INTO t (v) VALUES ('b')", writer);
-                    Stopwatch running = Stopwatch.StartNew();
-                    TimeSpan slowest = TimeSpan.Zero;
-                    while (running.Elapsed < TimeSpan.FromSeconds(10))
+                    ("host=worf-slow.test,127.0.0.1 hostaddr=,127.0.0.1", "sequence range exchange with node node_c done"),
+                    ("host=worf-slow.test target_session_attrs=prefer-standby", "could not translate host name \"worf-slow.test\""),
+                })
+                {
+                    await RefuseNodeCAsync(nodeB, token);
+                    int slow = nodeB.ReadLog().Length;
+                    _ = await nodeB.SafePsqlAsync(Database, $"""
+                        UPDATE worf.node_interface SET if_dsn = '{dsn} port={port} dbname={Database} user={SuperUser}'
+                        WHERE if_nodeid = (SELECT node_id FROM worf.node WHERE node_name = 'node_c')
+                        """, token);
+                    await using (NpgsqlConnection writer = await nodeB.OpenAsync(Database, token))
                     {
-                        Stopwatch one = Stopwatch.StartNew();
-                        _ = await insert.ExecuteNonQueryAsync(token);
-                        slowest = one.Elapsed > slowest ? one.Elapsed : slowest;
-                        await Task.Delay(TimeSpan.FromMilliseconds(10), token);
+                        await using NpgsqlCommand insert = new("INSERT INTO t (v) VALUES ('b')", writer);
+                        Stopwatch running = Stopwatch.StartNew();
+                        TimeSpan slowest = TimeSpan.Zero;
+                        // The inserts go on until the call ends, at least 12 s.
+                        while (running.Elapsed < TimeSpan.FromSeconds(12) || !nodeB.ReadLog()[slow..].Contains(outcome, StringComparison.Ordinal))
+                        {
+                            Assert.IsLessThan(TestNode.PollTimeout, running.Elapsed, $"node_b's call to node_c at {dsn}: {outcome}");
+                            Stopwatch one = Stopwatch.StartNew();
+                            _ = await insert.ExecuteNonQueryAsync(token);
+                            slowest = one.Elapsed > slowest ? one.Elapsed : slowest;
+                            await Task.Delay(TimeSpan.FromMilliseconds(10), token);
+                        }
+
+                        Assert.IsLessThan(TimeSpan.FromSeconds(1), slowest, $"node_b's slowest insert, while worf-slow.test is looked up for {dsn}");
                     }
 
-                    Assert.IsLessThan(TimeSpan.FromSeconds(1), slowest, "node_b's slowest insert, while worf-slow.test is looked up");
+                    Assert.IsTrue(await nodeB.PollLogAsync(slow, outcome, token), $"node_b's call to node_c at {dsn}: {outcome}");
                 }
-
-                Assert.IsTrue(await nodeB.PollLogAsync(slow, "sequence range exchange with node node_c done", token), "node_b's call to node_c past worf-slow.test");
 
                 // An address that never answers, as a listener whose queue is full, gives way at connect_timeout, which is 1 s
                 // from PostgreSQL 17, and at least 2 s before it, as libpq has it: node_c logs the connection that much after
