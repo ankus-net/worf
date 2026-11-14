@@ -42,6 +42,9 @@ internal static class SequenceRangeExchange
     // The sequences, with the prepared transactions holding their range rows, that this process has warned of.
     private static readonly HashSet<(uint Seqoid, string Gid)> s_preparedHolders = [];
 
+    // Whether the take-in now may wait for its range row, as the exchange holds no range row yet.
+    private static bool s_rangeWaitAllowed;
+
     // The neighbors whose messages the current transaction took in, with when their servers started and whether they
     // made them knowing this server was back, noted once it commits.
     private const long TimedOutBackoff = 60_000_000;
@@ -1507,6 +1510,7 @@ internal static class SequenceRangeExchange
                 if (changed)
                 {
                     _ = s_unchanged.Remove((senderId, entry.GetProperty("name").GetWorfString() ?? ""));
+                    s_rangeWaitAllowed = takenIn == 0;
                     PgTransaction.RunInSubtransaction(() =>
                     {
                         (bool g, bool r, bool l) = WithLockTimeout(() => ProcessSequence(node, root, entry, senderId, senderName, call, applied));
@@ -2063,9 +2067,9 @@ internal static class SequenceRangeExchange
     }
 
     /// <summary>
-    /// Takes a sequence in with the shortest lock timeout, so that a row of its that another transaction holds, as a drop
-    /// of a subscription left open does the reports it deleted, or a configuration change its range row, leaves the
-    /// sequence to a later exchange at once, rather than hold up the exchange, which holds the node's turn,
+    /// Takes a sequence in with the shortest lock timeout, past its range row, so that a row of its that another
+    /// transaction holds, as a drop of a subscription left open does the reports it deleted, leaves the sequence to a
+    /// later exchange at once, rather than hold up the exchange, which holds the node's turn,
     /// and the other sequences' blocks with it, for each such sequence and each exchange the holder stays open. The
     /// setting is made as SET LOCAL makes it, without a statement, which would take a transaction ID.
     /// </summary>
@@ -2227,14 +2231,44 @@ internal static class SequenceRangeExchange
             return (false, false, false);
         }
 
-        // The range row is locked first, as every change to the sequence's ranges does, under the take-in's shortest
-        // lock timeout: the exchange holds the rows of the sequences it took in before until it commits, so a wait for one
-        // that a configuration change of several sequences left open holds would deadlock with it as it reaches those, and
-        // a transaction that ran a block out, which holds the row until it ends, leaves the sequence to a later exchange.
+        // The range row is locked first, as every change to the sequence's ranges does. A transaction that ran a block
+        // out, or granted one and waits for a synchronous standby, holds it until it ends, so the exchange waits for it a
+        // quarter of worf.sequence_range_timeout at most, up to a second, while it holds no range row yet. Once it holds
+        // the rows of sequences it took in, which it does until it commits, it waits for none, as a transaction holding
+        // some range rows, as a configuration change of several sequences, would deadlock with it as it reaches those.
+        // While a session idle in its transaction holds rows of the ranges, as a configuration change left open does, no
+        // row is waited for, so that the turn isn't held up for those at every exchange.
         int epoch = entry.GetProperty("epoch").GetInt32();
         uint owner = entry.GetProperty("owner_id").GetUInt32();
-        WorfRows local = Worf.Query("SELECT owner_node, epoch, state, parent_node FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE", false, 1,
-            SpiParameter.Create(seqoid));
+        WorfRows local;
+        int nestLevel;
+        unsafe
+        {
+            nestLevel = NativeMethods.NewGUCNestLevel();
+        }
+
+        try
+        {
+            if (s_rangeWaitAllowed && !Worf.ReadScalar<bool>("""
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_locks l JOIN pg_catalog.pg_stat_activity a ON a.pid = l.pid
+                    WHERE l.locktype = 'relation' AND l.database = (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())
+                        AND l.relation = 'worf.sequence_range'::pg_catalog.regclass AND l.granted AND a.state LIKE 'idle in transaction%')
+                """))
+            {
+                _ = Worf.Execute($"SET LOCAL lock_timeout = {Math.Min(1000, SequenceRanges.ExchangeTimeout / 4).ToString(CultureInfo.InvariantCulture)}");
+            }
+
+            local = Worf.Query("SELECT owner_node, epoch, state, parent_node FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE", false, 1,
+                SpiParameter.Create(seqoid));
+        }
+        finally
+        {
+            unsafe
+            {
+                NativeMethods.AtEOXact_GUC(true, nestLevel);
+            }
+        }
 
         if (local.Count == 0)
         {
