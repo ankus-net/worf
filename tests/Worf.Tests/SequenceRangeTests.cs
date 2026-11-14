@@ -3090,17 +3090,20 @@ public sealed partial class SequenceRangeTests
 
     /// <summary>
     /// A node's exchange turn is held only by the work that needs it, and waits on no other session's lock, so that
-    /// node_b's inserts, which draw a block from node_a every 100 rows, go on drawing: an exchange waits for a range row
-    /// a configuration change left open holds once, rather than for each such row at every exchange; a forced lift on
-    /// node_a waits for a configuration change or a drop left open, and for a drop under way, before it takes the turn
-    /// rather than holding it, and so doesn't deadlock with the drop; a drop canceled in the turn lets it go; sessions' own advisory locks,
-    /// of whatever key, are never worf's; and a drop left open whose deletes a reply's take-in would wait for, or a fence's
-    /// lift in the range worker, holds up neither the turn nor the worker, so that node_a's own inserts, which switch
-    /// blocks of 10, go on too.
+    /// node_b's inserts, which draw a block from node_a every 100 rows, go on drawing: an exchange passes over the range
+    /// rows a configuration change of six sequences left open holds, rather than wait on them, which would deadlock with
+    /// the change as it reaches the rows the exchange took in; a forced lift on node_a waits for a configuration change or
+    /// a drop left open, and for a drop under way, before it takes the turn rather than holding it, and so doesn't deadlock
+    /// with the drop; a drop canceled in the turn lets it go; sessions' own advisory locks, of whatever key, are never
+    /// worf's; and a drop left open whose deletes a reply's take-in would wait for, or a fence's lift in the range worker,
+    /// holds up neither the turn nor the worker, so that node_a's own inserts, which switch blocks of 10, go on too. The
+    /// rows run alone: their 24 servers would take most of the 32 System V shared memory segments macOS allows beside
+    /// other tests', and node_b's draws wait on how fast the exchanges of four nodes supply blocks.
     /// </summary>
     /// <param name="how">What holds, or would hold, the turn.</param>
     /// <returns>The test.</returns>
     [TestMethod]
+    [DoNotParallelize]
     [OSCondition(OperatingSystems.Linux | OperatingSystems.OSX)]
     [DataRow("configuration open")]
     [DataRow("drop open")]
@@ -3116,7 +3119,7 @@ public sealed partial class SequenceRangeTests
         await using TestNode nodeC = await StartNodeAsync("node_c", token);
         await using TestNode nodeD = await StartNodeAsync("node_d", token);
         const string Tables = "CREATE TABLE t (id bigserial PRIMARY KEY, v text); CREATE TABLE u (id bigserial PRIMARY KEY); "
-            + "DO $$ BEGIN FOR g IN 1..20 LOOP EXECUTE format('CREATE SEQUENCE many_%s', lpad(g::text, 2, '0')); END LOOP; END $$";
+            + "DO $$ BEGIN FOR g IN 1..5 LOOP EXECUTE format('CREATE SEQUENCE many_%s', lpad(g::text, 2, '0')); END LOOP; END $$";
         foreach (TestNode node in new[] { nodeA, nodeB, nodeC, nodeD })
         {
             _ = await node.SafePsqlAsync(Database, Tables, token);
@@ -3129,7 +3132,7 @@ public sealed partial class SequenceRangeTests
             SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b,node_c,node_d}', range_size := 100, max_range_size := 100);
             SELECT worf.enable_sequence_range('u_id_seq', participants := '{}', range_size := 10, max_range_size := 10);
             SELECT count(worf.enable_sequence_range(format('many_%s', lpad(g::text, 2, '0'))::regclass, participants := '{node_c,node_d}', range_size := 100))
-            FROM generate_series(1, 20) g;
+            FROM generate_series(1, 5) g;
             """, token);
         await WaitActiveAsync([nodeA, nodeB, nodeC, nodeD], token);
         string nodeCId = await nodeC.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
@@ -3190,10 +3193,10 @@ public sealed partial class SequenceRangeTests
         {
             case "configuration open" or "drop open":
             {
-                // A configuration change left open holds the range rows of u_id_seq and the twenty others.
+                // A configuration change left open holds the range rows of u_id_seq and the five others.
                 await HoldAsync(how == "drop open" ? "SELECT worf.drop_subscription('a_from_c')" : """
                     SELECT worf.alter_sequence_range('u_id_seq', range_size := 10);
-                    SELECT count(worf.alter_sequence_range(format('many_%s', lpad(g::text, 2, '0'))::regclass, range_size := 50)) FROM generate_series(1, 20) g
+                    SELECT count(worf.alter_sequence_range(format('many_%s', lpad(g::text, 2, '0'))::regclass, range_size := 50)) FROM generate_series(1, 5) g
                     """);
                 Task lift = nodeA.SafePsqlAsync(Database, Lift, token);
                 Assert.AreEqual("", await InsertAsync(nodeB, "t"), $"node_b's inserts as a lift waits beside a {how}");
