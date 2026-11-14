@@ -653,11 +653,10 @@ internal static class SequenceRangeExchange
 
         // A reply that comes once the subscription is dropped or disabled, as when the provider answered only after
         // taking in the drop's word that this node leaves its slot, is no news of a neighbor this node still links to, so
-        // it's taken in as one that never came; and so is one whose subscription a drop holds, as a drop left in an open
-        // transaction does, rather than wait on the rows the drop deleted. The drop's lock, which it takes before it
-        // deletes anything, is an advisory one, which, unlike a row's, uses no transaction ID.
-        if (!WorfNode.GetNodeSubscriptions(node.Node.Id, false).Exists(current => current.Id == sub.Id && current.Enabled) ||
-            !WorfLocks.TryShareDrop(sub.Id))
+        // it's taken in as one that never came. One taken in as a drop left in an open transaction holds the rows it
+        // deleted waits for none of them, as no take-in waits for a row another transaction holds, and the reports it
+        // relays of other nodes go once the drop commits, as a neighbor no longer linked to does.
+        if (!WorfNode.GetNodeSubscriptions(node.Node.Id, false).Exists(current => current.Id == sub.Id && current.Enabled))
         {
             return (false, false);
         }

@@ -417,7 +417,6 @@ internal static class Functions
         if (sub is not null)
         {
             WorfLocalNode node = WorfNode.GetLocalNode(true, false)!;
-            WorfLocks.LockDrop(sub.Id);
 
             // First drop the status, after noting the slots its tables' syncs create, which may be left on the provider.
             List<string> syncSlotNames = Sync.SyncSlotNames(sub);

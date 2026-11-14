@@ -4,22 +4,19 @@ namespace Worf;
 
 /// <summary>
 /// The locks worf takes of its own: advisory locks of the database, which show in pg_locks with objsubid 5 for the
-/// node's exchange turn, 6, with the subscription's OID, for a drop's lock, 7 for the building of an exchange's message
-/// and 8 for the reservation of the Snowflake clock, which the keys of pg_advisory_lock and pg_advisory_lock_shared, whose
-/// objsubid is 1 or 2, never have, so that no session's advisory lock holds them up, as the switch gates' 3 and 4 don't
-/// either.
+/// node's exchange turn, 7 for the building of an exchange's message and 8 for the reservation of the Snowflake clock,
+/// which the keys of pg_advisory_lock and pg_advisory_lock_shared, whose objsubid is 1 or 2, never have, so that no
+/// session's advisory lock holds them up, as the switch gates' 3 and 4 don't either.
 /// </summary>
 internal static class WorfLocks
 {
-    // ShareLock and ExclusiveLock from storage/lockdefs.h, LOCKTAG_ADVISORY and DEFAULT_LOCKMETHOD from storage/lock.h,
-    // and LOCKACQUIRE_NOT_AVAIL.
-    private const int ShareLock = 5;
+    // ExclusiveLock from storage/lockdefs.h, LOCKTAG_ADVISORY and DEFAULT_LOCKMETHOD from storage/lock.h, and
+    // LOCKACQUIRE_NOT_AVAIL.
     private const int ExclusiveLock = 7;
     private const byte LockTagAdvisory = 10;
     private const byte DefaultLockMethod = 1;
     private const int NotAvailable = 0;
     private const ushort TurnKey = 5;
-    private const ushort DropKey = 6;
     private const ushort BuildKey = 7;
     private const ushort ClockKey = 8;
 
@@ -49,27 +46,6 @@ internal static class WorfLocks
         {
             _ = NativeMethods.LockRelease(&turn, ExclusiveLock, true);
         }
-    }
-
-    /// <summary>
-    /// Takes a subscription's drop lock, which the transaction holds until it ends, before the drop deletes anything.
-    /// </summary>
-    /// <param name="subid">The subscription.</param>
-    internal static unsafe void LockDrop(uint subid)
-    {
-        LOCKTAG drop = Tag(subid, DropKey);
-        _ = NativeMethods.LockAcquire(&drop, ExclusiveLock, false, false);
-    }
-
-    /// <summary>
-    /// Takes a subscription's drop lock shared, as a reply's take-in does, unless a drop holds it.
-    /// </summary>
-    /// <param name="subid">The subscription.</param>
-    /// <returns>Whether no drop holds it.</returns>
-    internal static unsafe bool TryShareDrop(uint subid)
-    {
-        LOCKTAG drop = Tag(subid, DropKey);
-        return NativeMethods.LockAcquire(&drop, ShareLock, false, true) != NotAvailable;
     }
 
     /// <summary>
