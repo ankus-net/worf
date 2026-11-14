@@ -3376,7 +3376,8 @@ internal static partial class SequenceRangeGuard
                         woken = 0;
                     }
 
-                    // The wait makes the exchange with the node waited for due, each second while it lasts.
+                    // The wait makes the exchange with the node waited for due, each second while it lasts, and asks this
+                    // node's subscribers to call it, as one that only calls this node can't be called.
                     long now = Worker.GetCurrentTimestamp();
                     if (now >= deadline)
                     {
@@ -3398,6 +3399,7 @@ internal static partial class SequenceRangeGuard
                         woken = now;
                         SequenceRangeHeard.Want(grantor);
                         SequenceRangeExchangeWorker.Wake();
+                        Worker.WantWord();
                     }
 
                     PgInterrupts.Check();

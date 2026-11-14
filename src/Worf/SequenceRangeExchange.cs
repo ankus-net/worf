@@ -905,11 +905,14 @@ internal static class SequenceRangeExchange
             // A statement that waits to draw from a block the neighbor granted, until this server hears from it since it
             // started, makes the exchange due, once a second at most, and a failed one's retry due half
             // worf.sequence_range_timeout after it ended, if its delay is longer, so that the statement, which waits up
-            // to twice that, gets an exchange soon after the neighbor is back; and so does the neighbor's word, over its
-            // replication stream, to call it, as an owner that granted itself a block sends.
+            // to twice that, gets an exchange soon after the neighbor is back; and so does the neighbor's word to call it,
+            // as an owner that granted itself a block, or that waits for this node since it restarted, sends, or its
+            // replication stream starting again, that came since the last exchange, or the failure the retry is of,
+            // though a session's request since has cleared the record of the last exchange.
             bool exchanged = s_exchangedAt.TryGetValue(sub.Id, out long at);
             bool spaced = !exchanged || now - at >= 1_000_000;
-            bool calledFor = exchanged && SequenceRangeHeard.CalledFor(sub.Origin.Id, at);
+            bool calledFor = (exchanged || retrying) &&
+                SequenceRangeHeard.CalledFor(sub.Origin.Id, Math.Max(exchanged ? at : 0, retrying ? retry.At - retry.Delay : 0));
             bool wanted = spaced && (SequenceRangeHeard.Wanted(sub.Origin.Id, now - 2_000_000) || calledFor);
             bool cut = wanted && retrying && now >= retry.At - retry.Delay + Math.Min(retry.Delay, SequenceRanges.ExchangeTimeout * 500L);
 

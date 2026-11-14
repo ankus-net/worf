@@ -4617,6 +4617,55 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// An owner's draws after it restarts wait for each node that calls it to answer since, up to twice
+    /// worf.sequence_range_timeout, here ten seconds: node_b, whose call and probe ran out of time as node_a hung before
+    /// it restarted, calls it as its replication stream from node_a starts again, rather than only once its retry,
+    /// twenty seconds after the probe ran out, is due.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [OSCondition(OperatingSystems.Linux | OperatingSystems.OSX)]
+    public async Task RestartedOwnersAskTheirCallersToCall()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100)", token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+        await InsertAsync(nodeA, 10, token);
+        await InsertAsync(nodeB, 10, token);
+
+        // node_b's call and the probe after it run out of time, so that its next call waits twenty seconds.
+        int logpos = nodeB.ReadLog().Length;
+        await SuspendAsync(nodeA, true, token);
+        try
+        {
+            Stopwatch hanging = Stopwatch.StartNew();
+            while (nodeB.ReadLog()[logpos..].Split("node node_a didn't answer within 5000 ms").Length < 3)
+            {
+                Assert.IsLessThan(TestNode.PollTimeout, hanging.Elapsed, "node_b's call and probe running out of time");
+                await Task.Delay(TimeSpan.FromMilliseconds(100), token);
+            }
+        }
+        finally
+        {
+            await SuspendAsync(nodeA, false, CancellationToken.None);
+        }
+
+        await nodeA.StopAsync("fast", token);
+        await nodeA.StartServerAsync(token);
+        await using NpgsqlConnection writer = await nodeA.OpenAsync(Database, token);
+        await using NpgsqlCommand insert = new("INSERT INTO t (v) VALUES ('a')", writer);
+        _ = await insert.ExecuteNonQueryAsync(token);
+    }
+
+    /// <summary>
     /// A subscriber that waits out an apply delay longer than the provider's wal_sender_timeout keeps its stream: it
     /// answers the walsender's requests for a reply as it reads ahead, and replies each status interval, so that the
     /// walsender doesn't end the stream, here over 30 seconds of a 40-second delay with wal_sender_timeout 10 s, and the

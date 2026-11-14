@@ -363,6 +363,10 @@ internal static unsafe partial class Apply
         FromProvider(sub, $"start streaming from slot \"{sub.SlotName}\"", () => PgBackgroundWorker.RunTransaction(() =>
             Worf.StartReplication(streamConn, sub.SlotName, originStartpos, origins, repsets, null, sub.ForceTextTransfer)));
 
+        // A provider that streams again answers again, as one that restarted, whose draws wait for this node to answer
+        // since: this node calls it now, rather than once the retry of a call that ran out of time as it went down is due.
+        CallProviderUnheard();
+
         if (catchingUp)
         {
             Sync.FinishSubscriptionSync(sub);
@@ -753,7 +757,7 @@ internal static unsafe partial class Apply
     /// <summary>
     /// Has this node call the provider about sequence ranges now, as the apply worker, waiting out its delay with as much
     /// of the provider's changes read ahead as it holds, reads no more of them, and so can't hear the provider's word to
-    /// call it, which comes after them.
+    /// call it, which comes after them, or has just started streaming from it.
     /// </summary>
     private static void CallProviderUnheard()
     {
