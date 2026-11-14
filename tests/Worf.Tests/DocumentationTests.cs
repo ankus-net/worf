@@ -111,8 +111,10 @@ public sealed class DocumentationTests
             s_sequenceRanges, "a word behind a large transaction (1700)");
         Assert.Contains("so the provider doesn't end the stream at `wal_sender_timeout`", s_sequenceRanges, "a delay longer than wal_sender_timeout (1703)");
         Assert.Contains("which the other nodes take as they next hear from the owner", s_sequenceRanges, "altered block sizes (1723)");
-        Assert.Contains("and every other node it subscribes to, or that calls it, that reports the sequence, and so may have heard of its draws", s_sequenceRanges,
-            "the neighbors a start waits for (1601, 1605)");
+        Assert.Contains("only once every other node it subscribes to, or that calls it, has answered it since in full", s_sequenceRanges,
+            "the neighbors a start waits for to report in full (1605)");
+        Assert.Contains("and once the block's grantor and each of those that report the sequence, and so may have heard of its draws", s_sequenceRanges,
+            "the neighbors a start waits for (1601)");
         Assert.Contains("a single-user server keeps its start as its first statement runs", s_sequenceRanges, "a single-user start (1602)");
         Assert.DoesNotContain("not at all once the node has written past where they saw its WAL position", s_sequenceRanges, "a restore's notice (1100, 1211)");
         Assert.Contains("Each server keeps its last 32 starts", s_sequenceRanges, "a restore across restarts (1400)");
