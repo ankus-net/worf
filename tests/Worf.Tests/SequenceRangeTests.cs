@@ -3851,6 +3851,10 @@ public sealed partial class SequenceRangeTests
                 CREATE TRIGGER trg_id BEFORE INSERT ON trg FOR EACH ROW EXECUTE FUNCTION trg_id();
                 CREATE TABLE vals (id bigint);
                 CREATE TABLE seqnames (n text); INSERT INTO seqnames VALUES ('s1');
+                CREATE TABLE g13t (id bigint DEFAULT nextval('s1'), w bigint);
+                CREATE FUNCTION g12() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.w := nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1'); RETURN NEW; END $$;
+                CREATE TRIGGER g12 BEFORE INSERT ON g13t FOR EACH ROW EXECUTE FUNCTION g12();
+                CREATE TABLE g13c (id bigint DEFAULT nextval('s1'), v text CHECK (nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') > 0));
                 CREATE TABLE ck (v text CHECK (nextval('s1') > 0));
                 CREATE TABLE tw (v text);
                 CREATE FUNCTION passed() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
@@ -3892,8 +3896,9 @@ public sealed partial class SequenceRangeTests
         // nodes counted; calls that first start as the statement runs, in a VALUES list's rows, a table's CHECK
         // constraint and a trigger's WHEN condition; PL/pgSQL loops that draw through a SQL function, with a computed name,
         // or in a DO block that EXECUTE runs; rows of 40 calls, more than the block's last twentieth; rows that contrib's
-        // autoinc trigger draws for; calls whose sequence a column names; and a prepared statement whose parameter names
-        // it, under a generic plan.
+        // autoinc trigger draws for; calls whose sequence a column names; a prepared statement whose parameter names it,
+        // under a generic plan; a VALUES list of six rows of 40 calls each, which each row starts before it draws; and rows
+        // that hold the gate and draw 13 values each, a default's and twelve of a trigger's or a CHECK constraint's.
         List<string> problems = [];
         foreach (string statement in new[] { "DO $$ BEGIN PERFORM nextval('s1'); END $$", "SELECT f_s1()", "BEGIN", "SELECT nextval('s1') FROM generate_series(1, 250)",
             "SELECT count(DISTINCT nextval('s1')) FROM generate_series(1, 250)", "SELECT f_loop(250) /* generate_series */",
@@ -3906,7 +3911,9 @@ public sealed partial class SequenceRangeTests
             "SELECT f_sql_loop(250) /* generate_series */", "SELECT f_named_loop(250, 's1') /* generate_series */", "SELECT f_exec(250) /* generate_series */",
             $"SELECT {string.Join(", ", Enumerable.Repeat("nextval('s1')", 40))} FROM generate_series(1, 6)",
             "INSERT INTO ai (v) SELECT 'x' FROM generate_series(1, 250)", "SELECT nextval(n) FROM seqnames, generate_series(1, 250)",
-            "PREPARED generic rows", "PREPARED generic", "PREPARED default" })
+            "PREPARED generic rows", "PREPARED generic", "PREPARED default",
+            $"INSERT INTO vals VALUES {string.Join(", ", Enumerable.Repeat($"({string.Join(" + ", Enumerable.Repeat("nextval('s1')", 40))})", 6))} /* generate_series */",
+            "INSERT INTO g13t (w) SELECT 0 FROM generate_series(1, 20)", "INSERT INTO g13c (v) SELECT 'x' FROM generate_series(1, 20)" })
         {
             Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 's1'::regclass", token),
                 "node_b drawing from a block of s1, with the next one ready");

@@ -56,6 +56,11 @@ internal static partial class SequenceRangeGuard
     // that took them, by their query descriptors, or the COPY FROM they run, with the gates each took. The sequences
     // each table's defaults draw from, as of the blocks last read.
     private static readonly Dictionary<uint, uint> s_gates = [];
+
+    // How many values of each gated sequence a row of the statements that hold its gate may draw: its default's, and the
+    // calls of the CHECK constraints, trigger conditions and trigger functions of the tables they write, by the tables.
+    private static readonly Dictionary<uint, long> s_gatedRowDraws = [];
+    private static readonly Dictionary<string, int> s_writtenCalls = [];
     private static readonly List<(nint Statement, uint Subxact, List<uint> Sequences)> s_gating = [];
     private static readonly Dictionary<uint, List<uint>> s_drawnBy = [];
 
@@ -698,12 +703,43 @@ internal static partial class SequenceRangeGuard
         }
 
         OpenGates((nint)queryDesc, [.. sequences, .. triggered]);
+        long rowDraws = 1 + WrittenCalls(written);
+        foreach (uint seqoid in sequences.Concat(triggered))
+        {
+            s_gatedRowDraws[seqoid] = Math.Max(s_gatedRowDraws.GetValueOrDefault(seqoid), rowDraws);
+        }
+
         if (functions.Count > 0)
         {
             HookTriggers((nint)queryDesc, functions);
         }
 
         WaitBeforeDrawing(sequences);
+    }
+
+    // The calls of nextval the CHECK constraints, trigger conditions and trigger functions of tables and their partitions
+    // make for a row, as their text names them, once until a table, a constraint or a function changes.
+    private static int WrittenCalls(List<uint> written)
+    {
+        string key = string.Join(',', written.Order());
+        if (!s_writtenCalls.TryGetValue(key, out int calls))
+        {
+            WatchTables();
+            long[] relids = [.. written.Select(table => (long)table)];
+            calls = Draws(WrittenChecks(relids)).Calls + Elevated.Run(() => Worf.Read("""
+                WITH t (relid) AS (
+                    SELECT r.relid::pg_catalog.oid FROM pg_catalog.unnest($1::pg_catalog.int8[]) r (relid)
+                    UNION ALL
+                    SELECT p.relid FROM pg_catalog.unnest($1::pg_catalog.int8[]) r (relid)
+                        CROSS JOIN LATERAL pg_catalog.pg_partition_tree(r.relid::pg_catalog.oid) p WHERE p.level > 0)
+                SELECT f.prosrc FROM t JOIN pg_catalog.pg_trigger g ON g.tgrelid = t.relid
+                    JOIN pg_catalog.pg_proc f ON f.oid = g.tgfoid JOIN pg_catalog.pg_language l ON l.oid = f.prolang
+                WHERE l.lanname NOT IN ('c', 'internal')
+                """, 0, SpiParameter.Create(relids))).Sum(row => NextvalCalls(row.Get<string?>(0) ?? ""));
+            s_writtenCalls[key] = calls;
+        }
+
+        return calls;
     }
 
     // Watches the trigger functions a statement may call, with the sequences its triggers name for each, until it ends.
@@ -829,8 +865,8 @@ internal static partial class SequenceRangeGuard
     /// <summary>
     /// Waits, before a statement that holds its gates draws from a sequence, for the switch, once the active block has
     /// reached its last twentieth, or the last value of one reserved for a load, or has no more values left than the
-    /// statements that hold the gate, which may each draw one before they check again, so that however many statements
-    /// draw at once, they don't run the block out. The sequence's position is read under the lock a SELECT from it takes,
+    /// statements that hold the gate, which may each draw a row's values before they check again, so that however many
+    /// statements draw at once, they don't run the block out. The sequence's position is read under the lock a SELECT from it takes,
     /// which no switch waits for, so the statement holds the sequence against no switch as it waits.
     /// </summary>
     private static void WaitBeforeDrawing(List<uint> sequences)
@@ -849,9 +885,12 @@ internal static partial class SequenceRangeGuard
     /// </summary>
     /// <param name="seqoid">The sequence.</param>
     /// <param name="draws">How many values the statement's next row may draw, which the block must hold past its last
-    /// twentieth, so that a row that draws more than that waits before it starts rather than run the block out.</param>
+    /// twentieth, so that a row that draws more than that waits before it starts rather than run the block out; a
+    /// statement that holds the sequence's gate counts at least the values its rows draw.</param>
     private static void WaitWhileShort(uint seqoid, long draws = 1)
     {
+        // A row of a statement that holds the gate may draw more, before the row is checked.
+        draws = Math.Max(draws, s_gates.ContainsKey(seqoid) ? s_gatedRowDraws.GetValueOrDefault(seqoid, 1) : 1);
         WaitForGrantor(seqoid);
         bool waitedForBlock = false;
         while (true)
@@ -1214,10 +1253,8 @@ internal static partial class SequenceRangeGuard
             return;
         }
 
-        long[] written = [.. Writing(query->plannedstmt).SelectMany(write => write.Written)];
-        int calls = Math.Max(written.Length > 0 ? Draws(WrittenChecks(written)).Calls : 0, 1);
         List<nint> nodes = [];
-        CountRows(query->planstate, nodes, calls, running: true);
+        CountRows(query->planstate, nodes, RunningRowCalls(queryDesc), running: true);
         if (nodes.Count > 0)
         {
             // A cursor's nodes, patched as a FETCH runs it in a savepoint, are its own as long as it is, so they're kept
@@ -1226,6 +1263,46 @@ internal static partial class SequenceRangeGuard
             RegisterCounted();
             s_countedNodes[queryDesc] = (portal is not null && portal->queryDesc == query ? portal->createSubid : NativeMethods.GetCurrentSubTransactionId(), nodes);
         }
+    }
+
+    // The calls of nextval a running statement's row may make as it starts them: those of the CHECK constraints and
+    // trigger conditions of the tables it writes, or of a row of a VALUES list, at least one.
+    private static unsafe int RunningRowCalls(nint queryDesc)
+    {
+        QueryDesc* query = (QueryDesc*)queryDesc;
+        if (query->plannedstmt is null || query->planstate is null)
+        {
+            return 1;
+        }
+
+        long[] written = [.. Writing(query->plannedstmt).SelectMany(write => write.Written)];
+        return Math.Max(Math.Max(written.Length > 0 ? Draws(WrittenChecks(written)).Calls : 0, ValuesRowCalls(query->planstate)), 1);
+    }
+
+    // The most calls of nextval a row of a VALUES list in a plan makes, which it starts all as the row is reached, before
+    // it draws any.
+    private static unsafe int ValuesRowCalls(PlanState* node)
+    {
+        if (node is null)
+        {
+            return 0;
+        }
+
+        int most = Math.Max(ValuesRowCalls(node->lefttree), ValuesRowCalls(node->righttree));
+        if (node->type == NodeTag.T_ValuesScanState && node->plan is not null)
+        {
+            List* rows = ((ValuesScan*)node->plan)->values_lists;
+            for (int i = 0; rows is not null && i < rows->length; i++)
+            {
+                most = Math.Max(most, Draws(PlanText((Node*)rows->elements[i].ptr_value)).Calls);
+            }
+        }
+        else if (node->type == NodeTag.T_SubqueryScanState)
+        {
+            most = Math.Max(most, ValuesRowCalls(((SubqueryScanState*)node)->subplan));
+        }
+
+        return most;
     }
 
     // How many calls of nextval a PL/pgSQL function's source has, once until it's replaced, or, for a DO block's, which
@@ -1938,6 +2015,7 @@ internal static partial class SequenceRangeGuard
     {
         _ = arg;
         s_namedByText.Clear();
+        s_writtenCalls.Clear();
 
         // What a table's triggers draw counts its partitions' too, which a change to a partition changes.
         s_drawnBy.Clear();
@@ -1974,6 +2052,7 @@ internal static partial class SequenceRangeGuard
         _ = cacheid;
         _ = hashvalue;
         s_defaultsText.Clear();
+        s_writtenCalls.Clear();
         s_domainDraws = null;
         s_plpgsqlCasts.Clear();
         s_checksUnnamed.Clear();
@@ -2527,9 +2606,12 @@ internal static partial class SequenceRangeGuard
             WaitForGrantor(seqoid, unnamed);
         }
 
+        // A call that first starts as its statement runs is its row's, which may make the row's other calls too before the
+        // count down the statement's later rows take.
+        long rowDraws = switching.Count > 0 && starting is { Running: not 0 } running ? RunningRowCalls(running.Running) : 1;
         foreach (uint seqoid in switching)
         {
-            WaitWhileShort(seqoid);
+            WaitWhileShort(seqoid, rowDraws);
         }
 
         if (switching.Count > 0)
@@ -3491,7 +3573,9 @@ internal static partial class SequenceRangeGuard
     /// <param name="draws">How many values the next row may draw, which the block must hold past its last twentieth.</param>
     private static bool Short(uint seqoid, bool ascending, long lo, long hi, long? position, Func<long?> reread, long draws = 1)
     {
-        // A row that draws several values needs them all past the last twentieth, in the sequence's steps.
+        // A row that draws several values needs them all past the last twentieth, in the sequence's steps, up to half
+        // the block, as one that draws more than a block holds runs into the next however soon the switch comes.
+        draws = Math.Min(draws, Math.Max((long)(((decimal)hi - lo) / 2), 1));
         decimal step = draws > 1 ? Math.Max(Math.Abs((decimal)SequenceRanges.GetInfo(seqoid).Increment), 1) : 1;
         decimal tail = (s_reservedActive.Contains((seqoid, lo)) ? 0 : ((decimal)hi - lo) / 20) + ((Math.Max(draws, 1) - 1) * step);
         decimal Left(long? at) => at is long p ? (ascending ? (decimal)hi - p : (decimal)p - lo) : (decimal)hi - lo + 1;
@@ -3760,6 +3844,7 @@ internal static partial class SequenceRangeGuard
             foreach (uint seqoid in s_gating[index].Sequences)
             {
                 LetGate(seqoid);
+                _ = s_gatedRowDraws.Remove(seqoid);
             }
 
             s_gating.RemoveAt(index);
@@ -4126,6 +4211,7 @@ internal static partial class SequenceRangeGuard
             foreach (uint seqoid in s_gates.Where(gate => gate.Value == aborted.Value).Select(gate => gate.Key).ToList())
             {
                 _ = s_gates.Remove(seqoid);
+                _ = s_gatedRowDraws.Remove(seqoid);
                 CountDrawer(seqoid, -1);
             }
 
@@ -4141,6 +4227,7 @@ internal static partial class SequenceRangeGuard
         }
 
         s_gates.Clear();
+        s_gatedRowDraws.Clear();
         s_gating.Clear();
         s_gatesRegistered = false;
     }
@@ -4210,6 +4297,7 @@ internal static partial class SequenceRangeGuard
     /// </summary>
     private static bool Check(uint seqoid, long value, bool inserted)
     {
+
         // worf's own apply and sync workers write other nodes' rows, which the guard's triggers, which fire in every
         // session so that another apply's rows are checked, leave alone, as they did when the triggers fired only in
         // sessions that write their own. Another session with session_replication_role replica writes what it likes, as
@@ -4294,6 +4382,7 @@ internal static partial class SequenceRangeGuard
     /// </summary>
     private static bool Admits(uint seqoid, long value, bool inserted = false)
     {
+
         // A sequence no longer under range management doesn't restrict its column.
         if (!s_sequences.TryGetValue(seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) sequence))
         {
@@ -4412,6 +4501,7 @@ internal static partial class SequenceRangeGuard
             CountWaiting(seqoid, lo, -1);
         }
 
+
         TakeGates(held);
         return switched;
     }
@@ -4459,6 +4549,7 @@ internal static partial class SequenceRangeGuard
 
             s_waitingFor.Clear();
             s_gates.Clear();
+            s_gatedRowDraws.Clear();
         });
     }
 
@@ -4681,7 +4772,9 @@ internal static partial class SequenceRangeGuard
         // under the lock nextval left this transaction holding.
         bool last = (ascending ? (decimal)hi - value : (decimal)value - lo) == 0;
         bool reserved = s_reservedActive.Contains((seqoid, lo));
-        if (((reserved ? last : WakeNearEnd(seqoid, ascending, lo, hi, value)) || (!last && Short(seqoid, ascending, lo, hi, Position(seqoid) ?? value, () => Position(seqoid) ?? value))) &&
+
+        if (((reserved ? last : WakeNearEnd(seqoid, ascending, lo, hi, value)) ||
+                (!last && Short(seqoid, ascending, lo, hi, Position(seqoid) ?? value, () => Position(seqoid) ?? value, s_gatedRowDraws.GetValueOrDefault(seqoid, 1)))) &&
             WaitForSwitch(seqoid, lo))
         {
             WaitWhileShort(seqoid);
