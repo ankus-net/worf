@@ -1684,7 +1684,8 @@ internal static class SequenceRangeExchange
         SpiParameter seq = SpiParameter.Create(seqoid);
         SpiParameter sender = SpiParameter.Create(senderId);
         WorfRows local = Worf.Read("""
-            SELECT epoch, state, fenced_at IS NOT NULL, root_start, watermark, owner_node, parent_node, distance FROM worf.sequence_range WHERE seqoid = $1
+            SELECT epoch, state, fenced_at IS NOT NULL, root_start, watermark, owner_node, parent_node, distance, range_size, max_range_size
+            FROM worf.sequence_range WHERE seqoid = $1
             """, 1, seq);
         int epoch = entry.GetProperty("epoch").GetInt32();
         string? state = Text(entry, "state");
@@ -1696,6 +1697,13 @@ internal static class SequenceRangeExchange
         if (local[0].Get<int>(0) != epoch)
         {
             return local[0].Get<int>(0) > epoch;
+        }
+
+        // Block sizes that differ from those the owner, or the parent, reports are taken in, though nothing else changed.
+        if (local[0].Get<uint>(5) != node.Node.Id && (senderId == local[0].Get<uint>(5) || senderId == local[0].Get<uint?>(6)) &&
+            (Nullable(entry, "range_size") != local[0].Get<long>(8) || Nullable(entry, "max_range_size") != local[0].Get<long>(9)))
+        {
+            return false;
         }
 
         // A neighbor that a fence's lift stopped waiting for is asked to reset once it's heard from again, whatever it reports.

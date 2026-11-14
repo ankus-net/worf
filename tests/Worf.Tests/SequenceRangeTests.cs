@@ -4573,8 +4573,9 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
-    /// The block sizes alter_sequence_range sets on the owner reach its participants, which request blocks of them from
-    /// then on, and the owner grants none larger than its largest size, though a participant requested one before it heard.
+    /// The block sizes alter_sequence_range sets on the owner reach its participants, an idle one too, which request
+    /// blocks of them from then on, and the owner grants none larger than its largest size, though a participant
+    /// requested one before it heard.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -4594,6 +4595,9 @@ public sealed partial class SequenceRangeTests
         await WaitActiveAsync([nodeA, nodeB], token);
         await InsertAsync(nodeB, 250, token);
 
+        // node_b settles first, so that the owner's report of the sizes is all that changes in its answers.
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
+            "SELECT next_lo IS NOT NULL AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_request) FROM worf.sequence_ranges", token), "node_b settled");
         string nodeBId = await nodeB.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
         string altered = await nodeA.SafePsqlAsync(Database, "SELECT worf.alter_sequence_range('t_id_seq', 10, 10); SELECT clock_timestamp()", token);
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
