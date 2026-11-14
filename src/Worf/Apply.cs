@@ -846,9 +846,16 @@ internal static unsafe partial class Apply
                 // nothing else meanwhile, doesn't end the stream at wal_sender_timeout.
                 // Past the read-ahead's limit, neither can come, so the provider is called, and replied to, each second
                 // instead.
+                bool filled = false;
                 (s_applyconn ?? throw new InvalidOperationException("The apply connection is not open.")).ReadAhead(
-                    TimeSpan.FromMicroseconds(sleepUsec), ReadAheadLimit, TakeAhead, static () => Worker.GotSigterm, static () =>
+                    TimeSpan.FromMicroseconds(sleepUsec), ReadAheadLimit, TakeAhead, static () => Worker.GotSigterm, () =>
                     {
+                        if (!filled)
+                        {
+                            filled = true;
+                            WorfLog.Debug1($"apply holds {ReadAheadLimit / (1024 * 1024)} MB of node {MySubscription?.Origin.Name}'s changes read ahead as it waits out its delay, and calls the node each second");
+                        }
+
                         CallProviderUnheard();
                         _ = SendFeedback(s_applyconn!, s_lastReceived, Worker.GetCurrentTimestamp(), true);
                     }, static () => SendFeedback(s_applyconn!, s_lastReceived, Worker.GetCurrentTimestamp(), false));

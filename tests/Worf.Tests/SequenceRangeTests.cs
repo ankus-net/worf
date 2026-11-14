@@ -4667,7 +4667,9 @@ public sealed partial class SequenceRangeTests
                 _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO big (v) SELECT repeat('x', 1000) FROM generate_series(1, 90000)", token);
                 if (how == "busy unkept")
                 {
+                    // Here the inserts start once node_b's read-ahead is full, which takes a slow walsender a while.
                     _ = await nodeA.SafePsqlAsync(Database, "SELECT count(pg_terminate_backend(pid)) FROM pg_catalog.pg_stat_activity WHERE application_name = 'b_from_a_range'", token);
+                    Assert.IsTrue(await nodeB.PollLogAsync(0, "of node node_a's changes read ahead as it waits out its delay", token), "node_b's read-ahead, full");
                 }
             }
         }
