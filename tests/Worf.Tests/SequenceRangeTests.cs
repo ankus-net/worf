@@ -2401,7 +2401,9 @@ public sealed partial class SequenceRangeTests
         int timed = nodeB.ReadLog().Length;
         await using (NpgsqlConnection writer = await nodeB.OpenAsync(Database, token))
         {
-            await using (NpgsqlCommand logged = new("SET log_min_duration_statement = 0", writer))
+            // The session runs an insert before the timed ones, so that its backend's first use of worf, which a loaded host
+            // may hold up for a second, isn't counted as a wait.
+            await using (NpgsqlCommand logged = new($"{Insert}; SET log_min_duration_statement = 0", writer))
             {
                 _ = await logged.ExecuteNonQueryAsync(token);
             }
@@ -2522,7 +2524,9 @@ public sealed partial class SequenceRangeTests
             Task draws = Task.Run(async () =>
             {
                 await using NpgsqlConnection writer = await nodeB.OpenAsync(Database, token);
-                await using (NpgsqlCommand logged = new("SET log_min_duration_statement = 0", writer))
+                // The session runs an insert before the timed ones, so that its backend's first use of worf, which a loaded host
+                // may hold up for a second, isn't counted as a wait.
+                await using (NpgsqlCommand logged = new($"{Insert}; SET log_min_duration_statement = 0", writer))
                 {
                     _ = await logged.ExecuteNonQueryAsync(token);
                 }
@@ -2599,7 +2603,9 @@ public sealed partial class SequenceRangeTests
         int timed = nodeB.ReadLog().Length;
         await using (NpgsqlConnection writer = await nodeB.OpenAsync(Database, token))
         {
-            await using (NpgsqlCommand logged = new("SET log_min_duration_statement = 0", writer))
+            // The session runs an insert before the timed ones, so that its backend's first use of worf, which a loaded host
+            // may hold up for a second, isn't counted as a wait.
+            await using (NpgsqlCommand logged = new($"{Insert}; SET log_min_duration_statement = 0", writer))
             {
                 _ = await logged.ExecuteNonQueryAsync(token);
             }
@@ -2701,7 +2707,9 @@ public sealed partial class SequenceRangeTests
             int timed = nodeB.ReadLog().Length;
             await using (NpgsqlConnection writer = await nodeB.OpenAsync(Database, token))
             {
-                await using (NpgsqlCommand logged = new("SET log_min_duration_statement = 0", writer))
+                // The session runs an insert before the timed ones, so that its backend's first use of worf, which a loaded host
+                // may hold up for a second, isn't counted as a wait.
+                await using (NpgsqlCommand logged = new($"{Insert}; SET log_min_duration_statement = 0", writer))
                 {
                     _ = await logged.ExecuteNonQueryAsync(token);
                 }
@@ -6850,7 +6858,9 @@ public sealed partial class SequenceRangeTests
         string delays = "";
         await using (NpgsqlConnection writer = await nodeB.OpenAsync(Database, token))
         {
-            await using (NpgsqlCommand logged = new("SET log_min_duration_statement = 0", writer))
+            // The session runs an insert before the timed ones, so that its backend's first use of worf, which a loaded host
+            // may hold up for a second, isn't counted as a wait.
+            await using (NpgsqlCommand logged = new($"{Insert}; SET log_min_duration_statement = 0", writer))
             {
                 _ = await logged.ExecuteNonQueryAsync(token);
             }
