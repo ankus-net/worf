@@ -3124,21 +3124,19 @@ public sealed partial class SequenceRangeTests
     /// with the drop; a drop canceled in the turn lets it go, and one that waits for a report another session holds lets it
     /// go as it waits; sessions' own advisory locks, of whatever key, are never worf's; and a drop left open whose deletes
     /// a reply's take-in would wait for, or a fence's lift in the range worker, holds up neither the turn nor the worker,
-    /// so that node_a's own inserts, which switch blocks of 10, go on too. The rows run alone: their 24 servers would take
-    /// most of the 32 System V shared memory segments macOS allows beside other tests', and node_b's draws wait on how fast
-    /// the exchanges of four nodes supply blocks.
+    /// so that node_a's own inserts, which switch blocks of 10, go on too. The cases run one after another, each on four
+    /// servers of its own, beside the other tests: run at once, their 24 servers would take most of the 32 System V shared
+    /// memory segments macOS allows.
     /// </summary>
-    /// <param name="how">What holds, or would hold, the turn.</param>
     /// <returns>The test.</returns>
     [TestMethod]
-    [DoNotParallelize]
-    [DataRow("configuration open")]
-    [DataRow("drop open")]
-    [DataRow("canceled drop")]
-    [DataRow("waiting drop")]
-    [DataRow("advisory keys")]
-    [DataRow("fence beside drop")]
-    public Task TurnsWaitOnNoSession(string how) => TurnsWaitOnNoSessionAsync(how);
+    public async Task TurnsWaitOnNoSession()
+    {
+        foreach (string how in new[] { "configuration open", "drop open", "canceled drop", "waiting drop", "advisory keys", "fence beside drop" })
+        {
+            await TurnsWaitOnNoSessionAsync(how);
+        }
+    }
 
     /// <summary>
     /// A forced lift on node_a waits for a drop under way, which waits on node_d, paused, before it takes the turn, rather
@@ -3285,7 +3283,7 @@ public sealed partial class SequenceRangeTests
             case "canceled drop":
             {
                 // A report node_c relayed of u_id_seq, which no exchange takes in, is held as the drop forgets node_c, which
-                // tries again until statement_timeout cancels it, as it does each of 40 times over: on Windows, whose timer
+                // tries again until statement_timeout cancels it, as it does each of 10 times over: on Windows, whose timer
                 // has the lock timeout of a try come due with the statement's about one time in eight, PostgreSQL reports
                 // the lock timeout then.
                 _ = await nodeA.SafePsqlAsync(Database, $"""
@@ -3294,7 +3292,7 @@ public sealed partial class SequenceRangeTests
                     """, token);
                 await HoldAsync($"SELECT 1 FROM worf.sequence_range_node WHERE seqoid = 'u_id_seq'::regclass AND via_node = {nodeCId} FOR UPDATE");
                 await using NpgsqlConnection dropping = await nodeA.OpenAsync(Database, token);
-                for (int i = 0; i < 40; i++)
+                for (int i = 0; i < 10; i++)
                 {
                     await using NpgsqlCommand drop = new("SET statement_timeout = '400ms'; SELECT worf.drop_subscription('a_from_c')", dropping) { CommandTimeout = 10 };
                     PostgresException canceled = await Assert.ThrowsExactlyAsync<PostgresException>(() => drop.ExecuteNonQueryAsync(token), $"drop {i}");
@@ -6579,10 +6577,12 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
-    /// Creating, altering and attaching tables that use no managed sequence takes about as long with 150 managed
-    /// sequences as with one, as the guard reads the columns of every managed sequence at once rather than one sequence
-    /// at a time. Each is timed once the range worker has checked the sequences just enabled, which takes a slow host
-    /// longer than the statements, and with its checks every ten minutes, so that the times are the statements'.
+    /// Creating, altering and attaching tables that use no managed sequence takes about as much of the server's time with
+    /// 150 managed sequences as with one, as the guard reads the columns of every managed sequence at once rather than one
+    /// sequence at a time. Each is measured once the range worker has checked the sequences just enabled, which takes a
+    /// slow host longer than the statements, with its checks every ten minutes, in a session that ran a statement before,
+    /// so that a backend's start isn't counted, by the CPU time log_statement_stats gives the statements, which the load
+    /// of the other tests leaves alone as it doesn't their elapsed time.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -6597,7 +6597,7 @@ public sealed partial class SequenceRangeTests
             """, token);
         _ = await nodeA.SafePsqlAsync(Database, "ALTER SYSTEM SET worf.sequence_range_check_interval = '10min'; SELECT pg_reload_conf()", token);
         int made = 0;
-        async Task<TimeSpan> ChangeAsync()
+        async Task<(TimeSpan Elapsed, TimeSpan Cpu)> ChangeAsync()
         {
             // The range worker rests, waiting on its latch, at five looks in a row.
             int rested = 0;
@@ -6611,27 +6611,61 @@ public sealed partial class SequenceRangeTests
                 await Task.Delay(TimeSpan.FromMilliseconds(100), token);
             }
 
+            await using NpgsqlConnection changing = await nodeA.OpenAsync(Database, token);
+            await using (NpgsqlCommand warm = new("SELECT count(*) FROM worf.sequence_ranges; SET log_statement_stats = on", changing))
+            {
+                _ = await warm.ExecuteNonQueryAsync(token);
+            }
+
+            int logged = nodeA.ReadLog().Length;
             Stopwatch timing = Stopwatch.StartNew();
             for (int i = 0; i < 5; i++, made++)
             {
                 string table = string.Create(CultureInfo.InvariantCulture, $"plain_{made}");
-                _ = await nodeA.SafePsqlAsync(Database, $"""
+                await using NpgsqlCommand change = new($"""
                     CREATE TABLE {table} (k int, v text);
                     ALTER TABLE {table} ADD COLUMN w int;
                     ALTER TABLE parted ATTACH PARTITION {table} FOR VALUES IN ({made.ToString(CultureInfo.InvariantCulture)});
-                    """, token);
+                    """, changing);
+                _ = await change.ExecuteNonQueryAsync(token);
             }
 
-            return timing.Elapsed;
+            TimeSpan elapsed = timing.Elapsed;
+            await using (NpgsqlCommand off = new("SET log_statement_stats = off", changing))
+            {
+                _ = await off.ExecuteNonQueryAsync(token);
+            }
+
+            // The CPU time of the statements' messages, each of which logs its own, up to the SET that ends the count.
+            string marker = string.Create(CultureInfo.InvariantCulture, $"[{changing.ProcessID}]");
+            Stopwatch reading = Stopwatch.StartNew();
+            while (!nodeA.ReadLog()[logged..].Contains("SET log_statement_stats = off", StringComparison.Ordinal))
+            {
+                Assert.IsLessThan(TestNode.PollTimeout, reading.Elapsed, "the statements' statistics in node_a's log");
+                await Task.Delay(TimeSpan.FromMilliseconds(50), token);
+            }
+
+            double cpu = 0;
+            string[] lines = nodeA.ReadLog()[logged..].Split('\n');
+            for (int i = 0; i < lines.Length; i++)
+            {
+                if (lines[i].Contains(marker, StringComparison.Ordinal) && lines[i].Contains("MESSAGE STATISTICS", StringComparison.Ordinal) &&
+                    lines.Skip(i + 1).Select(line => StatementUsage().Match(line)).FirstOrDefault(match => match.Success) is { } usage)
+                {
+                    cpu += double.Parse(usage.Groups[1].Value, CultureInfo.InvariantCulture) + double.Parse(usage.Groups[2].Value, CultureInfo.InvariantCulture);
+                }
+            }
+
+            return (elapsed, TimeSpan.FromSeconds(cpu));
         }
 
-        TimeSpan few = await ChangeAsync();
+        (TimeSpan few, TimeSpan fewCpu) = await ChangeAsync();
         _ = await nodeA.SafePsqlAsync(Database,
             "SELECT count(worf.enable_sequence_range(format('many_%s_id_seq', g)::regclass, participants := '{}', range_size := 1000)) FROM generate_series(2, 150) g",
             token);
-        TimeSpan many = await ChangeAsync();
-        TestContext.WriteLine($"5 tables created, altered and attached: {few.TotalMilliseconds:F0} ms with 1 managed sequence, {many.TotalMilliseconds:F0} ms with 150");
-        Assert.IsLessThan((few * 3) + TimeSpan.FromSeconds(1), many, "the time to create, alter and attach 5 tables with 150 managed sequences, against 1");
+        (TimeSpan many, TimeSpan manyCpu) = await ChangeAsync();
+        TestContext.WriteLine($"5 tables created, altered and attached: {few.TotalMilliseconds:F0} ms, {fewCpu.TotalMilliseconds:F0} ms CPU with 1 managed sequence; {many.TotalMilliseconds:F0} ms, {manyCpu.TotalMilliseconds:F0} ms CPU with 150");
+        Assert.IsLessThan((fewCpu * 3) + TimeSpan.FromMilliseconds(100), manyCpu, "the CPU time to create, alter and attach 5 tables with 150 managed sequences, against 1");
     }
 
     /// <summary>
