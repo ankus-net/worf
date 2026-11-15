@@ -5277,10 +5277,16 @@ public sealed partial class SequenceRangeTests
             await Task.Delay(TimeSpan.FromMilliseconds(250), token);
         }
 
+        // The idle sequence is checked in full once every ten check intervals, and at most once a second, over however
+        // long the draws and resets took, as a slow runner's psql stretches them.
         string log = nodeA.ReadLog()[logpos..];
+        TimeSpan took = drawing.Elapsed;
+        int interval = int.Parse(await nodeA.SafePsqlAsync(Database, "SELECT setting FROM pg_settings WHERE name = 'worf.sequence_range_check_interval'", token), CultureInfo.InvariantCulture);
+        int rested = (int)(took.TotalMilliseconds / Math.Max(1000, 10 * interval)) + 2;
         int own = log.Split(Checked(tid)).Length - 1;
         int other = log.Split(Checked(u)).Length - 1;
-        Assert.IsTrue(own > 40 && other < 25, $"the full checks of t_id_seq, {own}, and of the idle sequence that shares its counter under a hash, {other}, over 15 s");
+        Assert.IsTrue(own > 40 && other <= rested,
+            $"the full checks of t_id_seq, {own}, and of the idle sequence that shares its counter under a hash, {other}, at most {rested}, over {took.TotalSeconds:F1} s");
     }
 
     /// <summary>
@@ -6653,19 +6659,27 @@ public sealed partial class SequenceRangeTests
         Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT fenced_at IS NULL FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass", token),
             "node_a's fence, lifted");
 
-        // Over the fence, node_a spends less than a tenth of the time in statements on its ledger of grants, as it would if
-        // it compared each grant of t_id_seq with every other, or with every sequence's grants over the same values, at
-        // each check; and each check of a block taken back reads a few buffers, rather than every grant of t_id_seq.
-        string[] costs = (await nodeA.SafePsqlAsync(Database, """
-            SELECT round(coalesce(sum(total_exec_time) FILTER (WHERE query LIKE '%worf.sequence_range_grant%'), 0))::bigint || '|' ||
+        // Over the fence, each of node_a's searches of its ledger of grants reads about one buffer for each of t_id_seq's
+        // grants, rather than many times that, as it would if it compared each grant of t_id_seq with every other, or with
+        // every sequence's grants over the same values; and each check of a block taken back reads a few buffers, rather
+        // than every grant of t_id_seq. Buffers are counted rather than the statements' time, which a loaded runner
+        // stretches.
+        const string Search = "query LIKE 'WITH g AS MATERIALIZED%worf.sequence_range_grant%'";
+        string[] costs = (await nodeA.SafePsqlAsync(Database, $"""
+            SELECT coalesce(sum(calls) FILTER (WHERE {Search}), 0) || '|' ||
+                coalesce(sum(shared_blks_hit + shared_blks_read) FILTER (WHERE {Search}), 0) || '|' ||
                 (sum(shared_blks_hit + shared_blks_read) FILTER (WHERE query LIKE '%reset_lsn IS NOT NULL)%OR EXISTS%') /
-                    sum(calls) FILTER (WHERE query LIKE '%reset_lsn IS NOT NULL)%OR EXISTS%'))::bigint
+                    sum(calls) FILTER (WHERE query LIKE '%reset_lsn IS NOT NULL)%OR EXISTS%'))::bigint || '|' ||
+                (SELECT count(*) FROM worf.sequence_range_grant WHERE seqoid = 't_id_seq'::regclass)
             FROM pg_stat_statements
             """, token)).Split('|');
-        long searching = long.Parse(costs[0], CultureInfo.InvariantCulture);
-        long checkedHeld = long.Parse(costs[1], CultureInfo.InvariantCulture);
-        Assert.IsTrue(searching * 10 < fenced.ElapsedMilliseconds && checkedHeld < 200 && held * 4 < samples,
-            $"the milliseconds node_a spent in statements on its ledger of grants over the {fenced.ElapsedMilliseconds} ms of the fence, {searching}; the buffers each check of a block taken back read, {checkedHeld}; t_id_seq's range row, held at {held} of {samples} tries");
+        long searches = long.Parse(costs[0], CultureInfo.InvariantCulture);
+        long searched = long.Parse(costs[1], CultureInfo.InvariantCulture);
+        long checkedHeld = long.Parse(costs[2], CultureInfo.InvariantCulture);
+        long grants = long.Parse(costs[3], CultureInfo.InvariantCulture);
+        Assert.IsTrue(searches > 0 && searched < searches * grants * 3 / 2 && checkedHeld < 200 && held * 4 < samples,
+            $"node_a's {searches} searches of its ledger over the {fenced.ElapsedMilliseconds} ms of the fence, which read {searched} buffers against " +
+            $"t_id_seq's {grants} grants; the buffers each check of a block taken back read, {checkedHeld}; t_id_seq's range row, held at {held} of {samples} tries");
     }
 
     /// <summary>
