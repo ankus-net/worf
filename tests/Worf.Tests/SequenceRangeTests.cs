@@ -2005,15 +2005,30 @@ public sealed partial class SequenceRangeTests
             """;
         }
 
+        // A take-in that finds a row it writes held by another transaction, as the range worker's or a call's, leaves the
+        // sequence to the neighbor's next message, rolling back what it did, as node_b's own messages repeat a request
+        // until it's answered; so each made-up request is sent until node_a records it answered.
+        async Task AskAsync(string reset)
+        {
+            Stopwatch asking = Stopwatch.StartNew();
+            do
+            {
+                Assert.IsLessThan(TestNode.PollTimeout, asking.Elapsed, $"node_a's answer to node_b's made-up request {reset}");
+                _ = await nodeA.SafePsqlAsync(Database, $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{await RequestAsync(reset)}')", token);
+            }
+            while (await nodeA.SafePsqlAsync(Database,
+                $"SELECT reset_done = '{reset}' FROM worf.sequence_range_node WHERE seqoid = 't_id_seq'::regclass AND node_id = {nodeBId}", token) != "t");
+        }
+
         int asked = nodeA.ReadLog().Length;
-        _ = await nodeA.SafePsqlAsync(Database, $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{await RequestAsync("0/10")}')", token);
+        await AskAsync("0/10");
         Assert.Contains("node node_b asked this node to reset", nodeA.ReadLog()[asked..], "node_a's reset at node_b's made-up request");
 
         // node_a draws from a block again, so that a reset would have something to give up.
         await WaitActiveAsync([nodeA, nodeB], token);
         _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO t (v) VALUES ('a')", token);
         asked = nodeA.ReadLog().Length;
-        _ = await nodeA.SafePsqlAsync(Database, $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{await RequestAsync("0/11")}')", token);
+        await AskAsync("0/11");
         Assert.DoesNotContain("node node_b asked this node to reset", nodeA.ReadLog()[asked..], "node_a's reset at node_b's next made-up request");
         await WaitActiveAsync([nodeA, nodeB], token);
         await AssertNoSharedValuesAsync([nodeA, nodeB], token);
