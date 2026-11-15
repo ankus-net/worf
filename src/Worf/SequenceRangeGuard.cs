@@ -4115,8 +4115,8 @@ internal static partial class SequenceRangeGuard
         bool taken = false;
         try
         {
-            _ = Worf.Execute("SET LOCAL lock_timeout = 0");
-            _ = Worf.Execute("SET LOCAL deadlock_timeout = '1h'");
+            WorfLocks.SetAtNestLevel("lock_timeout", "0");
+            WorfLocks.SetAtNestLevel("deadlock_timeout", "1h");
             _ = NativeMethods.LockAcquire(&door, ExclusiveLock, false, false);
             shut = true;
             _ = NativeMethods.LockAcquire(&tag, ExclusiveLock, false, false);

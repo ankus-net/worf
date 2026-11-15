@@ -2341,7 +2341,7 @@ internal static class SequenceRangeExchange
                         AND a.state LIKE 'idle in transaction%')
                 """))
             {
-                _ = Worf.Execute($"SET LOCAL lock_timeout = {Math.Min(1000, SequenceRanges.ExchangeTimeout / 4).ToString(CultureInfo.InvariantCulture)}");
+                WorfLocks.SetAtNestLevel("lock_timeout", Math.Min(1000, SequenceRanges.ExchangeTimeout / 4).ToString(CultureInfo.InvariantCulture));
             }
 
             local = Worf.Query("SELECT owner_node, epoch, state, parent_node FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE", false, 1,

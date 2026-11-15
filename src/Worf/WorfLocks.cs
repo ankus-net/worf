@@ -107,6 +107,22 @@ internal static class WorfLocks
         }
     }
 
+    /// <summary>
+    /// Sets a setting at the GUC nest level just made, as a function's SET clause does, so that AtEOXact_GUC at that
+    /// level puts it back: a SET LOCAL made there would stay set for the enclosing level once the nested one commits.
+    /// </summary>
+    /// <param name="name">The setting.</param>
+    /// <param name="value">Its value.</param>
+    internal static unsafe void SetAtNestLevel(string name, string value)
+    {
+        fixed (byte* setting = Worf.ToServerCString(name))
+        fixed (byte* set = Worf.ToServerCString(value))
+        {
+            _ = NativeMethods.set_config_option((sbyte*)setting, (sbyte*)set, GucContext.PGC_SUSET, GucSource.PGC_S_SESSION,
+                GucAction.GUC_ACTION_SAVE, true, 0, false);
+        }
+    }
+
     private static LOCKTAG Tag(uint obj, ushort key)
     {
         uint database;

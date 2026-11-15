@@ -3301,6 +3301,11 @@ public sealed partial class SequenceRangeTests
                     Assert.AreEqual("57014", canceled.SqlState, canceled.MessageText);
                 }
 
+                // No take-in waited for the held report longer than its millisecond, as node_a logs a lock wait that
+                // outlasts a tenth of a second.
+                string[] waits = nodeA.ReadLog().Split("still waiting for")[1..];
+                Assert.AreEqual("", string.Join("\n", waits.Where(wait => wait.Contains("relation \"sequence_range_node\"", StringComparison.Ordinal))
+                    .Select(wait => wait[..Math.Min(200, wait.Length)])), "node_a's waits for report rows");
                 await holding.CommitAsync(token);
                 await using (NpgsqlCommand locks = new("SET statement_timeout = 0; SELECT count(*) FROM pg_locks WHERE pid = pg_backend_pid() AND locktype = 'advisory'", dropping))
                 {
@@ -4998,6 +5003,65 @@ public sealed partial class SequenceRangeTests
 
         _ = await nodeA.SafePsqlAsync(Database, "DROP EXTENSION worf CASCADE", token);
         Assert.DoesNotContain("deadlock detected", nodeA.ReadLog()[logpos..], "node_a's log");
+    }
+
+    /// <summary>
+    /// A take-in waits a millisecond for a report row another transaction holds, after the range row it may wait for
+    /// longer has come: node_a's open transaction holds node_b's report of t while node_b's calls, which take t's range
+    /// row in, ask for blocks, and node_a logs no wait for a report row that outlasts a tenth of a second, where the range
+    /// row's wait had left the rest of the sequence's take-in waiting up to a second, in the node's turn.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task TakeInsWaitAMillisecondForHeldReports()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token, "log_lock_waits = on\ndeadlock_timeout = 100ms");
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 10, max_range_size := 10)", token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+
+        await using NpgsqlConnection holder = await nodeA.OpenAsync(Database, token);
+        await using NpgsqlTransaction holding = await holder.BeginTransactionAsync(token);
+        await using (NpgsqlCommand hold = new("SELECT 1 FROM worf.sequence_range_node WHERE node_name = 'node_b' AND seqoid = 't_id_seq'::regclass FOR UPDATE", holder, holding))
+        {
+            _ = await hold.ExecuteNonQueryAsync(token);
+        }
+
+        // node_b draws its blocks out, and asks for more in each call, which can't take its report in, for 5 s.
+        int logged = nodeA.ReadLog().Length;
+        await using (NpgsqlConnection writer = await nodeB.OpenAsync(Database, token))
+        {
+            await using (NpgsqlCommand timeout = new("SET statement_timeout = '1s'", writer))
+            {
+                _ = await timeout.ExecuteNonQueryAsync(token);
+            }
+
+            await using NpgsqlCommand insert = new("INSERT INTO t (v) VALUES ('b')", writer);
+            Stopwatch drawing = Stopwatch.StartNew();
+            while (drawing.Elapsed < TimeSpan.FromSeconds(5))
+            {
+                try
+                {
+                    _ = await insert.ExecuteNonQueryAsync(token);
+                }
+                catch (PostgresException ranOut) when (ranOut.SqlState is "57014" or "2200H")
+                {
+                    // node_b's next blocks wait for its report to be taken in.
+                }
+            }
+        }
+
+        string[] waits = nodeA.ReadLog()[logged..].Split("still waiting for")[1..];
+        await holding.RollbackAsync(token);
+        Assert.AreEqual("", string.Join("\n", waits.Where(wait => wait.Contains("relation \"sequence_range_node\"", StringComparison.Ordinal))
+            .Select(wait => wait[..Math.Min(200, wait.Length)])), "node_a's waits for node_b's held report");
     }
 
     /// <summary>
