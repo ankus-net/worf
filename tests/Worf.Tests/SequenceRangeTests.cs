@@ -3332,9 +3332,7 @@ public sealed partial class SequenceRangeTests
 
                 // No take-in waited for the held report longer than its millisecond, as node_a logs a lock wait that
                 // outlasts a tenth of a second.
-                string[] waits = nodeA.ReadLog().Split("still waiting for")[1..];
-                Assert.AreEqual("", string.Join("\n", waits.Where(wait => wait.Contains("relation \"sequence_range_node\"", StringComparison.Ordinal))
-                    .Select(wait => wait[..Math.Min(200, wait.Length)])), "node_a's waits for report rows");
+                Assert.AreEqual("", string.Join("\n", ReportRowWaits(nodeA.ReadLog())), "node_a's waits for report rows");
                 await holding.CommitAsync(token);
                 await using (NpgsqlCommand locks = new("SET statement_timeout = 0; SELECT count(*) FROM pg_locks WHERE pid = pg_backend_pid() AND locktype = 'advisory'", dropping))
                 {
@@ -5087,10 +5085,9 @@ public sealed partial class SequenceRangeTests
             }
         }
 
-        string[] waits = nodeA.ReadLog()[logged..].Split("still waiting for")[1..];
+        string[] waits = ReportRowWaits(nodeA.ReadLog()[logged..]);
         await holding.RollbackAsync(token);
-        Assert.AreEqual("", string.Join("\n", waits.Where(wait => wait.Contains("relation \"sequence_range_node\"", StringComparison.Ordinal))
-            .Select(wait => wait[..Math.Min(200, wait.Length)])), "node_a's waits for node_b's held report");
+        Assert.AreEqual("", string.Join("\n", waits), "node_a's waits for node_b's held report");
     }
 
     /// <summary>
@@ -9898,6 +9895,32 @@ public sealed partial class SequenceRangeTests
             await connection.DisposeAsync();
             throw;
         }
+    }
+
+    /// <summary>
+    /// Finds the lock waits a log with log_lock_waits on reports for rows of worf.sequence_range_node, each with the lines
+    /// of its own entry, the wait's and its DETAIL and CONTEXT, which name the relation of a row it waits for.
+    /// </summary>
+    private static string[] ReportRowWaits(string log)
+    {
+        string[] lines = log.Split('\n');
+        List<string> waits = [];
+        for (int i = 0; i < lines.Length; i++)
+        {
+            int prefix = lines[i].IndexOf("]: ", StringComparison.Ordinal);
+            if (prefix < 0 || !lines[i].Contains("still waiting for", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            string entry = string.Join("\n", lines.Skip(i).Take(4).TakeWhile((line, k) => k == 0 || line.StartsWith(lines[i][..prefix], StringComparison.Ordinal)));
+            if (entry.Contains("relation \"sequence_range_node\"", StringComparison.Ordinal))
+            {
+                waits.Add(entry);
+            }
+        }
+
+        return [.. waits];
     }
 
     /// <summary>

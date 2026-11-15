@@ -2329,7 +2329,11 @@ public sealed partial class ExceptionBehaviourTests
 
         // Nor does a large table here whose deferrable key treats nulls as equal, which the transaction writes: its rows
         // join by hashing too, about as fast as a table's whose key's nulls are distinct, and a key the transaction updates
-        // to null conflicts with a null one here.
+        // to null conflicts with a null one here. The apply worker that meets the conflict exits, and the next replays the
+        // transaction, so the replay's cost is that worker's CPU time, which the other tests' load leaves alone as it
+        // doesn't the time the worker's restart takes.
+        const string ApplyWorker = "SELECT pid FROM pg_stat_activity WHERE backend_type LIKE 'worf apply%'";
+        static TimeSpan Cpu(string pid) => Process.GetProcessById(int.Parse(pid, CultureInfo.InvariantCulture)).TotalProcessorTime;
         Dictionary<string, TimeSpan> replays = [];
         foreach ((string name, string nulls, int after) in new[] { ("snu", "", 6), ("snd", " NULLS NOT DISTINCT", 7) })
         {
@@ -2346,6 +2350,11 @@ public sealed partial class ExceptionBehaviourTests
                 INSERT INTO {name} VALUES (1100001, NULL);
                 ANALYZE {name};
                 """, token);
+
+            // The apply worker is read before the transaction comes, which ends it at the conflict.
+            Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, $"SELECT EXISTS ({ApplyWorker})", token), "the apply worker");
+            string applying = await subscriber.SafePsqlAsync(Database, ApplyWorker, token);
+            TimeSpan before = Cpu(applying);
             _ = await provider.SafePsqlAsync(Database, $"""
                 BEGIN;
                 INSERT INTO {name} SELECT g, g FROM generate_series(1, 2000) g;
@@ -2354,14 +2363,14 @@ public sealed partial class ExceptionBehaviourTests
                 COMMIT;
                 INSERT INTO sw VALUES ({after}, {after});
                 """, token);
-            Stopwatch replay = Stopwatch.StartNew();
             Assert.IsTrue(await subscriber.PollQueryUntilAsync(Database, $"SELECT EXISTS (SELECT 1 FROM sw WHERE id = {after})", token), $"the row after {name}'s conflicts");
-            replays[name] = replay.Elapsed;
-            TestContext.WriteLine($"the replay into {name}: {replay.Elapsed.TotalSeconds:F1} s");
+            string replayed = await subscriber.SafePsqlAsync(Database, ApplyWorker, token);
+            replays[name] = replayed == applying ? Cpu(replayed) - before : Cpu(replayed);
+            TestContext.WriteLine($"the replay into {name}: {replays[name].TotalMilliseconds:F0} ms of CPU");
         }
 
-        Assert.IsLessThan((replays["snu"] * 2) + TimeSpan.FromSeconds(2), replays["snd"],
-            "the replay of 2,000 rows into a table of 100,000 whose key's nulls aren't distinct, against one whose are");
+        Assert.IsLessThan((replays["snu"] * 2) + TimeSpan.FromMilliseconds(500), replays["snd"],
+            "the CPU time of the replay of 2,000 rows into a table of 100,000 whose key's nulls aren't distinct, against one whose are");
         Assert.AreEqual("102001|5|UPDATE|5|23505", await subscriber.SafePsqlAsync(Database, """
             SELECT (SELECT count(*) FROM snd), (SELECT k FROM snd WHERE id = 5), string_agg(concat_ws('|', operation, remote_new_tuple->>'id', error_sqlstate), ',')
             FROM worf.exception_log WHERE table_name = 'snd'
