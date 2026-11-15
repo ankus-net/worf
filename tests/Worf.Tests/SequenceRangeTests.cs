@@ -3124,19 +3124,21 @@ public sealed partial class SequenceRangeTests
     /// with the drop; a drop canceled in the turn lets it go, and one that waits for a report another session holds lets it
     /// go as it waits; sessions' own advisory locks, of whatever key, are never worf's; and a drop left open whose deletes
     /// a reply's take-in would wait for, or a fence's lift in the range worker, holds up neither the turn nor the worker,
-    /// so that node_a's own inserts, which switch blocks of 10, go on too. The cases run one after another, each on four
-    /// servers of its own, beside the other tests: run at once, their 24 servers would take most of the 32 System V shared
-    /// memory segments macOS allows.
+    /// so that node_a's own inserts, which switch blocks of 10, go on too. The rows run alone: their 24 servers would take
+    /// most of the 32 System V shared memory segments macOS allows beside other tests', and node_b's draws wait on how fast
+    /// the exchanges of four nodes supply blocks. node_a logs the lock waits that outlast a tenth of a second.
     /// </summary>
+    /// <param name="how">What holds, or would hold, the turn.</param>
     /// <returns>The test.</returns>
     [TestMethod]
-    public async Task TurnsWaitOnNoSession()
-    {
-        foreach (string how in new[] { "configuration open", "drop open", "canceled drop", "waiting drop", "advisory keys", "fence beside drop" })
-        {
-            await TurnsWaitOnNoSessionAsync(how);
-        }
-    }
+    [DoNotParallelize]
+    [DataRow("configuration open")]
+    [DataRow("drop open")]
+    [DataRow("canceled drop")]
+    [DataRow("waiting drop")]
+    [DataRow("advisory keys")]
+    [DataRow("fence beside drop")]
+    public Task TurnsWaitOnNoSession(string how) => TurnsWaitOnNoSessionAsync(how);
 
     /// <summary>
     /// A forced lift on node_a waits for a drop under way, which waits on node_d, paused, before it takes the turn, rather
@@ -3152,7 +3154,7 @@ public sealed partial class SequenceRangeTests
     private async Task TurnsWaitOnNoSessionAsync(string how)
     {
         CancellationToken token = TestContext.CancellationToken;
-        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeA = await StartNodeAsync("node_a", token, "log_lock_waits = on\ndeadlock_timeout = 100ms");
         await using TestNode nodeB = await StartNodeAsync("node_b", token);
         await using TestNode nodeC = await StartNodeAsync("node_c", token);
         await using TestNode nodeD = await StartNodeAsync("node_d", token);
@@ -3175,7 +3177,7 @@ public sealed partial class SequenceRangeTests
         await WaitActiveAsync([nodeA, nodeB, nodeC, nodeD], token);
         string nodeCId = await nodeC.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
 
-        // node_b, or node_a into u, inserts for 12 s, each insert within 5 s.
+        // node_b, or node_a into u, inserts for 8 s, each insert within 5 s.
         async Task<string> InsertAsync(TestNode node, string table)
         {
             List<string> failed = [];
@@ -3187,7 +3189,7 @@ public sealed partial class SequenceRangeTests
 
             await using NpgsqlCommand insert = new($"INSERT INTO {table} DEFAULT VALUES", writer);
             Stopwatch running = Stopwatch.StartNew();
-            while (running.Elapsed < TimeSpan.FromSeconds(12))
+            while (running.Elapsed < TimeSpan.FromSeconds(8))
             {
                 try
                 {

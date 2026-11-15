@@ -1597,11 +1597,21 @@ internal static class SequenceRangeExchange
             WorfLog.Debug1($"sequence range exchange with node {senderName} left {left.Count.ToString(CultureInfo.InvariantCulture)} sequences to its next call, as the call had taken a third of its time");
         }
 
+        // A sequence the neighbor no longer carries is recorded as absent with the take-in's lock timeout, so that a row another
+        // transaction holds, as a drop of the neighbor's subscription left open holds those it deleted, is recorded by a later
+        // message rather than hold the node's turn.
         foreach (uint seqoid in absent)
         {
-            _ = Worf.Execute("""
-                INSERT INTO worf.sequence_range_absent VALUES ($1, $2, now()) ON CONFLICT (seqoid, node_id) DO UPDATE SET absent_at = excluded.absent_at
-                """, SpiParameter.Create(seqoid), SpiParameter.Create(senderId));
+            try
+            {
+                PgTransaction.RunInSubtransaction(() => _ = WithLockTimeout(() => Worf.Execute("""
+                    INSERT INTO worf.sequence_range_absent VALUES ($1, $2, now()) ON CONFLICT (seqoid, node_id) DO UPDATE SET absent_at = excluded.absent_at
+                    """, SpiParameter.Create(seqoid), SpiParameter.Create(senderId))));
+            }
+            catch (PgException held) when (held.SqlState == "55P03")
+            {
+                WorfLog.Debug1($"sequence range exchange with node {senderName} leaves the record of a sequence it no longer carries to a later message: {held.Message}");
+            }
         }
 
         // A message carries every sequence its node manages, and an owner's dropped epochs, so a sequence the neighbor
