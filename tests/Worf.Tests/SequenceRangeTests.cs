@@ -4522,6 +4522,32 @@ public sealed partial class SequenceRangeTests
     [GeneratedRegex(@"!\s*([0-9.]+) s user, ([0-9.]+) s system, [0-9.]+ s elapsed")]
     private static partial Regex StatementUsage();
 
+    // The CPU time a backend's messages took since a position in its server's log, each of which log_statement_stats
+    // logs, once the log shows a line that comes after them.
+    private static async Task<TimeSpan> StatementsCpuAsync(TestNode node, int logged, int pid, string after, CancellationToken token)
+    {
+        Stopwatch reading = Stopwatch.StartNew();
+        while (!node.ReadLog()[logged..].Contains(after, StringComparison.Ordinal))
+        {
+            Assert.IsLessThan(TestNode.PollTimeout, reading.Elapsed, $"the statements' statistics in {node.Name}'s log");
+            await Task.Delay(TimeSpan.FromMilliseconds(50), token);
+        }
+
+        string marker = string.Create(CultureInfo.InvariantCulture, $"[{pid}]");
+        string[] lines = node.ReadLog()[logged..].Split('\n');
+        double cpu = 0;
+        for (int i = 0; i < lines.Length; i++)
+        {
+            if (lines[i].Contains(marker, StringComparison.Ordinal) && lines[i].Contains("MESSAGE STATISTICS", StringComparison.Ordinal) &&
+                lines.Skip(i + 1).Select(line => StatementUsage().Match(line)).FirstOrDefault(match => match.Success) is { } usage)
+            {
+                cpu += double.Parse(usage.Groups[1].Value, CultureInfo.InvariantCulture) + double.Parse(usage.Groups[2].Value, CultureInfo.InvariantCulture);
+            }
+        }
+
+        return TimeSpan.FromSeconds(cpu);
+    }
+
     // A line of a failure that names an address and says nothing more, as libpq begins one for the next address.
     [GeneratedRegex("failed: *$", RegexOptions.Multiline)]
     private static partial Regex BareFailureLine();
@@ -6636,27 +6662,7 @@ public sealed partial class SequenceRangeTests
                 _ = await off.ExecuteNonQueryAsync(token);
             }
 
-            // The CPU time of the statements' messages, each of which logs its own, up to the SET that ends the count.
-            string marker = string.Create(CultureInfo.InvariantCulture, $"[{changing.ProcessID}]");
-            Stopwatch reading = Stopwatch.StartNew();
-            while (!nodeA.ReadLog()[logged..].Contains("SET log_statement_stats = off", StringComparison.Ordinal))
-            {
-                Assert.IsLessThan(TestNode.PollTimeout, reading.Elapsed, "the statements' statistics in node_a's log");
-                await Task.Delay(TimeSpan.FromMilliseconds(50), token);
-            }
-
-            double cpu = 0;
-            string[] lines = nodeA.ReadLog()[logged..].Split('\n');
-            for (int i = 0; i < lines.Length; i++)
-            {
-                if (lines[i].Contains(marker, StringComparison.Ordinal) && lines[i].Contains("MESSAGE STATISTICS", StringComparison.Ordinal) &&
-                    lines.Skip(i + 1).Select(line => StatementUsage().Match(line)).FirstOrDefault(match => match.Success) is { } usage)
-                {
-                    cpu += double.Parse(usage.Groups[1].Value, CultureInfo.InvariantCulture) + double.Parse(usage.Groups[2].Value, CultureInfo.InvariantCulture);
-                }
-            }
-
-            return (elapsed, TimeSpan.FromSeconds(cpu));
+            return (elapsed, await StatementsCpuAsync(nodeA, logged, changing.ProcessID, "SET log_statement_stats = off", token));
         }
 
         (TimeSpan few, TimeSpan fewCpu) = await ChangeAsync();
@@ -7392,27 +7398,7 @@ public sealed partial class SequenceRangeTests
             _ = await insert.ExecuteNonQueryAsync(token);
             TimeSpan elapsed = timing.Elapsed;
 
-            // The CPU time of the insert's messages, each of which logs its own.
-            string marker = string.Create(CultureInfo.InvariantCulture, $"[{pid}]");
-            Stopwatch reading = Stopwatch.StartNew();
-            while (!nodeB.ReadLog()[logged..].Contains("EXECUTE MESSAGE STATISTICS", StringComparison.Ordinal))
-            {
-                Assert.IsLessThan(TestNode.PollTimeout, reading.Elapsed, "the insert's statistics in node_b's log");
-                await Task.Delay(TimeSpan.FromMilliseconds(50), token);
-            }
-
-            double cpu = 0;
-            string[] lines = nodeB.ReadLog()[logged..].Split('\n');
-            for (int i = 0; i < lines.Length; i++)
-            {
-                if (lines[i].Contains(marker, StringComparison.Ordinal) && lines[i].Contains("MESSAGE STATISTICS", StringComparison.Ordinal) &&
-                    lines.Skip(i + 1).Select(line => StatementUsage().Match(line)).FirstOrDefault(match => match.Success) is { } usage)
-                {
-                    cpu += double.Parse(usage.Groups[1].Value, CultureInfo.InvariantCulture) + double.Parse(usage.Groups[2].Value, CultureInfo.InvariantCulture);
-                }
-            }
-
-            return (elapsed, TimeSpan.FromSeconds(cpu), PeakResident(pid) - before);
+            return (elapsed, await StatementsCpuAsync(nodeB, logged, pid, "EXECUTE MESSAGE STATISTICS", token), PeakResident(pid) - before);
         }
 
         (TimeSpan uncoerced, TimeSpan uncoercedCpu, long uncoercedPeak) = await InsertManyAsync("tint");
