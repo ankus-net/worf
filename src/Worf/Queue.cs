@@ -149,19 +149,12 @@ internal static class Queue
             Trigger* trigger = rel->trigdesc->triggers;
             uint funcoid = NativeMethods.LookupFuncName(funcname, 0, fargtypes, false);
 
-            for (int i = 0; i < rel->trigdesc->numtriggers; i++)
+            for (int i = 0; i < rel->trigdesc->numtriggers; i++, trigger++)
             {
-                if ((trigger->tgtype & TriggerTypeTruncate) == 0)
-                {
-                    continue;
-                }
-
-                if (trigger->tgfoid == funcoid)
+                if ((trigger->tgtype & TriggerTypeTruncate) != 0 && trigger->tgfoid == funcoid)
                 {
                     return;
                 }
-
-                trigger++;
             }
         }
 

@@ -97,7 +97,8 @@ may need to call `worf.alter_subscription_resynchronize_table()` to fix it.
 
 - `worf.replication_set_add_all_sequences(set_name name, schema_names text[], synchronize_data boolean)`
   Adds all sequences from the given schemas. Only existing sequences are added, any sequences that
-  will be created in future will not be added automatically.
+  will be created in future will not be added automatically. Sequences under
+  [sequence range management](../sequence-ranges/) are left out, with a notice.
 
   Parameters:
   - `set_name` - name of the existing replication set

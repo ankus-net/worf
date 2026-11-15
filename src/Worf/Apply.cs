@@ -15,47 +15,106 @@ internal static unsafe partial class Apply
     // Number of tuples inserted after which we switch to multi-insert.
     private const int MinMultiInsertTuples = 5;
 
+    // RVR_MISSING_OK from catalog/namespace.h.
+    private const uint RangeVarMissingOk = 1;
+
+    // How many milliseconds a synchronization that failed waits to start again, at first and at most.
+    private const long SyncRestartDelay = 5000;
+    private const long MaxSyncRestartDelay = 300_000;
+
     // How worf.exception_behaviour applies a failed transaction again: change by change, as a whole in a subtransaction,
     // or, when its commit fails however it's applied, not at all.
     private const int ExceptionByChange = 1;
     private const int ExceptionByTransaction = 2;
     private const int ExceptionWithoutApplying = 3;
 
+    // How many microseconds the apply worker waits before it tries again to drop slots that table syncs left, and
+    // between its looks for slots recorded that no sync uses.
+    private const long SyncSlotsRetryInterval = 5_000_000;
+    private const long SyncSlotsCheckInterval = 60_000_000;
+
     private static readonly LinkedList<(ulong LocalEnd, ulong RemoteEnd)> s_lsnMapping = new();
 
     private static bool s_inRemoteTransaction;
     private static ulong s_remoteOriginLsn;
+    private static string? s_remoteOriginName;
     private static ushort s_remoteOriginId;
     private static uint s_writerNodeId;
-    private static uint s_sessionWriterNodeId;
+
+    // The node whose transactions the session's origin commits, or null when it's not set up for one.
+    private static uint? s_sessionWriterNodeId;
 
     // The error of the failed transaction that a whole skip records with each of its changes, and whether this
     // transaction's changes are recorded as they're skipped.
     private static PgException? s_exceptionError;
     private static bool s_recordSkipped;
 
+    // The changes of the transaction applied again change by change that it skips, as they conflict at commit, by their
+    // places in it, with their errors; the transaction IDs of the subtransactions its applied changes took, with their
+    // places; and whether the last commit found more to skip.
+    private static Dictionary<long, PgException> s_exceptionSkips = [];
+    private static readonly List<(uint Xid, long Action)> s_changeXids = [];
+    private static readonly HashSet<uint> s_changeRelations = [];
+    private static bool s_skipsAdded;
+
     // Whether the stream passed the failed transaction without sending it again.
     private static bool s_exceptionPassed;
 
-    // A table sync worker's current remote transaction, kept so that it applies the transaction again under
-    // worf.exception_behaviour itself, since restarting would copy its table again; and the messages it applies again.
-    private static List<byte[]>? s_transactionMessages;
-    private static Queue<byte[]>? s_replayMessages;
+    // Where a table sync worker streams its changes again from to apply a failed transaction again under
+    // worf.exception_behaviour itself, since restarting would copy its table again, or zero.
+    private static ulong s_restreamFrom;
+    private static bool s_messageContextCreated;
 
-    // Whether the subscription's provider also subscribes to this node, and when that was last checked.
-    private static bool s_twoWay;
-    private static long s_twoWayCheckedAt;
+    // Whether other nodes subscribe to this node's changes, which can then meet a remote change somewhere, and when
+    // that was last checked.
+    private static bool s_replicated;
+    private static long s_replicatedCheckedAt;
 
-    // The origins of this worker's stream: its own and its relay origins.
-    private static readonly HashSet<ushort> s_streamOrigins = [];
+    // This worker's own replication origin and relay origins that exist, each with the full id of the transaction that
+    // created it, and when each relay origin last set up the session since the worker started.
+    private static Dictionary<ushort, ulong> s_streamOrigins = [];
+    private static readonly Dictionary<ushort, long> s_relayUsedAt = [];
 
-    // Whether this worker warned that no replication origin was free for a relay origin.
-    private static bool s_warnedNoRelayOrigin;
+    // When a relay origin's wait for a replication origin slot last ended with none come free, or zero.
+    private static long s_turnWaitedOutAt;
+
+    // How long, in microseconds, a relay origin keeps its slot after it last set up the session, rather than give it up
+    // to another of the worker's relay origins, while another slot can be had.
+    private const long RelayOriginHold = 60_000_000;
+
+    // How long, in microseconds, a relay origin waits for a slot to come free before the worker's other relay origins
+    // take turns with it.
+    private const long RelayTurnWait = 1_000_000;
+
+    // The writer and subscription of the origin of the last local row whose stream was looked up.
+    private static (ushort Origin, uint Xid, (uint Writer, uint SubId)? Recorded) s_lastOriginWriter;
+
+    // When this worker last warned that it dropped relay origins for want of replication origin slots, when the want
+    // that it last answered was, and when it last looked for an origin that another user of origins can't set up.
+    private static long s_reclaimWarnedAt;
+    private static long s_reclaimCheckedAt;
+    private static long s_ownReclaimCheckedAt;
+    private static long s_elsewhereCheckedAt;
+
+    // The origins of PostgreSQL subscriptions this worker last gave slots up for, and those it found waiting for none,
+    // with when it gives slots up for them again and the delay before that.
+    private static readonly HashSet<string> s_gaveUpFor = [];
+
+    private static readonly Dictionary<string, (long Until, long Delay)> s_notWaiting = [];
+
+    // When this worker next tries to drop the slots that table syncs left on the provider, or zero, and when it last
+    // looked for slots recorded that no sync uses.
+    private static long s_syncSlotsRetryAt;
+    private static long s_syncSlotsCheckedAt;
     private static bool s_skipRemoteTransaction;
     private static long s_applyDelay;
     private static uint s_queueRelid;
     private static List<WorfSyncStatus> s_syncingTables = [];
-    private static PgReplicationConnection? s_applyconn;
+
+    // When each table's sync worker last started, and how many times it has, so that one that fails, as on a value
+    // that fails to convert in its copy, starts again only after a delay that doubles each time.
+    private static readonly Dictionary<(string Nspname, string Relname), (long StartedAt, int Starts)> s_syncStarts = [];
+    private static WorfConnection? s_applyconn;
     private static ApplyFunctions s_applyApi = ApplyFunctions.Heap;
     private static WorfRelation? s_lastInsertRel;
     private static int s_lastInsertRelCnt;
@@ -63,6 +122,11 @@ internal static unsafe partial class Apply
     private static long s_clockSkewReportedAt;
     private static ulong s_remoteCommitLsn;
     private static long s_remoteCommitTime;
+
+    // The position of the last message received in the stream, and when apply last told copies waiting for it how far
+    // it has got into a remote transaction.
+    private static ulong s_messageLsn;
+    private static long s_copiesToldAt;
     private static ulong s_publishedFlushpos;
     private static bool s_publishesFlushpos;
 
@@ -88,6 +152,22 @@ internal static unsafe partial class Apply
     private static PgErrorContext? s_errorContext;
 
     /// <summary>
+    /// Gets how long, in microseconds, slots given up for PostgreSQL subscriptions' origins are left for them: ten
+    /// seconds, or twice wal_retrieve_retry_interval, after which PostgreSQL starts a failed worker again, if longer.
+    /// </summary>
+    private static long OriginSlotHold
+    {
+        get
+        {
+            fixed (byte* name = Worf.ToServerCString("wal_retrieve_retry_interval"))
+            {
+                return Math.Max(10_000_000L, 2_000L * long.Parse(Worf.FromServer(NativeMethods.GetConfigOption((sbyte*)name, false, false)),
+                    CultureInfo.InvariantCulture));
+            }
+        }
+    }
+
+    /// <summary>
     /// Gets how far ahead of the local clock a remote transaction's commit time can be for apply to wait for the clock
     /// to pass it, or -1 to never wait.
     /// </summary>
@@ -107,6 +187,12 @@ internal static unsafe partial class Apply
     private static ulong s_lastReceived;
 
     private static ulong s_lastRecvpos;
+
+    // When the last message had arrived as apply last asked the provider for a reply, so that it asks once a silence.
+    private static long s_pingedAt;
+
+    // The role the last of the current transaction's SQL from another node ran as, whose deferred work runs as it.
+    private static string? s_replicatedRole;
     private static ulong s_lastWritepos;
     private static ulong s_lastFlushpos;
     private static long s_lastSendTime;
@@ -134,15 +220,14 @@ internal static unsafe partial class Apply
     /// <summary>
     /// The apply worker's entry point.
     /// </summary>
-    /// <param name="mainArg">The worker's slot.</param>
+    /// <param name="mainArg">The worker's slot and its generation.</param>
     [PgBackgroundWorker(EntryPoint = "worf_apply_main")]
     internal static void ApplyMain(nuint mainArg)
     {
-        int slot = (int)mainArg;
 
         // Setup shmem.
-        Worker.WorkerAttach(slot, WorfWorkerType.Apply);
-        MyApplyWorkerSlot = slot;
+        Worker.WorkerAttach(mainArg, WorfWorkerType.Apply);
+        MyApplyWorkerSlot = Worker.MyWorfWorker;
 
         // Load correct apply API.
         if (Worf.UseSpi)
@@ -185,8 +270,9 @@ internal static unsafe partial class Apply
         // A crashed worker's failed transaction is applied again under worf.exception_behaviour, as the worker
         // recorded it, whichever worker slot this one has and across restarts.
         (s_exceptionLsn, s_exceptionLevel, s_exceptionError) = PgBackgroundWorker.RunTransaction(() => ExceptionLog.State(sub.Id));
+        s_exceptionSkips = PgBackgroundWorker.RunTransaction(() => ExceptionLog.Skips(sub.Id));
 
-        PgLog.Log($"starting apply for subscription {sub.Name}");
+        WorfLog.Log($"starting apply for subscription {sub.Name}");
 
         // Set apply delay if any.
         if (sub.ApplyDelay is PgInterval applyDelay)
@@ -197,56 +283,89 @@ internal static unsafe partial class Apply
         // If the subscription isn't initialized yet, initialize it.
         bool catchingUp = Sync.SyncSubscription(sub);
 
-        // Only a provider that also subscribes to this node writes changes that can conflict with this node's in both
-        // directions, and only then does apply wait out clock skew.
-        s_twoWay = TwoWay(sub);
-        s_twoWayCheckedAt = Worker.GetCurrentTimestamp();
-
-        PgLog.Debug1($"connecting to provider {sub.Origin.Name}, dsn {sub.OriginIf.Dsn}");
+        WorfLog.Debug1($"connecting to provider {sub.Origin.Name}, dsn {sub.OriginIf.Dsn}");
 
         // Cache the queue relation id.
         // TODO: invalidation
-        ulong originStartpos = PgBackgroundWorker.RunTransaction(() =>
+        ulong originStartpos = RunTakingOriginSlot(() =>
         {
             s_queueRelid = Queue.GetQueueTableOid();
 
             ushort originid = PgReplicationOrigin.Find(sub.SlotName)
                 ?? throw new PgException(PgSqlStates.UndefinedObject, $"replication origin \"{sub.SlotName}\" does not exist");
-            PgLog.Debug2($"setting up replication origin {sub.SlotName} (oid {originid})");
+
+            // An origin that worf_create_subscriber created has no record, and its rows would be in conflict with the
+            // subscription's later changes. It's claimed before the session takes it, as the claim waits for the lock
+            // a drop of the subscription holds while it waits for the session to let the origin go.
+            LoadStreamOrigins();
+            if (!s_streamOrigins.ContainsKey(originid))
+            {
+                s_streamOrigins[originid] = WorfNode.ClaimOrigin(sub.SlotName, sub.Origin.Id, sub.Id).SinceXid;
+            }
+
+            WorfLog.Debug2($"setting up replication origin {sub.SlotName} (oid {originid})");
             PgReplicationOrigin.SetupSession(originid);
 
-            // Relayed transactions advance their relay origins instead, so start after the latest of them all.
+            // Relayed transactions advance their relay origins instead, so start after the latest of them all. An origin
+            // with no progress starts from the position the subscription's sync status holds, which worf_create_subscriber
+            // records in the transaction that creates the subscription, as the position its restore point reached, so that
+            // a run that rolls back leaves no progress behind; worf's own syncs leave it zero.
             ulong startpos = PgReplicationOrigin.GetSessionProgress(false).Value;
-            _ = s_streamOrigins.Add(originid);
             foreach ((ushort relay, _) in WorfNode.RelayOrigins(sub.SlotName))
             {
                 startpos = Math.Max(startpos, PgReplicationOrigin.GetProgress(relay, false).Value);
-                _ = s_streamOrigins.Add(relay);
+            }
+
+            if (startpos == 0)
+            {
+                startpos = Sync.GetSubscriptionSyncStatus(sub.Id, true)?.Statuslsn ?? 0;
             }
 
             return startpos;
         });
 
-        // Start the replication.
-        using PgReplicationConnection streamConn = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, null);
+        // An apply worker that let a table's sync worker catch up waits for it before going past the position it gave
+        // it. This one starts from no further, so it waits for a catch-up that's still running too, or it would pass
+        // over the table's changes after that position, which the catch-up doesn't apply.
+        foreach (WorfSyncStatus sync in PgBackgroundWorker.RunTransaction(() => Sync.GetUnsyncedTables(sub.Id))
+            .Where(sync => sync.Status == Sync.SyncStatusCatchup))
+        {
+            Sync.WaitForCatchup(sub.Id, sync.Nspname, sync.Relname);
+        }
+
+        // Start the replication. Each call to the provider gives up after wal_receiver_timeout, and runs in a
+        // transaction, as a call cancelled outside one wouldn't come back as an error to name.
+        using WorfConnection streamConn = FromProvider(sub, "accept the replication connection",
+            () => PgBackgroundWorker.RunTransaction(() => Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, null)));
         string repsets = ReplicationSet.StringlistToIdentifierstr(sub.ReplicationSets);
         string origins = ReplicationSet.StringlistToIdentifierstr(sub.ForwardOrigins);
 
         // IDENTIFY_SYSTEM sets up some internal state on walsender so call it even if we don't (yet) want to use
         // any of the results.
-        _ = PgBackgroundWorker.RunTransaction(() => Worf.IdentifySystem(streamConn));
+        _ = FromProvider(sub, "identify itself", () => PgBackgroundWorker.RunTransaction(() => Worf.IdentifySystem(streamConn)));
 
         // The walsender of an apply worker that has just exited, as when the subscription's interface changes,
         // can hold the slot a moment longer. Wait for it, as the sync worker's cleanup does, rather than failing
         // and being restarted seconds later. A slot that stays busy fails below as before.
         long deadline = Worker.GetCurrentTimestamp() + 5000000L;
         while (!Worker.GotSigterm && Worker.GetCurrentTimestamp() < deadline &&
-            PgBackgroundWorker.RunTransaction(() => Rpc.RemoteSlotActive(streamConn, sub.SlotName)))
+            FromProvider(sub, $"say whether slot \"{sub.SlotName}\" is in use", () => PgBackgroundWorker.RunTransaction(() => Rpc.RemoteSlotActive(streamConn, sub.SlotName))))
         {
             _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(50));
         }
 
-        Worf.StartReplication(streamConn, sub.SlotName, originStartpos, origins, repsets, null, sub.ForceTextTransfer);
+        // Slots that the subscription's table syncs left on the provider are dropped, now and while one stays.
+        SetSyncSlotsLeft(false);
+        s_syncSlotsRetryAt = FromProvider(sub, "drop the slots the subscription's table syncs left", () => PgBackgroundWorker.RunTransaction(() =>
+            Sync.DropLeftSyncSlots(streamConn, sub).Count == 0))
+            ? 0 : Worker.GetCurrentTimestamp() + SyncSlotsRetryInterval;
+
+        FromProvider(sub, $"start streaming from slot \"{sub.SlotName}\"", () => PgBackgroundWorker.RunTransaction(() =>
+            Worf.StartReplication(streamConn, sub.SlotName, originStartpos, origins, repsets, null, sub.ForceTextTransfer)));
+
+        // A provider that streams again answers again, as one that restarted, whose draws wait for this node to answer
+        // since: this node calls it now, rather than once the retry of a call that ran out of time as it went down is due.
+        CallProviderUnheard();
 
         if (catchingUp)
         {
@@ -262,16 +381,28 @@ internal static unsafe partial class Apply
     /// Apply main loop.
     /// </summary>
     /// <param name="streamConn">The streaming connection.</param>
-    internal static void ApplyWork(PgReplicationConnection streamConn)
+    /// <returns>Where a table sync worker streams changes again from to apply a failed transaction again, or zero when
+    /// the worker was asked to stop.</returns>
+    internal static ulong ApplyWork(WorfConnection streamConn)
     {
         s_applyconn = streamConn;
         s_lastReceived = 0;
+        s_restreamFrom = 0;
 
-        // Init the MessageContext which we use for easier cleanup.
-        fixed (byte* name = Worf.ToServerCString("MessageContext"))
+        // Only workers that find no replication origin slot free from now on have relay origins give theirs up.
+        s_reclaimCheckedAt = Worker.OriginSlotWantedAt;
+        s_ownReclaimCheckedAt = Worker.OwnOriginSlotWantedAt;
+
+        // Init the MessageContext which we use for easier cleanup, once, as a table sync worker streams again.
+        if (!s_messageContextCreated)
         {
-            NativeGlobals.MessageContext = NativeMethods.AllocSetContextCreateInternal(NativeGlobals.TopMemoryContext,
-                (sbyte*)name, 0, 8 * 1024, 8 * 1024 * 1024);
+            fixed (byte* name = Worf.ToServerCString("MessageContext"))
+            {
+                NativeGlobals.MessageContext = NativeMethods.AllocSetContextCreateInternal(NativeGlobals.TopMemoryContext,
+                    (sbyte*)name, 0, 8 * 1024, 8 * 1024 * 1024);
+            }
+
+            s_messageContextCreated = true;
         }
 
         using PgErrorContext errorContext = PgErrorContext.Push("");
@@ -296,6 +427,10 @@ internal static unsafe partial class Apply
                     }
 
                     HandleCopyData(copybuf.ToArray(), inTransaction: false);
+                    if (s_restreamFrom != 0)
+                    {
+                        return s_restreamFrom;
+                    }
 
                     // While apply is behind, the walsender's request for a reply waits behind the changes still to be
                     // applied, so report progress every second rather than only once caught up.
@@ -313,6 +448,8 @@ internal static unsafe partial class Apply
                     throw new PgException(PgSqlStates.InternalError, "data stream ended");
                 }
 
+                CheckProviderSilence(streamConn);
+
                 // confirm all writes at once
                 SendFeedback(streamConn, s_lastReceived, Worker.GetCurrentTimestamp(), false);
 
@@ -321,12 +458,12 @@ internal static unsafe partial class Apply
                     ProcessSyncingTables(s_lastReceived);
                     DdlLock.Reconcile(MySubscription!);
 
-                    // The provider may come to subscribe to this node after this worker started.
-                    if (Worker.GetCurrentTimestamp() - s_twoWayCheckedAt >= 60_000_000)
-                    {
-                        s_twoWayCheckedAt = Worker.GetCurrentTimestamp();
-                        s_twoWay = TwoWay(MySubscription!);
-                    }
+                    // Relay origins this worker no longer needs give their slots up to another subscription's, a
+                    // table sync's or a relay origin that found none free.
+                    ReclaimRelayOriginsIfWanted();
+
+                    // A table sync that couldn't drop its slot leaves it to this worker.
+                    DropSyncSlotsIfLeft();
                 }
             }
         }
@@ -338,22 +475,33 @@ internal static unsafe partial class Apply
         {
             s_errorContext = null;
         }
+
+        return 0;
     }
 
     /// <summary>
     /// Execute an SQL command. This can be multiple multiple queries.
     /// </summary>
+    /// <remarks>
+    /// Another node's commands run with the role that ran them there as the session user, as <see cref="ReplicatedIdentity"/>
+    /// describes, so that they can set and reset the role as they could there, and the temporary objects they create
+    /// go once they end, as no session here keeps them. A node's own commands, as replicate_ddl_command runs them, run as
+    /// its session's user. Whatever the commands set lasts until they end. They can't control the transaction, which
+    /// apply commits; replicate_ddl_command refuses such statements, and those queued before it did are skipped, and a
+    /// DO block or procedure runs atomically, so that a transaction control statement in it fails.
+    /// </remarks>
     /// <param name="cmdstr">The commands.</param>
     /// <param name="role">The role that ran them on the origin.</param>
     /// <param name="isTopLevel">Whether the commands may run as a top level statement.</param>
     /// <param name="withoutConcurrently">Whether commands that would run concurrently run in the transaction.</param>
-    internal static void ExecuteSqlCommand(string cmdstr, string role, bool isTopLevel, bool withoutConcurrently = false)
+    /// <param name="applying">Whether another node queued the commands.</param>
+    internal static void ExecuteSqlCommand(string cmdstr, string role, bool isTopLevel, bool withoutConcurrently = false, bool applying = true)
     {
         sbyte* saveDebugQueryString = NativeGlobals.debug_query_string;
 
         MemoryContextData* oldcontext = Worf.MemoryContextSwitchTo(NativeGlobals.MessageContext);
 
-        using PgErrorContext errcallback = PgErrorContext.Push($"during execution of queued SQL statement: {cmdstr}");
+        using PgErrorContext errcallback = PgErrorContext.Push(Worf.Shown($"during execution of queued SQL statement: {cmdstr}"));
 
         sbyte* query = Worf.PStrDup(cmdstr);
         NativeGlobals.debug_query_string = query;
@@ -364,85 +512,119 @@ internal static unsafe partial class Apply
 
         // Do a limited amount of safety checking against CONCURRENTLY commands executed in situations where they
         // aren't allowed. The sender side should provide protection, but better be safe than sorry.
-        isTopLevel = isTopLevel && commands is not null && commands->length == 1;
+        isTopLevel = isTopLevel && commands is not null && commands->length == 1 &&
+            ((RawStmt*)commands->elements[0].ptr_value)->stmt->type is not (NodeTag.T_DoStmt or NodeTag.T_CallStmt);
 
-        for (int i = 0; commands is not null && i < commands->length; i++)
+        int nestLevel = applying ? ReplicatedIdentity.Enter(role) : NativeMethods.NewGUCNestLevel();
+        try
         {
-            RawStmt* command = (RawStmt*)commands->elements[i].ptr_value;
-            if (withoutConcurrently)
+            for (int i = 0; commands is not null && i < commands->length; i++)
             {
-                RemoveConcurrently(command->stmt);
+                RawStmt* command = (RawStmt*)commands->elements[i].ptr_value;
+                if (withoutConcurrently && !RemoveConcurrently(command->stmt))
+                {
+                    continue;
+                }
+
+                if (command->stmt->type == NodeTag.T_TransactionStmt)
+                {
+                    WorfLog.Warning($"skipping transaction control statement in queued SQL statement: {cmdstr}");
+                    continue;
+                }
+
+                ExecuteStatement(command, query, isTopLevel);
             }
 
-            // temporarily push snapshot for parse analysis/planning
-            NativeMethods.PushActiveSnapshot(NativeMethods.GetTransactionSnapshot());
-
-            oldcontext = Worf.MemoryContextSwitchTo(NativeGlobals.MessageContext);
-
-            // Set the current role to the user that executed the command on the origin server, until the command ends. An
-            // override would become the session's default role, which no nesting level restores, so later changes would
-            // apply as that role.
-            int saveNestlevel = NativeMethods.NewGUCNestLevel();
-            fixed (byte* name = Worf.ToServerCString("role"))
-            fixed (byte* value = Worf.ToServerCString(role))
+            // The cursors the commands declared close, as no session here could fetch from them, and one held open
+            // would run its query at commit as apply's own superuser. The deferred work they queued runs as the role
+            // just before the transaction commits.
+            if (applying)
             {
-                _ = NativeMethods.set_config_option((sbyte*)name, (sbyte*)value, GucContext.PGC_INTERNAL, GucSource.PGC_S_SESSION,
-                    GucAction.GUC_ACTION_SAVE, true, 0, false);
+                NativeMethods.PerformPortalClose(null);
+                NativeMethods.ResetTempTableNamespace();
+                s_replicatedRole = role;
             }
-
-            CommandTag commandTag = NativeMethods.CreateCommandTag(command->stmt);
-
-            List* querytreeList = NativeMethods.pg_analyze_and_rewrite_fixedparams(command, query, null, 0, null);
-
-            List* plantreeList = NativeMethods.pg_plan_queries(querytreeList, query, 0, null);
-
-            NativeMethods.PopActiveSnapshot();
-
-            PortalData* portal;
-            fixed (byte* name = Worf.ToServerCString(Worf.ExtensionName))
-            {
-                portal = NativeMethods.CreatePortal((sbyte*)name, true, true);
-            }
-
-            // Run the statement under the current resource owner, as SPI does. Dropping a portal hands the locks
-            // its own owner took to the transaction, and once a statement took more than 15 that scans every lock
-            // the transaction holds, so a transaction that runs many DDL statements would take quadratic time.
-            NativeMethods.ResourceOwnerDelete(portal->resowner);
-            portal->resowner = NativeGlobals.CurrentResourceOwner;
-
-            NativeMethods.PortalDefineQuery(portal, null, query, commandTag, plantreeList, null);
-            NativeMethods.PortalStart(portal, null, 0, null);
-
-            _DestReceiver* receiver = NativeMethods.CreateDestReceiver(CommandDest.DestNone);
-
-#if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
-            _ = NativeMethods.PortalRun(portal, NativeMethods.FETCH_ALL(), isTopLevel, true, receiver, receiver, null);
-#else
-            _ = NativeMethods.PortalRun(portal, NativeMethods.FETCH_ALL(), isTopLevel, receiver, receiver, null);
-#endif
-            receiver->rDestroy.Invoke(receiver);
-
-            // Dropping the portal would release and delete its resource owner, so take the current one back, along
-            // with the snapshot that a utility statement returning rows registers on it.
-            if (portal->holdSnapshot is not null)
-            {
-                NativeMethods.UnregisterSnapshotFromOwner(portal->holdSnapshot, portal->resowner);
-                portal->holdSnapshot = null;
-            }
-
-            portal->resowner = null;
-            NativeMethods.PortalDrop(portal, false);
-
-            NativeMethods.CommandCounterIncrement();
-
-            // Restore the GUC variables we set above.
-            NativeMethods.AtEOXact_GUC(true, saveNestlevel);
-
-            _ = Worf.MemoryContextSwitchTo(oldcontext);
         }
+        finally
+        {
+            // Restore the user and the GUC variables the commands set.
+            if (applying)
+            {
+                ReplicatedIdentity.Leave(nestLevel);
+            }
+            else
+            {
+                NativeMethods.AtEOXact_GUC(false, nestLevel);
+            }
+        }
+
+        // DDL run in a subtransaction, as apply runs it and as replicate_ddl_command may be called, ends with a record
+        // logical decoding takes a base snapshot from, wherever decoding starts again in it.
+        Worf.EndForDecoding();
 
         NativeGlobals.debug_query_string = saveDebugQueryString;
     }
+
+    /// <summary>
+    /// Runs one statement of an SQL command.
+    /// </summary>
+    private static void ExecuteStatement(RawStmt* command, sbyte* query, bool isTopLevel)
+    {
+        // temporarily push snapshot for parse analysis/planning
+        NativeMethods.PushActiveSnapshot(NativeMethods.GetTransactionSnapshot());
+
+        MemoryContextData* oldcontext = Worf.MemoryContextSwitchTo(NativeGlobals.MessageContext);
+
+        CommandTag commandTag = NativeMethods.CreateCommandTag(command->stmt);
+
+        List* querytreeList = NativeMethods.pg_analyze_and_rewrite_fixedparams(command, query, null, 0, null);
+
+        List* plantreeList = NativeMethods.pg_plan_queries(querytreeList, query, 0, null);
+
+        NativeMethods.PopActiveSnapshot();
+
+        PortalData* portal;
+        fixed (byte* name = Worf.ToServerCString(Worf.ExtensionName))
+        {
+            portal = NativeMethods.CreatePortal((sbyte*)name, true, true);
+        }
+
+        // Run the statement under the current resource owner, as SPI does. Dropping a portal hands the locks
+        // its own owner took to the transaction, and once a statement took more than 15 that scans every lock
+        // the transaction holds, so a transaction that runs many DDL statements would take quadratic time.
+        NativeMethods.ResourceOwnerDelete(portal->resowner);
+        portal->resowner = NativeGlobals.CurrentResourceOwner;
+
+        NativeMethods.PortalDefineQuery(portal, null, query, commandTag, plantreeList, null);
+        NativeMethods.PortalStart(portal, null, 0, null);
+
+        _DestReceiver* receiver = NativeMethods.CreateDestReceiver(CommandDest.DestNone);
+
+#if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
+        _ = NativeMethods.PortalRun(portal, NativeMethods.FETCH_ALL(), isTopLevel, true, receiver, receiver, null);
+#else
+        _ = NativeMethods.PortalRun(portal, NativeMethods.FETCH_ALL(), isTopLevel, receiver, receiver, null);
+#endif
+        receiver->rDestroy.Invoke(receiver);
+
+        // Dropping the portal would release and delete its resource owner, so take the current one back, along
+        // with the snapshot that a utility statement returning rows registers on it.
+        if (portal->holdSnapshot is not null)
+        {
+            NativeMethods.UnregisterSnapshotFromOwner(portal->holdSnapshot, portal->resowner);
+            portal->holdSnapshot = null;
+        }
+
+        portal->resowner = null;
+        NativeMethods.PortalDrop(portal, false);
+
+        NativeMethods.CommandCounterIncrement();
+
+        _ = Worf.MemoryContextSwitchTo(oldcontext);
+    }
+
+    // The most bytes of the messages that follow a delayed transaction that apply reads ahead as it waits out the delay.
+    private const long ReadAheadLimit = 64L * 1024 * 1024;
 
     /// <summary>
     /// Calculates how long the apply worker waits before applying a transaction, so that it applies the delay after
@@ -555,20 +737,76 @@ internal static unsafe partial class Apply
     {
         if (s_errorContext is not null)
         {
-            s_errorContext.Text = FormatActionDescription(s_actionName, s_errRel, s_isDdlOrDrop);
+            s_errorContext.Text = Worf.Shown(FormatActionDescription(s_actionName, s_errRel, s_isDdlOrDrop));
         }
+    }
+
+    /// <summary>
+    /// Has this node call the provider about sequence ranges now, as the provider asked.
+    /// </summary>
+    private static void CallProvider()
+    {
+        if (MySubscription is WorfSubscription sub)
+        {
+            WorfLog.Debug2($"node {sub.Origin.Name} asked this node to call it about sequence ranges");
+            SequenceRangeHeard.CallFor(sub.Origin.Id);
+            SequenceRangeExchangeWorker.Wake();
+        }
+    }
+
+    /// <summary>
+    /// Has this node call the provider about sequence ranges now, as the apply worker, waiting out its delay with as much
+    /// of the provider's changes read ahead as it holds, reads no more of them, and so can't hear the provider's word to
+    /// call it, which comes after them, or has just started streaming from it.
+    /// </summary>
+    private static void CallProviderUnheard()
+    {
+        if (MySubscription is WorfSubscription sub)
+        {
+            SequenceRangeHeard.CallFor(sub.Origin.Id);
+            SequenceRangeExchangeWorker.Wake();
+        }
+    }
+
+    /// <summary>
+    /// Handles a message read ahead of its turn: the provider's word to call it about sequence ranges, a CopyData
+    /// message whose replication message, past its three positions and times, is a 'W', which it takes; and a keepalive
+    /// that asks for a reply, which it answers with the positions of what came before the messages held, and leaves to
+    /// its turn.
+    /// </summary>
+    private static bool TakeAhead(ReadOnlySpan<byte> message)
+    {
+        if (message.Length > 25 && message[0] == (byte)'w' && message[25] == (byte)'W')
+        {
+            CallProvider();
+            return true;
+        }
+
+        if (message.Length >= 18 && message[0] == (byte)'k' && message[17] != 0)
+        {
+            _ = SendFeedback(s_applyconn!, s_lastReceived, Worker.GetCurrentTimestamp(), true);
+        }
+
+        return false;
     }
 
     private static void HandleBegin(StringInfoData* s)
     {
         s_xactActionCounter = 1;
+        s_changeXids.Clear();
+        s_changeRelations.Clear();
         s_actionName = "BEGIN";
+        s_replicatedRole = null;
 
         ProtoNative.ReadBegin(s, out ulong commitLsn, out long commitTime, out s_remoteXid);
+
+        // Everything that committed before this transaction is applied.
+        AllowCopies(commitLsn, 0);
 
         Worf.ReploriginSessionOriginTimestamp = commitTime;
         Worf.ReploriginSessionOriginLsn = commitLsn;
         s_remoteOriginId = 0;
+        s_remoteOriginName = null;
         s_writerNodeId = MySubscription!.Origin.Id;
         s_skipRemoteTransaction = false;
         s_recordSkipped = false;
@@ -601,7 +839,26 @@ internal static unsafe partial class Apply
                     sleepUsec += 100000;  // 100ms buffer
                 }
 
-                NativeMethods.pg_usleep(sleepUsec);
+                // The provider's word to call it about sequence ranges, as an owner that granted itself a block sends,
+                // which comes in the transactions that follow, is heard as the delay is waited out, so that the owner
+                // doesn't wait out the delay too; the rest waits its turn. So does the provider's request for a reply,
+                // which is answered now, and a reply goes each status interval too, so that the walsender, which hears
+                // nothing else meanwhile, doesn't end the stream at wal_sender_timeout.
+                // Past the read-ahead's limit, neither can come, so the provider is called, and replied to, each second
+                // instead.
+                bool filled = false;
+                (s_applyconn ?? throw new InvalidOperationException("The apply connection is not open.")).ReadAhead(
+                    TimeSpan.FromMicroseconds(sleepUsec), ReadAheadLimit, TakeAhead, static () => Worker.GotSigterm, () =>
+                    {
+                        if (!filled)
+                        {
+                            filled = true;
+                            WorfLog.Debug1($"apply holds {ReadAheadLimit / (1024 * 1024)} MB of node {MySubscription?.Origin.Name}'s changes read ahead as it waits out its delay, and calls the node each second");
+                        }
+
+                        CallProviderUnheard();
+                        _ = SendFeedback(s_applyconn!, s_lastReceived, Worker.GetCurrentTimestamp(), true);
+                    }, static () => SendFeedback(s_applyconn!, s_lastReceived, Worker.GetCurrentTimestamp(), false));
             }
         }
 
@@ -611,37 +868,38 @@ internal static unsafe partial class Apply
     }
 
     /// <summary>
-    /// Checks whether a subscription's provider also subscribes to this node. When the provider can't say, it's taken
-    /// to, which only makes apply wait out clock skew.
+    /// Checks whether other nodes subscribe to this node's changes, so that a local change can meet a remote one, on
+    /// the node that wrote it or on another that both reach, directly or through other nodes. Checked at most every
+    /// ten seconds.
     /// </summary>
-    private static bool TwoWay(WorfSubscription sub)
+    private static bool Replicated()
     {
-        try
+        long now = Worker.GetCurrentTimestamp();
+        if (now - s_replicatedCheckedAt >= 10_000_000)
         {
-            return PgBackgroundWorker.RunTransaction(() =>
-            {
-                using PgReplicationConnection conn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "info");
-                return Rpc.RemoteSubscribesTo(conn, sub.Target.Id).Subscribes;
-            });
+            s_replicatedCheckedAt = now;
+            s_replicated = PgBackgroundWorker.RunTransaction(static () => Worf.ReadScalar<bool>("""
+                SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_replication_slots
+                    WHERE plugin = 'worf' AND database = pg_catalog.current_database())
+                """));
         }
-        catch (Exception error) when (error is PgException or PgRemoteException)
-        {
-            return true;
-        }
+
+        return s_replicated;
     }
 
     /// <summary>
     /// Waits for the local clock to pass a remote transaction's commit time, so that local changes made after the
-    /// transaction applies commit later than it did, as last_update_wins and first_update_wins need. Only the apply
-    /// worker of a subscription whose provider also subscribes to this node waits, and only under those two.
+    /// transaction applies commit later than it did, as last_update_wins and first_update_wins need. Only an apply
+    /// worker on a node whose changes other nodes subscribe to waits, and only under those two.
     /// </summary>
     /// <param name="commitTime">The remote commit time.</param>
     private static void WaitForClock(long commitTime)
     {
         long ahead = commitTime - Worker.GetCurrentTimestamp();
         int maxClockSkew = MaxClockSkew;
-        if (maxClockSkew < 0 || !s_twoWay || Worker.MyWorker.WorkerType != WorfWorkerType.Apply ||
-            Conflict.ConflictResolver is not (WorfResolveOption.LastUpdateWins or WorfResolveOption.FirstUpdateWins))
+        if (ahead < 0 || maxClockSkew < 0 || Worker.MyWorker.WorkerType != WorfWorkerType.Apply ||
+            Conflict.ConflictResolver is not (WorfResolveOption.LastUpdateWins or WorfResolveOption.FirstUpdateWins) ||
+            !Replicated())
         {
             return;
         }
@@ -653,7 +911,7 @@ internal static unsafe partial class Apply
             if (now - s_clockSkewReportedAt >= 60_000_000)
             {
                 s_clockSkewReportedAt = now;
-                PgLog.Warning(new PgDiagnostic(
+                WorfLog.Warning(new PgDiagnostic(
                     $"remote commit time is {ahead / 1000} ms ahead of the local clock, more than worf.max_clock_skew")
                 {
                     Hint = "Synchronize the nodes' clocks. Until then, local changes can lose to earlier remote ones.",
@@ -701,8 +959,13 @@ internal static unsafe partial class Apply
         if (inTransaction)
         {
             MultiInsertFinish();
+            if (s_exceptionMode && s_exceptionLevel == ExceptionByChange)
+            {
+                SkipConflictsAtCommit();
+            }
 
             s_applyApi.OnCommit();
+            RunDeferredWorkAsReplicatedRole();
 
             // We need to write end_lsn to the commit record. It's set once deferred triggers have run, just before the
             // record is written: from PostgreSQL 16, an abort advances the origin too, and has to leave it at the
@@ -717,6 +980,34 @@ internal static unsafe partial class Apply
     }
 
     /// <summary>
+    /// Runs the deferred work of a transaction that ran another node's SQL, as committing it would, just before it
+    /// commits, as the role the SQL ran as, and then drops what that work left in apply's temporary schema, so that
+    /// none of it runs as apply's own superuser or outlasts the transaction: the deferred triggers fire, as before
+    /// PostgreSQL 18 they would as whoever the user is at commit, and from 18 each as the role that queued it, and the
+    /// cursors they declared close.
+    /// </summary>
+    private static void RunDeferredWorkAsReplicatedRole()
+    {
+        if (s_replicatedRole is not string role)
+        {
+            return;
+        }
+
+        s_replicatedRole = null;
+        int nestLevel = ReplicatedIdentity.Enter(role);
+        try
+        {
+            NativeMethods.AfterTriggerFireDeferred();
+            NativeMethods.PerformPortalClose(null);
+            NativeMethods.ResetTempTableNamespace();
+        }
+        finally
+        {
+            ReplicatedIdentity.Leave(nestLevel);
+        }
+    }
+
+    /// <summary>
     /// The part of COMMIT handling after the local transaction commits.
     /// </summary>
     private static void FinishCommit(ulong endLsn, bool committed)
@@ -726,6 +1017,9 @@ internal static unsafe partial class Apply
             // Track commit lsn
             _ = s_lsnMapping.AddLast((NativeGlobals.XactLastCommitEnd, endLsn));
         }
+
+        // The conflicts the transaction recorded go into the history now that it has committed.
+        ConflictHistory.WriteCommitted();
 
         // If the xact isn't from the immediate upstream, advance the slot of the node it originally came from so we
         // start replay of that node's change data at the right place.
@@ -743,7 +1037,10 @@ internal static unsafe partial class Apply
             ulong xactLastCommitEnd = NativeGlobals.XactLastCommitEnd;
             ushort remoteOriginId = s_remoteOriginId;
             ulong remoteOriginLsn = s_remoteOriginLsn;
-            PgLog.Debug3($"advancing origin oid {remoteOriginId} for forwarded row to {Worf.FormatLsn(xactLastCommitEnd)}");
+            if (PgLog.IsEnabled(PgLogLevel.Debug3))
+            {
+                WorfLog.Debug3($"advancing origin oid {remoteOriginId} for forwarded row to {Worf.FormatLsn(xactLastCommitEnd)}");
+            }
 
             PgBackgroundWorker.RunTransaction(() =>
                 PgReplicationOrigin.Advance(remoteOriginId, new PgLsn(remoteOriginLsn), new PgLsn(xactLastCommitEnd), false, false /* XXX ? */));
@@ -751,13 +1048,20 @@ internal static unsafe partial class Apply
 
         s_inRemoteTransaction = false;
 
+        // An error between transactions, as when the provider goes silent, has no change to name, as PostgreSQL's apply
+        // names none outside a message.
+        if (s_errorContext is not null)
+        {
+            s_errorContext.Text = "";
+        }
+
         // Stop replay if we're doing limited replay and we've replayed up to the last record we're supposed to
         // process.
         WorfWorker me = Worker.MyWorker;
         ulong replayStopLsn = me.Worker.Apply.ReplayStopLsn;
         if (replayStopLsn != 0 && replayStopLsn <= endLsn)
         {
-            PgLog.Log($"worf {(me.WorkerType == WorfWorkerType.Sync ? "sync" : "apply")} finished processing; replayed to {Worf.FormatLsn(endLsn)} of required {Worf.FormatLsn(replayStopLsn)}");
+            WorfLog.Log($"worf {(me.WorkerType == WorfWorkerType.Sync ? "sync" : "apply")} finished processing; replayed to {Worf.FormatLsn(endLsn)} of required {Worf.FormatLsn(replayStopLsn)}");
 
             // If this is sync worker, update syncing table state to done.
             if (me.WorkerType == WorfWorkerType.Sync)
@@ -769,15 +1073,15 @@ internal static unsafe partial class Apply
             // Flush all writes so the latest position can be reported back to the sender.
             NativeMethods.XLogFlush(NativeMethods.GetXLogWriteRecPtr());
 
-            // Disconnect.
-            //
-            // This needs to happen before the SyncWorkerFinish() call otherwise slot drop will fail.
-            s_applyconn!.Dispose();
-
-            // If this is sync worker, finish it.
+            // A sync worker ends its stream and drops its slot over the connection it streamed on, and finishes; an
+            // apply worker disconnects.
             if (me.WorkerType == WorfWorkerType.Sync)
             {
-                Sync.SyncWorkerFinish(Worker.NameStr(me.Worker.Sync.Nspname), Worker.NameStr(me.Worker.Sync.Relname));
+                Sync.FinishCatchup(s_applyconn!, Worker.NameStr(me.Worker.Sync.Nspname), Worker.NameStr(me.Worker.Sync.Relname));
+            }
+            else
+            {
+                s_applyconn!.Dispose();
             }
 
             // Stop gracefully
@@ -791,77 +1095,596 @@ internal static unsafe partial class Apply
     }
 
     /// <summary>
-    /// Handle ORIGIN message.
+    /// Reads an ORIGIN message, which names the origin the provider committed the remote transaction under, and the
+    /// node that wrote it.
     /// </summary>
-    private static void HandleOrigin(StringInfoData* s)
+    private static void ReadOrigin(byte[] message)
     {
-        string origin = ProtoNative.ReadOrigin(s, out s_remoteOriginLsn, out uint nodeId);
-        s_remoteOriginId = PgReplicationOrigin.Find(origin) ?? 0;
-
-        // The provider relays a transaction another node wrote. One this node wrote has come back, and is skipped.
-        if (nodeId != 0)
+        fixed (byte* data = message)
         {
-            s_writerNodeId = nodeId;
-            s_skipRemoteTransaction = nodeId == MySubscription!.Target.Id;
-        }
+            StringInfoData s;
+            s.data = (sbyte*)data;
+            s.len = message.Length;
+            s.maxlen = -1;
+            s.cursor = 1;
 
-        UseWriterOrigin();
+            s_remoteOriginName = ProtoNative.ReadOrigin(&s, out s_remoteOriginLsn, out uint nodeId);
+
+            // The provider relays a transaction another node wrote. One this node wrote has come back, and is skipped.
+            if (nodeId != 0)
+            {
+                s_writerNodeId = nodeId;
+                s_skipRemoteTransaction = nodeId == MySubscription!.Target.Id;
+            }
+        }
     }
 
     /// <summary>
-    /// Commits the remote transaction under the origin for the node that wrote it, so that its commit timestamps
-    /// record that node: the worker's own origin for its provider's transactions, or a relay origin for another
-    /// node's.
+    /// Sets the session up, before the remote transaction's local transaction starts, to commit the transaction under
+    /// the origin for the node that wrote it, so that its commit timestamp records that node: the worker's own origin
+    /// for its provider's transactions, or a relay origin for another node's.
     /// </summary>
+    /// <remarks>
+    /// A relay origin is created in a transaction of its own, which commits as this node's rather than under an origin.
+    /// A walsender that sends the remote transaction on to another node names its origin as it decodes the
+    /// transaction's start, and couldn't see an origin the transaction itself created. Nor does a failed remote
+    /// transaction roll back an origin that it used, whose progress would stay in shared memory for the next origin
+    /// created with its id.
+    /// </remarks>
     private static void UseWriterOrigin()
     {
         WorfSubscription sub = MySubscription!;
         uint writer = s_writerNodeId == sub.Origin.Id ? 0 : s_writerNodeId;
-        if (writer == s_sessionWriterNodeId || s_skipRemoteTransaction)
+        if (s_skipRemoteTransaction || (writer == s_sessionWriterNodeId && PgReplicationOrigin.SessionOrigin != 0))
         {
+            if (!s_skipRemoteTransaction && writer != 0)
+            {
+                s_relayUsedAt[PgReplicationOrigin.SessionOrigin] = Worker.GetCurrentTimestamp();
+            }
+
             return;
         }
 
         string name = writer == 0 ? sub.SlotName : WorfNode.RelayOriginName(sub.SlotName, writer);
-        ushort origin = PgReplicationOrigin.Find(name) ?? WorfNode.CreateOrigin(name, writer == 0 ? sub.Origin.Id : writer);
-        _ = s_streamOrigins.Add(origin);
-
-        // Keep the transaction's remote commit position and time across the change of origin. Each origin in use
-        // takes one of max_active_replication_origins, or max_replication_slots before PostgreSQL 18. With none free,
-        // the relayed changes are applied under the worker's own origin, as if its provider wrote them.
-        long commitTime = Worf.ReploriginSessionOriginTimestamp;
-        ulong commitLsn = Worf.ReploriginSessionOriginLsn;
-        PgReplicationOrigin.ResetSession();
-        try
+        if (PgReplicationOrigin.SessionOrigin != 0)
         {
-            PgTransaction.RunInSubtransaction(() => PgReplicationOrigin.SetupSession(origin));
-            s_sessionWriterNodeId = writer;
+            PgReplicationOrigin.ResetSession();
         }
-        catch (PgException error) when (error.SqlState == "53400" && writer != 0)
+
+        // Each origin in use takes one of max_active_replication_origins, or max_replication_slots before PostgreSQL
+        // 18, until it's dropped. Without one free, the worker's relay origins that its restart doesn't start from,
+        // and that haven't set up the session within RelayOriginHold, give theirs up, as worf.origin_writer still
+        // names the node that wrote the rows committed under them, all in one transaction with the origin's creation.
+        // They give them up first, so that the new origin takes the id of one of them, as PostgreSQL gives the lowest
+        // free id, and its record replaces the drop's. When more nodes' changes take turns than slots hold, the worker's
+        // other relay origins give theirs up even so, once a slot hasn't come free within RelayTurnWait, the newest's
+        // progress going to the worker's own origin, so that apply goes on, dropping and creating an origin at each
+        // turn, with a warning. A relay origin that finds none
+        // to take, as when other subscriptions' origins hold them all, or that would take one of the slots any worker
+        // gave up for PostgreSQL subscriptions' origins while their workers take to try again, waits for one, without
+        // writing, and the worker exits with 53400 once RunTakingOriginSlot gives up, to try again, as PostgreSQL's
+        // apply worker does when no slot is free: committing under the worker's own origin would count the rows as the
+        // provider's, which then sends them back to the node that wrote them.
+        s_sessionWriterNodeId = null;
+        uint writerNodeId = writer == 0 ? sub.Origin.Id : writer;
+        bool yielding = writer != 0 && Worker.GetCurrentTimestamp() < Worker.OriginSlotsGivenUpAt + OriginSlotHold;
+
+        // A slot that another user of origins gives up a moment later, as a table sync that's ending, or another worker
+        // asked to give up a relay origin it no longer needs, is waited for, up to RelayTurnWait and without writing,
+        // before this worker's other relay origins, which set up the session lately, take turns with this one.
+        if (!yielding)
         {
-            if (!s_warnedNoRelayOrigin)
+            WaitForOriginSlot(name, sub.SlotName);
+        }
+
+        List<ushort> dropped = [];
+        (ushort origin, ulong? sinceXid) = RunTakingOriginSlot(() =>
+        {
+            dropped = [];
+            ushort? existing = PgReplicationOrigin.Find(name);
+            if (yielding && (existing is null || !WorfNode.HasOriginSlot(existing.Value)))
             {
-                PgLog.Warning($"no replication origin is free for changes node {writer} wrote, so they apply as node {sub.Origin.Name}'s; " +
-                    "raise max_active_replication_origins, or max_replication_slots before PostgreSQL 18");
-                s_warnedNoRelayOrigin = true;
+                throw NoRelaySlot(name, true);
             }
 
-            PgReplicationOrigin.SetupSession(PgReplicationOrigin.Find(sub.SlotName)!.Value);
-            s_sessionWriterNodeId = 0;
+            // A transaction that would find no slot fails before it writes, so that waiting for one takes no
+            // transaction IDs.
+            if ((existing is null || !WorfNode.HasOriginSlot(existing.Value)) && WorfNode.OriginSlotsFull() &&
+                !s_streamOrigins.Keys.Any(other => other != existing && WorfNode.OriginName(other) is string otherName && otherName != sub.SlotName))
+            {
+                throw NoRelaySlot(name, false);
+            }
+
+            ushort id;
+            ulong? recorded = null;
+            if (existing is ushort found)
+            {
+                id = found;
+
+                // One that worf didn't create, or that applied something else, applies this from now on.
+                if (!s_streamOrigins.ContainsKey(id))
+                {
+                    (id, ulong since) = WorfNode.ClaimOrigin(name, writerNodeId, sub.Id);
+                    recorded = since;
+                }
+            }
+            else
+            {
+                if (WorfNode.OriginSlotsFull())
+                {
+                    _ = DropRelayOrigins(0, dropped) || DropRelayOrigins(0, dropped, true) || DropRelayOrigins(0, dropped, true, false, 1);
+                }
+
+                (id, ulong since) = WorfNode.CreateOrigin(name, writerNodeId, sub.Id);
+                recorded = since;
+            }
+
+            // Each pass gives up more of the worker's other relay origins, until the session has a slot.
+            Func<bool>[] freeing = [() => DropRelayOrigins(id, dropped), () => DropRelayOrigins(id, dropped, true), () => DropRelayOrigins(id, dropped, true, false, 1)];
+            if (!TrySetupSession(id) && !Array.Exists(freeing, free => free() && TrySetupSession(id)))
+            {
+                throw NoRelaySlot(name, false);
+            }
+
+            RecordDropped(dropped, id);
+            return (id, recorded);
+        }, own: false);
+
+        // An id that another origin takes doesn't apply this subscription's changes from then on.
+        foreach (ushort id in dropped)
+        {
+            _ = s_streamOrigins.Remove(id);
+            _ = s_relayUsedAt.Remove(id);
         }
 
-        Worf.ReploriginSessionOriginTimestamp = commitTime;
-        Worf.ReploriginSessionOriginLsn = commitLsn;
+        if (sinceXid is ulong since)
+        {
+            s_streamOrigins[origin] = since;
+        }
+
+        long now = Worker.GetCurrentTimestamp();
+        if (dropped.Count > 0 && now - s_reclaimWarnedAt >= 60_000_000)
+        {
+            s_reclaimWarnedAt = now;
+            WorfLog.Warning(new PgDiagnostic($"subscription \"{sub.Name}\" dropped relay origins to free replication origin slots")
+            {
+                Detail = "Each node whose changes a provider forwards takes a replication origin slot, and dropping and creating relay origins slows apply.",
+                Hint = "Raise max_active_replication_origins, or max_replication_slots before PostgreSQL 18.",
+            });
+        }
+
+        s_sessionWriterNodeId = writer;
+        if (writer != 0)
+        {
+            s_relayUsedAt[origin] = now;
+        }
+
+        Worf.ReploriginSessionOriginTimestamp = s_remoteCommitTime;
+        Worf.ReploriginSessionOriginLsn = s_remoteCommitLsn;
     }
 
     /// <summary>
-    /// Checks whether a local row came through this worker's subscription, under its own origin or one of its relay
-    /// origins, so that its later changes arrive in order rather than in conflict with it.
+    /// Fails apply, which tries again once it restarts, when no replication origin slot is free for the origin that
+    /// commits a transaction under the node that wrote it: committed under another origin, the transaction would count
+    /// as that origin's node's, and come back to the node that wrote it, which would apply it again.
+    /// </summary>
+    /// <param name="name">The origin.</param>
+    /// <param name="yielding">Whether slots are free, but held for PostgreSQL subscriptions' workers to try again.</param>
+    private static PgException NoRelaySlot(string name, bool yielding)
+        => new(PgSqlStates.ConfigurationLimitExceeded, $"no replication origin slot is free for replication origin \"{name}\"",
+            detail: yielding
+                ? "PostgreSQL subscriptions' origins may take the replication origin slots worf gave up for them, so no relay origin takes one until their workers have tried again."
+                : "Each node whose changes a provider forwards takes a replication origin slot, and other origins hold every slot.",
+            hint: "Raise max_active_replication_origins, or max_replication_slots before PostgreSQL 18.");
+
+    /// <summary>
+    /// Waits, up to <see cref="RelayTurnWait"/>, for a replication origin slot for a relay origin that has none, while
+    /// every slot is taken and none of this worker's relay origins that haven't set up the session within
+    /// <see cref="RelayOriginHold"/> could give one up, asking the other workers to give up theirs meanwhile, in
+    /// transactions that only read. Once a wait has ended with no slot come free, the turns after it, within
+    /// <see cref="RelayOriginHold"/>, wait no more, as the worker's own relay origins taking turns hold the slots.
+    /// </summary>
+    private static void WaitForOriginSlot(string name, string slotName)
+    {
+        long started = Worker.GetCurrentTimestamp();
+        if (started - s_turnWaitedOutAt < RelayOriginHold)
+        {
+            return;
+        }
+
+        long until = started + RelayTurnWait;
+        while (PgBackgroundWorker.RunTransaction(() =>
+        {
+            long now = Worker.GetCurrentTimestamp();
+            return (PgReplicationOrigin.Find(name) is not ushort have || !WorfNode.HasOriginSlot(have)) && WorfNode.OriginSlotsFull() &&
+                !s_streamOrigins.Keys.Any(id => WorfNode.OriginName(id) is string relay && relay != slotName && relay != name &&
+                    (!s_relayUsedAt.TryGetValue(id, out long usedAt) || now - usedAt >= RelayOriginHold));
+        }))
+        {
+            if (Worker.GotSigterm)
+            {
+                return;
+            }
+
+            if (Worker.GetCurrentTimestamp() >= until)
+            {
+                s_turnWaitedOutAt = Worker.GetCurrentTimestamp();
+                return;
+            }
+
+            MarkOwnWant(Worker.WantOriginSlot(false));
+            _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(50));
+        }
+
+        s_turnWaitedOutAt = 0;
+    }
+
+    /// <summary>
+    /// Records the relay origins dropped to free slots, but one whose id the origin set up took, whose own record
+    /// replaces the drop's.
+    /// </summary>
+    private static void RecordDropped(List<ushort> dropped, ushort taken)
+    {
+        foreach (ushort freed in dropped.Where(freed => freed != taken))
+        {
+            WorfNode.RecordOriginDropped(freed);
+        }
+    }
+
+    private static bool TrySetupSession(ushort origin)
+    {
+        try
+        {
+            PgTransaction.RunInSubtransaction(() => PgReplicationOrigin.SetupSession(origin));
+            return true;
+        }
+        catch (PgException error) when (error.SqlState == PgSqlStates.ConfigurationLimitExceeded)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Runs a transaction that takes a replication origin slot. When none is free, the workers of other subscriptions
+    /// give up the slots of relay origins they no longer need, and the transaction runs again until one is free or 10
+    /// seconds have passed.
+    /// </summary>
+    /// <typeparam name="T">The transaction's result.</typeparam>
+    /// <param name="work">The transaction's work.</param>
+    /// <param name="own">Whether the slot is for a subscription's or table sync's own origin, rather than a relay
+    /// origin, for which other workers give up even the relay origins they used last.</param>
+    /// <returns>Its result.</returns>
+    internal static T RunTakingOriginSlot<T>(Func<T> work, bool own = true)
+    {
+        long deadline = Worker.GetCurrentTimestamp() + 10_000_000;
+        while (true)
+        {
+            try
+            {
+                return PgBackgroundWorker.RunTransaction(work);
+            }
+            catch (PgException error) when (error.SqlState == PgSqlStates.ConfigurationLimitExceeded)
+            {
+                MarkOwnWant(Worker.WantOriginSlot(own));
+                if (Worker.GotSigterm || Worker.GetCurrentTimestamp() >= deadline)
+                {
+                    throw;
+                }
+
+                _ = PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(100));
+            }
+        }
+    }
+
+    // A worker's own want of a slot isn't one for it to answer by giving up its own relay origins.
+    private static void MarkOwnWant(long wantedAt)
+    {
+        s_reclaimCheckedAt = Math.Max(s_reclaimCheckedAt, wantedAt);
+        if (Worker.OwnOriginSlotWantedAt == wantedAt)
+        {
+            s_ownReclaimCheckedAt = Math.Max(s_ownReclaimCheckedAt, wantedAt);
+        }
+    }
+
+    /// <summary>
+    /// Runs a transaction that takes a replication origin slot, as the other overload does.
+    /// </summary>
+    /// <param name="work">The transaction's work.</param>
+    internal static void RunTakingOriginSlot(Action work) => _ = RunTakingOriginSlot(() =>
+    {
+        work();
+        return true;
+    });
+
+    /// <summary>
+    /// Has this worker give up the slots of relay origins it no longer needs when a worker found none free since it
+    /// last looked, or, every ten seconds, when an enabled PostgreSQL subscription's origin has none.
+    /// </summary>
+    private static void ReclaimRelayOriginsIfWanted()
+    {
+        long wantedAt = Worker.OriginSlotWantedAt;
+        long now = Worker.GetCurrentTimestamp();
+        // Another subscription's or table sync's worker can't apply without its own origin, so this worker gives up even
+        // its newest relay origin for it, as its writer's next transaction makes it again, taking turns; for another's
+        // relay origin, only those it no longer needs.
+        long ownWantedAt = Worker.OwnOriginSlotWantedAt;
+        if (ownWantedAt > s_ownReclaimCheckedAt)
+        {
+            s_ownReclaimCheckedAt = ownWantedAt;
+            s_reclaimCheckedAt = Math.Max(s_reclaimCheckedAt, wantedAt);
+            ReclaimRelayOrigins(true);
+        }
+        else if (wantedAt > s_reclaimCheckedAt)
+        {
+            s_reclaimCheckedAt = wantedAt;
+            ReclaimRelayOrigins();
+        }
+        else if (s_streamOrigins.Count > 1 && now - s_elsewhereCheckedAt >= OriginSlotHold)
+        {
+            s_elsewhereCheckedAt = now;
+
+            // An origin still without a slot since this worker gave slots up for it, which no relay origin took back
+            // meanwhile, isn't waiting for one, as when its subscription's provider can't be reached, so slots aren't
+            // given up for it again for a while that doubles, from ten minutes up to a day, so that the relay origins
+            // aren't made again and again.
+            if (s_gaveUpFor.Count > 0)
+            {
+                List<string> still = PgBackgroundWorker.RunTransaction(() => WorfNode.OriginsWithoutSlots(s_gaveUpFor));
+                foreach (string origin in still)
+                {
+                    long delay = s_notWaiting.TryGetValue(origin, out (long Until, long Delay) last) ? Math.Min(last.Delay * 2, 86_400_000_000L) : 600_000_000L;
+                    s_notWaiting[origin] = (now + delay, delay);
+                }
+
+                foreach (string origin in s_gaveUpFor.Except(still))
+                {
+                    _ = s_notWaiting.Remove(origin);
+                }
+
+                s_gaveUpFor.Clear();
+            }
+
+            List<string> wanting = PgBackgroundWorker.RunTransaction(WorfNode.OriginsWantingSlots)
+                .FindAll(origin => !s_notWaiting.TryGetValue(origin, out (long Until, long Delay) notWaiting) || now >= notWaiting.Until);
+            if (wanting.Count > 0)
+            {
+                s_gaveUpFor.UnionWith(wanting);
+                Worker.GaveUpOriginSlots();
+                ReclaimRelayOrigins(true);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Drops the slots on the provider that the subscription's table syncs left, when one says it left its slot, and
+    /// again every few seconds while one stays, as when something holds it or the provider can't be reached. A table
+    /// sync's slot is the subscription's own while the table synchronizes, so nothing else drops it.
+    /// </summary>
+    private static void DropSyncSlotsIfLeft()
+    {
+        long now = Worker.GetCurrentTimestamp();
+        if (!MyApplyWorker.SyncSlotsLeft && (s_syncSlotsRetryAt == 0 || now < s_syncSlotsRetryAt))
+        {
+            // A sync worker that ended without saying so, as one killed, left its slot recorded, which a look every
+            // minute finds.
+            if (now < s_syncSlotsCheckedAt + SyncSlotsCheckInterval)
+            {
+                return;
+            }
+
+            s_syncSlotsCheckedAt = now;
+            if (!PgBackgroundWorker.RunTransaction(() => Sync.RecordedSyncSlotsLeft(MySubscription!)))
+            {
+                return;
+            }
+        }
+
+        SetSyncSlotsLeft(false);
+        WorfSubscription sub = MySubscription!;
+        bool dropped;
+        try
+        {
+            dropped = FromProvider(sub, "drop the slots table syncs left", () => PgBackgroundWorker.RunTransaction(() =>
+            {
+                using WorfConnection conn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "cleanup");
+                return Sync.DropLeftSyncSlots(conn, sub).Count == 0;
+            }));
+        }
+        catch (PgException error)
+        {
+            WorfLog.Debug1($"could not drop the slots table syncs left on the provider: {error.Message}");
+            dropped = false;
+        }
+
+        s_syncSlotsRetryAt = dropped ? 0 : now + SyncSlotsRetryInterval;
+    }
+
+    private static void SetSyncSlotsLeft(bool left)
+    {
+        using PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive();
+        WorfWorker worker = guard[Worker.MyWorfWorker];
+        worker.Worker.Apply.SyncSlotsLeft = left;
+        guard[Worker.MyWorfWorker] = worker;
+    }
+
+    /// <summary>
+    /// Gives up the slots of relay origins this worker no longer needs when every slot is taken, or, for PostgreSQL
+    /// subscriptions' origins, when it needs them all, the slot of the newest too, its progress given to the worker's
+    /// own origin, as relayed transactions commit under the worker's own origin meanwhile.
+    /// </summary>
+    /// <param name="newest">Whether the newest relay origin, even the one the session uses, gives its slot up when no
+    /// other does.</param>
+    private static void ReclaimRelayOrigins(bool newest = false)
+    {
+        List<ushort> dropped = [];
+        if (newest && !PgBackgroundWorker.RunTransaction(() => s_streamOrigins.Keys.Any(id => id != PgReplicationOrigin.SessionOrigin &&
+            WorfNode.OriginName(id) is string name && name != MySubscription!.SlotName)) && s_sessionWriterNodeId != 0 &&
+            PgReplicationOrigin.SessionOrigin != 0)
+        {
+            PgReplicationOrigin.ResetSession();
+            s_sessionWriterNodeId = null;
+        }
+
+        PgBackgroundWorker.RunTransaction(() =>
+        {
+            if (WorfNode.OriginSlotsFull() &&
+                (DropRelayOrigins(PgReplicationOrigin.SessionOrigin, dropped, held: false) ||
+                    (newest && DropRelayOrigins(PgReplicationOrigin.SessionOrigin, dropped, true, false))))
+            {
+                foreach (ushort id in dropped)
+                {
+                    WorfNode.RecordOriginDropped(id);
+                }
+            }
+        });
+
+        foreach (ushort id in dropped)
+        {
+            _ = s_streamOrigins.Remove(id);
+            _ = s_relayUsedAt.Remove(id);
+        }
+    }
+
+    /// <summary>
+    /// Drops this worker's relay origins whose progress its restart doesn't start from, which frees their slots: it
+    /// starts from the latest of its origins. The caller records the drops.
+    /// </summary>
+    /// <param name="keep">An origin the worker uses next, which stays.</param>
+    /// <param name="dropped">The ids of those dropped, once the transaction commits.</param>
+    /// <param name="newest">Whether the newest goes too, its progress given to the worker's own origin, as when no
+    /// other slot can be freed.</param>
+    /// <param name="held">Whether those that set up the session within <see cref="RelayOriginHold"/> stay, as they do at
+    /// first for another of the worker's relay origins, which would otherwise take turns with them for each transaction,
+    /// until no slot can be had otherwise, but not for the origins of other subscriptions and table syncs, which ask for
+    /// slots seldom.</param>
+    /// <param name="most">How many to drop at most, those that set up the session least lately first, and of those that
+    /// hold a slot, as dropping one that holds none frees none.</param>
+    /// <returns>Whether any was dropped.</returns>
+    private static bool DropRelayOrigins(ushort keep, List<ushort> dropped, bool newest = false, bool held = true, int most = int.MaxValue)
+    {
+        string slotName = MySubscription!.SlotName;
+        ushort session = PgReplicationOrigin.SessionOrigin;
+        long now = Worker.GetCurrentTimestamp();
+        List<(ushort Id, ulong Progress)> origins = [.. s_streamOrigins.Keys.Select(id => (id, PgReplicationOrigin.GetProgress(id, false).Value))
+            .OrderBy(origin => s_relayUsedAt.GetValueOrDefault(origin.id))];
+        ulong latest = origins.Count == 0 ? 0 : origins.Max(o => o.Progress);
+        bool any = false;
+        int left = most;
+        foreach ((ushort id, ulong progress) in origins)
+        {
+            if (left == 0)
+            {
+                break;
+            }
+
+            if ((progress >= latest && !newest) || id == keep || id == session || WorfNode.OriginName(id) is not string name || name == slotName)
+            {
+                continue;
+            }
+
+            if (Stays(id, held, most, now))
+            {
+                continue;
+            }
+
+            // The newest goes only once the worker's own origin, which no session uses then, has taken its progress, so
+            // that a restart still starts after it.
+            if (progress >= latest && (PgReplicationOrigin.Find(slotName) is not ushort own || own == session || !TryAdvance(own, progress)))
+            {
+                continue;
+            }
+
+            if (TryDropOrigin(name))
+            {
+                dropped.Add(id);
+                any = true;
+                left--;
+            }
+        }
+
+        return any;
+    }
+
+    // Whether a relay origin stays as the worker gives slots up: one that set up the session lately while those are held,
+    // or, while only some are dropped, one that holds no slot to give.
+    private static bool Stays(ushort id, bool held, int most, long now)
+        => (held && s_relayUsedAt.TryGetValue(id, out long usedAt) && now - usedAt < RelayOriginHold) || (most != int.MaxValue && !WorfNode.HasOriginSlot(id));
+
+    /// <summary>
+    /// Moves an origin's progress forward, unless a process uses it.
+    /// </summary>
+    private static bool TryAdvance(ushort origin, ulong progress)
+    {
+        try
+        {
+            PgTransaction.RunInSubtransaction(() => PgReplicationOrigin.Advance(origin, new PgLsn(progress), PgLsn.Invalid, false, true));
+            return true;
+        }
+        catch (PgException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Drops an origin unless another process uses it, as one dropping the subscription can.
+    /// </summary>
+    private static bool TryDropOrigin(string name)
+    {
+        try
+        {
+            PgTransaction.RunInSubtransaction(() =>
+            {
+                PgReplicationOrigin.Drop(name, false);
+                Worf.EndForDecoding();
+            });
+            return true;
+        }
+        catch (PgException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Loads this worker's own replication origin and relay origins that exist, with which it tells the rows that came
+    /// through them quickly. Others, such as a finished table sync's, can be dropped and their ids taken by origins
+    /// that apply other changes while the worker runs, so their rows are looked up in what worf recorded.
+    /// </summary>
+    internal static void LoadStreamOrigins() => s_streamOrigins = WorfNode.WorkerOrigins(MySubscription!.Id, MySubscription.SlotName);
+
+    /// <summary>
+    /// Checks whether a local row came through this worker's subscription, under one of its apply or table sync
+    /// workers' own origins or relay origins, so that its later changes arrive in order rather than in conflict with
+    /// it. PostgreSQL reuses a dropped origin's id, so the subscription is the one the origin applied changes for when
+    /// the row's transaction ran.
     /// </summary>
     /// <param name="originId">The origin of the row's commit.</param>
+    /// <param name="xid">The row's transaction.</param>
     /// <returns>Whether it did.</returns>
-    internal static bool IsOwnStream(ushort originId)
-        => originId != 0 && (originId == Worf.ReploriginSessionOrigin || s_streamOrigins.Contains(originId));
+    internal static bool IsOwnStream(ushort originId, uint xid)
+        => originId != 0 &&
+            ((s_streamOrigins.TryGetValue(originId, out ulong sinceXid) && Worf.FullTransactionId(xid) >= sinceXid) ||
+                OriginWriter(originId, xid)?.SubId == MySubscription!.Id);
+
+    /// <summary>
+    /// Gets the node whose changes a replication origin applied when a local row's transaction ran, and the
+    /// subscription it applied them for, from what worf recorded. The last row's are kept, for the conflict resolution
+    /// that follows the check of its stream.
+    /// </summary>
+    /// <param name="originId">The origin of the row's commit.</param>
+    /// <param name="xid">The row's transaction.</param>
+    /// <returns>The node and the subscription, zeros when worf had dropped the origin, or null when worf didn't record
+    /// the origin.</returns>
+    internal static (uint Writer, uint SubId)? OriginWriter(ushort originId, uint xid)
+    {
+        if (s_lastOriginWriter.Origin != originId || s_lastOriginWriter.Xid != xid)
+        {
+            s_lastOriginWriter = (originId, xid, WorfNode.OriginWriter(originId, xid));
+        }
+
+        return s_lastOriginWriter.Recorded;
+    }
 
     /// <summary>
     /// Handle RELATION message. Note we don't do validation against local schema here. The validation is posponed
@@ -1103,10 +1926,11 @@ internal static unsafe partial class Apply
         }
 
         // The startup message consists of null-terminated strings as key/value pairs. The first entry is always the
-        // format identifier.
+        // format identifier. An older provider doesn't say how it formats money.
+        RelCache.ProviderMoneyFormat = null;
         do
         {
-            string k = Worf.FromServer(NativeMethods.pq_getmsgstring(s));
+            string k = Worf.FromServer(NativeMethods.pq_getmsgrawstring(s));
             if (k.Length == 0)
             {
                 throw new PgException(PgSqlStates.ProtocolViolation, "invalid startup message: key has zero length");
@@ -1118,7 +1942,7 @@ internal static unsafe partial class Apply
             }
 
             // It's OK to have a zero length value
-            string v = Worf.FromServer(NativeMethods.pq_getmsgstring(s));
+            string v = Worf.FromServer(NativeMethods.pq_getmsgrawstring(s));
 
             HandleStartupParam(k, v);
         }
@@ -1141,11 +1965,11 @@ internal static unsafe partial class Apply
 
     private static void HandleStartupParam(string key, string value)
     {
-        PgLog.Debug2($"apply got worf startup msg param  {key}={value}");
+        WorfLog.Debug2($"apply got worf startup msg param  {key}={value}");
 
         if (key == "pg_version")
         {
-            PgLog.Debug1($"upstream Pg version is {value}");
+            WorfLog.Debug1($"upstream Pg version is {value}");
         }
 
         if (key == "encoding")
@@ -1159,12 +1983,17 @@ internal static unsafe partial class Apply
             }
         }
 
+        if (key == "money_format")
+        {
+            RelCache.ProviderMoneyFormat = value;
+        }
+
         if (key == "forward_changeset_origins")
         {
             bool fwd = ParseBoolParam(key, value);
 
             // FIXME: Store this somewhere
-            PgLog.Debug1($"changeset origin forwarding enabled: {(fwd ? "t" : "f")}");
+            WorfLog.Debug1($"changeset origin forwarding enabled: {(fwd ? "t" : "f")}");
         }
 
         // We just ignore a bunch of parameters here because we specify what we require when we send our params to
@@ -1176,7 +2005,7 @@ internal static unsafe partial class Apply
         string? nspname = null;
         string? relname = null;
 
-        using JsonDocument document = JsonDocument.Parse(message);
+        using JsonDocument document = WorfJson.Parse(message);
         JsonElement root = document.RootElement;
 
         // Parse and validate the json message.
@@ -1208,11 +2037,11 @@ internal static unsafe partial class Apply
 
             if (isSchema)
             {
-                nspname = property.Value.GetString();
+                nspname = property.Value.GetWorfString();
             }
             else
             {
-                relname = property.Value.GetString();
+                relname = property.Value.GetWorfString();
             }
         }
 
@@ -1261,7 +2090,7 @@ internal static unsafe partial class Apply
 
         if (oldsync is not null)
         {
-            PgLog.Info($"table sync came from queue for table {schemaname}.{relname} which already being synchronized, skipping");
+            WorfLog.Info($"table sync came from queue for table {schemaname}.{relname} which already being synchronized, skipping");
 
             return;
         }
@@ -1287,7 +2116,7 @@ internal static unsafe partial class Apply
         string? relname = null;
         string? lastValueRaw = null;
 
-        using JsonDocument document = JsonDocument.Parse(queuedMessage.Message);
+        using JsonDocument document = WorfJson.Parse(queuedMessage.Message);
         JsonElement root = document.RootElement;
 
         // Parse and validate the json message.
@@ -1321,7 +2150,7 @@ internal static unsafe partial class Apply
                 throw new PgException(PgSqlStates.InternalError, $"unexpected type for key '{property.Name}': {JsonbType(property.Value)}");
             }
 
-            string? value = property.Value.GetString();
+            string? value = property.Value.GetWorfString();
             switch (target)
             {
                 case 0:
@@ -1352,25 +2181,45 @@ internal static unsafe partial class Apply
             throw new PgException(PgSqlStates.InternalError, "missing last_value in sequence message");
         }
 
-        uint nspoid;
+        // The state goes to the sequence of the same name. One missing here, as after a rename on either node, stops
+        // apply as a missing table does, rather than leaving the sequence behind the provider's unseen, until there is
+        // one or the provider no longer replicates a sequence of that name to this subscription.
         uint reloid;
         fixed (byte* cnspname = Worf.ToServerCString(nspname))
         fixed (byte* crelname = Worf.ToServerCString(relname))
         {
-            nspoid = NativeMethods.get_namespace_oid((sbyte*)cnspname, false);
-            reloid = NativeMethods.get_relname_relid((sbyte*)crelname, nspoid);
+            uint nspoid = NativeMethods.get_namespace_oid((sbyte*)cnspname, true);
+            reloid = nspoid == 0 ? 0 : NativeMethods.get_relname_relid((sbyte*)crelname, nspoid);
+        }
+
+        if (reloid == 0)
+        {
+            WorfSubscription sub = MySubscription!;
+            bool replicated = FromProvider(sub, $"say whether it replicates sequence {nspname}.{relname}", () =>
+            {
+                using WorfConnection conn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "sequence");
+                return Rpc.RemoteReplicatesSequence(conn, nspname, relname, sub.ReplicationSets);
+            });
+            if (!replicated)
+            {
+                WorfLog.Warning($"skipping the state of sequence {nspname}.{relname}, which doesn't exist here and which provider {sub.Origin.Name} doesn't replicate");
+                return;
+            }
+
+            throw new PgException(PgSqlStates.UndefinedTable, $"relation \"{nspname}.{relname}\" does not exist",
+                hint: $"Create the sequence, or remove it from its replication set on provider {sub.Origin.Name}.");
         }
 
         // A managed sequence's position is this node's own, and the provider's would fall outside its block.
         if (SequenceRanges.IsManaged(reloid))
         {
-            PgLog.Warning($"skipping the state of sequence {nspname}.{relname}, which is under range management here");
+            WorfLog.Warning($"skipping the state of sequence {nspname}.{relname}, which is under range management here");
             return;
         }
 
         long lastValue = ParseInt64Prefix(lastValueRaw);
 
-        _ = Spi.Execute("SELECT pg_catalog.setval($1, $2)", SpiParameter.Create(reloid), SpiParameter.Create(lastValue));
+        _ = Worf.Execute("SELECT pg_catalog.setval($1, $2)", SpiParameter.Create(reloid), SpiParameter.Create(lastValue));
     }
 
     /// <summary>
@@ -1378,7 +2227,7 @@ internal static unsafe partial class Apply
     /// </summary>
     private static void HandleSql(QueuedMessage queuedMessage, bool txJustStarted)
     {
-        using JsonDocument document = JsonDocument.Parse(queuedMessage.Message);
+        using JsonDocument document = WorfJson.Parse(queuedMessage.Message);
         JsonElement root = document.RootElement;
 
         // Validate the json and extract the SQL string from it.
@@ -1393,10 +2242,26 @@ internal static unsafe partial class Apply
                 $"malformed message in queued message tuple, expected value type 1 got {JsonbType(root)}");
         }
 
-        string sql = root.GetString()!;
+        string sql = root.GetWorfString()!;
 
-        // Run the extracted SQL.
-        ExecuteSqlCommand(sql, queuedMessage.Role, txJustStarted);
+        // Run the extracted SQL, out of the way of the indexes on this node alone, as DDL from the origin runs, in a
+        // subtransaction, so that one it can't build again is dropped and the SQL runs again. A statement that can't run
+        // in one, as one that builds an index concurrently, runs as the first of apply's transaction, as it ran before.
+        // It finds names under the empty search path that replicate_ddl_command ran it under on the origin.
+        int saveNestlevel = NativeMethods.NewGUCNestLevel();
+        SetDdlSetting("search_path", "");
+        RunQueuedCommand(sql, queuedMessage.Role, () =>
+        {
+            try
+            {
+                PgTransaction.RunInSubtransaction(() => ExecuteSqlCommand(sql, queuedMessage.Role, false), PgSubtransactionMode.Atomic);
+            }
+            catch (PgException error) when (txJustStarted && error.SqlState == PgSqlStates.ActiveSqlTransaction)
+            {
+                ExecuteSqlCommand(sql, queuedMessage.Role, true);
+            }
+        });
+        NativeMethods.AtEOXact_GUC(true, saveNestlevel);
     }
 
     /// <summary>
@@ -1404,7 +2269,7 @@ internal static unsafe partial class Apply
     /// </summary>
     private static void HandleDdl(QueuedMessage queuedMessage, bool txJustStarted)
     {
-        using JsonDocument document = JsonDocument.Parse(queuedMessage.Message);
+        using JsonDocument document = WorfJson.Parse(queuedMessage.Message);
         JsonElement root = document.RootElement;
         if (root.ValueKind != JsonValueKind.Object ||
             !root.TryGetProperty("search_path", out JsonElement searchPath) || searchPath.ValueKind != JsonValueKind.String ||
@@ -1422,7 +2287,7 @@ internal static unsafe partial class Apply
             foreach (JsonProperty position in positions.EnumerateObject())
             {
                 if (!uint.TryParse(position.Name, NumberStyles.None, CultureInfo.InvariantCulture, out uint nodeId) ||
-                    !Worf.TryParseLsn(position.Value.GetString() ?? "", out ulong lsn))
+                    !Worf.TryParseLsn(position.Value.GetWorfString() ?? "", out ulong lsn))
                 {
                     throw new PgException(PgSqlStates.InternalError, "malformed message in queued message tuple: expected node positions");
                 }
@@ -1434,27 +2299,73 @@ internal static unsafe partial class Apply
         }
 
         if (root.TryGetProperty("fence", out JsonElement fence) &&
-            ulong.TryParse(fence.GetString(), NumberStyles.None, CultureInfo.InvariantCulture, out ulong fenceId))
+            ulong.TryParse(fence.GetWorfString(), NumberStyles.None, CultureInfo.InvariantCulture, out ulong fenceId))
         {
             DdlLock.ReleaseOnCommit(fenceId);
         }
 
         // The statement runs with the settings it ran with, which change what it means.
         int saveNestlevel = NativeMethods.NewGUCNestLevel();
-        SetDdlSetting("search_path", searchPath.GetString()!);
+        SetDdlSetting("search_path", searchPath.GetWorfString()!);
         if (root.TryGetProperty("settings", out JsonElement settings) && settings.ValueKind == JsonValueKind.Object)
         {
             foreach (JsonProperty setting in settings.EnumerateObject())
             {
-                SetDdlSetting(setting.Name, setting.Value.GetString() ?? "");
+                SetDdlSetting(setting.Name, setting.Value.GetWorfString() ?? "");
             }
         }
 
         // A statement that runs concurrently commits along the way, which apply's transaction can't, so it runs
         // in that transaction instead.
-        ExecuteSqlCommand(command.GetString()!, queuedMessage.Role, false, true);
+        RunQueuedCommand(command.GetWorfString()!, queuedMessage.Role,
+            () => PgTransaction.RunInSubtransaction(() => ExecuteSqlCommand(command.GetWorfString()!, queuedMessage.Role, false, true),
+                PgSubtransactionMode.Atomic));
 
         NativeMethods.AtEOXact_GUC(true, saveNestlevel);
+    }
+
+    /// <summary>
+    /// Runs a command another node queued as the origin ran it, which has none of the indexes on this node alone, each of
+    /// whose statements keeps out of their way, and drops one that it can't build again, so that it applies.
+    /// </summary>
+    private static void RunQueuedCommand(string command, string role, Action run)
+    {
+        string origin = MySubscription!.Origin.Name;
+        bool writesRows;
+        using (PgErrorContext.Push(Worf.Shown($"during execution of queued SQL statement: {command}")))
+        {
+            writesRows = LocalIndex.WritesRows(command);
+        }
+
+        // A unique index on this node alone that finds duplicates as the command writes rows, rather than as it builds
+        // the index again, stops apply, as the rows can't be written here.
+        LocalIndex.Applying = true;
+        LocalIndex.Origin = origin;
+        try
+        {
+            while (true)
+            {
+                try
+                {
+                    run();
+                    break;
+                }
+                catch (PgException error) when (!writesRows && error.SqlState == PgSqlStates.UniqueViolation)
+                {
+                    // An index on this node alone that the command couldn't build again is dropped, once the statement
+                    // has unwound, and the command runs again; any other duplicate stops apply.
+                    if (!LocalIndex.DropUnbuilt(error, origin))
+                    {
+                        throw;
+                    }
+                }
+            }
+        }
+        finally
+        {
+            LocalIndex.Applying = false;
+            LocalIndex.Origin = null;
+        }
     }
 
     private static void SetDdlSetting(string name, string value)
@@ -1469,9 +2380,12 @@ internal static unsafe partial class Apply
 
     /// <summary>
     /// Makes a statement that would build or drop an index or detach a partition concurrently do it in its
-    /// transaction.
+    /// transaction. A concurrent detach replicates only once it has finished, so a detach, or one that finishes a
+    /// concurrent detach, finishes the concurrent detach under way here, detaches the partition at once where none is,
+    /// and does nothing where the partition is detached already, as when two nodes detached it.
     /// </summary>
-    private static void RemoveConcurrently(Node* stmt)
+    /// <returns>Whether the statement has anything to do.</returns>
+    private static bool RemoveConcurrently(Node* stmt)
     {
         switch (stmt->type)
         {
@@ -1488,10 +2402,20 @@ internal static unsafe partial class Apply
                 for (int i = 0; cmds is not null && i < cmds->length; i++)
                 {
                     AlterTableCmd* cmd = (AlterTableCmd*)cmds->elements[i].ptr_value;
-                    if (cmd->subtype == AlterTableType.AT_DetachPartition)
+                    if (cmd->subtype is not (AlterTableType.AT_DetachPartition or AlterTableType.AT_DetachPartitionFinalize))
                     {
-                        ((PartitionCmd*)cmd->def)->concurrent = false;
+                        continue;
                     }
+
+                    PartitionCmd* partition = (PartitionCmd*)cmd->def;
+                    partition->concurrent = false;
+                    bool? pending = DetachPending(((AlterTableStmt*)stmt)->relation, partition->name);
+                    if (pending is null)
+                    {
+                        return false;
+                    }
+
+                    cmd->subtype = pending.Value ? AlterTableType.AT_DetachPartitionFinalize : AlterTableType.AT_DetachPartition;
                 }
 
                 break;
@@ -1499,7 +2423,44 @@ internal static unsafe partial class Apply
             default:
                 break;
         }
+
+        return true;
     }
+
+    /// <summary>
+    /// Checks whether a partition's concurrent detach from a table is under way here, or whether the partition is
+    /// detached from it already. The check is made again once the table is locked as the detach will lock it, as a
+    /// plain detach or one that finishes a detach under way, so that a detach here can't finish in between.
+    /// </summary>
+    /// <returns>Whether a detach is under way, or null when the partition isn't the table's.</returns>
+    private static bool? DetachPending(RangeVar* table, RangeVar* partition)
+    {
+        uint parent = NativeMethods.RangeVarGetRelidExtended(table, 0, RangeVarMissingOk, default, null);
+        uint relid = NativeMethods.RangeVarGetRelidExtended(partition, 0, RangeVarMissingOk, default, null);
+        if (parent == 0 || relid == 0)
+        {
+            return false;
+        }
+
+        bool? pending = InheritsPending(relid, parent);
+        if (pending is null)
+        {
+            return null;
+        }
+
+        NativeMethods.LockRelationOid(parent, (int)(pending.Value ? PgLockMode.ShareUpdateExclusive : PgLockMode.AccessExclusive));
+        bool? locked = InheritsPending(relid, parent);
+        if (locked == false && pending.Value)
+        {
+            NativeMethods.LockRelationOid(parent, (int)PgLockMode.AccessExclusive);
+        }
+
+        return locked;
+    }
+
+    private static bool? InheritsPending(uint relid, uint parent)
+        => Worf.ReadScalar<bool?>("SELECT inhdetachpending FROM pg_catalog.pg_inherits WHERE inhrelid = $1 AND inhparent = $2",
+            SpiParameter.Create(relid), SpiParameter.Create(parent));
 
     /// <summary>
     /// Handles messages comming from the queue.
@@ -1580,6 +2541,7 @@ internal static unsafe partial class Apply
                 ulong startLsn = unchecked((ulong)NativeMethods.pq_getmsgint64(&s));
                 ulong endLsn = unchecked((ulong)NativeMethods.pq_getmsgint64(&s));
                 _ = NativeMethods.pq_getmsgint64(&s); // sendTime
+                s_messageLsn = startLsn;
 
                 if (s_lastReceived < startLsn)
                 {
@@ -1616,14 +2578,13 @@ internal static unsafe partial class Apply
                     me.Worker.Apply.ReplayStopLsn != 0 &&
                     me.Worker.Apply.ReplayStopLsn <= endpos)
                 {
-                    PgLog.Log($"worf sync finished processing via keepalive; provider at {Worf.FormatLsn(endpos)}, required {Worf.FormatLsn(me.Worker.Apply.ReplayStopLsn)}");
+                    WorfLog.Log($"worf sync finished processing via keepalive; provider at {Worf.FormatLsn(endpos)}, required {Worf.FormatLsn(me.Worker.Apply.ReplayStopLsn)}");
 
                     PgBackgroundWorker.RunTransaction(() => Sync.SetTableSyncStatus(me.Worker.Apply.SubId,
                         Worker.NameStr(me.Worker.Sync.Nspname), Worker.NameStr(me.Worker.Sync.Relname), Sync.SyncStatusSyncdone, endpos));
 
                     NativeMethods.XLogFlush(NativeMethods.GetXLogWriteRecPtr());
-                    s_applyconn!.Dispose();
-                    Sync.SyncWorkerFinish(Worker.NameStr(me.Worker.Sync.Nspname), Worker.NameStr(me.Worker.Sync.Relname));
+                    Sync.FinishCatchup(s_applyconn!, Worker.NameStr(me.Worker.Sync.Nspname), Worker.NameStr(me.Worker.Sync.Relname));
                     Worker.ProcExit(0);
                 }
             }
@@ -1702,6 +2663,11 @@ internal static unsafe partial class Apply
                     HandleStartup(&s);
                     break;
 
+                // The provider's word to call it now about sequence ranges, as an owner that granted itself a block sends.
+                case 'W':
+                    CallProvider();
+                    break;
+
                 default:
                     throw new PgException(PgSqlStates.InternalError, $"unknown action of type {action}");
             }
@@ -1712,9 +2678,6 @@ internal static unsafe partial class Apply
     {
         switch (action)
         {
-            case 'O':
-                HandleOrigin(s);
-                break;
             case 'I':
                 HandleInsert(s, startedTx);
                 break;
@@ -1756,33 +2719,151 @@ internal static unsafe partial class Apply
             return;
         }
 
+        int conflicts = ConflictHistory.PendingCount;
         try
         {
             PgTransaction.RunInSubtransaction(() =>
             {
                 DispatchChangeMessage(message, startedTx);
 
+                // A change that conflicts at commit is skipped, once read, so that it's recorded as it was.
+                if (s_exceptionSkips.TryGetValue(s_xactActionCounter, out PgException? skip) && message.Length > 0)
+                {
+                    TrackChange(message[0] switch
+                    {
+                        (byte)'I' => "INSERT",
+                        (byte)'U' => "UPDATE",
+                        (byte)'D' => "DELETE",
+                        _ => null,
+                    });
+                    throw skip;
+                }
+
                 // The change's writers can't outlive its subtransaction.
                 s_applyApi.OnCommit();
+                uint xid = NativeMethods.GetCurrentTransactionIdIfAny();
+                if (xid != 0)
+                {
+                    s_changeXids.Add((xid, s_xactActionCounter));
+                    if (s_errRel is not null)
+                    {
+                        _ = s_changeRelations.Add(s_errRel.Reloid);
+                    }
+                }
             }, PgSubtransactionMode.Atomic);
         }
         catch (PgException error) when (!IsTransient(error))
         {
+            ConflictHistory.ForgetPending(conflicts);
             ForgetFailedChange();
             ExceptionLog.Record(FailedChange(), WorfExceptionBehaviour.Discard, error);
         }
     }
 
     /// <summary>
-    /// Checks whether an error says nothing about the change's data, as a deadlock, a serialization failure, a lock or
-    /// statement timeout, a cancellation, a shutdown, running out of resources, a lost connection or an I/O error do,
-    /// so applying the transaction again can get past it.
+    /// Finds, before a transaction applied again change by change commits, its changes whose rows conflict in a
+    /// deferrable unique or exclusion constraint, whose rechecks wait for commit, as apply doesn't know where the
+    /// provider's statements ended, with a row that stays, as the changes applied one after another would, and has the
+    /// transaction applied again without them: rows that swap values, which each of the provider's statements left
+    /// unique, still apply, and only the changes that conflict are skipped and recorded. A row's change is the one whose
+    /// subtransaction wrote it last, and a row no change of the transaction wrote stays.
     /// </summary>
-    private static bool IsTransient(PgException error)
+    private static void SkipConflictsAtCommit()
+    {
+        if (s_changeXids.Count == 0)
+        {
+            return;
+        }
+
+        Dictionary<long, long> actionOf = [];
+        foreach ((uint xid, long action) in s_changeXids)
+        {
+            actionOf[xid] = action;
+        }
+
+        // Only the tables the changes wrote, and the rows they wrote, are compared with the others; a check that fails, as
+        // on a lock it can't take, leaves the commit to fail or not as it would.
+        SpiParameter ours = SpiParameter.Create(actionOf.Keys.ToArray());
+        Dictionary<long, List<(long Partner, PgException Conflict)>> partners = [];
+        try
+        {
+            PgTransaction.RunInSubtransaction(() =>
+            {
+                foreach (uint reloid in s_changeRelations)
+                {
+                    foreach ((_, PgException conflict, string rows, string conflicts) in Sync.DeferrableConstraints(reloid))
+                    {
+                        foreach (WorfRow pair in Worf.Read($"""
+                            SELECT a.xmin::pg_catalog.text::pg_catalog.int8, b.xmin::pg_catalog.text::pg_catalog.int8
+                            FROM {rows} b JOIN {rows} a ON (a.tableoid, a.ctid) OPERATOR(pg_catalog.<>) (b.tableoid, b.ctid) AND {conflicts}
+                            WHERE b.xmin::pg_catalog.text::pg_catalog.int8 OPERATOR(pg_catalog.=) ANY ($1)
+                            """, 0, ours))
+                        {
+                            long first = actionOf.GetValueOrDefault(pair.Get<long>(0));
+                            long second = actionOf.GetValueOrDefault(pair.Get<long>(1));
+                            (long later, long earlier) = first > second ? (first, second) : (second, first);
+                            if (!partners.TryGetValue(later, out List<(long, PgException)>? list))
+                            {
+                                partners[later] = list = [];
+                            }
+
+                            list.Add((earlier, conflict));
+                        }
+                    }
+                }
+            }, PgSubtransactionMode.Atomic);
+        }
+        catch (PgException error) when (!IsTransient(error))
+        {
+            WorfLog.Warning(new PgDiagnostic($"could not find which changes of the remote transaction conflict at commit: {error.Message}")
+            {
+                Detail = error.Detail,
+            });
+            return;
+        }
+
+        Dictionary<long, PgException> skips = [];
+        foreach (long action in partners.Keys.Order())
+        {
+            int stays = partners[action].FindIndex(partner => partner.Partner == 0 || !skips.ContainsKey(partner.Partner));
+            if (stays >= 0)
+            {
+                skips[action] = partners[action][stays].Conflict;
+            }
+        }
+
+        if (skips.Count == 0)
+        {
+            return;
+        }
+
+        foreach ((long action, PgException conflict) in skips)
+        {
+            s_exceptionSkips[action] = conflict;
+        }
+
+        s_skipsAdded = true;
+        long firstSkip = skips.Keys.Min();
+        throw new PgException(skips[firstSkip].SqlState, $"{skips[firstSkip].Message}, which the remote transaction's change #{firstSkip} conflicts in at commit",
+            detail: skips.Count == 1 ? "The transaction is applied again without that change."
+                : $"The transaction is applied again without the {skips.Count} changes that conflict.");
+    }
+
+    /// <summary>
+    /// Checks whether an error says nothing about the change's data, as a deadlock, a serialization failure, a lock or
+    /// statement timeout, a cancellation, a shutdown, running out of resources, a lost connection, an I/O error, a
+    /// column every value of which fails while the nodes format money differently or a call of nextval that waited too
+    /// long for a grantor this server hasn't heard from since it started, do, so applying the transaction again can get
+    /// past it. A value too short for its type's binary form, which fails with a protocol violation,
+    /// comes from the data, and so does any other object not in the state the change needs.
+    /// </summary>
+    internal static bool IsTransient(PgException error)
     {
         string state = error.SqlState;
         return state is "40000" or "40001" or "40003" or "40P01" or "55P03" or "58030" ||
-            state.StartsWith("08", StringComparison.Ordinal) || state.StartsWith("53", StringComparison.Ordinal) ||
+            (state == PgSqlStates.ObjectNotInPrerequisiteState &&
+                error.Detail is WorfColumnConversion.FailsUntilFormatsAgree or SequenceRangeGuard.GrantorUnheard or SequenceRangeGuard.UnnamedGrantorUnheard) ||
+            (state.StartsWith("08", StringComparison.Ordinal) && state != "08P01") || state.StartsWith("53", StringComparison.Ordinal) ||
             state.StartsWith("57", StringComparison.Ordinal);
     }
 
@@ -1799,23 +2880,89 @@ internal static unsafe partial class Apply
     }
 
     /// <summary>
-    /// Records a change of a transaction skipped as a whole, with the error that made worf skip it.
+    /// Records a change of a transaction skipped as a whole, with the error that made worf skip it. A failure to record
+    /// it fails the transaction, which is then skipped without recording its changes.
     /// </summary>
     private static void RecordSkippedChange(string operation)
     {
+        // A message queued on the provider, as DDL is, is recorded as the message, as when it's applied. DDL that held
+        // back this node's writes lets them go once the transaction that skips it commits, as when it's applied.
+        QueuedMessage? queued = operation == "INSERT" && s_exceptionMode ? SkippedQueuedMessage() : null;
+        if (queued?.MessageType == Queue.QueueCommandTypeDdl)
+        {
+            using JsonDocument document = WorfJson.Parse(queued.Message);
+            if (document.RootElement.ValueKind == JsonValueKind.Object &&
+                document.RootElement.TryGetProperty("fence", out JsonElement fence) &&
+                ulong.TryParse(fence.GetWorfString(), NumberStyles.None, CultureInfo.InvariantCulture, out ulong fenceId))
+            {
+                DdlLock.ReleaseOnCommit(fenceId);
+            }
+        }
+
         if (!s_recordSkipped)
         {
             return;
         }
 
         s_xactActionCounter++;
-        s_changeOperation = operation;
-        s_changeQueuedMessage = null;
+        s_changeOperation = queued is null ? operation : QueuedOperation(queued.MessageType);
+        s_changeQueuedMessage = queued?.Message;
         s_errRel = null;
+
         ExceptionLog.Record(FailedChange(),
             ExceptionBehaviour == WorfExceptionBehaviour.Transdiscard ? WorfExceptionBehaviour.Transdiscard : WorfExceptionBehaviour.Discard,
-            s_exceptionError ?? new PgException(PgSqlStates.InternalError, "skipped with its transaction"));
+            s_exceptionError ?? new PgException(PgSqlStates.InternalError, "skipped with its transaction"), isolated: false);
     }
+
+    /// <summary>
+    /// Reads the message a skipped insert queued, when it inserts into worf's queue.
+    /// </summary>
+    private static QueuedMessage? SkippedQueuedMessage()
+    {
+        byte[] message = s_changeMessage!;
+        if (message.Length < 6 || RelCache.RemoteName(BinaryPrimitives.ReadUInt32BigEndian(message.AsSpan(2))) != (Worf.ExtensionName, "queue"))
+        {
+            return null;
+        }
+
+        fixed (byte* data = message)
+        {
+            StringInfoData s;
+            s.data = (sbyte*)data;
+            s.len = message.Length;
+            s.maxlen = -1;
+            s.cursor = 1;
+
+            WorfRelation rel = ProtoNative.ReadInsert(&s, PgLockMode.AccessShare, out WorfTupleData newtup);
+            try
+            {
+                RelationData* relation = rel.Rel;
+                newtup.ConvertValues(relation->rd_att);
+                fixed (ulong* values = newtup.Values)
+                fixed (bool* nulls = newtup.Nulls)
+                {
+                    return Queue.QueuedMessageFromTuple(NativeMethods.heap_form_tuple(relation->rd_att, values, nulls));
+                }
+            }
+            finally
+            {
+                RelCache.RelationClose(rel, PgLockMode.None);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Names the operation of a message queued on the provider.
+    /// </summary>
+    private static string QueuedOperation(char messageType) => messageType switch
+    {
+        Queue.QueueCommandTypeSql => "QUEUED_SQL",
+        Queue.QueueCommandTypeTruncate => "QUEUED_TRUNCATE",
+        Queue.QueueCommandTypeTablesync => "QUEUED_TABLESYNC",
+        Queue.QueueCommandTypeSequence => "QUEUED_SEQUENCE",
+        Queue.QueueCommandTypeDdl => "QUEUED_DDL",
+        _ => "QUEUED",
+    };
 
     private static void TrackChange(string? operation)
     {
@@ -1852,9 +2999,17 @@ internal static unsafe partial class Apply
         // The worker that applies the transaction again learns how from the subscription's state.
         uint subId = MySubscription!.Id;
         ulong commitLsn = s_remoteCommitLsn;
-        PgBackgroundWorker.RunTransaction(() => ExceptionLog.SaveState(subId, commitLsn, level, error));
+        Dictionary<long, PgException> skips = s_exceptionSkips;
+        PgBackgroundWorker.RunTransaction(() =>
+        {
+            ExceptionLog.SaveState(subId, commitLsn, level, error);
+            if (level == ExceptionByChange && skips.Count > 0)
+            {
+                ExceptionLog.SaveSkips(subId, skips);
+            }
+        });
         SetExceptionMarker(s_remoteCommitLsn, level);
-        PgLog.Log($"applying the remote transaction at {Worf.FormatLsn(s_remoteCommitLsn)} under worf.exception_behaviour once the worker restarts");
+        WorfLog.Log($"applying the remote transaction at {Worf.FormatLsn(s_remoteCommitLsn)} under worf.exception_behaviour once the worker restarts");
     }
 
     /// <summary>
@@ -1882,17 +3037,27 @@ internal static unsafe partial class Apply
                     sub.Enabled = false;
                     WorfNode.AlterSubscription(sub);
                 });
-                PgLog.Log($"disabling subscription {change.Subscription.Name} after its remote transaction at {Worf.FormatLsn(s_remoteCommitLsn)} failed");
+                WorfLog.Log($"disabling subscription {change.Subscription.Name} after its remote transaction at {Worf.FormatLsn(s_remoteCommitLsn)} failed");
                 return null;
 
             case WorfExceptionBehaviour.Discard:
             case WorfExceptionBehaviour.Transdiscard:
+                // A transaction applied change by change whose commit found changes that conflict is applied so again,
+                // without them.
+                if (s_skipsAdded)
+                {
+                    s_skipsAdded = false;
+                    return ExceptionByChange;
+                }
+
                 // A transaction whose commit fails, as on a deferred constraint, or that fails again change by change
-                // is skipped as a whole next time. One whose commit fails even then, outside its subtransaction, is
-                // recorded now and not applied at all. One that fails when it isn't applied stops the worker until
-                // the error is fixed.
+                // is skipped as a whole next time, but one whose commit fails on a recheck that waited for commit only
+                // as apply had it wait is applied change by change first, where the recheck fires as each change ends.
+                // One whose commit fails even then, outside its subtransaction, is recorded now and not applied at all.
+                // One that fails when it isn't applied stops the worker until the error is fixed.
                 int level = s_exceptionMode ? s_exceptionLevel + 1
-                    : ExceptionBehaviour == WorfExceptionBehaviour.Transdiscard || s_changeOperation == "COMMIT"
+                    : ExceptionBehaviour == WorfExceptionBehaviour.Transdiscard ||
+                        (s_changeOperation == "COMMIT" && !(ReplicaRechecks.Deferred && error.SqlState is PgSqlStates.UniqueViolation or PgSqlStates.ExclusionViolation))
                         ? ExceptionByTransaction
                         : ExceptionByChange;
                 if (level > ExceptionWithoutApplying)
@@ -1924,6 +3089,55 @@ internal static unsafe partial class Apply
     }
 
     /// <summary>
+    /// Makes one of the calls to the provider that apply makes as it starts, giving up once wal_receiver_timeout has
+    /// passed without an answer, as <see cref="Worker.WithProviderDeadline"/> does; the error names what the call
+    /// waited for.
+    /// </summary>
+    private static T FromProvider<T>(WorfSubscription sub, string what, Func<T> call)
+        => Worker.WithProviderDeadline(() => $"provider \"{sub.Origin.Name}\" to {what}", call);
+
+    private static void FromProvider(WorfSubscription sub, string what, Action call) => _ = FromProvider(sub, what, () =>
+    {
+        call();
+        return true;
+    });
+
+    /// <summary>
+    /// Ends the worker once the provider has sent nothing for wal_receiver_timeout, as PostgreSQL's apply worker does,
+    /// and asks for a reply once half of that has passed, which a walsender that is still there answers at once: one
+    /// that streams sends keepalives while it has nothing else to send, so its silence means it, or the connection,
+    /// is stuck.
+    /// </summary>
+    private static void CheckProviderSilence(WorfConnection conn)
+    {
+        int timeout;
+        unsafe
+        {
+            timeout = NativeGlobals.wal_receiver_timeout;
+        }
+
+        if (timeout <= 0)
+        {
+            return;
+        }
+
+        long now = Worker.GetCurrentTimestamp();
+        long silent = now - conn.LastReceivedAt;
+        if (silent >= timeout * 1000L)
+        {
+            throw new PgException(PgSqlStates.ConnectionFailure,
+                $"terminating worf {Worker.WorkerTypeName(Worker.MyWorker.WorkerType)} worker for subscription \"{MySubscription!.Name}\" due to timeout",
+                detail: $"Provider \"{MySubscription.Origin.Name}\" sent nothing within wal_receiver_timeout ({timeout} ms).");
+        }
+
+        if (silent >= timeout * 500L && s_pingedAt != conn.LastReceivedAt)
+        {
+            _ = SendFeedback(conn, s_lastReceived, now, true, requestReply: true);
+            s_pingedAt = conn.LastReceivedAt;
+        }
+    }
+
+    /// <summary>
     /// Moves the origin back to the failed remote transaction's commit position, from which the provider sends the
     /// transaction again. From PostgreSQL 16, an abort advances the origin as a commit does, and one after the end
     /// position was set for the commit, as when the commit fails a serialization check, would skip the transaction.
@@ -1937,8 +3151,7 @@ internal static unsafe partial class Apply
             return;
         }
 
-        // Only an origin no session uses can move back. The worker stops after this, so it stays released. A relay
-        // origin the failed transaction created is gone with it, and has nothing to move back.
+        // Only an origin no session uses can move back. The worker stops after this, so it stays released.
         PgReplicationOrigin.ResetSession();
         ulong lsn = s_remoteCommitLsn;
         PgBackgroundWorker.RunTransaction(() =>
@@ -1958,32 +3171,44 @@ internal static unsafe partial class Apply
     private static void RunRemoteTransaction(byte[] firstMessage)
     {
         s_commitEndLsn = null;
-        bool keepsMessages = Worker.MyWorker.WorkerType == WorfWorkerType.Sync && ExceptionBehaviour != WorfExceptionBehaviour.Error;
-        if (keepsMessages && s_replayMessages is null)
+
+        // An ORIGIN message names the node that wrote the transaction first.
+        bool origin = firstMessage[0] == 'O';
+        if (origin)
         {
-            s_transactionMessages = [];
+            ReadOrigin(firstMessage);
         }
+
+        UseWriterOrigin();
 
         try
         {
             PgBackgroundWorker.RunTransaction(() =>
             {
                 // The changes are applied in MessageContext, which is reset after each batch of messages so that a
-                // large transaction doesn't keep every row's memory until it commits.
+                // large transaction doesn't keep every row's memory until it commits, and their text, which the
+                // provider sends in the database encoding, is read in it, whatever the worker's client encoding.
                 MemoryContextData* oldcontext = Worf.MemoryContextSwitchTo(NativeGlobals.MessageContext);
+                int client = Worf.InDatabaseEncoding();
                 try
                 {
-                    ApplyRemoteTransaction(firstMessage);
+                    if (s_remoteOriginName is not null)
+                    {
+                        s_remoteOriginId = PgReplicationOrigin.Find(s_remoteOriginName) ?? 0;
+                    }
+
+                    ApplyRemoteTransaction(origin ? null : firstMessage);
                 }
                 finally
                 {
+                    Worf.RestoreClientEncoding(client);
                     _ = Worf.MemoryContextSwitchTo(oldcontext);
                 }
             });
         }
         catch (PgException error)
         {
-            if (keepsMessages && ApplyAgainInSync(firstMessage, error))
+            if (Worker.MyWorker.WorkerType == WorfWorkerType.Sync && StreamAgainInSync(error))
             {
                 return;
             }
@@ -1999,6 +3224,7 @@ internal static unsafe partial class Apply
             s_exceptionPassed = false;
             s_exceptionLsn = 0;
             s_exceptionError = null;
+            s_exceptionSkips.Clear();
             if (Worker.MyWorker.WorkerType == WorfWorkerType.Apply)
             {
                 SetExceptionMarker(0, 0);
@@ -2007,65 +3233,40 @@ internal static unsafe partial class Apply
             }
         }
 
-        s_transactionMessages = null;
-        s_replayMessages = null;
-
         ulong endLsn = s_commitEndLsn!.Value;
         s_commitEndLsn = null;
         FinishCommit(endLsn, true);
     }
 
     /// <summary>
-    /// Applies a table sync worker's failed remote transaction again under <c>worf.exception_behaviour</c>, from the
-    /// messages it kept, as the apply worker does once it restarts.
+    /// Has a table sync worker stream its changes again from its failed remote transaction, to apply it again under
+    /// <c>worf.exception_behaviour</c>, as the apply worker does once it restarts, rather than restarting, which would
+    /// copy its table again.
     /// </summary>
-    /// <returns>Whether it did; otherwise the error stops the worker.</returns>
-    private static bool ApplyAgainInSync(byte[] firstMessage, PgException error)
+    /// <returns>Whether it does; otherwise the error stops the worker.</returns>
+    private static bool StreamAgainInSync(PgException error)
     {
         if (NextExceptionLevel(error) is not int level)
         {
             return false;
         }
 
-        // A relay origin the failed transaction created rolled back with it, so the worker starts from its own.
-        if (s_sessionWriterNodeId != 0)
-        {
-            PgReplicationOrigin.ResetSession();
-            PgReplicationOrigin.SetupSession(PgReplicationOrigin.Find(MySubscription!.SlotName)!.Value);
-            s_sessionWriterNodeId = 0;
-        }
-
-        s_exceptionMode = true;
+        s_exceptionLsn = s_remoteCommitLsn;
         s_exceptionLevel = level;
         s_exceptionError = error;
-        s_skipRemoteTransaction = false;
-        s_recordSkipped = false;
-        s_xactActionCounter = 0;
-        s_replayMessages = new Queue<byte[]>(s_transactionMessages ?? []);
-        PgLog.Log($"applying the remote transaction at {Worf.FormatLsn(s_remoteCommitLsn)} again under worf.exception_behaviour");
-        RunRemoteTransaction(firstMessage);
+        s_inRemoteTransaction = false;
+        s_restreamFrom = s_remoteCommitLsn;
+        WorfLog.Log($"applying the remote transaction at {Worf.FormatLsn(s_remoteCommitLsn)} again under worf.exception_behaviour");
         return true;
     }
 
-    private static void ApplyRemoteTransaction(byte[] firstMessage)
+    private static void ApplyRemoteTransaction(byte[]? firstChange)
     {
         // worf doesn't have "statements" as such, so we'll report one statement per applied transaction. The
         // transaction's start sets the transaction timestamp used by current_timestamp.
         s_applyApi.OnBegin();
+        ReplicaRechecks.Deferred = false;
 
-        // An ORIGIN message names the node that wrote the transaction first. Its change of origin stays out of the
-        // subtransactions that worf.exception_behaviour rolls back.
-        bool origin = firstMessage[0] == 'O';
-        if (origin)
-        {
-            DispatchChangeMessage(firstMessage, true);
-        }
-        else
-        {
-            UseWriterOrigin();
-        }
-
-        byte[]? firstChange = origin ? null : firstMessage;
         if (!s_exceptionMode || s_exceptionLevel == ExceptionByChange)
         {
             ApplyChanges(firstChange);
@@ -2074,11 +3275,11 @@ internal static unsafe partial class Apply
 
         // A transaction skipped as a whole, under transdiscard or when its commit failed under discard, isn't
         // applied, and each of its changes is recorded, unless recording them failed before. Its commit still
-        // advances the origin past it.
+        // advances the origin past it. Its records share one subtransaction, rather than taking one each.
         s_skipRemoteTransaction = true;
         s_recordSkipped = s_exceptionLevel == ExceptionByTransaction;
         _ = NativeMethods.GetTopTransactionId();
-        ApplyChanges(firstChange);
+        PgTransaction.RunInSubtransaction(() => ApplyChanges(firstChange), PgSubtransactionMode.Atomic);
     }
 
     /// <summary>
@@ -2091,16 +3292,10 @@ internal static unsafe partial class Apply
             ApplyChange(firstChange, true);
         }
 
-        // A table sync worker applying a transaction again takes the messages it kept first.
-        while (s_commitEndLsn is null && s_replayMessages is { Count: > 0 })
-        {
-            HandleCopyData(s_replayMessages.Dequeue(), inTransaction: true);
-        }
-
         long statusInterval = StatusInterval();
         bool reported = false;
 
-        PgReplicationConnection conn = s_applyconn ?? throw new InvalidOperationException("The apply connection is not open.");
+        WorfConnection conn = s_applyconn ?? throw new InvalidOperationException("The apply connection is not open.");
         while (s_commitEndLsn is null)
         {
             if (Worker.GotSigterm)
@@ -2113,13 +3308,19 @@ internal static unsafe partial class Apply
             PgReplicationReceiveStatus status = conn.Receive(TimeSpan.FromMilliseconds(1000), out ReadOnlySpan<byte> copybuf);
             while (status == PgReplicationReceiveStatus.Message && s_commitEndLsn is null)
             {
-                byte[] data = copybuf.ToArray();
-                s_transactionMessages?.Add(data);
-                HandleCopyData(data, inTransaction: true);
+                HandleCopyData(copybuf.ToArray(), inTransaction: true);
 
                 if (s_commitEndLsn is not null)
                 {
                     break;
+                }
+
+                // A transaction that takes a while to apply tells the copies that wait for apply how far into it apply
+                // has got, so that they keep their snapshots while it moves.
+                if (Stopwatch.GetElapsedTime(s_copiesToldAt) >= TimeSpan.FromSeconds(1))
+                {
+                    AllowCopies(s_remoteCommitLsn, s_messageLsn);
+                    s_copiesToldAt = Stopwatch.GetTimestamp();
                 }
 
                 // The walsender drops a connection it hears nothing from for wal_sender_timeout, and the keepalive it
@@ -2147,6 +3348,8 @@ internal static unsafe partial class Apply
 
             if (s_commitEndLsn is null)
             {
+                CheckProviderSilence(conn);
+
                 // confirm all writes at once
                 SendFeedback(conn, s_lastReceived, Worker.GetCurrentTimestamp(), false);
 
@@ -2203,7 +3406,7 @@ internal static unsafe partial class Apply
     /// <summary>
     /// Send a Standby Status Update message to server.
     /// </summary>
-    private static bool SendFeedback(PgReplicationConnection conn, ulong recvpos, long now, bool force)
+    private static bool SendFeedback(WorfConnection conn, ulong recvpos, long now, bool force, bool requestReply = false)
     {
         // It's legal to not pass a recvpos
         if (recvpos < s_lastRecvpos)
@@ -2256,9 +3459,12 @@ internal static unsafe partial class Apply
         BinaryPrimitives.WriteUInt64BigEndian(replyMessage[9..], flushpos);       // flush
         BinaryPrimitives.WriteUInt64BigEndian(replyMessage[17..], writepos);      // apply
         BinaryPrimitives.WriteInt64BigEndian(replyMessage[25..], now);            // sendTime
-        replyMessage[33] = 0;                                                     // replyRequested
+        replyMessage[33] = requestReply ? (byte)1 : (byte)0;                      // replyRequested
 
-        PgLog.Debug2($"sending feedback (force {(force ? 1 : 0)}) to recv {Worf.FormatLsn(recvpos)}, write {Worf.FormatLsn(writepos)}, flush {Worf.FormatLsn(flushpos)}");
+        if (PgLog.IsEnabled(PgLogLevel.Debug2))
+        {
+            WorfLog.Debug2($"sending feedback (force {(force ? 1 : 0)}) to recv {Worf.FormatLsn(recvpos)}, write {Worf.FormatLsn(writepos)}, flush {Worf.FormatLsn(flushpos)}");
+        }
 
         conn.Send(replyMessage);
         s_lastSendTime = now;
@@ -2284,13 +3490,26 @@ internal static unsafe partial class Apply
     /// <summary>
     /// Load list of tables currently pending sync. Must be inside transaction.
     /// </summary>
-    private static void RereadUnsyncedTables(uint subid) => s_syncingTables = Sync.GetUnsyncedTables(subid);
+    private static void RereadUnsyncedTables(uint subid)
+    {
+        List<WorfSyncStatus> before = s_syncingTables;
+        s_syncingTables = Sync.GetUnsyncedTables(subid);
+
+        // A table whose sync starts over, as a resynchronization asks, starts without waiting for its earlier starts.
+        foreach (WorfSyncStatus sync in s_syncingTables.Where(sync => sync.Status == Sync.SyncStatusInit && sync.Statuslsn == 0 &&
+            !before.Exists(old => old.Nspname == sync.Nspname && old.Relname == sync.Relname && old.Status == Sync.SyncStatusInit && old.Statuslsn == 0)))
+        {
+            _ = s_syncStarts.Remove((sync.Nspname, sync.Relname));
+        }
+    }
 
     private static void ProcessSyncingTables(ulong endLsn)
     {
         WorfApplyWorker myApplyWorker = MyApplyWorker;
         uint subid = myApplyWorker.SubId;
         uint myDatabaseId = NativeGlobals.MyDatabaseId;
+
+        AllowCopies(endLsn, 0);
 
         // First check if we need to update the cached information.
         if (myApplyWorker.SyncPending)
@@ -2314,11 +3533,13 @@ internal static unsafe partial class Apply
                     WorfSyncStatus? newsync = Sync.GetTableSyncStatus(subid, sync.Nspname, sync.Relname, true);
 
                     // TODO: what to do here? We don't really want to die, but this can mean many things, for now we
-                    // just assume table is not relevant for us anymore and leave fixing to the user.
+                    // just assume table is not relevant for us anymore and leave fixing to the user. A slot its sync
+                    // left goes.
                     if (newsync is null)
                     {
                         sync.Status = Sync.SyncStatusReady;
                         sync.Statuslsn = 0;
+                        s_syncSlotsRetryAt = Worker.GetCurrentTimestamp();
                     }
                     else
                     {
@@ -2343,17 +3564,23 @@ internal static unsafe partial class Apply
                             WorfWorker w = guard[worker];
                             w.Worker.Apply.ReplayStopLsn = endLsn;
                             guard[worker] = w;
-                            sync.Status = Sync.SyncStatusCatchup;
-
-                            PgBackgroundWorker.RunTransaction(() =>
-                                Sync.SetTableSyncStatus(subid, sync.Nspname, sync.Relname, sync.Status, sync.Statuslsn));
-
-                            if (guard[worker].Proc != 0)
-                            {
-                                Worker.SetProcLatch(guard[worker].Proc);
-                            }
-
                             caughtUp = true;
+                        }
+                    }
+
+                    // The sync worker catches up to the position set above once the catalog says so. The transaction
+                    // runs with the workers' lock released, as one that waits on a lock, or fails and releases every
+                    // lightweight lock as it aborts, mustn't hold it, and the worker is found again to be woken.
+                    if (caughtUp)
+                    {
+                        sync.Status = Sync.SyncStatusCatchup;
+                        PgBackgroundWorker.RunTransaction(() =>
+                            Sync.SetTableSyncStatus(subid, sync.Nspname, sync.Relname, sync.Status, sync.Statuslsn));
+                        using PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share();
+                        int worker = guard.Read((in _, workers) => Worker.SyncFind(workers, myDatabaseId, subid, syncNspname, syncRelname));
+                        if (worker >= 0 && guard[worker].Proc != 0)
+                        {
+                            Worker.SetProcLatch(guard[worker].Proc);
                         }
                     }
 
@@ -2381,6 +3608,7 @@ internal static unsafe partial class Apply
                 if (sync.Status == Sync.SyncStatusReady)
                 {
                     s_syncingTables.RemoveAt(index);
+                    _ = s_syncStarts.Remove((sync.Nspname, sync.Relname));
                     index--;
                 }
             }
@@ -2395,29 +3623,125 @@ internal static unsafe partial class Apply
             }
 
             int nworkers = 0;
+            long crashedAt = 0;
             using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
             {
-                nworkers = guard.Read((in _, workers) =>
+                (nworkers, crashedAt) = guard.Read((in _, workers) =>
                 {
                     int running = 0;
+                    long crashed = 0;
                     foreach (int worker in Worker.SyncFindAll(workers, myDatabaseId, subid))
                     {
                         running += Worker.WorkerRunning(workers, worker) ? 1 : 0;
+                        crashed = Math.Max(crashed, workers[worker].CrashedAt);
                     }
 
-                    return running;
+                    return (running, crashed);
                 });
             }
 
-            if (nworkers < 1)
+            // A sync worker that failed restarts after the delay an apply worker that fails does.
+            if (nworkers < 1 && Worker.GetCurrentTimestamp() - crashedAt >= Manager.RestartDelay * 1000)
             {
-                StartSyncWorker(sync.Nspname, sync.Relname);
+                // A table whose sync worker started before waits, 5 seconds after its first start and twice as long
+                // after each later one, up to 5 minutes, while another table's starts.
+                long now = Worker.GetCurrentTimestamp();
+                (long startedAt, int starts) = s_syncStarts.GetValueOrDefault((sync.Nspname, sync.Relname));
+                if (starts > 0 && now < startedAt + (SyncRestartDelayAfter(starts) * 1000))
+                {
+                    continue;
+                }
+
+                // Relay origins this worker no longer needs give their slots up to the sync worker's origin.
+                ReclaimRelayOrigins();
+
+                // One that stopped while it asked this worker to stop for its catch-up left the request, which the
+                // new one would find answered before it's ready. It asks again once it is.
+                if (sync.Status == Sync.SyncStatusSyncwait)
+                {
+                    sync.Status = Sync.SyncStatusCatchup;
+                    PgBackgroundWorker.RunTransaction(() =>
+                        Sync.SetTableSyncStatus(subid, sync.Nspname, sync.Relname, sync.Status, sync.Statuslsn));
+                }
+
+                // With every worker slot taken, the table waits for the next look, without counting a start.
+                if (StartSyncWorker(sync.Nspname, sync.Relname))
+                {
+                    s_syncStarts[(sync.Nspname, sync.Relname)] = (now, starts + 1);
+                }
+
                 break;
             }
         }
     }
 
-    private static void StartSyncWorker(string nspname, string relname)
+    /// <summary>
+    /// Gets how long a synchronization that failed, or started, a number of times waits to start again: 5 seconds,
+    /// and twice as long each time after, up to 5 minutes.
+    /// </summary>
+    /// <param name="times">How many times, at least one.</param>
+    /// <returns>The delay in milliseconds.</returns>
+    internal static long SyncRestartDelayAfter(int times) => Math.Min(SyncRestartDelay << Math.Min(times - 1, 6), MaxSyncRestartDelay);
+
+    /// <summary>
+    /// Tells the subscription's sync workers that wait to copy their table how far apply has got, so each copies once
+    /// everything that committed before its copy's snapshot is applied. Queued SQL that committed before a snapshot
+    /// changes the table before its copy, as it changed the provider's rows before it; run after the copy, it changes
+    /// the copied rows again.
+    /// </summary>
+    /// <param name="lsn">The position before which everything that committed is applied.</param>
+    /// <param name="changeLsn">The position of the last change applied of the transaction that commits at
+    /// <paramref name="lsn"/>, which tells a copy that apply moves through a transaction that takes a while, or zero.
+    /// </param>
+    private static void AllowCopies(ulong lsn, ulong changeLsn)
+    {
+        // None waits but while a table synchronizes, so look under the shared lock first.
+        uint dboid = NativeGlobals.MyDatabaseId;
+        bool waiting = false;
+        using (PgLwLockShareGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Share())
+        {
+            WorfWorker me = guard[Worker.MyWorfWorker];
+            for (int i = 0; i < guard.Length && me.WorkerType == WorfWorkerType.Apply && !waiting; i++)
+            {
+                waiting = WaitsForApply(guard[i], dboid, me.Worker.Apply.SubId, lsn, changeLsn);
+            }
+        }
+
+        if (!waiting)
+        {
+            return;
+        }
+
+        using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
+        {
+            uint subid = guard[Worker.MyWorfWorker].Worker.Apply.SubId;
+            for (int i = 0; i < guard.Length; i++)
+            {
+                WorfWorker worker = guard[i];
+                if (WaitsForApply(worker, dboid, subid, lsn, changeLsn))
+                {
+                    worker.Worker.Sync.AppliedLsn = lsn;
+                    worker.Worker.Sync.ChangeLsn = changeLsn;
+                    guard[i] = worker;
+                    if (lsn >= worker.Worker.Sync.CopyLsn)
+                    {
+                        Worker.SetProcLatch(worker.Proc);
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Checks whether a worker is a sync worker of the subscription that waits for the apply worker, which it hasn't
+    /// heard has got this far. A transaction applied again, as after a restart, isn't further than it got before.
+    /// </summary>
+    private static bool WaitsForApply(WorfWorker worker, uint dboid, uint subid, ulong lsn, ulong changeLsn)
+        => worker.WorkerType == WorfWorkerType.Sync && worker.Proc != 0 && worker.Dboid == dboid &&
+            worker.Worker.Apply.SubId == subid && worker.Worker.Sync.CopyLsn != 0 &&
+            (worker.Worker.Sync.AppliedLsn < lsn || (worker.Worker.Sync.AppliedLsn == lsn && worker.Worker.Sync.ChangeLsn < changeLsn));
+
+    private static bool StartSyncWorker(string nspname, string relname)
     {
         WorfWorker me = Worker.MyWorker;
 
@@ -2433,7 +3757,7 @@ internal static unsafe partial class Apply
         Worker.NameStrCpy(ref worker.Worker.Sync.Nspname, nspname);
         Worker.NameStrCpy(ref worker.Worker.Sync.Relname, relname);
 
-        _ = Worker.WorkerRegister(worker);
+        return Worker.WorkerRegister(worker) != -1;
     }
 
     private static void SetSyncPending(bool syncPending)

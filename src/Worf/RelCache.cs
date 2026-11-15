@@ -1,3 +1,4 @@
+using System.Globalization;
 using Ankus.Postgres;
 
 namespace Worf;
@@ -15,12 +16,48 @@ internal static partial class RelCache
     /// </summary>
     private static readonly Dictionary<uint, List<WorfRelation>> s_relationsByReloid = [];
 
+#if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
+    // TYPEOID and PROCOID, the ids of the catalog caches of types and functions, which only PostgreSQL 19's bindings
+    // name.
+    private const int TypeCacheId = 80;
+    private const int ProcCacheId = 45;
+#elif ANKUS_PG18
+    private const int TypeCacheId = 82;
+    private const int ProcCacheId = 47;
+#endif
+
+    /// <summary>
+    /// Counts the changes to types and functions this backend has seen, which the column conversions depend on.
+    /// </summary>
+    private static long s_typesStamp;
+
+    /// <summary>
+    /// Gets or sets how the provider formats money, as <see cref="OutputConfig.MoneyFormat"/> shows it, or null when it
+    /// didn't say. Values sent as money fail when this node formats it differently, under another <c>lc_monetary</c>,
+    /// since they count the provider's currency in its fraction digits.
+    /// </summary>
+    internal static string? ProviderMoneyFormat { get; set; }
+
+    // The lc_monetary that the relations' conversions were found under.
+    private static string? s_monetary;
+
     [PgNativeCallback(nameof(RelcacheInvalidateCallback))]
 #if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
     private static partial RelcacheCallbackFunction InvalidateCallback { get; }
 #else
     private static partial RelSyncCallbackFunction InvalidateCallback { get; }
 #endif
+
+    [PgNativeCallback(nameof(TypeInvalidateCallback))]
+    private static partial SyscacheCallbackFunction TypeCallback { get; }
+
+    /// <summary>
+    /// Gets the schema and name of a remote relation, without opening the local relation it maps to.
+    /// </summary>
+    /// <param name="remoteid">The remote relation's id.</param>
+    /// <returns>The schema and the name, or nulls when the provider hasn't described the relation.</returns>
+    internal static (string? Nspname, string? Relname) RemoteName(uint remoteid)
+        => s_relationHash is not null && s_relationHash.TryGetValue(remoteid, out WorfRelation? entry) ? (entry.Nspname, entry.Relname) : (null, null);
 
     /// <summary>
     /// Opens the local relation a remote relation maps to.
@@ -38,8 +75,36 @@ internal static partial class RelCache
             throw new PgException(PgSqlStates.InternalError, $"cache lookup failed for remote relation {remoteid}");
         }
 
+        // Money's conversions depend on how this node formats it, which a reload of lc_monetary changes, so every
+        // relation's are found again then.
+        if (OutputConfig.MonetaryChanged(ref s_monetary))
+        {
+            foreach (WorfRelation other in hash.Values)
+            {
+                other.IsValid = false;
+            }
+
+            s_relationsByReloid.Clear();
+        }
+
+        // Locking the relation takes the invalidations sent since it was last open, which can leave the mapping stale,
+        // as when the table was changed, renamed or dropped. It's then let go and looked up by name again. Its
+        // invalidation can also come while a change uses it, so it keeps its OID until then.
+        if (entry.IsValid && entry.Rel is null)
+        {
+            entry.Rel = NativeMethods.try_table_open(entry.Reloid, (int)lockmode);
+            entry.IsValid &= entry.Rel is not null;
+        }
+
+        if (entry.Rel is not null && !entry.IsValid)
+        {
+            NativeMethods.table_close(entry.Rel, (int)lockmode);
+            entry.Rel = null;
+        }
+
         // Need to update the local cache?
-        if (entry.Reloid == 0)
+        bool mapped = !entry.IsValid;
+        if (mapped)
         {
             RangeVar* rv = NativeMethods.makeRangeVar(Worf.PStrDup(entry.Nspname), Worf.PStrDup(entry.Relname), -1);
             entry.Rel = NativeMethods.table_openrv(rv, (int)lockmode);
@@ -57,6 +122,7 @@ internal static partial class RelCache
             }
 
             entry.Reloid = entry.Rel->rd_id;
+            entry.IsValid = true;
             if (!s_relationsByReloid.TryGetValue(entry.Reloid, out List<WorfRelation>? entries))
             {
                 entries = [];
@@ -67,6 +133,7 @@ internal static partial class RelCache
 
             // Cache trigger info.
             entry.HasTriggers = false;
+            entry.HasRechecks = false;
             TriggerDesc* trigdesc = entry.Rel->trigdesc;
             if (trigdesc is not null)
             {
@@ -74,19 +141,20 @@ internal static partial class RelCache
                 {
                     Trigger* trigger = &trigdesc->triggers[i];
 
+                    entry.HasRechecks |= trigger->tgisinternal && trigger->tgfoid == UniqueKeyRecheck;
+
                     // We only fire replica triggers on rows
-                    if (!(trigger->tgenabled == TriggerFiresOnOrigin || trigger->tgenabled == TriggerDisabled) &&
-                        (trigger->tgtype & TriggerTypeRow) != 0)
-                    {
-                        entry.HasTriggers = true;
-                        break;
-                    }
+                    entry.HasTriggers |= !(trigger->tgenabled == TriggerFiresOnOrigin || trigger->tgenabled == TriggerDisabled) &&
+                        (trigger->tgtype & TriggerTypeRow) != 0;
                 }
             }
         }
-        else if (entry.Rel is null)
+
+        // The conversions are found again for the local columns, and after a change to the types and functions they
+        // depend on.
+        if (mapped || (entry.ConversionsDependOnTypes && entry.ConversionsStamp != s_typesStamp))
         {
-            entry.Rel = NativeMethods.table_open(entry.Reloid, (int)lockmode);
+            FindConversions(entry);
         }
 
         return entry;
@@ -99,13 +167,20 @@ internal static partial class RelCache
     /// <param name="schemaname">The relation's schema.</param>
     /// <param name="relname">The relation's name.</param>
     /// <param name="attnames">The remote columns' names.</param>
-    internal static void RelationCacheUpdate(uint remoteid, string schemaname, string relname, string[] attnames)
+    /// <param name="types">The remote columns' types, or null when the provider didn't say.</param>
+    internal static void RelationCacheUpdate(uint remoteid, string schemaname, string relname, string[] attnames,
+        WorfRemoteType?[]? types = null)
     {
         Dictionary<uint, WorfRelation> hash = s_relationHash ??= RelcacheInit();
 
-        if (hash.TryGetValue(remoteid, out WorfRelation? old) && s_relationsByReloid.TryGetValue(old.Reloid, out List<WorfRelation>? entries))
+        if (hash.TryGetValue(remoteid, out WorfRelation? old))
         {
-            _ = entries.Remove(old);
+            if (s_relationsByReloid.TryGetValue(old.Reloid, out List<WorfRelation>? entries))
+            {
+                _ = entries.Remove(old);
+            }
+
+            ReleaseConversions(old);
         }
 
         // Make cached copy of the data
@@ -116,6 +191,8 @@ internal static partial class RelCache
             Relname = relname,
             Attnames = attnames,
             Attmap = new int[attnames.Length],
+            RemoteTypes = types ?? new WorfRemoteType?[attnames.Length],
+            Conversions = new WorfColumnConversion?[attnames.Length],
             Reloid = 0,
         };
     }
@@ -124,8 +201,9 @@ internal static partial class RelCache
     /// Records a remote relation's description from the information function.
     /// </summary>
     /// <param name="remoterel">The remote relation.</param>
-    internal static void RelationCacheUpdater(WorfRemoteRel remoterel)
-        => RelationCacheUpdate(remoterel.Relid, remoterel.Nspname, remoterel.Relname, [.. remoterel.Attnames]);
+    /// <param name="types">The remote columns' types, or null when the provider didn't say.</param>
+    internal static void RelationCacheUpdater(WorfRemoteRel remoterel, WorfRemoteType?[]? types)
+        => RelationCacheUpdate(remoterel.Relid, remoterel.Nspname, remoterel.Relname, [.. remoterel.Attnames], types);
 
     /// <summary>
     /// Closes the local relation. <see cref="PgLockMode.None"/> keeps the lock its open took until the transaction
@@ -176,7 +254,7 @@ internal static partial class RelCache
             {
                 foreach (WorfRelation entry in entries)
                 {
-                    entry.Reloid = 0;
+                    entry.IsValid = false;
                 }
             }
         }
@@ -185,11 +263,26 @@ internal static partial class RelCache
             // invalidate all cache entries
             foreach (WorfRelation entry in s_relationHash.Values)
             {
-                entry.Reloid = 0;
+                entry.IsValid = false;
             }
 
             s_relationsByReloid.Clear();
         }
+    }
+
+    /// <summary>
+    /// Notes a change to a type or function, after which the conversions that depend on them are found again.
+    /// </summary>
+#if ANKUS_PG19
+    private static void TypeInvalidateCallback(ulong arg, SysCacheIdentifier cacheid, uint hashvalue)
+#else
+    private static void TypeInvalidateCallback(ulong arg, int cacheid, uint hashvalue)
+#endif
+    {
+        _ = arg;
+        _ = cacheid;
+        _ = hashvalue;
+        s_typesStamp++;
     }
 
     private static Dictionary<uint, WorfRelation> RelcacheInit()
@@ -198,6 +291,13 @@ internal static partial class RelCache
         unsafe
         {
             NativeMethods.CacheRegisterRelcacheCallback(InvalidateCallback, 0);
+#if ANKUS_PG19
+            NativeMethods.CacheRegisterSyscacheCallback(SysCacheIdentifier.TYPEOID, TypeCallback, 0);
+            NativeMethods.CacheRegisterSyscacheCallback(SysCacheIdentifier.PROCOID, TypeCallback, 0);
+#else
+            NativeMethods.CacheRegisterSyscacheCallback(TypeCacheId, TypeCallback, 0);
+            NativeMethods.CacheRegisterSyscacheCallback(ProcCacheId, TypeCallback, 0);
+#endif
         }
 
         return [];
@@ -221,6 +321,258 @@ internal static partial class RelCache
         return -1;
     }
 
+    /// <summary>
+    /// Finds how each remote column's values convert to its local column's type, and releases the conversions found
+    /// before.
+    /// </summary>
+    private static unsafe void FindConversions(WorfRelation entry)
+    {
+        // Conversions left half found by an error are found again on the next open.
+        long stamp = s_typesStamp;
+        bool dependOnTypes = false;
+        entry.ConversionsDependOnTypes = true;
+        entry.ConversionsStamp = -1;
+        TupleDescData* desc = entry.Rel->rd_att;
+        for (int i = 0; i < entry.Natts; i++)
+        {
+            entry.Conversions[i]?.Release();
+            entry.Conversions[i] = null;
+            if (entry.Attmap[i] >= 0 && entry.RemoteTypes[i] is WorfRemoteType remote)
+            {
+                entry.Conversions[i] = ColumnConversion(remote, NativeMethods.TupleDescAttr(desc, entry.Attmap[i]));
+                dependOnTypes |= remote.Definition is not null || entry.Conversions[i] is not null;
+            }
+        }
+
+        entry.ConversionsDependOnTypes = dependOnTypes;
+        entry.ConversionsStamp = stamp;
+    }
+
+    private static void ReleaseConversions(WorfRelation entry)
+    {
+        foreach (WorfColumnConversion? conversion in entry.Conversions)
+        {
+            conversion?.Release();
+        }
+    }
+
+    /// <summary>
+    /// Finds how a remote column's values convert to the local column's type, when they're sent in another: PostgreSQL's
+    /// own types are read by OID, and others found by schema and name when defined the same. An enum's values are its
+    /// labels, which an enum column reads and another reads as text, and a type made of enums is read only for a
+    /// column whose type is made of the same ones, since the provider's labels may be ones they lack. A type the
+    /// subscriber lacks or defines differently, or made of enums the column's type isn't, can't be read in binary, and
+    /// the column's own type reads its text. Values sent as money fail when the provider formats money differently.
+    /// </summary>
+    /// <param name="remote">The type the column's values are sent in.</param>
+    /// <param name="att">The local column.</param>
+    /// <returns>The conversion, or null when the local column's type reads the values.</returns>
+    private static unsafe WorfColumnConversion? ColumnConversion(WorfRemoteType remote, FormData_pg_attribute* att)
+    {
+        // Money's binary form counts the smallest units of the currency, so values sent so mean the same only while both
+        // nodes count the same fraction digits, and are read as what they're sent in, then converted as any value is,
+        // for a column of another type, and its text, as the copy and text transfer send, means the same only where it
+        // reads here as the same amount.
+        if (SendsMoney(remote) && ProviderMoneyFormat is string providerFormat && MoneyAlike(providerFormat) is bool binaryAlike)
+        {
+            string column = Worf.FromServer((sbyte*)&att->attname);
+            string failure = $"column \"{column}\" gets money from a provider whose lc_monetary formats it as \"{providerFormat}\" where this node's formats it as \"{OutputConfig.MoneyFormat()}\"";
+            if (!binaryAlike)
+            {
+                return new WorfColumnConversion(column, "money", 0, att->atttypid, att->atttypmod, failure);
+            }
+
+            failure += ", which reads as another amount, or none, in the text the copy and text transfer send";
+            return ConvertedColumn(remote, att) is WorfColumnConversion converted
+                ? converted.FailingText(failure)
+                : new WorfColumnConversion(column, "money", 0, att->atttypid, att->atttypmod, failure, true);
+        }
+
+        return ConvertedColumn(remote, att);
+    }
+
+    /// <summary>
+    /// Finds how a remote column's values convert to the local column's type, as <see cref="ColumnConversion"/> does,
+    /// whatever the nodes' lc_monetary.
+    /// </summary>
+    private static unsafe WorfColumnConversion? ConvertedColumn(WorfRemoteType remote, FormData_pg_attribute* att)
+    {
+        uint local = NativeMethods.getBaseType(att->atttypid);
+        uint readType = 0;
+        string name;
+        if (remote.Definition is null)
+        {
+            if (remote.Oid == local)
+            {
+                return null;
+            }
+
+            if (Readable(remote.Oid))
+            {
+                readType = remote.Oid;
+                name = Worf.FromServer(NativeMethods.format_type_be(readType));
+            }
+            else
+            {
+                name = remote.Oid.ToString(CultureInfo.InvariantCulture);
+            }
+        }
+        else
+        {
+            name = $"{remote.Nspname}.{remote.Typname}";
+            if (remote.Definition == ProtoNative.EnumDefinition)
+            {
+                if (NativeMethods.get_typtype(local) == EnumType)
+                {
+                    return null;
+                }
+
+                readType = WorfColumnConversion.TextOid;
+            }
+            else if (ProtoNative.TypeDefinition(local) == remote.Definition)
+            {
+                return null;
+            }
+            else
+            {
+                WorfRows found = Worf.SelectCatalog("""
+                    SELECT t.oid FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+                    WHERE n.nspname = $1 AND t.typname = $2
+                    """, SpiParameter.Create(remote.Nspname), SpiParameter.Create(remote.Typname));
+                if (found.Count > 0 && Readable(found[0].Get<uint>(0)) &&
+                    ProtoNative.TypeDefinition(found[0].Get<uint>(0)) == remote.Definition &&
+                    MadeOfEnumsOf(att->atttypid, found[0].Get<uint>(0)))
+                {
+                    readType = NativeMethods.getBaseType(found[0].Get<uint>(0));
+                }
+            }
+        }
+
+        return new WorfColumnConversion(Worf.FromServer((sbyte*)&att->attname), name, readType, att->atttypid, att->atttypmod);
+    }
+
+    /// <summary>
+    /// Checks whether a type is made of only enums another type is made of too.
+    /// </summary>
+    /// <param name="column">The type that has to be made of the enums.</param>
+    /// <param name="type">The type whose enums those are.</param>
+    private static bool MadeOfEnumsOf(uint column, uint type)
+    {
+        HashSet<uint> enums = [];
+        CollectEnums(type, enums);
+        if (enums.Count == 0)
+        {
+            return true;
+        }
+
+        HashSet<uint> columnEnums = [];
+        CollectEnums(column, columnEnums);
+        return enums.IsSubsetOf(columnEnums);
+    }
+
+    /// <summary>
+    /// Collects the enums a type is made of: itself, its base type's, its element's, its subtype's or its attributes'.
+    /// </summary>
+    private static unsafe void CollectEnums(uint typoid, HashSet<uint> enums)
+    {
+        typoid = NativeMethods.getBaseType(typoid);
+        uint element = NativeMethods.get_element_type(typoid);
+        if (element != 0)
+        {
+            CollectEnums(element, enums);
+            return;
+        }
+
+        switch (NativeMethods.get_typtype(typoid))
+        {
+            case EnumType:
+                _ = enums.Add(typoid);
+                break;
+
+            case RangeType:
+                CollectEnums(NativeMethods.get_range_subtype(typoid), enums);
+                break;
+
+            case MultirangeType:
+                CollectEnums(NativeMethods.get_multirange_range(typoid), enums);
+                break;
+
+            case CompositeType:
+            {
+                TupleDescData* desc = NativeMethods.lookup_rowtype_tupdesc(typoid, -1);
+                for (int i = 0; i < desc->natts; i++)
+                {
+                    FormData_pg_attribute* att = NativeMethods.TupleDescAttr(desc, i);
+                    if (!att->attisdropped)
+                    {
+                        CollectEnums(att->atttypid, enums);
+                    }
+                }
+
+                if (desc->tdrefcount >= 0)
+                {
+                    NativeMethods.DecrTupleDescRefCount(desc);
+                }
+
+                break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Checks whether values sent in a type are money or made of it, as the type's OID or definition shows.
+    /// </summary>
+    /// <param name="remote">The type.</param>
+    /// <returns>Whether they are.</returns>
+    internal static bool SendsMoney(WorfRemoteType remote)
+        => remote.Definition is null
+            ? remote.Oid is MoneyOid or MoneyArrayOid
+            : remote.Definition.Split('(', ')', ',').Any(part => part is MoneyOidText or MoneyArrayOidText);
+
+    /// <summary>
+    /// Checks how far money the provider formats one way means here what it means there: in binary, its values count
+    /// the same fraction digits; as text, which the copy and text transfer send, its text for an amount, with the
+    /// separators and the sign, reads here as the same amount, where a text that fails to read, or reads as another
+    /// amount, means that other values may read as amounts a hundred times off.
+    /// </summary>
+    /// <param name="providerFormat">How the provider formats money, as <see cref="OutputConfig.MoneyFormat"/> shows it.</param>
+    /// <returns>Null when it means the same either way, true when it does only in binary, or false when it doesn't.</returns>
+    internal static bool? MoneyAlike(string providerFormat)
+    {
+        string local = OutputConfig.MoneyFormat();
+        if (providerFormat == local)
+        {
+            return null;
+        }
+
+        if (OutputConfig.MoneyAmount(providerFormat) != OutputConfig.MoneyAmount(local))
+        {
+            return false;
+        }
+
+        try
+        {
+            return PgTransaction.RunInSubtransaction(() => Worf.ReadScalar<bool>(
+                "SELECT $1::pg_catalog.money OPERATOR(pg_catalog.=) '-1234567'::pg_catalog.money",
+                SpiParameter.Create(OutputConfig.MoneyText(providerFormat))), PgSubtransactionMode.Atomic) ? null : true;
+        }
+        catch (PgException)
+        {
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Checks whether a type exists here and its values can be read, which a shell or pseudo-type's can't.
+    /// </summary>
+    private static bool Readable(uint typoid)
+    {
+        unsafe
+        {
+            return NativeMethods.get_typisdefined(typoid) && NativeMethods.get_typtype(typoid) != (sbyte)'p';
+        }
+    }
+
     private static bool ColumnDropped(uint relid, string attname)
         => Worf.SelectCatalog("""
             SELECT 1 FROM worf.dropped_column d
@@ -229,6 +581,19 @@ internal static partial class RelCache
             """, SpiParameter.Create(relid), SpiParameter.Create(attname)).Count > 0;
 
     private const sbyte TriggerFiresOnOrigin = (sbyte)'O';
+
+    // F_UNIQUE_KEY_RECHECK from utils/fmgroids.h, the function of every deferrable constraint's recheck trigger.
+    private const uint UniqueKeyRecheck = 1250;
     private const sbyte TriggerDisabled = (sbyte)'D';
     private const int TriggerTypeRow = 1;
+    private const sbyte EnumType = (sbyte)'e';
+    private const sbyte RangeType = (sbyte)'r';
+    private const sbyte MultirangeType = (sbyte)'m';
+    private const sbyte CompositeType = (sbyte)'c';
+
+    // The OIDs of money and its array, also as type definitions write them.
+    private const uint MoneyOid = 790;
+    private const uint MoneyArrayOid = 791;
+    private const string MoneyOidText = "790";
+    private const string MoneyArrayOidText = "791";
 }

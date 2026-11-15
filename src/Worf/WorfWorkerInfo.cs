@@ -19,4 +19,16 @@ internal struct WorfWorkerInfo
     /// </summary>
     [FieldOffset(0)]
     public WorfSyncWorker Sync;
+
+    /// <summary>
+    /// The exchange worker's info.
+    /// </summary>
+    [FieldOffset(0)]
+    public WorfExchangeWorker Exchange;
+
+    /// <summary>
+    /// The switch worker's info.
+    /// </summary>
+    [FieldOffset(0)]
+    public WorfSwitchWorker Switch;
 }

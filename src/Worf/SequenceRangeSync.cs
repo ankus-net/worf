@@ -18,7 +18,7 @@ internal static class SequenceRangeSync
     internal static List<WorfManagedSequence> FetchManaged(string dsn, string name)
     {
         List<WorfManagedSequence> managed = [];
-        using PgReplicationConnection conn = Worf.Connect(dsn, name, "ranges");
+        using WorfConnection conn = Worf.Connect(dsn, name, "ranges");
         if (conn.Query("SELECT to_regclass('worf.sequence_range') IS NOT NULL", 1)[0][0] != "t")
         {
             return managed;
@@ -48,10 +48,10 @@ internal static class SequenceRangeSync
     /// <param name="managed">The sequences.</param>
     internal static void RecordForRestore(List<WorfManagedSequence> managed)
     {
-        _ = Spi.Execute("DELETE FROM worf.sequence_range_restore");
+        _ = Worf.Execute("DELETE FROM worf.sequence_range_restore");
         foreach (WorfManagedSequence sequence in managed)
         {
-            _ = Spi.Execute("INSERT INTO worf.sequence_range_restore VALUES ($1, $2, $3, $4, $5, $6, $7)", SpiParameter.Create(sequence.Name),
+            _ = Worf.Execute("INSERT INTO worf.sequence_range_restore VALUES ($1, $2, $3, $4, $5, $6, $7)", SpiParameter.Create(sequence.Name),
                 SpiParameter.Create(sequence.Owner), SpiParameter.Create(sequence.Epoch), SpiParameter.Create(sequence.RangeSize),
                 SpiParameter.Create(sequence.MaxRangeSize), SpiParameter.Create(sequence.RootStart), SpiParameter.Create(sequence.RootEnd));
         }
@@ -60,7 +60,7 @@ internal static class SequenceRangeSync
     /// <summary>
     /// Forgets the provider's managed sequences once the structure is restored.
     /// </summary>
-    internal static void ClearRestore() => _ = Spi.Execute("DELETE FROM worf.sequence_range_restore");
+    internal static void ClearRestore() => _ = Worf.Execute("DELETE FROM worf.sequence_range_restore");
 
     /// <summary>
     /// Joins this node to the provider's managed sequences that exist here, before rows are copied into the tables
@@ -76,15 +76,45 @@ internal static class SequenceRangeSync
         }
 
         foreach ((WorfManagedSequence sequence, uint seqoid) in managed
-            .Select(sequence => (sequence, Spi.ExecuteScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(sequence.Name)) ?? 0))
+            .Select(sequence => (sequence, Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(sequence.Name)) ?? 0))
             .Where(found => found.Item2 != 0 && !SequenceRanges.IsManaged(found.Item2) &&
                 (relid == 0 || SequenceRanges.UsingColumns(found.Item2).Exists(column => column.Relid == relid))))
         {
             SequenceRanges.JoinFromNeighbor(seqoid, sequence.Owner, sequence.Epoch, sequence.RangeSize, sequence.MaxRangeSize, sequence.RootStart,
-                sequence.RootEnd, node);
+                sequence.RootEnd, node, false);
         }
 
         SequenceRanges.ChangedOnCommit();
+    }
+
+    /// <summary>
+    /// Joins a sequence that this node creates under the name of a managed sequence it took part in, and dropped, to the
+    /// owner's epoch again, in the transaction that creates it, as when its table is dropped and created again, so that
+    /// it issues none of its own values, which other nodes' blocks hold, before its blocks come.
+    /// </summary>
+    internal static void JoinRecreated()
+    {
+        if (WorfNode.GetLocalNode(false, true) is not WorfLocalNode node)
+        {
+            return;
+        }
+
+        WorfRows listed = Worf.SelectCatalog(
+            "SELECT name, owner_node, epoch, range_size, max_range_size, root_start, root_end FROM worf.sequence_range_dropped WHERE NOT owned");
+        for (int i = 0; i < listed.Count; i++)
+        {
+            WorfRow row = listed[i];
+            if (Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(row.Get<string>(0))) is uint seqoid &&
+                !SequenceRanges.IsManaged(seqoid))
+            {
+                // Should the epoch turn out to be disabled before it draws a block, it stays parked, as the epoch's
+                // values may lie in other nodes' blocks, until a new epoch takes it in.
+                SequenceRanges.JoinFromNeighbor(seqoid, row.Get<uint>(1), row.Get<int>(2), row.Get<long>(3), row.Get<long>(4), row.Get<long?>(5),
+                    row.Get<long?>(6), node);
+                _ = Worf.Execute("DELETE FROM worf.sequence_range_dropped WHERE name = $1", SpiParameter.Create(row.Get<string>(0)));
+                SequenceRanges.ChangedOnCommit();
+            }
+        }
     }
 
     /// <summary>
@@ -98,16 +128,16 @@ internal static class SequenceRangeSync
             return;
         }
 
-        SpiResult listed = Worf.SelectCatalog(
+        WorfRows listed = Worf.SelectCatalog(
             "SELECT name, owner_node, epoch, range_size, max_range_size, root_start, root_end FROM worf.sequence_range_restore");
         for (int i = 0; i < listed.Count; i++)
         {
-            SpiRow row = listed[i];
-            if (Spi.ExecuteScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(row.Get<string>(0))) is uint seqoid &&
+            WorfRow row = listed[i];
+            if (Worf.ReadScalar<uint?>("SELECT to_regclass($1)::oid", SpiParameter.Create(row.Get<string>(0))) is uint seqoid &&
                 !SequenceRanges.IsManaged(seqoid))
             {
                 SequenceRanges.JoinFromNeighbor(seqoid, row.Get<uint>(1), row.Get<int>(2), row.Get<long>(3), row.Get<long>(4), row.Get<long?>(5),
-                    row.Get<long?>(6), node);
+                    row.Get<long?>(6), node, false);
             }
         }
     }

@@ -437,7 +437,7 @@ SELECT * FROM pg_stat_activity WHERE application_name LIKE 'worf%';
 SHOW worf.conflict_history_enabled;
 
 -- Check if partition exists for current month
-SELECT worf.conflict_history_ensure_partition(CURRENT_DATE);
+SELECT worf.conflict_history_ensure_partition();
 ```
 
 ### Loopback Occurring (Infinite Replication)

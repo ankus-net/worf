@@ -8,12 +8,18 @@ internal static unsafe class OutputProto
     /// <summary>
     /// Our native protocol and the greatest version we can support.
     /// </summary>
-    internal const int ProtoVersionNum = 1;
+    internal const int ProtoVersionNum = 2;
 
     /// <summary>
     /// The oldest protocol version we have backwards compatibility for.
     /// </summary>
     internal const int ProtoMinVersionNum = 1;
+
+    /// <summary>
+    /// The protocol version from which a RELATION message carries each column's type, which a client that asks for
+    /// values in PostgreSQL's internal format needs to read them.
+    /// </summary>
+    internal const int ColumnTypesVersionNum = 2;
 
     /// <summary>
     /// The startup parameter format, versioned separately to the rest of the wire protocol because we negotiate the

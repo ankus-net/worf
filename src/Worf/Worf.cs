@@ -1,5 +1,8 @@
+using System.Buffers;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Text;
+using System.Text.Unicode;
 using Ankus.Postgres;
 using Path = System.IO.Path;
 
@@ -11,6 +14,20 @@ namespace Worf;
 internal static partial class Worf
 {
     private const uint TextOid = 25;
+    private const uint NameOid = 19;
+    private const uint NameArrayOid = 1003;
+    private const uint TextArrayOid = 1009;
+    private const int NameDataLen = 64;
+    private const int AccessShareLock = 1;
+    private const ushort BtEqualStrategyNumber = 3;
+
+    // The unpaired surrogates that stand for the bytes of a SQL_ASCII name that aren't valid UTF-8, each the byte plus
+    // U+DC00, and the most bytes a character converts to and a palloc takes.
+    private const char EscapedFirst = '\uDC80';
+    private const char EscapedLast = '\uDCFF';
+    private const int EscapedBase = 0xDC00;
+    private const int MaxConversionGrowth = 4;
+    private const long MaxAllocSize = 0x3fffffff;
 
     /// <summary>
     /// The extension version.
@@ -30,7 +47,7 @@ internal static partial class Worf
     /// <summary>
     /// The newest protocol version this worf speaks.
     /// </summary>
-    internal const int MaxProtoVersionNum = 1;
+    internal const int MaxProtoVersionNum = 2;
 
     /// <summary>
     /// The name of the extension, its schema and its library.
@@ -42,7 +59,12 @@ internal static partial class Worf
     /// </summary>
     internal const string ReplicationOriginAll = "all";
 
+    private static readonly Dictionary<uint, Dictionary<short, string>> s_keyEqualityOperators = [];
     private static string s_tempDirectory = "";
+
+    // The conversions between the database encoding and UTF-8, once looked up.
+    private static unsafe FmgrInfo* s_toUtf8;
+    private static unsafe FmgrInfo* s_fromUtf8;
 
     /// <summary>
     /// Gets worf's synchronous commit value.
@@ -108,12 +130,17 @@ internal static partial class Worf
     }
 
     /// <summary>
-    /// Shortens a string as <see cref="ShortenHash(ReadOnlySpan{byte}, int)"/> does.
+    /// Shortens a string as <see cref="ShortenHash(ReadOnlySpan{byte}, int)"/> does, but cuts its start at a
+    /// character's boundary, so that it stays valid.
     /// </summary>
     /// <param name="str">The string.</param>
     /// <param name="maxlen">The maximum length in server encoding bytes.</param>
     /// <returns>The shortened string.</returns>
-    internal static string ShortenHash(string str, int maxlen) => FromServer(ShortenHash(ToServer(str), maxlen));
+    internal static string ShortenHash(string str, int maxlen)
+    {
+        byte[] bytes = ToServer(str);
+        return bytes.Length <= maxlen ? str : Truncate(str, maxlen - 8) + HashAny(bytes).ToString("x8", CultureInfo.InvariantCulture)[..7];
+    }
 
     /// <summary>
     /// Hashes bytes with PostgreSQL's <c>hash_any</c>.
@@ -137,56 +164,349 @@ internal static partial class Worf
     internal static uint HashAny(string value) => HashAny(ToServer(value));
 
     /// <summary>
-    /// Converts a string to the bytes the database encoding uses for it.
+    /// Converts a string to the bytes the database encoding uses for it, the bytes of a SQL_ASCII name that isn't valid
+    /// UTF-8 among them, which <see cref="FromServer(ReadOnlySpan{byte})"/> reads as unpaired surrogates.
     /// </summary>
     /// <param name="value">The string.</param>
     /// <returns>The bytes, without a terminator.</returns>
-    internal static unsafe byte[] ToServer(string value)
+    internal static byte[] ToServer(string value)
     {
+        int encoding = DatabaseEncoding;
+        if (encoding == (int)pg_enc.PG_SQL_ASCII && value.AsSpan().IndexOfAnyInRange(EscapedFirst, EscapedLast) >= 0)
+        {
+            return EncodeSqlAscii(value);
+        }
+
         byte[] utf8 = Encoding.UTF8.GetBytes(value);
-        if (NativeMethods.GetDatabaseEncoding() == (int)pg_enc.PG_UTF8 || utf8.Length == 0)
+        if (encoding is (int)pg_enc.PG_UTF8 or (int)pg_enc.PG_SQL_ASCII || Ascii.IsValid(utf8))
         {
             return utf8;
         }
 
-        fixed (byte* input = utf8)
-        {
-            sbyte* converted = NativeMethods.pg_any_to_server((sbyte*)input, utf8.Length, (int)pg_enc.PG_UTF8);
-            if (converted == (sbyte*)input)
-            {
-                return utf8;
-            }
-
-            byte[] result = new ReadOnlySpan<byte>(converted, StrLen(converted)).ToArray();
-            NativeMethods.pfree(converted);
-            return result;
-        }
+        return ConvertEncoding(utf8, encoding, false);
     }
 
     /// <summary>
-    /// Converts bytes in the database encoding to a string.
+    /// Cuts a string to the longest start whose bytes in the database encoding fit, at a character's boundary, so that
+    /// they stay valid: PostgreSQL checks a SQL_ASCII database's bytes as UTF-8 as it converts them, and can't tell
+    /// where its characters end.
+    /// </summary>
+    /// <param name="value">The string.</param>
+    /// <param name="maxBytes">The most bytes the start may take.</param>
+    /// <returns>The start.</returns>
+    internal static string Truncate(string value, int maxBytes)
+    {
+        int fits = 0;
+        int over = Math.Min(value.Length, maxBytes) + 1;
+        while (over - fits > 1)
+        {
+            int mid = (fits + over) / 2;
+            if (ToServer(value[..mid]).Length <= maxBytes)
+            {
+                fits = mid;
+            }
+            else
+            {
+                over = mid;
+            }
+        }
+
+        if (fits > 0 && fits < value.Length && char.IsLowSurrogate(value[fits]))
+        {
+            fits--;
+        }
+
+        return value[..fits];
+    }
+
+    /// <summary>
+    /// Converts bytes in the database encoding to a string. A SQL_ASCII database's bytes have no encoding, and are
+    /// read as UTF-8, where each byte that isn't reads as an unpaired surrogate from U+DC80 to U+DCFF, as Ankus reads
+    /// such a name, so that a name, which PostgreSQL never checks, goes back to the database byte for byte through
+    /// <see cref="ToServer"/>. A message shows such a byte as U+FFFD, through <see cref="Shown"/>.
     /// </summary>
     /// <param name="value">The bytes, without a terminator.</param>
     /// <returns>The string.</returns>
-    internal static unsafe string FromServer(ReadOnlySpan<byte> value)
+    internal static string FromServer(ReadOnlySpan<byte> value)
     {
-        if (NativeMethods.GetDatabaseEncoding() == (int)pg_enc.PG_UTF8 || value.Length == 0)
+        int encoding = DatabaseEncoding;
+        if (encoding == (int)pg_enc.PG_UTF8 || Ascii.IsValid(value))
         {
             return Encoding.UTF8.GetString(value);
         }
 
-        fixed (byte* input = value)
+        if (encoding == (int)pg_enc.PG_SQL_ASCII)
         {
-            sbyte* converted = NativeMethods.pg_server_to_any((sbyte*)input, value.Length, (int)pg_enc.PG_UTF8);
-            if (converted == (sbyte*)input)
+            return DecodeSqlAscii(value);
+        }
+
+        return Encoding.UTF8.GetString(ConvertEncoding(value, encoding, true));
+    }
+
+    /// <summary>
+    /// Shows a string in a message: the bytes of a SQL_ASCII name that isn't valid UTF-8, which the string holds as
+    /// unpaired surrogates, as U+FFFD, as a message that PostgreSQL converts to UTF-8 would.
+    /// </summary>
+    /// <param name="value">The string, or null.</param>
+    /// <returns>The string to show.</returns>
+    [return: NotNullIfNotNull(nameof(value))]
+    internal static string? Shown(string? value)
+    {
+        if (value is null || value.AsSpan().IndexOfAnyInRange(EscapedFirst, EscapedLast) < 0)
+        {
+            return value;
+        }
+
+        return string.Create(value.Length, value, static (span, value) =>
+        {
+            for (int i = 0; i < value.Length; i++)
             {
-                return Encoding.UTF8.GetString(value);
+                span[i] = value[i] is >= EscapedFirst and <= EscapedLast ? '\uFFFD' : value[i];
+            }
+        });
+    }
+
+    /// <summary>
+    /// Checks whether a string holds the bytes of a SQL_ASCII name that isn't valid UTF-8, which only reach the
+    /// database exactly as bytes.
+    /// </summary>
+    /// <param name="value">The string.</param>
+    /// <returns>Whether it holds such bytes.</returns>
+    internal static bool HoldsUntranslatable(string? value)
+        => value is not null && value.AsSpan().IndexOfAnyInRange(EscapedFirst, EscapedLast) >= 0;
+
+    private static int DatabaseEncoding
+    {
+        get
+        {
+            unsafe
+            {
+                return NativeMethods.GetDatabaseEncoding();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Gets whether the database encoding converts to UTF-8, as neither UTF-8 nor SQL_ASCII does.
+    /// </summary>
+    internal static bool ConvertsEncoding => DatabaseEncoding is not ((int)pg_enc.PG_UTF8 or (int)pg_enc.PG_SQL_ASCII);
+
+    /// <summary>
+    /// Reads a value another node sent in binary with its type's receive function, as <c>OidReceiveFunctionCall</c>
+    /// does, reading text in the database encoding, which the other node sends it in, as PostgreSQL's apply worker
+    /// reads it, whatever the worker's client encoding.
+    /// </summary>
+    /// <param name="typreceive">The receive function.</param>
+    /// <param name="buf">The value's bytes.</param>
+    /// <param name="typioparam">The type's I/O parameter.</param>
+    /// <param name="typmod">The typmod.</param>
+    /// <returns>The value.</returns>
+    internal static unsafe ulong ReceiveValue(uint typreceive, StringInfoData* buf, uint typioparam, int typmod)
+    {
+        int client = InDatabaseEncoding();
+        try
+        {
+            return NativeMethods.OidReceiveFunctionCall(typreceive, buf, typioparam, typmod);
+        }
+        finally
+        {
+            RestoreClientEncoding(client);
+        }
+    }
+
+    /// <summary>
+    /// Reads a value another node sent in binary with a receive function looked up, as
+    /// <see cref="ReceiveValue(uint, StringInfoData*, uint, int)"/> does.
+    /// </summary>
+    /// <param name="receive">The receive function.</param>
+    /// <param name="buf">The value's bytes.</param>
+    /// <param name="typioparam">The type's I/O parameter.</param>
+    /// <param name="typmod">The typmod.</param>
+    /// <returns>The value.</returns>
+    internal static unsafe ulong ReceiveValue(FmgrInfo* receive, StringInfoData* buf, uint typioparam, int typmod)
+    {
+        int client = InDatabaseEncoding();
+        try
+        {
+            return NativeMethods.ReceiveFunctionCall(receive, buf, typioparam, typmod);
+        }
+        finally
+        {
+            RestoreClientEncoding(client);
+        }
+    }
+
+    /// <summary>
+    /// Has the client encoding take no conversion while receive functions read text another node sent, which is in the
+    /// database encoding, as in the transactions apply runs, and returns the one it was.
+    /// </summary>
+    /// <returns>The client encoding to restore with <see cref="RestoreClientEncoding"/>.</returns>
+    internal static int InDatabaseEncoding()
+    {
+        unsafe
+        {
+            int client = NativeMethods.pg_get_client_encoding();
+            if (client != (int)pg_enc.PG_SQL_ASCII && client != DatabaseEncoding)
+            {
+                _ = NativeMethods.SetClientEncoding((int)pg_enc.PG_SQL_ASCII);
             }
 
-            string result = Encoding.UTF8.GetString(new ReadOnlySpan<byte>(converted, StrLen(converted)));
-            NativeMethods.pfree(converted);
-            return result;
+            return client;
         }
+    }
+
+    /// <summary>
+    /// Restores the client encoding <see cref="InDatabaseEncoding"/> found, whose conversion PostgreSQL keeps.
+    /// </summary>
+    /// <param name="client">The client encoding.</param>
+    internal static void RestoreClientEncoding(int client)
+    {
+        unsafe
+        {
+            if (NativeMethods.pg_get_client_encoding() != client)
+            {
+                _ = NativeMethods.SetClientEncoding(client);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Looks up the conversions between the database encoding and UTF-8 once, in a transaction, so that strings convert
+    /// outside one too, as between a worker's transactions, as PostgreSQL keeps those between the database and client
+    /// encodings.
+    /// </summary>
+    internal static unsafe void PrepareEncodingConversions()
+    {
+        int encoding = NativeMethods.GetDatabaseEncoding();
+        if (encoding is (int)pg_enc.PG_UTF8 or (int)pg_enc.PG_SQL_ASCII || s_toUtf8 is not null || !NativeMethods.IsTransactionState())
+        {
+            return;
+        }
+
+        uint toUtf8 = NativeMethods.FindDefaultConversionProc(encoding, (int)pg_enc.PG_UTF8);
+        uint fromUtf8 = NativeMethods.FindDefaultConversionProc((int)pg_enc.PG_UTF8, encoding);
+        if (toUtf8 == 0 || fromUtf8 == 0)
+        {
+            return;
+        }
+
+        FmgrInfo* to = (FmgrInfo*)NativeMethods.MemoryContextAllocZero(NativeGlobals.TopMemoryContext, (ulong)sizeof(FmgrInfo));
+        FmgrInfo* from = (FmgrInfo*)NativeMethods.MemoryContextAllocZero(NativeGlobals.TopMemoryContext, (ulong)sizeof(FmgrInfo));
+        NativeMethods.fmgr_info_cxt(toUtf8, to, NativeGlobals.TopMemoryContext);
+        NativeMethods.fmgr_info_cxt(fromUtf8, from, NativeGlobals.TopMemoryContext);
+        s_toUtf8 = to;
+        s_fromUtf8 = from;
+    }
+
+    /// <summary>
+    /// Converts bytes between the database encoding and UTF-8 with the conversion <see cref="PrepareEncodingConversions"/>
+    /// looked up, as perform_default_encoding_conversion does, or, before it has, with pg_server_to_any or
+    /// pg_any_to_server, which look it up in the catalog.
+    /// </summary>
+    private static unsafe byte[] ConvertEncoding(ReadOnlySpan<byte> value, int encoding, bool toUtf8)
+    {
+        PrepareEncodingConversions();
+        int from = toUtf8 ? encoding : (int)pg_enc.PG_UTF8;
+        int to = toUtf8 ? (int)pg_enc.PG_UTF8 : encoding;
+        fixed (byte* input = value)
+        {
+            byte empty = 0;
+            byte* source = input is null ? &empty : input;
+
+            // PrepareEncodingConversions looks both up, or neither.
+            if (s_toUtf8 is null)
+            {
+                sbyte* converted = toUtf8
+                    ? NativeMethods.pg_server_to_any((sbyte*)source, value.Length, (int)pg_enc.PG_UTF8)
+                    : NativeMethods.pg_any_to_server((sbyte*)source, value.Length, (int)pg_enc.PG_UTF8);
+                if (converted == (sbyte*)source)
+                {
+                    return value.ToArray();
+                }
+
+                byte[] bytes = new ReadOnlySpan<byte>(converted, StrLen(converted)).ToArray();
+                NativeMethods.pfree(converted);
+                return bytes;
+            }
+
+            // Each character takes at most four bytes, as MAX_CONVERSION_GROWTH allows.
+            if ((long)value.Length * MaxConversionGrowth >= MaxAllocSize)
+            {
+                throw new PgException(PgSqlStates.ProgramLimitExceeded, "out of memory",
+                    detail: $"String of {value.Length} bytes is too long for encoding conversion.");
+            }
+
+            byte* result = (byte*)NativeMethods.palloc(((ulong)value.Length * MaxConversionGrowth) + 1);
+            try
+            {
+                _ = NativeMethods.FunctionCall6Coll(toUtf8 ? s_toUtf8 : s_fromUtf8, 0, (ulong)from, (ulong)to, (ulong)source, (ulong)result, (ulong)value.Length, 0);
+                return new ReadOnlySpan<byte>(result, StrLen((sbyte*)result)).ToArray();
+            }
+            finally
+            {
+                NativeMethods.pfree(result);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Reads a SQL_ASCII database's bytes as UTF-8, each byte that isn't as an unpaired surrogate.
+    /// </summary>
+    private static string DecodeSqlAscii(ReadOnlySpan<byte> value)
+    {
+        if (Utf8.IsValid(value))
+        {
+            return Encoding.UTF8.GetString(value);
+        }
+
+        StringBuilder result = new(value.Length);
+        Span<char> chars = stackalloc char[2];
+        while (!value.IsEmpty)
+        {
+            if (Rune.DecodeFromUtf8(value, out Rune rune, out int consumed) == OperationStatus.Done)
+            {
+                _ = result.Append(chars[..rune.EncodeToUtf16(chars)]);
+                value = value[consumed..];
+            }
+            else
+            {
+                _ = result.Append((char)(EscapedBase + value[0]));
+                value = value[1..];
+            }
+        }
+
+        return result.ToString();
+    }
+
+    /// <summary>
+    /// Writes a string as a SQL_ASCII database's bytes: each unpaired surrogate that stands for a byte as that byte, and
+    /// the rest as UTF-8.
+    /// </summary>
+    private static byte[] EncodeSqlAscii(string value)
+    {
+        List<byte> bytes = new(value.Length);
+        Span<byte> rune = stackalloc byte[4];
+        for (int i = 0; i < value.Length; i++)
+        {
+            char c = value[i];
+            if (c is >= EscapedFirst and <= EscapedLast)
+            {
+                bytes.Add((byte)(c - EscapedBase));
+                continue;
+            }
+
+            if (char.IsHighSurrogate(c) && i + 1 < value.Length && char.IsLowSurrogate(value[i + 1]))
+            {
+                int length = new Rune(c, value[++i]).EncodeToUtf8(rune);
+                bytes.AddRange(rune[..length]);
+                continue;
+            }
+
+            int written = (char.IsSurrogate(c) ? Rune.ReplacementChar : new Rune(c)).EncodeToUtf8(rune);
+            bytes.AddRange(rune[..written]);
+        }
+
+        return [.. bytes];
     }
 
     /// <summary>
@@ -195,6 +515,36 @@ internal static partial class Worf
     /// <param name="value">The C string.</param>
     /// <returns>The string.</returns>
     internal static unsafe string FromServer(sbyte* value) => FromServer(new ReadOnlySpan<byte>(value, StrLen(value)));
+
+    /// <summary>
+    /// Converts a value's text in the database encoding to a string for a log, keeping a SQL_ASCII database's bytes
+    /// that aren't valid UTF-8 as <see cref="FromServer(ReadOnlySpan{byte})"/> does, so that they go into the log's
+    /// JSON byte for byte through <see cref="TextParameter"/>, as <c>to_jsonb</c> keeps them in such a database.
+    /// </summary>
+    /// <param name="value">The bytes, without a terminator.</param>
+    /// <returns>The string.</returns>
+    internal static string LoggedText(ReadOnlySpan<byte> value) => FromServer(value);
+
+    /// <summary>
+    /// Checks whether bytes in the database encoding are a SQL_ASCII database's that aren't valid UTF-8.
+    /// </summary>
+    internal static bool NotUtf8InSqlAscii(ReadOnlySpan<byte> value)
+    {
+        int encoding;
+        unsafe
+        {
+            encoding = NativeMethods.GetDatabaseEncoding();
+        }
+
+        return encoding == (int)pg_enc.PG_SQL_ASCII && !Utf8.IsValid(value);
+    }
+
+    /// <summary>
+    /// Converts a value's terminated text in the database encoding to a string for a log, as the other overload does.
+    /// </summary>
+    /// <param name="value">The C string.</param>
+    /// <returns>The string.</returns>
+    internal static unsafe string LoggedText(sbyte* value) => LoggedText(new ReadOnlySpan<byte>(value, StrLen(value)));
 
     /// <summary>
     /// Converts a string to a terminated C string in the database encoding.
@@ -210,7 +560,65 @@ internal static partial class Worf
     }
 
     /// <summary>
-    /// Gets the replication origin of this session, <c>replorigin_session_origin</c>.
+    /// Widens a transaction id from the last two billion to its full, 64-bit id.
+    /// </summary>
+    /// <param name="xid">The transaction id.</param>
+    /// <returns>The full transaction id.</returns>
+    internal static ulong FullTransactionId(uint xid)
+    {
+        ulong next = NextFullTransactionId;
+        ulong epoch = next >> 32;
+        return ((xid <= (uint)next || epoch == 0 ? epoch : epoch - 1) << 32) | xid;
+    }
+
+    /// <summary>
+    /// Gets the full id that the next transaction to need one is given, above every id given so far.
+    /// </summary>
+    internal static ulong NextFullTransactionId
+    {
+        get
+        {
+            unsafe
+            {
+                return NativeMethods.ReadNextFullTransactionId().value;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Gets the full id of the oldest transaction whose commit timestamp and origin PostgreSQL still keeps, or the next
+    /// transaction's when it keeps none, as with <c>track_commit_timestamp</c> off. Vacuum moves it on as it truncates
+    /// <c>pg_commit_ts</c>, which can be well after the transactions are frozen.
+    /// </summary>
+    internal static ulong OldestCommitTsFullTransactionId
+    {
+        get
+        {
+            uint oldest;
+            unsafe
+            {
+#if ANKUS_PG15 || ANKUS_PG16
+                oldest = NativeGlobals.ShmemVariableCache->oldestCommitTsXid;
+#else
+                oldest = NativeGlobals.TransamVariables->oldestCommitTsXid;
+#endif
+            }
+
+            return oldest == 0 ? NextFullTransactionId : FullTransactionId(oldest);
+        }
+    }
+
+    /// <summary>
+    /// Gets the full id of this database's <c>datfrozenxid</c>, before which vacuum has frozen every row in its tables.
+    /// Vacuum moves it on as it freezes them.
+    /// </summary>
+    internal static ulong DatabaseFrozenFullTransactionId
+        => FullTransactionId((uint)ReadScalar<long>(
+            "SELECT datfrozenxid::text::bigint FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database()"));
+
+    /// <summary>
+    /// Gets or sets the replication origin of this session, <c>replorigin_session_origin</c>, which the records the
+    /// session writes carry.
     /// </summary>
     internal static ushort ReploriginSessionOrigin
     {
@@ -222,6 +630,18 @@ internal static partial class Worf
                 return NativeGlobals.DangerousAddressOf_replorigin_xact_state()->origin;
 #else
                 return NativeGlobals.replorigin_session_origin;
+#endif
+            }
+        }
+
+        set
+        {
+            unsafe
+            {
+#if ANKUS_PG19
+                NativeGlobals.DangerousAddressOf_replorigin_xact_state()->origin = value;
+#else
+                NativeGlobals.replorigin_session_origin = value;
 #endif
             }
         }
@@ -336,6 +756,44 @@ internal static partial class Worf
         NativeGlobals.CurrentMemoryContext = context;
         return old;
     }
+
+    /// <summary>
+    /// Runs work in a memory context of its own under the current one, deleted as the work ends. In a subtransaction,
+    /// that leaves the subtransaction's own context empty, which PostgreSQL then frees as it commits rather than keep it
+    /// until the transaction ends, as it would for each of many subtransactions.
+    /// </summary>
+    /// <param name="work">The work.</param>
+    /// <returns>What the work returns, which mustn't point into its context.</returns>
+    internal static unsafe T InOwnContext<T>(Func<T> work)
+    {
+        MemoryContextData* context;
+        fixed (byte* name = "worf work\0"u8)
+        {
+            // The name is static, as a memory context's has to be.
+            context = NativeMethods.AllocSetContextCreateInternal(NativeGlobals.CurrentMemoryContext, (sbyte*)name, 0, 8 * 1024, 8 * 1024 * 1024);
+        }
+
+        MemoryContextData* oldcontext = MemoryContextSwitchTo(context);
+        try
+        {
+            return work();
+        }
+        finally
+        {
+            _ = MemoryContextSwitchTo(oldcontext);
+            NativeMethods.MemoryContextDelete(context);
+        }
+    }
+
+    /// <summary>
+    /// Runs work in a memory context of its own under the current one, deleted as the work ends.
+    /// </summary>
+    /// <param name="work">The work.</param>
+    internal static void InOwnContext(Action work) => _ = InOwnContext(() =>
+    {
+        work();
+        return 0;
+    });
 
     /// <summary>
     /// Copies a string into the current memory context in the database encoding, as <c>pstrdup</c> does.
@@ -578,22 +1036,726 @@ internal static partial class Worf
 
     /// <summary>
     /// Selects rows from our catalog tables with the latest snapshot, as the C's catalog scans without a snapshot do,
-    /// so a read after waiting for a lock sees what the lock's holder committed.
+    /// so a read after waiting for a lock sees what the lock's holder committed. The query runs read-only, as SPI then
+    /// takes the snapshot pushed for it, rather than the transaction's, which in REPEATABLE READ is its first; and as a
+    /// writable query does, it sees what the transaction itself wrote before it.
     /// </summary>
     /// <param name="commandText">The query.</param>
     /// <param name="parameters">The query's parameters.</param>
     /// <returns>The rows.</returns>
-    internal static unsafe SpiResult SelectCatalog(string commandText, params ReadOnlySpan<SpiParameter> parameters)
+    internal static unsafe WorfRows SelectCatalog(string commandText, params ReadOnlySpan<SpiParameter> parameters)
     {
+        int nestLevel = PinSearchPath();
+        NativeMethods.CommandCounterIncrement();
         NativeMethods.PushActiveSnapshot(NativeMethods.GetLatestSnapshot());
         try
         {
-            return Spi.Select(commandText, parameters);
+            return NeedsExact(commandText, parameters)
+                ? RunExact(commandText, true, 0, parameters)
+                : new WorfRows(PlanCache.Get(commandText, parameters) is SpiPreparedStatement plan
+                    ? plan.Query(true, 0, parameters)
+                    : Spi.Query(commandText, true, 0, parameters));
         }
         finally
         {
             NativeMethods.PopActiveSnapshot();
+            UnpinSearchPath(nestLevel);
         }
+    }
+
+    // WAL_LEVEL_LOGICAL, which every supported version numbers 2.
+    private const int WalLevelLogical = 2;
+
+    // pg_depend and pg_class, which every supported version numbers so.
+    private const uint DependRelationId = 2608;
+    private const uint RelationRelationId = 1259;
+
+    // Whether this transaction writes the change EndForDecoding writes as it's prepared.
+    private static bool s_markOnPrepare;
+
+    /// <summary>
+    /// Ends the work of a subtransaction that changed the catalogs with a record logical decoding takes a base snapshot
+    /// from, in every database: the invalidations its last command left are logged first, as the end of a command logs
+    /// them, and then a row of pg_depend is inserted and deleted, so that a change is the subtransaction's last record.
+    /// Decoding that starts again inside a subtransaction takes it as a transaction of its own, and executes its
+    /// invalidations only once a change after that point has given it a base snapshot; an assert-enabled build aborts on
+    /// one whose records after that point are invalidations alone, as after an index build or ANALYZE, whose inplace
+    /// updates of the catalog it doesn't decode. Decoding takes a base snapshot from a heap change of any database and
+    /// any origin before it leaves out another database's or origin's changes, as it doesn't from a logical message of
+    /// another database, which a slot in another database of the server, as a provider's beside its subscriber's, then
+    /// aborts on. pg_depend is a catalog, so no publication or output plugin sends its changes and no replica identity
+    /// applies, and no syscache holds it, so the insert adds only an invalidation of catalog snapshots, which comes before
+    /// the delete; the row is deleted as it's inserted, so no session ever sees it. A top-level transaction needs none as
+    /// it commits, as decoding gives one that changed the catalogs a base snapshot then, but one that is prepared gets the
+    /// same change just before PREPARE TRANSACTION, as decoding that passes over a PREPARE executes its invalidations only
+    /// with a snapshot too. A subtransaction that wrote nothing needs none, nor does a server that writes no logical WAL.
+    /// Every utility statement that may change the catalogs ends so, as SPI runs one in a subtransaction, and so does
+    /// worf's work that changes them otherwise; the change is written where it's called, as a subtransaction's callbacks
+    /// don't run for every subtransaction.
+    /// </summary>
+    internal static void EndForDecoding()
+    {
+        int nestLevel;
+        unsafe
+        {
+            if (NativeGlobals.wal_level < WalLevelLogical)
+            {
+                return;
+            }
+
+            nestLevel = NativeMethods.GetCurrentTransactionNestLevel();
+        }
+
+        if (nestLevel > 1)
+        {
+            MarkIfWritten();
+        }
+        else if (!s_markOnPrepare)
+        {
+            s_markOnPrepare = true;
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.PrePrepare, MarkIfWritten);
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, static () => s_markOnPrepare = false);
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () => s_markOnPrepare = false);
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, static () => s_markOnPrepare = false);
+        }
+    }
+
+    // Marks the current subtransaction, or the transaction about to be prepared, for decoding, if it wrote anything.
+    private static void MarkIfWritten()
+    {
+        bool written;
+        unsafe
+        {
+            written = NativeMethods.GetCurrentTransactionIdIfAny() != 0;
+        }
+
+        if (written)
+        {
+            MarkForDecoding();
+        }
+    }
+
+    // Logs the invalidations the last command left, and inserts and deletes a row of pg_depend.
+    private static unsafe void MarkForDecoding()
+    {
+        NativeMethods.CommandCounterIncrement();
+        RelationData* depend = NativeMethods.table_open(DependRelationId, (int)PgLockMode.RowExclusive);
+        ulong* values = stackalloc ulong[7];
+        bool* nulls = stackalloc bool[7];
+        new Span<ulong>(values, 7).Clear();
+        new Span<bool>(nulls, 7).Clear();
+        values[0] = RelationRelationId;
+        values[3] = RelationRelationId;
+        values[6] = (byte)'n';
+        HeapTupleData* row = NativeMethods.heap_form_tuple(depend->rd_att, values, nulls);
+        try
+        {
+            NativeMethods.CatalogTupleInsert(depend, row);
+            NativeMethods.CommandCounterIncrement();
+            NativeMethods.CatalogTupleDelete(depend, &row->t_self);
+        }
+        finally
+        {
+            NativeMethods.heap_freetuple(row);
+        }
+
+        NativeMethods.table_close(depend, (int)PgLockMode.RowExclusive);
+    }
+
+    /// <summary>
+    /// Selects rows with the snapshot a statement of the transaction takes, as SPI's writable helpers do, without
+    /// assigning the transaction an ID as they do even for a SELECT: an idle worker then writes no commit records, and
+    /// a read before DROP INDEX CONCURRENTLY leaves it the first action in its transaction.
+    /// </summary>
+    /// <param name="commandText">The query.</param>
+    /// <param name="limit">The most rows to return, or zero for all.</param>
+    /// <param name="parameters">The query's parameters.</param>
+    /// <returns>The rows.</returns>
+    internal static unsafe WorfRows Read(string commandText, int limit, params ReadOnlySpan<SpiParameter> parameters)
+    {
+        int nestLevel = PinSearchPath();
+        NativeMethods.PushActiveSnapshot(NativeMethods.GetTransactionSnapshot());
+        try
+        {
+            return NeedsExact(commandText, parameters)
+                ? RunExact(commandText, true, limit, parameters)
+                : new WorfRows(PlanCache.Get(commandText, parameters) is SpiPreparedStatement plan
+                    ? plan.Select(limit, parameters)
+                    : Spi.Select(commandText, limit, parameters));
+        }
+        finally
+        {
+            NativeMethods.PopActiveSnapshot();
+            UnpinSearchPath(nestLevel);
+        }
+    }
+
+    /// <summary>
+    /// Runs a read-only query of worf's as <see cref="Spi.Select(string, ReadOnlySpan{SpiParameter})"/> does, with the
+    /// search path <see cref="PinSearchPath"/> sets.
+    /// </summary>
+    /// <param name="commandText">The query.</param>
+    /// <param name="parameters">The query's parameters.</param>
+    /// <returns>The rows.</returns>
+    internal static WorfRows Select(string commandText, params ReadOnlySpan<SpiParameter> parameters)
+    {
+        int nestLevel = PinSearchPath();
+        try
+        {
+            return NeedsExact(commandText, parameters)
+                ? RunExact(commandText, true, 0, parameters)
+                : new WorfRows(PlanCache.Get(commandText, parameters) is SpiPreparedStatement plan
+                    ? plan.Select(parameters)
+                    : Spi.Select(commandText, parameters));
+        }
+        finally
+        {
+            UnpinSearchPath(nestLevel);
+        }
+    }
+
+    /// <summary>
+    /// Runs a statement of worf's as <see cref="Spi.Execute(string, ReadOnlySpan{SpiParameter})"/> does, with the search
+    /// path <see cref="PinSearchPath"/> sets.
+    /// </summary>
+    /// <param name="commandText">The statement.</param>
+    /// <param name="parameters">The statement's parameters.</param>
+    /// <returns>The number of rows it processed.</returns>
+    internal static long Execute(string commandText, params ReadOnlySpan<SpiParameter> parameters)
+    {
+        int nestLevel = PinSearchPath();
+        try
+        {
+            return ExecuteUnpinned(commandText, parameters);
+        }
+        finally
+        {
+            UnpinSearchPath(nestLevel);
+        }
+    }
+
+    /// <summary>
+    /// Runs a statement under the session's search path, as SQL that fires a user's triggers does, as
+    /// <see cref="Spi.Execute(string, ReadOnlySpan{SpiParameter})"/> does.
+    /// </summary>
+    /// <param name="commandText">The statement.</param>
+    /// <param name="parameters">The statement's parameters.</param>
+    /// <returns>The number of rows it processed.</returns>
+    internal static long ExecuteUnpinned(string commandText, params ReadOnlySpan<SpiParameter> parameters)
+        => NeedsExact(commandText, parameters)
+            ? RunExact(commandText, false, 0, parameters).RowsAffected
+            : PlanCache.Get(commandText, parameters) is SpiPreparedStatement plan
+                ? plan.Execute(parameters)
+                : Spi.Execute(commandText, parameters);
+
+    /// <summary>
+    /// Runs a statement of worf's as <see cref="Spi.Execute(SpiCommand)"/> does, with the search path
+    /// <see cref="PinSearchPath"/> sets.
+    /// </summary>
+    /// <param name="command">The statement.</param>
+    /// <returns>The number of rows it processed.</returns>
+    internal static long Execute(SpiCommand command) => Execute(command.CommandText, command.Parameters);
+
+    /// <summary>
+    /// Runs a query of worf's as <see cref="Spi.Query(string, bool, int, ReadOnlySpan{SpiParameter})"/> does, with the
+    /// search path <see cref="PinSearchPath"/> sets.
+    /// </summary>
+    /// <param name="commandText">The query.</param>
+    /// <param name="readOnly">Whether it only reads.</param>
+    /// <param name="limit">The most rows to return, or zero for all.</param>
+    /// <param name="parameters">The query's parameters.</param>
+    /// <returns>The rows.</returns>
+    internal static WorfRows Query(string commandText, bool readOnly, int limit, params ReadOnlySpan<SpiParameter> parameters)
+    {
+        int nestLevel = PinSearchPath();
+        try
+        {
+            return NeedsExact(commandText, parameters)
+                ? RunExact(commandText, readOnly, limit, parameters)
+                : new WorfRows(PlanCache.Get(commandText, parameters) is SpiPreparedStatement plan
+                    ? plan.Query(readOnly, limit, parameters)
+                    : Spi.Query(commandText, readOnly, limit, parameters));
+        }
+        finally
+        {
+            UnpinSearchPath(nestLevel);
+        }
+    }
+
+    /// <summary>
+    /// Runs a query of worf's as <see cref="Spi.Query(string, ReadOnlySpan{SpiParameter})"/> does, with the search path
+    /// <see cref="PinSearchPath"/> sets.
+    /// </summary>
+    /// <param name="commandText">The query.</param>
+    /// <param name="parameters">The query's parameters.</param>
+    /// <returns>The rows.</returns>
+    internal static WorfRows Query(string commandText, params ReadOnlySpan<SpiParameter> parameters)
+        => Query(commandText, false, 0, parameters);
+
+    /// <summary>
+    /// Runs a query of worf's as <see cref="Spi.Query(SpiCommand, bool, int)"/> does, with the search path
+    /// <see cref="PinSearchPath"/> sets.
+    /// </summary>
+    /// <param name="command">The query.</param>
+    /// <param name="readOnly">Whether it only reads.</param>
+    /// <param name="limit">The most rows to return, or zero for all.</param>
+    /// <returns>The rows.</returns>
+    internal static WorfRows Query(SpiCommand command, bool readOnly, int limit)
+        => Query(command.CommandText, readOnly, limit, command.Parameters);
+
+    /// <summary>
+    /// Runs a query of worf's as <see cref="Spi.ExecuteScalar{T}(string, ReadOnlySpan{SpiParameter})"/> does, with the
+    /// search path <see cref="PinSearchPath"/> sets.
+    /// </summary>
+    /// <typeparam name="T">The column's managed type.</typeparam>
+    /// <param name="commandText">The query.</param>
+    /// <param name="parameters">The query's parameters.</param>
+    /// <returns>The first column of the first row.</returns>
+    internal static T? ExecuteScalar<[PgConvertible] T>(string commandText, params ReadOnlySpan<SpiParameter> parameters)
+    {
+        WorfRows rows = Query(commandText, false, 0, parameters);
+        return rows.Count == 0 ? default : rows[0].Get<T>(0);
+    }
+
+    /// <summary>
+    /// Makes the options of a <c>COPY FROM</c> of a copy that another node sends, whose text is in the database
+    /// encoding, as the connection's client encoding asks, whatever this session's client encoding is.
+    /// </summary>
+    /// <returns>The options.</returns>
+    internal static unsafe List* CopyFromOptions()
+    {
+        fixed (byte* encoding = "encoding\0"u8)
+        {
+            Node* value = (Node*)NativeMethods.makeString(NativeMethods.pstrdup(NativeMethods.GetDatabaseEncodingName()));
+            return NativeMethods.lappend(null, NativeMethods.makeDefElem(NativeMethods.pstrdup((sbyte*)encoding), value, -1));
+        }
+    }
+
+    /// <summary>
+    /// Quotes an identifier as <see cref="Spi.QuoteIdentifier(string)"/> does, or, when it holds the bytes of a
+    /// SQL_ASCII name that aren't valid UTF-8, which Ankus refuses, always, as quote_identifier quotes a name that needs
+    /// it, for SQL that then runs with its bytes exact.
+    /// </summary>
+    /// <param name="identifier">The identifier.</param>
+    /// <returns>The quoted identifier.</returns>
+    internal static string QuoteIdentifier(string identifier)
+        => HoldsUntranslatable(identifier) ? "\"" + identifier.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"" : Spi.QuoteIdentifier(identifier);
+
+    /// <summary>
+    /// Quotes a schema-qualified name as <see cref="Spi.QuoteQualifiedIdentifier(string, string)"/> does, quoting each
+    /// part as <see cref="QuoteIdentifier"/> does.
+    /// </summary>
+    /// <param name="qualifier">The schema.</param>
+    /// <param name="identifier">The name.</param>
+    /// <returns>The quoted name.</returns>
+    internal static string QuoteQualifiedIdentifier(string qualifier, string identifier)
+        => HoldsUntranslatable(qualifier) || HoldsUntranslatable(identifier)
+            ? QuoteIdentifier(qualifier) + "." + QuoteIdentifier(identifier)
+            : Spi.QuoteQualifiedIdentifier(qualifier, identifier);
+
+    /// <summary>
+    /// Quotes a literal as <see cref="Spi.QuoteLiteral(string)"/> does, or, when it holds the bytes of a SQL_ASCII name
+    /// that aren't valid UTF-8, as quote_literal does, for SQL that then runs with its bytes exact.
+    /// </summary>
+    /// <param name="literal">The literal.</param>
+    /// <returns>The quoted literal.</returns>
+    internal static string QuoteLiteral(string literal)
+    {
+        if (!HoldsUntranslatable(literal))
+        {
+            return Spi.QuoteLiteral(literal);
+        }
+
+        string quoted = literal.Replace("'", "''", StringComparison.Ordinal);
+        return literal.Contains('\\', StringComparison.Ordinal)
+            ? "E'" + quoted.Replace("\\", "\\\\", StringComparison.Ordinal) + "'"
+            : "'" + quoted + "'";
+    }
+
+    /// <summary>
+    /// Checks whether SQL must run with its bytes exact: its text, or a text parameter, holds the bytes of a SQL_ASCII
+    /// name that aren't valid UTF-8, which Ankus refuses to pass.
+    /// </summary>
+    private static bool NeedsExact(string commandText, ReadOnlySpan<SpiParameter> parameters)
+    {
+        if (HoldsUntranslatable(commandText))
+        {
+            return true;
+        }
+
+        foreach (SpiParameter parameter in parameters)
+        {
+            if (parameter.Value is string text ? HoldsUntranslatable(text) : parameter.Value is string?[] texts && Array.Exists(texts, HoldsUntranslatable))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Runs SQL through SPI with its text and text parameters in the database encoding byte for byte, as Ankus runs the
+    /// rest, and returns its rows.
+    /// </summary>
+    private static unsafe WorfRows RunExact(string commandText, bool readOnly, long limit, ReadOnlySpan<SpiParameter> parameters)
+    {
+        int count = parameters.Length;
+        uint[] types = new uint[Math.Max(count, 1)];
+        ulong[] values = new ulong[Math.Max(count, 1)];
+        sbyte[] nulls = new sbyte[Math.Max(count, 1)];
+        for (int i = 0; i < count; i++)
+        {
+            (types[i], values[i], bool isNull) = ExactParameter(parameters[i]);
+            nulls[i] = isNull ? (sbyte)'n' : (sbyte)' ';
+        }
+
+        byte[] sql = ToServerCString(commandText);
+        int rc = NativeMethods.SPI_connect();
+        if (rc < 0)
+        {
+            throw new PgException(PgSqlStates.InternalError, $"SPI_connect failed: {FromServer(NativeMethods.SPI_result_code_string(rc))}");
+        }
+
+        fixed (byte* source = sql)
+        fixed (uint* typesAddress = types)
+        fixed (ulong* valuesAddress = values)
+        fixed (sbyte* nullsAddress = nulls)
+        {
+            rc = NativeMethods.SPI_execute_with_args((sbyte*)source, count, typesAddress, valuesAddress, nullsAddress, readOnly, limit);
+        }
+
+        if (rc < 0)
+        {
+            _ = NativeMethods.SPI_finish();
+            throw new PgException(PgSqlStates.InternalError, $"SPI_execute_with_args failed: {FromServer(NativeMethods.SPI_result_code_string(rc))}");
+        }
+
+        long processed = (long)NativeGlobals.SPI_processed;
+        SPITupleTable* table = NativeGlobals.SPI_tuptable;
+        List<(string Name, uint TypeOid)> columns = [];
+        List<PgHeapTuple> rows = [];
+        if (table is not null)
+        {
+            TupleDescData* desc = table->tupdesc;
+            for (int i = 0; i < desc->natts; i++)
+            {
+                FormData_pg_attribute* att = NativeMethods.TupleDescAttr(desc, i);
+                columns.Add((FromServer((sbyte*)&att->attname), att->atttypid));
+            }
+
+            for (long i = 0; i < processed; i++)
+            {
+                rows.Add(PgHeapTuple.DangerousCopy((nint)table->vals[i], (nint)desc));
+            }
+        }
+
+        _ = NativeMethods.SPI_finish();
+        return new WorfRows(columns, rows, processed);
+    }
+
+    /// <summary>
+    /// Makes a text parameter, or a cell of a row a function returns, whose bytes in the database encoding are exact,
+    /// as a SQL_ASCII name's that aren't valid UTF-8, which Ankus refuses as a string, are.
+    /// </summary>
+    /// <param name="value">The text, or null.</param>
+    /// <returns>The parameter.</returns>
+    internal static SpiParameter TextParameter(string? value)
+    {
+        if (!HoldsUntranslatable(value))
+        {
+            return SpiParameter.Create(value);
+        }
+
+        unsafe
+        {
+            return SpiParameter.Create(PgDatum.DangerousCreate((nuint)TextDatum(value!, false), TextOid, PgMemoryContext.Current));
+        }
+    }
+
+    /// <summary>
+    /// Makes a text array parameter, or a cell of a row a function returns, whose elements' bytes are exact, as
+    /// <see cref="TextParameter"/> makes text.
+    /// </summary>
+    /// <param name="values">The texts, or null.</param>
+    /// <returns>The parameter.</returns>
+    internal static SpiParameter TextArrayParameter(string?[]? values)
+    {
+        if (values is null || !Array.Exists(values, HoldsUntranslatable))
+        {
+            return SpiParameter.Create(values);
+        }
+
+        unsafe
+        {
+            (_, ulong array, _) = ExactParameter(SpiParameter.Create(values));
+            return SpiParameter.Create(PgDatum.DangerousCreate((nuint)array, TextArrayOid, PgMemoryContext.Current));
+        }
+    }
+
+    /// <summary>
+    /// Makes a text array parameter of texts already in the database encoding, each a run of a buffer's bytes, or null,
+    /// in PostgreSQL's memory, so that large texts take no strings of their own.
+    /// </summary>
+    /// <param name="buffer">The texts' bytes.</param>
+    /// <param name="texts">Each text's start and length in them, or a length of -1 for null.</param>
+    /// <returns>The parameter.</returns>
+    internal static unsafe SpiParameter TextArrayParameter(byte[] buffer, IReadOnlyList<(int Start, int Length)> texts)
+    {
+        int count = texts.Count;
+        ulong* elements = (ulong*)NativeMethods.palloc((nuint)(sizeof(ulong) * Math.Max(count, 1)));
+        bool* nulls = (bool*)NativeMethods.palloc0((nuint)Math.Max(count, 1));
+        fixed (byte* address = buffer)
+        {
+            for (int i = 0; i < count; i++)
+            {
+                (int start, int length) = texts[i];
+                nulls[i] = length < 0;
+                elements[i] = length < 0 ? 0 : (ulong)NativeMethods.cstring_to_text_with_len((sbyte*)(address + start), length);
+            }
+        }
+
+        // The array holds copies of the texts, which go as soon as it's made.
+        int dims = count;
+        int lbs = 1;
+        ArrayType* array = NativeMethods.construct_md_array(elements, nulls, count == 0 ? 0 : 1, &dims, &lbs, TextOid, -1, false, (sbyte)'i');
+        for (int i = 0; i < count; i++)
+        {
+            if (!nulls[i])
+            {
+                NativeMethods.pfree((void*)elements[i]);
+            }
+        }
+
+        return SpiParameter.Create(PgDatum.DangerousCreate((nuint)array, TextArrayOid, PgMemoryContext.Current));
+    }
+
+    /// <summary>
+    /// Makes the datum of a parameter for SQL that runs with its bytes exact: text, or an array of it, from the bytes
+    /// <see cref="ToServer"/> writes, and the rest as Ankus makes it.
+    /// </summary>
+    private static unsafe (uint Type, ulong Value, bool IsNull) ExactParameter(SpiParameter parameter)
+    {
+        if (parameter.Value is string text)
+        {
+            return (parameter.TypeOid, TextDatum(text, parameter.TypeOid == NameOid), false);
+        }
+
+        if (parameter.Value is string?[] texts)
+        {
+            bool names = parameter.TypeOid == NameArrayOid;
+            ulong[] elements = new ulong[Math.Max(texts.Length, 1)];
+            bool[] nulls = new bool[Math.Max(texts.Length, 1)];
+            for (int i = 0; i < texts.Length; i++)
+            {
+                nulls[i] = texts[i] is null;
+                elements[i] = texts[i] is { } element ? TextDatum(element, names) : 0;
+            }
+
+            int dims = texts.Length;
+            int lbs = 1;
+            fixed (ulong* elementsAddress = elements)
+            fixed (bool* nullsAddress = nulls)
+            {
+                ArrayType* array = NativeMethods.construct_md_array(elementsAddress, nullsAddress, texts.Length == 0 ? 0 : 1, &dims, &lbs,
+                    names ? NameOid : TextOid, names ? NameDataLen : -1, false, names ? (sbyte)'c' : (sbyte)'i');
+                return (parameter.TypeOid, (ulong)array, false);
+            }
+        }
+
+        PgDatum datum = PgDatum.Create(parameter, PgMemoryContext.Current);
+        return (datum.TypeOid, datum.IsNull ? 0 : datum.DangerousGetBits(), datum.IsNull);
+    }
+
+    /// <summary>
+    /// Makes a text or name datum of a string's bytes in the database encoding.
+    /// </summary>
+    private static unsafe ulong TextDatum(string value, bool name)
+    {
+        byte[] bytes = ToServer(value);
+        fixed (byte* address = bytes)
+        {
+            if (!name)
+            {
+                return (ulong)NativeMethods.cstring_to_text_with_len((sbyte*)address, bytes.Length);
+            }
+
+            byte* data = (byte*)NativeMethods.palloc0(NameDataLen);
+            new ReadOnlySpan<byte>(address, Math.Min(bytes.Length, NameDataLen - 1)).CopyTo(new Span<byte>(data, NameDataLen - 1));
+            return (ulong)data;
+        }
+    }
+
+    /// <summary>
+    /// Gets the equality operator of each key column of a unique index, from the column's operator family, written as
+    /// <c>OPERATOR(schema.name)</c>, so that SQL comparing the columns that runs under a user's search path, as SQL that
+    /// fires their triggers does, uses the index's own operators rather than ones the path finds first.
+    /// </summary>
+    /// <param name="indexOid">The index.</param>
+    /// <returns>Each key column's operator, by its attribute number.</returns>
+    internal static unsafe Dictionary<short, string> KeyEqualityOperators(uint indexOid)
+    {
+        if (s_keyEqualityOperators.TryGetValue(indexOid, out Dictionary<short, string>? cached))
+        {
+            return cached;
+        }
+
+        Dictionary<short, string> operators = [];
+        RelationData* index = NativeMethods.index_open(indexOid, AccessShareLock);
+        short* indkey = (short*)(&index->rd_index->indkey + 1);
+        for (int i = 0; i < index->rd_index->indnkeyatts; i++)
+        {
+            uint opcintype = index->rd_opcintype[i];
+            uint op = NativeMethods.get_opfamily_member(index->rd_opfamily[i], opcintype, opcintype, (short)BtEqualStrategyNumber);
+            if (op != 0)
+            {
+                operators[indkey[i]] = $"OPERATOR({ReadScalar<string>("""
+                    SELECT pg_catalog.quote_ident(n.nspname) || '.' || o.oprname
+                    FROM pg_catalog.pg_operator o JOIN pg_catalog.pg_namespace n ON n.oid = o.oprnamespace
+                    WHERE o.oid = $1
+                    """, SpiParameter.Create(op))})";
+            }
+        }
+
+        NativeMethods.index_close(index, AccessShareLock);
+        s_keyEqualityOperators[indexOid] = operators;
+        return operators;
+    }
+
+    /// <summary>
+    /// Runs worf's own work, as a prepared statement's planning and execution, with the search path
+    /// <see cref="PinSearchPath"/> sets.
+    /// </summary>
+    /// <typeparam name="T">The work's result.</typeparam>
+    /// <param name="work">The work.</param>
+    /// <returns>Its result.</returns>
+    internal static T Pinned<T>(Func<T> work)
+    {
+        int nestLevel = PinSearchPath();
+        try
+        {
+            return work();
+        }
+        finally
+        {
+            UnpinSearchPath(nestLevel);
+        }
+    }
+
+    /// <summary>
+    /// Searches the system catalog first and temporary objects last until the GUC nest level it returns ends, so that a
+    /// query of worf's, run in a user's session, uses the system's operators and functions rather than ones a user put
+    /// ahead of them on the search path.
+    /// </summary>
+    /// <returns>The nest level, which the caller ends with <see cref="UnpinSearchPath"/>, or zero when the path is
+    /// already that, as in worf's workers other than apply and sync.</returns>
+    internal static unsafe int PinSearchPath()
+    {
+        s_ownSql++;
+        fixed (byte* name = ToServerCString("search_path"))
+        {
+            if (FromServer(NativeMethods.GetConfigOption((sbyte*)name, false, false)) == PinnedSearchPath)
+            {
+                return 0;
+            }
+
+            int nestLevel = NativeMethods.NewGUCNestLevel();
+            fixed (byte* value = ToServerCString(PinnedSearchPath))
+            {
+                _ = NativeMethods.set_config_option((sbyte*)name, (sbyte*)value, GucContext.PGC_USERSET, GucSource.PGC_S_SESSION,
+                    GucAction.GUC_ACTION_SAVE, true, 0, false);
+            }
+
+            return nestLevel;
+        }
+    }
+
+    /// <summary>
+    /// Searches the path the database and role set, as <c>RESET search_path</c> would, until the GUC nest level it
+    /// returns ends, so that a row filter's functions find the objects they name without a schema as pglogical's do,
+    /// on a connection that otherwise searches only the system catalog.
+    /// </summary>
+    /// <returns>The nest level, which the caller ends with <see cref="EndDefaultSearchPath"/>.</returns>
+    internal static unsafe int DefaultSearchPath()
+    {
+        s_ownSqlOutside.Push(s_ownSql);
+        s_ownSql = 0;
+        fixed (byte* name = ToServerCString("search_path"))
+        {
+            int nestLevel = NativeMethods.NewGUCNestLevel();
+            _ = NativeMethods.set_config_option((sbyte*)name, NativeMethods.GetConfigOptionResetString((sbyte*)name),
+                GucContext.PGC_USERSET, GucSource.PGC_S_SESSION, GucAction.GUC_ACTION_SAVE, true, 0, false);
+            return nestLevel;
+        }
+    }
+
+    /// <summary>
+    /// The search path worf's own SQL runs with, and its workers other than apply and sync run with.
+    /// </summary>
+    internal const string PinnedSearchPath = "pg_catalog, pg_temp";
+
+    /// <summary>
+    /// Gets whether the running code is worf's own SQL, which <see cref="PinSearchPath"/> and <see cref="Elevated.Run"/>
+    /// run, rather than a user's, as a row filter's that <see cref="DefaultSearchPath"/> runs within it, or one a session
+    /// runs with the same search path.
+    /// </summary>
+    internal static bool InOwnSql => s_ownSql > 0;
+
+    // How deep the running code is in worf's own SQL, and the depths a user's code it runs left.
+    private static int s_ownSql;
+    private static readonly Stack<int> s_ownSqlOutside = [];
+
+    /// <summary>
+    /// Enters worf's own SQL, as <see cref="Elevated.Run"/> does, until <see cref="LeaveOwnSql"/>.
+    /// </summary>
+    internal static void EnterOwnSql() => s_ownSql++;
+
+    /// <summary>
+    /// Leaves what <see cref="EnterOwnSql"/> entered.
+    /// </summary>
+    internal static void LeaveOwnSql() => s_ownSql--;
+
+
+    /// <summary>
+    /// Puts back the search path that <see cref="PinSearchPath"/> or <see cref="DefaultSearchPath"/> replaced.
+    /// </summary>
+    /// <param name="nestLevel">The nest level it returned.</param>
+    internal static void UnpinSearchPath(int nestLevel)
+    {
+        s_ownSql--;
+        if (nestLevel > 0)
+        {
+            unsafe
+            {
+                NativeMethods.AtEOXact_GUC(true, nestLevel);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Ends what <see cref="DefaultSearchPath"/> began.
+    /// </summary>
+    /// <param name="nestLevel">The nest level it returned.</param>
+    internal static void EndDefaultSearchPath(int nestLevel)
+    {
+        s_ownSql = s_ownSqlOutside.Pop();
+        unsafe
+        {
+            NativeMethods.AtEOXact_GUC(true, nestLevel);
+        }
+    }
+
+    /// <summary>
+    /// Reads the first column of a query's first row as <see cref="Read"/> reads rows.
+    /// </summary>
+    /// <typeparam name="T">The column's managed type.</typeparam>
+    /// <param name="commandText">The query.</param>
+    /// <param name="parameters">The query's parameters.</param>
+    /// <returns>The value, or the type's default when the query returns no rows.</returns>
+    internal static T ReadScalar<[PgConvertible] T>(string commandText, params ReadOnlySpan<SpiParameter> parameters)
+    {
+        WorfRows result = Read(commandText, 1, parameters);
+        return result.Count == 0 ? default! : result[0].Get<T>(0);
     }
 
     /// <summary>
@@ -619,11 +1781,15 @@ internal static partial class Worf
         Worker.WorkerShmemInit();
         DdlLock.ShmemInit();
         SequenceRanges.ShmemInit();
+        SequenceRangeGuard.ShmemInit();
         SequenceRangeReservations.ShmemInit();
+        SequenceRangeHeard.ShmemInit();
+        SequenceRangeTouches.ShmemInit();
         SnowflakeIds.ShmemInit();
 
         // Init executor module
         Executor.ExecutorInit();
+        SequenceRangeGuard.WatchPlpgsql();
 
         // Run the supervisor.
         PgBackgroundWorker.Register(new PgBackgroundWorkerOptions("worf supervisor", ExtensionName, "worf_supervisor_main")
@@ -640,9 +1806,12 @@ internal static partial class Worf
     /// <param name="connstring">The connection string.</param>
     /// <param name="connname">The name the connection's application name starts with.</param>
     /// <param name="suffix">The application name's suffix, or null.</param>
+    /// <param name="options">Connection options that override the connection string's, or null.</param>
+    /// <param name="setup">Statements the session runs once connected, with the one that pins its search path, in the
+    /// same round trip, or null.</param>
     /// <returns>The connection.</returns>
-    internal static PgReplicationConnection Connect(string connstring, string connname, string? suffix)
-        => ConnectBase(connstring, connname, suffix, false);
+    internal static WorfConnection Connect(string connstring, string connname, string? suffix, string? options = null, string? setup = null)
+        => ConnectBase(connstring, connname, suffix, false, options, setup);
 
     /// <summary>
     /// Make replication connection, ERROR on failure.
@@ -651,8 +1820,8 @@ internal static partial class Worf
     /// <param name="connname">The name the connection's application name starts with.</param>
     /// <param name="suffix">The application name's suffix, or null.</param>
     /// <returns>The connection.</returns>
-    internal static PgReplicationConnection ConnectReplica(string connstring, string connname, string? suffix)
-        => ConnectBase(connstring, connname, suffix, true);
+    internal static WorfConnection ConnectReplica(string connstring, string connname, string? suffix)
+        => ConnectBase(connstring, connname, suffix, true, null, null);
 
     /// <summary>
     /// Make sure the extension is up to date. Called by db manager.
@@ -670,13 +1839,13 @@ internal static partial class Worf
             NativeMethods.LockRelationOid(Dependency.ExtensionRelationId, WorfNode.ShareUpdateExclusiveLock);
         }
 
-        string? extversion = Spi.ExecuteScalar<string?>(
+        string? extversion = ReadScalar<string?>(
             "SELECT extversion FROM pg_catalog.pg_extension WHERE extname = $1", SpiParameter.Create(ExtensionName));
 
         // No extension, nothing to update. Only run the alter if the versions don't match.
         if (extversion is not null && extversion != Version)
         {
-            Spi.Execute("ALTER EXTENSION " + Spi.QuoteIdentifier(ExtensionName) + " UPDATE");
+            Execute("ALTER EXTENSION " + QuoteIdentifier(ExtensionName) + " UPDATE");
         }
     }
 
@@ -685,7 +1854,7 @@ internal static partial class Worf
     /// </summary>
     /// <param name="streamConn">The replication connection.</param>
     /// <returns>The system identifier, timeline, WAL position and database name.</returns>
-    internal static (ulong Sysid, uint Timeline, ulong Xlogpos, string Dbname) IdentifySystem(PgReplicationConnection streamConn)
+    internal static (ulong Sysid, uint Timeline, ulong Xlogpos, string Dbname) IdentifySystem(WorfConnection streamConn)
     {
         IReadOnlyList<string?[]> res;
         try
@@ -733,7 +1902,7 @@ internal static partial class Worf
     /// <param name="replicationSets">The replication sets, or null.</param>
     /// <param name="replicateOnlyTable">The only table to replicate, or null.</param>
     /// <param name="forceTextTransfer">Whether to transfer data as text.</param>
-    internal static void StartReplication(PgReplicationConnection streamConn, string slotName, ulong startPos,
+    internal static void StartReplication(WorfConnection streamConn, string slotName, ulong startPos,
         string? forwardOrigins, string? replicationSets, string? replicateOnlyTable, bool forceTextTransfer)
     {
         string wantBinary = forceTextTransfer ? "0" : "1";
@@ -748,8 +1917,9 @@ internal static partial class Worf
         command.Append(CultureInfo.InvariantCulture, $", max_proto_version '{MaxProtoVersionNum}'");
         command.Append(", startup_params_format '1'");
 
-        // Binary protocol compatibility.
-        command.Append(CultureInfo.InvariantCulture, $", \"binary.want_internal_basetypes\" '{wantBinary}'");
+        // Binary protocol compatibility. Values in PostgreSQL's internal format can't take the writer's replicated rows,
+        // which read text and binary, so they would apply more slowly than binary.
+        command.Append(", \"binary.want_internal_basetypes\" '0'");
         command.Append(CultureInfo.InvariantCulture, $", \"binary.want_binary_basetypes\" '{wantBinary}'");
         command.Append(CultureInfo.InvariantCulture, $", \"binary.basetypes_major_version\" '{pgVersionNum / 100}'");
         command.Append(CultureInfo.InvariantCulture, $", \"binary.sizeof_datum\" '{SizeofDatum}'");
@@ -765,19 +1935,19 @@ internal static partial class Worf
 
         if (forwardOrigins is not null)
         {
-            command.Append(", \"worf.forward_origins\" ").Append(Spi.QuoteLiteral(forwardOrigins));
+            command.Append(", \"worf.forward_origins\" ").Append(QuoteLiteral(forwardOrigins));
         }
 
         if (replicateOnlyTable is not null)
         {
             // Send the table name we want to the upstream
-            command.Append(", \"worf.replicate_only_table\" ").Append(Spi.QuoteLiteral(replicateOnlyTable));
+            command.Append(", \"worf.replicate_only_table\" ").Append(QuoteLiteral(replicateOnlyTable));
         }
 
         if (replicationSets is not null)
         {
             // Send the replication set names we want to the upstream
-            command.Append(", \"worf.replication_set_names\" ").Append(Spi.QuoteLiteral(replicationSets));
+            command.Append(", \"worf.replication_set_names\" ").Append(QuoteLiteral(replicationSets));
         }
 
         // Tell the upstream that we want unbounded metadata cache size
@@ -797,7 +1967,7 @@ internal static partial class Worf
         }
         catch (PgRemoteException error)
         {
-            PgLog.Write(PgLogLevel.Fatal, new PgDiagnostic(
+            WorfLog.Write(PgLogLevel.Fatal, new PgDiagnostic(
                 $"could not send replication command \"{command}\": ERROR:  {error.Message}\n, sqlstate: {error.SqlState}"));
         }
     }
@@ -915,20 +2085,28 @@ internal static partial class Worf
             guard.Header = ctx;
         }
 
+        // The WAL position this server started from is read before anything else writes WAL. A start the file couldn't
+        // keep is noted again each time the supervisor wakes, until it does.
+        bool startKept = SequenceRangeHeard.NoteStart();
+
         // Make it easy to identify our processes.
         Worker.SetConfigOption("application_name", PgBackgroundWorker.Name);
 
-        PgLog.Log("starting worf supervisor");
+        WorfLog.Log("starting worf supervisor");
 
         // Setup connection to pinned catalogs (we only ever read pg_database).
         PgBackgroundWorker.Connect(null, null);
 
-        // Main wait loop.
+        // Main wait loop. The supervisor starts once recovery has finished, so the prepared transactions a standby
+        // replayed are this server's by then, for the managers to note as they start.
         while (!Worker.GotSigterm)
         {
             PgInterrupts.Check();
             Worker.ProcessConfigReload();
+            startKept = startKept || SequenceRangeHeard.NoteStart();
 
+            // The prepared transactions that may have given managers something to manage wake them as they end.
+            bool watchingPrepared = Worker.WakeForEndedPrepared();
             bool subscriptionsChanged;
             using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
             {
@@ -944,7 +2122,7 @@ internal static partial class Worf
             {
                 try
                 {
-                    PgBackgroundWorker.RunTransaction(StartManagerWorkers);
+                    StartManagerWorkers(PgBackgroundWorker.RunTransaction(ConnectableDatabases));
                 }
                 catch (OperationCanceledException) when (Worker.GotSigterm)
                 {
@@ -954,7 +2132,7 @@ internal static partial class Worf
 
             // Wait for latch signal or timeout. On Windows, use a shorter timeout to ensure faster response to
             // subscription changes, as process startup and IPC can be slower than on Unix systems.
-            if (!PgBackgroundWorker.Wait(TimeSpan.FromMilliseconds(OperatingSystem.IsWindows() ? 30000 : 180000)))
+            if (!PgBackgroundWorker.Wait(watchingPrepared ? Worker.PreparedWatchInterval : SupervisorInterval))
             {
                 break;
             }
@@ -962,78 +2140,130 @@ internal static partial class Worf
     }
 
     /// <summary>
-    /// Start the manager workers for every db which has a worf node. Note that we start workers that are not
-    /// necessary here. We do this because we need to check every individual database to check if there is worf
-    /// node setup and it's not possible to switch connections to different databases within one background
-    /// worker. The workers that won't find any worf node setup will exit immediately during startup. Must be run
-    /// inside a transaction.
+    /// Gets how long the supervisor waits between its regular looks, which is also how long it leaves alone a database
+    /// whose manager found nothing to manage, in milliseconds, or 0 for its default. A setting for tests, hidden from
+    /// SHOW ALL.
     /// </summary>
-    private static unsafe void StartManagerWorkers()
+    [PgGucInt("worf.supervisor_interval", 0, "Sets how long the supervisor waits between its regular looks at the databases.",
+        Minimum = 0, Maximum = int.MaxValue, Unit = PgGucUnit.Milliseconds, Context = PgGucContext.Sighup, Flags = PgGucOptions.NoShowAll)]
+    internal static partial int SupervisorIntervalSetting { get; }
+
+    // How long the supervisor waits between its regular looks: as set, or 3 minutes, and 30 seconds on Windows, where
+    // process startup and IPC are slower.
+    private static TimeSpan SupervisorInterval
+        => TimeSpan.FromMilliseconds(SupervisorIntervalSetting > 0 ? SupervisorIntervalSetting : OperatingSystem.IsWindows() ? 30000 : 180000);
+
+    /// <summary>
+    /// Lists the databases that allow connections, and frees the worker slots of those dropped. Runs in a
+    /// transaction, which ends before the managers start, as PostgreSQL's logical replication launcher starts its
+    /// workers, so that waiting for one holds no lock and no snapshot.
+    /// </summary>
+    /// <returns>The databases that allow connections, with their names.</returns>
+    private static unsafe List<(uint Dboid, string Name)> ConnectableDatabases()
     {
         const uint DatabaseRelationId = 1262;
 
-        // Run manager worker for every connectable database.
+        // Every database, and those that allow connections, with their names.
+        HashSet<uint> databases = [];
+        List<(uint Dboid, string Name)> connectable = [];
         RelationData* rel = NativeMethods.table_open(DatabaseRelationId, (int)PgLockMode.AccessShare);
         TableScanDescData* scan = NativeMethods.table_beginscan_catalog(rel, 0, null);
-
         HeapTupleData* tup;
         while ((tup = NativeMethods.heap_getnext(scan, ScanDirection.ForwardScanDirection)) is not null)
         {
             FormData_pg_database* pgdatabase = (FormData_pg_database*)NativeMethods.GETSTRUCT(tup);
-            uint dboid = pgdatabase->oid;
-
-            PgInterrupts.Check();
-
-            // Can't run workers on databases which don't allow connection.
-            if (!pgdatabase->datallowconn)
+            _ = databases.Add(pgdatabase->oid);
+            if (pgdatabase->datallowconn)
             {
-                continue;
+                connectable.Add((pgdatabase->oid, FromServer((sbyte*)&pgdatabase->datname)));
             }
+        }
+
+        NativeMethods.table_endscan(scan);
+        NativeMethods.table_close(rel, (int)PgLockMode.AccessShare);
+
+        // A database dropped, as with DROP DATABASE ... WITH (FORCE), which terminates its workers, has no manager left
+        // to clean up after them, and their slots would be kept for it for good, so they're freed here once their
+        // processes have gone.
+        using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
+        {
+            for (int i = 0; i < guard.Length; i++)
+            {
+                WorfWorker worker = guard[i];
+                if (worker.WorkerType != WorfWorkerType.None && worker.Dboid != 0 && worker.Proc == 0 && !databases.Contains(worker.Dboid))
+                {
+                    WorfLog.Debug1($"freeing worf worker slot {i} of dropped database {worker.Dboid}");
+                    worker.WorkerType = WorfWorkerType.None;
+                    worker.Dboid = 0;
+                    worker.CrashedAt = 0;
+                    guard[i] = worker;
+                }
+            }
+        }
+
+        return connectable;
+    }
+
+    /// <summary>
+    /// Start the manager workers for every db which has a worf node. Note that we start workers that are not
+    /// necessary here. We do this because we need to check every individual database to check if there is worf
+    /// node setup and it's not possible to switch connections to different databases within one background
+    /// worker. The workers that won't find any worf node setup will exit immediately during startup.
+    /// </summary>
+    /// <param name="connectable">The databases that allow connections, with their names.</param>
+    private static void StartManagerWorkers(List<(uint Dboid, string Name)> connectable)
+    {
+        // Run manager worker for every connectable database, but one whose manager had nothing to manage since the
+        // supervisor's last regular look.
+        long idleSince = Worker.GetCurrentTimestamp() - ((long)SupervisorInterval.TotalMilliseconds * 1000);
+        foreach ((uint dboid, string name) in connectable)
+        {
+            PgInterrupts.Check();
 
             // Worker already attached, nothing to do.
             using (PgLwLockExclusiveGuard<WorfContext, WorfWorker> guard = Worker.WorfCtx.Exclusive())
             {
                 if (guard.Read((in _, workers) =>
-                    Worker.WorkerRunning(workers, Worker.ManagerFind(workers, dboid))))
+                    Worker.WorkerRunning(workers, Worker.ManagerFind(workers, dboid)) || Worker.ManagerIdle(workers, dboid, idleSince)))
                 {
                     continue;
                 }
             }
 
             // No record found, try running new worker.
-            PgLog.Debug1($"registering worf manager process for database {FromServer((sbyte*)&pgdatabase->datname)}");
+            WorfLog.Debug1($"registering worf manager process for database {name}");
 
             WorfWorker worker = default;
             worker.WorkerType = WorfWorkerType.Manager;
             worker.Dboid = dboid;
 
+            // With every worker slot taken, the database waits for the supervisor's next look.
             _ = Worker.WorkerRegister(worker);
         }
-
-        NativeMethods.table_endscan(scan);
-        NativeMethods.table_close(rel, (int)PgLockMode.AccessShare);
     }
 
-    private static PgReplicationConnection ConnectBase(string connstr, string appname, string? suffix, bool replication)
+    /// <summary>
+    /// Gets the application name a connection made with <see cref="Connect"/> or <see cref="ConnectReplica"/> has.
+    /// </summary>
+    /// <param name="connname">The name the connection's application name starts with.</param>
+    /// <param name="suffix">The application name's suffix, or null.</param>
+    /// <returns>The application name.</returns>
+    internal static string ApplicationName(string connname, string? suffix)
     {
-        string s = ExtraConnectionOptions + " " + connstr;
-        string applicationName = appname;
-        if (suffix is not null)
+        if (suffix is null)
         {
-            applicationName = $"{ShortenHash(appname, Worker.NameDataLen - ToServer(suffix).Length - 2)}_{suffix}";
-            byte[] bytes = ToServer(applicationName);
-            if (bytes.Length > Worker.NameDataLen - 1)
-            {
-                applicationName = FromServer(bytes.AsSpan(0, Worker.NameDataLen - 1));
-            }
+            return connname;
         }
 
-        // We use the connection string as the base and pass some extra options after it, which override the ones it
-        // names, as libpq's expand_dbname does.
-        StringBuilder conninfo = new(connstr);
-        conninfo.Append(" application_name=");
-        Fe.AppendConnstrValue(conninfo, applicationName);
-        conninfo.Append(" connect_timeout=30 keepalives=1 keepalives_idle=20 keepalives_interval=20 keepalives_count=5");
+        string applicationName = $"{ShortenHash(connname, Worker.NameDataLen - ToServer(suffix).Length - 2)}_{suffix}";
+        byte[] bytes = ToServer(applicationName);
+        return bytes.Length > Worker.NameDataLen - 1 ? Truncate(applicationName, Worker.NameDataLen - 1) : applicationName;
+    }
+
+    private static WorfConnection ConnectBase(string connstr, string appname, string? suffix, bool replication, string? options, string? setup)
+    {
+        string s = ExtraConnectionOptions + " " + connstr;
+        (string conninfo, string applicationName) = ConnectionString(connstr, appname, suffix, options);
 
         bool inTransaction;
         unsafe
@@ -1041,15 +2271,27 @@ internal static partial class Worf
             inTransaction = NativeMethods.IsTransactionState();
         }
 
-        if (!inTransaction)
+        // An apply or table sync worker's connection gives up once wal_receiver_timeout has passed, as a server that
+        // takes the connection and then answers nothing would hold the worker for good, which libpq's connect_timeout
+        // doesn't bound here. A worker connects in a transaction, so that the cancellation that ends the wait is an
+        // error it can catch.
+        string described = $"the connection \"{applicationName}\" to {(replication ? "replicate" : "connect")}";
+        if (!inTransaction && Worker.MyWorfWorker >= 0 && Worker.MyWorker.WorkerType is WorfWorkerType.Apply or WorfWorkerType.Sync)
         {
-            return WithDefaultSearchPath(PgReplicationConnection.Connect(conninfo.ToString(), applicationName, replication));
+            return Worker.WithProviderDeadline(() => described,
+                () => PgBackgroundWorker.RunTransaction(() => WithPinnedSearchPath(WorfConnection.Connect(conninfo, applicationName, replication, NodeOf(connstr)), setup)));
         }
 
-        PgReplicationConnection? conn = null;
+        if (!inTransaction)
+        {
+            return WithPinnedSearchPath(WorfConnection.Connect(conninfo, applicationName, replication), setup);
+        }
+
+        WorfConnection? conn = null;
         try
         {
-            PgTransaction.RunInSubtransaction(() => conn = PgReplicationConnection.Connect(conninfo.ToString(), applicationName, replication));
+            Worker.WithProviderDeadline(() => described,
+                () => PgTransaction.RunInSubtransaction(() => conn = WorfConnection.Connect(conninfo, applicationName, replication, NodeOf(connstr))));
         }
         catch (PgException error) when (error.SqlState == PgSqlStates.ConnectionFailure)
         {
@@ -1067,17 +2309,98 @@ internal static partial class Worf
                 detail: $"dsn was: {s}");
         }
 
-        return WithDefaultSearchPath(conn!);
+        return WithPinnedSearchPath(conn!, setup);
+    }
+
+    // The node whose interface a connection string is, whose name the log gives its notices and against which they count,
+    // or none; read in a transaction.
+    private static (string Name, uint Id) NodeOf(string dsn)
+        => CatalogOid("node_interface") == 0 ? default
+            : Elevated.Run(() => Read("""
+                SELECT n.node_name::pg_catalog.text, i.if_nodeid FROM worf.node_interface i JOIN worf.node n ON n.node_id = i.if_nodeid WHERE i.if_dsn = $1 LIMIT 1
+                """, 1, SpiParameter.Create(dsn))) is [WorfRow row] ? (row.Get<string>(0), row.Get<uint>(1)) : default;
+
+    // The settings worf connects with unless the connection string gives its own: a time to connect, and keepalives.
+    private static readonly (string Option, string Value)[] s_connectionDefaults =
+        [("connect_timeout", "30"), ("keepalives", "1"), ("keepalives_idle", "20"), ("keepalives_interval", "20"), ("keepalives_count", "5")];
+
+    /// <summary>
+    /// Builds the connection string worf connects with, as keywords, so that a URI takes options after it too: the
+    /// options of worf.extra_connection_options, the given one's, which override them, a connection timeout and
+    /// keepalives where neither those, a service file nor the environment give their own, the options given, which
+    /// override all of them, and the application name.
+    /// </summary>
+    /// <param name="connstr">The connection string.</param>
+    /// <param name="appname">The name the connection's application name starts with.</param>
+    /// <param name="suffix">The application name's suffix, or null.</param>
+    /// <param name="options">Connection options that override the connection string's, or null.</param>
+    /// <returns>The connection string, and the application name.</returns>
+    internal static (string Conninfo, string ApplicationName) ConnectionString(string connstr, string appname, string? suffix, string? options = null)
+    {
+        string applicationName = ApplicationName(appname, suffix);
+        StringBuilder conninfo = new();
+        AppendKeywords(conninfo, ExtraConnectionOptions);
+        AppendKeywords(conninfo, connstr);
+        Dictionary<string, string>? effective = WorfConnection.EffectiveOptions(conninfo.ToString(), applicationName);
+        foreach ((string option, string value) in s_connectionDefaults.Where(setting => effective?.GetValueOrDefault(setting.Option) is not { Length: > 0 }))
+        {
+            Append(conninfo, option, value);
+        }
+
+        if (options is not null)
+        {
+            AppendKeywords(conninfo, options);
+        }
+
+        Append(conninfo, "application_name", applicationName);
+        return (conninfo.ToString(), applicationName);
+
+        // A connection string's options, as keywords, or the string itself when libpq can't parse it, which then fails
+        // the connection as libpq words it.
+        static void AppendKeywords(StringBuilder conninfo, string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return;
+            }
+
+            if (WorfConnection.ParseConninfo(text) is not List<(string Keyword, string Value)> parsed)
+            {
+                _ = conninfo.Append(' ').Append(text);
+                return;
+            }
+
+            foreach ((string keyword, string value) in parsed)
+            {
+                Append(conninfo, keyword, value);
+            }
+        }
+
+        static void Append(StringBuilder conninfo, string keyword, string value)
+        {
+            _ = conninfo.Append(' ').Append(keyword).Append('=');
+            Fe.AppendConnstrValue(conninfo, value);
+        }
     }
 
     /// <summary>
-    /// Restores the session's default search_path, which <c>libpqwalreceiver</c> empties on the logical replication
-    /// connections it opens. pglogical connects with plain libpq, so its sessions, including the WAL sender that
-    /// evaluates row filters, use the server's default search_path.
+    /// Gets what an ordinary connection worf makes runs once connected: the settings it needs, the search path it pins,
+    /// and the statements given.
     /// </summary>
-    private static PgReplicationConnection WithDefaultSearchPath(PgReplicationConnection conn)
+    /// <param name="setup">The statements, or null.</param>
+    /// <returns>The statements, in one string.</returns>
+    internal static string SessionSetup(string? setup)
+        => $"{WorfConnection.OrdinarySettings}; SET search_path = {PinnedSearchPath}" + (setup is null ? "" : $"; {setup}");
+
+    /// <summary>
+    /// Has the session search only the system catalog and then temporary objects, so that worf's queries to the other
+    /// node use the system's operators and functions rather than ones its database or role put ahead of them, whose
+    /// owner could have them run as the connection's user. Row filters run under the path the database and role set,
+    /// as pglogical's do, through <see cref="DefaultSearchPath"/>.
+    /// </summary>
+    private static WorfConnection WithPinnedSearchPath(WorfConnection conn, string? setup)
     {
-        conn.Execute("RESET search_path");
+        conn.Execute(setup is null ? $"SET search_path = {PinnedSearchPath}" : $"SET search_path = {PinnedSearchPath}; {setup}");
         return conn;
     }
 

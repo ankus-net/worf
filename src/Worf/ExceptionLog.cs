@@ -12,7 +12,7 @@ using Ankus.Postgres;
         remote_xid xid NOT NULL,
         remote_commit_ts timestamptz NOT NULL,
         remote_commit_lsn pg_lsn NOT NULL,
-        action_counter integer NOT NULL,
+        action_counter bigint NOT NULL,
         operation text,
         schema_name name,
         table_name name,
@@ -37,6 +37,17 @@ using Ankus.Postgres;
 
     COMMENT ON TABLE worf.exception_state IS
         'The remote transaction each subscription applies again under worf.exception_behaviour, and how';
+
+    CREATE TABLE worf.exception_skip (
+        sub_id oid NOT NULL,
+        action_counter bigint NOT NULL,
+        error_sqlstate text NOT NULL,
+        error_message text NOT NULL,
+        PRIMARY KEY (sub_id, action_counter)
+    );
+
+    COMMENT ON TABLE worf.exception_skip IS
+        'The changes of the remote transaction each subscription applies again change by change that it skips, as they conflict at commit';
     """, Requires = ["node-tables"])]
 
 namespace Worf;
@@ -46,6 +57,13 @@ namespace Worf;
 /// </summary>
 internal static class ExceptionLog
 {
+    /// <summary>
+    /// The most bytes of JSON text a row recorded as jsonb may take: jsonb holds a value of at most 2^28 - 1 bytes, its
+    /// JEntry's offsets being 28 bits wide, and the text, whose quotes, colons and commas take about what jsonb's
+    /// entries do, leaves room for a few more bytes a column that jsonb takes.
+    /// </summary>
+    internal const int MaxJsonBytes = 0x0FFFFFFF - 8192;
+
     private const string InsertSql =
         "INSERT INTO worf.exception_log (sub_id, sub_name, remote_node_id, remote_xid, remote_commit_ts, " +
         "remote_commit_lsn, action_counter, operation, schema_name, table_name, remote_old_tuple, remote_new_tuple, " +
@@ -53,63 +71,210 @@ internal static class ExceptionLog
         "VALUES ($1, $2, $3, $4::text::xid, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13, $14, $15, $16)";
 
     /// <summary>
-    /// Records a failed change, or the change that made a transaction fail. A failure to record is reported and
-    /// otherwise ignored.
+    /// Records a failed change, or the change that made a transaction fail.
     /// </summary>
     /// <param name="change">The change, and the transaction it belongs to.</param>
     /// <param name="behaviour">What apply did with it.</param>
     /// <param name="error">The error.</param>
-    internal static void Record(WorfFailedChange change, WorfExceptionBehaviour behaviour, PgException error)
+    /// <param name="isolated">Whether a failure to record is reported and otherwise ignored, which takes a
+    /// subtransaction of its own; otherwise it fails the transaction, as each change of a transaction skipped as a
+    /// whole is recorded without a subtransaction's xid each.</param>
+    internal static void Record(WorfFailedChange change, WorfExceptionBehaviour behaviour, PgException error, bool isolated = true)
     {
-        (string? oldTuple, string? newTuple) = (null, null);
+        (string? oldTuple, string? newTuple) = (null, change.NewTuple);
         (string? schemaName, string? tableName) = (change.Relation?.Nspname, change.Relation?.Relname);
-        if (change.Message is not null)
+
+        // A value this node can't read fails the first read of the rows, and the second records its bytes instead.
+        for (int read = 0; change.Message is not null && read < 2; read++)
         {
+            bool unreadableAsHex = read > 0;
             try
             {
                 PgTransaction.RunInSubtransaction(() =>
                 {
-                    (oldTuple, newTuple, string schema, string table) = ReadTuples(change.Message);
+                    (oldTuple, newTuple, string schema, string table) = ReadTuples(change.Message, unreadableAsHex);
                     schemaName ??= schema;
                     tableName ??= table;
                 });
+                break;
             }
             catch (PgException)
             {
-                // The rows stay unrecorded when the change can't be read again, as when its table is missing.
+                // The rows stay unrecorded when the change can't be read again, as when its table is missing. The
+                // rollback released the relation the read opened.
+                RelCache.ForgetOpenRelations();
             }
         }
 
+        // A row too large for jsonb is recorded without it, as a copy's row is.
+        (bool oldTooLarge, bool newTooLarge) = (TooLarge(oldTuple), TooLarge(newTuple));
+        if (oldTooLarge || newTooLarge)
+        {
+            WorfLog.Warning("the failed remote change's row is too large for worf.exception_log to record its data");
+            (oldTuple, newTuple) = (oldTooLarge ? null : oldTuple, newTooLarge ? null : newTuple);
+        }
+
+        void Insert() => _ = Worf.Execute(InsertSql,
+            SpiParameter.Create(change.Subscription.Id),
+            Worf.TextParameter(change.Subscription.Name),
+            SpiParameter.Create(change.WriterNodeId),
+            SpiParameter.Create(change.RemoteXid.ToString(CultureInfo.InvariantCulture)),
+            SpiParameter.Create(new PgTimestampTz(change.CommitTime)),
+            Worf.LsnParameter(change.CommitLsn),
+            SpiParameter.Create(change.ActionCounter),
+            SpiParameter.Create<string?>(change.Operation),
+            Worf.TextParameter(schemaName),
+            Worf.TextParameter(tableName),
+            Worf.TextParameter(oldTuple),
+            Worf.TextParameter(newTuple),
+            Worf.TextParameter(change.QueuedMessage),
+            SpiParameter.Create(behaviour switch
+            {
+                WorfExceptionBehaviour.Discard => "discard",
+                WorfExceptionBehaviour.Transdiscard => "transdiscard",
+                _ => "sub_disable",
+            }),
+            SpiParameter.Create(error.SqlState),
+            Worf.TextParameter(error.Message));
+
+        if (!isolated)
+        {
+            Insert();
+            return;
+        }
+
+        // The insert's memory goes as it ends, so that the subtransaction's own stays empty, which PostgreSQL then frees as it
+        // commits rather than keep it until the transaction ends, as a copy that records many rows would.
         try
         {
-            PgTransaction.RunInSubtransaction(() => _ = Spi.Execute(InsertSql,
-                SpiParameter.Create(change.Subscription.Id),
-                SpiParameter.Create(change.Subscription.Name),
-                SpiParameter.Create(change.WriterNodeId),
-                SpiParameter.Create(change.RemoteXid.ToString(CultureInfo.InvariantCulture)),
-                SpiParameter.Create(new PgTimestampTz(change.CommitTime)),
-                Worf.LsnParameter(change.CommitLsn),
-                SpiParameter.Create((int)change.ActionCounter),
-                SpiParameter.Create<string?>(change.Operation),
-                SpiParameter.Create<string?>(schemaName),
-                SpiParameter.Create<string?>(tableName),
-                SpiParameter.Create<string?>(oldTuple),
-                SpiParameter.Create<string?>(newTuple),
-                SpiParameter.Create<string?>(change.QueuedMessage),
-                SpiParameter.Create(behaviour switch
-                {
-                    WorfExceptionBehaviour.Discard => "discard",
-                    WorfExceptionBehaviour.Transdiscard => "transdiscard",
-                    _ => "sub_disable",
-                }),
-                SpiParameter.Create(error.SqlState),
-                SpiParameter.Create(error.Message)));
+            PgTransaction.RunInSubtransaction(() => Worf.InOwnContext(Insert));
         }
         catch (PgException)
         {
-            PgLog.Warning("could not record the failed remote change in worf.exception_log");
+            WorfLog.Warning("could not record the failed remote change in worf.exception_log");
         }
     }
+
+    /// <summary>
+    /// Records rows of a table's copy that failed, all in one statement, which takes one transaction ID for them all
+    /// rather than one each, as a copy that skips many rows records them. A statement that fails, as on a row the log
+    /// can't hold, rolls back alone, and the rows are recorded one at a time, as apply records its changes.
+    /// </summary>
+    /// <param name="change">The copy, which the rows share.</param>
+    /// <param name="failures">The rows, of the copy, in order: each one's number, its JSON, by where it is in the
+    /// rows' text, or a length of -1 when it has none, and its error.</param>
+    /// <param name="json">The rows' text, in the database encoding.</param>
+    internal static void RecordCopied(WorfFailedChange change, IReadOnlyList<(long ActionCounter, int Start, int Length, PgException Error)> failures,
+        byte[] json)
+    {
+        if (failures.Count == 0)
+        {
+            return;
+        }
+
+        if (TryRecord(failures))
+        {
+            return;
+        }
+
+        for (int i = 0; i < failures.Count; i++)
+        {
+            if (!TryRecord([failures[i]]))
+            {
+                WorfLog.Warning("could not record the failed remote change in worf.exception_log");
+            }
+        }
+
+        bool TryRecord(IReadOnlyList<(long ActionCounter, int Start, int Length, PgException Error)> rows)
+        {
+            try
+            {
+                PgTransaction.RunInSubtransaction(() => Worf.InOwnContext(() => InsertCopied(change, rows, json)));
+                return true;
+            }
+            catch (PgException)
+            {
+                return false;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Records rows of a table's copy that failed, which a query gives, each as its JSON, number and error, in one
+    /// statement with the query, so that however many and wide they are, none is kept but in the log.
+    /// </summary>
+    /// <param name="change">The copy, which the rows share.</param>
+    /// <param name="rows">The query, of each row's JSON, its number in the copy or 0, SQLSTATE and message, in order,
+    /// which may change the rows it gives, as a DELETE … RETURNING does.</param>
+    /// <param name="parameters">The query's parameters.</param>
+    /// <returns>Whether the rows were recorded; otherwise the query has had no effect, as when the log can't hold
+    /// one of them.</returns>
+    internal static bool TryRecordCopied(WorfFailedChange change, string rows, params SpiParameter[] parameters)
+    {
+        int n = parameters.Length;
+        try
+        {
+            PgTransaction.RunInSubtransaction(() => Worf.InOwnContext(() => _ = Worf.Execute($"""
+                WITH f (new_tuple, action_counter, error_sqlstate, error_message) AS ({rows})
+                INSERT INTO worf.exception_log (sub_id, sub_name, remote_node_id, remote_xid, remote_commit_ts, remote_commit_lsn,
+                    action_counter, operation, schema_name, table_name, remote_new_tuple, behaviour, error_sqlstate, error_message)
+                SELECT ${n + 1}, ${n + 2}, ${n + 3}, ${n + 4}::pg_catalog.text::pg_catalog.xid, ${n + 5}, ${n + 6}, f.action_counter, ${n + 7}, ${n + 8},
+                    ${n + 9}, f.new_tuple::pg_catalog.jsonb, ${n + 10}, f.error_sqlstate, f.error_message
+                FROM f
+                """,
+                [.. parameters,
+                    SpiParameter.Create(change.Subscription.Id),
+                    SpiParameter.Create(change.Subscription.Name),
+                    SpiParameter.Create(change.WriterNodeId),
+                    SpiParameter.Create(change.RemoteXid.ToString(CultureInfo.InvariantCulture)),
+                    SpiParameter.Create(new PgTimestampTz(change.CommitTime)),
+                    Worf.LsnParameter(change.CommitLsn),
+                    SpiParameter.Create<string?>(change.Operation),
+                    SpiParameter.Create<string?>(change.Relation?.Nspname),
+                    SpiParameter.Create<string?>(change.Relation?.Relname),
+                    SpiParameter.Create(CopyBehaviour)])));
+            return true;
+        }
+        catch (PgException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Inserts rows of a table's copy that failed into the log, in one statement, which takes their text as it is.
+    /// </summary>
+    private static void InsertCopied(WorfFailedChange change, IReadOnlyList<(long ActionCounter, int Start, int Length, PgException Error)> failures,
+        byte[] json)
+        => _ = Worf.Execute("""
+            INSERT INTO worf.exception_log (sub_id, sub_name, remote_node_id, remote_xid, remote_commit_ts, remote_commit_lsn,
+                action_counter, operation, schema_name, table_name, remote_new_tuple, behaviour, error_sqlstate, error_message)
+            SELECT $1, $2, $3, $4::text::xid, $5, $6, f.action_counter, $7, $8, $9, f.new_tuple::jsonb, $14,
+                f.error_sqlstate, f.error_message
+            FROM ROWS FROM (pg_catalog.unnest($10::bigint[]), pg_catalog.unnest($11::text[]), pg_catalog.unnest($12::text[]),
+                pg_catalog.unnest($13::text[])) WITH ORDINALITY AS f (action_counter, new_tuple, error_sqlstate, error_message, n)
+            ORDER BY f.n
+            """,
+            SpiParameter.Create(change.Subscription.Id),
+            SpiParameter.Create(change.Subscription.Name),
+            SpiParameter.Create(change.WriterNodeId),
+            SpiParameter.Create(change.RemoteXid.ToString(CultureInfo.InvariantCulture)),
+            SpiParameter.Create(new PgTimestampTz(change.CommitTime)),
+            Worf.LsnParameter(change.CommitLsn),
+            SpiParameter.Create<string?>(change.Operation),
+            SpiParameter.Create<string?>(change.Relation?.Nspname),
+            SpiParameter.Create<string?>(change.Relation?.Relname),
+            SpiParameter.Create(failures.Select(failure => failure.ActionCounter).ToArray()),
+            Worf.TextArrayParameter(json, [.. failures.Select(failure => (failure.Start, failure.Length))]),
+            SpiParameter.Create(failures.Select(failure => failure.Error.SqlState).ToArray()),
+            SpiParameter.Create(failures.Select(failure => failure.Error.Message).ToArray()),
+            SpiParameter.Create(CopyBehaviour));
+
+    // The behaviour a copy's skipped rows are recorded under: transdiscard skips a copy's rows one by one, as discard
+    // does, and records them under its own name, as apply does the changes it skips.
+    private static string CopyBehaviour => Apply.ExceptionBehaviour == WorfExceptionBehaviour.Transdiscard ? "transdiscard" : "discard";
+
+    private static bool TooLarge(string? json) => json is not null && json.Length > MaxJsonBytes / 3 && Worf.ToServer(json).Length > MaxJsonBytes;
 
     /// <summary>
     /// Records the remote transaction a subscription applies again under <c>worf.exception_behaviour</c>, how, and
@@ -120,7 +285,7 @@ internal static class ExceptionLog
     /// <param name="level">How it's applied again.</param>
     /// <param name="error">The error.</param>
     internal static void SaveState(uint subId, ulong commitLsn, int level, PgException error)
-        => _ = Spi.Execute("""
+        => _ = Worf.Execute("""
             INSERT INTO worf.exception_state VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (sub_id) DO UPDATE SET commit_lsn = excluded.commit_lsn, level = excluded.level,
                 error_sqlstate = excluded.error_sqlstate, error_message = excluded.error_message
@@ -134,7 +299,7 @@ internal static class ExceptionLog
     /// <returns>Its commit position, how it's applied again and the error, or zeros and null for none.</returns>
     internal static (ulong CommitLsn, int Level, PgException? Error) State(uint subId)
     {
-        SpiResult state = Worf.SelectCatalog(
+        WorfRows state = Worf.SelectCatalog(
             "SELECT commit_lsn::text, level, error_sqlstate, error_message FROM worf.exception_state WHERE sub_id = $1",
             SpiParameter.Create(subId));
         return state.Count == 0 || !Worf.TryParseLsn(state[0].Get<string>(0), out ulong lsn) ? (0, 0, null)
@@ -146,14 +311,45 @@ internal static class ExceptionLog
     /// </summary>
     /// <param name="subId">The subscription.</param>
     internal static void ForgetState(uint subId)
-        => _ = Spi.Execute("DELETE FROM worf.exception_state WHERE sub_id = $1", SpiParameter.Create(subId));
+    {
+        _ = Worf.Execute("DELETE FROM worf.exception_state WHERE sub_id = $1", SpiParameter.Create(subId));
+        _ = Worf.Execute("DELETE FROM worf.exception_skip WHERE sub_id = $1", SpiParameter.Create(subId));
+    }
+
+    /// <summary>
+    /// Records changes of the remote transaction a subscription applies again change by change that it skips, by their
+    /// places in the transaction, with the errors they're recorded with.
+    /// </summary>
+    /// <param name="subId">The subscription.</param>
+    /// <param name="skips">The changes, and their errors.</param>
+    internal static void SaveSkips(uint subId, IReadOnlyDictionary<long, PgException> skips)
+        => _ = Worf.Execute("""
+            INSERT INTO worf.exception_skip
+            SELECT $1, s.action_counter, s.error_sqlstate, s.error_message
+            FROM ROWS FROM (pg_catalog.unnest($2::pg_catalog.int8[]), pg_catalog.unnest($3::pg_catalog.text[]), pg_catalog.unnest($4::pg_catalog.text[]))
+                AS s (action_counter, error_sqlstate, error_message)
+            ON CONFLICT (sub_id, action_counter) DO NOTHING
+            """, SpiParameter.Create(subId), SpiParameter.Create(skips.Keys.ToArray()), SpiParameter.Create(skips.Values.Select(error => error.SqlState).ToArray()),
+            SpiParameter.Create(skips.Values.Select(error => error.Message).ToArray()));
+
+    /// <summary>
+    /// Reads the changes of the remote transaction a subscription applies again change by change that it skips.
+    /// </summary>
+    /// <param name="subId">The subscription.</param>
+    /// <returns>The changes, by their places in the transaction, with their errors.</returns>
+    internal static Dictionary<long, PgException> Skips(uint subId)
+        => Worf.SelectCatalog("SELECT action_counter, error_sqlstate, error_message FROM worf.exception_skip WHERE sub_id = $1", SpiParameter.Create(subId))
+            .ToDictionary(row => row.Get<long>(0), row => new PgException(row.Get<string>(1), row.Get<string>(2)));
 
     /// <summary>
     /// Reads a change's rows from its message again, as JSON objects of the text of the columns it sent.
     /// </summary>
     /// <param name="message">The INSERT, UPDATE or DELETE message.</param>
+    /// <param name="unreadableAsHex">Whether a value this node can't read is recorded as its bytes rather than failing
+    /// the read, which then reads each value in a subtransaction.</param>
     /// <returns>The key of the row an update or delete changes, and the row an insert or update writes.</returns>
-    private static unsafe (string? OldTuple, string? NewTuple, string Schema, string Table) ReadTuples(byte[] message)
+    private static unsafe (string? OldTuple, string? NewTuple, string Schema, string Table) ReadTuples(byte[] message,
+        bool unreadableAsHex)
     {
         fixed (byte* data = message)
         {
@@ -188,8 +384,8 @@ internal static class ExceptionLog
 
             try
             {
-                TupleDescData* desc = rel.Rel->rd_att;
-                return (TupleToJson(desc, oldtup), TupleToJson(desc, newtup), rel.Nspname, rel.Relname);
+                return (TupleToJson(rel, oldtup, unreadableAsHex), TupleToJson(rel, newtup, unreadableAsHex), rel.Nspname,
+                    rel.Relname);
             }
             finally
             {
@@ -199,16 +395,16 @@ internal static class ExceptionLog
     }
 
     /// <summary>
-    /// Converts the columns a remote change sent to a JSON object of their text. Values in the internal format point
-    /// into the message, which has to stay pinned.
+    /// Converts the columns a remote change sent to a JSON object of their text.
     /// </summary>
-    private static unsafe string? TupleToJson(TupleDescData* desc, WorfTupleData? tuple)
+    private static unsafe string? TupleToJson(WorfRelation rel, WorfTupleData? tuple, bool unreadableAsHex)
     {
         if (tuple is null)
         {
             return null;
         }
 
+        TupleDescData* desc = rel.Rel->rd_att;
         StringBuilder json = new("{");
         for (int natt = 0; natt < desc->natts && natt < tuple.Kinds.Length; natt++)
         {
@@ -231,16 +427,15 @@ internal static class ExceptionLog
                     json.Append("null");
                     break;
 
+                // Text is recorded as it came, and so is an enum's value in binary, its label, which is also its text.
                 case 't':
-                    Executor.EscapeJson(json, Worf.FromServer(tuple.Data[natt]!));
-                    break;
-
-                case 'b':
-                    Executor.EscapeJson(json, ValueToText(attr, BinaryToValue(attr, tuple.Data[natt]!)));
+                case 'b' when rel.RemoteType(natt)?.Definition == ProtoNative.EnumDefinition:
+                    Executor.EscapeJson(json, Worf.LoggedText(tuple.Data[natt]!));
                     break;
 
                 default:
-                    Executor.EscapeJson(json, ValueToText(attr, tuple.Values[natt]));
+                    Executor.EscapeJson(json, tuple.Converted[natt] ? ValueToText(attr->atttypid, tuple.Values[natt])
+                        : BinaryToText(attr, tuple, natt, unreadableAsHex));
                     break;
             }
         }
@@ -249,29 +444,41 @@ internal static class ExceptionLog
     }
 
     /// <summary>
-    /// Converts a value in its type's binary format to a datum.
+    /// Gets the text of a value sent in binary, or in the internal format of another type than its column's, read
+    /// with the type it converts from, or else the column's own, without the column's domain constraints. A value this
+    /// node can't read fails, or is recorded as its bytes in hex, as bytea shows them.
     /// </summary>
-    private static unsafe ulong BinaryToValue(FormData_pg_attribute* attr, byte[] data)
+    private static unsafe string BinaryToText(FormData_pg_attribute* attr, WorfTupleData tuple, int natt, bool unreadableAsHex)
     {
-        uint typreceive;
-        uint typioparam;
-        NativeMethods.getTypeBinaryInputInfo(attr->atttypid, &typreceive, &typioparam);
-
-        StringInfoData buf;
-        NativeMethods.initStringInfo(&buf);
-        fixed (byte* bytes = data)
+        char kind = tuple.Kinds[natt];
+        byte[] data = tuple.Data[natt]!;
+        uint type = tuple.Conversions?[natt] is { } conversion ? conversion.ReadType : NativeMethods.getBaseType(attr->atttypid);
+        if (type != 0 && !unreadableAsHex)
         {
-            Worf.AppendBinaryStringInfo(&buf, bytes, data.Length);
+            return ValueToText(type, WorfColumnConversion.Read(type, kind, data));
         }
 
-        return NativeMethods.OidReceiveFunctionCall(typreceive, &buf, typioparam, attr->atttypmod);
+        string? text = null;
+        if (type != 0)
+        {
+            try
+            {
+                PgTransaction.RunInSubtransaction(() => text = ValueToText(type, WorfColumnConversion.Read(type, kind, data)));
+            }
+            catch (PgException)
+            {
+                // The bytes are recorded instead.
+            }
+        }
+
+        return text ?? "\\x" + Convert.ToHexStringLower(data);
     }
 
-    private static unsafe string ValueToText(FormData_pg_attribute* attr, ulong value)
+    private static unsafe string ValueToText(uint type, ulong value)
     {
         uint typoutput;
         bool typisvarlena;
-        NativeMethods.getTypeOutputInfo(attr->atttypid, &typoutput, &typisvarlena);
-        return Worf.FromServer(NativeMethods.OidOutputFunctionCall(typoutput, value));
+        NativeMethods.getTypeOutputInfo(type, &typoutput, &typisvarlena);
+        return Worf.LoggedText(NativeMethods.OidOutputFunctionCall(typoutput, value));
     }
 }
