@@ -332,7 +332,7 @@ internal static unsafe partial class SequenceRanges
     // sequence's range row until it ends, which it then can't prepare, with what it did, or whose switches are logged as
     // it commits, so that a switch or function that rolled back to a savepoint is neither; whether their callbacks are
     // registered; and where a switch beside the transactions that hold a sequence moves it as its transaction ends.
-    private static readonly List<(uint Subxact, string? Logged, (string Did, string Hint)? Refused)> s_switchedIn = [];
+    private static readonly List<(uint Subxact, string? Logged, bool Warning, (string Did, string Hint)? Refused)> s_switchedIn = [];
     private static bool s_switchedInRegistered;
     private static (uint Seqoid, long Start)? s_pendingMove;
 
@@ -4390,7 +4390,8 @@ internal static unsafe partial class SequenceRanges
     /// </summary>
     /// <param name="logged">What to log of the switch, or null.</param>
     /// <param name="refused">What the transaction did that it can't be prepared with, and why, or null.</param>
-    private static void NoteSwitch(string? logged, (string Did, string Hint)? refused)
+    /// <param name="warning">Whether what's logged is a warning.</param>
+    private static void NoteSwitch(string? logged, (string Did, string Hint)? refused, bool warning = false)
     {
         if (!s_switchedInRegistered)
         {
@@ -4405,9 +4406,16 @@ internal static unsafe partial class SequenceRanges
             });
             _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () =>
             {
-                foreach ((uint _, string? logged, _) in s_switchedIn.Where(switched => switched.Logged is not null))
+                foreach ((uint _, string? logged, bool warns, _) in s_switchedIn.Where(switched => switched.Logged is not null))
                 {
-                    WorfLog.Log(logged!);
+                    if (warns)
+                    {
+                        WorfLog.Warning(logged!);
+                    }
+                    else
+                    {
+                        WorfLog.Log(logged!);
+                    }
                 }
 
                 ForgetSwitched();
@@ -4428,8 +4436,16 @@ internal static unsafe partial class SequenceRanges
             });
         }
 
-        s_switchedIn.Add((NativeMethods.GetCurrentSubTransactionId(), logged, refused));
+        s_switchedIn.Add((NativeMethods.GetCurrentSubTransactionId(), logged, warning, refused));
     }
+
+    /// <summary>
+    /// Logs a warning once this transaction commits, as an exchange logs the resets its take-in of a sequence made, once
+    /// the take-in's subtransaction has committed, so that a take-in left for a row another transaction holds, which rolls
+    /// its reset back, logs none.
+    /// </summary>
+    /// <param name="warning">The warning.</param>
+    internal static void WarnOnCommit(string warning) => NoteSwitch(warning, null, true);
 
     private static void ForgetSwitched()
     {

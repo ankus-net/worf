@@ -47,6 +47,9 @@ internal static class SequenceRangeExchange
     private static bool s_rangeWaitAllowed;
     private static bool s_rangeWaitSpent;
 
+    // The warnings of the resets a sequence's take-in made, logged only once its subtransaction commits.
+    private static readonly List<string> s_takeInWarnings = [];
+
     // The neighbors whose messages the current transaction took in, with when their servers started and whether they
     // made them knowing this server was back, noted once it commits.
     private const long TimedOutBackoff = 60_000_000;
@@ -1536,6 +1539,7 @@ internal static class SequenceRangeExchange
                 {
                     _ = s_unchanged.Remove((senderId, entry.GetProperty("name").GetWorfString() ?? ""));
                     s_rangeWaitAllowed = takenIn == 0;
+                    s_takeInWarnings.Clear();
                     PgTransaction.RunInSubtransaction(() =>
                     {
                         (bool g, bool r, bool l) = WithLockTimeout(() => ProcessSequence(node, root, entry, senderId, senderName, call, applied));
@@ -1544,6 +1548,15 @@ internal static class SequenceRangeExchange
                         learned |= l;
                     });
                     takenIn++;
+
+                    // The resets the take-in made are logged once the transaction commits, and only once its
+                    // subtransaction has: one left for a row another transaction held rolled them back.
+                    foreach (string warning in s_takeInWarnings)
+                    {
+                        SequenceRanges.WarnOnCommit(warning);
+                    }
+
+                    s_takeInWarnings.Clear();
 
                     // Backends reload their blocks, which an activation or a grant may have changed, once this commits,
                     // and the range worker checks the sequence in full.
@@ -2648,7 +2661,7 @@ internal static class SequenceRangeExchange
                 WHERE seqoid = $1 AND node_id = $2 AND (reset_at IS NULL OR reset_at < $4)
                 """, seq, sender, SpiParameter.Create(reset), SpiParameter.Create(new PgTimestampTz(window))) > 0)
             {
-                WorfLog.Warning(reset.StartsWith("FFFFFFFF/", StringComparison.Ordinal)
+                s_takeInWarnings.Add(reset.StartsWith("FFFFFFFF/", StringComparison.Ordinal)
                     ? $"sequence {info.Name}: node {senderName} lifted a fence over grants of this node's that overlap another's, so it abandons its blocks and requests new ones"
                     : reset.StartsWith("FFFFFFFE/", StringComparison.Ordinal)
                     ? $"sequence {info.Name}: node {senderName} lifted its fence without this node's report, so it abandons its blocks and requests new ones"
@@ -2679,7 +2692,7 @@ internal static class SequenceRangeExchange
                 UPDATE worf.sequence_range_node SET reset_at = pg_catalog.clock_timestamp() WHERE seqoid = $1 AND node_id = $2 AND (reset_at IS NULL OR reset_at < $3)
                 """, seq, sender, SpiParameter.Create(new PgTimestampTz(window))) > 0)
             {
-                WorfLog.Warning($"sequence {info.Name}: node {senderName} has heard of grants up to {mark}, beyond this owner's watermark, so this owner lost them; it resets");
+                s_takeInWarnings.Add($"sequence {info.Name}: node {senderName} has heard of grants up to {mark}, beyond this owner's watermark, so this owner lost them; it resets");
                 _ = Worf.Execute($"UPDATE worf.sequence_range SET heard_watermark = {raised}(coalesce(heard_watermark, $2), $2) WHERE seqoid = $1",
                     seq, SpiParameter.Create(mark));
                 SequenceRanges.Reset(seqoid, node, false);

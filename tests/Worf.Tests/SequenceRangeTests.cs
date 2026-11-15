@@ -1668,13 +1668,13 @@ public sealed partial class SequenceRangeTests
                     "reset": null, "reset_done": null, "held_complete": false, "held": [], "requests": [], "reports": [{{madeUp}}], "grants": [], "acks": []}]}
             """;
         int flooded = nodeB.ReadLog().Length;
+        const string MadeUpKept = "SELECT count(*) FROM worf.sequence_range_node WHERE seqoid = 't_id_seq'::regclass AND node_name LIKE 'made_up_%'";
+        await ExchangeUntilAsync(nodeB, flood, async () => await nodeB.SafePsqlAsync(Database, MadeUpKept, token) != "0", "node_b's take-in of the relays", token);
         Assert.AreEqual("t|t", await nodeB.SafePsqlAsync(Database, $"""
             SET SESSION AUTHORIZATION {SuperUser};
             SELECT worf.sequence_range_heard({nodeAId}, true, '-infinity', false) > now() - interval '1 minute',
                 worf.sequence_range_heard({nodeCId}, false, '-infinity', false) > now() - interval '1 minute'
-            FROM (SELECT worf.sequence_range_exchange('{flood}')) e
             """, token), "node_a and node_c heard from");
-        const string MadeUpKept = "SELECT count(*) FROM worf.sequence_range_node WHERE seqoid = 't_id_seq'::regclass AND node_name LIKE 'made_up_%'";
         Assert.AreEqual("t", await nodeB.SafePsqlAsync(Database,
             $"SELECT count(*) BETWEEN 200 AND 256 FROM worf.sequence_range_node WHERE seqoid = 't_id_seq'::regclass AND via_node = {nodeAId} AND node_id <> via_node",
             token), "the nodes node_b keeps from node_a's relays");
@@ -1684,8 +1684,8 @@ public sealed partial class SequenceRangeTests
         Assert.IsTrue(await nodeB.PollLogAsync(flooded, "or the 256 it keeps from one neighbor; they are ignored", token), "the ignored reports");
 
         // A call that relays them no more leaves none of them.
-        _ = await nodeB.SafePsqlAsync(Database, $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{flood.Replace(madeUp, "")}')", token);
-        Assert.AreEqual("0", await nodeB.SafePsqlAsync(Database, MadeUpKept, token), "the made-up nodes node_b forgets");
+        await ExchangeUntilAsync(nodeB, flood.Replace(madeUp, ""), async () => await nodeB.SafePsqlAsync(Database, MadeUpKept, token) == "0",
+            "the made-up nodes node_b forgets", token);
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.alter_subscription_enable('a_from_b')", token);
 
         // node_a's calls fail once they have taken in the reply, while node_b uses up its blocks and asks for more.
@@ -1751,7 +1751,8 @@ public sealed partial class SequenceRangeTests
                     "reset": null, "reset_done": null, "held_complete": false, "held": [], "requests": [], "reports": [], "grants": [], "acks": []}]}
             """;
         int forgedAt = nodeA.ReadLog().Length;
-        _ = await nodeA.SafePsqlAsync(Database, $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{madeUpWatermark}')", token);
+        await ExchangeUntilAsync(nodeA, madeUpWatermark,
+            () => Task.FromResult(nodeA.ReadLog()[forgedAt..].Contains("node node_b has heard of grants up to", StringComparison.Ordinal)), "node_a's reset on the made-up watermark", token);
         Assert.IsTrue(await nodeA.PollLogAsync(forgedAt, "node node_b reports grants up to 9000000000000000000, beyond any a node could have heard of", token),
             "node_a's warning of the made-up watermark");
         Assert.IsTrue(await nodeA.PollLogAsync(forgedAt, "the allocator's fence lifted", token), "node_a's fence lifted");
@@ -1962,10 +1963,9 @@ public sealed partial class SequenceRangeTests
         }
 
         _ = await nodeA.SafePsqlAsync(Database, "ROLLBACK PREPARED 'held_a'", token);
-        _ = await nodeA.SafePsqlAsync(Database, $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{Report("")}')", token);
-        Assert.AreEqual("t", await nodeA.SafePsqlAsync(Database,
-            $"SELECT reset_lsn::text LIKE 'FFFFFFFE/%' FROM worf.sequence_range_node WHERE seqoid = 't_id_seq'::regclass AND node_id = {nodeBId}", token),
-            "node_a's request that node_b reset, at node_b's message that reports what it reported before");
+        await ExchangeUntilAsync(nodeA, Report(""), async () => await nodeA.SafePsqlAsync(Database,
+            $"SELECT reset_lsn::text LIKE 'FFFFFFFE/%' FROM worf.sequence_range_node WHERE seqoid = 't_id_seq'::regclass AND node_id = {nodeBId}", token) == "t",
+            "node_a's request that node_b reset, at node_b's message that reports what it reported before", token);
 
         await nodeB.StartServerAsync(token);
         int waited = nodeB.ReadLog().Length;
@@ -2020,9 +2020,23 @@ public sealed partial class SequenceRangeTests
                 $"SELECT reset_done = '{reset}' FROM worf.sequence_range_node WHERE seqoid = 't_id_seq'::regclass AND node_id = {nodeBId}", token) != "t");
         }
 
+        // The first is sent while a transaction holds node_a's blocks, which the reset gives up: the take-ins leave it until
+        // the transaction ends, and the reset is logged once, as the take-in that makes it commits.
         int asked = nodeA.ReadLog().Length;
-        await AskAsync("0/10");
-        Assert.Contains("node node_b asked this node to reset", nodeA.ReadLog()[asked..], "node_a's reset at node_b's made-up request");
+        await using (NpgsqlConnection holder = await nodeA.OpenAsync(Database, token))
+        {
+            NpgsqlTransaction holding = await holder.BeginTransactionAsync(token);
+            await ExecuteAsync(holder, "SELECT 1 FROM worf.sequence_range_block WHERE seqoid = 't_id_seq'::regclass AND state IN ('active', 'next') FOR UPDATE", token);
+            Task releasing = Task.Run(async () =>
+            {
+                await Task.Delay(TimeSpan.FromSeconds(1.5), token);
+                await holding.RollbackAsync(token);
+            }, token);
+            await AskAsync("0/10");
+            await releasing;
+        }
+
+        Assert.AreEqual(1, nodeA.ReadLog()[asked..].Split("node node_b asked this node to reset").Length - 1, "node_a's resets at node_b's made-up request");
 
         // node_a draws from a block again, so that a reset would have something to give up.
         await WaitActiveAsync([nodeA, nodeB], token);
@@ -9887,6 +9901,22 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// Sends a node a message made up as a neighbor's until it shows taken in: a take-in that finds a row it writes held
+    /// by another transaction, as the range worker's, leaves the sequence to the neighbor's next message, rolling back what
+    /// it did, as a neighbor's own messages, which repeat what they carry until it's answered, send.
+    /// </summary>
+    private static async Task ExchangeUntilAsync(TestNode node, string message, Func<Task<bool>> taken, string what, CancellationToken token)
+    {
+        Stopwatch sending = Stopwatch.StartNew();
+        do
+        {
+            Assert.IsLessThan(TestNode.PollTimeout, sending.Elapsed, what);
+            _ = await node.SafePsqlAsync(Database, $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{message}')", token);
+        }
+        while (!await taken());
+    }
+
+    /// <summary>
     /// Requests to reset that node_a, node_b's grantor, makes up as a fence's lift asks, naming no block node_b holds
     /// from it, reset node_b's sequence no more often than any neighbor's requests do, however many come and though
     /// node_b draws between them. One that names a block node_b holds from node_a resets it at once, in a window of the
@@ -9924,8 +9954,8 @@ public sealed partial class SequenceRangeTests
         Assert.AreNotEqual("", heldBlock, "a block node_b holds from node_a");
         lifting = nodeB.ReadLog().Length;
         Stopwatch window = Stopwatch.StartNew();
-        _ = await nodeB.SafePsqlAsync(Database,
-            $"SET SESSION AUTHORIZATION {SuperUser}; SELECT worf.sequence_range_exchange('{Lift("FFFFFFFF/00000010", $"\"{heldBlock}\"")}')", token);
+        await ExchangeUntilAsync(nodeB, Lift("FFFFFFFF/00000010", $"\"{heldBlock}\""),
+            () => Task.FromResult(nodeB.ReadLog()[lifting..].Contains(Lifted, StringComparison.Ordinal)), "node_b's reset on a lift that names a block it holds", token);
         Assert.AreEqual(1, nodeB.ReadLog()[lifting..].Split(Lifted).Length - 1, "node_b's reset on a lift that names a block it holds");
         await InsertAsync(nodeB, 20, token);
         _ = await nodeB.SafePsqlAsync(Database,
