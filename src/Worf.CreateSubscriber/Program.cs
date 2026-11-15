@@ -1648,6 +1648,7 @@ int? ReadClusterState(string dataDir)
     }
 
     using WalSegments own = new(walDir, names, ownTimeline, segmentSize);
+    ushort? pageMagic = null;
 
     // The records from the checkpoint's redo point on, as far as they're whole, which recovery replays, through the
     // checkpoint record. A record that a crash of the server that wrote it cut short, which the page after it says was
@@ -1787,7 +1788,7 @@ int? ReadClusterState(string dataDir)
     // header says the record that continued onto it was overwritten, past the header; or null when none does.
     ulong? Overwritten(ulong at)
     {
-        if (Stream(own.Read, at, RecordHeader) is not (byte[] header, _))
+        if (Stream(own.Read, at, RecordHeader, continues: false) is not (byte[] header, _))
         {
             return null;
         }
@@ -1837,21 +1838,61 @@ int? ReadClusterState(string dataDir)
         return (crc ^ 0xFFFFFFFF) == Read32(record, 20);
     }
 
-    // A number of WAL bytes from a position, past the page headers, each of which must give its page's own address, and
-    // where they end.
-    (byte[] Bytes, ulong End)? Stream(Func<ulong, int, byte[]?> read, ulong at, int length)
+    // Whether a page's header is one recovery takes, as PostgreSQL's reader checks every page it reads, and the first
+    // page of every segment it reads from: the magic of the first page read, no unknown flag, the page's own address, a
+    // long header with the segment's and the page's sizes on a segment's first page, and, given how many bytes of a
+    // record go on onto the page, the flag that they do and that count.
+    bool PageValid(Func<ulong, int, byte[]?> read, ulong page, uint? continued)
+    {
+        bool first = page % segmentBytes == 0;
+        if (read(page, first ? LongPageHeader : ShortPageHeader) is not byte[] pageHeader || Read64(pageHeader, 8) != page)
+        {
+            return false;
+        }
+
+        ushort magic = BitConverter.ToUInt16(pageHeader, 0);
+        ushort info = BitConverter.ToUInt16(pageHeader, 2);
+        pageMagic ??= magic;
+        if (magic != pageMagic || (info & ~(magic >= 0xD122 ? 0x0007 : 0x000F)) != 0)
+        {
+            return false;
+        }
+
+        bool longHeader = (info & 0x0002) != 0 && Read32(pageHeader, 32) == segmentBytes && Read32(pageHeader, 36) == pageBytes;
+        if (first && !longHeader)
+        {
+            return false;
+        }
+
+        return continued is not uint left || ((info & 0x0001) != 0 && Read32(pageHeader, 16) == left);
+    }
+
+    // A number of WAL bytes from the start of a record, past the page headers, and where they end, from pages whose
+    // headers recovery takes, the record going on onto each after the first, unless the record may be one a crash cut
+    // short, which the page may say was overwritten.
+    (byte[] Bytes, ulong End)? Stream(Func<ulong, int, byte[]?> read, ulong at, int length, bool continues = true)
     {
         List<byte> bytes = new(length);
+        ulong valid = ulong.MaxValue;
         while (bytes.Count < length)
         {
-            if (at % pageBytes == 0)
+            ulong page = at / pageBytes * pageBytes;
+            bool first = page % segmentBytes == 0;
+            if (page != valid)
             {
-                if (read(at, 16) is not byte[] pageHeader || Read64(pageHeader, 8) != at)
+                ulong segment = page / segmentBytes * segmentBytes;
+                if ((!first && valid / segmentBytes * segmentBytes != segment && !PageValid(read, segment, null)) ||
+                    !PageValid(read, page, continues && bytes.Count > 0 ? Read32([.. bytes], 0) - (uint)bytes.Count : null))
                 {
                     return null;
                 }
 
-                at += at % segmentBytes == 0 ? LongPageHeader : (ulong)ShortPageHeader;
+                valid = page;
+            }
+
+            if (at == page)
+            {
+                at += first ? LongPageHeader : (ulong)ShortPageHeader;
                 continue;
             }
 

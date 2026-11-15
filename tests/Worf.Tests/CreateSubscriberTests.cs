@@ -1164,7 +1164,9 @@ public sealed class CreateSubscriberTests
     /// but whose own WAL runs past it; and one that left the provider's WAL behind where it ends, as the run's role may
     /// not list the provider's WAL, which leaves its WAL unchecked; and, from PostgreSQL 17 on, where an online checkpoint's redo point
     /// always comes before its record, one with a torn record between them, in WAL the provider has removed, from which
-    /// recovery would replay.
+    /// recovery would replay; and one whose page at its checkpoint's redo point has a header recovery refuses, here with a
+    /// flag PostgreSQL doesn't know, or, from PostgreSQL 17 on, whose first page between the redo point and the checkpoint
+    /// that a record goes on onto gives a wrong count of the record's bytes left.
     /// </summary>
     /// <param name="when">How the standby's WAL meets the provider's.</param>
     /// <returns>The test.</returns>
@@ -1177,6 +1179,8 @@ public sealed class CreateSubscriberTests
     [DataRow("ahead")]
     [DataRow("beyond")]
     [DataRow("torn")]
+    [DataRow("torn page")]
+    [DataRow("torn continuation")]
     public async Task StandbysWhoseOwnWalReachesTheProvidersAreSubscribed(string when)
     {
         CancellationToken token = TestContext.CancellationToken;
@@ -1368,6 +1372,54 @@ public sealed class CreateSubscriberTests
                 redoBytes[redoOffset + 24] ^= 0x55;
                 await File.WriteAllBytesAsync(redoFile, redoBytes, token);
                 break;
+            case "torn page":
+                // The page that holds the standby's latest checkpoint's redo point says it has a flag no PostgreSQL has.
+                (int pageExit, string pageControl) = await provider.RunProgramAsync("pg_controldata", [backupDir], token);
+                Assert.AreEqual(0, pageExit, pageControl);
+                string pageRedo = pageControl.Split('\n').Single(line => line.StartsWith("Latest checkpoint's REDO location:", StringComparison.Ordinal))
+                    ["Latest checkpoint's REDO location:".Length..].Trim();
+                string pageFile = Path.Join(backupDir, "pg_wal", await provider.SafePsqlAsync(Database, $"SELECT pg_catalog.pg_walfile_name('{pageRedo}')", token));
+                long pageOffset = long.Parse(await provider.SafePsqlAsync(Database,
+                    $"SELECT (('{pageRedo}'::pg_catalog.pg_lsn - '0/0'::pg_catalog.pg_lsn) % 16777216)::bigint / 8192 * 8192", token), CultureInfo.InvariantCulture);
+                byte[] pageBytes = await File.ReadAllBytesAsync(pageFile, token);
+                pageBytes[pageOffset + 2] |= 0x40;
+                await File.WriteAllBytesAsync(pageFile, pageBytes, token);
+                break;
+            case "torn continuation":
+                // The first page after the redo point that a record goes on onto says fewer of its bytes are left.
+                (int nextExit, string nextControl) = await provider.RunProgramAsync("pg_controldata", [backupDir], token);
+                Assert.AreEqual(0, nextExit, nextControl);
+                string Position(string name) => nextControl.Split('\n').Single(line => line.StartsWith(name, StringComparison.Ordinal))[name.Length..].Trim();
+                string[] span = (await provider.SafePsqlAsync(Database, $"""
+                    SELECT ('{Position("Latest checkpoint's REDO location:")}'::pg_catalog.pg_lsn - '0/0'::pg_catalog.pg_lsn)::bigint,
+                        ('{Position("Latest checkpoint location:")}'::pg_catalog.pg_lsn - '0/0'::pg_catalog.pg_lsn)::bigint
+                    """, token)).Split('|');
+                long from = long.Parse(span[0], CultureInfo.InvariantCulture);
+                long to = long.Parse(span[1], CultureInfo.InvariantCulture);
+                if (from / 8192 == to / 8192)
+                {
+                    Assert.IsLessThan(170000, int.Parse(await provider.SafePsqlAsync(Database, "SHOW server_version_num", token), CultureInfo.InvariantCulture),
+                        "the server, whose online checkpoints come after their redo points from PostgreSQL 17 on");
+                    return;
+                }
+
+                bool torn = false;
+                for (long page = ((from / 8192) + 1) * 8192; page <= to && !torn; page += 8192)
+                {
+                    string segmentFile = Path.Join(backupDir, "pg_wal", await provider.SafePsqlAsync(Database,
+                        $"SELECT pg_catalog.pg_walfile_name('{page >> 32:X}/{page & 0xFFFFFFFF:X}')", token));
+                    byte[] segmentBytes = await File.ReadAllBytesAsync(segmentFile, token);
+                    long at = page % 16777216;
+                    if ((segmentBytes[at + 2] & 0x01) != 0)
+                    {
+                        segmentBytes[at + 16] ^= 0x01;
+                        await File.WriteAllBytesAsync(segmentFile, segmentBytes, token);
+                        torn = true;
+                    }
+                }
+
+                Assert.IsTrue(torn, "a page between the standby's redo point and its checkpoint that a record goes on onto");
+                break;
             default:
                 break;
         }
@@ -1418,11 +1470,11 @@ public sealed class CreateSubscriberTests
                 return;
             }
 
-            if (when == "torn")
+            if (when is "torn" or "torn page" or "torn continuation")
             {
                 (int refused, string refusal) = await RefusedRunAsync(command, arguments, work.FullName, port, token);
-                Assert.AreEqual("1|True", $"{refused}|{refusal.Contains("after whole records from its redo point", StringComparison.Ordinal)}",
-                    $"a run on the standby with a torn record after its checkpoint's redo point: {refusal}");
+                Assert.AreEqual("1|True", $"{refused}|{refusal.Contains(when == "torn page" ? "isn't the checkpoint record its own WAL holds there" : "after whole records from its redo point", StringComparison.Ordinal)}",
+                    $"a run on the standby with a torn {(when == "torn page" ? "page header" : when == "torn" ? "record" : "continuation")} after its checkpoint's redo point: {refusal}");
                 return;
             }
 
