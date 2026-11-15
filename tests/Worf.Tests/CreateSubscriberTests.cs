@@ -1165,8 +1165,9 @@ public sealed class CreateSubscriberTests
     /// not list the provider's WAL, which leaves its WAL unchecked; and, from PostgreSQL 17 on, where an online checkpoint's redo point
     /// always comes before its record, one with a torn record between them, in WAL the provider has removed, from which
     /// recovery would replay; and one whose page at its checkpoint's redo point has a header recovery refuses, here with a
-    /// flag PostgreSQL doesn't know, or, from PostgreSQL 17 on, whose first page between the redo point and the checkpoint
-    /// that a record goes on onto gives a wrong count of the record's bytes left.
+    /// flag PostgreSQL doesn't know, or whose first page between the redo point and the checkpoint that a record goes on
+    /// onto, as the provider wrote records of 10 kB while the base backup's checkpoint ran, gives a wrong count of the
+    /// record's bytes left.
     /// </summary>
     /// <param name="when">How the standby's WAL meets the provider's.</param>
     /// <returns>The test.</returns>
@@ -1203,7 +1204,29 @@ public sealed class CreateSubscriberTests
         string autoConf = Path.Join(provider.Cluster.DataDirectory, "postgresql.auto.conf");
         await File.WriteAllLinesAsync(autoConf,
             (await File.ReadAllLinesAsync(autoConf, token)).Where(static line => !line.TrimStart().StartsWith("port", StringComparison.Ordinal)), token);
+        // For a torn continuation, the provider writes records of 10 kB, each going on onto the page after its first, fifty
+        // a second, as the base backup's checkpoint, the standby's latest, runs, so that some lie between its redo point
+        // and its record: the checkpoint, spread, writes the forty or so pages a new table dirtied a tenth of a second
+        // apart, so it runs for seconds, while the WAL written stays a few megabytes, which the standby soon replays.
+        if (when == "torn continuation")
+        {
+            _ = await provider.SafePsqlAsync(Database, "CREATE TABLE fill AS SELECT g, pg_catalog.repeat('x', 1000) AS v FROM generate_series(1, 300) g", token);
+        }
+
+        using CancellationTokenSource emitting = CancellationTokenSource.CreateLinkedTokenSource(token);
+        Task emitter = when != "torn continuation" ? Task.CompletedTask : Task.Run(async () =>
+        {
+            await using NpgsqlConnection emitterConnection = await provider.OpenAsync(Database, token);
+            await using NpgsqlCommand emit = new("SELECT pg_catalog.pg_logical_emit_message(false, 'c', pg_catalog.repeat('x', 10000))", emitterConnection);
+            while (!emitting.IsCancellationRequested)
+            {
+                _ = await emit.ExecuteNonQueryAsync(token);
+                await Task.Delay(TimeSpan.FromMilliseconds(20), token);
+            }
+        }, token);
         (int backedUp, string backupOutput) = await provider.RunProgramAsync("pg_basebackup", ["-D", backupDir, "-d", providerDsn, "-X", "stream", "-R"], token);
+        await emitting.CancelAsync();
+        await emitter;
         Assert.AreEqual(0, backedUp, backupOutput);
 
         // The standby streams segments that hold no checkpoint, catches up and stops in recovery, keeping its own WAL
@@ -1396,13 +1419,6 @@ public sealed class CreateSubscriberTests
                     """, token)).Split('|');
                 long from = long.Parse(span[0], CultureInfo.InvariantCulture);
                 long to = long.Parse(span[1], CultureInfo.InvariantCulture);
-                if (from / 8192 == to / 8192)
-                {
-                    Assert.IsLessThan(170000, int.Parse(await provider.SafePsqlAsync(Database, "SHOW server_version_num", token), CultureInfo.InvariantCulture),
-                        "the server, whose online checkpoints come after their redo points from PostgreSQL 17 on");
-                    return;
-                }
-
                 bool torn = false;
                 for (long page = ((from / 8192) + 1) * 8192; page <= to && !torn; page += 8192)
                 {

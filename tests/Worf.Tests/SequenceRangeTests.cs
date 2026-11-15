@@ -4508,43 +4508,24 @@ public sealed partial class SequenceRangeTests
         _ = await nodeB.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
         await Task.Delay(TimeSpan.FromSeconds(3), token);
 
-        // node_b resets many_01 all along, giving up its blocks and asking for new ones, so that its report of it changes on
-        // every call, and many_01 alone, which sorts first, so that no later sequence's change cuts a call; a draw alone
-        // changes no report. node_b's calls then come to a new process on node_a, which has checked none of their reports:
-        // taking many_01 in passes a third of the call's time, and the call leaves the rest. A reset that waits past its
-        // time for a range row a call holds is let go.
-        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO slow_on DEFAULT VALUES", token);
-        using CancellationTokenSource stopDrawing = CancellationTokenSource.CreateLinkedTokenSource(token);
-        Task drawing = Task.Run(async () =>
-        {
-            await using NpgsqlConnection busy = await nodeB.OpenAsync(Database, token);
-            await using NpgsqlCommand reset = new("SET statement_timeout = '2s'; SELECT worf.reset_sequence_range('many_01')", busy);
-            while (!stopDrawing.IsCancellationRequested)
-            {
-                try
-                {
-                    _ = await reset.ExecuteNonQueryAsync(token);
-                }
-                catch (PostgresException waited) when (waited.SqlState is "55P03" or "57014")
-                {
-                    // The reset goes on at the next turn.
-                }
-
-                await Task.Delay(TimeSpan.FromMilliseconds(300), token);
-            }
-        }, token);
-        await Task.Delay(TimeSpan.FromSeconds(3), token);
-        int logpos = nodeA.ReadLog().Length;
+        // node_b's calls find no exchange on node_a while node_a's process for them ends and node_b resets many_01, giving
+        // up its blocks and asking for new ones, so that its report of it changes, and many_01 alone, which sorts first, so
+        // that no later sequence's change cuts a call; a draw alone changes no report. node_b's next call then comes to a
+        // new process on node_a, which has checked none of its reports: taking many_01 in passes a third of the call's
+        // time, and the call leaves the rest. A call that came to the new process before the reset would find every report
+        // as it was, which the process then passes over, unread, at every call after.
+        _ = await nodeA.SafePsqlAsync(Database,
+            "INSERT INTO slow_on DEFAULT VALUES; ALTER FUNCTION worf.sequence_range_exchange(text) RENAME TO sequence_range_exchange_paused", token);
         _ = await nodeA.SafePsqlAsync(Database, "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE application_name = 'b_from_a_range'", token);
+        _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.reset_sequence_range('many_01')", token);
+        int logpos = nodeA.ReadLog().Length;
+        _ = await nodeA.SafePsqlAsync(Database, "ALTER FUNCTION worf.sequence_range_exchange_paused(text) RENAME TO sequence_range_exchange", token);
         Stopwatch cutting = Stopwatch.StartNew();
         while (!LeftToNextCall().IsMatch(nodeA.ReadLog()[logpos..]))
         {
             Assert.IsLessThan(TestNode.PollTimeout, cutting.Elapsed, "node_a's late call, leaving the sequences it would have had to check");
             await Task.Delay(TimeSpan.FromMilliseconds(200), token);
         }
-
-        await stopDrawing.CancelAsync();
-        await drawing;
     }
 
     // The peak resident memory of a process of the server, which runs beside the test, in kB, as Linux reports it, or 0
