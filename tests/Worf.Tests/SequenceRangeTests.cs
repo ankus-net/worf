@@ -3076,6 +3076,10 @@ public sealed partial class SequenceRangeTests
                     await using (NpgsqlConnection writer = await nodeB.OpenAsync(Database, token))
                     {
                         await using NpgsqlCommand insert = new("INSERT INTO t (v) VALUES ('b')", writer);
+
+                        // The session runs an insert before the timed ones, so that its backend's first use of worf, which a
+                        // loaded host may hold up for a second, isn't counted as a wait.
+                        _ = await insert.ExecuteNonQueryAsync(token);
                         Stopwatch running = Stopwatch.StartNew();
                         TimeSpan slowest = TimeSpan.Zero;
                         // The inserts go on until the call ends, at least 12 s.
@@ -3290,8 +3294,19 @@ public sealed partial class SequenceRangeTests
                     DELETE FROM worf.sequence_range_back WHERE node_id = (SELECT node_id FROM worf.node WHERE node_name = 'node_c')
                     """);
                 Task lift = nodeA.SafePsqlAsync(Database, Lift, token);
+
+                // node_b draws from u_id_seq too, which runs out as the change holds its range row, so that each of node_b's
+                // calls takes that row in after t_id_seq's, and, once the second a take-in that began as the change ran may
+                // wait has passed, none of node_a's exchanges joins the queue of a row the change holds: one that waited
+                // there, however short its lock timeout, could be found in a cycle with a change that waits for a row the
+                // exchange holds, and fail it as a deadlock.
+                Task<long> queued = how == "configuration open" ? QueuedOnRangeRowsAsync(nodeA, TimeSpan.FromSeconds(1.5), TimeSpan.FromSeconds(6), token)
+                    : Task.FromResult(0L);
+                Task drawsOfU = how == "configuration open" ? DrawUntilTimeoutAsync(nodeB, "INSERT INTO u SELECT FROM generate_series(1, 1000)", token) : Task.CompletedTask;
                 Assert.AreEqual("", await InsertAsync(nodeB, "t"), $"node_b's inserts as a lift waits beside a {how}");
+                Assert.AreEqual(0L, await queued, "node_a's exchanges found waiting in the queue of a range row the configuration change holds");
                 await holding.CommitAsync(token);
+                await drawsOfU;
                 Assert.AreNotEqual("40P01", await OutcomeAsync(lift), "the lift");
                 break;
             }
@@ -9912,6 +9927,48 @@ public sealed partial class SequenceRangeTests
         }
 
         return [.. waits];
+    }
+
+    /// <summary>
+    /// Counts, sampling as fast as a session can for a while after a delay, the times a node's exchanges are found in the
+    /// queue of a sequence's range row: holding the row's tuple lock and waiting for the transaction that holds the row.
+    /// </summary>
+    private static async Task<long> QueuedOnRangeRowsAsync(TestNode node, TimeSpan delay, TimeSpan window, CancellationToken token)
+    {
+        await Task.Delay(delay, token);
+        await using NpgsqlConnection watcher = await node.OpenAsync(Database, token);
+        await using NpgsqlCommand sample = new("""
+            SELECT count(*) FROM pg_catalog.pg_locks w JOIN pg_catalog.pg_stat_activity a ON a.pid = w.pid
+            WHERE NOT w.granted AND w.locktype = 'transactionid' AND (a.backend_type <> 'client backend' OR a.application_name LIKE '%\_range')
+                AND EXISTS (SELECT 1 FROM pg_catalog.pg_locks t WHERE t.pid = w.pid AND t.granted AND t.locktype = 'tuple'
+                    AND t.relation = 'worf.sequence_range'::pg_catalog.regclass)
+            """, watcher);
+        long queued = 0;
+        Stopwatch watching = Stopwatch.StartNew();
+        while (watching.Elapsed < window)
+        {
+            queued += (long)(await sample.ExecuteScalarAsync(token))!;
+        }
+
+        return queued;
+    }
+
+    /// <summary>
+    /// Runs a statement that draws from a sequence on a session whose statements time out after 8 s, as one that waits
+    /// for a block then does.
+    /// </summary>
+    private static async Task DrawUntilTimeoutAsync(TestNode node, string statement, CancellationToken token)
+    {
+        await using NpgsqlConnection drawer = await node.OpenAsync(Database, token);
+        await using NpgsqlCommand draw = new($"SET statement_timeout = '8s'; {statement}", drawer);
+        try
+        {
+            _ = await draw.ExecuteNonQueryAsync(token);
+        }
+        catch (PostgresException timedOut) when (timedOut.SqlState == "57014")
+        {
+            // The draw waited for a block until it timed out.
+        }
     }
 
     /// <summary>

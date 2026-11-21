@@ -2334,7 +2334,10 @@ internal static class SequenceRangeExchange
         // While a session idle in its transaction holds rows of the ranges, as a configuration change left open does,
         // rather than having only read them, no row is waited for, so that the turn isn't held up for those at every
         // exchange, and once a wait has run out, none is in the rest of the message, so that the turn is held up for one
-        // wait a message at most.
+        // wait a message at most. A row it doesn't wait for is taken only if no transaction holds it, rather than with the
+        // take-in's lock timeout, which leaves the exchange in the row's queue until it next runs, however short the
+        // timeout: on a busy host, a configuration change that holds the row and waits for one the exchange took would
+        // find the cycle first, and fail as a deadlock.
         int epoch = entry.GetProperty("epoch").GetInt32();
         uint owner = entry.GetProperty("owner_id").GetUInt32();
         WorfRows local;
@@ -2346,19 +2349,22 @@ internal static class SequenceRangeExchange
 
         try
         {
-            if (s_rangeWaitAllowed && !s_rangeWaitSpent && !Worf.ReadScalar<bool>("""
+            bool wait = s_rangeWaitAllowed && !s_rangeWaitSpent && !Worf.ReadScalar<bool>("""
                 SELECT EXISTS (
                     SELECT 1 FROM pg_catalog.pg_locks l JOIN pg_catalog.pg_stat_activity a ON a.pid = l.pid
                     WHERE l.locktype = 'relation' AND l.database = (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())
                         AND l.relation = 'worf.sequence_range'::pg_catalog.regclass AND l.granted AND l.mode <> 'AccessShareLock'
                         AND a.state LIKE 'idle in transaction%')
-                """))
+                """);
+            if (wait)
             {
                 WorfLocks.SetAtNestLevel("lock_timeout", Math.Min(1000, SequenceRanges.ExchangeTimeout / 4).ToString(CultureInfo.InvariantCulture));
             }
 
-            local = Worf.Query("SELECT owner_node, epoch, state, parent_node FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE", false, 1,
-                SpiParameter.Create(seqoid));
+            local = Worf.Query(wait
+                ? "SELECT owner_node, epoch, state, parent_node FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE"
+                : "SELECT owner_node, epoch, state, parent_node FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE NOWAIT",
+                false, 1, SpiParameter.Create(seqoid));
         }
         catch (PgException held) when (held.SqlState == "55P03")
         {
