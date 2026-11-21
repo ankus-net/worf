@@ -44,9 +44,11 @@ jobs:
       run:
         shell: bash
     # The tests' nodes load the worf the build step publishes, rather than the test harness building and publishing it
-    # again in its own directories, which every node then waited for.
+    # again in its own directories, which every node then waited for, and the tests run the worf_create_subscriber the
+    # job restored or published, rather than wait for a NativeAOT publish of their own.
     env:
       WORF_TEST_PUBLICATION: src/Worf/bin/ankus/pg${{ matrix.postgresql }}/${{ matrix.platform }}/Release
+      WORF_TEST_CREATE_SUBSCRIBER: artifacts/worf-create-subscriber/${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v7
 
@@ -81,6 +83,16 @@ jobs:
             ${{ steps.bindings.outputs.sdk }}-
             ${{ steps.bindings.outputs.version }}-
 
+      # worf_create_subscriber doesn't depend on the PostgreSQL version, and its NativeAOT publish takes a minute or two,
+      # so each platform's is kept under the hash of what it's built from, and published again only when that changes.
+      - name: Restore worf_create_subscriber
+        id: tool
+        if: github.event_name != 'schedule' && inputs.nightly != true
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.WORF_TEST_CREATE_SUBSCRIBER }}
+          key: worf-create-subscriber-${{ matrix.platform }}-${{ hashFiles('global.json', 'Directory.Build.props', 'Directory.Packages.props', 'src/Worf.CreateSubscriber/**', 'src/Worf/Fe.cs') }}
+
       - name: Build
         id: build
         run: |
@@ -89,6 +101,9 @@ jobs:
           dotnet ankus build --pg ${{ matrix.postgresql }} --project src/Worf/Worf.csproj | tee "$RUNNER_TEMP/build.log"
           if grep -q "Managed binding compilation: built" "$RUNNER_TEMP/build.log"; then
             echo "compiled-bindings=true" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "${{ steps.tool.outcome }}" = success ] && [ "${{ steps.tool.outputs.cache-hit }}" != true ]; then
+            dotnet publish src/Worf.CreateSubscriber/Worf.CreateSubscriber.csproj -c Release -r ${{ matrix.platform }} -o "$WORF_TEST_CREATE_SUBSCRIBER"
           fi
 
       # Bindings depend on the PostgreSQL symbols worf uses, so restored ones go stale when worf starts using another.
@@ -110,6 +125,13 @@ jobs:
         with:
           path: ${{ runner.temp }}/ankus-bindings
           key: ${{ steps.bindings.outputs.image }}-${{ github.run_id }}
+
+      - name: Save worf_create_subscriber
+        if: steps.tool.outcome == 'success' && steps.tool.outputs.cache-hit != 'true' && (github.ref == 'refs/heads/main' || github.event_name == 'pull_request')
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.WORF_TEST_CREATE_SUBSCRIBER }}
+          key: ${{ steps.tool.outputs.cache-primary-key }}
 
       # The regression suite runs in the background of the multi-server tests' step. Run beside them while pgbench wrote
       # as fast as it could, pglogical's timing-sensitive regression tests failed; with pgbench's rate bounded they pass.

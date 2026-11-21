@@ -132,8 +132,15 @@ internal static class CreateSubscriberCommand
         }
     }
 
+    // The command CI published, in the directory WORF_TEST_CREATE_SUBSCRIBER names, absolute or from the repository's
+    // root, so that the tests that run it don't wait for a NativeAOT publish of their own, or otherwise one published now.
     private static async Task<string> PublishAsync()
     {
+        if (Environment.GetEnvironmentVariable("WORF_TEST_CREATE_SUBSCRIBER") is { Length: > 0 } published)
+        {
+            return Path.Join(Path.GetFullPath(published, RepositoryPaths.Root), FileName);
+        }
+
         string output = Path.Join(RepositoryPaths.Root, "artifacts", "worf-create-subscriber", RuntimeInformation.RuntimeIdentifier);
         (int exitCode, string stdout, string stderr) = await ProcessRunner.RunAsync("dotnet",
         [
