@@ -50,8 +50,9 @@ internal sealed class TestNode : IAsyncDisposable
     /// <summary>
     /// Starts a node with worf in shared_preload_libraries and the given settings. The test run's nodes share one
     /// publication of worf, and before PostgreSQL 18, one staged copy of the installation the run selects with worf's
-    /// files in it, which the harness would otherwise make for each node; each still has a cluster of its own, with worf
-    /// created in its test database, as the harness creates it.
+    /// files in it, which the harness would otherwise make for each node; each still has a cluster of its own. worf isn't
+    /// created in the harness's test database, which no test uses: each test creates it where it works, and a second
+    /// copy would cost each node its creation and a database manager for as long as it runs.
     /// </summary>
     /// <param name="name">The node's name.</param>
     /// <param name="configuration">The node's postgresql.conf settings.</param>
@@ -78,19 +79,7 @@ internal sealed class TestNode : IAsyncDisposable
             PostgreSqlConfiguration = [.. shared.Settings, .. configuration],
             ProcessEnvironment = environment is null ? new Dictionary<string, string?>() : new Dictionary<string, string?>(environment),
         }, cancellationToken);
-        TestNode node = new(name, cluster);
-        try
-        {
-            await using NpgsqlConnection connection = await cluster.OpenConnectionAsync(cancellationToken);
-            _ = await QueryAsync(connection, "CREATE EXTENSION worf", cancellationToken);
-        }
-        catch
-        {
-            await node.DisposeAsync();
-            throw;
-        }
-
-        return node;
+        return new TestNode(name, cluster);
     }
 
     /// <summary>

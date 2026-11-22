@@ -47,6 +47,7 @@ public sealed class GlobalDdlLockTests
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
+    [TestCategory("EveryVersion")]
     public async Task DdlThatCantApplyInAnyOrderHoldsBackWrites()
     {
         CancellationToken token = TestContext.CancellationToken;

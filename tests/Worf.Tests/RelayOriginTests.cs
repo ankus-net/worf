@@ -106,6 +106,7 @@ public sealed class RelayOriginTests
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
+    [TestCategory("EveryVersion")]
     public async Task OriginsKeepTheirSubscriptionAndFreeTheirSlots()
     {
         CancellationToken token = TestContext.CancellationToken;

@@ -38,6 +38,7 @@ public sealed class ColumnTypeTests
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
+    [TestCategory("EveryVersion")]
     public async Task ValuesConvertToTheSubscribersColumnTypes()
     {
         CancellationToken token = TestContext.CancellationToken;

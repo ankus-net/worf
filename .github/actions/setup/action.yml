@@ -134,18 +134,20 @@ runs:
         echo "key=$ANKUS_KEY-${installation##*[\\/]}" >> "$GITHUB_OUTPUT"
 
     # Saved as soon as it's installed, so a later failing step doesn't make the next run build it again, and only when
-    # the cache didn't have it. Only main stores installations: every branch and tag can restore main's, while copies of
-    # their own, which only they can restore, crowd main's out of the cache.
+    # the cache didn't have it. Main stores installations every branch and tag can restore. A pull request stores its
+    # Linux and macOS builds too, tens of megabytes each, which only its later runs read, so that a PostgreSQL release
+    # main hasn't built yet is built once rather than in every job of every run, for two minutes or more; its Windows
+    # installations, hundreds of megabytes each and only downloaded, would crowd main's out of the cache.
     - name: Prune PostgreSQL
       # An installation ankus init replaced stays beside the new one.
-      if: github.ref == 'refs/heads/main' && steps.postgresql-cache.outputs.cache-matched-key != steps.postgresql.outputs.key
+      if: (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && runner.os != 'Windows')) && steps.postgresql-cache.outputs.cache-matched-key != steps.postgresql.outputs.key
       shell: bash
       env:
         INSTALLATION: ${{ steps.postgresql.outputs.directory }}
       run: find ~/.ankus/postgres -mindepth 1 -maxdepth 1 -type d ! -name "$INSTALLATION" -prune -exec rm -rf {} +
 
     - name: Save PostgreSQL
-      if: github.ref == 'refs/heads/main' && steps.postgresql-cache.outputs.cache-matched-key != steps.postgresql.outputs.key
+      if: (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && runner.os != 'Windows')) && steps.postgresql-cache.outputs.cache-matched-key != steps.postgresql.outputs.key
       uses: actions/cache/save@v6
       with:
         path: ~/.ankus/postgres

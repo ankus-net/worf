@@ -2934,6 +2934,7 @@ public sealed partial class SequenceRangeTests
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
+    [TestCategory("EveryVersion")]
     [OSCondition(OperatingSystems.Linux)]
     public async Task ConnectionsReachTheServerLibpqWould()
     {
@@ -6996,6 +6997,7 @@ public sealed partial class SequenceRangeTests
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
+    [TestCategory("EveryVersion")]
     public async Task RestartedNodesDrawNothingBeforeTheirGrantorAnswers()
     {
         CancellationToken token = TestContext.CancellationToken;

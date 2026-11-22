@@ -1172,6 +1172,7 @@ public sealed class CreateSubscriberTests
     /// <param name="when">How the standby's WAL meets the provider's.</param>
     /// <returns>The test.</returns>
     [TestMethod]
+    [TestCategory("EveryVersion")]
     [DataRow("overlap")]
     [DataRow("partial")]
     [DataRow("boundary")]
