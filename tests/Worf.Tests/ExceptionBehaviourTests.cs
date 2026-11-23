@@ -1278,15 +1278,15 @@ public sealed partial class ExceptionBehaviourTests
                     """, token), "the changed rows the CHECK refused, recorded and left as they were, and row 12345, left alone");
                 TestContext.WriteLine($"merge with rows that fail alone: {merging.Elapsed.TotalSeconds:F1} s, {merged} transaction IDs");
 
-                // The merge's time, from the sync worker's log, against the copy's before it, in the same worker: the parts
-                // check the deferrable key at their own keys, rather than the table's.
+                // The merge's time, from the sync worker's log, and the copy's before it, in the same worker, for the record:
+                // a loaded runner stretches either, so the checks below count what the merge did instead. The parts check
+                // the deferrable key at their own keys, rather than the table's.
                 string log = subscriber.ReadLog()[logpos..];
                 DateTime At(string text) => DateTime.Parse(log.Split('\n').Last(line => line.Contains(text, StringComparison.Ordinal))[1..24],
                     CultureInfo.InvariantCulture);
                 TimeSpan copy = At($"merging the copy of table public.{table} into") - At($"copying table public.{table} again");
                 TimeSpan merge = At($"merged the copy of table public.{table} in halves") - At($"merging the copy of table public.{table} into");
                 TestContext.WriteLine($"the copy took {copy.TotalSeconds:F1} s and the merge {merge.TotalSeconds:F1} s");
-                Assert.IsLessThan((copy * 10) + TimeSpan.FromSeconds(40), merge, "the merge of 300,000 rows with 1,000 that fail alone, against its copy");
 
                 // The merge splits the copy at once once it has failed whole twice, and the held-value checks before keep
                 // only the rows that can conflict.

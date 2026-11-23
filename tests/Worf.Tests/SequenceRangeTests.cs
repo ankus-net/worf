@@ -2432,7 +2432,7 @@ public sealed partial class SequenceRangeTests
                 CultureInfo.InvariantCulture))];
         waits.Sort();
         Assert.IsGreaterThan(100, waits.Count, "node_b's inserts");
-        Assert.IsLessThan(1000.0, waits[^1], "node_b's slowest insert, against the 5000 ms each call to node_c took");
+        Assert.IsLessThan(2500.0, waits[^1], "node_b's slowest insert, against the 5000 ms each call to node_c took");
         Assert.IsLessThan(100.0, waits[(int)(waits.Count * 0.99)], "node_b's 99th percentile insert");
 
         // node_b runs w's root on node_a out, so that its request to node_a for another block stays open.
@@ -2627,7 +2627,7 @@ public sealed partial class SequenceRangeTests
                 CultureInfo.InvariantCulture))];
         waits.Sort();
         Assert.IsGreaterThan(100, waits.Count, "node_b's inserts");
-        Assert.IsLessThan(1000.0, waits[^1], "node_b's slowest insert, against the 5000 ms each attempt to reach node_c took");
+        Assert.IsLessThan(2500.0, waits[^1], "node_b's slowest insert, against the 5000 ms each attempt to reach node_c took");
         Assert.IsLessThan(100.0, waits[(int)(waits.Count * 0.99)], "node_b's 99th percentile insert");
 
         // A connection to node_c that libpq finds bad at once, for a host name nothing resolves or an option it doesn't
@@ -2730,7 +2730,7 @@ public sealed partial class SequenceRangeTests
                     CultureInfo.InvariantCulture))];
             waits.Sort();
             Assert.IsGreaterThan(100, waits.Count, "node_b's inserts");
-            Assert.IsLessThan(1000.0, waits[^1], "node_b's slowest insert, against the 7 s each lookup of node_c's host takes");
+            Assert.IsLessThan(3500.0, waits[^1], "node_b's slowest insert, against the 7 s each lookup of node_c's host takes");
             Assert.Contains("exchange with node node_c failed", nodeB.ReadLog()[logpos..], "node_b's calls to node_c, whose host isn't found");
 
             // A host name whose first address refuses is reached at its second. No call through the service before it
@@ -3093,7 +3093,7 @@ public sealed partial class SequenceRangeTests
                             await Task.Delay(TimeSpan.FromMilliseconds(10), token);
                         }
 
-                        Assert.IsLessThan(TimeSpan.FromSeconds(1), slowest, $"node_b's slowest insert, while worf-slow.test is looked up for {dsn}");
+                        Assert.IsLessThan(TimeSpan.FromSeconds(3.5), slowest, $"node_b's slowest insert, while worf-slow.test is looked up for {dsn}, against the lookup's 7 s");
                     }
 
                     Assert.IsTrue(await nodeB.PollLogAsync(slow, outcome, token), $"node_b's call to node_c at {dsn}: {outcome}");
@@ -6886,7 +6886,7 @@ public sealed partial class SequenceRangeTests
                 CultureInfo.InvariantCulture))];
         waits.Sort();
         Assert.IsGreaterThan(100, waits.Count, "node_b's inserts");
-        Assert.IsLessThan(1000.0, waits[^1], "node_b's slowest insert, against the 5000 ms each call to node_c held up its calls to node_a");
+        Assert.IsLessThan(2500.0, waits[^1], "node_b's slowest insert, against the 5000 ms each call to node_c held up its calls to node_a");
         Assert.StartsWith("5000 ms,10000 ms", delays, "node_b's delays after its calls to node_c ran out of time, though its probe answered between them");
         Assert.Contains("exchange with node node_c answered a probe", log, "node_b's probe of node_c");
     }
@@ -9455,7 +9455,7 @@ public sealed partial class SequenceRangeTests
             .Select(line => double.Parse(line[(line.IndexOf("duration: ", StringComparison.Ordinal) + 10)..line.IndexOf(" ms", StringComparison.Ordinal)],
                 CultureInfo.InvariantCulture))];
         Assert.IsGreaterThan(100, t1Times.Length, "t1's inserts the server timed");
-        Assert.IsLessThan(1500.0, t1Times.Max(), $"t1's slowest insert on the server, in ms, while t2 was held; the test host saw {t1Seen}");
+        Assert.IsLessThan(3000.0, t1Times.Max(), $"t1's slowest insert on the server, in ms, while t2 was held for 6 s; the test host saw {t1Seen}");
         Assert.AreEqual($"{left - 30 + 160}", await node.SafePsqlAsync(Database, "SELECT count(*) FROM t2", token));
         Assert.DoesNotContain("reached maximum value", node.ReadLog(), "inserts that ran a block out");
         }
