@@ -4300,6 +4300,40 @@ public sealed partial class SequenceRangeTests
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 's1'::regclass", token),
             "node_b drawing from a block of s1, with the next one ready");
 
+        // A statement run again in a transaction that drew s1 takes about as long as in one that drew nothing, each in a
+        // session of its own that has run nothing else: its calls of nextval are read once for its text, rather than from
+        // its plan's text each time it starts. The two sessions' inserts alternate, and the first 20 of each warm up.
+        string values = $"INSERT INTO vt VALUES {string.Join(", ", Enumerable.Range(1, 4000).Select(i => string.Create(CultureInfo.InvariantCulture, $"({i})")))}";
+        await using (NpgsqlConnection drawingConnection = await nodeB.OpenAsync(Database, token))
+        await using (NpgsqlConnection plainConnection = await nodeB.OpenAsync(Database, token))
+        {
+            await using NpgsqlTransaction drawingTransaction = await drawingConnection.BeginTransactionAsync(token);
+            await using NpgsqlTransaction plainTransaction = await plainConnection.BeginTransactionAsync(token);
+            await using (NpgsqlCommand drawOnce = new("SELECT nextval('s1')", drawingConnection, drawingTransaction))
+            {
+                _ = await drawOnce.ExecuteNonQueryAsync(token);
+            }
+
+            await using NpgsqlCommand drawingInsert = new(values, drawingConnection, drawingTransaction);
+            await using NpgsqlCommand plainInsert = new(values, plainConnection, plainTransaction);
+            TimeSpan drawing = TimeSpan.Zero;
+            TimeSpan plainly = TimeSpan.Zero;
+            for (int i = 0; i < 60; i++)
+            {
+                foreach ((NpgsqlCommand insert, bool drew) in i % 2 == 0 ? new[] { (drawingInsert, true), (plainInsert, false) } : [(plainInsert, false), (drawingInsert, true)])
+                {
+                    Stopwatch timing = Stopwatch.StartNew();
+                    _ = await insert.ExecuteNonQueryAsync(token);
+                    drawing += i >= 20 && drew ? timing.Elapsed : TimeSpan.Zero;
+                    plainly += i >= 20 && !drew ? timing.Elapsed : TimeSpan.Zero;
+                }
+            }
+
+            Assert.IsLessThan(plainly * 1.2, drawing, $"40 inserts of 4,000 rows in a transaction that drew s1, against {plainly} in one that didn't");
+            await drawingTransaction.RollbackAsync(token);
+            await plainTransaction.RollbackAsync(token);
+        }
+
         // With node_a down, a transaction on node_b draws s1, and another session then draws s1 until a draw waits for a
         // switch that can't come, in the last block's last twentieth.
         await nodeA.StopAsync("fast", token);
@@ -4356,34 +4390,6 @@ public sealed partial class SequenceRangeTests
 
         Assert.IsLessThan(TimeSpan.FromSeconds(3), selecting.Elapsed, "100 statements of SELECT 1 in the transaction");
 
-        // Statements run again in the transaction, which drew s1, take about as long as in one that drew nothing: a
-        // statement's calls of nextval are read once for its text, rather than from its plan's text each time it starts.
-        string values = $"INSERT INTO vt VALUES {string.Join(", ", Enumerable.Range(1, 4000).Select(i => string.Create(CultureInfo.InvariantCulture, $"({i})")))}";
-        await using NpgsqlConnection plainConnection = await nodeB.OpenAsync(Database, token);
-        await using NpgsqlTransaction plainTransaction = await plainConnection.BeginTransactionAsync(token);
-        TimeSpan drawing = TimeSpan.Zero;
-        TimeSpan plainly = TimeSpan.Zero;
-        for (int round = 0; round < 3; round++)
-        {
-            foreach ((NpgsqlConnection inserting, NpgsqlTransaction within, bool drew) in new[] { (connection, transaction, true), (plainConnection, plainTransaction, false) })
-            {
-                await using NpgsqlCommand insert = new(values, inserting, within);
-                Stopwatch timing = Stopwatch.StartNew();
-                for (int i = 0; i < 20; i++)
-                {
-                    _ = await insert.ExecuteNonQueryAsync(token);
-                }
-
-                if (round > 0)
-                {
-                    drawing += drew ? timing.Elapsed : TimeSpan.Zero;
-                    plainly += drew ? TimeSpan.Zero : timing.Elapsed;
-                }
-            }
-        }
-
-        Assert.IsLessThan(plainly * 1.2, drawing, $"40 inserts of 4,000 rows in the transaction that drew s1, against {plainly} in one that didn't");
-        await plainTransaction.CommitAsync(token);
 
         await transaction.CommitAsync(token);
     }
@@ -6483,12 +6489,14 @@ public sealed partial class SequenceRangeTests
             _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
         }
 
-        // node_b refuses, while worf_test.refuse_ties is on, to tie a slot to a node at a call made while the slot is
-        // streamed, as a node's first exchange through its slot ties it.
+        // node_b refuses, while its unlogged table refusing holds a row, which neither replicates nor survives a restore,
+        // to tie a slot to a node at a call made while the slot is streamed, as a node's first exchange through its slot
+        // ties it.
         _ = await nodeB.SafePsqlAsync(Database, """
+            CREATE UNLOGGED TABLE refusing (); INSERT INTO refusing DEFAULT VALUES;
             CREATE FUNCTION refuse_ties() RETURNS trigger LANGUAGE plpgsql AS $$
             BEGIN
-                IF current_setting('worf_test.refuse_ties', true) = 'on'
+                IF EXISTS (SELECT FROM public.refusing)
                     AND EXISTS (SELECT FROM pg_catalog.pg_replication_slots WHERE slot_name = NEW.slot_name AND active) THEN
                     RAISE EXCEPTION 'worf-test-refused-tie';
                 END IF;
@@ -6496,8 +6504,6 @@ public sealed partial class SequenceRangeTests
             END $$;
             CREATE TRIGGER refuse_ties BEFORE INSERT ON worf.sequence_range_link FOR EACH ROW EXECUTE FUNCTION refuse_ties();
             """, token);
-        _ = await nodeB.SafePsqlAsync(Database, "ALTER SYSTEM SET worf_test.refuse_ties = 'on'", token);
-        _ = await nodeB.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
 
         // node_a's root starts before node_c subscribes to node_b, which it reaches node_a through.
         await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
@@ -6517,13 +6523,7 @@ public sealed partial class SequenceRangeTests
         string copy = Path.Join(copies.FullName, "node_b");
         await BackUpDataAsync(nodeB, copy, token, wal: true);
         CopySlots(nodeB, copy);
-        async Task TieAgainAsync()
-        {
-            _ = await nodeB.SafePsqlAsync(Database, "ALTER SYSTEM RESET worf_test.refuse_ties", token);
-            _ = await nodeB.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
-        }
-
-        await TieAgainAsync();
+        _ = await nodeB.SafePsqlAsync(Database, "DELETE FROM refusing", token);
         const string HeardOfB = "FROM worf.sequence_range_node WHERE node_name = 'node_b' AND seqoid = 't_id_seq'::regclass";
         Assert.IsTrue(await nodeC.PollQueryUntilAsync(Database, $"SELECT EXISTS (SELECT 1 {HeardOfB})", token), "node_c hearing of node_b");
         await nodeA.StopAsync("fast", token);
@@ -6531,7 +6531,7 @@ public sealed partial class SequenceRangeTests
         Assert.IsTrue(await nodeC.PollQueryUntilAsync(Database, $"SELECT drawn >= {before.Max(long.Parse)} {HeardOfB}", token), "node_c hearing of node_b's draws");
         await nodeC.StopAsync("fast", token);
         await RestoreDataAsync(nodeB, copy, token);
-        await TieAgainAsync();
+        Assert.AreEqual("0", await nodeB.SafePsqlAsync(Database, "SELECT count(*) FROM refusing", token), "node_b's refusing rows after the restore");
         await nodeA.StartServerAsync(token);
 
         PostgresException waited = await Assert.ThrowsExactlyAsync<PostgresException>(() => nodeB.SafePsqlAsync(Database, "INSERT INTO t (v) VALUES ('waiting')", token),
