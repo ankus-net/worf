@@ -2850,12 +2850,9 @@ internal static partial class SequenceRangeGuard
         // One whose sequence they don't name waits so only for a sequence whose block has run out, as any draw from it
         // would fail, and its rows count the others down as they're seen to draw from them.
         long rowDraws = switching.Count > 0 && starting is { Running: not 0 } running ? RunningRowCalls(running.Running) : 1;
-        foreach (uint seqoid in switching)
+        foreach (uint seqoid in switching.Where(seqoid => !anyOf || spelled.Contains(seqoid) || RunOut(seqoid, Position(seqoid))))
         {
-            if (!anyOf || spelled.Contains(seqoid) || RunOut(seqoid, Position(seqoid)))
-            {
-                WaitWhileShort(seqoid, rowDraws);
-            }
+            WaitWhileShort(seqoid, rowDraws);
         }
 
         if (switching.Count > 0)

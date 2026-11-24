@@ -708,8 +708,15 @@ internal sealed unsafe class WorfProbe : IDisposable
     // path or a name starting with @. On Windows an absolute path also starts with \ or a drive letter, a colon and either
     // separator.
     internal static bool IsSocketPath(string host)
-        => host.Length > 0 && (host[0] is '/' or '@' || (OperatingSystem.IsWindows() &&
-            (host[0] == '\\' || (host.Length >= 3 && char.IsAsciiLetter(host[0]) && host[1] == ':' && host[2] is '/' or '\\'))));
+    {
+        if (host.Length == 0 || host[0] is '/' or '@')
+        {
+            return host.Length > 0;
+        }
+
+        bool drive = host.Length >= 3 && char.IsAsciiLetter(host[0]) && host[1] == ':';
+        return OperatingSystem.IsWindows() && (host[0] == '\\' || (drive && host[2] is '/' or '\\'));
+    }
 
     // A line with the first address in it that is quoted, as libpq names one, named by its name as well.
     private static string NamedLine(string line, string host, string address)

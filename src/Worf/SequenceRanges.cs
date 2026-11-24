@@ -953,10 +953,8 @@ internal static unsafe partial class SequenceRanges
         bool waited = false;
         foreach ((string table, string column) in s_neighborRows)
         {
-            foreach (WorfRow row in Worf.Read($"SELECT ctid::text FROM {table} WHERE {column} = $1", 0, SpiParameter.Create(nodeId)))
+            foreach (string ctid in Worf.Read($"SELECT ctid::text FROM {table} WHERE {column} = $1", 0, SpiParameter.Create(nodeId)).Select(row => row.Get<string>(0)))
             {
-                waited = true;
-                string ctid = row.Get<string>(0);
                 try
                 {
                     PgTransaction.RunInSubtransaction(() =>
@@ -967,6 +965,7 @@ internal static unsafe partial class SequenceRanges
                 }
                 catch (PgException free) when (free.SqlState == RowWaitedFor)
                 {
+                    waited = true;
                 }
             }
         }
