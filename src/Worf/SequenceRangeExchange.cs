@@ -115,8 +115,11 @@ internal static class SequenceRangeExchange
         string slot = root.GetProperty("slot").GetWorfString() ?? "";
 
         // A subscriber that drops its subscription leaves the slot, if it ever called through it, and this node's fences no
-        // longer wait on it.
+        // longer wait on it. One whose sync has just made the slot joins through it, binding it before anything streams it,
+        // so that this node, though a backup restores it from before the subscriber's first call, still knows the node calls
+        // it, and waits for it after it starts.
         bool leaving = root.TryGetProperty("leave", out JsonElement leave) && leave.ValueKind == JsonValueKind.True;
+        bool joining = root.TryGetProperty("join", out JsonElement join) && join.ValueKind == JsonValueKind.True;
         if (leaving && Worf.SelectCatalog("SELECT 1 FROM worf.sequence_range_link WHERE slot_name = $1", SpiParameter.Create(slot)).Count == 0)
         {
             return "{}";
@@ -126,9 +129,9 @@ internal static class SequenceRangeExchange
         // streams it, is no failure: the subscriber asks again soon. Nor is one that isn't there, as before the apply
         // worker makes it, or once the subscription is dropped, which the subscriber logs if it lasts, so that this node
         // logs no error for it; one that a subscriber leaves must be there.
-        switch (Authenticate(slot, senderId))
+        switch (Authenticate(slot, senderId, joining))
         {
-            case null when !leaving:
+            case null when !leaving && !joining:
                 return """{"streamed":false,"slot":false}""";
             case null:
                 throw new PgException("42501", $"no worf replication slot \"{slot}\" carries this sequence range exchange");
@@ -136,6 +139,12 @@ internal static class SequenceRangeExchange
                 return """{"streamed":false}""";
             default:
                 break;
+        }
+
+        if (joining)
+        {
+            SequenceRanges.ChangedOnCommit();
+            return "{}";
         }
 
         TakeTurn();
@@ -162,10 +171,12 @@ internal static class SequenceRangeExchange
     /// deleted, so that one subscriber's role can't speak for another node: a provider tells its subscribers apart by
     /// their roles alone. A node re-created under another name, with the same subscription name and role, takes over
     /// the slot its old node was bound to once the role may speak for it, or, for a superuser, once the old node has
-    /// been silent for as long as a neighbor counts as in touch, and the old node is forgotten.
+    /// been silent for as long as a neighbor counts as in touch, and the old node is forgotten. A subscriber's sync, which
+    /// has just made the slot, binds it as it joins, before anything streams it, as a role that may stream slots, which
+    /// could bind it so by streaming it.
     /// </summary>
     /// <returns>Whether the slot is streamed or bound, false while it's neither, or null when there's no such slot.</returns>
-    private static bool? Authenticate(string slot, uint senderId)
+    private static bool? Authenticate(string slot, uint senderId, bool joining = false)
     {
         uint role;
         unsafe
@@ -186,12 +197,13 @@ internal static class SequenceRangeExchange
 
         bool active = slots[0].Get<bool>(0);
         WorfRows link = Worf.SelectCatalog("SELECT node_id, role_id FROM worf.sequence_range_link WHERE slot_name = $1", name);
-        if (!active && link.Count == 0)
+        if (!active && link.Count == 0 && (!joining ||
+            !Worf.ReadScalar<bool>("SELECT rolreplication OR rolsuper FROM pg_catalog.pg_roles WHERE oid = $1", SpiParameter.Create(role))))
         {
             return false;
         }
 
-        if (active ? slots[0].Get<uint?>(1) != role : link[0].Get<uint>(1) != role)
+        if (active ? slots[0].Get<uint?>(1) != role : link.Count > 0 && link[0].Get<uint>(1) != role)
         {
             throw new PgException("42501", active ? $"replication slot \"{slot}\" is streamed by another role than this sequence range exchange's"
                 : $"replication slot \"{slot}\" is bound to another role than this sequence range exchange's");
@@ -280,6 +292,48 @@ internal static class SequenceRangeExchange
                 < now() - $2::interval
             FROM worf.sequence_range_node WHERE node_id = $1
             """, SpiParameter.Create(nodeId), SpiParameter.Create(SequenceRanges.StaleAfter()));
+
+    /// <summary>
+    /// Ties a subscription's slot to this node on its provider as soon as the subscription's sync has made it, before
+    /// anything streams it, so that the provider, though a backup restores it from before this node's first exchange with
+    /// it, knows this node calls it, and its draws wait for this node after it starts. A provider that can't be told, or
+    /// has no exchange, is left to tie the slot at this node's first exchange with it.
+    /// </summary>
+    /// <param name="sub">The subscription.</param>
+    internal static void Join(WorfSubscription sub)
+    {
+        try
+        {
+            _ = PgBackgroundWorker.RunTransaction(() =>
+            {
+                WorfLocalNode node = WorfNode.GetLocalNode(false, false)!;
+                using WorfConnection conn = Worf.Connect(sub.OriginIf.Dsn, sub.Name, "join");
+                if (!Rpc.RemoteFunctionExists(conn, "worf", "sequence_range_exchange", 1, null))
+                {
+                    return false;
+                }
+
+                using MemoryStream stream = new();
+                using (Utf8JsonWriter writer = new(stream))
+                {
+                    writer.WriteStartObject();
+                    writer.WriteNumber("node_id", node.Node.Id);
+                    writer.WriteString("node_name", WorfJson.Encode(node.Node.Name));
+                    writer.WriteString("slot", WorfJson.Encode(sub.SlotName));
+                    writer.WriteBoolean("join", true);
+                    writer.WriteEndObject();
+                }
+
+                conn.Execute($"SET statement_timeout = {SequenceRanges.ExchangeTimeout.ToString(CultureInfo.InvariantCulture)}");
+                _ = conn.Query("SELECT worf.sequence_range_exchange(" + Worf.QuoteLiteral(Encoding.UTF8.GetString(stream.ToArray())) + ")", 1);
+                return true;
+            });
+        }
+        catch (Exception error) when (error is PgException or PgRemoteException)
+        {
+            WorfLog.Log($"could not tie replication slot \"{sub.SlotName}\" to this node on node {sub.Origin.Name}, which ties it at this node's first sequence range exchange with it: {error.Message}");
+        }
+    }
 
     /// <summary>
     /// Tells a subscription's provider, as the subscription is dropped, that this node leaves the subscription's slot, so

@@ -120,6 +120,7 @@ internal static class Sync
             using WorfConnection originConnRepl = Worf.ConnectReplica(sub.OriginIf.Dsn, sub.Name, "snap");
 
             string snapshot = EnsureReplicationSlotSnapshot(sub, originConnRepl, "snap", useFailoverSlot, out lsn);
+            SequenceRangeExchange.Join(sub);
 
             try
             {

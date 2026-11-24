@@ -1591,6 +1591,21 @@ public sealed partial class SequenceRangeTests
         Assert.AreEqual("42501", impersonated.SqlState);
         Assert.Contains("is bound to another role", impersonated.MessageText);
 
+        // Nor through a join, which binds only a slot that is bound to no node and that nothing streams, for a role that
+        // may stream slots, as c_user may not yet.
+        string forgedJoin = $$"""{"node_id": {{nodeAId}}, "node_name": "node_a", "slot": "{{slot}}", "join": true}""";
+        PostgresException joined = await Assert.ThrowsExactlyAsync<PostgresException>(() => nodeB.SafePsqlAsync(Database,
+            $"SET SESSION AUTHORIZATION c_user; SELECT worf.sequence_range_exchange('{forgedJoin}')", token));
+        Assert.AreEqual("42501", joined.SqlState);
+        Assert.Contains("is bound to another role", joined.MessageText);
+        _ = await nodeB.SafePsqlAsync(Database, "SELECT pg_create_logical_replication_slot('c_join', 'worf')", token);
+        string joinAsNodeA = $$"""{"node_id": {{nodeAId}}, "node_name": "node_a", "slot": "c_join", "join": true}""";
+        Assert.AreEqual("""{"streamed":false}""",
+            await nodeB.SafePsqlAsync(Database, $"SET SESSION AUTHORIZATION c_user; SELECT worf.sequence_range_exchange('{joinAsNodeA}')", token),
+            "c_user's join, without REPLICATION");
+        Assert.AreEqual("0", await nodeB.SafePsqlAsync(Database, "SELECT count(*) FROM worf.sequence_range_link WHERE slot_name = 'c_join'", token),
+            "c_join's link after c_user's join");
+
         // Nor can it by streaming the slot itself, as a role with REPLICATION can, while it speaks for node_c, even once
         // it has dropped its own slot.
         string nodeCId = await nodeC.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
@@ -1620,6 +1635,13 @@ public sealed partial class SequenceRangeTests
 
             await streaming.CancelAsync();
         }
+
+        // Nor, with REPLICATION, can it join as node_a through a slot bound to no node.
+        PostgresException joinedAsOther = await Assert.ThrowsExactlyAsync<PostgresException>(() => nodeB.SafePsqlAsync(Database,
+            $"SET SESSION AUTHORIZATION c_user; SELECT worf.sequence_range_exchange('{joinAsNodeA}')", token));
+        Assert.AreEqual("42501", joinedAsOther.SqlState);
+        Assert.Contains("already speaks for node", joinedAsOther.MessageText);
+        _ = await nodeB.SafePsqlAsync(Database, "SELECT pg_drop_replication_slot('c_join')", token);
 
         // A node re-created under another name, with the same subscription name and role, takes over its old node's slot
         // once the role's row is deleted, rather than being locked out by the slot's link, and forgets the old node in
@@ -6288,6 +6310,88 @@ public sealed partial class SequenceRangeTests
         Assert.AreEqual("55000", waited.SqlState, waited.MessageText);
         Assert.Contains("node node_c", waited.MessageText);
         await open.RollbackAsync(token);
+
+        await nodeC.StartServerAsync(token);
+        HashSet<string> after = await InsertIdsAsync(nodeB, "after", token);
+        Assert.AreEqual("", string.Join(",", before.Intersect(after)), "the ids node_b drew both before the restore and after it");
+    }
+
+    /// <summary>
+    /// A restored node waits, before it draws, for a node that only calls it, though the backup is from before that node's
+    /// first exchange: node_c's sync ties its slot on node_b to node_c as it makes it, while node_b refuses to tie it at
+    /// a call while node_c's apply streams it, as a node_b that a backup restores from before node_c's first call has no
+    /// tie for it. node_c hears of node_b's draws after the backup and is down as node_b comes back, so node_b's inserts
+    /// wait for node_c, naming it, and once node_c finds node_b went back, node_b never draws those values again.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task RestoredNodesWaitForSubscribersThatFirstCalledAfterTheBackup()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        await using TestNode nodeC = await StartNodeAsync("node_c", token);
+        foreach (TestNode node in new[] { nodeA, nodeB, nodeC })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        // node_b refuses, while worf_test.refuse_ties is on, to tie a slot to a node at a call made while the slot is
+        // streamed, as a node's first exchange through its slot ties it.
+        _ = await nodeB.SafePsqlAsync(Database, """
+            CREATE FUNCTION refuse_ties() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                IF current_setting('worf_test.refuse_ties', true) = 'on'
+                    AND EXISTS (SELECT FROM pg_catalog.pg_replication_slots WHERE slot_name = NEW.slot_name AND active) THEN
+                    RAISE EXCEPTION 'worf-test-refused-tie';
+                END IF;
+                RETURN NEW;
+            END $$;
+            CREATE TRIGGER refuse_ties BEFORE INSERT ON worf.sequence_range_link FOR EACH ROW EXECUTE FUNCTION refuse_ties();
+            """, token);
+        _ = await nodeB.SafePsqlAsync(Database, "ALTER SYSTEM SET worf_test.refuse_ties = 'on'", token);
+        _ = await nodeB.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
+
+        // node_a's root starts before node_c subscribes to node_b, which it reaches node_a through.
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b,node_c}', range_size := 1000)", token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass)", token),
+            "t_id_seq's range");
+        await Task.Delay(TimeSpan.FromSeconds(2), token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.activate_sequence_range('t_id_seq')", token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+        await SubscribeAsync(nodeC, "c_from_b", nodeB, token);
+        string nodeCId = await nodeC.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
+        _ = await InsertIdsAsync(nodeB, "first", token);
+
+        // node_b is backed up whole, with its slots, as a snapshot keeps them; then it ties slots at calls again, and draws
+        // while node_a is down, which node_c hears of; node_c stops before the restore.
+        using TemporaryDirectory copies = new($"worf-sequence-range-caller-restore-{Guid.NewGuid():N}");
+        string copy = Path.Join(copies.FullName, "node_b");
+        await BackUpDataAsync(nodeB, copy, token, wal: true);
+        CopySlots(nodeB, copy);
+        async Task TieAgainAsync()
+        {
+            _ = await nodeB.SafePsqlAsync(Database, "ALTER SYSTEM RESET worf_test.refuse_ties", token);
+            _ = await nodeB.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
+        }
+
+        await TieAgainAsync();
+        const string HeardOfB = "FROM worf.sequence_range_node WHERE node_name = 'node_b' AND seqoid = 't_id_seq'::regclass";
+        Assert.IsTrue(await nodeC.PollQueryUntilAsync(Database, $"SELECT EXISTS (SELECT 1 {HeardOfB})", token), "node_c hearing of node_b");
+        await nodeA.StopAsync("fast", token);
+        HashSet<string> before = await InsertIdsAsync(nodeB, "before", token);
+        Assert.IsTrue(await nodeC.PollQueryUntilAsync(Database, $"SELECT drawn >= {before.Max(long.Parse)} {HeardOfB}", token), "node_c hearing of node_b's draws");
+        await nodeC.StopAsync("fast", token);
+        await RestoreDataAsync(nodeB, copy, token);
+        await TieAgainAsync();
+        await nodeA.StartServerAsync(token);
+
+        PostgresException waited = await Assert.ThrowsExactlyAsync<PostgresException>(() => nodeB.SafePsqlAsync(Database, "INSERT INTO t (v) VALUES ('waiting')", token),
+            "node_b's insert while node_c is down");
+        Assert.AreEqual("55000", waited.SqlState, waited.MessageText);
+        Assert.IsTrue(waited.MessageText.Contains("node node_c", StringComparison.Ordinal) || waited.MessageText.Contains($"node {nodeCId},", StringComparison.Ordinal),
+            $"node_b's wait, naming node_c, by its id while node_b knows no name for it: {waited.MessageText}");
 
         await nodeC.StartServerAsync(token);
         HashSet<string> after = await InsertIdsAsync(nodeB, "after", token);
