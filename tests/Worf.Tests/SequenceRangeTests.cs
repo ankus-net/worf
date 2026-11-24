@@ -3988,6 +3988,13 @@ public sealed partial class SequenceRangeTests
                 CREATE FUNCTION g12() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.w := nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1'); RETURN NEW; END $$;
                 CREATE TRIGGER g12 BEFORE INSERT ON g13t FOR EACH ROW EXECUTE FUNCTION g12();
                 CREATE TABLE g13c (id bigint DEFAULT nextval('s1'), v text CHECK (nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') > 0));
+                CREATE TABLE g13l (id bigint DEFAULT nextval('s1'), w bigint);
+                CREATE FUNCTION g12_loop() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.w := 0; FOR i IN 1..12 LOOP NEW.w := NEW.w + nextval('s1'); END LOOP; RETURN NEW; END $$;
+                CREATE TRIGGER g12_loop BEFORE INSERT ON g13l FOR EACH ROW EXECUTE FUNCTION g12_loop();
+                CREATE TABLE g13h (id bigint DEFAULT nextval('s1'), w bigint);
+                CREATE FUNCTION draw12() RETURNS bigint LANGUAGE plpgsql AS $$ BEGIN RETURN nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1') + nextval('s1'); END $$;
+                CREATE FUNCTION g12_helper() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.w := draw12(); RETURN NEW; END $$;
+                CREATE TRIGGER g12_helper BEFORE INSERT ON g13h FOR EACH ROW EXECUTE FUNCTION g12_helper();
                 CREATE TABLE ck (v text CHECK (nextval('s1') > 0));
                 CREATE TABLE tw (v text);
                 CREATE FUNCTION passed() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
@@ -4030,8 +4037,11 @@ public sealed partial class SequenceRangeTests
         // constraint and a trigger's WHEN condition; PL/pgSQL loops that draw through a SQL function, with a computed name,
         // or in a DO block that EXECUTE runs; rows of 40 calls, more than the block's last twentieth; rows that contrib's
         // autoinc trigger draws for; calls whose sequence a column names; a prepared statement whose parameter names it,
-        // under a generic plan; a VALUES list of six rows of 40 calls each, which each row starts before it draws; and rows
-        // that hold the gate and draw 13 values each, a default's and twelve of a trigger's or a CHECK constraint's.
+        // under a generic plan; a VALUES list of six rows of 40 calls each, which each row starts before it draws, alone,
+        // through UNION ALL or in a MATERIALIZED CTE; and rows that hold the gate and draw 13 values each, a default's and
+        // twelve of a trigger's or a CHECK constraint's, or of a trigger's loop or a function it calls, from a SELECT or in
+        // single-row inserts of one transaction.
+        string values40 = $"({string.Join(" + ", Enumerable.Repeat("nextval('s1')", 40))})";
         List<string> problems = [];
         foreach (string statement in new[] { "DO $$ BEGIN PERFORM nextval('s1'); END $$", "SELECT f_s1()", "BEGIN", "SELECT nextval('s1') FROM generate_series(1, 250)",
             "SELECT count(DISTINCT nextval('s1')) FROM generate_series(1, 250)", "SELECT f_loop(250) /* generate_series */",
@@ -4046,7 +4056,10 @@ public sealed partial class SequenceRangeTests
             "INSERT INTO ai (v) SELECT 'x' FROM generate_series(1, 250)", "SELECT nextval(n) FROM seqnames, generate_series(1, 250)",
             "PREPARED generic rows", "PREPARED generic", "PREPARED default",
             $"INSERT INTO vals VALUES {string.Join(", ", Enumerable.Repeat($"({string.Join(" + ", Enumerable.Repeat("nextval('s1')", 40))})", 6))} /* generate_series */",
-            "INSERT INTO g13t (w) SELECT 0 FROM generate_series(1, 20)", "INSERT INTO g13c (v) SELECT 'x' FROM generate_series(1, 20)" })
+            "INSERT INTO g13t (w) SELECT 0 FROM generate_series(1, 20)", "INSERT INTO g13c (v) SELECT 'x' FROM generate_series(1, 20)",
+            $"INSERT INTO vals SELECT * FROM (VALUES {string.Join(", ", Enumerable.Repeat(values40, 3))}) a UNION ALL SELECT * FROM (VALUES {string.Join(", ", Enumerable.Repeat(values40, 3))}) b /* generate_series */",
+            $"WITH v AS MATERIALIZED (VALUES {string.Join(", ", Enumerable.Repeat(values40, 6))}) INSERT INTO vals SELECT * FROM v /* generate_series */",
+            "INSERT INTO g13l (w) SELECT 0 FROM generate_series(1, 20)", "INSERT INTO g13h (w) SELECT 0 FROM generate_series(1, 20)", "BEGIN g13l", "BEGIN g13h" })
         {
             Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 's1'::regclass", token),
                 "node_b drawing from a block of s1, with the next one ready");
@@ -4097,6 +4110,20 @@ public sealed partial class SequenceRangeTests
                         _ = await execute.ExecuteNonQueryAsync(token);
                     }
 
+                    continue;
+                }
+
+                if (statement.StartsWith("BEGIN g13", StringComparison.Ordinal))
+                {
+                    // Single-row inserts in one transaction, whose trigger draws 12 in a loop or through a function it calls.
+                    await using NpgsqlTransaction inserting = await connection.BeginTransactionAsync(token);
+                    await using NpgsqlCommand insert = new($"INSERT INTO {statement["BEGIN ".Length..]} (w) VALUES (0)", connection, inserting);
+                    for (int i = 0; i < 250; i++)
+                    {
+                        _ = await insert.ExecuteNonQueryAsync(token);
+                    }
+
+                    await inserting.CommitAsync(token);
                     continue;
                 }
 

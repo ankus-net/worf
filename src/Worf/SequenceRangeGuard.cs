@@ -58,8 +58,15 @@ internal static partial class SequenceRangeGuard
     private static readonly Dictionary<uint, uint> s_gates = [];
 
     // How many values of each gated sequence a row of the statements that hold its gate may draw: its default's, and the
-    // calls of the CHECK constraints, trigger conditions and trigger functions of the tables they write, by the tables.
+    // calls of the CHECK constraints, trigger conditions and trigger functions of the tables they write, by the tables,
+    // or as many as a row was seen to draw, as a trigger's loop or a function it calls draws more than its source shows.
+    // The position each row of a gated statement was checked at, and the most values a row drew from each sequence in
+    // the session's last statement that held its gate, up to a quarter of the block, which its next such statement
+    // starts from.
     private static readonly Dictionary<uint, long> s_gatedRowDraws = [];
+    private static readonly Dictionary<uint, long> s_rowMarks = [];
+    private static readonly Dictionary<uint, long> s_seenRowDraws = [];
+    private static readonly HashSet<uint> s_seenThisStatement = [];
     private static readonly Dictionary<string, int> s_writtenCalls = [];
     private static readonly List<(nint Statement, uint Subxact, List<uint> Sequences)> s_gating = [];
     private static readonly Dictionary<uint, List<uint>> s_drawnBy = [];
@@ -707,7 +714,8 @@ internal static partial class SequenceRangeGuard
         long rowDraws = 1 + WrittenCalls(written);
         foreach (uint seqoid in sequences.Concat(triggered))
         {
-            s_gatedRowDraws[seqoid] = Math.Max(s_gatedRowDraws.GetValueOrDefault(seqoid), rowDraws);
+            s_gatedRowDraws[seqoid] = Math.Max(s_gatedRowDraws.GetValueOrDefault(seqoid), Math.Max(rowDraws, s_seenRowDraws.GetValueOrDefault(seqoid)));
+            _ = s_seenThisStatement.Remove(seqoid);
         }
 
         if (functions.Count > 0)
@@ -716,6 +724,56 @@ internal static partial class SequenceRangeGuard
         }
 
         WaitBeforeDrawing(sequences);
+        foreach (uint seqoid in sequences.Concat(triggered))
+        {
+            MarkRow(seqoid);
+        }
+    }
+
+    // Notes where a gated sequence is as a statement that holds its gate starts, or one of its rows is checked, so that
+    // the next row's check sees how many values the row drew.
+    private static void MarkRow(uint seqoid)
+    {
+        if (Position(seqoid) is long position)
+        {
+            s_rowMarks[seqoid] = position;
+        }
+        else
+        {
+            _ = s_rowMarks.Remove(seqoid);
+        }
+    }
+
+    // Counts the values a row of a statement that holds a sequence's gate drew since the last mark, within the active
+    // block, other sessions' draws meanwhile too, toward how many the statement's later rows, and the session's next such
+    // statement, count each row to draw, up to a quarter of the block, so that a trigger that draws more than its source
+    // shows, in a loop or through a function it calls, waits for the switch rather than run the block out.
+    private static void SeeRowDraws(uint seqoid)
+    {
+        if (!s_gates.ContainsKey(seqoid))
+        {
+            return;
+        }
+
+        long? position = Position(seqoid);
+        if (s_rowMarks.TryGetValue(seqoid, out long mark) && position is long now &&
+            s_sequences.TryGetValue(seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) sequence) &&
+            sequence.Blocks.Find(block => block.State == "active") is { Hi: var hi, Lo: var lo } && mark >= lo && mark <= hi && now >= lo && now <= hi)
+        {
+            decimal step = Math.Max(Math.Abs((decimal)SequenceRanges.GetInfo(seqoid).Increment), 1);
+            long drawn = (long)Math.Min(Math.Abs((decimal)now - mark) / step, (((decimal)hi - lo) / step / 4) + 1);
+            if (drawn > s_gatedRowDraws.GetValueOrDefault(seqoid, 1))
+            {
+                s_gatedRowDraws[seqoid] = drawn;
+            }
+
+            s_seenRowDraws[seqoid] = s_seenThisStatement.Add(seqoid) ? drawn : Math.Max(s_seenRowDraws.GetValueOrDefault(seqoid), drawn);
+        }
+
+        if (position is long at)
+        {
+            s_rowMarks[seqoid] = at;
+        }
     }
 
     // The calls of nextval the CHECK constraints, trigger conditions and trigger functions of tables and their partitions
@@ -1281,26 +1339,58 @@ internal static partial class SequenceRangeGuard
     }
 
     // The most calls of nextval a row of a VALUES list in a plan makes, which it starts all as the row is reached, before
-    // it draws any.
-    private static unsafe int ValuesRowCalls(PlanState* node)
+    // it draws any: in the plan's nodes, those under them, their initPlans and subplans, as a CTE's, and the plans an
+    // Append, a MergeAppend, a subquery scan or a CTE scan runs, each once.
+    private static unsafe int ValuesRowCalls(PlanState* node) => ValuesRowCalls(node, []);
+
+    private static unsafe int ValuesRowCalls(PlanState* node, HashSet<nint> seen)
     {
-        if (node is null)
+        if (node is null || !seen.Add((nint)node))
         {
             return 0;
         }
 
-        int most = Math.Max(ValuesRowCalls(node->lefttree), ValuesRowCalls(node->righttree));
-        if (node->type == NodeTag.T_ValuesScanState && node->plan is not null)
+        int most = Math.Max(ValuesRowCalls(node->lefttree, seen), ValuesRowCalls(node->righttree, seen));
+        foreach (List* subplans in new[] { node->initPlan, node->subPlan })
         {
-            List* rows = ((ValuesScan*)node->plan)->values_lists;
-            for (int i = 0; rows is not null && i < rows->length; i++)
+            for (int i = 0; subplans is not null && i < subplans->length; i++)
             {
-                most = Math.Max(most, Draws(PlanText((Node*)rows->elements[i].ptr_value)).Calls);
+                most = Math.Max(most, ValuesRowCalls(((SubPlanState*)subplans->elements[i].ptr_value)->planstate, seen));
             }
         }
-        else if (node->type == NodeTag.T_SubqueryScanState)
+
+        switch (node->type)
         {
-            most = Math.Max(most, ValuesRowCalls(((SubqueryScanState*)node)->subplan));
+            case NodeTag.T_ValuesScanState when node->plan is not null:
+                List* rows = ((ValuesScan*)node->plan)->values_lists;
+                for (int i = 0; rows is not null && i < rows->length; i++)
+                {
+                    most = Math.Max(most, Draws(PlanText((Node*)rows->elements[i].ptr_value)).Calls);
+                }
+
+                break;
+            case NodeTag.T_SubqueryScanState:
+                most = Math.Max(most, ValuesRowCalls(((SubqueryScanState*)node)->subplan, seen));
+                break;
+            case NodeTag.T_AppendState:
+                for (int i = 0; i < ((AppendState*)node)->as_nplans; i++)
+                {
+                    most = Math.Max(most, ValuesRowCalls(((AppendState*)node)->appendplans[i], seen));
+                }
+
+                break;
+            case NodeTag.T_MergeAppendState:
+                for (int i = 0; i < ((MergeAppendState*)node)->ms_nplans; i++)
+                {
+                    most = Math.Max(most, ValuesRowCalls(((MergeAppendState*)node)->mergeplans[i], seen));
+                }
+
+                break;
+            case NodeTag.T_CteScanState:
+                most = Math.Max(most, ValuesRowCalls(((CteScanState*)node)->cteplanstate, seen));
+                break;
+            default:
+                break;
         }
 
         return most;
@@ -3846,6 +3936,7 @@ internal static partial class SequenceRangeGuard
             {
                 LetGate(seqoid);
                 _ = s_gatedRowDraws.Remove(seqoid);
+                _ = s_rowMarks.Remove(seqoid);
             }
 
             s_gating.RemoveAt(index);
@@ -4213,6 +4304,7 @@ internal static partial class SequenceRangeGuard
             {
                 _ = s_gates.Remove(seqoid);
                 _ = s_gatedRowDraws.Remove(seqoid);
+                _ = s_rowMarks.Remove(seqoid);
                 CountDrawer(seqoid, -1);
             }
 
@@ -4229,6 +4321,7 @@ internal static partial class SequenceRangeGuard
 
         s_gates.Clear();
         s_gatedRowDraws.Clear();
+        s_rowMarks.Clear();
         s_gating.Clear();
         s_gatesRegistered = false;
     }
@@ -4350,6 +4443,11 @@ internal static partial class SequenceRangeGuard
             throw new PgException(CheckViolation,
                 $"this node's identity changed, so its sequence range blocks of sequence {SequenceRanges.GetInfo(seqoid).Name} are no longer its own",
                 hint: "The range worker abandons them and requests new blocks; try again once it has.");
+        }
+
+        if (inserted)
+        {
+            SeeRowDraws(seqoid);
         }
 
         if (!Admits(seqoid, value, inserted) && (!Restoring() || MayIssue(seqoid, value)))
@@ -4548,6 +4646,7 @@ internal static partial class SequenceRangeGuard
             s_waitingFor.Clear();
             s_gates.Clear();
             s_gatedRowDraws.Clear();
+            s_rowMarks.Clear();
         });
     }
 
