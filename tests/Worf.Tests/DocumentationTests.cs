@@ -111,8 +111,15 @@ public sealed class DocumentationTests
             s_sequenceRanges, "a word behind a large transaction (1700)");
         Assert.Contains("so the provider doesn't end the stream at `wal_sender_timeout`", s_sequenceRanges, "a delay longer than wal_sender_timeout (1703)");
         Assert.Contains("which the other nodes take as they next hear from the owner", s_sequenceRanges, "altered block sizes (1723)");
-        Assert.Contains("only once every other node it subscribes to, or that calls it, has answered it since in full", s_sequenceRanges,
+        Assert.Contains("only once every other node it subscribes to, or that calls it, as a node whose subscription's sync made its slot here does from then on, before its first call, has answered it since in full", s_sequenceRanges,
             "the neighbors a start waits for to report in full (1605)");
+        Assert.Contains("or removes `worf_starts` when that can't be written either", s_sequenceRanges, "a start that can't mark itself unkept (1602)");
+        Assert.Contains("or take a block of up to sixteen times `max_range_size` with each made-up request for a pool or a reservation", s_sequenceRanges,
+            "made-up pool and reserved requests (1900)");
+        Assert.Contains("as a trigger's loop, or a function it calls, draws more than its source shows", s_sequenceRanges, "a row's unseen draws (1663)");
+        Assert.Contains("waits so beforehand only for a sequence whose block has run out", s_sequenceRanges, "calls that name no sequence (1665)");
+        Assert.Contains("A statement's calls are read from its plan once for its text, the search path and the role it runs as", s_sequenceRanges,
+            "a statement's calls, read once (1941)");
         Assert.Contains("and once the block's grantor and each of those that report the sequence, and so may have heard of its draws", s_sequenceRanges,
             "the neighbors a start waits for (1601)");
         Assert.Contains("a single-user server keeps its start as its first statement runs", s_sequenceRanges, "a single-user start (1602)");

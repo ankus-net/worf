@@ -3185,12 +3185,13 @@ public sealed partial class SequenceRangeTests
     /// rows a configuration change of six sequences left open holds, rather than wait on them, which would deadlock with
     /// the change as it reaches the rows the exchange took in; a forced lift on node_a waits for a configuration change or
     /// a drop left open, and for a drop under way, before it takes the turn rather than holding it, and so doesn't deadlock
-    /// with the drop; a drop canceled in the turn lets it go, and one that waits for a report another session holds lets it
-    /// go as it waits; sessions' own advisory locks, of whatever key, are never worf's; and a drop left open whose deletes
-    /// a reply's take-in would wait for, or a fence's lift in the range worker, holds up neither the turn nor the worker,
-    /// so that node_a's own inserts, which switch blocks of 10, go on too. The rows run alone: their 24 servers would take
-    /// most of the 32 System V shared memory segments macOS allows beside other tests', and node_b's draws wait on how fast
-    /// the exchanges of four nodes supply blocks. node_a logs the lock waits that outlast a tenth of a second.
+    /// with the drop; a drop that waits for a report another session holds waits for it as for a lock, outside the turn,
+    /// and holds nothing once canceled; sessions' own advisory locks, of whatever key, are never worf's; and a drop left
+    /// open whose deletes a reply's take-in would wait for, or a fence's lift in the range worker, holds up neither the
+    /// turn nor the worker, so that node_a's own inserts, which switch blocks of 10, go on too. The rows run alone: their
+    /// 24 servers would take most of the 32 System V shared memory segments macOS allows beside other tests', and node_b's
+    /// draws wait on how fast the exchanges of four nodes supply blocks. node_a logs the lock waits that outlast a tenth of
+    /// a second.
     /// </summary>
     /// <param name="how">What holds, or would hold, the turn.</param>
     /// <returns>The test.</returns>
@@ -3360,9 +3361,9 @@ public sealed partial class SequenceRangeTests
             case "canceled drop":
             {
                 // A report node_c relayed of u_id_seq, which no exchange takes in, is held as the drop forgets node_c, which
-                // tries again until statement_timeout cancels it, as it does each of 10 times over: on Windows, whose timer
-                // has the lock timeout of a try come due with the statement's about one time in eight, PostgreSQL reports
-                // the lock timeout then.
+                // waits for it as for a lock, outside the turn, until statement_timeout cancels it, as it does each of 10
+                // times over: on Windows, whose timer has the lock timeout of a try come due with the statement's about one
+                // time in eight, PostgreSQL reports the lock timeout then.
                 _ = await nodeA.SafePsqlAsync(Database, $"""
                     INSERT INTO worf.sequence_range_node (seqoid, node_id, node_name, via_node, reported_at)
                     VALUES ('u_id_seq'::regclass, 2000002, 'relayed_by_c', {nodeCId}, now())
@@ -3377,8 +3378,9 @@ public sealed partial class SequenceRangeTests
                 }
 
                 // No take-in waited for the held report longer than its millisecond, as node_a logs a lock wait that
-                // outlasts a tenth of a second.
-                Assert.AreEqual("", string.Join("\n", ReportRowWaits(nodeA.ReadLog())), "node_a's waits for report rows");
+                // outlasts a tenth of a second; the drops' own waits are theirs.
+                Assert.AreEqual("", string.Join("\n", ReportRowWaits(nodeA.ReadLog()).Where(wait => !wait.Contains($"process {dropping.ProcessID} ", StringComparison.Ordinal))),
+                    "node_a's waits for report rows");
                 await holding.CommitAsync(token);
                 await using (NpgsqlCommand locks = new("SET statement_timeout = 0; SELECT count(*) FROM pg_locks WHERE pid = pg_backend_pid() AND locktype = 'advisory'", dropping))
                 {

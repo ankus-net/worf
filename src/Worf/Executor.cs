@@ -309,24 +309,6 @@ internal static unsafe partial class Executor
         if (parsetree->type == NodeTag.T_DropStmt)
         {
             s_lastDropBehavior = ((DropStmt*)parsetree)->behavior;
-            if (DropsWorf((DropStmt*)parsetree))
-            {
-                // A node that provides subscriptions keeps worf, which the drop is refused before it takes anything.
-                RefuseDropWhileProviding();
-
-                // The drop takes worf's tables and then the tables whose triggers it drops, which an insert holds as it
-                // reads worf's tables, so it takes those tables first, in order, before PostgreSQL takes worf's.
-                foreach (uint relid in Elevated.Run(() => Worf.Read("""
-                    SELECT DISTINCT t.tgrelid FROM pg_catalog.pg_trigger t
-                        JOIN pg_catalog.pg_depend d ON d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass AND d.objid = t.tgfoid
-                            AND d.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass AND d.deptype = 'e'
-                        JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid AND e.extname = 'worf'
-                    ORDER BY 1
-                    """, 0)).Select(static row => row.Get<uint>(0)).ToList())
-                {
-                    NativeMethods.LockRelationOid(relid, (int)PgLockMode.AccessExclusive);
-                }
-            }
         }
 
         if (parsetree->type == NodeTag.T_CreatedbStmt)
@@ -370,6 +352,31 @@ internal static unsafe partial class Executor
         // Which objects a DROP drops is known only before it runs, and whether a statement uses temporary objects only
         // as it runs.
         string? ddl = DdlReplication.CommandToQueue(pstmt, queryString, context, out bool sessionLocal);
+
+        // worf's drop, once DDL replication has had its say on what it drops with, is refused on a provider before it
+        // takes anything, and takes the tables worf's triggers guard before PostgreSQL takes worf's own.
+        if (parsetree->type == NodeTag.T_DropStmt && DropsWorf((DropStmt*)parsetree))
+        {
+            RefuseDropWhileProviding();
+
+            // PostgreSQL takes worf's tables and then the tables whose triggers it drops, which an insert holds as it
+            // reads worf's tables, so the drop takes those tables first, in order; worf's own it leaves to PostgreSQL.
+            foreach (uint relid in Elevated.Run(() => Worf.Read("""
+                SELECT DISTINCT t.tgrelid FROM pg_catalog.pg_trigger t
+                    JOIN pg_catalog.pg_depend d ON d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass AND d.objid = t.tgfoid
+                        AND d.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass AND d.deptype = 'e'
+                    JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid AND e.extname = 'worf'
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_depend m
+                    WHERE m.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND m.objid = t.tgrelid
+                        AND m.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass AND m.refobjid = e.oid AND m.deptype = 'e')
+                ORDER BY 1
+                """, 0)).Select(static row => row.Get<uint>(0)).ToList())
+            {
+                NativeMethods.LockRelationOid(relid, (int)PgLockMode.AccessExclusive);
+            }
+        }
+
         (uint Role, string Settings) ddlContext = default;
         if (ddl is not null)
         {

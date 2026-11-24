@@ -802,7 +802,8 @@ internal static partial class SequenceRangeGuard
         long? position = Position(seqoid);
         if (s_rowMarks.TryGetValue(seqoid, out long mark) && position is long now &&
             s_sequences.TryGetValue(seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) sequence) &&
-            sequence.Blocks.Find(block => block.State == "active") is { Hi: var hi, Lo: var lo } && mark >= lo && mark <= hi && now >= lo && now <= hi)
+            sequence.Blocks.FindIndex(block => block.State == "active") is int index and >= 0 &&
+            sequence.Blocks[index] is (long lo, long hi, _) && mark >= lo && mark <= hi && now >= lo && now <= hi)
         {
             decimal step = Math.Max(Math.Abs((decimal)SequenceRanges.GetInfo(seqoid).Increment), 1);
             long drawn = (long)Math.Min(Math.Abs((decimal)now - mark) / step, (((decimal)hi - lo) / step / 4) + 1);
@@ -1570,8 +1571,8 @@ internal static partial class SequenceRangeGuard
                         continue;
                     }
 
-                    count = SeenDrawn(seqoid);
-                    runOut = RunOut(seqoid);
+                    count = SeenDrawn(seqoid, out long? seen);
+                    runOut = RunOut(seqoid, seen);
                     if (count == 0 && !runOut)
                     {
                         continue;
@@ -1617,7 +1618,7 @@ internal static partial class SequenceRangeGuard
         {
             foreach (uint seqoid in s_drawingUngated.Keys.Where(seqoid => !named.Contains(seqoid)).ToList())
             {
-                if (RunOut(seqoid) && !s_gates.ContainsKey(seqoid))
+                if (RunOut(seqoid, Position(seqoid)) && !s_gates.ContainsKey(seqoid))
                 {
                     WaitWhileShort(seqoid);
                     s_drawingUngated[seqoid] = RowsUntilShort(seqoid);
@@ -1637,9 +1638,9 @@ internal static partial class SequenceRangeGuard
 
     // How many values of a sequence were drawn, by any session, since it was last counted down for a call that names no
     // sequence, or since the statement making that call started.
-    private static long SeenDrawn(uint seqoid)
+    private static long SeenDrawn(uint seqoid, out long? position)
     {
-        long? position = Position(seqoid);
+        position = Position(seqoid);
         long seen = 0;
         if (position is long now && s_unnamedMarks.TryGetValue(seqoid, out long mark) && mark != now)
         {
@@ -1655,9 +1656,9 @@ internal static partial class SequenceRangeGuard
         return seen;
     }
 
-    // Whether a sequence has no active block, or is at its active block's last value or past it, so that a draw from it
-    // would fail.
-    private static bool RunOut(uint seqoid)
+    // Whether a sequence has no active block, or is, at the position given, at its active block's last value or past
+    // it, so that a draw from it would fail.
+    private static bool RunOut(uint seqoid, long? position)
     {
         Reload();
         if (!s_sequences.TryGetValue(seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) sequence) ||
@@ -1667,7 +1668,7 @@ internal static partial class SequenceRangeGuard
         }
 
         (long lo, long hi, _) = sequence.Blocks[index];
-        return ReadPosition(seqoid) is long position && (sequence.Ascending ? position >= hi : position <= lo);
+        return position is long at && (sequence.Ascending ? at >= hi : at <= lo);
     }
 
     // How many draws a sequence may take before it is checked again: half its steps left before the active block's last
@@ -2851,7 +2852,7 @@ internal static partial class SequenceRangeGuard
         long rowDraws = switching.Count > 0 && starting is { Running: not 0 } running ? RunningRowCalls(running.Running) : 1;
         foreach (uint seqoid in switching)
         {
-            if (!anyOf || spelled.Contains(seqoid) || RunOut(seqoid))
+            if (!anyOf || spelled.Contains(seqoid) || RunOut(seqoid, Position(seqoid)))
             {
                 WaitWhileShort(seqoid, rowDraws);
             }
