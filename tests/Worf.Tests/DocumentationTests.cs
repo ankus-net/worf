@@ -120,7 +120,10 @@ public sealed class DocumentationTests
         Assert.Contains("A participant's block for a load is granted whole, whatever its size", s_sequenceRanges, "a participant's reservation (2000)");
         Assert.Contains("keeps, after worf is dropped, the bounds of the block the node drew from", s_nodes, "sequences' bounds after worf's drop (2021)");
         Assert.Contains("as a trigger's loop, or a function it calls, draws more than its source shows", s_sequenceRanges, "a row's unseen draws (1663)");
-        Assert.Contains("waits so beforehand only for a sequence whose block has run out", s_sequenceRanges, "calls that name no sequence (1665)");
+        Assert.Contains("waits so beforehand only for a sequence whose block has fewer values left than a row's calls take", s_sequenceRanges, "calls that name no sequence (1665, 2041)");
+        Assert.Contains("and until the session has seen such a row, half the block for a row whose triggers loop", s_sequenceRanges, "a fresh session's first row (1663)");
+        Assert.Contains("An `INSERT … ON CONFLICT` or a `MERGE` checks them before each row it takes too", s_sequenceRanges, "upserts and merges (2040)");
+        Assert.Contains("counts among the statements drawing from the sequence from its first check until it ends", s_sequenceRanges, "SELECTs of nextval at once (2042)");
         Assert.Contains("A statement's calls are read from its plan once for its text, the search path and the role it runs as", s_sequenceRanges,
             "a statement's calls, read once (1941)");
         Assert.Contains("and once the block's grantor and each of those that report the sequence, and so may have heard of its draws", s_sequenceRanges,

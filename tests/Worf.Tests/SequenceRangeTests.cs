@@ -4413,6 +4413,181 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// A fresh session's first row waits for the switch before it runs node_b's last block out, though node_b has seen no
+    /// row like it draw: a row into a table whose trigger draws 12 in a loop, through a function it calls or through a
+    /// statement it builds, or 40 in a loop, counts for up to a quarter of the block until a row is seen, and a statement
+    /// whose 40 calls take the sequence's name from a column waits while the block holds fewer than its row's calls. node_a,
+    /// down as node_b reaches its last block with 8 or 30 values left, starts again 3 s in.
+    /// </summary>
+    /// <param name="form">The row, and how many values the last block has left as it runs.</param>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [DataRow("loop")]
+    [DataRow("helper")]
+    [DataRow("execute")]
+    [DataRow("merge")]
+    [DataRow("loop of 40")]
+    [DataRow("named by a column")]
+    public async Task FreshRowsWaitBeforeRunningTheLastBlockOut(string form)
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, """
+                CREATE SEQUENCE s1;
+                CREATE FUNCTION draw(n int) RETURNS bigint LANGUAGE plpgsql AS $$ DECLARE w bigint := 0; BEGIN FOR i IN 1..n LOOP w := w + nextval('s1'); END LOOP; RETURN w; END $$;
+                CREATE FUNCTION draw12() RETURNS bigint LANGUAGE plpgsql AS $$ BEGIN RETURN draw(12); END $$;
+                CREATE TABLE g13l (id bigint DEFAULT nextval('s1'), w bigint);
+                CREATE FUNCTION g12_loop() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.w := 0; FOR i IN 1..12 LOOP NEW.w := NEW.w + nextval('s1'); END LOOP; RETURN NEW; END $$;
+                CREATE TRIGGER g12_loop BEFORE INSERT ON g13l FOR EACH ROW EXECUTE FUNCTION g12_loop();
+                CREATE TABLE g13h (id bigint DEFAULT nextval('s1'), w bigint);
+                CREATE FUNCTION g12_helper() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.w := draw12(); RETURN NEW; END $$;
+                CREATE TRIGGER g12_helper BEFORE INSERT ON g13h FOR EACH ROW EXECUTE FUNCTION g12_helper();
+                CREATE TABLE g13e (id bigint DEFAULT nextval('s1'), w bigint);
+                CREATE FUNCTION g12_execute() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN EXECUTE format('SELECT %s', (SELECT string_agg('nextval(''s1'')', ' + ') FROM generate_series(1, 12))) INTO NEW.w; RETURN NEW; END $$;
+                CREATE TRIGGER g12_execute BEFORE INSERT ON g13e FOR EACH ROW EXECUTE FUNCTION g12_execute();
+                CREATE TABLE g41l (id bigint DEFAULT nextval('s1'), w bigint);
+                CREATE FUNCTION g40_loop() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.w := 0; FOR i IN 1..40 LOOP NEW.w := NEW.w + nextval('s1'); END LOOP; RETURN NEW; END $$;
+                CREATE TRIGGER g40_loop BEFORE INSERT ON g41l FOR EACH ROW EXECUTE FUNCTION g40_loop();
+                CREATE TABLE seqnames (n text);
+                """, token);
+        }
+
+        _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO seqnames VALUES ('s1')", token);
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('s1', participants := '{node_b}', range_size := 100, max_range_size := 100)", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 's1'::regclass", token),
+            "node_b drawing from a block of s1, with the next one ready");
+
+        // With node_a down, node_b draws s1 into its last block until the form's values are left.
+        int left = form is "loop of 40" or "named by a column" ? 30 : 8;
+        await nodeA.StopAsync("fast", token);
+        await using (NpgsqlConnection drawing = await nodeB.OpenAsync(Database, token))
+        {
+            await using NpgsqlCommand remaining = new("""
+                SELECT next_lo IS NULL AND active_lo <= (SELECT last_value FROM s1), active_hi - (SELECT last_value FROM s1)
+                FROM worf.sequence_ranges WHERE sequence = 's1'::regclass
+                """, drawing);
+            await using NpgsqlCommand draw = new("SET statement_timeout = '5s'; SELECT nextval('s1')", drawing);
+            for (int i = 0; ; i++)
+            {
+                Assert.IsLessThan(300, i, $"node_b's draws of s1 before its last block has {left} left");
+                await using (NpgsqlDataReader reader = await remaining.ExecuteReaderAsync(token))
+                {
+                    _ = await reader.ReadAsync(token);
+                    if (reader.GetBoolean(0) && reader.GetInt64(1) == left)
+                    {
+                        break;
+                    }
+                }
+
+                _ = await draw.ExecuteNonQueryAsync(token);
+            }
+        }
+
+        // A fresh session's row runs, as node_a starts again 3 s in.
+        Task starting = Task.Run(async () =>
+        {
+            await Task.Delay(TimeSpan.FromSeconds(3), token);
+            await nodeA.StartServerAsync(token);
+        }, token);
+        string statement = form switch
+        {
+            "loop" => "INSERT INTO g13l (w) VALUES (0)",
+            "helper" => "INSERT INTO g13h (w) VALUES (0)",
+            "execute" => "INSERT INTO g13e (w) VALUES (0)",
+            "merge" => "MERGE INTO g13l USING (VALUES (1)) v (k) ON false WHEN NOT MATCHED THEN INSERT (w) VALUES (0)",
+            "loop of 40" => "INSERT INTO g41l (w) VALUES (0)",
+            _ => $"SELECT {string.Join(" + ", Enumerable.Repeat("nextval(n)", 40))} FROM seqnames",
+        };
+        _ = await nodeB.SafePsqlAsync(Database, $"SET statement_timeout = '30s'; {statement}", token);
+        await starting;
+    }
+
+    /// <summary>
+    /// An upsert, or a merge, whose rows conflict, or which it matches, checks its sequence between them, though such
+    /// rows fire no guard trigger, so that the defaults its proposed rows draw, and the draws of its SET, go on through
+    /// the blocks as the switches come rather than run one out: 250 rows that each draw, from blocks of 100.
+    /// </summary>
+    /// <param name="form">The statement.</param>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [DataRow("do nothing")]
+    [DataRow("do update")]
+    [DataRow("do update drawing")]
+    [DataRow("merge")]
+    public async Task UpsertsAndMergesCheckBetweenRows(string form)
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE SEQUENCE s1;
+            CREATE TABLE g1k (k int PRIMARY KEY, id bigint DEFAULT nextval('s1'), w bigint);
+            SELECT worf.enable_sequence_range('s1', participants := '{}', range_size := 100, max_range_size := 100);
+            """, token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 's1'::regclass", token),
+            "node_a drawing from a block of s1, with the next one ready");
+        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO g1k (k, w) SELECT g, 0 FROM generate_series(1, 250) g", token);
+        _ = await nodeA.SafePsqlAsync(Database, form switch
+        {
+            "do nothing" => "INSERT INTO g1k (k, w) SELECT g, 0 FROM generate_series(1, 250) g ON CONFLICT DO NOTHING",
+            "do update" => "INSERT INTO g1k (k, w) SELECT g, 0 FROM generate_series(1, 250) g ON CONFLICT (k) DO UPDATE SET w = 0",
+            "do update drawing" => "INSERT INTO g1k (k, w) SELECT g, 0 FROM generate_series(1, 250) g ON CONFLICT (k) DO UPDATE SET w = nextval('s1')",
+            _ => """
+                MERGE INTO g1k USING generate_series(1, 250) g ON g1k.k = g
+                WHEN MATCHED THEN UPDATE SET w = nextval('s1') WHEN NOT MATCHED THEN INSERT (k, w) VALUES (g, 0)
+                """,
+        }, token);
+    }
+
+    /// <summary>
+    /// Sessions that each draw with SELECT nextval at once leave each other values enough: each counts among those
+    /// drawing from the sequence from its first check until it ends, so that the block's last twentieth, under five values
+    /// for a block of 100, isn't run out by six of them drawing past it before any switch.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task ConcurrentSelectsOfNextvalLeaveEachOtherValues()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE SEQUENCE s2;
+            SELECT worf.enable_sequence_range('s2', participants := '{}', range_size := 100, max_range_size := 100);
+            """, token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 's2'::regclass", token),
+            "node_a drawing from a block of s2, with the next one ready");
+        int draws = 0;
+        List<string> failures = [];
+        DateTime until = DateTime.UtcNow.AddSeconds(10);
+        await Task.WhenAll(Enumerable.Range(0, 6).Select(async session =>
+        {
+            await using NpgsqlConnection connection = await nodeA.OpenAsync(Database, token);
+            await using NpgsqlCommand draw = new("SELECT nextval('s2')", connection);
+            while (DateTime.UtcNow < until)
+            {
+                try
+                {
+                    _ = await draw.ExecuteScalarAsync(token);
+                    _ = Interlocked.Increment(ref draws);
+                }
+                catch (PostgresException failed)
+                {
+                    lock (failures)
+                    {
+                        failures.Add($"{failed.SqlState} {failed.MessageText}");
+                    }
+                }
+            }
+        }));
+        Assert.IsEmpty(failures, $"{failures.Count} failures of {draws + failures.Count} draws: {string.Join("; ", failures.Distinct().Take(3))}");
+        Assert.IsGreaterThan(1000, draws, "the six sessions' draws");
+    }
+
+    /// <summary>
     /// A statement whose wait for a block's switch gave up, as the block's owner was down, leaves the session's later
     /// statements to wait for the switch again, in later transactions too: once the owner is back, a transaction's 20
     /// draws wait for the switch rather than run the block out.

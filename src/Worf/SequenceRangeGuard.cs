@@ -61,13 +61,13 @@ internal static partial class SequenceRangeGuard
     // calls of the CHECK constraints, trigger conditions and trigger functions of the tables they write, by the tables,
     // or as many as a row was seen to draw, as a trigger's loop or a function it calls draws more than its source shows.
     // The position each row of a gated statement was checked at, and the most values a row drew from each sequence in
-    // the session's last statement that held its gate, up to a quarter of the block, which its next such statement
+    // the session's last statement that held its gate, up to half the block, which its next such statement
     // starts from.
     private static readonly Dictionary<uint, long> s_gatedRowDraws = [];
     private static readonly Dictionary<uint, long> s_rowMarks = [];
     private static readonly Dictionary<uint, long> s_seenRowDraws = [];
     private static readonly HashSet<uint> s_seenThisStatement = [];
-    private static readonly Dictionary<string, int> s_writtenCalls = [];
+    private static readonly Dictionary<string, (int Calls, bool Unseen)> s_writtenCalls = [];
     private static readonly List<(nint Statement, uint Subxact, List<uint> Sequences)> s_gating = [];
     private static readonly Dictionary<uint, List<uint>> s_drawnBy = [];
 
@@ -298,6 +298,19 @@ internal static partial class SequenceRangeGuard
 
     [PgNativeCallback(nameof(CountedRow))]
     private static partial ExecProcNodeMtd CountedRowCallback { get; }
+
+    // The statements that draw from a sequence without its gate, as a SELECT of nextval does, which count among the
+    // statements drawing from it from their first check on, until they end: by the depth of the statements starting as
+    // each was counted, and the statement it is, once its plan has started.
+    private static readonly List<(int Depth, nint Statement, uint Subxact, uint Seqoid)> s_ungatedDrawers = [];
+    private static bool s_ungatedDrawersRegistered;
+
+    // The source plan nodes of the upserts and merges that hold gates, with the functions that produce their rows and
+    // the sequences whose gates they hold, which the guard checks before each row.
+    private static readonly Dictionary<nint, (ExecProcNodeMtd Function, List<uint> Sequences)> s_gatedRows = [];
+
+    [PgNativeCallback(nameof(GatedRow))]
+    private static partial ExecProcNodeMtd GatedRowCallback { get; }
 
     [PgNativeCallback(nameof(PlpgsqlStatement))]
     private static partial PLpgSQL_plugin_stmt_begCallback PlpgsqlStatementCallback { get; }
@@ -580,7 +593,7 @@ internal static partial class SequenceRangeGuard
             (HashSet<uint> called, int calls, bool unnamed) = StatementDraws(queryDesc);
             if (unnamed)
             {
-                StartUnnamed(called);
+                StartUnnamed(called, calls);
             }
 
             if (calls > 0)
@@ -706,6 +719,14 @@ internal static partial class SequenceRangeGuard
         }
 
         ForgetCounted((nint)queryDesc);
+        for (int i = s_ungatedDrawers.Count - 1; i >= 0; i--)
+        {
+            if (s_ungatedDrawers[i].Statement == (nint)queryDesc)
+            {
+                CountDrawer(s_ungatedDrawers[i].Seqoid, -1);
+                s_ungatedDrawers.RemoveAt(i);
+            }
+        }
 
         if (s_moving.Count > 0)
         {
@@ -789,10 +810,14 @@ internal static partial class SequenceRangeGuard
         }
 
         OpenGates((nint)queryDesc, [.. sequences, .. triggered]);
-        long rowDraws = 1 + WrittenCalls(written);
+        (int calls, bool unseen) = WrittenCalls(written);
+        long rowDraws = 1 + calls;
         foreach (uint seqoid in sequences.Concat(triggered))
         {
-            s_gatedRowDraws[seqoid] = Math.Max(s_gatedRowDraws.GetValueOrDefault(seqoid), Math.Max(rowDraws, s_seenRowDraws.GetValueOrDefault(seqoid)));
+            // A row whose triggers may draw more than their source shows counts, until this session has seen a row draw,
+            // for as many as a row's draws are counted for at most.
+            long seen = s_seenRowDraws.TryGetValue(seqoid, out long drawn) ? drawn : unseen ? RowDrawsAtMost(seqoid) : 0;
+            s_gatedRowDraws[seqoid] = Math.Max(s_gatedRowDraws.GetValueOrDefault(seqoid), Math.Max(rowDraws, seen));
             _ = s_seenThisStatement.Remove(seqoid);
         }
 
@@ -824,7 +849,7 @@ internal static partial class SequenceRangeGuard
 
     // Counts the values a row of a statement that holds a sequence's gate drew since the last mark, within the active
     // block, other sessions' draws meanwhile too, toward how many the statement's later rows, and the session's next such
-    // statement, count each row to draw, up to a quarter of the block, so that a trigger that draws more than its source
+    // statement, count each row to draw, up to half the block, so that a trigger that draws more than its source
     // shows, in a loop or through a function it calls, waits for the switch rather than run the block out.
     private static void SeeRowDraws(uint seqoid)
     {
@@ -840,7 +865,7 @@ internal static partial class SequenceRangeGuard
             sequence.Blocks[index] is (long lo, long hi, _) && mark >= lo && mark <= hi && now >= lo && now <= hi)
         {
             decimal step = Math.Max(Math.Abs((decimal)SequenceRanges.GetInfo(seqoid).Increment), 1);
-            long drawn = (long)Math.Min(Math.Abs((decimal)now - mark) / step, (((decimal)hi - lo) / step / 4) + 1);
+            long drawn = (long)Math.Min(Math.Abs((decimal)now - mark) / step, RowDrawsAtMost(seqoid));
             if (drawn > s_gatedRowDraws.GetValueOrDefault(seqoid, 1))
             {
                 s_gatedRowDraws[seqoid] = drawn;
@@ -856,15 +881,17 @@ internal static partial class SequenceRangeGuard
     }
 
     // The calls of nextval the CHECK constraints, trigger conditions and trigger functions of tables and their partitions
-    // make for a row, as their text names them, once until a table, a constraint or a function changes.
-    private static int WrittenCalls(List<uint> written)
+    // make for a row, as their text names them, and whether the trigger functions may make more than their text shows,
+    // as one that loops, runs a statement it builds or calls a function of a user's does, once until a table, a
+    // constraint or a function changes.
+    private static (int Calls, bool Unseen) WrittenCalls(List<uint> written)
     {
         string key = string.Join(',', written.Order());
-        if (!s_writtenCalls.TryGetValue(key, out int calls))
+        if (!s_writtenCalls.TryGetValue(key, out (int Calls, bool Unseen) counted))
         {
             WatchTables();
             long[] relids = [.. written.Select(table => (long)table)];
-            calls = Draws(WrittenChecks(relids)).Calls + Elevated.Run(() => Worf.Read("""
+            string[] sources = [.. Elevated.Run(() => Worf.Read("""
                 WITH t (relid) AS (
                     SELECT r.relid::pg_catalog.oid FROM pg_catalog.unnest($1::pg_catalog.int8[]) r (relid)
                     UNION ALL
@@ -873,11 +900,46 @@ internal static partial class SequenceRangeGuard
                 SELECT f.prosrc FROM t JOIN pg_catalog.pg_trigger g ON g.tgrelid = t.relid
                     JOIN pg_catalog.pg_proc f ON f.oid = g.tgfoid JOIN pg_catalog.pg_language l ON l.oid = f.prolang
                 WHERE l.lanname NOT IN ('c', 'internal')
-                """, 0, SpiParameter.Create(relids))).Sum(row => NextvalCalls(row.Get<string?>(0) ?? ""));
-            s_writtenCalls[key] = calls;
+                """, 0, SpiParameter.Create(relids))).Select(row => row.Get<string?>(0) ?? "")];
+            string[] called = [.. sources.SelectMany(source => CalledName().Matches(source).Select(call => call.Groups[1].Value.ToLowerInvariant())).Distinct()];
+            bool unseen = sources.Any(source => ExecuteWord().IsMatch(source) || (LoopWord().IsMatch(source) && NextvalCalls(source) > 0)) || (called.Length > 0 && Elevated.Run(() => Worf.ReadScalar<bool>("""
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+                    WHERE p.proname = ANY ($1::pg_catalog.text[]) AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'worf'))
+                """, SpiParameter.Create(called))));
+            counted = (Draws(WrittenChecks(relids)).Calls + sources.Sum(NextvalCalls), unseen);
+            s_writtenCalls[key] = counted;
         }
 
-        return calls;
+        return counted;
+    }
+
+    // A word of a function's source that runs a statement it builds, whose draws its text doesn't show.
+    [GeneratedRegex(@"\bexecute\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex ExecuteWord();
+
+    // A word of a function's source that loops, whose calls its text shows once each however often they run.
+    [GeneratedRegex(@"\bloop\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex LoopWord();
+
+    // A name a function's source calls, as a function of a user's that may draw.
+    [GeneratedRegex(@"\b([A-Za-z_][A-Za-z0-9_$]*)\s*\(", RegexOptions.CultureInvariant)]
+    private static partial Regex CalledName();
+
+    // The most draws a gated row counts for, half the sequence's active block, as Short counts no more: a row that draws
+    // more runs into the next block however soon the switch comes.
+    private static long RowDrawsAtMost(uint seqoid)
+    {
+        Reload();
+        if (!s_sequences.TryGetValue(seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) sequence) ||
+            sequence.Blocks.FindIndex(block => block.State == "active") is not (int index and >= 0))
+        {
+            return 0;
+        }
+
+        (long lo, long hi, _) = sequence.Blocks[index];
+        decimal step = Math.Max(Math.Abs((decimal)SequenceRanges.GetInfo(seqoid).Increment), 1);
+        return (long)((((decimal)hi - lo) / step / 2) + 1);
     }
 
     // Watches the trigger functions a statement may call, with the sequences its triggers name for each, until it ends.
@@ -1229,7 +1291,114 @@ internal static partial class SequenceRangeGuard
             }
         }
 
+        CheckGatedRows(queryDesc);
+        for (int i = 0; i < s_ungatedDrawers.Count; i++)
+        {
+            if (s_ungatedDrawers[i] is { Statement: 0 } drawer && drawer.Depth == s_starting.Count)
+            {
+                s_ungatedDrawers[i] = drawer with { Statement = queryDesc };
+            }
+        }
+
         StartedExpressions();
+    }
+
+    // Counts the statement whose plan is starting among those drawing from sequences it draws from without their gates,
+    // before it first checks them, so that statements drawing at once, each one value before it checks again, leave one
+    // another values enough, until it ends.
+    private static void CountUngated(List<uint> sequences)
+    {
+        if (!s_ungatedDrawersRegistered)
+        {
+            s_ungatedDrawersRegistered = true;
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, ForgetUngatedDrawers);
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, ForgetUngatedDrawers);
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, ForgetUngatedDrawers);
+            _ = PgTransaction.RegisterSubtransactionCallback(PgSubtransactionEvent.Abort, static (aborted, parent) =>
+            {
+                foreach ((int, nint, uint, uint Seqoid) drawer in s_ungatedDrawers.Where(drawer => drawer.Subxact >= aborted.Value).ToList())
+                {
+                    CountDrawer(drawer.Seqoid, -1);
+                    _ = s_ungatedDrawers.Remove(drawer);
+                }
+            });
+        }
+
+        uint subxact;
+        unsafe
+        {
+            subxact = NativeMethods.GetCurrentSubTransactionId();
+        }
+
+        foreach (uint seqoid in sequences)
+        {
+            CountDrawer(seqoid, 1);
+            s_ungatedDrawers.Add((s_starting.Count, 0, subxact, seqoid));
+        }
+    }
+
+    private static void ForgetUngatedDrawers()
+    {
+        foreach ((int, nint, uint, uint Seqoid) drawer in s_ungatedDrawers)
+        {
+            CountDrawer(drawer.Seqoid, -1);
+        }
+
+        s_ungatedDrawers.Clear();
+        s_ungatedDrawersRegistered = false;
+    }
+
+    // Has an upsert or a merge that holds gates check its gated sequences before each row its source gives, as an
+    // insert's guard trigger does after each row it writes: a row that conflicts, or that a merge matches, fires no such
+    // trigger, though its default, its SET and its triggers draw.
+    private static unsafe void CheckGatedRows(nint queryDesc)
+    {
+        QueryDesc* query = (QueryDesc*)queryDesc;
+        int gating = s_gating.FindLastIndex(entry => entry.Statement == queryDesc);
+        if (gating < 0 || query->planstate is null || query->planstate->type != NodeTag.T_ModifyTableState || query->planstate->plan is null ||
+            (query->operation != CmdType.CMD_MERGE && ((ModifyTable*)query->planstate->plan)->onConflictAction == OnConflictAction.ONCONFLICT_NONE))
+        {
+            return;
+        }
+
+        PlanState* source = query->planstate->lefttree;
+        if (source is null || s_gatedRows.ContainsKey((nint)source))
+        {
+            return;
+        }
+
+        s_gatedRows[(nint)source] = (source->ExecProcNodeReal, [.. s_gating[gating].Sequences]);
+        source->ExecProcNodeReal = GatedRowCallback;
+        RegisterCounted();
+        List<nint> nodes = s_countedNodes.TryGetValue(queryDesc, out (uint Subxact, List<nint> Nodes) counted) ? counted.Nodes : [];
+        nodes.Add((nint)source);
+        s_countedNodes[queryDesc] = (NativeMethods.GetCurrentSubTransactionId(), nodes);
+    }
+
+    // Produces an upsert's or a merge's next source row, after checking the sequences whose gates it holds: a switch
+    // waiting for a gate passes, the draws the last row was seen to make count toward the next's, and a block too short
+    // for them waits for its switch.
+    private static unsafe TupleTableSlot* GatedRow(PlanState* node)
+    {
+        (ExecProcNodeMtd function, List<uint> sequences) = s_gatedRows[(nint)node];
+        if (!s_namingGrantors && !Worf.InOwnSql)
+        {
+            List<uint> passed = PassGates();
+            Refresh();
+            Reload();
+            foreach (uint seqoid in passed)
+            {
+                WaitWhileShort(seqoid);
+            }
+
+            foreach (uint seqoid in sequences.Where(s_gates.ContainsKey))
+            {
+                SeeRowDraws(seqoid);
+                WaitWhileShort(seqoid);
+            }
+        }
+
+        return function.Invoke(node);
     }
 
     // Has the guard count down before each row a plan node, and those under it, produce: its children, its initPlans
@@ -1521,6 +1690,7 @@ internal static partial class SequenceRangeGuard
             foreach (nint node in counted.Nodes)
             {
                 _ = s_rowFunctions.Remove(node);
+                _ = s_gatedRows.Remove(node);
             }
         }
     }
@@ -1537,6 +1707,7 @@ internal static partial class SequenceRangeGuard
         {
             s_countedNodes.Clear();
             s_rowFunctions.Clear();
+            s_gatedRows.Clear();
             s_countedRegistered = false;
         });
         _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () => s_countedRegistered = false);
@@ -1606,7 +1777,7 @@ internal static partial class SequenceRangeGuard
                     }
 
                     count = SeenDrawn(seqoid, out long? seen);
-                    runOut = RunOut(seqoid, seen);
+                    runOut = RunOut(seqoid, seen, draws);
                     if (count == 0 && !runOut)
                     {
                         continue;
@@ -1621,7 +1792,7 @@ internal static partial class SequenceRangeGuard
 
                 if (gated || !s_gates.ContainsKey(seqoid))
                 {
-                    WaitWhileShort(seqoid, Math.Max(count, 1));
+                    WaitWhileShort(seqoid, Math.Max(Math.Max(count, draws), 1));
                 }
 
                 s_drawingUngated[seqoid] = RowsUntilShort(seqoid);
@@ -1639,8 +1810,8 @@ internal static partial class SequenceRangeGuard
 
     // Notes where each sequence the transaction draws from without its gate, and a statement's calls don't name, is as
     // the statement starts, so that its rows count one down only as far as they're seen to draw from it, and waits for
-    // the switch of one whose block has run out, as any draw from it would fail.
-    private static void StartUnnamed(IReadOnlyCollection<uint> named)
+    // the switch of one whose block has fewer values left than a row's calls take, as a row's draws from it would fail.
+    private static void StartUnnamed(IReadOnlyCollection<uint> named, int calls)
     {
         if (s_drawingUngated.Count == 0 || s_countingDown || s_namingGrantors || Worf.InOwnSql)
         {
@@ -1652,9 +1823,9 @@ internal static partial class SequenceRangeGuard
         {
             foreach (uint seqoid in s_drawingUngated.Keys.Where(seqoid => !named.Contains(seqoid)).ToList())
             {
-                if (RunOut(seqoid, Position(seqoid)) && !s_gates.ContainsKey(seqoid))
+                if (RunOut(seqoid, Position(seqoid), calls) && !s_gates.ContainsKey(seqoid))
                 {
-                    WaitWhileShort(seqoid);
+                    WaitWhileShort(seqoid, Math.Max(calls, 1));
                     s_drawingUngated[seqoid] = RowsUntilShort(seqoid);
                 }
 
@@ -1690,9 +1861,9 @@ internal static partial class SequenceRangeGuard
         return seen;
     }
 
-    // Whether a sequence has no active block, or is, at the position given, at its active block's last value or past
-    // it, so that a draw from it would fail.
-    private static bool RunOut(uint seqoid, long? position)
+    // Whether a sequence has no active block, or has, past the position given, fewer of its active block's values left
+    // than a row's calls take, so that a row's draws from it would fail.
+    private static bool RunOut(uint seqoid, long? position, long calls = 1)
     {
         Reload();
         if (!s_sequences.TryGetValue(seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) sequence) ||
@@ -1702,7 +1873,14 @@ internal static partial class SequenceRangeGuard
         }
 
         (long lo, long hi, _) = sequence.Blocks[index];
-        return position is long at && (sequence.Ascending ? at >= hi : at <= lo);
+        if (position is not long at)
+        {
+            return false;
+        }
+
+        decimal step = Math.Max(Math.Abs((decimal)SequenceRanges.GetInfo(seqoid).Increment), 1);
+        decimal left = sequence.Ascending ? (decimal)hi - at : (decimal)at - lo;
+        return left / step < Math.Max(calls, 1);
     }
 
     // How many draws a sequence may take before it is checked again: half its steps left before the active block's last
@@ -2881,12 +3059,19 @@ internal static partial class SequenceRangeGuard
 
         // A call that first starts as its statement runs is its row's, which may make the row's other calls too before the
         // count down the statement's later rows take.
-        // One whose sequence they don't name waits so only for a sequence whose block has run out, as any draw from it
-        // would fail, and its rows count the others down as they're seen to draw from them.
+        // One whose sequence they don't name waits so only for a sequence whose block has fewer values left than a row's
+        // calls take, as a row's draws from it would fail, and its rows count the others down as they're seen to draw
+        // from them.
         long rowDraws = switching.Count > 0 && starting is { Running: not 0 } running ? RunningRowCalls(running.Running) : 1;
-        foreach (uint seqoid in switching.Where(seqoid => !anyOf || spelled.Contains(seqoid) || RunOut(seqoid, Position(seqoid))))
+        long rowCalls = Math.Max(rowDraws, starting?.Draws.Calls ?? 1);
+        if (!plpgsql && starting is not null)
         {
-            WaitWhileShort(seqoid, rowDraws);
+            CountUngated(switching);
+        }
+
+        foreach (uint seqoid in switching.Where(seqoid => !anyOf || spelled.Contains(seqoid) || RunOut(seqoid, Position(seqoid), rowCalls)))
+        {
+            WaitWhileShort(seqoid, anyOf && !spelled.Contains(seqoid) ? rowCalls : rowDraws);
         }
 
         if (switching.Count > 0)
