@@ -4302,8 +4302,11 @@ public sealed partial class SequenceRangeTests
 
         // A statement run again in a transaction that drew s1 takes about as long as in one that drew nothing, each in a
         // session of its own that has run nothing else: its calls of nextval are read once for its text, rather than from
-        // its plan's text each time it starts. The two sessions' inserts alternate, and the first 20 of each warm up.
+        // its plan's text each time it starts, and so are a statement's with parameters, as a driver sends its values,
+        // which makes none. The two sessions' inserts of 4,000 literal rows, and of 1,000 rows of parameters, alternate,
+        // and the first 20 of each warm up.
         string values = $"INSERT INTO vt VALUES {string.Join(", ", Enumerable.Range(1, 4000).Select(i => string.Create(CultureInfo.InvariantCulture, $"({i})")))}";
+        string parameters = $"INSERT INTO vt VALUES {string.Join(", ", Enumerable.Range(1, 1000).Select(i => string.Create(CultureInfo.InvariantCulture, $"(${i})")))}";
         await using (NpgsqlConnection drawingConnection = await nodeB.OpenAsync(Database, token))
         await using (NpgsqlConnection plainConnection = await nodeB.OpenAsync(Database, token))
         {
@@ -4314,22 +4317,38 @@ public sealed partial class SequenceRangeTests
                 _ = await drawOnce.ExecuteNonQueryAsync(token);
             }
 
-            await using NpgsqlCommand drawingInsert = new(values, drawingConnection, drawingTransaction);
-            await using NpgsqlCommand plainInsert = new(values, plainConnection, plainTransaction);
-            TimeSpan drawing = TimeSpan.Zero;
-            TimeSpan plainly = TimeSpan.Zero;
-            for (int i = 0; i < 60; i++)
+            foreach (string sql in new[] { values, parameters })
             {
-                foreach ((NpgsqlCommand insert, bool drew) in i % 2 == 0 ? new[] { (drawingInsert, true), (plainInsert, false) } : [(plainInsert, false), (drawingInsert, true)])
+                NpgsqlCommand Insert(NpgsqlConnection inserting, NpgsqlTransaction within)
                 {
-                    Stopwatch timing = Stopwatch.StartNew();
-                    _ = await insert.ExecuteNonQueryAsync(token);
-                    drawing += i >= 20 && drew ? timing.Elapsed : TimeSpan.Zero;
-                    plainly += i >= 20 && !drew ? timing.Elapsed : TimeSpan.Zero;
+                    NpgsqlCommand insert = new(sql, inserting, within);
+                    for (int i = 1; sql == parameters && i <= 1000; i++)
+                    {
+                        _ = insert.Parameters.Add(new NpgsqlParameter { Value = i });
+                    }
+
+                    return insert;
                 }
+
+                await using NpgsqlCommand drawingInsert = Insert(drawingConnection, drawingTransaction);
+                await using NpgsqlCommand plainInsert = Insert(plainConnection, plainTransaction);
+                TimeSpan drawing = TimeSpan.Zero;
+                TimeSpan plainly = TimeSpan.Zero;
+                for (int i = 0; i < 60; i++)
+                {
+                    foreach ((NpgsqlCommand insert, bool drew) in i % 2 == 0 ? new[] { (drawingInsert, true), (plainInsert, false) } : [(plainInsert, false), (drawingInsert, true)])
+                    {
+                        Stopwatch timing = Stopwatch.StartNew();
+                        _ = await insert.ExecuteNonQueryAsync(token);
+                        drawing += i >= 20 && drew ? timing.Elapsed : TimeSpan.Zero;
+                        plainly += i >= 20 && !drew ? timing.Elapsed : TimeSpan.Zero;
+                    }
+                }
+
+                string what = sql == values ? "4,000 literal rows" : "1,000 rows of parameters";
+                Assert.IsLessThan(plainly * 1.2, drawing, $"40 inserts of {what} in a transaction that drew s1, against {plainly} in one that didn't");
             }
 
-            Assert.IsLessThan(plainly * 1.2, drawing, $"40 inserts of 4,000 rows in a transaction that drew s1, against {plainly} in one that didn't");
             await drawingTransaction.RollbackAsync(token);
             await plainTransaction.RollbackAsync(token);
         }

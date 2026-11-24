@@ -635,23 +635,32 @@ internal static partial class SequenceRangeGuard
 
     /// <summary>
     /// Reads the calls of nextval a statement's plan makes, kept by the statement's text, the search path and the role it
-    /// runs as, unless it has parameters, whose values its plan may hold, until a table, a type, a constraint, a function
-    /// or a schema changes, or the managed sequences do, so that a statement run again doesn't write its plan out again.
+    /// runs as, until a table, a type, a constraint, a function or a schema changes, or the managed sequences do, so that
+    /// a statement run again doesn't write its plan out again. Of a statement with parameters, whose values a plan may
+    /// hold, as the sequence a call names, only that it makes no call is kept, and only when neither its text nor a
+    /// function of a user's that it calls, which the planner may inline as the values have it, may call nextval: its
+    /// calls come from its text, its views and the functions it calls, which its values change none of.
     /// </summary>
     private static unsafe (HashSet<uint> Called, int Calls, bool Unnamed) StatementDraws(QueryDesc* queryDesc)
     {
         PlannedStmt* planned = queryDesc->plannedstmt;
-        if (queryDesc->sourceText is null || (queryDesc->@params is not null && queryDesc->@params->numParams > 0))
+        if (queryDesc->sourceText is null)
         {
             return Draws(PlanText((Node*)planned));
         }
 
+        bool parameters = queryDesc->@params is not null && queryDesc->@params->numParams > 0;
         WatchTables();
-        (string Text, string Path, uint User) key = (StatementText((nint)queryDesc->sourceText, planned->stmt_location, planned->stmt_len), SearchPath(),
-            NativeMethods.GetUserId());
-        if (!s_drawsByText.TryGetValue(key, out (HashSet<uint> Called, int Calls, bool Unnamed) draws))
+        string text = StatementText((nint)queryDesc->sourceText, planned->stmt_location, planned->stmt_len);
+        (string Text, string Path, uint User) key = (text, SearchPath(), NativeMethods.GetUserId());
+        if (s_drawsByText.TryGetValue(key, out (HashSet<uint> Called, int Calls, bool Unnamed) draws))
         {
-            draws = Draws(PlanText((Node*)planned));
+            return draws;
+        }
+
+        draws = Draws(PlanText((Node*)planned));
+        if (!parameters || (draws is { Calls: 0, Unnamed: false } && !text.Contains("nextval", StringComparison.OrdinalIgnoreCase) && !CallsUserFunctions(planned)))
+        {
             if (s_drawsByText.Count >= 1000)
             {
                 s_drawsByText.Clear();
@@ -661,6 +670,26 @@ internal static partial class SequenceRangeGuard
         }
 
         return draws;
+    }
+
+    // Whether a plan calls a function of a user's, which it depends on, as one the planner inlined.
+    private static unsafe bool CallsUserFunctions(PlannedStmt* planned)
+    {
+#if ANKUS_PG19
+        const int procedures = (int)SysCacheIdentifier.PROCOID;
+#else
+        const int procedures = ProcedureCacheId;
+#endif
+        List* items = planned->invalItems;
+        for (int i = 0; items is not null && i < items->length; i++)
+        {
+            if (((PlanInvalItem*)items->elements[i].ptr_value)->cacheId == procedures)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>
