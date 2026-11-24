@@ -764,6 +764,36 @@ internal static class Sync
     }
 
     /// <summary>
+    /// Deletes a sync status row a scan found, or the version a concurrent update left of it, and passes over one another
+    /// transaction deleted first, rather than fail as simple_heap_delete does: drop_subscription and a drop of a table,
+    /// as apply runs one that DDL replication brought, both delete the table's row.
+    /// </summary>
+    private static unsafe void DeleteStatus(RelationData* rel, ItemPointerData* found)
+    {
+        ItemPointerData tid = *found;
+        while (true)
+        {
+            TM_FailureData failure;
+#if ANKUS_PG19
+            TM_Result result = NativeMethods.heap_delete(rel, &tid, NativeMethods.GetCurrentCommandId(true), 0, null, true, &failure);
+#else
+            TM_Result result = NativeMethods.heap_delete(rel, &tid, NativeMethods.GetCurrentCommandId(true), null, true, &failure, false);
+#endif
+            if (result is TM_Result.TM_Ok or TM_Result.TM_Deleted)
+            {
+                return;
+            }
+
+            if (result != TM_Result.TM_Updated)
+            {
+                throw new PgException(PgSqlStates.InternalError, $"unexpected result {result} of deleting a sync status row");
+            }
+
+            tid = failure.ctid;
+        }
+    }
+
+    /// <summary>
     /// Remove subscription sync status record from catalog.
     /// </summary>
     /// <param name="subid">The subscription.</param>
@@ -780,7 +810,7 @@ internal static class Sync
         HeapTupleData* tuple;
         while ((tuple = NativeMethods.systable_getnext(scan)) is not null)
         {
-            NativeMethods.simple_heap_delete(rel, &tuple->t_self);
+            DeleteStatus(rel, &tuple->t_self);
         }
 
         // Cleanup.
@@ -872,7 +902,7 @@ internal static class Sync
         HeapTupleData* tuple;
         while ((tuple = NativeMethods.systable_getnext(scan)) is not null)
         {
-            NativeMethods.simple_heap_delete(rel, &tuple->t_self);
+            DeleteStatus(rel, &tuple->t_self);
         }
 
         // Cleanup.
@@ -899,7 +929,7 @@ internal static class Sync
         HeapTupleData* tuple;
         while ((tuple = NativeMethods.systable_getnext(scan)) is not null)
         {
-            NativeMethods.simple_heap_delete(rel, &tuple->t_self);
+            DeleteStatus(rel, &tuple->t_self);
         }
 
         // Cleanup.

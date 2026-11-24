@@ -4390,7 +4390,6 @@ public sealed partial class SequenceRangeTests
 
         Assert.IsLessThan(TimeSpan.FromSeconds(3), selecting.Elapsed, "100 statements of SELECT 1 in the transaction");
 
-
         await transaction.CommitAsync(token);
     }
 

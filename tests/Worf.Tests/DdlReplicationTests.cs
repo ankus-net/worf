@@ -601,6 +601,54 @@ public sealed class DdlReplicationTests
         Assert.DoesNotContain("replica identity", nodeB.ReadLog(), "node_b's log");
     }
 
+    /// <summary>
+    /// A subscription's drop and a drop of one of its tables, as apply runs one that DDL replication brought, both delete
+    /// the table's sync status: the subscription's drop, which finds the row while the table's drop holds it, waits for
+    /// that drop and passes over the row it deleted, rather than fail with "tuple concurrently deleted".
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task SubscriptionDropsPassOverSyncStatusATableDropDeleted()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "SET worf.enable_ddl_replication = off; CREATE TABLE ts (a int PRIMARY KEY)", token);
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database,
+            "SELECT worf.replication_set_add_table('default', 'ts') WHERE NOT EXISTS (SELECT 1 FROM worf.tables WHERE relid = 'ts'::regclass AND set_name = 'default')", token);
+        _ = await nodeB.SafePsqlAsync(Database, $$"""
+            SELECT worf.create_subscription(
+                subscription_name := 'b_from_a',
+                provider_dsn := '{{nodeA.Dsn(Database, SuperUser)}}',
+                synchronize_structure := false,
+                synchronize_data := true,
+                forward_origins := '{}')
+            """, token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, """
+            SELECT EXISTS (SELECT 1 FROM worf.show_subscription_status() WHERE subscription_name = 'b_from_a' AND status = 'replicating')
+                AND EXISTS (SELECT 1 FROM worf.local_sync_status WHERE sync_relname = 'ts' AND sync_status = 'r')
+            """, token), "b_from_a replicating, with ts synchronized");
+
+        await using NpgsqlConnection dropping = await nodeB.OpenAsync(Database, token);
+        await using NpgsqlTransaction dropTable = await dropping.BeginTransactionAsync(token);
+        await using (NpgsqlCommand drop = new("SET LOCAL worf.enable_ddl_replication = off; DROP TABLE ts", dropping, dropTable))
+        {
+            _ = await drop.ExecuteNonQueryAsync(token);
+        }
+
+        Task<string> dropSubscription = nodeB.SafePsqlAsync(Database, "SELECT worf.drop_subscription('b_from_a')", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, """
+            SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE query LIKE '%drop_subscription(''b_from_a'')%' AND wait_event_type = 'Lock')
+            """, token), "the subscription's drop, waiting for the table's");
+        await dropTable.CommitAsync(token);
+        _ = await dropSubscription;
+        Assert.AreEqual("0", await nodeB.SafePsqlAsync(Database, "SELECT count(*) FROM worf.local_sync_status", token), "node_b's sync status rows");
+    }
+
     private static async Task<TestNode> StartNodeAsync(string name, CancellationToken token, params string[] settings)
     {
         TestNode node = await TestNode.StartAsync(name,
