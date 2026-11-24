@@ -7360,8 +7360,11 @@ public sealed partial class SequenceRangeTests
         }
 
         await RestoreDataAsync(nodeB, copy, token);
+
+        // node_a reaches mv_id_seq's report once its calls have taken in the many_ sequences' reports ahead of it, each
+        // with node_b's reserve: about 8 s here, and 15 on a macOS runner.
         Stopwatch trying = Stopwatch.StartNew();
-        while (trying.Elapsed < TimeSpan.FromSeconds(15))
+        while (trying.Elapsed < TimeSpan.FromSeconds(30))
         {
             try
             {
