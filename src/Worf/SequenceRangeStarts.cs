@@ -14,7 +14,8 @@ namespace Worf;
 /// may have hidden a restore: it keeps a start just before its own at position 0, so that every neighbor that heard of a
 /// position from the node before it takes the node as gone back. A start the file can't keep, as when neither it nor its
 /// temporary file can be written, leaves the file worf_starts.lost, which has the next start the file keeps count the
-/// starts before it as lost too, as that start, a restore's perhaps, isn't among them.
+/// starts before it as lost too, as that start, a restore's perhaps, isn't among them; one that can't write that either
+/// removes the file of starts, which only the directory has to allow, so that the next start finds it gone.
 /// </summary>
 internal static class SequenceRangeStarts
 {
@@ -85,7 +86,8 @@ internal static class SequenceRangeStarts
     }
 
     // Leaves the file that shows a start wasn't kept, durably, so that the next start the file keeps counts the starts
-    // before it as lost.
+    // before it as lost, or, when that can't be written either, removes the file of starts, which the next start counts as
+    // lost the same way, though the files are put right before it.
     private static unsafe void Unkept()
     {
         try
@@ -98,7 +100,11 @@ internal static class SequenceRangeStarts
         }
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or NotSupportedException or System.Security.SecurityException)
         {
-            WorfLog.Warning($"could not write file \"{LostName}\": {error.Message}");
+            WorfLog.Warning($"could not write file \"{LostName}\": {error.Message}; removing file \"{FileName}\" instead");
+            fixed (byte* name = Encoding.UTF8.GetBytes(FileName + "\0"))
+            {
+                _ = NativeMethods.durable_unlink((sbyte*)name, (int)PgLogLevel.Warning);
+            }
         }
     }
 
