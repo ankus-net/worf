@@ -4426,6 +4426,52 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// A node that can't reach the other nodes keeps taking writes: node_b, with node_a, the owner, down, inserts far past
+    /// the blocks it holds, loads 3,000 rows it reserved for, and goes on after it restarts, taking its blocks from its
+    /// reserve; once node_a is back, its own rows take none of node_b's values.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task OfflineNodesKeepTakingWrites()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database,
+            "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100, max_range_size := 1000)", token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
+            "SELECT EXISTS (SELECT 1 FROM worf.sequence_range_block WHERE seqoid = 't_id_seq'::regclass AND kind = 'p' AND state = 'open')", token),
+            "node_b's reserve");
+
+        await nodeA.StopAsync("fast", token);
+        _ = await nodeB.SafePsqlAsync(Database, "SET statement_timeout = '60s'; INSERT INTO t (v) SELECT 'offline' FROM generate_series(1, 5000)", token);
+        _ = await nodeB.SafePsqlAsync(Database, """
+            SET statement_timeout = '60s';
+            BEGIN;
+            SELECT worf.reserve_sequence_range('t_id_seq', 3000);
+            INSERT INTO t (v) SELECT 'load' FROM generate_series(1, 3000);
+            COMMIT;
+            """, token);
+        await nodeB.StopAsync("fast", token);
+        await nodeB.StartServerAsync(token);
+        _ = await nodeB.SafePsqlAsync(Database, "SET statement_timeout = '60s'; INSERT INTO t (v) SELECT 'restarted' FROM generate_series(1, 100)", token);
+        Assert.AreEqual("8100|8100", await nodeB.SafePsqlAsync(Database, "SELECT count(*), count(DISTINCT id) FROM t", token), "node_b's rows and ids");
+
+        await nodeA.StartServerAsync(token);
+        _ = await nodeA.SafePsqlAsync(Database, "SET statement_timeout = '60s'; INSERT INTO t (v) SELECT 'a' FROM generate_series(1, 2000)", token);
+        string bIds = await nodeB.SafePsqlAsync(Database, "SELECT string_agg(id::text, ',') FROM t", token);
+        Assert.AreEqual("0", await nodeA.SafePsqlAsync(Database,
+            $"SELECT count(*) FROM t WHERE v = 'a' AND id = ANY ('{{{bIds}}}'::bigint[])", token), "node_a's ids among node_b's");
+    }
+
+    /// <summary>
     /// A fresh session's first row waits for the switch before it runs node_b's last block out, though node_b has seen no
     /// row like it draw: a row into a table whose trigger draws 12 in a loop, through a function it calls or through a
     /// statement it builds, or 40 in a loop, counts for up to half the block until a row is seen, and a statement

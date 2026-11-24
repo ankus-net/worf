@@ -3031,7 +3031,9 @@ internal static class SequenceRangeExchange
         long largest = range[0].Get<long>(3);
         size = kind == "n" ? (reserved ? size : Math.Min(size, largest)) : Math.Min(size, SequenceRanges.LargestGrant(largest));
 
-        return SequenceRanges.Allocate(seqoid, info, epoch, size, granteeId, granteeName, requestId, kind[0]) is not null;
+        // A node's reserve, a pool block it asks for to take its own blocks from while it can't reach the other nodes, comes
+        // from the end of the free values, so that the blocks granted from their start stay where they would be.
+        return SequenceRanges.Allocate(seqoid, info, epoch, size, granteeId, granteeName, requestId, kind[0], fromEnd: kind == "p" && reserved) is not null;
     }
 
     /// <summary>

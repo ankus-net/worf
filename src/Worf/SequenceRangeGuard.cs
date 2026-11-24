@@ -17,18 +17,6 @@ internal static partial class SequenceRangeGuard
 {
     private const string CheckViolation = "23514";
 
-    /// <summary>
-    /// Gets the detail of the failure of a call of nextval that waited for its grantor too long, which an apply worker
-    /// applies again later, as it says nothing about the change's data.
-    /// </summary>
-    internal const string GrantorUnheard = "A server that restarted draws from a sequence's blocks only once the block's parent, and every other node it exchanges with that reports the sequence, has checked its report since: the parent may have given the block's values out again meanwhile, and any of them may have heard of draws a restore took back.";
-
-    /// <summary>
-    /// Gets the detail of the failure of a call of nextval whose sequence worf can't tell that waited for a grantor too
-    /// long, which an apply worker applies again later.
-    /// </summary>
-    internal const string UnnamedGrantorUnheard = "worf can't tell which sequence the call draws from before it runs, as for a name computed as it runs, so the call waits for every grantor this server hasn't heard from.";
-
     // SESSION_REPLICATION_ROLE_REPLICA from commands/trigger.h.
     private const int SessionReplicationRoleReplica = 1;
 
@@ -248,6 +236,11 @@ internal static partial class SequenceRangeGuard
 
     // Whether this server's start was kept in the data directory's file of starts, as once seen it stays.
     private static bool s_startKept;
+
+    // Whether this backend warned that it draws though the file of starts doesn't keep this server's start, and the
+    // sequences, with the nodes they waited for, that it draws from though those nodes haven't answered since the start.
+    private static bool s_startUnkeptWarned;
+    private static readonly HashSet<(uint Seqoid, uint Node)> s_unanswered = [];
 
     // Whether the guard is reading the blocks to find the grantors a statement's plan names.
     private static bool s_namingGrantors;
@@ -3898,16 +3891,21 @@ internal static partial class SequenceRangeGuard
         }
     }
 
+    // When statements stop waiting, after this server's start, for its file of starts and for the nodes they wait for:
+    // worf.sequence_range_timeout after the start, so that a node that can't reach the others goes on taking writes.
+    private static long StartWaitEnds() => SequenceRangeHeard.Started + (SequenceRanges.ExchangeTimeout * 1000L);
+
     /// <summary>
     /// Waits, before a statement draws from a managed sequence, until the data directory's file of starts keeps this
     /// server's start, which worf's supervisor notes again until it does: a later start that finds it gone, as after a
     /// restore whose start the file couldn't keep, would take no position from before it as gone back, and so draw again
-    /// values drawn since. The statement lets its gates go and waits up to twice <c>worf.sequence_range_timeout</c>, as
-    /// for a neighbor after a start, and then fails.
+    /// values drawn since. The statement lets its gates go and waits until <c>worf.sequence_range_timeout</c> has passed
+    /// since the server started, as for a neighbor after a start, and then draws, with a warning, so that a server whose
+    /// file can't be written still takes writes.
     /// </summary>
     private static void WaitForStartKept(uint seqoid, bool unnamed)
     {
-        if (s_startKept || (s_startKept = SequenceRangeHeard.StartKept))
+        if (s_startKept || (s_startKept = SequenceRangeHeard.StartKept) || s_startUnkeptWarned)
         {
             return;
         }
@@ -3922,16 +3920,19 @@ internal static partial class SequenceRangeGuard
         List<uint> held = LetGates();
         try
         {
-            long deadline = Worker.GetCurrentTimestamp() + (SequenceRanges.ExchangeTimeout * 2000L);
+            long deadline = StartWaitEnds();
             while (!(s_startKept = SequenceRangeHeard.StartKept))
             {
                 if (Worker.GetCurrentTimestamp() >= deadline)
                 {
-                    throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState,
-                        unnamed ? "nextval can't draw until the file worf_starts in the data directory keeps this server's start"
-                            : $"sequence {sequence} can't draw until the file worf_starts in the data directory keeps this server's start",
-                        detail: "A server whose start the file doesn't keep can't tell, at its next start, whether it went back to before it, as a restored one does, and so whether it draws again values drawn since.",
-                        hint: "Make worf_starts, and worf_starts.tmp if it is there, writable by the server; worf's supervisor keeps the start as soon as it can.");
+                    s_startUnkeptWarned = true;
+                    WorfLog.Warning(new PgDiagnostic(unnamed ? "nextval draws though the file worf_starts in the data directory doesn't keep this server's start"
+                        : $"sequence {sequence} draws though the file worf_starts in the data directory doesn't keep this server's start")
+                    {
+                        Detail = "A server whose start the file doesn't keep can't tell, at its next start, whether it went back to before it, as a restored one does.",
+                        Hint = "Make worf_starts, and worf_starts.tmp if it is there, writable by the server; worf's supervisor keeps the start as soon as it can.",
+                    });
+                    return;
                 }
 
                 PgInterrupts.Check();
@@ -3958,7 +3959,7 @@ internal static partial class SequenceRangeGuard
     {
         WaitForStartKept(seqoid, unnamed);
         Reload();
-        if (!s_grantors.TryGetValue(seqoid, out uint grantor) || s_confirmedSequences.Contains(seqoid))
+        if (!s_grantors.TryGetValue(seqoid, out uint grantor) || s_confirmedSequences.Contains(seqoid) || s_unanswered.Contains((seqoid, grantor)))
         {
             return;
         }
@@ -3991,7 +3992,7 @@ internal static partial class SequenceRangeGuard
             List<uint> held = LetGates();
             try
             {
-                long deadline = Worker.GetCurrentTimestamp() + (SequenceRanges.ExchangeTimeout * 2000L);
+                long deadline = StartWaitEnds();
                 long woken = 0;
                 while (true)
                 {
@@ -4021,17 +4022,13 @@ internal static partial class SequenceRangeGuard
                     long now = Worker.GetCurrentTimestamp();
                     if (now >= deadline)
                     {
-                        throw unnamed
-                            ? new PgException(PgSqlStates.ObjectNotInPrerequisiteState,
-                                $"nextval can't draw until node {parent}, {role}, answers this server, which started since",
-                                detail: UnnamedGrantorUnheard,
-                                hint: $"Make sure node {parent} is up and its exchanges with this node succeed, or name the sequence in the statement.")
-                            : new PgException(PgSqlStates.ObjectNotInPrerequisiteState,
-                                heardBy
-                                    ? $"sequence {sequence} can't draw until node {parent}, which may have heard of its draws, answers this server, which started since"
-                                    : $"sequence {sequence} can't draw from the block node {parent} granted it until node {parent} answers this server, which started since",
-                                detail: GrantorUnheard,
-                                hint: $"Make sure node {parent} is up and its exchanges with this node succeed.");
+                        _ = s_unanswered.Add((seqoid, current));
+                        WorfLog.Warning(new PgDiagnostic($"sequence {sequence} draws though node {parent} hasn't answered this server since it started")
+                        {
+                            Detail = "If this server was restored from a backup, it may issue again values it issued after the backup, which that node may hold.",
+                            Hint = "After restoring a node from a backup, run worf.reset_sequence_range() on it before it takes writes.",
+                        });
+                        break;
                     }
 
                     if (now - woken >= 1_000_000)
