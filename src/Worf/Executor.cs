@@ -902,20 +902,25 @@ internal static unsafe partial class Executor
             }
             catch (PgException held) when (held.SqlState == LockWaited)
             {
+                WaitForTable(busy);
             }
+        }
+    }
 
-            try
+    // Waits for a table worf's drop needs, held by another transaction, as for a lock, and lets it go again.
+    private static void WaitForTable(uint relid)
+    {
+        try
+        {
+            PgTransaction.RunInSubtransaction(() =>
             {
-                PgTransaction.RunInSubtransaction(() =>
-                {
-                    NativeMethods.LockRelationOid(busy, (int)PgLockMode.AccessExclusive);
-                    throw new PgException(LockWaited, "the table is free");
-                });
-            }
-            catch (PgException free) when (free.SqlState == LockWaited)
-            {
-                PgInterrupts.Check();
-            }
+                NativeMethods.LockRelationOid(relid, (int)PgLockMode.AccessExclusive);
+                throw new PgException(LockWaited, "the table is free");
+            });
+        }
+        catch (PgException free) when (free.SqlState == LockWaited)
+        {
+            PgInterrupts.Check();
         }
     }
 
