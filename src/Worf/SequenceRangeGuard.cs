@@ -309,6 +309,11 @@ internal static partial class SequenceRangeGuard
     // time ran out, and the start of the client statement that waited, as a later statement waits again.
     private static readonly Dictionary<(uint Seqoid, long Lo), (long Deadline, bool Expired, long Statement)> s_waited = [];
 
+    // The neighbors this transaction dropped the subscriptions to, which its draws wait for still, as they would but for
+    // the drop, until it commits: the drop may yet roll back, to a savepoint too, and the values drawn meanwhile with it.
+    private static readonly Dictionary<uint, string> s_droppedNeighbors = [];
+    private static bool s_droppedRegistered;
+
     // The active blocks, by sequence and start, that this transaction has tried to switch away from itself, as it ran
     // them out, each with the subtransaction that tried, and the managed sequences that the COPY FROM statements
     // running in this backend draw from, innermost last.
@@ -3727,7 +3732,7 @@ internal static partial class SequenceRangeGuard
                 parent = Elevated.Run(() => Worf.ReadScalar<string?>("""
                     SELECT coalesce((SELECT node_name::text FROM worf.node WHERE node_id = $1),
                         (SELECT max(node_name::text) FROM worf.sequence_range_node WHERE node_id = $1))
-                    """, SpiParameter.Create(waitFor))) ?? waitFor.ToString(CultureInfo.InvariantCulture);
+                    """, SpiParameter.Create(waitFor))) ?? s_droppedNeighbors.GetValueOrDefault(waitFor) ?? waitFor.ToString(CultureInfo.InvariantCulture);
                 heardBy = s_heardBy.Contains(seqoid);
                 role = heardBy ? $"which may have heard of sequence {sequence}'s draws" : $"which granted sequence {sequence}'s block";
             }
@@ -5379,6 +5384,31 @@ internal static partial class SequenceRangeGuard
     }
 
     /// <summary>
+    /// Notes a neighbor whose subscription this transaction drops, which the transaction's draws wait for still, as they
+    /// would but for the drop, until it commits.
+    /// </summary>
+    /// <param name="nodeId">The neighbor.</param>
+    /// <param name="name">Its name, which its waits give, though the drop deleted the rows that held it.</param>
+    internal static void DroppingNeighbor(uint nodeId, string name)
+    {
+        if (!s_droppedRegistered)
+        {
+            s_droppedRegistered = true;
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, ForgetDroppedNeighbors);
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, ForgetDroppedNeighbors);
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, ForgetDroppedNeighbors);
+        }
+
+        s_droppedNeighbors[nodeId] = name;
+    }
+
+    private static void ForgetDroppedNeighbors()
+    {
+        s_droppedNeighbors.Clear();
+        s_droppedRegistered = false;
+    }
+
+    /// <summary>
     /// Reads the blocks this node holds again once the range worker, a function or this backend's own transaction has
     /// changed them.
     /// </summary>
@@ -5428,11 +5458,13 @@ internal static partial class SequenceRangeGuard
                     (SELECT c.node_id FROM worf.sequence_range_node c
                     WHERE c.seqoid = r.seqoid AND c.node_id <> l.node_id AND c.confirmed_start IS DISTINCT FROM $3
                         AND (EXISTS (SELECT 1 FROM worf.subscription s WHERE s.sub_origin = c.node_id AND s.sub_target = l.node_id)
-                            OR EXISTS (SELECT 1 FROM worf.sequence_range_link k WHERE k.node_id = c.node_id))
+                            OR EXISTS (SELECT 1 FROM worf.sequence_range_link k WHERE k.node_id = c.node_id)
+                            OR c.node_id::pg_catalog.int8 = ANY ($5))
                     ORDER BY c.node_name LIMIT 1),
                     (SELECT k.node_id FROM (
                             SELECT s.sub_origin AS node_id FROM worf.subscription s WHERE s.sub_target = l.node_id
-                            UNION SELECT k.node_id FROM worf.sequence_range_link k) k
+                            UNION SELECT k.node_id FROM worf.sequence_range_link k
+                            UNION SELECT d::pg_catalog.oid FROM pg_catalog.unnest($5) d) k
                     WHERE k.node_id <> l.node_id AND NOT (k.node_id::pg_catalog.int8 = ANY ($4))
                         AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_node c WHERE c.seqoid = r.seqoid AND c.node_id = k.node_id)
                     ORDER BY k.node_id LIMIT 1)),
@@ -5443,7 +5475,7 @@ internal static partial class SequenceRangeGuard
                 LEFT JOIN worf.sequence_range_block b ON b.seqoid = r.seqoid AND b.kind IN ('n', 'i')
                     AND b.state IN ('next', 'active', 'retired', 'imported')
             """, SpiParameter.Create((decimal)sysid), SpiParameter.Create((long)timeline), SpiParameter.Create(SequenceRangeHeard.Started),
-            SpiParameter.Create(s_complete)));
+            SpiParameter.Create(s_complete), SpiParameter.Create(s_droppedNeighbors.Keys.Select(static node => (long)node).ToArray())));
         for (int i = 0; i < result.Count; i++)
         {
             WorfRow row = result[i];

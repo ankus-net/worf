@@ -5136,9 +5136,10 @@ public sealed partial class SequenceRangeTests
 
     /// <summary>
     /// The sessions that read node_b's neighbors as a drop of its subscription to node_c changes them read them again:
-    /// node_b, restarted with node_c down, waits for node_c again once a drop of b_from_c that a session drew under rolls
-    /// back, whole or to a savepoint, rather than drawing on as the drop left it; and once a drop commits, a session that
-    /// already gave up on node_c, and one waiting for it, go on drawing.
+    /// node_b, restarted with node_c down, waits for node_c in the dropping transaction until the drop of b_from_c
+    /// commits, as the drop may yet roll back, whole, to a savepoint or out of a PL/pgSQL exception block, and again
+    /// once it has; and once a drop commits, a session that already gave up on node_c, and one waiting for it, go on
+    /// drawing.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -5175,17 +5176,36 @@ public sealed partial class SequenceRangeTests
 
         await using (NpgsqlConnection rolledBack = await nodeB.OpenAsync(Database, token))
         {
-            await ExecuteAsync(rolledBack, "BEGIN; SELECT worf.drop_subscription('b_from_c'); SELECT nextval('t_id_seq'); ROLLBACK", token);
-            await WaitsForNodeCAsync(rolledBack, "SET statement_timeout = '30s'; INSERT INTO t (v) VALUES ('after the rollback')",
-                "the insert after the drop rolled back");
+            await ExecuteAsync(rolledBack, "SET statement_timeout = '30s'; BEGIN; SELECT worf.drop_subscription('b_from_c')", token);
+            await WaitsForNodeCAsync(rolledBack, "SELECT nextval('t_id_seq') FROM generate_series(1, 20)", "the draws after the drop, in its transaction");
+            await ExecuteAsync(rolledBack, "ROLLBACK", token);
+            await WaitsForNodeCAsync(rolledBack, "INSERT INTO t (v) VALUES ('after the rollback')", "the insert after the drop rolled back");
         }
 
         await using (NpgsqlConnection toSavepoint = await nodeB.OpenAsync(Database, token))
         {
-            await ExecuteAsync(toSavepoint,
-                "BEGIN; SET LOCAL statement_timeout = '30s'; SAVEPOINT s; SELECT worf.drop_subscription('b_from_c'); SELECT nextval('t_id_seq'); ROLLBACK TO SAVEPOINT s",
-                token);
+            await ExecuteAsync(toSavepoint, "SET statement_timeout = '30s'; BEGIN; SAVEPOINT s; SELECT worf.drop_subscription('b_from_c')", token);
+            await WaitsForNodeCAsync(toSavepoint, "SELECT nextval('t_id_seq') FROM generate_series(1, 20)", "the draws after the drop, under its savepoint");
+            await ExecuteAsync(toSavepoint, "ROLLBACK TO SAVEPOINT s", token);
             await WaitsForNodeCAsync(toSavepoint, "INSERT INTO t (v) VALUES ('after the savepoint')", "the insert after the drop rolled back to its savepoint");
+            await ExecuteAsync(toSavepoint, "ROLLBACK", token);
+        }
+
+        await using (NpgsqlConnection excepted = await nodeB.OpenAsync(Database, token))
+        {
+            await WaitsForNodeCAsync(excepted, """
+                SET statement_timeout = '30s';
+                DO $$
+                BEGIN
+                    BEGIN
+                        PERFORM worf.drop_subscription('b_from_c');
+                        PERFORM nextval('t_id_seq') FROM generate_series(1, 20);
+                        RAISE EXCEPTION 'undo the drop';
+                    EXCEPTION WHEN raise_exception THEN
+                        NULL;
+                    END;
+                END $$
+                """, "the draws after the drop, in an exception block");
         }
 
         await using NpgsqlConnection gaveUp = await nodeB.OpenAsync(Database, token);

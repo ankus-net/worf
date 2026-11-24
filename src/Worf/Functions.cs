@@ -575,7 +575,9 @@ internal static class Functions
 
             // The sequence guard's sessions read the node's neighbors, which the drop changes, again: this session at
             // once and again if the drop rolls back, as to a savepoint, and the others as it commits, so that none waits
-            // for the provider once it's gone, and none stops waiting for it while it isn't.
+            // for the provider once it's gone, and none stops waiting for it while it isn't, this session's draws until
+            // the drop commits too.
+            SequenceRangeGuard.DroppingNeighbor(origin, sub.Origin.Name);
             SequenceRanges.ChangedOnCommit();
             while (true)
             {
