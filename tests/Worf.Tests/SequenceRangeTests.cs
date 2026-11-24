@@ -4272,8 +4272,7 @@ public sealed partial class SequenceRangeTests
     /// A PL/pgSQL statement counts down only the managed sequences its function draws from: after the transaction drew
     /// s1, and another session drew s1 into its block's last twentieth, which can't switch as its owner is down, a loop
     /// that draws from a sequence no range manages, and a trigger that does, run at once, rather than wait for s1's switch,
-    /// and so does a statement whose calls take that sequence's name from a column, and 100 statements that draw nothing;
-    /// and statements run again take about as long as in a transaction that drew nothing.
+    /// and so does a statement whose calls take that sequence's name from a column, and 100 statements that draw nothing.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -4290,7 +4289,7 @@ public sealed partial class SequenceRangeTests
                 CREATE TABLE pt (id bigint, v text);
                 CREATE FUNCTION pt_id() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.id := nextval('plain'); RETURN NEW; END $$;
                 CREATE TRIGGER pt_id BEFORE INSERT ON pt FOR EACH ROW EXECUTE FUNCTION pt_id();
-                CREATE TABLE plainnames (n text); CREATE TABLE vt (x int);
+                CREATE TABLE plainnames (n text);
                 """, token);
         }
 
@@ -4299,59 +4298,6 @@ public sealed partial class SequenceRangeTests
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('s1', participants := '{node_b}', range_size := 100, max_range_size := 100)", token);
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 's1'::regclass", token),
             "node_b drawing from a block of s1, with the next one ready");
-
-        // A statement run again in a transaction that drew s1 takes about as long as in one that drew nothing, each in a
-        // session of its own that has run nothing else: its calls of nextval are read once for its text, rather than from
-        // its plan's text each time it starts, and so are a statement's with parameters, as a driver sends its values,
-        // which makes none. The two sessions' inserts of 4,000 literal rows, and of 1,000 rows of parameters, alternate,
-        // and the first 20 of each warm up.
-        string values = $"INSERT INTO vt VALUES {string.Join(", ", Enumerable.Range(1, 4000).Select(i => string.Create(CultureInfo.InvariantCulture, $"({i})")))}";
-        string parameters = $"INSERT INTO vt VALUES {string.Join(", ", Enumerable.Range(1, 1000).Select(i => string.Create(CultureInfo.InvariantCulture, $"(${i})")))}";
-        await using (NpgsqlConnection drawingConnection = await nodeB.OpenAsync(Database, token))
-        await using (NpgsqlConnection plainConnection = await nodeB.OpenAsync(Database, token))
-        {
-            await using NpgsqlTransaction drawingTransaction = await drawingConnection.BeginTransactionAsync(token);
-            await using NpgsqlTransaction plainTransaction = await plainConnection.BeginTransactionAsync(token);
-            await using (NpgsqlCommand drawOnce = new("SELECT nextval('s1')", drawingConnection, drawingTransaction))
-            {
-                _ = await drawOnce.ExecuteNonQueryAsync(token);
-            }
-
-            foreach (string sql in new[] { values, parameters })
-            {
-                NpgsqlCommand Insert(NpgsqlConnection inserting, NpgsqlTransaction within)
-                {
-                    NpgsqlCommand insert = new(sql, inserting, within);
-                    for (int i = 1; sql == parameters && i <= 1000; i++)
-                    {
-                        _ = insert.Parameters.Add(new NpgsqlParameter { Value = i });
-                    }
-
-                    return insert;
-                }
-
-                await using NpgsqlCommand drawingInsert = Insert(drawingConnection, drawingTransaction);
-                await using NpgsqlCommand plainInsert = Insert(plainConnection, plainTransaction);
-                TimeSpan drawing = TimeSpan.Zero;
-                TimeSpan plainly = TimeSpan.Zero;
-                for (int i = 0; i < 60; i++)
-                {
-                    foreach ((NpgsqlCommand insert, bool drew) in i % 2 == 0 ? new[] { (drawingInsert, true), (plainInsert, false) } : [(plainInsert, false), (drawingInsert, true)])
-                    {
-                        Stopwatch timing = Stopwatch.StartNew();
-                        _ = await insert.ExecuteNonQueryAsync(token);
-                        drawing += i >= 20 && drew ? timing.Elapsed : TimeSpan.Zero;
-                        plainly += i >= 20 && !drew ? timing.Elapsed : TimeSpan.Zero;
-                    }
-                }
-
-                string what = sql == values ? "4,000 literal rows" : "1,000 rows of parameters";
-                Assert.IsLessThan(plainly * 1.2, drawing, $"40 inserts of {what} in a transaction that drew s1, against {plainly} in one that didn't");
-            }
-
-            await drawingTransaction.RollbackAsync(token);
-            await plainTransaction.RollbackAsync(token);
-        }
 
         // With node_a down, a transaction on node_b draws s1, and another session then draws s1 until a draw waits for a
         // switch that can't come, in the last block's last twentieth.
@@ -4413,9 +4359,76 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// A statement run again in a transaction that drew a managed sequence takes about as long as in one that drew
+    /// nothing, each in a session of its own that has run nothing else: its calls of nextval are read once for its text,
+    /// rather than from its plan's text each time it starts, and so are a statement's with parameters, as a driver sends
+    /// its values, which makes none. The two sessions' inserts of 4,000 literal rows, and of 1,000 rows of parameters,
+    /// alternate, and the first 20 of each warm up. The test runs alone, as other tests' load hides the difference.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [DoNotParallelize]
+    public async Task StatementsAfterADrawCostWhatTheyDidBefore()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE SEQUENCE s1; CREATE TABLE vt (x int);
+            SELECT worf.enable_sequence_range('s1', participants := '{}', range_size := 100);
+            """, token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges WHERE sequence = 's1'::regclass", token),
+            "node_a drawing from a block of s1");
+        string values = $"INSERT INTO vt VALUES {string.Join(", ", Enumerable.Range(1, 4000).Select(i => string.Create(CultureInfo.InvariantCulture, $"({i})")))}";
+        string parameters = $"INSERT INTO vt VALUES {string.Join(", ", Enumerable.Range(1, 1000).Select(i => string.Create(CultureInfo.InvariantCulture, $"(${i})")))}";
+        await using NpgsqlConnection drawingConnection = await nodeA.OpenAsync(Database, token);
+        await using NpgsqlConnection plainConnection = await nodeA.OpenAsync(Database, token);
+        await using NpgsqlTransaction drawingTransaction = await drawingConnection.BeginTransactionAsync(token);
+        await using NpgsqlTransaction plainTransaction = await plainConnection.BeginTransactionAsync(token);
+        await using (NpgsqlCommand drawOnce = new("SELECT nextval('s1')", drawingConnection, drawingTransaction))
+        {
+            _ = await drawOnce.ExecuteNonQueryAsync(token);
+        }
+
+        foreach (string sql in new[] { values, parameters })
+        {
+            NpgsqlCommand Insert(NpgsqlConnection inserting, NpgsqlTransaction within)
+            {
+                NpgsqlCommand insert = new(sql, inserting, within);
+                for (int i = 1; sql == parameters && i <= 1000; i++)
+                {
+                    _ = insert.Parameters.Add(new NpgsqlParameter { Value = i });
+                }
+
+                return insert;
+            }
+
+            await using NpgsqlCommand drawingInsert = Insert(drawingConnection, drawingTransaction);
+            await using NpgsqlCommand plainInsert = Insert(plainConnection, plainTransaction);
+            TimeSpan drawing = TimeSpan.Zero;
+            TimeSpan plainly = TimeSpan.Zero;
+            for (int i = 0; i < 60; i++)
+            {
+                foreach ((NpgsqlCommand insert, bool drew) in i % 2 == 0 ? new[] { (drawingInsert, true), (plainInsert, false) } : [(plainInsert, false), (drawingInsert, true)])
+                {
+                    Stopwatch timing = Stopwatch.StartNew();
+                    _ = await insert.ExecuteNonQueryAsync(token);
+                    drawing += i >= 20 && drew ? timing.Elapsed : TimeSpan.Zero;
+                    plainly += i >= 20 && !drew ? timing.Elapsed : TimeSpan.Zero;
+                }
+            }
+
+            string what = sql == values ? "4,000 literal rows" : "1,000 rows of parameters";
+            Assert.IsLessThan(plainly * 1.2, drawing, $"40 inserts of {what} in a transaction that drew s1, against {plainly} in one that didn't");
+        }
+
+        await drawingTransaction.RollbackAsync(token);
+        await plainTransaction.RollbackAsync(token);
+    }
+
+    /// <summary>
     /// A fresh session's first row waits for the switch before it runs node_b's last block out, though node_b has seen no
     /// row like it draw: a row into a table whose trigger draws 12 in a loop, through a function it calls or through a
-    /// statement it builds, or 40 in a loop, counts for up to a quarter of the block until a row is seen, and a statement
+    /// statement it builds, or 40 in a loop, counts for up to half the block until a row is seen, and a statement
     /// whose 40 calls take the sequence's name from a column waits while the block holds fewer than its row's calls. node_a,
     /// down as node_b reaches its last block with 8 or 30 values left, starts again 3 s in.
     /// </summary>
