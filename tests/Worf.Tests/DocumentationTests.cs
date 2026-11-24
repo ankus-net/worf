@@ -112,8 +112,10 @@ public sealed class DocumentationTests
             s_sequenceRanges, "a word behind a large transaction (1700)");
         Assert.Contains("so the provider doesn't end the stream at `wal_sender_timeout`", s_sequenceRanges, "a delay longer than wal_sender_timeout (1703)");
         Assert.Contains("which the other nodes take as they next hear from the owner", s_sequenceRanges, "altered block sizes (1723)");
-        Assert.Contains("only once every other node it subscribes to, or that calls it, as a node whose subscription's sync made its slot here does from then on, before its first call, has answered it since in full", s_sequenceRanges,
+        Assert.Contains("only once every other node its restored tables know as one it subscribes to, or as one that calls it through a slot tied to that node, has answered it since in full", s_sequenceRanges,
             "the neighbors a start waits for to report in full (1605)");
+        Assert.Contains("a node that subscribed to it after the backup was taken, or whose slot was tied after it, is one its restored tables don't know", s_sequenceRanges,
+            "the neighbors a restored node can't know of (1605)");
         Assert.Contains("or removes `worf_starts` when that can't be written either", s_sequenceRanges, "a start that can't mark itself unkept (1602)");
         Assert.Contains("so that repeated requests can take the sequence's values until none are left", s_sequenceRanges,
             "made-up pool and reserved requests (1900)");
