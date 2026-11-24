@@ -68,6 +68,7 @@ internal static partial class SequenceRangeGuard
     private static readonly Dictionary<uint, long> s_seenRowDraws = [];
     private static readonly HashSet<uint> s_seenThisStatement = [];
     private static readonly Dictionary<string, (int Calls, bool Unseen)> s_writtenCalls = [];
+    private static readonly Dictionary<uint, decimal> s_steps = [];
     private static readonly List<(nint Statement, uint Subxact, List<uint> Sequences)> s_gating = [];
     private static readonly Dictionary<uint, List<uint>> s_drawnBy = [];
 
@@ -872,7 +873,7 @@ internal static partial class SequenceRangeGuard
             sequence.Blocks.FindIndex(block => block.State == "active") is int index and >= 0 &&
             sequence.Blocks[index] is (long lo, long hi, _) && mark >= lo && mark <= hi && now >= lo && now <= hi)
         {
-            decimal step = Math.Max(Math.Abs((decimal)SequenceRanges.GetInfo(seqoid).Increment), 1);
+            decimal step = Step(seqoid);
             long drawn = (long)Math.Min(Math.Abs((decimal)now - mark) / step, RowDrawsAtMost(seqoid));
             if (drawn > s_gatedRowDraws.GetValueOrDefault(seqoid, 1))
             {
@@ -934,6 +935,20 @@ internal static partial class SequenceRangeGuard
     [GeneratedRegex(@"\b([A-Za-z_][A-Za-z0-9_$]*)\s*\(", RegexOptions.CultureInvariant)]
     private static partial Regex CalledName();
 
+    // A sequence's step, its increment's size, at least 1, which the guard reads for each row, kept until the sequence
+    // changes, as ALTER SEQUENCE changes it, rather than read from the catalog each time.
+    private static decimal Step(uint seqoid)
+    {
+        if (!s_steps.TryGetValue(seqoid, out decimal step))
+        {
+            WatchTables();
+            step = Math.Max(Math.Abs((decimal)SequenceRanges.GetInfo(seqoid).Increment), 1);
+            s_steps[seqoid] = step;
+        }
+
+        return step;
+    }
+
     // The most draws a gated row counts for, half the sequence's active block, as Short counts no more: a row that draws
     // more runs into the next block however soon the switch comes.
     private static long RowDrawsAtMost(uint seqoid)
@@ -946,7 +961,7 @@ internal static partial class SequenceRangeGuard
         }
 
         (long lo, long hi, _) = sequence.Blocks[index];
-        decimal step = Math.Max(Math.Abs((decimal)SequenceRanges.GetInfo(seqoid).Increment), 1);
+        decimal step = Step(seqoid);
         return (long)((((decimal)hi - lo) / step / 2) + 1);
     }
 
@@ -1858,7 +1873,7 @@ internal static partial class SequenceRangeGuard
         long seen = 0;
         if (position is long now && s_unnamedMarks.TryGetValue(seqoid, out long mark) && mark != now)
         {
-            decimal step = Math.Max(Math.Abs((decimal)SequenceRanges.GetInfo(seqoid).Increment), 1);
+            decimal step = Step(seqoid);
             seen = (long)Math.Min(Math.Abs((decimal)now - mark) / step, int.MaxValue);
         }
 
@@ -1887,7 +1902,7 @@ internal static partial class SequenceRangeGuard
             return false;
         }
 
-        decimal step = Math.Max(Math.Abs((decimal)SequenceRanges.GetInfo(seqoid).Increment), 1);
+        decimal step = Step(seqoid);
         decimal left = sequence.Ascending ? (decimal)hi - at : (decimal)at - lo;
         return left / step < Math.Max(calls, 1);
     }
@@ -1906,7 +1921,7 @@ internal static partial class SequenceRangeGuard
         (long lo, long hi, _) = sequence.Blocks[index];
         decimal tail = ((decimal)hi - lo) / 20;
         decimal left = sequence.Ascending ? hi - tail - position : position - lo - tail;
-        decimal step = Math.Max(Math.Abs((decimal)SequenceRanges.GetInfo(seqoid).Increment), 1);
+        decimal step = Step(seqoid);
         return left <= 0 ? 0 : (long)Math.Min(left / step / 2, int.MaxValue);
     }
 
@@ -2468,6 +2483,15 @@ internal static partial class SequenceRangeGuard
     private static void TableInvalidated(ulong arg, uint relid)
     {
         _ = arg;
+        if (relid == 0)
+        {
+            s_steps.Clear();
+        }
+        else
+        {
+            _ = s_steps.Remove(relid);
+        }
+
         s_namedByText.Clear();
         s_drawsByText.Clear();
         s_writtenCalls.Clear();
@@ -4045,7 +4069,7 @@ internal static partial class SequenceRangeGuard
         // A row that draws several values needs them all past the last twentieth, in the sequence's steps, up to half
         // the block, as one that draws more than a block holds runs into the next however soon the switch comes.
         draws = Math.Min(draws, Math.Max((long)(((decimal)hi - lo) / 2), 1));
-        decimal step = draws > 1 ? Math.Max(Math.Abs((decimal)SequenceRanges.GetInfo(seqoid).Increment), 1) : 1;
+        decimal step = draws > 1 ? Step(seqoid) : 1;
         decimal tail = (s_reservedActive.Contains((seqoid, lo)) ? 0 : ((decimal)hi - lo) / 20) + ((Math.Max(draws, 1) - 1) * step);
         decimal Left(long? at) => at is long p ? (ascending ? (decimal)hi - p : (decimal)p - lo) : (decimal)hi - lo + 1;
 
