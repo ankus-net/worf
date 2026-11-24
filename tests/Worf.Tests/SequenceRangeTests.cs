@@ -5194,6 +5194,53 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// worf's drop takes the tables its triggers guard before worf's own, so a transaction that holds one as it inserts,
+    /// and then reads worf's tables, as an insert's draw does, goes on and commits, and the drop follows it rather than
+    /// deadlocking with it; on node_a, which provides a subscription, the drop is refused at once, without waiting for the
+    /// table.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task WorfDropsBesideInserts()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100)", token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            await using NpgsqlConnection inserting = await node.OpenAsync(Database, token);
+            await ExecuteAsync(inserting, "BEGIN; INSERT INTO t (v) VALUES ('held')", token);
+            await using NpgsqlConnection dropping = await node.OpenAsync(Database, token);
+            Stopwatch dropped = Stopwatch.StartNew();
+            Task drop = ExecuteAsync(dropping, "SET statement_timeout = '30s'; DROP EXTENSION worf CASCADE", token);
+            if (node == nodeA)
+            {
+                PostgresException refused = await Assert.ThrowsExactlyAsync<PostgresException>(() => drop);
+                Assert.AreEqual("55006", refused.SqlState, refused.MessageText);
+                Assert.IsLessThan(TimeSpan.FromSeconds(5), dropped.Elapsed, "node_a's refusal, while an insert holds t");
+                await ExecuteAsync(inserting, "COMMIT", token);
+                continue;
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(1), token);
+            Assert.IsFalse(drop.IsCompleted, "node_b's drop, waiting for the insert");
+            await ExecuteAsync(inserting, "SET LOCAL statement_timeout = '10s'; SELECT count(*) FROM worf.sequence_ranges; INSERT INTO t (v) VALUES ('held again'); COMMIT", token);
+            await drop;
+            Assert.AreEqual("0", await node.SafePsqlAsync(Database, "SELECT count(*) FROM pg_extension WHERE extname = 'worf'", token), "worf on node_b");
+            Assert.AreEqual("2", await node.SafePsqlAsync(Database, "SELECT count(*) FROM t WHERE v LIKE 'held%'", token), "node_b's rows from the transaction the drop waited for");
+        }
+    }
+
+    /// <summary>
     /// worf's drop doesn't deadlock with its range worker, which checks the database's managed sequences as the drop
     /// takes worf's tables, its configuration first: five times, a session draws 8 of a sequence's block of 10, so that
     /// the worker's next check switches it, which reads the configuration, and takes the configuration's and then the

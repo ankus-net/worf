@@ -309,6 +309,24 @@ internal static unsafe partial class Executor
         if (parsetree->type == NodeTag.T_DropStmt)
         {
             s_lastDropBehavior = ((DropStmt*)parsetree)->behavior;
+            if (DropsWorf((DropStmt*)parsetree))
+            {
+                // A node that provides subscriptions keeps worf, which the drop is refused before it takes anything.
+                RefuseDropWhileProviding();
+
+                // The drop takes worf's tables and then the tables whose triggers it drops, which an insert holds as it
+                // reads worf's tables, so it takes those tables first, in order, before PostgreSQL takes worf's.
+                foreach (uint relid in Elevated.Run(() => Worf.Read("""
+                    SELECT DISTINCT t.tgrelid FROM pg_catalog.pg_trigger t
+                        JOIN pg_catalog.pg_depend d ON d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass AND d.objid = t.tgfoid
+                            AND d.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass AND d.deptype = 'e'
+                        JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid AND e.extname = 'worf'
+                    ORDER BY 1
+                    """, 0)).Select(static row => row.Get<uint>(0)).ToList())
+                {
+                    NativeMethods.LockRelationOid(relid, (int)PgLockMode.AccessExclusive);
+                }
+            }
         }
 
         if (parsetree->type == NodeTag.T_CreatedbStmt)
@@ -599,16 +617,7 @@ internal static unsafe partial class Executor
                     uint database = NativeGlobals.MyDatabaseId;
                     _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, () => SequenceRangeTouches.FreeDatabase(database));
 
-                    if (!NativeGlobals.IsBinaryUpgrade &&
-                        Elevated.Run(() => Worf.ReadScalar<string?>("""
-                            SELECT pg_catalog.string_agg(pg_catalog.quote_ident(slot_name::pg_catalog.text), ', ' ORDER BY slot_name)
-                            FROM pg_catalog.pg_replication_slots WHERE plugin = 'worf' AND database = pg_catalog.current_database()
-                            """)) is string slots)
-                    {
-                        throw new PgException("55006", "worf can't be dropped while this node provides subscriptions",
-                            detail: $"Replication slots {slots} stream this database's changes to worf's subscribers.",
-                            hint: "Drop those subscriptions on their subscribers, which drops their slots, or drop the slots with pg_drop_replication_slot, which gives up the changes their subscribers haven't received.");
-                    }
+                    RefuseDropWhileProviding();
 
                     s_droppingWorfObj = true;
                 }
@@ -815,6 +824,45 @@ internal static unsafe partial class Executor
         if (@event == FmgrHookEventType.FHET_START)
         {
             SequenceRangeGuard.StartingTrigger(flinfo->fn_oid);
+        }
+    }
+
+    // Whether a DROP statement drops worf itself.
+    private static bool DropsWorf(DropStmt* drop)
+    {
+        if (drop->removeType != ObjectType.OBJECT_EXTENSION || drop->objects is null)
+        {
+            return false;
+        }
+
+        uint worf = NativeMethods.get_extension_oid(Worf.PStrDup(Worf.ExtensionName), true);
+        for (int i = 0; worf != 0 && i < drop->objects->length; i++)
+        {
+            RelationData* rel = null;
+            if (NativeMethods.get_object_address(ObjectType.OBJECT_EXTENSION, (Node*)drop->objects->elements[i].ptr_value, &rel,
+                (int)PgLockMode.AccessShare, true).objectId == worf)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // Refuses worf's drop on a node that provides subscriptions: the walsenders that serve them read worf's tables as they
+    // decode changes, those made before the drop too, and can't once the drop has removed them, nor serve the
+    // subscriptions after it, whose slots would then keep WAL for nothing.
+    private static void RefuseDropWhileProviding()
+    {
+        if (!NativeGlobals.IsBinaryUpgrade &&
+            Elevated.Run(() => Worf.ReadScalar<string?>("""
+                SELECT pg_catalog.string_agg(pg_catalog.quote_ident(slot_name::pg_catalog.text), ', ' ORDER BY slot_name)
+                FROM pg_catalog.pg_replication_slots WHERE plugin = 'worf' AND database = pg_catalog.current_database()
+                """)) is string slots)
+        {
+            throw new PgException("55006", "worf can't be dropped while this node provides subscriptions",
+                detail: $"Replication slots {slots} stream this database's changes to worf's subscribers.",
+                hint: "Drop those subscriptions on their subscribers, which drops their slots, or drop the slots with pg_drop_replication_slot, which gives up the changes their subscribers haven't received.");
         }
     }
 
