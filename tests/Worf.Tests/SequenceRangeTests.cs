@@ -4380,7 +4380,7 @@ public sealed partial class SequenceRangeTests
             }
         }
 
-        Assert.IsLessThan(plainly * 1.25, drawing, $"40 inserts of 4,000 rows in the transaction that drew s1, against {plainly} in one that didn't");
+        Assert.IsLessThan(plainly * 1.2, drawing, $"40 inserts of 4,000 rows in the transaction that drew s1, against {plainly} in one that didn't");
         await plainTransaction.CommitAsync(token);
 
         await transaction.CommitAsync(token);
