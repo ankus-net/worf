@@ -193,7 +193,7 @@ using Ankus.Postgres;
     );
 
     CREATE VIEW worf.sequence_ranges AS
-        SELECT r.seqoid AS sequence, coalesce(o.node_name, ro.node_name) AS owner, r.epoch, coalesce(p.node_name, rp.node_name) AS parent,
+        SELECT r.seqoid AS sequence, coalesce(o.node_name, ro.node_name) AS allocator, r.epoch, coalesce(p.node_name, rp.node_name) AS parent,
             CASE WHEN r.fenced_at IS NOT NULL THEN 'fenced' ELSE r.state END AS state,
             a.lo AS active_lo, a.hi AS active_hi,
             CASE
@@ -367,6 +367,21 @@ internal static unsafe partial class SequenceRanges
     [PgGucInt("worf.sequence_range_timeout", 10000, "Sets the timeout for a sequence range exchange.",
         Minimum = 100, Maximum = int.MaxValue, Unit = PgGucUnit.Milliseconds, Context = PgGucContext.Sighup)]
     internal static partial int ExchangeTimeout { get; }
+
+    /// <summary>
+    /// Gets how long a node waits for the other nodes before it goes on without them: a node takes its next block from
+    /// its reserve once its request has gone unanswered this long, the allocator switches to a block it granted itself
+    /// once this long has passed since the grant though no other node has heard of it, and statements draw this long
+    /// after the server starts though the nodes they draw blocks from haven't answered since. -1 never goes on without
+    /// them.
+    /// </summary>
+    [PgGucInt("worf.sequence_range_offline_wait", 10000, "Sets how long a node waits for the other nodes before it goes on without them.",
+        Minimum = -1, Maximum = int.MaxValue, Unit = PgGucUnit.Milliseconds, Context = PgGucContext.Sighup)]
+    internal static partial int OfflineWait { get; }
+
+    // worf.sequence_range_offline_wait as an interval, or null when a node never goes on without the other nodes.
+    private static string? OfflineWaitInterval()
+        => OfflineWait < 0 ? null : $"{OfflineWait.ToString(CultureInfo.InvariantCulture)} milliseconds";
 
     /// <summary>
     /// Gets whether this session restores rows, as other nodes wrote them or as they were before range management, so
@@ -549,8 +564,9 @@ internal static unsafe partial class SequenceRanges
                     AND worf.sequence_range_heard(node_id, false, reported_at, true) > now() - interval '1 minute'
                 """, SpiParameter.Create(seqoid), SpiParameter.Create(node.Node.Id), SpiParameter.Create(current)).Count > 0)
             {
-                throw new PgException(PgSqlStates.ObjectInUse, $"sequence {info.Name} is still under range management by its owner",
-                    hint: "Disable it with worf.disable_sequence_range on its owner first, or pass force := true if the owner is gone for good.");
+                string allocator = AllocatorName(seqoid, existing[0].Get<uint>(2));
+                throw new PgException(PgSqlStates.ObjectInUse, $"node {allocator} still hands out sequence {info.Name}'s numbers",
+                    hint: $"Run worf.disable_sequence_range on node {allocator} first, or pass force := true if node {allocator} is gone for good.");
             }
 
             epoch = Math.Max(current, Worf.ReadScalar<int?>("SELECT max(epoch) FROM worf.sequence_range_node WHERE seqoid = $1",
@@ -1405,8 +1421,7 @@ internal static unsafe partial class SequenceRanges
             SpiParameter.Create(ReserveSize(seqoid, info)));
 
     /// <summary>
-    /// Asks this node's parent for a reserve, a pool block marked as one, which its grantor takes from the end of its
-    /// free values.
+    /// Asks this node's parent for a reserve, a pool block marked as one.
     /// </summary>
     private static void RequestReserve(uint seqoid, SequenceInfo info)
         => _ = Worf.Execute("""
@@ -1418,16 +1433,22 @@ internal static unsafe partial class SequenceRanges
             """, SpiParameter.Create(seqoid), SpiParameter.Create(ReserveSize(seqoid, info)));
 
     /// <summary>
-    /// Takes a node's next block from its reserve, when it isn't the owner, has no next block, and either has no parent
-    /// to ask, as while it can't reach the other nodes, hasn't heard from its parent within
-    /// <c>worf.sequence_range_timeout</c>, or hasn't had its request for one answered within that, so that its statements go
-    /// on rather than wait for a block that can't come. A block it takes so is of the largest size, so that it switches no
+    /// Takes a node's next block from its reserve, when it isn't the allocator, has no next block, and either has no
+    /// parent to ask, as while it can't reach the other nodes, hasn't heard from its parent for an exchange interval and
+    /// <c>worf.sequence_range_offline_wait</c>, in which a parent in touch would have answered, or hasn't had its request
+    /// for one answered within <c>worf.sequence_range_offline_wait</c>, so that its statements go on rather than wait for a
+    /// block that can't come. With -1, it takes none. A block it takes so is of the largest size, so that it switches no
     /// more often than it must; one reserved for a load is taken whole, as the request for it asks. The request taken is dropped, so that an
     /// answer that comes later is abandoned.
     /// </summary>
     /// <returns>Whether it took one, or, without <paramref name="apply"/>, whether it would.</returns>
     private static bool TakeFromReserve(uint seqoid, SequenceInfo info, WorfLocalNode node, int epoch, bool apply, bool loadsOnly = false)
     {
+        if (OfflineWaitInterval() is not string offlineWait)
+        {
+            return false;
+        }
+
         WorfRows wanted = Worf.Read("""
             SELECT q.request_id, CASE WHEN q.reserved THEN q.size ELSE r.max_range_size END, coalesce(q.reserved, false)
             FROM worf.sequence_range r
@@ -1436,11 +1457,11 @@ internal static unsafe partial class SequenceRanges
                 OR (q.request_id IS NOT NULL AND NOT EXISTS (
                     SELECT 1 FROM worf.sequence_range_node n
                     WHERE n.seqoid = r.seqoid AND n.node_id = r.parent_node AND n.via_node = n.node_id
-                        AND worf.sequence_range_heard(n.node_id, true, n.reported_at, false) > now() - $2::interval)))
+                        AND worf.sequence_range_heard(n.node_id, true, n.reported_at, false) > now() - $4::interval)))
             ORDER BY q.reserved DESC NULLS LAST
             LIMIT 1
-            """, 1, SpiParameter.Create(seqoid), SpiParameter.Create($"{ExchangeTimeout.ToString(CultureInfo.InvariantCulture)} milliseconds"),
-            SpiParameter.Create(loadsOnly));
+            """, 1, SpiParameter.Create(seqoid), SpiParameter.Create(offlineWait), SpiParameter.Create(loadsOnly),
+            SpiParameter.Create($"{((long)ExchangeInterval + Math.Max(OfflineWait, ExchangeTimeout)).ToString(CultureInfo.InvariantCulture)} milliseconds"));
         if (wanted.Count == 0)
         {
             return false;
@@ -1482,8 +1503,8 @@ internal static unsafe partial class SequenceRanges
     /// in touch, which still exchanges or streams this node's changes, has reported a watermark that covers it, so that
     /// the neighbors know of the values before they can hold rows with them: an owner restored to before the grant gives
     /// up its free values up to the highest watermark those neighbors report, and never issues them again. It switches
-    /// to it anyway when none is in touch, or once <c>worf.sequence_range_timeout</c> has passed since the grant, so that
-    /// its statements go on while it can't reach the other nodes. A Snowflake node number carries its times and needs no
+    /// to it anyway when none is in touch, or once <c>worf.sequence_range_offline_wait</c> has passed since the grant, so
+    /// that its statements go on while it can't reach the other nodes. A Snowflake node number carries its times and needs no
     /// such care.
     /// </summary>
     /// <remarks>
@@ -1507,8 +1528,7 @@ internal static unsafe partial class SequenceRanges
                 OR EXISTS (SELECT 1 FROM touching WHERE watermark {(info.Ascending ? ">= b.hi" : "<= b.lo")})
                 OR EXISTS (SELECT 1 FROM worf.sequence_range_grant g WHERE g.grant_id = $1 AND g.granted_at < now() - $4::interval)
             FROM b
-            """, SpiParameter.Create(block), SpiParameter.Create(StaleAfter()), SpiParameter.Create(seqoid),
-            SpiParameter.Create($"{ExchangeTimeout.ToString(CultureInfo.InvariantCulture)} milliseconds"));
+            """, SpiParameter.Create(block), SpiParameter.Create(StaleAfter()), SpiParameter.Create(seqoid), SpiParameter.Create(OfflineWaitInterval()));
 
     /// <summary>
     /// Checks whether the owner's root has a free span for its next block, without locking it.
@@ -1556,7 +1576,7 @@ internal static unsafe partial class SequenceRanges
                 WHERE n.seqoid = $1 AND n.node_id = $2 AND worf.sequence_range_heard(n.node_id, false, n.reported_at, false) <= now() - $3::interval / 2)
             """, seq, SpiParameter.Create(owner), reuse))
         {
-            return "the owner of the numbers hasn't been heard from for half a day";
+            return "the node that hands out the numbers hasn't been heard from for half a day";
         }
 
         string? other = Worf.ReadScalar<string?>("""
@@ -3427,10 +3447,20 @@ internal static unsafe partial class SequenceRanges
 
         if (result[0].Get<uint>(0) != node.Node.Id)
         {
-            throw new PgException(PgSqlStates.InvalidParameterValue, $"sequence {GetInfo(seqoid).Name} is owned by another node",
-                hint: "Run this on its owner.");
+            string allocator = AllocatorName(seqoid, result[0].Get<uint>(0));
+            throw new PgException(PgSqlStates.InvalidParameterValue, $"node {allocator} hands out sequence {GetInfo(seqoid).Name}'s numbers, not this node",
+                hint: $"Run this on node {allocator}.");
         }
     }
+
+    // The name of the node that hands out a sequence's numbers, as this node knows it.
+    private static string AllocatorName(uint seqoid, uint allocator)
+        => Worf.SelectCatalog("""
+            SELECT coalesce(
+                (SELECT node_name::text FROM worf.node WHERE node_id = $2),
+                (SELECT node_name::text FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2 LIMIT 1),
+                $2::text)
+            """, SpiParameter.Create(seqoid), SpiParameter.Create(allocator))[0].Get<string>(0);
 
     /// <summary>
     /// Joins this node to a managed sequence: guards the tables that use it, quarantines it, and records the highest
@@ -4135,7 +4165,7 @@ internal static unsafe partial class SequenceRanges
                 : UsingColumns(seqoid).Find(column => !Checkable(column.TypeOid)) is (uint relid, string column, uint typeOid) && relid != 0
                     ? $"column \"{column}\" of table {QualifiedName(relid)} has type {Worf.FromServer(NativeMethods.format_type_be(typeOid))} here, whose values the guard can't check"
                     : issued is long h && rootStart is long start && (info.Ascending ? h >= start : h <= start)
-                        ? $"the sequence issued values up to {h} here before it joined, which reach into the root; disable and enable it on its owner to start a root above them"
+                        ? $"the sequence issued values up to {h} here before it joined, which reach into the root; run worf.disable_sequence_range and then worf.enable_sequence_range on the node that hands out its numbers to start above them"
                         : null;
         // The range worker and the exchange worker may both join a sequence; the first does.
         if (Worf.Execute("""
@@ -4262,7 +4292,7 @@ internal static unsafe partial class SequenceRanges
                 info.QuarantineEdge + 1);
             if (start > end && !snowflake)
             {
-                throw new PgException(SequenceLimitExceeded, $"sequence {info.Name} has no values left above {start - 1} for a root");
+                throw new PgException(SequenceLimitExceeded, $"sequence {info.Name} has no values left above {start - 1} to hand out");
             }
         }
         else
@@ -4271,7 +4301,7 @@ internal static unsafe partial class SequenceRanges
                 info.QuarantineEdge - 1);
             if (start < end)
             {
-                throw new PgException(SequenceLimitExceeded, $"sequence {info.Name} has no values left below {start + 1} for a root");
+                throw new PgException(SequenceLimitExceeded, $"sequence {info.Name} has no values left below {start + 1} to hand out");
             }
         }
 
@@ -4995,13 +5025,12 @@ internal static unsafe partial class SequenceRanges
 
     /// <summary>
     /// Grants a block of a size, in steps of the increment, from the start of the lowest free span of this node's root
-    /// or pool blocks that holds it, or, for a node's reserve, from the end of the highest, so that the reserves leave the
-    /// blocks granted from the start where they would be, under a row lock, committed with synchronous_commit on. A
-    /// request granted before gets the same grant again.
+    /// or pool blocks that holds it, under a row lock, committed with synchronous_commit on. A request granted before
+    /// gets the same grant again.
     /// </summary>
     /// <returns>The grant and its bounds, or null when no free span holds the size.</returns>
     internal static (Guid Grant, long Lo, long Hi)? Allocate(uint seqoid, SequenceInfo info, int epoch, long size, uint granteeId,
-        string granteeName, Guid requestId, char kind = 'n', bool fromEnd = false)
+        string granteeName, Guid requestId, char kind = 'n')
     {
         WorfRows granted = Worf.SelectCatalog("SELECT grant_id, lo, hi FROM worf.sequence_range_grant WHERE request_id = $1 AND kind <> 'x'",
             SpiParameter.Create(requestId));
@@ -5014,7 +5043,7 @@ internal static unsafe partial class SequenceRanges
         // timeline changed grants nothing, even before its worker fences it, since a grant on the old timeline may be lost.
         LockLedger(seqoid);
         decimal span = ((decimal)size - 1) * Math.Abs(info.Increment);
-        bool ascending = info.Ascending != fromEnd;
+        bool ascending = info.Ascending;
         WorfRows free = Worf.Query(Spi.Sql($"""
             SELECT f.block_id, f.lo, f.hi, f.not_before
             FROM worf.sequence_range_free f JOIN worf.sequence_range_block b ON b.block_id = f.block_id
@@ -5069,7 +5098,7 @@ internal static unsafe partial class SequenceRanges
             """, SpiParameter.Create(block), SpiParameter.Create(taken));
         if (left is not null)
         {
-            WorfLog.Warning($"sequence {info.Name}'s root has granted nine tenths of its values and has {left} left; widen the sequence's type, or re-enable it with a later pool_start, before they run out");
+            WorfLog.Warning($"sequence {info.Name} has handed out nine tenths of its numbers and has {left} left; widen the sequence's type, or re-enable it with a later pool_start, before they run out");
         }
     }
 

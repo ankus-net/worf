@@ -7,9 +7,7 @@ The **Conflict History** feature records replication conflicts to a queryable ta
 
 ## Overview
 
-When replication conflicts occur (e.g., the same row is modified on multiple nodes), worf detects and resolves them automatically. Previously, these conflicts were only logged to PostgreSQL's log files, making them difficult to query and analyze.
-
-With Conflict History, conflicts are now recorded to the `worf.conflict_history` table, allowing DBAs to:
+When replication conflicts occur (e.g., the same row is modified on multiple nodes), worf detects and resolves them automatically and logs them. With Conflict History, it also records them in the `worf.conflict_history` table, so you can:
 
 - Query conflicts using standard SQL
 - Analyze conflict patterns over time
@@ -227,5 +225,5 @@ The cleanup function returns the number of partitions dropped.
 - Conflict history is recorded on the **subscriber** side only (where conflicts are detected during apply)
 - Very large tuple values are truncated based on `worf.conflict_history_max_tuple_size`
 - External TOAST values are stored as `"(unchanged-toast-datum)"` rather than the actual value
-- Conflicts are written once the apply transaction that met them commits, in a transaction of their own, so a transaction that rolls back records nothing, and one that commits just before a crash may leave its conflicts unrecorded
-- Recording failures do not abort replication - they are logged as warnings, with the error and its SQLSTATE, and replication continues. That holds for anything the record sets off, such as a trigger on the history that writes to a table whose deferred constraint fails as the record commits
+- Conflicts are recorded in a separate transaction after the apply transaction commits. A transaction that rolls back records nothing, and a crash right after a commit may lose that transaction's records
+- If recording fails, replication goes on, and the error is logged as a warning with its SQLSTATE. This includes failures in anything the record sets off, such as a trigger on the history table

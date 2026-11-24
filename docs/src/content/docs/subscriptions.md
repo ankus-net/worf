@@ -18,12 +18,11 @@ description: Create, alter, synchronize and drop subscriptions.
     provider to the subscriber, default false
   - `synchronize_data` - specifies if to synchronize data from provider to
     the subscriber, default true
-  - `forward_origins` - array of origin names to forward, currently only
-    supported values are empty array meaning don't forward any changes
-    that didn't originate on provider node (this is useful for two-way
-    replication between the nodes), or "{all}" which means replicate all
-    changes no matter what is their origin, default is "{all}"; a node
-    skips its own changes when another node forwards them back
+  - `forward_origins` - which changes the provider sends: `{}` sends only
+    changes made on the provider itself, which two-way replication needs;
+    `{all}` also sends changes the provider received from other nodes.
+    Default is `{all}`. A node always skips its own changes when another node
+    sends them back.
   - `apply_delay` - how much to delay replication, default is 0 seconds
   - `force_text_transfer` - force the provider to replicate all columns
     using a text representation (which is slower), default is false
@@ -88,12 +87,11 @@ description: Create, alter, synchronize and drop subscriptions.
   foreign key constraints.
   **WARNING: This function will truncate the table immediately, and only then
   begin synchronising it, so it will be empty while being synced**
-  The copy starts once apply has caught up with the provider, so it waits, and
-  logs that it does and how far apply is, while apply fails on a change. Its
-  snapshot keeps the provider from removing dead rows, so it lets the snapshot
-  go when apply gets no further for 10 s, as on such a change, and twice as
-  long each time after. Apply moving through a long transaction's changes gets
-  further.
+  The copy starts once apply has caught up with the provider. While apply is
+  stuck on a failing change, the copy waits and logs how far apply has got.
+  Its snapshot keeps the provider from removing dead rows, so it gives the
+  snapshot up when apply makes no progress for 10 seconds, then twice as long
+  each time after.
 
   Does not block, use `worf.wait_for_table_sync_complete` to wait for
   completion.
@@ -171,15 +169,12 @@ description: Create, alter, synchronize and drop subscriptions.
   - `replication_set` - name of replication set to remove
 
 
-There is also a `postgresql.conf` parameter,
-`worf.extra_connection_options`, that may be set to assign connection
-options that apply to all connections made by worf, which a node's DSN
-overrides. This can be a useful place to set up custom keepalive options,
-etc. A DSN may be a connection string or a URI.
+The `worf.extra_connection_options` setting adds connection options to every
+connection worf makes, such as keepalive options. A node's DSN overrides it. A
+DSN may be a connection string or a URI.
 
-worf defaults to enabling TCP keepalives to ensure that it notices
-when the upstream server disappears unexpectedly, and to a
-`connect_timeout` of 30 seconds, for each option that neither the DSN,
-`worf.extra_connection_options`, a service file nor the environment
-sets. To disable keepalives on every connection, add `keepalives = 0`
-to `worf.extra_connection_options`.
+By default, worf turns on TCP keepalives, so it notices when the other server
+disappears, and uses a `connect_timeout` of 30 seconds. These defaults apply
+only where the DSN, `worf.extra_connection_options`, a service file or the
+environment doesn't set the option. To turn keepalives off everywhere, add
+`keepalives = 0` to `worf.extra_connection_options`.

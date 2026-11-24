@@ -2767,7 +2767,7 @@ internal static class SequenceRangeExchange
                 UPDATE worf.sequence_range_node SET reset_at = pg_catalog.clock_timestamp() WHERE seqoid = $1 AND node_id = $2 AND (reset_at IS NULL OR reset_at < $3)
                 """, seq, sender, SpiParameter.Create(new PgTimestampTz(window))) > 0)
             {
-                s_takeInWarnings.Add($"sequence {info.Name}: node {senderName} has heard of grants up to {mark}, beyond this owner's watermark, so this owner lost them; it resets");
+                s_takeInWarnings.Add($"sequence {info.Name}: node {senderName} has heard of grants up to {mark}, beyond what this node has handed out, so this node lost track of them; it resets");
                 _ = Worf.Execute($"UPDATE worf.sequence_range SET heard_watermark = {raised}(coalesce(heard_watermark, $2), $2) WHERE seqoid = $1",
                     seq, SpiParameter.Create(mark));
                 SequenceRanges.Reset(seqoid, node, false);
@@ -3004,7 +3004,7 @@ internal static class SequenceRangeExchange
                 ON CONFLICT (request_id) DO UPDATE SET state = 'sent'
                 """, SpiParameter.Create(requestId), SpiParameter.Create(seqoid), SpiParameter.Create(granteeId),
                 SpiParameter.Create(granteeName), SpiParameter.Create(h));
-            WorfLog.Warning($"sequence {info.Name}: node {granteeName} joined with values up to {h}, which reach into the root; it is refused");
+            WorfLog.Warning($"sequence {info.Name}: node {granteeName} joined with values up to {h}, among the numbers this node hands out as blocks; it is refused");
             return null;
         }
 
@@ -3031,9 +3031,7 @@ internal static class SequenceRangeExchange
         long largest = range[0].Get<long>(3);
         size = kind == "n" ? (reserved ? size : Math.Min(size, largest)) : Math.Min(size, SequenceRanges.LargestGrant(largest));
 
-        // A node's reserve, a pool block it asks for to take its own blocks from while it can't reach the other nodes, comes
-        // from the end of the free values, so that the blocks granted from their start stay where they would be.
-        return SequenceRanges.Allocate(seqoid, info, epoch, size, granteeId, granteeName, requestId, kind[0], fromEnd: kind == "p" && reserved) is not null;
+        return SequenceRanges.Allocate(seqoid, info, epoch, size, granteeId, granteeName, requestId, kind[0]) is not null;
     }
 
     /// <summary>

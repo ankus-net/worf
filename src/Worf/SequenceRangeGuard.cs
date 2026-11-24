@@ -17,6 +17,18 @@ internal static partial class SequenceRangeGuard
 {
     private const string CheckViolation = "23514";
 
+    /// <summary>
+    /// Gets the detail of the failure of a call of nextval that waited for its grantor too long, which an apply worker
+    /// applies again later, as it says nothing about the change's data.
+    /// </summary>
+    internal const string GrantorUnheard = "A server that restarted draws from a sequence's blocks only once the block's parent, and every other node it exchanges with that reports the sequence, has checked its report since: the parent may have given the block's values out again meanwhile, and any of them may have heard of draws a restore took back.";
+
+    /// <summary>
+    /// Gets the detail of the failure of a call of nextval whose sequence worf can't tell that waited for a grantor too
+    /// long, which an apply worker applies again later.
+    /// </summary>
+    internal const string UnnamedGrantorUnheard = "worf can't tell which sequence the call draws from before it runs, as for a name computed as it runs, so the call waits for every grantor this server hasn't heard from.";
+
     // SESSION_REPLICATION_ROLE_REPLICA from commands/trigger.h.
     private const int SessionReplicationRoleReplica = 1;
 
@@ -1169,7 +1181,7 @@ internal static partial class SequenceRangeGuard
     /// <summary>
     /// Waits, with the statement's gates let go, for a sequence that has no block to draw from, as one that just reset,
     /// to switch to the one its range worker asks for, while the sequence is active, or quarantined until its blocks
-    /// come, up to twice <c>worf.sequence_range_timeout</c>, as for the next block at a block's end.
+    /// come, as long as for the next block at a block's end.
     /// </summary>
     /// <returns>Whether the sequence has a block to draw from.</returns>
     private static bool WaitForBlock(uint seqoid)
@@ -1185,7 +1197,7 @@ internal static partial class SequenceRangeGuard
         List<uint> held = LetGates();
         try
         {
-            long deadline = Worker.GetCurrentTimestamp() + (SequenceRanges.ExchangeTimeout * 2000L);
+            long deadline = Worker.GetCurrentTimestamp() + BlockWait();
             long checkedComing = Worker.GetCurrentTimestamp();
             while (true)
             {
@@ -3891,17 +3903,29 @@ internal static partial class SequenceRangeGuard
         }
     }
 
-    // When statements stop waiting, after this server's start, for its file of starts and for the nodes they wait for:
-    // worf.sequence_range_timeout after the start, so that a node that can't reach the others goes on taking writes.
-    private static long StartWaitEnds() => SequenceRangeHeard.Started + (SequenceRanges.ExchangeTimeout * 1000L);
+    // How long, in microseconds, a statement waits for a sequence's next block: twice worf.sequence_range_timeout, and
+    // worf.sequence_range_offline_wait on top, after which a node that can't reach the others takes it from its reserve.
+    private static long BlockWait() => (SequenceRanges.ExchangeTimeout * 2000L) + (Math.Max(SequenceRanges.OfflineWait, 0) * 1000L);
+
+    // Whether statements wait, after this server's start, for its file of starts and for the nodes they wait for until
+    // those answer, failing after twice worf.sequence_range_timeout each, rather than only until
+    // worf.sequence_range_offline_wait has passed since the start, after which they draw.
+    private static bool WaitsUntilAnswered => SequenceRanges.OfflineWait < 0;
+
+    // When a statement stops waiting for the file of starts or for a node: twice worf.sequence_range_timeout after it
+    // starts to wait, or, unless statements wait until answered, worf.sequence_range_offline_wait after the start.
+    private static long StartWaitEnds() => WaitsUntilAnswered
+        ? Worker.GetCurrentTimestamp() + (SequenceRanges.ExchangeTimeout * 2000L)
+        : SequenceRangeHeard.Started + (SequenceRanges.OfflineWait * 1000L);
 
     /// <summary>
     /// Waits, before a statement draws from a managed sequence, until the data directory's file of starts keeps this
     /// server's start, which worf's supervisor notes again until it does: a later start that finds it gone, as after a
     /// restore whose start the file couldn't keep, would take no position from before it as gone back, and so draw again
-    /// values drawn since. The statement lets its gates go and waits until <c>worf.sequence_range_timeout</c> has passed
-    /// since the server started, as for a neighbor after a start, and then draws, with a warning, so that a server whose
-    /// file can't be written still takes writes.
+    /// values drawn since. The statement lets its gates go and waits as for a neighbor after a start: until
+    /// <c>worf.sequence_range_offline_wait</c> has passed since the server started, and then draws, with a warning, so
+    /// that a server whose file can't be written still takes writes, or, with -1, up to twice
+    /// <c>worf.sequence_range_timeout</c>, and then fails.
     /// </summary>
     private static void WaitForStartKept(uint seqoid, bool unnamed)
     {
@@ -3923,6 +3947,15 @@ internal static partial class SequenceRangeGuard
             long deadline = StartWaitEnds();
             while (!(s_startKept = SequenceRangeHeard.StartKept))
             {
+                if (Worker.GetCurrentTimestamp() >= deadline && WaitsUntilAnswered)
+                {
+                    throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState,
+                        unnamed ? "nextval can't draw until the file worf_starts in the data directory keeps this server's start"
+                            : $"sequence {sequence} can't draw until the file worf_starts in the data directory keeps this server's start",
+                        detail: "A server whose start the file doesn't keep can't tell, at its next start, whether it went back to before it, as a restored one does, and so whether it draws again values drawn since.",
+                        hint: "Make worf_starts, and worf_starts.tmp if it is there, writable by the server; worf's supervisor keeps the start as soon as it can.");
+                }
+
                 if (Worker.GetCurrentTimestamp() >= deadline)
                 {
                     s_startUnkeptWarned = true;
@@ -3952,8 +3985,9 @@ internal static partial class SequenceRangeGuard
     /// report, as when <c>worf.activate_sequence_range</c> stopped waiting for it, holds values the lift gave out again,
     /// and a node restored from a backup may draw again values a neighbor heard it draw, its own blocks' too, as an
     /// owner's; the first message after from such a node asks it to reset, so it draws none of them. The statement lets its
-    /// gates go and waits up to twice <c>worf.sequence_range_timeout</c>, as for the next block at a block's end, and
-    /// then fails, naming the parent, as an error that ends the wait first, as <c>statement_timeout</c>'s, does.
+    /// gates go and waits until <c>worf.sequence_range_offline_wait</c> has passed since the server started, and then
+    /// draws, with a warning, so that a node that can't reach the others still takes writes; with -1, it waits up to
+    /// twice <c>worf.sequence_range_timeout</c>, and then fails, naming the parent, as an error that ends the wait first, as <c>statement_timeout</c>'s, does.
     /// </summary>
     private static void WaitForGrantor(uint seqoid, bool unnamed = false)
     {
@@ -4020,6 +4054,21 @@ internal static partial class SequenceRangeGuard
                     // The wait makes the exchange with the node waited for due, each second while it lasts, and asks this
                     // node's subscribers to call it, as one that only calls this node can't be called.
                     long now = Worker.GetCurrentTimestamp();
+                    if (now >= deadline && WaitsUntilAnswered)
+                    {
+                        throw unnamed
+                            ? new PgException(PgSqlStates.ObjectNotInPrerequisiteState,
+                                $"nextval can't draw until node {parent}, {role}, answers this server, which started since",
+                                detail: UnnamedGrantorUnheard,
+                                hint: $"Make sure node {parent} is up and its exchanges with this node succeed, or name the sequence in the statement.")
+                            : new PgException(PgSqlStates.ObjectNotInPrerequisiteState,
+                                heardBy
+                                    ? $"sequence {sequence} can't draw until node {parent}, which may have heard of its draws, answers this server, which started since"
+                                    : $"sequence {sequence} can't draw from the block node {parent} granted it until node {parent} answers this server, which started since",
+                                detail: GrantorUnheard,
+                                hint: $"Make sure node {parent} is up and its exchanges with this node succeed.");
+                    }
+
                     if (now >= deadline)
                     {
                         _ = s_unanswered.Add((seqoid, current));
@@ -4971,7 +5020,8 @@ internal static partial class SequenceRangeGuard
     /// inserts wait for the range worker to wake and switch, or for a next block on its way from the exchange worker,
     /// rather than run the block out. While the next block is still to come, as over an exchange that may hang, a
     /// backend waits up to twice the exchange timeout for each block in all, which covers an exchange that hangs and the
-    /// check after it, however many of its statements and rows wait. Once the next block is here, the switch is this
+    /// check after it, and <c>worf.sequence_range_offline_wait</c> on top, after which a node that can't reach the others
+    /// takes the block from its reserve, however many of its statements and rows wait. Once the next block is here, the switch is this
     /// node's alone, and a backend waits for it as for a lock, until it comes, or statement_timeout or a cancellation
     /// ends the wait, however long a busy node takes to come to the sequence, while a range or switch worker runs to make
     /// it; once a worker has tried and not switched it, as when a transaction holds its range row, the time is up as
@@ -5067,7 +5117,7 @@ internal static partial class SequenceRangeGuard
 
         if (!s_waited.TryGetValue((seqoid, lo), out (long Deadline, bool Expired, long Statement) waited) || waited.Statement != statement)
         {
-            waited = (now + (SequenceRanges.ExchangeTimeout * 2000L), false, statement);
+            waited = (now + BlockWait(), false, statement);
             s_waited[(seqoid, lo)] = waited;
         }
 
@@ -5226,7 +5276,7 @@ internal static partial class SequenceRangeGuard
 
         // A transaction that switched the sequence itself holds it against the range worker's switches, which would
         // otherwise come as it waits, so it waits for the next block the worker brings meanwhile, and switches to it.
-        long deadline = Worker.GetCurrentTimestamp() + (SequenceRanges.ExchangeTimeout * 2000L);
+        long deadline = Worker.GetCurrentTimestamp() + BlockWait();
         long woken = 0;
         while (true)
         {

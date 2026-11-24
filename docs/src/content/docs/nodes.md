@@ -21,20 +21,17 @@ Nodes can be added and removed dynamically using the SQL interfaces.
   - `ifexists` - if true, error is not thrown when subscription does not exist,
     default is false
 
-A node keeps worf while it provides subscriptions: `DROP EXTENSION worf` is
-refused while worf's replication slots in the database stream its changes to
-subscribers, whose walsenders read worf's tables to decode them, the changes
-made before the drop too. Drop those subscriptions on their subscribers first,
-which drops their slots, or drop the slots with `pg_drop_replication_slot`,
-which gives up the changes their subscribers haven't received.
+`DROP EXTENSION worf` is refused while other nodes subscribe to this one, since
+their replication reads worf's tables. Drop those subscriptions on the
+subscribers first, which drops their replication slots here. Or drop the slots
+with `pg_drop_replication_slot`, which throws away the changes those
+subscribers haven't received yet.
 
-Each sequence whose values worf's sequence ranges managed keeps, after worf is
-dropped, the bounds of the block the node drew from, with a warning naming
-them, so that it issues no value another node may hold: once the block is used
-up, its `nextval` fails. Widen its bounds with `ALTER SEQUENCE` once no other
-node draws from the sequence's values. The drop takes the tables it needs, worf's
-and those whose triggers it drops, all at once, waiting for a transaction that
-holds one with none of them held.
+After worf is dropped, each sequence that used sequence ranges stays limited to
+the block of numbers this node was using, so it can't hand out a number another
+node may have. worf logs a warning for each one. Once that block is used up,
+`nextval` fails. When no other node uses the sequence anymore, widen its limits
+with `ALTER SEQUENCE`.
 
 - `worf.alter_node_add_interface(node_name name, interface_name name, dsn text)`
   Adds additional interface to a node.

@@ -123,27 +123,29 @@ replication sets for newly created tables.
 
 Example:
 
-    CREATE OR REPLACE FUNCTION worf_assign_repset()
-    RETURNS event_trigger AS $$
-    DECLARE obj record;
-    BEGIN
-        FOR obj IN SELECT * FROM pg_event_trigger_ddl_commands()
-        LOOP
-            IF obj.object_type = 'table' THEN
-                IF obj.schema_name = 'config' THEN
-                    PERFORM worf.replication_set_add_table('configuration', obj.objid);
-                ELSIF NOT obj.in_extension THEN
-                    PERFORM worf.replication_set_add_table('default', obj.objid);
-                END IF;
+```sql
+CREATE OR REPLACE FUNCTION worf_assign_repset()
+RETURNS event_trigger AS $$
+DECLARE obj record;
+BEGIN
+    FOR obj IN SELECT * FROM pg_event_trigger_ddl_commands()
+    LOOP
+        IF obj.object_type = 'table' THEN
+            IF obj.schema_name = 'config' THEN
+                PERFORM worf.replication_set_add_table('configuration', obj.objid);
+            ELSIF NOT obj.in_extension THEN
+                PERFORM worf.replication_set_add_table('default', obj.objid);
             END IF;
-        END LOOP;
-    END;
-    $$ LANGUAGE plpgsql;
+        END IF;
+    END LOOP;
+END;
+$$ LANGUAGE plpgsql;
 
-    CREATE EVENT TRIGGER worf_assign_repset_trg
-        ON ddl_command_end
-        WHEN TAG IN ('CREATE TABLE', 'CREATE TABLE AS')
-        EXECUTE PROCEDURE worf_assign_repset();
+CREATE EVENT TRIGGER worf_assign_repset_trg
+    ON ddl_command_end
+    WHEN TAG IN ('CREATE TABLE', 'CREATE TABLE AS')
+    EXECUTE PROCEDURE worf_assign_repset();
+```
 
 The above example will put all new tables created in schema `config` into
 replication set `configuration` and all other new tables which are not created

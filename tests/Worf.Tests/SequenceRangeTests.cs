@@ -1231,7 +1231,7 @@ public sealed partial class SequenceRangeTests
         // A reservation that takes most of a root warns.
         logpos = node.ReadLog().Length;
         _ = await node.SafePsqlAsync(Database, "SELECT worf.reserve_sequence_range('small', 850)", token);
-        Assert.IsTrue(await node.PollLogAsync(logpos, "root has granted nine tenths of its values", token), "the root's warning");
+        Assert.IsTrue(await node.PollLogAsync(logpos, "has handed out nine tenths of its numbers", token), "the warning that the numbers are running out");
 
         // Partitions take the parent's guard, and one detached keeps a guard of its own.
         _ = await node.SafePsqlAsync(Database, "INSERT INTO pt (v) VALUES ('a'), ('b')", token);
@@ -1401,7 +1401,7 @@ public sealed partial class SequenceRangeTests
         int refused = nodeA.ReadLog().Length;
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('narrow_id_seq', participants := '{node_b}')", token);
         Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, """
-            SELECT detail = 'sequence public.narrow_id_seq has no values left above 32767 for a root' FROM worf.sequence_ranges
+            SELECT detail = 'sequence public.narrow_id_seq has no values left above 32767 to hand out' FROM worf.sequence_ranges
             WHERE sequence = 'narrow_id_seq'::regclass
             """, token), "narrow_id_seq's root can't start");
         TimeSpan rest = TimeSpan.FromSeconds(10.5) - sinceId.Elapsed;
@@ -1413,7 +1413,7 @@ public sealed partial class SequenceRangeTests
         // Nor does the range worker reserve the Snowflake clock, which it did every five seconds, while no session issues
         // IDs: it stops ten seconds after the last.
         await AssertIdleAsync([nodeA, nodeB], true, token, TimeSpan.FromSeconds(6));
-        Assert.AreEqual(1, nodeA.ReadLog()[refused..].Split("has no values left above 32767 for a root").Length - 1, "node_a warned once");
+        Assert.AreEqual(1, nodeA.ReadLog()[refused..].Split("has no values left above 32767 to hand out").Length - 1, "node_a warned once");
 
         // A session that can't write, here in a read-only transaction, can't reserve the clock after an idle stretch
         // itself, so the range worker reserves it for the session, even while an exchange hangs, which holds up only the
@@ -4299,9 +4299,11 @@ public sealed partial class SequenceRangeTests
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 's1'::regclass", token),
             "node_b drawing from a block of s1, with the next one ready");
 
-        // With node_a down, a transaction on node_b draws s1, and another session then draws s1 until a draw waits for a
-        // switch that can't come, in the last block's last twentieth.
+        // With node_a down, and node_b's reserve, which would give it its next block, used up, a transaction on node_b
+        // draws s1, and another session then draws s1 until a draw waits for a switch that can't come, in the last block's
+        // last twentieth.
         await nodeA.StopAsync("fast", token);
+        await UseUpReserveAsync(nodeB, "s1", token);
         await using NpgsqlConnection connection = await nodeB.OpenAsync(Database, token);
         await using NpgsqlTransaction transaction = await connection.BeginTransactionAsync(token);
         await using (NpgsqlCommand first = new("SELECT nextval('s1')", connection, transaction))
@@ -4426,9 +4428,11 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
-    /// A node that can't reach the other nodes keeps taking writes: node_b, with node_a, the owner, down, inserts far past
-    /// the blocks it holds, loads 3,000 rows it reserved for, and goes on after it restarts, taking its blocks from its
-    /// reserve; once node_a is back, its own rows take none of node_b's values.
+    /// A node that can't reach the other nodes keeps taking writes, and needn't know which node hands out the numbers:
+    /// node_b shows node_a as the allocator, and alter_sequence_range run on node_b names node_a. With node_a down, node_b
+    /// inserts far past the blocks it holds and loads 3,000 rows it reserved for, taking its blocks from its
+    /// reserve, and after it restarts draws, with a warning, once worf.sequence_range_offline_wait's default has passed;
+    /// once node_a is back, its own rows take none of node_b's values.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -4436,7 +4440,7 @@ public sealed partial class SequenceRangeTests
     {
         CancellationToken token = TestContext.CancellationToken;
         await using TestNode nodeA = await StartNodeAsync("node_a", token);
-        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token, "worf.sequence_range_offline_wait = 10000");
         foreach (TestNode node in new[] { nodeA, nodeB })
         {
             _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
@@ -4446,6 +4450,13 @@ public sealed partial class SequenceRangeTests
         _ = await nodeA.SafePsqlAsync(Database,
             "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100, max_range_size := 1000)", token);
         await WaitActiveAsync([nodeA, nodeB], token);
+
+        // node_b shows which node hands out the numbers, and a function that has to run there names it.
+        Assert.AreEqual("node_a", await nodeB.SafePsqlAsync(Database, "SELECT allocator FROM worf.sequence_ranges", token), "the allocator");
+        PostgresException elsewhere = await Assert.ThrowsExactlyAsync<PostgresException>(() =>
+            nodeB.SafePsqlAsync(Database, "SELECT worf.alter_sequence_range('t_id_seq', range_size := 200)", token));
+        Assert.AreEqual("node node_a hands out sequence public.t_id_seq's numbers, not this node|Run this on node node_a.",
+            $"{elsewhere.MessageText}|{elsewhere.Hint}", "the function run on node_b");
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
             "SELECT EXISTS (SELECT 1 FROM worf.sequence_range_block WHERE seqoid = 't_id_seq'::regclass AND kind = 'p' AND state = 'open')", token),
             "node_b's reserve");
@@ -4459,9 +4470,14 @@ public sealed partial class SequenceRangeTests
             INSERT INTO t (v) SELECT 'load' FROM generate_series(1, 3000);
             COMMIT;
             """, token);
+        Assert.Contains("from this node's reserve, as no other node answered its request for one", nodeB.ReadLog(), "node_b's blocks from its reserve");
         await nodeB.StopAsync("fast", token);
         await nodeB.StartServerAsync(token);
+        int restarted = nodeB.ReadLog().Length;
+        Stopwatch waited = Stopwatch.StartNew();
         _ = await nodeB.SafePsqlAsync(Database, "SET statement_timeout = '60s'; INSERT INTO t (v) SELECT 'restarted' FROM generate_series(1, 100)", token);
+        Assert.IsLessThan(TimeSpan.FromSeconds(30), waited.Elapsed, "node_b's wait after its restart");
+        Assert.Contains("draws though node node_a hasn't answered this server since it started", nodeB.ReadLog()[restarted..], "node_b's warning");
         Assert.AreEqual("8100|8100", await nodeB.SafePsqlAsync(Database, "SELECT count(*), count(DISTINCT id) FROM t", token), "node_b's rows and ids");
 
         await nodeA.StartServerAsync(token);
@@ -4668,9 +4684,11 @@ public sealed partial class SequenceRangeTests
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 's1'::regclass", token),
             "node_b drawing from a block of s1, with the next one ready");
 
-        // With node_a down, a transaction on node_b draws s1, and another session then draws s1 until a draw waits for a
-        // switch that can't come, in the last block's last twentieth.
+        // With node_a down, and node_b's reserve, which would give it its next block, used up, a transaction on node_b
+        // draws s1, and another session then draws s1 until a draw waits for a switch that can't come, in the last block's
+        // last twentieth.
         await nodeA.StopAsync("fast", token);
+        await UseUpReserveAsync(nodeB, "s1", token);
         await using NpgsqlConnection connection = await nodeB.OpenAsync(Database, token);
         await using (NpgsqlTransaction first = await connection.BeginTransactionAsync(token))
         {
@@ -7451,7 +7469,7 @@ public sealed partial class SequenceRangeTests
         // node_a granted 20,000 blocks of t_id_seq to a node long gone.
         _ = await nodeA.SafePsqlAsync(Database, """
             INSERT INTO worf.sequence_range_grant (grant_id, request_id, seqoid, grantee_id, grantee_name, kind, lo, hi, state, granted_at)
-            SELECT gen_random_uuid(), gen_random_uuid(), 't_id_seq'::regclass, 1, 'gone', 'n', 1000000000000 + g * 10, 1000000000000 + g * 10 + 9, 'abandoned', now()
+            SELECT gen_random_uuid(), gen_random_uuid(), 't_id_seq'::regclass, 1, 'gone', 'n', 900000000000000000 + g * 10, 900000000000000000 + g * 10 + 9, 'abandoned', now()
             FROM generate_series(1, 20000) g;
             ANALYZE worf.sequence_range_grant;
             """, token);
@@ -7557,7 +7575,7 @@ public sealed partial class SequenceRangeTests
         // same values.
         _ = await nodeA.SafePsqlAsync(Database, """
             INSERT INTO worf.sequence_range_grant (grant_id, request_id, seqoid, grantee_id, grantee_name, kind, lo, hi, state, granted_at)
-            SELECT gen_random_uuid(), gen_random_uuid(), s, 1, 'gone', 'n', 1000000000000 + g * 10, 1000000000000 + g * 10 + 9, 'abandoned', now()
+            SELECT gen_random_uuid(), gen_random_uuid(), s, 1, 'gone', 'n', 900000000000000000 + g * 10, 900000000000000000 + g * 10 + 9, 'abandoned', now()
             FROM (SELECT 't_id_seq'::regclass UNION ALL SELECT format('other_%s', o)::regclass FROM generate_series(1, 100) o) q (s), generate_series(1, 2000) g;
             ANALYZE worf.sequence_range_grant;
             """, token);
@@ -9946,7 +9964,7 @@ public sealed partial class SequenceRangeTests
             Assert.IsTrue(await node.PollQueryUntilAsync(Database, "SELECT state = 'active' AND epoch = 2 FROM worf.sequence_ranges", token),
                 $"{node.Name} drawing from the new epoch");
 
-            Assert.AreEqual("node_b", await node.SafePsqlAsync(Database, "SELECT owner FROM worf.sequence_ranges", token));
+            Assert.AreEqual("node_b", await node.SafePsqlAsync(Database, "SELECT allocator FROM worf.sequence_ranges", token));
         }
 
         long oldEnd = long.MinValue;
@@ -10003,10 +10021,14 @@ public sealed partial class SequenceRangeTests
         }
 
         // Keys that rows carry: free ones are granted exactly, and ones another node holds are refused.
-        _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.reserve_sequence_values('t_id_seq', 1000000000000, 1000000000099)", token);
-        _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO t (id, v) SELECT g, 'imported' FROM generate_series(1000000000000, 1000000000099) g", token);
-        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.reserve_sequence_values('t_id_seq', 2000000000000, 2000000000009)", token);
-        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO t (id, v) SELECT g, 'imported' FROM generate_series(2000000000000, 2000000000009) g", token);
+        // They lie just above every block handed out, node_b's reserve too.
+        long free = long.Parse(await nodeA.SafePsqlAsync(Database, "SELECT max(hi) FROM worf.sequence_range_grant WHERE seqoid = 't_id_seq'::regclass", token),
+            CultureInfo.InvariantCulture) + 1_000_000_000;
+        _ = await nodeB.SafePsqlAsync(Database, $"SELECT worf.reserve_sequence_values('t_id_seq', {free}, {free + 99})", token);
+        _ = await nodeB.SafePsqlAsync(Database, $"INSERT INTO t (id, v) SELECT g, 'imported' FROM generate_series({free}, {free + 99}) g", token);
+        _ = await nodeA.SafePsqlAsync(Database, $"SELECT worf.reserve_sequence_values('t_id_seq', {free + 1_000_000_000}, {free + 1_000_000_009})", token);
+        _ = await nodeA.SafePsqlAsync(Database,
+            $"INSERT INTO t (id, v) SELECT g, 'imported' FROM generate_series({free + 1_000_000_000}, {free + 1_000_000_009}) g", token);
         string held = await nodeA.SafePsqlAsync(Database, "SELECT active_lo FROM worf.sequence_ranges", token);
         PostgresException refused = await Assert.ThrowsExactlyAsync<PostgresException>(() => nodeB.SafePsqlAsync(Database,
             $"SELECT worf.reserve_sequence_values('t_id_seq', {held}, {held})", token));
@@ -10174,7 +10196,7 @@ public sealed partial class SequenceRangeTests
         int logpos = nodeA.ReadLog().Length;
         string beyond = await nodeB.SafePsqlAsync(Database, "UPDATE worf.sequence_range SET watermark = watermark + 1000000 WHERE seqoid = 't_id_seq'::regclass RETURNING watermark", token);
         _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.reset_sequence_range('t_id_seq')", token);
-        Assert.IsTrue(await nodeA.PollLogAsync(logpos, $"has heard of grants up to {beyond}, beyond this owner's watermark", token), "node_a reset");
+        Assert.IsTrue(await nodeA.PollLogAsync(logpos, $"has heard of grants up to {beyond}, beyond what this node has handed out", token), "node_a reset");
         await Task.Delay(TimeSpan.FromSeconds(4), token);
 
         // The fence lifts just after one of node_b's calls, which go over the session node_b keeps on node_a, where each
@@ -11302,6 +11324,13 @@ public sealed partial class SequenceRangeTests
         return last < 0 ? $"{Warm}SET statement_timeout = '2s'; {form}" : $"{Warm}{form[..(last + 2)]}SET statement_timeout = '2s'; {form[(last + 2)..]}";
     }
 
+    // Uses up a node's reserve of a sequence's numbers, so that while it can't reach the other nodes it gets no blocks.
+    private static async Task UseUpReserveAsync(TestNode node, string sequence, CancellationToken token)
+        => _ = await node.SafePsqlAsync(Database, $"""
+            DELETE FROM worf.sequence_range_free f USING worf.sequence_range_block b
+            WHERE b.block_id = f.block_id AND b.seqoid = '{sequence}'::regclass AND b.kind = 'p'
+            """, token);
+
     private static async Task<TestNode> StartNodeAsync(string name, CancellationToken token, string? setting = null,
         IReadOnlyDictionary<string, string?>? environment = null)
     {
@@ -11313,6 +11342,10 @@ public sealed partial class SequenceRangeTests
             "worf.sequence_range_check_interval = 100",
             "worf.sequence_range_exchange_interval = 500",
             "worf.sequence_range_timeout = 5000",
+
+            // Nodes never go on without the other nodes, as the restore checks need; OfflineNodesKeepTakingWrites takes
+            // the default.
+            "worf.sequence_range_offline_wait = -1",
             "max_worker_processes = 16",
             "autovacuum = off",
             .. setting is null ? Array.Empty<string>() : [setting],

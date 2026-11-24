@@ -3,60 +3,42 @@ title: Installation
 description: Install worf from a release package or build it from source.
 ---
 
-To use worf the provider and subscriber must be running PostgreSQL 15 or newer.
+## Requirements
 
-The `worf` extension must be installed on both provider and subscriber.
-You must `CREATE EXTENSION worf` on both.
+- The provider and subscriber run PostgreSQL 15 or newer.
+- worf is installed on both, and `CREATE EXTENSION worf` has been run on both.
+- Replicated tables have the same schema, name, columns and primary key on both.
+- `CHECK`, `NOT NULL` and other constraints on the subscriber are the same as
+  on the provider, or looser. Avoid extra `UNIQUE` constraints; see
+  [Limitations](../../limitations/).
 
-Tables on the provider and subscriber must have the same names and be in the
-same schema. Future revisions may add mapping features.
+## Column types
 
-Tables on the provider and subscriber must have the same columns. A column may
-have another data type on the subscriber, as while a change of its type is on
-its way. Its values, in the initial copy too, are read with the provider's type
-and converted as an assignment does, as `ALTER COLUMN ... TYPE` without `USING`
-would, or else through text, which the column type's input reads with the
-column's type modifier. An enum's values are its labels. Types that aren't
-PostgreSQL's own are found by schema and name, and used when defined the same:
-of the same kind, with the same input and receive functions and length, or the
-same subtype, element or attribute types in order. A type made of enums, such as
-an enum's array, is used only for a column made of the same enums, since the
-provider's labels may be ones they lack. Values of a type the subscriber lacks,
-defines differently or doesn't use are read by the column type's input when sent
-as text (in the initial copy, with `force_text_transfer`, between major
-versions, for composites and arrays of types that aren't PostgreSQL's own, and
-for domains and ranges of anything but PostgreSQL's own plain types), and fail
-with error 42804 when sent in binary. Values convert under the subscriber's
-settings, such as `TimeZone` and `bytea_output`, however they're sent. The
-initial copy passes the text of a value that needs no conversion, such as an
-integer going into a wider one or `varchar` into `text`, straight to the column.
-A value that doesn't convert fails with PostgreSQL's error, which
-`worf.exception_behaviour` handles, in the initial copy too. Values of `money`,
-or made of it, fail with error 55000 when the provider's `lc_monetary` counts
-other fraction digits than the subscriber's, whatever column they go to, since
-their amounts then differ. When the digits agree but the provider formats money
-in text that the subscriber's doesn't read as the same amount, values sent as
-text, as in the initial copy and with `force_text_transfer`, fail with error
-55000, while values sent in binary, which count the currency's smallest units,
-replicate, read as `money` and converted as any value is for a column of another
-type. Every `worf.exception_behaviour` retries this error, as one that doesn't
-come from the data, until the formats agree. A node whose `lc_monetary`
-changes, on a reload too, checks again: a provider ends its stream at its next
-change, so that the subscriber reconnects, and a subscriber finds its columns'
-conversions again. An older worf doesn't
-send or read column types, or say how it formats money, so columns replicated
-through an older provider, subscriber or relay node need the same types, and
-money the same `lc_monetary`. `CHECK` constraints, `NOT NULL` constraints, etc.,
-must be the same or weaker (more permissive) on the subscriber than the
-provider. A subscriber ignores a column it dropped in rows from a provider that
-still has it.
+A column can have a different type on the subscriber, for example while a type
+change is on its way. Values are converted the way `ALTER COLUMN ... TYPE`
+without `USING` would convert them, or else through their text form. A value
+that doesn't convert fails with PostgreSQL's error, which
+`worf.exception_behaviour` handles, in the initial copy too. Values convert
+under the subscriber's settings, such as `TimeZone` and `bytea_output`.
 
-Tables must have the same `PRIMARY KEY`s. It is not recommended to add additional
-`UNIQUE` constraints other than the `PRIMARY KEY` (see below).
+Types that aren't built into PostgreSQL are matched by schema and name, and
+treated as the same type only if they are defined the same way on both nodes.
+Enums are matched by their labels, so a type built on an enum, such as an
+enum's array, is only used for a column built on the same enum. Values of a
+type the subscriber doesn't have, or defines differently, must be sent as text:
+they are when `force_text_transfer` is on, in the initial copy, and between
+major versions. Sent in binary, they fail with error `42804`.
 
-Some additional requirements are covered in [Limitations and Restrictions](../../limitations/).
+`money` values fail with error `55000` if the provider's and subscriber's
+`lc_monetary` use a different number of decimal places, since the amounts
+would differ. If only the format differs, values sent in binary still
+replicate, but values sent as text, as in the initial copy, fail with `55000`.
+worf retries these errors until the settings agree, and checks again when
+`lc_monetary` changes. Older worf versions don't send this information, so
+columns replicated through an older node need the same types, and `money`
+needs the same `lc_monetary`.
 
-## Installation
+A subscriber ignores a column it dropped when the provider still has it.
 
 ## Packages
 
@@ -73,9 +55,11 @@ Copy each directory's files into the matching directory of your PostgreSQL
 installation, as `pg_config --bindir`, `--pkglibdir` and `--sharedir` report
 them:
 
-    cp bin/* "$(pg_config --bindir)/"
-    cp lib/* "$(pg_config --pkglibdir)/"
-    cp share/extension/* "$(pg_config --sharedir)/extension/"
+```sh
+cp bin/* "$(pg_config --bindir)/"
+cp lib/* "$(pg_config --pkglibdir)/"
+cp share/extension/* "$(pg_config --sharedir)/extension/"
+```
 
 You might need to use `sudo` for these steps. A package works with any build of
 the PostgreSQL major version it names. On Windows, the MSI finds your PostgreSQL
@@ -89,9 +73,11 @@ worf builds with the [.NET 10 SDK](https://dotnet.microsoft.com/download) and
 headers of the PostgreSQL release you build for. From a clone of this
 repository:
 
-    dotnet tool restore
-    dotnet ankus init --pg17 "$(command -v pg_config)"
-    dotnet ankus install --pg 17 --project src/Worf/Worf.csproj
+```sh
+dotnet tool restore
+dotnet ankus init --pg17 "$(command -v pg_config)"
+dotnet ankus install --pg 17 --project src/Worf/Worf.csproj
+```
 
 `ankus install` builds the extension with Native AOT and installs it into that
 PostgreSQL installation. `dotnet ankus package --pg 17 --project src/Worf/Worf.csproj --output dist`
