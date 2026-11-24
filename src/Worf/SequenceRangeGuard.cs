@@ -141,6 +141,9 @@ internal static partial class SequenceRangeGuard
     // a table, a type, a constraint or a function changes, or the managed sequences do.
     private static readonly Dictionary<(string Text, string Path, uint User), HashSet<uint>> s_namedByText = [];
 
+    // The calls of nextval statements' plans make, kept as the sequences they name are.
+    private static readonly Dictionary<(string Text, string Path, uint User), (HashSet<uint> Called, int Calls, bool Unnamed)> s_drawsByText = [];
+
     // The managed sequences the CHECK constraints, trigger conditions, defaults and column domains of the tables each
     // native subscription writes draw from, by the subscription, or null where one of them doesn't name its sequence,
     // read again once a table, a type, a constraint, a function or the subscription's tables change.
@@ -275,9 +278,14 @@ internal static partial class SequenceRangeGuard
     private static bool s_drawingRegistered;
     private static bool s_countingDown;
 
+    // Where each of those sequences was as it was last counted down for a call that names no sequence, which counts one
+    // down only as far as it has moved since.
+    private static readonly Dictionary<uint, long> s_unnamedMarks = [];
+
     // The plan nodes of the statements that draw so, with the functions that produce their rows, which the guard counts
-    // down for before each row, by the statement.
-    private static readonly Dictionary<nint, (ExecProcNodeMtd Function, int Calls)> s_rowFunctions = [];
+    // down for before each row, by the statement, with the sequences the statement's calls name, or null when one names
+    // none.
+    private static readonly Dictionary<nint, (ExecProcNodeMtd Function, int Calls, IReadOnlyCollection<uint>? Named)> s_rowFunctions = [];
     private static readonly Dictionary<nint, (uint Subxact, List<nint> Nodes)> s_countedNodes = [];
     private static readonly Dictionary<(uint Function, uint Xmin), int> s_functionCalls = [];
     private static readonly Dictionary<(uint Function, uint Xmin), HashSet<uint>?> s_functionNamed = [];
@@ -559,14 +567,20 @@ internal static partial class SequenceRangeGuard
     /// <param name="written">The tables it writes to.</param>
     internal static unsafe void StartStatement(QueryDesc* queryDesc, List<uint> written)
     {
-        // A statement counts down for the sequences its calls of nextval name, or every sequence the transaction draws
-        // from when one names none, and a statement with no such call, which draws nothing as it starts, for none.
+        // A statement counts down for the sequences its calls of nextval name, and, when one names none, its rows count
+        // the others the transaction draws from down as they're seen to draw from them, and a statement with no such call,
+        // which draws nothing as it starts, counts down for none.
         if (s_drawingUngated.Count > 0 && queryDesc->plannedstmt is not null)
         {
-            (HashSet<uint> called, int calls, bool unnamed) = Draws(PlanText((Node*)queryDesc->plannedstmt));
-            if (calls > 0 || unnamed)
+            (HashSet<uint> called, int calls, bool unnamed) = StatementDraws(queryDesc);
+            if (unnamed)
             {
-                CountDownDraws(1, unnamed ? null : called);
+                StartUnnamed(called);
+            }
+
+            if (calls > 0)
+            {
+                CountDownDraws(1, called);
             }
         }
 
@@ -612,6 +626,36 @@ internal static partial class SequenceRangeGuard
 
             s_moving.Add(((nint)queryDesc, NativeMethods.GetCurrentSubTransactionId(), queryDesc->snapshot->curcid));
         }
+    }
+
+    /// <summary>
+    /// Reads the calls of nextval a statement's plan makes, kept by the statement's text, the search path and the role it
+    /// runs as, unless it has parameters, whose values its plan may hold, until a table, a type, a constraint, a function
+    /// or a schema changes, or the managed sequences do, so that a statement run again doesn't write its plan out again.
+    /// </summary>
+    private static unsafe (HashSet<uint> Called, int Calls, bool Unnamed) StatementDraws(QueryDesc* queryDesc)
+    {
+        PlannedStmt* planned = queryDesc->plannedstmt;
+        if (queryDesc->sourceText is null || (queryDesc->@params is not null && queryDesc->@params->numParams > 0))
+        {
+            return Draws(PlanText((Node*)planned));
+        }
+
+        WatchTables();
+        (string Text, string Path, uint User) key = (StatementText((nint)queryDesc->sourceText, planned->stmt_location, planned->stmt_len), SearchPath(),
+            NativeMethods.GetUserId());
+        if (!s_drawsByText.TryGetValue(key, out (HashSet<uint> Called, int Calls, bool Unnamed) draws))
+        {
+            draws = Draws(PlanText((Node*)planned));
+            if (s_drawsByText.Count >= 1000)
+            {
+                s_drawsByText.Clear();
+            }
+
+            s_drawsByText[key] = draws;
+        }
+
+        return draws;
     }
 
     /// <summary>
@@ -1141,7 +1185,7 @@ internal static partial class SequenceRangeGuard
             {
                 QueryDesc* query = (QueryDesc*)queryDesc;
                 List<nint> nodes = [];
-                CountRows(query->planstate, nodes, Math.Max(s_starting[^1].Draws.Calls, 1));
+                CountRows(query->planstate, nodes, Math.Max(s_starting[^1].Draws.Calls, 1), named: s_starting[^1].Draws.Unnamed ? null : s_starting[^1].Draws.Called);
                 if (nodes.Count > 0)
                 {
                     RegisterCounted();
@@ -1155,7 +1199,7 @@ internal static partial class SequenceRangeGuard
 
     // Has the guard count down before each row a plan node, and those under it, produce: its children, its initPlans
     // and subplans, as an ARRAY or scalar subquery runs, and the plans an Append, a MergeAppend or a subquery scan runs.
-    private static unsafe void CountRows(PlanState* node, List<nint> nodes, int calls, bool running = false)
+    private static unsafe void CountRows(PlanState* node, List<nint> nodes, int calls, bool running = false, IReadOnlyCollection<uint>? named = null)
     {
         if (node is null || s_rowFunctions.ContainsKey((nint)node))
         {
@@ -1163,7 +1207,7 @@ internal static partial class SequenceRangeGuard
         }
 
         ExecProcNodeMtd real = node->ExecProcNodeReal;
-        s_rowFunctions[(nint)node] = (real, calls);
+        s_rowFunctions[(nint)node] = (real, calls, named);
         node->ExecProcNodeReal = CountedRowCallback;
 
         // A node that has produced a row runs its own function, as ExecProcNodeFirst left it, with no wrapper.
@@ -1173,13 +1217,13 @@ internal static partial class SequenceRangeGuard
         }
 
         nodes.Add((nint)node);
-        CountRows(node->lefttree, nodes, calls, running);
-        CountRows(node->righttree, nodes, calls, running);
+        CountRows(node->lefttree, nodes, calls, running, named);
+        CountRows(node->righttree, nodes, calls, running, named);
         foreach (List* subplans in new[] { node->initPlan, node->subPlan })
         {
             for (int i = 0; subplans is not null && i < subplans->length; i++)
             {
-                CountRows(((SubPlanState*)subplans->elements[i].ptr_value)->planstate, nodes, calls, running);
+                CountRows(((SubPlanState*)subplans->elements[i].ptr_value)->planstate, nodes, calls, running, named);
             }
         }
 
@@ -1188,19 +1232,19 @@ internal static partial class SequenceRangeGuard
             case NodeTag.T_AppendState:
                 for (int i = 0; i < ((AppendState*)node)->as_nplans; i++)
                 {
-                    CountRows(((AppendState*)node)->appendplans[i], nodes, calls, running);
+                    CountRows(((AppendState*)node)->appendplans[i], nodes, calls, running, named);
                 }
 
                 break;
             case NodeTag.T_MergeAppendState:
                 for (int i = 0; i < ((MergeAppendState*)node)->ms_nplans; i++)
                 {
-                    CountRows(((MergeAppendState*)node)->mergeplans[i], nodes, calls, running);
+                    CountRows(((MergeAppendState*)node)->mergeplans[i], nodes, calls, running, named);
                 }
 
                 break;
             case NodeTag.T_SubqueryScanState:
-                CountRows(((SubqueryScanState*)node)->subplan, nodes, calls, running);
+                CountRows(((SubqueryScanState*)node)->subplan, nodes, calls, running, named);
                 break;
             default:
                 break;
@@ -1210,8 +1254,8 @@ internal static partial class SequenceRangeGuard
     // Produces a plan node's next row, after counting down for the checks of the sequences the statement draws from.
     private static unsafe TupleTableSlot* CountedRow(PlanState* node)
     {
-        (ExecProcNodeMtd function, int calls) = s_rowFunctions[(nint)node];
-        CountDownDraws(calls);
+        (ExecProcNodeMtd function, int calls, IReadOnlyCollection<uint>? named) = s_rowFunctions[(nint)node];
+        CountDownDraws(calls, named);
         return function.Invoke(node);
     }
 
@@ -1234,7 +1278,8 @@ internal static partial class SequenceRangeGuard
         }
         else if (FunctionCalls(estate->func) is int calls and > 0)
         {
-            CountDownDraws(calls, FunctionNamed(estate->func));
+            HashSet<uint>? named = FunctionNamed(estate->func);
+            CountDownDraws(calls, named, unnamed: named is null);
         }
     }
 
@@ -1485,19 +1530,26 @@ internal static partial class SequenceRangeGuard
         foreach (uint seqoid in sequences)
         {
             s_drawingUngated[seqoid] = RowsUntilShort(seqoid);
+            if (Position(seqoid) is long position)
+            {
+                s_unnamedMarks[seqoid] = position;
+            }
         }
     }
 
     private static void ForgetUngated()
     {
         s_drawingUngated.Clear();
+        s_unnamedMarks.Clear();
         s_drawingRegistered = false;
     }
 
-    // Counts a row, statement or call down, by the draws it may take, for each sequence drawn from without its gate,
-    // and checks it for the switch, as before its first draw, once its count runs out, which half the values left
-    // before the block's last twentieth, in the sequence's steps, sets, as other sessions may draw too.
-    private static void CountDownDraws(long draws = 1, IReadOnlyCollection<uint>? only = null, bool gated = false)
+    // Counts a row, statement or call down, by the draws it may take, for each sequence drawn from without its gate that
+    // it names, and, when it names none, or a call of it names none, for each other as far as it's seen to have drawn
+    // from it since, or at once when its block has run out, as any draw from it would fail, and checks it for the
+    // switch, as before its first draw, once its count runs out, which half the values left before the block's last
+    // twentieth, in the sequence's steps, sets, as other sessions may draw too.
+    private static void CountDownDraws(long draws = 1, IReadOnlyCollection<uint>? only = null, bool gated = false, bool unnamed = false)
     {
         if (s_drawingUngated.Count == 0 || s_countingDown || s_namingGrantors || Worf.InOwnSql)
         {
@@ -1507,26 +1559,115 @@ internal static partial class SequenceRangeGuard
         s_countingDown = true;
         try
         {
-            foreach (uint seqoid in s_drawingUngated.Keys.Where(seqoid => only is null || only.Contains(seqoid)).ToList())
+            foreach (uint seqoid in s_drawingUngated.Keys.ToList())
             {
-                if (s_drawingUngated[seqoid] >= draws)
+                long count = draws;
+                bool runOut = false;
+                if (only is null || !only.Contains(seqoid))
                 {
-                    s_drawingUngated[seqoid] -= draws;
+                    if (only is not null && !unnamed)
+                    {
+                        continue;
+                    }
+
+                    count = SeenDrawn(seqoid);
+                    runOut = RunOut(seqoid);
+                    if (count == 0 && !runOut)
+                    {
+                        continue;
+                    }
+                }
+
+                if (!runOut && s_drawingUngated[seqoid] >= count)
+                {
+                    s_drawingUngated[seqoid] -= count;
                     continue;
                 }
 
                 if (gated || !s_gates.ContainsKey(seqoid))
                 {
-                    WaitWhileShort(seqoid, draws);
+                    WaitWhileShort(seqoid, Math.Max(count, 1));
                 }
 
                 s_drawingUngated[seqoid] = RowsUntilShort(seqoid);
+                if (Position(seqoid) is long position)
+                {
+                    s_unnamedMarks[seqoid] = position;
+                }
             }
         }
         finally
         {
             s_countingDown = false;
         }
+    }
+
+    // Notes where each sequence the transaction draws from without its gate, and a statement's calls don't name, is as
+    // the statement starts, so that its rows count one down only as far as they're seen to draw from it, and waits for
+    // the switch of one whose block has run out, as any draw from it would fail.
+    private static void StartUnnamed(IReadOnlyCollection<uint> named)
+    {
+        if (s_drawingUngated.Count == 0 || s_countingDown || s_namingGrantors || Worf.InOwnSql)
+        {
+            return;
+        }
+
+        s_countingDown = true;
+        try
+        {
+            foreach (uint seqoid in s_drawingUngated.Keys.Where(seqoid => !named.Contains(seqoid)).ToList())
+            {
+                if (RunOut(seqoid) && !s_gates.ContainsKey(seqoid))
+                {
+                    WaitWhileShort(seqoid);
+                    s_drawingUngated[seqoid] = RowsUntilShort(seqoid);
+                }
+
+                if (Position(seqoid) is long position)
+                {
+                    s_unnamedMarks[seqoid] = position;
+                }
+            }
+        }
+        finally
+        {
+            s_countingDown = false;
+        }
+    }
+
+    // How many values of a sequence were drawn, by any session, since it was last counted down for a call that names no
+    // sequence, or since the statement making that call started.
+    private static long SeenDrawn(uint seqoid)
+    {
+        long? position = Position(seqoid);
+        long seen = 0;
+        if (position is long now && s_unnamedMarks.TryGetValue(seqoid, out long mark) && mark != now)
+        {
+            decimal step = Math.Max(Math.Abs((decimal)SequenceRanges.GetInfo(seqoid).Increment), 1);
+            seen = (long)Math.Min(Math.Abs((decimal)now - mark) / step, int.MaxValue);
+        }
+
+        if (position is long at)
+        {
+            s_unnamedMarks[seqoid] = at;
+        }
+
+        return seen;
+    }
+
+    // Whether a sequence has no active block, or is at its active block's last value or past it, so that a draw from it
+    // would fail.
+    private static bool RunOut(uint seqoid)
+    {
+        Reload();
+        if (!s_sequences.TryGetValue(seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) sequence) ||
+            sequence.Blocks.FindIndex(block => block.State == "active") is not (int index and >= 0))
+        {
+            return s_sequences.ContainsKey(seqoid);
+        }
+
+        (long lo, long hi, _) = sequence.Blocks[index];
+        return ReadPosition(seqoid) is long position && (sequence.Ascending ? position >= hi : position <= lo);
     }
 
     // How many draws a sequence may take before it is checked again: half its steps left before the active block's last
@@ -2106,6 +2247,7 @@ internal static partial class SequenceRangeGuard
     {
         _ = arg;
         s_namedByText.Clear();
+        s_drawsByText.Clear();
         s_writtenCalls.Clear();
 
         // What a table's triggers draw counts its partitions' too, which a change to a partition changes.
@@ -2148,6 +2290,7 @@ internal static partial class SequenceRangeGuard
         s_plpgsqlCasts.Clear();
         s_checksUnnamed.Clear();
         s_namedByText.Clear();
+        s_drawsByText.Clear();
         s_subscriptionDraws.Clear();
 
         // A native subscription's tables change as REFRESH PUBLICATION adds one, which sends no relcache invalidation.
@@ -2615,6 +2758,8 @@ internal static partial class SequenceRangeGuard
         List<uint> switching = [];
         List<uint> counted = [];
         bool unnamed = false;
+        bool anyOf = false;
+        HashSet<uint> spelled = [];
         try
         {
             Reload();
@@ -2637,7 +2782,9 @@ internal static partial class SequenceRangeGuard
             // or a parameter a generic plan leaves unknown.
             if (s_sequences.Count > 0 && (plpgsql ? simple != 0 && s_simple.Draws is { Unnamed: true } : starting is { Draws.Unnamed: true }))
             {
+                spelled = named ?? [];
                 named = [.. s_sequences.Keys];
+                anyOf = true;
             }
 
             if (named is not null)
@@ -2699,10 +2846,15 @@ internal static partial class SequenceRangeGuard
 
         // A call that first starts as its statement runs is its row's, which may make the row's other calls too before the
         // count down the statement's later rows take.
+        // One whose sequence they don't name waits so only for a sequence whose block has run out, as any draw from it
+        // would fail, and its rows count the others down as they're seen to draw from them.
         long rowDraws = switching.Count > 0 && starting is { Running: not 0 } running ? RunningRowCalls(running.Running) : 1;
         foreach (uint seqoid in switching)
         {
-            WaitWhileShort(seqoid, rowDraws);
+            if (!anyOf || spelled.Contains(seqoid) || RunOut(seqoid))
+            {
+                WaitWhileShort(seqoid, rowDraws);
+            }
         }
 
         if (switching.Count > 0)
@@ -2719,7 +2871,7 @@ internal static partial class SequenceRangeGuard
 
         if (counted.Count > 0)
         {
-            CountDownDraws(1, counted);
+            CountDownDraws(1, anyOf ? [.. counted.Where(spelled.Contains)] : counted, unnamed: anyOf);
         }
     }
 
@@ -5346,6 +5498,7 @@ internal static partial class SequenceRangeGuard
         {
             s_managedSignature = signature;
             s_namedByText.Clear();
+            s_drawsByText.Clear();
         }
 
         s_version = version;

@@ -4270,7 +4270,8 @@ public sealed partial class SequenceRangeTests
     /// A PL/pgSQL statement counts down only the managed sequences its function draws from: after the transaction drew
     /// s1, and another session drew s1 into its block's last twentieth, which can't switch as its owner is down, a loop
     /// that draws from a sequence no range manages, and a trigger that does, run at once, rather than wait for s1's switch,
-    /// and so do 100 statements that draw nothing.
+    /// and so does a statement whose calls take that sequence's name from a column, and 100 statements that draw nothing;
+    /// and statements run again take about as long as in a transaction that drew nothing.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -4287,9 +4288,11 @@ public sealed partial class SequenceRangeTests
                 CREATE TABLE pt (id bigint, v text);
                 CREATE FUNCTION pt_id() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.id := nextval('plain'); RETURN NEW; END $$;
                 CREATE TRIGGER pt_id BEFORE INSERT ON pt FOR EACH ROW EXECUTE FUNCTION pt_id();
+                CREATE TABLE plainnames (n text); CREATE TABLE vt (x int);
                 """, token);
         }
 
+        _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO plainnames SELECT 'plain' FROM generate_series(1, 100)", token);
         await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('s1', participants := '{node_b}', range_size := 100, max_range_size := 100)", token);
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 's1'::regclass", token),
@@ -4327,9 +4330,9 @@ public sealed partial class SequenceRangeTests
             }
         }
 
-        // The transaction then runs the loop and the trigger, which draw from plain alone, and statements that draw
-        // nothing.
-        foreach (string statement in new[] { "SELECT f_plain_loop(1000)", "INSERT INTO pt (v) SELECT 'x' FROM generate_series(1, 1000)" })
+        // The transaction then runs the loop and the trigger, which draw from plain alone, a statement whose calls take
+        // plain's name from a column, and statements that draw nothing.
+        foreach (string statement in new[] { "SELECT f_plain_loop(1000)", "INSERT INTO pt (v) SELECT 'x' FROM generate_series(1, 1000)", "SELECT nextval(n) FROM plainnames" })
         {
             await using NpgsqlCommand run = new($"SET LOCAL statement_timeout = '5s'; {statement}", connection, transaction);
             Stopwatch running = Stopwatch.StartNew();
@@ -4351,7 +4354,122 @@ public sealed partial class SequenceRangeTests
 
         Assert.IsLessThan(TimeSpan.FromSeconds(3), selecting.Elapsed, "100 statements of SELECT 1 in the transaction");
 
+        // Statements run again in the transaction, which drew s1, take about as long as in one that drew nothing: a
+        // statement's calls of nextval are read once for its text, rather than from its plan's text each time it starts.
+        string values = $"INSERT INTO vt VALUES {string.Join(", ", Enumerable.Range(1, 4000).Select(i => string.Create(CultureInfo.InvariantCulture, $"({i})")))}";
+        await using NpgsqlConnection plainConnection = await nodeB.OpenAsync(Database, token);
+        await using NpgsqlTransaction plainTransaction = await plainConnection.BeginTransactionAsync(token);
+        TimeSpan drawing = TimeSpan.Zero;
+        TimeSpan plainly = TimeSpan.Zero;
+        for (int round = 0; round < 3; round++)
+        {
+            foreach ((NpgsqlConnection inserting, NpgsqlTransaction within, bool drew) in new[] { (connection, transaction, true), (plainConnection, plainTransaction, false) })
+            {
+                await using NpgsqlCommand insert = new(values, inserting, within);
+                Stopwatch timing = Stopwatch.StartNew();
+                for (int i = 0; i < 20; i++)
+                {
+                    _ = await insert.ExecuteNonQueryAsync(token);
+                }
+
+                if (round > 0)
+                {
+                    drawing += drew ? timing.Elapsed : TimeSpan.Zero;
+                    plainly += drew ? TimeSpan.Zero : timing.Elapsed;
+                }
+            }
+        }
+
+        Assert.IsLessThan(plainly * 1.25, drawing, $"40 inserts of 4,000 rows in the transaction that drew s1, against {plainly} in one that didn't");
+        await plainTransaction.CommitAsync(token);
+
         await transaction.CommitAsync(token);
+    }
+
+    /// <summary>
+    /// A statement whose wait for a block's switch gave up, as the block's owner was down, leaves the session's later
+    /// statements to wait for the switch again, in later transactions too: once the owner is back, a transaction's 20
+    /// draws wait for the switch rather than run the block out.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task GivenUpSwitchWaitsWaitAgain()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE SEQUENCE s1", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('s1', participants := '{node_b}', range_size := 100, max_range_size := 100)", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 's1'::regclass", token),
+            "node_b drawing from a block of s1, with the next one ready");
+
+        // With node_a down, a transaction on node_b draws s1, and another session then draws s1 until a draw waits for a
+        // switch that can't come, in the last block's last twentieth.
+        await nodeA.StopAsync("fast", token);
+        await using NpgsqlConnection connection = await nodeB.OpenAsync(Database, token);
+        await using (NpgsqlTransaction first = await connection.BeginTransactionAsync(token))
+        {
+            await using (NpgsqlCommand draw = new("SELECT nextval('s1')", connection, first))
+            {
+                _ = await draw.ExecuteNonQueryAsync(token);
+            }
+
+            await using (NpgsqlConnection other = await nodeB.OpenAsync(Database, token))
+            {
+                await using (NpgsqlCommand timeout = new("SET statement_timeout = '2s'", other))
+                {
+                    _ = await timeout.ExecuteNonQueryAsync(token);
+                }
+
+                await using NpgsqlCommand draw = new("SELECT nextval('s1')", other);
+                for (int i = 0; ; i++)
+                {
+                    Assert.IsLessThan(300, i, "node_b's draws of s1 before one waits");
+                    try
+                    {
+                        _ = await draw.ExecuteScalarAsync(token);
+                    }
+                    catch (PostgresException waited) when (waited.SqlState == "57014")
+                    {
+                        break;
+                    }
+                }
+            }
+
+            // The transaction's next draw waits for the switch until it gives up, and draws from the block's tail.
+            await using (NpgsqlCommand givingUp = new("SET LOCAL statement_timeout = '60s'; SELECT nextval('s1')", connection, first))
+            {
+                Stopwatch waiting = Stopwatch.StartNew();
+                _ = await givingUp.ExecuteNonQueryAsync(token);
+                Assert.IsGreaterThan(TimeSpan.FromSeconds(5), waiting.Elapsed, "the draw that gave up waiting for s1's switch");
+            }
+
+            await first.RollbackAsync(token);
+        }
+
+        // A later transaction draws 20 values, while node_a starts again 3 s in, each waiting for the switch as it must.
+        Task starting = Task.Run(async () =>
+        {
+            await Task.Delay(TimeSpan.FromSeconds(3), token);
+            await nodeA.StartServerAsync(token);
+        }, token);
+        await using (NpgsqlTransaction later = await connection.BeginTransactionAsync(token))
+        {
+            await using NpgsqlCommand draw = new("SET LOCAL statement_timeout = '15s'; SELECT nextval('s1')", connection, later);
+            for (int i = 0; i < 20; i++)
+            {
+                _ = await draw.ExecuteNonQueryAsync(token);
+            }
+
+            await later.CommitAsync(token);
+        }
+
+        await starting;
     }
 
     /// <summary>
