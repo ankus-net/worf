@@ -5267,13 +5267,16 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
-    /// A request for a pool block, or for a block reserved for a load, that a participant makes up gets no more than
-    /// sixteen of the owner's largest blocks, the most either asks for: node_b's made-up requests for nearly all of the
-    /// sequence each get 16,000 values at most, and node_a goes on inserting; a reservation larger than that is refused.
+    /// A reservation is served whole on a participant and on the owner, however many of the owner's largest blocks it
+    /// takes: node_b and node_a each reserve 20,000 values, more than sixteen blocks of 1,000, and load them. A request for
+    /// a pool block that a participant makes up gets no more than sixteen of the owner's largest blocks, the most a pool
+    /// asks for: node_b's made-up request for nearly all of the sequence gets 16,000 values, and node_a goes on
+    /// inserting. Each grant node_a logs, its grants in the calls that carry those requests too, goes without the call's
+    /// statement, which holds the whole message.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
-    public async Task MadeUpPoolAndReservedRequestsAreCapped()
+    public async Task ReservationsAreServedWholeAndMadeUpPoolRequestsCapped()
     {
         CancellationToken token = TestContext.CancellationToken;
         await using TestNode nodeA = await StartNodeAsync("node_a", token);
@@ -5287,41 +5290,47 @@ public sealed partial class SequenceRangeTests
         _ = await nodeA.SafePsqlAsync(Database,
             "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100, max_range_size := 1000)", token);
         await WaitActiveAsync([nodeA, nodeB], token);
-        PostgresException tooLarge = await Assert.ThrowsExactlyAsync<PostgresException>(() =>
-            nodeB.SafePsqlAsync(Database, "SELECT worf.reserve_sequence_range('t_id_seq', 16000)", token));
-        Assert.AreEqual("22023", tooLarge.SqlState, tooLarge.MessageText);
-        Assert.Contains("takes at most 16000 values", tooLarge.MessageText);
+        foreach (TestNode node in new[] { nodeB, nodeA })
+        {
+            _ = await node.SafePsqlAsync(Database, $"""
+                BEGIN;
+                SELECT worf.reserve_sequence_range('t_id_seq', 20000);
+                INSERT INTO t (v) SELECT '{node.Name}' FROM generate_series(1, 20000);
+                COMMIT;
+                """, token);
+            Assert.AreEqual("20000", await node.SafePsqlAsync(Database, $"SELECT count(*) FROM t WHERE v = '{node.Name}'", token), $"{node.Name}'s reserved load");
+        }
 
         string nodeAId = await nodeA.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
         string nodeBId = await nodeB.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
         string bSlot = await nodeB.SafePsqlAsync(Database, "SELECT sub_slot_name FROM worf.subscription WHERE sub_name = 'b_from_a'", token);
-        foreach (string request in new[] { "\"kind\": \"p\"", "\"kind\": \"n\", \"reserved\": true" })
-        {
-            string[] recorded = (await nodeA.SafePsqlAsync(Database, $"""
-                SELECT n.sysid, n.timeline, n.epoch, n.state, coalesce(n.distance::text, 'null'), coalesce(n.high_water::text, 'null'),
-                    coalesce(n.watermark::text, 'null'), coalesce(pg_catalog.array_to_json(n.holds)::text, 'null'), coalesce(n.clock::text, 'null'),
-                    r.range_size, r.max_range_size, coalesce(r.root_start::text, 'null'), coalesce(r.root_end::text, 'null')
-                FROM worf.sequence_range_node n JOIN worf.sequence_range r ON r.seqoid = n.seqoid
-                WHERE n.seqoid = 't_id_seq'::regclass AND n.node_id = {nodeBId}
-                """, token)).Split('|');
-            string walLsn = await nodeB.SafePsqlAsync(Database, "SELECT pg_current_wal_lsn()", token);
-            string requestId = Guid.NewGuid().ToString();
-            string madeUp = $$"""
-                {"node_id": {{nodeBId}}, "node_name": "node_b", "slot": "{{bSlot}}", "sysid": "{{recorded[0]}}", "timeline": {{recorded[1]}}, "wal_lsn": "{{walLsn}}", "sequences": [
-                    {"name": "public.t_id_seq", "owner_id": {{nodeAId}}, "epoch": {{recorded[2]}}, "range_size": {{recorded[9]}}, "max_range_size": {{recorded[10]}},
-                        "distance": {{recorded[4]}}, "high_water": {{recorded[5]}}, "watermark": {{recorded[6]}}, "state": "{{recorded[3]}}", "root_start": {{recorded[11]}},
-                        "root_end": {{recorded[12]}}, "holds": {{recorded[7]}}, "clock": {{recorded[8]}}, "reset": null, "reset_done": null, "held_complete": false,
-                        "held": [], "requests": [{"id": "{{requestId}}", "size": 9223372036854770000, {{request}}, "lo": null, "hi": null}],
-                        "reports": [], "grants": [], "acks": []}]}
-                """;
-            await ExchangeUntilAsync(nodeA, madeUp, async () => await nodeA.SafePsqlAsync(Database,
-                $"SELECT count(*) FROM worf.sequence_range_grant WHERE request_id = '{requestId}'", token) != "0", $"node_a's grant for {request}", token);
-            Assert.AreEqual("16000", await nodeA.SafePsqlAsync(Database,
-                $"SELECT hi - lo + 1 FROM worf.sequence_range_grant WHERE request_id = '{requestId}'", token), $"the block node_a granted for {request}");
-        }
+        string[] recorded = (await nodeA.SafePsqlAsync(Database, $"""
+            SELECT n.sysid, n.timeline, n.epoch, n.state, coalesce(n.distance::text, 'null'), coalesce(n.high_water::text, 'null'),
+                coalesce(n.watermark::text, 'null'), coalesce(pg_catalog.array_to_json(n.holds)::text, 'null'), coalesce(n.clock::text, 'null'),
+                r.range_size, r.max_range_size, coalesce(r.root_start::text, 'null'), coalesce(r.root_end::text, 'null')
+            FROM worf.sequence_range_node n JOIN worf.sequence_range r ON r.seqoid = n.seqoid
+            WHERE n.seqoid = 't_id_seq'::regclass AND n.node_id = {nodeBId}
+            """, token)).Split('|');
+        string walLsn = await nodeB.SafePsqlAsync(Database, "SELECT pg_current_wal_lsn()", token);
+        string requestId = Guid.NewGuid().ToString();
+        string madeUp = $$"""
+            {"node_id": {{nodeBId}}, "node_name": "node_b", "slot": "{{bSlot}}", "sysid": "{{recorded[0]}}", "timeline": {{recorded[1]}}, "wal_lsn": "{{walLsn}}", "sequences": [
+                {"name": "public.t_id_seq", "owner_id": {{nodeAId}}, "epoch": {{recorded[2]}}, "range_size": {{recorded[9]}}, "max_range_size": {{recorded[10]}},
+                    "distance": {{recorded[4]}}, "high_water": {{recorded[5]}}, "watermark": {{recorded[6]}}, "state": "{{recorded[3]}}", "root_start": {{recorded[11]}},
+                    "root_end": {{recorded[12]}}, "holds": {{recorded[7]}}, "clock": {{recorded[8]}}, "reset": null, "reset_done": null, "held_complete": false,
+                    "held": [], "requests": [{"id": "{{requestId}}", "size": 9223372036854770000, "kind": "p", "lo": null, "hi": null}],
+                    "reports": [], "grants": [], "acks": []}]}
+            """;
+        await ExchangeUntilAsync(nodeA, madeUp, async () => await nodeA.SafePsqlAsync(Database,
+            $"SELECT count(*) FROM worf.sequence_range_grant WHERE request_id = '{requestId}'", token) != "0", "node_a's grant for the made-up pool request", token);
+        Assert.AreEqual("16000", await nodeA.SafePsqlAsync(Database,
+            $"SELECT hi - lo + 1 FROM worf.sequence_range_grant WHERE request_id = '{requestId}'", token), "the block node_a granted for the made-up pool request");
 
         _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO t (v) SELECT 'after' FROM generate_series(1, 10000)", token);
-        Assert.AreEqual("10000", await nodeA.SafePsqlAsync(Database, "SELECT count(*) FROM t WHERE v = 'after'", token), "node_a's rows after the made-up requests");
+        Assert.AreEqual("10000", await nodeA.SafePsqlAsync(Database, "SELECT count(*) FROM t WHERE v = 'after'", token), "node_a's rows after the made-up request");
+        string log = nodeA.ReadLog();
+        Assert.Contains("granted block", log, "node_a's grants");
+        Assert.DoesNotContain("STATEMENT:  SELECT worf.sequence_range_exchange(", log, "node_a's log lines of the calls' statements");
     }
 
     /// <summary>
@@ -5412,6 +5421,116 @@ public sealed partial class SequenceRangeTests
             Assert.AreEqual("0", await node.SafePsqlAsync(Database, "SELECT count(*) FROM pg_extension WHERE extname = 'worf'", token), "worf on node_b");
             Assert.AreEqual("2", await node.SafePsqlAsync(Database, "SELECT count(*) FROM t WHERE v LIKE 'held%'", token), "node_b's rows from the transaction the drop waited for");
         }
+    }
+
+    /// <summary>
+    /// worf's drop takes the tables it needs at once or not at all, so it never waits for one while holding another, and
+    /// a transaction that read worf's tables, reserved a block or wrote another guarded table before it inserts into t
+    /// goes on and commits, the drop following it rather than deadlocking with it; DROP SCHEMA worf CASCADE does too,
+    /// and on node_a, which provides a subscription, is refused at once. A drop PostgreSQL refuses, by a role that doesn't
+    /// own worf or without CASCADE while the guard's triggers depend on worf, takes no table before it's refused, so an
+    /// insert into t goes on beside it. A drop that runs warns that t_id_seq keeps its block's bounds.
+    /// </summary>
+    /// <param name="how">What the other transaction did first, the schema's drop, or a drop PostgreSQL refuses.</param>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [DataRow("worf read")]
+    [DataRow("reserved")]
+    [DataRow("guarded written")]
+    [DataRow("schema")]
+    [DataRow("not owner")]
+    [DataRow("restrict")]
+    public async Task WorfDropsTakeTheirTablesAtOnce(string how)
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text); CREATE TABLE t2 (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100);
+            SELECT worf.enable_sequence_range('t2_id_seq', participants := '{node_b}', range_size := 100);
+            """, token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT count(*) = 2 FROM worf.sequence_ranges WHERE state = 'active'", token),
+            "node_b drawing from blocks of t_id_seq and t2_id_seq");
+        _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO t (v) VALUES ('first'); INSERT INTO t2 (v) VALUES ('first')", token);
+
+        if (how is "not owner" or "restrict")
+        {
+            // A reader holds t, and a drop PostgreSQL refuses fails at once, leaving an insert into t free to go on.
+            _ = await nodeB.SafePsqlAsync(Database, "CREATE ROLE nobody LOGIN", token);
+            await using NpgsqlConnection reading = await nodeB.OpenAsync(Database, token);
+            await using NpgsqlTransaction read = await reading.BeginTransactionAsync(token);
+            await using (NpgsqlCommand hold = new("SELECT count(*) FROM t", reading, read))
+            {
+                _ = await hold.ExecuteNonQueryAsync(token);
+            }
+
+            await using NpgsqlConnection refusedConnection = await nodeB.OpenAsync(Database, token, how == "not owner" ? "nobody" : "postgres");
+            await using NpgsqlCommand refusedDrop = new($"SET statement_timeout = '8s'; DROP EXTENSION worf{(how == "not owner" ? " CASCADE" : "")}", refusedConnection);
+            Stopwatch refusing = Stopwatch.StartNew();
+            PostgresException refused = await Assert.ThrowsExactlyAsync<PostgresException>(() => refusedDrop.ExecuteNonQueryAsync(token));
+            Assert.AreEqual(how == "not owner" ? "42501" : "2BP01", refused.SqlState, refused.MessageText);
+            Assert.IsLessThan(TimeSpan.FromSeconds(2), refusing.Elapsed, $"the {how} drop's refusal while a reader holds t");
+            Stopwatch inserting = Stopwatch.StartNew();
+            _ = await nodeB.SafePsqlAsync(Database, "SET statement_timeout = '3s'; INSERT INTO t (v) VALUES ('beside')", token);
+            Assert.IsLessThan(TimeSpan.FromSeconds(2), inserting.Elapsed, "the insert after the refused drop");
+            await read.RollbackAsync(token);
+            return;
+        }
+
+        if (how == "schema")
+        {
+            // node_a provides b_from_a, and refuses the schema's drop at once, though an insert holds t.
+            await using NpgsqlConnection holdingA = await nodeA.OpenAsync(Database, token);
+            await using NpgsqlTransaction heldA = await holdingA.BeginTransactionAsync(token);
+            await using (NpgsqlCommand insert = new("INSERT INTO t (v) VALUES ('held')", holdingA, heldA))
+            {
+                _ = await insert.ExecuteNonQueryAsync(token);
+            }
+
+            Stopwatch refusing = Stopwatch.StartNew();
+            PostgresException providing = await Assert.ThrowsExactlyAsync<PostgresException>(() =>
+                nodeA.SafePsqlAsync(Database, "SET statement_timeout = '30s'; DROP SCHEMA worf CASCADE", token));
+            Assert.AreEqual("55006", providing.SqlState, providing.MessageText);
+            Assert.IsLessThan(TimeSpan.FromSeconds(5), refusing.Elapsed, "node_a's refusal of the schema's drop");
+            await heldA.CommitAsync(token);
+        }
+
+        // On node_b, a transaction first reads worf's tables, reserves a block or writes t2, then the drop starts, and
+        // the transaction inserts into t and commits.
+        await using NpgsqlConnection holding = await nodeB.OpenAsync(Database, token);
+        await using NpgsqlTransaction held = await holding.BeginTransactionAsync(token);
+        await using (NpgsqlCommand first = new(how switch
+        {
+            "worf read" => "SELECT count(*) FROM worf.sequence_ranges",
+            "reserved" => "SELECT worf.reserve_sequence_range('t_id_seq', 50)",
+            _ => "INSERT INTO t2 (v) VALUES ('held')",
+        }, holding, held))
+        {
+            _ = await first.ExecuteNonQueryAsync(token);
+        }
+
+        int logged = nodeB.ReadLog().Length;
+        Task<string> dropping = nodeB.SafePsqlAsync(Database,
+            $"SET statement_timeout = '30s'; {(how == "schema" ? "DROP SCHEMA worf CASCADE" : "DROP EXTENSION worf CASCADE")}", token);
+        await Task.Delay(TimeSpan.FromSeconds(1), token);
+        Assert.IsFalse(dropping.IsCompleted, "node_b's drop, waiting for the transaction");
+        await using (NpgsqlCommand then = new("SET LOCAL statement_timeout = '10s'; INSERT INTO t (v) VALUES ('then')", holding, held))
+        {
+            _ = await then.ExecuteNonQueryAsync(token);
+        }
+
+        await held.CommitAsync(token);
+        _ = await dropping;
+        Assert.AreEqual("0", await nodeB.SafePsqlAsync(Database, "SELECT count(*) FROM pg_extension WHERE extname = 'worf'", token), "worf on node_b");
+        Assert.AreEqual("1", await nodeB.SafePsqlAsync(Database, "SELECT count(*) FROM t WHERE v = 'then'", token), "node_b's row the drop waited for");
+        Assert.Contains("sequence public.t_id_seq keeps its bounds", nodeB.ReadLog()[logged..], "node_b's warning of t_id_seq's bounds");
     }
 
     /// <summary>

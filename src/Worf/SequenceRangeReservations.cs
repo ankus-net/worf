@@ -78,16 +78,6 @@ internal static class SequenceRangeReservations
         // would size the block to a minute of loads, and leave the next block unused.
         long needed = (long)Math.Min(count + Math.Ceiling(count / 20m), MaxNeeded);
 
-        // A grantor grants a reservation no more than sixteen of the sequence's largest blocks.
-        long largest = SequenceRanges.LargestGrant(Worf.ReadScalar<long>("SELECT max_range_size FROM worf.sequence_range WHERE seqoid = $1",
-            SpiParameter.Create(seqoid)));
-        if (needed > largest)
-        {
-            throw new PgException(PgSqlStates.InvalidParameterValue,
-                $"a reservation of sequence {info.Name} takes at most {largest} values, and {count} with a twentieth more for other sessions is {needed}",
-                hint: "Reserve in parts, or raise max_range_size with worf.alter_sequence_range: a reservation takes up to sixteen times it.");
-        }
-
         long deadline = Worker.GetCurrentTimestamp() + (long)Int128.Min(timeout.ToComparisonMicroseconds(), long.MaxValue / 2);
         Guid requestId = Guid.NewGuid();
         bool requested = false;

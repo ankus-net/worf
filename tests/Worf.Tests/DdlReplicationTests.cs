@@ -649,6 +649,43 @@ public sealed class DdlReplicationTests
         Assert.AreEqual("0", await nodeB.SafePsqlAsync(Database, "SELECT count(*) FROM worf.local_sync_status", token), "node_b's sync status rows");
     }
 
+    /// <summary>
+    /// A drop of a subscription another session is dropping, or a change to it, waits for that drop and then finds it
+    /// gone: the drop with ifexists drops nothing, and the drop without it, and the disable, fail as for a subscription
+    /// there is no such, rather than with an internal error.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task ChangesOfASubscriptionBeingDroppedWaitForTheDrop()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+
+        await using NpgsqlConnection dropping = await nodeB.OpenAsync(Database, token);
+        await using NpgsqlTransaction drop = await dropping.BeginTransactionAsync(token);
+        await using (NpgsqlCommand first = new("SELECT worf.drop_subscription('b_from_a')", dropping, drop))
+        {
+            _ = await first.ExecuteNonQueryAsync(token);
+        }
+
+        Task<string> ifExists = nodeB.SafePsqlAsync(Database, "SELECT worf.drop_subscription('b_from_a', ifexists := true)", token);
+        Task<string> again = nodeB.SafePsqlAsync(Database, "SELECT worf.drop_subscription('b_from_a')", token);
+        Task<string> disable = nodeB.SafePsqlAsync(Database, "SELECT worf.alter_subscription_disable('b_from_a')", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
+            "SELECT count(*) = 3 FROM pg_stat_activity WHERE query LIKE 'SELECT worf.%(''b_from_a''%' AND wait_event_type = 'Lock'", token),
+            "the second drops and the disable, waiting for the first drop");
+        await drop.CommitAsync(token);
+        Assert.AreEqual("0", await ifExists, "the drop with ifexists");
+        foreach ((Task<string> failing, string what) in new[] { (again, "the second drop"), (disable, "the disable") })
+        {
+            PostgresException missing = await Assert.ThrowsExactlyAsync<PostgresException>(() => failing, what);
+            Assert.AreEqual("42704", missing.SqlState, $"{what}: {missing.MessageText}");
+            Assert.Contains("subscription b_from_a not found", missing.MessageText, what);
+        }
+    }
+
     private static async Task<TestNode> StartNodeAsync(string name, CancellationToken token, params string[] settings)
     {
         TestNode node = await TestNode.StartAsync(name,

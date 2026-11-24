@@ -28,6 +28,14 @@ made before the drop too. Drop those subscriptions on their subscribers first,
 which drops their slots, or drop the slots with `pg_drop_replication_slot`,
 which gives up the changes their subscribers haven't received.
 
+Each sequence whose values worf's sequence ranges managed keeps, after worf is
+dropped, the bounds of the block the node drew from, with a warning naming
+them, so that it issues no value another node may hold: once the block is used
+up, its `nextval` fails. Widen its bounds with `ALTER SEQUENCE` once no other
+node draws from the sequence's values. The drop takes the tables it needs, worf's
+and those whose triggers it drops, all at once, waiting for a transaction that
+holds one with none of them held.
+
 - `worf.alter_node_add_interface(node_name name, interface_name name, dsn text)`
   Adds additional interface to a node.
 

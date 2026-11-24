@@ -412,7 +412,7 @@ internal static class Functions
     [return: PgSqlType("oid", Schema = "pg_catalog")]
     internal static PgDatum DropSubscription([PgSqlType("name", Schema = "pg_catalog")] PgDatum subscriptionName, bool ifexists)
     {
-        WorfSubscription? sub = WorfNode.GetSubscriptionByName(NameArg(subscriptionName), ifexists);
+        WorfSubscription? sub = WorfNode.GetSubscriptionByName(NameArg(subscriptionName), ifexists, forUpdate: true);
 
         if (sub is not null)
         {
@@ -632,7 +632,7 @@ internal static class Functions
         """)]
     internal static bool AlterSubscriptionDisable([PgSqlType("name", Schema = "pg_catalog")] PgDatum subscriptionName, bool immediate)
     {
-        WorfSubscription sub = WorfNode.GetSubscriptionByName(NameArg(subscriptionName), false)!;
+        WorfSubscription sub = WorfNode.GetSubscriptionByName(NameArg(subscriptionName), false, forUpdate: true)!;
 
         // XXX: Only used for locking purposes.
         _ = WorfNode.GetLocalNode(true, false);
@@ -674,7 +674,7 @@ internal static class Functions
         """)]
     internal static bool AlterSubscriptionEnable([PgSqlType("name", Schema = "pg_catalog")] PgDatum subscriptionName, bool immediate)
     {
-        WorfSubscription sub = WorfNode.GetSubscriptionByName(NameArg(subscriptionName), false)!;
+        WorfSubscription sub = WorfNode.GetSubscriptionByName(NameArg(subscriptionName), false, forUpdate: true)!;
 
         // XXX: Only used for locking purposes.
         _ = WorfNode.GetLocalNode(true, false);
@@ -709,7 +709,7 @@ internal static class Functions
     internal static bool AlterSubscriptionInterface([PgSqlType("name", Schema = "pg_catalog")] PgDatum subscriptionName,
         [PgSqlType("name", Schema = "pg_catalog")] PgDatum interfaceName)
     {
-        WorfSubscription sub = WorfNode.GetSubscriptionByName(NameArg(subscriptionName), false)!;
+        WorfSubscription sub = WorfNode.GetSubscriptionByName(NameArg(subscriptionName), false, forUpdate: true)!;
 
         // XXX: Only used for locking purposes.
         _ = WorfNode.GetLocalNode(true, false);
@@ -737,7 +737,7 @@ internal static class Functions
     internal static bool AlterSubscriptionAddReplicationSet([PgSqlType("name", Schema = "pg_catalog")] PgDatum subscriptionName,
         [PgSqlType("name", Schema = "pg_catalog")] PgDatum replicationSet)
     {
-        WorfSubscription sub = WorfNode.GetSubscriptionByName(NameArg(subscriptionName), false)!;
+        WorfSubscription sub = WorfNode.GetSubscriptionByName(NameArg(subscriptionName), false, forUpdate: true)!;
         string repsetName = NameArg(replicationSet);
 
         if (sub.ReplicationSets.Contains(repsetName))
@@ -761,7 +761,7 @@ internal static class Functions
     internal static bool AlterSubscriptionRemoveReplicationSet([PgSqlType("name", Schema = "pg_catalog")] PgDatum subscriptionName,
         [PgSqlType("name", Schema = "pg_catalog")] PgDatum replicationSet)
     {
-        WorfSubscription sub = WorfNode.GetSubscriptionByName(NameArg(subscriptionName), false)!;
+        WorfSubscription sub = WorfNode.GetSubscriptionByName(NameArg(subscriptionName), false, forUpdate: true)!;
         string repsetName = NameArg(replicationSet);
 
         if (sub.ReplicationSets.Remove(repsetName))
@@ -784,7 +784,7 @@ internal static class Functions
     internal static bool AlterSubscriptionSynchronize([PgSqlType("name", Schema = "pg_catalog")] PgDatum subscriptionName, bool truncate)
     {
         string subName = NameArg(subscriptionName);
-        WorfSubscription sub = WorfNode.GetSubscriptionByName(subName, false)!;
+        WorfSubscription sub = WorfNode.GetSubscriptionByName(subName, false, forUpdate: true)!;
 
         // Read table list from provider.
         List<WorfRemoteRel> remoteTables;
@@ -846,7 +846,7 @@ internal static class Functions
     internal static bool AlterSubscriptionResynchronizeTable([PgSqlType("name", Schema = "pg_catalog")] PgDatum subscriptionName,
         [PgSqlType("regclass", Schema = "pg_catalog")] PgDatum relation, bool truncate)
     {
-        WorfSubscription sub = WorfNode.GetSubscriptionByName(NameArg(subscriptionName), false)!;
+        WorfSubscription sub = WorfNode.GetSubscriptionByName(NameArg(subscriptionName), false, forUpdate: true)!;
         string nspname;
         string relname;
 

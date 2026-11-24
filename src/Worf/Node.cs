@@ -401,10 +401,15 @@ internal sealed partial class WorfNode
     /// </summary>
     /// <param name="name">The subscription's name.</param>
     /// <param name="missingOk">Whether to return null for a missing subscription.</param>
+    /// <param name="forUpdate">Whether to lock the subscription, as a function that changes it does.</param>
     /// <returns>The subscription.</returns>
-    internal static WorfSubscription? GetSubscriptionByName(string name, bool missingOk)
+    internal static WorfSubscription? GetSubscriptionByName(string name, bool missingOk, bool forUpdate = false)
     {
-        WorfRows result = Worf.SelectCatalog(SubscriptionQuery + " WHERE sub_name = $1::name", SpiParameter.Create(name));
+        // A function that changes the subscription locks it first, so that one that comes while another session drops it
+        // waits for the drop, and then finds it gone.
+        WorfRows result = forUpdate
+            ? Worf.Query(SubscriptionQuery + " WHERE sub_name = $1::name FOR UPDATE", SpiParameter.Create(name))
+            : Worf.SelectCatalog(SubscriptionQuery + " WHERE sub_name = $1::name", SpiParameter.Create(name));
         if (result.Count == 0)
         {
             if (missingOk)
@@ -412,7 +417,7 @@ internal sealed partial class WorfNode
                 return null;
             }
 
-            throw new PgException(PgSqlStates.InternalError, $"subscriber {name} not found");
+            throw new PgException(PgSqlStates.UndefinedObject, $"subscription {name} not found");
         }
 
         return SubscriptionFromRow(result[0]);

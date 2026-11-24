@@ -32,6 +32,10 @@ internal static unsafe partial class Executor
     // SESSION_REPLICATION_ROLE_REPLICA from commands/trigger.h.
     private const int SessionReplicationRoleReplica = 1;
 
+    // The SQLSTATE of the error that rolls back a subtransaction worf's drop took or waited for a lock in, which is worf's
+    // own and never leaves the drop.
+    private const string LockWaited = "WRF02";
+
     // RVR_MISSING_OK from catalog/namespace.h.
     private const uint RangeVarMissingOk = 1;
 
@@ -353,27 +357,23 @@ internal static unsafe partial class Executor
         // as it runs.
         string? ddl = DdlReplication.CommandToQueue(pstmt, queryString, context, out bool sessionLocal);
 
-        // worf's drop, once DDL replication has had its say on what it drops with, is refused on a provider before it
-        // takes anything, and takes the tables worf's triggers guard before PostgreSQL takes worf's own.
-        if (parsetree->type == NodeTag.T_DropStmt && DropsWorf((DropStmt*)parsetree))
+        // worf's drop, once DDL replication has had its say on what it drops with, by a role PostgreSQL lets drop it,
+        // takes worf's tables at once, which PostgreSQL takes one by one as it finds what the drop drops, so that it
+        // doesn't deadlock with worf's workers. With CASCADE it's refused on a provider before it takes anything, and
+        // takes the tables whose triggers it drops too, warning of the sequences that keep their blocks' bounds; without,
+        // PostgreSQL refuses it while those triggers depend on worf, so it takes none of them ahead of that.
+        if (parsetree->type == NodeTag.T_DropStmt && DropsWorf((DropStmt*)parsetree, out bool owner) && owner)
         {
-            RefuseDropWhileProviding();
-
-            // PostgreSQL takes worf's tables and then the tables whose triggers it drops, which an insert holds as it
-            // reads worf's tables, so the drop takes those tables first, in order; worf's own it leaves to PostgreSQL.
-            foreach (uint relid in Elevated.Run(() => Worf.Read("""
-                SELECT DISTINCT t.tgrelid FROM pg_catalog.pg_trigger t
-                    JOIN pg_catalog.pg_depend d ON d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass AND d.objid = t.tgfoid
-                        AND d.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass AND d.deptype = 'e'
-                    JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid AND e.extname = 'worf'
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM pg_catalog.pg_depend m
-                    WHERE m.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND m.objid = t.tgrelid
-                        AND m.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass AND m.refobjid = e.oid AND m.deptype = 'e')
-                ORDER BY 1
-                """, 0)).Select(static row => row.Get<uint>(0)).ToList())
+            bool cascade = ((DropStmt*)parsetree)->behavior == DropBehavior.DROP_CASCADE;
+            if (cascade)
             {
-                NativeMethods.LockRelationOid(relid, (int)PgLockMode.AccessExclusive);
+                RefuseDropWhileProviding();
+            }
+
+            LockForWorfDrop(cascade);
+            if (cascade)
+            {
+                WarnKeptBounds();
             }
         }
 
@@ -834,26 +834,107 @@ internal static unsafe partial class Executor
         }
     }
 
-    // Whether a DROP statement drops worf itself.
-    private static bool DropsWorf(DropStmt* drop)
+    // Whether a DROP statement drops worf itself, as DROP EXTENSION worf does, or its schema, which takes worf with it,
+    // and whether the role running it owns what it drops of those, as PostgreSQL requires.
+    private static bool DropsWorf(DropStmt* drop, out bool owner)
     {
-        if (drop->removeType != ObjectType.OBJECT_EXTENSION || drop->objects is null)
+        owner = false;
+        if (drop->removeType is not (ObjectType.OBJECT_EXTENSION or ObjectType.OBJECT_SCHEMA) || drop->objects is null)
         {
             return false;
         }
 
-        uint worf = NativeMethods.get_extension_oid(Worf.PStrDup(Worf.ExtensionName), true);
+        bool extension = drop->removeType == ObjectType.OBJECT_EXTENSION;
+        uint worf = extension ? NativeMethods.get_extension_oid(Worf.PStrDup(Worf.ExtensionName), true)
+            : NativeMethods.get_namespace_oid(Worf.PStrDup(Worf.ExtensionName), true);
         for (int i = 0; worf != 0 && i < drop->objects->length; i++)
         {
             RelationData* rel = null;
-            if (NativeMethods.get_object_address(ObjectType.OBJECT_EXTENSION, (Node*)drop->objects->elements[i].ptr_value, &rel,
+            if (NativeMethods.get_object_address(drop->removeType, (Node*)drop->objects->elements[i].ptr_value, &rel,
                 (int)PgLockMode.AccessShare, true).objectId == worf)
             {
+                owner = Worf.ReadScalar<bool>(extension
+                    ? "SELECT pg_catalog.pg_has_role(extowner, 'USAGE') FROM pg_catalog.pg_extension WHERE oid = $1"
+                    : "SELECT pg_catalog.pg_has_role(nspowner, 'USAGE') FROM pg_catalog.pg_namespace WHERE oid = $1", SpiParameter.Create(worf));
                 return true;
             }
         }
 
         return false;
+    }
+
+    // Takes the locks worf's drop needs, on worf's tables and, with the guard's triggers, the tables whose triggers it
+    // drops, all at once or none: it takes each it can at once, and while one is held, lets those it took go, waits for
+    // that one as for a lock, and tries again, so that it never holds some while it waits for another, which a
+    // transaction that holds that one may then wait for, whatever order the transaction took its own in.
+    private static void LockForWorfDrop(bool triggers)
+    {
+        List<uint> relids = [.. Elevated.Run(() => Worf.Read("""
+            SELECT c.oid FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_class c ON c.oid = d.objid
+                JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid AND e.extname = 'worf'
+            WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
+                AND d.deptype = 'e'
+            UNION
+            SELECT t.tgrelid FROM pg_catalog.pg_trigger t
+                JOIN pg_catalog.pg_depend d ON d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass AND d.objid = t.tgfoid
+                    AND d.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass AND d.deptype = 'e'
+                JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid AND e.extname = 'worf'
+            WHERE $1
+            ORDER BY 1
+            """, 0, SpiParameter.Create(triggers))).Select(static row => row.Get<uint>(0))];
+        while (true)
+        {
+            uint busy = 0;
+            try
+            {
+                PgTransaction.RunInSubtransaction(() =>
+                {
+                    foreach (uint relid in relids)
+                    {
+                        if (!NativeMethods.ConditionalLockRelationOid(relid, (int)PgLockMode.AccessExclusive))
+                        {
+                            busy = relid;
+                            throw new PgException(LockWaited, "a table is held");
+                        }
+                    }
+                });
+                return;
+            }
+            catch (PgException held) when (held.SqlState == LockWaited)
+            {
+            }
+
+            try
+            {
+                PgTransaction.RunInSubtransaction(() =>
+                {
+                    NativeMethods.LockRelationOid(busy, (int)PgLockMode.AccessExclusive);
+                    throw new PgException(LockWaited, "the table is free");
+                });
+            }
+            catch (PgException free) when (free.SqlState == LockWaited)
+            {
+                PgInterrupts.Check();
+            }
+        }
+    }
+
+    // Warns, as worf is dropped, of each sequence it manages, which keeps the bounds of the block this node draws from,
+    // so that it issues no value another node may hold.
+    private static void WarnKeptBounds()
+    {
+        foreach (WorfRow row in Elevated.Run(() => Worf.Read("""
+            SELECT r.seqoid::pg_catalog.regclass::pg_catalog.text, s.seqmin, s.seqmax
+            FROM worf.sequence_range r JOIN pg_catalog.pg_sequence s ON s.seqrelid = r.seqoid
+            ORDER BY 1
+            """, 0)))
+        {
+            WorfLog.Warning(new PgDiagnostic($"sequence {row.Get<string>(0)} keeps its bounds, {row.Get<long>(1)} to {row.Get<long>(2)}, those of this node's block")
+            {
+                Detail = "worf's sequence ranges gave this node's block of the sequence's values to it alone; past it, the sequence would issue values other nodes may hold.",
+                Hint = "Once no other node draws from the sequence's values, widen its bounds with ALTER SEQUENCE.",
+            });
+        }
     }
 
     // Refuses worf's drop on a node that provides subscriptions: the walsenders that serve them read worf's tables as they

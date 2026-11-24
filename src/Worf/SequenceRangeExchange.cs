@@ -99,7 +99,24 @@ internal static class SequenceRangeExchange
         RETURNS text STRICT VOLATILE SECURITY DEFINER SET search_path = pg_catalog, pg_temp LANGUAGE c AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
         REVOKE ALL ON FUNCTION worf.sequence_range_exchange(text) FROM public;
         """)]
-    internal static string Exchange(string message)
+    internal static unsafe string Exchange(string message)
+    {
+        // The call's message, which runs to megabytes with many sequences, goes into none of the call's log lines:
+        // PostgreSQL adds the statement to each message at LOG and above, as each grant's is.
+        sbyte* statement = NativeGlobals.debug_query_string;
+        NativeGlobals.debug_query_string = null;
+        try
+        {
+            return Exchanged(message);
+        }
+        finally
+        {
+            NativeGlobals.debug_query_string = statement;
+        }
+    }
+
+    // Answers a call, as Exchange does.
+    private static string Exchanged(string message)
     {
         // A standby, or a node still finishing its promotion, can write nothing and has no timeline to report, so it
         // takes in no sequence of the call.
@@ -3006,13 +3023,13 @@ internal static class SequenceRangeExchange
         }
 
         // A next block is granted no larger than this node's largest size, as alter_sequence_range lowered it, though the
-        // node requested it before it heard; a block reserved for a load, which a session waits for whole, and a pool
-        // block are granted no larger than sixteen of those, the most either asks for, so a made-up one takes no more.
+        // node requested it before it heard; a pool block no larger than sixteen of those, the most a pool asks for; and a
+        // block reserved for a load whole, as the session that reserved it waits for it whole, whatever its size.
         string kind = request.TryGetProperty("kind", out JsonElement value) ? value.GetWorfString() ?? "n" : "n";
         long size = request.GetProperty("size").GetInt64();
         bool reserved = request.TryGetProperty("reserved", out JsonElement reservedFor) && reservedFor.ValueKind == JsonValueKind.True;
         long largest = range[0].Get<long>(3);
-        size = Math.Min(size, kind == "n" && !reserved ? largest : SequenceRanges.LargestGrant(largest));
+        size = kind == "n" ? (reserved ? size : Math.Min(size, largest)) : Math.Min(size, SequenceRanges.LargestGrant(largest));
 
         return SequenceRanges.Allocate(seqoid, info, epoch, size, granteeId, granteeName, requestId, kind[0]) is not null;
     }

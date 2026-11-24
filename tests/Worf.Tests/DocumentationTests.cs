@@ -11,6 +11,7 @@ public sealed class DocumentationTests
     private static readonly string s_readme = Read("README.md");
     private static readonly string s_configuration = Read("docs", "src", "content", "docs", "configuration.md");
     private static readonly string s_sequenceRanges = Read("docs", "src", "content", "docs", "sequence-ranges.md");
+    private static readonly string s_nodes = Read("docs", "src", "content", "docs", "nodes.md");
 
     /// <summary>
     /// The sequence range docs say what a neighbor that asks a node to reset does meanwhile, how often made-up requests
@@ -114,8 +115,10 @@ public sealed class DocumentationTests
         Assert.Contains("only once every other node it subscribes to, or that calls it, as a node whose subscription's sync made its slot here does from then on, before its first call, has answered it since in full", s_sequenceRanges,
             "the neighbors a start waits for to report in full (1605)");
         Assert.Contains("or removes `worf_starts` when that can't be written either", s_sequenceRanges, "a start that can't mark itself unkept (1602)");
-        Assert.Contains("or take a block of up to sixteen times `max_range_size` with each made-up request for a pool or a reservation", s_sequenceRanges,
+        Assert.Contains("so that repeated requests can take the sequence's values until none are left", s_sequenceRanges,
             "made-up pool and reserved requests (1900)");
+        Assert.Contains("A participant's block for a load is granted whole, whatever its size", s_sequenceRanges, "a participant's reservation (2000)");
+        Assert.Contains("keeps, after worf is dropped, the bounds of the block the node drew from", s_nodes, "sequences' bounds after worf's drop (2021)");
         Assert.Contains("as a trigger's loop, or a function it calls, draws more than its source shows", s_sequenceRanges, "a row's unseen draws (1663)");
         Assert.Contains("waits so beforehand only for a sequence whose block has run out", s_sequenceRanges, "calls that name no sequence (1665)");
         Assert.Contains("A statement's calls are read from its plan once for its text, the search path and the role it runs as", s_sequenceRanges,
