@@ -173,7 +173,7 @@ internal sealed unsafe class WorfProbe : IDisposable
                     string name = i < names.Length ? names[i] : "";
                     string address = i < addresses.Length ? addresses[i] : "";
                     hosts.Add(address.Length > 0 ? (name + "\0" + address, null)
-                        : (name, name.Length == 0 || name[0] is '/' or '@' || (name.Trim() == name && IPAddress.TryParse(name, out _)) ? null : HostLookup.Start(name)));
+                        : (name, name.Length == 0 || IsSocketPath(name) || (name.Trim() == name && IPAddress.TryParse(name, out _)) ? null : HostLookup.Start(name)));
                 }
             }
         }
@@ -703,6 +703,13 @@ internal sealed unsafe class WorfProbe : IDisposable
             ? string.Join('\n', message.Split('\n').Select(line => NamedLine(line, host, address)))
             : message;
     }
+
+    // Whether libpq takes a host as a Unix-socket directory or abstract socket, as its is_unixsock_path does: an absolute
+    // path or a name starting with @. On Windows an absolute path also starts with \ or a drive letter, a colon and either
+    // separator.
+    internal static bool IsSocketPath(string host)
+        => host.Length > 0 && (host[0] is '/' or '@' || (OperatingSystem.IsWindows() &&
+            (host[0] == '\\' || (host.Length >= 3 && char.IsAsciiLetter(host[0]) && host[1] == ':' && host[2] is '/' or '\\'))));
 
     // A line with the first address in it that is quoted, as libpq names one, named by its name as well.
     private static string NamedLine(string line, string host, string address)

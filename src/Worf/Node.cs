@@ -236,7 +236,6 @@ internal sealed partial class WorfNode
     /// </summary>
     private static unsafe WorfLocalNode? ReadLocalNode(RelationData* rel, bool forUpdate, bool missingOk)
     {
-
         if (rel is null)
         {
             if (missingOk)

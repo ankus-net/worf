@@ -224,7 +224,6 @@ internal static unsafe partial class Apply
     [PgBackgroundWorker(EntryPoint = "worf_apply_main")]
     internal static void ApplyMain(nuint mainArg)
     {
-
         // Setup shmem.
         Worker.WorkerAttach(mainArg, WorfWorkerType.Apply);
         MyApplyWorkerSlot = Worker.MyWorfWorker;

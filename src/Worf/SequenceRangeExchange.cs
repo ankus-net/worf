@@ -64,7 +64,6 @@ internal static class SequenceRangeExchange
     // before that, which doubles from the check interval up to the exchange interval while nothing changes.
     private static readonly Dictionary<uint, (string What, long At, long Delay)> s_waits = [];
 
-
     // The subscriptions whose provider answered the last exchange that their slot isn't streamed yet, those whose
     // provider answered the last call that it has no such slot, and those whose last exchange failed so, logged only
     // if the next fails so too, as a subscription that is being dropped no longer has one.
@@ -1320,7 +1319,6 @@ internal static class SequenceRangeExchange
         {
             WriteHolds(writer, OwnHolds(seqoid), SnowflakeIds.ReservedClock());
         }
-
 
         // A reset this node asks of the neighbor, whose WAL position moved backwards, and one it honored.
         IReadOnlyList<WorfRow> neighborRow = parts["neighbor", seqoid];
@@ -2954,15 +2952,13 @@ internal static class SequenceRangeExchange
         }
 
         // A next block is granted no larger than this node's largest size, as alter_sequence_range lowered it, though the
-        // node requested it before it heard; a block reserved for a load, which a session waits for whole, is granted
-        // whole.
+        // node requested it before it heard; a block reserved for a load, which a session waits for whole, and a pool
+        // block are granted no larger than sixteen of those, the most either asks for, so a made-up one takes no more.
         string kind = request.TryGetProperty("kind", out JsonElement value) ? value.GetWorfString() ?? "n" : "n";
         long size = request.GetProperty("size").GetInt64();
         bool reserved = request.TryGetProperty("reserved", out JsonElement reservedFor) && reservedFor.ValueKind == JsonValueKind.True;
-        if (kind == "n" && !reserved)
-        {
-            size = Math.Min(size, range[0].Get<long>(3));
-        }
+        long largest = range[0].Get<long>(3);
+        size = Math.Min(size, kind == "n" && !reserved ? largest : SequenceRanges.LargestGrant(largest));
 
         return SequenceRanges.Allocate(seqoid, info, epoch, size, granteeId, granteeName, requestId, kind[0]) is not null;
     }
@@ -3111,11 +3107,11 @@ internal static class SequenceRangeExchange
     {
         _ = Worf.Execute("""
             INSERT INTO worf.sequence_range_request (request_id, seqoid, parent_node, kind, size, created_at)
-            SELECT gen_random_uuid(), r.seqoid, r.parent_node, 'p', least($2::numeric * 16, 4611686018427387903)::bigint, now()
+            SELECT gen_random_uuid(), r.seqoid, r.parent_node, 'p', least($2::numeric * 16, $3)::bigint, now()
             FROM worf.sequence_range r
             WHERE r.seqoid = $1 AND r.parent_node IS NOT NULL
                 AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_request q WHERE q.seqoid = r.seqoid AND q.kind = 'p' AND q.state = 'open')
-            """, SpiParameter.Create(seqoid), SpiParameter.Create(childSize));
+            """, SpiParameter.Create(seqoid), SpiParameter.Create(childSize), SpiParameter.Create(SequenceRanges.MaxGrant));
     }
 
     /// <summary>

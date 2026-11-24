@@ -289,6 +289,32 @@ public sealed class StalledPeerTests
     }
 
     /// <summary>
+    /// On Windows a host that starts with a backslash, or with a drive letter, a colon and either separator, names a
+    /// Unix-socket directory, as libpq takes it, so worf's connection fails on the socket there, as psql's does, rather
+    /// than looking the directory up as a host name.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [OSCondition(OperatingSystems.Windows)]
+    public async Task WindowsSocketDirectoriesAreNotHostNames()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode subscriber = await StartNodeAsync("subscriber", token);
+        // A backslash in a connection string escapes the next character, so \\ gives one.
+        foreach ((string host, string socket) in new[] { ("C:/worf-sock", "C:/worf-sock"), (@"C:\\worf-sock", @"C:\worf-sock"), (@"\\worf-sock", @"\worf-sock") })
+        {
+            await using NpgsqlConnection connection = await subscriber.OpenAsync(Database, token);
+            await using NpgsqlCommand create = new($"""
+                SET statement_timeout = '20s';
+                SELECT worf.create_subscription('socket', provider_dsn := 'host={host} port=5432 dbname={Database} user={SuperUser}')
+                """, connection) { CommandTimeout = 30 };
+            PostgresException failed = await Assert.ThrowsExactlyAsync<PostgresException>(() => create.ExecuteNonQueryAsync(token));
+            Assert.Contains($"on socket \"{socket}", failed.MessageText, host);
+            Assert.DoesNotContain("could not translate host name", failed.MessageText, host);
+        }
+    }
+
+    /// <summary>
     /// Apply's replication connection keeps its connection string's options after worf's own, here one that has the
     /// provider log the replication commands it gets, and passes a first address that drops connection attempts, as a
     /// listener whose queue is full does, at the connection string's connect_timeout, rather than wait on it for good.

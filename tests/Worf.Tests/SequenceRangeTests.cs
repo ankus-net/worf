@@ -4961,6 +4961,64 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// A request for a pool block, or for a block reserved for a load, that a participant makes up gets no more than
+    /// sixteen of the owner's largest blocks, the most either asks for: node_b's made-up requests for nearly all of the
+    /// sequence each get 16,000 values at most, and node_a goes on inserting; a reservation larger than that is refused.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task MadeUpPoolAndReservedRequestsAreCapped()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database,
+            "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 100, max_range_size := 1000)", token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+        PostgresException tooLarge = await Assert.ThrowsExactlyAsync<PostgresException>(() =>
+            nodeB.SafePsqlAsync(Database, "SELECT worf.reserve_sequence_range('t_id_seq', 16000)", token));
+        Assert.AreEqual("22023", tooLarge.SqlState, tooLarge.MessageText);
+        Assert.Contains("takes at most 16000 values", tooLarge.MessageText);
+
+        string nodeAId = await nodeA.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
+        string nodeBId = await nodeB.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
+        string bSlot = await nodeB.SafePsqlAsync(Database, "SELECT sub_slot_name FROM worf.subscription WHERE sub_name = 'b_from_a'", token);
+        foreach (string request in new[] { "\"kind\": \"p\"", "\"kind\": \"n\", \"reserved\": true" })
+        {
+            string[] recorded = (await nodeA.SafePsqlAsync(Database, $"""
+                SELECT n.sysid, n.timeline, n.epoch, n.state, coalesce(n.distance::text, 'null'), coalesce(n.high_water::text, 'null'),
+                    coalesce(n.watermark::text, 'null'), coalesce(pg_catalog.array_to_json(n.holds)::text, 'null'), coalesce(n.clock::text, 'null'),
+                    r.range_size, r.max_range_size, coalesce(r.root_start::text, 'null'), coalesce(r.root_end::text, 'null')
+                FROM worf.sequence_range_node n JOIN worf.sequence_range r ON r.seqoid = n.seqoid
+                WHERE n.seqoid = 't_id_seq'::regclass AND n.node_id = {nodeBId}
+                """, token)).Split('|');
+            string walLsn = await nodeB.SafePsqlAsync(Database, "SELECT pg_current_wal_lsn()", token);
+            string requestId = Guid.NewGuid().ToString();
+            string madeUp = $$"""
+                {"node_id": {{nodeBId}}, "node_name": "node_b", "slot": "{{bSlot}}", "sysid": "{{recorded[0]}}", "timeline": {{recorded[1]}}, "wal_lsn": "{{walLsn}}", "sequences": [
+                    {"name": "public.t_id_seq", "owner_id": {{nodeAId}}, "epoch": {{recorded[2]}}, "range_size": {{recorded[9]}}, "max_range_size": {{recorded[10]}},
+                        "distance": {{recorded[4]}}, "high_water": {{recorded[5]}}, "watermark": {{recorded[6]}}, "state": "{{recorded[3]}}", "root_start": {{recorded[11]}},
+                        "root_end": {{recorded[12]}}, "holds": {{recorded[7]}}, "clock": {{recorded[8]}}, "reset": null, "reset_done": null, "held_complete": false,
+                        "held": [], "requests": [{"id": "{{requestId}}", "size": 9223372036854770000, {{request}}, "lo": null, "hi": null}],
+                        "reports": [], "grants": [], "acks": []}]}
+                """;
+            await ExchangeUntilAsync(nodeA, madeUp, async () => await nodeA.SafePsqlAsync(Database,
+                $"SELECT count(*) FROM worf.sequence_range_grant WHERE request_id = '{requestId}'", token) != "0", $"node_a's grant for {request}", token);
+            Assert.AreEqual("16000", await nodeA.SafePsqlAsync(Database,
+                $"SELECT hi - lo + 1 FROM worf.sequence_range_grant WHERE request_id = '{requestId}'", token), $"the block node_a granted for {request}");
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO t (v) SELECT 'after' FROM generate_series(1, 10000)", token);
+        Assert.AreEqual("10000", await nodeA.SafePsqlAsync(Database, "SELECT count(*) FROM t WHERE v = 'after'", token), "node_a's rows after the made-up requests");
+    }
+
+    /// <summary>
     /// A cursor whose rows' calls of nextval first start in a savepoint that rolls back goes on: its next FETCH, and a
     /// PL/pgSQL block's after an exception block it fetched in, draw as the first did.
     /// </summary>
@@ -9495,7 +9553,6 @@ public sealed partial class SequenceRangeTests
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, """
             SELECT count(*) = 2 AND bool_and(state = 'active') FROM worf.sequence_ranges
             """, token), "node_b drawing from blocks of both sequences");
-
 
         Assert.AreEqual("20|20|2|0", await nodeB.SafePsqlAsync(Database, """
             SELECT (SELECT count(*) FROM t), (SELECT count(*) FROM u),

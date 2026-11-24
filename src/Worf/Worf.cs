@@ -1715,7 +1715,6 @@ internal static partial class Worf
     /// </summary>
     internal static void LeaveOwnSql() => s_ownSql--;
 
-
     /// <summary>
     /// Puts back the search path that <see cref="PinSearchPath"/> or <see cref="DefaultSearchPath"/> replaced.
     /// </summary>

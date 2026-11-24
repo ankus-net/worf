@@ -466,7 +466,6 @@ internal static class Sync
     [PgBackgroundWorker(EntryPoint = "worf_sync_main")]
     internal static void SyncMain(nuint mainArg)
     {
-
         // Setup shmem.
         Worker.WorkerAttach(mainArg, WorfWorkerType.Sync);
         WorfSyncWorker mySyncWorker = Worker.MyWorker.Worker.Sync;

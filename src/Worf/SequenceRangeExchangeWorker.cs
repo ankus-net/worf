@@ -22,7 +22,6 @@ internal static class SequenceRangeExchangeWorker
     // Whether this exchange worker's watcher stopped.
     private static bool s_unwatched;
 
-
     /// <summary>
     /// Gets whether this exchange worker's watcher stopped, so that it makes no more calls.
     /// </summary>

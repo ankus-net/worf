@@ -259,6 +259,11 @@ internal static unsafe partial class SequenceRanges
     internal const string PartitionUpdateGuardName = "worf_sequence_range_partition_guard_update";
 
     private const string SequenceLimitExceeded = "2200H";
+
+    /// <summary>
+    /// The largest block a request may ask for, 2^62 - 1, which leaves the sums of sizes room in a bigint.
+    /// </summary>
+    internal const long MaxGrant = 4_611_686_018_427_387_903;
     private const string FeatureNotSupported = "0A000";
 
     // Types whose values the guard reads: smallint, integer, bigint and numeric.
@@ -5015,6 +5020,13 @@ internal static unsafe partial class SequenceRanges
     }
 
     /// <summary>
+    /// The most values a pool block, which serves sixteen of a child's requests, or a block reserved for a load is granted:
+    /// sixteen of the sequence's largest blocks, which also bounds what a made-up request of either kind can take.
+    /// </summary>
+    /// <param name="maxRangeSize">The sequence's largest block size.</param>
+    internal static long LargestGrant(long maxRangeSize) => maxRangeSize > MaxGrant / 16 ? MaxGrant : maxRangeSize * 16;
+
+    /// <summary>
     /// Counts the values, in steps of the increment, a block holds.
     /// </summary>
     internal static long Steps(SequenceInfo info, long lo, long hi)
@@ -5053,7 +5065,6 @@ internal static unsafe partial class SequenceRanges
     /// <returns>The last value, or null.</returns>
     internal static long? LastValue(uint seqoid) => Elevated.Run(() =>
     {
-
         // A switch moves the sequence's position at once, and its bounds and block as it commits, so a read in between
         // could pair the old block with the new position, or, just after the switch commits, the new block with the old
         // position. The read takes a lock that every switch's conflicts with, but not nextval's, which waits for a switch

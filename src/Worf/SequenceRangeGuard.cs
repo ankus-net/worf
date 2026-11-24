@@ -290,8 +290,9 @@ internal static partial class SequenceRangeGuard
     // The points in each sequence's active block, by sequence and value, at which this backend has woken the range worker.
     private static readonly HashSet<(uint Seqoid, long Mark)> s_woken = [];
 
-    // The active blocks, by sequence and start, whose switch this backend has waited for, and until when it may.
-    private static readonly Dictionary<(uint Seqoid, long Lo), (long Deadline, bool Expired)> s_waited = [];
+    // The active blocks, by sequence and start, whose switch this backend has waited for, until when it may, whether that
+    // time ran out, and the start of the client statement that waited, as a later statement waits again.
+    private static readonly Dictionary<(uint Seqoid, long Lo), (long Deadline, bool Expired, long Statement)> s_waited = [];
 
     // The active blocks, by sequence and start, that this transaction has tried to switch away from itself, as it ran
     // them out, each with the subtransaction that tried, and the managed sequences that the COPY FROM statements
@@ -4297,7 +4298,6 @@ internal static partial class SequenceRangeGuard
     /// </summary>
     private static bool Check(uint seqoid, long value, bool inserted)
     {
-
         // worf's own apply and sync workers write other nodes' rows, which the guard's triggers, which fire in every
         // session so that another apply's rows are checked, leave alone, as they did when the triggers fired only in
         // sessions that write their own. Another session with session_replication_role replica writes what it likes, as
@@ -4382,7 +4382,6 @@ internal static partial class SequenceRangeGuard
     /// </summary>
     private static bool Admits(uint seqoid, long value, bool inserted = false)
     {
-
         // A sequence no longer under range management doesn't restrict its column.
         if (!s_sequences.TryGetValue(seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) sequence))
         {
@@ -4501,7 +4500,6 @@ internal static partial class SequenceRangeGuard
             CountWaiting(seqoid, lo, -1);
         }
 
-
         TakeGates(held);
         return switched;
     }
@@ -4562,14 +4560,20 @@ internal static partial class SequenceRangeGuard
         SpiParameter database = SpiParameter.Create(DatabaseId());
         SpiParameter switching = SpiParameter.Create(Switchers());
         long now = Worker.GetCurrentTimestamp();
-        if (!s_waited.TryGetValue((seqoid, lo), out (long Deadline, bool Expired) waited))
+        long statement;
+        unsafe
         {
-            waited = (now + (SequenceRanges.ExchangeTimeout * 2000L), false);
-            s_waited.Add((seqoid, lo), waited);
+            statement = NativeMethods.GetCurrentStatementStartTimestamp();
         }
 
-        // A wait for the block that ran out of time already, as an earlier row's, waits no more, unless the block has
-        // switched since.
+        if (!s_waited.TryGetValue((seqoid, lo), out (long Deadline, bool Expired, long Statement) waited) || waited.Statement != statement)
+        {
+            waited = (now + (SequenceRanges.ExchangeTimeout * 2000L), false, statement);
+            s_waited[(seqoid, lo)] = waited;
+        }
+
+        // A wait for the block that ran out of time already in this client statement, as an earlier row's or an earlier
+        // statement's of a function it runs, waits no more, unless the block has switched since.
         if (waited.Expired)
         {
             Reload();
@@ -4641,7 +4645,7 @@ internal static partial class SequenceRangeGuard
             if (now >= deadline &&
                 !(counted.Dboid != 0 && sequence.Blocks.Exists(block => block.State == "next") && Switchers().Length > 0 && Drawer(seqoid).Attempts <= attempts + 1))
             {
-                s_waited[(seqoid, lo)] = (deadline, true);
+                s_waited[(seqoid, lo)] = (deadline, true, statement);
                 return false;
             }
         }
