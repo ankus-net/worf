@@ -568,9 +568,15 @@ internal static class Functions
             // held, or gone. The turn is taken last, after the calls to the provider above, so that no node holds its
             // turn while it waits on another, and let go once the deletes are done, rather than as the transaction ends.
             // A report another session holds, as one that locked it and stays open, has the deletes wait for no more than
-            // a moment in the turn: they're tried again after a tenth of a second, the turn let go meanwhile, so that the
-            // node's exchanges go on while the drop waits.
+            // a moment in the turn: the turn is let go, so that the node's exchanges go on, and the drop waits for the
+            // rows' holders as for any lock, under the session's lock_timeout and in sight of the deadlock check, and
+            // then tries again.
             uint origin = sub.Origin.Id;
+
+            // The sequence guard's sessions read the node's neighbors, which the drop changes, again: this session at
+            // once and again if the drop rolls back, as to a savepoint, and the others as it commits, so that none waits
+            // for the provider once it's gone, and none stops waiting for it while it isn't.
+            SequenceRanges.ChangedOnCommit();
             while (true)
             {
                 try
@@ -584,7 +590,11 @@ internal static class Functions
                 }
                 catch (PgException held) when (held.SqlState == "55P03")
                 {
-                    Worker.WaitLatch(100);
+                    if (!SequenceRanges.WaitForNeighborRows(origin))
+                    {
+                        Worker.WaitLatch(100);
+                    }
+
                     PgInterrupts.Check();
                 }
             }

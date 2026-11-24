@@ -4961,6 +4961,138 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// The sessions that read node_b's neighbors as a drop of its subscription to node_c changes them read them again:
+    /// node_b, restarted with node_c down, waits for node_c again once a drop of b_from_c that a session drew under rolls
+    /// back, whole or to a savepoint, rather than drawing on as the drop left it; and once a drop commits, a session that
+    /// already gave up on node_c, and one waiting for it, go on drawing.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task SessionsHearOfSubscriptionDrops()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        await using TestNode nodeC = await StartNodeAsync("node_c", token);
+        foreach (TestNode node in new[] { nodeA, nodeB, nodeC })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        await SubscribeAsync(nodeB, "b_from_c", nodeC, token);
+        await SubscribeAsync(nodeC, "c_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b,node_c}', range_size := 100)", token);
+        await WaitActiveAsync([nodeA, nodeB, nodeC], token);
+        await InsertAsync(nodeB, 10, token);
+        await InsertAsync(nodeC, 10, token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
+            "SELECT EXISTS (SELECT 1 FROM worf.sequence_range_node WHERE node_name = 'node_c' AND seqoid = 't_id_seq'::regclass)", token), "node_c's report on node_b");
+        await nodeC.StopAsync("fast", token);
+        await nodeB.StopAsync("fast", token);
+        await nodeB.StartServerAsync(token);
+
+        async Task WaitsForNodeCAsync(NpgsqlConnection connection, string statements, string what)
+        {
+            PostgresException waited = await Assert.ThrowsExactlyAsync<PostgresException>(() => ExecuteAsync(connection, statements, token), what);
+            Assert.AreEqual("55000", waited.SqlState, $"{what}: {waited.MessageText}");
+            Assert.Contains("node_c", waited.MessageText, what);
+        }
+
+        await using (NpgsqlConnection rolledBack = await nodeB.OpenAsync(Database, token))
+        {
+            await ExecuteAsync(rolledBack, "BEGIN; SELECT worf.drop_subscription('b_from_c'); SELECT nextval('t_id_seq'); ROLLBACK", token);
+            await WaitsForNodeCAsync(rolledBack, "SET statement_timeout = '30s'; INSERT INTO t (v) VALUES ('after the rollback')",
+                "the insert after the drop rolled back");
+        }
+
+        await using (NpgsqlConnection toSavepoint = await nodeB.OpenAsync(Database, token))
+        {
+            await ExecuteAsync(toSavepoint,
+                "BEGIN; SET LOCAL statement_timeout = '30s'; SAVEPOINT s; SELECT worf.drop_subscription('b_from_c'); SELECT nextval('t_id_seq'); ROLLBACK TO SAVEPOINT s",
+                token);
+            await WaitsForNodeCAsync(toSavepoint, "INSERT INTO t (v) VALUES ('after the savepoint')", "the insert after the drop rolled back to its savepoint");
+        }
+
+        await using NpgsqlConnection gaveUp = await nodeB.OpenAsync(Database, token);
+        await WaitsForNodeCAsync(gaveUp, "SET statement_timeout = '30s'; INSERT INTO t (v) VALUES ('before the drop')", "the insert before the drop");
+        await using NpgsqlConnection waiting = await nodeB.OpenAsync(Database, token);
+        Task waitingInsert = ExecuteAsync(waiting, "SET statement_timeout = '30s'; INSERT INTO t (v) VALUES ('during the drop')", token);
+        await Task.Delay(TimeSpan.FromSeconds(2), token);
+        Assert.IsFalse(waitingInsert.IsCompleted, "the insert waiting for node_c");
+        _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.drop_subscription('b_from_c')", token);
+        Stopwatch dropped = Stopwatch.StartNew();
+        await waitingInsert;
+        Assert.IsLessThan(TimeSpan.FromSeconds(5), dropped.Elapsed, "the waiting insert, once the drop committed");
+        dropped.Restart();
+        await ExecuteAsync(gaveUp, "INSERT INTO t (v) VALUES ('after the drop')", token);
+        Assert.IsLessThan(TimeSpan.FromSeconds(5), dropped.Elapsed, "the insert after the drop, in the session that gave up on node_c");
+    }
+
+    /// <summary>
+    /// A drop of a subscription that waits for a report another session holds waits for it as for any lock: it fails at
+    /// the session's lock_timeout, and a holder that then waits for a lock the dropping transaction holds is a deadlock
+    /// PostgreSQL finds, rather than the drop trying again until its statement_timeout.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task DroppingSubscriptionsWaitForHeldReportsAsLocks()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeC = await StartNodeAsync("node_c", token);
+        foreach (TestNode node in new[] { nodeA, nodeC })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE u (id bigserial PRIMARY KEY)", token);
+        }
+
+        await SubscribeAsync(nodeA, "a_from_c", nodeC, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('u_id_seq', participants := '{}', range_size := 10)", token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database,
+            "SELECT state = 'active' FROM worf.sequence_ranges WHERE sequence = 'u_id_seq'::regclass", token), "node_a drawing from a block of u_id_seq");
+        string nodeCId = await nodeC.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
+        _ = await nodeA.SafePsqlAsync(Database, $"""
+            INSERT INTO worf.sequence_range_node (seqoid, node_id, node_name, via_node, reported_at)
+            VALUES ('u_id_seq'::regclass, 2000002, 'relayed_by_c', {nodeCId}, now())
+            """, token);
+        await using NpgsqlConnection holder = await nodeA.OpenAsync(Database, token);
+        await ExecuteAsync(holder,
+            $"BEGIN; SELECT 1 FROM worf.sequence_range_node WHERE seqoid = 'u_id_seq'::regclass AND via_node = {nodeCId} FOR UPDATE", token);
+
+        await using (NpgsqlConnection dropper = await nodeA.OpenAsync(Database, token))
+        {
+            Stopwatch dropping = Stopwatch.StartNew();
+            PostgresException timedOut = await Assert.ThrowsExactlyAsync<PostgresException>(() =>
+                ExecuteAsync(dropper, "SET lock_timeout = '2s'; SET statement_timeout = '30s'; SELECT worf.drop_subscription('a_from_c')", token));
+            Assert.AreEqual("55P03", timedOut.SqlState, timedOut.MessageText);
+            Assert.IsLessThan(TimeSpan.FromSeconds(10), dropping.Elapsed, "the drop's wait for the held report, at its 2 s lock_timeout");
+        }
+
+        // The dropping transaction holds an advisory lock that the holder then waits for.
+        await using NpgsqlConnection deadlocked = await nodeA.OpenAsync(Database, token);
+        Stopwatch waiting = Stopwatch.StartNew();
+        Task drop = ExecuteAsync(deadlocked,
+            "SET statement_timeout = '30s'; BEGIN; SELECT pg_advisory_xact_lock(42); SELECT worf.drop_subscription('a_from_c'); COMMIT", token);
+        await Task.Delay(TimeSpan.FromSeconds(1), token);
+        Task holderWait = ExecuteAsync(holder, "SELECT pg_advisory_xact_lock(42)", token);
+        List<string> failures = [];
+        foreach (Task waited in new[] { drop, holderWait })
+        {
+            try
+            {
+                await waited;
+            }
+            catch (PostgresException failure)
+            {
+                failures.Add(failure.SqlState);
+            }
+        }
+
+        Assert.Contains("40P01", failures, string.Join(", ", failures));
+        Assert.IsLessThan(TimeSpan.FromSeconds(15), waiting.Elapsed, "PostgreSQL finding the deadlock between the drop and the holder");
+    }
+
+    /// <summary>
     /// A request for a pool block, or for a block reserved for a load, that a participant makes up gets no more than
     /// sixteen of the owner's largest blocks, the most either asks for: node_b's made-up requests for nearly all of the
     /// sequence each get 16,000 values at most, and node_a goes on inserting; a reservation larger than that is refused.

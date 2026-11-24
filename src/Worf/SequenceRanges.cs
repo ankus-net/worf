@@ -260,6 +260,19 @@ internal static unsafe partial class SequenceRanges
 
     private const string SequenceLimitExceeded = "2200H";
 
+    // The code a wait for a row throws to let it go, rolling back the subtransaction that locked it.
+    private const string RowWaitedFor = "WRF01";
+
+    // The tables, and the column naming the node, whose rows ForgetNeighbor deletes.
+    private static readonly (string Table, string Column)[] s_neighborRows =
+    [
+        ("worf.sequence_range_fence_wait", "node_id"),
+        ("worf.sequence_range_node", "via_node"),
+        ("worf.sequence_range_absent", "node_id"),
+        ("worf.sequence_range_back", "node_id"),
+        ("worf.sequence_range_dropped_node", "node_id"),
+    ];
+
     /// <summary>
     /// The largest block a request may ask for, 2^62 - 1, which leaves the sums of sizes room in a bigint.
     /// </summary>
@@ -925,6 +938,40 @@ internal static unsafe partial class SequenceRanges
         _ = Worf.Execute("DELETE FROM worf.sequence_range_absent WHERE node_id = $1", SpiParameter.Create(nodeId));
         _ = Worf.Execute("DELETE FROM worf.sequence_range_back WHERE node_id = $1", SpiParameter.Create(nodeId));
         _ = Worf.Execute("DELETE FROM worf.sequence_range_dropped_node WHERE node_id = $1", SpiParameter.Create(nodeId));
+    }
+
+    /// <summary>
+    /// Waits, in no turn, for the transactions that hold the rows <see cref="ForgetNeighbor"/> deletes, as a lock waits:
+    /// under the session's lock_timeout and in sight of the deadlock check. Each row is locked and let go in a
+    /// subtransaction of its own, so that the wait for one holds none of the others, which an exchange's take-in, in the
+    /// turn, may lock in another order.
+    /// </summary>
+    /// <param name="nodeId">The node being forgotten.</param>
+    /// <returns>Whether there were rows to wait for.</returns>
+    internal static bool WaitForNeighborRows(uint nodeId)
+    {
+        bool waited = false;
+        foreach ((string table, string column) in s_neighborRows)
+        {
+            foreach (WorfRow row in Worf.Read($"SELECT ctid::text FROM {table} WHERE {column} = $1", 0, SpiParameter.Create(nodeId)))
+            {
+                waited = true;
+                string ctid = row.Get<string>(0);
+                try
+                {
+                    PgTransaction.RunInSubtransaction(() =>
+                    {
+                        _ = Worf.Execute($"SELECT 1 FROM {table} WHERE ctid = $1::tid FOR UPDATE", SpiParameter.Create(ctid));
+                        throw new PgException(RowWaitedFor, "the row is free");
+                    });
+                }
+                catch (PgException free) when (free.SqlState == RowWaitedFor)
+                {
+                }
+            }
+        }
+
+        return waited;
     }
 
     /// <summary>
