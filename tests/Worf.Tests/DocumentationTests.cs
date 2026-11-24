@@ -96,16 +96,9 @@ public sealed partial class DocumentationTests
     private static IEnumerable<string> Sentences(string page)
     {
         string text = Markup().Replace(Tables().Replace(Code().Replace(FrontMatter().Replace(page, ""), ""), ""), " ");
-        foreach (string block in Blocks().Split(text))
-        {
-            foreach (string sentence in SentenceEnd().Split(Spaces().Replace(block, " ").Trim()))
-            {
-                if (sentence.Length > 0)
-                {
-                    yield return sentence;
-                }
-            }
-        }
+        return Blocks().Split(text)
+            .SelectMany(block => SentenceEnd().Split(Spaces().Replace(block, " ").Trim()))
+            .Where(sentence => sentence.Length > 0);
     }
 
     [GeneratedRegex(@"\A---.*?\n---\n", RegexOptions.Singleline)]
