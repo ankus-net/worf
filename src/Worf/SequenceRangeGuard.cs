@@ -306,8 +306,10 @@ internal static partial class SequenceRangeGuard
     private static bool s_ungatedDrawersRegistered;
 
     // The source plan nodes of the upserts and merges that hold gates, with the functions that produce their rows and
-    // the sequences whose gates they hold, which the guard checks before each row.
+    // the sequences their rows draw from, which the guard checks before each row, and those sequences by the statement,
+    // as it starts, until its plan has.
     private static readonly Dictionary<nint, (ExecProcNodeMtd Function, List<uint> Sequences)> s_gatedRows = [];
+    private static readonly Dictionary<nint, List<uint>> s_rowsDrawing = [];
 
     [PgNativeCallback(nameof(GatedRow))]
     private static partial ExecProcNodeMtd GatedRowCallback { get; }
@@ -713,6 +715,7 @@ internal static partial class SequenceRangeGuard
     internal static unsafe void EndStatement(QueryDesc* queryDesc)
     {
         _ = s_planStarted.Remove((nint)queryDesc);
+        _ = s_rowsDrawing.Remove((nint)queryDesc);
         if (s_hookingStatements.Count > 0)
         {
             _ = s_hookingStatements.RemoveAll(entry => entry.Statement == (nint)queryDesc);
@@ -830,6 +833,11 @@ internal static partial class SequenceRangeGuard
         foreach (uint seqoid in sequences.Concat(triggered))
         {
             MarkRow(seqoid);
+        }
+
+        if (sequences.Count > 0)
+        {
+            s_rowsDrawing[(nint)queryDesc] = sequences;
         }
     }
 
@@ -1348,14 +1356,15 @@ internal static partial class SequenceRangeGuard
         s_ungatedDrawersRegistered = false;
     }
 
-    // Has an upsert or a merge that holds gates check its gated sequences before each row its source gives, as an
-    // insert's guard trigger does after each row it writes: a row that conflicts, or that a merge matches, fires no such
-    // trigger, though its default, its SET and its triggers draw.
+    // Has an upsert or a merge that holds gates check the sequences its rows draw from before each row its source gives,
+    // as an insert's guard trigger does after each row it writes: a row that conflicts, or that a merge matches, fires no
+    // such trigger, though its default, its SET and its triggers draw. A sequence a trigger's arguments name is checked as
+    // the trigger fires.
     private static unsafe void CheckGatedRows(nint queryDesc)
     {
         QueryDesc* query = (QueryDesc*)queryDesc;
-        int gating = s_gating.FindLastIndex(entry => entry.Statement == queryDesc);
-        if (gating < 0 || query->planstate is null || query->planstate->type != NodeTag.T_ModifyTableState || query->planstate->plan is null ||
+        if (!s_rowsDrawing.Remove(queryDesc, out List<uint>? drawing) || query->planstate is null || query->planstate->type != NodeTag.T_ModifyTableState ||
+            query->planstate->plan is null ||
             (query->operation != CmdType.CMD_MERGE && ((ModifyTable*)query->planstate->plan)->onConflictAction == OnConflictAction.ONCONFLICT_NONE))
         {
             return;
@@ -1367,7 +1376,7 @@ internal static partial class SequenceRangeGuard
             return;
         }
 
-        s_gatedRows[(nint)source] = (source->ExecProcNodeReal, [.. s_gating[gating].Sequences]);
+        s_gatedRows[(nint)source] = (source->ExecProcNodeReal, drawing);
         source->ExecProcNodeReal = GatedRowCallback;
         RegisterCounted();
         List<nint> nodes = s_countedNodes.TryGetValue(queryDesc, out (uint Subxact, List<nint> Nodes) counted) ? counted.Nodes : [];
@@ -4683,6 +4692,7 @@ internal static partial class SequenceRangeGuard
 
     private static void ForgetGates()
     {
+        s_rowsDrawing.Clear();
         foreach (uint seqoid in s_gates.Keys)
         {
             CountDrawer(seqoid, -1);
