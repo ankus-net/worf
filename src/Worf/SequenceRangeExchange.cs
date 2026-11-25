@@ -2335,7 +2335,8 @@ internal static class SequenceRangeExchange
     /// Checks, only reading, whether this node would leave a neighbor's requests for blocks as they are, as while the
     /// root has run out, or, on a node between it and the owner, can't start: none was answered before, and no free
     /// span of this node's root or pool blocks holds the smallest, while this node, unless it is the owner, has asked its
-    /// parent for a pool block already, or this node, a Snowflake pool holder, hasn't heard from the owner lately.
+    /// parent for a pool block already, or this node, a Snowflake pool holder, hasn't heard from the owner lately. A load
+    /// larger than one may take is refused, which answers it, however large the free spans.
     /// </summary>
     private static bool Unanswerable(uint seqoid, SequenceInfo info, int epoch, JsonElement requests, bool isOwner)
     {
@@ -2343,7 +2344,9 @@ internal static class SequenceRangeExchange
         long smallest = long.MaxValue;
         foreach (JsonElement request in requests.EnumerateArray())
         {
-            if (Text(request, "kind") is not (null or "n" or "p"))
+            if (Text(request, "kind") is not (null or "n" or "p") ||
+                (Text(request, "kind") is null or "n" && request.TryGetProperty("reserved", out JsonElement reserved) && reserved.ValueKind == JsonValueKind.True &&
+                    request.GetProperty("size").GetInt64() > SequenceRanges.FreeValues(seqoid, epoch, Math.Max(Math.Abs(info.Increment), 1)) / 16))
             {
                 return false;
             }

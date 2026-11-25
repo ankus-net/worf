@@ -1831,6 +1831,7 @@ internal static partial class SequenceRangeGuard
             _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, ForgetUngated);
         }
 
+        GateUngated(sequences);
         foreach (uint seqoid in sequences)
         {
             Share(seqoid);
@@ -1868,6 +1869,13 @@ internal static partial class SequenceRangeGuard
         s_countingDown = true;
         try
         {
+            // A row lets the gates its statement took go while a switch waits for them, and takes them again once the
+            // switch has committed, so that the switch moves no sequence between a row's check and its draws.
+            if (s_gates.Count > 0)
+            {
+                _ = PassGates();
+            }
+
             // A statement that draws row after row holds its sequences' locks, so PostgreSQL reads no bounds again as it
             // goes: once another session has switched a sequence, the next row reads the new block's from the catalog,
             // rather than run past the old block's end.
@@ -1923,7 +1931,7 @@ internal static partial class SequenceRangeGuard
 
                 // The values left of the sequence's count count no more, for this check and those of other statements.
                 Promise(seqoid, 0);
-                if (gated || !s_gates.ContainsKey(seqoid))
+                if (gated || !StatementGated(seqoid))
                 {
                     WaitWhileShort(seqoid, Math.Max(Math.Max(count, draws), 1));
                 }
@@ -1973,7 +1981,7 @@ internal static partial class SequenceRangeGuard
         {
             foreach (uint seqoid in s_drawingUngated.Keys.Where(seqoid => !named.Contains(seqoid)).ToList())
             {
-                if (RunOut(seqoid, Position(seqoid), calls) && !s_gates.ContainsKey(seqoid))
+                if (RunOut(seqoid, Position(seqoid), calls) && !StatementGated(seqoid))
                 {
                     Promise(seqoid, 0);
                     WaitWhileShort(seqoid, Math.Max(calls, 1));
@@ -2058,6 +2066,12 @@ internal static partial class SequenceRangeGuard
     // Notes a statement that starts, with the subtransaction it starts in, so that one an error ends counts no more.
     private static void Running(nint queryDesc)
     {
+        // worf's own statements, as a wait reads its tables with, run within the statement that waits.
+        if (Worf.InOwnSql)
+        {
+            return;
+        }
+
         if (!s_runningRegistered)
         {
             s_runningRegistered = true;
@@ -2094,7 +2108,20 @@ internal static partial class SequenceRangeGuard
     // take without a check go back to other backends' statements, and its next draw checks first.
     private static void Ended(nint queryDesc)
     {
+        if (Worf.InOwnSql)
+        {
+            return;
+        }
+
         _ = s_running.RemoveAll(entry => entry.QueryDesc == queryDesc);
+        if (s_running.Count == 0 && s_gates.Count > 0)
+        {
+            foreach (uint seqoid in s_gates.Keys.Where(seqoid => !StatementGated(seqoid)).ToList())
+            {
+                LetGate(seqoid);
+            }
+        }
+
         if (s_running.Count == 0 && s_promised.Count > 0)
         {
             foreach (uint seqoid in s_promised.Keys.ToList())
@@ -2108,6 +2135,21 @@ internal static partial class SequenceRangeGuard
             }
         }
     }
+
+    // Takes the switch gates of sequences that statements draw from without gates of their own, after their first check,
+    // so that a switch beside them moves a sequence only between their rows, as it does for statements that write; a
+    // switch that committed meanwhile, as the take waits for, is heard of.
+    private static void GateUngated(List<uint> sequences)
+    {
+        List<uint> taking = [.. sequences.Where(seqoid => !s_gates.ContainsKey(seqoid)).Distinct().Order()];
+        if (taking.Count > 0)
+        {
+            TakeGates(taking);
+        }
+    }
+
+    // Whether a statement that writes, as an insert or a COPY, holds a sequence's gate, and checks it at its rows itself.
+    private static bool StatementGated(uint seqoid) => s_gating.Exists(entry => entry.Sequences.Contains(seqoid));
 
     // Gives a statement drawing from a sequence without its gate its count of draws before it checks the sequence again,
     // and counts them in the shared table, which other statements' checks leave them.
@@ -3284,7 +3326,7 @@ internal static partial class SequenceRangeGuard
                     counted = [.. named.Where(seqoid => starting.Switched.Contains(seqoid) && s_drawingUngated.ContainsKey(seqoid))];
                 }
 
-                switching = [.. named.Where(seqoid => seqoid != snowflake && s_sequences.ContainsKey(seqoid) && !s_gates.ContainsKey(seqoid) &&
+                switching = [.. named.Where(seqoid => seqoid != snowflake && s_sequences.ContainsKey(seqoid) && !StatementGated(seqoid) &&
                     (plpgsql || starting!.Switched.Add(seqoid)))];
             }
 

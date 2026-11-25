@@ -925,9 +925,13 @@ internal static unsafe partial class Executor
         }
     }
 
-    // Waits for a table worf's drop needs, held by another transaction, as for a lock, and lets it go again.
+    // Waits for a table worf's drop needs, held by another transaction, as for a lock, and lets it go again. It waits a
+    // tenth of a second at a time, so that a worker that queues behind it for the table, as one that holds another table
+    // the drop needs may, waits no longer than that, and the drop tries all the tables again.
     private static void WaitForTable(uint relid)
     {
+        int nestLevel = NativeMethods.NewGUCNestLevel();
+        WorfLocks.SetAtNestLevel("lock_timeout", "100");
         try
         {
             PgTransaction.RunInSubtransaction(() =>
@@ -936,11 +940,17 @@ internal static unsafe partial class Executor
                 throw new PgException(LockWaited, "the table is free");
             });
         }
-        catch (PgException free) when (free.SqlState == LockWaited)
+        catch (PgException free) when (free.SqlState is LockWaited or LockNotAvailable)
         {
             PgInterrupts.Check();
         }
+        finally
+        {
+            NativeMethods.AtEOXact_GUC(true, nestLevel);
+        }
     }
+
+    private const string LockNotAvailable = "55P03";
 
     // Widens, as worf is dropped, the bounds of each sequence it manages whose values no other node was ever given, out
     // to the end of the values the sequence's range spanned, as past its position they are this node's own; and warns
