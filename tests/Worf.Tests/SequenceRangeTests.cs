@@ -7763,10 +7763,9 @@ public sealed partial class SequenceRangeTests
     /// A node restored from a backup taken before a neighbor first called it, here node_c, whose subscription to node_b
     /// was made while node_b's exchange function was renamed, waits for that neighbor though its restored tables don't
     /// know it: node_b registers node_c with node_a, its other neighbor, as node_c first calls, and draws only once node_a
-    /// has told it back. With node_a down as node_c first calls, node_b so draws nothing until node_a is back to hear of
-    /// node_c (1605), where it once drew values that node_c then held and a restore gave out again. With node_a hearing
-    /// of node_c before it goes down, the restored node_b draws none of them again: node_a, which heard from node_b since
-    /// the backup, has it reset, as it did before the fix, or names node_c, which node_b then waits for.
+    /// has told it back, and node_a's answer to the restored node_b names node_c, which node_b then waits for, down,
+    /// unless node_a has it reset, rather than draw again what node_c holds. With node_a down as node_c first calls,
+    /// node_b draws nothing until node_a is back to hear of node_c (1605).
     /// </summary>
     /// <param name="order">Whether node_a goes down after node_c first calls node_b, or before.</param>
     /// <returns>The test.</returns>
@@ -7817,30 +7816,45 @@ public sealed partial class SequenceRangeTests
             return;
         }
 
-        // node_c first calls, node_a hears of it and tells node_b back, which node_b's draws wait for, and node_a stops;
-        // node_b draws again, which node_c hears of, and node_c stops.
+        // node_c first calls, node_a hears of it and tells node_b back, and node_a stops; node_b draws, which node_c hears
+        // of, and node_c stops.
         _ = await nodeB.SafePsqlAsync(Database, "ALTER FUNCTION worf.sequence_range_exchange_paused(text) RENAME TO sequence_range_exchange", token);
-        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM worf.sequence_range_link)", token), "node_c calling node_b");
-        _ = await InsertIdsAsync(nodeB, "registered", token);
+        Assert.IsTrue(await NamedNodeCAsync(nodeB, token), "node_a telling node_b back of node_c");
         await nodeA.StopAsync("fast", token);
         HashSet<string> before = await InsertIdsAsync(nodeB, "before", token);
         const string HeardOfB = "FROM worf.sequence_range_node WHERE node_name = 'node_b' AND seqoid = 't_id_seq'::regclass";
         Assert.IsTrue(await nodeC.PollQueryUntilAsync(Database, $"SELECT drawn >= {before.Max(long.Parse)} {HeardOfB}", token), "node_c hearing of node_b's draws");
-        string nodeCId = await nodeC.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
         await nodeC.StopAsync("fast", token);
 
-        // node_b is restored and node_a started: node_a names node_c back to node_b, which waits for node_c, down, by its
-        // id until it has heard its name, unless node_a, from node_b's WAL position, has it reset and draw from new blocks;
-        // either way it draws none of what node_c holds.
+        // node_b is restored and node_a started: node_a names node_c back to node_b, which waits for node_c, down, unless
+        // node_a, from node_b's WAL position, has it reset and draw from new blocks; either way it draws none of what node_c
+        // holds.
         int restored = nodeB.ReadLog().Length;
         await RestoreDataAsync(nodeB, copy, token);
         await nodeA.StartServerAsync(token);
-        HashSet<string> after = await WaitsOrResetsAsync(nodeB, ["node_c", $"{nodeCId},"], restored, token);
+        Assert.IsTrue(await NamedNodeCAsync(nodeB, token), "node_a naming node_c to the restored node_b");
+        HashSet<string> after = await WaitsOrResetsAsync(nodeB, ["node_c"], restored, token);
 
         // Once node_c is back and finds node_b went back, node_b never draws those values again.
         await nodeC.StartServerAsync(token);
         after.UnionWith(await InsertIdsAsync(nodeB, "after", token));
         Assert.AreEqual("", string.Join(",", before.Intersect(after)), "the ids node_b drew both before the restore and after it");
+    }
+
+    /// <summary>
+    /// Waits until a neighbor has named node_c to a node as a neighbor of its own. A build from before nodes told each
+    /// other of their neighbors has no table of them and nothing to wait for, so the wait is over at once there (2203).
+    /// </summary>
+    private static async Task<bool> NamedNodeCAsync(TestNode node, CancellationToken token)
+    {
+        try
+        {
+            return await node.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM worf.sequence_range_named WHERE neighbor_name = 'node_c')", token);
+        }
+        catch (PostgresException missing) when (missing.SqlState == "42P01")
+        {
+            return true;
+        }
     }
 
     /// <summary>
