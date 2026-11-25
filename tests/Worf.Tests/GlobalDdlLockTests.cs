@@ -357,10 +357,20 @@ public sealed class GlobalDdlLockTests
                     _ = await timeout.ExecuteNonQueryAsync(token);
                 }
 
+                int unqueuedAt = nodeA.ReadLog().Length;
                 await using NpgsqlCommand build = new("CREATE UNIQUE INDEX CONCURRENTLY dupe_id ON dupe (id)", building);
                 PostgresException unqueued = await Assert.ThrowsExactlyAsync<PostgresException>(() => build.ExecuteNonQueryAsync(token));
                 Assert.AreEqual("55P03", unqueued.SqlState);
-                await WritesGoSoonAsync(nodeB, "UPDATE dupe SET v = v WHERE id = 0", "the build's fence went as its DDL couldn't be queued", token);
+
+                // node_b asks node_a about the fence as the build's session ends, rather than ten seconds later, and can't
+                // read the queue either, so it takes the DDL for queued and lets the fence go once it has applied as far
+                // as node_a had written then. How soon it hears that it has is node_a's walsender's to say, which took 19 s
+                // on a CI runner, so the ask is timed, on node_a's clock, and the write only waited for: node_a logs
+                // the ask's read of the queue giving up a second after it logged the build's wait for the queue doing so.
+                Assert.IsTrue(await PollSucceedsAsync(nodeB, "UPDATE dupe SET v = v WHERE id = 0", token), "the build's fence went as its DDL couldn't be queued");
+                List<DateTime> gaveUp = nodeA.LogTimes(unqueuedAt, "canceling statement due to lock timeout");
+                Assert.IsGreaterThanOrEqualTo(2, gaveUp.Count, "the build's wait for the queue and node_b's read of it, each given up");
+                Assert.IsLessThan(5000.0, (gaveUp[1] - gaveUp[0]).TotalMilliseconds, "how long after the build failed node_b's ask of node_a gave up reading the queue, in ms");
             }
 
             // An index that REINDEX SCHEMA, or a column's new type or a concurrent reindex from any session, builds
