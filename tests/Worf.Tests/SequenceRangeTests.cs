@@ -4364,7 +4364,8 @@ public sealed partial class SequenceRangeTests
     /// nothing, each in a session of its own that has run nothing else: its calls of nextval are read once for its text,
     /// rather than from its plan's text each time it starts, and so are a statement's with parameters, as a driver sends
     /// its values, which makes none. The two sessions' inserts of 4,000 literal rows, and of 1,000 rows of parameters,
-    /// alternate, and the first 20 of each warm up. The test runs alone, as other tests' load hides the difference.
+    /// alternate, the first 20 of each warm up, and of the 40 that follow, each session's fastest 30 count, as a busy
+    /// runner stalls a statement now and then. The test runs alone, as other tests' load hides the difference.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -4405,21 +4406,27 @@ public sealed partial class SequenceRangeTests
 
             await using NpgsqlCommand drawingInsert = Insert(drawingConnection, drawingTransaction);
             await using NpgsqlCommand plainInsert = Insert(plainConnection, plainTransaction);
-            TimeSpan drawing = TimeSpan.Zero;
-            TimeSpan plainly = TimeSpan.Zero;
+            List<TimeSpan> drawingTimes = [];
+            List<TimeSpan> plainTimes = [];
             for (int i = 0; i < 60; i++)
             {
                 foreach ((NpgsqlCommand insert, bool drew) in i % 2 == 0 ? new[] { (drawingInsert, true), (plainInsert, false) } : [(plainInsert, false), (drawingInsert, true)])
                 {
                     Stopwatch timing = Stopwatch.StartNew();
                     _ = await insert.ExecuteNonQueryAsync(token);
-                    drawing += i >= 20 && drew ? timing.Elapsed : TimeSpan.Zero;
-                    plainly += i >= 20 && !drew ? timing.Elapsed : TimeSpan.Zero;
+                    if (i >= 20)
+                    {
+                        (drew ? drawingTimes : plainTimes).Add(timing.Elapsed);
+                    }
                 }
             }
 
+            static TimeSpan Fastest(List<TimeSpan> times) => TimeSpan.FromTicks(times.Order().Take(30).Sum(time => time.Ticks));
+            TimeSpan drawing = Fastest(drawingTimes);
+            TimeSpan plainly = Fastest(plainTimes);
             string what = sql == values ? "4,000 literal rows" : "1,000 rows of parameters";
-            Assert.IsLessThan(plainly * 1.2, drawing, $"40 inserts of {what} in a transaction that drew s1, against {plainly} in one that didn't");
+            Assert.IsLessThan(plainly * 1.2, drawing, $"the fastest 30 of 40 inserts of {what} in a transaction that drew s1, against {plainly} in one that didn't; " +
+                $"the slowest took {drawingTimes.Max()} and {plainTimes.Max()}");
         }
 
         await drawingTransaction.RollbackAsync(token);
@@ -7819,15 +7826,16 @@ public sealed partial class SequenceRangeTests
         HashSet<string> before = await InsertIdsAsync(nodeB, "before", token);
         const string HeardOfB = "FROM worf.sequence_range_node WHERE node_name = 'node_b' AND seqoid = 't_id_seq'::regclass";
         Assert.IsTrue(await nodeC.PollQueryUntilAsync(Database, $"SELECT drawn >= {before.Max(long.Parse)} {HeardOfB}", token), "node_c hearing of node_b's draws");
+        string nodeCId = await nodeC.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
         await nodeC.StopAsync("fast", token);
 
-        // node_b is restored and node_a started: node_a names node_c back to node_b, which waits for node_c, down, unless
-        // node_a, from node_b's WAL position, has it reset and draw from new blocks; either way it draws none of what node_c
-        // holds.
+        // node_b is restored and node_a started: node_a names node_c back to node_b, which waits for node_c, down, by its
+        // id until it has heard its name, unless node_a, from node_b's WAL position, has it reset and draw from new blocks;
+        // either way it draws none of what node_c holds.
         int restored = nodeB.ReadLog().Length;
         await RestoreDataAsync(nodeB, copy, token);
         await nodeA.StartServerAsync(token);
-        HashSet<string> after = await WaitsOrResetsAsync(nodeB, ["node_c"], restored, token);
+        HashSet<string> after = await WaitsOrResetsAsync(nodeB, ["node_c", $"{nodeCId},"], restored, token);
 
         // Once node_c is back and finds node_b went back, node_b never draws those values again.
         await nodeC.StartServerAsync(token);
