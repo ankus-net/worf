@@ -467,6 +467,12 @@ internal static unsafe partial class Executor
                 NativeMethods.standard_ProcessUtility(pstmt, queryString, readOnlyTree, context, @params, queryEnv, dest, qc);
             }
 
+            // A block that drew outside any plan, as a DO block's assignments do, draws no more.
+            if (context == ProcessUtilityContext.PROCESS_UTILITY_TOPLEVEL)
+            {
+                SequenceRangeGuard.EndCommand();
+            }
+
             // A statement that may change the catalogs, in a subtransaction, ends it with a record decoding takes a
             // base snapshot from.
             if (MayChangeCatalogs(parsetree->type))
@@ -726,6 +732,12 @@ internal static unsafe partial class Executor
     {
         // A statement starts expressions as it runs, as a VALUES row's, a CHECK's or those of a partition taking a row.
         bool starting = SequenceRangeGuard.StartingRun(queryDesc);
+
+        // Rows that go to the client as they're produced wait on it, as those a query's own consumer takes don't.
+        bool toClient = queryDesc->dest is not null && queryDesc->dest->mydest is CommandDest.DestRemote or CommandDest.DestRemoteExecute or
+            CommandDest.DestRemoteSimple or CommandDest.DestCopyOut or CommandDest.DestDebug;
+        bool noted = SequenceRangeGuard.EnterRun((nint)queryDesc, toClient);
+        bool failed = true;
         try
         {
             if (!s_nextExecutorRunHook.IsNull)
@@ -745,14 +757,13 @@ internal static unsafe partial class Executor
 #endif
             }
 
-            // A statement run to its end draws no more rows, though its portal stays open until the client's next command.
-            if (count == 0)
-            {
-                SequenceRangeGuard.RanToEnd((nint)queryDesc);
-            }
+            failed = false;
         }
         finally
         {
+            // A SELECT run to its end draws no more, though its portal stays open until the client's next command.
+            SequenceRangeGuard.LeaveRun((nint)queryDesc, toClient, noted, failed, count == 0 && queryDesc->operation == CmdType.CMD_SELECT &&
+                queryDesc->plannedstmt is not null && !queryDesc->plannedstmt->hasModifyingCTE);
             if (starting)
             {
                 SequenceRangeGuard.StartedExpressions();
@@ -764,6 +775,8 @@ internal static unsafe partial class Executor
     {
         // A data-modifying WITH that the statement didn't read to its end writes the rest of its rows as it finishes.
         bool starting = SequenceRangeGuard.StartingRun(queryDesc);
+        bool noted = SequenceRangeGuard.EnterRun((nint)queryDesc, false);
+        bool failed = true;
         try
         {
             if (!s_nextExecutorFinishHook.IsNull)
@@ -774,9 +787,12 @@ internal static unsafe partial class Executor
             {
                 NativeMethods.standard_ExecutorFinish(queryDesc);
             }
+
+            failed = false;
         }
         finally
         {
+            SequenceRangeGuard.LeaveRun((nint)queryDesc, false, noted, failed, false);
             if (starting)
             {
                 SequenceRangeGuard.StartedExpressions();

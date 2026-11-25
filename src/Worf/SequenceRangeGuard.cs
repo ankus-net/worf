@@ -200,7 +200,9 @@ internal static partial class SequenceRangeGuard
     // counters it was looked up at.
     private static readonly Dictionary<uint, (bool Guarded, bool Argued)> s_guarded = [];
     private static (long Version, long Local) s_guardedAt = (-1, -1);
-    private static bool s_gatesRegistered;
+
+    // Whether the transaction has taken on the callbacks that forget, as it ends, what the guard notes of its statements.
+    private static bool s_endRegistered;
 
     // The sequences this backend waits for a switch of, which it counts until it stops waiting, or exits, as at a FATAL
     // error, which skips the code after the wait.
@@ -290,10 +292,32 @@ internal static partial class SequenceRangeGuard
     // counts them, and how many of those they took since it last counted.
     private static readonly Dictionary<uint, (long Promised, long Drawn)> s_promised = [];
 
-    // The statements running in this backend, with the subtransactions they started in.
-    private static readonly List<(nint QueryDesc, uint Subxact)> s_running = [];
-    private static bool s_runningRegistered;
-    private static bool s_drawingRegistered;
+    // The sequences whose gates this backend holds for a unit of a statement that draws without gates of its own, a row
+    // of its plan or a PL/pgSQL statement, which it lets go as the unit ends, rather than for a statement that writes.
+    private static readonly HashSet<uint> s_unitGates = [];
+
+    // The executor runs, plan rows and PL/pgSQL statements under way that may hold such gates, innermost last: each with
+    // its kind, what it is, the function state a PL/pgSQL statement runs under, the subtransaction a PL/pgSQL statement
+    // started in, and where the gates it took start among those the scopes took, innermost last too.
+    private static readonly List<(byte Kind, nint Key, nint Owner, uint Subxact, int First)> s_scopes = [];
+    private static readonly List<uint> s_scopeGates = [];
+    private const byte RunScope = 1;
+    private const byte RowScope = 2;
+    private const byte StatementScope = 3;
+
+    // The PL/pgSQL statements whose own expressions were seen to draw this transaction, which take their sequences' gates
+    // as they start; whether PL/pgSQL's plugin is worf's own, which alone tells worf of a statement's end; and how many
+    // statement scopes are open, while any of which PL/pgSQL tells it.
+    private static readonly HashSet<nint> s_drawingStatements = [];
+    private static bool s_ownsPlugin;
+    private static int s_statementScopes;
+
+    // The statement run, as a QueryDesc, under which each sequence's count of draws before its next check was given, or
+    // zero outside any, which gives it up as the run ends.
+    private static readonly Dictionary<uint, nint> s_shareRuns = [];
+
+    // The rows counted down since one last looked for a switch waiting for the gates this backend holds.
+    private static int s_rowsSincePass;
     private static bool s_countingDown;
 
     // Where each of those sequences was as it was last counted down for a call that names no sequence, which counts one
@@ -312,7 +336,6 @@ internal static partial class SequenceRangeGuard
     // sequences they name, by the function's compiled state.
     private static readonly Dictionary<nint, (int Calls, HashSet<uint> Named)> s_functionDraws = [];
     private static bool s_functionDrawsRegistered;
-    private static bool s_countedRegistered;
 
     [PgNativeCallback(nameof(CountedRow))]
     private static partial ExecProcNodeMtd CountedRowCallback { get; }
@@ -321,7 +344,6 @@ internal static partial class SequenceRangeGuard
     // statements drawing from it from their first check on, until they end: by the depth of the statements starting as
     // each was counted, and the statement it is, once its plan has started.
     private static readonly List<(int Depth, nint Statement, uint Subxact, uint Seqoid)> s_ungatedDrawers = [];
-    private static bool s_ungatedDrawersRegistered;
 
     // The source plan nodes of the upserts and merges that hold gates, with the functions that produce their rows and
     // the sequences their rows draw from, which the guard checks before each row, and those sequences by the statement,
@@ -334,6 +356,9 @@ internal static partial class SequenceRangeGuard
 
     [PgNativeCallback(nameof(PlpgsqlStatement))]
     private static partial PLpgSQL_plugin_stmt_begCallback PlpgsqlStatementCallback { get; }
+
+    [PgNativeCallback(nameof(PlpgsqlStatementEnd))]
+    private static partial PLpgSQL_plugin_stmt_endCallback PlpgsqlStatementEndCallback { get; }
 
     // The points in each sequence's active block, by sequence and value, at which this backend has woken the range worker.
     private static readonly HashSet<(uint Seqoid, long Mark)> s_woken = [];
@@ -605,22 +630,14 @@ internal static partial class SequenceRangeGuard
     /// <param name="written">The tables it writes to.</param>
     internal static unsafe void StartStatement(QueryDesc* queryDesc, List<uint> written)
     {
-        Running((nint)queryDesc);
-
-        // A statement counts down for the sequences its calls of nextval name, and, when one names none, its rows count
-        // the others the transaction draws from down as they're seen to draw from them, and a statement with no such call,
-        // which draws nothing as it starts, counts down for none.
+        // A statement one of whose calls of nextval names no sequence has its rows count the sequences the transaction
+        // draws from down as they're seen to draw from them. The sequences its calls name are checked as its rows start.
         if (s_drawingUngated.Count > 0 && queryDesc->plannedstmt is not null)
         {
             (HashSet<uint> called, int calls, bool unnamed) = StatementDraws(queryDesc);
             if (unnamed)
             {
                 StartUnnamed(called, calls);
-            }
-
-            if (calls > 0)
-            {
-                CountDownDraws(1, called);
             }
         }
 
@@ -734,7 +751,6 @@ internal static partial class SequenceRangeGuard
     /// <param name="queryDesc">The statement.</param>
     internal static unsafe void EndStatement(QueryDesc* queryDesc)
     {
-        Ended((nint)queryDesc);
         _ = s_planStarted.Remove((nint)queryDesc);
         _ = s_rowsDrawing.Remove((nint)queryDesc);
         if (s_hookingStatements.Count > 0)
@@ -743,22 +759,7 @@ internal static partial class SequenceRangeGuard
         }
 
         ForgetCounted((nint)queryDesc);
-        for (int i = s_ungatedDrawers.Count - 1; i >= 0; i--)
-        {
-            if (s_ungatedDrawers[i].Statement == (nint)queryDesc)
-            {
-                // The statement's rows are done, so the draws it could still take without a check go back to the other
-                // statements, and the transaction's next draw checks first.
-                uint seqoid = s_ungatedDrawers[i].Seqoid;
-                CountDrawer(seqoid, -1);
-                s_ungatedDrawers.RemoveAt(i);
-                if (s_drawingUngated.ContainsKey(seqoid))
-                {
-                    s_drawingUngated[seqoid] = 0;
-                    Promise(seqoid, 0);
-                }
-            }
-        }
+        EndDrawing((nint)queryDesc);
 
         if (s_moving.Count > 0)
         {
@@ -1262,7 +1263,7 @@ internal static partial class SequenceRangeGuard
             return false;
         }
 
-        List<uint> held = LetGates();
+        List<(uint Seqoid, bool Unit)> held = LetGates();
         try
         {
             long deadline = Worker.GetCurrentTimestamp() + BlockWait(seqoid);
@@ -1323,6 +1324,7 @@ internal static partial class SequenceRangeGuard
             PLpgSQL_plugin* plugin = (PLpgSQL_plugin*)NativeMemory.AllocZeroed((nuint)sizeof(PLpgSQL_plugin));
             plugin->stmt_beg = PlpgsqlStatementCallback;
             *s_plpgsqlPlugin = plugin;
+            s_ownsPlugin = true;
         }
     }
 
@@ -1344,7 +1346,7 @@ internal static partial class SequenceRangeGuard
             int location = planned->stmt_location;
             int length = planned->stmt_len;
             s_starting.Add(new(() => Draws(PlanText((Node*)statement)), (nint)NativeGlobals.error_context_stack, false,
-                source == 0 || parameters ? null : () => StatementText(source, location, length)));
+                source == 0 || parameters ? null : () => StatementText(source, location, length), planned: true));
             return;
         }
 
@@ -1400,27 +1402,39 @@ internal static partial class SequenceRangeGuard
         StartedExpressions();
     }
 
+    // Counts a statement no more among those drawing from its sequences, as it ends, or once it has run to its end: the
+    // draws it could still take without a check go back to the other statements, and the transaction's next draw checks
+    // first.
+    private static void EndDrawing(nint queryDesc)
+    {
+        for (int i = s_ungatedDrawers.Count - 1; i >= 0; i--)
+        {
+            if (s_ungatedDrawers[i].Statement == queryDesc)
+            {
+                uint seqoid = s_ungatedDrawers[i].Seqoid;
+                long promised = s_promised.Remove(seqoid, out (long Promised, long Drawn) held) ? held.Promised : 0;
+                CountDrawer(seqoid, -1, promised: -promised);
+                if (promised != 0)
+                {
+                    _ = PgAtomic.Add(SequenceRanges.PromisedDraws, -promised);
+                }
+
+                s_ungatedDrawers.RemoveAt(i);
+                _ = s_shareRuns.Remove(seqoid);
+                if (s_drawingUngated.ContainsKey(seqoid))
+                {
+                    s_drawingUngated[seqoid] = 0;
+                }
+            }
+        }
+    }
+
     // Counts the statement whose plan is starting among those drawing from sequences it draws from without their gates,
     // before it first checks them, so that statements drawing at once, each one value before it checks again, leave one
     // another values enough, until it ends.
     private static void CountUngated(List<uint> sequences)
     {
-        if (!s_ungatedDrawersRegistered)
-        {
-            s_ungatedDrawersRegistered = true;
-            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, ForgetUngatedDrawers);
-            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, ForgetUngatedDrawers);
-            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, ForgetUngatedDrawers);
-            _ = PgTransaction.RegisterSubtransactionCallback(PgSubtransactionEvent.Abort, static (aborted, parent) =>
-            {
-                foreach ((int, nint, uint, uint Seqoid) drawer in s_ungatedDrawers.Where(drawer => drawer.Subxact >= aborted.Value).ToList())
-                {
-                    CountDrawer(drawer.Seqoid, -1);
-                    _ = s_ungatedDrawers.Remove(drawer);
-                }
-            });
-        }
-
+        RegisterEnd();
         uint subxact;
         unsafe
         {
@@ -1434,6 +1448,32 @@ internal static partial class SequenceRangeGuard
         }
     }
 
+    // Counts this backend among those drawing from the sequences a PL/pgSQL function's own expression draws from, as a
+    // statement whose plan names them is counted, from the expression's first call on, until the statement run the
+    // function runs under ends, or, for a block outside any, as a DO block, until the block does.
+    private static void CountFunction(List<uint> sequences)
+    {
+        RegisterEnd();
+        int run = s_scopes.Count - 1;
+        while (run >= 0 && s_scopes[run].Kind != RunScope)
+        {
+            run--;
+        }
+
+        nint statement = run < 0 ? 0 : s_scopes[run].Key;
+        uint subxact;
+        unsafe
+        {
+            subxact = NativeMethods.GetCurrentSubTransactionId();
+        }
+
+        foreach (uint seqoid in sequences.Where(seqoid => !s_ungatedDrawers.Exists(drawer => drawer.Depth == -1 && drawer.Statement == statement && drawer.Seqoid == seqoid)))
+        {
+            CountDrawer(seqoid, 1);
+            s_ungatedDrawers.Add((-1, statement, subxact, seqoid));
+        }
+    }
+
     private static void ForgetUngatedDrawers()
     {
         foreach ((int, nint, uint, uint Seqoid) drawer in s_ungatedDrawers)
@@ -1442,7 +1482,6 @@ internal static partial class SequenceRangeGuard
         }
 
         s_ungatedDrawers.Clear();
-        s_ungatedDrawersRegistered = false;
     }
 
     // Has an upsert or a merge that holds gates check the sequences its rows draw from before each row its source gives,
@@ -1554,11 +1593,41 @@ internal static partial class SequenceRangeGuard
     }
 
     // Produces a plan node's next row, after counting down for the checks of the sequences the statement draws from.
+    // The row is a unit: it holds its sequences' gates from its check until it's produced, and no longer, so that a
+    // statement paused between its rows, as one whose client reads slowly, or a cursor between its FETCHes, holds none.
     private static unsafe TupleTableSlot* CountedRow(PlanState* node)
     {
         (ExecProcNodeMtd function, int calls, IReadOnlyCollection<uint>? named) = s_rowFunctions[(nint)node];
-        CountDownDraws(calls, named);
-        return function.Invoke(node);
+
+        // A Result with no plan under it gives one row a scan: once it has, its next call starts nothing.
+        bool single = node->type == NodeTag.T_ResultState && node->lefttree is null;
+        if (single && ((ResultState*)node)->rs_done)
+        {
+            return function.Invoke(node);
+        }
+
+        // A row under another, as one of many that a node gathers, is part of that row's unit, and the rows of a run
+        // whose rows no client reads, as an INSERT's source or a function's query, keep their gates until the run ends,
+        // passing them as a switch waits, as nothing but the rows' own work lies between them.
+        if (s_scopes.Count > 0 && s_scopes[^1] is { Kind: RowScope } or { Kind: RunScope, Owner: not 0 })
+        {
+            CountDownDraws(calls, named, gate: s_scopes[^1].Kind == RunScope, single: single);
+            return function.Invoke(node);
+        }
+
+        EnterScope(RowScope, (nint)node);
+        bool failed = true;
+        try
+        {
+            CountDownDraws(calls, named, single: single);
+            TupleTableSlot* row = function.Invoke(node);
+            failed = false;
+            return row;
+        }
+        finally
+        {
+            LeaveScope(RowScope, (nint)node, failed: failed);
+        }
     }
 
     // Counts a PL/pgSQL statement down, as PL/pgSQL starts it, as a loop's assignment draws each time it runs, which
@@ -1566,22 +1635,53 @@ internal static partial class SequenceRangeGuard
     // this transaction make, through the SQL functions they inline too, and for the sequences they name, or with none
     // started, for as many draws as its function's source has calls, for the sequences that source names, so that a
     // statement draws no sequence another's call left short down.
+    // A statement whose own expressions were seen to draw is a unit, which holds its sequences' gates from its check
+    // until it ends; any other takes none, as it may run long without drawing. One that starts within a unit that holds
+    // gates suspends it until it ends.
     private static unsafe void PlpgsqlStatement(PLpgSQL_execstate* estate, PLpgSQL_stmt* stmt)
     {
-        _ = stmt;
-        if (s_drawingUngated.Count == 0 || s_countingDown || s_namingGrantors || Worf.InOwnSql || estate is null || estate->func is null)
+        if (s_countingDown || s_namingGrantors || Worf.InOwnSql || estate is null || estate->func is null)
+        {
+            return;
+        }
+
+        bool drawing = s_drawingStatements.Contains((nint)stmt);
+        if (s_ownsPlugin && (drawing || s_unitGates.Count > 0))
+        {
+            EnterScope(StatementScope, (nint)stmt, (nint)estate);
+        }
+
+        if (s_drawingUngated.Count == 0)
         {
             return;
         }
 
         if (s_functionDraws.TryGetValue((nint)estate->func, out (int Calls, HashSet<uint> Named) noted))
         {
-            CountDownDraws(Math.Max(noted.Calls, 1), noted.Named);
+            CountDownDraws(Math.Max(noted.Calls, 1), noted.Named, gate: drawing);
         }
         else if (FunctionCalls(estate->func) is int calls and > 0)
         {
             HashSet<uint>? named = FunctionNamed(estate->func);
-            CountDownDraws(calls, named, unnamed: named is null);
+            CountDownDraws(calls, named, unnamed: named is null, gate: drawing);
+        }
+    }
+
+    // Ends a PL/pgSQL statement's scope, as PL/pgSQL tells of each statement's end while one is open.
+    private static unsafe void PlpgsqlStatementEnd(PLpgSQL_execstate* estate, PLpgSQL_stmt* stmt)
+    {
+        if (s_statementScopes > 0)
+        {
+            LeaveScope(StatementScope, (nint)stmt, (nint)estate);
+        }
+    }
+
+    // Has PL/pgSQL tell worf of its statements' ends, or no longer, through worf's own plugin.
+    private static unsafe void WatchStatementEnds(bool watch)
+    {
+        if (s_ownsPlugin && s_plpgsqlPlugin is not null && *s_plpgsqlPlugin is not null)
+        {
+            ((PLpgSQL_plugin*)*s_plpgsqlPlugin)->stmt_end = watch ? PlpgsqlStatementEndCallback : default;
         }
     }
 
@@ -1793,45 +1893,63 @@ internal static partial class SequenceRangeGuard
         }
     }
 
-    private static void RegisterCounted()
+    private static void RegisterCounted() => RegisterEnd();
+
+    // Has the transaction forget, as it ends, what the guard notes of the statements that draw in it, and a
+    // subtransaction that aborts what it notes of that one's: the statements counted among their sequences' drawers, the
+    // draws they may take without a check, the plan nodes that count down, and the gates. The transaction takes the
+    // callbacks on once, with its first such statement.
+    private static void RegisterEnd()
     {
-        if (s_countedRegistered)
+        if (s_endRegistered)
         {
             return;
         }
 
-        s_countedRegistered = true;
-        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, static () =>
+        s_endRegistered = true;
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () => ForgetStatements(false));
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, static () => ForgetStatements(true));
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.PrePrepare, static () => _ = LetGates());
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, static () => ForgetStatements(false));
+        _ = PgTransaction.RegisterSubtransactionCallback(PgSubtransactionEvent.Commit, static (subxact, parent) => PassGatesToParent(subxact.Value, parent.Value));
+        _ = PgTransaction.RegisterSubtransactionCallback(PgSubtransactionEvent.Abort, static (aborted, parent) =>
         {
-            s_countedNodes.Clear();
-            s_rowFunctions.Clear();
-            s_gatedRows.Clear();
-            s_countedRegistered = false;
-        });
-        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () => s_countedRegistered = false);
-        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, static () => s_countedRegistered = false);
-        _ = PgTransaction.RegisterSubtransactionCallback(PgSubtransactionEvent.Abort, static (aborted, _) =>
-        {
+            ForgetGatesOf(aborted.Value);
             foreach (nint queryDesc in s_countedNodes.Where(entry => entry.Value.Subxact >= aborted.Value).Select(entry => entry.Key).ToList())
             {
                 ForgetCounted(queryDesc);
             }
+
+            foreach ((int, nint, uint, uint Seqoid) drawer in s_ungatedDrawers.Where(drawer => drawer.Subxact >= aborted.Value).ToList())
+            {
+                CountDrawer(drawer.Seqoid, -1);
+                _ = s_ungatedDrawers.Remove(drawer);
+            }
         });
+    }
+
+    private static void ForgetStatements(bool aborted)
+    {
+        s_endRegistered = false;
+        ForgetUngatedDrawers();
+        ForgetUngated();
+
+        // The statements of a transaction that aborts end without ExecutorEnd.
+        if (aborted)
+        {
+            s_countedNodes.Clear();
+            s_rowFunctions.Clear();
+            s_gatedRows.Clear();
+        }
+
+        ForgetGates();
     }
 
     // Notes the managed sequences a statement draws from without their switch gates, after their first check, until the
     // transaction ends.
     private static void DrawUngated(List<uint> sequences)
     {
-        if (!s_drawingRegistered)
-        {
-            s_drawingRegistered = true;
-            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, ForgetUngated);
-            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, ForgetUngated);
-            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, ForgetUngated);
-        }
-
-        GateUngated(sequences);
+        RegisterEnd();
         foreach (uint seqoid in sequences)
         {
             Share(seqoid);
@@ -1842,6 +1960,51 @@ internal static partial class SequenceRangeGuard
         }
     }
 
+    // Notes the managed sequences a statement's plan names as it starts, which the statement draws from without their
+    // switch gates, for its first row to check: the plan starts its calls before the statement runs, as a cursor's does
+    // before its first FETCH, and a check then would hold values back, and a gate, while the session idles.
+    private static void DeferUngated(List<uint> sequences)
+    {
+        RegisterEnd();
+        foreach (uint seqoid in sequences)
+        {
+            _ = s_drawingUngated.TryAdd(seqoid, 0);
+        }
+    }
+
+    // Takes, as a call of nextval starts within a unit, the gates of the sequences it may draw from: for a call a
+    // PL/pgSQL statement's own expression makes, the statement is the unit, from now until it ends, and each time it
+    // starts again; for one a statement starts as it runs, the row it runs, or the run. A call that starts otherwise, as
+    // one a utility statement makes, takes none.
+    private static unsafe void GateStarting(bool plpgsql, nint estate, WorfStartingStatement? starting, List<uint> sequences)
+    {
+        if (plpgsql)
+        {
+            PLpgSQL_stmt* statement = estate == 0 ? null : ((PLpgSQL_execstate*)estate)->err_stmt;
+            if (!s_ownsPlugin || statement is null)
+            {
+                return;
+            }
+
+            _ = s_drawingStatements.Add((nint)statement);
+            if (s_scopes.Count == 0 || s_scopes[^1] is not { Kind: StatementScope } top || top.Key != (nint)statement || top.Owner != estate)
+            {
+                EnterScope(StatementScope, (nint)statement, estate);
+            }
+        }
+        else if (starting is not { Running: not 0 })
+        {
+            return;
+        }
+
+        foreach (uint seqoid in sequences.Order())
+        {
+            GateUnit(seqoid);
+        }
+
+        HearOfSwitches();
+    }
+
     private static void ForgetUngated()
     {
         foreach (uint seqoid in s_promised.Keys.ToList())
@@ -1849,9 +2012,10 @@ internal static partial class SequenceRangeGuard
             Promise(seqoid, 0);
         }
 
+        s_shareRuns.Clear();
+        s_drawingStatements.Clear();
         s_drawingUngated.Clear();
         s_unnamedMarks.Clear();
-        s_drawingRegistered = false;
     }
 
     // Counts a row, statement or call down, by the draws it may take, for each sequence drawn from without its gate that
@@ -1859,7 +2023,8 @@ internal static partial class SequenceRangeGuard
     // from it since, or at once when its block has run out, as any draw from it would fail, and checks it for the
     // switch, as before its first draw, once its count runs out, which half the values left before the block's last
     // twentieth, in the sequence's steps, sets, as other sessions may draw too.
-    private static void CountDownDraws(long draws = 1, IReadOnlyCollection<uint>? only = null, bool gated = false, bool unnamed = false)
+    private static void CountDownDraws(long draws = 1, IReadOnlyCollection<uint>? only = null, bool gated = false, bool unnamed = false,
+        bool gate = true, bool single = false)
     {
         if (s_drawingUngated.Count == 0 || s_countingDown || s_namingGrantors || Worf.InOwnSql)
         {
@@ -1869,9 +2034,36 @@ internal static partial class SequenceRangeGuard
         s_countingDown = true;
         try
         {
-            // A row lets the gates its statement took go while a switch waits for them, and takes them again once the
-            // switch has committed, so that the switch moves no sequence between a row's check and its draws.
-            if (s_gates.Count > 0)
+            // The unit takes the gates of the sequences it may draw from, in their order, so that a switch beside it
+            // moves none of them between its check and its draws. One that holds them already, as a row of many under
+            // one that gathers them does, lets them go while a switch waits for them, and takes them again once the
+            // switch has committed.
+            bool held = s_gates.Count > 0;
+            if (gate && s_scopes.Count > 0)
+            {
+                if (s_drawingUngated.Count == 1)
+                {
+                    uint seqoid = OnlyUngated();
+                    if (only is null || unnamed || only.Contains(seqoid))
+                    {
+                        GateUnit(seqoid);
+                    }
+                }
+                else
+                {
+                    foreach (uint seqoid in s_drawingUngated.Keys.Where(seqoid => only is null || unnamed || only.Contains(seqoid)).Order().ToList())
+                    {
+                        GateUnit(seqoid);
+                    }
+                }
+            }
+
+            // A unit that has just taken its gates holds up no switch yet. One that held gates before, as a row under
+            // the row that took them, looks for a waiting switch every few rows, as the look reads shared memory, and
+            // one with none, which nothing keeps a switch from moving beside, at every row.
+            bool switching = s_gates.Count == 0 ? SequenceRanges.SwitchesPending.Value != 0
+                : held && (++s_rowsSincePass & 7) == 0 && SequenceRanges.SwitchesPending.Value != 0;
+            if (switching && s_gates.Count > 0)
             {
                 _ = PassGates();
             }
@@ -1895,7 +2087,7 @@ internal static partial class SequenceRangeGuard
             }
 
             // So does a row while the switch is under way, as it may have moved the sequence already.
-            else if (SequenceRanges.SwitchesPending.Value != 0)
+            else if (switching)
             {
                 foreach (uint seqoid in s_drawingUngated.Keys.Where(seqoid => Drawer(seqoid).Switching > 0).ToList())
                 {
@@ -1903,49 +2095,75 @@ internal static partial class SequenceRangeGuard
                 }
             }
 
+            if (s_drawingUngated.Count == 1)
+            {
+                CountDown(OnlyUngated(), draws, only, gated, unnamed, single);
+                return;
+            }
+
             foreach (uint seqoid in s_drawingUngated.Keys.ToList())
             {
-                long count = draws;
-                bool runOut = false;
-                if (only is null || !only.Contains(seqoid))
-                {
-                    if (only is not null && !unnamed)
-                    {
-                        continue;
-                    }
-
-                    count = SeenDrawn(seqoid, out long? seen);
-                    runOut = RunOut(seqoid, seen, draws);
-                    if (count == 0 && !runOut)
-                    {
-                        continue;
-                    }
-                }
-
-                if (!runOut && s_drawingUngated[seqoid] >= count)
-                {
-                    s_drawingUngated[seqoid] -= count;
-                    Drew(seqoid, count);
-                    continue;
-                }
-
-                // The values left of the sequence's count count no more, for this check and those of other statements.
-                Promise(seqoid, 0);
-                if (gated || !StatementGated(seqoid))
-                {
-                    WaitWhileShort(seqoid, Math.Max(Math.Max(count, draws), 1));
-                }
-
-                Share(seqoid);
-                if (Position(seqoid) is long position)
-                {
-                    s_unnamedMarks[seqoid] = position;
-                }
+                CountDown(seqoid, draws, only, gated, unnamed, single);
             }
         }
         finally
         {
             s_countingDown = false;
+        }
+    }
+
+    // The one sequence drawn from without its gate, read without a list of them all, as every row reads it.
+    private static uint OnlyUngated()
+    {
+        using Dictionary<uint, long>.KeyCollection.Enumerator keys = s_drawingUngated.Keys.GetEnumerator();
+        return keys.MoveNext() ? keys.Current : 0;
+    }
+
+    // Counts one sequence down for a row, statement or call, as CountDownDraws does each.
+    private static void CountDown(uint seqoid, long draws, IReadOnlyCollection<uint>? only, bool gated, bool unnamed, bool single)
+    {
+        long count = draws;
+        bool runOut = false;
+        if (only is null || !only.Contains(seqoid))
+        {
+            if (only is not null && !unnamed)
+            {
+                return;
+            }
+
+            count = SeenDrawn(seqoid, out long? seen);
+            runOut = RunOut(seqoid, seen, draws);
+            if (count == 0 && !runOut)
+            {
+                return;
+            }
+        }
+
+        if (!runOut && s_drawingUngated[seqoid] >= count)
+        {
+            s_drawingUngated[seqoid] -= count;
+            Drew(seqoid, count);
+            return;
+        }
+
+        // The values left of the sequence's count count no more, for this check and those of other statements.
+        Promise(seqoid, 0);
+        if (gated || !StatementGated(seqoid))
+        {
+            WaitWhileShort(seqoid, Math.Max(Math.Max(count, draws), 1));
+        }
+
+        // A statement of one row counts no draws for later rows, which it would hold back from the others for nothing.
+        if (single)
+        {
+            s_drawingUngated[seqoid] = 0;
+            return;
+        }
+
+        Share(seqoid);
+        if (Position(seqoid) is long position)
+        {
+            s_unnamedMarks[seqoid] = position;
         }
     }
 
@@ -2063,88 +2281,254 @@ internal static partial class SequenceRangeGuard
         return left <= 0 ? 0 : (long)Math.Min(left / step / 2 / Math.Max(Drawing(seqoid).Statements, 1), int.MaxValue);
     }
 
-    // Notes a statement that starts, with the subtransaction it starts in, so that one an error ends counts no more.
-    private static void Running(nint queryDesc)
+    /// <summary>
+    /// Notes an executor run that starts: a unit of an enclosing statement that holds gates lets them go meanwhile, as it
+    /// draws nothing while the run goes on, which may be long.
+    /// </summary>
+    /// <param name="queryDesc">The statement run.</param>
+    /// <param name="toClient">Whether the run's rows go to the client as they're produced, which may read them slowly,
+    /// so that each row lets its gates go as it's produced.</param>
+    /// <returns>Whether the run is noted, as worf's own statements, which a unit's check runs, aren't.</returns>
+    internal static bool EnterRun(nint queryDesc, bool toClient)
     {
-        // worf's own statements, as a wait reads its tables with, run within the statement that waits.
-        if (Worf.InOwnSql)
+        if (Worf.InOwnSql || s_countingDown || s_namingGrantors)
         {
-            return;
+            return false;
         }
 
-        if (!s_runningRegistered)
-        {
-            s_runningRegistered = true;
-            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, ForgetRunning);
-            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, ForgetRunning);
-            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, ForgetRunning);
-            _ = PgTransaction.RegisterSubtransactionCallback(PgSubtransactionEvent.Abort,
-                static (aborted, _) => s_running.RemoveAll(entry => entry.Subxact >= aborted.Value));
-        }
-
-        uint subxact;
-        unsafe
-        {
-            subxact = NativeMethods.GetCurrentSubTransactionId();
-        }
-
-        s_running.Add((queryDesc, subxact));
-    }
-
-    private static void ForgetRunning()
-    {
-        s_running.Clear();
-        s_runningRegistered = false;
+        EnterScope(RunScope, queryDesc, toClient ? 0 : 1);
+        return true;
     }
 
     /// <summary>
-    /// Notes a statement whose rows are all produced, which draws no more but as it finishes or as later statements do,
-    /// as it ends.
+    /// Notes an executor run that ends, as a FETCH's does with its cursor still open: the gates its rows left held go, the
+    /// draws its sequences could still take without a check go back to other backends' statements, so that its next run
+    /// checks first, and the unit of the enclosing statement takes its gates again.
     /// </summary>
-    /// <param name="queryDesc">The statement.</param>
-    internal static void RanToEnd(nint queryDesc) => Ended(queryDesc);
-
-    // Notes a statement that ends. Once no statement runs, none draws, so the draws this backend's statements could still
-    // take without a check go back to other backends' statements, and its next draw checks first.
-    private static void Ended(nint queryDesc)
+    /// <param name="queryDesc">The statement run.</param>
+    /// <param name="toClient">Whether the run's rows go to the client, as <see cref="EnterRun"/> was told.</param>
+    /// <param name="noted">Whether <see cref="EnterRun"/> noted the run.</param>
+    /// <param name="failed">Whether the run failed, whose transaction or subtransaction lets its gates go.</param>
+    /// <param name="ended">Whether the statement ran to its end and draws no more.</param>
+    internal static void LeaveRun(nint queryDesc, bool toClient, bool noted, bool failed, bool ended)
     {
-        if (Worf.InOwnSql)
+        if (!noted)
         {
             return;
         }
 
-        _ = s_running.RemoveAll(entry => entry.QueryDesc == queryDesc);
-        if (s_running.Count == 0 && s_gates.Count > 0)
+        LeaveScope(RunScope, queryDesc, toClient ? 0 : 1, failed);
+        if (failed)
         {
-            foreach (uint seqoid in s_gates.Keys.Where(seqoid => !StatementGated(seqoid)).ToList())
+            return;
+        }
+
+        if (ended && s_ungatedDrawers.Count > 0)
+        {
+            EndDrawing(queryDesc);
+        }
+
+        if (s_shareRuns.Count == 0)
+        {
+            return;
+        }
+
+        foreach (uint seqoid in s_shareRuns.Where(share => share.Value == queryDesc).Select(share => share.Key).ToList())
+        {
+            _ = s_shareRuns.Remove(seqoid);
+            if (s_drawingUngated.ContainsKey(seqoid))
+            {
+                s_drawingUngated[seqoid] = 0;
+            }
+
+            Promise(seqoid, 0);
+        }
+    }
+
+    /// <summary>
+    /// Gives up, as a statement outside any other ends, the draws this backend's statements could still take without a
+    /// check, as those a PL/pgSQL block counted outside a plan.
+    /// </summary>
+    internal static void EndCommand()
+    {
+        if (s_scopes.Count > 0 || Worf.InOwnSql)
+        {
+            return;
+        }
+
+        // A block's functions, which were counted among their sequences' drawers outside any statement, draw no more.
+        if (s_ungatedDrawers.Count > 0)
+        {
+            EndDrawing(0);
+        }
+
+        foreach (uint seqoid in s_promised.Keys.ToList())
+        {
+            if (s_drawingUngated.ContainsKey(seqoid))
+            {
+                s_drawingUngated[seqoid] = 0;
+            }
+
+            Promise(seqoid, 0);
+        }
+
+        s_shareRuns.Clear();
+    }
+
+    // Starts a scope. A run or a PL/pgSQL statement that starts within a unit suspends it: the gates the enclosing scopes
+    // hold go until it ends, as their units draw nothing meanwhile. A row lets go of the gates a call took that started
+    // in its run before any row's check, as the first of a statement's calls that start as it runs does.
+    private static void EnterScope(byte kind, nint key, nint owner = 0)
+    {
+        if (kind != RowScope && s_unitGates.Count > 0)
+        {
+            foreach (uint seqoid in s_unitGates.ToList())
             {
                 LetGate(seqoid);
             }
         }
-
-        if (s_running.Count == 0 && s_promised.Count > 0)
+        else if (kind == RowScope && s_scopes.Count > 0 && s_scopes[^1].Kind == RunScope && s_scopeGates.Count > s_scopes[^1].First)
         {
-            foreach (uint seqoid in s_promised.Keys.ToList())
+            for (int i = s_scopeGates.Count - 1; i >= s_scopes[^1].First; i--)
             {
-                if (s_drawingUngated.ContainsKey(seqoid))
+                if (s_unitGates.Contains(s_scopeGates[i]))
                 {
-                    s_drawingUngated[seqoid] = 0;
+                    LetGate(s_scopeGates[i]);
                 }
-
-                Promise(seqoid, 0);
             }
+
+            s_scopeGates.RemoveRange(s_scopes[^1].First, s_scopeGates.Count - s_scopes[^1].First);
+        }
+
+        uint subxact = 0;
+        if (kind == StatementScope)
+        {
+            RegisterGates();
+            unsafe
+            {
+                subxact = NativeMethods.GetCurrentSubTransactionId();
+            }
+
+            WatchStatementEnds(++s_statementScopes > 0);
+        }
+
+        s_scopes.Add((kind, key, owner, subxact, s_scopeGates.Count));
+    }
+
+    // Ends a scope, and those left open within it: the gates they took go, and the scope now innermost, which a run or a
+    // PL/pgSQL statement suspended, takes its own again, and hears of the switches committed meanwhile. A scope that
+    // failed leaves its gates to the transaction or subtransaction that ends with it.
+    private static void LeaveScope(byte kind, nint key, nint owner = 0, bool failed = false)
+    {
+        int index = s_scopes.Count - 1;
+        while (index >= 0 && (s_scopes[index].Kind != kind || s_scopes[index].Key != key || s_scopes[index].Owner != owner))
+        {
+            index--;
+        }
+
+        if (index < 0)
+        {
+            return;
+        }
+
+        CloseScopes(index, !failed);
+        if (failed || kind == RowScope || s_scopes.Count == 0)
+        {
+            return;
+        }
+
+        // The gates of the rows and of the run or statement they run in, which were held as the scope started.
+        int from = s_scopes.Count - 1;
+        while (from > 0 && s_scopes[from].Kind == RowScope)
+        {
+            from--;
+        }
+
+        bool taken = false;
+        for (int i = s_scopes[from].First; i < s_scopeGates.Count; i++)
+        {
+            if (!s_gates.ContainsKey(s_scopeGates[i]))
+            {
+                TakeGate(s_scopeGates[i], unit: true);
+                taken = true;
+            }
+        }
+
+        if (taken)
+        {
+            HearOfSwitches();
         }
     }
 
-    // Takes the switch gates of sequences that statements draw from without gates of their own, after their first check,
-    // so that a switch beside them moves a sequence only between their rows, as it does for statements that write; a
-    // switch that committed meanwhile, as the take waits for, is heard of.
-    private static void GateUngated(List<uint> sequences)
+    // Forgets the scopes from one on, letting the gates they took go unless their transaction or subtransaction does.
+    private static void CloseScopes(int index, bool letGo)
     {
-        List<uint> taking = [.. sequences.Where(seqoid => !s_gates.ContainsKey(seqoid)).Distinct().Order()];
-        if (taking.Count > 0)
+        int first = s_scopes[index].First;
+        for (int i = s_scopeGates.Count - 1; letGo && i >= first; i--)
         {
-            TakeGates(taking);
+            if (s_unitGates.Contains(s_scopeGates[i]))
+            {
+                LetGate(s_scopeGates[i]);
+            }
+        }
+
+        s_scopeGates.RemoveRange(first, s_scopeGates.Count - first);
+        int statements = 0;
+        for (int i = index; i < s_scopes.Count; i++)
+        {
+            statements += s_scopes[i].Kind == StatementScope ? 1 : 0;
+        }
+
+        s_scopes.RemoveRange(index, s_scopes.Count - index);
+        if (statements > 0)
+        {
+            s_statementScopes -= statements;
+            WatchStatementEnds(s_statementScopes > 0);
+        }
+    }
+
+    // Takes a sequence's gate for the unit innermost, a row or a PL/pgSQL statement, or the run a call starts in outside
+    // a row, unless the backend holds it, so that a switch beside the unit moves the sequence only once the unit has
+    // drawn, and the unit reads the bounds of any switch before it. A call outside any, as one a plan starts before it
+    // runs, takes none, as it would hold it while the session idles.
+    private static void GateUnit(uint seqoid)
+    {
+        if (s_scopes.Count == 0 || s_gates.ContainsKey(seqoid))
+        {
+            return;
+        }
+
+        TakeGate(seqoid, unit: true);
+        s_scopeGates.Add(seqoid);
+    }
+
+    // Whether the unit now running, a row or the run or PL/pgSQL statement it runs in, took a sequence's gate, which a
+    // scope within it may have suspended since, or a statement made its own.
+    private static bool UnitTook(uint seqoid)
+    {
+        if (s_scopes.Count == 0)
+        {
+            return false;
+        }
+
+        int from = s_scopes.Count - 1;
+        while (from > 0 && s_scopes[from].Kind == RowScope)
+        {
+            from--;
+        }
+
+        return s_scopeGates.IndexOf(seqoid, s_scopes[from].First) >= 0;
+    }
+
+    // Reads the blocks and bounds again once a switch has committed since this backend last read them, as one it waited
+    // for at a gate has.
+    private static void HearOfSwitches()
+    {
+        if (SequenceRanges.Version.Value != s_version || SequenceRanges.LocalVersion != s_localVersion)
+        {
+            Refresh();
+            ForgetBounds();
+            Reload();
         }
     }
 
@@ -2156,8 +2540,24 @@ internal static partial class SequenceRangeGuard
     private static void Share(uint seqoid)
     {
         long rows = RowsUntilShort(seqoid);
-        s_drawingUngated[seqoid] = rows;
         Promise(seqoid, rows);
+
+        // The count holds only once the other statements can see it, so the values left are read again: those drawn
+        // between the first read and then, as while this backend waited for a processor, are none of the count's.
+        if (rows > 0 && RowsUntilShort(seqoid) is long left && left < rows)
+        {
+            rows = left;
+            Promise(seqoid, rows);
+        }
+
+        s_drawingUngated[seqoid] = rows;
+        int run = s_scopes.Count - 1;
+        while (run >= 0 && s_scopes[run].Kind != RunScope)
+        {
+            run--;
+        }
+
+        s_shareRuns[seqoid] = run < 0 ? 0 : s_scopes[run].Key;
     }
 
     // Counts the draws this backend may still take from a sequence without checking it in the shared table, in place of
@@ -2183,14 +2583,15 @@ internal static partial class SequenceRangeGuard
         HookExit();
     }
 
-    // Notes draws taken of the count, which the shared table counts no more once there are a few of them, so that other
-    // statements have the values the count no longer holds back without this backend taking the table's lock at every row.
+    // Notes draws taken of the count, which the shared table counts no more once there are a few of them, an eighth of
+    // the count at least, so that other statements have the values the count no longer holds back without this backend
+    // taking the table's lock at every row.
     private static void Drew(uint seqoid, long draws)
     {
         if (s_promised.TryGetValue(seqoid, out (long Promised, long Drawn) promised))
         {
             promised.Drawn += draws;
-            if (promised.Drawn >= PromiseBatch)
+            if (promised.Drawn >= Math.Max(PromiseBatch, promised.Promised / 8))
             {
                 long taken = Math.Min(promised.Drawn, promised.Promised);
                 CountDrawer(seqoid, 0, promised: -taken);
@@ -3385,6 +3786,22 @@ internal static partial class SequenceRangeGuard
         {
             CountUngated(switching);
         }
+        else if (plpgsql && switching.Count > 0)
+        {
+            CountFunction(switching);
+        }
+
+        // A plan that names its sequences leaves their checks to its first row.
+        if (!plpgsql && !anyOf && starting is { Planned: true })
+        {
+            DeferUngated(switching);
+            switching = [];
+        }
+
+        if (switching.Count > 0)
+        {
+            GateStarting(plpgsql, estate, starting, switching);
+        }
 
         foreach (uint seqoid in switching.Where(seqoid => !anyOf || spelled.Contains(seqoid) || RunOut(seqoid, Position(seqoid), rowCalls)))
         {
@@ -4288,7 +4705,7 @@ internal static partial class SequenceRangeGuard
         }
 
         using PgErrorContext context = PgErrorContext.Push("waiting for the file worf_starts in the data directory to keep this server's start");
-        List<uint> held = LetGates();
+        List<(uint Seqoid, bool Unit)> held = LetGates();
         try
         {
             long deadline = StartWaitEnds();
@@ -4371,7 +4788,7 @@ internal static partial class SequenceRangeGuard
             string waitingFor = $"waiting for node {parent}, {role}, to answer this server since it started" +
                 (unnamed ? ", as worf can't tell which sequence the call of nextval draws from before it runs" : "");
             using PgErrorContext context = PgErrorContext.Push(Worf.Shown(waitingFor));
-            List<uint> held = LetGates();
+            List<(uint Seqoid, bool Unit)> held = LetGates();
             try
             {
                 long deadline = StartWaitEnds();
@@ -4703,21 +5120,32 @@ internal static partial class SequenceRangeGuard
     /// </summary>
     private static void OpenGates(nint statement, List<uint> sequences)
     {
-        List<uint> taken = [];
-        foreach (uint seqoid in sequences.Distinct().Order().Where(seqoid => !s_gates.ContainsKey(seqoid)))
+        // A gate a unit holds around the statement, as a row's whose function runs the statement, becomes the
+        // statement's own, still held, until the statement ends, when it is the unit's again.
+        uint subxact;
+        unsafe
         {
-            TakeGate(seqoid);
+            subxact = NativeMethods.GetCurrentSubTransactionId();
+        }
+
+        List<uint> taken = [];
+        foreach (uint seqoid in sequences.Distinct().Order().Where(seqoid => !s_gates.ContainsKey(seqoid) || s_unitGates.Contains(seqoid)))
+        {
+            if (s_unitGates.Remove(seqoid))
+            {
+                s_gates[seqoid] = subxact;
+                CountDrawer(seqoid, 1);
+            }
+            else
+            {
+                TakeGate(seqoid);
+            }
+
             taken.Add(seqoid);
         }
 
         if (taken.Count > 0)
         {
-            uint subxact;
-            unsafe
-            {
-                subxact = NativeMethods.GetCurrentSubTransactionId();
-            }
-
             s_gating.Add((statement, subxact, taken));
             Refresh();
         }
@@ -4733,7 +5161,18 @@ internal static partial class SequenceRangeGuard
         {
             foreach (uint seqoid in s_gating[index].Sequences)
             {
-                LetGate(seqoid);
+                // A gate the unit around the statement took before it is the unit's again, still held, so that no switch
+                // moves the sequence before the unit's own draws.
+                if (s_gates.ContainsKey(seqoid) && UnitTook(seqoid))
+                {
+                    _ = s_unitGates.Add(seqoid);
+                    CountDrawer(seqoid, -1);
+                }
+                else
+                {
+                    LetGate(seqoid);
+                }
+
                 _ = s_gatedRowDraws.Remove(seqoid);
                 _ = s_unseenRowDraws.Remove(seqoid);
                 _ = s_rowMarks.Remove(seqoid);
@@ -4755,24 +5194,25 @@ internal static partial class SequenceRangeGuard
             return [];
         }
 
-        List<uint> passing = [.. s_gates.Keys.Where(seqoid => Drawer(seqoid).Switching > 0).Order()];
-        foreach (uint seqoid in passing)
+        List<(uint Seqoid, bool Unit)> passing = [.. s_gates.Keys.Where(seqoid => Drawer(seqoid).Switching > 0).Order()
+            .Select(seqoid => (seqoid, s_unitGates.Contains(seqoid)))];
+        foreach ((uint seqoid, _) in passing)
         {
             LetGate(seqoid);
         }
 
         TakeGates(passing);
-        return passing;
+        return [.. passing.Select(gate => gate.Seqoid)];
     }
 
     /// <summary>
     /// Lets every gate this backend holds go, as before it waits for a switch, which waits for the gates.
     /// </summary>
-    /// <returns>The gates it held.</returns>
-    private static List<uint> LetGates()
+    /// <returns>The gates it held, and whether each was a unit's.</returns>
+    private static List<(uint Seqoid, bool Unit)> LetGates()
     {
-        List<uint> held = [.. s_gates.Keys.Order()];
-        foreach (uint seqoid in held)
+        List<(uint Seqoid, bool Unit)> held = [.. s_gates.Keys.Order().Select(seqoid => (seqoid, s_unitGates.Contains(seqoid)))];
+        foreach ((uint seqoid, _) in held)
         {
             LetGate(seqoid);
         }
@@ -4783,11 +5223,11 @@ internal static partial class SequenceRangeGuard
     /// <summary>
     /// Takes gates again, and hears of the switches committed meanwhile.
     /// </summary>
-    private static void TakeGates(List<uint> gates)
+    private static void TakeGates(List<(uint Seqoid, bool Unit)> gates)
     {
-        foreach (uint seqoid in gates)
+        foreach ((uint seqoid, bool unit) in gates)
         {
-            TakeGate(seqoid);
+            TakeGate(seqoid, unit);
         }
 
         if (gates.Count > 0)
@@ -4796,28 +5236,77 @@ internal static partial class SequenceRangeGuard
         }
     }
 
-    private static unsafe void TakeGate(uint seqoid)
+    // Takes a sequence's gate, for a statement that writes, which counts among those drawing from the sequence while it
+    // holds it, or for a unit of one that doesn't, which its statement's own count covers.
+    private static unsafe void TakeGate(uint seqoid, bool unit = false)
     {
         HookExit();
         RegisterGates();
 
-        // The door, which a switch shuts, is passed on the way.
-        LOCKTAG door = GateTag(seqoid, DoorKey);
-        _ = NativeMethods.LockAcquire(&door, ShareLock, false, false);
-        LOCKTAG tag = GateTag(seqoid);
-        _ = NativeMethods.LockAcquire(&tag, ShareLock, false, false);
-        _ = NativeMethods.LockRelease(&door, ShareLock, false);
+        // The gate is free unless a switch holds it or waits for it, and then the door, which the switch shuts, is waited
+        // at first, as for a lock, until the switch has committed.
+        if (AcquireGate(seqoid, ShareLock, true) == LockAcquireResult.LOCKACQUIRE_NOT_AVAIL)
+        {
+            LOCKTAG door = GateTag(seqoid, DoorKey);
+            _ = NativeMethods.LockAcquire(&door, ShareLock, false, false);
+            _ = AcquireGate(seqoid, ShareLock, false);
+            _ = NativeMethods.LockRelease(&door, ShareLock, false);
+        }
+
         s_gates[seqoid] = NativeMethods.GetCurrentSubTransactionId();
-        CountDrawer(seqoid, 1);
+        if (unit)
+        {
+            _ = s_unitGates.Add(seqoid);
+        }
+        else
+        {
+            CountDrawer(seqoid, 1);
+        }
     }
 
-    private static unsafe void LetGate(uint seqoid)
+    private static void LetGate(uint seqoid)
     {
         if (s_gates.Remove(seqoid))
         {
-            LOCKTAG tag = GateTag(seqoid);
-            _ = NativeMethods.LockRelease(&tag, ShareLock, false);
-            CountDrawer(seqoid, -1);
+            ReleaseGate(seqoid, ShareLock);
+            if (!s_unitGates.Remove(seqoid))
+            {
+                CountDrawer(seqoid, -1);
+            }
+        }
+    }
+
+    // Takes a sequence's gate, as a statement does or a switch, under the transaction's own resource owner, whichever
+    // portal's or subtransaction's is current: PostgreSQL lets a lock go only under the owner that took it, and a gate
+    // taken as a cursor's row runs is let go as the loop over the cursor runs, under another.
+    private static unsafe LockAcquireResult AcquireGate(uint seqoid, int mode, bool nowait)
+    {
+        LOCKTAG tag = GateTag(seqoid);
+        ResourceOwnerData* current = NativeGlobals.CurrentResourceOwner;
+        NativeGlobals.CurrentResourceOwner = NativeGlobals.TopTransactionResourceOwner;
+        try
+        {
+            return NativeMethods.LockAcquire(&tag, mode, false, nowait);
+        }
+        finally
+        {
+            NativeGlobals.CurrentResourceOwner = current;
+        }
+    }
+
+    // Lets a sequence's gate go, under the resource owner AcquireGate took it under.
+    private static unsafe void ReleaseGate(uint seqoid, int mode)
+    {
+        LOCKTAG tag = GateTag(seqoid);
+        ResourceOwnerData* current = NativeGlobals.CurrentResourceOwner;
+        NativeGlobals.CurrentResourceOwner = NativeGlobals.TopTransactionResourceOwner;
+        try
+        {
+            _ = NativeMethods.LockRelease(&tag, mode, false);
+        }
+        finally
+        {
+            NativeGlobals.CurrentResourceOwner = current;
         }
     }
 
@@ -5075,64 +5564,70 @@ internal static partial class SequenceRangeGuard
     /// parent, one that aborts lets them go, as PostgreSQL does their locks, and a transaction that prepares lets them
     /// all go first, so that a prepared transaction holds none.
     /// </summary>
-    private static void RegisterGates()
+    private static void RegisterGates() => RegisterEnd();
+
+    // Passes the gates a subtransaction took to its parent as it commits.
+    private static void PassGatesToParent(uint subxact, uint parent)
     {
-        if (s_gatesRegistered)
+        foreach (uint seqoid in s_gates.Where(gate => gate.Value == subxact).Select(gate => gate.Key).ToList())
         {
-            return;
+            s_gates[seqoid] = parent;
         }
 
-        s_gatesRegistered = true;
-        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, ForgetGates);
-        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, ForgetGates);
-        _ = PgTransaction.RegisterCallback(PgTransactionEvent.PrePrepare, static () => _ = LetGates());
-        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, ForgetGates);
-        _ = PgTransaction.RegisterSubtransactionCallback(PgSubtransactionEvent.Commit, static (subxact, parent) =>
+        for (int i = 0; i < s_gating.Count; i++)
         {
-            foreach (uint seqoid in s_gates.Where(gate => gate.Value == subxact.Value).Select(gate => gate.Key).ToList())
+            if (s_gating[i].Subxact == subxact)
             {
-                s_gates[seqoid] = parent.Value;
+                s_gating[i] = s_gating[i] with { Subxact = parent };
             }
+        }
+    }
 
-            for (int i = 0; i < s_gating.Count; i++)
-            {
-                if (s_gating[i].Subxact == subxact.Value)
-                {
-                    s_gating[i] = s_gating[i] with { Subxact = parent.Value };
-                }
-            }
-        });
-
-        // The statements of a subtransaction that aborts end without ExecutorEnd.
-        _ = PgTransaction.RegisterSubtransactionCallback(PgSubtransactionEvent.Abort, static (aborted, parent) =>
+    // Lets go of the gates a subtransaction that aborts took: its statements end without ExecutorEnd, and its PL/pgSQL
+    // statements without their ends. The gates are the transaction's own, so PostgreSQL doesn't let them go with it.
+    private static void ForgetGatesOf(uint aborted)
+    {
+        foreach (uint seqoid in s_gates.Where(gate => gate.Value == aborted).Select(gate => gate.Key).ToList())
         {
-            foreach (uint seqoid in s_gates.Where(gate => gate.Value == aborted.Value).Select(gate => gate.Key).ToList())
+            _ = s_gates.Remove(seqoid);
+            ReleaseGate(seqoid, ShareLock);
+            if (s_unitGates.Remove(seqoid))
             {
-                _ = s_gates.Remove(seqoid);
-                _ = s_gatedRowDraws.Remove(seqoid);
-                _ = s_unseenRowDraws.Remove(seqoid);
-                _ = s_rowMarks.Remove(seqoid);
-                CountDrawer(seqoid, -1);
+                continue;
             }
 
-            _ = s_gating.RemoveAll(entry => entry.Subxact == aborted.Value);
-        });
+            _ = s_gatedRowDraws.Remove(seqoid);
+            _ = s_unseenRowDraws.Remove(seqoid);
+            _ = s_rowMarks.Remove(seqoid);
+            CountDrawer(seqoid, -1);
+        }
+
+        _ = s_gating.RemoveAll(entry => entry.Subxact == aborted);
+        int dead = s_scopes.FindIndex(scope => scope.Subxact != 0 && scope.Subxact >= aborted);
+        if (dead >= 0)
+        {
+            CloseScopes(dead, false);
+        }
     }
 
     private static void ForgetGates()
     {
         s_rowsDrawing.Clear();
-        foreach (uint seqoid in s_gates.Keys)
+        foreach (uint seqoid in s_gates.Keys.Where(seqoid => !s_unitGates.Contains(seqoid)))
         {
             CountDrawer(seqoid, -1);
         }
 
         s_gates.Clear();
+        s_unitGates.Clear();
+        s_scopes.Clear();
+        s_scopeGates.Clear();
+        s_statementScopes = 0;
+        WatchStatementEnds(false);
         s_gatedRowDraws.Clear();
         s_unseenRowDraws.Clear();
         s_rowMarks.Clear();
         s_gating.Clear();
-        s_gatesRegistered = false;
     }
 
     /// <summary>
@@ -5396,7 +5891,7 @@ internal static partial class SequenceRangeGuard
     {
         // The switch waits for the gates, which the statement lets go meanwhile, and the range worker switches the block
         // while statements wait for it, however many values it has left.
-        List<uint> held = LetGates();
+        List<(uint Seqoid, bool Unit)> held = LetGates();
         CountWaiting(seqoid, lo, 1);
         bool switched;
         try
@@ -5448,7 +5943,7 @@ internal static partial class SequenceRangeGuard
                 CountDrawer(seqoid, 0, -waiting, waitingFor: lo);
             }
 
-            foreach (uint seqoid in s_gates.Keys)
+            foreach (uint seqoid in s_gates.Keys.Where(seqoid => !s_unitGates.Contains(seqoid)))
             {
                 CountDrawer(seqoid, -1);
             }
@@ -5460,6 +5955,7 @@ internal static partial class SequenceRangeGuard
 
             s_waitingFor.Clear();
             s_gates.Clear();
+            s_unitGates.Clear();
             s_gatedRowDraws.Clear();
             s_unseenRowDraws.Clear();
             s_rowMarks.Clear();
@@ -5691,7 +6187,7 @@ internal static partial class SequenceRangeGuard
             return;
         }
 
-        List<uint> held = LetGates();
+        List<(uint Seqoid, bool Unit)> held = LetGates();
 
         // A savepoint that rolls back undoes the switches made under it, so the transaction may try them again.
         if (s_switchedInTransaction.Count == 1 && !s_switchesRegistered)

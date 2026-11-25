@@ -11,8 +11,9 @@ namespace Worf;
 /// <param name="text">Reads the statement's own text, as the client sent it, or null when it has none or has
 /// parameters, whose values a plan may hold.</param>
 /// <param name="running">The statement running, as a QueryDesc, whose expressions start as it runs, or zero.</param>
+/// <param name="planned">Whether a statement's plan starts, whose rows the guard then counts.</param>
 internal sealed class WorfStartingStatement(Func<(HashSet<uint> Called, int Calls, bool Unnamed)> draws, nint context, bool explained,
-    Func<string?>? text = null, nint running = 0)
+    Func<string?>? text = null, nint running = 0, bool planned = false)
 {
     private (HashSet<uint> Called, int Calls, bool Unnamed)? _draws;
     private string? _text;
@@ -52,4 +53,10 @@ internal sealed class WorfStartingStatement(Func<(HashSet<uint> Called, int Call
     /// trigger condition's do, or zero for one whose plan starts.
     /// </summary>
     internal nint Running { get; } = running;
+
+    /// <summary>
+    /// Gets a value indicating whether a statement's plan starts, before the statement runs, whose rows the guard counts
+    /// from the first on.
+    /// </summary>
+    internal bool Planned { get; } = planned;
 }

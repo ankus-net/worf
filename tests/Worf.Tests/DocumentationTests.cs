@@ -82,6 +82,11 @@ public sealed partial class DocumentationTests
             "how long inserts wait for a switch (130)");
         Assert.Contains("goes on to the end of its range if no other node was ever given any of its values. Otherwise it stays limited to the block of numbers this node was using, so it can't hand out a number another node may have, and worf logs a warning for it.",
             s_nodes, "sequences' bounds after worf's drop (2021, 2164)");
+        Assert.Contains("The drop does wait for a transaction that already holds one of worf's tables, such as one that read them or reserved a block. That transaction's inserts go on, and the drop runs once it ends.",
+            s_sequenceRanges, "inserts beside worf's drop (2205)");
+        Assert.DoesNotContain("While the drop runs, new inserts that use a managed sequence fail", s_sequenceRanges, "inserts beside worf's drop (2205)");
+        Assert.Contains("A cursor between fetches, a client that reads slowly and a transaction left idle hold nothing, so they don't delay a switch.",
+            s_sequenceRanges, "statements that hold no gate while they idle (2200)");
 
         string ranges = Read("src", "Worf", "SequenceRanges.cs");
         Assert.DoesNotContain("which switches beside those transactions, without waiting for them, while the range worker checks", ranges,

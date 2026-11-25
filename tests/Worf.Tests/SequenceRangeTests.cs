@@ -4688,6 +4688,211 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// A session that idles in a transaction that drew from a managed sequence holds up none of the sequence's switches
+    /// (2200): with a cursor that fetched some of its rows, one only declared, or a DO block's assignment behind it, another
+    /// session's 300 inserts, which switch blocks of 100 twice and more, finish in seconds, rather than wait at the
+    /// switch until they time out; the cursor then fetches on, and no value is drawn twice.
+    /// </summary>
+    /// <param name="idle">What the idle session ran.</param>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [DataRow("fetched cursor")]
+    [DataRow("declared cursor")]
+    [DataRow("do block")]
+    public async Task IdleTransactionsThatDrewHoldUpNoSwitch(string idle)
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE SEQUENCE s1;
+            CREATE TABLE t1 (id bigint DEFAULT nextval('s1'), v text);
+            CREATE TABLE drawn (id bigint);
+            SELECT worf.enable_sequence_range('s1', participants := '{}', range_size := 100, max_range_size := 100);
+            """, token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges", token),
+            "node_a drawing from a block of s1, with the next one ready");
+
+        await using NpgsqlConnection idling = await nodeA.OpenAsync(Database, token);
+        await ExecuteAsync(idling, "BEGIN", token);
+        await ExecuteAsync(idling, idle switch
+        {
+            "do block" => "DO $$ DECLARE x bigint; BEGIN x := nextval('s1'); END $$",
+            _ => "DECLARE c CURSOR FOR SELECT nextval('s1') FROM generate_series(1, 1000)",
+        }, token);
+        async Task<List<long>> FetchAsync(int count)
+        {
+            await using NpgsqlCommand fetch = new($"FETCH {count} FROM c", idling);
+            await using NpgsqlDataReader rows = await fetch.ExecuteReaderAsync(token);
+            List<long> ids = [];
+            while (await rows.ReadAsync(token))
+            {
+                ids.Add(rows.GetInt64(0));
+            }
+
+            return ids;
+        }
+
+        List<long> fetched = idle == "fetched cursor" ? await FetchAsync(5) : [];
+        Assert.HasCount(idle == "fetched cursor" ? 5 : 0, fetched, "the cursor's first rows");
+
+        Stopwatch inserting = Stopwatch.StartNew();
+        _ = await nodeA.SafePsqlAsync(Database, "SET statement_timeout = '20s'; INSERT INTO t1 (v) SELECT 'x' FROM generate_series(1, 300)", token);
+        Assert.IsLessThan(TimeSpan.FromSeconds(10), inserting.Elapsed, $"the inserts beside the idle transaction's {idle}");
+
+        // The idle session goes on drawing, from the block the sequence has switched to since.
+        if (idle == "do block")
+        {
+            await ExecuteAsync(idling, "INSERT INTO drawn SELECT currval('s1')", token);
+        }
+        else
+        {
+            List<long> later = await FetchAsync(150);
+            Assert.HasCount(150, later, "the cursor's later rows");
+            fetched.AddRange(later);
+            await ExecuteAsync(idling, $"INSERT INTO drawn SELECT unnest(ARRAY[{string.Join(',', fetched)}]::bigint[])", token);
+        }
+
+        await ExecuteAsync(idling, "COMMIT", token);
+        Assert.AreEqual("0", await nodeA.SafePsqlAsync(Database, "SELECT count(*) FROM drawn d JOIN t1 USING (id)", token),
+            "the values both the idle session and the inserts drew");
+        Assert.AreEqual("300", await nodeA.SafePsqlAsync(Database, "SELECT count(DISTINCT id) FROM t1", token), "the inserts' ids");
+    }
+
+    /// <summary>
+    /// A statement of one row that draws holds no values back from other sessions: it counts no draws for later rows, which
+    /// it hasn't, so while one runs on, sleeping in its row, another session draws 85 of the block's 100 values without
+    /// waiting, all from that block, rather than find it short sooner and wait for a switch that the first holds up.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task OneRowStatementsHoldNoValuesBack()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE SEQUENCE s1;
+            SELECT worf.enable_sequence_range('s1', participants := '{}', range_size := 100, max_range_size := 100);
+            """, token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges", token),
+            "node_a drawing from a block of s1, with the next one ready");
+        string[] block = (await nodeA.SafePsqlAsync(Database, "SELECT active_lo || ' ' || active_hi FROM worf.sequence_ranges", token)).Split(' ');
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT nextval('s1')", token);
+        Task<string> sleeping = nodeA.SafePsqlAsync(Database, "SELECT nextval('s1'), pg_sleep(4)", token);
+        await Task.Delay(TimeSpan.FromMilliseconds(500), token);
+        await using NpgsqlConnection drawing = await nodeA.OpenAsync(Database, token);
+        await using NpgsqlCommand draw = new("SELECT nextval('s1')", drawing);
+        Stopwatch timing = Stopwatch.StartNew();
+        List<long> drawn = [];
+        for (int i = 0; i < 85; i++)
+        {
+            drawn.Add((long)(await draw.ExecuteScalarAsync(token))!);
+        }
+
+        Assert.IsLessThan(TimeSpan.FromSeconds(3), timing.Elapsed, "the 85 draws beside the statement that sleeps in its row");
+        Assert.IsLessThanOrEqualTo(long.Parse(block[1], CultureInfo.InvariantCulture), drawn.Max(), $"the draws' values, all from the block [{block[0]}, {block[1]}]");
+        _ = await sleeping;
+    }
+
+    /// <summary>
+    /// A row that draws keeps its sequence's switch gate once a statement its function ran has ended, which had the gate
+    /// as its own while it drew from the sequence too: the row, which sleeps after its function's insert and draws after
+    /// that, holds the gate as it sleeps, so that a switch beside it moves the sequence only once the row has drawn, and
+    /// holds none once it has.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task RowsKeepTheirGatesPastTheStatementsTheyRun()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE SEQUENCE s1;
+            CREATE TABLE t1 (id bigint DEFAULT nextval('s1'), v text);
+            CREATE FUNCTION ins() RETURNS bigint LANGUAGE sql AS $$ INSERT INTO t1 (v) VALUES ('in') RETURNING id $$;
+            SELECT worf.enable_sequence_range('s1', participants := '{}', range_size := 100, max_range_size := 100);
+            """, token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges", token),
+            "node_a drawing from a block of s1, with the next one ready");
+        await using NpgsqlConnection drawing = await nodeA.OpenAsync(Database, token);
+        string gates = $"""
+            SELECT count(*) FROM pg_locks
+            WHERE pid = {drawing.ProcessID} AND locktype = 'advisory' AND classid = 's1'::regclass::oid AND objsubid = 3
+                AND mode = 'ShareLock' AND granted
+            """;
+        await using NpgsqlCommand draw = new("SELECT ins() || ' ' || pg_sleep(3)::text || nextval('s1')", drawing);
+        Task<object?> row = draw.ExecuteScalarAsync(token);
+        string held = "";
+        for (int i = 0; i < 20 && held != "t"; i++)
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(100), token);
+            held = await nodeA.SafePsqlAsync(Database,
+                $"SELECT ({gates}) = 1 FROM pg_stat_activity WHERE pid = {drawing.ProcessID} AND wait_event = 'PgSleep'", token);
+        }
+
+        string[] ids = ((string)(await row)!).Split(' ');
+        Assert.AreEqual("t", held, "whether the row holds the gate of s1 as it sleeps after its function's insert");
+        Assert.AreEqual(long.Parse(ids[0], CultureInfo.InvariantCulture) + 1, long.Parse(ids[1], CultureInfo.InvariantCulture),
+            "the row's own draw, next after its function's insert's");
+        Assert.AreEqual("0", await nodeA.SafePsqlAsync(Database, gates, token), "the gates of s1 the session holds once the row is out");
+    }
+
+    /// <summary>
+    /// A PL/pgSQL loop that draws passes the switches other sessions' inserts need, though its transaction's portals and
+    /// subtransactions take and let go of the sequence's gate under resource owners of their own (2201): a FOR loop over a
+    /// query that draws, sleeping between its rows, and an insert whose trigger runs another insert in a block with an
+    /// exception handler, each beside 300 inserts of another session, both finish, with no deadlock and no lock let go
+    /// under the wrong owner.
+    /// </summary>
+    /// <param name="form">What draws beside the other session's inserts.</param>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [DataRow("loop over a query")]
+    [DataRow("insert in a subtransaction")]
+    public async Task LoopsThatDrawPassTheSwitchesOthersNeed(string form)
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE SEQUENCE s1; CREATE SEQUENCE s2;
+            CREATE TABLE t1 (id bigint DEFAULT nextval('s1'), v text);
+            CREATE TABLE t2 (id bigint DEFAULT nextval('s2'), v text);
+            CREATE TABLE slow_t (id bigint DEFAULT nextval('s1'), v text);
+            CREATE FUNCTION slow() RETURNS void LANGUAGE plpgsql AS $$
+            DECLARE r record;
+            BEGIN
+                FOR r IN SELECT nextval('s1') FROM generate_series(1, 40) LOOP PERFORM pg_sleep(0.1); END LOOP;
+            END $$;
+            CREATE FUNCTION slow_row() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                PERFORM pg_sleep(0.1);
+                BEGIN
+                    INSERT INTO t2 (v) VALUES ('in');
+                EXCEPTION WHEN division_by_zero THEN NULL;
+                END;
+                RETURN NEW;
+            END $$;
+            CREATE TRIGGER slow_row BEFORE INSERT ON slow_t FOR EACH ROW EXECUTE FUNCTION slow_row();
+            SELECT worf.enable_sequence_range('s1', participants := '{}', range_size := 100, max_range_size := 100);
+            SELECT worf.enable_sequence_range('s2', participants := '{}', range_size := 100, max_range_size := 100);
+            """, token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT bool_and(state = 'active' AND next_lo IS NOT NULL) FROM worf.sequence_ranges", token),
+            "node_a drawing from blocks of s1 and s2, with the next ones ready");
+        int logpos = nodeA.ReadLog().Length;
+        Task<string> looping = nodeA.SafePsqlAsync(Database, form == "loop over a query"
+            ? "SET statement_timeout = '60s'; SELECT slow()"
+            : "SET statement_timeout = '60s'; INSERT INTO slow_t (v) SELECT 'slow' FROM generate_series(1, 40)", token);
+        await Task.Delay(TimeSpan.FromMilliseconds(500), token);
+        Stopwatch inserting = Stopwatch.StartNew();
+        _ = await nodeA.SafePsqlAsync(Database, "SET statement_timeout = '20s'; INSERT INTO t1 (v) SELECT 'x' FROM generate_series(1, 300)", token);
+        Assert.IsLessThan(TimeSpan.FromSeconds(10), inserting.Elapsed, $"the inserts beside the {form}");
+        _ = await looping;
+        string log = nodeA.ReadLog()[logpos..];
+        Assert.DoesNotContain("you don't own a lock", log, "node_a's log of locks let go under another owner");
+        Assert.DoesNotContain("deadlock detected", log, "node_a's log of deadlocks");
+        Assert.AreEqual("300", await nodeA.SafePsqlAsync(Database, "SELECT count(DISTINCT id) FROM t1", token), "the inserts' ids");
+    }
+
+    /// <summary>
     /// Dropping worf widens a managed sequence whose values no other node was given to the end of its range, with or
     /// without CASCADE, so it goes on past its block (2021).
     /// </summary>
@@ -4711,7 +4916,9 @@ public sealed partial class SequenceRangeTests
 
     /// <summary>
     /// A session's first draw reads the blocks with JIT off, as worf's tables have no statistics until they're analyzed
-    /// and the read's estimated cost would have JIT compile it (2142): auto_explain logs the read without the session's jit on.
+    /// and the read's estimated cost would have JIT compile it (2142, 2202). auto_explain lists a setting with a statement
+    /// only where it differs from the server's built-in value, so in a session with jit on, the read is logged with
+    /// jit off where jit is on by default, and without jit on where it's off by default.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -4724,6 +4931,7 @@ public sealed partial class SequenceRangeTests
             SELECT worf.enable_sequence_range('s1', participants := '{}', range_size := 100);
             """, token);
         Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges", token), "node_a drawing");
+        string builtIn = await nodeA.SafePsqlAsync(Database, "SELECT boot_val FROM pg_settings WHERE name = 'jit'", token);
         int logpos = nodeA.ReadLog().Length;
         _ = await nodeA.SafePsqlAsync(Database, """
             LOAD 'auto_explain';
@@ -4738,8 +4946,15 @@ public sealed partial class SequenceRangeTests
         Assert.IsGreaterThanOrEqualTo(0, read, "the logged read of the blocks");
         int settings = log.IndexOf("Settings:", read, StringComparison.Ordinal);
         Assert.IsGreaterThanOrEqualTo(0, settings, "the read's settings");
-        // The settings list jit only where its default differs, as it's off by default on servers built without LLVM.
-        Assert.DoesNotContain("jit = 'on'", log[settings..log.IndexOf('\n', settings)], "the read's JIT");
+        string listed = log[settings..log.IndexOf('\n', settings)];
+        if (builtIn == "on")
+        {
+            Assert.Contains("jit = 'off'", listed, "the read's JIT, where it's on by default");
+        }
+        else
+        {
+            Assert.DoesNotContain("jit = 'on'", listed, "the read's JIT, where it's off by default");
+        }
     }
 
     /// <summary>
@@ -5083,8 +5298,8 @@ public sealed partial class SequenceRangeTests
     /// drawing from the sequence from its first check until it ends, so that the block's last twentieth, under five values
     /// for a block of 100, isn't run out by six of them drawing past it before any switch. So do calls whose sequence the
     /// plan doesn't name, from a column or a parameter, which wait once the block holds fewer values than they and the
-    /// other drawing statements may take, and a SELECT of five rows, whose rows drawing without a check are shared among
-    /// the statements drawing (2042).
+    /// other drawing statements may take, a SELECT of five rows, whose rows drawing without a check are shared among
+    /// the statements drawing (2042), and a PL/pgSQL loop's five assignments, each a unit of its own.
     /// </summary>
     /// <param name="form">How each session draws.</param>
     /// <returns>The test.</returns>
@@ -5093,6 +5308,7 @@ public sealed partial class SequenceRangeTests
     [DataRow("from a column")]
     [DataRow("from a parameter")]
     [DataRow("five rows")]
+    [DataRow("loop of five")]
     public async Task ConcurrentSelectsOfNextvalLeaveEachOtherValues(string form)
     {
         CancellationToken token = TestContext.CancellationToken;
@@ -5101,6 +5317,9 @@ public sealed partial class SequenceRangeTests
             CREATE SEQUENCE s2;
             CREATE TABLE seqnames (n text);
             INSERT INTO seqnames VALUES ('s2');
+            CREATE FUNCTION draw5() RETURNS SETOF bigint LANGUAGE plpgsql AS $$
+            DECLARE x bigint;
+            BEGIN FOR i IN 1..5 LOOP x := nextval('s2'); RETURN NEXT x; END LOOP; END $$;
             SELECT worf.enable_sequence_range('s2', participants := '{}', range_size := 100, max_range_size := 100);
             """, token);
         Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 's2'::regclass", token),
@@ -5116,6 +5335,7 @@ public sealed partial class SequenceRangeTests
                 "from a column" => "SELECT nextval(n) FROM seqnames",
                 "from a parameter" => "SELECT nextval($1::regclass)",
                 "five rows" => "SELECT nextval('s2') FROM generate_series(1, 5)",
+                "loop of five" => "SELECT draw5()",
                 _ => "SELECT nextval('s2')",
             }, connection);
             if (form == "from a parameter")
@@ -6042,14 +6262,47 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// A participant's reservation of more than a sixteenth of what an integer sequence has left fails at once, with
+    /// 22023, and its inserts go on (2101): the allocator refuses the load though nothing else in the participant's
+    /// message changed, and though no free span of its root could hold it.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task OversizedLoadsAreRefusedAtOnce()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE ti (id serial PRIMARY KEY, v text)", token);
+        }
+
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('ti_id_seq', participants := '{node_b}', range_size := 100, max_range_size := 1000)", token);
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges WHERE sequence = 'ti_id_seq'::regclass", token),
+            "node_b drawing from ti_id_seq");
+
+        // Once node_b's exchanges with node_a carry nothing else new, its request for the load is all that changes.
+        await Task.Delay(TimeSpan.FromSeconds(3), token);
+        Stopwatch refusing = Stopwatch.StartNew();
+        PostgresException tooLarge = await Assert.ThrowsExactlyAsync<PostgresException>(() => nodeB.SafePsqlAsync(Database,
+            "BEGIN; SELECT worf.reserve_sequence_range('ti_id_seq', 3000000000, timeout := '20s')", token));
+        Assert.AreEqual("22023", tooLarge.SqlState, "node_b's reservation of more than ti_id_seq has left");
+        Assert.IsLessThan(TimeSpan.FromSeconds(15), refusing.Elapsed, "node_b's refused reservation");
+        Stopwatch inserting = Stopwatch.StartNew();
+        _ = await nodeB.SafePsqlAsync(Database, "SET statement_timeout = '30s'; INSERT INTO ti (v) SELECT 'b' FROM generate_series(1, 2000)", token);
+        Assert.IsLessThan(TimeSpan.FromSeconds(15), inserting.Elapsed, "node_b's inserts after the refused reservation");
+    }
+
+    /// <summary>
     /// A reservation is served whole on a participant and on the owner, however many of the owner's largest blocks it
     /// takes: node_b and node_a each reserve 20,000 values, more than sixteen blocks of 1,000, and load them. A request for
     /// a pool block that a participant makes up gets no more than sixteen of the owner's largest blocks, the most a pool
     /// asks for: node_b's made-up request for nearly all of the sequence gets 16,000 values, and node_a goes on
     /// inserting. Each grant node_a logs, its grants in the calls that carry those requests too, goes without the call's
     /// statement, which holds the whole message. Five more made-up pool requests take no more than two pools in ten
-    /// minutes, a made-up load of everything left is refused, and a participant's reservation of more than a sixteenth of
-    /// what an integer sequence has left fails at once with its inserts going on.
+    /// minutes, and a made-up load of everything left is refused.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -6130,29 +6383,6 @@ public sealed partial class SequenceRangeTests
             "node_a's answer to the made-up load (2100)");
         _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO t (v) SELECT 'after load' FROM generate_series(1, 10000)", token);
         _ = await nodeB.SafePsqlAsync(Database, "INSERT INTO t (v) SELECT 'b after load' FROM generate_series(1, 1000)", token);
-
-        // A participant's reservation of more than a sixteenth of what the integer sequence has left fails at once, and its
-        // inserts go on (2101).
-        foreach (TestNode node in new[] { nodeA, nodeB })
-        {
-            _ = await node.SafePsqlAsync(Database, "CREATE TABLE ti (id serial PRIMARY KEY, v text)", token);
-        }
-
-        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('ti_id_seq', participants := '{node_b}', range_size := 100, max_range_size := 1000)", token);
-        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges WHERE sequence = 'ti_id_seq'::regclass", token),
-            "node_b drawing from ti_id_seq");
-
-        // Once node_b's exchanges with node_a carry nothing else new, its request for the load is all that changes, which
-        // node_a refuses though no free span of its root could hold the load.
-        await Task.Delay(TimeSpan.FromSeconds(3), token);
-        Stopwatch refusing = Stopwatch.StartNew();
-        PostgresException tooLarge = await Assert.ThrowsExactlyAsync<PostgresException>(() => nodeB.SafePsqlAsync(Database,
-            "BEGIN; SELECT worf.reserve_sequence_range('ti_id_seq', 3000000000, timeout := '20s')", token));
-        Assert.AreEqual("22023", tooLarge.SqlState, "node_b's reservation of more than ti_id_seq has left (2101)");
-        Assert.IsLessThan(TimeSpan.FromSeconds(15), refusing.Elapsed, "node_b's refused reservation (2101)");
-        Stopwatch inserting = Stopwatch.StartNew();
-        _ = await nodeB.SafePsqlAsync(Database, "SET statement_timeout = '30s'; INSERT INTO ti (v) SELECT 'b' FROM generate_series(1, 2000)", token);
-        Assert.IsLessThan(TimeSpan.FromSeconds(15), inserting.Elapsed, "node_b's inserts after the refused reservation (2101)");
     }
 
     /// <summary>
@@ -7526,9 +7756,10 @@ public sealed partial class SequenceRangeTests
     /// A node restored from a backup taken before a neighbor first called it, here node_c, whose subscription to node_b
     /// was made while node_b's exchange function was renamed, waits for that neighbor though its restored tables don't
     /// know it: node_b registers node_c with node_a, its other neighbor, as node_c first calls, and draws only once node_a
-    /// has told it back, and node_a's answer to the restored node_b names node_c, which node_b then waits for, down,
-    /// unless node_a has it reset, rather than draw again what node_c holds. With node_a down as node_c first calls,
-    /// node_b draws nothing until node_a is back to hear of node_c (1605).
+    /// has told it back. With node_a down as node_c first calls, node_b so draws nothing until node_a is back to hear of
+    /// node_c (1605), where it once drew values that node_c then held and a restore gave out again. With node_a hearing
+    /// of node_c before it goes down, the restored node_b draws none of them again: node_a, which heard from node_b since
+    /// the backup, has it reset, as it did before the fix, or names node_c, which node_b then waits for.
     /// </summary>
     /// <param name="order">Whether node_a goes down after node_c first calls node_b, or before.</param>
     /// <returns>The test.</returns>
@@ -7579,11 +7810,11 @@ public sealed partial class SequenceRangeTests
             return;
         }
 
-        // node_c first calls, node_a hears of it and tells node_b back, and node_a stops; node_b draws, which node_c hears
-        // of, and node_c stops.
+        // node_c first calls, node_a hears of it and tells node_b back, which node_b's draws wait for, and node_a stops;
+        // node_b draws again, which node_c hears of, and node_c stops.
         _ = await nodeB.SafePsqlAsync(Database, "ALTER FUNCTION worf.sequence_range_exchange_paused(text) RENAME TO sequence_range_exchange", token);
-        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
-            "SELECT EXISTS (SELECT 1 FROM worf.sequence_range_named WHERE neighbor_name = 'node_c')", token), "node_a telling node_b back of node_c");
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, "SELECT EXISTS (SELECT 1 FROM worf.sequence_range_link)", token), "node_c calling node_b");
+        _ = await InsertIdsAsync(nodeB, "registered", token);
         await nodeA.StopAsync("fast", token);
         HashSet<string> before = await InsertIdsAsync(nodeB, "before", token);
         const string HeardOfB = "FROM worf.sequence_range_node WHERE node_name = 'node_b' AND seqoid = 't_id_seq'::regclass";
@@ -7596,8 +7827,6 @@ public sealed partial class SequenceRangeTests
         int restored = nodeB.ReadLog().Length;
         await RestoreDataAsync(nodeB, copy, token);
         await nodeA.StartServerAsync(token);
-        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
-            "SELECT EXISTS (SELECT 1 FROM worf.sequence_range_named WHERE neighbor_name = 'node_c')", token), "node_a naming node_c to the restored node_b");
         HashSet<string> after = await WaitsOrResetsAsync(nodeB, ["node_c"], restored, token);
 
         // Once node_c is back and finds node_b went back, node_b never draws those values again.

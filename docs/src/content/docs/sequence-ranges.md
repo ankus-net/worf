@@ -141,6 +141,10 @@ gate) and let it go between rows when a switch is waiting. A statement that hold
 else, such as `COPY FROM STDIN` waiting for its client, holds the switch up until it continues. If such waits form a
 cycle, PostgreSQL ends one of the statements with SQLSTATE `40P01`.
 
+Other statements that draw, such as `SELECT nextval(...)` or a PL/pgSQL assignment, hold the gate only while they
+work out a row or run the statement that draws. A cursor between fetches, a client that reads slowly and a
+transaction left idle hold nothing, so they don't delay a switch.
+
 worf doesn't see C code that calls `nextval` directly rather than through SQL. Such code can run a block out, so don't
 use it with managed sequences.
 
@@ -284,5 +288,7 @@ column, the sequence hands out those numbers again.
 
 Dropping worf leaves each managed sequence with its block's bounds, so that it hands out no number another node may
 hold. Once that block is used up, `nextval` fails. Widen the sequence's bounds with `ALTER SEQUENCE` once no other node
-uses its numbers. While the drop runs, new inserts that use a managed sequence fail with SQLSTATE `55006`, and those
-waiting for a block give up, so the drop doesn't wait on them.
+uses its numbers. While the drop waits for its tables, an insert that uses a managed sequence fails with SQLSTATE
+`55006`, and one waiting for a block gives up, so new inserts don't hold the drop up. The drop does wait for a
+transaction that already holds one of worf's tables, such as one that read them or reserved a block. That
+transaction's inserts go on, and the drop runs once it ends.
