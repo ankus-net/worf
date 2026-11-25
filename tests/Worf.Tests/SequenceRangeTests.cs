@@ -4346,20 +4346,19 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
-    /// A statement run again in a transaction that drew a managed sequence takes about as long as in one that drew
-    /// nothing, each in a session of its own that has run nothing else: its calls of nextval are read once for its text,
-    /// rather than from its plan's text each time it starts, and so are a statement's with parameters, as a driver sends
-    /// its values, which makes none. The two sessions' inserts of 4,000 literal rows, and of 1,000 rows of parameters,
-    /// alternate, the first 20 of each warm up, and of the 40 that follow, each session's fastest 30 count, as a busy
-    /// runner stalls a statement now and then. The test runs alone, as other tests' load hides the difference.
+    /// A statement run again in a transaction that drew a managed sequence has its calls of nextval read once for its
+    /// text, rather than from its plan's text each time it starts, which took the statement half as long again, and so
+    /// has a statement with parameters, as a driver sends its values, which makes none. The session's 60 inserts of 4,000
+    /// literal rows, and of 1,000 rows of parameters, have node_a log a read of a plan a few times at most, as a change
+    /// to a table has them read again. The reads are counted, where the inserts were timed against another session's,
+    /// which a busy machine upset.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
-    [DoNotParallelize]
-    public async Task StatementsAfterADrawCostWhatTheyDidBefore()
+    public async Task StatementsAfterADrawReadTheirPlansOnce()
     {
         CancellationToken token = TestContext.CancellationToken;
-        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeA = await StartNodeAsync("node_a", token, "log_min_messages = debug1");
         _ = await nodeA.SafePsqlAsync(Database, """
             CREATE SEQUENCE s1; CREATE TABLE vt (x int);
             SELECT worf.enable_sequence_range('s1', participants := '{}', range_size := 100);
@@ -4368,55 +4367,35 @@ public sealed partial class SequenceRangeTests
             "node_a drawing from a block of s1");
         string values = $"INSERT INTO vt VALUES {string.Join(", ", Enumerable.Range(1, 4000).Select(i => string.Create(CultureInfo.InvariantCulture, $"({i})")))}";
         string parameters = $"INSERT INTO vt VALUES {string.Join(", ", Enumerable.Range(1, 1000).Select(i => string.Create(CultureInfo.InvariantCulture, $"(${i})")))}";
-        await using NpgsqlConnection drawingConnection = await nodeA.OpenAsync(Database, token);
-        await using NpgsqlConnection plainConnection = await nodeA.OpenAsync(Database, token);
-        await using NpgsqlTransaction drawingTransaction = await drawingConnection.BeginTransactionAsync(token);
-        await using NpgsqlTransaction plainTransaction = await plainConnection.BeginTransactionAsync(token);
-        await using (NpgsqlCommand drawOnce = new("SELECT nextval('s1')", drawingConnection, drawingTransaction))
+        await using NpgsqlConnection drawing = await nodeA.OpenAsync(Database, token);
+        await using NpgsqlTransaction transaction = await drawing.BeginTransactionAsync(token);
+        await using (NpgsqlCommand drawOnce = new("SELECT nextval('s1')", drawing, transaction))
         {
             _ = await drawOnce.ExecuteNonQueryAsync(token);
         }
 
         foreach (string sql in new[] { values, parameters })
         {
-            NpgsqlCommand Insert(NpgsqlConnection inserting, NpgsqlTransaction within)
+            int logpos = nodeA.ReadLog().Length;
+            await using NpgsqlCommand insert = new(sql, drawing, transaction);
+            for (int i = 1; sql == parameters && i <= 1000; i++)
             {
-                NpgsqlCommand insert = new(sql, inserting, within);
-                for (int i = 1; sql == parameters && i <= 1000; i++)
-                {
-                    _ = insert.Parameters.Add(new NpgsqlParameter { Value = i });
-                }
-
-                return insert;
+                _ = insert.Parameters.Add(new NpgsqlParameter { Value = i });
             }
 
-            await using NpgsqlCommand drawingInsert = Insert(drawingConnection, drawingTransaction);
-            await using NpgsqlCommand plainInsert = Insert(plainConnection, plainTransaction);
-            List<TimeSpan> drawingTimes = [];
-            List<TimeSpan> plainTimes = [];
             for (int i = 0; i < 60; i++)
             {
-                foreach ((NpgsqlCommand insert, bool drew) in i % 2 == 0 ? new[] { (drawingInsert, true), (plainInsert, false) } : [(plainInsert, false), (drawingInsert, true)])
-                {
-                    Stopwatch timing = Stopwatch.StartNew();
-                    _ = await insert.ExecuteNonQueryAsync(token);
-                    if (i >= 20)
-                    {
-                        (drew ? drawingTimes : plainTimes).Add(timing.Elapsed);
-                    }
-                }
+                _ = await insert.ExecuteNonQueryAsync(token);
             }
 
-            static TimeSpan Fastest(List<TimeSpan> times) => TimeSpan.FromTicks(times.Order().Take(30).Sum(time => time.Ticks));
-            TimeSpan drawing = Fastest(drawingTimes);
-            TimeSpan plainly = Fastest(plainTimes);
+            int reads = nodeA.ReadLog()[logpos..].Split('\n').Count(line => line.Contains($"[{drawing.ProcessID}]", StringComparison.Ordinal) &&
+                line.Contains("read a statement's plan for its calls of nextval", StringComparison.Ordinal));
             string what = sql == values ? "4,000 literal rows" : "1,000 rows of parameters";
-            Assert.IsLessThan(plainly * 1.2, drawing, $"the fastest 30 of 40 inserts of {what} in a transaction that drew s1, against {plainly} in one that didn't; " +
-                $"the slowest took {drawingTimes.Max()} and {plainTimes.Max()}");
+            Assert.IsGreaterThanOrEqualTo(1, reads, $"the reads of the plan of 60 inserts of {what} in a transaction that drew s1");
+            Assert.IsLessThanOrEqualTo(5, reads, $"the reads of the plan of 60 inserts of {what} in a transaction that drew s1");
         }
 
-        await drawingTransaction.RollbackAsync(token);
-        await plainTransaction.RollbackAsync(token);
+        await transaction.RollbackAsync(token);
     }
 
     /// <summary>

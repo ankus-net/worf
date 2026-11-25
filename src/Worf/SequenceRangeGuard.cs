@@ -733,6 +733,7 @@ internal static partial class SequenceRangeGuard
         }
 
         draws = Draws(PlanText((Node*)planned));
+        WorfLog.Debug1("read a statement's plan for its calls of nextval");
         if (!parameters || (draws is { Calls: 0, Unnamed: false } && !text.Contains("nextval", StringComparison.OrdinalIgnoreCase) && !CallsUserFunctions(planned)))
         {
             if (s_drawsByText.Count >= 1000)
