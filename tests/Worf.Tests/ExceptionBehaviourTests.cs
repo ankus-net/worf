@@ -1795,8 +1795,10 @@ public sealed partial class ExceptionBehaviourTests
     /// A copy in which no row fails costs about the same CPU under error and under discard, which copies at once as
     /// error does unless a row fails: under error, which does no more than discard, within a fifth more than discard's,
     /// and under discard within half again of error's. The copy hands COPY every message received rather than one row
-    /// at a time, which cost error a third more than discard, and discard reads the rows no differently. On Linux, where /proc gives the
-    /// worker's CPU; the copies run at once.
+    /// at a time, which cost error a third more than discard, and discard reads the rows no differently. On Linux, where
+    /// /proc gives the worker's CPU. The copies of a pair run at once, and a pair outside the bounds is followed by
+    /// another, twice at most, with each behaviour's lowest figure counting: a busy machine's other work costs a copy
+    /// CPU that its own work doesn't, and never spares it any (2303).
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -1810,27 +1812,30 @@ public sealed partial class ExceptionBehaviourTests
             INSERT INTO n SELECT g, g, 'x' FROM generate_series(1, 1000000) g;
             SELECT * FROM worf.replication_set_add_all_tables('default', '{public}');
             """, token);
-        // The two copies run at once, so that whatever else the machine runs weighs on both alike.
-        await using TestNode underError = await StartNodeAsync("sub_error", token);
-        await using TestNode underDiscard = await StartNodeAsync("sub_discard", token);
-        Dictionary<string, double> cpu = [];
-        await Task.WhenAll(new[] { ("error", underError), ("discard", underDiscard) }.Select(async copy =>
+        Dictionary<string, double> cpu = new() { ["error"] = double.MaxValue, ["discard"] = double.MaxValue };
+        bool Within() => cpu["error"] < cpu["discard"] * 1.2 && cpu["discard"] < cpu["error"] * 1.5;
+        for (int pair = 1; pair <= 3 && (pair == 1 || !Within()); pair++)
         {
-            (string behaviour, TestNode subscriber) = copy;
-            _ = await subscriber.SafePsqlAsync(Database, "CREATE TABLE n (id integer PRIMARY KEY, v integer, w text)", token);
-            await SetBehaviourAsync(subscriber, behaviour, token);
-            (double used, _) = await CopyAsync(provider, subscriber, token, $"sub_{behaviour}");
-            lock (cpu)
+            // The two copies run at once, so that whatever else the machine runs weighs on both alike.
+            await using TestNode underError = await StartNodeAsync($"sub_error_{pair}", token);
+            await using TestNode underDiscard = await StartNodeAsync($"sub_discard_{pair}", token);
+            await Task.WhenAll(new[] { ("error", underError), ("discard", underDiscard) }.Select(async copy =>
             {
-                cpu[behaviour] = used;
-            }
+                (string behaviour, TestNode subscriber) = copy;
+                _ = await subscriber.SafePsqlAsync(Database, "CREATE TABLE n (id integer PRIMARY KEY, v integer, w text)", token);
+                await SetBehaviourAsync(subscriber, behaviour, token);
+                (double used, _) = await CopyAsync(provider, subscriber, token, $"sub_{behaviour}_{pair}");
+                Assert.AreEqual("1000000", await subscriber.SafePsqlAsync(Database, "SELECT count(*) FROM n", token), $"the rows copied under {behaviour}");
+                TestContext.WriteLine($"pair {pair}: apply worker CPU under {behaviour} {used:0.00} s");
+                lock (cpu)
+                {
+                    cpu[behaviour] = Math.Min(cpu[behaviour], used);
+                }
+            }));
+        }
 
-            Assert.AreEqual("1000000", await subscriber.SafePsqlAsync(Database, "SELECT count(*) FROM n", token), $"the rows copied under {behaviour}");
-        }));
-
-        TestContext.WriteLine($"apply worker CPU: error {cpu["error"]:0.00} s, discard {cpu["discard"]:0.00} s");
-        Assert.IsLessThan(cpu["discard"] * 1.2, cpu["error"], "the copy's CPU under error, against discard's");
-        Assert.IsLessThan(cpu["error"] * 1.5, cpu["discard"], "the copy's CPU under discard, against error's");
+        Assert.IsLessThan(cpu["discard"] * 1.2, cpu["error"], "the copy's lowest CPU under error, against discard's");
+        Assert.IsLessThan(cpu["error"] * 1.5, cpu["discard"], "the copy's lowest CPU under discard, against error's");
     }
 
     /// <summary>

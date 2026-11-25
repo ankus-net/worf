@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -305,6 +306,12 @@ internal static partial class SequenceRangeGuard
     private const byte RowScope = 2;
     private const byte StatementScope = 3;
 
+    // A PL/pgSQL assignment that draws, whose end PL/pgSQL doesn't tell worf of, which spares each turn of a loop a second
+    // call into worf: it ends as the next statement of its function starts, or as the function ends. Once a run or
+    // another function's statement starts under one, which may be within it or after it, PL/pgSQL tells of its end too.
+    private const byte QuietScope = 4;
+    private const byte ToldQuietScope = 5;
+
     // The PL/pgSQL statements whose own expressions were seen to draw this transaction, which take their sequences' gates
     // as they start; whether PL/pgSQL's plugin is worf's own, which alone tells worf of a statement's end; and how many
     // statement scopes are open, while any of which PL/pgSQL tells it.
@@ -312,12 +319,24 @@ internal static partial class SequenceRangeGuard
     private static bool s_ownsPlugin;
     private static int s_statementScopes;
 
+    // How many assignments' scopes are open, whose ends the next statement or the function's end tells of.
+    private static int s_quietScopes;
+
     // The statement run, as a QueryDesc, under which each sequence's count of draws before its next check was given, or
     // zero outside any, which gives it up as the run ends.
     private static readonly Dictionary<uint, nint> s_shareRuns = [];
 
-    // The rows counted down since one last looked for a switch waiting for the gates this backend holds.
-    private static int s_rowsSincePass;
+    // The gates a PL/pgSQL statement that drew kept as it ended, for the statement that starts next: one that draws too
+    // makes them its own, so that a loop that draws at every turn takes its gates once; any other lets them go as it
+    // starts, as a run that starts does, and the function as it ends, which PL/pgSQL tells worf of while any may be kept.
+    private static readonly HashSet<uint> s_keptGates = [];
+    private static bool s_watchingFunctionEnds;
+
+    // When this backend last looked in shared memory for a switch waiting for the gates it holds, in the stopwatch's
+    // ticks, and how long a unit that held its gates already lets pass before it looks again: a tenth of a millisecond.
+    // A switch so waits for the row or statement under way and no longer, and for those that take less, that long.
+    private static long s_lookedAt;
+    private static readonly long s_lookEvery = Math.Max(Stopwatch.Frequency / 10000, 1);
     private static bool s_countingDown;
 
     // Where each of those sequences was as it was last counted down for a call that names no sequence, which counts one
@@ -359,6 +378,9 @@ internal static partial class SequenceRangeGuard
 
     [PgNativeCallback(nameof(PlpgsqlStatementEnd))]
     private static partial PLpgSQL_plugin_stmt_endCallback PlpgsqlStatementEndCallback { get; }
+
+    [PgNativeCallback(nameof(PlpgsqlFunctionEnd))]
+    private static partial PLpgSQL_plugin_func_endCallback PlpgsqlFunctionEndCallback { get; }
 
     // The points in each sequence's active block, by sequence and value, at which this backend has woken the range worker.
     private static readonly HashSet<(uint Seqoid, long Mark)> s_woken = [];
@@ -1636,8 +1658,9 @@ internal static partial class SequenceRangeGuard
     // started, for as many draws as its function's source has calls, for the sequences that source names, so that a
     // statement draws no sequence another's call left short down.
     // A statement whose own expressions were seen to draw is a unit, which holds its sequences' gates from its check
-    // until it ends; any other takes none, as it may run long without drawing. One that starts within a unit that holds
-    // gates suspends it until it ends.
+    // until it ends, and keeps them then for the statement that starts next; any other takes none, as it may run long
+    // without drawing, and lets go of those kept. One that starts within a unit that holds gates suspends it until it
+    // ends.
     private static unsafe void PlpgsqlStatement(PLpgSQL_execstate* estate, PLpgSQL_stmt* stmt)
     {
         if (s_countingDown || s_namingGrantors || Worf.InOwnSql || estate is null || estate->func is null)
@@ -1645,10 +1668,28 @@ internal static partial class SequenceRangeGuard
             return;
         }
 
+        // An assignment of this function that drew has ended, unless it is the one that starts again, as a loop's does,
+        // which goes on under the scope it has.
         bool drawing = s_drawingStatements.Contains((nint)stmt);
-        if (s_ownsPlugin && (drawing || s_unitGates.Count > 0))
+        bool again = false;
+        if (s_quietScopes > 0 && QuietScopeOf((nint)estate) is int quiet and >= 0)
         {
-            EnterScope(StatementScope, (nint)stmt, (nint)estate);
+            again = drawing && quiet == s_scopes.Count - 1 && s_scopes[quiet].Key == (nint)stmt;
+            if (!again)
+            {
+                LeaveScopeAt(quiet, false);
+            }
+        }
+
+        if (!drawing && s_keptGates.Count > 0)
+        {
+            LetKeptGates();
+        }
+
+        if (!again && s_ownsPlugin && (drawing || s_unitGates.Count > 0))
+        {
+            bool quietly = drawing && stmt->cmd_type == PLpgSQL_stmt_type.PLPGSQL_STMT_ASSIGN;
+            EnterScope(quietly ? QuietScope : StatementScope, (nint)stmt, (nint)estate, keep: drawing);
         }
 
         if (s_drawingUngated.Count == 0)
@@ -1683,6 +1724,59 @@ internal static partial class SequenceRangeGuard
         {
             ((PLpgSQL_plugin*)*s_plpgsqlPlugin)->stmt_end = watch ? PlpgsqlStatementEndCallback : default;
         }
+    }
+
+    // Ends a function's last assignment that drew, and lets the gates its last statement kept go, as the function
+    // ends and nothing of it starts next.
+    private static unsafe void PlpgsqlFunctionEnd(PLpgSQL_execstate* estate, PLpgSQL_function* func)
+    {
+        _ = func;
+        if (s_quietScopes > 0 && QuietScopeOf((nint)estate) is int quiet and >= 0)
+        {
+            LeaveScopeAt(quiet, false);
+        }
+
+        if (s_keptGates.Count > 0)
+        {
+            LetKeptGates();
+        }
+
+        WatchFunctionEnds(s_quietScopes > 0);
+    }
+
+    // Finds the open scope of an assignment of a function's that drew, innermost first, or -1.
+    private static int QuietScopeOf(nint estate)
+    {
+        for (int i = s_scopes.Count - 1; i >= 0; i--)
+        {
+            if (s_scopes[i].Kind >= QuietScope && s_scopes[i].Owner == estate)
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    // Has PL/pgSQL tell worf of its functions' ends, or no longer, through worf's own plugin.
+    private static unsafe void WatchFunctionEnds(bool watch)
+    {
+        if (watch != s_watchingFunctionEnds && s_ownsPlugin && s_plpgsqlPlugin is not null && *s_plpgsqlPlugin is not null)
+        {
+            s_watchingFunctionEnds = watch;
+            ((PLpgSQL_plugin*)*s_plpgsqlPlugin)->func_end = watch ? PlpgsqlFunctionEndCallback : default;
+        }
+    }
+
+    // Lets the gates a PL/pgSQL statement kept as it ended go.
+    private static void LetKeptGates()
+    {
+        foreach (uint seqoid in s_keptGates)
+        {
+            LetGate(seqoid);
+        }
+
+        s_keptGates.Clear();
     }
 
     // Notes the draws a PL/pgSQL function's expression that starts makes, for the function's statements to count down
@@ -1987,7 +2081,7 @@ internal static partial class SequenceRangeGuard
             }
 
             _ = s_drawingStatements.Add((nint)statement);
-            if (s_scopes.Count == 0 || s_scopes[^1] is not { Kind: StatementScope } top || top.Key != (nint)statement || top.Owner != estate)
+            if (s_scopes.Count == 0 || s_scopes[^1] is not { Kind: >= StatementScope } top || top.Key != (nint)statement || top.Owner != estate)
             {
                 EnterScope(StatementScope, (nint)statement, estate);
             }
@@ -2038,7 +2132,7 @@ internal static partial class SequenceRangeGuard
             // moves none of them between its check and its draws. One that holds them already, as a row of many under
             // one that gathers them does, lets them go while a switch waits for them, and takes them again once the
             // switch has committed.
-            bool held = s_gates.Count > 0;
+            int held = s_gates.Count;
             if (gate && s_scopes.Count > 0)
             {
                 if (s_drawingUngated.Count == 1)
@@ -2058,11 +2152,20 @@ internal static partial class SequenceRangeGuard
                 }
             }
 
-            // A unit that has just taken its gates holds up no switch yet. One that held gates before, as a row under
-            // the row that took them, looks for a waiting switch every few rows, as the look reads shared memory, and
-            // one with none, which nothing keeps a switch from moving beside, at every row.
-            bool switching = s_gates.Count == 0 ? SequenceRanges.SwitchesPending.Value != 0
-                : held && (++s_rowsSincePass & 7) == 0 && SequenceRanges.SwitchesPending.Value != 0;
+            // A unit that has just taken its gates holds up no switch yet. One that held them all before, as a row under
+            // the row that took them, or a PL/pgSQL statement that keeps the one before's, looks for a waiting switch
+            // as it starts, unless one looked a moment ago, as the look reads shared memory; and one with none, which
+            // nothing keeps a switch from moving beside, always looks.
+            bool took = s_gates.Count != held;
+            bool looked = s_gates.Count == 0;
+            if (!looked && !took)
+            {
+                long now = Stopwatch.GetTimestamp();
+                looked = now - s_lookedAt >= s_lookEvery;
+                s_lookedAt = looked ? now : s_lookedAt;
+            }
+
+            bool switching = looked && SequenceRanges.SwitchesPending.Value != 0;
             if (switching && s_gates.Count > 0)
             {
                 _ = PassGates();
@@ -2070,8 +2173,9 @@ internal static partial class SequenceRangeGuard
 
             // A statement that draws row after row holds its sequences' locks, so PostgreSQL reads no bounds again as it
             // goes: once another session has switched a sequence, the next row reads the new block's from the catalog,
-            // rather than run past the old block's end.
-            if (SequenceRanges.Version.Value != s_version || SequenceRanges.LocalVersion != s_localVersion)
+            // rather than run past the old block's end. No switch of a sequence commits while its gate is held, so a
+            // unit that has held its gates since the last one read hears of the others' with its next look.
+            if ((took || looked) && (SequenceRanges.Version.Value != s_version || SequenceRanges.LocalVersion != s_localVersion))
             {
                 Refresh();
                 ForgetBounds();
@@ -2356,6 +2460,11 @@ internal static partial class SequenceRangeGuard
             return;
         }
 
+        if (s_keptGates.Count > 0)
+        {
+            LetKeptGates();
+        }
+
         // A block's functions, which were counted among their sequences' drawers outside any statement, draw no more.
         if (s_ungatedDrawers.Count > 0)
         {
@@ -2377,12 +2486,26 @@ internal static partial class SequenceRangeGuard
 
     // Starts a scope. A run or a PL/pgSQL statement that starts within a unit suspends it: the gates the enclosing scopes
     // hold go until it ends, as their units draw nothing meanwhile. A row lets go of the gates a call took that started
-    // in its run before any row's check, as the first of a statement's calls that start as it runs does.
-    private static void EnterScope(byte kind, nint key, nint owner = 0)
+    // in its run before any row's check, as the first of a statement's calls that start as it runs does. A PL/pgSQL
+    // statement that draws keeps those the statement before it kept.
+    private static void EnterScope(byte kind, nint key, nint owner = 0, bool keep = false)
     {
-        if (kind != RowScope && s_unitGates.Count > 0)
+        // An assignment under which a scope starts may still be under way, so PL/pgSQL tells of its end from here on.
+        if (s_scopes.Count > 0 && s_scopes[^1].Kind == QuietScope)
         {
-            foreach (uint seqoid in s_unitGates.ToList())
+            s_scopes[^1] = s_scopes[^1] with { Kind = ToldQuietScope };
+            WatchStatementEnds(++s_statementScopes > 0);
+        }
+
+        // The gates a PL/pgSQL statement kept go as anything but a statement that draws starts.
+        if (!keep && s_keptGates.Count > 0)
+        {
+            LetKeptGates();
+        }
+
+        if (kind != RowScope && s_unitGates.Count > s_keptGates.Count)
+        {
+            foreach (uint seqoid in s_unitGates.Except(s_keptGates).ToList())
             {
                 LetGate(seqoid);
             }
@@ -2401,7 +2524,7 @@ internal static partial class SequenceRangeGuard
         }
 
         uint subxact = 0;
-        if (kind == StatementScope)
+        if (kind >= StatementScope)
         {
             RegisterGates();
             unsafe
@@ -2409,26 +2532,50 @@ internal static partial class SequenceRangeGuard
                 subxact = NativeMethods.GetCurrentSubTransactionId();
             }
 
-            WatchStatementEnds(++s_statementScopes > 0);
+            if (kind == StatementScope)
+            {
+                WatchStatementEnds(++s_statementScopes > 0);
+            }
+            else
+            {
+                s_quietScopes++;
+                WatchFunctionEnds(true);
+            }
         }
 
         s_scopes.Add((kind, key, owner, subxact, s_scopeGates.Count));
     }
 
-    // Ends a scope, and those left open within it: the gates they took go, and the scope now innermost, which a run or a
-    // PL/pgSQL statement suspended, takes its own again, and hears of the switches committed meanwhile. A scope that
-    // failed leaves its gates to the transaction or subtransaction that ends with it.
+    // Ends the innermost scope of a kind that is of a run, a row's node or a PL/pgSQL statement, as LeaveScopeAt does.
     private static void LeaveScope(byte kind, nint key, nint owner = 0, bool failed = false)
     {
         int index = s_scopes.Count - 1;
-        while (index >= 0 && (s_scopes[index].Kind != kind || s_scopes[index].Key != key || s_scopes[index].Owner != owner))
+        while (index >= 0 && ((kind == StatementScope ? s_scopes[index].Kind < StatementScope : s_scopes[index].Kind != kind) ||
+            s_scopes[index].Key != key || s_scopes[index].Owner != owner))
         {
             index--;
         }
 
-        if (index < 0)
+        if (index >= 0)
         {
-            return;
+            LeaveScopeAt(index, failed);
+        }
+    }
+
+    // Ends a scope, and those left open within it: the gates they took go, and the scope now innermost, which a run or a
+    // PL/pgSQL statement suspended, takes its own again, and hears of the switches committed meanwhile. A scope that
+    // failed leaves its gates to the transaction or subtransaction that ends with it.
+    private static void LeaveScopeAt(int index, bool failed)
+    {
+        // A PL/pgSQL statement that drew keeps its gates for the statement that starts next, which a loop that draws at
+        // every turn so takes once, where no unit around it waits to take its own again.
+        byte kind = s_scopes[index].Kind;
+        if (!failed && kind >= StatementScope && index == s_scopes.Count - 1 && s_scopes[index].First == 0 && s_scopeGates.Count > 0 &&
+            s_drawingStatements.Contains(s_scopes[index].Key))
+        {
+            s_keptGates.UnionWith(s_scopeGates.Where(s_unitGates.Contains));
+            s_scopeGates.Clear();
+            WatchFunctionEnds(true);
         }
 
         CloseScopes(index, !failed);
@@ -2476,7 +2623,8 @@ internal static partial class SequenceRangeGuard
         int statements = 0;
         for (int i = index; i < s_scopes.Count; i++)
         {
-            statements += s_scopes[i].Kind == StatementScope ? 1 : 0;
+            statements += s_scopes[i].Kind is StatementScope or ToldQuietScope ? 1 : 0;
+            s_quietScopes -= s_scopes[i].Kind >= QuietScope ? 1 : 0;
         }
 
         s_scopes.RemoveRange(index, s_scopes.Count - index);
@@ -2493,8 +2641,20 @@ internal static partial class SequenceRangeGuard
     // runs, takes none, as it would hold it while the session idles.
     private static void GateUnit(uint seqoid)
     {
-        if (s_scopes.Count == 0 || s_gates.ContainsKey(seqoid))
+        if (s_scopes.Count == 0)
         {
+            return;
+        }
+
+        bool kept = s_keptGates.Count > 0 && s_keptGates.Remove(seqoid);
+        if (s_gates.ContainsKey(seqoid))
+        {
+            // A gate the statement before kept is this unit's own from here on.
+            if (kept)
+            {
+                s_scopeGates.Add(seqoid);
+            }
+
             return;
         }
 
@@ -5133,6 +5293,7 @@ internal static partial class SequenceRangeGuard
         {
             if (s_unitGates.Remove(seqoid))
             {
+                _ = s_keptGates.Remove(seqoid);
                 s_gates[seqoid] = subxact;
                 CountDrawer(seqoid, 1);
             }
@@ -5593,6 +5754,7 @@ internal static partial class SequenceRangeGuard
             ReleaseGate(seqoid, ShareLock);
             if (s_unitGates.Remove(seqoid))
             {
+                _ = s_keptGates.Remove(seqoid);
                 continue;
             }
 
@@ -5620,10 +5782,13 @@ internal static partial class SequenceRangeGuard
 
         s_gates.Clear();
         s_unitGates.Clear();
+        s_keptGates.Clear();
         s_scopes.Clear();
         s_scopeGates.Clear();
         s_statementScopes = 0;
+        s_quietScopes = 0;
         WatchStatementEnds(false);
+        WatchFunctionEnds(false);
         s_gatedRowDraws.Clear();
         s_unseenRowDraws.Clear();
         s_rowMarks.Clear();
@@ -5956,6 +6121,7 @@ internal static partial class SequenceRangeGuard
             s_waitingFor.Clear();
             s_gates.Clear();
             s_unitGates.Clear();
+            s_keptGates.Clear();
             s_gatedRowDraws.Clear();
             s_unseenRowDraws.Clear();
             s_rowMarks.Clear();

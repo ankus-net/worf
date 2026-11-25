@@ -87,6 +87,9 @@ public sealed partial class DocumentationTests
         Assert.DoesNotContain("While the drop runs, new inserts that use a managed sequence fail", s_sequenceRanges, "inserts beside worf's drop (2205)");
         Assert.Contains("A cursor between fetches, a client that reads slowly and a transaction left idle hold nothing, so they don't delay a switch.",
             s_sequenceRanges, "statements that hold no gate while they idle (2200)");
+        Assert.Contains("Where the next row or the next turn of a loop draws straight away, they keep the gate and let it go when a switch waits for it. They look for a waiting switch at each row or turn, or every tenth of a millisecond when those take less.",
+            s_sequenceRanges, "statements that keep the gate from row to row (2300, 2301)");
+        Assert.DoesNotContain("hold the gate only while they work out a row", s_sequenceRanges, "statements that keep the gate from row to row (2300)");
 
         string ranges = Read("src", "Worf", "SequenceRanges.cs");
         Assert.DoesNotContain("which switches beside those transactions, without waiting for them, while the range worker checks", ranges,

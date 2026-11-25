@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using System.Net;
@@ -1647,20 +1648,13 @@ public sealed partial class SequenceRangeTests
         // once the role's row is deleted, rather than being locked out by the slot's link, and forgets the old node in
         // node_b's exchange turn, as every write of several nodes' reports does: here it waits there for a report node_c
         // relayed, which a session holds.
-        _ = await nodeB.SafePsqlAsync(Database, $"""
-            INSERT INTO worf.sequence_range_node (seqoid, node_id, node_name, via_node, reported_at)
-            VALUES ('t_id_seq'::regclass, 2000002, 'relayed_by_c', {nodeCId}, now())
-            """, token);
         _ = await nodeB.SafePsqlAsync(Database, "DELETE FROM worf.sequence_range_role WHERE role_id = 'c_user'::regrole", token);
         _ = await nodeB.SafePsqlAsync(Database, "SELECT pg_create_logical_replication_slot('c_link', 'worf')", token);
         string recreated = $$"""{"node_id": 2000001, "node_name": "node_c_again", "slot": "c_link", "sysid": "1", "timeline": 1, "wal_lsn": "0/0", "sequences": []}""";
         await using (NpgsqlConnection holder = await nodeB.OpenAsync(Database, token))
         {
             await using NpgsqlTransaction holding = await holder.BeginTransactionAsync(token);
-            await using (NpgsqlCommand hold = new($"SELECT 1 FROM worf.sequence_range_node WHERE via_node = {nodeCId} FOR UPDATE", holder, holding))
-            {
-                _ = await hold.ExecuteNonQueryAsync(token);
-            }
+            await HoldRelayedReportAsync(nodeB, holder, holding, "t_id_seq", nodeCId, token);
 
             Task takeover = nodeB.SafePsqlAsync(Database, $"SET SESSION AUTHORIZATION c_user; SELECT worf.sequence_range_exchange('{recreated}')", token);
             Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, """
@@ -3360,15 +3354,11 @@ public sealed partial class SequenceRangeTests
 
             case "canceled drop":
             {
-                // A report node_c relayed of u_id_seq, which no exchange takes in, is held as the drop forgets node_c, which
-                // waits for it as for a lock, outside the turn, until statement_timeout cancels it, as it does each of 10
-                // times over: on Windows, whose timer has the lock timeout of a try come due with the statement's about one
-                // time in eight, PostgreSQL reports the lock timeout then.
-                _ = await nodeA.SafePsqlAsync(Database, $"""
-                    INSERT INTO worf.sequence_range_node (seqoid, node_id, node_name, via_node, reported_at)
-                    VALUES ('u_id_seq'::regclass, 2000002, 'relayed_by_c', {nodeCId}, now())
-                    """, token);
-                await HoldAsync($"SELECT 1 FROM worf.sequence_range_node WHERE seqoid = 'u_id_seq'::regclass AND via_node = {nodeCId} FOR UPDATE");
+                // A report node_c relayed of u_id_seq is held as the drop forgets node_c, which waits for it as for a lock,
+                // outside the turn, until statement_timeout cancels it, as it does each of 10 times over: on Windows, whose
+                // timer has the lock timeout of a try come due with the statement's about one time in eight, PostgreSQL
+                // reports the lock timeout then.
+                await HoldRelayedReportAsync(nodeA, holder, holding, "u_id_seq", nodeCId, token);
                 await using NpgsqlConnection dropping = await nodeA.OpenAsync(Database, token);
                 for (int i = 0; i < 10; i++)
                 {
@@ -3395,11 +3385,7 @@ public sealed partial class SequenceRangeTests
             {
                 // A report node_c relayed of u_id_seq is held as the drop forgets node_c, which waits for it, letting the
                 // turn go meanwhile, until the holder ends.
-                _ = await nodeA.SafePsqlAsync(Database, $"""
-                    INSERT INTO worf.sequence_range_node (seqoid, node_id, node_name, via_node, reported_at)
-                    VALUES ('u_id_seq'::regclass, 2000002, 'relayed_by_c', {nodeCId}, now())
-                    """, token);
-                await HoldAsync($"SELECT 1 FROM worf.sequence_range_node WHERE seqoid = 'u_id_seq'::regclass AND via_node = {nodeCId} FOR UPDATE");
+                await HoldRelayedReportAsync(nodeA, holder, holding, "u_id_seq", nodeCId, token);
                 Task<string> drop = nodeA.SafePsqlAsync(Database, "SET statement_timeout = '25s'; SELECT worf.drop_subscription('a_from_c')", token);
                 Assert.AreEqual("", await InsertAsync(nodeB, "t"), "node_b's inserts as the drop waits for the held report");
                 Assert.IsFalse(drop.IsCompleted, "the drop, waiting for the held report");
@@ -4844,6 +4830,182 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// A statement whose rows that draw feed the rest of its plan, or a table worf doesn't guard, keeps its sequence's
+    /// gate from row to row and lets a waiting switch pass at each (2300): beside one whose rows take half a second each,
+    /// under an aggregate, in CREATE TABLE AS, or inserted into a table without a managed default, another session's 300
+    /// inserts, which switch blocks of 100, wait a row at each switch, where they waited eight, 4 s each. So does a
+    /// PL/pgSQL loop of one assignment that draws, which keeps the gate from turn to turn (2301), at each turn.
+    /// </summary>
+    /// <param name="form">What the rows that draw feed, or the loop.</param>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [DataRow("aggregate")]
+    [DataRow("create table as")]
+    [DataRow("insert into a plain table")]
+    [DataRow("plpgsql loop")]
+    public async Task StatementsThatKeepAGateLetSwitchesPassAtEachRow(string form)
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE SEQUENCE s1;
+            CREATE TABLE t1 (id bigint DEFAULT nextval('s1'), v text);
+            CREATE TABLE plain_t (id bigint, v text);
+            SELECT worf.enable_sequence_range('s1', participants := '{}', range_size := 100, max_range_size := 100);
+            """, token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges", token),
+            "node_a drawing from a block of s1, with the next one ready");
+        await using NpgsqlConnection slow = await nodeA.OpenAsync(Database, token);
+        await using NpgsqlCommand draw = new(form switch
+        {
+            "aggregate" => "SELECT count(*) FROM (SELECT nextval('s1'), pg_sleep(0.5) FROM generate_series(1, 40) OFFSET 0) q",
+            "create table as" => "CREATE TABLE made AS SELECT nextval('s1') AS id, pg_sleep(0.5)::text AS v FROM generate_series(1, 40)",
+            "plpgsql loop" => "DO $$ DECLARE x bigint; BEGIN FOR i IN 1..40 LOOP x := nextval('s1') + length(pg_sleep(0.5)::text); END LOOP; END $$",
+            _ => "INSERT INTO plain_t (id, v) SELECT nextval('s1'), pg_sleep(0.5)::text FROM generate_series(1, 40)",
+        }, slow) { CommandTimeout = 120 };
+        Task<object?> drawing = draw.ExecuteScalarAsync(token);
+        await Task.Delay(TimeSpan.FromMilliseconds(700), token);
+        Stopwatch inserting = Stopwatch.StartNew();
+        string failed = "";
+        try
+        {
+            _ = await nodeA.SafePsqlAsync(Database, "SET statement_timeout = '60s'; INSERT INTO t1 (v) SELECT 'x' FROM generate_series(1, 300)", token);
+        }
+        catch (PostgresException failure)
+        {
+            failed = $"{failure.SqlState} {failure.MessageText}";
+        }
+
+        TimeSpan took = inserting.Elapsed;
+        TestContext.WriteLine($"the inserts took {took.TotalSeconds:F1} s");
+
+        // The slow statement has shown what it had to, and is canceled rather than waited for.
+        _ = await nodeA.SafePsqlAsync(Database, $"SELECT pg_cancel_backend({slow.ProcessID})", token);
+        string ended = "";
+        try
+        {
+            _ = await drawing;
+        }
+        catch (PostgresException canceled) when (canceled.SqlState == "57014")
+        {
+            ended = canceled.SqlState;
+        }
+
+        Assert.AreEqual("", failed, $"the inserts beside the {form} that draws");
+        Assert.IsLessThan(TimeSpan.FromSeconds(10), took, $"the inserts beside the {form} that draws, half a second a row");
+        Assert.AreEqual("57014", ended, $"the {form}, still drawing as the inserts finished, and canceled");
+        Assert.AreEqual("300", await nodeA.SafePsqlAsync(Database, "SELECT count(DISTINCT id) FROM t1", token), "the inserts' ids");
+    }
+
+    /// <summary>
+    /// A PL/pgSQL loop that draws from a managed sequence at every turn takes about as long as one that draws from a plain
+    /// sequence (2301): its assignment keeps the sequence's gate from one turn to the next, and PL/pgSQL calls worf once a
+    /// turn, as it does for any statement, where it called twice and took the gate each time. Loops of 100,000 draws
+    /// alternate, the first two of each warm up, and each one's fastest 8 of the 12 that follow count. The test runs alone,
+    /// as other tests' load hides the difference.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [DoNotParallelize]
+    public async Task PlpgsqlLoopsThatDrawCostWhatPlainOnesDo()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE SEQUENCE s1; CREATE SEQUENCE plain_s;
+            SELECT worf.enable_sequence_range('s1', participants := '{}', range_size := 100000000);
+            """, token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges WHERE sequence = 's1'::regclass", token),
+            "node_a drawing from a block of s1");
+        await using NpgsqlConnection connection = await nodeA.OpenAsync(Database, token);
+        Dictionary<string, List<TimeSpan>> times = new() { ["s1"] = [], ["plain_s"] = [] };
+        for (int i = 0; i < 14; i++)
+        {
+            foreach (string sequence in i % 2 == 0 ? new[] { "s1", "plain_s" } : ["plain_s", "s1"])
+            {
+                await using NpgsqlCommand loop = new(
+                    $"DO $$ DECLARE x bigint; BEGIN FOR i IN 1..100000 LOOP x := nextval('{sequence}'); END LOOP; END $$", connection) { CommandTimeout = 120 };
+                Stopwatch timing = Stopwatch.StartNew();
+                _ = await loop.ExecuteNonQueryAsync(token);
+                if (i >= 2)
+                {
+                    times[sequence].Add(timing.Elapsed);
+                }
+            }
+        }
+
+        static TimeSpan Fastest(List<TimeSpan> times) => TimeSpan.FromTicks(times.Order().Take(8).Sum(time => time.Ticks));
+        TimeSpan managed = Fastest(times["s1"]);
+        TimeSpan plain = Fastest(times["plain_s"]);
+        Assert.IsLessThan(plain * 1.5, managed, $"the fastest 8 of 12 loops of 100,000 draws from a managed sequence, against {plain} from a plain one");
+    }
+
+    /// <summary>
+    /// A PL/pgSQL loop keeps its sequence's gate only while it draws at every turn (2301): a function that sleeps in an
+    /// assignment after such a loop holds no gate as it sleeps, nor does the row that called one whose last statements
+    /// all draw, as the row sleeps, nor the transaction once the statement has ended, so that none holds up a switch.
+    /// </summary>
+    /// <param name="after">What follows the loop.</param>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [DataRow("an assignment that sleeps")]
+    [DataRow("the function's end")]
+    public async Task PlpgsqlLoopsKeepTheirGateOnlyWhileTheyDraw(string after)
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE SEQUENCE s1;
+            CREATE FUNCTION draws_then_sleeps() RETURNS void LANGUAGE plpgsql AS $$
+            DECLARE x bigint; y text;
+            BEGIN
+                FOR i IN 1..20 LOOP x := nextval('s1'); END LOOP;
+                y := pg_sleep(3)::text;
+            END $$;
+            CREATE FUNCTION draws() RETURNS bigint LANGUAGE plpgsql AS $$
+            DECLARE x bigint;
+            BEGIN
+                FOR i IN 1..20 LOOP x := nextval('s1'); END LOOP;
+                RETURN nextval('s1');
+            END $$;
+            SELECT worf.enable_sequence_range('s1', participants := '{}', range_size := 100, max_range_size := 100);
+            """, token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges", token),
+            "node_a drawing from a block of s1, with the next one ready");
+        await using NpgsqlConnection drawing = await nodeA.OpenAsync(Database, token);
+        string gates = $"""
+            SELECT count(*) FROM pg_locks
+            WHERE pid = {drawing.ProcessID} AND locktype = 'advisory' AND classid = 's1'::regclass::oid AND objsubid = 3
+            """;
+        await ExecuteAsync(drawing, "BEGIN", token);
+        string held = "";
+        await using (NpgsqlCommand draw = new(after == "an assignment that sleeps" ? "SELECT draws_then_sleeps()" : "SELECT draws()::text || pg_sleep(3)::text", drawing))
+        {
+            Task<object?> call = draw.ExecuteScalarAsync(token);
+            for (int i = 0; i < 20 && held.Length == 0; i++)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(100), token);
+                held = await nodeA.SafePsqlAsync(Database,
+                    $"SELECT ({gates}) FROM pg_stat_activity WHERE pid = {drawing.ProcessID} AND wait_event = 'PgSleep'", token);
+            }
+
+            _ = await call;
+        }
+
+        string idle = await nodeA.SafePsqlAsync(Database, gates, token);
+        long drawn;
+        await using (NpgsqlCommand last = new("SELECT currval('s1')", drawing))
+        {
+            drawn = (long)(await last.ExecuteScalarAsync(token))!;
+        }
+
+        await ExecuteAsync(drawing, "COMMIT", token);
+        Assert.AreEqual("0", held, $"the gates of s1 the session holds after its loop, at {after}");
+        Assert.AreEqual("0", idle, "the gates of s1 the session holds once the statement has ended");
+        Assert.IsGreaterThanOrEqualTo(20L, drawn, "the loop's last draw");
+    }
+
+    /// <summary>
     /// A PL/pgSQL loop that draws passes the switches other sessions' inserts need, though its transaction's portals and
     /// subtransactions take and let go of the sequence's gate under resource owners of their own (2201): a FOR loop over a
     /// query that draws, sleeping between its rows, and an insert whose trigger runs another insert in a block with an
@@ -5306,7 +5468,8 @@ public sealed partial class SequenceRangeTests
     /// for a block of 100, isn't run out by six of them drawing past it before any switch. So do calls whose sequence the
     /// plan doesn't name, from a column or a parameter, which wait once the block holds fewer values than they and the
     /// other drawing statements may take, a SELECT of five rows, whose rows drawing without a check are shared among
-    /// the statements drawing (2042), and a PL/pgSQL loop's five assignments, each a unit of its own.
+    /// the statements drawing (2042), a PL/pgSQL loop's five assignments, each a unit of its own, and a loop of nothing
+    /// but an assignment that draws, which keeps the sequence's gate from turn to turn (2301). No value is drawn twice.
     /// </summary>
     /// <param name="form">How each session draws.</param>
     /// <returns>The test.</returns>
@@ -5316,6 +5479,7 @@ public sealed partial class SequenceRangeTests
     [DataRow("from a parameter")]
     [DataRow("five rows")]
     [DataRow("loop of five")]
+    [DataRow("tight loop of five")]
     public async Task ConcurrentSelectsOfNextvalLeaveEachOtherValues(string form)
     {
         CancellationToken token = TestContext.CancellationToken;
@@ -5327,12 +5491,16 @@ public sealed partial class SequenceRangeTests
             CREATE FUNCTION draw5() RETURNS SETOF bigint LANGUAGE plpgsql AS $$
             DECLARE x bigint;
             BEGIN FOR i IN 1..5 LOOP x := nextval('s2'); RETURN NEXT x; END LOOP; END $$;
+            CREATE FUNCTION draw5_tightly() RETURNS bigint[] LANGUAGE plpgsql AS $$
+            DECLARE a bigint[] := '{}';
+            BEGIN FOR i IN 1..5 LOOP a := a || nextval('s2'); END LOOP; RETURN a; END $$;
             SELECT worf.enable_sequence_range('s2', participants := '{}', range_size := 100, max_range_size := 100);
             """, token);
         Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 's2'::regclass", token),
             "node_a drawing from a block of s2, with the next one ready");
         int draws = 0;
         List<string> failures = [];
+        ConcurrentBag<long> drawn = [];
         DateTime until = DateTime.UtcNow.AddSeconds(10);
         await Task.WhenAll(Enumerable.Range(0, 6).Select(async session =>
         {
@@ -5343,6 +5511,7 @@ public sealed partial class SequenceRangeTests
                 "from a parameter" => "SELECT nextval($1::regclass)",
                 "five rows" => "SELECT nextval('s2') FROM generate_series(1, 5)",
                 "loop of five" => "SELECT draw5()",
+                "tight loop of five" => "SELECT unnest(draw5_tightly())",
                 _ => "SELECT nextval('s2')",
             }, connection);
             if (form == "from a parameter")
@@ -5359,6 +5528,7 @@ public sealed partial class SequenceRangeTests
                     while (await reader.ReadAsync(token))
                     {
                         _ = Interlocked.Increment(ref draws);
+                        drawn.Add(reader.GetInt64(0));
                     }
                 }
                 catch (PostgresException failed)
@@ -5372,6 +5542,7 @@ public sealed partial class SequenceRangeTests
         }));
         Assert.IsEmpty(failures, $"{failures.Count} failures of {draws + failures.Count} draws: {string.Join("; ", failures.Distinct().Take(3))}");
         Assert.IsGreaterThan(1000, draws, "the six sessions' draws");
+        Assert.HasCount(drawn.Count, drawn.Distinct().ToList(), "the values drawn, each once");
     }
 
     /// <summary>
@@ -6206,6 +6377,31 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// Has a transaction hold a report that node_c relayed of a sequence, of a node made up for it. An exchange with
+    /// node_c, which relays no such node, takes the report away now and then, so it's put back until the transaction
+    /// holds it: a session that locked nothing would hold up no drop.
+    /// </summary>
+    private static async Task HoldRelayedReportAsync(TestNode node, NpgsqlConnection holder, NpgsqlTransaction? holding, string sequence, string via,
+        CancellationToken token)
+    {
+        for (int i = 0; i < 50; i++)
+        {
+            _ = await node.SafePsqlAsync(Database, $"""
+                INSERT INTO worf.sequence_range_node (seqoid, node_id, node_name, via_node, reported_at)
+                VALUES ('{sequence}'::regclass, 2000002, 'relayed_by_c', {via}, now()) ON CONFLICT DO NOTHING
+                """, token);
+            await using NpgsqlCommand hold = new(
+                $"SELECT 1 FROM worf.sequence_range_node WHERE seqoid = '{sequence}'::regclass AND node_id = 2000002 FOR UPDATE", holder, holding);
+            if (await hold.ExecuteScalarAsync(token) is not null)
+            {
+                return;
+            }
+        }
+
+        Assert.Fail("the relayed report was taken away 50 times before a transaction held it");
+    }
+
+    /// <summary>
     /// A drop of a subscription that waits for a report another session holds waits for it as for any lock: it fails at
     /// the session's lock_timeout, and a holder that then waits for a lock the dropping transaction holds is a deadlock
     /// PostgreSQL finds, rather than the drop trying again until its statement_timeout.
@@ -6227,13 +6423,9 @@ public sealed partial class SequenceRangeTests
         Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database,
             "SELECT state = 'active' FROM worf.sequence_ranges WHERE sequence = 'u_id_seq'::regclass", token), "node_a drawing from a block of u_id_seq");
         string nodeCId = await nodeC.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
-        _ = await nodeA.SafePsqlAsync(Database, $"""
-            INSERT INTO worf.sequence_range_node (seqoid, node_id, node_name, via_node, reported_at)
-            VALUES ('u_id_seq'::regclass, 2000002, 'relayed_by_c', {nodeCId}, now())
-            """, token);
         await using NpgsqlConnection holder = await nodeA.OpenAsync(Database, token);
-        await ExecuteAsync(holder,
-            $"BEGIN; SELECT 1 FROM worf.sequence_range_node WHERE seqoid = 'u_id_seq'::regclass AND via_node = {nodeCId} FOR UPDATE", token);
+        await ExecuteAsync(holder, "BEGIN", token);
+        await HoldRelayedReportAsync(nodeA, holder, null, "u_id_seq", nodeCId, token);
 
         await using (NpgsqlConnection dropper = await nodeA.OpenAsync(Database, token))
         {
@@ -6982,12 +7174,28 @@ public sealed partial class SequenceRangeTests
             string log = nodeA.ReadLog()[logpos..];
             Assert.Contains("sequences to its next call", log, "node_a's calls, cut short");
 
-            // A call cut at a third of its 9 s, after the grant under way then, and its answer, takes well under the 4.5 s
-            // that half would leave it.
-            double longest = log.Split('\n').Where(line => line.Contains("statement: SELECT worf.sequence_range_exchange(", StringComparison.Ordinal))
-                .Select(line => double.Parse(line[(line.IndexOf("duration: ", StringComparison.Ordinal) + 10)..line.IndexOf(" ms", StringComparison.Ordinal)], CultureInfo.InvariantCulture))
-                .DefaultIfEmpty(0).Max();
-            Assert.IsLessThan(4200.0, longest, "the longest of node_a's calls, in milliseconds");
+            // A call cut at a third of its 9 s makes five grants of 0.6 s each, and the sixth it may have under way then;
+            // one cut at half would make eight. The count holds however slow the machine, which only has each grant take
+            // longer, where the calls' durations, which were compared with 4.2 s, depend on it (2304).
+            Dictionary<string, int> granting = [];
+            int most = 0;
+            foreach (string line in log.Split('\n'))
+            {
+                string[] fields = line.Split('[', ']');
+                string process = fields.Length > 3 ? fields[3] : "";
+                if (line.Contains(" granted block ", StringComparison.Ordinal) && line.Contains(" to node node_b", StringComparison.Ordinal))
+                {
+                    granting[process] = granting.GetValueOrDefault(process) + 1;
+                }
+                else if (line.Contains("statement: SELECT worf.sequence_range_exchange(", StringComparison.Ordinal))
+                {
+                    most = Math.Max(most, granting.GetValueOrDefault(process));
+                    granting[process] = 0;
+                }
+            }
+
+            Assert.IsGreaterThanOrEqualTo(2, most, "the most grants one of node_a's calls made");
+            Assert.IsLessThanOrEqualTo(6, most, "the most grants one of node_a's calls made");
         }
         finally
         {
@@ -7765,13 +7973,18 @@ public sealed partial class SequenceRangeTests
     /// know it: node_b registers node_c with node_a, its other neighbor, as node_c first calls, and draws only once node_a
     /// has told it back, and node_a's answer to the restored node_b names node_c, which node_b then waits for, down,
     /// unless node_a has it reset, rather than draw again what node_c holds. With node_a down as node_c first calls,
-    /// node_b draws nothing until node_a is back to hear of node_c (1605).
+    /// node_b draws nothing until node_a is back to hear of node_c (1605). And with what node_a recorded of node_b's WAL
+    /// positions gone, so that node_a can't tell the restore, node_b waits for node_c, and draws once node_c is back
+    /// and has it reset (2302). The restored node_b's exchange function gets its name again, as the backup was taken
+    /// while it was renamed, which kept node_c's calls from a restored node_b.
     /// </summary>
-    /// <param name="order">Whether node_a goes down after node_c first calls node_b, or before.</param>
+    /// <param name="order">Whether node_a goes down after node_c first calls node_b, or before, or after it with its
+    /// tables recording nothing of node_b since the backup.</param>
     /// <returns>The test.</returns>
     [TestMethod]
     [DataRow("allocator down after")]
     [DataRow("allocator down before")]
+    [DataRow("allocator down after, recording nothing")]
     public async Task RestoredNodesWaitForNeighborsTakenOnAfterTheBackup(string order)
     {
         CancellationToken token = TestContext.CancellationToken;
@@ -7791,6 +8004,8 @@ public sealed partial class SequenceRangeTests
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.activate_sequence_range('t_id_seq')", token);
         await WaitActiveAsync([nodeA, nodeB], token);
         _ = await InsertIdsAsync(nodeB, "first", token);
+
+        bool unrecorded = order == "allocator down after, recording nothing";
 
         // node_c subscribes while node_b's exchange function is renamed, so it doesn't call node_b, and node_b is backed
         // up with its slots, as a snapshot keeps them, before node_c first calls.
@@ -7820,6 +8035,20 @@ public sealed partial class SequenceRangeTests
         // of, and node_c stops.
         _ = await nodeB.SafePsqlAsync(Database, "ALTER FUNCTION worf.sequence_range_exchange_paused(text) RENAME TO sequence_range_exchange", token);
         Assert.IsTrue(await NamedNodeCAsync(nodeB, token), "node_a telling node_b back of node_c");
+        if (unrecorded)
+        {
+            // Nothing keeps node_a from telling that node_b went back: it compares every WAL position node_b reports. So
+            // that only node_c can tell, node_a takes no more calls, and what it recorded of node_b's positions goes.
+            _ = await nodeA.SafePsqlAsync(Database, "ALTER FUNCTION worf.sequence_range_exchange(text) RENAME TO sequence_range_exchange_paused", token);
+            Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, """
+                SELECT NOT EXISTS (SELECT 1 FROM pg_stat_activity WHERE state = 'active' AND pid <> pg_backend_pid() AND query LIKE '%sequence_range_exchange(%')
+                """, token), "node_a's last call from node_b ending");
+            _ = await nodeA.SafePsqlAsync(Database, """
+                UPDATE worf.sequence_range_node SET wal_lsn = '0/1', reply_lsn = '0/1' WHERE node_name = 'node_b';
+                DELETE FROM worf.sequence_range_back;
+                """, token);
+        }
+
         await nodeA.StopAsync("fast", token);
         HashSet<string> before = await InsertIdsAsync(nodeB, "before", token);
         const string HeardOfB = "FROM worf.sequence_range_node WHERE node_name = 'node_b' AND seqoid = 't_id_seq'::regclass";
@@ -7828,17 +8057,36 @@ public sealed partial class SequenceRangeTests
 
         // node_b is restored and node_a started: node_a names node_c back to node_b, which waits for node_c, down, unless
         // node_a, from node_b's WAL position, has it reset and draw from new blocks; either way it draws none of what node_c
-        // holds.
+        // holds. The backup has node_b's exchange function under the name it had as node_c subscribed, which no restore
+        // of a node in use has, so it gets its own again, for node_c to call.
         int restored = nodeB.ReadLog().Length;
         await RestoreDataAsync(nodeB, copy, token);
+        _ = await nodeB.SafePsqlAsync(Database, "ALTER FUNCTION worf.sequence_range_exchange_paused(text) RENAME TO sequence_range_exchange", token);
         await nodeA.StartServerAsync(token);
+        if (unrecorded)
+        {
+            _ = await nodeA.SafePsqlAsync(Database, "ALTER FUNCTION worf.sequence_range_exchange_paused(text) RENAME TO sequence_range_exchange", token);
+        }
+
         Assert.IsTrue(await NamedNodeCAsync(nodeB, token), "node_a naming node_c to the restored node_b");
         HashSet<string> after = await WaitsOrResetsAsync(nodeB, ["node_c"], restored, token);
+        if (unrecorded)
+        {
+            Assert.IsEmpty(after, "the ids node_b drew before node_c is back, as node_a can't tell it went back");
+            Assert.DoesNotContain("abandons its blocks", nodeB.ReadLog()[restored..], "node_b's resets before node_c is back");
+        }
 
         // Once node_c is back and finds node_b went back, node_b never draws those values again.
         await nodeC.StartServerAsync(token);
         after.UnionWith(await InsertIdsAsync(nodeB, "after", token));
         Assert.AreEqual("", string.Join(",", before.Intersect(after)), "the ids node_b drew both before the restore and after it");
+        if (unrecorded)
+        {
+            // node_c tells node_b that it went back, or node_b finds node_c holding blocks it has no record of granting.
+            string log = nodeB.ReadLog()[restored..];
+            Assert.IsTrue(log.Contains("abandons its blocks", StringComparison.Ordinal) || log.Contains("this node went back; it resets", StringComparison.Ordinal),
+                "node_b's reset once node_c is back");
+        }
     }
 
     /// <summary>
