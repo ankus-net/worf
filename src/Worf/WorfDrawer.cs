@@ -2,8 +2,9 @@ namespace Worf;
 
 /// <summary>
 /// The number of statements that hold a managed sequence's switch gate, which may each draw a value before they check
-/// the sequence again, the number that wait for it to switch, the number of switches that wait for its gate, and how
-/// often a worker has tried to switch it.
+/// the sequence again, the values statements drawing without the gate may draw before they check it again, the number
+/// that wait for it to switch, the number of switches that wait for its gate, and how often a worker has tried to
+/// switch it.
 /// </summary>
 internal struct WorfDrawer
 {
@@ -22,6 +23,12 @@ internal struct WorfDrawer
     /// The number of statements that hold the gate.
     /// </summary>
     public int Statements;
+
+    /// <summary>
+    /// The values statements drawing without the gate may draw before they check the sequence again, as each counts
+    /// them when it checks, which other statements' checks leave them.
+    /// </summary>
+    public long Promised;
 
     /// <summary>
     /// The number of statements that wait for the switch from the active block that <see cref="WaitingFor"/> starts.

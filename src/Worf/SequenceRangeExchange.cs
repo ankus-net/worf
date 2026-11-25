@@ -47,6 +47,12 @@ internal static class SequenceRangeExchange
     private static bool s_rangeWaitAllowed;
     private static bool s_rangeWaitSpent;
 
+    // How far this node applied the neighbor's changes that the message taken in now can't be behind of, or zero, and
+    // whether this node has compared the message with that, as it can't the first call of a neighbor's server since it
+    // started.
+    private static ulong s_applied;
+    private static bool s_compared = true;
+
     // The warnings of the resets a sequence's take-in made, logged only once its subtransaction commits.
     private static readonly List<string> s_takeInWarnings = [];
 
@@ -172,12 +178,104 @@ internal static class SequenceRangeExchange
             return "{}";
         }
 
-        _ = Process(node, root, senderId, root.GetProperty("node_name").GetWorfString() ?? "", true);
+        (ulong floor, bool compared) = CallFloor(slot, senderId, node.Node.Id, SenderStart(root).Start);
+        _ = Process(node, root, senderId, root.GetProperty("node_name").GetWorfString() ?? "", true, floor, compared);
 
         (string reply, List<Guid> refusals) = Build(node, senderId, null);
         AcknowledgeRefusals(refusals);
         return reply;
     }
+
+    // At most this many of the neighbors a message names, the sender's or the recipient's, are taken in.
+    private const int MaxNamedNeighbors = 64;
+
+    /// <summary>
+    /// Lists this node's neighbors, by id and name, but one: the nodes it subscribes to and the nodes that call it.
+    /// </summary>
+    internal static WorfRows Neighbors(uint except)
+        => Worf.SelectCatalog("""
+            SELECT k.node_id, coalesce((SELECT n.node_name::text FROM worf.node n WHERE n.node_id = k.node_id),
+                (SELECT max(c.node_name::text) FROM worf.sequence_range_node c WHERE c.node_id = k.node_id), k.node_id::text)
+            FROM (SELECT s.sub_origin AS node_id FROM worf.subscription s CROSS JOIN worf.local_node l WHERE s.sub_target = l.node_id
+                UNION SELECT k.node_id FROM worf.sequence_range_link k) k
+            WHERE k.node_id <> $1
+            ORDER BY 1
+            """, SpiParameter.Create(except));
+
+    // Writes a list of nodes, each as its id and name.
+    private static void WriteNeighbors(Utf8JsonWriter writer, string name, WorfRows nodes)
+    {
+        writer.WriteStartArray(name);
+        for (int i = 0; i < nodes.Count; i++)
+        {
+            writer.WriteStartArray();
+            writer.WriteNumberValue(nodes[i].Get<uint>(0));
+            writer.WriteStringValue(WorfJson.Encode(nodes[i].Get<string>(1)));
+            writer.WriteEndArray();
+        }
+
+        writer.WriteEndArray();
+    }
+
+    /// <summary>
+    /// Takes in the neighbors a message's sender says it has, which this node keeps, until the sender says one left, and
+    /// tells it back, as a sender restored from a backup taken before it took one on says nothing of it; and the ones it
+    /// says this node has, which a draw of this node's waits for after its server starts, as one that only calls this node
+    /// may hold its values. Only what changed is written.
+    /// </summary>
+    private static void TakeNeighbors(JsonElement root, uint senderId, uint self)
+    {
+        List<(long Id, string Name)> told = Listed(root, "neighbors", senderId, self);
+        List<(long Id, string Name)> left = Listed(root, "left", senderId, self);
+        SpiParameter sender = SpiParameter.Create(senderId);
+        if (told.Count > 0 && Worf.ReadScalar<bool>("""
+            SELECT EXISTS (
+                SELECT 1 FROM ROWS FROM (pg_catalog.unnest($2::pg_catalog.int8[]), pg_catalog.unnest($3::pg_catalog.text[])) AS u (id, name)
+                WHERE NOT EXISTS (SELECT 1 FROM worf.sequence_range_neighbor_of o WHERE o.holder = $1 AND o.neighbor = u.id::pg_catalog.oid AND o.neighbor_name = u.name))
+            """, sender, SpiParameter.Create(told.Select(node => node.Id).ToArray()), SpiParameter.Create(told.Select(node => node.Name).ToArray())))
+        {
+            _ = Worf.Execute("""
+                INSERT INTO worf.sequence_range_neighbor_of (holder, neighbor, neighbor_name)
+                SELECT $1, u.id::pg_catalog.oid, u.name FROM ROWS FROM (pg_catalog.unnest($2::pg_catalog.int8[]), pg_catalog.unnest($3::pg_catalog.text[])) AS u (id, name)
+                ON CONFLICT (holder, neighbor) DO UPDATE SET neighbor_name = excluded.neighbor_name
+                """, sender, SpiParameter.Create(told.Select(node => node.Id).ToArray()), SpiParameter.Create(told.Select(node => node.Name).ToArray()));
+        }
+
+        SpiParameter gone = SpiParameter.Create(left.Select(node => node.Id).Except(told.Select(node => node.Id)).ToArray());
+        if (left.Count > 0 && Worf.ReadScalar<bool>(
+            "SELECT EXISTS (SELECT 1 FROM worf.sequence_range_neighbor_of WHERE holder = $1 AND neighbor::pg_catalog.int8 = ANY ($2))", sender, gone))
+        {
+            _ = Worf.Execute("DELETE FROM worf.sequence_range_neighbor_of WHERE holder = $1 AND neighbor::pg_catalog.int8 = ANY ($2)", sender, gone);
+        }
+
+        if (root.TryGetProperty("neighbors_of_you", out JsonElement back) && back.ValueKind == JsonValueKind.Array)
+        {
+            List<(long Id, string Name)> named = Listed(root, "neighbors_of_you", senderId, self);
+            SpiParameter ids = SpiParameter.Create(named.Select(node => node.Id).ToArray());
+            SpiParameter names = SpiParameter.Create(named.Select(node => node.Name).ToArray());
+            if (!Worf.ReadScalar<bool>("""
+                SELECT coalesce(pg_catalog.array_agg(neighbor::pg_catalog.int8 ORDER BY neighbor), '{}') = $2
+                    AND coalesce(pg_catalog.array_agg(neighbor_name::pg_catalog.text ORDER BY neighbor), '{}') = $3
+                FROM worf.sequence_range_named WHERE named_by = $1
+                """, sender, ids, names))
+            {
+                _ = Worf.Execute("DELETE FROM worf.sequence_range_named WHERE named_by = $1", sender);
+                _ = Worf.Execute("""
+                    INSERT INTO worf.sequence_range_named (named_by, neighbor, neighbor_name)
+                    SELECT $1, u.id::pg_catalog.oid, u.name FROM ROWS FROM (pg_catalog.unnest($2::pg_catalog.int8[]), pg_catalog.unnest($3::pg_catalog.text[])) AS u (id, name)
+                    """, sender, ids, names);
+                SequenceRanges.ChangedOnCommit();
+            }
+        }
+    }
+
+    // The nodes a message's list names, by id, but this node and the sender, at most so many.
+    private static List<(long Id, string Name)> Listed(JsonElement root, string field, uint senderId, uint self)
+        => !root.TryGetProperty(field, out JsonElement told) || told.ValueKind != JsonValueKind.Array ? [] : [.. told.EnumerateArray()
+            .Where(node => node.ValueKind == JsonValueKind.Array && node.GetArrayLength() == 2 && node[0].TryGetUInt32(out _))
+            .Select(node => ((long)node[0].GetUInt32(), node[1].GetWorfString() ?? ""))
+            .Where(node => node.Item1 != self && node.Item1 != senderId)
+            .DistinctBy(node => node.Item1).OrderBy(node => node.Item1).Take(MaxNamedNeighbors)];
 
     /// <summary>
     /// Ties a call to the subscription whose slot it names. The slot must be worf's, in this database, and streamed by
@@ -1067,8 +1165,37 @@ internal static class SequenceRangeExchange
     }
 
     /// <summary>
-    /// Gets the WAL position a neighbor's answer can't be behind of: how far this node applied its changes, unless the
-    /// neighbor already reset for going back past that, as it reports for each sequence.
+    /// Gets how far this node had applied a calling neighbor's changes, through its subscriptions to the neighbor, at the
+    /// neighbor's first call through a slot since its server started, which this node notes then, and whether that call
+    /// came before this one. The neighbor makes its calls through a slot one at a time, each built after the last one's
+    /// answer, so a later call's WAL position can't be behind that unless the neighbor went back, as a restore takes it,
+    /// though this node can't call it, as when the restore lost the slot of this node's subscription.
+    /// </summary>
+    /// <returns>The position, or zero, and whether the call can be compared with it.</returns>
+    private static (ulong Floor, bool Compared) CallFloor(string slot, uint senderId, uint localId, long? senderStart)
+    {
+        List<WorfSubscription> subs = [.. WorfNode.GetNodeSubscriptions(senderId, true).Where(sub => sub.Target.Id == localId)];
+        if (senderStart is not long start || subs.Count == 0)
+        {
+            return (0, true);
+        }
+
+        WorfRows noted = Worf.Read("SELECT floor_start, floor_lsn::text FROM worf.sequence_range_link WHERE slot_name = $1", 1, SpiParameter.Create(slot));
+        if (noted.Count > 0 && noted[0].Get<long?>(0) == start)
+        {
+            return (Worf.TryParseLsn(noted[0].Get<string?>(1) ?? "", out ulong floor) ? floor : 0, true);
+        }
+
+        ulong applied = subs.Select(Applied).DefaultIfEmpty().Max();
+        _ = Worf.Execute("UPDATE worf.sequence_range_link SET floor_start = $2, floor_lsn = $3::pg_lsn WHERE slot_name = $1",
+            SpiParameter.Create(slot), SpiParameter.Create(start), SpiParameter.Create(Worf.FormatLsn(applied)));
+        return (0, false);
+    }
+
+    /// <summary>
+    /// Gets the WAL position a neighbor's message can't be behind of: how far this node applied its changes, before its
+    /// call for an answer, and at the neighbor's first call since it started for a call, unless the neighbor already
+    /// reset for going back past that, as it reports for each sequence.
     /// </summary>
     private static ulong AppliedFloor(ulong applied, JsonElement entry)
         => Text(entry, "reset_done") is string done && Worf.TryParseLsn(done, out ulong reset) && applied <= reset ? 0 : applied;
@@ -1207,6 +1334,19 @@ internal static class SequenceRangeExchange
             }
 
             writer.WriteEndArray();
+
+            // This node's other neighbors, which the neighbor tells back, and the ones the neighbor said it has, so that a
+            // node restored from a backup taken before it took one on learns of it from the others, and waits for it.
+            WriteNeighbors(writer, "neighbors", Neighbors(neighbor));
+            WriteNeighbors(writer, "left", Worf.SelectCatalog("""
+                SELECT d.neighbor, d.neighbor::text FROM worf.sequence_range_left d
+                WHERE d.left_at > now() - interval '7 days' AND d.neighbor <> $1
+                    AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_link k WHERE k.node_id = d.neighbor)
+                    AND NOT EXISTS (SELECT 1 FROM worf.subscription s JOIN worf.local_node l ON l.node_id = s.sub_target WHERE s.sub_origin = d.neighbor)
+                ORDER BY 1
+                """, SpiParameter.Create(neighbor)));
+            WriteNeighbors(writer, "neighbors_of_you", Worf.SelectCatalog(
+                "SELECT neighbor, neighbor_name::text FROM worf.sequence_range_neighbor_of WHERE holder = $1 ORDER BY 1", SpiParameter.Create(neighbor)));
 
             writer.WriteStartArray("sequences");
             // An epoch this node owned of a sequence it dropped goes out as disabled, with nothing else.
@@ -1506,11 +1646,16 @@ internal static class SequenceRangeExchange
     /// <param name="senderId">The neighbor's node id.</param>
     /// <param name="senderName">The neighbor's name.</param>
     /// <param name="call">Whether the neighbor called this node, rather than answered its call.</param>
-    /// <param name="applied">How far this node applied the neighbor's changes before its call, or zero.</param>
+    /// <param name="applied">How far this node applied the neighbor's changes that the message can't be behind of, or
+    /// zero.</param>
+    /// <param name="compared">Whether this node can compare the message with that: not a neighbor's first call since its
+    /// server started, through a slot, when this node subscribes to it.</param>
     /// <returns>Whether this node granted the neighbor a block, and whether it received one.</returns>
     private static (bool Granted, bool Received, bool Changed) Process(WorfLocalNode node, JsonElement root, uint senderId, string senderName, bool call,
-        ulong applied = 0)
+        ulong applied = 0, bool compared = true)
     {
+        s_applied = applied;
+        s_compared = compared;
         bool granted = false;
         bool received = false;
         bool learned = false;
@@ -1518,6 +1663,7 @@ internal static class SequenceRangeExchange
         // The neighbor is heard from now, in shared memory, which an exchange that changes nothing else is all it writes to,
         // unless shared memory has no room for it, and then its report is written to the tables.
         bool heard = SequenceRangeHeard.Record(senderId, senderId, Worker.GetCurrentTimestamp());
+        TakeNeighbors(root, senderId, node.Node.Id);
         if (!root.TryGetProperty("sequences", out JsonElement sequences))
         {
             return (false, false, false);
@@ -2339,14 +2485,14 @@ internal static class SequenceRangeExchange
         }
 
         ulong recorded = Worf.TryParseLsn(kept[0].Get<string?>(2) ?? "", out ulong at) ? at : 0;
-        long? start = SenderStart(root).Start;
+        long? start = s_compared ? SenderStart(root).Start : null;
         if (kept[0].Get<string>(0) != root.GetProperty("sysid").GetWorfString() || kept[0].Get<long>(1) != root.GetProperty("timeline").GetInt64() ||
-            recorded > position || WentBackTo(recorded, kept[0].Get<long?>(3) ?? 0, root) is not null)
+            Math.Max(recorded, AppliedFloor(s_applied, entry)) > position || WentBackTo(recorded, kept[0].Get<long?>(3) ?? 0, root) is not null)
         {
             if (write)
             {
                 _ = Worf.Execute("UPDATE worf.sequence_range_dropped_node SET reset_lsn = $3::pg_lsn WHERE name = $1 AND node_id = $2",
-                    name, sender, SpiParameter.Create(Worf.FormatLsn(Math.Max(recorded, position))));
+                    name, sender, SpiParameter.Create(Worf.FormatLsn(Math.Max(Math.Max(recorded, AppliedFloor(s_applied, entry)), position))));
                 WorfLog.Warning($"sequence {entry.GetProperty("name").GetWorfString()}: node {senderName}'s WAL position moved back from " +
                     $"{Worf.FormatLsn(recorded)}, which this node recorded before it dropped the sequence, so it must give up the blocks it keeps of it");
             }
@@ -2521,8 +2667,9 @@ internal static class SequenceRangeExchange
         // report replaces, and none written in between is lost.
         // The position compared is the latest of the one the tables recorded, the one shared memory holds, which the
         // tables record only once it moves by a WAL segment, the one a call or answer that left the sequence out kept for
-        // it, and, in an answer, how far this node applied the neighbor's changes, which neither its restart nor its crash
-        // forgets, and which stays put while the neighbor is idle.
+        // it, and how far this node applied the neighbor's changes, before its call for an answer and at the neighbor's
+        // first call since it started for a later call, which neither this node's restart nor its crash forgets, and which
+        // stays put while the neighbor is idle.
         _ = Worf.Execute("SELECT 1 FROM worf.sequence_range_node WHERE seqoid = $1 AND node_id = $2 FOR UPDATE", seq, sender);
 
         // A neighbor that reports an older timeline of its system than one this node heard from it on, as the tables, a
@@ -2952,13 +3099,15 @@ internal static class SequenceRangeExchange
 
         // This node has checked the neighbor's report of the sequence since the neighbor's server started, unless it found
         // the neighbor went back, or still asks it to reset, which its messages say back for the sequence, so that the
-        // neighbor draws from the sequence's blocks again.
+        // neighbor draws from the sequence's blocks again. A neighbor's first call since its start, when this node
+        // subscribes to it, has nothing yet to be compared with of the changes of its this node applied, as a neighbor
+        // restored from a backup is behind, so this node checks the report again at its next call.
         if (senderStart is long checkedStart)
         {
             _ = Worf.Execute("""
-                UPDATE worf.sequence_range_node SET checked_start = CASE WHEN $4 OR reset_lsn IS NOT NULL THEN NULL ELSE $3 END
-                WHERE seqoid = $1 AND node_id = $2 AND checked_start IS DISTINCT FROM CASE WHEN $4 OR reset_lsn IS NOT NULL THEN NULL ELSE $3 END
-                """, seq, sender, SpiParameter.Create(checkedStart), SpiParameter.Create(wentBack));
+                UPDATE worf.sequence_range_node SET checked_start = CASE WHEN $4 OR NOT $5 OR reset_lsn IS NOT NULL THEN NULL ELSE $3 END
+                WHERE seqoid = $1 AND node_id = $2 AND checked_start IS DISTINCT FROM CASE WHEN $4 OR NOT $5 OR reset_lsn IS NOT NULL THEN NULL ELSE $3 END
+                """, seq, sender, SpiParameter.Create(checkedStart), SpiParameter.Create(wentBack), SpiParameter.Create(s_compared));
         }
 
         // An answer that changed nothing is noted in shared memory alone, and one that did here, under the range row's lock,
@@ -3030,6 +3179,42 @@ internal static class SequenceRangeExchange
         bool reserved = request.TryGetProperty("reserved", out JsonElement reservedFor) && reservedFor.ValueKind == JsonValueKind.True;
         long largest = range[0].Get<long>(3);
         size = kind == "n" ? (reserved ? size : Math.Min(size, largest)) : Math.Min(size, SequenceRanges.LargestGrant(largest));
+
+        // Pools and loads, the blocks a neighbor sizes itself, are bounded by what it took lately, as a made-up message
+        // may ask for any size: a neighbor takes at most two of the largest pools in ten minutes for itself and for each
+        // node this node reaches through it, whose blocks and reserves its pools hold, and a load at most a sixteenth of
+        // the values this node has left, in ten minutes as at once. A larger load is refused, so that the session that
+        // reserved it fails at once; anything else past its bound waits.
+        if (kind == "p" || reserved)
+        {
+            long step = Math.Max(Math.Abs(info.Increment), 1);
+            // A load's grant is told from a next block's by its size, as no next block is larger than the largest size.
+            decimal recent = Worf.ReadScalar<decimal>("""
+                SELECT coalesce(sum((g.hi::numeric - g.lo) / $4 + 1), 0) FROM worf.sequence_range_grant g
+                WHERE g.seqoid = $1 AND g.grantee_id = $2 AND g.kind = $3::"char" AND g.granted_at > now() - interval '10 minutes'
+                    AND ($3 = 'p' OR (g.hi::numeric - g.lo) / $4 + 1 > $5)
+                """, SpiParameter.Create(seqoid), SpiParameter.Create(granteeId), SpiParameter.Create(kind), SpiParameter.Create(step),
+                SpiParameter.Create(largest));
+            decimal bound = kind == "p"
+                ? 2m * SequenceRanges.LargestGrant(largest) * (1 + Worf.ReadScalar<long>(
+                    "SELECT count(*) FROM worf.sequence_range_node WHERE seqoid = $1 AND via_node = $2 AND node_id <> $2",
+                    SpiParameter.Create(seqoid), SpiParameter.Create(granteeId)))
+                : SequenceRanges.FreeValues(seqoid, epoch, step) / 16;
+            if (reserved && size > bound)
+            {
+                _ = Worf.Execute("""
+                    INSERT INTO worf.sequence_range_grant VALUES (gen_random_uuid(), $1, $2, NULL, $3, $4, 'x', 0, 0, 'sent', now())
+                    ON CONFLICT (request_id) DO UPDATE SET state = 'sent'
+                    """, SpiParameter.Create(requestId), SpiParameter.Create(seqoid), SpiParameter.Create(granteeId), SpiParameter.Create(granteeName));
+                WorfLog.Warning($"sequence {info.Name}: node {granteeName} asked for a load of {size} values, more than the sixteenth of the {bound * 16} values this node has left that one load may take; it is refused");
+                return null;
+            }
+
+            if (recent + size > bound)
+            {
+                return false;
+            }
+        }
 
         return SequenceRanges.Allocate(seqoid, info, epoch, size, granteeId, granteeName, requestId, kind[0]) is not null;
     }
@@ -3199,9 +3384,11 @@ internal static class SequenceRangeExchange
         if (kind == "x")
         {
             string? refused = Worf.ExecuteScalar<string?>(
-                "UPDATE worf.sequence_range_request SET state = 'refused' WHERE request_id = $1 AND state = 'open' RETURNING kind::text",
+                "UPDATE worf.sequence_range_request SET state = 'refused' WHERE request_id = $1 AND state = 'open' RETURNING kind::text || reserved::text",
                 SpiParameter.Create(requestId));
-            if (refused == "n")
+
+            // A refused load fails the session that reserved it, and the node goes on as it was.
+            if (refused == "nfalse")
             {
                 _ = Worf.Execute("""
                     UPDATE worf.sequence_range SET state = 'refused',

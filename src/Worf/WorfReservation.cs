@@ -24,7 +24,7 @@ internal struct WorfReservation
     /// <summary>
     /// The kind of block: 'n' for a node block of at least <see cref="Size"/> values, 'i' for exactly
     /// [<see cref="Lo"/>, <see cref="Hi"/>], 'a' for the active block [<see cref="Lo"/>, <see cref="Hi"/>], which has
-    /// values enough left for the load.
+    /// values enough left for the load, or 'w' to withdraw the request of the same id, which its session gave up on.
     /// </summary>
     public byte Kind;
 

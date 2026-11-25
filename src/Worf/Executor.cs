@@ -371,10 +371,7 @@ internal static unsafe partial class Executor
             }
 
             LockForWorfDrop(cascade);
-            if (cascade)
-            {
-                WarnKeptBounds();
-            }
+            KeepOrWidenBounds();
         }
 
         (uint Role, string Settings) ddlContext = default;
@@ -693,6 +690,8 @@ internal static unsafe partial class Executor
         List<uint> written = DdlLock.WrittenTables(queryDesc, eflags);
         if (written.Count > 0)
         {
+            // A write to a guarded table holds off worf's drop before it reads worf's tables, which the drop waits for.
+            SequenceRangeGuard.HoldOffWorfDrop(written);
             DdlLock.CheckWrite(written);
             LocalIndex.CheckWrites(written);
         }
@@ -744,6 +743,12 @@ internal static unsafe partial class Executor
 #else
                 NativeMethods.standard_ExecutorRun(queryDesc, direction, count);
 #endif
+            }
+
+            // A statement run to its end draws no more rows, though its portal stays open until the client's next command.
+            if (count == 0)
+            {
+                SequenceRangeGuard.RanToEnd((nint)queryDesc);
             }
         }
         finally
@@ -863,12 +868,25 @@ internal static unsafe partial class Executor
         return false;
     }
 
+    /// <summary>
+    /// Gets the key of the lock worf's drop holds for its transaction, 'Worf' as an integer, with its id.
+    /// </summary>
+    internal const int WorfDropLockKey = 1466921574;
+
+    /// <summary>
+    /// Gets the id of the lock worf's drop holds for its transaction.
+    /// </summary>
+    internal const int WorfDropLockId = 1;
+
     // Takes the locks worf's drop needs, on worf's tables and, with the guard's triggers, the tables whose triggers it
     // drops, all at once or none: it takes each it can at once, and while one is held, lets those it took go, waits for
     // that one as for a lock, and tries again, so that it never holds some while it waits for another, which a
     // transaction that holds that one may then wait for, whatever order the transaction took its own in.
     private static void LockForWorfDrop(bool triggers)
     {
+        // The drop says it's under way first, so that statements waiting for a block, which hold the tables it waits for,
+        // stop waiting rather than hold it up.
+        SequenceRangeGuard.TakeWorfDropLock();
         List<uint> relids = [.. Elevated.Run(() => Worf.Read("""
             SELECT c.oid FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_class c ON c.oid = d.objid
                 JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid AND e.extname = 'worf'
@@ -924,21 +942,46 @@ internal static unsafe partial class Executor
         }
     }
 
-    // Warns, as worf is dropped, of each sequence it manages, which keeps the bounds of the block this node draws from,
-    // so that it issues no value another node may hold.
-    private static void WarnKeptBounds()
+    // Widens, as worf is dropped, the bounds of each sequence it manages whose values no other node was ever given, out
+    // to the end of the values the sequence's range spanned, as past its position they are this node's own; and warns
+    // of each other one, which keeps the bounds of the block this node draws from, so that it issues no value another
+    // node may hold.
+    private static void KeepOrWidenBounds()
     {
         foreach (WorfRow row in Elevated.Run(() => Worf.Read("""
-            SELECT r.seqoid::pg_catalog.regclass::pg_catalog.text, s.seqmin, s.seqmax
-            FROM worf.sequence_range r JOIN pg_catalog.pg_sequence s ON s.seqrelid = r.seqoid
-            ORDER BY 1
+            SELECT r.seqoid::pg_catalog.oid, r.seqoid::pg_catalog.regclass::pg_catalog.text, s.seqmin, s.seqmax, s.seqincrement > 0, r.root_end,
+                r.owner_node = l.node_id
+                    AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_grant g WHERE g.seqoid = r.seqoid AND g.grantee_id <> l.node_id AND g.kind <> 'x')
+                    AND NOT EXISTS (SELECT 1 FROM worf.sequence_range_node n WHERE n.seqoid = r.seqoid AND n.node_id <> l.node_id)
+            FROM worf.sequence_range r JOIN pg_catalog.pg_sequence s ON s.seqrelid = r.seqoid CROSS JOIN worf.local_node l
+            ORDER BY 2
             """, 0)))
         {
-            WorfLog.Warning(new PgDiagnostic($"sequence {row.Get<string>(0)} keeps its bounds, {row.Get<long>(1)} to {row.Get<long>(2)}, those of this node's block")
+            string name = row.Get<string>(1);
+            long min = row.Get<long>(2);
+            long max = row.Get<long>(3);
+            if (row.Get<bool>(6))
+            {
+                bool ascending = row.Get<bool>(4);
+                long end = row.Get<long>(5);
+                _ = Elevated.Run(() => Worf.Execute(
+                    ascending ? "UPDATE pg_catalog.pg_sequence SET seqmax = greatest(seqmax, $2) WHERE seqrelid = $1"
+                        : "UPDATE pg_catalog.pg_sequence SET seqmin = least(seqmin, $2) WHERE seqrelid = $1",
+                    SpiParameter.Create(row.Get<uint>(0)), SpiParameter.Create(end)));
+                WorfLog.Log($"sequence {name} goes on to {end}, as no other node was given any of its values");
+                continue;
+            }
+
+            WorfLog.Warning(new PgDiagnostic($"sequence {name} keeps its bounds, {min} to {max}, those of this node's block")
             {
                 Detail = "worf's sequence ranges gave this node's block of the sequence's values to it alone; past it, the sequence would issue values other nodes may hold.",
                 Hint = "Once no other node draws from the sequence's values, widen its bounds with ALTER SEQUENCE.",
             });
+        }
+
+        unsafe
+        {
+            NativeMethods.CommandCounterIncrement();
         }
     }
 

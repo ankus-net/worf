@@ -81,6 +81,7 @@ internal static class SequenceRangeReservations
         long deadline = Worker.GetCurrentTimestamp() + (long)Int128.Min(timeout.ToComparisonMicroseconds(), long.MaxValue / 2);
         Guid requestId = Guid.NewGuid();
         bool requested = false;
+        bool served = false;
         Guid? requestedUnder = null;
         try
         {
@@ -102,6 +103,7 @@ internal static class SequenceRangeReservations
 
                 if (active is not null && Reserved(active.Value.Id) && (left >= needed || (requested && active.Value.Id != requestedUnder)))
                 {
+                    served = true;
                     break;
                 }
 
@@ -118,7 +120,7 @@ internal static class SequenceRangeReservations
                         Post(new WorfReservation { RequestId = requestId, Seqoid = seqoid, Kind = (byte)'a', Size = needed, Lo = active.Value.Lo, Hi = active.Value.Hi });
                     }
 
-                    Wait(requestId, deadline, $"a block of {needed} values of sequence {info.Name}");
+                    Wait(seqoid, requestId, deadline, $"a block of {needed} values of sequence {info.Name}");
                     continue;
                 }
 
@@ -132,7 +134,10 @@ internal static class SequenceRangeReservations
                 }
                 else if (!pending && Refused(requestId))
                 {
-                    throw new PgException("2200H", $"sequence {info.Name} has no free span of {needed} values left");
+                    throw new PgException(PgSqlStates.InvalidParameterValue,
+                        $"the node that hands out sequence {info.Name}'s numbers refused a block of {needed} values for the load",
+                        detail: "One load may take at most a sixteenth of the values that node has left, and no more than that in ten minutes.",
+                        hint: "Reserve fewer values at a time.");
                 }
                 else if (!pending)
                 {
@@ -142,13 +147,19 @@ internal static class SequenceRangeReservations
                     Post(new WorfReservation { RequestId = requestId, Seqoid = seqoid, Kind = (byte)'n', Size = needed });
                 }
 
-                Wait(requestId, deadline, $"a block of {needed} values of sequence {info.Name}");
+                Wait(seqoid, requestId, deadline, $"a block of {needed} values of sequence {info.Name}");
             }
         }
         finally
         {
-            // A cancelled session's request doesn't stay behind for the worker.
+            // A session that gave up, as on its timeout or a cancellation, leaves neither its post for the worker nor the
+            // request the worker made of it, which the worker withdraws, so that the node asks for its next blocks again
+            // and a block that answers the request later is abandoned.
             Remove(id => id == requestId);
+            if (requested && !served)
+            {
+                Post(new WorfReservation { RequestId = requestId, Seqoid = seqoid, Kind = (byte)'w' });
+            }
         }
 
         // The worker switched beside this transaction, which may hold the sequence, as nextval leaves it held, and so not
@@ -202,7 +213,7 @@ internal static class SequenceRangeReservations
                         hint: "Load the rows without their keys so that the sequence numbers them, or load them before enabling range management.");
                 }
 
-                Wait(requestId, deadline, $"values [{lo}, {hi}] of sequence {info.Name}");
+                Wait(seqoid, requestId, deadline, $"values [{lo}, {hi}] of sequence {info.Name}");
             }
         }
         finally
@@ -239,6 +250,14 @@ internal static class SequenceRangeReservations
         List<Guid> recorded = [];
         foreach (WorfReservation reservation in posted)
         {
+            // A session that gave up withdraws its request.
+            if (reservation.Kind == (byte)'w')
+            {
+                _ = Worf.Execute("DELETE FROM worf.sequence_range_request WHERE request_id = $1 AND state = 'open'", SpiParameter.Create(reservation.RequestId));
+                recorded.Add(reservation.RequestId);
+                continue;
+            }
+
             WorfRows range = Worf.Query("SELECT owner_node, epoch FROM worf.sequence_range WHERE seqoid = $1 FOR NO KEY UPDATE", false, 1,
                 SpiParameter.Create(reservation.Seqoid));
 
@@ -458,15 +477,24 @@ internal static class SequenceRangeReservations
         guard.Header = table;
     }
 
+    // How often this session has waited for an answer, so that it looks for a drop of worf now and then.
+    private static long s_waits;
+
     /// <summary>
     /// Waits a moment for an answer, and gives up, withdrawing the request from the worker, once the time is up.
     /// </summary>
-    private static void Wait(Guid requestId, long deadline, string what)
+    private static void Wait(uint seqoid, Guid requestId, long deadline, string what)
     {
         if (Worker.GetCurrentTimestamp() >= deadline)
         {
             Remove(id => id == requestId);
             throw new PgException("57014", $"timed out waiting for {what}");
+        }
+
+        // A drop of worf that waits for the tables this session read isn't held up by the wait.
+        if (++s_waits % 5 == 0)
+        {
+            SequenceRangeGuard.FailIfWorfDropWaits(seqoid);
         }
 
         PgInterrupts.Check();

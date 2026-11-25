@@ -21,6 +21,10 @@ public sealed partial class DocumentationTests
     [TestMethod]
     public void DocsUseShortSentences()
     {
+        // A sentence of clauses joined by colons and semicolons is one sentence.
+        string clauses = string.Join("; ", Enumerable.Repeat(string.Join(' ', Enumerable.Repeat("word", 33)), 3)) + ".";
+        Assert.HasCount(1, [.. Sentences(clauses)], "a sentence of three clauses");
+
         string docs = Path.Join(RepositoryPaths.Root, "docs", "src", "content", "docs");
         foreach (string file in Directory.EnumerateFiles(docs, "*.md", SearchOption.AllDirectories).Append(Path.Join(RepositoryPaths.Root, "README.md")))
         {
@@ -49,19 +53,35 @@ public sealed partial class DocumentationTests
             s_sequenceRanges, "going on without the other nodes");
         Assert.Contains("A node takes its next block from its reserve when the node it asks hasn't answered.", s_sequenceRanges, "offline blocks");
         Assert.Contains("That includes blocks for `reserve_sequence_range`, so bulk loads work offline too", s_sequenceRanges, "offline loads");
-        Assert.Contains("After a restart, a node draws from its blocks, and logs a warning naming the nodes that didn't answer.", s_sequenceRanges,
-            "offline restarts");
-        Assert.Contains("`-1` waits until they answer", s_configuration, "strict restarts");
-        Assert.Contains("How long a node waits for the other nodes before it goes on without them", s_configuration, "offline blocks");
-        Assert.Contains("The block is handed out whole, whatever its size.", s_sequenceRanges, "a participant's reservation (2000)");
-        Assert.Contains("Repeated requests can take all of a sequence's numbers.", s_sequenceRanges, "made-up pool and reserved requests (1900)");
+        Assert.Contains("A node that restarted is different: it might have been restored from a backup, so it draws nothing, and takes nothing from its reserve, until the other nodes it exchanges with have answered it.",
+            s_sequenceRanges, "restarts (2110–2114)");
+        Assert.Contains("With `-1`, a restarted node waits until they answer", s_configuration, "restarts (2110–2114)");
+        Assert.Contains("A node tells its other neighbors about each new neighbor, such as a node that starts subscribing to it, and draws only once one of them has heard of it.",
+            s_sequenceRanges, "new neighbors (1605)");
+        Assert.Contains("With `-1`, a node that can't reach the others keeps drawing from the blocks it holds, and then waits for them.", s_configuration,
+            "what -1 does (2160)");
+        Assert.Contains("A call that runs out of time, or a failed probe, is retried after a delay that starts at no more than 10 seconds and doubles each time, up to a minute or this interval, whichever is longer, whether or not anything waits.",
+            s_configuration, "a timed-out call's retries (2161)");
+        Assert.Contains("make a node give up its blocks: once in ten minutes for each neighbor, and, for the node's grantor, once in ten seconds at first",
+            s_sequenceRanges, "made-up resets (2162)");
+        Assert.Contains("Rows written with `session_replication_role` set to `replica`, as worf's apply and sync workers write the rows they bring from other nodes, aren't checked.",
+            s_sequenceRanges, "unchecked rows (2163)");
+        Assert.Contains("or \"reached minimum value\" for a descending sequence", s_sequenceRanges, "a descending sequence's error (2165)");
+        Assert.Contains("statements at the end of its last block fail at once with SQLSTATE `2200H` instead of waiting", s_sequenceRanges,
+            "a used-up reserve (2154)");
+        Assert.Contains("How long a running node waits for the other nodes before it goes on without them", s_configuration, "offline blocks");
+        Assert.Contains("The block is handed out whole, up to a sixteenth of the values the allocator has left.", s_sequenceRanges,
+            "a participant's reservation (2000, 2101)");
+        Assert.DoesNotContain("Repeated requests can take all of a sequence's numbers.", s_sequenceRanges, "made-up pool and reserved requests (1900)");
+        Assert.Contains("Every ten minutes, that's up to two pools of sixteen times `max_range_size` for the node and for each node behind it, and loads of up to a sixteenth of the values the allocator has left.",
+            s_sequenceRanges, "made-up pool and reserved requests (1900, 2100)");
         Assert.Contains("From a block's last twentieth, statements wait for the switch before they draw more.", s_sequenceRanges, "the switch (130)");
         Assert.Contains("it allows half a block per row until it has seen such a row", s_sequenceRanges, "a row's unseen draws (1663)");
         Assert.Contains("Inserts, `COPY FROM`, `INSERT … ON CONFLICT` and `MERGE` check between rows.", s_sequenceRanges, "upserts and merges (2040)");
         Assert.Contains("up to twice this long, plus `worf.sequence_range_offline_wait`, if the next block hasn't arrived or a switch failed, and otherwise until the switch is done", s_configuration,
             "how long inserts wait for a switch (130)");
-        Assert.Contains("each sequence that used sequence ranges stays limited to the block of numbers this node was using", s_nodes,
-            "sequences' bounds after worf's drop (2021)");
+        Assert.Contains("goes on to the end of its range if no other node was ever given any of its values. Otherwise it stays limited to the block of numbers this node was using, so it can't hand out a number another node may have, and worf logs a warning for it.",
+            s_nodes, "sequences' bounds after worf's drop (2021, 2164)");
 
         string ranges = Read("src", "Worf", "SequenceRanges.cs");
         Assert.DoesNotContain("which switches beside those transactions, without waiting for them, while the range worker checks", ranges,
@@ -92,7 +112,7 @@ public sealed partial class DocumentationTests
     }
 
     // The sentences of a page's prose: without its front matter, code, tables and markup, split after each full stop,
-    // question mark, colon or semicolon that ends a clause.
+    // question mark or exclamation mark that ends one, and before each list item.
     private static IEnumerable<string> Sentences(string page)
     {
         string text = Markup().Replace(Tables().Replace(Code().Replace(FrontMatter().Replace(page, ""), ""), ""), " ");
@@ -117,7 +137,7 @@ public sealed partial class DocumentationTests
     [GeneratedRegex(@"\n\s*\n|\n(?=\s*(?:[-*]|\d+\.) )")]
     private static partial Regex Blocks();
 
-    [GeneratedRegex(@"(?<=[.?!:;])\s+")]
+    [GeneratedRegex(@"(?<=[.?!])\s+")]
     private static partial Regex SentenceEnd();
 
     [GeneratedRegex(@"\s+")]

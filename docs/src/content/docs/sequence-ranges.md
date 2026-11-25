@@ -43,7 +43,8 @@ SELECT worf.enable_sequence_range('inventory_id_seq', participants := '{node_bet
 
 The allocator starts handing out blocks once every other node has reported in. Blocks start above every number any node
 has already used. Until a node has its first block, its `nextval` fails with SQLSTATE `2200H` ("reached maximum
-value"), because worf parks the sequence at the edge of its type until then. A node that joins later with rows whose
+value", or "reached minimum value" for a descending sequence), because worf parks the sequence at the edge of its type
+until then. A node that joins later with rows whose
 keys are already in the handed-out range is refused, and its state shows `refused`.
 
 To call the functions below, a role that isn't a superuser needs `USAGE` on schema `worf` and the privileges of the
@@ -67,7 +68,7 @@ it waits for, if any. `worf.sequence_range_grants` lists the blocks this node ha
 | `worf.alter_sequence_range` | The allocator | Changes the block sizes, each at least 2. The other nodes pick them up at their next exchange. |
 | `worf.disable_sequence_range` | The allocator | Stops handing out blocks. Nodes keep using the blocks they have. |
 | `worf.reset_sequence_range` | Any node | Gives up this node's blocks and asks for new ones; without a sequence, for every managed sequence. |
-| `worf.reserve_sequence_range` | Any node | Makes sure the active block has `count` numbers left, plus 5% for other sessions, before a bulk load. The block is handed out whole, whatever its size. |
+| `worf.reserve_sequence_range` | Any node | Makes sure the active block has `count` numbers left, plus 5% for other sessions, before a bulk load. The block is handed out whole, up to a sixteenth of the values the allocator has left. |
 | `worf.reserve_sequence_values` | Any node | Gives this node exactly the numbers from `lo` to `hi`, for rows that already carry those keys. |
 
 ```sql
@@ -89,8 +90,9 @@ for `bigint`. If a block lasted less than an hour, the node asks for twice as ma
 worth at its peak insert rate.
 
 A node's reserve holds sixteen of its largest blocks, or 1/256 of the numbers the sequence's type can hold,
-whichever is smaller. A node asks for a new reserve once less than half of its current one is left. The allocator
-takes its own blocks straight from the free numbers, so it needs no reserve.
+whichever is smaller. A block taken from the reserve has the largest size, or what the reserve has left if that's
+less. A node asks for a new reserve once less than half of its current one is left. The allocator takes its own
+blocks straight from the free numbers, so it needs no reserve.
 
 ## Working without the other nodes
 
@@ -99,10 +101,16 @@ A node keeps taking inserts while it can't reach the other nodes. It waits for t
 
 - A node takes its next block from its reserve when the node it asks hasn't answered. That includes blocks for
   `reserve_sequence_range`, so bulk loads work offline too, as long as they fit in what is left of the reserve.
-- The allocator uses a block it gave itself, even if no other node has heard of it yet.
-- After a restart, a node draws from its blocks, and logs a warning naming the nodes that didn't answer.
+- The allocator waits once for another node to hear of a block it gave itself, and then uses its own blocks without
+  waiting until another node answers.
 
-When the nodes reach each other again, they exchange what they hold and carry on.
+When the nodes reach each other again, they exchange what they hold and carry on. If a node's reserve has nothing
+left while it's cut off, `worf.sequence_ranges` says so, and statements at the end of its last block fail at once
+with SQLSTATE `2200H` instead of waiting.
+
+A node that restarted is different: it might have been restored from a backup, so it draws nothing, and takes nothing
+from its reserve, until the other nodes it exchanges with have answered it. See
+[Restores and failover](#restores-and-failover).
 
 ## When a block runs low
 
@@ -147,7 +155,9 @@ SELECT worf.reserve_sequence_range('inventory_id_seq', 500000);
 COMMIT;
 ```
 
-Other sessions keep drawing from the same block. If they leave the load short, it carries on in the next block.
+Other sessions keep drawing from the same block. If they leave the load short, it carries on in the next block. One
+load may take at most a sixteenth of the values the allocator has left; a larger reservation fails at once with
+SQLSTATE `22023`.
 
 To load rows that already have keys, reserve exactly those keys with `worf.reserve_sequence_values` on the node that
 loads them. The allocator refuses keys that may already be in use.
@@ -157,8 +167,9 @@ loads them. The allocator refuses keys that may already be in use.
 worf adds two triggers to each table with a column that takes its default from a managed sequence. They check each
 row a local session writes: a new row's value, and a value an update changes. A value is allowed only if it's in one
 of this node's blocks and the sequence has already gone past it. Anything else fails the statement with SQLSTATE
-`23514`. Rows that worf's apply and sync workers bring from other nodes aren't checked. The triggers can't be
-disabled.
+`23514`. Rows written with `session_replication_role` set to `replica`, as worf's apply and sync workers write the
+rows they bring from other nodes, aren't checked. Setting it takes a superuser or `GRANT SET ON PARAMETER`. The
+triggers can't be disabled.
 
 The column must be `smallint`, `integer`, `bigint` or `numeric`, and its default, or its domain's, must be `nextval`
 of the sequence, alone or cast to the column's type. worf refuses other defaults that use the sequence, such as
@@ -195,13 +206,18 @@ guards against this where it can:
   position it reports and from its last 32 starts, which it keeps in the file `worf_starts` in its data directory.
   They tell it to reset, and take nothing from it until it has. If `worf_starts` is missing, the node's neighbors treat
   every earlier position as gone back.
-- After a restart, a node waits briefly for the other nodes to confirm it didn't go back, as described in
-  [Working without the other nodes](#working-without-the-other-nodes).
+- After a restart, a node draws nothing from the blocks it held until the other nodes it exchanges with have answered
+  it, so they can tell it whether it went back. Each statement that draws waits up to twice
+  `worf.sequence_range_timeout`, and then fails with SQLSTATE `55000` naming the node it waits for. Blocks it gets
+  after the restart, as `worf.reset_sequence_range()` brings, it draws from at once. `worf.sequence_range_restart_wait` lets it draw after a set time
+  instead, at the risk of duplicate keys after a restore.
 
-worf can't catch everything. A node that is restored while it can't reach the others, or whose neighbors don't hear
-from it in time, may hand out numbers again. To make nodes wait until the others answer instead, set
-`worf.sequence_range_offline_wait` to `-1`. A node also doesn't know about nodes that subscribed to it after its backup
-was taken. So after restoring a node from a backup, run `worf.reset_sequence_range()` on it before it takes writes. A
+- A node tells its other neighbors about each new neighbor, such as a node that starts subscribing to it, and draws
+  only once one of them has heard of it. A node restored from a backup taken before then learns of the new neighbor
+  from them, and waits for it too.
+
+worf can't catch everything, for example a node whose only neighbor is the one it took on after the backup. So after
+restoring a node from a backup, run `worf.reset_sequence_range()` on it before it takes writes. A
 synchronous standby for the allocator keeps a crash from losing the record of a block it handed out.
 
 A node that `worf_create_subscriber` makes from a base backup gives up its source's blocks. Its copied rows overlap
@@ -215,10 +231,12 @@ for other nodes. At worst, a user with `EXECUTE` on `worf.sequence_range_exchang
 
 - hold a sequence up, for example by keeping the allocator from starting or a node from finishing its wait after a
   reset;
-- make a node give up its blocks, at most once in ten minutes for each neighbor, and less often if it keeps asking;
+- make a node give up its blocks: once in ten minutes for each neighbor, and, for the node's grantor, once in ten
+  seconds at first, both less often if it keeps asking;
 - make a later range start above a made-up value;
-- take numbers: up to sixteen times `max_range_size` with each made-up request for a pool, and any number with each
-  made-up reservation, since that can't be told from a real one. Repeated requests can take all of a sequence's numbers.
+- take numbers, since a made-up request can't be told from a real one. Every ten minutes, that's up to two pools of
+  sixteen times `max_range_size` for the node and for each node behind it, and loads of up to a sixteenth of the
+  values the allocator has left.
 
 Grant `EXECUTE` on `worf.sequence_range_exchange` only to the users of nodes you trust with the sequence's numbers.
 
@@ -266,4 +284,5 @@ column, the sequence hands out those numbers again.
 
 Dropping worf leaves each managed sequence with its block's bounds, so that it hands out no number another node may
 hold. Once that block is used up, `nextval` fails. Widen the sequence's bounds with `ALTER SEQUENCE` once no other node
-uses its numbers.
+uses its numbers. While the drop runs, new inserts that use a managed sequence fail with SQLSTATE `55006`, and those
+waiting for a block give up, so the drop doesn't wait on them.

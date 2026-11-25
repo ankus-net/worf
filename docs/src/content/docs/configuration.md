@@ -293,7 +293,10 @@ See [Sequence ranges](../sequence-ranges/).
   when nothing is waiting. While a request waits, nodes exchange more often,
   starting at every check interval. A failed exchange is retried after a delay
   that doubles each time, up to this interval, or up to half of
-  `worf.sequence_range_timeout` while something waits on that neighbor. The
+  `worf.sequence_range_timeout` while something waits on that neighbor. A call
+  that runs out of time, or a failed probe, is retried after a delay that
+  starts at no more than 10 seconds and doubles each time, up to a minute or
+  this interval, whichever is longer, whether or not anything waits. The
   user in each provider connection string needs `EXECUTE` on
   `worf.sequence_range_exchange`, which `PUBLIC` doesn't have. The default is
   `1min`.
@@ -306,12 +309,21 @@ See [Sequence ranges](../sequence-ranges/).
   The default is `10s`.
 
 - `worf.sequence_range_offline_wait`
-  How long a node waits for the other nodes before it goes on without them:
-  it then takes blocks from its reserve, and after a restart it draws from its
-  blocks, with a warning. The wait lets the other nodes catch a node restored
-  from a backup before it hands out numbers it already used. `-1` waits until
-  they answer, so a node that can't reach them can't insert into tables that
-  use managed sequences. The default is `10s`.
+  How long a running node waits for the other nodes before it goes on without
+  them. A node takes its next block from its reserve once its request has gone
+  unanswered this long. The allocator waits this long once for another node to
+  hear of a block it gave itself, and then uses its own blocks without waiting
+  until another node answers. With `-1`, a node that can't reach the others
+  keeps drawing from the blocks it holds, and then waits for them. The default
+  is `10s`.
+
+- `worf.sequence_range_restart_wait`
+  How long a node that restarted waits for the other nodes to answer before it
+  draws from its blocks anyway, with a warning. The wait lets the other nodes
+  catch a node restored from a backup before it hands out numbers it already
+  used, so a value other than `-1` risks duplicate keys after a restore. With
+  `-1`, a restarted node waits until they answer, and each statement that draws
+  gives up after twice `worf.sequence_range_timeout`. The default is `-1`.
 
 - `worf.sequence_range_restore`
   Lets a session write rows with values that this node's sequences can no
