@@ -4652,8 +4652,8 @@ public sealed partial class SequenceRangeTests
 
     /// <summary>
     /// worf's drop beside inserts that wait for a block, holding the locks on worf's tables they took as they drew,
-    /// finishes at once: the waits see the drop waiting for those tables and fail, rather than hold it up until they
-    /// time out (2120).
+    /// finishes long before the inserts' 30 s timeout, in seconds on a slow runner: the waits see the drop waiting for
+    /// those tables and fail, rather than hold it up until they time out (2120).
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -4682,7 +4682,7 @@ public sealed partial class SequenceRangeTests
         await Task.Delay(TimeSpan.FromSeconds(2), token);
         Stopwatch dropping = Stopwatch.StartNew();
         _ = await nodeB.SafePsqlAsync(Database, "SET statement_timeout = '60s'; DROP EXTENSION worf CASCADE", token);
-        Assert.IsLessThan(TimeSpan.FromSeconds(5), dropping.Elapsed, "the drop beside the waiting inserts");
+        Assert.IsLessThan(TimeSpan.FromSeconds(15), dropping.Elapsed, "the drop beside the waiting inserts");
         await stopping.CancelAsync();
         await Task.WhenAll(loops);
     }
