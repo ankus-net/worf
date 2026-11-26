@@ -4893,17 +4893,20 @@ public sealed partial class SequenceRangeTests
         CancellationToken token = TestContext.CancellationToken;
         await using TestNode nodeA = await StartNodeAsync("node_a", token);
         Dictionary<string, TimeSpan> took = await TimeLoopsAsync(nodeA,
-            [("managed", false, "x := nextval('s1')"), ("told", true, "x := nextval('plain_s')")], token);
+        [
+            ("managed", false, "FOR i IN 1..100000 LOOP x := nextval('s1'); END LOOP"),
+            ("told", true, "FOR i IN 1..100000 LOOP x := nextval('plain_s'); END LOOP"),
+        ], token);
         Assert.IsLessThan(took["told"] * 1.5, took["managed"],
             $"the fastest 8 of 12 loops of 100,000 draws from a managed sequence, against {took["told"]} from a plain one, each telling worf of every statement");
     }
 
     /// <summary>
-    /// PL/pgSQL runs without a call into worf where nothing may draw from a managed sequence (2400): a loop in a
-    /// transaction that drew from none, and one, in a transaction that did, in a block without a call of nextval, each
-    /// take less than a third as long as a loop whose every statement PL/pgSQL tells worf of, as it does in a block that
-    /// calls nextval, of a plain sequence here, once its transaction drew. A call into worf costs several times what a
-    /// statement that does little takes, and every statement of every function made one, on any server that loaded worf.
+    /// PL/pgSQL runs without a call into worf where nothing may draw from a managed sequence (2400): a loop of additions
+    /// in a transaction that drew from none, and one, in a transaction that did, in a block without a call of nextval,
+    /// each take less than a third as long as the loop does once PL/pgSQL tells worf of its every statement, as it does
+    /// in a block that calls nextval, of a plain sequence here, once its transaction drew. A call into worf costs many
+    /// times what an addition takes, and every statement of every function made one, on any server that loaded worf.
     /// Loops of 100,000 turns alternate, the first two of each warm up, and each one's fastest 8 of the 12 that follow
     /// count. The test runs alone, as other tests' load hides the difference.
     /// </summary>
@@ -4914,23 +4917,24 @@ public sealed partial class SequenceRangeTests
     {
         CancellationToken token = TestContext.CancellationToken;
         await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        const string Additions = "FOR i IN 1..100000 LOOP y := i + 1; END LOOP";
         Dictionary<string, TimeSpan> took = await TimeLoopsAsync(nodeA,
         [
-            ("fresh", false, "x := nextval('plain_s')"),
-            ("told", true, "x := nextval('plain_s')"),
-            ("after", true, "y := i + 1"),
+            ("fresh", false, $"x := nextval('plain_s'); {Additions}"),
+            ("told", true, $"x := nextval('plain_s'); {Additions}"),
+            ("after", true, Additions),
         ], token);
         Assert.IsLessThan(took["told"], took["fresh"] * 3,
-            $"three times the fastest 8 of 12 loops of 100,000 draws from a plain sequence in a transaction that drew nothing, against {took["told"]} with worf told of every statement");
+            $"three times the fastest 8 of 12 loops of 100,000 additions in a transaction that drew nothing, against {took["told"]} with worf told of every statement");
         Assert.IsLessThan(took["told"], took["after"] * 3,
-            $"three times the fastest 8 of 12 loops of 100,000 turns that draw nothing, after a draw in their transaction, against {took["told"]} with worf told of every statement");
+            $"three times the fastest 8 of 12 loops of 100,000 additions in a block that draws nothing, after a draw in its transaction, against {took["told"]} with worf told of every statement");
     }
 
     /// <summary>
-    /// Times DO blocks of a 100,000-turn loop on one connection, each kind in turn, 14 times over, some after a draw from
-    /// the managed sequence s1 in their transaction, and gives each kind's fastest 8 of its last 12, summed.
+    /// Times DO blocks that loop 100,000 times on one connection, each kind in turn, 14 times over, some after a draw
+    /// from the managed sequence s1 in their transaction, and gives each kind's fastest 8 of its last 12, summed.
     /// </summary>
-    private static async Task<Dictionary<string, TimeSpan>> TimeLoopsAsync(TestNode node, (string Kind, bool AfterDraw, string Turn)[] loops, CancellationToken token)
+    private static async Task<Dictionary<string, TimeSpan>> TimeLoopsAsync(TestNode node, (string Kind, bool AfterDraw, string Body)[] loops, CancellationToken token)
     {
         _ = await node.SafePsqlAsync(Database, """
             CREATE SEQUENCE s1; CREATE SEQUENCE plain_s;
@@ -4942,11 +4946,10 @@ public sealed partial class SequenceRangeTests
         Dictionary<string, List<TimeSpan>> times = loops.ToDictionary(loop => loop.Kind, _ => new List<TimeSpan>());
         for (int i = 0; i < 14; i++)
         {
-            foreach ((string kind, bool afterDraw, string turn) in i % 2 == 0 ? loops : loops.Reverse())
+            foreach ((string kind, bool afterDraw, string body) in i % 2 == 0 ? loops : loops.Reverse())
             {
                 await ExecuteAsync(connection, afterDraw ? "BEGIN; SELECT nextval('s1')" : "BEGIN", token);
-                await using NpgsqlCommand loop = new(
-                    $"DO $$ DECLARE x bigint; y int; BEGIN FOR i IN 1..100000 LOOP {turn}; END LOOP; END $$", connection) { CommandTimeout = 120 };
+                await using NpgsqlCommand loop = new($"DO $$ DECLARE x bigint; y int; BEGIN {body}; END $$", connection) { CommandTimeout = 120 };
                 Stopwatch timing = Stopwatch.StartNew();
                 _ = await loop.ExecuteNonQueryAsync(token);
                 timing.Stop();
