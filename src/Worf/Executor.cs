@@ -507,19 +507,26 @@ internal static unsafe partial class Executor
         }
         finally
         {
-            if (copying)
-            {
-                SequenceRangeGuard.EndCopy();
-            }
-
+            // What worf only notes goes first, and the rest goes whatever fails before it: a cancellation stays pending
+            // until the statement ends, and fails every call into PostgreSQL meanwhile.
             if (startingCopy || startingUtility)
             {
                 SequenceRangeGuard.StartedExpressions();
             }
 
-            LocalIndex.EndStatement(tracking);
-            LocalIndex.EndIsolation(isolated);
-            usedTemp = DdlReplication.EndStatement(xactFlags, ddl is not null);
+            try
+            {
+                if (copying)
+                {
+                    SequenceRangeGuard.EndCopy();
+                }
+            }
+            finally
+            {
+                LocalIndex.EndStatement(tracking);
+                LocalIndex.EndIsolation(isolated);
+                usedTemp = DdlReplication.EndStatement(xactFlags, ddl is not null);
+            }
         }
 
         LocalIndex.Restore(isolated);
@@ -775,13 +782,14 @@ internal static unsafe partial class Executor
         }
         finally
         {
-            // A SELECT run to its end draws no more, though its portal stays open until the client's next command.
-            SequenceRangeGuard.LeaveRun((nint)queryDesc, toClient, noted, failed, count == 0 && queryDesc->operation == CmdType.CMD_SELECT &&
-                queryDesc->plannedstmt is not null && !queryDesc->plannedstmt->hasModifyingCTE);
             if (starting)
             {
                 SequenceRangeGuard.StartedExpressions();
             }
+
+            // A SELECT run to its end draws no more, though its portal stays open until the client's next command.
+            SequenceRangeGuard.LeaveRun((nint)queryDesc, toClient, noted, failed, count == 0 && queryDesc->operation == CmdType.CMD_SELECT &&
+                queryDesc->plannedstmt is not null && !queryDesc->plannedstmt->hasModifyingCTE);
         }
     }
 
@@ -806,11 +814,12 @@ internal static unsafe partial class Executor
         }
         finally
         {
-            SequenceRangeGuard.LeaveRun((nint)queryDesc, false, noted, failed, false);
             if (starting)
             {
                 SequenceRangeGuard.StartedExpressions();
             }
+
+            SequenceRangeGuard.LeaveRun((nint)queryDesc, false, noted, failed, false);
         }
     }
 

@@ -83,6 +83,26 @@ internal static class SequenceRangeReservations
         bool requested = false;
         bool served = false;
         Guid? requestedUnder = null;
+
+        // A session that gave up, as on its timeout or a cancellation, leaves neither its post for the worker nor the
+        // request the worker made of it, which the worker withdraws, so that the node asks for its next blocks again
+        // and a block that answers the request later is abandoned.
+        bool gone = false;
+        void Leave()
+        {
+            if (!gone)
+            {
+                Remove(id => id == requestId);
+                if (requested && !served)
+                {
+                    Post(new WorfReservation { RequestId = requestId, Seqoid = seqoid, Kind = (byte)'w' });
+                }
+
+                gone = true;
+            }
+        }
+
+        LeaveAtEnd(Leave);
         try
         {
             while (true)
@@ -152,14 +172,7 @@ internal static class SequenceRangeReservations
         }
         finally
         {
-            // A session that gave up, as on its timeout or a cancellation, leaves neither its post for the worker nor the
-            // request the worker made of it, which the worker withdraws, so that the node asks for its next blocks again
-            // and a block that answers the request later is abandoned.
-            Remove(id => id == requestId);
-            if (requested && !served)
-            {
-                Post(new WorfReservation { RequestId = requestId, Seqoid = seqoid, Kind = (byte)'w' });
-            }
+            Leave();
         }
 
         // The worker switched beside this transaction, which may hold the sequence, as nextval leaves it held, and so not
@@ -167,6 +180,30 @@ internal static class SequenceRangeReservations
         SequenceRangeGuard.ForgetBounds();
 
         SequenceRanges.ChangedOnCommit(seqoid);
+    }
+
+    /// <summary>
+    /// Has a session leave what it posted as its transaction ends, or a subtransaction of it aborts, where it couldn't
+    /// as its wait ended: a cancellation stays pending until the statement has ended, and fails every call into
+    /// PostgreSQL meanwhile, the shared table's lock among them.
+    /// </summary>
+    private static void LeaveAtEnd(Action leave)
+    {
+        void Left()
+        {
+            try
+            {
+                leave();
+            }
+            catch (PgException failed)
+            {
+                WorfLog.Warning($"could not withdraw a sequence range reservation: {failed.Message}");
+            }
+        }
+
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, Left);
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, Left);
+        _ = PgTransaction.RegisterSubtransactionCallback(PgSubtransactionEvent.Abort, (_, _) => Left());
     }
 
     /// <summary>
@@ -194,6 +231,19 @@ internal static class SequenceRangeReservations
         SequenceInfo info = SequenceRanges.GetInfo(seqoid);
         Guid requestId = Guid.NewGuid();
         long deadline = Worker.GetCurrentTimestamp() + (long)Int128.Min(timeout.ToComparisonMicroseconds(), long.MaxValue / 2);
+
+        // A cancelled session's request doesn't stay behind for the worker.
+        bool gone = false;
+        void Leave()
+        {
+            if (!gone)
+            {
+                Remove(id => id == requestId);
+                gone = true;
+            }
+        }
+
+        LeaveAtEnd(Leave);
         Post(new WorfReservation { RequestId = requestId, Seqoid = seqoid, Kind = (byte)'i', Size = SequenceRanges.Steps(info, lo, hi), Lo = lo, Hi = hi });
         try
         {
@@ -218,8 +268,7 @@ internal static class SequenceRangeReservations
         }
         finally
         {
-            // A cancelled session's request doesn't stay behind for the worker.
-            Remove(id => id == requestId);
+            Leave();
         }
 
         SequenceRanges.ChangedOnCommit(seqoid);

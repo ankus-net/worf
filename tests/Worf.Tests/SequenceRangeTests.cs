@@ -4486,11 +4486,16 @@ public sealed partial class SequenceRangeTests
     /// <summary>
     /// A reservation that times out while node_b is cut off leaves its reserve to its other inserts: the request it made
     /// goes with the session, and a load that doesn't fit the reserve doesn't keep plain blocks from coming out of it,
-    /// so node_b inserts 4,000 rows from its reserve after the reservation of 20,000 timed out (2152).
+    /// so node_b inserts 4,000 rows from its reserve after the reservation of 20,000 timed out (2152). So does one
+    /// that the statement's own timeout cancels (2600): a cancellation stays pending until the statement has ended, so
+    /// the session withdraws its request as its transaction ends.
     /// </summary>
+    /// <param name="timeout">Whose timeout ends the reservation.</param>
     /// <returns>The test.</returns>
     [TestMethod]
-    public async Task TimedOutReservationsLeaveTheReserve()
+    [DataRow("its own")]
+    [DataRow("the statement's")]
+    public async Task TimedOutReservationsLeaveTheReserve(string timeout)
     {
         CancellationToken token = TestContext.CancellationToken;
         await using TestNode nodeA = await StartNodeAsync("node_a", token);
@@ -4508,8 +4513,9 @@ public sealed partial class SequenceRangeTests
             "SELECT EXISTS (SELECT 1 FROM worf.sequence_range_block WHERE seqoid = 't_id_seq'::regclass AND kind = 'p' AND state = 'open')", token),
             "node_b's reserve");
         await nodeA.StopAsync("fast", token);
-        PostgresException timedOut = await Assert.ThrowsExactlyAsync<PostgresException>(() =>
-            nodeB.SafePsqlAsync(Database, "BEGIN; SELECT worf.reserve_sequence_range('t_id_seq', 20000, '5 seconds')", token));
+        PostgresException timedOut = await Assert.ThrowsExactlyAsync<PostgresException>(() => nodeB.SafePsqlAsync(Database, timeout == "its own"
+            ? "BEGIN; SELECT worf.reserve_sequence_range('t_id_seq', 20000, '5 seconds')"
+            : "SET statement_timeout = '5s'; BEGIN; SELECT worf.reserve_sequence_range('t_id_seq', 20000, '5 minutes')", token));
         Assert.AreEqual("57014", timedOut.SqlState, "node_b's reservation while node_a is down");
         Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
             "SELECT NOT EXISTS (SELECT 1 FROM worf.sequence_range_request WHERE seqoid = 't_id_seq'::regclass AND reserved AND state = 'open')", token),
@@ -4810,14 +4816,15 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
-    /// A row that draws keeps its sequence's switch gate once a statement its function ran has ended, which had the gate
-    /// as its own while it drew from the sequence too: the row, which sleeps after its function's insert and draws after
-    /// that, holds the gate as it sleeps, so that a switch beside it moves the sequence only once the row has drawn, and
-    /// holds none once it has.
+    /// A row that draws after a statement its function ran, which held its sequence's gate while it drew from the
+    /// sequence too, holds no gate meanwhile and draws a value no other session has: the row sleeps after its
+    /// function's insert, another session's 150 inserts run the block out and switch it beside the sleeping row,
+    /// without waiting for it, and the row's own draw then comes from the new block. A row held the gate until it had
+    /// drawn, which held the switch up as long as it slept.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
-    public async Task RowsKeepTheirGatesPastTheStatementsTheyRun()
+    public async Task RowsDrawSafelyPastTheStatementsTheyRun()
     {
         CancellationToken token = TestContext.CancellationToken;
         await using TestNode nodeA = await StartNodeAsync("node_a", token);
@@ -4835,20 +4842,35 @@ public sealed partial class SequenceRangeTests
             WHERE pid = {drawing.ProcessID} AND locktype = 'advisory' AND classid = 's1'::regclass::oid AND objsubid = 3
                 AND mode = 'ShareLock' AND granted
             """;
-        await using NpgsqlCommand draw = new("SELECT ins() || ' ' || pg_sleep(3)::text || nextval('s1')", drawing);
+        await using NpgsqlCommand draw = new("SELECT ins() || ' ' || pg_sleep(4)::text || nextval('s1')", drawing);
         Task<object?> row = draw.ExecuteScalarAsync(token);
         string held = "";
-        for (int i = 0; i < 20 && held != "t"; i++)
+        for (int i = 0; i < 20 && held.Length == 0; i++)
         {
             await Task.Delay(TimeSpan.FromMilliseconds(100), token);
             held = await nodeA.SafePsqlAsync(Database,
-                $"SELECT ({gates}) = 1 FROM pg_stat_activity WHERE pid = {drawing.ProcessID} AND wait_event = 'PgSleep'", token);
+                $"SELECT ({gates}) FROM pg_stat_activity WHERE pid = {drawing.ProcessID} AND wait_event = 'PgSleep'", token);
         }
 
+        Stopwatch inserting = Stopwatch.StartNew();
+        string inserted = "";
+        try
+        {
+            _ = await nodeA.SafePsqlAsync(Database, "INSERT INTO t1 (v) SELECT 'beside' FROM generate_series(1, 150)", token);
+        }
+        catch (PostgresException failed)
+        {
+            inserted = $"{failed.SqlState} {failed.MessageText}";
+        }
+
+        inserting.Stop();
         string[] ids = ((string)(await row)!).Split(' ');
-        Assert.AreEqual("t", held, "whether the row holds the gate of s1 as it sleeps after its function's insert");
-        Assert.AreEqual(long.Parse(ids[0], CultureInfo.InvariantCulture) + 1, long.Parse(ids[1], CultureInfo.InvariantCulture),
-            "the row's own draw, next after its function's insert's");
+        Assert.AreEqual("0", held, "the gates of s1 the row holds as it sleeps after its function's insert");
+        Assert.AreEqual("", inserted, "the 150 inserts beside the sleeping row");
+        Assert.IsLessThan(TimeSpan.FromSeconds(2.5), inserting.Elapsed, "the 150 inserts beside the row, which sleeps 4 s");
+        Assert.AreEqual("0", await nodeA.SafePsqlAsync(Database, $"SELECT count(*) FROM t1 WHERE id = {long.Parse(ids[1], CultureInfo.InvariantCulture)}", token),
+            "the rows that hold the value the row drew after it slept");
+        Assert.IsGreaterThan(100L, long.Parse(ids[1], CultureInfo.InvariantCulture), "the row's own draw, from a block switched to as it slept");
         Assert.AreEqual("0", await nodeA.SafePsqlAsync(Database, gates, token), "the gates of s1 the session holds once the row is out");
     }
 
@@ -4923,8 +4945,9 @@ public sealed partial class SequenceRangeTests
     /// <summary>
     /// A PL/pgSQL loop that draws from a managed sequence at every turn takes less than twice as long as one that draws
     /// from a plain sequence, which runs without a call into worf (2301, 2501), and so does one that also adds at every
-    /// turn, a statement that draws nothing (2500). worf counts each draw within PostgreSQL's own call of nextval, where
-    /// it took a call into worf at every statement, which cost seven times what a plain draw does. Loops of 100,000
+    /// turn, a statement that draws nothing (2500), and one whose call names its sequence, managed or plain, with a
+    /// variable (2601). worf counts each draw within PostgreSQL's own call of nextval, where it took a call into worf
+    /// at every statement, or at every call that a variable named, which cost seven times what a plain draw does. Loops of 100,000
     /// turns alternate, each in a transaction of its own, the first two of each warm up, and each one's fastest 8 of
     /// the 12 that follow count. The test runs alone, as other tests' load hides the difference.
     /// </summary>
@@ -4941,11 +4964,19 @@ public sealed partial class SequenceRangeTests
             ("plain", false, "FOR i IN 1..100000 LOOP x := nextval('plain_s'); END LOOP"),
             ("managed, adding", false, "FOR i IN 1..100000 LOOP x := nextval('s1'); y := i + 1; END LOOP"),
             ("plain, adding", false, "FOR i IN 1..100000 LOOP x := nextval('plain_s'); y := i + 1; END LOOP"),
+            ("managed, named by a variable", false, "DECLARE s regclass := 's1'; BEGIN FOR i IN 1..100000 LOOP x := nextval(s); END LOOP; END"),
+            ("plain, named by a variable", false, "DECLARE s regclass := 'plain_s'; BEGIN FOR i IN 1..100000 LOOP x := nextval(s); END LOOP; END"),
         ], token);
         Assert.IsLessThan(took["plain"] * 2, took["managed"],
             $"the fastest 8 of 12 loops of 100,000 draws from a managed sequence, against {took["plain"]} from a plain one");
         Assert.IsLessThan(took["plain, adding"] * 2, took["managed, adding"],
             $"the fastest 8 of 12 loops of 100,000 draws from a managed sequence, each with an addition, against {took["plain, adding"]} from a plain one");
+        string[] named = ["managed, named by a variable", "plain, named by a variable"];
+        foreach (string loop in named)
+        {
+            Assert.IsLessThan(took["plain"] * 2, took[loop],
+                $"the fastest 8 of 12 loops of 100,000 draws from a sequence, {loop}, against {took["plain"]} from a plain one that a constant names");
+        }
     }
 
     /// <summary>
@@ -4985,8 +5016,32 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
-    /// Times DO blocks that loop 100,000 times on one connection, each kind in turn, 14 times over, some after a draw
-    /// from the managed sequence s1 in their transaction, and gives each kind's fastest 8 of its last 12, summed.
+    /// A statement that draws from a managed sequence at each of its rows takes less than twice as long as one that
+    /// draws from a plain sequence: an aggregate over 100,000 rows that each draw, which took 7.8 times as long. worf
+    /// counts each draw within PostgreSQL's own call of nextval, as it does a PL/pgSQL expression's, where it took a
+    /// call into worf before each row. The statements alternate, the first two of each warm up, and each one's fastest
+    /// 8 of the 12 that follow count. The test runs alone, as other tests' load hides the difference.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [DoNotParallelize]
+    public async Task RowsThatDrawCostWhatPlainOnesDo()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        Dictionary<string, TimeSpan> took = await TimeLoopsAsync(nodeA,
+        [
+            ("managed", false, "SELECT count(nextval('s1')) FROM generate_series(1, 100000)"),
+            ("plain", false, "SELECT count(nextval('plain_s')) FROM generate_series(1, 100000)"),
+        ], token);
+        Assert.IsLessThan(took["plain"] * 2, took["managed"],
+            $"the fastest 8 of 12 aggregates over 100,000 rows that draw from a managed sequence, against {took["plain"]} from a plain one");
+    }
+
+    /// <summary>
+    /// Times DO blocks that loop 100,000 times on one connection, or statements given whole, each kind in turn, 14 times
+    /// over, some after a draw from the managed sequence s1 in their transaction, and gives each kind's fastest 8 of its
+    /// last 12, summed.
     /// </summary>
     private static async Task<Dictionary<string, TimeSpan>> TimeLoopsAsync(TestNode node, (string Kind, bool AfterDraw, string Body)[] loops, CancellationToken token)
     {
@@ -5003,9 +5058,10 @@ public sealed partial class SequenceRangeTests
             foreach ((string kind, bool afterDraw, string body) in i % 2 == 0 ? loops : loops.Reverse())
             {
                 await ExecuteAsync(connection, afterDraw ? "BEGIN; SELECT nextval('s1')" : "BEGIN", token);
-                await using NpgsqlCommand loop = new($"DO $$ DECLARE x bigint; y int; BEGIN {body}; END $$", connection) { CommandTimeout = 120 };
+                await using NpgsqlCommand loop = new(body.StartsWith("SELECT ", StringComparison.Ordinal) ? body : $"DO $$ DECLARE x bigint; y int; BEGIN {body}; END $$",
+                    connection) { CommandTimeout = 120 };
                 Stopwatch timing = Stopwatch.StartNew();
-                _ = await loop.ExecuteNonQueryAsync(token);
+                _ = await loop.ExecuteScalarAsync(token);
                 timing.Stop();
                 await ExecuteAsync(connection, "COMMIT", token);
                 if (i >= 2)
@@ -5030,7 +5086,8 @@ public sealed partial class SequenceRangeTests
     /// loop whose draw fails at every fortieth turn, for want of the privilege, and is made again, and from
     /// assignments that fail once they have drawn, as they give a variable that takes none a null, each in a
     /// subtransaction that so aborts before PL/pgSQL tells of a statement, in a function, in a DO block, and in DO
-    /// blocks that end with it, and no value is drawn twice.
+    /// blocks that end with it, and from a cursor whose query names its sequence with a parameter, beside another
+    /// cursor left open over the same plan that names a plain sequence, and no value is drawn twice.
     /// </summary>
     /// <param name="form">Where the draws start.</param>
     /// <returns>The test.</returns>
@@ -5050,6 +5107,7 @@ public sealed partial class SequenceRangeTests
     [DataRow("assignments that fail once they have drawn")]
     [DataRow("a do block's assignments that fail once they have drawn")]
     [DataRow("do blocks that fail once they have drawn")]
+    [DataRow("beside another cursor over the same plan")]
     public async Task PlpgsqlDrawsAreCountedWhereverTheyStart(string form)
     {
         CancellationToken token = TestContext.CancellationToken;
@@ -5105,6 +5163,23 @@ public sealed partial class SequenceRangeTests
                     END;
                 END LOOP;
                 INSERT INTO drawn SELECT unnest(a);
+            END $$;
+            CREATE SEQUENCE plain_seq;
+            CREATE FUNCTION draw_beside_cursor(name regclass, n int, depth int) RETURNS void LANGUAGE plpgsql SET plan_cache_mode = force_generic_plan AS $$
+            DECLARE c refcursor; r record;
+            BEGIN
+                OPEN c FOR SELECT nextval(name) AS id FROM generate_series(1, n);
+                IF depth = 0 THEN
+                    FETCH c INTO r;
+                    RETURN;
+                END IF;
+                PERFORM draw_beside_cursor('plain_seq', 3, depth - 1);
+                LOOP
+                    FETCH c INTO r;
+                    EXIT WHEN NOT FOUND;
+                    INSERT INTO drawn VALUES (r.id);
+                END LOOP;
+                CLOSE c;
             END $$;
             CREATE FUNCTION draw_and_fail(n int) RETURNS void LANGUAGE plpgsql AS $$
             DECLARE a bigint[] := '{}'; filled bigint NOT NULL := 0;
@@ -5165,6 +5240,7 @@ public sealed partial class SequenceRangeTests
                 END $$
                 """,
             "do blocks that fail once they have drawn" => "SELECT draw_in_blocks_that_fail(350)",
+            "beside another cursor over the same plan" => "SELECT draw_beside_cursor('s1', 350, 1)",
             _ => "INSERT INTO filled (v) SELECT 'x' FROM generate_series(1, 350); INSERT INTO drawn SELECT id FROM filled",
         }, token);
         Assert.AreEqual("350|350", await nodeA.SafePsqlAsync(Database, "SELECT count(*), count(DISTINCT id) FROM drawn", token), $"the ids drawn from the {form}, and how many differ");
@@ -5780,6 +5856,219 @@ public sealed partial class SequenceRangeTests
         Assert.IsEmpty(failures, $"{failures.Count} failures of {draws + failures.Count} draws: {string.Join("; ", failures.Distinct().Take(3))}");
         Assert.IsGreaterThan(1000, draws, "the six sessions' draws");
         Assert.HasCount(drawn.Count, drawn.Distinct().ToList(), "the values drawn, each once");
+    }
+
+    /// <summary>
+    /// A statement that draws and is cancelled leaves its session drawing (2600): after 30 statements of 150 draws each
+    /// from blocks of 100, cut by statement timeouts of 1 to 24 ms, as many of them are while they wait for a switch,
+    /// none fails but with the timeout's 57014, and 30 more without a timeout all draw, as do 150 of one row each.
+    /// A cancellation stays pending until its statement has ended and fails every call into PostgreSQL meanwhile, so
+    /// what worf undid as the statement unwound stopped at the first such call: the session went on as though all its
+    /// statements were worf's own, which draw unchecked, and failed at its block's end with 2200H, though other
+    /// sessions drew; and a PL/pgSQL expression whose run failed counted as still running when it next started. The
+    /// statements are a SELECT over rows, a PL/pgSQL loop, an INSERT, a COPY, and a block that catches the
+    /// cancellation and draws on.
+    /// </summary>
+    /// <param name="form">How the session draws.</param>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [DataRow("select")]
+    [DataRow("plpgsql loop")]
+    [DataRow("insert")]
+    [DataRow("copy")]
+    [DataRow("a block that catches the cancellation")]
+    public async Task CancelledDrawsLeaveTheSessionDrawing(string form)
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE SEQUENCE s1;
+            CREATE TABLE drawn (id bigint DEFAULT nextval('s1'), g int);
+            CREATE FUNCTION draw150() RETURNS bigint LANGUAGE plpgsql AS $$
+            DECLARE x bigint;
+            BEGIN FOR i IN 1..150 LOOP x := nextval('s1'); END LOOP; RETURN x; END $$;
+            SELECT worf.enable_sequence_range('s1', participants := '{}', range_size := 100, max_range_size := 100);
+            """, token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges", token),
+            "node_a drawing from a block of s1, with the next one ready");
+        string file = (await nodeA.SafePsqlAsync(Database, "SELECT current_setting('data_directory')", token)).Replace('\\', '/') + "/draws.txt";
+        _ = await nodeA.SafePsqlAsync(Database, $"COPY (SELECT g FROM generate_series(1, 150) g) TO '{file}'", token);
+        string draw = form switch
+        {
+            "plpgsql loop" => "SELECT draw150()",
+            "insert" => "INSERT INTO drawn (g) SELECT g FROM generate_series(1, 150) g",
+            "copy" => $"COPY drawn (g) FROM '{file}'",
+            "a block that catches the cancellation" => """
+                DO $$ DECLARE x bigint;
+                BEGIN FOR i IN 1..2 LOOP BEGIN x := draw150(); EXCEPTION WHEN query_canceled THEN x := draw150(); END; END LOOP; END $$
+                """,
+            _ => "SELECT count(nextval('s1')) FROM generate_series(1, 150)",
+        };
+        await using NpgsqlConnection session = await nodeA.OpenAsync(Database, token);
+        List<string> failures = [];
+        int cancelled = 0;
+        async Task DrawAsync(string sql, string step)
+        {
+            try
+            {
+                await ExecuteAsync(session, sql, token);
+            }
+            catch (PostgresException failed) when (failed.SqlState == "57014")
+            {
+                cancelled++;
+            }
+            catch (PostgresException failed)
+            {
+                failures.Add($"{step}: {failed.SqlState} {failed.MessageText}");
+            }
+        }
+
+        // The timeout a statement sets cuts the one that sets the next, too, on a busy host.
+        async Task SetTimeoutAsync(int milliseconds)
+        {
+            for (int tries = 0; ; tries++)
+            {
+                try
+                {
+                    await ExecuteAsync(session, $"SET statement_timeout = {milliseconds}", token);
+                    return;
+                }
+                catch (PostgresException failed) when (failed.SqlState == "57014" && tries < 100)
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(1), token);
+                }
+            }
+        }
+
+        for (int i = 0; i < 30; i++)
+        {
+            await SetTimeoutAsync((i % 24) + 1);
+            await DrawAsync(draw, "cut");
+        }
+
+        await SetTimeoutAsync(0);
+        for (int i = 0; i < 30; i++)
+        {
+            await DrawAsync(draw, "after");
+        }
+
+        for (int i = 0; i < 150; i++)
+        {
+            await DrawAsync("SELECT nextval('s1')", "one row");
+        }
+
+        Assert.IsEmpty(failures, $"{failures.Count} statements of the session's that failed, after {cancelled} cancelled: {string.Join("; ", failures.Distinct().Take(3))}");
+        if (form != "a block that catches the cancellation")
+        {
+            Assert.IsGreaterThan(0, cancelled, "the statements cut by their timeouts");
+        }
+    }
+
+    /// <summary>
+    /// Sessions that another cancels as they draw go on drawing (2600): six sessions draw for ten seconds from blocks of
+    /// 100, with a SELECT over rows, a PL/pgSQL loop, an INSERT, a loop whose block catches the cancellation, a call
+    /// whose sequence a variable names and a SELECT of one row, while a seventh cancels one of them every few
+    /// milliseconds. No statement fails but with the cancellation's 57014, and no value is drawn twice.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task SessionsCancelledAsTheyDrawGoOnDrawing()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE SEQUENCE s1;
+            CREATE TABLE drawn (id bigint DEFAULT nextval('s1'), g int);
+            CREATE FUNCTION draw(n int) RETURNS bigint[] LANGUAGE plpgsql AS $$
+            DECLARE a bigint[] := '{}';
+            BEGIN FOR i IN 1..n LOOP a := a || nextval('s1'); END LOOP; RETURN a; END $$;
+            CREATE FUNCTION draw_named(n int, name text) RETURNS bigint[] LANGUAGE plpgsql AS $$
+            DECLARE a bigint[] := '{}';
+            BEGIN FOR i IN 1..n LOOP a := a || nextval(name); END LOOP; RETURN a; END $$;
+            CREATE FUNCTION draw_on(n int) RETURNS bigint[] LANGUAGE plpgsql AS $$
+            DECLARE a bigint[] := '{}';
+            BEGIN
+                FOR i IN 1..n LOOP
+                    BEGIN
+                        a := a || nextval('s1');
+                    EXCEPTION WHEN query_canceled THEN
+                        a := a || nextval('s1');
+                    END;
+                END LOOP;
+                RETURN a;
+            END $$;
+            SELECT worf.enable_sequence_range('s1', participants := '{}', range_size := 100, max_range_size := 100);
+            """, token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges", token),
+            "node_a drawing from a block of s1, with the next one ready");
+        string[] statements =
+        [
+            "SELECT nextval('s1') FROM generate_series(1, 40)",
+            "SELECT unnest(draw(40))",
+            "INSERT INTO drawn (g) SELECT g FROM generate_series(1, 40) g RETURNING id",
+            "SELECT unnest(draw_on(40))",
+            "SELECT unnest(draw_named(40, 's1'))",
+            "SELECT nextval('s1')",
+        ];
+        List<string> failures = [];
+        ConcurrentBag<long> values = [];
+        ConcurrentBag<int> pids = [];
+        int cancelled = 0;
+        DateTime until = DateTime.UtcNow.AddSeconds(10);
+        Task[] drawing = [.. statements.Select(async statement =>
+        {
+            await using NpgsqlConnection connection = await nodeA.OpenAsync(Database, token);
+            pids.Add(connection.ProcessID);
+            await using NpgsqlCommand draw = new(statement, connection);
+            while (DateTime.UtcNow < until)
+            {
+                List<long> got = [];
+                try
+                {
+                    await using NpgsqlDataReader reader = await draw.ExecuteReaderAsync(token);
+                    while (await reader.ReadAsync(token))
+                    {
+                        got.Add(reader.GetInt64(0));
+                    }
+
+                    foreach (long value in got)
+                    {
+                        values.Add(value);
+                    }
+                }
+                catch (PostgresException failed) when (failed.SqlState == "57014")
+                {
+                    _ = Interlocked.Increment(ref cancelled);
+                }
+                catch (PostgresException failed)
+                {
+                    lock (failures)
+                    {
+                        failures.Add($"{statement}: {failed.SqlState} {failed.MessageText}");
+                    }
+                }
+            }
+        })];
+        await using (NpgsqlConnection canceller = await nodeA.OpenAsync(Database, token))
+        {
+            Random random = new(36);
+            while (DateTime.UtcNow < until)
+            {
+                int[] known = [.. pids];
+                if (known.Length > 0)
+                {
+                    await ExecuteAsync(canceller, $"SELECT pg_cancel_backend({known[random.Next(known.Length)]})", token);
+                }
+
+                await Task.Delay(TimeSpan.FromMilliseconds(random.Next(5, 40)), token);
+            }
+        }
+
+        await Task.WhenAll(drawing);
+        Assert.IsEmpty(failures, $"{failures.Count} statements that failed, beside {cancelled} cancelled: {string.Join("; ", failures.Distinct().Take(3))}");
+        Assert.IsGreaterThan(5, cancelled, "the statements cancelled");
+        Assert.IsGreaterThan(200, values.Count, "the sessions' draws");
+        Assert.HasCount(values.Count, values.Distinct().ToList(), "the values drawn, each once");
     }
 
     /// <summary>

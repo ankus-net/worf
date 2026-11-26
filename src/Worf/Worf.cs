@@ -1046,8 +1046,17 @@ internal static partial class Worf
     internal static unsafe WorfRows SelectCatalog(string commandText, params ReadOnlySpan<SpiParameter> parameters)
     {
         int nestLevel = PinSearchPath();
-        NativeMethods.CommandCounterIncrement();
-        NativeMethods.PushActiveSnapshot(NativeMethods.GetLatestSnapshot());
+        try
+        {
+            NativeMethods.CommandCounterIncrement();
+            NativeMethods.PushActiveSnapshot(NativeMethods.GetLatestSnapshot());
+        }
+        catch
+        {
+            UnpinSearchPath(nestLevel);
+            throw;
+        }
+
         try
         {
             return NeedsExact(commandText, parameters)
@@ -1058,8 +1067,16 @@ internal static partial class Worf
         }
         finally
         {
-            NativeMethods.PopActiveSnapshot();
-            UnpinSearchPath(nestLevel);
+            // A cancellation stays pending until the statement ends and fails every call into PostgreSQL meanwhile,
+            // this pop too, so the search path's end, which counts worf's own SQL down first, mustn't hang on it.
+            try
+            {
+                NativeMethods.PopActiveSnapshot();
+            }
+            finally
+            {
+                UnpinSearchPath(nestLevel);
+            }
         }
     }
 
@@ -1174,7 +1191,16 @@ internal static partial class Worf
     internal static unsafe WorfRows Read(string commandText, int limit, params ReadOnlySpan<SpiParameter> parameters)
     {
         int nestLevel = PinSearchPath();
-        NativeMethods.PushActiveSnapshot(NativeMethods.GetTransactionSnapshot());
+        try
+        {
+            NativeMethods.PushActiveSnapshot(NativeMethods.GetTransactionSnapshot());
+        }
+        catch
+        {
+            UnpinSearchPath(nestLevel);
+            throw;
+        }
+
         try
         {
             return NeedsExact(commandText, parameters)
@@ -1185,8 +1211,16 @@ internal static partial class Worf
         }
         finally
         {
-            NativeMethods.PopActiveSnapshot();
-            UnpinSearchPath(nestLevel);
+            // A cancellation stays pending until the statement ends and fails every call into PostgreSQL meanwhile,
+            // this pop too, so the search path's end, which counts worf's own SQL down first, mustn't hang on it.
+            try
+            {
+                NativeMethods.PopActiveSnapshot();
+            }
+            finally
+            {
+                UnpinSearchPath(nestLevel);
+            }
         }
     }
 
@@ -1652,21 +1686,31 @@ internal static partial class Worf
     internal static unsafe int PinSearchPath()
     {
         s_ownSql++;
-        fixed (byte* name = ToServerCString("search_path"))
+        try
         {
-            if (FromServer(NativeMethods.GetConfigOption((sbyte*)name, false, false)) == PinnedSearchPath)
+            fixed (byte* name = ToServerCString("search_path"))
             {
-                return 0;
-            }
+                if (FromServer(NativeMethods.GetConfigOption((sbyte*)name, false, false)) == PinnedSearchPath)
+                {
+                    return 0;
+                }
 
-            int nestLevel = NativeMethods.NewGUCNestLevel();
-            fixed (byte* value = ToServerCString(PinnedSearchPath))
-            {
-                _ = NativeMethods.set_config_option((sbyte*)name, (sbyte*)value, GucContext.PGC_USERSET, GucSource.PGC_S_SESSION,
-                    GucAction.GUC_ACTION_SAVE, true, 0, false);
-            }
+                int nestLevel = NativeMethods.NewGUCNestLevel();
+                fixed (byte* value = ToServerCString(PinnedSearchPath))
+                {
+                    _ = NativeMethods.set_config_option((sbyte*)name, (sbyte*)value, GucContext.PGC_USERSET, GucSource.PGC_S_SESSION,
+                        GucAction.GUC_ACTION_SAVE, true, 0, false);
+                }
 
-            return nestLevel;
+                return nestLevel;
+            }
+        }
+        catch
+        {
+            // A call into PostgreSQL that fails, as each does while a cancellation is pending, leaves the caller no
+            // nest level to end, so worf's own SQL is counted down here.
+            s_ownSql--;
+            throw;
         }
     }
 
@@ -1680,12 +1724,21 @@ internal static partial class Worf
     {
         s_ownSqlOutside.Push(s_ownSql);
         s_ownSql = 0;
-        fixed (byte* name = ToServerCString("search_path"))
+        try
         {
-            int nestLevel = NativeMethods.NewGUCNestLevel();
-            _ = NativeMethods.set_config_option((sbyte*)name, NativeMethods.GetConfigOptionResetString((sbyte*)name),
-                GucContext.PGC_USERSET, GucSource.PGC_S_SESSION, GucAction.GUC_ACTION_SAVE, true, 0, false);
-            return nestLevel;
+            fixed (byte* name = ToServerCString("search_path"))
+            {
+                int nestLevel = NativeMethods.NewGUCNestLevel();
+                _ = NativeMethods.set_config_option((sbyte*)name, NativeMethods.GetConfigOptionResetString((sbyte*)name),
+                    GucContext.PGC_USERSET, GucSource.PGC_S_SESSION, GucAction.GUC_ACTION_SAVE, true, 0, false);
+                return nestLevel;
+            }
+        }
+        catch
+        {
+            // As in PinSearchPath: the caller has no nest level to end.
+            s_ownSql = s_ownSqlOutside.Pop();
+            throw;
         }
     }
 

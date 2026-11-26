@@ -121,8 +121,9 @@ internal static partial class SequenceRangeGuard
     private static readonly HashSet<string> s_typeListFields = ["funccoltypes", "coltypes", "colTypes"];
 
     // The PL/pgSQL expression whose calls of nextval started last, which PL/pgSQL starts outside a statement, as of the
-    // transaction it started in before, with the sequences its calls name once a call has looked, and how many have.
-    private static (nint Expr, uint Lxid, (HashSet<uint> Called, int Calls, bool Unnamed)? Draws, int Looked) s_simple;
+    // transaction it started in before and the transaction and subtransaction it starts in now, with the sequences its
+    // calls name once a call has looked, and how many have.
+    private static (nint Expr, (uint Started, uint Transaction, uint Subtransaction) Start, (HashSet<uint> Called, int Calls, bool Unnamed)? Draws, int Looked) s_simple;
 
     // Where PL/pgSQL finds its instrumentation plugin, which it tells the function its error context calls.
     private static unsafe void** s_plpgsqlPlugin;
@@ -342,11 +343,24 @@ internal static partial class SequenceRangeGuard
     // expressions go with it: an expression's state is there to change only once it has started.
     private static readonly List<(nint Expr, uint Subxact, nint Estate, bool Inline)> s_startedSites = [];
 
-    // The calls of nextval in PL/pgSQL expressions that go through the fmgr hook this transaction, by their place in
-    // the expression's plan, each with the managed sequence it names; and the transaction's number among those that
-    // had any, which a call keeps with its sequence once it has looked it up here.
-    private static readonly Dictionary<nint, uint> s_sites = [];
+    // The calls of nextval in expressions' states that go through the fmgr hook this transaction, each with the managed
+    // sequence it names, or zero where it names its sequence as it runs, its arguments and its function's lookup; where
+    // each is among them, by its place in the expression's plan, the last started of those that share one, as two
+    // runs of one plan do; and the transaction's number among those that had any, which a call keeps with its place
+    // among them once it has looked it up.
+    private static readonly List<(uint Named, nint Arguments, nint Function)> s_sites = [];
+    private static readonly Dictionary<nint, int> s_siteOf = [];
     private static uint s_siteGeneration = 1;
+
+    // The calls among them, by their call information, that a statement of one row makes, which counts no draws for
+    // later rows, as it has none, so that it holds no values back from other sessions while it runs on.
+    private static readonly HashSet<nint> s_singleCalls = [];
+
+    // The places among them that the plans of statements still open took, each with its call's place in the plan and
+    // its call information, by statement, as a QueryDesc, and those that statements that ended left free for the
+    // next: a transaction may run any number of statements.
+    private static readonly Dictionary<nint, List<(int Site, nint Call, nint Information)>> s_planSites = [];
+    private static readonly Stack<int> s_freeSites = [];
 
     // Where PostgreSQL's nextval is, and GuardedNextval as PostgreSQL calls it; where PostgreSQL's function that wraps
     // a call in the fmgr hook is, or zero where calls of nextval don't go through it, and whether that was looked up;
@@ -807,6 +821,7 @@ internal static partial class SequenceRangeGuard
     /// <param name="queryDesc">The statement.</param>
     internal static unsafe void EndStatement(QueryDesc* queryDesc)
     {
+        FreePlanSites((nint)queryDesc);
         _ = s_planStarted.Remove((nint)queryDesc);
         _ = s_rowsDrawing.Remove((nint)queryDesc);
         if (s_hookingStatements.Count > 0)
@@ -1426,17 +1441,22 @@ internal static partial class SequenceRangeGuard
             s_planStarted[queryDesc] = s_starting[^1].Looked;
         }
 
-        // A statement that draws from a managed sequence without its switch gate, as a SELECT of nextval does, counts
-        // down for its sequences' checks before each row its plan's nodes produce, so that one statement that draws more
-        // values than the block has left waits for the switch, as separate statements do.
-        // Each row counts for as many draws as the statement has calls of nextval, as a row may call each of them once.
+        // A statement that draws from a managed sequence without its switch gate, as a SELECT of nextval does, has
+        // each of its calls go through the guard, so that one statement that draws more values than the block has left
+        // waits for the switch, as separate statements do. Where its calls can't all be found, it counts down for
+        // its sequences' checks before each row its plan's nodes produce instead: each row counts for as many draws
+        // as the statement has calls of nextval, as a row may call each of them once.
         if (s_starting.Count > 0 && s_starting[^1].Switched.Count > 0 && !s_starting[^1].Explained)
         {
             unsafe
             {
                 QueryDesc* query = (QueryDesc*)queryDesc;
                 List<nint> nodes = [];
-                CountRows(query->planstate, nodes, Math.Max(s_starting[^1].Draws.Calls, 1), named: s_starting[^1].Draws.Unnamed ? null : s_starting[^1].Draws.Called);
+                if (!GuardPlan(query, s_starting[^1].Looked))
+                {
+                    CountRows(query->planstate, nodes, Math.Max(s_starting[^1].Draws.Calls, 1), named: s_starting[^1].Draws.Unnamed ? null : s_starting[^1].Draws.Called);
+                }
+
                 if (nodes.Count > 0)
                 {
                     RegisterCounted();
@@ -1773,14 +1793,7 @@ internal static partial class SequenceRangeGuard
             return;
         }
 
-        if (s_nextval == 0)
-        {
-            FmgrInfo nextval = default;
-            NativeMethods.fmgr_info(NextvalOid, &nextval);
-            s_nextval = (nint)nextval.fn_addr.DangerousGetAddress();
-            s_guardedNextval = (nint)GuardedNextvalCallback.DangerousGetAddress();
-        }
-
+        ReadNextval();
         RegisterEnd();
         HookExit();
         s_snowflake = Worf.CatalogOid("snowflake_node");
@@ -1805,11 +1818,10 @@ internal static partial class SequenceRangeGuard
         WatchStatements();
     }
 
-    // Has the calls of nextval of a PL/pgSQL expression that has started go through the guard. A call that names a
-    // managed sequence is made to go through PostgreSQL's function that wraps a call in the fmgr hook, in which worf
-    // counts the draw without leaving PostgreSQL's own call of nextval. One that names its sequence only as it runs,
-    // or any where that hook isn't worf's, goes into GuardedNextval. One that names a sequence that isn't managed
-    // stays as it is. Returns whether the expression has started.
+    // Has the calls of nextval of a PL/pgSQL expression that has started go through the guard. A call is made to go
+    // through PostgreSQL's function that wraps a call in the fmgr hook, in which worf counts the draw without leaving
+    // PostgreSQL's own call of nextval, or, where that hook isn't worf's, into GuardedNextval. One that names, with a
+    // constant, a sequence that isn't managed stays as it is. Returns whether the expression has started.
     private static unsafe bool GuardSite(nint started)
     {
         PLpgSQL_expr* expr = (PLpgSQL_expr*)started;
@@ -1821,32 +1833,239 @@ internal static partial class SequenceRangeGuard
 
         for (int i = 0; i < state->steps_len; i++)
         {
-            ExprEvalStep* step = &state->steps[i];
-            if (!CallsFunction(NativeMethods.ExecEvalStepOp(state, step)) || step->d.func.nargs != 1 ||
-                (nint)step->d.func.fn_addr.DangerousGetAddress() != s_nextval)
+            if (CallsNextval(state, &state->steps[i]))
             {
-                continue;
-            }
-
-            Node* call = step->d.func.finfo->fn_expr;
-            uint named = NamedByCall(call);
-            if (named != 0 && (named == s_snowflake || !s_sequences.ContainsKey(named)))
-            {
-                continue;
-            }
-
-            if (named != 0 && s_hookedCall != 0)
-            {
-                s_sites[(nint)call] = named;
-                step->d.func.fn_addr = new PGFunction((void*)s_hookedCall);
-            }
-            else
-            {
-                step->d.func.fn_addr = new PGFunction((void*)s_guardedNextval);
+                _ = GuardCall(&state->steps[i]);
             }
         }
 
         return true;
+    }
+
+    // Whether a step of an expression's state calls nextval.
+    private static unsafe bool CallsNextval(ExprState* state, ExprEvalStep* step)
+        => CallsFunction(NativeMethods.ExecEvalStepOp(state, step)) && step->d.func.nargs == 1 &&
+            (nint)step->d.func.fn_addr.DangerousGetAddress() == s_nextval;
+
+    // Has a call of nextval in an expression's state go through the guard each time it runs, and gives its place
+    // among the calls that go through the fmgr hook, or -1 for one that doesn't.
+    private static unsafe int GuardCall(ExprEvalStep* step)
+    {
+        Node* call = step->d.func.finfo->fn_expr;
+        uint named = NamedByCall(call);
+        if (named != 0 && (named == s_snowflake || !s_sequences.ContainsKey(named)))
+        {
+            return -1;
+        }
+
+        if (s_hookedCall == 0)
+        {
+            step->d.func.fn_addr = new PGFunction((void*)s_guardedNextval);
+            return -1;
+        }
+
+        (uint, nint, nint) site = (named, (nint)step->d.func.fcinfo_data + sizeof(FunctionCallInfoBaseData), (nint)step->d.func.finfo);
+        int index = s_sites.Count;
+        if (s_freeSites.Count > 0)
+        {
+            index = s_freeSites.Pop();
+            s_sites[index] = site;
+        }
+        else
+        {
+            s_sites.Add(site);
+        }
+
+        s_siteOf[(nint)call] = index;
+        step->d.func.fn_addr = new PGFunction((void*)s_hookedCall);
+        return index;
+    }
+
+    // Leaves the places a statement's calls took to the statements after it, as it ends.
+    private static void FreePlanSites(nint queryDesc)
+    {
+        if (s_planSites.Count == 0 || !s_planSites.Remove(queryDesc, out List<(int Site, nint Call, nint Information)>? sites))
+        {
+            return;
+        }
+
+        foreach ((int site, nint call, nint information) in sites)
+        {
+            _ = s_singleCalls.Remove(information);
+            if (site < 0)
+            {
+                continue;
+            }
+
+            if (s_siteOf.TryGetValue(call, out int current) && current == site)
+            {
+                _ = s_siteOf.Remove(call);
+            }
+
+            s_sites[site] = default;
+            s_freeSites.Push(site);
+        }
+    }
+
+    // Finds PostgreSQL's nextval, and GuardedNextval as PostgreSQL calls it, once for the backend.
+    private static unsafe void ReadNextval()
+    {
+        if (s_nextval == 0)
+        {
+            FmgrInfo nextval = default;
+            NativeMethods.fmgr_info(NextvalOid, &nextval);
+            s_nextval = (nint)nextval.fn_addr.DangerousGetAddress();
+            s_guardedNextval = (nint)GuardedNextvalCallback.DangerousGetAddress();
+        }
+    }
+
+    // PGJIT_EXPR, from jit/jit.h: the statement's expressions are compiled, each with its calls' functions built in.
+    private const int JitExpressions = 1 << 3;
+
+    // Has the calls of nextval that a statement's plan started go through the guard each time they run, as a PL/pgSQL
+    // expression's do, in place of a check before each row its nodes produce, which costs a call into worf a row.
+    // That holds only where every call the plan started is found among the expression states its nodes hold, in those
+    // of their conditions, their rows and an aggregate's transitions, and the statement's expressions aren't compiled:
+    // any other statement counts its rows.
+    private static unsafe bool GuardPlan(QueryDesc* query, int started)
+    {
+        if (started <= 0 || query->estate is null || (query->estate->es_jit_flags & JitExpressions) != 0 || !Executor.CountsDraws)
+        {
+            return false;
+        }
+
+        ReadNextval();
+        ReadHookedCall();
+        if (s_hookedCall == 0)
+        {
+            return false;
+        }
+
+        List<(nint Step, bool Single)> calls = [];
+        FindCalls(query->planstate, calls, []);
+        if (calls.Count != started)
+        {
+            return false;
+        }
+
+        RegisterEnd();
+        HookExit();
+        s_snowflake = Worf.CatalogOid("snowflake_node");
+        List<(int, nint, nint)> sites = [];
+        foreach ((nint call, bool single) in calls)
+        {
+            ExprEvalStep* step = (ExprEvalStep*)call;
+            int site = GuardCall(step);
+            if (single)
+            {
+                _ = s_singleCalls.Add((nint)step->d.func.fcinfo_data);
+            }
+
+            if (site >= 0 || single)
+            {
+                sites.Add((site, (nint)step->d.func.finfo->fn_expr, (nint)step->d.func.fcinfo_data));
+            }
+        }
+
+        if (sites.Count > 0)
+        {
+            s_planSites[(nint)query] = sites;
+        }
+
+        return true;
+    }
+
+    // Finds the calls of nextval in the expression states a plan's nodes hold, through the nodes CountRows reaches.
+    private static unsafe void FindCalls(PlanState* node, List<(nint Step, bool Single)> calls, HashSet<nint> seen)
+    {
+        if (node is null || !seen.Add((nint)node))
+        {
+            return;
+        }
+
+        // A Result with no plan under it gives one row a scan.
+        bool single = node->type == NodeTag.T_ResultState && node->lefttree is null;
+        FindCalls(node->qual, calls, seen, single);
+        if (node->ps_ProjInfo is not null)
+        {
+            FindCalls(&node->ps_ProjInfo->pi_state, calls, seen, single);
+        }
+
+        FindCalls(node->lefttree, calls, seen);
+        FindCalls(node->righttree, calls, seen);
+        foreach (List* subplans in new[] { node->initPlan, node->subPlan })
+        {
+            for (int i = 0; subplans is not null && i < subplans->length; i++)
+            {
+                FindCalls(((SubPlanState*)subplans->elements[i].ptr_value)->planstate, calls, seen);
+            }
+        }
+
+        switch (node->type)
+        {
+            case NodeTag.T_AppendState:
+                for (int i = 0; i < ((AppendState*)node)->as_nplans; i++)
+                {
+                    FindCalls(((AppendState*)node)->appendplans[i], calls, seen);
+                }
+
+                break;
+            case NodeTag.T_MergeAppendState:
+                for (int i = 0; i < ((MergeAppendState*)node)->ms_nplans; i++)
+                {
+                    FindCalls(((MergeAppendState*)node)->mergeplans[i], calls, seen);
+                }
+
+                break;
+            case NodeTag.T_SubqueryScanState:
+                FindCalls(((SubqueryScanState*)node)->subplan, calls, seen);
+                break;
+            case NodeTag.T_ResultState:
+                FindCalls(((ResultState*)node)->resconstantqual, calls, seen, single);
+                break;
+            case NodeTag.T_ProjectSetState:
+                for (int i = 0; i < ((ProjectSetState*)node)->nelems; i++)
+                {
+                    Node* elem = ((ProjectSetState*)node)->elems[i];
+                    if (elem is not null && elem->type == NodeTag.T_ExprState)
+                    {
+                        FindCalls((ExprState*)elem, calls, seen, false);
+                    }
+                }
+
+                break;
+            case NodeTag.T_AggState:
+                for (int i = 0; i < ((AggState*)node)->numphases; i++)
+                {
+                    AggStatePerPhaseData* phase = &((AggState*)node)->phases[i];
+                    FindCalls(phase->evaltrans, calls, seen, false);
+                    ExprState** cached = (ExprState**)&phase->evaltrans_cache;
+                    for (int j = 0; j < 4; j++)
+                    {
+                        FindCalls(cached[j], calls, seen, false);
+                    }
+                }
+
+                break;
+            default:
+                break;
+        }
+    }
+
+    private static unsafe void FindCalls(ExprState* state, List<(nint Step, bool Single)> calls, HashSet<nint> seen, bool single)
+    {
+        if (state is null || !seen.Add((nint)state))
+        {
+            return;
+        }
+
+        for (int i = 0; i < state->steps_len; i++)
+        {
+            if (CallsNextval(state, &state->steps[i]))
+            {
+                calls.Add(((nint)(&state->steps[i]), single));
+            }
+        }
     }
 
     // Deals with the expressions that started a call in a subtransaction that aborts before PL/pgSQL told of a
@@ -2028,15 +2247,41 @@ internal static partial class SequenceRangeGuard
             return true;
         }
 
+        // A call finds its place by its place in the plan, once: PostgreSQL keeps what it looked up for the call, which
+        // this hook is given, where the call's own lookup points, so a place whose lookup points elsewhere is another
+        // run's of the same plan, and the call goes into GuardedNextval, which reads its own arguments.
         if (*site >> 32 != s_siteGeneration)
         {
-            *site = ((ulong)s_siteGeneration << 32) | (s_sites.TryGetValue((nint)flinfo->fn_expr, out uint named) ? named : 0);
+            int place = s_siteOf.TryGetValue((nint)flinfo->fn_expr, out int found) && ((FmgrInfo*)s_sites[found].Function)->fn_extra == flinfo ? found + 1 : 0;
+            *site = ((ulong)s_siteGeneration << 32) | (uint)place;
         }
 
-        uint seqoid = (uint)*site;
-        if (seqoid == 0 || s_fastSlot is null)
+        int index = (int)(uint)*site - 1;
+        if (index < 0 || index >= s_sites.Count || s_fastSlot is null)
         {
             return false;
+        }
+
+        // A call that names its sequence as it runs has worked its argument out by now. One of a sequence that isn't
+        // managed goes on as it is, where the blocks this backend read still hold.
+        (uint seqoid, nint arguments, _) = s_sites[index];
+        if (seqoid == 0)
+        {
+            if (arguments == 0)
+            {
+                return false;
+            }
+
+            seqoid = (uint)*(ulong*)arguments;
+            if (Volatile.Read(ref s_fastDraws[WorfFastDraws.Changes]) != s_changesRead || s_version < 0 || SequenceRanges.LocalVersion != s_localVersion)
+            {
+                return false;
+            }
+
+            if (seqoid == s_snowflake || !s_sequences.ContainsKey(seqoid))
+            {
+                return true;
+            }
         }
 
         // A statement that writes and holds the sequence's gate checks its rows' draws itself.
@@ -2147,7 +2392,7 @@ internal static partial class SequenceRangeGuard
                 DrawUngated(starting);
             }
 
-            CountDownDraws(1, [seqoid]);
+            CountDownDraws(1, [seqoid], single: s_singleCalls.Count > 0 && s_singleCalls.Contains((nint)fcinfo));
             ulong value = NativeMethods.nextval_oid(fcinfo);
             failed = false;
             return value;
@@ -2320,6 +2565,13 @@ internal static partial class SequenceRangeGuard
         s_endRegistered = false;
         ForgetUngatedDrawers();
         ForgetUngated();
+
+        // No statement waits for a switch once its transaction has ended.
+        foreach ((uint seqoid, (int waiting, long lo)) in s_waitingFor.ToList())
+        {
+            CountDrawer(seqoid, 0, -waiting, waitingFor: lo);
+            _ = s_waitingFor.Remove(seqoid);
+        }
 
         // The statements of a transaction that aborts end without ExecutorEnd.
         if (aborted)
@@ -4069,10 +4321,12 @@ internal static partial class SequenceRangeGuard
             plpgsql = InPlpgsql(out simple, out inUse, out estate);
             if (plpgsql && simple != 0)
             {
-                uint lxid = ((PLpgSQL_expr*)simple)->expr_simple_lxid;
-                if (s_simple.Expr != simple || s_simple.Lxid != lxid)
+                // A start that failed, as one cancelled within its first call's check, left PL/pgSQL's mark of the
+                // expression's transaction as it was, so the start is told by this transaction and subtransaction too.
+                (uint, uint, uint) start = (((PLpgSQL_expr*)simple)->expr_simple_lxid, Lxid(), NativeMethods.GetCurrentSubTransactionId());
+                if (s_simple.Expr != simple || s_simple.Start != start)
                 {
-                    s_simple = (simple, lxid, null, 0);
+                    s_simple = (simple, start, null, 0);
                 }
 
                 s_simple.Looked++;
@@ -4649,7 +4903,9 @@ internal static partial class SequenceRangeGuard
             PLpgSQL_expr* expr = parameters is null ? null : (PLpgSQL_expr*)parameters->parserSetupArg;
             if (expr is not null && expr->expr_simple_expr is not null)
             {
-                if (expr->expr_simple_in_use)
+                // PL/pgSQL marks an expression in use as it runs it and clears the mark as the run ends, so a run that
+                // failed leaves it set, and PL/pgSQL goes by it only in the transaction it started the expression in.
+                if (expr->expr_simple_in_use && expr->expr_simple_lxid == Lxid())
                 {
                     inUse = (nint)expr;
                 }
@@ -5689,23 +5945,29 @@ internal static partial class SequenceRangeGuard
             _ = NativeMethods.LockRelease(&door, ShareLock, false);
         }
 
-        s_gates[seqoid] = NativeMethods.GetCurrentSubTransactionId();
+        // The gate is noted once what counts it has succeeded, so that a failure leaves nothing to count down.
+        uint subxact = NativeMethods.GetCurrentSubTransactionId();
+        if (!unit)
+        {
+            CountDrawer(seqoid, 1);
+        }
+
+        s_gates[seqoid] = subxact;
         if (unit)
         {
             _ = s_unitGates.Add(seqoid);
             WatchStatements();
         }
-        else
-        {
-            CountDrawer(seqoid, 1);
-        }
     }
 
     private static void LetGate(uint seqoid)
     {
-        if (s_gates.Remove(seqoid))
+        if (s_gates.ContainsKey(seqoid))
         {
+            // A release that fails, as every call into PostgreSQL does while a cancellation is pending, leaves the gate
+            // noted, for the transaction's end, which lets its lock go, to count down.
             ReleaseGate(seqoid, ShareLock);
+            _ = s_gates.Remove(seqoid);
             if (s_unitGates.Remove(seqoid))
             {
                 WatchStatements();
@@ -5972,8 +6234,32 @@ internal static partial class SequenceRangeGuard
     /// <param name="seqoid">The sequence.</param>
     internal static unsafe void AwaitGate(uint seqoid)
     {
+        // The switch counts as pending no more once the wait is over, or once the transaction ends where the wait
+        // failed: a cancellation, which stays pending until the statement ends, fails every call into PostgreSQL
+        // after it, the shared table's lock too.
+        bool pending = false;
+        bool switching = false;
+        void Counted()
+        {
+            if (pending)
+            {
+                pending = false;
+                CountPending(-1);
+            }
+
+            if (switching)
+            {
+                CountDrawer(seqoid, 0, 0, -1);
+                switching = false;
+            }
+        }
+
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, Counted);
+        _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, Counted);
         CountPending(1);
+        pending = true;
         CountDrawer(seqoid, 0, 0, 1);
+        switching = true;
         int nestLevel = NativeMethods.NewGUCNestLevel();
         LOCKTAG door = GateTag(seqoid, DoorKey);
         LOCKTAG tag = GateTag(seqoid);
@@ -5990,19 +6276,24 @@ internal static partial class SequenceRangeGuard
         }
         finally
         {
-            if (taken)
+            try
             {
-                _ = NativeMethods.LockRelease(&tag, ExclusiveLock, false);
-            }
+                if (taken)
+                {
+                    _ = NativeMethods.LockRelease(&tag, ExclusiveLock, false);
+                }
 
-            if (shut)
+                if (shut)
+                {
+                    _ = NativeMethods.LockRelease(&door, ExclusiveLock, false);
+                }
+
+                NativeMethods.AtEOXact_GUC(true, nestLevel);
+            }
+            finally
             {
-                _ = NativeMethods.LockRelease(&door, ExclusiveLock, false);
+                Counted();
             }
-
-            NativeMethods.AtEOXact_GUC(true, nestLevel);
-            CountDrawer(seqoid, 0, 0, -1);
-            CountPending(-1);
         }
     }
 
@@ -6107,9 +6398,13 @@ internal static partial class SequenceRangeGuard
 
         // The states of the transaction's PL/pgSQL expressions end with it, and their calls' places may be others' next.
         s_startedSites.Clear();
+        s_singleCalls.Clear();
+        s_planSites.Clear();
+        s_freeSites.Clear();
         if (s_sites.Count > 0)
         {
             s_sites.Clear();
+            s_siteOf.Clear();
             s_siteGeneration++;
         }
 
@@ -6404,7 +6699,14 @@ internal static partial class SequenceRangeGuard
     /// </summary>
     private static void CountWaiting(uint seqoid, long lo, int change)
     {
+        // A wait that a cancellation ends can't count itself down, as no call into PostgreSQL succeeds until the
+        // statement has ended, so the transaction's end does.
         HookExit();
+        if (change > 0)
+        {
+            RegisterEnd();
+        }
+
         CountDrawer(seqoid, 0, change, waitingFor: lo);
         int waiting = s_waitingFor.GetValueOrDefault(seqoid).Count + change;
         if (waiting > 0)
@@ -6826,9 +7128,10 @@ internal static partial class SequenceRangeGuard
     /// </summary>
     internal static void EndCopy()
     {
-        CloseGates(s_copyGates[^1]);
+        nint gates = s_copyGates[^1];
         s_copyGates.RemoveAt(s_copyGates.Count - 1);
         s_copying.RemoveAt(s_copying.Count - 1);
+        CloseGates(gates);
     }
 
     /// <summary>

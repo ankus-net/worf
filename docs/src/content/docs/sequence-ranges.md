@@ -141,15 +141,16 @@ gate) and let it go between rows when a switch is waiting. A statement that hold
 else, such as `COPY FROM STDIN` waiting for its client, holds the switch up until it continues. If such waits form a
 cycle, PostgreSQL ends one of the statements with SQLSTATE `40P01`.
 
-Other statements that draw, such as `SELECT nextval(...)`, hold the gate while they work out a row. Where the next
-row draws straight away, they keep the gate and let it go when a switch waits for it. They look for a waiting switch
-at each row, or every tenth of a millisecond when rows take less. A cursor between fetches, a client that reads
-slowly and a transaction left idle hold nothing, so they don't delay a switch.
+Other draws, such as those of `SELECT nextval(...)` or of a PL/pgSQL assignment in a loop, take the gate only when
+they have to check the block, as a statement's first draw does, or the first by a PL/pgSQL expression in a
+transaction. The draws between hold nothing, and a switch waits only for the ones under way. They cost about what
+draws from a plain sequence do, and the statements around them cost nothing extra. A cursor between fetches, a client
+that reads slowly and a transaction left idle hold nothing, so they don't delay a switch.
 
-A PL/pgSQL expression that draws, such as an assignment in a loop, takes the gate only when it has to check the
-block, as it does the first time it runs in a transaction. Its other draws hold nothing, and a switch waits only for
-the draws under way. They cost about what draws from a plain sequence do, and the statements around them cost nothing
-extra.
+worf can't always reach a statement's calls one by one, for example when PostgreSQL compiles the statement with JIT.
+Such statements check before each row instead and hold the gate while they work out a row. Where the next row draws
+straight away, they keep the gate and let it go when a switch waits for it. They look for a waiting switch at each
+row, or every tenth of a millisecond when rows take less.
 
 worf doesn't see C code that calls `nextval` directly rather than through SQL. Such code can run a block out, so don't
 use it with managed sequences.
