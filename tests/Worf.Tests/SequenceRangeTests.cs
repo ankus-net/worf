@@ -3321,15 +3321,16 @@ public sealed partial class SequenceRangeTests
                 Task lift = nodeA.SafePsqlAsync(Database, Lift, token);
 
                 // node_b draws from u_id_seq too, which runs out as the change holds its range row, so that each of node_b's
-                // calls takes that row in after t_id_seq's, and, once the second a take-in that began as the change ran may
-                // wait has passed, none of node_a's exchanges joins the queue of a row the change holds: one that waited
+                // calls takes that row in after t_id_seq's, and, once a take-in that began as the change ran has waited the
+                // second it may, none of node_a's exchanges joins the queue of a row the change holds: one that waited
                 // there, however short its lock timeout, could be found in a cycle with a change that waits for a row the
-                // exchange holds, and fail it as a deadlock.
-                Task<long> queued = how == "configuration open" ? QueuedOnRangeRowsAsync(nodeA, TimeSpan.FromSeconds(1.5), TimeSpan.FromSeconds(6), token)
-                    : Task.FromResult(0L);
+                // exchange holds, and fail it as a deadlock. Each backend's first wait is that second, whenever it comes:
+                // one that waits for the node's turn behind another's wait starts its own only then.
+                Task<long> queued = how == "configuration open" ? QueuedOnRangeRowsAsync(nodeA, TimeSpan.FromSeconds(7.5), token) : Task.FromResult(0L);
                 Task drawsOfU = how == "configuration open" ? DrawUntilTimeoutAsync(nodeB, "INSERT INTO u SELECT FROM generate_series(1, 1000)", token) : Task.CompletedTask;
                 Assert.AreEqual("", await InsertAsync(nodeB, "t"), $"node_b's inserts as a lift waits beside a {how}");
-                Assert.AreEqual(0L, await queued, "node_a's exchanges found waiting in the queue of a range row the configuration change holds");
+                Assert.AreEqual(0L, await queued,
+                    "node_a's exchanges found waiting in the queue of a range row the configuration change holds, after the one wait each may make, of 4 s at most");
                 await holding.CommitAsync(token);
                 await drawsOfU;
                 Assert.AreNotEqual("40P01", await OutcomeAsync(lift), "the lift");
@@ -12546,24 +12547,42 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
-    /// Counts, sampling as fast as a session can for a while after a delay, the times a node's exchanges are found in the
-    /// queue of a sequence's range row: holding the row's tuple lock and waiting for the transaction that holds the row.
+    /// Counts, sampling as fast as a session can for a while, the times a node's exchanges are found in the queue of a
+    /// sequence's range row, holding the row's tuple lock and waiting for the transaction that holds the row, past the
+    /// one wait each backend may make there, of 4 s at most.
     /// </summary>
-    private static async Task<long> QueuedOnRangeRowsAsync(TestNode node, TimeSpan delay, TimeSpan window, CancellationToken token)
+    private static async Task<long> QueuedOnRangeRowsAsync(TestNode node, TimeSpan window, CancellationToken token)
     {
-        await Task.Delay(delay, token);
         await using NpgsqlConnection watcher = await node.OpenAsync(Database, token);
         await using NpgsqlCommand sample = new("""
-            SELECT count(*) FROM pg_catalog.pg_locks w JOIN pg_catalog.pg_stat_activity a ON a.pid = w.pid
+            SELECT coalesce(array_agg(DISTINCT w.pid), '{}') FROM pg_catalog.pg_locks w JOIN pg_catalog.pg_stat_activity a ON a.pid = w.pid
             WHERE NOT w.granted AND w.locktype = 'transactionid' AND (a.backend_type <> 'client backend' OR a.application_name LIKE '%\_range')
                 AND EXISTS (SELECT 1 FROM pg_catalog.pg_locks t WHERE t.pid = w.pid AND t.granted AND t.locktype = 'tuple'
                     AND t.relation = 'worf.sequence_range'::pg_catalog.regclass)
             """, watcher);
         long queued = 0;
+        Dictionary<int, (TimeSpan Since, bool Waiting)> first = [];
         Stopwatch watching = Stopwatch.StartNew();
         while (watching.Elapsed < window)
         {
-            queued += (long)(await sample.ExecuteScalarAsync(token))!;
+            int[] waiting = (int[])(await sample.ExecuteScalarAsync(token))!;
+            TimeSpan now = watching.Elapsed;
+            foreach (int pid in waiting)
+            {
+                if (!first.TryGetValue(pid, out (TimeSpan Since, bool Waiting) wait))
+                {
+                    first[pid] = (now, true);
+                }
+                else if (!wait.Waiting || now - wait.Since > TimeSpan.FromSeconds(4))
+                {
+                    queued++;
+                }
+            }
+
+            foreach (int pid in first.Keys.Where(pid => first[pid].Waiting && !waiting.Contains(pid)).ToList())
+            {
+                first[pid] = (first[pid].Since, false);
+            }
         }
 
         return queued;
