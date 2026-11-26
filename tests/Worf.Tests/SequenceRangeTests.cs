@@ -12421,10 +12421,24 @@ public sealed partial class SequenceRangeTests
                 UNION ALL SELECT 'request ' || to_jsonb(q)::text FROM worf.sequence_range_request q
                 UNION ALL SELECT 'absent ' || to_jsonb(a)::text FROM worf.sequence_range_absent a) rows
             """;
-        string[] heldBefore = managed ? await Task.WhenAll(nodes.Select(node => node.SafePsqlAsync(Database, Held, token))) : [];
-        string[][] before = await Task.WhenAll(nodes.Select(async node => (await node.SafePsqlAsync(Database, Next, token)).Split('|')));
-        await Task.Delay(idle, token);
-        string[][] after = await Task.WhenAll(nodes.Select(async node => (await node.SafePsqlAsync(Database, Next, token)).Split('|')));
+        // A transaction a worker had open as the nodes settled, as an exchange's first with a new neighbor, commits within
+        // the while, so the nodes are idle once one while among five shows nothing: workers that use transaction IDs
+        // or write as they tick do in every one.
+        string[] heldBefore = [];
+        string[][] before = [];
+        string[][] after = [];
+        for (int attempt = 1; attempt <= 5; attempt++)
+        {
+            heldBefore = managed ? await Task.WhenAll(nodes.Select(node => node.SafePsqlAsync(Database, Held, token))) : [];
+            before = await Task.WhenAll(nodes.Select(async node => (await node.SafePsqlAsync(Database, Next, token)).Split('|')));
+            await Task.Delay(idle, token);
+            after = await Task.WhenAll(nodes.Select(async node => (await node.SafePsqlAsync(Database, Next, token)).Split('|')));
+            if (Enumerable.Range(0, nodes.Length).All(i => before[i][0] == after[i][0] && before[i][3] == after[i][3]))
+            {
+                break;
+            }
+        }
+
         for (int i = 0; i < nodes.Length; i++)
         {
             // The records written meanwhile, which name what wrote them, are read first, for either check's message.
