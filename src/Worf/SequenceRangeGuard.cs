@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -95,6 +96,7 @@ internal static partial class SequenceRangeGuard
 
     // TRIGGEROID, the type a trigger function returns.
     private const uint TriggerTypeOid = 2279;
+    private const uint NextvalOid = 1574;
     private const int TriggerTypeUpdate = 1 << 4;
 
     // The managed sequences each table's columns draw from, by column, through a default or as identity columns.
@@ -224,9 +226,18 @@ internal static partial class SequenceRangeGuard
     internal static PgLwLock<WorfDrawers, WorfDrawer> Drawers { get; } = new("worf_sequence_range_drawers");
 
     /// <summary>
+    /// Gets the shared counts of the draws under way that hold no gate, which a switch waits for.
+    /// </summary>
+    internal static PgShared<WorfFastDraws> FastDraws { get; } = new("worf_sequence_range_fast_draws");
+
+    /// <summary>
     /// Sets up the shared memory.
     /// </summary>
-    internal static void ShmemInit() => PgSharedMemory.Initialize(Drawers, MaxDrawers, static () => default, static _ => default);
+    internal static void ShmemInit()
+    {
+        PgSharedMemory.Initialize(Drawers, MaxDrawers, static () => default, static _ => default);
+        PgSharedMemory.Initialize(FastDraws);
+    }
 
     // The blocks this node holds under its current identity, by sequence, as of the versions of the shared and this
     // backend's counters they were read at, and the sequences whose blocks were received under another identity.
@@ -306,45 +317,55 @@ internal static partial class SequenceRangeGuard
     private const byte RowScope = 2;
     private const byte StatementScope = 3;
 
-    // A PL/pgSQL assignment that draws, whose end PL/pgSQL doesn't tell worf of, which spares each turn of a loop a second
-    // call into worf: it ends as the next statement of its function starts, or as the function ends. Once a run or
-    // another function's statement starts under one, which may be within it or after it, PL/pgSQL tells of its end too.
-    private const byte QuietScope = 4;
-    private const byte ToldQuietScope = 5;
+    // A PL/pgSQL statement whose expression starts a call of nextval, which holds the call's gates from then until
+    // PL/pgSQL next tells of a statement of its function, by when the call has drawn.
+    private const byte DrawScope = 4;
 
-    // The PL/pgSQL statements whose own expressions were seen to draw this transaction, which take their sequences' gates
-    // as they start; whether PL/pgSQL's plugin is worf's own, which alone tells worf of a statement's end; and how many
-    // statement scopes are open, while any of which PL/pgSQL tells it.
-    private static readonly HashSet<nint> s_drawingStatements = [];
+    // Whether PL/pgSQL's plugin is worf's own, which alone tells worf of its statements; and how many statement and
+    // draw scopes are open, while any of which PL/pgSQL tells of its statements' ends.
     private static bool s_ownsPlugin;
     private static int s_statementScopes;
-
-    // How many assignments' scopes are open, whose ends the next statement or the function's end tells of.
-    private static int s_quietScopes;
 
     // The statement run, as a QueryDesc, under which each sequence's count of draws before its next check was given, or
     // zero outside any, which gives it up as the run ends.
     private static readonly Dictionary<uint, nint> s_shareRuns = [];
 
-    // The gates a PL/pgSQL statement that drew kept as it ended, for the statement that starts next: one that draws too
-    // makes them its own, so that a loop that draws at every turn takes its gates once; any other lets them go as it
-    // starts, as a run that starts does, and the function as it ends, which PL/pgSQL tells worf of while any may be kept.
-    private static readonly HashSet<uint> s_keptGates = [];
-
     // worf's own PL/pgSQL plugin, or null where another library's was there first.
     private static unsafe PLpgSQL_plugin* s_plugin;
 
-    // Whether PL/pgSQL tells worf of the functions it starts and ends, as it does only while the transaction has draws
-    // for their statements to count down, or gates for them to suspend or keep, so that a transaction with neither
-    // runs its PL/pgSQL without a call into worf; and whether it tells of each statement it starts, as it does while the
-    // function running may draw, or isn't known, having started before PL/pgSQL told of any.
-    private static bool s_watchingFunctions;
-    private static bool s_watchingStatements;
+    // Whether PL/pgSQL tells worf of each statement it starts, and of each one's end, as WatchStatements has it.
+    private static bool s_watchingStarts;
+    private static bool s_watchingEnds;
 
-    // The PL/pgSQL functions running whose start PL/pgSQL told worf of, innermost last: each one's state, the
-    // subtransaction it started in, and whether its statements may draw, as its source has it or the expressions of its
-    // that started this transaction do.
-    private static readonly List<(nint Estate, uint Subxact, bool Draws)> s_functions = [];
+    // The PL/pgSQL expressions that started a call of nextval since PL/pgSQL last told of a statement, each with the
+    // subtransaction it started in, the state of the function running it, and whether that is a DO block's, whose
+    // expressions go with it: an expression's state is there to change only once it has started.
+    private static readonly List<(nint Expr, uint Subxact, nint Estate, bool Inline)> s_startedSites = [];
+
+    // The calls of nextval in PL/pgSQL expressions that go through the fmgr hook this transaction, by their place in
+    // the expression's plan, each with the managed sequence it names; and the transaction's number among those that
+    // had any, which a call keeps with its sequence once it has looked it up here.
+    private static readonly Dictionary<nint, uint> s_sites = [];
+    private static uint s_siteGeneration = 1;
+
+    // Where PostgreSQL's nextval is, and GuardedNextval as PostgreSQL calls it; where PostgreSQL's function that wraps
+    // a call in the fmgr hook is, or zero where calls of nextval don't go through it, and whether that was looked up;
+    // and the sequence Snowflake node numbers come from, as a call started last.
+    private static nint s_nextval;
+    private static nint s_guardedNextval;
+    private static nint s_hookedCall;
+    private static bool s_hookedCallRead;
+    private static uint s_snowflake;
+
+    // What shared memory holds for the draws that hold no gate, which read it without a call into PostgreSQL; the
+    // count there of those under way in this backend and those that share its place; how many changes to the blocks it
+    // told of as this backend last read them; whether this backend has such a draw under way; and the call whose
+    // function the fmgr hook replaced with GuardedNextval, until that call ends.
+    private static unsafe long* s_fastDraws;
+    private static unsafe long* s_fastSlot;
+    private static long s_changesRead = -1;
+    private static bool s_drawingFast;
+    private static nint s_handedOff;
 
     // When this backend last looked in shared memory for a switch waiting for the gates it holds, in the stopwatch's
     // ticks, and how long a unit that held its gates already lets pass before it looks again: a tenth of a millisecond.
@@ -362,13 +383,6 @@ internal static partial class SequenceRangeGuard
     // none.
     private static readonly Dictionary<nint, (ExecProcNodeMtd Function, int Calls, IReadOnlyCollection<uint>? Named)> s_rowFunctions = [];
     private static readonly Dictionary<nint, (uint Subxact, List<nint> Nodes)> s_countedNodes = [];
-    private static readonly Dictionary<(uint Function, uint Xmin), int> s_functionCalls = [];
-    private static readonly Dictionary<(uint Function, uint Xmin), HashSet<uint>?> s_functionNamed = [];
-
-    // The draws of each PL/pgSQL function's expressions that started this transaction: the most calls one makes, and the
-    // sequences they name, by the function's compiled state.
-    private static readonly Dictionary<nint, (int Calls, HashSet<uint> Named)> s_functionDraws = [];
-    private static bool s_functionDrawsRegistered;
 
     [PgNativeCallback(nameof(CountedRow))]
     private static partial ExecProcNodeMtd CountedRowCallback { get; }
@@ -393,11 +407,8 @@ internal static partial class SequenceRangeGuard
     [PgNativeCallback(nameof(PlpgsqlStatementEnd))]
     private static partial PLpgSQL_plugin_stmt_endCallback PlpgsqlStatementEndCallback { get; }
 
-    [PgNativeCallback(nameof(PlpgsqlFunctionEnd))]
-    private static partial PLpgSQL_plugin_func_endCallback PlpgsqlFunctionEndCallback { get; }
-
-    [PgNativeCallback(nameof(PlpgsqlFunctionBegin))]
-    private static partial PLpgSQL_plugin_func_begCallback PlpgsqlFunctionBeginCallback { get; }
+    [PgNativeCallback(nameof(GuardedNextval))]
+    private static partial PGFunction GuardedNextvalCallback { get; }
 
     // The points in each sequence's active block, by sequence and value, at which this backend has woken the range worker.
     private static readonly HashSet<(uint Seqoid, long Mark)> s_woken = [];
@@ -1355,8 +1366,7 @@ internal static partial class SequenceRangeGuard
     /// Finds where PL/pgSQL looks for its instrumentation plugin, and gives it one that instruments nothing when no other
     /// library has, so that PL/pgSQL tells the plugin the function its error context calls as each of its functions
     /// starts, which <see cref="InPlpgsql"/> finds a running function's state through. PL/pgSQL calls into worf through
-    /// it only while a transaction has something for its statements to count down, suspend or keep, as each call costs
-    /// far more than a statement that does little.
+    /// it only as <see cref="WatchStatements"/> has it, as each call costs far more than a statement that does little.
     /// </summary>
     internal static unsafe void WatchPlpgsql()
     {
@@ -1680,288 +1690,473 @@ internal static partial class SequenceRangeGuard
         }
     }
 
-    // Counts a PL/pgSQL statement down, as PL/pgSQL starts it, as a loop's assignment draws each time it runs, which
-    // starts its expression only once a transaction: for the calls of nextval its function's expressions that started
-    // this transaction make, through the SQL functions they inline too, and for the sequences they name, or with none
-    // started, for as many draws as its function's source has calls, for the sequences that source names, so that a
-    // statement draws no sequence another's call left short down.
-    // A statement whose own expressions were seen to draw is a unit, which holds its sequences' gates from its check
-    // until it ends, and keeps them then for the statement that starts next; any other takes none, as it may run long
-    // without drawing, and lets go of those kept. One that starts within a unit that holds gates suspends it until it
-    // ends.
+    // Runs as PL/pgSQL starts a statement, while it tells of them. The calls of nextval its expressions started since
+    // it last told of one go through the guard from here on, and the statement of this function whose expression
+    // started one has drawn, so its scope ends. A statement that starts within a unit that holds gates suspends it
+    // until it ends, as it may run long without drawing.
     private static unsafe void PlpgsqlStatement(PLpgSQL_execstate* estate, PLpgSQL_stmt* stmt)
     {
+        GuardSites();
         if (s_countingDown || s_namingGrantors || Worf.InOwnSql || estate is null || estate->func is null)
         {
             return;
         }
 
-        // An assignment of this function that drew has ended, unless it is the one that starts again, as a loop's does,
-        // which goes on under the scope it has.
-        bool drawing = s_drawingStatements.Contains((nint)stmt);
-        bool again = false;
-        if (s_quietScopes > 0 && QuietScopeOf((nint)estate) is int quiet and >= 0)
+        EndDrawScope((nint)estate);
+        if (s_ownsPlugin && s_unitGates.Count > 0)
         {
-            again = drawing && quiet == s_scopes.Count - 1 && s_scopes[quiet].Key == (nint)stmt;
-            if (!again)
-            {
-                LeaveScopeAt(quiet, false);
-            }
-        }
-
-        if (!drawing && s_keptGates.Count > 0)
-        {
-            LetKeptGates();
-        }
-
-        if (!again && s_ownsPlugin && (drawing || s_unitGates.Count > 0))
-        {
-            bool quietly = drawing && stmt->cmd_type == PLpgSQL_stmt_type.PLPGSQL_STMT_ASSIGN;
-            EnterScope(quietly ? QuietScope : StatementScope, (nint)stmt, (nint)estate, keep: drawing);
-        }
-
-        if (s_drawingUngated.Count == 0)
-        {
-            return;
-        }
-
-        if (s_functionDraws.TryGetValue((nint)estate->func, out (int Calls, HashSet<uint> Named) noted))
-        {
-            CountDownDraws(Math.Max(noted.Calls, 1), noted.Named, gate: drawing);
-        }
-        else if (FunctionCalls(estate->func) is int calls and > 0)
-        {
-            HashSet<uint>? named = FunctionNamed(estate->func);
-            CountDownDraws(calls, named, unnamed: named is null, gate: drawing);
+            EnterScope(StatementScope, (nint)stmt, (nint)estate);
         }
     }
 
-    // Ends a PL/pgSQL statement's scope, as PL/pgSQL tells of each statement's end while one is open.
+    // Runs as a PL/pgSQL statement ends, while PL/pgSQL tells of that: as a statement's start does, and the scope the
+    // statement started ends.
     private static unsafe void PlpgsqlStatementEnd(PLpgSQL_execstate* estate, PLpgSQL_stmt* stmt)
     {
+        GuardSites();
+        EndDrawScope((nint)estate);
         if (s_statementScopes > 0)
         {
             LeaveScope(StatementScope, (nint)stmt, (nint)estate);
         }
     }
 
-    // Has PL/pgSQL tell worf of its statements' ends, or no longer, through worf's own plugin.
-    private static unsafe void WatchStatementEnds(bool watch)
+    // Ends the scope of a function's statement whose expression started a call of nextval.
+    private static void EndDrawScope(nint estate)
     {
-        if (s_plugin is not null)
+        for (int i = s_scopes.Count - 1; s_statementScopes > 0 && i >= 0; i--)
         {
-            s_plugin->stmt_end = watch ? PlpgsqlStatementEndCallback : default;
+            if (s_scopes[i].Kind == DrawScope && s_scopes[i].Owner == estate)
+            {
+                LeaveScopeAt(i, false);
+                return;
+            }
         }
     }
 
-    // Has PL/pgSQL tell worf of the functions it starts and ends from here on, until the transaction ends, and of each
-    // statement of those running now, which it told of no start of.
-    private static unsafe void WatchFunctions()
+    // Has PL/pgSQL tell worf of the statements it starts and ends, or no longer, through worf's own plugin: of both
+    // while an expression that started a call has yet to have it go through the guard, or a scope that a statement's
+    // end closes is open; and of those it starts while a unit holds gates for a statement to suspend. Otherwise
+    // PL/pgSQL runs without a call into worf, each of which costs far more than a statement that does little.
+    private static unsafe void WatchStatements()
     {
-        if (s_watchingFunctions || s_plugin is null)
+        if (s_plugin is null)
         {
             return;
+        }
+
+        bool ends = s_startedSites.Count > 0 || s_statementScopes > 0;
+        bool starts = s_startedSites.Count > 0 || s_unitGates.Count > 0;
+        if (starts != s_watchingStarts)
+        {
+            s_watchingStarts = starts;
+            s_plugin->stmt_beg = starts ? PlpgsqlStatementCallback : default;
+        }
+
+        if (ends != s_watchingEnds)
+        {
+            s_watchingEnds = ends;
+            s_plugin->stmt_end = ends ? PlpgsqlStatementEndCallback : default;
+        }
+    }
+
+    // Whether PL/pgSQL tells worf of its statements: its plugin is worf's own, and still the one it looks at.
+    private static unsafe bool TellsOfStatements() => s_ownsPlugin && *s_plpgsqlPlugin == s_plugin;
+
+    // Notes a PL/pgSQL expression that starts a call of nextval, for the call to go through the guard once PL/pgSQL
+    // next tells of a statement. An expression starts its calls once a transaction and makes them each time it runs,
+    // as a loop's assignment does at every turn, without telling the guard of the runs after the first.
+    private static unsafe void StartSite(nint simple, nint estate)
+    {
+        if (!TellsOfStatements() || estate == 0 || s_startedSites.Exists(site => site.Expr == simple))
+        {
+            return;
+        }
+
+        if (s_nextval == 0)
+        {
+            FmgrInfo nextval = default;
+            NativeMethods.fmgr_info(NextvalOid, &nextval);
+            s_nextval = (nint)nextval.fn_addr.DangerousGetAddress();
+            s_guardedNextval = (nint)GuardedNextvalCallback.DangerousGetAddress();
         }
 
         RegisterEnd();
-        s_watchingFunctions = true;
-        s_plugin->func_beg = PlpgsqlFunctionBeginCallback;
-        s_plugin->func_end = PlpgsqlFunctionEndCallback;
-        WatchStatements(true);
+        HookExit();
+        s_snowflake = Worf.CatalogOid("snowflake_node");
+        PLpgSQL_function* function = ((PLpgSQL_execstate*)estate)->func;
+        s_startedSites.Add((simple, NativeMethods.GetCurrentSubTransactionId(), estate, function is null || function->fn_oid == 0));
+        WatchStatements();
     }
 
-    // Has PL/pgSQL call into worf no more, as the transaction ends.
-    private static unsafe void UnwatchFunctions()
+    // Has the calls of nextval that PL/pgSQL expressions started go through the guard each time they run from here
+    // on, as PL/pgSQL tells of a statement.
+    private static void GuardSites()
     {
-        s_functions.Clear();
-        if (s_watchingFunctions && s_plugin is not null)
-        {
-            s_watchingFunctions = false;
-            s_plugin->func_beg = default;
-            s_plugin->func_end = default;
-        }
-
-        WatchStatements(false);
-    }
-
-    // Has PL/pgSQL tell worf of each statement it starts, or no longer, through worf's own plugin.
-    private static unsafe void WatchStatements(bool watch)
-    {
-        if (watch != s_watchingStatements && s_plugin is not null)
-        {
-            s_watchingStatements = watch;
-            s_plugin->stmt_beg = watch ? PlpgsqlStatementCallback : default;
-        }
-    }
-
-    // Whether PL/pgSQL is to tell of the statements of the function now innermost: one that may draw, or one it told no
-    // start of; or of any function's, while a unit holds gates for a statement to suspend, or an assignment that drew
-    // has yet to end.
-    private static bool StatementsMatter()
-        => s_functions.Count == 0 || s_functions[^1].Draws || s_unitGates.Count > 0 || s_quietScopes > 0;
-
-    // Notes a function PL/pgSQL starts, and whether its statements may draw from a managed sequence, which they count
-    // down for: by the calls of nextval its source has, unless each names a sequence that isn't managed, or by those
-    // its expressions that started this transaction make. worf's own statements, and a check under way, leave that to
-    // each statement.
-    private static unsafe void PlpgsqlFunctionBegin(PLpgSQL_execstate* estate, PLpgSQL_function* func)
-    {
-        bool draws = s_countingDown || s_namingGrantors || Worf.InOwnSql || func is null ||
-            (s_functionDraws.TryGetValue((nint)func, out (int Calls, HashSet<uint> Named) noted) && noted.Named.Count > 0) ||
-            (FunctionCalls(func) > 0 && FunctionNamed(func) is not { Count: 0 });
-        s_functions.Add(((nint)estate, NativeMethods.GetCurrentSubTransactionId(), draws));
-        WatchStatements(StatementsMatter());
-    }
-
-    // Notes that a running function's statements may draw, as an expression of its that draws from a managed sequence
-    // starts, while PL/pgSQL tells of functions.
-    private static void NoteFunctionDrawing(nint estate)
-    {
-        if (!s_watchingFunctions)
+        if (s_startedSites.Count == 0)
         {
             return;
         }
 
-        for (int i = s_functions.Count - 1; i >= 0; i--)
+        // An expression that has yet to start, as one whose first call's check is still under way, waits for the next
+        // statement.
+        ReadHookedCall();
+        _ = s_startedSites.RemoveAll(static site => GuardSite(site.Expr));
+        WatchStatements();
+    }
+
+    // Has the calls of nextval of a PL/pgSQL expression that has started go through the guard. A call that names a
+    // managed sequence is made to go through PostgreSQL's function that wraps a call in the fmgr hook, in which worf
+    // counts the draw without leaving PostgreSQL's own call of nextval. One that names its sequence only as it runs,
+    // or any where that hook isn't worf's, goes into GuardedNextval. One that names a sequence that isn't managed
+    // stays as it is. Returns whether the expression has started.
+    private static unsafe bool GuardSite(nint started)
+    {
+        PLpgSQL_expr* expr = (PLpgSQL_expr*)started;
+        ExprState* state = expr->expr_simple_state;
+        if (state is null || expr->expr_simple_lxid != Lxid())
         {
-            if (s_functions[i].Estate == estate)
+            return false;
+        }
+
+        for (int i = 0; i < state->steps_len; i++)
+        {
+            ExprEvalStep* step = &state->steps[i];
+            if (!CallsFunction(NativeMethods.ExecEvalStepOp(state, step)) || step->d.func.nargs != 1 ||
+                (nint)step->d.func.fn_addr.DangerousGetAddress() != s_nextval)
             {
-                s_functions[i] = s_functions[i] with { Draws = true };
-                break;
+                continue;
+            }
+
+            Node* call = step->d.func.finfo->fn_expr;
+            uint named = NamedByCall(call);
+            if (named != 0 && (named == s_snowflake || !s_sequences.ContainsKey(named)))
+            {
+                continue;
+            }
+
+            if (named != 0 && s_hookedCall != 0)
+            {
+                s_sites[(nint)call] = named;
+                step->d.func.fn_addr = new PGFunction((void*)s_hookedCall);
+            }
+            else
+            {
+                step->d.func.fn_addr = new PGFunction((void*)s_guardedNextval);
             }
         }
 
-        WatchStatements(true);
+        return true;
     }
 
-    // Forgets the functions that started in a subtransaction that aborts, which end without PL/pgSQL telling of it.
-    private static void ForgetFunctionsOf(uint aborted)
+    // Deals with the expressions that started a call in a subtransaction that aborts before PL/pgSQL told of a
+    // statement. An expression's state outlives the subtransaction, and PL/pgSQL runs it again without starting it,
+    // so its calls go through the guard from here on, unless a DO block that the abort ended ran it, which took its
+    // expressions with it: PL/pgSQL's error contexts, by now those of the functions still running, tell.
+    private static unsafe void ForgetSitesOf(uint aborted)
     {
-        if (s_functions.Count > 0 && s_functions.RemoveAll(function => function.Subxact >= aborted) > 0)
+        if (s_startedSites.Count == 0)
         {
-            WatchStatements(StatementsMatter());
-        }
-    }
-
-    // Ends a function's last assignment that drew, and lets the gates its last statement kept go, as the function
-    // ends and nothing of it starts next.
-    private static unsafe void PlpgsqlFunctionEnd(PLpgSQL_execstate* estate, PLpgSQL_function* func)
-    {
-        _ = func;
-        if (s_quietScopes > 0 && QuietScopeOf((nint)estate) is int quiet and >= 0)
-        {
-            LeaveScopeAt(quiet, false);
+            return;
         }
 
-        if (s_keptGates.Count > 0)
+        PLpgSQL_plugin* plugin = s_plpgsqlPlugin is null ? null : (PLpgSQL_plugin*)*s_plpgsqlPlugin;
+        void* callback = plugin is null || plugin->error_callback.IsNull ? null : plugin->error_callback.DangerousGetAddress();
+        for (int i = s_startedSites.Count - 1; i >= 0; i--)
         {
-            LetKeptGates();
-        }
-
-        // The function that called it, if PL/pgSQL told of its start, is innermost again.
-        for (int i = s_functions.Count - 1; i >= 0; i--)
-        {
-            if (s_functions[i].Estate == (nint)estate)
+            (nint started, uint subxact, nint estate, bool inline) = s_startedSites[i];
+            if (subxact < aborted)
             {
-                s_functions.RemoveRange(i, s_functions.Count - i);
-                break;
+                continue;
             }
-        }
 
-        WatchStatements(StatementsMatter());
-    }
-
-    // Finds the open scope of an assignment of a function's that drew, innermost first, or -1.
-    private static int QuietScopeOf(nint estate)
-    {
-        for (int i = s_scopes.Count - 1; i >= 0; i--)
-        {
-            if (s_scopes[i].Kind >= QuietScope && s_scopes[i].Owner == estate)
+            bool running = false;
+            for (ErrorContextCallback* context = NativeGlobals.error_context_stack; inline && callback is not null && context is not null && !running;
+                context = context->previous)
             {
-                return i;
+                running = context->callback.DangerousGetAddress() == callback && (nint)context->arg == estate;
             }
+
+            if (!inline || running)
+            {
+                _ = GuardSite(started);
+            }
+
+            s_startedSites.RemoveAt(i);
         }
 
-        return -1;
+        WatchStatements();
     }
 
-    // Lets the gates a PL/pgSQL statement kept as it ended go.
-    private static void LetKeptGates()
-    {
-        foreach (uint seqoid in s_keptGates)
-        {
-            LetGate(seqoid);
-        }
-
-        s_keptGates.Clear();
-    }
-
-    // Notes the draws a PL/pgSQL function's expression that starts makes, for the function's statements to count down
-    // by, until the transaction ends.
-    private static unsafe void NoteFunctionDraws(nint estate, int calls, HashSet<uint> named)
-    {
-        if (!s_functionDrawsRegistered)
-        {
-            s_functionDrawsRegistered = true;
-            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, ForgetFunctionDraws);
-            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, ForgetFunctionDraws);
-            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, ForgetFunctionDraws);
-        }
-
-        if (named.Count > 0)
-        {
-            NoteFunctionDrawing(estate);
-        }
-
-        nint function = (nint)((PLpgSQL_execstate*)estate)->func;
-        if (s_functionDraws.TryGetValue(function, out (int Calls, HashSet<uint> Named) noted))
-        {
-            noted.Named.UnionWith(named);
-            s_functionDraws[function] = (Math.Max(noted.Calls, calls), noted.Named);
-        }
-        else
-        {
-            s_functionDraws[function] = (calls, [.. named]);
-        }
-    }
-
-    private static void ForgetFunctionDraws()
-    {
-        s_functionDraws.Clear();
-        s_functionDrawsRegistered = false;
-    }
-
-    // The managed sequences a PL/pgSQL function's source names in its calls of nextval, once until it's replaced, or
-    // null when a call names none, as one with a computed name, or for a DO block's.
-    private static unsafe HashSet<uint>? FunctionNamed(PLpgSQL_function* function)
-    {
-        if (function->fn_oid == 0)
-        {
-            return null;
-        }
-
-#if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
-        (uint, uint) key = (function->fn_oid, function->fn_xmin);
-#else
-        (uint, uint) key = (function->fn_oid, function->cfunc.fn_xmin);
+    // Whether a step of an expression calls a function.
+    private static bool CallsFunction(ExprEvalOp op)
+        => op is ExprEvalOp.EEOP_FUNCEXPR or ExprEvalOp.EEOP_FUNCEXPR_STRICT or ExprEvalOp.EEOP_FUNCEXPR_FUSAGE or ExprEvalOp.EEOP_FUNCEXPR_STRICT_FUSAGE
+#if !(ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17)
+            or ExprEvalOp.EEOP_FUNCEXPR_STRICT_1 or ExprEvalOp.EEOP_FUNCEXPR_STRICT_2
 #endif
-        if (!s_functionNamed.TryGetValue(key, out HashSet<uint>? named))
-        {
-            uint oid = function->fn_oid;
-            string source = Worf.ReadScalar<string?>("SELECT prosrc FROM pg_catalog.pg_proc WHERE oid = $1", SpiParameter.Create(oid)) ?? "";
-            MatchCollection literals = NamedNextval().Matches(source);
-            named = literals.Count == NextvalCalls(source)
-                ? [.. literals.Select(call => ManagedNamed(call.Groups[1].Value.Replace("''", "'", StringComparison.Ordinal)) ?? []).SelectMany(each => each)]
-                : null;
-            s_functionNamed[key] = named;
-        }
+            ;
 
-        return named;
+    // The sequence a call of nextval names with a constant, or zero for one that names it as it runs.
+    private static unsafe uint NamedByCall(Node* call)
+    {
+        List* args = call is null ? null
+            : call->type == NodeTag.T_FuncExpr ? ((FuncExpr*)call)->args
+            : call->type == NodeTag.T_OpExpr ? ((OpExpr*)call)->args
+            : null;
+        Node* arg = args is null || args->length != 1 ? null : (Node*)args->elements[0].ptr_value;
+        return arg is not null && arg->type == NodeTag.T_Const && !((Const*)arg)->constisnull ? (uint)((Const*)arg)->constvalue : 0;
     }
 
-    // A call of nextval with a constant name, in a function's source.
-    [GeneratedRegex(@"nextval\s*\(\s*'((?:[^']|'')*)'", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
-    private static partial Regex NamedNextval();
+    // This backend's number for the transaction it runs, which PL/pgSQL marks the expressions it started in it with.
+    private static unsafe uint Lxid()
+#if ANKUS_PG15 || ANKUS_PG16
+        => NativeGlobals.MyProc->lxid;
+#else
+        => NativeGlobals.MyProc->vxid.lxid;
+#endif
+
+    // Finds PostgreSQL's function that wraps a call in the fmgr hook, once for the backend. PostgreSQL has a function
+    // that isn't built in go through it where the hook check asks for it, so the check asks for it for PL/pgSQL's call
+    // handler meanwhile. Calls of nextval go through it only where the fmgr hook is worf's own and counts them without
+    // a call into PostgreSQL, and where nextval has no settings or owner to run as, which PostgreSQL ignores for a
+    // built-in function and that function wouldn't.
+    private static unsafe void ReadHookedCall()
+    {
+        if (s_hookedCallRead)
+        {
+            return;
+        }
+
+        if (Executor.CountsDraws && !Worf.ReadScalar<bool>($"SELECT prosecdef OR proconfig IS NOT NULL FROM pg_catalog.pg_proc WHERE oid = {NextvalOid}"))
+        {
+            List* name = NativeMethods.lappend(null, NativeMethods.makeString(Worf.PStrDup("pg_catalog")));
+            name = NativeMethods.lappend(name, NativeMethods.makeString(Worf.PStrDup("plpgsql_call_handler")));
+            uint handler = NativeMethods.LookupFuncName(name, 0, null, true);
+            FmgrInfo own = default;
+            FmgrInfo hooked = default;
+            if (handler != 0)
+            {
+                NativeMethods.fmgr_info(handler, &own);
+                ReadingHookedCall = true;
+                try
+                {
+                    NativeMethods.fmgr_info(handler, &hooked);
+                }
+                finally
+                {
+                    ReadingHookedCall = false;
+                }
+            }
+
+            if (!hooked.fn_addr.IsNull && hooked.fn_addr.DangerousGetAddress() != own.fn_addr.DangerousGetAddress())
+            {
+                s_fastSlot = Shared() + (((uint)Environment.ProcessId % WorfFastDraws.Slots) + 1) * WorfFastDraws.SlotLongs;
+                s_hookedCall = (nint)hooked.fn_addr.DangerousGetAddress();
+            }
+        }
+
+        s_hookedCallRead = true;
+    }
+
+    // What shared memory holds for the draws that hold no gate, where this backend has it, found once.
+    private static unsafe long* Shared()
+    {
+        if (s_fastDraws is null)
+        {
+            s_fastDraws = (long*)FastDraws.Read(static (in shared) => (nint)Unsafe.AsPointer(ref Unsafe.AsRef(in shared)));
+        }
+
+        return s_fastDraws;
+    }
+
+    /// <summary>
+    /// Tells the draws that hold no gate of a change to the blocks, once the counter every backend reads has moved.
+    /// </summary>
+    internal static unsafe void TellOfChange() => _ = Interlocked.Increment(ref Shared()[WorfFastDraws.Changes]);
+
+    // Counts a switch as pending, or no more, for the statements that hold gates and for the draws that hold none.
+    private static unsafe void CountPending(long change)
+    {
+        _ = PgAtomic.Add(SequenceRanges.SwitchesPending, change);
+        _ = Interlocked.Add(ref Shared()[WorfFastDraws.Pending], change);
+    }
+
+    /// <summary>
+    /// Gets whether the guard is asking PostgreSQL where its function that wraps a call in the fmgr hook is, for
+    /// which the hook check answers yes.
+    /// </summary>
+    internal static bool ReadingHookedCall { get; private set; }
+
+    /// <summary>
+    /// Runs in the fmgr hook as a call of nextval that goes through it starts, within PostgreSQL's own call, where
+    /// worf may call nothing of PostgreSQL's: the draw goes on at once where this backend has draws of the sequence
+    /// left to take before it checks it again, and no switch has started or committed since it last read the blocks.
+    /// It then counts among the draws under way, which a switch waits for before it moves a sequence, in place of
+    /// holding the sequence's gate. Any other call goes into <see cref="GuardedNextval"/> instead of nextval.
+    /// </summary>
+    /// <param name="flinfo">The function about to be called.</param>
+    /// <param name="site">The call's own value in the hook, which keeps its sequence.</param>
+    internal static unsafe void DrawStarting(FmgrInfo* flinfo, ulong* site)
+    {
+        if (!DrawsAtOnce(flinfo, site))
+        {
+            s_handedOff = (nint)flinfo;
+            flinfo->fn_addr = new PGFunction((void*)s_guardedNextval);
+        }
+    }
+
+    /// <summary>
+    /// Runs in the fmgr hook as a call of nextval that goes through it ends or fails: its draw is under way no more.
+    /// </summary>
+    /// <param name="flinfo">The function called.</param>
+    internal static unsafe void DrawEnded(FmgrInfo* flinfo)
+    {
+        LeaveFastDraw();
+        if (s_handedOff == (nint)flinfo)
+        {
+            s_handedOff = 0;
+            flinfo->fn_addr = new PGFunction((void*)s_nextval);
+        }
+    }
+
+    // Whether a call of nextval may draw without a call into PostgreSQL, and counts its draw if so.
+    private static unsafe bool DrawsAtOnce(FmgrInfo* flinfo, ulong* site)
+    {
+        // A check under way, and worf's own statements, count no draws, as before.
+        if (s_countingDown || s_namingGrantors || Worf.InOwnSql)
+        {
+            return true;
+        }
+
+        if (*site >> 32 != s_siteGeneration)
+        {
+            *site = ((ulong)s_siteGeneration << 32) | (s_sites.TryGetValue((nint)flinfo->fn_expr, out uint named) ? named : 0);
+        }
+
+        uint seqoid = (uint)*site;
+        if (seqoid == 0 || s_fastSlot is null)
+        {
+            return false;
+        }
+
+        // A statement that writes and holds the sequence's gate checks its rows' draws itself.
+        for (int i = 0; i < s_gating.Count; i++)
+        {
+            if (s_gating[i].Sequences.Contains(seqoid))
+            {
+                return true;
+            }
+        }
+
+        ref long left = ref CollectionsMarshal.GetValueRefOrNullRef(s_drawingUngated, seqoid);
+        if (Unsafe.IsNullRef(ref left) || left < 1)
+        {
+            return false;
+        }
+
+        // The draws taken of the count are told to the shared table once there are a few, which takes its lock.
+        ref (long Promised, long Drawn) promised = ref CollectionsMarshal.GetValueRefOrNullRef(s_promised, seqoid);
+        bool counted = !Unsafe.IsNullRef(ref promised);
+        if (counted && promised.Drawn + 1 >= Math.Max(PromiseBatch, promised.Promised / 8))
+        {
+            return false;
+        }
+
+        // A switch counts itself as pending before it looks for draws under way, and this draw counts itself under
+        // way before it looks for a switch, so one of them sees the other. A switch that has committed has told of
+        // its change first.
+        if (s_gates.Count == 0 || !s_gates.ContainsKey(seqoid))
+        {
+            _ = Interlocked.Increment(ref *s_fastSlot);
+            if (Volatile.Read(ref s_fastDraws[WorfFastDraws.Pending]) != 0 || Volatile.Read(ref s_fastDraws[WorfFastDraws.Changes]) != s_changesRead ||
+                s_version < 0 || SequenceRanges.LocalVersion != s_localVersion)
+            {
+                _ = Interlocked.Decrement(ref *s_fastSlot);
+                return false;
+            }
+
+            s_drawingFast = true;
+        }
+
+        left--;
+        if (counted)
+        {
+            promised.Drawn++;
+        }
+
+        return true;
+    }
+
+    // Counts this backend's draw under way no more.
+    private static unsafe void LeaveFastDraw()
+    {
+        if (s_drawingFast)
+        {
+            s_drawingFast = false;
+            _ = Interlocked.Decrement(ref *s_fastSlot);
+        }
+    }
+
+    // Draws for a call of nextval in a PL/pgSQL expression that the fmgr hook couldn't count at once, or that doesn't
+    // go through it. The call is a unit, as a statement's row is: it takes its sequence's gate, counts the draw down,
+    // waiting for the switch where the block is short, draws and lets the gate go. A sequence the transaction hasn't
+    // drawn from without its gate yet is checked first, as a call that starts is.
+    private static unsafe ulong GuardedNextval(FunctionCallInfoBaseData* fcinfo)
+    {
+        if (s_handedOff != 0 && s_handedOff == (nint)fcinfo->flinfo)
+        {
+            s_handedOff = 0;
+            fcinfo->flinfo->fn_addr = new PGFunction((void*)s_nextval);
+        }
+
+        ulong* args = (ulong*)((byte*)fcinfo + sizeof(FunctionCallInfoBaseData));
+        uint seqoid = (uint)args[0];
+        bool quiet = NativeGlobals.creating_extension || NativeGlobals.XactReadOnly;
+        if (s_countingDown || s_namingGrantors || Worf.InOwnSql || quiet)
+        {
+            return NativeMethods.nextval_oid(fcinfo);
+        }
+
+        // The blocks are read again after a change, which the hook leaves to this call.
+        s_namingGrantors = true;
+        try
+        {
+            Reload();
+        }
+        finally
+        {
+            s_namingGrantors = false;
+        }
+
+        if (!s_sequences.ContainsKey(seqoid) || StatementGated(seqoid) || seqoid == Worf.CatalogOid("snowflake_node"))
+        {
+            return NativeMethods.nextval_oid(fcinfo);
+        }
+
+        EnterScope(RowScope, (nint)fcinfo);
+        bool failed = true;
+        try
+        {
+            if (!s_drawingUngated.ContainsKey(seqoid))
+            {
+                List<uint> starting = [seqoid];
+                CountFunction(starting);
+                GateUnit(seqoid);
+                HearOfSwitches();
+                WaitWhileShort(seqoid);
+                DrawUngated(starting);
+            }
+
+            CountDownDraws(1, [seqoid]);
+            ulong value = NativeMethods.nextval_oid(fcinfo);
+            failed = false;
+            return value;
+        }
+        finally
+        {
+            LeaveScope(RowScope, (nint)fcinfo, failed: failed);
+        }
+    }
 
     // Has a running statement's plan nodes count down before each row they produce, for the calls of nextval the CHECK
     // constraints and trigger conditions of the tables it writes make for each row, at least one, from the first call
@@ -2059,30 +2254,6 @@ internal static partial class SequenceRangeGuard
         return most;
     }
 
-    // How many calls of nextval a PL/pgSQL function's source has, once until it's replaced, or, for a DO block's, which
-    // has no source of its own, the statement that runs it.
-    private static unsafe int FunctionCalls(PLpgSQL_function* function)
-    {
-        if (function->fn_oid == 0)
-        {
-            return NextvalCalls(NativeGlobals.debug_query_string is null ? "" : Worf.FromServer(NativeGlobals.debug_query_string));
-        }
-
-#if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
-        (uint, uint) key = (function->fn_oid, function->fn_xmin);
-#else
-        (uint, uint) key = (function->fn_oid, function->cfunc.fn_xmin);
-#endif
-        if (!s_functionCalls.TryGetValue(key, out int calls))
-        {
-            uint oid = function->fn_oid;
-            calls = NextvalCalls(Worf.ReadScalar<string?>("SELECT prosrc FROM pg_catalog.pg_proc WHERE oid = $1", SpiParameter.Create(oid)) ?? "");
-            s_functionCalls[key] = calls;
-        }
-
-        return calls;
-    }
-
     // How many calls of nextval a text has, as its name does.
     private static int NextvalCalls(string text)
     {
@@ -2131,7 +2302,6 @@ internal static partial class SequenceRangeGuard
         _ = PgTransaction.RegisterSubtransactionCallback(PgSubtransactionEvent.Abort, static (aborted, parent) =>
         {
             ForgetGatesOf(aborted.Value);
-            ForgetFunctionsOf(aborted.Value);
             foreach (nint queryDesc in s_countedNodes.Where(entry => entry.Value.Subxact >= aborted.Value).Select(entry => entry.Key).ToList())
             {
                 ForgetCounted(queryDesc);
@@ -2172,7 +2342,6 @@ internal static partial class SequenceRangeGuard
         }
 
         RegisterEnd();
-        WatchFunctions();
         foreach (uint seqoid in sequences)
         {
             Share(seqoid);
@@ -2194,7 +2363,6 @@ internal static partial class SequenceRangeGuard
         }
 
         RegisterEnd();
-        WatchFunctions();
         foreach (uint seqoid in sequences)
         {
             _ = s_drawingUngated.TryAdd(seqoid, 0);
@@ -2202,25 +2370,22 @@ internal static partial class SequenceRangeGuard
     }
 
     // Takes, as a call of nextval starts within a unit, the gates of the sequences it may draw from: for a call a
-    // PL/pgSQL statement's own expression makes, the statement is the unit, from now until it ends, and each time it
-    // starts again; for one a statement starts as it runs, the row it runs, or the run. A call that starts otherwise, as
-    // one a utility statement makes, takes none.
+    // PL/pgSQL statement's own expression makes, which draws straight after, from now until PL/pgSQL next tells of a
+    // statement of the function; for one a statement starts as it runs, the row it runs, or the run. A call that starts
+    // otherwise, as one a utility statement makes, takes none.
     private static unsafe void GateStarting(bool plpgsql, nint estate, WorfStartingStatement? starting, List<uint> sequences)
     {
         if (plpgsql)
         {
             PLpgSQL_stmt* statement = estate == 0 ? null : ((PLpgSQL_execstate*)estate)->err_stmt;
-            if (!s_ownsPlugin || statement is null)
+            if (!TellsOfStatements() || statement is null)
             {
                 return;
             }
 
-            _ = s_drawingStatements.Add((nint)statement);
-            WatchFunctions();
-            NoteFunctionDrawing(estate);
-            if (s_scopes.Count == 0 || s_scopes[^1] is not { Kind: >= StatementScope } top || top.Key != (nint)statement || top.Owner != estate)
+            if (s_scopes.Count == 0 || s_scopes[^1] is not { Kind: DrawScope } top || top.Key != (nint)statement || top.Owner != estate)
             {
-                EnterScope(StatementScope, (nint)statement, estate);
+                EnterScope(DrawScope, (nint)statement, estate);
             }
         }
         else if (starting is not { Running: not 0 })
@@ -2244,7 +2409,6 @@ internal static partial class SequenceRangeGuard
         }
 
         s_shareRuns.Clear();
-        s_drawingStatements.Clear();
         s_drawingUngated.Clear();
         s_unnamedMarks.Clear();
     }
@@ -2597,11 +2761,6 @@ internal static partial class SequenceRangeGuard
             return;
         }
 
-        if (s_keptGates.Count > 0)
-        {
-            LetKeptGates();
-        }
-
         // A block's functions, which were counted among their sequences' drawers outside any statement, draw no more.
         if (s_ungatedDrawers.Count > 0)
         {
@@ -2623,26 +2782,12 @@ internal static partial class SequenceRangeGuard
 
     // Starts a scope. A run or a PL/pgSQL statement that starts within a unit suspends it: the gates the enclosing scopes
     // hold go until it ends, as their units draw nothing meanwhile. A row lets go of the gates a call took that started
-    // in its run before any row's check, as the first of a statement's calls that start as it runs does. A PL/pgSQL
-    // statement that draws keeps those the statement before it kept.
-    private static void EnterScope(byte kind, nint key, nint owner = 0, bool keep = false)
+    // in its run before any row's check, as the first of a statement's calls that start as it runs does.
+    private static void EnterScope(byte kind, nint key, nint owner = 0)
     {
-        // An assignment under which a scope starts may still be under way, so PL/pgSQL tells of its end from here on.
-        if (s_scopes.Count > 0 && s_scopes[^1].Kind == QuietScope)
+        if (kind != RowScope && s_unitGates.Count > 0)
         {
-            s_scopes[^1] = s_scopes[^1] with { Kind = ToldQuietScope };
-            WatchStatementEnds(++s_statementScopes > 0);
-        }
-
-        // The gates a PL/pgSQL statement kept go as anything but a statement that draws starts.
-        if (!keep && s_keptGates.Count > 0)
-        {
-            LetKeptGates();
-        }
-
-        if (kind != RowScope && s_unitGates.Count > s_keptGates.Count)
-        {
-            foreach (uint seqoid in s_unitGates.Except(s_keptGates).ToList())
+            foreach (uint seqoid in s_unitGates.ToList())
             {
                 LetGate(seqoid);
             }
@@ -2669,18 +2814,11 @@ internal static partial class SequenceRangeGuard
                 subxact = NativeMethods.GetCurrentSubTransactionId();
             }
 
-            if (kind == StatementScope)
-            {
-                WatchStatementEnds(++s_statementScopes > 0);
-            }
-            else
-            {
-                s_quietScopes++;
-                WatchFunctions();
-            }
+            s_statementScopes++;
         }
 
         s_scopes.Add((kind, key, owner, subxact, s_scopeGates.Count));
+        WatchStatements();
     }
 
     // Ends the innermost scope of a kind that is of a run, a row's node or a PL/pgSQL statement, as LeaveScopeAt does.
@@ -2704,17 +2842,7 @@ internal static partial class SequenceRangeGuard
     // failed leaves its gates to the transaction or subtransaction that ends with it.
     private static void LeaveScopeAt(int index, bool failed)
     {
-        // A PL/pgSQL statement that drew keeps its gates for the statement that starts next, which a loop that draws at
-        // every turn so takes once, where no unit around it waits to take its own again.
         byte kind = s_scopes[index].Kind;
-        if (!failed && kind >= StatementScope && index == s_scopes.Count - 1 && s_scopes[index].First == 0 && s_scopeGates.Count > 0 &&
-            s_drawingStatements.Contains(s_scopes[index].Key))
-        {
-            s_keptGates.UnionWith(s_scopeGates.Where(s_unitGates.Contains));
-            s_scopeGates.Clear();
-            WatchFunctions();
-        }
-
         CloseScopes(index, !failed);
         if (failed || kind == RowScope || s_scopes.Count == 0)
         {
@@ -2757,19 +2885,13 @@ internal static partial class SequenceRangeGuard
         }
 
         s_scopeGates.RemoveRange(first, s_scopeGates.Count - first);
-        int statements = 0;
         for (int i = index; i < s_scopes.Count; i++)
         {
-            statements += s_scopes[i].Kind is StatementScope or ToldQuietScope ? 1 : 0;
-            s_quietScopes -= s_scopes[i].Kind >= QuietScope ? 1 : 0;
+            s_statementScopes -= s_scopes[i].Kind >= StatementScope ? 1 : 0;
         }
 
         s_scopes.RemoveRange(index, s_scopes.Count - index);
-        if (statements > 0)
-        {
-            s_statementScopes -= statements;
-            WatchStatementEnds(s_statementScopes > 0);
-        }
+        WatchStatements();
     }
 
     // Takes a sequence's gate for the unit innermost, a row or a PL/pgSQL statement, or the run a call starts in outside
@@ -2783,15 +2905,8 @@ internal static partial class SequenceRangeGuard
             return;
         }
 
-        bool kept = s_keptGates.Count > 0 && s_keptGates.Remove(seqoid);
         if (s_gates.ContainsKey(seqoid))
         {
-            // A gate the statement before kept is this unit's own from here on.
-            if (kept)
-            {
-                s_scopeGates.Add(seqoid);
-            }
-
             return;
         }
 
@@ -4028,11 +4143,11 @@ internal static partial class SequenceRangeGuard
                     (plpgsql || starting!.Switched.Add(seqoid)))];
             }
 
-            // The function whose expression starts counts down, as each of its statements starts, for the calls its
-            // expressions make, of the sequences they name.
-            if (plpgsql && simple != 0 && estate != 0 && named is not null && s_simple.Draws is { } simpleDraws)
+            // A PL/pgSQL expression starts its calls once a transaction, so each goes through the guard from the
+            // expression's next run on.
+            if (plpgsql && simple != 0 && s_sequences.Count > 0)
             {
-                NoteFunctionDraws(estate, simpleDraws.Calls, named);
+                StartSite(simple, estate);
             }
 
             // The sequences whose grantors haven't answered, in the order of their OIDs, so that a statement that waits
@@ -4230,6 +4345,30 @@ internal static partial class SequenceRangeGuard
 
         s_simple.Draws ??= Draws(PlanText((Node*)((PLpgSQL_expr*)simple)->expr_simple_expr));
         return s_simple.Draws.Value.Unnamed || s_simple.Looked > s_simple.Draws.Value.Calls ? null : s_simple.Draws.Value.Called;
+    }
+
+    /// <summary>
+    /// Tells whether <see cref="StartingTrigger"/> has anything to check for a function that starts, from what the
+    /// guard has noted alone, as the fmgr hook asks where it may call nothing of PostgreSQL's.
+    /// </summary>
+    /// <param name="fnOid">The function.</param>
+    /// <returns>Whether it is a trigger function the guard watches.</returns>
+    internal static bool WatchesTrigger(uint fnOid)
+    {
+        if (s_hookedTriggers.Contains(fnOid))
+        {
+            return true;
+        }
+
+        foreach ((nint, uint, Dictionary<uint, HashSet<uint>> Functions) hooking in s_hookingStatements)
+        {
+            if (hooking.Functions.ContainsKey(fnOid))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -5430,7 +5569,6 @@ internal static partial class SequenceRangeGuard
         {
             if (s_unitGates.Remove(seqoid))
             {
-                _ = s_keptGates.Remove(seqoid);
                 s_gates[seqoid] = subxact;
                 CountDrawer(seqoid, 1);
             }
@@ -5555,7 +5693,7 @@ internal static partial class SequenceRangeGuard
         if (unit)
         {
             _ = s_unitGates.Add(seqoid);
-            WatchFunctions();
+            WatchStatements();
         }
         else
         {
@@ -5568,7 +5706,11 @@ internal static partial class SequenceRangeGuard
         if (s_gates.Remove(seqoid))
         {
             ReleaseGate(seqoid, ShareLock);
-            if (!s_unitGates.Remove(seqoid))
+            if (s_unitGates.Remove(seqoid))
+            {
+                WatchStatements();
+            }
+            else
             {
                 CountDrawer(seqoid, -1);
             }
@@ -5759,7 +5901,7 @@ internal static partial class SequenceRangeGuard
     /// <see cref="AwaitGate"/>, and again after such a failure.</param>
     internal static unsafe void ShutGate(uint seqoid, int timeout)
     {
-        _ = PgAtomic.Add(SequenceRanges.SwitchesPending, 1L);
+        CountPending(1);
         CountDrawer(seqoid, 0, 0, 1);
 
         // Backends hear of the switch before it no longer counts as under way, so that a row that draws without the gate
@@ -5768,7 +5910,7 @@ internal static partial class SequenceRangeGuard
         {
             SequenceRanges.Changed();
             CountDrawer(seqoid, 0, 0, -1);
-            _ = PgAtomic.Add(SequenceRanges.SwitchesPending, -1L);
+            CountPending(-1);
         }
 
         _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, Done);
@@ -5778,6 +5920,44 @@ internal static partial class SequenceRangeGuard
         _ = NativeMethods.LockAcquire(&door, ExclusiveLock, false, false);
         LOCKTAG tag = GateTag(seqoid);
         _ = NativeMethods.LockAcquire(&tag, ExclusiveLock, false, false);
+        AwaitFastDraws(timeout);
+    }
+
+    // Waits for the draws under way that hold no gate, which count themselves in shared memory for the moment each
+    // takes: the switch has counted itself as pending, so no more of them start, and those that had are done within
+    // that moment, unless one waits for a lock within nextval, which holds the switch up as a statement that holds
+    // the gate does, for as long as the switch waits for a lock.
+    private static unsafe void AwaitFastDraws(int timeout)
+    {
+        long* draws = Shared();
+        long until = Worker.GetCurrentTimestamp() + (timeout * 1000L);
+        for (int spins = 0; ; spins++)
+        {
+            bool drawing = false;
+            for (int slot = 1; slot <= WorfFastDraws.Slots && !drawing; slot++)
+            {
+                drawing = Volatile.Read(ref draws[slot * WorfFastDraws.SlotLongs]) != 0;
+            }
+
+            if (!drawing)
+            {
+                return;
+            }
+
+            if (spins < 100)
+            {
+                Thread.SpinWait(100);
+                continue;
+            }
+
+            PgInterrupts.Check();
+            if (Worker.GetCurrentTimestamp() >= until)
+            {
+                throw new PgException("55P03", "canceling statement due to lock timeout");
+            }
+
+            Worker.WaitLatch(1);
+        }
     }
 
     /// <summary>
@@ -5792,7 +5972,7 @@ internal static partial class SequenceRangeGuard
     /// <param name="seqoid">The sequence.</param>
     internal static unsafe void AwaitGate(uint seqoid)
     {
-        _ = PgAtomic.Add(SequenceRanges.SwitchesPending, 1L);
+        CountPending(1);
         CountDrawer(seqoid, 0, 0, 1);
         int nestLevel = NativeMethods.NewGUCNestLevel();
         LOCKTAG door = GateTag(seqoid, DoorKey);
@@ -5822,7 +6002,7 @@ internal static partial class SequenceRangeGuard
 
             NativeMethods.AtEOXact_GUC(true, nestLevel);
             CountDrawer(seqoid, 0, 0, -1);
-            _ = PgAtomic.Add(SequenceRanges.SwitchesPending, -1L);
+            CountPending(-1);
         }
     }
 
@@ -5892,7 +6072,6 @@ internal static partial class SequenceRangeGuard
             ReleaseGate(seqoid, ShareLock);
             if (s_unitGates.Remove(seqoid))
             {
-                _ = s_keptGates.Remove(seqoid);
                 continue;
             }
 
@@ -5908,6 +6087,8 @@ internal static partial class SequenceRangeGuard
         {
             CloseScopes(dead, false);
         }
+
+        ForgetSitesOf(aborted);
     }
 
     private static void ForgetGates()
@@ -5920,13 +6101,21 @@ internal static partial class SequenceRangeGuard
 
         s_gates.Clear();
         s_unitGates.Clear();
-        s_keptGates.Clear();
         s_scopes.Clear();
         s_scopeGates.Clear();
         s_statementScopes = 0;
-        s_quietScopes = 0;
-        WatchStatementEnds(false);
-        UnwatchFunctions();
+
+        // The states of the transaction's PL/pgSQL expressions end with it, and their calls' places may be others' next.
+        s_startedSites.Clear();
+        if (s_sites.Count > 0)
+        {
+            s_sites.Clear();
+            s_siteGeneration++;
+        }
+
+        s_handedOff = 0;
+        LeaveFastDraw();
+        WatchStatements();
         s_gatedRowDraws.Clear();
         s_unseenRowDraws.Clear();
         s_rowMarks.Clear();
@@ -6256,10 +6445,10 @@ internal static partial class SequenceRangeGuard
                 Promise(seqoid, 0);
             }
 
+            LeaveFastDraw();
             s_waitingFor.Clear();
             s_gates.Clear();
             s_unitGates.Clear();
-            s_keptGates.Clear();
             s_gatedRowDraws.Clear();
             s_unseenRowDraws.Clear();
             s_rowMarks.Clear();
@@ -6961,10 +7150,19 @@ internal static partial class SequenceRangeGuard
     /// </summary>
     private static void Reload()
     {
+        // The changes told to the draws that hold no gate are read first: a change moves the counter every backend
+        // reads before it tells them, so those read here are none the blocks read below lack.
+        long changes;
+        unsafe
+        {
+            changes = Volatile.Read(ref Shared()[WorfFastDraws.Changes]);
+        }
+
         long version = SequenceRanges.Version.Value;
         long localVersion = SequenceRanges.LocalVersion;
         if (version == s_version && localVersion == s_localVersion)
         {
+            s_changesRead = changes;
             return;
         }
 
@@ -7028,6 +7226,7 @@ internal static partial class SequenceRangeGuard
 
         s_version = version;
         s_localVersion = localVersion;
+        s_changesRead = changes;
     }
 
     // Reads every managed sequence's blocks as last committed, with the node each one's draws wait for.

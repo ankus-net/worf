@@ -3440,7 +3440,11 @@ internal static unsafe partial class SequenceRanges
     /// <summary>
     /// Tells backends to reload the blocks they cache for the guard.
     /// </summary>
-    internal static void Changed() => _ = PgAtomic.Add(Version, 1L);
+    internal static void Changed()
+    {
+        _ = PgAtomic.Add(Version, 1L);
+        SequenceRangeGuard.TellOfChange();
+    }
 
     /// <summary>
     /// Tells backends to reload their blocks once this transaction commits, so they don't cache what it hasn't, and this

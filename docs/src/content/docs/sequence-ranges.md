@@ -141,11 +141,15 @@ gate) and let it go between rows when a switch is waiting. A statement that hold
 else, such as `COPY FROM STDIN` waiting for its client, holds the switch up until it continues. If such waits form a
 cycle, PostgreSQL ends one of the statements with SQLSTATE `40P01`.
 
-Other statements that draw, such as `SELECT nextval(...)` or a PL/pgSQL assignment, hold the gate while they work
-out a row or run the statement that draws. Where the next row or the next turn of a loop draws straight away, they
-keep the gate and let it go when a switch waits for it. They look for a waiting switch at each row or turn, or every
-tenth of a millisecond when those take less. A cursor between fetches, a client that reads slowly and a transaction
-left idle hold nothing, so they don't delay a switch.
+Other statements that draw, such as `SELECT nextval(...)`, hold the gate while they work out a row. Where the next
+row draws straight away, they keep the gate and let it go when a switch waits for it. They look for a waiting switch
+at each row, or every tenth of a millisecond when rows take less. A cursor between fetches, a client that reads
+slowly and a transaction left idle hold nothing, so they don't delay a switch.
+
+A PL/pgSQL expression that draws, such as an assignment in a loop, takes the gate only when it has to check the
+block, as it does the first time it runs in a transaction. Its other draws hold nothing, and a switch waits only for
+the draws under way. They cost about what draws from a plain sequence do, and the statements around them cost nothing
+extra.
 
 worf doesn't see C code that calls `nextval` directly rather than through SQL. Such code can run a block out, so don't
 use it with managed sequences.

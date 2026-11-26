@@ -4849,8 +4849,8 @@ public sealed partial class SequenceRangeTests
     /// A statement whose rows that draw feed the rest of its plan, or a table worf doesn't guard, keeps its sequence's
     /// gate from row to row and lets a waiting switch pass at each (2300): beside one whose rows take half a second each,
     /// under an aggregate, in CREATE TABLE AS, or inserted into a table without a managed default, another session's 300
-    /// inserts, which switch blocks of 100, wait a row at each switch, where they waited eight, 4 s each. So does a
-    /// PL/pgSQL loop of one assignment that draws, which keeps the gate from turn to turn (2301), at each turn.
+    /// inserts, which switch blocks of 100, wait a row at each switch, where they waited eight, 4 s each. A PL/pgSQL
+    /// loop of one assignment that draws, which holds no gate between its draws (2301, 2501), holds them up no longer.
     /// </summary>
     /// <param name="form">What the rows that draw feed, or the loop.</param>
     /// <returns>The test.</returns>
@@ -4914,13 +4914,12 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
-    /// A PL/pgSQL loop that draws from a managed sequence at every turn takes about as long as one that draws from a plain
-    /// sequence in a block that PL/pgSQL tells worf each statement of (2301): its assignment keeps the sequence's gate
-    /// from one turn to the next, and PL/pgSQL calls worf once a turn, where it called twice and took the gate each time.
-    /// The plain loop runs after a draw from the managed sequence in its transaction, as a loop in a transaction that
-    /// drew nothing runs without a call into worf (2400). Loops of 100,000 draws alternate, the first two of each warm
-    /// up, and each one's fastest 8 of the 12 that follow count. The test runs alone, as other tests' load hides the
-    /// difference.
+    /// A PL/pgSQL loop that draws from a managed sequence at every turn takes less than twice as long as one that draws
+    /// from a plain sequence, which runs without a call into worf (2301, 2501), and so does one that also adds at every
+    /// turn, a statement that draws nothing (2500). worf counts each draw within PostgreSQL's own call of nextval, where
+    /// it took a call into worf at every statement, which cost seven times what a plain draw does. Loops of 100,000
+    /// turns alternate, each in a transaction of its own, the first two of each warm up, and each one's fastest 8 of
+    /// the 12 that follow count. The test runs alone, as other tests' load hides the difference.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -4932,39 +4931,50 @@ public sealed partial class SequenceRangeTests
         Dictionary<string, TimeSpan> took = await TimeLoopsAsync(nodeA,
         [
             ("managed", false, "FOR i IN 1..100000 LOOP x := nextval('s1'); END LOOP"),
-            ("told", true, "FOR i IN 1..100000 LOOP x := nextval('plain_s'); END LOOP"),
+            ("plain", false, "FOR i IN 1..100000 LOOP x := nextval('plain_s'); END LOOP"),
+            ("managed, adding", false, "FOR i IN 1..100000 LOOP x := nextval('s1'); y := i + 1; END LOOP"),
+            ("plain, adding", false, "FOR i IN 1..100000 LOOP x := nextval('plain_s'); y := i + 1; END LOOP"),
         ], token);
-        Assert.IsLessThan(took["told"] * 1.5, took["managed"],
-            $"the fastest 8 of 12 loops of 100,000 draws from a managed sequence, against {took["told"]} from a plain one, each telling worf of every statement");
+        Assert.IsLessThan(took["plain"] * 2, took["managed"],
+            $"the fastest 8 of 12 loops of 100,000 draws from a managed sequence, against {took["plain"]} from a plain one");
+        Assert.IsLessThan(took["plain, adding"] * 2, took["managed, adding"],
+            $"the fastest 8 of 12 loops of 100,000 draws from a managed sequence, each with an addition, against {took["plain, adding"]} from a plain one");
     }
 
     /// <summary>
-    /// PL/pgSQL runs without a call into worf where nothing may draw from a managed sequence (2400): a loop of additions
-    /// in a transaction that drew from none, and one, in a transaction that did, in a block without a call of nextval,
-    /// each take less than a third as long as the loop does once PL/pgSQL tells worf of its every statement, as it does
-    /// in a block that calls nextval, of a plain sequence here, once its transaction drew. A call into worf costs many
-    /// times what an addition takes, and every statement of every function made one, on any server that loaded worf.
-    /// Loops of 100,000 turns alternate, the first two of each warm up, and each one's fastest 8 of the 12 that follow
-    /// count. The test runs alone, as other tests' load hides the difference.
+    /// PL/pgSQL runs without a call into worf at the statements that draw nothing (2400, 2500). A loop of additions
+    /// takes less than four times as long as in a transaction that drew nothing where its transaction drew from a
+    /// managed sequence before, where its own block drew from one in an assignment first, and where the block around it
+    /// drew from one as it started, in a variable's default. The loop in a transaction that drew nothing takes less
+    /// than twice as long as a statement that adds over as many rows, which PL/pgSQL runs as one statement. A call into
+    /// worf costs many times what an addition takes: every statement of every function made one, and then every
+    /// statement of a function that drew at all. Loops of 100,000 turns alternate, the first two of each warm up, and
+    /// each one's fastest 8 of the 12 that follow count. The test runs alone, as other tests' load hides the difference.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
     [DoNotParallelize]
-    public async Task PlpgsqlRunsWithoutWorfWhereNothingMayDraw()
+    public async Task PlpgsqlRunsWithoutWorfWhereNothingDraws()
     {
         CancellationToken token = TestContext.CancellationToken;
         await using TestNode nodeA = await StartNodeAsync("node_a", token);
         const string Additions = "FOR i IN 1..100000 LOOP y := i + 1; END LOOP";
         Dictionary<string, TimeSpan> took = await TimeLoopsAsync(nodeA,
         [
-            ("fresh", false, $"x := nextval('plain_s'); {Additions}"),
-            ("told", true, $"x := nextval('plain_s'); {Additions}"),
-            ("after", true, Additions),
+            ("fresh", false, Additions),
+            ("after a draw", true, Additions),
+            ("after its block's draw", false, $"x := nextval('s1'); {Additions}"),
+            ("in a block that drew as it started", false, $"DECLARE z bigint := nextval('s1'); BEGIN {Additions}; END"),
+            ("rows", false, "PERFORM sum(g + 1) FROM generate_series(1, 100000) g"),
         ], token);
-        Assert.IsLessThan(took["told"], took["fresh"] * 3,
-            $"three times the fastest 8 of 12 loops of 100,000 additions in a transaction that drew nothing, against {took["told"]} with worf told of every statement");
-        Assert.IsLessThan(took["told"], took["after"] * 3,
-            $"three times the fastest 8 of 12 loops of 100,000 additions in a block that draws nothing, after a draw in its transaction, against {took["told"]} with worf told of every statement");
+        Assert.IsLessThan(took["rows"] * 2, took["fresh"],
+            $"the fastest 8 of 12 loops of 100,000 additions in a transaction that drew nothing, against {took["rows"]} for a statement that adds over 100,000 rows");
+        string[] places = ["after a draw", "after its block's draw", "in a block that drew as it started"];
+        foreach (string where in places)
+        {
+            Assert.IsLessThan(took["fresh"] * 4, took[where],
+                $"the fastest 8 of 12 loops of 100,000 additions {where} from a managed sequence, against {took["fresh"]} in a transaction that drew nothing");
+        }
     }
 
     /// <summary>
@@ -5002,12 +5012,18 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
-    /// A PL/pgSQL function's draws are counted down wherever it starts them, though PL/pgSQL tells worf only of the
-    /// statements of functions that may draw (2400): 350 draws from blocks of 100, in one session, wait for each switch
-    /// rather than run a block out, from a DO block that starts before its transaction has drawn, from a function called
-    /// after a draw, from one that a function without a call of nextval calls at each turn, from one that calls such a
-    /// function at each turn, from an assignment that draws through an SQL function, which its own source doesn't show,
-    /// in a function called after a draw, from dynamic SQL, and from a trigger's assignment, and no value is drawn twice.
+    /// A PL/pgSQL function's draws are counted down wherever it starts them, though PL/pgSQL tells worf of none of its
+    /// statements once its calls of nextval go through the guard (2400, 2500, 2501): 350 draws from blocks of 100, in
+    /// one session, wait for each switch rather than run a block out, from a DO block that starts before its
+    /// transaction has drawn, from a function called after a draw, from one that a function without a call of nextval
+    /// calls at each turn, from one that calls such a function at each turn, from an assignment that draws through an
+    /// SQL function, which its own source doesn't show, in a function called after a draw, from dynamic SQL, from a
+    /// trigger's assignment, from a call whose sequence a variable names, from a loop's condition, from the default of
+    /// a variable of a block within a loop, from a function that runs as its owner with a setting of its own, from a
+    /// loop whose draw fails at every fortieth turn, for want of the privilege, and is made again, and from
+    /// assignments that fail once they have drawn, as they give a variable that takes none a null, each in a
+    /// subtransaction that so aborts before PL/pgSQL tells of a statement, in a function, in a DO block, and in DO
+    /// blocks that end with it, and no value is drawn twice.
     /// </summary>
     /// <param name="form">Where the draws start.</param>
     /// <returns>The test.</returns>
@@ -5019,6 +5035,14 @@ public sealed partial class SequenceRangeTests
     [DataRow("through an sql function")]
     [DataRow("dynamic sql")]
     [DataRow("trigger")]
+    [DataRow("a name held in a variable")]
+    [DataRow("a loop's condition")]
+    [DataRow("a block's default")]
+    [DataRow("a function with settings of its own")]
+    [DataRow("past draws that fail")]
+    [DataRow("assignments that fail once they have drawn")]
+    [DataRow("a do block's assignments that fail once they have drawn")]
+    [DataRow("do blocks that fail once they have drawn")]
     public async Task PlpgsqlDrawsAreCountedWhereverTheyStart(string form)
     {
         CancellationToken token = TestContext.CancellationToken;
@@ -5047,6 +5071,58 @@ public sealed partial class SequenceRangeTests
             BEGIN FOR i IN 1..n LOOP EXECUTE 'SELECT next' || 'val(''s1'')' INTO x; a := a || x; END LOOP; INSERT INTO drawn SELECT unnest(a); END $$;
             CREATE FUNCTION fill_id() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.id := nextval('s1'); RETURN NEW; END $$;
             CREATE TRIGGER fill_id BEFORE INSERT ON filled FOR EACH ROW EXECUTE FUNCTION fill_id();
+            CREATE FUNCTION draw_named(n int, name regclass) RETURNS void LANGUAGE plpgsql AS $$
+            DECLARE a bigint[] := '{}';
+            BEGIN FOR i IN 1..n LOOP a := a || nextval(name); END LOOP; INSERT INTO drawn SELECT unnest(a); END $$;
+            CREATE FUNCTION draw_while(n int) RETURNS void LANGUAGE plpgsql AS $$
+            DECLARE a bigint[] := '{}'; c int := 0;
+            BEGIN WHILE c < n AND nextval('s1') > 0 LOOP c := c + 1; a := a || currval('s1'); END LOOP; INSERT INTO drawn SELECT unnest(a); END $$;
+            CREATE FUNCTION draw_by_default(n int) RETURNS void LANGUAGE plpgsql AS $$
+            DECLARE a bigint[] := '{}';
+            BEGIN FOR i IN 1..n LOOP DECLARE v bigint := nextval('s1'); BEGIN a := a || v; END; END LOOP; INSERT INTO drawn SELECT unnest(a); END $$;
+            CREATE FUNCTION draw_set(n int) RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET work_mem = '8MB' AS $$
+            DECLARE a bigint[] := '{}';
+            BEGIN FOR i IN 1..n LOOP a := a || nextval('s1'); END LOOP; INSERT INTO drawn SELECT unnest(a); END $$;
+            CREATE ROLE draws_nothing;
+            GRANT INSERT ON drawn TO draws_nothing;
+            CREATE FUNCTION draw_past_failures(n int) RETURNS void LANGUAGE plpgsql AS $$
+            DECLARE a bigint[] := '{}';
+            BEGIN
+                FOR i IN 1..n LOOP
+                    IF i % 40 = 0 THEN SET LOCAL ROLE draws_nothing; END IF;
+                    BEGIN
+                        a := a || nextval('s1');
+                    EXCEPTION WHEN insufficient_privilege THEN
+                        RESET ROLE;
+                        a := a || nextval('s1');
+                    END;
+                END LOOP;
+                INSERT INTO drawn SELECT unnest(a);
+            END $$;
+            CREATE FUNCTION draw_and_fail(n int) RETURNS void LANGUAGE plpgsql AS $$
+            DECLARE a bigint[] := '{}'; filled bigint NOT NULL := 0;
+            BEGIN
+                FOR i IN 1..n LOOP
+                    BEGIN
+                        filled := CASE WHEN nextval('s1') IS NOT NULL THEN NULL::bigint END;
+                    EXCEPTION WHEN null_value_not_allowed THEN
+                        a := a || currval('s1');
+                    END;
+                END LOOP;
+                INSERT INTO drawn SELECT unnest(a);
+            END $$;
+            CREATE FUNCTION draw_in_blocks_that_fail(n int) RETURNS void LANGUAGE plpgsql AS $$
+            DECLARE a bigint[] := '{}';
+            BEGIN
+                FOR i IN 1..n LOOP
+                    BEGIN
+                        EXECUTE 'DO $do$ DECLARE filled bigint NOT NULL := 0; BEGIN filled := CASE WHEN nextval(''s1'') IS NOT NULL THEN NULL::bigint END; END $do$';
+                    EXCEPTION WHEN null_value_not_allowed THEN
+                        a := a || currval('s1');
+                    END;
+                END LOOP;
+                INSERT INTO drawn SELECT unnest(a);
+            END $$;
             SELECT worf.enable_sequence_range('s1', participants := '{}', range_size := 100, max_range_size := 100);
             """, token);
         Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges", token),
@@ -5062,13 +5138,33 @@ public sealed partial class SequenceRangeTests
             "beside a function that draws nothing" => "SELECT draw_beside(350)",
             "through an sql function" => "BEGIN; INSERT INTO drawn SELECT nextval('s1'); SELECT draw_through(349); COMMIT",
             "dynamic sql" => "SELECT draw_dynamically(350)",
+            "a name held in a variable" => "SELECT draw_named(350, 's1')",
+            "a loop's condition" => "SELECT draw_while(350)",
+            "a block's default" => "SELECT draw_by_default(350)",
+            "a function with settings of its own" => "SELECT draw_set(350)",
+            "past draws that fail" => "SELECT draw_past_failures(350)",
+            "assignments that fail once they have drawn" => "SELECT draw_and_fail(350)",
+            "a do block's assignments that fail once they have drawn" => """
+                DO $$ DECLARE a bigint[] := '{}'; filled bigint NOT NULL := 0;
+                BEGIN
+                    FOR i IN 1..350 LOOP
+                        BEGIN
+                            filled := CASE WHEN nextval('s1') IS NOT NULL THEN NULL::bigint END;
+                        EXCEPTION WHEN null_value_not_allowed THEN
+                            a := a || currval('s1');
+                        END;
+                    END LOOP;
+                    INSERT INTO drawn SELECT unnest(a);
+                END $$
+                """,
+            "do blocks that fail once they have drawn" => "SELECT draw_in_blocks_that_fail(350)",
             _ => "INSERT INTO filled (v) SELECT 'x' FROM generate_series(1, 350); INSERT INTO drawn SELECT id FROM filled",
         }, token);
         Assert.AreEqual("350|350", await nodeA.SafePsqlAsync(Database, "SELECT count(*), count(DISTINCT id) FROM drawn", token), $"the ids drawn from the {form}, and how many differ");
     }
 
     /// <summary>
-    /// A PL/pgSQL loop keeps its sequence's gate only while it draws at every turn (2301): a function that sleeps in an
+    /// A PL/pgSQL loop that draws holds no gate once it has drawn (2301, 2501): a function that sleeps in an
     /// assignment after such a loop holds no gate as it sleeps, nor does the row that called one whose last statements
     /// all draw, as the row sleeps, nor the transaction once the statement has ended, so that none holds up a switch.
     /// </summary>
@@ -5595,8 +5691,9 @@ public sealed partial class SequenceRangeTests
     /// for a block of 100, isn't run out by six of them drawing past it before any switch. So do calls whose sequence the
     /// plan doesn't name, from a column or a parameter, which wait once the block holds fewer values than they and the
     /// other drawing statements may take, a SELECT of five rows, whose rows drawing without a check are shared among
-    /// the statements drawing (2042), a PL/pgSQL loop's five assignments, each a unit of its own, and a loop of nothing
-    /// but an assignment that draws, which keeps the sequence's gate from turn to turn (2301). No value is drawn twice.
+    /// the statements drawing (2042), a PL/pgSQL loop's five assignments, a loop of nothing but an assignment that
+    /// draws (2301), and loops of 500 such draws from blocks of 2,000, most of which hold no gate and count
+    /// themselves as under way instead, beside the switches the others' draws bring on (2501). No value is drawn twice.
     /// </summary>
     /// <param name="form">How each session draws.</param>
     /// <returns>The test.</returns>
@@ -5607,6 +5704,7 @@ public sealed partial class SequenceRangeTests
     [DataRow("five rows")]
     [DataRow("loop of five")]
     [DataRow("tight loop of five")]
+    [DataRow("long loop")]
     public async Task ConcurrentSelectsOfNextvalLeaveEachOtherValues(string form)
     {
         CancellationToken token = TestContext.CancellationToken;
@@ -5621,8 +5719,12 @@ public sealed partial class SequenceRangeTests
             CREATE FUNCTION draw5_tightly() RETURNS bigint[] LANGUAGE plpgsql AS $$
             DECLARE a bigint[] := '{}';
             BEGIN FOR i IN 1..5 LOOP a := a || nextval('s2'); END LOOP; RETURN a; END $$;
-            SELECT worf.enable_sequence_range('s2', participants := '{}', range_size := 100, max_range_size := 100);
+            CREATE FUNCTION draw500() RETURNS bigint[] LANGUAGE plpgsql AS $$
+            DECLARE a bigint[] := '{}';
+            BEGIN FOR i IN 1..500 LOOP a := a || nextval('s2'); END LOOP; RETURN a; END $$;
             """, token);
+        string size = form == "long loop" ? "2000" : "100";
+        _ = await nodeA.SafePsqlAsync(Database, $"SELECT worf.enable_sequence_range('s2', participants := '{{}}', range_size := {size}, max_range_size := {size})", token);
         Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 's2'::regclass", token),
             "node_a drawing from a block of s2, with the next one ready");
         int draws = 0;
@@ -5639,6 +5741,7 @@ public sealed partial class SequenceRangeTests
                 "five rows" => "SELECT nextval('s2') FROM generate_series(1, 5)",
                 "loop of five" => "SELECT draw5()",
                 "tight loop of five" => "SELECT unnest(draw5_tightly())",
+                "long loop" => "SELECT unnest(draw500())",
                 _ => "SELECT nextval('s2')",
             }, connection);
             if (form == "from a parameter")

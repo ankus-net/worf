@@ -1,4 +1,6 @@
 using System.Globalization;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Text;
 using Ankus.Postgres;
 
@@ -229,8 +231,14 @@ internal static unsafe partial class Executor
 
         // The fmgr hook, which runs as the functions the check asked for it for start, as the trigger functions whose
         // C code the sequence range guard can't see draw.
+        // Where no other library has the hook, and under a postmaster, worf's runs within PostgreSQL's own call, so
+        // that a call of nextval that goes through it draws without a call into worf's managed side.
         s_nextFmgrHook = NativeGlobals.fmgr_hook;
-        NativeGlobals.fmgr_hook = FmgrHookCallback;
+        CountsDraws = s_nextFmgrHook.IsNull && NativeGlobals.IsPostmasterEnvironment;
+        s_hookedTriggerAddress = (nint)HookedTriggerCallback.DangerousGetAddress();
+        NativeGlobals.fmgr_hook = CountsDraws
+            ? new fmgr_hook_type((delegate* unmanaged[Cdecl]<FmgrHookEventType, FmgrInfo*, ulong*, void>)&WorfDrawHook)
+            : FmgrHookCallback;
         s_installed = true;
     }
 
@@ -691,6 +699,12 @@ internal static unsafe partial class Executor
 
     private static void WorfExecutorStart(QueryDesc* queryDesc, int eflags)
     {
+        if (s_hookFailure is { } failure)
+        {
+            s_hookFailure = null;
+            throw new InvalidOperationException("worf's fmgr hook failed.", failure);
+        }
+
         NoteSingleUserStart();
         DdlLock.UnfencePending();
         List<uint> written = DdlLock.WrittenTables(queryDesc, eflags);
@@ -833,6 +847,11 @@ internal static unsafe partial class Executor
     /// </summary>
     private static bool WorfNeedsFmgrHook(uint fnOid)
     {
+        if (SequenceRangeGuard.ReadingHookedCall)
+        {
+            return true;
+        }
+
         TemporaryObjectUse.NoteFunctionUse(fnOid);
         bool hooked = SequenceRangeGuard.HooksTrigger(fnOid);
         return (!s_nextNeedsFmgrHook.IsNull && s_nextNeedsFmgrHook.Invoke(fnOid)) || hooked;
@@ -853,6 +872,76 @@ internal static unsafe partial class Executor
         {
             SequenceRangeGuard.StartingTrigger(flinfo->fn_oid);
         }
+    }
+
+    /// <summary>
+    /// Gets whether the fmgr hook counts the draws of the calls of nextval that go through it.
+    /// </summary>
+    internal static bool CountsDraws { get; private set; }
+
+    // The fmgr hook where no other library has one. PostgreSQL calls it straight, not through Ankus, which costs a
+    // call far more than a draw takes, so it may call nothing of PostgreSQL's and let no exception out: an error
+    // PostgreSQL raised would leave this frame behind. A call of nextval is the guard's. Any other function the hook
+    // check asked for is a trigger function, which runs through HookedTrigger in its place, where worf may call
+    // PostgreSQL; a function that goes through the hook for its own settings or owner goes on as it is.
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static void WorfDrawHook(FmgrHookEventType @event, FmgrInfo* flinfo, ulong* @private)
+    {
+        try
+        {
+            if (flinfo->fn_oid == NextvalOid)
+            {
+                if (@event == FmgrHookEventType.FHET_START)
+                {
+                    SequenceRangeGuard.DrawStarting(flinfo, @private);
+                }
+                else
+                {
+                    SequenceRangeGuard.DrawEnded(flinfo);
+                }
+            }
+            else if (@event == FmgrHookEventType.FHET_START)
+            {
+                if (SequenceRangeGuard.WatchesTrigger(flinfo->fn_oid))
+                {
+                    s_hookedTrigger = ((nint)flinfo, (nint)flinfo->fn_addr.DangerousGetAddress());
+                    flinfo->fn_addr = new PGFunction((void*)s_hookedTriggerAddress);
+                }
+            }
+            else if (s_hookedTrigger.Function == (nint)flinfo)
+            {
+                flinfo->fn_addr = new PGFunction((void*)s_hookedTrigger.Address);
+                s_hookedTrigger = default;
+            }
+        }
+        catch (Exception failure) when (failure is NullReferenceException or InvalidOperationException or ArgumentException or
+            IndexOutOfRangeException or KeyNotFoundException)
+        {
+            // Nothing above throws unless worf's own state is wrong. The next statement that starts reports it.
+            s_hookFailure ??= failure;
+        }
+    }
+
+    private static (nint Function, nint Address) s_hookedTrigger;
+    private static nint s_hookedTriggerAddress;
+    private static Exception? s_hookFailure;
+
+    [PgNativeCallback(nameof(HookedTrigger))]
+    private static partial PGFunction HookedTriggerCallback { get; }
+
+    // Runs a trigger function the fmgr hook watches, in its place, after the guard's check as it starts.
+    private static ulong HookedTrigger(FunctionCallInfoBaseData* fcinfo)
+    {
+        (nint function, nint address) = s_hookedTrigger;
+        if (function != (nint)fcinfo->flinfo)
+        {
+            throw new InvalidOperationException("worf's fmgr hook lost the function it replaced.");
+        }
+
+        s_hookedTrigger = default;
+        fcinfo->flinfo->fn_addr = new PGFunction((void*)address);
+        SequenceRangeGuard.StartingTrigger(fcinfo->flinfo->fn_oid);
+        return new PGFunction((void*)address).Invoke(fcinfo);
     }
 
     // Whether a DROP statement drops worf itself, as DROP EXTENSION worf does, or its schema, which takes worf with it,

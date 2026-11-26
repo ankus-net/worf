@@ -87,9 +87,12 @@ public sealed partial class DocumentationTests
         Assert.DoesNotContain("While the drop runs, new inserts that use a managed sequence fail", s_sequenceRanges, "inserts beside worf's drop (2205)");
         Assert.Contains("A cursor between fetches, a client that reads slowly and a transaction left idle hold nothing, so they don't delay a switch.",
             s_sequenceRanges, "statements that hold no gate while they idle (2200)");
-        Assert.Contains("Where the next row or the next turn of a loop draws straight away, they keep the gate and let it go when a switch waits for it. They look for a waiting switch at each row or turn, or every tenth of a millisecond when those take less.",
-            s_sequenceRanges, "statements that keep the gate from row to row (2300, 2301)");
+        Assert.Contains("Where the next row draws straight away, they keep the gate and let it go when a switch waits for it. They look for a waiting switch at each row, or every tenth of a millisecond when rows take less.",
+            s_sequenceRanges, "statements that keep the gate from row to row (2300)");
         Assert.DoesNotContain("hold the gate only while they work out a row", s_sequenceRanges, "statements that keep the gate from row to row (2300)");
+        Assert.Contains("A PL/pgSQL expression that draws, such as an assignment in a loop, takes the gate only when it has to check the block, as it does the first time it runs in a transaction. Its other draws hold nothing, and a switch waits only for the draws under way.",
+            s_sequenceRanges, "PL/pgSQL draws that hold no gate (2301, 2500, 2501)");
+        Assert.DoesNotContain("or the next turn of a loop draws straight away", s_sequenceRanges, "PL/pgSQL loops that keep no gate (2501)");
 
         string ranges = Read("src", "Worf", "SequenceRanges.cs");
         Assert.DoesNotContain("which switches beside those transactions, without waiting for them, while the range worker checks", ranges,
