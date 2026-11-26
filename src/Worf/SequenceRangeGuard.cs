@@ -330,7 +330,21 @@ internal static partial class SequenceRangeGuard
     // makes them its own, so that a loop that draws at every turn takes its gates once; any other lets them go as it
     // starts, as a run that starts does, and the function as it ends, which PL/pgSQL tells worf of while any may be kept.
     private static readonly HashSet<uint> s_keptGates = [];
-    private static bool s_watchingFunctionEnds;
+
+    // worf's own PL/pgSQL plugin, or null where another library's was there first.
+    private static unsafe PLpgSQL_plugin* s_plugin;
+
+    // Whether PL/pgSQL tells worf of the functions it starts and ends, as it does only while the transaction has draws
+    // for their statements to count down, or gates for them to suspend or keep, so that a transaction with neither
+    // runs its PL/pgSQL without a call into worf; and whether it tells of each statement it starts, as it does while the
+    // function running may draw, or isn't known, having started before PL/pgSQL told of any.
+    private static bool s_watchingFunctions;
+    private static bool s_watchingStatements;
+
+    // The PL/pgSQL functions running whose start PL/pgSQL told worf of, innermost last: each one's state, the
+    // subtransaction it started in, and whether its statements may draw, as its source has it or the expressions of its
+    // that started this transaction do.
+    private static readonly List<(nint Estate, uint Subxact, bool Draws)> s_functions = [];
 
     // When this backend last looked in shared memory for a switch waiting for the gates it holds, in the stopwatch's
     // ticks, and how long a unit that held its gates already lets pass before it looks again: a tenth of a millisecond.
@@ -381,6 +395,9 @@ internal static partial class SequenceRangeGuard
 
     [PgNativeCallback(nameof(PlpgsqlFunctionEnd))]
     private static partial PLpgSQL_plugin_func_endCallback PlpgsqlFunctionEndCallback { get; }
+
+    [PgNativeCallback(nameof(PlpgsqlFunctionBegin))]
+    private static partial PLpgSQL_plugin_func_begCallback PlpgsqlFunctionBeginCallback { get; }
 
     // The points in each sequence's active block, by sequence and value, at which this backend has woken the range worker.
     private static readonly HashSet<(uint Seqoid, long Mark)> s_woken = [];
@@ -1332,7 +1349,9 @@ internal static partial class SequenceRangeGuard
     /// <summary>
     /// Finds where PL/pgSQL looks for its instrumentation plugin, and gives it one that instruments nothing when no other
     /// library has, so that PL/pgSQL tells the plugin the function its error context calls as each of its functions
-    /// starts, which <see cref="InPlpgsql"/> finds a running function's state through.
+    /// starts, which <see cref="InPlpgsql"/> finds a running function's state through. PL/pgSQL calls into worf through
+    /// it only while a transaction has something for its statements to count down, suspend or keep, as each call costs
+    /// far more than a statement that does little.
     /// </summary>
     internal static unsafe void WatchPlpgsql()
     {
@@ -1341,12 +1360,10 @@ internal static partial class SequenceRangeGuard
             s_plpgsqlPlugin = NativeMethods.find_rendezvous_variable((sbyte*)name);
         }
 
-        // The plugin worf gives counts the statements PL/pgSQL starts down too.
         if (*s_plpgsqlPlugin is null)
         {
-            PLpgSQL_plugin* plugin = (PLpgSQL_plugin*)NativeMemory.AllocZeroed((nuint)sizeof(PLpgSQL_plugin));
-            plugin->stmt_beg = PlpgsqlStatementCallback;
-            *s_plpgsqlPlugin = plugin;
+            s_plugin = (PLpgSQL_plugin*)NativeMemory.AllocZeroed((nuint)sizeof(PLpgSQL_plugin));
+            *s_plpgsqlPlugin = s_plugin;
             s_ownsPlugin = true;
         }
     }
@@ -1721,9 +1738,98 @@ internal static partial class SequenceRangeGuard
     // Has PL/pgSQL tell worf of its statements' ends, or no longer, through worf's own plugin.
     private static unsafe void WatchStatementEnds(bool watch)
     {
-        if (s_ownsPlugin && s_plpgsqlPlugin is not null && *s_plpgsqlPlugin is not null)
+        if (s_plugin is not null)
         {
-            ((PLpgSQL_plugin*)*s_plpgsqlPlugin)->stmt_end = watch ? PlpgsqlStatementEndCallback : default;
+            s_plugin->stmt_end = watch ? PlpgsqlStatementEndCallback : default;
+        }
+    }
+
+    // Has PL/pgSQL tell worf of the functions it starts and ends from here on, until the transaction ends, and of each
+    // statement of those running now, which it told of no start of.
+    private static unsafe void WatchFunctions()
+    {
+        if (s_watchingFunctions || s_plugin is null)
+        {
+            return;
+        }
+
+        RegisterEnd();
+        s_watchingFunctions = true;
+        s_plugin->func_beg = PlpgsqlFunctionBeginCallback;
+        s_plugin->func_end = PlpgsqlFunctionEndCallback;
+        WatchStatements(true);
+    }
+
+    // Has PL/pgSQL call into worf no more, as the transaction ends.
+    private static unsafe void UnwatchFunctions()
+    {
+        s_functions.Clear();
+        if (s_watchingFunctions && s_plugin is not null)
+        {
+            s_watchingFunctions = false;
+            s_plugin->func_beg = default;
+            s_plugin->func_end = default;
+        }
+
+        WatchStatements(false);
+    }
+
+    // Has PL/pgSQL tell worf of each statement it starts, or no longer, through worf's own plugin.
+    private static unsafe void WatchStatements(bool watch)
+    {
+        if (watch != s_watchingStatements && s_plugin is not null)
+        {
+            s_watchingStatements = watch;
+            s_plugin->stmt_beg = watch ? PlpgsqlStatementCallback : default;
+        }
+    }
+
+    // Whether PL/pgSQL is to tell of the statements of the function now innermost: one that may draw, or one it told no
+    // start of; or of any function's, while a unit holds gates for a statement to suspend, or an assignment that drew
+    // has yet to end.
+    private static bool StatementsMatter()
+        => s_functions.Count == 0 || s_functions[^1].Draws || s_unitGates.Count > 0 || s_quietScopes > 0;
+
+    // Notes a function PL/pgSQL starts, and whether its statements may draw from a managed sequence, which they count
+    // down for: by the calls of nextval its source has, unless each names a sequence that isn't managed, or by those
+    // its expressions that started this transaction make. worf's own statements, and a check under way, leave that to
+    // each statement.
+    private static unsafe void PlpgsqlFunctionBegin(PLpgSQL_execstate* estate, PLpgSQL_function* func)
+    {
+        bool draws = s_countingDown || s_namingGrantors || Worf.InOwnSql || func is null ||
+            (s_functionDraws.TryGetValue((nint)func, out (int Calls, HashSet<uint> Named) noted) && noted.Named.Count > 0) ||
+            (FunctionCalls(func) > 0 && FunctionNamed(func) is not { Count: 0 });
+        s_functions.Add(((nint)estate, NativeMethods.GetCurrentSubTransactionId(), draws));
+        WatchStatements(StatementsMatter());
+    }
+
+    // Notes that a running function's statements may draw, as an expression of its that draws from a managed sequence
+    // starts, while PL/pgSQL tells of functions.
+    private static void NoteFunctionDrawing(nint estate)
+    {
+        if (!s_watchingFunctions)
+        {
+            return;
+        }
+
+        for (int i = s_functions.Count - 1; i >= 0; i--)
+        {
+            if (s_functions[i].Estate == estate)
+            {
+                s_functions[i] = s_functions[i] with { Draws = true };
+                break;
+            }
+        }
+
+        WatchStatements(true);
+    }
+
+    // Forgets the functions that started in a subtransaction that aborts, which end without PL/pgSQL telling of it.
+    private static void ForgetFunctionsOf(uint aborted)
+    {
+        if (s_functions.Count > 0 && s_functions.RemoveAll(function => function.Subxact >= aborted) > 0)
+        {
+            WatchStatements(StatementsMatter());
         }
     }
 
@@ -1742,7 +1848,17 @@ internal static partial class SequenceRangeGuard
             LetKeptGates();
         }
 
-        WatchFunctionEnds(s_quietScopes > 0);
+        // The function that called it, if PL/pgSQL told of its start, is innermost again.
+        for (int i = s_functions.Count - 1; i >= 0; i--)
+        {
+            if (s_functions[i].Estate == (nint)estate)
+            {
+                s_functions.RemoveRange(i, s_functions.Count - i);
+                break;
+            }
+        }
+
+        WatchStatements(StatementsMatter());
     }
 
     // Finds the open scope of an assignment of a function's that drew, innermost first, or -1.
@@ -1757,16 +1873,6 @@ internal static partial class SequenceRangeGuard
         }
 
         return -1;
-    }
-
-    // Has PL/pgSQL tell worf of its functions' ends, or no longer, through worf's own plugin.
-    private static unsafe void WatchFunctionEnds(bool watch)
-    {
-        if (watch != s_watchingFunctionEnds && s_ownsPlugin && s_plpgsqlPlugin is not null && *s_plpgsqlPlugin is not null)
-        {
-            s_watchingFunctionEnds = watch;
-            ((PLpgSQL_plugin*)*s_plpgsqlPlugin)->func_end = watch ? PlpgsqlFunctionEndCallback : default;
-        }
     }
 
     // Lets the gates a PL/pgSQL statement kept as it ended go.
@@ -1790,6 +1896,11 @@ internal static partial class SequenceRangeGuard
             _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, ForgetFunctionDraws);
             _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, ForgetFunctionDraws);
             _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, ForgetFunctionDraws);
+        }
+
+        if (named.Count > 0)
+        {
+            NoteFunctionDrawing(estate);
         }
 
         nint function = (nint)((PLpgSQL_execstate*)estate)->func;
@@ -2010,6 +2121,7 @@ internal static partial class SequenceRangeGuard
         _ = PgTransaction.RegisterSubtransactionCallback(PgSubtransactionEvent.Abort, static (aborted, parent) =>
         {
             ForgetGatesOf(aborted.Value);
+            ForgetFunctionsOf(aborted.Value);
             foreach (nint queryDesc in s_countedNodes.Where(entry => entry.Value.Subxact >= aborted.Value).Select(entry => entry.Key).ToList())
             {
                 ForgetCounted(queryDesc);
@@ -2044,7 +2156,13 @@ internal static partial class SequenceRangeGuard
     // transaction ends.
     private static void DrawUngated(List<uint> sequences)
     {
+        if (sequences.Count == 0)
+        {
+            return;
+        }
+
         RegisterEnd();
+        WatchFunctions();
         foreach (uint seqoid in sequences)
         {
             Share(seqoid);
@@ -2060,7 +2178,13 @@ internal static partial class SequenceRangeGuard
     // before its first FETCH, and a check then would hold values back, and a gate, while the session idles.
     private static void DeferUngated(List<uint> sequences)
     {
+        if (sequences.Count == 0)
+        {
+            return;
+        }
+
         RegisterEnd();
+        WatchFunctions();
         foreach (uint seqoid in sequences)
         {
             _ = s_drawingUngated.TryAdd(seqoid, 0);
@@ -2082,6 +2206,8 @@ internal static partial class SequenceRangeGuard
             }
 
             _ = s_drawingStatements.Add((nint)statement);
+            WatchFunctions();
+            NoteFunctionDrawing(estate);
             if (s_scopes.Count == 0 || s_scopes[^1] is not { Kind: >= StatementScope } top || top.Key != (nint)statement || top.Owner != estate)
             {
                 EnterScope(StatementScope, (nint)statement, estate);
@@ -2540,7 +2666,7 @@ internal static partial class SequenceRangeGuard
             else
             {
                 s_quietScopes++;
-                WatchFunctionEnds(true);
+                WatchFunctions();
             }
         }
 
@@ -2576,7 +2702,7 @@ internal static partial class SequenceRangeGuard
         {
             s_keptGates.UnionWith(s_scopeGates.Where(s_unitGates.Contains));
             s_scopeGates.Clear();
-            WatchFunctionEnds(true);
+            WatchFunctions();
         }
 
         CloseScopes(index, !failed);
@@ -5419,6 +5545,7 @@ internal static partial class SequenceRangeGuard
         if (unit)
         {
             _ = s_unitGates.Add(seqoid);
+            WatchFunctions();
         }
         else
         {
@@ -5789,7 +5916,7 @@ internal static partial class SequenceRangeGuard
         s_statementScopes = 0;
         s_quietScopes = 0;
         WatchStatementEnds(false);
-        WatchFunctionEnds(false);
+        UnwatchFunctions();
         s_gatedRowDraws.Clear();
         s_unseenRowDraws.Clear();
         s_rowMarks.Clear();

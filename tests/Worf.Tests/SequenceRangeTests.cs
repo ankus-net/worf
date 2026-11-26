@@ -4878,10 +4878,12 @@ public sealed partial class SequenceRangeTests
 
     /// <summary>
     /// A PL/pgSQL loop that draws from a managed sequence at every turn takes about as long as one that draws from a plain
-    /// sequence (2301): its assignment keeps the sequence's gate from one turn to the next, and PL/pgSQL calls worf once a
-    /// turn, as it does for any statement, where it called twice and took the gate each time. Loops of 100,000 draws
-    /// alternate, the first two of each warm up, and each one's fastest 8 of the 12 that follow count. The test runs alone,
-    /// as other tests' load hides the difference.
+    /// sequence in a block that PL/pgSQL tells worf each statement of (2301): its assignment keeps the sequence's gate
+    /// from one turn to the next, and PL/pgSQL calls worf once a turn, where it called twice and took the gate each time.
+    /// The plain loop runs after a draw from the managed sequence in its transaction, as a loop in a transaction that
+    /// drew nothing runs without a call into worf (2400). Loops of 100,000 draws alternate, the first two of each warm
+    /// up, and each one's fastest 8 of the 12 that follow count. The test runs alone, as other tests' load hides the
+    /// difference.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -4890,33 +4892,139 @@ public sealed partial class SequenceRangeTests
     {
         CancellationToken token = TestContext.CancellationToken;
         await using TestNode nodeA = await StartNodeAsync("node_a", token);
-        _ = await nodeA.SafePsqlAsync(Database, """
+        Dictionary<string, TimeSpan> took = await TimeLoopsAsync(nodeA,
+            [("managed", false, "x := nextval('s1')"), ("told", true, "x := nextval('plain_s')")], token);
+        Assert.IsLessThan(took["told"] * 1.5, took["managed"],
+            $"the fastest 8 of 12 loops of 100,000 draws from a managed sequence, against {took["told"]} from a plain one, each telling worf of every statement");
+    }
+
+    /// <summary>
+    /// PL/pgSQL runs without a call into worf where nothing may draw from a managed sequence (2400): a loop in a
+    /// transaction that drew from none, and one, in a transaction that did, in a block without a call of nextval, each
+    /// take less than a third as long as a loop whose every statement PL/pgSQL tells worf of, as it does in a block that
+    /// calls nextval, of a plain sequence here, once its transaction drew. A call into worf costs several times what a
+    /// statement that does little takes, and every statement of every function made one, on any server that loaded worf.
+    /// Loops of 100,000 turns alternate, the first two of each warm up, and each one's fastest 8 of the 12 that follow
+    /// count. The test runs alone, as other tests' load hides the difference.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [DoNotParallelize]
+    public async Task PlpgsqlRunsWithoutWorfWhereNothingMayDraw()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        Dictionary<string, TimeSpan> took = await TimeLoopsAsync(nodeA,
+        [
+            ("fresh", false, "x := nextval('plain_s')"),
+            ("told", true, "x := nextval('plain_s')"),
+            ("after", true, "y := i + 1"),
+        ], token);
+        Assert.IsLessThan(took["told"], took["fresh"] * 3,
+            $"three times the fastest 8 of 12 loops of 100,000 draws from a plain sequence in a transaction that drew nothing, against {took["told"]} with worf told of every statement");
+        Assert.IsLessThan(took["told"], took["after"] * 3,
+            $"three times the fastest 8 of 12 loops of 100,000 turns that draw nothing, after a draw in their transaction, against {took["told"]} with worf told of every statement");
+    }
+
+    /// <summary>
+    /// Times DO blocks of a 100,000-turn loop on one connection, each kind in turn, 14 times over, some after a draw from
+    /// the managed sequence s1 in their transaction, and gives each kind's fastest 8 of its last 12, summed.
+    /// </summary>
+    private static async Task<Dictionary<string, TimeSpan>> TimeLoopsAsync(TestNode node, (string Kind, bool AfterDraw, string Turn)[] loops, CancellationToken token)
+    {
+        _ = await node.SafePsqlAsync(Database, """
             CREATE SEQUENCE s1; CREATE SEQUENCE plain_s;
             SELECT worf.enable_sequence_range('s1', participants := '{}', range_size := 100000000);
             """, token);
-        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges WHERE sequence = 's1'::regclass", token),
+        Assert.IsTrue(await node.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges WHERE sequence = 's1'::regclass", token),
             "node_a drawing from a block of s1");
-        await using NpgsqlConnection connection = await nodeA.OpenAsync(Database, token);
-        Dictionary<string, List<TimeSpan>> times = new() { ["s1"] = [], ["plain_s"] = [] };
+        await using NpgsqlConnection connection = await node.OpenAsync(Database, token);
+        Dictionary<string, List<TimeSpan>> times = loops.ToDictionary(loop => loop.Kind, _ => new List<TimeSpan>());
         for (int i = 0; i < 14; i++)
         {
-            foreach (string sequence in i % 2 == 0 ? new[] { "s1", "plain_s" } : ["plain_s", "s1"])
+            foreach ((string kind, bool afterDraw, string turn) in i % 2 == 0 ? loops : loops.Reverse())
             {
+                await ExecuteAsync(connection, afterDraw ? "BEGIN; SELECT nextval('s1')" : "BEGIN", token);
                 await using NpgsqlCommand loop = new(
-                    $"DO $$ DECLARE x bigint; BEGIN FOR i IN 1..100000 LOOP x := nextval('{sequence}'); END LOOP; END $$", connection) { CommandTimeout = 120 };
+                    $"DO $$ DECLARE x bigint; y int; BEGIN FOR i IN 1..100000 LOOP {turn}; END LOOP; END $$", connection) { CommandTimeout = 120 };
                 Stopwatch timing = Stopwatch.StartNew();
                 _ = await loop.ExecuteNonQueryAsync(token);
+                timing.Stop();
+                await ExecuteAsync(connection, "COMMIT", token);
                 if (i >= 2)
                 {
-                    times[sequence].Add(timing.Elapsed);
+                    times[kind].Add(timing.Elapsed);
                 }
             }
         }
 
-        static TimeSpan Fastest(List<TimeSpan> times) => TimeSpan.FromTicks(times.Order().Take(8).Sum(time => time.Ticks));
-        TimeSpan managed = Fastest(times["s1"]);
-        TimeSpan plain = Fastest(times["plain_s"]);
-        Assert.IsLessThan(plain * 1.5, managed, $"the fastest 8 of 12 loops of 100,000 draws from a managed sequence, against {plain} from a plain one");
+        return times.ToDictionary(kind => kind.Key, kind => TimeSpan.FromTicks(kind.Value.Order().Take(8).Sum(time => time.Ticks)));
+    }
+
+    /// <summary>
+    /// A PL/pgSQL function's draws are counted down wherever it starts them, though PL/pgSQL tells worf only of the
+    /// statements of functions that may draw (2400): 350 draws from blocks of 100, in one session, wait for each switch
+    /// rather than run a block out, from a DO block that starts before its transaction has drawn, from a function called
+    /// after a draw, from one that a function without a call of nextval calls at each turn, from one that calls such a
+    /// function at each turn, from an assignment that draws through an SQL function, which its own source doesn't show,
+    /// in a function called after a draw, from dynamic SQL, and from a trigger's assignment, and no value is drawn twice.
+    /// </summary>
+    /// <param name="form">Where the draws start.</param>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [DataRow("do block")]
+    [DataRow("function after a draw")]
+    [DataRow("function called at each turn")]
+    [DataRow("beside a function that draws nothing")]
+    [DataRow("through an sql function")]
+    [DataRow("dynamic sql")]
+    [DataRow("trigger")]
+    public async Task PlpgsqlDrawsAreCountedWhereverTheyStart(string form)
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE SEQUENCE s1;
+            CREATE TABLE drawn (id bigint);
+            CREATE TABLE filled (id bigint, v text);
+            CREATE FUNCTION next_id() RETURNS bigint LANGUAGE sql AS $$ SELECT nextval('s1') $$;
+            CREATE FUNCTION draw_many(n int) RETURNS void LANGUAGE plpgsql AS $$
+            DECLARE a bigint[] := '{}';
+            BEGIN FOR i IN 1..n LOOP a := a || nextval('s1'); END LOOP; INSERT INTO drawn SELECT unnest(a); END $$;
+            CREATE FUNCTION draw_one() RETURNS bigint LANGUAGE plpgsql AS $$ BEGIN RETURN nextval('s1'); END $$;
+            CREATE FUNCTION call_many(n int) RETURNS void LANGUAGE plpgsql AS $$
+            DECLARE a bigint[] := '{}';
+            BEGIN FOR i IN 1..n LOOP a := a || draw_one(); END LOOP; INSERT INTO drawn SELECT unnest(a); END $$;
+            CREATE FUNCTION one_more(i int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN i + 1; END $$;
+            CREATE FUNCTION draw_beside(n int) RETURNS void LANGUAGE plpgsql AS $$
+            DECLARE a bigint[] := '{}'; y int := 0;
+            BEGIN FOR i IN 1..n LOOP a := a || nextval('s1'); y := one_more(y); END LOOP; INSERT INTO drawn SELECT unnest(a); END $$;
+            CREATE FUNCTION draw_through(n int) RETURNS void LANGUAGE plpgsql AS $$
+            DECLARE a bigint[] := '{}';
+            BEGIN FOR i IN 1..n LOOP a := a || next_id(); END LOOP; INSERT INTO drawn SELECT unnest(a); END $$;
+            CREATE FUNCTION draw_dynamically(n int) RETURNS void LANGUAGE plpgsql AS $$
+            DECLARE a bigint[] := '{}'; x bigint;
+            BEGIN FOR i IN 1..n LOOP EXECUTE 'SELECT next' || 'val(''s1'')' INTO x; a := a || x; END LOOP; INSERT INTO drawn SELECT unnest(a); END $$;
+            CREATE FUNCTION fill_id() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.id := nextval('s1'); RETURN NEW; END $$;
+            CREATE TRIGGER fill_id BEFORE INSERT ON filled FOR EACH ROW EXECUTE FUNCTION fill_id();
+            SELECT worf.enable_sequence_range('s1', participants := '{}', range_size := 100, max_range_size := 100);
+            """, token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges", token),
+            "node_a drawing from a block of s1, with the next one ready");
+        _ = await nodeA.SafePsqlAsync(Database, form switch
+        {
+            "do block" => """
+                DO $$ DECLARE a bigint[] := '{}';
+                BEGIN FOR i IN 1..350 LOOP a := a || nextval('s1'); END LOOP; INSERT INTO drawn SELECT unnest(a); END $$
+                """,
+            "function after a draw" => "BEGIN; INSERT INTO drawn SELECT nextval('s1'); SELECT draw_many(349); COMMIT",
+            "function called at each turn" => "SELECT call_many(350)",
+            "beside a function that draws nothing" => "SELECT draw_beside(350)",
+            "through an sql function" => "BEGIN; INSERT INTO drawn SELECT nextval('s1'); SELECT draw_through(349); COMMIT",
+            "dynamic sql" => "SELECT draw_dynamically(350)",
+            _ => "INSERT INTO filled (v) SELECT 'x' FROM generate_series(1, 350); INSERT INTO drawn SELECT id FROM filled",
+        }, token);
+        Assert.AreEqual("350|350", await nodeA.SafePsqlAsync(Database, "SELECT count(*), count(DISTINCT id) FROM drawn", token), $"the ids drawn from the {form}, and how many differ");
     }
 
     /// <summary>
