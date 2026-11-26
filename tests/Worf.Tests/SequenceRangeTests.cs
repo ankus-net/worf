@@ -2441,19 +2441,19 @@ public sealed partial class SequenceRangeTests
         }
 
         // Without the probes, each of node_b's calls to node_c held up its calls to node_a for 5 s, so its inserts waited
-        // seconds for blocks; with them, none waits for a call to node_c, only for node_a's answers. The blocks node_b
-        // takes are counted, rather than how long most inserts took, which a host short of processors stretches: one
-        // for each call to node_c would be three.
-        string[] timedLog = nodeB.ReadLog()[timed..].Split('\n');
-        List<double> waits = [.. timedLog
+        // seconds for blocks; with them, none waits for a call to node_c, only for node_a's answers. The inserts that
+        // took a second or more, a fifth of a call to node_c, are counted, rather than how long most took: on a host
+        // short of processors the range worker switches some blocks late, and an insert that waits for one takes a
+        // tenth of a second or two.
+        List<double> waits = [.. nodeB.ReadLog()[timed..].Split('\n')
             .Where(line => line.Contains($": {Insert}", StringComparison.Ordinal) && line.Contains("  execute ", StringComparison.Ordinal))
             .Select(line => double.Parse(line[(line.IndexOf("duration: ", StringComparison.Ordinal) + 10)..line.IndexOf(" ms", StringComparison.Ordinal)],
                 CultureInfo.InvariantCulture))];
         waits.Sort();
         Assert.IsGreaterThan(100, waits.Count, "node_b's inserts");
         Assert.IsLessThan(2500.0, waits[^1], "node_b's slowest insert, against the 5000 ms each call to node_c took");
-        Assert.IsGreaterThan(6, timedLog.Count(line => line.Contains("sequence public.t_id_seq switched to its block", StringComparison.Ordinal)),
-            "the blocks of t node_b took in fifteen seconds, against three, one for each call to node_c");
+        Assert.IsLessThanOrEqualTo(waits.Count / 100, waits.Count(wait => wait >= 1000.0),
+            $"node_b's inserts that took a second or more, against one in a hundred of its {waits.Count}");
 
         // node_b runs w's root on node_a out, so that its request to node_a for another block stays open.
         await using (NpgsqlConnection writer = await nodeB.OpenAsync(Database, token))
@@ -2640,18 +2640,18 @@ public sealed partial class SequenceRangeTests
         }
 
         // Each attempt to reach node_c held up node_b's calls to node_a for 5 s, until the first counted as running out of
-        // time; now none does after the first. The blocks node_b takes are counted, rather than how long most inserts
-        // took, which a host short of processors stretches: one for each attempt to reach node_c would be three.
-        string[] timedLog = nodeB.ReadLog()[timed..].Split('\n');
-        List<double> waits = [.. timedLog
+        // time; now none does after the first. The inserts that took a second or more, a fifth of such an attempt, are
+        // counted, rather than how long most took: on a host short of processors the range worker switches some blocks
+        // late, and an insert that waits for one takes a tenth of a second or two.
+        List<double> waits = [.. nodeB.ReadLog()[timed..].Split('\n')
             .Where(line => line.Contains($": {Insert}", StringComparison.Ordinal) && line.Contains("  execute ", StringComparison.Ordinal))
             .Select(line => double.Parse(line[(line.IndexOf("duration: ", StringComparison.Ordinal) + 10)..line.IndexOf(" ms", StringComparison.Ordinal)],
                 CultureInfo.InvariantCulture))];
         waits.Sort();
         Assert.IsGreaterThan(100, waits.Count, "node_b's inserts");
         Assert.IsLessThan(2500.0, waits[^1], "node_b's slowest insert, against the 5000 ms each attempt to reach node_c took");
-        Assert.IsGreaterThan(6, timedLog.Count(line => line.Contains("sequence public.t_id_seq switched to its block", StringComparison.Ordinal)),
-            "the blocks of t node_b took in fifteen seconds, against three, one for each attempt to reach node_c");
+        Assert.IsLessThanOrEqualTo(waits.Count / 100, waits.Count(wait => wait >= 1000.0),
+            $"node_b's inserts that took a second or more, against one in a hundred of its {waits.Count}");
 
         // A connection to node_c that libpq finds bad at once, for a host name nothing resolves or an option it doesn't
         // know, fails its probe, and the exchange worker goes on.
