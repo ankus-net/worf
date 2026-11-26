@@ -727,22 +727,27 @@ internal static partial class SequenceRangeGuard
     /// <summary>
     /// Reads the calls of nextval a statement's plan makes, kept by the statement's text, the search path and the role it
     /// runs as, until a table, a type, a constraint, a function or a schema changes, or the managed sequences do, so that
-    /// a statement run again doesn't write its plan out again. Of a statement with parameters, whose values a plan may
+    /// a statement run again doesn't write its plan out again, as it runs or as a call of nextval of its starts, of a
+    /// sequence worf manages or not. Of a statement with parameters, whose values a plan may
     /// hold, as the sequence a call names, only that it makes no call is kept, and only when neither its text nor a
     /// function of a user's that it calls, which the planner may inline as the values have it, may call nextval: its
     /// calls come from its text, its views and the functions it calls, which its values change none of.
     /// </summary>
     private static unsafe (HashSet<uint> Called, int Calls, bool Unnamed) StatementDraws(QueryDesc* queryDesc)
+        => PlanDraws((nint)queryDesc->plannedstmt, (nint)queryDesc->sourceText, queryDesc->@params is not null && queryDesc->@params->numParams > 0);
+
+    // Reads the calls of nextval a plan makes, as StatementDraws keeps them: for a statement that runs, and for one whose
+    // plan starts, which every call of nextval that starts asks of, whichever sequence it draws from.
+    private static unsafe (HashSet<uint> Called, int Calls, bool Unnamed) PlanDraws(nint statement, nint source, bool parameters)
     {
-        PlannedStmt* planned = queryDesc->plannedstmt;
-        if (queryDesc->sourceText is null)
+        PlannedStmt* planned = (PlannedStmt*)statement;
+        if (source == 0)
         {
             return Draws(PlanText((Node*)planned));
         }
 
-        bool parameters = queryDesc->@params is not null && queryDesc->@params->numParams > 0;
         WatchTables();
-        string text = StatementText((nint)queryDesc->sourceText, planned->stmt_location, planned->stmt_len);
+        string text = StatementText(source, planned->stmt_location, planned->stmt_len);
         (string Text, string Path, uint User) key = (text, SearchPath(), NativeMethods.GetUserId());
         if (s_drawsByText.TryGetValue(key, out (HashSet<uint> Called, int Calls, bool Unnamed) draws))
         {
@@ -1385,7 +1390,7 @@ internal static partial class SequenceRangeGuard
             PlannedStmt* planned = (PlannedStmt*)statement;
             int location = planned->stmt_location;
             int length = planned->stmt_len;
-            s_starting.Add(new(() => Draws(PlanText((Node*)statement)), (nint)NativeGlobals.error_context_stack, false,
+            s_starting.Add(new(() => PlanDraws(statement, source, parameters), (nint)NativeGlobals.error_context_stack, false,
                 source == 0 || parameters ? null : () => StatementText(source, location, length), planned: true));
             return;
         }
@@ -1474,6 +1479,11 @@ internal static partial class SequenceRangeGuard
     // another values enough, until it ends.
     private static void CountUngated(List<uint> sequences)
     {
+        if (sequences.Count == 0)
+        {
+            return;
+        }
+
         RegisterEnd();
         uint subxact;
         unsafe

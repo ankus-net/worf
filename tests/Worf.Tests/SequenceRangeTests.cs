@@ -4399,6 +4399,43 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// A statement that calls nextval of a sequence worf doesn't manage, in a database that has managed ones, has its
+    /// plan read once for its text, as its call starts, rather than each time it runs, which cost a draw from a plain
+    /// sequence a tenth of the statement and a large insert into a table with a serial column far more: 60 runs of each
+    /// have node_a log a read of a plan a few times at most.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task StatementsThatDrawFromPlainSequencesReadTheirPlansOnce()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token, "log_min_messages = debug1");
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE SEQUENCE s1; CREATE SEQUENCE plain_s; CREATE TABLE st (id bigserial, x int);
+            SELECT worf.enable_sequence_range('s1', participants := '{}', range_size := 100);
+            """, token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges WHERE sequence = 's1'::regclass", token),
+            "node_a drawing from a block of s1");
+        string values = $"INSERT INTO st (x) VALUES {string.Join(", ", Enumerable.Range(1, 2000).Select(i => string.Create(CultureInfo.InvariantCulture, $"({i})")))}";
+        await using NpgsqlConnection drawing = await nodeA.OpenAsync(Database, token);
+        foreach (string sql in new[] { "SELECT nextval('plain_s')", values })
+        {
+            int logpos = nodeA.ReadLog().Length;
+            await using NpgsqlCommand draw = new(sql, drawing);
+            for (int i = 0; i < 60; i++)
+            {
+                _ = await draw.ExecuteNonQueryAsync(token);
+            }
+
+            int reads = nodeA.ReadLog()[logpos..].Split('\n').Count(line => line.Contains($"[{drawing.ProcessID}]", StringComparison.Ordinal) &&
+                line.Contains("read a statement's plan for its calls of nextval", StringComparison.Ordinal));
+            string what = sql == values ? "inserts of 2,000 rows into a table with a serial column" : "draws from a plain sequence";
+            Assert.IsGreaterThanOrEqualTo(1, reads, $"the reads of the plan of 60 {what}");
+            Assert.IsLessThanOrEqualTo(5, reads, $"the reads of the plan of 60 {what}");
+        }
+    }
+
+    /// <summary>
     /// A node cut off from the allocator takes blocks from its reserve that fit in it: a smallserial's reserve, which
     /// holds fewer values than its largest block, still gives node_b blocks while node_a is down (2151).
     /// </summary>
