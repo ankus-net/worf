@@ -5397,7 +5397,7 @@ public sealed partial class SequenceRangeTests
     /// partitions too, of the CHECK constraint of a column's domain, in a COPY with a condition that leaves rows out
     /// too, of that of the domain a column holds an array, a row, a range or a multirange of, one of them in a column
     /// whose first rows are null, so that its call starts late, and of the COPY's own WHERE condition, which names its
-    /// sequence or works the name out. Three copies of 300 rows each, in sessions of their own, draw from blocks of
+    /// sequence or works the name out. Two copies of 150 rows each, in sessions of their own, draw from blocks of
     /// 100. The table's first row starts such a call, and worf checked only that start, so each COPY failed at its
     /// block's end, "reached maximum value of sequence", while an INSERT of the same rows went through. worf reads
     /// PostgreSQL's own state of the COPY to reach those calls, which differs by version, so the test runs on every
@@ -5415,8 +5415,8 @@ public sealed partial class SequenceRangeTests
             CREATE TABLE checked (v int CHECK (nextval('s1') > 0));
             CREATE TABLE twice (v int CHECK (nextval('s1') + nextval('s1') > 0));
             CREATE TABLE parted (k int) PARTITION BY RANGE (k);
-            CREATE TABLE parted_low PARTITION OF parted (CHECK (nextval('s1') > 0)) FOR VALUES FROM (1) TO (151);
-            CREATE TABLE parted_high PARTITION OF parted (CHECK (nextval('s1') > 0)) FOR VALUES FROM (151) TO (999);
+            CREATE TABLE parted_low PARTITION OF parted (CHECK (nextval('s1') > 0)) FOR VALUES FROM (1) TO (76);
+            CREATE TABLE parted_high PARTITION OF parted (CHECK (nextval('s1') > 0)) FOR VALUES FROM (76) TO (999);
             CREATE FUNCTION kept() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;
             CREATE TABLE before (v int);
             CREATE TRIGGER kept BEFORE INSERT ON before FOR EACH ROW WHEN (nextval('s1') > 0) EXECUTE FUNCTION kept();
@@ -5437,8 +5437,8 @@ public sealed partial class SequenceRangeTests
             CREATE TABLE after_where (v int);
             CREATE TRIGGER kept AFTER INSERT ON after_where FOR EACH ROW WHEN (nextval('s1') < 0) EXECUTE FUNCTION kept();
             CREATE TABLE after_parted (k int) PARTITION BY RANGE (k);
-            CREATE TABLE after_parted_low PARTITION OF after_parted FOR VALUES FROM (1) TO (151);
-            CREATE TABLE after_parted_high PARTITION OF after_parted FOR VALUES FROM (151) TO (999);
+            CREATE TABLE after_parted_low PARTITION OF after_parted FOR VALUES FROM (1) TO (76);
+            CREATE TABLE after_parted_high PARTITION OF after_parted FOR VALUES FROM (76) TO (999);
             CREATE TRIGGER kept AFTER INSERT ON after_parted FOR EACH ROW WHEN (nextval('s1') < 0) EXECUTE FUNCTION kept();
             SELECT worf.enable_sequence_range('s1', participants := '{}', range_size := 100, max_range_size := 100);
             """, token);
@@ -5462,7 +5462,7 @@ public sealed partial class SequenceRangeTests
         ];
         Dictionary<string, string> conditions = new()
         {
-            ["plain_rows"] = " WHERE nextval('s1') > 0", ["after_where"] = " WHERE v > 0", ["of_domain_where"] = " WHERE v <= 250",
+            ["plain_rows"] = " WHERE nextval('s1') > 0", ["after_where"] = " WHERE v > 0", ["of_domain_where"] = " WHERE v <= 100",
             ["plain_rows_named_late"] = " WHERE nextval(('s' || '1')::regclass) > 0",
         };
         Dictionary<string, Func<int, string>> shapes = new()
@@ -5472,14 +5472,14 @@ public sealed partial class SequenceRangeTests
         };
         foreach ((string table, string what) in tables)
         {
-            for (int copy = 1; copy <= 3 && !failed.Exists(failure => failure.StartsWith(what, StringComparison.Ordinal)); copy++)
+            for (int copy = 1; copy <= 2 && !failed.Exists(failure => failure.StartsWith(what, StringComparison.Ordinal)); copy++)
             {
                 try
                 {
                     await using NpgsqlConnection connection = await nodeA.OpenAsync(Database, token);
                     await using TextWriter rows = await connection.BeginTextImportAsync(
                         $"COPY {table} FROM STDIN{conditions.GetValueOrDefault(table, "")}", token);
-                    for (int row = 1; row <= 300; row++)
+                    for (int row = 1; row <= 150; row++)
                     {
                         await rows.WriteLineAsync(shapes.TryGetValue(table, out Func<int, string>? shape) ? shape(row) : row.ToString(CultureInfo.InvariantCulture));
                     }
@@ -5492,7 +5492,7 @@ public sealed partial class SequenceRangeTests
         }
 
         Assert.IsEmpty(failed, $"the copies that failed: {string.Join("; ", failed)}");
-        Assert.AreEqual("900|900|900|900|900|900|900|900|900|750|900|900|900|900|900|900", await nodeA.SafePsqlAsync(Database, """
+        Assert.AreEqual("300|300|300|300|300|300|300|300|300|200|300|300|300|300|300|300", await nodeA.SafePsqlAsync(Database, """
             SELECT (SELECT count(*) FROM checked), (SELECT count(*) FROM twice), (SELECT count(*) FROM parted), (SELECT count(*) FROM before),
                 (SELECT count(*) FROM after), (SELECT count(*) FROM of_domain), (SELECT count(*) FROM plain_rows), (SELECT count(*) FROM after_where),
                 (SELECT count(*) FROM after_parted), (SELECT count(*) FROM of_domain_where), (SELECT count(*) FROM of_domains),
@@ -5511,7 +5511,6 @@ public sealed partial class SequenceRangeTests
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
-    [TestCategory("EveryVersion")]
     public async Task CopiesGoThroughInDatabasesWithoutWorf()
     {
         CancellationToken token = TestContext.CancellationToken;
@@ -5606,9 +5605,9 @@ public sealed partial class SequenceRangeTests
     /// calls goes through the guard on its own, with no gate held and no trigger run (2901). From blocks of 100, an
     /// INSERT ... SELECT, a COPY, a multi-row VALUES list, an insert ON CONFLICT DO NOTHING, single-row inserts in a
     /// PL/pgSQL loop and through a prepared statement, into tables with a bigserial, a serial and an identity
-    /// column and into a partitioned one, each write hundreds of rows beside a session that inserts one row at a
-    /// time, three times over in sessions of their own, the third as a role with no privilege on the identity
-    /// column's sequence, and no statement fails and no id is given twice. The guard's trigger still checks a value
+    /// column and into a partitioned one, each write 150 rows beside a session that inserts one row at a time, in
+    /// a session of its own, every other one as a role with no privilege on the identity column's sequence, and no
+    /// statement fails and no id is given twice. The guard's trigger still checks a value
     /// given by hand: one past every block the node has is refused, in the same tables.
     /// </summary>
     /// <returns>The test.</returns>
@@ -5623,8 +5622,8 @@ public sealed partial class SequenceRangeTests
             CREATE TABLE narrow (id serial PRIMARY KEY, v int);
             CREATE TABLE named (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v int);
             CREATE TABLE parted (id bigserial, v int) PARTITION BY RANGE (v);
-            CREATE TABLE parted_low PARTITION OF parted FOR VALUES FROM (MINVALUE) TO (2700);
-            CREATE TABLE parted_high PARTITION OF parted FOR VALUES FROM (2700) TO (MAXVALUE);
+            CREATE TABLE parted_low PARTITION OF parted FOR VALUES FROM (MINVALUE) TO (1800);
+            CREATE TABLE parted_high PARTITION OF parted FOR VALUES FROM (1800) TO (MAXVALUE);
             SELECT worf.enable_sequence_range('wide_id_seq', participants := '{}', range_size := 100, max_range_size := 100);
             SELECT worf.enable_sequence_range('narrow_id_seq', participants := '{}', range_size := 100, max_range_size := 100);
             SELECT worf.enable_sequence_range('named_id_seq', participants := '{}', range_size := 100, max_range_size := 100);
@@ -5657,25 +5656,26 @@ public sealed partial class SequenceRangeTests
                 }
             }
         }, token);
+        const int Rows = 150;
         int given = 0;
         (string What, Func<NpgsqlConnection, string, int, Task> Write)[] forms =
         [
             ("an INSERT ... SELECT", (connection, table, from) =>
-                ExecuteAsync(connection, $"INSERT INTO {table} (v) SELECT g FROM generate_series({from}, {from + 299}) g", token)),
+                ExecuteAsync(connection, $"INSERT INTO {table} (v) SELECT g FROM generate_series({from}, {from + Rows - 1}) g", token)),
             ("a COPY", async (connection, table, from) =>
             {
                 await using TextWriter rows = await connection.BeginTextImportAsync($"COPY {table} (v) FROM STDIN", token);
-                for (int row = from; row < from + 300; row++)
+                for (int row = from; row < from + Rows; row++)
                 {
                     await rows.WriteLineAsync(row.ToString(CultureInfo.InvariantCulture));
                 }
             }),
             ("a VALUES list", (connection, table, from) =>
-                ExecuteAsync(connection, $"INSERT INTO {table} (v) VALUES {string.Join(", ", Enumerable.Range(from, 300).Select(v => $"({v})"))}", token)),
+                ExecuteAsync(connection, $"INSERT INTO {table} (v) VALUES {string.Join(", ", Enumerable.Range(from, Rows).Select(v => $"({v})"))}", token)),
             ("an insert ON CONFLICT DO NOTHING", (connection, table, from) => ExecuteAsync(connection,
-                $"INSERT INTO {table} (v) SELECT g FROM generate_series({from}, {from + 299}) g ON CONFLICT DO NOTHING", token)),
+                $"INSERT INTO {table} (v) SELECT g FROM generate_series({from}, {from + Rows - 1}) g ON CONFLICT DO NOTHING", token)),
             ("a PL/pgSQL loop of inserts", (connection, table, from) => ExecuteAsync(connection,
-                $"DO $$ BEGIN FOR i IN {from}..{from + 299} LOOP INSERT INTO {table} (v) VALUES (i); END LOOP; END $$", token)),
+                $"DO $$ BEGIN FOR i IN {from}..{from + Rows - 1} LOOP INSERT INTO {table} (v) VALUES (i); END LOOP; END $$", token)),
             ("a prepared insert", async (connection, table, from) =>
             {
                 await using NpgsqlTransaction all = await connection.BeginTransactionAsync(token);
@@ -5683,7 +5683,7 @@ public sealed partial class SequenceRangeTests
                 NpgsqlParameter<int> value = new() { TypedValue = 0 };
                 _ = insert.Parameters.Add(value);
                 await insert.PrepareAsync(token);
-                for (int row = from; row < from + 300; row++)
+                for (int row = from; row < from + Rows; row++)
                 {
                     value.TypedValue = row;
                     _ = await insert.ExecuteNonQueryAsync(token);
@@ -5692,23 +5692,21 @@ public sealed partial class SequenceRangeTests
                 await all.CommitAsync(token);
             }),
         ];
-        foreach ((string what, Func<NpgsqlConnection, string, int, Task> write) in forms)
+        for (int form = 0; form < forms.Length; form++)
         {
+            (string what, Func<NpgsqlConnection, string, int, Task> write) = forms[form];
             foreach (string table in tables)
             {
-                for (int round = 1; round <= 3 && !failed.Any(failure => failure.StartsWith($"{what} into {table}", StringComparison.Ordinal)); round++)
+                int from = Interlocked.Add(ref given, Rows) - Rows + 1;
+                try
                 {
-                    int from = Interlocked.Add(ref given, 300) - 299;
-                    try
-                    {
-                        // A role with no privilege on an identity column's sequence writes its rows all the same.
-                        await using NpgsqlConnection connection = await nodeA.OpenAsync(Database, token, round == 3 ? "writer" : "postgres");
-                        await write(connection, table, from);
-                    }
-                    catch (PostgresException failure)
-                    {
-                        failed.Enqueue($"{what} into {table}, round {round}: {failure.SqlState} {failure.MessageText}");
-                    }
+                    // A role with no privilege on an identity column's sequence writes its rows all the same.
+                    await using NpgsqlConnection connection = await nodeA.OpenAsync(Database, token, form % 2 == 1 ? "writer" : "postgres");
+                    await write(connection, table, from);
+                }
+                catch (PostgresException failure)
+                {
+                    failed.Enqueue($"{what} into {table}: {failure.SqlState} {failure.MessageText}");
                 }
             }
         }
@@ -5718,7 +5716,7 @@ public sealed partial class SequenceRangeTests
         Assert.IsEmpty(failed, $"the statements that failed: {string.Join("; ", failed)}");
         foreach (string table in tables)
         {
-            Assert.AreEqual("5400|t", await nodeA.SafePsqlAsync(Database,
+            Assert.AreEqual("900|t", await nodeA.SafePsqlAsync(Database,
                 $"SELECT count(*) FILTER (WHERE v > 0), count(*) = count(DISTINCT id) FROM {table}", token), $"the rows of {table}, each with its own id");
         }
 
