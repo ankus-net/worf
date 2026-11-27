@@ -147,9 +147,8 @@ transaction. The draws between hold nothing, and a switch waits only for the one
 draws from a plain sequence do, and the statements around them cost nothing extra. A cursor between fetches, a client
 that reads slowly and a transaction left idle hold nothing, so they don't delay a switch.
 
-worf can't always reach a statement's calls one by one, for example one in a join's condition, unless PostgreSQL
-compiles the statement with JIT. Such statements check before each row instead and hold the gate while they work out a
-row. Where the next row draws
+worf can't always reach a statement's calls one by one, for example where another extension uses PostgreSQL's hook
+for function calls. Such statements check before each row instead and hold the gate while they work out a row. Where the next row draws
 straight away, they keep the gate and let it go when a switch waits for it. They look for a waiting switch at each
 row, or every tenth of a millisecond when rows take less.
 

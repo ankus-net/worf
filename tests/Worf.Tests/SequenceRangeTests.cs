@@ -5051,8 +5051,12 @@ public sealed partial class SequenceRangeTests
     /// turn, a statement that draws nothing (2500), and one whose call names its sequence, managed or plain, with a
     /// variable (2601). So does a statement that draws at each of its rows, an aggregate over 100,000 rows, which
     /// took 7.8 times as long, and one that PostgreSQL marks for JIT, whether the server has a JIT provider and
-    /// compiles it or has none. worf counts each draw within PostgreSQL's own call of nextval, where it took a call
-    /// into worf at every statement, at every call that a variable named, or before each row. Loops of 100,000
+    /// compiles it or has none, and one whose call sits in a join's condition, a nested loop's, or a window
+    /// function's argument, which took 9 to 19 times as long (2700), or in a CHECK constraint of the table it
+    /// inserts 20,000 rows into, which took 10 times as long, or in the 5,000 rows of a VALUES list, which took 2.3
+    /// times as long. worf counts each draw within PostgreSQL's own
+    /// call of nextval, where it took a call into worf at every statement, at every call that a variable named, or
+    /// before each row. Loops of 100,000
     /// turns alternate, each in a transaction of its own, the first two of each warm up, and each one's fastest 8 of
     /// the 12 that follow count. The test runs alone, as other tests' load hides the difference.
     /// </summary>
@@ -5075,6 +5079,8 @@ public sealed partial class SequenceRangeTests
             ("plain rows", false, "SELECT count(nextval('plain_s')) FROM generate_series(1, 100000)"),
             ("managed rows, marked for JIT", false, "SELECT count(nextval('s1')) FROM generate_series(1, 100000)"),
             ("plain rows, marked for JIT", false, "SELECT count(nextval('plain_s')) FROM generate_series(1, 100000)"),
+            .. s_places.Select(static place => ($"managed in {place.Place}", false, string.Format(CultureInfo.InvariantCulture, place.Statement, "s1"))),
+            .. s_places.Select(static place => ($"plain in {place.Place}", false, string.Format(CultureInfo.InvariantCulture, place.Statement, "plain_s"))),
         ], token);
         Assert.IsLessThan(took["plain"] * 2, took["managed"],
             $"the fastest 8 of 12 loops of 100,000 draws from a managed sequence, against {took["plain"]} from a plain one");
@@ -5095,6 +5101,252 @@ public sealed partial class SequenceRangeTests
             "the fastest 8 of 12 aggregates over 100,000 rows that draw from a managed sequence, marked for JIT, " +
             $"against {took["plain rows, marked for JIT"]} from a plain one, on a server where pg_jit_available() is " +
             await nodeA.SafePsqlAsync(Database, "SET jit = on; SELECT pg_jit_available()", token));
+        foreach ((string place, _) in s_places)
+        {
+            // A VALUES list's statement, most of whose time goes to reading its 5,000 rows, took 2.3 times as long.
+            bool values = place.Contains("VALUES", StringComparison.Ordinal);
+            Assert.IsLessThan(took[$"plain in {place}"] * (values ? 1.5 : 2), took[$"managed in {place}"],
+                $"the fastest 8 of 12 statements that draw from a managed sequence at each row, in {place}, against {took[$"plain in {place}"]} from a plain one");
+        }
+    }
+
+    // Statements that draw from the sequence {0} at each of many rows, through a call that sits outside their rows and
+    // conditions, or that starts as they run.
+    private static readonly (string Place, string Statement)[] s_places =
+    [
+        ("a join's condition", "SELECT count(*) FROM generate_series(1, 100000) a JOIN generate_series(1, 100000) b ON a = b AND nextval('{0}') > 0"),
+        ("a nested loop's condition", "SELECT count(*) FROM generate_series(1, 1000) a, generate_series(1, 100) b WHERE nextval('{0}') > a - b - 1000000000"),
+        ("a window function's argument", "SELECT count(*) FROM (SELECT sum(nextval('{0}')) OVER () FROM generate_series(1, 100000)) q"),
+        ("a table's CHECK constraint", "WITH rows AS (INSERT INTO checked_{0} SELECT g FROM generate_series(1, 20000) g RETURNING 1) SELECT count(*) FROM rows"),
+        ("the rows of a VALUES list", $"SELECT count(*) FROM (VALUES {string.Join(", ", Enumerable.Repeat("(nextval('{0}'))", 5000))}) v"),
+        ("the rows of a VALUES list it inserts", $"INSERT INTO valued VALUES {string.Join(", ", Enumerable.Repeat("(nextval('{0}'))", 5000))}"),
+    ];
+
+    /// <summary>
+    /// A statement's calls of nextval go through the guard one by one wherever they sit in its plan (2700): in a join's
+    /// condition, a nested loop's, a window function's argument, filter or frame, a subquery's test, the arguments of a
+    /// function in FROM or in the select list, a LIMIT, a TABLESAMPLE, an ordered-set aggregate's direct argument, what
+    /// an insert returns or sets on a conflict, a MERGE's condition and a view's check option. A statement with a call
+    /// worf didn't find checked before each row, and its row held the sequence's gate while it was worked out. Each
+    /// statement here sleeps in its row once it has drawn, all at once, and holds no gate meanwhile. So do the calls
+    /// that start as a statement runs, once their expressions are there to find, from the table's second row on: a
+    /// CHECK constraint's, a partition's, and a trigger's WHEN condition's. The states that hold these expressions
+    /// differ by PostgreSQL version, so the test runs on every one.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [TestCategory("EveryVersion")]
+    public async Task RowsHoldNoGateWhereverTheirCallsSit()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        const string Draw = "nextval('s1') + 0 * length(pg_sleep(3)::text)";
+        _ = await nodeA.SafePsqlAsync(Database, $"""
+            CREATE SEQUENCE s1;
+            CREATE TABLE sink (id bigint);
+            INSERT INTO sink VALUES (1), (2), (3);
+            CREATE TABLE keyed (k int PRIMARY KEY, v bigint);
+            INSERT INTO keyed VALUES (1, 0), (2, 0);
+            CREATE VIEW checked AS SELECT * FROM sink WHERE id < {Draw} WITH CHECK OPTION;
+            CREATE TABLE constrained (id bigint CHECK ({Draw} > 0));
+            CREATE TABLE parted (id bigint) PARTITION BY RANGE (id);
+            CREATE TABLE parted_low PARTITION OF parted (CHECK ({Draw} > 0)) FOR VALUES FROM (0) TO (100);
+            CREATE FUNCTION kept() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;
+            CREATE TABLE triggered (id bigint);
+            CREATE TRIGGER kept BEFORE INSERT ON triggered FOR EACH ROW WHEN ({Draw} > 0) EXECUTE FUNCTION kept();
+            SELECT worf.enable_sequence_range('s1', participants := '{"{}"}', range_size := 1000);
+            """, token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges", token),
+            "node_a drawing from a block of s1, with the next one ready");
+        (string Place, string Statement)[] statements =
+        [
+            ("a join's condition", $"SELECT count(*) FROM generate_series(1, 1) a JOIN generate_series(1, 1) b ON a = b AND {Draw} > 0"),
+            ("a nested loop's condition", $"SELECT count(*) FROM generate_series(1, 1) a, generate_series(1, 1) b WHERE {Draw} > a - b - 1000000000"),
+            ("a window function's argument", $"SELECT count(*) FROM (SELECT sum({Draw}) OVER () FROM generate_series(1, 1)) q"),
+            ("a window function's filter", $"SELECT count(*) FROM (SELECT count(*) FILTER (WHERE {Draw} > 0) OVER () FROM generate_series(1, 1)) q"),
+            ("a window frame's bound", $"SELECT max(x) FROM (SELECT sum(g) OVER (ORDER BY g ROWS BETWEEN 0 * ({Draw}) PRECEDING AND CURRENT ROW) AS x FROM generate_series(1, 2) g) q"),
+            ("a subquery's test", $"SELECT count(*) FROM generate_series(1, 1) g WHERE {Draw} NOT IN (SELECT 0::bigint)"),
+            ("the arguments of a function in FROM", $"SELECT count(*) FROM generate_series(1, 1) a, LATERAL generate_series(a, a + 0 * ({Draw})) b"),
+            ("the arguments of a function in the select list", $"SELECT count(*) FROM (SELECT generate_series(1, 1 + 0 * ({Draw})) FROM generate_series(1, 1)) q"),
+            ("a LIMIT", $"SELECT count(*) FROM (SELECT g FROM generate_series(1, 3) g LIMIT {Draw}) q"),
+            ("a TABLESAMPLE's argument", $"SELECT count(*) FROM sink TABLESAMPLE BERNOULLI (50 + 0 * ({Draw}))"),
+            ("an ordered-set aggregate's direct argument", $"SELECT percentile_disc((0.5 + 0 * ({Draw}))::float8) WITHIN GROUP (ORDER BY g) FROM generate_series(1, 3) g"),
+            ("what an insert returns", $"INSERT INTO sink VALUES (-1) RETURNING {Draw}"),
+            ("what an insert sets on a conflict", $"INSERT INTO keyed VALUES (1, 0) ON CONFLICT (k) DO UPDATE SET v = {Draw}"),
+            ("a MERGE's condition", $"MERGE INTO keyed t USING generate_series(2, 2) g ON t.k = g WHEN MATCHED AND {Draw} > 0 THEN UPDATE SET v = t.v + 1"),
+            ("a view's check option", "INSERT INTO checked VALUES (-5)"),
+
+            // The first row's call starts as the statement reaches it, and that row holds the gate.
+            ("a table's CHECK constraint, from the second row", "INSERT INTO constrained SELECT g FROM generate_series(1, 2) g"),
+            ("a partition's CHECK constraint, from the second row", "INSERT INTO parted SELECT g FROM generate_series(1, 2) g"),
+            ("a trigger's WHEN condition, from the second row", "INSERT INTO triggered SELECT g FROM generate_series(1, 2) g"),
+        ];
+        List<NpgsqlConnection> connections = [];
+        try
+        {
+            for (int i = 0; i < statements.Length; i++)
+            {
+                connections.Add(await nodeA.OpenAsync(Database, token));
+            }
+
+            // Each session's gates of s1, as ShareLocks with objsubid 3, read while pg_stat_activity shows it asleep.
+            string pids = string.Join(", ", connections.Select(connection => connection.ProcessID));
+            string look = $"""
+                SELECT a.pid || ':' || (SELECT count(*) FROM pg_locks l WHERE l.pid = a.pid AND l.locktype = 'advisory'
+                    AND l.classid = 's1'::regclass::oid AND l.objsubid = 3 AND l.granted)
+                FROM pg_stat_activity a WHERE a.wait_event = 'PgSleep' AND a.pid IN ({pids})
+                """;
+            List<Task<string>> running = [.. statements.Select((statement, i) => Task.Run(async () =>
+            {
+                try
+                {
+                    await using NpgsqlCommand command = new(statement.Statement, connections[i]) { CommandTimeout = 60 };
+                    _ = await command.ExecuteScalarAsync(token);
+                    return "";
+                }
+                catch (PostgresException failed)
+                {
+                    return $"{failed.SqlState} {failed.MessageText}";
+                }
+            }, token))];
+            // Each session's gates at the last look that found it asleep, which a statement of two rows is in its second.
+            Dictionary<int, string> gates = [];
+            for (int looks = 0; looks < 200 && !running.All(statement => statement.IsCompleted); looks++)
+            {
+                await Task.Delay(50, token);
+                foreach (string[] seen in (await nodeA.SafePsqlAsync(Database, look, token)).Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(row => row.Split(':')))
+                {
+                    gates[int.Parse(seen[0], CultureInfo.InvariantCulture)] = seen[1];
+                }
+            }
+
+            string[] ended = await Task.WhenAll(running);
+            List<string> failed = [];
+            for (int i = 0; i < statements.Length; i++)
+            {
+                string held = gates.GetValueOrDefault(connections[i].ProcessID, "not seen asleep");
+                if (ended[i].Length > 0 || held != "0")
+                {
+                    failed.Add($"{statements[i].Place}: {(ended[i].Length > 0 ? ended[i] : $"gates held while asleep: {held}")}");
+                }
+            }
+
+            Assert.IsEmpty(failed, $"the statements that failed, or held a gate of s1 as their row slept: {string.Join("; ", failed)}");
+        }
+        finally
+        {
+            foreach (NpgsqlConnection connection in connections)
+            {
+                await connection.DisposeAsync();
+            }
+        }
+    }
+
+    /// <summary>
+    /// The calls of nextval that start as a statement runs wait for their switches once worf has found them and the
+    /// statement checks before its rows no more: inserts of 350 and more rows, each of which draws from blocks of 100
+    /// in a CHECK constraint of the table, of each of three partitions, the last of which takes its first row after
+    /// 300 others, or in a trigger's WHEN condition, beside a session that inserts a row at a time, all succeed. So do
+    /// statements whose 250 VALUES rows draw, which each check as their calls start: an insert whose rows no client
+    /// reads, one sent as psql sends it, and a list the client reads row by row, and no value comes twice.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task CallsThatStartAsAStatementRunsWaitForTheirSwitches()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE SEQUENCE s1;
+            CREATE TABLE t1 (id bigint DEFAULT nextval('s1') PRIMARY KEY, v text);
+            CREATE TABLE constrained (id bigint CHECK (nextval('s1') > 0));
+            CREATE TABLE parted (id bigint) PARTITION BY RANGE (id);
+            CREATE TABLE parted_0 PARTITION OF parted (CHECK (nextval('s1') > 0)) FOR VALUES FROM (0) TO (1000);
+            CREATE TABLE parted_1 PARTITION OF parted (CHECK (nextval('s1') > 0)) FOR VALUES FROM (1000) TO (2000);
+            CREATE TABLE parted_2 PARTITION OF parted (CHECK (nextval('s1') > 0)) FOR VALUES FROM (2000) TO (3000);
+            CREATE FUNCTION kept() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;
+            CREATE TABLE triggered (id bigint);
+            CREATE TRIGGER kept BEFORE INSERT ON triggered FOR EACH ROW WHEN (nextval('s1') > 0) EXECUTE FUNCTION kept();
+            CREATE TABLE valued (id bigint);
+            SELECT worf.enable_sequence_range('s1', participants := '{}', range_size := 100, max_range_size := 100);
+            """, token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges", token),
+            "node_a drawing from a block of s1, with the next one ready");
+        string rowsThatDraw = string.Join(", ", Enumerable.Repeat("(nextval('s1'))", 250));
+        using CancellationTokenSource done = CancellationTokenSource.CreateLinkedTokenSource(token);
+        Task<(int Rows, string Failed)> beside = Task.Run(async () =>
+        {
+            int rows = 0;
+            try
+            {
+                await using NpgsqlConnection connection = await nodeA.OpenAsync(Database, token);
+                while (!done.IsCancellationRequested)
+                {
+                    await ExecuteAsync(connection, "INSERT INTO t1 (v) VALUES ('beside')", token);
+                    rows++;
+                }
+
+                return (rows, "");
+            }
+            catch (PostgresException failed)
+            {
+                return (rows, $"{failed.SqlState} {failed.MessageText}");
+            }
+        }, token);
+        List<string> failures = [];
+        (string What, string Statement)[] statements =
+        [
+            ("a table's CHECK constraint", "INSERT INTO constrained SELECT g FROM generate_series(1, 350) g"),
+            ("three partitions' CHECK constraints, a row each in turn", "INSERT INTO parted SELECT (g % 3) * 1000 + g FROM generate_series(1, 360) g"),
+            ("three partitions' CHECK constraints, one partition after another",
+                "INSERT INTO parted SELECT g FROM generate_series(1, 150) g UNION ALL SELECT 1000 + g FROM generate_series(1, 150) g UNION ALL SELECT 2000 + g FROM generate_series(1, 150) g"),
+            ("a trigger's WHEN condition", "INSERT INTO triggered SELECT g FROM generate_series(1, 350) g"),
+            ("a CHECK constraint and a VALUES list's rows", "INSERT INTO constrained VALUES (nextval('s1')), (nextval('s1')), (nextval('s1'))"),
+            ("a table's CHECK constraint, in a second statement", "INSERT INTO constrained SELECT g FROM generate_series(1, 350) g"),
+            ("a VALUES list's rows, as psql sends them", $"INSERT INTO valued VALUES {rowsThatDraw}"),
+        ];
+        foreach ((string what, string statement) in statements)
+        {
+            try
+            {
+                _ = await nodeA.SafePsqlAsync(Database, statement, token);
+            }
+            catch (PostgresException failed)
+            {
+                failures.Add($"{what}: {failed.SqlState} {failed.MessageText}");
+            }
+        }
+
+        // An insert sent as a prepared statement has no client to read rows, and a VALUES list's rows the client reads.
+        List<long> read = [];
+        try
+        {
+            await using NpgsqlConnection connection = await nodeA.OpenAsync(Database, token);
+            await ExecuteAsync(connection, $"INSERT INTO valued VALUES {rowsThatDraw}", token);
+            await using NpgsqlCommand list = new($"VALUES {rowsThatDraw}", connection);
+            await using NpgsqlDataReader reader = await list.ExecuteReaderAsync(token);
+            while (await reader.ReadAsync(token))
+            {
+                read.Add(reader.GetInt64(0));
+            }
+        }
+        catch (PostgresException failed)
+        {
+            failures.Add($"a VALUES list's rows, inserted or read: {failed.SqlState} {failed.MessageText}");
+        }
+
+        await done.CancelAsync();
+        (int rows, string failedBeside) = await beside;
+        Assert.IsEmpty(failures, $"the statements that failed: {string.Join("; ", failures)}");
+        Assert.AreEqual("", failedBeside, $"the inserts beside them, of which {rows} went through");
+        Assert.AreEqual("703|810|350", await nodeA.SafePsqlAsync(Database,
+            "SELECT (SELECT count(*) FROM constrained), (SELECT count(*) FROM parted), (SELECT count(*) FROM triggered)", token), "the rows inserted");
+        Assert.AreEqual("500|500|0", await nodeA.SafePsqlAsync(Database, $"""
+            SELECT count(*), count(DISTINCT id), count(*) FILTER (WHERE id = ANY('{"{"}{string.Join(",", read)}{"}"}'::bigint[]) OR id IN (SELECT id FROM t1)) FROM valued
+            """, token), "the values the two VALUES inserts drew, those that differ, and those the list read or the inserts beside them drew too");
+        Assert.HasCount(250, read.Distinct(), "the values the VALUES list read drew, all different");
+        Assert.AreEqual($"{rows}|{rows}", await nodeA.SafePsqlAsync(Database, "SELECT count(*), count(DISTINCT id) FROM t1", token),
+            "the rows inserted beside them, and their ids that differ");
     }
 
     /// <summary>
@@ -5194,6 +5446,9 @@ public sealed partial class SequenceRangeTests
     {
         _ = await node.SafePsqlAsync(Database, """
             CREATE SEQUENCE s1; CREATE SEQUENCE plain_s;
+            CREATE TABLE checked_s1 (id bigint CHECK (nextval('s1') > 0));
+            CREATE TABLE checked_plain_s (id bigint CHECK (nextval('plain_s') > 0));
+            CREATE TABLE valued (id bigint);
             SELECT worf.enable_sequence_range('s1', participants := '{}', range_size := 100000000);
             """, token);
         Assert.IsTrue(await node.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges WHERE sequence = 's1'::regclass", token),
@@ -5207,7 +5462,9 @@ public sealed partial class SequenceRangeTests
                 await ExecuteAsync(connection, afterDraw ? "BEGIN; SELECT nextval('s1')"
                     : kind.EndsWith("marked for JIT", StringComparison.Ordinal) ? "BEGIN; SET LOCAL jit = on; SET LOCAL jit_above_cost = 0"
                     : "BEGIN", token);
-                await using NpgsqlCommand loop = new(body.StartsWith("SELECT ", StringComparison.Ordinal) ? body : $"DO $$ DECLARE x bigint; y int; BEGIN {body}; END $$",
+                await using NpgsqlCommand loop = new(
+                    body.StartsWith("SELECT ", StringComparison.Ordinal) || body.StartsWith("WITH ", StringComparison.Ordinal) || body.StartsWith("INSERT ", StringComparison.Ordinal)
+                        ? body : $"DO $$ DECLARE x bigint; y int; BEGIN {body}; END $$",
                     connection) { CommandTimeout = 120 };
                 Stopwatch timing = Stopwatch.StartNew();
                 _ = await loop.ExecuteScalarAsync(token);

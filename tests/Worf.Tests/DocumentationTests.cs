@@ -92,7 +92,7 @@ public sealed partial class DocumentationTests
         Assert.DoesNotContain("hold the gate only while they work out a row", s_sequenceRanges, "statements that keep the gate from row to row (2300)");
         Assert.Contains("Other draws, such as those of `SELECT nextval(...)` or of a PL/pgSQL assignment in a loop, take the gate only when they have to check the block, as a statement's first draw does, or the first by a PL/pgSQL expression in a transaction. The draws between hold nothing, and a switch waits only for the ones under way.",
             s_sequenceRanges, "draws that hold no gate (2301, 2500, 2501, the thirty-sixth review's rows)");
-        Assert.Contains("worf can't always reach a statement's calls one by one, for example one in a join's condition, unless PostgreSQL compiles the statement with JIT. Such statements check before each row instead and hold the gate while they work out a row.",
+        Assert.Contains("worf can't always reach a statement's calls one by one, for example where another extension uses PostgreSQL's hook for function calls. Such statements check before each row instead and hold the gate while they work out a row.",
             s_sequenceRanges, "statements that check before each row");
         Assert.DoesNotContain("or the next turn of a loop draws straight away", s_sequenceRanges, "PL/pgSQL loops that keep no gate (2501)");
 

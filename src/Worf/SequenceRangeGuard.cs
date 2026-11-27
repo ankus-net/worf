@@ -398,6 +398,26 @@ internal static partial class SequenceRangeGuard
     private static readonly Dictionary<nint, (ExecProcNodeMtd Function, int Calls, IReadOnlyCollection<uint>? Named)> s_rowFunctions = [];
     private static readonly Dictionary<nint, (uint Subxact, List<nint> Nodes)> s_countedNodes = [];
 
+    // The calls of nextval a statement has started as it ran, by statement, those of them found in the expression states
+    // its tables keep, which go through the guard one by one, and how many had started as they were last looked for.
+    // The plan nodes that count rows down only until those calls are found tell the statement they belong to.
+    private static readonly Dictionary<nint, int> s_runStarted = [];
+    private static readonly Dictionary<nint, (HashSet<nint> Found, int Looked)> s_runFound = [];
+    private static readonly Dictionary<nint, nint> s_runRows = [];
+
+    // The memory in which each VALUES list of a statement builds a row's expressions, with the list's node, by
+    // statement. PostgreSQL builds them anew for each row and forgets them with it, so a call that starts there is that
+    // row's alone, which its start checks, and no later row runs it again.
+    private static readonly Dictionary<nint, (nint Memory, nint Node)[]> s_valuesRows = [];
+
+    // The VALUES row whose calls last started, and how many of its calls have: a row starts all its calls before it
+    // draws for any, so each start counts for those before it too, which the sequence doesn't show as drawn yet.
+    private static (nint Node, int Row, int Started) s_valuesRow;
+
+    // The running statements of which only the plan's top node counts its rows down, as VALUES rows that go to the
+    // client have it do: each row the client reads lets go the gates its calls took as they started.
+    private static readonly HashSet<nint> s_runTop = [];
+
     [PgNativeCallback(nameof(CountedRow))]
     private static partial ExecProcNodeMtd CountedRowCallback { get; }
 
@@ -823,6 +843,14 @@ internal static partial class SequenceRangeGuard
     {
         FreePlanSites((nint)queryDesc);
         _ = s_planStarted.Remove((nint)queryDesc);
+        _ = s_runStarted.Remove((nint)queryDesc);
+        _ = s_runFound.Remove((nint)queryDesc);
+        if (s_valuesRows.Remove((nint)queryDesc))
+        {
+            s_valuesRow = default;
+        }
+
+        _ = s_runTop.Remove((nint)queryDesc);
         _ = s_rowsDrawing.Remove((nint)queryDesc);
         if (s_hookingStatements.Count > 0)
         {
@@ -1621,31 +1649,42 @@ internal static partial class SequenceRangeGuard
 
     // Has the guard count down before each row a plan node, and those under it, produce: its children, its initPlans
     // and subplans, as an ARRAY or scalar subquery runs, and the plans an Append, a MergeAppend or a subquery scan runs.
-    private static unsafe void CountRows(PlanState* node, List<nint> nodes, int calls, bool running = false, IReadOnlyCollection<uint>? named = null)
+    private static unsafe void CountRows(PlanState* node, List<nint> nodes, int calls, bool running = false, IReadOnlyCollection<uint>? named = null,
+        bool under = false, bool alone = false)
     {
-        if (node is null || s_rowFunctions.ContainsKey((nint)node))
+        // A node that counts already has those under it count too, unless only the plan's top node did so far.
+        if (node is null || (s_rowFunctions.ContainsKey((nint)node) && !under))
         {
             return;
         }
 
-        ExecProcNodeMtd real = node->ExecProcNodeReal;
-        s_rowFunctions[(nint)node] = (real, calls, named);
-        node->ExecProcNodeReal = CountedRowCallback;
-
-        // A node that has produced a row runs its own function, as ExecProcNodeFirst left it, with no wrapper.
-        if (running && node->ExecProcNode.DangerousGetAddress() == real.DangerousGetAddress())
+        if (!s_rowFunctions.ContainsKey((nint)node))
         {
-            node->ExecProcNode = CountedRowCallback;
+            ExecProcNodeMtd real = node->ExecProcNodeReal;
+            s_rowFunctions[(nint)node] = (real, calls, named);
+            node->ExecProcNodeReal = CountedRowCallback;
+
+            // A node that has produced a row runs its own function, as ExecProcNodeFirst left it, with no wrapper.
+            if (running && node->ExecProcNode.DangerousGetAddress() == real.DangerousGetAddress())
+            {
+                node->ExecProcNode = CountedRowCallback;
+            }
+
+            nodes.Add((nint)node);
         }
 
-        nodes.Add((nint)node);
-        CountRows(node->lefttree, nodes, calls, running, named);
-        CountRows(node->righttree, nodes, calls, running, named);
+        if (alone)
+        {
+            return;
+        }
+
+        CountRows(node->lefttree, nodes, calls, running, named, under);
+        CountRows(node->righttree, nodes, calls, running, named, under);
         foreach (List* subplans in new[] { node->initPlan, node->subPlan })
         {
             for (int i = 0; subplans is not null && i < subplans->length; i++)
             {
-                CountRows(((SubPlanState*)subplans->elements[i].ptr_value)->planstate, nodes, calls, running, named);
+                CountRows(((SubPlanState*)subplans->elements[i].ptr_value)->planstate, nodes, calls, running, named, under);
             }
         }
 
@@ -1654,19 +1693,19 @@ internal static partial class SequenceRangeGuard
             case NodeTag.T_AppendState:
                 for (int i = 0; i < ((AppendState*)node)->as_nplans; i++)
                 {
-                    CountRows(((AppendState*)node)->appendplans[i], nodes, calls, running, named);
+                    CountRows(((AppendState*)node)->appendplans[i], nodes, calls, running, named, under);
                 }
 
                 break;
             case NodeTag.T_MergeAppendState:
                 for (int i = 0; i < ((MergeAppendState*)node)->ms_nplans; i++)
                 {
-                    CountRows(((MergeAppendState*)node)->mergeplans[i], nodes, calls, running, named);
+                    CountRows(((MergeAppendState*)node)->mergeplans[i], nodes, calls, running, named, under);
                 }
 
                 break;
             case NodeTag.T_SubqueryScanState:
-                CountRows(((SubqueryScanState*)node)->subplan, nodes, calls, running, named);
+                CountRows(((SubqueryScanState*)node)->subplan, nodes, calls, running, named, under);
                 break;
             default:
                 break;
@@ -1679,6 +1718,13 @@ internal static partial class SequenceRangeGuard
     private static unsafe TupleTableSlot* CountedRow(PlanState* node)
     {
         (ExecProcNodeMtd function, int calls, IReadOnlyCollection<uint>? named) = s_rowFunctions[(nint)node];
+
+        // A statement that counts its rows down only for calls that started as it ran stops once they all go through
+        // the guard themselves.
+        if (s_runRows.Count > 0 && s_runRows.TryGetValue((nint)node, out nint running) && GuardRunCalls((QueryDesc*)running, node))
+        {
+            return function.Invoke(node);
+        }
 
         // A Result with no plan under it gives one row a scan: once it has, its next call starts nothing.
         bool single = node->type == NodeTag.T_ResultState && node->lefttree is null;
@@ -1923,9 +1969,13 @@ internal static partial class SequenceRangeGuard
     // PGJIT_EXPR, from jit/jit.h: PostgreSQL compiles the statement's expressions, where it has a JIT provider.
     private const int JitExpressions = 1 << 3;
 
-    // The function PostgreSQL sets an expression's state to run through first where its interpreter is to run it. One
-    // that PostgreSQL compiled, with its calls' functions built in, has another, as has one that has run already.
-    private static nint s_interpreted;
+    // EEO_FLAG_INTERPRETER_INITIALIZED, from executor/execExpr.h: PostgreSQL's interpreter runs the expression's
+    // state. One that PostgreSQL compiled, with its calls' functions built in, never has it.
+#if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
+    private const int InterpreterInitialized = 1 << 1;
+#else
+    private const int InterpreterInitialized = 1 << 5;
+#endif
 
     // Whether PostgreSQL has compiled a call of this transaction's to go through the fmgr hook.
     private static bool s_compiledCalls;
@@ -1976,11 +2026,6 @@ internal static partial class SequenceRangeGuard
         }
 
         // A statement marked for JIT is compiled only where the server has a JIT provider, so each state is asked.
-        if (s_interpreted == 0)
-        {
-            s_interpreted = (nint)NativeMethods.ExecInitExpr((Expr*)NativeMethods.makeBoolConst(true, false), null)->evalfunc.DangerousGetAddress();
-        }
-
         List<(nint Step, bool Single, bool Compiled)> calls = [];
         FindCalls(query->planstate, calls, []);
         int interpreted = 0;
@@ -2021,7 +2066,11 @@ internal static partial class SequenceRangeGuard
         return true;
     }
 
-    // Finds the calls of nextval in the expression states a plan's nodes hold, through the nodes CountRows reaches.
+    // Finds the calls of nextval in the expression states a plan's nodes hold, through the nodes CountRows reaches:
+    // each node's condition and row, a join's condition, a window function's arguments, filter and frame, an
+    // aggregate's transitions and direct arguments, a set-returning function's arguments, a LIMIT's, a TABLESAMPLE's,
+    // the conditions and arguments of the subqueries its expressions run, and what a table's writes return, check
+    // or set on a conflict or in a MERGE.
     private static unsafe void FindCalls(PlanState* node, List<(nint Step, bool Single, bool Compiled)> calls, HashSet<nint> seen)
     {
         if (node is null || !seen.Add((nint)node))
@@ -2043,12 +2092,72 @@ internal static partial class SequenceRangeGuard
         {
             for (int i = 0; subplans is not null && i < subplans->length; i++)
             {
-                FindCalls(((SubPlanState*)subplans->elements[i].ptr_value)->planstate, calls, seen);
+                SubPlanState* subplan = (SubPlanState*)subplans->elements[i].ptr_value;
+                FindCalls(subplan->planstate, calls, seen);
+                FindCalls(subplan->testexpr, calls, seen, false);
+                FindCalls(subplan->projLeft, calls, seen);
+                FindCalls(subplan->projRight, calls, seen);
+#if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
+                FindCalls(subplan->args, calls, seen);
+#endif
             }
         }
 
         switch (node->type)
         {
+            case NodeTag.T_NestLoopState:
+            case NodeTag.T_MergeJoinState:
+            case NodeTag.T_HashJoinState:
+                FindCalls(((JoinState*)node)->joinqual, calls, seen, false);
+                break;
+            case NodeTag.T_WindowAggState:
+                WindowAggState* window = (WindowAggState*)node;
+                for (int i = 0; window->funcs is not null && i < window->funcs->length; i++)
+                {
+                    WindowFuncExprState* function = (WindowFuncExprState*)window->funcs->elements[i].ptr_value;
+                    FindCalls(function->args, calls, seen);
+                    FindCalls(function->aggfilter, calls, seen, false);
+                }
+
+                FindCalls(window->startOffset, calls, seen, false);
+                FindCalls(window->endOffset, calls, seen, false);
+                FindCalls(window->runcondition, calls, seen, false);
+                break;
+            case NodeTag.T_LimitState:
+                FindCalls(((LimitState*)node)->limitOffset, calls, seen, false);
+                FindCalls(((LimitState*)node)->limitCount, calls, seen, false);
+                break;
+            case NodeTag.T_SampleScanState:
+                FindCalls(((SampleScanState*)node)->args, calls, seen);
+                FindCalls(((SampleScanState*)node)->repeatable, calls, seen, false);
+                break;
+            case NodeTag.T_ValuesScanState:
+                // The rows whose expressions run subqueries, which PostgreSQL builds as the statement starts.
+                ValuesScanState* values = (ValuesScanState*)node;
+                for (int i = 0; values->exprstatelists is not null && i < values->array_len; i++)
+                {
+                    FindCalls(values->exprstatelists[i], calls, seen);
+                }
+
+                break;
+            case NodeTag.T_FunctionScanState:
+                // What a function scan keeps for each function is PostgreSQL's own, but for its first field, the
+                // function's state, so only a scan of one function is looked into.
+                FunctionScanState* scan = (FunctionScanState*)node;
+                if (scan->nfuncs == 1 && scan->funcstates is not null)
+                {
+                    FindCalls(*(SetExprState**)scan->funcstates, calls, seen);
+                }
+
+                break;
+            case NodeTag.T_ModifyTableState:
+                ModifyTableState* modify = (ModifyTableState*)node;
+                for (int i = 0; modify->resultRelInfo is not null && i < modify->mt_nrels; i++)
+                {
+                    FindWriteCalls(&modify->resultRelInfo[i], calls, seen);
+                }
+
+                break;
             case NodeTag.T_AppendState:
                 for (int i = 0; i < ((AppendState*)node)->as_nplans; i++)
                 {
@@ -2077,6 +2186,10 @@ internal static partial class SequenceRangeGuard
                     {
                         FindCalls((ExprState*)elem, calls, seen, false);
                     }
+                    else
+                    {
+                        FindCalls((SetExprState*)elem, calls, seen);
+                    }
                 }
 
                 break;
@@ -2092,9 +2205,296 @@ internal static partial class SequenceRangeGuard
                     }
                 }
 
+                for (int i = 0; ((AggState*)node)->peragg is not null && i < ((AggState*)node)->numaggs; i++)
+                {
+                    FindCalls(((AggState*)node)->peragg[i].aggdirectargs, calls, seen);
+                }
+
                 break;
             default:
                 break;
+        }
+    }
+
+    // Finds the calls in the expression states of a list.
+    private static unsafe void FindCalls(List* states, List<(nint Step, bool Single, bool Compiled)> calls, HashSet<nint> seen)
+    {
+        for (int i = 0; states is not null && states->type == NodeTag.T_List && i < states->length; i++)
+        {
+            Node* state = (Node*)states->elements[i].ptr_value;
+            if (state is not null && state->type == NodeTag.T_ExprState)
+            {
+                FindCalls((ExprState*)state, calls, seen, false);
+            }
+        }
+    }
+
+    // Finds the calls in a projection's expression state.
+    private static unsafe void FindCalls(ProjectionInfo* projection, List<(nint Step, bool Single, bool Compiled)> calls, HashSet<nint> seen)
+    {
+        if (projection is not null)
+        {
+            FindCalls(&projection->pi_state, calls, seen, false);
+        }
+    }
+
+    // Finds the calls in the arguments of a function that returns a set, or in the expression that stands for it.
+    private static unsafe void FindCalls(SetExprState* function, List<(nint Step, bool Single, bool Compiled)> calls, HashSet<nint> seen)
+    {
+        if (function is not null && function->type == NodeTag.T_SetExprState)
+        {
+            FindCalls(function->args, calls, seen);
+            FindCalls(function->elidedFuncState, calls, seen, false);
+        }
+    }
+
+    // Finds the calls in the conditions and the rows of a MERGE's actions.
+    private static unsafe void FindMergeCalls(List* actions, List<(nint Step, bool Single, bool Compiled)> calls, HashSet<nint> seen)
+    {
+        for (int i = 0; actions is not null && i < actions->length; i++)
+        {
+            MergeActionState* action = (MergeActionState*)actions->elements[i].ptr_value;
+            FindCalls(action->mas_proj, calls, seen);
+            FindCalls(action->mas_whenqual, calls, seen, false);
+        }
+    }
+
+    // Finds the calls in the expression states a table a statement writes keeps for its rows: its CHECK constraints,
+    // its generated columns and its triggers' WHEN conditions, which start with the table's first row, and, for a
+    // partition a row is routed to, what its rows return, check or set on a conflict or in a MERGE.
+    private static unsafe void FindCalls(ResultRelInfo* written, bool routed, List<(nint Step, bool Single, bool Compiled)> calls, HashSet<nint> seen)
+    {
+        TupleDescData* row = written->ri_RelationDesc is null ? null : written->ri_RelationDesc->rd_att;
+        if (row is null)
+        {
+            return;
+        }
+
+#if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
+        ExprState** checks = written->ri_ConstraintExprs;
+#else
+        ExprState** checks = written->ri_CheckConstraintExprs;
+#endif
+        for (int i = 0; checks is not null && row->constr is not null && i < row->constr->num_check; i++)
+        {
+            FindCalls(checks[i], calls, seen, false);
+        }
+
+#if ANKUS_PG15
+        ExprState**[] generated = [written->ri_GeneratedExprs];
+#else
+        ExprState**[] generated = [written->ri_GeneratedExprsI, written->ri_GeneratedExprsU];
+#endif
+        foreach (ExprState** columns in generated)
+        {
+            for (int i = 0; columns is not null && i < row->natts; i++)
+            {
+                FindCalls(columns[i], calls, seen, false);
+            }
+        }
+
+        for (int i = 0; written->ri_TrigWhenExprs is not null && written->ri_TrigDesc is not null && i < written->ri_TrigDesc->numtriggers; i++)
+        {
+            FindCalls(written->ri_TrigWhenExprs[i], calls, seen, false);
+        }
+
+        if (routed)
+        {
+            FindWriteCalls(written, calls, seen);
+        }
+    }
+
+    // Finds the calls in what a table's writes return, check for a view, or set on a conflict or in a MERGE.
+    private static unsafe void FindWriteCalls(ResultRelInfo* written, List<(nint Step, bool Single, bool Compiled)> calls, HashSet<nint> seen)
+    {
+        FindCalls(written->ri_projectReturning, calls, seen);
+        FindCalls(written->ri_WithCheckOptionExprs, calls, seen);
+        if (written->ri_onConflict is not null)
+        {
+            FindCalls(written->ri_onConflict->oc_ProjInfo, calls, seen);
+            FindCalls(written->ri_onConflict->oc_WhereClause, calls, seen, false);
+        }
+
+#if ANKUS_PG15 || ANKUS_PG16
+        FindMergeCalls(written->ri_matchedMergeAction, calls, seen);
+        FindMergeCalls(written->ri_notMatchedMergeAction, calls, seen);
+#else
+        // One list for each of MERGE's three kinds of match.
+        List** actions = (List**)&written->ri_MergeActions;
+        for (int kind = 0; kind < 3; kind++)
+        {
+            FindMergeCalls(actions[kind], calls, seen);
+        }
+
+        FindCalls(written->ri_MergeJoinCondition, calls, seen, false);
+#endif
+    }
+
+    // Has the calls of nextval that a statement started as it ran go through the guard each time they run, once they
+    // are found in the states its tables keep, and its rows count down no more once every one of them does, but for
+    // those the client reads of a statement with a VALUES list. A call that PostgreSQL compiled, or whose state is
+    // kept elsewhere, as a domain's CHECK constraint's may be, is never found, and the statement goes on checking
+    // before each row. Tells whether the node whose row is due counts no more.
+    private static unsafe bool GuardRunCalls(QueryDesc* query, PlanState* due)
+    {
+        int started = s_runStarted.GetValueOrDefault((nint)query);
+        if (started == 0 || query->estate is null || !Executor.CountsDraws)
+        {
+            return false;
+        }
+
+        if (!s_runFound.TryGetValue((nint)query, out (HashSet<nint> Found, int Looked) found))
+        {
+            found = ([], 0);
+        }
+
+        if (found.Looked == started)
+        {
+            return false;
+        }
+
+        ReadNextval();
+        ReadHookedCall();
+        if (s_hookedCall == 0)
+        {
+            return false;
+        }
+
+        RegisterEnd();
+        HookExit();
+        s_snowflake = Worf.CatalogOid("snowflake_node");
+        if (!s_planSites.TryGetValue((nint)query, out List<(int Site, nint Call, nint Information)>? sites))
+        {
+            sites = [];
+        }
+
+        foreach ((nint call, _, bool compiled) in RunCalls(query->estate))
+        {
+            if (compiled || !found.Found.Add(call))
+            {
+                continue;
+            }
+
+            ExprEvalStep* step = (ExprEvalStep*)call;
+            int site = GuardCall(step);
+            if (site >= 0)
+            {
+                sites.Add((site, (nint)step->d.func.finfo->fn_expr, (nint)step->d.func.fcinfo_data));
+            }
+        }
+
+        if (sites.Count > 0)
+        {
+            s_planSites[(nint)query] = sites;
+        }
+
+        s_runFound[(nint)query] = (found.Found, started);
+        if (found.Found.Count != started)
+        {
+            return false;
+        }
+
+        // A statement whose VALUES rows go to the client has its top node go on counting, which lets their gates go.
+        bool top = s_valuesRows.TryGetValue((nint)query, out (nint Memory, nint Node)[]? values) && values.Length > 0 && !RunKeepsGates((nint)query);
+        StopCountingRows(query, top);
+        if (top && due == query->planstate)
+        {
+            return false;
+        }
+
+        LetRunGates((nint)query);
+        return true;
+    }
+
+    // Finds the calls in the expression states the tables a running statement writes keep for their rows.
+    private static unsafe List<(nint Step, bool Single, bool Compiled)> RunCalls(EState* estate)
+    {
+        List<(nint Step, bool Single, bool Compiled)> calls = [];
+        HashSet<nint> seen = [];
+        for (int i = 0; estate->es_opened_result_relations is not null && i < estate->es_opened_result_relations->length; i++)
+        {
+            FindCalls((ResultRelInfo*)estate->es_opened_result_relations->elements[i].ptr_value, false, calls, seen);
+        }
+
+        for (int i = 0; estate->es_tuple_routing_result_relations is not null && i < estate->es_tuple_routing_result_relations->length; i++)
+        {
+            FindCalls((ResultRelInfo*)estate->es_tuple_routing_result_relations->elements[i].ptr_value, true, calls, seen);
+        }
+
+        for (int i = 0; estate->es_trig_target_relations is not null && i < estate->es_trig_target_relations->length; i++)
+        {
+            FindCalls((ResultRelInfo*)estate->es_trig_target_relations->elements[i].ptr_value, false, calls, seen);
+        }
+
+        return calls;
+    }
+
+    // Has a running statement's nodes count their rows down no more, but for its plan's top node where asked.
+    private static unsafe void StopCountingRows(QueryDesc* query, bool top)
+    {
+        if (!s_countedNodes.Remove((nint)query, out (uint Subxact, List<nint> Nodes) counted))
+        {
+            return;
+        }
+
+        void* counts = CountedRowCallback.DangerousGetAddress();
+        List<nint> kept = [];
+        foreach (nint counting in counted.Nodes)
+        {
+            if ((top && counting == (nint)query->planstate) || !s_runRows.Remove(counting) ||
+                !s_rowFunctions.Remove(counting, out (ExecProcNodeMtd Function, int Calls, IReadOnlyCollection<uint>? Named) row))
+            {
+                kept.Add(counting);
+                continue;
+            }
+
+            PlanState* node = (PlanState*)counting;
+            if (node->ExecProcNode.DangerousGetAddress() == counts)
+            {
+                node->ExecProcNode = row.Function;
+            }
+
+            node->ExecProcNodeReal = row.Function;
+        }
+
+        if (kept.Count > 0)
+        {
+            s_countedNodes[(nint)query] = (counted.Subxact, kept);
+        }
+
+        if (top && kept.Contains((nint)query->planstate))
+        {
+            _ = s_runTop.Add((nint)query);
+        }
+    }
+
+    // Lets go the gates a statement's run and the rows under way in it hold, as a row's start does those of its run.
+    private static void LetRunGates(nint queryDesc)
+    {
+        int run = s_scopes.Count - 1;
+        while (run >= 0 && (s_scopes[run].Kind != RunScope || s_scopes[run].Key != queryDesc))
+        {
+            run--;
+        }
+
+        if (run < 0 || s_scopeGates.Count <= s_scopes[run].First)
+        {
+            return;
+        }
+
+        int first = s_scopes[run].First;
+        for (int i = s_scopeGates.Count - 1; i >= first; i--)
+        {
+            if (s_unitGates.Contains(s_scopeGates[i]))
+            {
+                LetGate(s_scopeGates[i]);
+            }
+        }
+
+        s_scopeGates.RemoveRange(first, s_scopeGates.Count - first);
+        for (int i = run; i < s_scopes.Count; i++)
+        {
+            s_scopes[i] = s_scopes[i] with { First = Math.Min(s_scopes[i].First, first) };
         }
     }
 
@@ -2105,7 +2505,7 @@ internal static partial class SequenceRangeGuard
             return;
         }
 
-        bool compiled = (nint)state->evalfunc.DangerousGetAddress() != s_interpreted;
+        bool compiled = (state->flags & InterpreterInitialized) == 0;
         for (int i = 0; i < state->steps_len; i++)
         {
             if (CallsNextval(state, &state->steps[i]))
@@ -2475,7 +2875,7 @@ internal static partial class SequenceRangeGuard
     // constraints and trigger conditions of the tables it writes make for each row, at least one, from the first call
     // that starts as it runs on: nodes that have already produced a row run their own function, which the count takes the
     // place of too.
-    private static unsafe void CountRunningRows(nint queryDesc)
+    private static unsafe void CountRunningRows(nint queryDesc, nint valuesRow = 0)
     {
         QueryDesc* query = (QueryDesc*)queryDesc;
         if (query->plannedstmt is null || query->planstate is null)
@@ -2483,21 +2883,39 @@ internal static partial class SequenceRangeGuard
             return;
         }
 
+        // For a VALUES list's row, whose calls each start checks, the plan's top node alone counts, the rows the
+        // client reads; for any other call, every node does, those under a top node that counted alone too.
         List<nint> nodes = [];
-        CountRows(query->planstate, nodes, RunningRowCalls(queryDesc), running: true);
+        bool under = valuesRow == 0 && s_runTop.Remove(queryDesc);
+        CountRows(query->planstate, nodes, RunningRowCalls(queryDesc, valuesRow), running: true, under: under, alone: valuesRow != 0);
+        foreach (nint node in nodes)
+        {
+            s_runRows[node] = queryDesc;
+        }
+
+        if (valuesRow != 0)
+        {
+            _ = s_runTop.Add(queryDesc);
+        }
+
         if (nodes.Count > 0)
         {
             // A cursor's nodes, patched as a FETCH runs it in a savepoint, are its own as long as it is, so they're kept
             // by the subtransaction it was made in, which a rollback to the savepoint leaves, rather than the FETCH's.
             PortalData* portal = NativeGlobals.ActivePortal;
             RegisterCounted();
+            if (s_countedNodes.TryGetValue(queryDesc, out (uint Subxact, List<nint> Nodes) counted))
+            {
+                nodes.AddRange(counted.Nodes);
+            }
+
             s_countedNodes[queryDesc] = (portal is not null && portal->queryDesc == query ? portal->createSubid : NativeMethods.GetCurrentSubTransactionId(), nodes);
         }
     }
 
     // The calls of nextval a running statement's row may make as it starts them: those of the CHECK constraints and
     // trigger conditions of the tables it writes, or of a row of a VALUES list, at least one.
-    private static unsafe int RunningRowCalls(nint queryDesc)
+    private static unsafe int RunningRowCalls(nint queryDesc, nint valuesRow = 0)
     {
         QueryDesc* query = (QueryDesc*)queryDesc;
         if (query->plannedstmt is null || query->planstate is null)
@@ -2505,8 +2923,123 @@ internal static partial class SequenceRangeGuard
             return 1;
         }
 
+        // A call that starts in a VALUES list's row is one of that row's, which alone is read for its calls.
+        int row = 0;
+        if (valuesRow != 0)
+        {
+            ValuesScanState* values = (ValuesScanState*)valuesRow;
+            List* rows = values->ss.ps.plan is null ? null : ((ValuesScan*)values->ss.ps.plan)->values_lists;
+            row = rows is not null && values->curr_idx >= 0 && values->curr_idx < rows->length
+                ? Draws(PlanText((Node*)rows->elements[values->curr_idx].ptr_value)).Calls : ValuesRowCalls(query->planstate);
+        }
+        else if (!s_valuesRows.TryGetValue(queryDesc, out (nint Memory, nint Node)[]? lists) || lists.Length == 0)
+        {
+            // A VALUES list's calls count themselves as they start, so the statement's other rows count none for them.
+            row = ValuesRowCalls(query->planstate);
+        }
+
         long[] written = [.. Writing(query->plannedstmt).SelectMany(write => write.Written)];
-        return Math.Max(Math.Max(written.Length > 0 ? Draws(WrittenChecks(written)).Calls : 0, ValuesRowCalls(query->planstate)), 1);
+        return Math.Max(Math.Max(written.Length > 0 ? Draws(WrittenChecks(written)).Calls : 0, row), 1);
+    }
+
+    // The VALUES list of a running statement whose row's expressions PostgreSQL is building, as it does in the row's own
+    // memory, or zero.
+    private static unsafe nint ValuesRow(QueryDesc* query)
+    {
+        if (!s_valuesRows.TryGetValue((nint)query, out (nint Memory, nint Node)[]? rows))
+        {
+            List<(nint, nint)> lists = [];
+            ValuesRows(query->planstate, lists, []);
+            rows = [.. lists];
+            s_valuesRows[(nint)query] = rows;
+        }
+
+        if (rows.Length == 0)
+        {
+            return 0;
+        }
+
+        nint memory = (nint)NativeGlobals.CurrentMemoryContext;
+        foreach ((nint row, nint node) in rows)
+        {
+            if (row == memory)
+            {
+                return node;
+            }
+        }
+
+        return 0;
+    }
+
+    // Finds a plan's VALUES lists, through the nodes ValuesRowCalls reaches.
+    private static unsafe void ValuesRows(PlanState* node, List<(nint Memory, nint Node)> lists, HashSet<nint> seen)
+    {
+        if (node is null || !seen.Add((nint)node))
+        {
+            return;
+        }
+
+        ValuesRows(node->lefttree, lists, seen);
+        ValuesRows(node->righttree, lists, seen);
+        foreach (List* subplans in new[] { node->initPlan, node->subPlan })
+        {
+            for (int i = 0; subplans is not null && i < subplans->length; i++)
+            {
+                ValuesRows(((SubPlanState*)subplans->elements[i].ptr_value)->planstate, lists, seen);
+            }
+        }
+
+        switch (node->type)
+        {
+            case NodeTag.T_ValuesScanState when ((ValuesScanState*)node)->rowcontext is not null:
+                lists.Add(((nint)((ValuesScanState*)node)->rowcontext->ecxt_per_tuple_memory, (nint)node));
+                break;
+            case NodeTag.T_SubqueryScanState:
+                ValuesRows(((SubqueryScanState*)node)->subplan, lists, seen);
+                break;
+            case NodeTag.T_AppendState:
+                for (int i = 0; i < ((AppendState*)node)->as_nplans; i++)
+                {
+                    ValuesRows(((AppendState*)node)->appendplans[i], lists, seen);
+                }
+
+                break;
+            case NodeTag.T_MergeAppendState:
+                for (int i = 0; i < ((MergeAppendState*)node)->ms_nplans; i++)
+                {
+                    ValuesRows(((MergeAppendState*)node)->mergeplans[i], lists, seen);
+                }
+
+                break;
+            case NodeTag.T_CteScanState:
+                ValuesRows(((CteScanState*)node)->cteplanstate, lists, seen);
+                break;
+            default:
+                break;
+        }
+    }
+
+    // Whether a running statement's nodes are to start counting rows down for a call that starts as it runs: all of
+    // them where none does yet, or only the top one does, and for a VALUES list's row the top one alone, where none
+    // does and the client reads the rows.
+    private static bool RowsAreToCount(nint queryDesc, nint valuesRow)
+    {
+        bool counting = s_countedNodes.ContainsKey(queryDesc);
+        return valuesRow == 0 ? !counting || s_runTop.Contains(queryDesc) : !counting && !RunKeepsGates(queryDesc);
+    }
+
+    // Whether a statement's run keeps its rows' gates from row to row, as one whose rows no client reads does.
+    private static bool RunKeepsGates(nint queryDesc)
+    {
+        for (int i = s_scopes.Count - 1; i >= 0; i--)
+        {
+            if (s_scopes[i].Kind == RunScope && s_scopes[i].Key == queryDesc)
+            {
+                return s_scopes[i].Owner != 0;
+            }
+        }
+
+        return false;
     }
 
     // The most calls of nextval a row of a VALUES list in a plan makes, which it starts all as the row is reached, before
@@ -2589,6 +3122,7 @@ internal static partial class SequenceRangeGuard
             {
                 _ = s_rowFunctions.Remove(node);
                 _ = s_gatedRows.Remove(node);
+                _ = s_runRows.Remove(node);
             }
         }
     }
@@ -2647,6 +3181,12 @@ internal static partial class SequenceRangeGuard
             s_countedNodes.Clear();
             s_rowFunctions.Clear();
             s_gatedRows.Clear();
+            s_runRows.Clear();
+            s_runStarted.Clear();
+            s_runFound.Clear();
+            s_valuesRows.Clear();
+            s_runTop.Clear();
+            s_valuesRow = default;
         }
 
         ForgetGates();
@@ -4383,6 +4923,7 @@ internal static partial class SequenceRangeGuard
         nint simple;
         nint inUse;
         nint estate;
+        nint valuesRow = 0;
         WorfStartingStatement? starting = null;
         unsafe
         {
@@ -4405,6 +4946,24 @@ internal static partial class SequenceRangeGuard
         {
             starting = s_starting[^1];
             starting.Looked++;
+            if (starting.Running != 0)
+            {
+                unsafe
+                {
+                    valuesRow = ValuesRow((QueryDesc*)starting.Running);
+                    if (valuesRow != 0)
+                    {
+                        int row = ((ValuesScanState*)valuesRow)->curr_idx;
+                        s_valuesRow = s_valuesRow.Node == valuesRow && s_valuesRow.Row == row ? s_valuesRow with { Started = s_valuesRow.Started + 1 } : (valuesRow, row, 1);
+                    }
+                }
+
+                // A call of a VALUES list's row is checked as it starts and never runs again, so it isn't one to find.
+                if (valuesRow == 0)
+                {
+                    s_runStarted[starting.Running] = s_runStarted.GetValueOrDefault(starting.Running) + 1;
+                }
+            }
         }
 
         bool quiet;
@@ -4526,7 +5085,7 @@ internal static partial class SequenceRangeGuard
         // One whose sequence they don't name waits so only for a sequence whose block has fewer values left than a row's
         // calls take, as a row's draws from it would fail, and its rows count the others down as they're seen to draw
         // from them.
-        long rowDraws = switching.Count > 0 && starting is { Running: not 0 } running ? RunningRowCalls(running.Running) : 1;
+        long rowDraws = switching.Count > 0 && starting is { Running: not 0 } running ? RunningRowCalls(running.Running, valuesRow) : 1;
         long rowCalls = Math.Max(rowDraws, starting?.Draws.Calls ?? 1);
         if (!plpgsql && starting is not null)
         {
@@ -4557,18 +5116,22 @@ internal static partial class SequenceRangeGuard
         if (switching.Count > 0)
         {
             DrawUngated(switching);
+        }
 
-            // A statement whose calls first start as it runs, as those of a CHECK constraint or a trigger's WHEN
-            // condition do, which then run for each row, counts its rows down from then on.
-            if (starting is { Running: not 0 } && !s_countedNodes.ContainsKey(starting.Running))
-            {
-                CountRunningRows(starting.Running);
-            }
+        // A statement whose calls first start as it runs, as those of a CHECK constraint or a trigger's WHEN condition
+        // do, which then run for each row, counts its rows down from then on, until the calls are found in the states
+        // its tables keep, and again from a call that starts later, as a partition's does with its first row.
+        // A row of a VALUES list starts its calls anew, so each is checked as it starts and the rows need no count,
+        // unless the statement's rows go to the client, which may read them slowly: the plan's top node then counts
+        // them, which lets a row's gates go as it's produced.
+        if ((switching.Count > 0 || counted.Count > 0) && starting is { Running: not 0 } && RowsAreToCount(starting.Running, valuesRow))
+        {
+            CountRunningRows(starting.Running, valuesRow);
         }
 
         if (counted.Count > 0)
         {
-            CountDownDraws(1, anyOf ? [.. counted.Where(spelled.Contains)] : counted, unnamed: anyOf);
+            CountDownDraws(valuesRow != 0 ? s_valuesRow.Started : 1, anyOf ? [.. counted.Where(spelled.Contains)] : counted, unnamed: anyOf);
         }
     }
 
