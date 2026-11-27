@@ -13,8 +13,9 @@ namespace Worf;
 /// <param name="running">The statement running, as a QueryDesc, whose expressions start as it runs, or zero.</param>
 /// <param name="planned">Whether a statement's plan starts, whose rows the guard then counts.</param>
 /// <param name="compiles">Whether PostgreSQL compiles the plan's expressions with JIT, where it has a JIT provider.</param>
+/// <param name="copy">Whether the statement is a COPY FROM, whose tables' expressions start as its rows come.</param>
 internal sealed class WorfStartingStatement(Func<(HashSet<uint> Called, int Calls, bool Unnamed)> draws, nint context, bool explained,
-    Func<string?>? text = null, nint running = 0, bool planned = false, bool compiles = false)
+    Func<string?>? text = null, nint running = 0, bool planned = false, bool compiles = false, bool copy = false)
 {
     private (HashSet<uint> Called, int Calls, bool Unnamed)? _draws;
     private string? _text;
@@ -38,6 +39,41 @@ internal sealed class WorfStartingStatement(Func<(HashSet<uint> Called, int Call
     /// Gets or sets how many of the calls PostgreSQL has compiled to go through the fmgr hook.
     /// </summary>
     internal int Hooked { get; set; }
+
+    /// <summary>
+    /// Gets a value indicating whether the statement is a COPY FROM.
+    /// </summary>
+    internal bool Copy { get; } = copy;
+
+    /// <summary>
+    /// Gets or sets the executor state a COPY FROM writes its rows with, once one of its tables' calls has started.
+    /// </summary>
+    internal nint CopyState { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether a COPY FROM's next row is to look for the calls that started with the
+    /// one before.
+    /// </summary>
+    internal bool CopyWatched { get; set; }
+
+    /// <summary>
+    /// Gets or sets PostgreSQL's own state of a COPY FROM, once the calls of its condition and of the domains its
+    /// columns hold go through the guard, which its next rows then look for too.
+    /// </summary>
+    internal nint CopyRead { get; set; }
+
+    /// <summary>
+    /// Gets the calls of a COPY FROM that the guard has found so far.
+    /// </summary>
+    internal HashSet<nint> CopyCalls { get; } = [];
+
+    /// <summary>
+    /// Gets or sets what a call that started in a VALUES list's row came to, once one waited for nothing and switched
+    /// nothing: the sequences its start counts down, whether its row names none, and what the guard had read then,
+    /// its blocks' changes, its own changes, the sequences drawn from without their gates and those the statement
+    /// switched. While none of that has changed, the row's next calls come to the same.
+    /// </summary>
+    internal (uint[] Counted, bool Unnamed, long Changes, long Local, int Ungated, int Switched)? Settled { get; set; }
 
     /// <summary>
     /// Gets a value indicating whether PostgreSQL compiles the plan's expressions with JIT, where it has a JIT provider.

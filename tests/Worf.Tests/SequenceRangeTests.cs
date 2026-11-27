@@ -5103,8 +5103,9 @@ public sealed partial class SequenceRangeTests
             await nodeA.SafePsqlAsync(Database, "SET jit = on; SELECT pg_jit_available()", token));
         foreach ((string place, _) in s_places)
         {
-            // A VALUES list's statement, most of whose time goes to reading its 5,000 rows, took 2.3 times as long.
-            bool values = place.Contains("VALUES", StringComparison.Ordinal);
+            // A VALUES list's statement, most of whose time goes to reading its 5,000 rows, took 2.3 times as long, and
+            // one over several functions of ROWS FROM, most of whose time goes to the functions' rows, 1.9 times (2801).
+            bool values = place.Contains("VALUES", StringComparison.Ordinal) || place.Contains("ROWS FROM", StringComparison.Ordinal);
             Assert.IsLessThan(took[$"plain in {place}"] * (values ? 1.5 : 2), took[$"managed in {place}"],
                 $"the fastest 8 of 12 statements that draw from a managed sequence at each row, in {place}, against {took[$"plain in {place}"]} from a plain one");
         }
@@ -5120,6 +5121,8 @@ public sealed partial class SequenceRangeTests
         ("a table's CHECK constraint", "WITH rows AS (INSERT INTO checked_{0} SELECT g FROM generate_series(1, 20000) g RETURNING 1) SELECT count(*) FROM rows"),
         ("the rows of a VALUES list", $"SELECT count(*) FROM (VALUES {string.Join(", ", Enumerable.Repeat("(nextval('{0}'))", 5000))}) v"),
         ("the rows of a VALUES list it inserts", $"INSERT INTO valued VALUES {string.Join(", ", Enumerable.Repeat("(nextval('{0}'))", 5000))}"),
+        ("one of several functions of ROWS FROM",
+            "SELECT count(*) FROM generate_series(1, 20000) g, LATERAL ROWS FROM (generate_series(g, g + (nextval('{0}') % 1)::int), generate_series(1, 1)) r"),
     ];
 
     /// <summary>
@@ -5168,6 +5171,8 @@ public sealed partial class SequenceRangeTests
             ("a subquery's test", $"SELECT count(*) FROM generate_series(1, 1) g WHERE {Draw} NOT IN (SELECT 0::bigint)"),
             ("the arguments of a function in FROM", $"SELECT count(*) FROM generate_series(1, 1) a, LATERAL generate_series(a, a + 0 * ({Draw})) b"),
             ("the arguments of a function in the select list", $"SELECT count(*) FROM (SELECT generate_series(1, 1 + 0 * ({Draw})) FROM generate_series(1, 1)) q"),
+            ("the arguments of one of several functions of ROWS FROM (2801)",
+                $"SELECT count(*) FROM generate_series(1, 1) g, LATERAL ROWS FROM (generate_series(1, 1), generate_series(g, g + 0 * ({Draw}))) r"),
             ("a LIMIT", $"SELECT count(*) FROM (SELECT g FROM generate_series(1, 3) g LIMIT {Draw}) q"),
             ("a TABLESAMPLE's argument", $"SELECT count(*) FROM sink TABLESAMPLE BERNOULLI (50 + 0 * ({Draw}))"),
             ("an ordered-set aggregate's direct argument", $"SELECT percentile_disc((0.5 + 0 * ({Draw}))::float8) WITHIN GROUP (ORDER BY g) FROM generate_series(1, 3) g"),
@@ -5347,6 +5352,243 @@ public sealed partial class SequenceRangeTests
         Assert.HasCount(250, read.Distinct(), "the values the VALUES list read drew, all different");
         Assert.AreEqual($"{rows}|{rows}", await nodeA.SafePsqlAsync(Database, "SELECT count(*), count(DISTINCT id) FROM t1", token),
             "the rows inserted beside them, and their ids that differ");
+    }
+
+    /// <summary>
+    /// A COPY into a table none of whose defaults draw waits for the switches of the calls its rows make all the same
+    /// (2800): those of a CHECK constraint, of one with two calls, of two partitions' CHECK constraints, of the WHEN
+    /// conditions of triggers that fire before and after a row, the latter in a COPY with a condition and over two
+    /// partitions too, of the CHECK constraint of a column's domain, in a COPY with a condition that leaves rows out
+    /// too, of that of the domain a column holds an array, a row, a range or a multirange of, one of them in a column
+    /// whose first rows are null, so that its call starts late, and of the COPY's own WHERE condition, which names its
+    /// sequence or works the name out. Three copies of 300 rows each, in sessions of their own, draw from blocks of
+    /// 100. The table's first row starts such a call, and worf checked only that start, so each COPY failed at its
+    /// block's end, "reached maximum value of sequence", while an INSERT of the same rows went through. worf reads
+    /// PostgreSQL's own state of the COPY to reach those calls, which differs by version, so the test runs on every
+    /// one.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [TestCategory("EveryVersion")]
+    public async Task CopiesWaitForTheSwitchesOfTheCallsTheirTablesStart()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE SEQUENCE s1;
+            CREATE TABLE checked (v int CHECK (nextval('s1') > 0));
+            CREATE TABLE twice (v int CHECK (nextval('s1') + nextval('s1') > 0));
+            CREATE TABLE parted (k int) PARTITION BY RANGE (k);
+            CREATE TABLE parted_low PARTITION OF parted (CHECK (nextval('s1') > 0)) FOR VALUES FROM (1) TO (151);
+            CREATE TABLE parted_high PARTITION OF parted (CHECK (nextval('s1') > 0)) FOR VALUES FROM (151) TO (999);
+            CREATE FUNCTION kept() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;
+            CREATE TABLE before (v int);
+            CREATE TRIGGER kept BEFORE INSERT ON before FOR EACH ROW WHEN (nextval('s1') > 0) EXECUTE FUNCTION kept();
+            CREATE TABLE after (v int);
+            CREATE TRIGGER kept AFTER INSERT ON after FOR EACH ROW WHEN (nextval('s1') < 0) EXECUTE FUNCTION kept();
+            CREATE DOMAIN drawing AS int CHECK (nextval('s1') > 0);
+            CREATE TABLE of_domain (v drawing);
+            CREATE TABLE of_domain_where (v drawing);
+            CREATE TABLE of_domains (v drawing[]);
+            CREATE TABLE of_domains_late (v drawing[]);
+            CREATE TYPE holding AS (held drawing, beside int);
+            CREATE TABLE of_rows (v holding);
+            CREATE TYPE spans AS RANGE (subtype = drawing);
+            CREATE TABLE of_ranges (v spans);
+            CREATE TABLE of_multiranges (v spans_multirange);
+            CREATE TABLE plain_rows (v int);
+            CREATE TABLE plain_rows_named_late (v int);
+            CREATE TABLE after_where (v int);
+            CREATE TRIGGER kept AFTER INSERT ON after_where FOR EACH ROW WHEN (nextval('s1') < 0) EXECUTE FUNCTION kept();
+            CREATE TABLE after_parted (k int) PARTITION BY RANGE (k);
+            CREATE TABLE after_parted_low PARTITION OF after_parted FOR VALUES FROM (1) TO (151);
+            CREATE TABLE after_parted_high PARTITION OF after_parted FOR VALUES FROM (151) TO (999);
+            CREATE TRIGGER kept AFTER INSERT ON after_parted FOR EACH ROW WHEN (nextval('s1') < 0) EXECUTE FUNCTION kept();
+            SELECT worf.enable_sequence_range('s1', participants := '{}', range_size := 100, max_range_size := 100);
+            """, token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges", token),
+            "node_a drawing from a block of s1, with the next one ready");
+        List<string> failed = [];
+        (string Table, string What)[] tables =
+        [
+            ("checked", "a CHECK constraint"), ("twice", "a CHECK constraint with two calls"), ("parted", "two partitions' CHECK constraints"),
+            ("before", "the WHEN condition of a trigger before the row"), ("after", "the WHEN condition of a trigger after the row"),
+            ("of_domain", "the CHECK constraint of a column's domain"), ("plain_rows", "the COPY's own WHERE condition"),
+            ("after_where", "the WHEN condition of a trigger after the row, in a COPY with a WHERE condition"),
+            ("after_parted", "the WHEN condition of a trigger after the rows of two partitions"),
+            ("of_domain_where", "the CHECK constraint of a column's domain, in a COPY with a WHERE condition"),
+            ("of_domains", "the CHECK constraint of the domain a column holds an array of"),
+            ("of_domains_late", "the CHECK constraint of the domain a column holds an array of, after rows that hold none"),
+            ("of_rows", "the CHECK constraint of the domain a column holds a row of"),
+            ("of_ranges", "the CHECK constraint of the domain a column holds a range of"),
+            ("of_multiranges", "the CHECK constraint of the domain a column holds a multirange of"),
+            ("plain_rows_named_late", "the COPY's own WHERE condition, which works out its sequence's name"),
+        ];
+        Dictionary<string, string> conditions = new()
+        {
+            ["plain_rows"] = " WHERE nextval('s1') > 0", ["after_where"] = " WHERE v > 0", ["of_domain_where"] = " WHERE v <= 250",
+            ["plain_rows_named_late"] = " WHERE nextval(('s' || '1')::regclass) > 0",
+        };
+        Dictionary<string, Func<int, string>> shapes = new()
+        {
+            ["of_domains"] = row => $"{{{row}}}", ["of_domains_late"] = row => row <= 20 ? "\\N" : $"{{{row}}}", ["of_rows"] = row => $"({row},1)",
+            ["of_ranges"] = row => $"[{row},{row}]", ["of_multiranges"] = row => $"{{[{row},{row}]}}",
+        };
+        foreach ((string table, string what) in tables)
+        {
+            for (int copy = 1; copy <= 3 && !failed.Exists(failure => failure.StartsWith(what, StringComparison.Ordinal)); copy++)
+            {
+                try
+                {
+                    await using NpgsqlConnection connection = await nodeA.OpenAsync(Database, token);
+                    await using TextWriter rows = await connection.BeginTextImportAsync(
+                        $"COPY {table} FROM STDIN{conditions.GetValueOrDefault(table, "")}", token);
+                    for (int row = 1; row <= 300; row++)
+                    {
+                        await rows.WriteLineAsync(shapes.TryGetValue(table, out Func<int, string>? shape) ? shape(row) : row.ToString(CultureInfo.InvariantCulture));
+                    }
+                }
+                catch (PostgresException failure)
+                {
+                    failed.Add($"{what}, copy {copy}: {failure.SqlState} {failure.MessageText}");
+                }
+            }
+        }
+
+        Assert.IsEmpty(failed, $"the copies that failed: {string.Join("; ", failed)}");
+        Assert.AreEqual("900|900|900|900|900|900|900|900|900|750|900|900|900|900|900|900", await nodeA.SafePsqlAsync(Database, """
+            SELECT (SELECT count(*) FROM checked), (SELECT count(*) FROM twice), (SELECT count(*) FROM parted), (SELECT count(*) FROM before),
+                (SELECT count(*) FROM after), (SELECT count(*) FROM of_domain), (SELECT count(*) FROM plain_rows), (SELECT count(*) FROM after_where),
+                (SELECT count(*) FROM after_parted), (SELECT count(*) FROM of_domain_where), (SELECT count(*) FROM of_domains),
+                (SELECT count(*) FROM of_domains_late), (SELECT count(*) FROM of_rows), (SELECT count(*) FROM of_ranges),
+                (SELECT count(*) FROM of_multiranges), (SELECT count(*) FROM plain_rows_named_late)
+            """, token), "the rows copied into each table, of which one COPY's condition leaves 50 out each time");
+    }
+
+    /// <summary>
+    /// A COPY whose rows draw from a managed sequence, through a CHECK constraint, two partitions' CHECK constraints,
+    /// the WHEN condition of a trigger after the row, a column's domain, the domain a column holds rows of arrays of, or
+    /// its own WHERE condition, costs what it costs over a plain sequence: once worf has found the calls, each draws as
+    /// a statement's does. The fastest 8 of
+    /// 12 copies of 20,000 rows take less than 1.5 times as long, where a COPY that checks its sequences for each row
+    /// takes more than 10 times. The server reads the rows from a file, and the test runs alone, as other tests' load
+    /// hides the difference.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [DoNotParallelize]
+    public async Task CopiesThatDrawCostWhatPlainOnesDo()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        string[] sequences = ["s1", "plain_s"];
+        _ = await nodeA.SafePsqlAsync(Database, "CREATE SEQUENCE s1; CREATE SEQUENCE plain_s; CREATE FUNCTION kept() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$", token);
+        foreach (string sequence in sequences)
+        {
+            _ = await nodeA.SafePsqlAsync(Database, $"""
+                CREATE TABLE checked_{sequence} (v int CHECK (nextval('{sequence}') > 0));
+                CREATE TABLE parted_{sequence} (v int) PARTITION BY RANGE (v);
+                CREATE TABLE parted_{sequence}_low PARTITION OF parted_{sequence} (CHECK (nextval('{sequence}') > 0)) FOR VALUES FROM (1) TO (10001);
+                CREATE TABLE parted_{sequence}_high PARTITION OF parted_{sequence} (CHECK (nextval('{sequence}') > 0)) FOR VALUES FROM (10001) TO (99999);
+                CREATE TABLE after_{sequence} (v int);
+                CREATE TRIGGER kept AFTER INSERT ON after_{sequence} FOR EACH ROW WHEN (nextval('{sequence}') < 0) EXECUTE FUNCTION kept();
+                CREATE DOMAIN drawing_{sequence} AS int CHECK (nextval('{sequence}') > 0);
+                CREATE TABLE of_domain_{sequence} (v drawing_{sequence});
+                CREATE TYPE holding_{sequence} AS (held drawing_{sequence}[], beside int);
+                CREATE TABLE of_rows_{sequence} (v holding_{sequence});
+                CREATE TABLE plain_rows_{sequence} (v int);
+                """, token);
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('s1', participants := '{}', range_size := 100000000)", token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges WHERE sequence = 's1'::regclass", token),
+            "node_a drawing from a block of s1");
+        string file = Path.Join(nodeA.Cluster.DataDirectory, "copied_rows.txt");
+        string held = Path.Join(nodeA.Cluster.DataDirectory, "copied_held_rows.txt");
+        await File.WriteAllLinesAsync(file, Enumerable.Range(1, 20000).Select(row => row.ToString(CultureInfo.InvariantCulture)), token);
+        await File.WriteAllLinesAsync(held, Enumerable.Range(1, 20000).Select(row => $"(\"{{{row}}}\",1)"), token);
+        (string Table, string Condition, string What)[] forms =
+        [
+            ("checked", "", "a CHECK constraint"), ("parted", "", "two partitions' CHECK constraints"),
+            ("after", "", "the WHEN condition of a trigger after the row"), ("of_domain", "", "the CHECK constraint of a column's domain"),
+            ("of_rows", "", "the CHECK constraint of the domain a column holds rows of arrays of"),
+            ("plain_rows", " WHERE nextval('{0}') > 0", "the COPY's own WHERE condition"),
+        ];
+        await using NpgsqlConnection connection = await nodeA.OpenAsync(Database, token);
+        foreach ((string table, string condition, string what) in forms)
+        {
+            Dictionary<string, List<TimeSpan>> times = new() { ["s1"] = [], ["plain_s"] = [] };
+            for (int i = 0; i < 14; i++)
+            {
+                foreach (string sequence in i % 2 == 0 ? sequences : [.. sequences.Reverse()])
+                {
+                    string copy = $"COPY {table}_{sequence} FROM '{(table == "of_rows" ? held : file)}'{condition.Replace("{0}", sequence, StringComparison.Ordinal)}";
+                    await using (NpgsqlCommand run = new(copy, connection) { CommandTimeout = 120 })
+                    {
+                        Stopwatch timing = Stopwatch.StartNew();
+                        _ = await run.ExecuteNonQueryAsync(token);
+                        timing.Stop();
+                        if (i >= 2)
+                        {
+                            times[sequence].Add(timing.Elapsed);
+                        }
+                    }
+
+                    await ExecuteAsync(connection, $"TRUNCATE {table}_{sequence}", token);
+                }
+            }
+
+            TimeSpan Fastest(string sequence) => TimeSpan.FromTicks(times[sequence].Order().Take(8).Sum(time => time.Ticks));
+            Assert.IsLessThan(Fastest("plain_s") * 1.5, Fastest("s1"),
+                $"the fastest 8 of 12 copies of 20,000 rows that draw from a managed sequence through {what}, against {Fastest("plain_s")} from a plain one");
+        }
+    }
+
+    /// <summary>
+    /// The rows of a VALUES list that call nextval cost what they cost in a database without worf (2802): a list of
+    /// 5,000 rows over a plain sequence, in a database with worf and a managed sequence, takes less than 1.3 times what
+    /// it takes in a database of the same server that has neither, where it took 1.6 times. worf read the whole list's
+    /// text, to tell the sequences its calls name, and worked out each call's start anew. Each database's fastest 8 of 12
+    /// runs count, and the test runs alone, as other tests' load hides the difference.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [DoNotParallelize]
+    public async Task ValuesRowsThatDrawCostWhatTheyDoWithoutWorf()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE SEQUENCE s1; CREATE SEQUENCE plain_s;
+            SELECT worf.enable_sequence_range('s1', participants := '{}', range_size := 100000000);
+            """, token);
+        _ = await nodeA.SafePsqlAsync(Database, "CREATE DATABASE bare", token);
+        _ = await nodeA.SafePsqlAsync("bare", "CREATE SEQUENCE plain_s", token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges WHERE sequence = 's1'::regclass", token),
+            "node_a drawing from a block of s1");
+        string list = $"SELECT count(*) FROM (VALUES {string.Join(", ", Enumerable.Repeat("(nextval('plain_s'))", 5000))}) q";
+        await using NpgsqlConnection with = await nodeA.OpenAsync(Database, token);
+        await using NpgsqlConnection without = await nodeA.OpenAsync("bare", token);
+        Dictionary<NpgsqlConnection, List<TimeSpan>> times = new() { [with] = [], [without] = [] };
+        NpgsqlConnection[][] orders = [[with, without], [without, with]];
+        for (int i = 0; i < 14; i++)
+        {
+            foreach (NpgsqlConnection connection in orders[i % 2])
+            {
+                await using NpgsqlCommand run = new(list, connection) { CommandTimeout = 120 };
+                Stopwatch timing = Stopwatch.StartNew();
+                _ = await run.ExecuteScalarAsync(token);
+                timing.Stop();
+                if (i >= 2)
+                {
+                    times[connection].Add(timing.Elapsed);
+                }
+            }
+        }
+
+        TimeSpan Fastest(NpgsqlConnection connection) => TimeSpan.FromTicks(times[connection].Order().Take(8).Sum(time => time.Ticks));
+        Assert.IsLessThan(Fastest(without) * 1.3, Fastest(with),
+            $"the fastest 8 of 12 lists of 5,000 rows that draw from a plain sequence in a database with worf, against {Fastest(without)} in one without");
     }
 
     /// <summary>

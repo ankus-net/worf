@@ -403,7 +403,7 @@ internal static unsafe partial class Executor
         bool copying = parsetree->type == NodeTag.T_CopyStmt && ((CopyStmt*)parsetree)->is_from && ((CopyStmt*)parsetree)->relation is not null;
         uint copied = copying ? NativeMethods.RangeVarGetRelidExtended(((CopyStmt*)parsetree)->relation, 0, RangeVarMissingOk, default, null) : 0;
         string copyCondition = copied != 0 ? SequenceRangeGuard.CopyConditionText(copied, ((CopyStmt*)parsetree)->whereClause) : "";
-        Node* check = copying ? SequenceRangeGuard.CopyCondition(copied) : null;
+        Node* check = copying ? SequenceRangeGuard.CopyCondition(copied, copyCondition) : null;
         if (check is not null)
         {
             if (readOnlyTree)
@@ -949,6 +949,13 @@ internal static unsafe partial class Executor
     private static (nint Function, nint Address) s_hookedTrigger;
     private static nint s_hookedTriggerAddress;
     private static Exception? s_hookFailure;
+
+    /// <summary>
+    /// Notes a failure of worf's own in code PostgreSQL calls straight, which lets no exception out, for the next
+    /// statement that starts to report.
+    /// </summary>
+    /// <param name="failure">The failure.</param>
+    internal static void NoteHookFailure(Exception failure) => s_hookFailure ??= failure;
 
     [PgNativeCallback(nameof(HookedTrigger))]
     private static partial PGFunction HookedTriggerCallback { get; }
