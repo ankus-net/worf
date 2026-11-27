@@ -1145,6 +1145,14 @@ internal static class SequenceRangeExchange
     internal static void WithTurn(Action work) => WorfLocks.WithTurn(work);
 
     /// <summary>
+    /// Runs such work in a subtransaction, for a caller that tries again when a lock the work waits for only a moment
+    /// isn't free: the turn is let go once the subtransaction has rolled back, so that the node's exchanges go on
+    /// between the tries.
+    /// </summary>
+    /// <param name="work">The work, which waits on no other node.</param>
+    internal static void WithTurnInSubtransaction(Action work) => WorfLocks.WithTurnInSubtransaction(work);
+
+    /// <summary>
     /// Gets the furthest WAL position of the provider whose changes this node has applied through a subscription, under
     /// the subscription's origin or one of its relay origins. Replication origins record it with each commit, so it
     /// survives a restart or crash of this node, and an idle provider never moves it. Before its first commit, a

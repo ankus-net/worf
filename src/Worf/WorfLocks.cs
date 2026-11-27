@@ -30,21 +30,109 @@ internal static class WorfLocks
     }
 
     /// <summary>
-    /// Runs work in the node's exchange turn, held for the session and let go as the work ends, however it ends, as a
-    /// cancel such as statement_timeout's ends it, rather than as the transaction does, which a session lock outlives.
+    /// Runs work in the node's exchange turn, held for the session and let go as the work ends, however it ends, rather
+    /// than as the transaction does, which a session lock outlives. Work that fails may leave PostgreSQL out of reach as
+    /// it ends: within a subtransaction until that has rolled back, and after a cancel, such as statement_timeout's,
+    /// until the statement has ended. The turn is then owed, and let go as the subtransaction or the transaction ends,
+    /// or before the next turn is taken.
     /// </summary>
     /// <param name="work">The work.</param>
-    internal static unsafe void WithTurn(Action work)
+    internal static void WithTurn(Action work)
     {
-        LOCKTAG turn = Tag(0, TurnKey);
-        _ = NativeMethods.LockAcquire(&turn, ExclusiveLock, true, false);
+        TakeTurnForSession();
         try
         {
             work();
         }
         finally
         {
+            s_turnsOwed++;
+            LeaveTurns();
+        }
+    }
+
+    /// <summary>
+    /// Runs work in a subtransaction, in the node's exchange turn, for a caller that tries again when the work fails:
+    /// the turn is taken within the subtransaction, so that a wait for it that fails is one more try, and let go once
+    /// the subtransaction has ended, as PostgreSQL takes no call from one that failed until it has rolled back.
+    /// </summary>
+    /// <param name="work">The work.</param>
+    internal static void WithTurnInSubtransaction(Action work)
+    {
+        bool taken = false;
+        try
+        {
+            PgTransaction.RunInSubtransaction(() =>
+            {
+                TakeTurnForSession();
+                taken = true;
+                work();
+            });
+        }
+        finally
+        {
+            if (taken)
+            {
+                s_turnsOwed++;
+                LeaveTurns();
+            }
+        }
+    }
+
+    // The turns this session took whose work has ended, and whether this transaction's end lets them go.
+    private static int s_turnsOwed;
+    private static bool s_turnEnds;
+
+    // Takes the node's exchange turn for the session, once the turns owed are let go.
+    private static unsafe void TakeTurnForSession()
+    {
+        LeaveTurns();
+        if (!s_turnEnds)
+        {
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Commit, static () => EndTurns(false));
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Prepare, static () => EndTurns(false));
+            _ = PgTransaction.RegisterCallback(PgTransactionEvent.Abort, static () => EndTurns(true));
+            _ = PgTransaction.RegisterSubtransactionCallback(PgSubtransactionEvent.Abort, static (_, _) => EndTurns(false, true));
+            s_turnEnds = true;
+        }
+
+        LOCKTAG turn = Tag(0, TurnKey);
+        _ = NativeMethods.LockAcquire(&turn, ExclusiveLock, true, false);
+    }
+
+    // Lets go the turns whose work has ended. Each is counted as owed until PostgreSQL has let it go.
+    private static unsafe void LeaveTurns()
+    {
+        while (s_turnsOwed > 0)
+        {
+            LOCKTAG turn = Tag(0, TurnKey);
             _ = NativeMethods.LockRelease(&turn, ExclusiveLock, true);
+            s_turnsOwed--;
+        }
+    }
+
+    // Lets the turns owed go as a subtransaction rolls back or the transaction ends. An abort of the transaction lets
+    // go every lock of the session's but those of pg_advisory_lock, so nothing is owed after it.
+    private static void EndTurns(bool aborted, bool subtransaction = false)
+    {
+        if (!subtransaction)
+        {
+            s_turnEnds = false;
+        }
+
+        if (aborted)
+        {
+            s_turnsOwed = 0;
+            return;
+        }
+
+        try
+        {
+            LeaveTurns();
+        }
+        catch (PgException failed)
+        {
+            WorfLog.Warning($"could not let the node's exchange turn go: {failed.Message}");
         }
     }
 

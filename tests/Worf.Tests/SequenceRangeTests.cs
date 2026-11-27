@@ -2065,6 +2065,103 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// A forced lift that finds the sequence held, here by a transaction that changed its comment, tries again until
+    /// the sequence is free. It holds the node's exchange turn only as it tries, not through its waits between, and
+    /// not once it's done: PostgreSQL takes no call from a try that failed until its subtransaction has rolled back,
+    /// so a turn that the try let go as it ended stayed the session's. The node's exchanges then waited for the
+    /// session to end, and the session's end stopped a server built with assertions, as it left a lock behind.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task LiftsThatTryAgainLetTheTurnGo()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        await using TestNode nodeB = await StartNodeAsync("node_b", token);
+        foreach (TestNode node in new[] { nodeA, nodeB })
+        {
+            _ = await node.SafePsqlAsync(Database, """
+                CREATE TABLE t (id bigserial PRIMARY KEY, v text);
+                SELECT * FROM worf.replication_set_add_table('default', 't');
+                """, token);
+        }
+
+        await SubscribeAsync(nodeA, "a_from_b", nodeB, token);
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 1000)", token);
+        await WaitActiveAsync([nodeA, nodeB], token);
+
+        // node_a's ledger comes to hold a grant to itself over node_b's active block, and node_a resets, so its fence
+        // finds the grants overlapping once node_b reports, and a forced lift resets node_a, which alters the sequence.
+        string nodeBId = await nodeB.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
+        string activeB = await nodeB.SafePsqlAsync(Database, "SELECT active_lo FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token);
+        int logB = nodeB.ReadLog().Length;
+        _ = await nodeA.SafePsqlAsync(Database, $"""
+            INSERT INTO worf.sequence_range_grant (grant_id, request_id, seqoid, grantee_id, grantee_name, kind, lo, hi, state, granted_at)
+            SELECT gen_random_uuid(), gen_random_uuid(), g.seqoid, n.node_id, n.node_name, g.kind, g.lo, g.hi, 'acknowledged', now()
+            FROM worf.sequence_range_grant g CROSS JOIN worf.local_node l JOIN worf.node n ON n.node_id = l.node_id
+            WHERE g.seqoid = 't_id_seq'::regclass AND g.grantee_id = {nodeBId} AND g.lo = {activeB};
+            SELECT worf.reset_sequence_range('t_id_seq');
+            """, token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database,
+            "SELECT coalesce(detail, '') LIKE '%overlap%' FROM worf.sequence_range WHERE seqoid = 't_id_seq'::regclass AND fenced_at IS NOT NULL", token),
+            "node_a's fence held by the overlap");
+
+        await using NpgsqlConnection holder = await nodeA.OpenAsync(Database, token);
+        await using NpgsqlConnection lifter = await nodeA.OpenAsync(Database, token);
+        string lifterPid;
+        await using (NpgsqlCommand own = new("SELECT pg_backend_pid()", lifter))
+        {
+            lifterPid = Convert.ToString(await own.ExecuteScalarAsync(token), CultureInfo.InvariantCulture)!;
+        }
+
+        // The turn shows in pg_locks as an advisory lock of the database with objsubid 5. The lift's session sleeps a
+        // tenth of a second between its tries, which pg_stat_activity shows as a wait of an extension's.
+        string turns = $"SELECT count(*) FROM pg_locks WHERE pid = {lifterPid} AND locktype = 'advisory' AND objsubid = 5 AND granted";
+        string look = $"""
+            SELECT coalesce((a.wait_event_type = 'Extension')::int, 0) || '|' || ({turns})
+            FROM pg_stat_activity a WHERE a.pid = {lifterPid}
+            """;
+        await ExecuteAsync(holder, "BEGIN; COMMENT ON SEQUENCE t_id_seq IS 'held'", token);
+        Task lifting = ExecuteAsync(lifter, "SELECT worf.activate_sequence_range('t_id_seq')", token);
+        int asleep = 0;
+        int held = 0;
+        for (int looks = 0; looks < 40; looks++)
+        {
+            await Task.Delay(50, token);
+            string[] found = (await nodeA.SafePsqlAsync(Database, look, token)).Split('|');
+            asleep += found[0] == "1" ? 1 : 0;
+            held += found[0] == "1" && found[1] != "0" ? 1 : 0;
+        }
+
+        bool waited = !lifting.IsCompleted;
+        await ExecuteAsync(holder, "ROLLBACK", token);
+        await lifting;
+        Assert.IsTrue(waited, "the lift waiting for the sequence's holder");
+
+        // A turn kept from a try that failed showed at every look between the tries.
+        Assert.IsGreaterThan(4, asleep, "the looks, of 40 as the lift waited, that found its session between two tries");
+        Assert.IsLessThan(asleep, held * 2, $"the looks, of the {asleep} that found the lift's session between two tries, that found it holding the node's turn");
+        Assert.AreEqual("0", await nodeA.SafePsqlAsync(Database, turns, token), "the turns the lift's session holds once the lift is done");
+
+        // The session stays, and the node's exchanges go on: node_b hears of the lift, resets, and draws from a new block.
+        Assert.IsTrue(await nodeB.PollLogAsync(logB, "node node_a lifted a fence over grants of this node's that overlap another's", token),
+            "node_b's reset on the lift");
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database,
+            $"SELECT state = 'active' AND active_lo IS NOT NULL AND active_lo <> {activeB} FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass", token),
+            "node_b drawing from a block granted after its reset on the lift");
+        await WaitActiveAsync([nodeA, nodeB], token);
+
+        // The session ends holding nothing, so the server goes on.
+        int ended = nodeA.ReadLog().Length;
+        await lifter.CloseAsync();
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, $"SELECT NOT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = {lifterPid})", token),
+            "the lift's session gone");
+        Assert.DoesNotContain("terminated by signal", nodeA.ReadLog()[ended..], "node_a's log as the lift's session ended");
+        await AssertNoSharedValuesAsync([nodeA, nodeB], token);
+    }
+
+    /// <summary>
     /// A session that ends while it waits for a switch, as one terminated, leaves no count of it behind: the range worker
     /// switches the block it waited on, and then leaves the next one alone until it runs low.
     /// </summary>
@@ -4953,7 +5050,8 @@ public sealed partial class SequenceRangeTests
     /// from a plain sequence, which runs without a call into worf (2301, 2501), and so does one that also adds at every
     /// turn, a statement that draws nothing (2500), and one whose call names its sequence, managed or plain, with a
     /// variable (2601). So does a statement that draws at each of its rows, an aggregate over 100,000 rows, which
-    /// took 7.8 times as long. worf counts each draw within PostgreSQL's own call of nextval, where it took a call
+    /// took 7.8 times as long, and one that PostgreSQL marks for JIT, whether the server has a JIT provider and
+    /// compiles it or has none. worf counts each draw within PostgreSQL's own call of nextval, where it took a call
     /// into worf at every statement, at every call that a variable named, or before each row. Loops of 100,000
     /// turns alternate, each in a transaction of its own, the first two of each warm up, and each one's fastest 8 of
     /// the 12 that follow count. The test runs alone, as other tests' load hides the difference.
@@ -4975,6 +5073,8 @@ public sealed partial class SequenceRangeTests
             ("plain, named by a variable", false, "DECLARE s regclass := 'plain_s'; BEGIN FOR i IN 1..100000 LOOP x := nextval(s); END LOOP; END"),
             ("managed rows", false, "SELECT count(nextval('s1')) FROM generate_series(1, 100000)"),
             ("plain rows", false, "SELECT count(nextval('plain_s')) FROM generate_series(1, 100000)"),
+            ("managed rows, marked for JIT", false, "SELECT count(nextval('s1')) FROM generate_series(1, 100000)"),
+            ("plain rows, marked for JIT", false, "SELECT count(nextval('plain_s')) FROM generate_series(1, 100000)"),
         ], token);
         Assert.IsLessThan(took["plain"] * 2, took["managed"],
             $"the fastest 8 of 12 loops of 100,000 draws from a managed sequence, against {took["plain"]} from a plain one");
@@ -4989,6 +5089,64 @@ public sealed partial class SequenceRangeTests
 
         Assert.IsLessThan(took["plain rows"] * 2, took["managed rows"],
             $"the fastest 8 of 12 aggregates over 100,000 rows that draw from a managed sequence, against {took["plain rows"]} from a plain one");
+
+        // A statement marked for JIT is compiled only on a server that has a JIT provider.
+        Assert.IsLessThan(took["plain rows, marked for JIT"] * 2, took["managed rows, marked for JIT"],
+            "the fastest 8 of 12 aggregates over 100,000 rows that draw from a managed sequence, marked for JIT, " +
+            $"against {took["plain rows, marked for JIT"]} from a plain one, on a server where pg_jit_available() is " +
+            await nodeA.SafePsqlAsync(Database, "SET jit = on; SELECT pg_jit_available()", token));
+    }
+
+    /// <summary>
+    /// worf's own statements aren't compiled with JIT, however low jit_above_cost is set: they are small, and one that
+    /// ran as a session ended, as worf looks up each index PostgreSQL drops with the session's temporary tables, stopped
+    /// the server where PostgreSQL had compiled it. A session that made a temporary table ends, and the server goes
+    /// on. Only a server with a JIT provider compiles anything, so on another the test shows nothing.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task SessionsWithTemporaryTablesEndWhereJitCompilesEveryStatement()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token, "jit_above_cost = 0");
+        int ended = nodeA.ReadLog().Length;
+        string session = await nodeA.SafePsqlAsync(Database, "CREATE TEMP TABLE held (v text); SELECT pg_backend_pid()", token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, $"SELECT NOT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = {session})", token),
+            "the session that made a temporary table gone");
+        Assert.DoesNotContain("terminated by signal", nodeA.ReadLog()[ended..], "node_a's log as the session with a temporary table ended");
+    }
+
+    /// <summary>
+    /// A statement PostgreSQL marks for JIT draws as any other does. Where the server has a JIT provider, PostgreSQL
+    /// compiles each call with its function built in, so worf has it compile the call to go through the fmgr hook, and
+    /// where it has none, worf finds the interpreter's calls as in any statement. Inserts into a plain table of rows
+    /// that draw from blocks of 100, one with a second call in a join's condition, which worf doesn't look for, and one
+    /// whose calls a column names, and an aggregate over 350 more, wait for each switch, and no value is drawn twice.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task StatementsMarkedForJitWaitForTheirSwitches()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE SEQUENCE s1;
+            CREATE TABLE drawn (id bigint);
+            CREATE TABLE names (name text);
+            INSERT INTO names VALUES ('s1');
+            SELECT worf.enable_sequence_range('s1', participants := '{}', range_size := 100, max_range_size := 100);
+            """, token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges", token),
+            "node_a drawing from a block of s1, with the next one ready");
+        Assert.AreEqual("800|800|350", await nodeA.SafePsqlAsync(Database, """
+            SET jit = on; SET jit_above_cost = 0; SET jit_inline_above_cost = 0; SET jit_optimize_above_cost = 0;
+            INSERT INTO drawn SELECT nextval('s1') FROM generate_series(1, 350);
+            INSERT INTO drawn SELECT nextval('s1') FROM generate_series(1, 150) a JOIN generate_series(1, 1) b ON a + b < nextval('s1') + 1000;
+            INSERT INTO drawn SELECT nextval(n.name::regclass) FROM names n JOIN generate_series(1, 300) g ON g < nextval(n.name::regclass) + 1000;
+            SELECT (SELECT count(*) FROM drawn), (SELECT count(DISTINCT id) FROM drawn), count(nextval('s1')) FROM generate_series(1, 350)
+            """, token), "the rows the inserts marked for JIT drew, how many differ, and the aggregate's draws");
+        Assert.AreEqual("0", await nodeA.SafePsqlAsync(Database, "SELECT count(*) FROM drawn WHERE id >= (SELECT last_value - 349 FROM s1)", token),
+            "the insert's ids among the aggregate's 350, the last drawn");
     }
 
     /// <summary>
@@ -5046,7 +5204,9 @@ public sealed partial class SequenceRangeTests
         {
             foreach ((string kind, bool afterDraw, string body) in i % 2 == 0 ? loops : loops.Reverse())
             {
-                await ExecuteAsync(connection, afterDraw ? "BEGIN; SELECT nextval('s1')" : "BEGIN", token);
+                await ExecuteAsync(connection, afterDraw ? "BEGIN; SELECT nextval('s1')"
+                    : kind.EndsWith("marked for JIT", StringComparison.Ordinal) ? "BEGIN; SET LOCAL jit = on; SET LOCAL jit_above_cost = 0"
+                    : "BEGIN", token);
                 await using NpgsqlCommand loop = new(body.StartsWith("SELECT ", StringComparison.Ordinal) ? body : $"DO $$ DECLARE x bigint; y int; BEGIN {body}; END $$",
                     connection) { CommandTimeout = 120 };
                 Stopwatch timing = Stopwatch.StartNew();
@@ -13064,6 +13224,9 @@ public sealed partial class SequenceRangeTests
             "max_worker_processes = 16",
             "autovacuum = off",
             .. setting is null ? Array.Empty<string>() : [setting],
+
+            // Settings for a whole run, as jit_above_cost = 0 on a server with a JIT provider, apart by semicolons.
+            .. Environment.GetEnvironmentVariable("WORF_TEST_SETTINGS") is { Length: > 0 } settings ? settings.Split(';') : Array.Empty<string>(),
         ], token, environment: environment);
         try
         {

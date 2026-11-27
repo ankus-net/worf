@@ -1416,7 +1416,8 @@ internal static partial class SequenceRangeGuard
             int location = planned->stmt_location;
             int length = planned->stmt_len;
             s_starting.Add(new(() => PlanDraws(statement, source, parameters), (nint)NativeGlobals.error_context_stack, false,
-                source == 0 || parameters ? null : () => StatementText(source, location, length), planned: true));
+                source == 0 || parameters ? null : () => StatementText(source, location, length), planned: true,
+                compiles: (planned->jitFlags & JitExpressions) != 0));
             return;
         }
 
@@ -1452,7 +1453,7 @@ internal static partial class SequenceRangeGuard
             {
                 QueryDesc* query = (QueryDesc*)queryDesc;
                 List<nint> nodes = [];
-                if (!GuardPlan(query, s_starting[^1].Looked))
+                if (!GuardPlan(query, s_starting[^1]))
                 {
                     CountRows(query->planstate, nodes, Math.Max(s_starting[^1].Draws.Calls, 1), named: s_starting[^1].Draws.Unnamed ? null : s_starting[^1].Draws.Called);
                 }
@@ -1919,17 +1920,50 @@ internal static partial class SequenceRangeGuard
         }
     }
 
-    // PGJIT_EXPR, from jit/jit.h: the statement's expressions are compiled, each with its calls' functions built in.
+    // PGJIT_EXPR, from jit/jit.h: PostgreSQL compiles the statement's expressions, where it has a JIT provider.
     private const int JitExpressions = 1 << 3;
+
+    // The function PostgreSQL sets an expression's state to run through first where its interpreter is to run it. One
+    // that PostgreSQL compiled, with its calls' functions built in, has another, as has one that has run already.
+    private static nint s_interpreted;
+
+    // Whether PostgreSQL has compiled a call of this transaction's to go through the fmgr hook.
+    private static bool s_compiledCalls;
+
+    /// <summary>
+    /// Tells PostgreSQL, as it compiles a call of nextval with JIT and asks whether the call needs the fmgr hook, to
+    /// have the call go through it: a compiled call has its function built in, so the guard can't send it through
+    /// the hook afterwards, as it does the interpreter's. That is asked while a statement starts that PostgreSQL
+    /// compiles and that draws from a managed sequence without its switch gate, where the hook counts draws.
+    /// </summary>
+    /// <returns>Whether the call goes through the hook.</returns>
+    internal static bool HooksCompiledCall()
+    {
+        if (s_starting.Count == 0 || s_hookedCall == 0 || s_namingGrantors)
+        {
+            return false;
+        }
+
+        WorfStartingStatement starting = s_starting[^1];
+        if (!starting.Compiles || starting.Switched.Count == 0)
+        {
+            return false;
+        }
+
+        starting.Hooked++;
+        s_compiledCalls = true;
+        return true;
+    }
 
     // Has the calls of nextval that a statement's plan started go through the guard each time they run, as a PL/pgSQL
     // expression's do, in place of a check before each row its nodes produce, which costs a call into worf a row.
-    // That holds only where every call the plan started is found among the expression states its nodes hold, in those
-    // of their conditions, their rows and an aggregate's transitions, and the statement's expressions aren't compiled:
-    // any other statement counts its rows.
-    private static unsafe bool GuardPlan(QueryDesc* query, int started)
+    // That holds only where every call the plan started goes through the guard: one PostgreSQL's interpreter is to
+    // run is found among the expression states the plan's nodes hold, in those of their conditions, their rows and an
+    // aggregate's transitions, and one PostgreSQL compiled with JIT was compiled to go through the fmgr hook. Any
+    // other statement counts its rows.
+    private static unsafe bool GuardPlan(QueryDesc* query, WorfStartingStatement starting)
     {
-        if (started <= 0 || query->estate is null || (query->estate->es_jit_flags & JitExpressions) != 0 || !Executor.CountsDraws)
+        if (starting.Looked <= 0 || !Executor.CountsDraws)
         {
             return false;
         }
@@ -1941,9 +1975,21 @@ internal static partial class SequenceRangeGuard
             return false;
         }
 
-        List<(nint Step, bool Single)> calls = [];
+        // A statement marked for JIT is compiled only where the server has a JIT provider, so each state is asked.
+        if (s_interpreted == 0)
+        {
+            s_interpreted = (nint)NativeMethods.ExecInitExpr((Expr*)NativeMethods.makeBoolConst(true, false), null)->evalfunc.DangerousGetAddress();
+        }
+
+        List<(nint Step, bool Single, bool Compiled)> calls = [];
         FindCalls(query->planstate, calls, []);
-        if (calls.Count != started)
+        int interpreted = 0;
+        foreach ((_, _, bool compiled) in calls)
+        {
+            interpreted += compiled ? 0 : 1;
+        }
+
+        if (interpreted + starting.Hooked != starting.Looked)
         {
             return false;
         }
@@ -1952,7 +1998,7 @@ internal static partial class SequenceRangeGuard
         HookExit();
         s_snowflake = Worf.CatalogOid("snowflake_node");
         List<(int, nint, nint)> sites = [];
-        foreach ((nint call, bool single) in calls)
+        foreach ((nint call, bool single, _) in calls)
         {
             ExprEvalStep* step = (ExprEvalStep*)call;
             int site = GuardCall(step);
@@ -1976,7 +2022,7 @@ internal static partial class SequenceRangeGuard
     }
 
     // Finds the calls of nextval in the expression states a plan's nodes hold, through the nodes CountRows reaches.
-    private static unsafe void FindCalls(PlanState* node, List<(nint Step, bool Single)> calls, HashSet<nint> seen)
+    private static unsafe void FindCalls(PlanState* node, List<(nint Step, bool Single, bool Compiled)> calls, HashSet<nint> seen)
     {
         if (node is null || !seen.Add((nint)node))
         {
@@ -2052,18 +2098,19 @@ internal static partial class SequenceRangeGuard
         }
     }
 
-    private static unsafe void FindCalls(ExprState* state, List<(nint Step, bool Single)> calls, HashSet<nint> seen, bool single)
+    private static unsafe void FindCalls(ExprState* state, List<(nint Step, bool Single, bool Compiled)> calls, HashSet<nint> seen, bool single)
     {
         if (state is null || !seen.Add((nint)state))
         {
             return;
         }
 
+        bool compiled = (nint)state->evalfunc.DangerousGetAddress() != s_interpreted;
         for (int i = 0; i < state->steps_len; i++)
         {
             if (CallsNextval(state, &state->steps[i]))
             {
-                calls.Add(((nint)(&state->steps[i]), single));
+                calls.Add(((nint)(&state->steps[i]), single, compiled));
             }
         }
     }
@@ -2257,14 +2304,28 @@ internal static partial class SequenceRangeGuard
         }
 
         int index = (int)(uint)*site - 1;
-        if (index < 0 || index >= s_sites.Count || s_fastSlot is null)
+        if (s_fastSlot is null)
+        {
+            return false;
+        }
+
+        // A call with no place that PostgreSQL compiled to go through the hook is one the guard didn't find in the
+        // plan, or gave no place, as one of a sequence that isn't managed: its expression still tells the sequence
+        // it names, and one that names none goes into GuardedNextval.
+        uint seqoid;
+        nint arguments = 0;
+        bool placed = index >= 0 && index < s_sites.Count;
+        if (placed)
+        {
+            (seqoid, arguments, _) = s_sites[index];
+        }
+        else if (!s_compiledCalls || (seqoid = NamedByCall(flinfo->fn_expr)) == 0)
         {
             return false;
         }
 
         // A call that names its sequence as it runs has worked its argument out by now. One of a sequence that isn't
         // managed goes on as it is, where the blocks this backend read still hold.
-        (uint seqoid, nint arguments, _) = s_sites[index];
         if (seqoid == 0)
         {
             if (arguments == 0)
@@ -2294,7 +2355,14 @@ internal static partial class SequenceRangeGuard
         }
 
         ref long left = ref CollectionsMarshal.GetValueRefOrNullRef(s_drawingUngated, seqoid);
-        if (Unsafe.IsNullRef(ref left) || left < 1)
+        if (Unsafe.IsNullRef(ref left))
+        {
+            // A compiled call with no place may name a sequence that isn't managed, which goes on as it is.
+            return !placed && Volatile.Read(ref s_fastDraws[WorfFastDraws.Changes]) == s_changesRead && s_version >= 0 &&
+                SequenceRanges.LocalVersion == s_localVersion && (seqoid == s_snowflake || !s_sequences.ContainsKey(seqoid));
+        }
+
+        if (left < 1)
         {
             return false;
         }
@@ -4436,6 +4504,18 @@ internal static partial class SequenceRangeGuard
             s_namingGrantors = false;
         }
 
+        // A statement PostgreSQL compiles has its calls go through the fmgr hook from the start: PostgreSQL asks the
+        // hook check about each as it compiles it, once the expression's calls have started, so what the hook needs is
+        // read before then.
+        if (starting is { Compiles: true, Switched.Count: > 0, Hooked: 0 } && Executor.CountsDraws)
+        {
+            ReadNextval();
+            ReadHookedCall();
+            s_snowflake = Worf.CatalogOid("snowflake_node");
+            RegisterEnd();
+            HookExit();
+        }
+
         foreach (uint seqoid in waiting)
         {
             WaitForGrantor(seqoid, unnamed);
@@ -6409,6 +6489,7 @@ internal static partial class SequenceRangeGuard
         }
 
         s_handedOff = 0;
+        s_compiledCalls = false;
         LeaveFastDraw();
         WatchStatements();
         s_gatedRowDraws.Clear();

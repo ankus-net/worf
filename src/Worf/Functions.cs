@@ -583,11 +583,11 @@ internal static class Functions
             {
                 try
                 {
-                    PgTransaction.RunInSubtransaction(() => SequenceRangeExchange.WithTurn(() => _ = SequenceRangeExchange.WithLockTimeout(() =>
+                    SequenceRangeExchange.WithTurnInSubtransaction(() => _ = SequenceRangeExchange.WithLockTimeout(() =>
                     {
                         SequenceRanges.ForgetNeighbor(origin);
                         return true;
-                    })));
+                    }));
                     break;
                 }
                 catch (PgException held) when (held.SqlState == "55P03")

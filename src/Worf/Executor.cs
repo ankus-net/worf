@@ -712,6 +712,15 @@ internal static unsafe partial class Executor
             throw new InvalidOperationException("worf's fmgr hook failed.", failure);
         }
 
+        // worf's own statements are small and gain nothing from JIT, which a low jit_above_cost has PostgreSQL compile
+        // them with. One that runs as a session ends, as worf's look at each temporary object PostgreSQL then drops,
+        // would stop the server: LLVM leaves a context's release undone in a backend that exits, and PostgreSQL then
+        // frees the context again as the subtransaction that owned it ends.
+        if (Worf.InOwnSql && queryDesc->plannedstmt is not null)
+        {
+            queryDesc->plannedstmt->jitFlags = 0;
+        }
+
         NoteSingleUserStart();
         DdlLock.UnfencePending();
         List<uint> written = DdlLock.WrittenTables(queryDesc, eflags);
@@ -857,6 +866,12 @@ internal static unsafe partial class Executor
     private static bool WorfNeedsFmgrHook(uint fnOid)
     {
         if (SequenceRangeGuard.ReadingHookedCall)
+        {
+            return true;
+        }
+
+        // PostgreSQL asks about a built-in function only as it compiles a call of it with JIT.
+        if (fnOid == NextvalOid && SequenceRangeGuard.HooksCompiledCall())
         {
             return true;
         }

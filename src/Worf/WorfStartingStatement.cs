@@ -12,8 +12,9 @@ namespace Worf;
 /// parameters, whose values a plan may hold.</param>
 /// <param name="running">The statement running, as a QueryDesc, whose expressions start as it runs, or zero.</param>
 /// <param name="planned">Whether a statement's plan starts, whose rows the guard then counts.</param>
+/// <param name="compiles">Whether PostgreSQL compiles the plan's expressions with JIT, where it has a JIT provider.</param>
 internal sealed class WorfStartingStatement(Func<(HashSet<uint> Called, int Calls, bool Unnamed)> draws, nint context, bool explained,
-    Func<string?>? text = null, nint running = 0, bool planned = false)
+    Func<string?>? text = null, nint running = 0, bool planned = false, bool compiles = false)
 {
     private (HashSet<uint> Called, int Calls, bool Unnamed)? _draws;
     private string? _text;
@@ -32,6 +33,16 @@ internal sealed class WorfStartingStatement(Func<(HashSet<uint> Called, int Call
     /// Gets or sets how many of the calls have started.
     /// </summary>
     internal int Looked { get; set; }
+
+    /// <summary>
+    /// Gets or sets how many of the calls PostgreSQL has compiled to go through the fmgr hook.
+    /// </summary>
+    internal int Hooked { get; set; }
+
+    /// <summary>
+    /// Gets a value indicating whether PostgreSQL compiles the plan's expressions with JIT, where it has a JIT provider.
+    /// </summary>
+    internal bool Compiles { get; } = compiles;
 
     /// <summary>
     /// Gets the managed sequences the statement has waited for a switch of, as it holds no switch gate, once each.

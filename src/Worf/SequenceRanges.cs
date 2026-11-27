@@ -679,11 +679,11 @@ internal static unsafe partial class SequenceRanges
                 {
                     try
                     {
-                        PgTransaction.RunInSubtransaction(() => SequenceRangeExchange.WithTurn(() => _ = SequenceRangeExchange.WithLockTimeout(() =>
+                        SequenceRangeExchange.WithTurnInSubtransaction(() => _ = SequenceRangeExchange.WithLockTimeout(() =>
                         {
                             ActivateOrLift(seqoid);
                             return true;
-                        })));
+                        }));
                         return;
                     }
                     catch (PgException held) when (held.SqlState == "55P03")
