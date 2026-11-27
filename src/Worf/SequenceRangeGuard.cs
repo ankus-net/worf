@@ -101,6 +101,7 @@ internal static partial class SequenceRangeGuard
 
     // The type regclass, of the constant a call of nextval names its sequence with.
     private const uint RegclassOid = 2205;
+    private const uint BigintOid = 20;
     private const uint DomainInOid = 2597;
     private const uint DomainReceiveOid = 2598;
     private const uint ArrayInOid = 750;
@@ -737,6 +738,7 @@ internal static partial class SequenceRangeGuard
         if (s_drawingUngated.Count > 0 && queryDesc->plannedstmt is not null)
         {
             (HashSet<uint> called, int calls, bool unnamed) = StatementDraws(queryDesc);
+            s_readDraws = ((nint)queryDesc->plannedstmt, (called, calls, unnamed));
             if (unnamed)
             {
                 StartUnnamed(called, calls);
@@ -794,7 +796,8 @@ internal static partial class SequenceRangeGuard
     /// sequence worf manages or not. Of a statement with parameters, whose values a plan may
     /// hold, as the sequence a call names, only that it makes no call is kept, and only when neither its text nor a
     /// function of a user's that it calls, which the planner may inline as the values have it, may call nextval: its
-    /// calls come from its text, its views and the functions it calls, which its values change none of.
+    /// calls come from its text, its views and the functions it calls, which its values change none of. The calls of
+    /// an INSERT of the rows it is given are kept too, on the same terms: they are its columns' defaults'.
     /// </summary>
     private static unsafe (HashSet<uint> Called, int Calls, bool Unnamed) StatementDraws(QueryDesc* queryDesc)
         => PlanDraws((nint)queryDesc->plannedstmt, (nint)queryDesc->sourceText, queryDesc->@params is not null && queryDesc->@params->numParams > 0);
@@ -819,7 +822,8 @@ internal static partial class SequenceRangeGuard
 
         draws = Draws(PlanText((Node*)planned));
         WorfLog.Debug1("read a statement's plan for its calls of nextval");
-        if (!parameters || (draws is { Calls: 0, Unnamed: false } && !text.Contains("nextval", StringComparison.OrdinalIgnoreCase) && !CallsUserFunctions(planned)))
+        if (!parameters || (!text.Contains("nextval", StringComparison.OrdinalIgnoreCase) && !CallsUserFunctions(planned) &&
+            (draws is { Calls: 0, Unnamed: false } || InsertsRowsAsGiven(planned))))
         {
             if (s_drawsByText.Count >= 1000)
             {
@@ -830,6 +834,21 @@ internal static partial class SequenceRangeGuard
         }
 
         return draws;
+    }
+
+    // Whether a plan is an INSERT's that writes the rows one node with nothing under it gives, as a VALUES list's: its
+    // calls of nextval are then those of the columns' defaults, whatever values its parameters hold.
+    private static unsafe bool InsertsRowsAsGiven(PlannedStmt* planned)
+    {
+        if (planned->commandType != CmdType.CMD_INSERT || planned->hasModifyingCTE || planned->subplans is not null || planned->planTree is null ||
+            planned->planTree->type != NodeTag.T_ModifyTable)
+        {
+            return false;
+        }
+
+        Plan* rows = planned->planTree->lefttree;
+        return rows is not null && rows->lefttree is null && rows->righttree is null && rows->initPlan is null &&
+            rows->type is NodeTag.T_Result or NodeTag.T_ValuesScan;
     }
 
     // Whether a plan calls a function of a user's, which it depends on, as one the planner inlined.
@@ -860,6 +879,11 @@ internal static partial class SequenceRangeGuard
     internal static unsafe void EndStatement(QueryDesc* queryDesc)
     {
         FreePlanSites((nint)queryDesc);
+        if (s_routing.Count > 0 && s_routing.RemoveAll(routed => routed.Query == (nint)queryDesc) > 0)
+        {
+            _ = s_routedMarked.Remove((nint)queryDesc->estate);
+        }
+
         _ = s_planStarted.Remove((nint)queryDesc);
         _ = s_runStarted.Remove((nint)queryDesc);
         _ = s_runFound.Remove((nint)queryDesc);
@@ -914,6 +938,16 @@ internal static partial class SequenceRangeGuard
         Reload();
         if (s_sequences.Count == 0)
         {
+            return;
+        }
+
+        // An INSERT whose rows take what the guard's trigger checks from the columns' own defaults writes nothing for
+        // the trigger to see: each value is one its sequence has just issued. Such a statement takes no gate, its
+        // calls go through the guard one by one, as those of a SELECT of nextval do, and its rows skip the trigger.
+        s_identitiesRead.Clear();
+        if (!s_gatingAfterAll && TakesDefaults(queryDesc, written, s_identitiesRead, out bool routes))
+        {
+            s_takingDefaults[(nint)queryDesc] = (written, s_identitiesRead.Count == 0 ? s_noIdentities : [.. s_identitiesRead], routes);
             return;
         }
 
@@ -998,6 +1032,533 @@ internal static partial class SequenceRangeGuard
             s_rowsDrawing[(nint)queryDesc] = sequences;
         }
     }
+
+    // The calls of nextval the plan of the statement starting makes, as its start read them.
+    private static (nint Statement, (HashSet<uint> Called, int Calls, bool Unnamed) Draws) s_readDraws;
+
+    // The statements starting whose rows take the guarded columns' values from the columns' defaults, with the tables
+    // they write and the sequences of the identity columns among those columns.
+    private static readonly Dictionary<nint, (List<uint> Written, List<uint> Identities, bool Routes)> s_takingDefaults = [];
+
+    // Whether a statement that set out to take its defaults without a gate takes its gates after all.
+    private static bool s_gatingAfterAll;
+
+    // The identity columns' sequences read of the statement starting, and the list of none.
+    private static readonly List<uint> s_identitiesRead = [];
+    private static readonly List<uint> s_noIdentities = [];
+
+    // What the guard's insert trigger checks of each table: whether a row can take what it checks from the defaults
+    // alone, and the columns it checks, with the sequences it checks each under. Read once, until a table changes.
+    private static readonly Dictionary<uint, (bool Plain, List<(short Column, uint[] Sequences)> Columns, bool Routes)> s_checked = [];
+
+    // Whether an INSERT writes one table whose rows hold, in every column the guard's trigger checks, the value the
+    // column's own default draws from a managed sequence the trigger checks it under, which it then needn't check:
+    // the plan gives each such column a call of nextval that names the sequence, under no more than a cast, no row
+    // trigger runs before the row is written, which might change it, and no trigger's arguments name a sequence.
+    private static unsafe bool TakesDefaults(QueryDesc* queryDesc, List<uint> written, List<uint> identities, out bool routes)
+    {
+        routes = false;
+        PlannedStmt* statement = queryDesc->plannedstmt;
+        if (queryDesc->operation != CmdType.CMD_INSERT || statement->hasModifyingCTE || written.Count != 1 || statement->planTree is null ||
+            statement->planTree->type != NodeTag.T_ModifyTable)
+        {
+            return false;
+        }
+
+        ModifyTable* modify = (ModifyTable*)statement->planTree;
+        Plan* rows = modify->plan.lefttree;
+        if (modify->rootRelation != 0 || modify->onConflictAction == OnConflictAction.ONCONFLICT_UPDATE || rows is null || modify->resultRelations is null ||
+            modify->resultRelations->length != 1)
+        {
+            return false;
+        }
+
+        uint relid = ((RangeTblEntry*)statement->rtable->elements[modify->resultRelations->elements[0].int_value - 1].ptr_value)->relid;
+        (bool plain, List<(short Column, uint[] Sequences)> columns, routes) = Checked(relid);
+        if (relid != written[0] || !plain || columns.Count == 0)
+        {
+            return false;
+        }
+
+        foreach ((short column, uint[] sequences) in columns)
+        {
+            Node* value = null;
+            for (int i = 0; rows->targetlist is not null && i < rows->targetlist->length; i++)
+            {
+                TargetEntry* entry = (TargetEntry*)rows->targetlist->elements[i].ptr_value;
+                if (entry->resno == column && !entry->resjunk)
+                {
+                    value = Uncast((Node*)entry->expr);
+                    break;
+                }
+            }
+
+            if (!DrawsFrom(value, sequences, identities))
+            {
+                return false;
+            }
+        }
+
+        // A trigger whose arguments name a sequence may draw from it in C code, which only a gate held makes safe.
+        return ArguedFunctions(relid, TriggerTypeInsert).Count == 0;
+    }
+
+    // Whether an expression is a call of nextval that names, with a constant, one of some sequences, each managed and
+    // this node's own to draw from, or the draw of an identity column from one, which is no call of nextval: worf
+    // then has it run as one, where its calls go through the fmgr hook, and the sequence is noted.
+    private static unsafe bool DrawsFrom(Node* value, uint[] sequences, List<uint> identities)
+    {
+        if (value is null)
+        {
+            return false;
+        }
+
+        uint named = 0;
+        if (value->type == NodeTag.T_FuncExpr && ((FuncExpr*)value)->funcid == NextvalOid && NamesRegclass(value))
+        {
+            named = NamedByCall(value);
+        }
+        else if (value->type == NodeTag.T_NextValueExpr && HooksCalls())
+        {
+            named = ((NextValueExpr*)value)->seqid;
+            identities.Add(named);
+        }
+
+        return named != 0 && Array.IndexOf(sequences, named) >= 0 && s_sequences.ContainsKey(named) && !s_moved.Contains(named);
+    }
+
+    // Whether a call of nextval can go through the fmgr hook, within PostgreSQL's own call.
+    private static bool HooksCalls()
+    {
+        if (!Executor.CountsDraws)
+        {
+            return false;
+        }
+
+        ReadNextval();
+        ReadHookedCall();
+        return s_hookedCall != 0;
+    }
+
+    // Has the draws of the identity columns of a statement whose rows take their defaults run as calls of nextval that
+    // go through the guard, and tells whether it found one for each of the columns' sequences. PostgreSQL draws for
+    // an identity column in a step of its own, which calls no function, so the step becomes the call's: a call of
+    // nextval that names the sequence is started beside it, and its step's code and what it holds take the draw's
+    // place. The call runs as the bootstrap superuser, as fmgr_security_definer runs a function whose state names
+    // an owner, since an identity column asks its writer for no privilege on its sequence.
+    private static unsafe bool HookIdentityDraws(QueryDesc* query, WorfStartingStatement starting, List<uint> identities)
+    {
+        PlanState* rows = query->planstate is null ? null : query->planstate->lefttree;
+        if (identities.Count == 0 || rows is null || query->estate is null)
+        {
+            return identities.Count == 0;
+        }
+
+        List<(nint Step, bool Single, bool Compiled)> draws = [];
+        s_findingIdentities = true;
+        try
+        {
+            FindCalls(rows, draws, []);
+        }
+        finally
+        {
+            s_findingIdentities = false;
+        }
+
+        if (!s_planSites.TryGetValue((nint)query, out List<(int Site, nint Call, nint Information)>? sites))
+        {
+            sites = [];
+        }
+
+        s_snowflake = Worf.CatalogOid("snowflake_node");
+        HashSet<uint> hooked = [];
+        foreach ((nint draw, bool single, bool compiled) in draws)
+        {
+            ExprEvalStep* step = (ExprEvalStep*)draw;
+            uint seqoid = step->d.nextvalueexpr.seqid;
+            if (compiled || !identities.Contains(seqoid) || !HookDraw(step, query->estate->es_query_cxt))
+            {
+                continue;
+            }
+
+            StartHooked(starting, seqoid);
+            int site = GuardCall(step);
+            if (single)
+            {
+                _ = s_singleCalls.Add((nint)step->d.func.fcinfo_data);
+            }
+
+            sites.Add((site, (nint)step->d.func.finfo->fn_expr, (nint)step->d.func.fcinfo_data));
+            _ = hooked.Add(seqoid);
+        }
+
+        if (sites.Count > 0)
+        {
+            RegisterEnd();
+            HookExit();
+            s_planSites[(nint)query] = sites;
+        }
+
+        return identities.TrueForAll(hooked.Contains);
+    }
+
+    // Whether steps that draw for identity columns are looked for, rather than calls of nextval.
+    private static bool s_findingIdentities;
+
+    // What a step that calls nextval holds, read once for the backend from a call started for it: the step's code,
+    // as the interpreter knows it, what PostgreSQL looked up for the function, and the call's expression.
+    private static bool s_drawRead;
+    private static long s_drawCode;
+    private static FmgrInfo s_drawFunction;
+    private static nint s_drawCall;
+
+    // The expression of the call each identity column's sequence is drawn from with, by sequence.
+    private static readonly Dictionary<uint, nint> s_drawCalls = [];
+
+    // Starts a call of nextval that names a sequence with a constant, as anyone may, to read what its step holds.
+    private static unsafe bool ReadDraw()
+    {
+        if (s_drawRead)
+        {
+            return s_drawCode != 0;
+        }
+
+        uint userId;
+        int secContext;
+        NativeMethods.GetUserIdAndSecContext(&userId, &secContext);
+        bool naming = s_namingGrantors;
+        s_namingGrantors = true;
+        try
+        {
+            NativeMethods.SetUserIdAndSecContext(BootstrapSuperuserId, secContext | SecurityLocalUseridChange);
+            MemoryContextData* old = Worf.MemoryContextSwitchTo(NativeGlobals.TopMemoryContext);
+            FuncExpr* call;
+            try
+            {
+                Const* named = NativeMethods.makeConst(RegclassOid, -1, 0, sizeof(uint), 0, false, true);
+                call = NativeMethods.makeFuncExpr(NextvalOid, BigintOid, NativeMethods.lappend(null, named), 0, 0, CoercionForm.COERCE_EXPLICIT_CALL);
+            }
+            finally
+            {
+                _ = Worf.MemoryContextSwitchTo(old);
+            }
+
+            ExprState* started = NativeMethods.ExecInitExpr((Expr*)call, null);
+            ExprEvalStep* draw = started->steps_len > 0 ? &started->steps[0] : null;
+            if (draw is not null && (started->flags & InterpreterInitialized) != 0 && CallsNextval(started, draw))
+            {
+                s_drawFunction = *draw->d.func.finfo;
+                s_drawCall = (nint)call;
+                s_drawCode = draw->opcode;
+            }
+
+            s_drawRead = true;
+        }
+        finally
+        {
+            s_namingGrantors = naming;
+            NativeMethods.SetUserIdAndSecContext(userId, secContext);
+        }
+
+        return s_drawCode != 0;
+    }
+
+    // Turns a step that draws for an identity column into a call of nextval that names the column's sequence, and
+    // tells whether it did. One piece of some memory holds what the step's call needs: what PostgreSQL looks up for
+    // the function, what fmgr_security_definer keeps of a function it runs, which begins with that lookup and the
+    // role to run it as on every version and which zeros leave empty, and the call's argument.
+    private static unsafe bool HookDraw(ExprEvalStep* step, MemoryContextData* memory)
+    {
+        const int CacheSize = 128;
+        if (!ReadDraw())
+        {
+            return false;
+        }
+
+        // The call's expression, which names the sequence, is one for all the sequence's draws, kept for the backend:
+        // two of them hooked at once, as a row's trigger writing the same table has, share its place among the calls
+        // that go through the hook, which sends the outer one's draws into worf proper.
+        uint seqoid = step->d.nextvalueexpr.seqid;
+        if (!s_drawCalls.TryGetValue(seqoid, out nint named))
+        {
+            MemoryContextData* top = Worf.MemoryContextSwitchTo(NativeGlobals.TopMemoryContext);
+            try
+            {
+                FuncExpr* made = (FuncExpr*)NativeMethods.copyObjectImpl((void*)s_drawCall);
+                ((Const*)made->args->elements[0].ptr_value)->constvalue = seqoid;
+                named = (nint)made;
+            }
+            finally
+            {
+                _ = Worf.MemoryContextSwitchTo(top);
+            }
+
+            s_drawCalls[seqoid] = named;
+        }
+
+        int callSize = sizeof(FunctionCallInfoBaseData) + (2 * sizeof(ulong));
+        MemoryContextData* old = Worf.MemoryContextSwitchTo(memory);
+        try
+        {
+            byte* piece = (byte*)NativeMethods.MemoryContextAllocZero(memory, (nuint)(sizeof(FmgrInfo) + CacheSize + callSize));
+            FuncExpr* call = (FuncExpr*)named;
+            FmgrInfo* function = (FmgrInfo*)piece;
+            byte* cache = piece + sizeof(FmgrInfo);
+            FunctionCallInfoBaseData* arguments = (FunctionCallInfoBaseData*)(cache + CacheSize);
+            *function = s_drawFunction;
+            function->fn_mcxt = memory;
+            function->fn_expr = (Node*)call;
+            function->fn_extra = null;
+            *(FmgrInfo*)cache = *function;
+            *(uint*)(cache + sizeof(FmgrInfo)) = BootstrapSuperuserId;
+            function->fn_extra = cache;
+            arguments->flinfo = function;
+            arguments->nargs = 1;
+            *(ulong*)((byte*)arguments + sizeof(FunctionCallInfoBaseData)) = seqoid;
+            step->opcode = s_drawCode;
+            step->d.func.finfo = function;
+            step->d.func.fcinfo_data = arguments;
+            step->d.func.fn_addr = s_drawFunction.fn_addr;
+            step->d.func.nargs = 1;
+            return true;
+        }
+        finally
+        {
+            _ = Worf.MemoryContextSwitchTo(old);
+        }
+    }
+
+    // Notes, for a draw worf turned into a call of nextval, what the call's start would have: the statement draws
+    // from the sequence without its gate, waits for its grantor, and is counted among those drawing from it, its
+    // check left to its first row.
+    private static void StartHooked(WorfStartingStatement starting, uint seqoid)
+    {
+        if (starting.Explained || StatementGated(seqoid) || !starting.Switched.Add(seqoid))
+        {
+            return;
+        }
+
+        if (s_grantors.ContainsKey(seqoid) && !s_confirmedSequences.Contains(seqoid))
+        {
+            WaitForGrantor(seqoid);
+        }
+
+        List<uint> drawn = [seqoid];
+        if (Within() && s_drewWithin.Contains(seqoid))
+        {
+            CountFunction(drawn);
+        }
+        else
+        {
+            CountUngated(drawn);
+        }
+
+        NoteDrawsWithin(drawn);
+        DeferUngated(drawn);
+    }
+
+    // The expression under the casts that give a value its column's type.
+    private static unsafe Node* Uncast(Node* value)
+    {
+        while (value is not null)
+        {
+            if (value->type == NodeTag.T_RelabelType)
+            {
+                value = (Node*)((RelabelType*)value)->arg;
+            }
+            else if (value->type == NodeTag.T_CoerceToDomain)
+            {
+                value = (Node*)((CoerceToDomain*)value)->arg;
+            }
+            else if (value->type == NodeTag.T_FuncExpr && ((FuncExpr*)value)->funcformat != CoercionForm.COERCE_EXPLICIT_CALL &&
+                ((FuncExpr*)value)->funcid != NextvalOid && ((FuncExpr*)value)->args is not null && ((FuncExpr*)value)->args->length >= 1)
+            {
+                value = (Node*)((FuncExpr*)value)->args->elements[0].ptr_value;
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        return value;
+    }
+
+    // Reads what the guard's insert trigger checks of a table, from the arguments worf gave it: each names a column
+    // by number and the sequences it is checked under, by OID, or by a name a default gives as text, which only the
+    // trigger can look up as the row is written. Only a table that is no partition, with no row trigger before or
+    // instead of its inserts, can have rows that take what the trigger checks from the defaults alone; one that is
+    // partitioned routes its rows to partitions, none of which may have such a trigger either, or a column of its
+    // own that the guard checks.
+    private static (bool Plain, List<(short Column, uint[] Sequences)> Columns, bool Routes) Checked(uint relid)
+    {
+        _ = Triggers(relid);
+        if (s_checked.TryGetValue(relid, out (bool Plain, List<(short Column, uint[] Sequences)> Columns, bool Routes) found))
+        {
+            return found;
+        }
+
+        WorfRows read = Elevated.Run(() => Worf.Read($"""
+            SELECT (SELECT pg_catalog.encode(t.tgargs, 'escape') FROM pg_catalog.pg_trigger t
+                    WHERE t.tgrelid = c.oid AND t.tgname = {Worf.QuoteLiteral(SequenceRanges.GuardName)}),
+                c.relkind IN ('r', 'p') AND NOT c.relispartition AND NOT EXISTS (
+                    SELECT 1 FROM pg_catalog.pg_trigger t
+                    WHERE t.tgrelid IN (SELECT c.oid UNION ALL SELECT p.relid FROM pg_catalog.pg_partition_tree(c.oid) p WHERE p.level > 0)
+                        AND (t.tgname = {Worf.QuoteLiteral(SequenceRanges.PartitionGuardName)}
+                            OR (NOT t.tgisinternal AND (t.tgtype & 1) <> 0 AND (t.tgtype & 4) <> 0 AND (t.tgtype & 66) <> 0))),
+                c.relkind = 'p'
+            FROM pg_catalog.pg_class c WHERE c.oid = $1
+            """, 1, SpiParameter.Create(relid)));
+        found = (false, [], false);
+        if (read.Count == 1 && read[0].Get<string?>(0) is string arguments)
+        {
+            bool plain = read[0].Get<bool>(1);
+            foreach (string argument in arguments.Split("\\000", StringSplitOptions.RemoveEmptyEntries))
+            {
+                int colon = argument.IndexOf(':', StringComparison.Ordinal);
+                if (colon <= 0 || !short.TryParse(argument.AsSpan(0, colon), NumberStyles.None, CultureInfo.InvariantCulture, out short column))
+                {
+                    continue;
+                }
+
+                List<uint> sequences = [];
+                foreach (string named in argument[(colon + 1)..].Split(','))
+                {
+                    if (uint.TryParse(named, NumberStyles.None, CultureInfo.InvariantCulture, out uint seqoid))
+                    {
+                        sequences.Add(seqoid);
+                    }
+                    else
+                    {
+                        plain = false;
+                    }
+                }
+
+                found.Columns.Add((column, [.. sequences]));
+            }
+
+            found = (plain, found.Columns, read[0].Get<bool>(2));
+        }
+
+        s_checked[relid] = found;
+        return found;
+    }
+
+    // The statements running whose rows take the guarded columns' values from the columns' defaults and go to
+    // partitions, with the subtransactions they started in, and the executor state of a COPY of such rows, with how
+    // deep the scopes around its rows stand and how many COPYs deep it runs. A partition's copy of the guard's trigger is made as its first row
+    // comes, so the trigger is skipped from the row after: as PostgreSQL starts the trigger's condition, worf marks
+    // it disabled in the partition's copy, and the check that first row runs passes it unread.
+    private static readonly List<(nint Query, uint Subxact)> s_routing = [];
+    private static (nint State, int Depth, int Copies) s_copyRouting;
+
+    /// <summary>
+    /// Gets a value indicating whether a statement or COPY under way routes rows that take their defaults to
+    /// partitions, whose copies of the guard's trigger are to be skipped as they're made.
+    /// </summary>
+    internal static bool RoutesDefaults => s_routing.Count > 0 || s_copyRouting.State != 0;
+
+    /// <summary>
+    /// Has the partitions that the statements and COPY routing rows that take their defaults have opened so far skip
+    /// the guard's trigger, as a function of some expression starts, which the trigger's condition in a partition
+    /// newly opened does.
+    /// </summary>
+    internal static unsafe void SkipRoutedGuards()
+    {
+        foreach ((nint routed, _) in s_routing)
+        {
+            SkipRoutedGuards(((QueryDesc*)routed)->estate);
+        }
+
+        if (s_copyRouting.State != 0)
+        {
+            SkipRoutedGuards((EState*)s_copyRouting.State);
+        }
+    }
+
+    private static unsafe void SkipRoutedGuards(EState* state)
+    {
+        if (state is null || state->es_tuple_routing_result_relations is null)
+        {
+            return;
+        }
+
+        // Each partition is marked once, as the first function after it opens starts.
+        int opened = state->es_tuple_routing_result_relations->length;
+        for (int i = s_routedMarked.GetValueOrDefault((nint)state); i < opened; i++)
+        {
+            SkipGuard((ResultRelInfo*)state->es_tuple_routing_result_relations->elements[i].ptr_value);
+        }
+
+        s_routedMarked[(nint)state] = opened;
+    }
+
+    // How many of the partitions each executor state has opened have had the guard's trigger marked skipped.
+    private static readonly Dictionary<nint, int> s_routedMarked = [];
+
+    // Whether the row whose value the guard's trigger is checking is one of a statement's or a COPY's that takes the
+    // value from the column's default: the innermost statement running is such a statement, or no statement has
+    // started within such a COPY.
+    private static bool ChecksDefaultTaken()
+    {
+        if (s_copyRouting.State != 0 && s_scopes.Count == s_copyRouting.Depth)
+        {
+            return true;
+        }
+
+        for (int i = s_scopes.Count - 1; i >= 0 && s_routing.Count > 0; i--)
+        {
+            if (s_scopes[i].Kind == RunScope)
+            {
+                nint run = s_scopes[i].Key;
+                return s_routing.Exists(routed => routed.Query == run);
+            }
+        }
+
+        return false;
+    }
+
+    // Has the rows of an INSERT that take the guarded columns' values from their defaults skip the guard's trigger:
+    // each table a statement writes keeps its own copy of the table's triggers, in which the trigger is marked
+    // disabled, and where no other trigger fires after a row's insert, PostgreSQL then looks at none for it.
+    private static unsafe void SkipGuard(ResultRelInfo* written)
+    {
+        const int Row = 1 << 0;
+        const int Before = 1 << 1;
+        const int Instead = 1 << 6;
+        const sbyte Disabled = (sbyte)'D';
+        TriggerDesc* triggers = written->ri_TrigDesc;
+        if (triggers is null)
+        {
+            return;
+        }
+
+        bool others = false;
+        for (int i = 0; i < triggers->numtriggers; i++)
+        {
+            Trigger* trigger = &triggers->triggers[i];
+            if ((trigger->tgtype & (Row | Before | TriggerTypeInsert | Instead)) != (Row | TriggerTypeInsert))
+            {
+                continue;
+            }
+
+            if (MemoryMarshal.CreateReadOnlySpanFromNullTerminated((byte*)trigger->tgname).SequenceEqual(GuardNameBytes))
+            {
+                trigger->tgenabled = Disabled;
+            }
+            else
+            {
+                others = true;
+            }
+        }
+
+        if (!others)
+        {
+            triggers->trig_insert_after_row = false;
+        }
+    }
+
+    private static ReadOnlySpan<byte> GuardNameBytes => "worf_sequence_range_guard"u8;
 
     // Notes where a gated sequence is as a statement that holds its gate starts, or one of its rows is checked, so that
     // the next row's check sees how many values the row drew.
@@ -1461,7 +2022,11 @@ internal static partial class SequenceRangeGuard
             PlannedStmt* planned = (PlannedStmt*)statement;
             int location = planned->stmt_location;
             int length = planned->stmt_len;
-            s_starting.Add(new(() => PlanDraws(statement, source, parameters), (nint)NativeGlobals.error_context_stack, false,
+
+            // What the statement's start read of its plan's calls a moment ago serves its calls that start too.
+            (HashSet<uint> Called, int Calls, bool Unnamed)? read = s_readDraws.Statement == statement ? s_readDraws.Draws : null;
+            s_readDraws = default;
+            s_starting.Add(new(read is { } known ? () => known : () => PlanDraws(statement, source, parameters), (nint)NativeGlobals.error_context_stack, false,
                 source == 0 || parameters ? null : () => StatementText(source, location, length), planned: true,
                 compiles: (planned->jitFlags & JitExpressions) != 0));
             return;
@@ -1481,11 +2046,51 @@ internal static partial class SequenceRangeGuard
     /// and forgets the statement's start.
     /// </summary>
     /// <param name="queryDesc">The statement.</param>
-    internal static void StartedPlan(nint queryDesc)
+    /// <param name="started">Whether the plan started, rather than failed as it did.</param>
+    internal static void StartedPlan(nint queryDesc, bool started)
     {
         if (s_starting.Count > 0 && s_starting[^1].Looked > 0)
         {
             s_planStarted[queryDesc] = s_starting[^1].Looked;
+        }
+
+        bool identities = false;
+        if (s_takingDefaults.Count > 0 && s_takingDefaults.Remove(queryDesc, out (List<uint> Written, List<uint> Identities, bool Routes) taking) && started)
+        {
+            unsafe
+            {
+                QueryDesc* query = (QueryDesc*)queryDesc;
+                PlanState* top = query->planstate;
+                ModifyTableState* modify = top is not null && top->type == NodeTag.T_ModifyTableState ? (ModifyTableState*)top : null;
+                if (modify is not null && s_starting.Count > 0 && HookIdentityDraws(query, s_starting[^1], taking.Identities))
+                {
+                    identities = taking.Identities.Count > 0;
+                    for (int i = 0; i < modify->mt_nrels; i++)
+                    {
+                        SkipGuard(&modify->resultRelInfo[i]);
+                    }
+
+                    if (taking.Routes)
+                    {
+                        RegisterEnd();
+                        s_routing.Add((queryDesc, NativeMethods.GetCurrentSubTransactionId()));
+                    }
+                }
+                else
+                {
+                    // An identity column whose draw worf didn't find leaves the statement to hold its gates and
+                    // the guard's trigger to check its rows, as a statement that gives its values by hand does.
+                    s_gatingAfterAll = true;
+                    try
+                    {
+                        GateStatement(query, taking.Written);
+                    }
+                    finally
+                    {
+                        s_gatingAfterAll = false;
+                    }
+                }
+            }
         }
 
         // A statement that draws from a managed sequence without its switch gate, as a SELECT of nextval does, has
@@ -1499,7 +2104,10 @@ internal static partial class SequenceRangeGuard
             {
                 QueryDesc* query = (QueryDesc*)queryDesc;
                 List<nint> nodes = [];
-                if (!GuardPlan(query, s_starting[^1]))
+
+                // A statement that started no call of nextval, but whose identity columns' draws run as calls that go
+                // through the guard, has no row to count.
+                if (!GuardPlan(query, s_starting[^1]) && (s_starting[^1].Looked > 0 || !identities))
                 {
                     CountRows(query->planstate, nodes, Math.Max(s_starting[^1].Draws.Calls, 1), named: s_starting[^1].Draws.Unnamed ? null : s_starting[^1].Draws.Called);
                 }
@@ -2069,7 +2677,11 @@ internal static partial class SequenceRangeGuard
         RegisterEnd();
         HookExit();
         s_snowflake = Worf.CatalogOid("snowflake_node");
-        List<(int, nint, nint)> sites = [];
+        if (!s_planSites.TryGetValue((nint)query, out List<(int Site, nint Call, nint Information)>? sites))
+        {
+            sites = [];
+        }
+
         foreach ((nint call, bool single, _) in calls)
         {
             ExprEvalStep* step = (ExprEvalStep*)call;
@@ -2537,7 +3149,25 @@ internal static partial class SequenceRangeGuard
         bool compiled = (state->flags & InterpreterInitialized) == 0;
         for (int i = 0; i < state->steps_len; i++)
         {
-            if (CallsNextval(state, &state->steps[i]))
+            if (s_findingIdentities)
+            {
+                if (NativeMethods.ExecEvalStepOp(state, &state->steps[i]) != ExprEvalOp.EEOP_NEXTVALUEEXPR)
+                {
+                    continue;
+                }
+
+                // An expression PostgreSQL is to compile calls the draw's own function from the code it builds, so
+                // the one expression that draws for an identity column goes back to the interpreter, whose step
+                // can become a call: PostgreSQL has built no code for the statement yet as its plan starts.
+                if (compiled)
+                {
+                    NativeMethods.ExecReadyInterpretedExpr(state);
+                    compiled = (state->flags & InterpreterInitialized) == 0;
+                }
+
+                calls.Add(((nint)(&state->steps[i]), single, compiled));
+            }
+            else if (CallsNextval(state, &state->steps[i]))
             {
                 calls.Add(((nint)(&state->steps[i]), single, compiled));
             }
@@ -2889,7 +3519,7 @@ internal static partial class SequenceRangeGuard
                 DrawUngated(starting);
             }
 
-            CountDownDraws(1, [seqoid], single: s_singleCalls.Count > 0 && s_singleCalls.Contains((nint)fcinfo));
+            CountDownDraws(1, [seqoid], single: s_singleCalls.Count > 0 && s_singleCalls.Contains((nint)fcinfo) && !DrawsAgainWithin(seqoid));
             ulong value = NativeMethods.nextval_oid(fcinfo);
             failed = false;
             return value;
@@ -3178,6 +3808,11 @@ internal static partial class SequenceRangeGuard
         _ = PgTransaction.RegisterSubtransactionCallback(PgSubtransactionEvent.Abort, static (aborted, parent) =>
         {
             ForgetGatesOf(aborted.Value);
+            if (s_routing.RemoveAll(routed => routed.Subxact >= aborted.Value) > 0)
+            {
+                s_routedMarked.Clear();
+            }
+
             foreach (nint queryDesc in s_countedNodes.Where(entry => entry.Value.Subxact >= aborted.Value).Select(entry => entry.Key).ToList())
             {
                 ForgetCounted(queryDesc);
@@ -3194,6 +3829,8 @@ internal static partial class SequenceRangeGuard
     private static void ForgetStatements(bool aborted)
     {
         s_endRegistered = false;
+        s_routing.Clear();
+        s_routedMarked.Clear();
         ForgetUngatedDrawers();
         ForgetUngated();
 
@@ -3451,14 +4088,40 @@ internal static partial class SequenceRangeGuard
         if (single)
         {
             s_drawingUngated[seqoid] = 0;
+            WakeAhead(seqoid, Position(seqoid), Math.Max(count, 1));
             return;
         }
 
         Share(seqoid);
-        if (Position(seqoid) is long position)
+        long? position = Position(seqoid);
+        if (position is long at)
         {
-            s_unnamedMarks[seqoid] = position;
+            s_unnamedMarks[seqoid] = at;
         }
+
+        WakeAhead(seqoid, position, s_drawingUngated[seqoid] + Math.Max(count, 1));
+    }
+
+    // Wakes the range worker where the draws a statement is about to take without its sequence's gate bring the
+    // sequence past half its active block, or into its last twentieth, as the guard's trigger does once a row's
+    // value is there, so that the worker switches before the next statement needs it to.
+    private static void WakeAhead(uint seqoid, long? position, long draws)
+    {
+        if (position is not long from || !s_sequences.TryGetValue(seqoid, out (bool Ascending, List<(long Lo, long Hi, string State)> Blocks) sequence) ||
+            sequence.Blocks.FindIndex(block => block.State == "active") is not (int index and >= 0))
+        {
+            return;
+        }
+
+        (long lo, long hi, _) = sequence.Blocks[index];
+        if (from < lo || from > hi || s_reservedActive.Contains((seqoid, lo)))
+        {
+            return;
+        }
+
+        decimal reach = draws * Step(seqoid);
+        long ahead = (long)(sequence.Ascending ? Math.Min(from + reach, hi) : Math.Max(from - reach, lo));
+        _ = WakeNearEnd(seqoid, sequence.Ascending, lo, hi, ahead);
     }
 
     // Waits, a second at most, while a sequence stands outside every block of its this backend knows, as a switch's move
@@ -3649,6 +4312,9 @@ internal static partial class SequenceRangeGuard
         {
             return;
         }
+
+        s_drewWithin.Clear();
+        s_drawAgainWithin.Clear();
 
         // A block's functions, which were counted among their sequences' drawers outside any statement, draw no more.
         if (s_ungatedDrawers.Count > 0)
@@ -3858,8 +4524,74 @@ internal static partial class SequenceRangeGuard
             run--;
         }
 
+        // The count of a statement that draws again within a command is the command's: it goes back as the statement
+        // or block around the statement ends, so the next turn of a loop finds it. A statement with nothing around
+        // it keeps its count its own.
+        if (run >= 0 && DrawsAgainWithin(seqoid))
+        {
+            int around = run - 1;
+            while (around >= 0 && s_scopes[around].Kind != RunScope)
+            {
+                around--;
+            }
+
+            if (around >= 0 || s_commandDepth > 0)
+            {
+                run = around;
+            }
+        }
+
         s_shareRuns[seqoid] = run < 0 ? 0 : s_scopes[run].Key;
     }
+
+    // How many utility statements a client sent are running: a statement that starts under one, as each of a DO
+    // block's, runs within its command.
+    private static int s_commandDepth;
+
+    // The sequences the statements of the command under way have drawn from without their gates, and those a second
+    // such statement drew from, whose draws are the command's from then on.
+    private static readonly HashSet<uint> s_drewWithin = [];
+    private static readonly HashSet<uint> s_drawAgainWithin = [];
+
+    /// <summary>
+    /// Notes a utility statement a client sent, as it starts and ends.
+    /// </summary>
+    /// <param name="change">One as it starts, minus one as it ends.</param>
+    internal static void CountCommand(int change)
+    {
+        // A command that failed left what its statements drew from noted.
+        if (change > 0 && s_commandDepth == 0)
+        {
+            s_drewWithin.Clear();
+            s_drawAgainWithin.Clear();
+        }
+
+        s_commandDepth = Math.Max(s_commandDepth + change, 0);
+    }
+
+    // Whether a statement that starts does so within another statement's run, or within a utility statement, as a
+    // function's or a DO block's statements do.
+    private static bool Within() => s_commandDepth > 0 || s_scopes.Exists(scope => scope.Kind == RunScope);
+
+    // Notes the sequences a statement that starts draws from without their gates: a statement that starts on its
+    // own begins a command, and one within a command that draws from a sequence an earlier one of it drew from
+    // makes the sequence's draws the command's.
+    private static void NoteDrawsWithin(List<uint> sequences)
+    {
+        if (!Within())
+        {
+            s_drewWithin.Clear();
+            s_drawAgainWithin.Clear();
+            return;
+        }
+
+        s_drawAgainWithin.UnionWith(sequences.Where(s_drewWithin.Contains));
+        s_drewWithin.UnionWith(sequences);
+    }
+
+    // Whether a sequence's draws are those of the command under way, as the statements within it draw from it one
+    // after another.
+    private static bool DrawsAgainWithin(uint seqoid) => s_drawAgainWithin.Count > 0 && s_drawAgainWithin.Contains(seqoid);
 
     // Counts the draws this backend may still take from a sequence without checking it in the shared table, in place of
     // those it counted.
@@ -3922,7 +4654,33 @@ internal static partial class SequenceRangeGuard
     /// <param name="defaults">Whether the COPY's DEFAULT option has it start every column's default.</param>
     /// <param name="condition">The text of the COPY's WHERE condition, as <see cref="CopyConditionText"/> reads it.</param>
     internal static void StartingCopy(uint relid, short[]? columns, bool defaults, string condition = "")
-        => Starting(() => Draws(CopyDefaultsText(relid, columns, defaults) + " " + condition + " " + WrittenChecks([relid])), copy: true);
+    {
+        Starting(() => Draws(CopyDefaultsText(relid, columns, defaults) + " " + condition + " " + WrittenChecks([relid])), copy: true);
+
+        // An identity column's default starts no call of nextval, so what the start of one notes of a COPY's is
+        // noted here, for each sequence such a column of the COPY draws from without its gate: the COPY waits for
+        // its grantor and for a block with values left, and counts among those drawing from it.
+        List<uint>? identities = s_copyIdentities;
+        s_copyIdentities = null;
+        WorfStartingStatement starting = s_starting[^1];
+        foreach (uint seqoid in identities ?? [])
+        {
+            if (StatementGated(seqoid) || !starting.Switched.Add(seqoid))
+            {
+                continue;
+            }
+
+            if (s_grantors.ContainsKey(seqoid) && !s_confirmedSequences.Contains(seqoid))
+            {
+                WaitForGrantor(seqoid);
+            }
+
+            List<uint> drawn = [seqoid];
+            CountUngated(drawn);
+            WaitWhileShort(seqoid);
+            DrawUngated(drawn);
+        }
+    }
 
     /// <summary>
     /// Notes a COPY FROM that worf runs itself, as a table's sync does, as <see cref="StartingCopy(uint, short[], bool, string)"/>
@@ -4613,6 +5371,7 @@ internal static partial class SequenceRangeGuard
         s_arguedBy.Clear();
         s_arguedFunctions.Clear();
         s_guarded.Clear();
+        s_checked.Clear();
         s_subscriptionDraws.Clear();
         s_triggerArguments.Clear();
         if (relid == 0)
@@ -5259,7 +6018,21 @@ internal static partial class SequenceRangeGuard
         long rowCalls = Math.Max(rowDraws, starting?.Draws.Calls ?? 1);
         if (!plpgsql && starting is not null)
         {
-            CountUngated(switching);
+            // A statement that runs within another, or within a block, after one that drew from the same sequence
+            // there, as each turn of a loop of inserts does, is counted with the statement or block around it, as a
+            // PL/pgSQL expression's draws are: the draws it could still take stay its command's, for the next turn.
+            List<uint> again = Within() ? [.. switching.Where(s_drewWithin.Contains)] : [];
+            if (again.Count > 0)
+            {
+                CountFunction(again);
+                CountUngated([.. switching.Where(seqoid => !again.Contains(seqoid))]);
+            }
+            else
+            {
+                CountUngated(switching);
+            }
+
+            NoteDrawsWithin(switching);
         }
         else if (plpgsql && switching.Count > 0)
         {
@@ -6618,6 +7391,24 @@ internal static partial class SequenceRangeGuard
     /// </summary>
     private static bool Guarded(uint relid) => Triggers(relid).Guarded;
 
+    // The version of the blocks, read from its atomic, which costs a statement that runs a moment as much as a table
+    // lookup, only once the counter the fast draws read has moved: a change moves the version first and that counter
+    // straight after.
+    private static long s_blocksVersion = -1;
+    private static long s_blocksVersionAt = -1;
+
+    private static unsafe long BlocksVersion()
+    {
+        long changes = Volatile.Read(ref Shared()[WorfFastDraws.Changes]);
+        if (changes != s_blocksVersionAt || s_blocksVersion < 0)
+        {
+            s_blocksVersion = SequenceRanges.Version.Value;
+            s_blocksVersionAt = changes;
+        }
+
+        return s_blocksVersion;
+    }
+
     /// <summary>
     /// Checks, from the system catalogs alone, as <see cref="Guarded"/> does, whether a table has the guard's triggers,
     /// and whether it has a trigger that takes arguments, which may name a sequence the trigger draws from.
@@ -6625,10 +7416,11 @@ internal static partial class SequenceRangeGuard
     private static (bool Guarded, bool Argued) Triggers(uint relid)
     {
         WatchTables();
-        (long, long) version = (SequenceRanges.Version.Value, SequenceRanges.LocalVersion);
+        (long, long) version = (BlocksVersion(), SequenceRanges.LocalVersion);
         if (version != s_guardedAt)
         {
             s_guarded.Clear();
+            s_checked.Clear();
             s_guardedAt = version;
         }
 
@@ -7465,6 +8257,13 @@ internal static partial class SequenceRangeGuard
     /// </summary>
     private static bool Check(uint seqoid, long value, bool inserted)
     {
+        // The first row a partition takes of a statement whose rows take the column's default runs the partition's
+        // trigger once, before worf marks it skipped: its value is one the sequence has just issued.
+        if (inserted && (s_routing.Count > 0 || s_copyRouting.State != 0) && ChecksDefaultTaken())
+        {
+            return false;
+        }
+
         // worf's own apply and sync workers write other nodes' rows, which the guard's triggers, which fire in every
         // session so that another apply's rows are checked, leave alone, as they did when the triggers fired only in
         // sessions that write their own. Another session with session_replication_role replica writes what it likes, as
@@ -8071,14 +8870,24 @@ internal static partial class SequenceRangeGuard
     /// </summary>
     /// <param name="relid">The table.</param>
     /// <param name="condition">The text of the COPY's own WHERE condition, as <see cref="CopyConditionText"/> reads it.</param>
+    /// <param name="columns">The columns the COPY reads, by number, or null for all of them.</param>
+    /// <param name="defaults">Whether the COPY's DEFAULT option lets a marker stand for a column's default.</param>
     /// <returns>The condition, unparsed, or null when no managed sequence numbers the table's rows.</returns>
-    internal static unsafe Node* CopyCondition(uint relid, string condition)
+    internal static unsafe Node* CopyCondition(uint relid, string condition, short[]? columns, bool defaults)
     {
         s_copying.Add([]);
         s_copyGates.Add(--s_lastCopyGate);
         s_copyFirst.Add(default);
+        s_copyTables.Add(relid);
+
+        // A database without worf has none of its tables to read.
+        if (relid == 0 || Worf.CatalogOid("sequence_range") == 0)
+        {
+            return null;
+        }
+
         Reload();
-        if (s_sequences.Count == 0 || relid == 0)
+        if (s_sequences.Count == 0)
         {
             return null;
         }
@@ -8093,7 +8902,17 @@ internal static partial class SequenceRangeGuard
         bool alone = condition.Length == 0;
         bool prepares = after && alone && NativeMethods.get_rel_relkind(relid) == (sbyte)'r' && CopyErrorCallback() != 0;
         Node* apart = after && !prepares ? Parsed("SELECT pg_catalog.random() >= 0") : null;
-        s_copying[^1].AddRange(DrawnBy(relid));
+
+        // A COPY that reads none of the columns the guard's trigger checks, each of which then takes what its own
+        // default draws, holds no gate and checks no sequence for each row: its first row has the defaults' calls go
+        // through the guard one by one, as a statement's do, and its rows skip the trigger.
+        List<uint> identities = [];
+        bool takes = !defaults && CopyErrorCallback() != 0 && CopyTakesDefaults(relid, columns, identities);
+        s_copyIdentities = takes && identities.Count > 0 ? identities : null;
+        if (!takes)
+        {
+            s_copying[^1].AddRange(DrawnBy(relid));
+        }
 
         // A row's values are checked against their columns' domains as the row is read, by expressions the input
         // functions keep to themselves, and the COPY's own condition runs for each row: the sequences those draw from
@@ -8105,8 +8924,8 @@ internal static partial class SequenceRangeGuard
         uint[] besides = [.. (unnamed ? s_sequences.Keys : read.Where(s_sequences.ContainsKey)).Where(seqoid => !s_copying[^1].Contains(seqoid))];
         s_copying[^1].AddRange(besides);
         bool finds = besides.Length > 0 && besides.Length == s_copying[^1].Count && CopyErrorCallback() != 0 && !ChecksUnnamedDomains(reads);
-        s_copyFirst[^1] = (prepares, finds, alone);
-        if (s_copying[^1].Count == 0 && !prepares)
+        s_copyFirst[^1] = (prepares, finds, alone, takes, s_copyIdentities);
+        if (s_copying[^1].Count == 0 && !prepares && !takes)
         {
             return apart;
         }
@@ -8134,8 +8953,12 @@ internal static partial class SequenceRangeGuard
 
     // For each COPY FROM under way, the innermost last, what its first row is to do in the condition worf adds: start
     // the conditions of the triggers that fire after its table's rows, and find the calls its own condition and its
-    // columns' domains make. Alone tells of a COPY with no condition of its own.
-    private static readonly List<(bool Prepares, bool Finds, bool Alone)> s_copyFirst = [];
+    // columns' domains make. Alone tells of a COPY with no condition of its own, and Takes of one whose rows take
+    // what the guard's trigger checks from the columns' defaults.
+    private static readonly List<(bool Prepares, bool Finds, bool Alone, bool Takes, List<uint>? Identities)> s_copyFirst = [];
+
+    // The sequences of the identity columns whose draws the COPY about to start has go through the guard.
+    private static List<uint>? s_copyIdentities;
 
     // Where PostgreSQL's CopyFromErrorCallback is, which marks a COPY FROM's state among the error contexts, or -1.
     private static nint s_copyErrorCallback;
@@ -8177,24 +9000,42 @@ internal static partial class SequenceRangeGuard
     // whose memory holds the row's.
     private static unsafe void StartCopyRows()
     {
-        (bool prepares, bool finds, bool alone) = s_copyFirst[^1];
+        (bool prepares, bool finds, bool alone, bool takes, List<uint>? identities) = s_copyFirst[^1];
         s_copyFirst[^1] = default;
         MemoryContextData* row = NativeGlobals.CurrentMemoryContext;
         EState* state = ExecutorStateOf(row is null ? null : row->parent);
         CopyFromStateData* copy = CopyUnderWay();
         if (state is null || copy is null)
         {
-            if (prepares)
+            if (prepares || takes)
             {
-                WorfLog.Warning("worf found no executor state for a COPY whose triggers' conditions draw from a managed sequence");
+                WorfLog.Warning("worf found no executor state for a COPY whose table's rows draw from a managed sequence");
+            }
+
+            if (takes)
+            {
+                GateCopy(s_copyTables[^1]);
             }
 
             return;
         }
 
-        if (finds)
+        // A COPY whose rows take the defaults goes on as one that checks each row where worf can't find every call.
+        bool found = (finds || takes) && GuardReadCalls(state, copy, takes, identities ?? []);
+        if (takes && !found)
         {
-            GuardReadCalls(state, copy);
+            GateCopy(s_copyTables[^1]);
+        }
+
+        for (int i = 0; takes && found && state->es_opened_result_relations is not null && i < state->es_opened_result_relations->length; i++)
+        {
+            SkipGuard((ResultRelInfo*)state->es_opened_result_relations->elements[i].ptr_value);
+        }
+
+        if (takes && found && Checked(s_copyTables[^1]).Routes)
+        {
+            s_copyRouting = ((nint)state, s_scopes.Count, s_copying.Count);
+            SkipRoutedGuards(state);
         }
 
         if (prepares)
@@ -8238,11 +9079,11 @@ internal static partial class SequenceRangeGuard
     // and those its tables keep are every call that has started in it so far: one kept where worf doesn't look
     // leaves the COPY checking for each row. A call that starts later, as a column's first value that isn't null
     // starts those of the domain it holds an array of, is found before the row after.
-    private static unsafe void GuardReadCalls(EState* state, CopyFromStateData* copy)
+    private static unsafe bool GuardReadCalls(EState* state, CopyFromStateData* copy, bool defaults, List<uint> identities)
     {
         if (s_starting.Count == 0 || s_starting[^1] is not { Copy: true } starting || (starting.CopyState != 0 && starting.CopyState != (nint)state))
         {
-            return;
+            return false;
         }
 
         ReadNextval();
@@ -8251,7 +9092,8 @@ internal static partial class SequenceRangeGuard
         FindReadCalls(copy, calls, seen);
 
         // The defaults a COPY works out are those of the columns it doesn't read, and from PostgreSQL 16 on those of
-        // the columns it reads too, where a marker may stand for them.
+        // the columns it reads too, where a marker may stand for them. Their calls go through the guard too where the
+        // COPY holds no gate for them.
         int own = calls.Count;
         for (int i = 0; i < copy->num_defaults; i++)
         {
@@ -8272,7 +9114,12 @@ internal static partial class SequenceRangeGuard
         HashSet<nint> found = [.. calls.Select(call => call.Step), .. RunCalls(state).Select(call => call.Step), .. starting.CopyCalls];
         if (found.Count != starting.Looked || calls.Exists(call => call.Compiled))
         {
-            return;
+            return false;
+        }
+
+        if (defaults)
+        {
+            own = calls.Count;
         }
 
         ReadHookedCall();
@@ -8282,6 +9129,52 @@ internal static partial class SequenceRangeGuard
         if (!s_planSites.TryGetValue((nint)state, out List<(int Site, nint Call, nint Information)>? sites))
         {
             sites = [];
+        }
+
+        // The draws of the identity columns among the defaults run as calls of nextval, as a statement's do.
+        if (identities.Count > 0)
+        {
+            List<(nint Step, bool Single, bool Compiled)> draws = [];
+            s_findingIdentities = true;
+            try
+            {
+                HashSet<nint> looked = [];
+                for (int i = 0; i < copy->num_defaults; i++)
+                {
+#if ANKUS_PG15
+                    FindCalls(copy->defexprs[i], draws, looked, false);
+#else
+                    FindCalls(copy->defexprs[copy->defmap[i]], draws, looked, false);
+#endif
+                }
+            }
+            finally
+            {
+                s_findingIdentities = false;
+            }
+
+            HashSet<uint> hooked = [];
+            foreach ((nint draw, _, _) in draws)
+            {
+                ExprEvalStep* step = (ExprEvalStep*)draw;
+                uint seqoid = step->d.nextvalueexpr.seqid;
+                if (identities.Contains(seqoid) && HookDraw(step, state->es_query_cxt))
+                {
+                    sites.Add((GuardCall(step), (nint)step->d.func.finfo->fn_expr, (nint)step->d.func.fcinfo_data));
+                    _ = hooked.Add(seqoid);
+                }
+            }
+
+            if (sites.Count > 0)
+            {
+                s_planSites[(nint)state] = sites;
+                starting.CopyState = (nint)state;
+            }
+
+            if (!identities.TrueForAll(hooked.Contains))
+            {
+                return false;
+            }
         }
 
         for (int i = 0; i < own; i++)
@@ -8304,6 +9197,54 @@ internal static partial class SequenceRangeGuard
         starting.CopyRead = (nint)copy;
         s_copying[^1].Clear();
         CloseGates(s_copyGates[^1]);
+        return true;
+    }
+
+    // For each COPY FROM under way, the innermost last, the table it writes.
+    private static readonly List<uint> s_copyTables = [];
+
+    // Whether a COPY's rows take, in every column the guard's trigger checks of its table, what the column's own
+    // default draws from a managed sequence the trigger checks it under: the COPY reads none of those columns, and
+    // each one's default is a call of nextval that names such a sequence, under no more than a cast.
+    private static unsafe bool CopyTakesDefaults(uint relid, short[]? columns, List<uint> identities)
+    {
+        (bool plain, List<(short Column, uint[] Sequences)> guarded, _) = Checked(relid);
+        if (!plain || guarded.Count == 0 || columns is null || guarded.Exists(column => Array.IndexOf(columns, column.Column) >= 0) ||
+            ArguedBy(relid, TriggerTypeInsert).Count > 0)
+        {
+            return false;
+        }
+
+        RelationData* table = NativeMethods.relation_open(relid, (int)PgLockMode.AccessShare);
+        try
+        {
+            foreach ((short column, uint[] sequences) in guarded)
+            {
+                if (!DrawsFrom(Uncast(NativeMethods.build_column_default(table, column)), sequences, identities))
+                {
+                    return false;
+                }
+            }
+        }
+        finally
+        {
+            NativeMethods.relation_close(table, (int)PgLockMode.None);
+        }
+
+        return true;
+    }
+
+    // Has a COPY that set out holding no gate check its table's sequences for each row after all, from this row on, as
+    // one whose rows the guard's trigger checks does.
+    private static void GateCopy(uint relid)
+    {
+        uint[] drawn = [.. DrawnBy(relid).Where(seqoid => !s_copying[^1].Contains(seqoid))];
+        s_copying[^1].AddRange(drawn);
+        if (s_copying[^1].Count > 0)
+        {
+            OpenGates(s_copyGates[^1], s_copying[^1]);
+            WaitBeforeDrawing(s_copying[^1]);
+        }
     }
 
     // Finds the calls a COPY's rows make as they are read: those of its condition, and those of the domains the
@@ -8446,10 +9387,17 @@ internal static partial class SequenceRangeGuard
     /// </summary>
     internal static void EndCopy()
     {
+        if (s_copyRouting.State != 0 && s_copyRouting.Copies == s_copying.Count)
+        {
+            _ = s_routedMarked.Remove(s_copyRouting.State);
+            s_copyRouting = default;
+        }
+
         nint gates = s_copyGates[^1];
         s_copyGates.RemoveAt(s_copyGates.Count - 1);
         s_copying.RemoveAt(s_copying.Count - 1);
         s_copyFirst.RemoveAt(s_copyFirst.Count - 1);
+        s_copyTables.RemoveAt(s_copyTables.Count - 1);
         CloseGates(gates);
     }
 
@@ -8458,7 +9406,7 @@ internal static partial class SequenceRangeGuard
     /// </summary>
     private static unsafe sbyte* CheckCopied()
     {
-        if (s_copyFirst.Count > 0 && (s_copyFirst[^1].Prepares || s_copyFirst[^1].Finds))
+        if (s_copyFirst.Count > 0 && (s_copyFirst[^1].Prepares || s_copyFirst[^1].Finds || s_copyFirst[^1].Takes))
         {
             StartCopyRows();
         }
@@ -8775,6 +9723,9 @@ internal static partial class SequenceRangeGuard
     /// Reads the blocks this node holds again once the range worker, a function or this backend's own transaction has
     /// changed them.
     /// </summary>
+    // The fast draws' counter as the blocks' version was last read.
+    private static long s_versionReadAt = -1;
+
     private static void Reload()
     {
         // The changes told to the draws that hold no gate are read first: a change moves the counter every backend
@@ -8785,8 +9736,16 @@ internal static partial class SequenceRangeGuard
             changes = Volatile.Read(ref Shared()[WorfFastDraws.Changes]);
         }
 
-        long version = SequenceRanges.Version.Value;
+        // A change moves the version and then that counter, one straight after the other, so while the counter stands
+        // where the last read found it, the version does too, and its atomic, which costs far more to read, isn't.
         long localVersion = SequenceRanges.LocalVersion;
+        if (changes == s_changesRead && s_version >= 0 && localVersion == s_localVersion && s_versionReadAt == changes)
+        {
+            return;
+        }
+
+        long version = SequenceRanges.Version.Value;
+        s_versionReadAt = changes;
         if (version == s_version && localVersion == s_localVersion)
         {
             s_changesRead = changes;

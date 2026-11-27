@@ -123,8 +123,8 @@ Statements never run past a block while the next one can still come:
   numbers a row, through several `nextval` calls or through triggers, waits that much earlier. When worf can't tell
   from a trigger's code how many numbers it draws (a loop, `EXECUTE`, or a call to one of your own functions), it
   allows half a block per row until it has seen such a row.
-- Inserts, `COPY FROM`, `INSERT … ON CONFLICT` and `MERGE` check between rows. `SELECT nextval(...)` checks before it
-  draws and as its rows go on.
+- A statement checks before it draws and as its rows go on. A write whose rows the guard triggers check, such as
+  `INSERT … ON CONFLICT DO UPDATE`, `MERGE` or rows that give the column's value themselves, checks between rows.
 - Statements that run at the same time leave each other enough numbers.
 - A statement waits for a block for up to twice `worf.sequence_range_timeout` plus `worf.sequence_range_offline_wait`,
   so a node that can't reach the others has time to take one from its reserve. `statement_timeout` also ends the
@@ -136,10 +136,13 @@ next block itself, and other sessions' inserts wait for it to end. Such a transa
 A transaction that drew from a block and stays open delays the range worker's switch until it ends. In the block's
 last twentieth, a switch worker switches around it instead.
 
-While they draw, inserts and `COPY FROM` hold a lock on the sequence (an advisory lock that worf calls its switch
-gate) and let it go between rows when a switch is waiting. A statement that holds it while it waits for something
-else, such as `COPY FROM STDIN` waiting for its client, holds the switch up until it continues. If such waits form a
-cycle, PostgreSQL ends one of the statements with SQLSTATE `40P01`.
+An insert or `COPY FROM` whose rows take the column's value from its default draws as `SELECT nextval(...)` does,
+described below. Other writes to a table the guard triggers check hold a lock on the sequence while they draw (an
+advisory lock that worf calls its switch gate) and let it go between rows when a switch is waiting. Those are rows
+that give the column's value themselves, `INSERT … ON CONFLICT DO UPDATE`, `MERGE`, and writes to a table with a row
+trigger before its inserts. A statement that holds the gate while it waits for something else, such as
+`COPY FROM STDIN` waiting for its client, holds the switch up until it continues. If such waits form a cycle,
+PostgreSQL ends one of the statements with SQLSTATE `40P01`.
 
 Other draws, such as those of `SELECT nextval(...)` or of a PL/pgSQL assignment in a loop, take the gate only when
 they have to check the block, as a statement's first draw does, or the first by a PL/pgSQL expression in a
@@ -177,7 +180,10 @@ loads them. The allocator refuses keys that may already be in use.
 
 worf adds two triggers to each table with a column that takes its default from a managed sequence. They check each
 row a local session writes: a new row's value, and a value an update changes. A value is allowed only if it's in one
-of this node's blocks and the sequence has already gone past it. Anything else fails the statement with SQLSTATE
+of this node's blocks and the sequence has already gone past it. A new row that takes the value from the column's
+default needs no check, so an insert or `COPY FROM` of such rows skips the trigger and costs about what it costs over
+a plain sequence. A table with a row trigger before its inserts, which could change the value, has every row
+checked. Anything else fails the statement with SQLSTATE
 `23514`. Rows written with `session_replication_role` set to `replica`, as worf's apply and sync workers write the
 rows they bring from other nodes, aren't checked. Setting it takes a superuser or `GRANT SET ON PARAMETER`. The
 triggers can't be disabled.

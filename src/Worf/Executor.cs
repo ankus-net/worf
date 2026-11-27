@@ -403,7 +403,33 @@ internal static unsafe partial class Executor
         bool copying = parsetree->type == NodeTag.T_CopyStmt && ((CopyStmt*)parsetree)->is_from && ((CopyStmt*)parsetree)->relation is not null;
         uint copied = copying ? NativeMethods.RangeVarGetRelidExtended(((CopyStmt*)parsetree)->relation, 0, RangeVarMissingOk, default, null) : 0;
         string copyCondition = copied != 0 ? SequenceRangeGuard.CopyConditionText(copied, ((CopyStmt*)parsetree)->whereClause) : "";
-        Node* check = copying ? SequenceRangeGuard.CopyCondition(copied, copyCondition) : null;
+
+        // The columns it reads, and whether a marker may stand for a column's default.
+        short[]? copyRead = null;
+        bool copyDefaults = false;
+        if (copied != 0)
+        {
+            CopyStmt* read = (CopyStmt*)parsetree;
+            if (read->attlist is not null)
+            {
+                RelationData* rel = NativeMethods.relation_open(copied, (int)PgLockMode.AccessShare);
+                List* numbers = NativeMethods.CopyGetAttnums(rel->rd_att, rel, read->attlist);
+                copyRead = new short[numbers is null ? 0 : numbers->length];
+                for (int i = 0; i < copyRead.Length; i++)
+                {
+                    copyRead[i] = (short)numbers->elements[i].int_value;
+                }
+
+                NativeMethods.relation_close(rel, (int)PgLockMode.None);
+            }
+
+            for (int i = 0; read->options is not null && i < read->options->length; i++)
+            {
+                copyDefaults |= Worf.FromServer(((DefElem*)read->options->elements[i].ptr_value)->defname) == "default";
+            }
+        }
+
+        Node* check = copying ? SequenceRangeGuard.CopyCondition(copied, copyCondition, copyRead, copyDefaults) : null;
         if (check is not null)
         {
             if (readOnlyTree)
@@ -428,29 +454,6 @@ internal static unsafe partial class Executor
 
         // A COPY FROM's calls of nextval, in the defaults it starts before its rows, name the sequences they draw from.
         bool startingCopy = copied != 0;
-        short[]? copyRead = null;
-        bool copyDefaults = false;
-        if (startingCopy)
-        {
-            CopyStmt* copy = (CopyStmt*)parsetree;
-            if (copy->attlist is not null)
-            {
-                RelationData* rel = NativeMethods.relation_open(copied, (int)PgLockMode.AccessShare);
-                List* numbers = NativeMethods.CopyGetAttnums(rel->rd_att, rel, copy->attlist);
-                copyRead = new short[numbers is null ? 0 : numbers->length];
-                for (int i = 0; i < copyRead.Length; i++)
-                {
-                    copyRead[i] = (short)numbers->elements[i].int_value;
-                }
-
-                NativeMethods.relation_close(rel, (int)PgLockMode.None);
-            }
-
-            for (int i = 0; copy->options is not null && i < copy->options->length; i++)
-            {
-                copyDefaults |= Worf.FromServer(((DefElem*)copy->options->elements[i].ptr_value)->defname) == "default";
-            }
-        }
 
         uint xactFlags = DdlReplication.BeginStatement(ddl is not null);
         bool tracking = LocalIndex.BeginStatement(parsetree, ddl is not null);
@@ -464,6 +467,12 @@ internal static unsafe partial class Executor
         bool startingUtility = !startingCopy && SequenceRangeGuard.StartingUtility(parsetree);
 
         bool usedTemp;
+        bool command = context == ProcessUtilityContext.PROCESS_UTILITY_TOPLEVEL;
+        if (command)
+        {
+            SequenceRangeGuard.CountCommand(1);
+        }
+
         try
         {
             if (!s_nextProcessUtilityHook.IsNull)
@@ -509,6 +518,11 @@ internal static unsafe partial class Executor
         {
             // What worf only notes goes first, and the rest goes whatever fails before it: a cancellation stays pending
             // until the statement ends, and fails every call into PostgreSQL meanwhile.
+            if (command)
+            {
+                SequenceRangeGuard.CountCommand(-1);
+            }
+
             if (startingCopy || startingUtility)
             {
                 SequenceRangeGuard.StartedExpressions();
@@ -599,6 +613,12 @@ internal static unsafe partial class Executor
         if (access == ObjectAccessType.OAT_FUNCTION_EXECUTE && objectId == NextvalOid)
         {
             SequenceRangeGuard.BeforeNextval();
+        }
+
+        // A function that starts may be the guard's check in the trigger of a partition just opened.
+        if (access == ObjectAccessType.OAT_FUNCTION_EXECUTE && SequenceRangeGuard.RoutesDefaults)
+        {
+            SequenceRangeGuard.SkipRoutedGuards();
         }
 
         if (access == ObjectAccessType.OAT_POST_CREATE && classId == Dependency.RelationRelationId && subId == 0)
@@ -737,6 +757,7 @@ internal static unsafe partial class Executor
         // A statement only explained draws nothing as its expressions start, unless it prunes partitions through a call.
         SequenceRangeGuard.StartingExpressions((nint)queryDesc->plannedstmt, (eflags & ExecFlagExplainOnly) != 0, (nint)queryDesc->sourceText,
             queryDesc->@params is not null && queryDesc->@params->numParams > 0);
+        bool started = false;
         try
         {
             if (!s_nextExecutorStartHook.IsNull)
@@ -747,10 +768,12 @@ internal static unsafe partial class Executor
             {
                 NativeMethods.standard_ExecutorStart(queryDesc, eflags);
             }
+
+            started = true;
         }
         finally
         {
-            SequenceRangeGuard.StartedPlan((nint)queryDesc);
+            SequenceRangeGuard.StartedPlan((nint)queryDesc, started);
         }
     }
 

@@ -1,5 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using Ankus.PgConfig;
 using Ankus.Testing;
@@ -455,8 +457,25 @@ internal sealed class TestNode : IAsyncDisposable
     /// <param name="mode">The shutdown mode: <c>smart</c>, <c>fast</c> or <c>immediate</c>.</param>
     /// <param name="cancellationToken">Cancels waiting for the server.</param>
     /// <returns>The work.</returns>
-    public Task StopAsync(string mode, CancellationToken cancellationToken)
-        => RunPgCtlAsync(["stop", "-D", Cluster.DataDirectory, "-m", mode, "-w"], cancellationToken);
+    public async Task StopAsync(string mode, CancellationToken cancellationToken)
+    {
+        await RunPgCtlAsync(["stop", "-D", Cluster.DataDirectory, "-m", mode, "-w"], cancellationToken);
+
+        // The node keeps its port while its server is down, so that no other test's server takes it meanwhile.
+        try
+        {
+            Socket held = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            held.Bind(new IPEndPoint(IPAddress.Loopback, Cluster.Port));
+            _heldPort?.Dispose();
+            _heldPort = held;
+        }
+        catch (SocketException)
+        {
+            // Something has the port already, and the server's next start tells.
+        }
+    }
+
+    private Socket? _heldPort;
 
     /// <summary>
     /// Starts the node's server again after <see cref="StopAsync"/>, with the settings it had.
@@ -467,8 +486,12 @@ internal sealed class TestNode : IAsyncDisposable
     /// <returns>The work.</returns>
     public Task StartServerAsync(CancellationToken cancellationToken, string? options = null,
         IReadOnlyDictionary<string, string>? environment = null)
-        => RunPgCtlAsync(["start", "-D", Cluster.DataDirectory, "-l", RestartLogPath, "-w", "-t", "180",
+    {
+        _heldPort?.Dispose();
+        _heldPort = null;
+        return RunPgCtlAsync(["start", "-D", Cluster.DataDirectory, "-l", RestartLogPath, "-w", "-t", "180",
             .. options is null ? Array.Empty<string>() : ["-o", options]], cancellationToken, environment);
+    }
 
     /// <summary>
     /// Reads the node's server log, and what the server wrote after <see cref="StartServerAsync"/>.
@@ -501,7 +524,12 @@ internal sealed class TestNode : IAsyncDisposable
             .Select(line => DateTime.ParseExact(line[1..24], "yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture))];
 
     /// <inheritdoc/>
-    public ValueTask DisposeAsync() => Cluster.DisposeAsync();
+    public ValueTask DisposeAsync()
+    {
+        _heldPort?.Dispose();
+        _heldPort = null;
+        return Cluster.DisposeAsync();
+    }
 
     /// <summary>
     /// Gets the publication of worf the test run's nodes share, making it the first time.

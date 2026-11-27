@@ -77,7 +77,13 @@ public sealed partial class DocumentationTests
             s_sequenceRanges, "made-up pool and reserved requests (1900, 2100)");
         Assert.Contains("From a block's last twentieth, statements wait for the switch before they draw more.", s_sequenceRanges, "the switch (130)");
         Assert.Contains("it allows half a block per row until it has seen such a row", s_sequenceRanges, "a row's unseen draws (1663)");
-        Assert.Contains("Inserts, `COPY FROM`, `INSERT … ON CONFLICT` and `MERGE` check between rows.", s_sequenceRanges, "upserts and merges (2040)");
+        Assert.Contains("A write whose rows the guard triggers check, such as `INSERT … ON CONFLICT DO UPDATE`, `MERGE` or rows that give the column's value themselves, checks between rows.",
+            s_sequenceRanges, "upserts and merges (2040)");
+        Assert.Contains("An insert or `COPY FROM` whose rows take the column's value from its default draws as `SELECT nextval(...)` does",
+            s_sequenceRanges, "rows that take their defaults (2901)");
+        Assert.Contains("A new row that takes the value from the column's default needs no check, so an insert or `COPY FROM` of such rows skips the trigger",
+            s_sequenceRanges, "rows that take their defaults (2901)");
+        Assert.DoesNotContain("While they draw, inserts and `COPY FROM` hold a lock on the sequence", s_sequenceRanges, "rows that take their defaults (2901)");
         Assert.Contains("up to twice this long, plus `worf.sequence_range_offline_wait`, if the next block hasn't arrived or a switch failed, and otherwise until the switch is done", s_configuration,
             "how long inserts wait for a switch (130)");
         Assert.Contains("goes on to the end of its range if no other node was ever given any of its values. Otherwise it stays limited to the block of numbers this node was using, so it can't hand out a number another node may have, and worf logs a warning for it.",
