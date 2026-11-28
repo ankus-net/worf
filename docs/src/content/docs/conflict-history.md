@@ -7,9 +7,7 @@ The **Conflict History** feature records replication conflicts to a queryable ta
 
 ## Overview
 
-When replication conflicts occur (e.g., the same row is modified on multiple nodes), worf detects and resolves them automatically. Previously, these conflicts were only logged to PostgreSQL's log files, making them difficult to query and analyze.
-
-With Conflict History, conflicts are now recorded to the `worf.conflict_history` table, allowing DBAs to:
+When replication conflicts occur (e.g., the same row is modified on multiple nodes), worf detects and resolves them automatically and logs them. With Conflict History, it also records them in the `worf.conflict_history` table, so you can:
 
 - Query conflicts using standard SQL
 - Analyze conflict patterns over time
@@ -157,7 +155,7 @@ The `worf.conflict_history` table contains:
 
 ## Partition Management
 
-The `conflict_history` table is partitioned by month for efficient data management.
+The `conflict_history` table is partitioned by month, in UTC whatever the session's time zone, for efficient data management.
 
 ### Partitions are Created Automatically
 
@@ -227,4 +225,5 @@ The cleanup function returns the number of partitions dropped.
 - Conflict history is recorded on the **subscriber** side only (where conflicts are detected during apply)
 - Very large tuple values are truncated based on `worf.conflict_history_max_tuple_size`
 - External TOAST values are stored as `"(unchanged-toast-datum)"` rather than the actual value
-- Recording failures do not abort replication - they are logged as warnings and replication continues
+- Conflicts are recorded in a separate transaction after the apply transaction commits. A transaction that rolls back records nothing, and a crash right after a commit may lose that transaction's records
+- If recording fails, replication goes on, and the error is logged as a warning with its SQLSTATE. This includes failures in anything the record sets off, such as a trigger on the history table

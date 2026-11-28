@@ -14,19 +14,23 @@ directory, and installs:
 - `bin\worf_create_subscriber.exe`
 - `lib\worf.dll`
 - `share\extension\worf.control` and `share\extension\worf--*.sql`
+- `doc\worf\LICENSE` and `doc\worf\THIRD-PARTY-NOTICES.txt`
 
 Remove it from **Apps** in Settings.
 
 ### ZIP
 
 Extract `worf-<version>-pg<major>-windows-x64.zip` and copy its directories into
-the PostgreSQL installation:
+the PostgreSQL installation, with the licenses beside them as the MSI places
+them:
 
 ```powershell
 $PG_DIR = "C:\Program Files\PostgreSQL\17"
 Copy-Item "bin\*.exe" "$PG_DIR\bin\"
 Copy-Item "lib\*.dll" "$PG_DIR\lib\"
 Copy-Item "share\extension\*" "$PG_DIR\share\extension\"
+New-Item -ItemType Directory -Force "$PG_DIR\doc\worf" | Out-Null
+Copy-Item "LICENSE", "THIRD-PARTY-NOTICES.txt" "$PG_DIR\doc\worf\"
 ```
 
 Then configure PostgreSQL as the [README](../getting-started/quick-setup/) describes,

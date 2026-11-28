@@ -9,6 +9,18 @@ CREATE TABLE public.test_publicschema(id serial primary key, data text);
 
 \c :subscriber_dsn
 
+-- 11_replication_set's DROP of the table replicates, so wait for it before creating this one.
+DO $$
+BEGIN
+	FOR i IN 1..100 LOOP
+		IF to_regclass('public.test_publicschema') IS NULL THEN
+			RETURN;
+		END IF;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END;
+$$;
+
 CREATE TABLE public.test_publicschema(data text, id serial primary key);
 
 \c :provider_dsn
@@ -84,13 +96,49 @@ INSERT INTO public.test_publicschema VALUES(4, 'd');
 INSERT INTO "strange.schema-IS".test_strangeschema VALUES(3, DEFAULT);
 INSERT INTO "strange.schema-IS".test_strangeschema VALUES(4, DEFAULT);
 
+-- The subscriber has no sequences of these names, as after a rename on either node, so apply stops at their states, as
+-- at a change to a missing table, until there is one, or until the provider no longer replicates one of the name.
+CREATE SEQUENCE public.test_provider_only_seq;
+SELECT * FROM worf.replication_set_add_sequence('default', 'test_provider_only_seq');
+CREATE SEQUENCE public.test_removed_seq;
+SELECT * FROM worf.replication_set_add_sequence('default', 'test_removed_seq');
+
 SELECT worf.synchronize_sequence(c.oid)
   FROM pg_class c, pg_namespace n
  WHERE c.relkind = 'S' AND c.relnamespace = n.oid AND n.nspname IN ('public', 'strange.schema-IS');
 
+\c :subscriber_dsn
+
+DO $$
+BEGIN
+	FOR i IN 1..300 LOOP
+		IF EXISTS (SELECT 1 FROM worf.show_subscription_status() WHERE status = 'down') THEN
+			RETURN;
+		END IF;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+	RAISE EXCEPTION 'apply went on past the state of a sequence it does not have';
+END;
+$$;
+
+CREATE SEQUENCE public.test_renamed_seq;
+ALTER SEQUENCE public.test_renamed_seq RENAME TO test_provider_only_seq;
+
+\c :provider_dsn
+
+SELECT * FROM worf.replication_set_remove_sequence('default', 'test_removed_seq');
+
+BEGIN;
+SET LOCAL statement_timeout = '60s';
 SELECT worf.wait_slot_confirm_lsn(NULL, NULL);
+COMMIT;
+
+DROP SEQUENCE public.test_provider_only_seq CASCADE;
+DROP SEQUENCE public.test_removed_seq;
 
 \c :subscriber_dsn
+SELECT last_value > 1000 FROM public.test_provider_only_seq;
+DROP SEQUENCE public.test_provider_only_seq;
 SELECT * FROM public.test_publicschema;
 SELECT * FROM "strange.schema-IS".test_strangeschema;
 
@@ -156,6 +204,7 @@ SELECT * FROM "strange.schema-IS".test_strangeschema;
 
 \c :provider_dsn
 
+-- The walsender already streaming test_diff_repset stops replicating it at once.
 SELECT * FROM worf.alter_replication_set('repset_test', replicate_insert := false, replicate_update := false, replicate_delete := false, replicate_truncate := false);
 
 INSERT INTO "strange.schema-IS".test_diff_repset VALUES(3);
@@ -188,6 +237,40 @@ SELECT * FROM "strange.schema-IS".test_diff_repset;
 TRUNCATE "strange.schema-IS".test_diff_repset;
 
 SELECT worf.wait_slot_confirm_lsn(NULL, NULL);
+
+\c :subscriber_dsn
+
+SELECT * FROM "strange.schema-IS".test_diff_repset;
+
+-- A walsender that starts after the set stops replicating inserts still replicates the ones made before.
+SELECT worf.alter_subscription_disable('test_subscription', true);
+
+\c :provider_dsn
+
+DO $$
+BEGIN
+	FOR i IN 1..100 LOOP
+		IF NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE active) THEN
+			RETURN;
+		END IF;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END;
+$$;
+
+INSERT INTO "strange.schema-IS".test_diff_repset VALUES(7);
+SELECT * FROM worf.alter_replication_set('repset_test', replicate_insert := false);
+INSERT INTO "strange.schema-IS".test_diff_repset VALUES(8);
+
+\c :subscriber_dsn
+
+SELECT worf.alter_subscription_enable('test_subscription', true);
+
+\c :provider_dsn
+
+SELECT worf.wait_slot_confirm_lsn(NULL, NULL);
+
+SELECT * FROM worf.alter_replication_set('repset_test', replicate_insert := true);
 
 \c :subscriber_dsn
 

@@ -23,7 +23,8 @@ internal struct WorfReservation
 
     /// <summary>
     /// The kind of block: 'n' for a node block of at least <see cref="Size"/> values, 'i' for exactly
-    /// [<see cref="Lo"/>, <see cref="Hi"/>].
+    /// [<see cref="Lo"/>, <see cref="Hi"/>], 'a' for the active block [<see cref="Lo"/>, <see cref="Hi"/>], which has
+    /// values enough left for the load, or 'w' to withdraw the request of the same id, which its session gave up on.
     /// </summary>
     public byte Kind;
 
@@ -33,12 +34,12 @@ internal struct WorfReservation
     public long Size;
 
     /// <summary>
-    /// The start of an imported block.
+    /// The start of an imported block, or of the active block.
     /// </summary>
     public long Lo;
 
     /// <summary>
-    /// The end of an imported block.
+    /// The end of an imported block, or of the active block.
     /// </summary>
     public long Hi;
 }

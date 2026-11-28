@@ -45,58 +45,63 @@ constraints must *not be more restrictive* than those on the upstream(s).
 Partial secondary unique indexes are permitted, but will be ignored for
 conflict resolution purposes.
 
-## Unique constraints must not be deferrable
+## Deferrable constraints
 
-On the downstream end worf does not support index-based constraints
-defined as `DEFERRABLE`. It will emit the error
+PostgreSQL normally skips the recheck of deferrable unique and exclusion
+constraints for rows that apply writes. worf makes it run, so these constraints
+are checked for replicated rows just as for local ones:
 
-    ERROR: worf doesn't support index rechecks needed for deferrable indexes
-    DETAIL: relation "public"."test_relation" has deferrable indexes: "index1", "index2"
+- A constraint that is initially deferred is checked at commit, and a
+  violation fails the whole incoming transaction.
+- A constraint that is initially immediate is checked as each change ends. If a
+  local transaction is writing a conflicting row, apply waits for it.
 
-if such an index is present when it attempts to apply changes to a table.
+`worf.exception_behaviour` handles these failures like any other. A table's
+initial copy is checked against these constraints once it has copied.
 
 ## DDL
 
 With `worf.enable_ddl_replication` on, DDL replicates as it runs, and
 `worf.include_ddl_repset` adds the tables it creates to replication sets.
-Otherwise, managing DDL so that the provider and subscriber database(s) remain
-compatible is the responsibility of the user.
-
-worf provides the `worf.replicate_ddl_command` function to allow DDL
-to be run on the provider and subscriber at a consistent point.
+Otherwise, it's up to you to keep the provider and subscriber databases
+compatible. `worf.replicate_ddl_command` runs DDL on the provider and
+subscribers at a consistent point.
 
 A replicated `ALTER TABLE ... ADD COLUMN` with a volatile default, such as
-`now()` or `gen_random_uuid()`, fills existing rows with each node's own
-values.
+`now()` or `gen_random_uuid()`, fills existing rows with different values on
+each node.
 
-With `worf.global_ddl_lock`, a statement in the same transaction that writes
-rows another node is about to change, before DDL that takes the lock, can
-make the DDL wait until `worf.ddl_lock_timeout`. A node notices within about a
-minute that a node holding back its writes for DDL died before the DDL
-committed.
+With `worf.global_ddl_lock`, DDL that needs the lock fails at once with SQLSTATE
+`55P03` if an earlier statement in the same transaction holds a lock that the
+other nodes' changes need. For example, the earlier statement ran `LOCK TABLE`
+or `TRUNCATE`, or updated a row that another node also changed. Run such DDL
+first in its transaction, or in a transaction of its own. If a node that is
+blocking writes for DDL dies before the DDL commits, the other nodes notice
+within about a minute.
 
-## No replication queue flush
+`worf.replicate_ddl_command` doesn't take the global DDL lock, so the DDL it
+queues applies on each node wherever it falls among that node's own writes.
 
-There's no support for freezing transactions on the master and waiting until
-all pending queued xacts are replayed from slots. Support for making the
-upstream read-only for this will be added in a future release.
+DDL that uses temporary objects runs on its own node only, without a notice,
+or fails if it also creates or changes permanent objects; see
+`worf.enable_ddl_replication`. worf misses one case: a temporary type named
+without a schema before a string constant, as in `tmp_type '1'`, inside an
+expression the statement doesn't keep, such as `ALTER TABLE ... USING`. Such a
+statement replicates. Write the type as `pg_temp.tmp_type`, or write the cast
+with `::`.
 
-This means that care must be taken when applying table structure changes. If
-there are committed transactions that aren't yet replicated and the table
-structure of the provider and subscriber are changed at the same time in a way
-that makes the subscriber table incompatible with the queued transactions
-replication will stop.
+## Schema changes without the global DDL lock
 
-Administrators should either ensure that writes to the master are stopped
-before making schema changes, or use the `worf.replicate_ddl_command`
-function to queue schema changes so they're replayed at a consistent point
-on the replica.
+Without `worf.global_ddl_lock`, worf doesn't stop writes on the other nodes
+while DDL replicates. If transactions that aren't replicated yet no longer fit
+the changed table, replication stops.
 
-Once multi-master replication support is added then using
-`worf.replicate_ddl_command` will not be enough, as the subscriber may be
-generating new xacts with the old structure after the schema change is
-committed on the publisher. Users will have to ensure writes are stopped on all
-nodes and all slots are caught up before making schema changes.
+Either stop writes to the provider before changing a table, or use
+`worf.replicate_ddl_command` so the change applies at a consistent point on the
+subscribers. When every node writes, that isn't enough, since another node may
+write with the old structure after the change commits. Then use
+`worf.enable_ddl_replication` with `worf.global_ddl_lock`, or stop writes on
+every node and let all slots catch up before changing tables.
 
 ## FOREIGN KEYS
 
@@ -123,6 +128,12 @@ that the subscribers actually receive future state of the sequence. This
 minimizes the chance of subscriber's notion of sequence's `last_value` falling
 behind but does not completely eliminate the possibility.
 
+A sequence's state goes to the subscriber's sequence with the same schema and
+name. If the subscriber has no such sequence, for example because it was
+renamed on only one node, apply stops with an error until it exists. To go on
+without it, remove the sequence from its replication sets on the provider with
+`worf.replication_set_remove_sequence`. Apply then skips it, with a warning.
+
 It might be desirable to call `synchronize_sequence` to ensure all subscribers
 have up to date information about given sequence after "big events" in the
 database such as data loading or during the online upgrade.
@@ -143,9 +154,14 @@ point.
 
 ## Triggers
 
-Apply process and the initial COPY process both run with
-`session_replication_role` set to `replica` which means that `ENABLE REPLICA`
-and `ENABLE ALWAYS` triggers will be fired.
+Apply and the initial copy both run with `session_replication_role` set to
+`replica`, so `ENABLE REPLICA` and `ENABLE ALWAYS` triggers fire.
+
+They run with the `search_path` set for the database and role, so a trigger
+that names a function or table without a schema finds the same one a local
+session would. Row filters run with the `search_path` of the provider's
+database and role. worf's own queries search only `pg_catalog`, then temporary
+objects.
 
 ## PostgreSQL Version differences
 

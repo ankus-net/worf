@@ -30,6 +30,30 @@ public sealed class ConflictTieBreakTests
         await using TestNode nodeB = await StartNodeAsync("node_b", token);
         bool aWins = await NodeIdAsync(nodeA, token) > await NodeIdAsync(nodeB, token);
 
+        // node_a records its conflicts, but can't create the partition for this month, which another partition already
+        // covers. The conflict resolves all the same, with a warning. Sessions in different time zones agree on where
+        // months start.
+        _ = await nodeA.SafePsqlAsync(Database, "ALTER SYSTEM SET worf.conflict_history_enabled = on", token);
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
+        _ = await nodeA.SafePsqlAsync(Database, """
+            SET worf.allow_ddl_from_functions = on;
+            SET TimeZone = 'Pacific/Pago_Pago';
+            SELECT worf.conflict_history_ensure_partition('2030-01-15');
+            SET TimeZone = 'UTC';
+            SELECT worf.conflict_history_ensure_partition('2030-02-15');
+            DO $$
+            DECLARE
+                part regclass;
+            BEGIN
+                FOR part IN SELECT inhrelid::regclass FROM pg_inherits WHERE inhparent = 'worf.conflict_history'::regclass LOOP
+                    EXECUTE format('ALTER TABLE worf.conflict_history DETACH PARTITION %s', part);
+                    EXECUTE format('ALTER TABLE %s RENAME TO %I', part, 'old_' || part::oid);
+                END LOOP;
+            END;
+            $$;
+            CREATE TABLE worf.conflict_history_all PARTITION OF worf.conflict_history FOR VALUES FROM (MINVALUE) TO (MAXVALUE);
+            """, token);
+
         // node_a applies node_b's change. The provider forwards every origin, so the change node_b commits under a
         // replication origin, which sets its commit timestamp, reaches node_a.
         await SubscribeAsync(nodeA, "a_from_b", nodeB, true, token);
@@ -37,14 +61,39 @@ public sealed class ConflictTieBreakTests
         await UpdateAtAsync(nodeB, "b1", committed, token);
         _ = await nodeB.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
         Assert.AreEqual(aWins ? "a1" : "b1", await ValueAsync(nodeA, token));
+        Assert.Contains("conflict_history: recording failed for the update_update conflict on table public.", nodeA.ReadLog(), "node_a's log");
+        Assert.Contains("(SQLSTATE 42P17)", nodeA.ReadLog(), "node_a's log");
+        Assert.DoesNotContain("terminated by signal", nodeA.ReadLog(), "node_a's log");
 
-        // node_b applies node_a's change.
+        // node_b applies node_a's change. It records its conflicts into a history whose trigger writes each row to a table
+        // whose deferred constraint refuses it, which fails as the record commits, in a transaction of its own after
+        // apply's, so apply goes on without the record.
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.drop_subscription('a_from_b')", token);
+        _ = await nodeB.SafePsqlAsync(Database, """
+            ALTER SYSTEM SET worf.conflict_history_enabled = on;
+            SELECT pg_reload_conf();
+            CREATE TABLE history_audit (sub_name name);
+            CREATE FUNCTION refuse_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'audit refused'; END $$;
+            CREATE CONSTRAINT TRIGGER refuse_audit AFTER INSERT ON history_audit DEFERRABLE INITIALLY DEFERRED
+                FOR EACH ROW EXECUTE FUNCTION refuse_audit();
+            ALTER TABLE history_audit ENABLE ALWAYS TRIGGER refuse_audit;
+            CREATE FUNCTION audit_history() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                INSERT INTO public.history_audit VALUES (NEW.sub_name);
+                RETURN NEW;
+            END $$;
+            CREATE TRIGGER audit_history AFTER INSERT ON worf.conflict_history FOR EACH ROW EXECUTE FUNCTION audit_history();
+            ALTER TABLE worf.conflict_history ENABLE ALWAYS TRIGGER audit_history;
+            """, token);
         await SubscribeAsync(nodeB, "b_from_a", nodeA, true, token);
+        int logpos = nodeB.ReadLog().Length;
         committed = await UpdateAsync(nodeB, "b2", token);
         await UpdateAtAsync(nodeA, "a2", committed, token);
         _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.wait_slot_confirm_lsn(NULL, NULL)", token);
         Assert.AreEqual(aWins ? "a2" : "b2", await ValueAsync(nodeB, token));
+        Assert.IsTrue(await nodeB.PollLogAsync(logpos, "audit refused (SQLSTATE P0001)", token), "node_b's warning");
+        Assert.DoesNotContain("exiting with error", nodeB.ReadLog()[logpos..], "node_b's apply");
+        Assert.AreEqual("0", await nodeB.SafePsqlAsync(Database, "SELECT count(*) FROM worf.conflict_history", token));
     }
 
     /// <summary>

@@ -21,6 +21,19 @@ Nodes can be added and removed dynamically using the SQL interfaces.
   - `ifexists` - if true, error is not thrown when subscription does not exist,
     default is false
 
+`DROP EXTENSION worf` is refused while other nodes subscribe to this one, since
+their replication reads worf's tables. Drop those subscriptions on the
+subscribers first, which drops their replication slots here. Or drop the slots
+with `pg_drop_replication_slot`, which throws away the changes those
+subscribers haven't received yet.
+
+When worf is dropped, a sequence that used sequence ranges goes on to the end of
+its range if no other node was ever given any of its values. Otherwise it stays
+limited to the block of numbers this node was using, so it can't hand out a
+number another node may have, and worf logs a warning for it. Once that block
+is used up, `nextval` fails. When no other node uses the sequence anymore,
+widen its limits with `ALTER SEQUENCE`.
+
 - `worf.alter_node_add_interface(node_name name, interface_name name, dsn text)`
   Adds additional interface to a node.
 

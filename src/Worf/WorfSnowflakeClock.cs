@@ -29,4 +29,10 @@ internal struct WorfSnowflakeClock
     /// The time up to which IDs may be issued, which the range worker has written durably.
     /// </summary>
     public long ReservedMs;
+
+    /// <summary>
+    /// Whether a session that can't reserve the time itself, as in a read-only transaction, waits for the range worker
+    /// to.
+    /// </summary>
+    public bool Wanted;
 }

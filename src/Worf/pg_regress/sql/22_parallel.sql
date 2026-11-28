@@ -85,6 +85,43 @@ SELECT * FROM basic_dml2;
 SELECT * FROM basic_dml1;
 SELECT * FROM basic_dml2;
 
+-- A set dropped and created again under its name while the subscription is disabled is the one the walsender follows
+-- past the drop.
+SELECT worf.alter_subscription_disable('test_subscription_parallel', true);
+
+\c :provider_dsn
+
+DO $$
+BEGIN
+	FOR i IN 1..100 LOOP
+		IF NOT EXISTS (SELECT 1 FROM pg_stat_replication WHERE application_name = 'test_subscription_parallel') THEN
+			RETURN;
+		END IF;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END;
+$$;
+
+SELECT * FROM worf.drop_replication_set('parallel');
+SELECT * FROM worf.create_replication_set('parallel');
+SELECT * FROM worf.replication_set_add_table('parallel', 'basic_dml2');
+INSERT INTO basic_dml2 VALUES (6, 6, 'recreated', NULL);
+
+\c :subscriber_dsn
+
+SELECT worf.alter_subscription_enable('test_subscription_parallel', true);
+
+\c :provider_dsn
+
+BEGIN;
+SET LOCAL statement_timeout = '60s';
+SELECT worf.wait_slot_confirm_lsn(NULL, NULL);
+COMMIT;
+
+\c :subscriber_dsn
+
+SELECT * FROM basic_dml2 WHERE id = 6;
+
 SELECT worf.drop_subscription('test_subscription_parallel');
 
 \c :provider_dsn

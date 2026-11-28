@@ -97,7 +97,8 @@ may need to call `worf.alter_subscription_resynchronize_table()` to fix it.
 
 - `worf.replication_set_add_all_sequences(set_name name, schema_names text[], synchronize_data boolean)`
   Adds all sequences from the given schemas. Only existing sequences are added, any sequences that
-  will be created in future will not be added automatically.
+  will be created in future will not be added automatically. Sequences under
+  [sequence range management](../sequence-ranges/) are left out, with a notice.
 
   Parameters:
   - `set_name` - name of the existing replication set
@@ -122,27 +123,29 @@ replication sets for newly created tables.
 
 Example:
 
-    CREATE OR REPLACE FUNCTION worf_assign_repset()
-    RETURNS event_trigger AS $$
-    DECLARE obj record;
-    BEGIN
-        FOR obj IN SELECT * FROM pg_event_trigger_ddl_commands()
-        LOOP
-            IF obj.object_type = 'table' THEN
-                IF obj.schema_name = 'config' THEN
-                    PERFORM worf.replication_set_add_table('configuration', obj.objid);
-                ELSIF NOT obj.in_extension THEN
-                    PERFORM worf.replication_set_add_table('default', obj.objid);
-                END IF;
+```sql
+CREATE OR REPLACE FUNCTION worf_assign_repset()
+RETURNS event_trigger AS $$
+DECLARE obj record;
+BEGIN
+    FOR obj IN SELECT * FROM pg_event_trigger_ddl_commands()
+    LOOP
+        IF obj.object_type = 'table' THEN
+            IF obj.schema_name = 'config' THEN
+                PERFORM worf.replication_set_add_table('configuration', obj.objid);
+            ELSIF NOT obj.in_extension THEN
+                PERFORM worf.replication_set_add_table('default', obj.objid);
             END IF;
-        END LOOP;
-    END;
-    $$ LANGUAGE plpgsql;
+        END IF;
+    END LOOP;
+END;
+$$ LANGUAGE plpgsql;
 
-    CREATE EVENT TRIGGER worf_assign_repset_trg
-        ON ddl_command_end
-        WHEN TAG IN ('CREATE TABLE', 'CREATE TABLE AS')
-        EXECUTE PROCEDURE worf_assign_repset();
+CREATE EVENT TRIGGER worf_assign_repset_trg
+    ON ddl_command_end
+    WHEN TAG IN ('CREATE TABLE', 'CREATE TABLE AS')
+    EXECUTE PROCEDURE worf_assign_repset();
+```
 
 The above example will put all new tables created in schema `config` into
 replication set `configuration` and all other new tables which are not created

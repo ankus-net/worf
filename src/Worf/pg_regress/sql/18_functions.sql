@@ -169,6 +169,10 @@ SELECT quote_literal(pg_current_xlog_location()) as curr_lsn
 INSERT INTO public.not_nullcheck_tbl(id,id1,name) VALUES (1,1,'name1');
 INSERT INTO public.not_nullcheck_tbl(id,id1,name) VALUES (2,2,'name2');
 
+-- Other transactions may commit in this database meanwhile, which the slot carries too: the changes are read up to here.
+SELECT quote_literal(pg_current_xlog_location()) as inserted_lsn
+\gset
+
 SELECT worf.wait_slot_confirm_lsn(NULL, :curr_lsn);
 
 \c :subscriber_dsn
@@ -192,8 +196,7 @@ BEGIN
 END;
 $$;
 
-SELECT data::json->'action' as action, CASE WHEN data::json->>'action' IN ('I', 'D', 'U') THEN data END as data FROM pg_logical_slot_get_changes((SELECT slot_name FROM pg_replication_slots), NULL, 1, 'min_proto_version', '1', 'max_proto_version', '1', 'startup_params_format', '1', 'proto_format', 'json', 'worf.replication_set_names', 'default');
-SELECT data::json->'action' as action, CASE WHEN data::json->>'action' IN ('I', 'D', 'U') THEN data END as data FROM pg_logical_slot_get_changes((SELECT slot_name FROM pg_replication_slots), NULL, 1, 'min_proto_version', '1', 'max_proto_version', '1', 'startup_params_format', '1', 'proto_format', 'json', 'worf.replication_set_names', 'default');
+SELECT data::json->'action' as action, data FROM pg_logical_slot_get_changes((SELECT slot_name FROM pg_replication_slots), :inserted_lsn, NULL, 'min_proto_version', '1', 'max_proto_version', '1', 'startup_params_format', '1', 'proto_format', 'json', 'worf.replication_set_names', 'default') WHERE data::json->>'action' IN ('I', 'D', 'U');
 
 \c :subscriber_dsn
 

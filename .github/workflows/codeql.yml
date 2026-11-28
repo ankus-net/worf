@@ -62,16 +62,25 @@ jobs:
           postgresql: 18
 
       # Ankus compiles its bindings once and reuses them, so the scan reads worf and not the generated bindings. The scan
-      # keeps bindings of its own, since each save drops the sets its build didn't use. As in ci.yml, the newest for the
-      # Ankus SDK are restored, or else the newest for the version, or else CI's.
+      # keeps bindings of its own, since each save drops the sets its build didn't use, and as in ci.yml, each runner
+      # image keeps its own. The newest for the image and Ankus SDK are restored, or else the newest for the Ankus SDK,
+      # or else the newest for the version, or else CI's.
+      - name: Key Ankus bindings
+        id: bindings
+        if: matrix.build-mode == 'manual'
+        run: |
+          echo "sdk=ankus-bindings-v2-codeql-pg18-${{ hashFiles('global.json') }}" >> "$GITHUB_OUTPUT"
+          echo "image=ankus-bindings-v2-codeql-pg18-${{ hashFiles('global.json') }}-$ImageOS-$ImageVersion" >> "$GITHUB_OUTPUT"
+
       - name: Restore Ankus bindings
         if: matrix.build-mode == 'manual'
         uses: actions/cache/restore@v6
         with:
           path: ${{ runner.temp }}/ankus-bindings
-          key: ankus-bindings-v2-codeql-pg18-${{ hashFiles('global.json') }}-${{ github.run_id }}
+          key: ${{ steps.bindings.outputs.image }}-${{ github.run_id }}
           restore-keys: |
-            ankus-bindings-v2-codeql-pg18-${{ hashFiles('global.json') }}-
+            ${{ steps.bindings.outputs.image }}-
+            ${{ steps.bindings.outputs.sdk }}-
             ankus-bindings-v2-codeql-pg18-
             ankus-bindings-v2-linux-x64-pg18-
 
@@ -109,7 +118,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: ${{ runner.temp }}/ankus-bindings
-          key: ankus-bindings-v2-codeql-pg18-${{ hashFiles('global.json') }}-${{ github.run_id }}
+          key: ${{ steps.bindings.outputs.image }}-${{ github.run_id }}
 
       - name: Analyze
         uses: github/codeql-action/analyze@v4

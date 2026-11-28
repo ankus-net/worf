@@ -30,12 +30,26 @@ internal static class Sequences
         string seqname;
         unsafe
         {
-            seqname = Spi.QuoteQualifiedIdentifier(
+            seqname = Worf.QuoteQualifiedIdentifier(
                 Worf.FromServer(NativeMethods.get_namespace_name(NativeMethods.get_rel_namespace(seqoid))),
                 Worf.FromServer(NativeMethods.get_rel_name(seqoid)));
         }
 
-        return Spi.ExecuteScalar<long>("SELECT last_value FROM " + seqname);
+        return Worf.ReadScalar<long>("SELECT last_value FROM " + seqname);
+    }
+
+    /// <summary>
+    /// Gets a relation's name, with its bytes exact.
+    /// </summary>
+    private static unsafe string SequenceName(uint seqoid) => Worf.FromServer(NativeMethods.get_rel_name(seqoid));
+
+    // Takes a sequence's lock for the manager's pass, unless another session holds it.
+    private static bool LockedIfFree(uint seqoid)
+    {
+        unsafe
+        {
+            return NativeMethods.ConditionalLockRelationOid(seqoid, (int)PgLockMode.AccessShare);
+        }
     }
 
     /// <summary>
@@ -54,19 +68,37 @@ internal static class Sequences
                 return;
             }
 
-            SpiResult states = Spi.Query("SELECT seqoid, cache_size, last_value FROM worf.sequence_state FOR UPDATE", false, 0);
+            // A row lock assigns the transaction an ID, so only the rows to update are locked, and a pass with nothing to
+            // update writes no commit record.
+            WorfRows states = Worf.Read("SELECT seqoid, last_value FROM worf.sequence_state", 0);
 
-            foreach (SpiRow oldseq in states)
+            foreach (WorfRow oldseq in states)
             {
                 PgInterrupts.Check();
 
                 uint seqoid = oldseq.Get<uint>(0);
-                int cacheSize = oldseq.Get<int>(1);
-                long oldLastValue = oldseq.Get<long>(2);
 
+                // Not enough of the sequence was consumed yet for us to care. A sequence whose lock another session holds,
+                // as ALTER SEQUENCE does, is passed over too: the pass holds the rows it locked earlier, which that session
+                // may wait for, as synchronize_sequence does.
+                if (!LockedIfFree(seqoid) || oldseq.Get<long>(1) >= SequenceGetLastValue(seqoid) + (SequenceReplicationMinCache / 2))
+                {
+                    continue;
+                }
+
+                // A row a session holds, as worf.synchronize_sequence does, is passed over: the session brings the sequence up
+                // to date itself, and a pass that waited for it could wait on a session that waits for a row the pass holds,
+                // as one synchronizing several sequences in another order does.
+                WorfRows locked = Worf.Query("SELECT cache_size, last_value FROM worf.sequence_state WHERE seqoid = $1 FOR UPDATE SKIP LOCKED",
+                    false, 0, SpiParameter.Create(seqoid));
+                if (locked.Count == 0)
+                {
+                    continue;
+                }
+
+                int cacheSize = locked[0].Get<int>(0);
+                long oldLastValue = locked[0].Get<long>(1);
                 long lastValue = SequenceGetLastValue(seqoid);
-
-                // Not enough of the sequence was consumed yet for us to care.
                 if (oldLastValue >= lastValue + (SequenceReplicationMinCache / 2))
                 {
                     continue;
@@ -86,7 +118,7 @@ internal static class Sequences
 
                 long newLastValue = lastValue + cacheSize;
 
-                _ = Spi.Execute("UPDATE worf.sequence_state SET cache_size = $2, last_value = $3 WHERE seqoid = $1",
+                _ = Worf.Execute("UPDATE worf.sequence_state SET cache_size = $2, last_value = $3 WHERE seqoid = $1",
                     SpiParameter.Create(seqoid), SpiParameter.Create(cacheSize), SpiParameter.Create(newLastValue));
 
                 QueueSequence(localNode, seqoid, newLastValue);
@@ -108,21 +140,21 @@ internal static class Sequences
         using PgRelation seqrel = PgRelation.Open(seqoid, PgLockMode.AccessShare);
         if (!seqrel.IsSequence)
         {
-            throw new PgException(PgSqlStates.WrongObjectType, $"\"{seqrel.Name}\" is not a sequence");
+            throw new PgException(PgSqlStates.WrongObjectType, $"\"{SequenceName(seqoid)}\" is not a sequence");
         }
 
         // Now search for it in our tracking table.
-        SpiResult result = Spi.Query("SELECT cache_size FROM worf.sequence_state WHERE seqoid = $1 FOR UPDATE", false, 0,
+        WorfRows result = Worf.Query("SELECT cache_size FROM worf.sequence_state WHERE seqoid = $1 FOR UPDATE", false, 0,
             SpiParameter.Create(seqoid));
         if (result.Count == 0)
         {
-            throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState, $"\"{seqrel.Name}\" is not a replicated sequence");
+            throw new PgException(PgSqlStates.ObjectNotInPrerequisiteState, $"\"{SequenceName(seqoid)}\" is not a replicated sequence");
         }
 
         int cacheSize = result[0].Get<int>(0);
         long lastValue = SequenceGetLastValue(seqoid) + cacheSize;
 
-        _ = Spi.Execute("UPDATE worf.sequence_state SET last_value = $2 WHERE seqoid = $1",
+        _ = Worf.Execute("UPDATE worf.sequence_state SET last_value = $2 WHERE seqoid = $1",
             SpiParameter.Create(seqoid), SpiParameter.Create(lastValue));
 
         QueueSequence(localNode, seqoid, lastValue);
@@ -135,9 +167,9 @@ internal static class Sequences
     internal static void CreateSequenceStateRecord(uint seqoid)
     {
         // Check if the state record already exists, and if it doesn't insert it.
-        if (Spi.ExecuteScalar<long>("SELECT count(*) FROM worf.sequence_state WHERE seqoid = $1", SpiParameter.Create(seqoid)) == 0)
+        if (Worf.ReadScalar<long>("SELECT count(*) FROM worf.sequence_state WHERE seqoid = $1", SpiParameter.Create(seqoid)) == 0)
         {
-            _ = Spi.Execute("INSERT INTO worf.sequence_state VALUES ($1, $2, $3)",
+            _ = Worf.Execute("INSERT INTO worf.sequence_state VALUES ($1, $2, $3)",
                 SpiParameter.Create(seqoid), SpiParameter.Create(SequenceReplicationMinCache),
                 SpiParameter.Create(SequenceGetLastValue(seqoid)));
         }
@@ -154,7 +186,7 @@ internal static class Sequences
     /// <param name="seqoid">The sequence.</param>
     internal static void DropSequenceStateRecord(uint seqoid)
     {
-        _ = Spi.Execute("DELETE FROM worf.sequence_state WHERE seqoid = $1", SpiParameter.Create(seqoid));
+        _ = Worf.Execute("DELETE FROM worf.sequence_state WHERE seqoid = $1", SpiParameter.Create(seqoid));
 
         unsafe
         {

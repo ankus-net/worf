@@ -43,6 +43,20 @@ internal struct WorfWorker
     public bool TerminateRequested;
 
     /// <summary>
+    /// When the database's manager, which last exited with nothing to manage, as in a database without worf, began to
+    /// look at what it manages, on a slot that is free, or zero. The supervisor looks again only once something wakes it
+    /// with a change, and starts no manager for the database then until a transaction there that changes what it
+    /// manages, as CREATE EXTENSION worf, commits, or a supervisor interval has passed since the manager looked.
+    /// </summary>
+    public long IdleAt;
+
+    /// <summary>
+    /// For a range worker, how many words to call its node its database's grants have asked for, once committed, which it
+    /// writes, as one, when the count moves.
+    /// </summary>
+    public long WordsWanted;
+
+    /// <summary>
     /// Type-specific worker info.
     /// </summary>
     public WorfWorkerInfo Worker;
