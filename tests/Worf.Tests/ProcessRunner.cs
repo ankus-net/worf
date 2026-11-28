@@ -66,7 +66,10 @@ internal static class ProcessRunner
     /// Starts a program. A program a test has just copied can't be run while another test's process, forked in the
     /// meantime, still holds the copy open (ETXTBSY), so that is retried briefly.
     /// </summary>
-    private static async Task<Process> StartAsync(ProcessStartInfo start, CancellationToken cancellationToken)
+    /// <param name="start">The program, with its arguments and how it starts.</param>
+    /// <param name="cancellationToken">A token to cancel the wait for the copy to be free.</param>
+    /// <returns>The process started.</returns>
+    internal static async Task<Process> StartAsync(ProcessStartInfo start, CancellationToken cancellationToken)
     {
         const int TextFileBusy = 26;
         for (int attempt = 1; ; attempt++)

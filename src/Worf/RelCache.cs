@@ -134,6 +134,7 @@ internal static partial class RelCache
             // Cache trigger info.
             entry.HasTriggers = false;
             entry.HasRechecks = false;
+            entry.HasGuards = false;
             TriggerDesc* trigdesc = entry.Rel->trigdesc;
             if (trigdesc is not null)
             {
@@ -142,6 +143,7 @@ internal static partial class RelCache
                     Trigger* trigger = &trigdesc->triggers[i];
 
                     entry.HasRechecks |= trigger->tgisinternal && trigger->tgfoid == UniqueKeyRecheck;
+                    entry.HasGuards |= SequenceRangeGuard.SkippedByWorkers(trigger);
 
                     // We only fire replica triggers on rows
                     entry.HasTriggers |= !(trigger->tgenabled == TriggerFiresOnOrigin || trigger->tgenabled == TriggerDisabled) &&

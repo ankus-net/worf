@@ -77,10 +77,13 @@ public sealed partial class DocumentationTests
             s_sequenceRanges, "made-up pool and reserved requests (1900, 2100)");
         Assert.Contains("From a block's last twentieth, statements wait for the switch before they draw more.", s_sequenceRanges, "the switch (130)");
         Assert.Contains("it allows half a block per row until it has seen such a row", s_sequenceRanges, "a row's unseen draws (1663)");
-        Assert.Contains("A write whose rows the guard triggers check, such as `INSERT … ON CONFLICT DO UPDATE`, `MERGE` or rows that give the column's value themselves, checks between rows.",
-            s_sequenceRanges, "upserts and merges (2040)");
-        Assert.Contains("An insert or `COPY FROM` whose rows take the column's value from its default draws as `SELECT nextval(...)` does",
+        Assert.Contains("A write whose rows the guard triggers check, such as rows that give the column's value themselves or an update that sets it, checks between rows.",
+            s_sequenceRanges, "writes the guard checks (2040, 2901)");
+        Assert.Contains("An insert, `COPY FROM`, `INSERT … ON CONFLICT DO UPDATE` or `MERGE` whose new rows take the column's value from its default draws as `SELECT nextval(...)` does",
             s_sequenceRanges, "rows that take their defaults (2901)");
+        Assert.Contains("A row trigger before the table's inserts could change the value, so worf compares each such row with the value its default drew and checks only a row that differs.",
+            s_sequenceRanges, "rows a trigger may change (2901)");
+        Assert.Contains("A partitioned table has one trigger, which `pg_trigger` lists as disabled", s_sequenceRanges, "a partitioned table's trigger (2901)");
         Assert.Contains("A new row that takes the value from the column's default needs no check, so an insert or `COPY FROM` of such rows skips the trigger",
             s_sequenceRanges, "rows that take their defaults (2901)");
         Assert.DoesNotContain("While they draw, inserts and `COPY FROM` hold a lock on the sequence", s_sequenceRanges, "rows that take their defaults (2901)");

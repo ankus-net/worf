@@ -11,7 +11,9 @@ namespace Worf;
 /// that another session's ANALYZE or ALTER TABLE sends does, is marked again as it's built, before the writer can copy
 /// it. PostgreSQL then rechecks each row that its index found might conflict, at commit or, for a constraint that is
 /// initially immediate, as the change ends, or at commit too for a writer that applies a transaction, whatever the
-/// constraint's expressions and predicate.
+/// constraint's expressions and predicate. The sequence range guard's triggers that hold no condition, which fire
+/// always and would run worf's own function for every row a worker writes, are marked disabled for a worf worker's
+/// writer the same way: the rows it brings from other nodes aren't checked.
 /// </summary>
 internal static unsafe partial class ReplicaRechecks
 {
@@ -20,10 +22,11 @@ internal static unsafe partial class ReplicaRechecks
     private const uint UniqueKeyRecheck = 1250;
     private const sbyte FiresOnOrigin = (sbyte)'O';
     private const sbyte FiresAlways = (sbyte)'A';
+    private const sbyte Disabled = (sbyte)'D';
 
     // The relcache entries marked now, which stay at their addresses as they're built again, with whether their
     // rechecks wait for commit and the triggers that were marked.
-    private static readonly List<(nint Relation, bool UntilCommit, List<uint> Enabled, List<uint> Deferred)> s_marked = [];
+    private static readonly List<(nint Relation, bool UntilCommit, List<uint> Enabled, List<uint> Deferred, List<(uint Trigger, sbyte Fired)> Skipped)> s_marked = [];
 
     private static bool s_watching;
 
@@ -62,7 +65,7 @@ internal static unsafe partial class ReplicaRechecks
         // again in place, where it's marked again, rather than dropped and built when the writer opens it.
         NativeMethods.LockRelationOid(reloid, (int)PgLockMode.RowExclusive);
         RelationData* relation = NativeMethods.RelationIdGetRelation(reloid);
-        (nint Relation, bool UntilCommit, List<uint> Enabled, List<uint> Deferred) entry = ((nint)relation, untilCommit, [], []);
+        (nint Relation, bool UntilCommit, List<uint> Enabled, List<uint> Deferred, List<(uint Trigger, sbyte Fired)> Skipped) entry = ((nint)relation, untilCommit, [], [], []);
         Mark(entry);
         s_marked.Add(entry);
         try
@@ -85,6 +88,14 @@ internal static unsafe partial class ReplicaRechecks
                 {
                     trigger->tginitdeferred = false;
                 }
+
+                foreach ((uint skipped, sbyte fired) in entry.Skipped)
+                {
+                    if (skipped == trigger->tgoid)
+                    {
+                        trigger->tgenabled = fired;
+                    }
+                }
             }
 
             NativeMethods.RelationClose(relation);
@@ -94,12 +105,22 @@ internal static unsafe partial class ReplicaRechecks
     // Marks the rechecks of an entry's current descriptor, adding those it marks to those marked before. A descriptor
     // kept as the entry is built again, as when the catalog's matches it but for the marks, keeps its marks; the
     // catalog's triggers can't change meanwhile, as the table's lock keeps ALTER TABLE ... TRIGGER waiting.
-    private static void Mark((nint Relation, bool UntilCommit, List<uint> Enabled, List<uint> Deferred) entry)
+    private static void Mark((nint Relation, bool UntilCommit, List<uint> Enabled, List<uint> Deferred, List<(uint Trigger, sbyte Fired)> Skipped) entry)
     {
         TriggerDesc* trigdesc = ((RelationData*)entry.Relation)->trigdesc;
         for (int i = 0; trigdesc is not null && i < trigdesc->numtriggers; i++)
         {
             Trigger* trigger = &trigdesc->triggers[i];
+
+            // The sequence range guard's triggers that hold no condition would run their function for each row, which
+            // leaves a worker's rows alone, so the writer's copy of them is disabled.
+            if (trigger->tgenabled != Disabled && Worker.MyWorfWorker >= 0 && SequenceRangeGuard.SkippedByWorkers(trigger))
+            {
+                entry.Skipped.Add((trigger->tgoid, trigger->tgenabled));
+                trigger->tgenabled = Disabled;
+                continue;
+            }
+
             if (!trigger->tgisinternal || trigger->tgfoid != UniqueKeyRecheck)
             {
                 continue;
@@ -125,7 +146,7 @@ internal static unsafe partial class ReplicaRechecks
     private static void RelcacheInvalidated(ulong arg, uint reloid)
     {
         _ = arg;
-        foreach ((nint Relation, bool UntilCommit, List<uint> Enabled, List<uint> Deferred) entry in s_marked)
+        foreach ((nint Relation, bool UntilCommit, List<uint> Enabled, List<uint> Deferred, List<(uint Trigger, sbyte Fired)> Skipped) entry in s_marked)
         {
             RelationData* relation = (RelationData*)entry.Relation;
             if ((reloid == 0 || relation->rd_id == reloid) && relation->rd_isvalid)

@@ -2355,7 +2355,8 @@ internal static unsafe partial class SequenceRanges
         for (int i = 0; i < cmds->length; i++)
         {
             AlterTableCmd* cmd = (AlterTableCmd*)cmds->elements[i].ptr_value;
-            if (cmd->subtype != AlterTableType.AT_EnableAlwaysTrig || cmd->name is null || !IsGuardName(Worf.FromServer(cmd->name)))
+            if (cmd->subtype is not (AlterTableType.AT_EnableAlwaysTrig or AlterTableType.AT_DisableTrig) || cmd->name is null ||
+                !IsGuardName(Worf.FromServer(cmd->name)))
             {
                 return false;
             }
@@ -2697,8 +2698,7 @@ internal static unsafe partial class SequenceRanges
         return Enumerable.Range(0, managed.Count).Any(i => MayDrawFrom(calls, managed[i].Get<uint>(0), schema).Draws);
     }
 
-    private static bool AnyManaged()
-        => Worf.CatalogOid("sequence_range") != 0 && Elevated.Run(() => Worf.ReadScalar<bool>("SELECT EXISTS (SELECT 1 FROM worf.sequence_range)"));
+    private static bool AnyManaged() => Worf.CatalogOid("sequence_range") != 0 && Worf.ReadCatalog("sequence_range", "seqoid").Count > 0;
 
     /// <summary>
     /// Checks whether a trigger name is one of the guard's.
@@ -3370,48 +3370,81 @@ internal static unsafe partial class SequenceRanges
     /// user's, so that the owner needs no rights on worf's schema, and the trigger depends on what the condition uses,
     /// as one whose condition PostgreSQL parses does.
     /// </summary>
-    private static void CreateGuardTrigger(uint relid, string sql)
+    private static void CreateGuardTrigger(uint relid, string sql, char fires)
     {
         sbyte* text = Worf.PStrDup(sql);
         CreateTrigStmt* trigger = (CreateTrigStmt*)((RawStmt*)NativeMethods.raw_parser(text, RawParseMode.RAW_PARSE_DEFAULT)->elements[0].ptr_value)->stmt;
-        (nint when, nint rtable) = Elevated.Run(() =>
+        uint function = GuardFunction();
+        if (trigger->whenClause is null)
         {
             // The lock CREATE TRIGGER takes, taken first.
-            RelationData* rel = NativeMethods.table_open(relid, (int)PgLockMode.ShareRowExclusive);
-            ParseState* pstate = NativeMethods.make_parsestate(null);
-            pstate->p_sourcetext = text;
-            foreach (string alias in s_triggerAliases)
+            NativeMethods.table_close(NativeMethods.table_open(relid, (int)PgLockMode.ShareRowExclusive), (int)PgLockMode.None);
+            _ = TableOwner.Run(relid, () => NativeMethods.CreateTrigger(trigger, text, relid, 0, 0, 0, function, 0, null, false, false));
+        }
+        else
+        {
+            (nint when, nint rtable) = Elevated.Run(() =>
             {
-                ParseNamespaceItem* item = NativeMethods.addRangeTableEntryForRelation(pstate, rel, (int)PgLockMode.AccessShare,
-                    NativeMethods.makeAlias(Worf.PStrDup(alias), null), false, false);
-                NativeMethods.addNSItemToQuery(pstate, item, false, true, true);
-            }
+                // The lock CREATE TRIGGER takes, taken first.
+                RelationData* rel = NativeMethods.table_open(relid, (int)PgLockMode.ShareRowExclusive);
+                ParseState* pstate = NativeMethods.make_parsestate(null);
+                pstate->p_sourcetext = text;
+                foreach (string alias in s_triggerAliases)
+                {
+                    ParseNamespaceItem* item = NativeMethods.addRangeTableEntryForRelation(pstate, rel, (int)PgLockMode.AccessShare,
+                        NativeMethods.makeAlias(Worf.PStrDup(alias), null), false, false);
+                    NativeMethods.addNSItemToQuery(pstate, item, false, true, true);
+                }
 
-            Node* condition = NativeMethods.transformWhereClause(pstate, (Node*)NativeMethods.copyObjectImpl(trigger->whenClause),
-                ParseExprKind.EXPR_KIND_TRIGGER_WHEN, Worf.PStrDup("WHEN"));
-            NativeMethods.assign_expr_collations(pstate, condition);
-            NativeMethods.table_close(rel, (int)PgLockMode.None);
-            return ((nint)condition, (nint)pstate->p_rtable);
-        });
-        uint function = GuardFunction();
-        ObjectAddress created = TableOwner.Run(relid, () => NativeMethods.CreateTrigger(trigger, text, relid, 0, 0, 0, function, 0, (Node*)when, false, false));
-        NativeMethods.recordDependencyOnExpr(&created, (Node*)when, (List*)rtable, DependencyType.DEPENDENCY_NORMAL);
+                Node* condition = NativeMethods.transformWhereClause(pstate, (Node*)NativeMethods.copyObjectImpl(trigger->whenClause),
+                    ParseExprKind.EXPR_KIND_TRIGGER_WHEN, Worf.PStrDup("WHEN"));
+                NativeMethods.assign_expr_collations(pstate, condition);
+                NativeMethods.table_close(rel, (int)PgLockMode.None);
+                return ((nint)condition, (nint)pstate->p_rtable);
+            });
+            ObjectAddress created = TableOwner.Run(relid, () => NativeMethods.CreateTrigger(trigger, text, relid, 0, 0, 0, function, 0, (Node*)when, false, false));
+            NativeMethods.recordDependencyOnExpr(&created, (Node*)when, (List*)rtable, DependencyType.DEPENDENCY_NORMAL);
+        }
+
         NativeMethods.CommandCounterIncrement();
 
-        // The trigger fires in every session, as ENABLE ALWAYS has it, so that rows another subscription's apply writes,
-        // with session_replication_role replica, are checked too.
-        RelationData* table = NativeMethods.table_open(relid, (int)PgLockMode.ShareRowExclusive);
-        try
-        {
+        // A trigger that fires in every session, as ENABLE ALWAYS has it, checks the rows another subscription's apply
+        // writes, with session_replication_role replica, too, and one that is disabled fires only for the statements
+        // that have it check their rows. A partitioned table's partitions take the same from it.
+        // PostgreSQL 16 and later carry the change down a partitioned table themselves, and PostgreSQL 15 only
+        // where it changes the table's own trigger, so there each partition's is set too, once the changes before
+        // it show.
+        List<uint> tables = [relid];
 #if ANKUS_PG15
-            NativeMethods.EnableDisableTrigger(table, trigger->trigname, (sbyte)'A', false, (int)PgLockMode.ShareRowExclusive);
-#else
-            NativeMethods.EnableDisableTrigger(table, trigger->trigname, 0, (sbyte)'A', false, true, (int)PgLockMode.ShareRowExclusive);
-#endif
-        }
-        finally
+        if (NativeMethods.get_rel_relkind(relid) == (sbyte)'p')
         {
-            NativeMethods.table_close(table, (int)PgLockMode.None);
+            List* partitions = NativeMethods.find_all_inheritors(relid, (int)PgLockMode.ShareRowExclusive, null);
+            for (int i = 0; partitions is not null && i < partitions->length; i++)
+            {
+                uint partition = partitions->elements[i].oid_value;
+                if (partition != relid && NativeMethods.get_trigger_oid(partition, trigger->trigname, true) != 0)
+                {
+                    tables.Add(partition);
+                }
+            }
+        }
+#endif
+        foreach (uint member in tables)
+        {
+            RelationData* table = NativeMethods.table_open(member, (int)PgLockMode.ShareRowExclusive);
+            try
+            {
+#if ANKUS_PG15
+                NativeMethods.EnableDisableTrigger(table, trigger->trigname, (sbyte)fires, false, (int)PgLockMode.ShareRowExclusive);
+                NativeMethods.CommandCounterIncrement();
+#else
+                NativeMethods.EnableDisableTrigger(table, trigger->trigname, 0, (sbyte)fires, false, true, (int)PgLockMode.ShareRowExclusive);
+#endif
+            }
+            finally
+            {
+                NativeMethods.table_close(table, (int)PgLockMode.None);
+            }
         }
 
         NativeMethods.CommandCounterIncrement();
@@ -3545,22 +3578,43 @@ internal static unsafe partial class SequenceRanges
     /// <returns>The definition.</returns>
     internal static SequenceInfo GetInfo(uint seqoid)
     {
-        WorfRows result = Worf.SelectCatalog("""
-            SELECT s.seqtypid, s.seqincrement, s.seqmin, s.seqmax, s.seqcycle, c.relpersistence::text,
-                pg_catalog.quote_ident(n.nspname) || '.' || pg_catalog.quote_ident(c.relname)
-            FROM pg_catalog.pg_sequence s
-                JOIN pg_catalog.pg_class c ON c.oid = s.seqrelid
-                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-            WHERE s.seqrelid = $1
-            """, SpiParameter.Create(seqoid));
-        if (result.Count == 0)
+        // pg_sequence, its index by sequence, and its columns seqrelid, seqtypid, seqincrement, seqmax, seqmin and
+        // seqcycle, which every supported version numbers so. The row is read as last committed, straight from the
+        // catalog: a query for it would leave what PostgreSQL looked up to plan it in every session that draws.
+        const uint Sequences = 2224;
+        const uint SequencesByOid = 5002;
+        List<object?[]> rows;
+        string? name = null;
+        sbyte persistence = 0;
+        unsafe
+        {
+            NativeMethods.CommandCounterIncrement();
+            NativeMethods.PushActiveSnapshot(NativeMethods.GetLatestSnapshot());
+            try
+            {
+                rows = Worf.ScanRelation(Sequences, SequencesByOid, [(1, seqoid)], true, 2, 4, 6, 5, 8);
+            }
+            finally
+            {
+                NativeMethods.PopActiveSnapshot();
+            }
+
+            sbyte* schema = rows.Count == 0 ? null : NativeMethods.get_namespace_name(NativeMethods.get_rel_namespace(seqoid));
+            sbyte* relation = schema is null ? null : NativeMethods.get_rel_name(seqoid);
+            if (relation is not null)
+            {
+                name = Worf.FromServer(NativeMethods.quote_qualified_identifier(schema, relation));
+                persistence = NativeMethods.get_rel_persistence(seqoid);
+            }
+        }
+
+        if (name is null)
         {
             throw new PgException(PgSqlStates.WrongObjectType, $"relation {seqoid} is not a sequence");
         }
 
-        WorfRow row = result[0];
-        return new SequenceInfo(seqoid, row.Get<string>(6), row.Get<uint>(0), row.Get<long>(1), row.Get<long>(2), row.Get<long>(3),
-            row.Get<bool>(4), row.Get<string>(5)[0]);
+        object?[] row = rows[0];
+        return new SequenceInfo(seqoid, name, (uint)row[0]!, (long)row[1]!, (long)row[2]!, (long)row[3]!, (bool)row[4]!, (char)persistence);
     }
 
     /// <summary>
@@ -5678,14 +5732,15 @@ internal static unsafe partial class SequenceRanges
         // Only worf creates a trigger with the guard's function, so one with another, as a trigger with the guard's name
         // that predates worf has, or one that doesn't fire, is no guard.
         WorfRows existing = Worf.Read("""
-            SELECT tgrelid::oid, tgname::text, encode(tgargs, 'hex'), tgfoid = $3 AND tgenabled = 'A'
+            SELECT tgrelid::oid, tgname::text, encode(tgargs, 'hex'),
+                CASE WHEN tgfoid = $3 THEN tgenabled::text || CASE WHEN tgqual IS NULL THEN '' ELSE 'w' END ELSE '' END
             FROM pg_catalog.pg_trigger WHERE tgrelid = ANY ($1::oid[]) AND tgname = ANY ($2) AND tgparentid = 0
             """, 0, SpiParameter.Create(members.Keys.Select(member => (long)member).ToArray()), SpiParameter.Create(s_guardNames),
             SpiParameter.Create(GuardFunction()));
-        List<(uint Relid, string Name, string Arguments, bool Ours)> triggers = [];
+        List<(uint Relid, string Name, string Arguments, string Form)> triggers = [];
         for (int i = 0; i < existing.Count; i++)
         {
-            triggers.Add((existing[i].Get<uint>(0), existing[i].Get<string>(1), existing[i].Get<string>(2), existing[i].Get<bool>(3)));
+            triggers.Add((existing[i].Get<uint>(0), existing[i].Get<string>(1), existing[i].Get<string>(2), existing[i].Get<string>(3)));
         }
 
         // A row trigger that runs before an update may change any column, so the update guard of a table that has one, or
@@ -5699,14 +5754,33 @@ internal static unsafe partial class SequenceRanges
             SpiParameter.Create(BeforeInsertRow), SpiParameter.Create(root));
         HashSet<uint> changing = [.. Enumerable.Range(0, before.Count).Where(i => before[i].Get<bool>(1)).Select(i => before[i].Get<uint>(0))];
 
+        // The root's pair holds no conditions of its own: a statement that writes values the guard must check has the
+        // conditions run for its rows, built once for the session, where PostgreSQL would copy their text for every
+        // statement that writes the table and build them again for each, and a statement whose rows take their
+        // columns' defaults runs none. On a table that is no partition the pair fires in every session, so that a row
+        // a statement wrote without the conditions is still checked, by the trigger's function. A partition takes
+        // its copy of a partitioned table's triggers as its first row comes, too late for a statement to have one
+        // skipped or checked there, and PostgreSQL looks at a partition's triggers for every row it takes once one
+        // of them fires after an insert, in whatever session. So a partitioned table has no trigger for its new
+        // rows: a statement checks its rows as it gives them to the table, and the partitions as they open. Its
+        // trigger for updated rows, which tells what the guard checks, is disabled where the table keeps it, and a
+        // statement that updates has it check the rows of the partitions it writes. The pair
+        // keeps its conditions, and fires in every session, where that can't stand in for them: a partition's row
+        // trigger that runs before the write may change the row after the statement gave it, and a column that
+        // names its sequence as text is checked under the sequence the name finds as the row is written.
+        bool partitioned = NativeMethods.get_rel_relkind(root) == (sbyte)'p';
+        bool changedBelow = Enumerable.Range(0, before.Count).Any(i => before[i].Get<uint>(0) != root);
+        bool conditioned = (partitioned && changedBelow) || rootColumns.Values.Any(column => column.Names.Count > 0);
+        InstallPair(root, GuardName, UpdateGuardName, "worf.sequence_range_check", rootColumns, before.Count > 0, triggers,
+            conditioned, !conditioned && partitioned ? 'D' : 'A', inserts: conditioned || !partitioned);
+
         // A moved row's insert into a partition leaves the check of the root's columns to the root's update guard, which
         // compares the row's old and new values, but a partition's own columns are checked as a new row's.
-        InstallPair(root, GuardName, UpdateGuardName, "worf.sequence_range_check", rootColumns, before.Count > 0, triggers);
         foreach (uint member in members.Keys)
         {
             InstallPair(member, PartitionGuardName, PartitionUpdateGuardName, "worf.sequence_range_check_update",
                 member != root && partitions.TryGetValue(member, out Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)>? columns) ? columns : [],
-                changing.Contains(member), triggers);
+                changing.Contains(member), triggers, true, 'A');
         }
     }
 
@@ -5717,10 +5791,14 @@ internal static unsafe partial class SequenceRanges
     /// </summary>
     private static void InstallPair(uint relid, string insertName, string updateName, string insertCheck,
         Dictionary<string, (uint TypeOid, List<uint> Sequences, List<string> Names)> columns, bool everyUpdate,
-        List<(uint Relid, string Name, string Arguments, bool Ours)> triggers)
+        List<(uint Relid, string Name, string Arguments, string Form)> triggers, bool conditioned, char fires, bool inserts = true)
     {
-        List<(uint Relid, string Name, string Arguments, bool Ours)> existing = triggers.FindAll(trigger =>
-            trigger.Relid == relid && (trigger.Name == insertName || trigger.Name == updateName));
+        // A trigger is worf's own as it stands when it has the guard's function, fires where this pair is to and
+        // holds a condition or none as this pair is to.
+        string form = fires + (conditioned ? "w" : "");
+        List<(uint Relid, string Name, string Arguments, bool Ours)> existing = [.. triggers
+            .Where(trigger => trigger.Relid == relid && (trigger.Name == insertName || trigger.Name == updateName))
+            .Select(trigger => (trigger.Relid, trigger.Name, trigger.Arguments, trigger.Form == form))];
         if (columns.Count == 0 && existing.Count == 0)
         {
             return;
@@ -5752,7 +5830,8 @@ internal static unsafe partial class SequenceRanges
             .Select(column => $"{attnums[column.Key]}:{string.Join(",", [.. column.Value.Sequences.Select(seq => seq.ToString(CultureInfo.InvariantCulture)), .. column.Value.Names])}"),
             .. everyUpdate ? ["every update"] : Array.Empty<string>()];
         string encoded = Convert.ToHexStringLower(Encoding.UTF8.GetBytes(string.Concat(arguments.Select(argument => argument + "\0"))));
-        if (guarded.Count == 0 || (existing.Count == 2 && existing.TrueForAll(trigger => trigger.Arguments == encoded && trigger.Ours)))
+        if (guarded.Count == 0 || (existing.Count == (inserts ? 2 : 1) && existing.TrueForAll(trigger => trigger.Arguments == encoded && trigger.Ours) &&
+            (inserts || existing[0].Name == updateName)))
         {
             // A table with no column to check keeps no pair.
             foreach ((_, string name, _, _) in guarded.Count == 0 ? existing : [])
@@ -5765,35 +5844,59 @@ internal static unsafe partial class SequenceRanges
 
         foreach ((_, string name, _, bool ours) in existing)
         {
-            if (!ours)
+            if (!ours || (!inserts && name == insertName))
             {
                 DropGuardTrigger(relid, name);
             }
         }
 
-        // An update's condition checks only a value it changes. A value that none of a column's sequences admits is
-        // checked under each, so that every one of them has its say.
-        static string Check(string check, string name, string type, List<string> sequences)
+        List<(string Name, string Type, List<string> Sequences)> checkedColumns = [.. guarded.Select(c => (c.Name, c.Type, c.Sequences))];
+        string function = $"worf.sequence_range_guard({string.Join(", ", arguments.Select(Worf.QuoteLiteral))})";
+        if (inserts)
         {
-            string each = string.Join(" OR ", sequences.Select(seq => $"{check}({seq}, NEW.{name}::{type})"));
-            return sequences.Count == 1
-                ? each
-                : $"(NOT ({string.Join(" OR ", sequences.Select(seq => $"worf.sequence_range_admits({seq}, NEW.{name}::{type})"))}) AND ({each}))";
+            CreateGuardTrigger(relid, $"""
+                CREATE OR REPLACE TRIGGER {insertName} AFTER INSERT ON {table}
+                FOR EACH ROW{(conditioned ? $" WHEN ({InsertCondition(insertCheck, checkedColumns)})" : "")}
+                EXECUTE FUNCTION {function}
+                """, fires);
         }
 
-        string function = $"worf.sequence_range_guard({string.Join(", ", arguments.Select(Worf.QuoteLiteral))})";
-        CreateGuardTrigger(relid, $"""
-            CREATE OR REPLACE TRIGGER {insertName} AFTER INSERT ON {table}
-            FOR EACH ROW WHEN ({string.Join(" OR ", guarded.Select(c => Check(insertCheck, c.Name, c.Type, c.Sequences)))})
-            EXECUTE FUNCTION {function}
-            """);
         CreateGuardTrigger(relid, $"""
             CREATE OR REPLACE TRIGGER {updateName} AFTER UPDATE{(everyUpdate ? "" : $" OF {string.Join(", ", guarded.Select(c => c.Name))}")} ON {table}
-            FOR EACH ROW WHEN ({string.Join(" OR ", guarded.Select(c =>
-                $"(OLD.{c.Name} IS DISTINCT FROM NEW.{c.Name} AND {Check("worf.sequence_range_check_update", c.Name, c.Type, c.Sequences)})"))})
+            FOR EACH ROW{(conditioned ? $" WHEN ({UpdateCondition(checkedColumns)})" : "")}
             EXECUTE FUNCTION {function}
-            """);
+            """, fires);
     }
+
+    // The check of a column's value under its sequences. A value that none of a column's sequences admits is checked
+    // under each, so that every one of them has its say.
+    private static string ColumnCheck(string check, string name, string type, List<string> sequences, string row = "NEW.")
+    {
+        string each = string.Join(" OR ", sequences.Select(seq => $"{check}({seq}, {row}{name}::{type})"));
+        return sequences.Count == 1
+            ? each
+            : $"(NOT ({string.Join(" OR ", sequences.Select(seq => $"worf.sequence_range_admits({seq}, {row}{name}::{type})"))}) AND ({each}))";
+    }
+
+    /// <summary>
+    /// Writes the condition the guard checks a new row under: each column's value under the sequences it uses, each
+    /// given as the arguments the check takes ahead of the value.
+    /// </summary>
+    /// <param name="check">The function that checks a value.</param>
+    /// <param name="columns">The columns, by quoted name, with the type each value is checked as.</param>
+    /// <param name="row">What comes before a column's name: the row as NEW, or nothing where the columns are the row's own.</param>
+    /// <returns>The condition.</returns>
+    internal static string InsertCondition(string check, List<(string Name, string Type, List<string> Sequences)> columns, string row = "NEW.")
+        => string.Join(" OR ", columns.Select(c => ColumnCheck(check, c.Name, c.Type, c.Sequences, row)));
+
+    /// <summary>
+    /// Writes the condition the guard checks an updated row under, which checks only a value the update changes.
+    /// </summary>
+    /// <param name="columns">The columns, by quoted name, with the type each value is checked as.</param>
+    /// <returns>The condition, with the row's versions as OLD and NEW.</returns>
+    internal static string UpdateCondition(List<(string Name, string Type, List<string> Sequences)> columns)
+        => string.Join(" OR ", columns.Select(c =>
+            $"(OLD.{c.Name} IS DISTINCT FROM NEW.{c.Name} AND {ColumnCheck("worf.sequence_range_check_update", c.Name, c.Type, c.Sequences)})"));
 
     /// <summary>
     /// Lists the managed sequences a column uses: those its defaults name by oid, and those a name a default gives as

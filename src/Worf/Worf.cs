@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Unicode;
 using Ankus.Postgres;
@@ -830,9 +831,26 @@ internal static partial class Worf
     /// <returns>The catalog, or zero when worf isn't installed.</returns>
     internal static unsafe uint CatalogOid(string table)
     {
+        // A catalog found, or found missing, stays so until a table or a schema changes, which the sequence range
+        // guard hears of: every statement asks for several, and a lookup makes two copies of a name each time.
+        if (s_catalogs.TryGetValue(table, out uint found))
+        {
+            return found;
+        }
+
+        SequenceRangeGuard.WatchCatalogs();
         uint nspoid = NativeMethods.get_namespace_oid(PStrDup(ExtensionName), true);
-        return nspoid == 0 ? 0 : NativeMethods.get_relname_relid(PStrDup(table), nspoid);
+        found = nspoid == 0 ? 0 : NativeMethods.get_relname_relid(PStrDup(table), nspoid);
+        s_catalogs[table] = found;
+        return found;
     }
+
+    private static readonly Dictionary<string, uint> s_catalogs = [];
+
+    /// <summary>
+    /// Forgets where worf's catalogs are, as a table or a schema changes.
+    /// </summary>
+    internal static void ForgetCatalogs() => s_catalogs.Clear();
 
     /// <summary>
     /// Reads a setting's display value, as <c>GetConfigOptionByName</c> returns it.
@@ -1078,6 +1096,191 @@ internal static partial class Worf
                 UnpinSearchPath(nestLevel);
             }
         }
+    }
+
+    /// <summary>
+    /// Reads some columns of every row of one of worf's tables under the active snapshot, straight from the table. No
+    /// query is planned for it, so a session keeps nothing of the read but the table's own entry in PostgreSQL's
+    /// cache, where a planned query leaves there every index, operator, type and statistic its planning looked up.
+    /// </summary>
+    /// <param name="table">The table's name.</param>
+    /// <param name="columns">The columns' names.</param>
+    /// <returns>
+    /// The rows, each with its columns' values in the order asked for: a bool, a char, a long for a whole number or
+    /// a timestamp, a uint for an oid, a string for a text, a numeric or an expression's tree, the bytes of a name or
+    /// of a bytea, or null.
+    /// </returns>
+    internal static unsafe List<object?[]> ScanCatalog(string table, params ReadOnlySpan<string> columns)
+    {
+        uint relid = CatalogOid(table);
+        if (relid == 0)
+        {
+            return [];
+        }
+
+        // The lock stays until the transaction ends, as a query's would.
+        RelationData* relation = NativeMethods.table_open(relid, (int)PgLockMode.AccessShare);
+        try
+        {
+            TupleDescData* row = relation->rd_att;
+            short[] places = new short[columns.Length];
+            for (int i = 0; i < columns.Length; i++)
+            {
+                for (int at = 0; at < row->natts && places[i] == 0; at++)
+                {
+                    FormData_pg_attribute* column = NativeMethods.TupleDescAttr(row, at);
+                    if (!column->attisdropped && FromServer((sbyte*)&column->attname) == columns[i])
+                    {
+                        places[i] = (short)(at + 1);
+                    }
+                }
+
+                if (places[i] == 0)
+                {
+                    throw new InvalidOperationException($"worf.{table} has no column {columns[i]}.");
+                }
+            }
+
+            return ScanRows(relation, 0, [], NativeMethods.GetActiveSnapshot(), places);
+        }
+        finally
+        {
+            NativeMethods.table_close(relation, (int)PgLockMode.None);
+        }
+    }
+
+    /// <summary>
+    /// Reads some columns of every row of one of worf's tables as <see cref="ScanCatalog"/> does, under the
+    /// transaction's snapshot, as <see cref="Read"/> reads.
+    /// </summary>
+    /// <param name="table">The table's name.</param>
+    /// <param name="columns">The columns' names.</param>
+    /// <returns>The rows.</returns>
+    internal static unsafe List<object?[]> ReadCatalog(string table, params ReadOnlySpan<string> columns)
+    {
+        NativeMethods.PushActiveSnapshot(NativeMethods.GetTransactionSnapshot());
+        try
+        {
+            return ScanCatalog(table, columns);
+        }
+        finally
+        {
+            NativeMethods.PopActiveSnapshot();
+        }
+    }
+
+    /// <summary>
+    /// Reads some columns of the rows of one of PostgreSQL's catalogs whose columns of object ids hold given ones,
+    /// straight from the catalog, by an index of it where one is given, as <see cref="ScanCatalog"/> reads worf's
+    /// tables.
+    /// </summary>
+    /// <param name="catalog">The catalog.</param>
+    /// <param name="index">The index to read it by, whose leading columns are the ones given, or zero for none.</param>
+    /// <param name="keys">The columns that hold object ids, by number, with the id each row read holds there.</param>
+    /// <param name="latest">Whether the rows are read under the active snapshot, and otherwise as PostgreSQL reads its catalogs.</param>
+    /// <param name="columns">The columns to read, by number.</param>
+    /// <returns>The rows.</returns>
+    internal static unsafe List<object?[]> ScanRelation(uint catalog, uint index, ReadOnlySpan<(short Column, uint Value)> keys, bool latest,
+        params ReadOnlySpan<short> columns)
+    {
+        RelationData* relation = NativeMethods.table_open(catalog, (int)PgLockMode.AccessShare);
+        try
+        {
+            return ScanRows(relation, index, keys, latest ? NativeMethods.GetActiveSnapshot() : null, columns);
+        }
+        finally
+        {
+            NativeMethods.table_close(relation, (int)PgLockMode.AccessShare);
+        }
+    }
+
+    // Reads columns, by number, of the rows of an open table that hold given object ids in given columns.
+    private static unsafe List<object?[]> ScanRows(RelationData* relation, uint index, ReadOnlySpan<(short Column, uint Value)> keys, SnapshotData* snapshot,
+        ReadOnlySpan<short> columns)
+    {
+        // The function that compares two object ids, numeric's output function, the strategy of equality and the
+        // type of an expression's stored tree.
+        const PgBuiltInOid NodeTreeOid = (PgBuiltInOid)194;
+        const uint OidEq = 184;
+        const uint NumericOut = 1702;
+        const ushort Equal = 3;
+        List<object?[]> rows = [];
+        TupleDescData* row = relation->rd_att;
+        ulong* values = stackalloc ulong[row->natts];
+        bool* nulls = stackalloc bool[row->natts];
+        ScanKeyData* conditions = stackalloc ScanKeyData[Math.Max(keys.Length, 1)];
+        for (int i = 0; i < keys.Length; i++)
+        {
+            NativeMethods.ScanKeyInit(&conditions[i], keys[i].Column, Equal, OidEq, keys[i].Value);
+        }
+
+        SysScanDescData* scan = NativeMethods.systable_beginscan(relation, index, index != 0, snapshot, keys.Length, conditions);
+        try
+        {
+            HeapTupleData* tuple;
+            while ((tuple = NativeMethods.systable_getnext(scan)) is not null)
+            {
+                NativeMethods.heap_deform_tuple(tuple, row, values, nulls);
+                object?[] read = new object?[columns.Length];
+                for (int i = 0; i < columns.Length; i++)
+                {
+                    ulong value = values[columns[i] - 1];
+                    if (nulls[columns[i] - 1])
+                    {
+                        continue;
+                    }
+
+                    switch ((PgBuiltInOid)NativeMethods.TupleDescAttr(row, columns[i] - 1)->atttypid)
+                    {
+                        case PgBuiltInOid.BoolOid:
+                            read[i] = (byte)value != 0;
+                            break;
+                        case PgBuiltInOid.CharOid:
+                            read[i] = (char)(byte)value;
+                            break;
+                        case PgBuiltInOid.Int2Oid:
+                            read[i] = (long)(short)value;
+                            break;
+                        case PgBuiltInOid.Int4Oid:
+                            read[i] = (long)(int)value;
+                            break;
+                        case PgBuiltInOid.Int8Oid or PgBuiltInOid.TimestamptzOid:
+                            read[i] = (long)value;
+                            break;
+                        case PgBuiltInOid.OidOid or PgBuiltInOid.RegClassOid:
+                            read[i] = (uint)value;
+                            break;
+                        case PgBuiltInOid.NameOid:
+                            read[i] = MemoryMarshal.CreateReadOnlySpanFromNullTerminated((byte*)value).ToArray();
+                            break;
+                        case PgBuiltInOid.TextOid or NodeTreeOid:
+                            sbyte* text = NativeMethods.text_to_cstring((varlena*)value);
+                            read[i] = FromServer(text);
+                            NativeMethods.pfree(text);
+                            break;
+                        case PgBuiltInOid.ByteaOid:
+                            varlena* whole = NativeMethods.pg_detoast_datum_packed((varlena*)value);
+                            read[i] = new ReadOnlySpan<byte>(NativeMethods.VARDATA_ANY(whole), (int)NativeMethods.VARSIZE_ANY_EXHDR(whole)).ToArray();
+                            break;
+                        case PgBuiltInOid.NumericOid:
+                            sbyte* number = NativeMethods.OidOutputFunctionCall(NumericOut, value);
+                            read[i] = FromServer(number);
+                            NativeMethods.pfree(number);
+                            break;
+                        default:
+                            throw new InvalidOperationException($"Column {columns[i]} of relation {relation->rd_id} has a type this read doesn't know.");
+                    }
+                }
+
+                rows.Add(read);
+            }
+        }
+        finally
+        {
+            NativeMethods.systable_endscan(scan);
+        }
+
+        return rows;
     }
 
     // WAL_LEVEL_LOGICAL, which every supported version numbers 2.

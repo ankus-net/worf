@@ -1,3 +1,4 @@
+using System.Globalization;
 using Ankus.Postgres;
 
 namespace Worf;
@@ -27,6 +28,45 @@ internal static class WorfLocks
     {
         LOCKTAG turn = Tag(0, TurnKey);
         _ = NativeMethods.LockAcquire(&turn, ExclusiveLock, false, false);
+    }
+
+    /// <summary>
+    /// Waits for the node's exchange turn, in its queue, for no longer than until a time, and holds it until the
+    /// transaction ends. The wait runs in a subtransaction, so that one that runs out is rolled back alone.
+    /// </summary>
+    /// <param name="until">The time.</param>
+    /// <returns>Whether the turn came in time.</returns>
+    internal static bool TakeTurnUntil(long until)
+    {
+        bool taken = false;
+        int nestLevel;
+        unsafe
+        {
+            nestLevel = NativeMethods.NewGUCNestLevel();
+        }
+
+        try
+        {
+            SetAtNestLevel("lock_timeout", Math.Max((until - Worker.GetCurrentTimestamp()) / 1000L, 1).ToString(CultureInfo.InvariantCulture));
+            PgTransaction.RunInSubtransaction(() =>
+            {
+                TakeTurn();
+                taken = true;
+            });
+        }
+        catch (PgException held) when (held.SqlState == "55P03")
+        {
+            EndIfTimedOut();
+        }
+        finally
+        {
+            unsafe
+            {
+                NativeMethods.AtEOXact_GUC(true, nestLevel);
+            }
+        }
+
+        return taken;
     }
 
     /// <summary>

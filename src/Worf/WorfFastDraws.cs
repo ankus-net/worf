@@ -5,7 +5,7 @@ namespace Worf;
 /// <summary>
 /// What shared memory holds for the draws under way that hold no switch gate, as 8-byte words, which they read and
 /// write without a call into PostgreSQL: the number of switches pending, the number of changes to the blocks told, and
-/// then the counts of such draws under way. A backend counts itself in one of those for the moment its draw takes, and
+/// then the counts of such draws under way. A backend counts itself in its own for the moment its draw takes, and
 /// a switch waits until all are zero. Each count has a cache line to itself, so backends that draw at once don't slow
 /// each other.
 /// </summary>
@@ -23,9 +23,10 @@ internal struct WorfFastDraws
     internal const int Changes = 1;
 
     /// <summary>
-    /// The number of counts, which backends share by their process IDs. The first follows the first cache line.
+    /// The number of counts, each a backend's own, by its place among the server's processes. The first follows the
+    /// first cache line. A backend past the last has none, and its every draw takes its sequence's gate.
     /// </summary>
-    internal const int Slots = 256;
+    internal const int Slots = 8192;
 
     /// <summary>
     /// The size of a cache line, in words.

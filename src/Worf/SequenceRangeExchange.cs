@@ -71,9 +71,11 @@ internal static class SequenceRangeExchange
     private static readonly Dictionary<uint, (string What, long At, long Delay)> s_waits = [];
 
     // The subscriptions whose provider answered the last exchange that their slot isn't streamed yet, those whose
+    // provider answered it that its turn didn't come in the call's time, those whose
     // provider answered the last call that it has no such slot, and those whose last exchange failed so, logged only
     // if the next fails so too, as a subscription that is being dropped no longer has one.
     private static readonly HashSet<uint> s_notStreamed = [];
+    private static readonly HashSet<uint> s_noTurn = [];
     private static readonly HashSet<uint> s_noSlot = [];
     private static readonly HashSet<uint> s_noSlotOnce = [];
 
@@ -170,7 +172,23 @@ internal static class SequenceRangeExchange
             return "{}";
         }
 
-        TakeTurn();
+        // The call waits for this node's turn, behind the node's other exchanges, for no more than a third of the
+        // time the caller's statement_timeout gives it. A call that waited there until its time ran out ended as a
+        // statement that timed out, with an error in both nodes' logs, though nothing was wrong: the turn was busy,
+        // as it is for as long as the exchanges ahead take, each of which waits up to a second for a range row and
+        // works as slowly as the host makes it (2903). It answers instead that the turn didn't come, having taken
+        // nothing in, and the caller asks again soon, sending the same. A subscriber that leaves is told once, and
+        // waits for the turn as long as its call has.
+        if (leaving || CallTimeThird() is not long turnBy)
+        {
+            TakeTurn();
+        }
+        else if (!WorfLocks.TakeTurnUntil(turnBy))
+        {
+            WorfLog.Debug1($"sequence range exchange with node {senderId} found this node's turn taken for a third of the call's time");
+            return """{"turn":false}""";
+        }
+
         if (leaving)
         {
             _ = Worf.Execute("DELETE FROM worf.sequence_range_link WHERE slot_name = $1", SpiParameter.Create(slot));
@@ -822,6 +840,17 @@ internal static class SequenceRangeExchange
     private static (bool Granted, bool Received) TakeReply(WorfLocalNode node, WorfPendingExchange pending, string reply)
     {
         WorfSubscription sub = pending.Sub;
+
+        // A provider whose turn didn't come within the call's time took nothing in and says so, rather than let the
+        // call run out of time: this node asks again soon, with the same message, and acknowledges nothing meanwhile.
+        using JsonDocument document = JsonDocument.Parse(reply);
+        if (document.RootElement.TryGetProperty("turn", out JsonElement turn) && turn.ValueKind == JsonValueKind.False)
+        {
+            _ = s_noTurn.Add(sub.Id);
+            return (false, false);
+        }
+
+        _ = s_noTurn.Remove(sub.Id);
         TakeTurn();
 
         // A reply that comes once the subscription is dropped or disabled, as when the provider answered only after
@@ -835,7 +864,6 @@ internal static class SequenceRangeExchange
         }
 
         AcknowledgeRefusals(pending.Refusals);
-        using JsonDocument document = JsonDocument.Parse(reply);
         if (document.RootElement.TryGetProperty("streamed", out JsonElement streamed) && streamed.ValueKind == JsonValueKind.False)
         {
             // A provider without the slot answers so, rather than failing the call, which would log an error there too.
@@ -880,6 +908,14 @@ internal static class SequenceRangeExchange
         WorfSubscription sub = pending.Sub;
         long now = pending.StartedAt;
         WorfLog.Debug2($"sequence range exchange with node {sub.Origin.Name} done");
+
+        // A provider whose turn didn't come in the call's time is asked again after a check interval.
+        if (s_noTurn.Contains(sub.Id))
+        {
+            s_retries[sub.Id] = (Worker.GetCurrentTimestamp() + (SequenceRanges.CheckInterval * 1000L), SequenceRanges.CheckInterval * 1000L);
+            WorfLog.Debug1($"sequence range exchange with node {sub.Origin.Name} waits for the node's other exchanges to take their turns");
+            return false;
+        }
 
         // A provider whose slot isn't streamed yet is asked again after a check interval.
         if (s_notStreamed.Contains(sub.Id))

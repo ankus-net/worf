@@ -450,6 +450,7 @@ internal static unsafe partial class Executor
         if (parsetree->type == NodeTag.T_TransactionStmt && ((TransactionStmt*)parsetree)->kind == TransactionStmtKind.TRANS_STMT_PREPARE)
         {
             Worker.NotePrepared();
+            SequenceRangeGuard.RegisterPrepare();
         }
 
         // A COPY FROM's calls of nextval, in the defaults it starts before its rows, name the sequences they draw from.
@@ -752,11 +753,17 @@ internal static unsafe partial class Executor
             LocalIndex.CheckWrites(written);
         }
 
-        SequenceRangeGuard.StartStatement(queryDesc, written);
+        // An INSERT of one row that ran in full before goes by what the guard kept of it.
+        bool settled = SequenceRangeGuard.StartsSettled(queryDesc, (eflags & ExecFlagExplainOnly) != 0);
+        if (!settled)
+        {
+            SequenceRangeGuard.StartStatement(queryDesc, written);
 
-        // A statement only explained draws nothing as its expressions start, unless it prunes partitions through a call.
-        SequenceRangeGuard.StartingExpressions((nint)queryDesc->plannedstmt, (eflags & ExecFlagExplainOnly) != 0, (nint)queryDesc->sourceText,
-            queryDesc->@params is not null && queryDesc->@params->numParams > 0);
+            // A statement only explained draws nothing as its expressions start, unless it prunes partitions through a call.
+            SequenceRangeGuard.StartingExpressions((nint)queryDesc->plannedstmt, (eflags & ExecFlagExplainOnly) != 0, (nint)queryDesc->sourceText,
+                queryDesc->@params is not null && queryDesc->@params->numParams > 0);
+        }
+
         bool started = false;
         try
         {
@@ -773,7 +780,14 @@ internal static unsafe partial class Executor
         }
         finally
         {
-            SequenceRangeGuard.StartedPlan((nint)queryDesc, started);
+            if (settled)
+            {
+                SequenceRangeGuard.StartedSettled((nint)queryDesc, started);
+            }
+            else
+            {
+                SequenceRangeGuard.StartedPlan((nint)queryDesc, started);
+            }
         }
     }
 
@@ -783,13 +797,15 @@ internal static unsafe partial class Executor
     private static void WorfExecutorRun(QueryDesc* queryDesc, ScanDirection direction, ulong count)
 #endif
     {
-        // A statement starts expressions as it runs, as a VALUES row's, a CHECK's or those of a partition taking a row.
-        bool starting = SequenceRangeGuard.StartingRun(queryDesc);
+        // A statement starts expressions as it runs, as a VALUES row's, a CHECK's or those of a partition taking a row,
+        // but for an INSERT of one row that goes by what the guard kept of it, which starts none the guard reads.
+        bool settled = SequenceRangeGuard.RunsSettled((nint)queryDesc);
+        bool starting = !settled && SequenceRangeGuard.StartingRun(queryDesc);
 
         // Rows that go to the client as they're produced wait on it, as those a query's own consumer takes don't.
         bool toClient = queryDesc->dest is not null && queryDesc->dest->mydest is CommandDest.DestRemote or CommandDest.DestRemoteExecute or
             CommandDest.DestRemoteSimple or CommandDest.DestCopyOut or CommandDest.DestDebug;
-        bool noted = SequenceRangeGuard.EnterRun((nint)queryDesc, toClient);
+        bool noted = !settled && SequenceRangeGuard.EnterRun((nint)queryDesc, toClient);
         bool failed = true;
         try
         {
@@ -820,16 +836,20 @@ internal static unsafe partial class Executor
             }
 
             // A SELECT run to its end draws no more, though its portal stays open until the client's next command.
-            SequenceRangeGuard.LeaveRun((nint)queryDesc, toClient, noted, failed, count == 0 && queryDesc->operation == CmdType.CMD_SELECT &&
-                queryDesc->plannedstmt is not null && !queryDesc->plannedstmt->hasModifyingCTE);
+            if (!settled)
+            {
+                SequenceRangeGuard.LeaveRun((nint)queryDesc, toClient, noted, failed, count == 0 && queryDesc->operation == CmdType.CMD_SELECT &&
+                    queryDesc->plannedstmt is not null && !queryDesc->plannedstmt->hasModifyingCTE);
+            }
         }
     }
 
     private static void WorfExecutorFinish(QueryDesc* queryDesc)
     {
         // A data-modifying WITH that the statement didn't read to its end writes the rest of its rows as it finishes.
-        bool starting = SequenceRangeGuard.StartingRun(queryDesc);
-        bool noted = SequenceRangeGuard.EnterRun((nint)queryDesc, false);
+        bool settled = SequenceRangeGuard.RunsSettled((nint)queryDesc);
+        bool starting = !settled && SequenceRangeGuard.StartingRun(queryDesc);
+        bool noted = !settled && SequenceRangeGuard.EnterRun((nint)queryDesc, false);
         bool failed = true;
         try
         {
@@ -851,7 +871,10 @@ internal static unsafe partial class Executor
                 SequenceRangeGuard.StartedExpressions();
             }
 
-            SequenceRangeGuard.LeaveRun((nint)queryDesc, false, noted, failed, false);
+            if (!settled)
+            {
+                SequenceRangeGuard.LeaveRun((nint)queryDesc, false, noted, failed, false);
+            }
         }
     }
 
@@ -900,7 +923,7 @@ internal static unsafe partial class Executor
         }
 
         TemporaryObjectUse.NoteFunctionUse(fnOid);
-        bool hooked = SequenceRangeGuard.HooksTrigger(fnOid);
+        bool hooked = SequenceRangeGuard.HooksGuard(fnOid) || SequenceRangeGuard.HooksTrigger(fnOid);
         return (!s_nextNeedsFmgrHook.IsNull && s_nextNeedsFmgrHook.Invoke(fnOid)) || hooked;
     }
 
@@ -915,7 +938,21 @@ internal static unsafe partial class Executor
             s_nextFmgrHook.Invoke(@event, flinfo, @private);
         }
 
-        if (@event == FmgrHookEventType.FHET_START)
+        // The guard's trigger function runs through HookedTrigger, which checks the row itself.
+        if (SequenceRangeGuard.IsGuardFunction(flinfo->fn_oid))
+        {
+            if (@event == FmgrHookEventType.FHET_START)
+            {
+                s_hookedTrigger = ((nint)flinfo, (nint)flinfo->fn_addr.DangerousGetAddress());
+                flinfo->fn_addr = new PGFunction((void*)s_hookedTriggerAddress);
+            }
+            else if (s_hookedTrigger.Function == (nint)flinfo)
+            {
+                flinfo->fn_addr = new PGFunction((void*)s_hookedTrigger.Address);
+                s_hookedTrigger = default;
+            }
+        }
+        else if (@event == FmgrHookEventType.FHET_START)
         {
             SequenceRangeGuard.StartingTrigger(flinfo->fn_oid);
         }
@@ -994,6 +1031,15 @@ internal static unsafe partial class Executor
 
         s_hookedTrigger = default;
         fcinfo->flinfo->fn_addr = new PGFunction((void*)address);
+
+        // The guard's own trigger function checks the row here, as PostgreSQL holds it, and returns no row, as a
+        // trigger that fires after the write does.
+        if (SequenceRangeGuard.IsGuardFunction(fcinfo->flinfo->fn_oid))
+        {
+            SequenceRangeGuard.GuardRow(fcinfo);
+            return 0;
+        }
+
         SequenceRangeGuard.StartingTrigger(fcinfo->flinfo->fn_oid);
         return new PGFunction((void*)address).Invoke(fcinfo);
     }

@@ -791,7 +791,7 @@ public sealed partial class SequenceRangeTests
             CREATE TRIGGER audited BEFORE INSERT ON ddl_audit FOR EACH ROW EXECUTE FUNCTION app.audited();
             ALTER TABLE app.audited ALTER COLUMN id SET DEFAULT nextval('public.t_id_seq');
             """, token);
-        Assert.AreEqual("f|6", await node.SafePsqlAsync(Database, """
+        Assert.AreEqual("f|4", await node.SafePsqlAsync(Database, """
             SELECT rolsuper, (SELECT count(*) FROM pg_trigger WHERE tgrelid IN ('app.pk'::regclass, 'app.pk_all'::regclass, 'app.audited'::regclass))
             FROM pg_roles WHERE rolname = 'app';
             DROP EVENT TRIGGER audit;
@@ -1261,9 +1261,9 @@ public sealed partial class SequenceRangeTests
             _ = await commit.ExecuteNonQueryAsync(token);
         }
 
-        Assert.AreEqual("6", await node.SafePsqlAsync(Database,
+        Assert.AreEqual("3", await node.SafePsqlAsync(Database,
             "SELECT count(*) FROM pg_trigger WHERE tgrelid IN ('pt'::regclass, 'pt_low'::regclass, 'pt_high'::regclass) AND tgname LIKE 'worf_sequence_range_guard%'",
-            token), "a guard pair on each table");
+            token), "the guard's trigger for updated rows on each table");
     }
 
     /// <summary>
@@ -1541,6 +1541,70 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
+    /// An exchange call that finds its provider's turn taken waits for it for a third of its time and then answers
+    /// that the turn didn't come, and the caller asks again, rather than wait until its statement times out (2903).
+    /// The wait for the turn was the one wait of a call with no bound of its own, so a call behind exchanges that
+    /// took long enough between them, as on a host that runs every statement many times slower, ended as a
+    /// statement that timed out, logged as an error on both nodes. Here a call left open in its transaction holds
+    /// node_a's turn for twice the two seconds the nodes give an exchange, while node_b, which has switched to its
+    /// next block, calls node_a for another: neither node logs a statement that timed out, and once the turn is
+    /// free, node_b's next block comes.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    public async Task ExchangeCallsThatFindTheTurnTakenAskAgain()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token, "worf.sequence_range_timeout = 2000");
+        await using TestNode nodeB = await StartNodeAsync("node_b", token, "worf.sequence_range_timeout = 2000");
+        TestNode[] nodes = [nodeA, nodeB];
+        foreach (TestNode node in nodes)
+        {
+            _ = await node.SafePsqlAsync(Database, "CREATE TABLE t (id bigserial PRIMARY KEY, v text)", token);
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database, "SELECT worf.enable_sequence_range('t_id_seq', participants := '{node_b}', range_size := 50)", token);
+        await SubscribeAsync(nodeB, "b_from_a", nodeA, token);
+        await WaitActiveAsync(nodes, token);
+        const string NextBlock = "SELECT next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 't_id_seq'::regclass";
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, NextBlock, token), "node_b's next block");
+        string slot = await nodeA.SafePsqlAsync(Database, "SELECT slot_name FROM pg_replication_slots", token);
+        string nodeBId = await nodeB.SafePsqlAsync(Database, "SELECT node_id FROM worf.local_node", token);
+        string held = $$"""{"node_id": {{nodeBId}}, "node_name": "node_b", "slot": "{{slot}}", "sysid": "1", "timeline": 1, "wal_lsn": "0/0", "sequences": []}""";
+        await using (NpgsqlConnection holder = await nodeA.OpenAsync(Database, token, SuperUser))
+        {
+            // The call, as the role that streams the slot, takes node_a's turn, which its transaction holds until
+            // it ends.
+            await using NpgsqlTransaction holding = await holder.BeginTransactionAsync(token);
+            await ExecuteAsync(holder, $"SELECT worf.sequence_range_exchange('{held}')", token);
+            Assert.AreEqual("t", await nodeA.SafePsqlAsync(Database,
+                $"SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = {holder.ProcessID} AND locktype = 'advisory' AND objsubid = 5 AND granted)", token),
+                "node_a's turn, held");
+            int[] logpositions = [.. nodes.Select(node => node.ReadLog().Length)];
+
+            // node_b uses its block up and switches to its next one, so it calls node_a for another.
+            await InsertAsync(nodeB, 60, token);
+            Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, $"""
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+                    WHERE l.locktype = 'advisory' AND l.objsubid = 5 AND NOT l.granted AND a.application_name LIKE '%b_from_a%')
+                """, token), "node_b's call waiting for node_a's turn");
+            await Task.Delay(TimeSpan.FromSeconds(4), token);
+            Assert.AreEqual("f", await nodeB.SafePsqlAsync(Database, NextBlock, token), "node_b's next block, while node_a's turn is held");
+            for (int i = 0; i < nodes.Length; i++)
+            {
+                Assert.DoesNotContain("statement timeout", nodes[i].ReadLog()[logpositions[i]..], $"{nodes[i].Name}'s log while node_a's turn is held");
+            }
+
+            await holding.CommitAsync(token);
+        }
+
+        Assert.IsTrue(await nodeB.PollQueryUntilAsync(Database, NextBlock, token), "node_b's next block, once node_a's turn is free");
+        await InsertAsync(nodeB, 60, token);
+        await AssertNoSharedValuesAsync(nodes, token);
+    }
+
+    /// <summary>
     /// A node that gathers from two providers grants their blocks in its own calls. A grant reaches a provider only
     /// once the node committed it, so an exchange that fails after a call, as an injected error here does, loses no
     /// grant another node holds. A call that names a slot it doesn't stream, or another node's, or another role's that
@@ -1722,24 +1786,6 @@ public sealed partial class SequenceRangeTests
         await SubscribeAsync(nodeB, "b_from_c", nodeC, token);
         await SubscribeAsync(nodeC, "c_from_b", nodeB, token);
 
-        // A call waits up to a third of its time for a range row another holds and then works on, which on a machine
-        // that runs every statement many times slower can pass the five seconds these nodes give an exchange, with
-        // no call waiting on another (2903). Here the nodes give their exchanges a minute, which only a call that
-        // waits without end runs out: each exchange connects anew, with the time its node has then.
-        async Task SetExchangeTimeAsync(int milliseconds)
-        {
-            foreach (TestNode node in nodes)
-            {
-                _ = await node.SafePsqlAsync(Database, $"ALTER SYSTEM SET worf.sequence_range_timeout = {milliseconds}", token);
-                _ = await node.SafePsqlAsync(Database, "SELECT pg_reload_conf()", token);
-            }
-
-            await Task.Delay(TimeSpan.FromSeconds(1), token);
-        }
-
-        int exchangeTime = int.Parse(await nodeA.SafePsqlAsync(Database, "SELECT setting FROM pg_settings WHERE name = 'worf.sequence_range_timeout'", token),
-            CultureInfo.InvariantCulture);
-        await SetExchangeTimeAsync(60000);
         int[] logpositions = [.. nodes.Select(node => node.ReadLog().Length)];
         await Task.WhenAll(nodes.Select(node => InsertAsync(node, 400, token)));
         for (int i = 0; i < nodes.Length; i++)
@@ -1748,8 +1794,6 @@ public sealed partial class SequenceRangeTests
             Assert.DoesNotContain("deadlock detected", log, nodes[i].Name);
             Assert.DoesNotContain("statement timeout", log, nodes[i].Name);
         }
-
-        await SetExchangeTimeAsync(exchangeTime);
 
         await AssertNoSharedValuesAsync(nodes, token);
 
@@ -5397,7 +5441,7 @@ public sealed partial class SequenceRangeTests
     /// partitions too, of the CHECK constraint of a column's domain, in a COPY with a condition that leaves rows out
     /// too, of that of the domain a column holds an array, a row, a range or a multirange of, one of them in a column
     /// whose first rows are null, so that its call starts late, and of the COPY's own WHERE condition, which names its
-    /// sequence or works the name out. Two copies of 150 rows each, in sessions of their own, draw from blocks of
+    /// sequence or works the name out. Three copies of 300 rows each, in sessions of their own, draw from blocks of
     /// 100. The table's first row starts such a call, and worf checked only that start, so each COPY failed at its
     /// block's end, "reached maximum value of sequence", while an INSERT of the same rows went through. worf reads
     /// PostgreSQL's own state of the COPY to reach those calls, which differs by version, so the test runs on every
@@ -5415,8 +5459,8 @@ public sealed partial class SequenceRangeTests
             CREATE TABLE checked (v int CHECK (nextval('s1') > 0));
             CREATE TABLE twice (v int CHECK (nextval('s1') + nextval('s1') > 0));
             CREATE TABLE parted (k int) PARTITION BY RANGE (k);
-            CREATE TABLE parted_low PARTITION OF parted (CHECK (nextval('s1') > 0)) FOR VALUES FROM (1) TO (76);
-            CREATE TABLE parted_high PARTITION OF parted (CHECK (nextval('s1') > 0)) FOR VALUES FROM (76) TO (999);
+            CREATE TABLE parted_low PARTITION OF parted (CHECK (nextval('s1') > 0)) FOR VALUES FROM (1) TO (151);
+            CREATE TABLE parted_high PARTITION OF parted (CHECK (nextval('s1') > 0)) FOR VALUES FROM (151) TO (999);
             CREATE FUNCTION kept() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;
             CREATE TABLE before (v int);
             CREATE TRIGGER kept BEFORE INSERT ON before FOR EACH ROW WHEN (nextval('s1') > 0) EXECUTE FUNCTION kept();
@@ -5437,8 +5481,8 @@ public sealed partial class SequenceRangeTests
             CREATE TABLE after_where (v int);
             CREATE TRIGGER kept AFTER INSERT ON after_where FOR EACH ROW WHEN (nextval('s1') < 0) EXECUTE FUNCTION kept();
             CREATE TABLE after_parted (k int) PARTITION BY RANGE (k);
-            CREATE TABLE after_parted_low PARTITION OF after_parted FOR VALUES FROM (1) TO (76);
-            CREATE TABLE after_parted_high PARTITION OF after_parted FOR VALUES FROM (76) TO (999);
+            CREATE TABLE after_parted_low PARTITION OF after_parted FOR VALUES FROM (1) TO (151);
+            CREATE TABLE after_parted_high PARTITION OF after_parted FOR VALUES FROM (151) TO (999);
             CREATE TRIGGER kept AFTER INSERT ON after_parted FOR EACH ROW WHEN (nextval('s1') < 0) EXECUTE FUNCTION kept();
             SELECT worf.enable_sequence_range('s1', participants := '{}', range_size := 100, max_range_size := 100);
             """, token);
@@ -5462,7 +5506,7 @@ public sealed partial class SequenceRangeTests
         ];
         Dictionary<string, string> conditions = new()
         {
-            ["plain_rows"] = " WHERE nextval('s1') > 0", ["after_where"] = " WHERE v > 0", ["of_domain_where"] = " WHERE v <= 100",
+            ["plain_rows"] = " WHERE nextval('s1') > 0", ["after_where"] = " WHERE v > 0", ["of_domain_where"] = " WHERE v <= 250",
             ["plain_rows_named_late"] = " WHERE nextval(('s' || '1')::regclass) > 0",
         };
         Dictionary<string, Func<int, string>> shapes = new()
@@ -5472,14 +5516,14 @@ public sealed partial class SequenceRangeTests
         };
         foreach ((string table, string what) in tables)
         {
-            for (int copy = 1; copy <= 2 && !failed.Exists(failure => failure.StartsWith(what, StringComparison.Ordinal)); copy++)
+            for (int copy = 1; copy <= 3 && !failed.Exists(failure => failure.StartsWith(what, StringComparison.Ordinal)); copy++)
             {
                 try
                 {
                     await using NpgsqlConnection connection = await nodeA.OpenAsync(Database, token);
                     await using TextWriter rows = await connection.BeginTextImportAsync(
                         $"COPY {table} FROM STDIN{conditions.GetValueOrDefault(table, "")}", token);
-                    for (int row = 1; row <= 150; row++)
+                    for (int row = 1; row <= 300; row++)
                     {
                         await rows.WriteLineAsync(shapes.TryGetValue(table, out Func<int, string>? shape) ? shape(row) : row.ToString(CultureInfo.InvariantCulture));
                     }
@@ -5492,7 +5536,7 @@ public sealed partial class SequenceRangeTests
         }
 
         Assert.IsEmpty(failed, $"the copies that failed: {string.Join("; ", failed)}");
-        Assert.AreEqual("300|300|300|300|300|300|300|300|300|200|300|300|300|300|300|300", await nodeA.SafePsqlAsync(Database, """
+        Assert.AreEqual("900|900|900|900|900|900|900|900|900|750|900|900|900|900|900|900", await nodeA.SafePsqlAsync(Database, """
             SELECT (SELECT count(*) FROM checked), (SELECT count(*) FROM twice), (SELECT count(*) FROM parted), (SELECT count(*) FROM before),
                 (SELECT count(*) FROM after), (SELECT count(*) FROM of_domain), (SELECT count(*) FROM plain_rows), (SELECT count(*) FROM after_where),
                 (SELECT count(*) FROM after_parted), (SELECT count(*) FROM of_domain_where), (SELECT count(*) FROM of_domains),
@@ -5511,6 +5555,7 @@ public sealed partial class SequenceRangeTests
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
+    [TestCategory("EveryVersion")]
     public async Task CopiesGoThroughInDatabasesWithoutWorf()
     {
         CancellationToken token = TestContext.CancellationToken;
@@ -5605,13 +5650,14 @@ public sealed partial class SequenceRangeTests
     /// calls goes through the guard on its own, with no gate held and no trigger run (2901). From blocks of 100, an
     /// INSERT ... SELECT, a COPY, a multi-row VALUES list, an insert ON CONFLICT DO NOTHING, single-row inserts in a
     /// PL/pgSQL loop and through a prepared statement, into tables with a bigserial, a serial and an identity
-    /// column and into a partitioned one, each write 150 rows beside a session that inserts one row at a time, in
-    /// a session of its own, every other one as a role with no privilege on the identity column's sequence, and no
-    /// statement fails and no id is given twice. The guard's trigger still checks a value
+    /// column and into a partitioned one, each write hundreds of rows beside a session that inserts one row at a
+    /// time, three times over in sessions of their own, the third as a role with no privilege on the identity
+    /// column's sequence, and no statement fails and no id is given twice. The guard's trigger still checks a value
     /// given by hand: one past every block the node has is refused, in the same tables.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
+    [TestCategory("EveryVersion")]
     public async Task InsertsThatTakeTheirDefaultsWaitForTheirSwitches()
     {
         CancellationToken token = TestContext.CancellationToken;
@@ -5621,8 +5667,8 @@ public sealed partial class SequenceRangeTests
             CREATE TABLE narrow (id serial PRIMARY KEY, v int);
             CREATE TABLE named (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v int);
             CREATE TABLE parted (id bigserial, v int) PARTITION BY RANGE (v);
-            CREATE TABLE parted_low PARTITION OF parted FOR VALUES FROM (MINVALUE) TO (1800);
-            CREATE TABLE parted_high PARTITION OF parted FOR VALUES FROM (1800) TO (MAXVALUE);
+            CREATE TABLE parted_low PARTITION OF parted FOR VALUES FROM (MINVALUE) TO (2700);
+            CREATE TABLE parted_high PARTITION OF parted FOR VALUES FROM (2700) TO (MAXVALUE);
             SELECT worf.enable_sequence_range('wide_id_seq', participants := '{}', range_size := 100, max_range_size := 100);
             SELECT worf.enable_sequence_range('narrow_id_seq', participants := '{}', range_size := 100, max_range_size := 100);
             SELECT worf.enable_sequence_range('named_id_seq', participants := '{}', range_size := 100, max_range_size := 100);
@@ -5655,26 +5701,25 @@ public sealed partial class SequenceRangeTests
                 }
             }
         }, token);
-        const int Rows = 150;
         int given = 0;
         (string What, Func<NpgsqlConnection, string, int, Task> Write)[] forms =
         [
             ("an INSERT ... SELECT", (connection, table, from) =>
-                ExecuteAsync(connection, $"INSERT INTO {table} (v) SELECT g FROM generate_series({from}, {from + Rows - 1}) g", token)),
+                ExecuteAsync(connection, $"INSERT INTO {table} (v) SELECT g FROM generate_series({from}, {from + 299}) g", token)),
             ("a COPY", async (connection, table, from) =>
             {
                 await using TextWriter rows = await connection.BeginTextImportAsync($"COPY {table} (v) FROM STDIN", token);
-                for (int row = from; row < from + Rows; row++)
+                for (int row = from; row < from + 300; row++)
                 {
                     await rows.WriteLineAsync(row.ToString(CultureInfo.InvariantCulture));
                 }
             }),
             ("a VALUES list", (connection, table, from) =>
-                ExecuteAsync(connection, $"INSERT INTO {table} (v) VALUES {string.Join(", ", Enumerable.Range(from, Rows).Select(v => $"({v})"))}", token)),
+                ExecuteAsync(connection, $"INSERT INTO {table} (v) VALUES {string.Join(", ", Enumerable.Range(from, 300).Select(v => $"({v})"))}", token)),
             ("an insert ON CONFLICT DO NOTHING", (connection, table, from) => ExecuteAsync(connection,
-                $"INSERT INTO {table} (v) SELECT g FROM generate_series({from}, {from + Rows - 1}) g ON CONFLICT DO NOTHING", token)),
+                $"INSERT INTO {table} (v) SELECT g FROM generate_series({from}, {from + 299}) g ON CONFLICT DO NOTHING", token)),
             ("a PL/pgSQL loop of inserts", (connection, table, from) => ExecuteAsync(connection,
-                $"DO $$ BEGIN FOR i IN {from}..{from + Rows - 1} LOOP INSERT INTO {table} (v) VALUES (i); END LOOP; END $$", token)),
+                $"DO $$ BEGIN FOR i IN {from}..{from + 299} LOOP INSERT INTO {table} (v) VALUES (i); END LOOP; END $$", token)),
             ("a prepared insert", async (connection, table, from) =>
             {
                 await using NpgsqlTransaction all = await connection.BeginTransactionAsync(token);
@@ -5682,7 +5727,7 @@ public sealed partial class SequenceRangeTests
                 NpgsqlParameter<int> value = new() { TypedValue = 0 };
                 _ = insert.Parameters.Add(value);
                 await insert.PrepareAsync(token);
-                for (int row = from; row < from + Rows; row++)
+                for (int row = from; row < from + 300; row++)
                 {
                     value.TypedValue = row;
                     _ = await insert.ExecuteNonQueryAsync(token);
@@ -5691,21 +5736,23 @@ public sealed partial class SequenceRangeTests
                 await all.CommitAsync(token);
             }),
         ];
-        for (int form = 0; form < forms.Length; form++)
+        foreach ((string what, Func<NpgsqlConnection, string, int, Task> write) in forms)
         {
-            (string what, Func<NpgsqlConnection, string, int, Task> write) = forms[form];
             foreach (string table in tables)
             {
-                int from = Interlocked.Add(ref given, Rows) - Rows + 1;
-                try
+                for (int round = 1; round <= 3 && !failed.Any(failure => failure.StartsWith($"{what} into {table}", StringComparison.Ordinal)); round++)
                 {
-                    // A role with no privilege on an identity column's sequence writes its rows all the same.
-                    await using NpgsqlConnection connection = await nodeA.OpenAsync(Database, token, form % 2 == 1 ? "writer" : "postgres");
-                    await write(connection, table, from);
-                }
-                catch (PostgresException failure)
-                {
-                    failed.Enqueue($"{what} into {table}: {failure.SqlState} {failure.MessageText}");
+                    int from = Interlocked.Add(ref given, 300) - 299;
+                    try
+                    {
+                        // A role with no privilege on an identity column's sequence writes its rows all the same.
+                        await using NpgsqlConnection connection = await nodeA.OpenAsync(Database, token, round == 3 ? "writer" : "postgres");
+                        await write(connection, table, from);
+                    }
+                    catch (PostgresException failure)
+                    {
+                        failed.Enqueue($"{what} into {table}, round {round}: {failure.SqlState} {failure.MessageText}");
+                    }
                 }
             }
         }
@@ -5715,7 +5762,7 @@ public sealed partial class SequenceRangeTests
         Assert.IsEmpty(failed, $"the statements that failed: {string.Join("; ", failed)}");
         foreach (string table in tables)
         {
-            Assert.AreEqual("900|t", await nodeA.SafePsqlAsync(Database,
+            Assert.AreEqual("5400|t", await nodeA.SafePsqlAsync(Database,
                 $"SELECT count(*) FILTER (WHERE v > 0), count(*) = count(DISTINCT id) FROM {table}", token), $"the rows of {table}, each with its own id");
         }
 
@@ -5732,67 +5779,88 @@ public sealed partial class SequenceRangeTests
 
     /// <summary>
     /// Writes into a table whose default draws from a managed sequence cost what they cost over a plain one (2901),
-    /// and a default that draws from a plain sequence costs what it costs in a database without worf (2902), for a
-    /// column with a default, an identity column and a partitioned table alike. An INSERT ... SELECT and a COPY of
-    /// 20,000 rows take less than 1.5 times as long over the managed sequence, where they took 11 and 32 times: the
-    /// guard's trigger checked each row, in a call into worf that read the sequence.
-    /// A thousand single-row inserts in a PL/pgSQL loop take less than 1.7 times as long over the managed sequence,
-    /// or less than 12 microseconds longer each, where they took twice as long and more, 24 microseconds longer each,
-    /// and less than 1.3 times as long over the plain sequence as in a database without worf,
-    /// where they took 1.7 times: worf wrote each statement's plan out as text to read its calls. Each form's
-    /// fastest 8 of 12 runs count, and the test runs alone, as other tests' load hides the difference.
+    /// and a default that draws from a plain sequence costs what it costs in a database without worf (2902): for a
+    /// column with a default, an identity column, a partitioned table and a table with a row trigger before its
+    /// inserts, an INSERT ... SELECT and a COPY of 10,000 rows and 500 single-row inserts in a PL/pgSQL loop, and
+    /// for a MERGE that inserts 10,000 rows and an insert ON CONFLICT DO UPDATE of as many, each takes less than
+    /// 1.1 times as long over the managed sequence. They took from 1.2 to 9 times as long: the guard's trigger
+    /// checked each row of a table with a trigger before its inserts, of a MERGE and of an insert that may update,
+    /// in a call into worf that read the sequence, PostgreSQL copied the guard's triggers and built their
+    /// conditions for every statement, and worf read each single-row statement's plan every time it ran. The
+    /// single-row inserts take less than 1.3 times as long over the plain sequence as in a database without worf.
+    /// Each form's fastest run of eight counts, a form measured again, four times at most, before it counts as slow,
+    /// and the test runs alone, as other tests' load hides the difference. What the guard does to a statement differs
+    /// by version, so the test runs on every version.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
     [DoNotParallelize]
+    [TestCategory("EveryVersion")]
     public async Task WritesThatTakeTheirDefaultsCostWhatPlainOnesDo()
     {
         CancellationToken token = TestContext.CancellationToken;
         await using TestNode nodeA = await StartNodeAsync("node_a", token);
-        const string Tables = """
-            CREATE TABLE dt_plain_s (id bigint DEFAULT nextval('plain_s'), v int);
-            CREATE TABLE identified_plain_s (id bigint GENERATED ALWAYS AS IDENTITY, v int);
-            CREATE TABLE parted_plain_s (id bigint DEFAULT nextval('plain_s'), v int) PARTITION BY RANGE (v);
-            CREATE TABLE parted_plain_s_low PARTITION OF parted_plain_s FOR VALUES FROM (MINVALUE) TO (10001);
-            CREATE TABLE parted_plain_s_high PARTITION OF parted_plain_s FOR VALUES FROM (10001) TO (MAXVALUE);
+        static string Tables(string sequence) => $"""
+            CREATE TABLE dt_{sequence} (id bigint DEFAULT nextval('{sequence}'), v int);
+            CREATE TABLE identified_{sequence} (id bigint GENERATED ALWAYS AS IDENTITY, v int);
+            CREATE TABLE parted_{sequence} (id bigint DEFAULT nextval('{sequence}'), v int) PARTITION BY RANGE (v);
+            CREATE TABLE parted_{sequence}_low PARTITION OF parted_{sequence} FOR VALUES FROM (MINVALUE) TO (5001);
+            CREATE TABLE parted_{sequence}_high PARTITION OF parted_{sequence} FOR VALUES FROM (5001) TO (MAXVALUE);
+            CREATE TABLE before_{sequence} (id bigint DEFAULT nextval('{sequence}'), v int);
+            CREATE TRIGGER kept BEFORE INSERT ON before_{sequence} FOR EACH ROW EXECUTE FUNCTION kept();
+            CREATE TABLE keyed_{sequence} (id bigint DEFAULT nextval('{sequence}') PRIMARY KEY, v int);
             """;
+        const string Kept = "CREATE FUNCTION kept() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;";
         _ = await nodeA.SafePsqlAsync(Database, $"""
             CREATE SEQUENCE s1; CREATE SEQUENCE plain_s;
-            CREATE TABLE dt_s1 (id bigint DEFAULT nextval('s1'), v int);
-            CREATE TABLE identified_s1 (id bigint GENERATED ALWAYS AS IDENTITY, v int);
-            CREATE TABLE parted_s1 (id bigint DEFAULT nextval('s1'), v int) PARTITION BY RANGE (v);
-            CREATE TABLE parted_s1_low PARTITION OF parted_s1 FOR VALUES FROM (MINVALUE) TO (10001);
-            CREATE TABLE parted_s1_high PARTITION OF parted_s1 FOR VALUES FROM (10001) TO (MAXVALUE);
-            {Tables}
+            {Kept}
+            {Tables("s1")}
+            {Tables("plain_s")}
             SELECT worf.enable_sequence_range('s1', participants := '{"{}"}', range_size := 100000000);
             SELECT worf.enable_sequence_range('identified_s1_id_seq', participants := '{"{}"}', range_size := 100000000);
             """, token);
         _ = await nodeA.SafePsqlAsync(Database, "CREATE DATABASE bare", token);
-        _ = await nodeA.SafePsqlAsync("bare", $"CREATE SEQUENCE plain_s; {Tables}", token);
+        _ = await nodeA.SafePsqlAsync("bare", $"CREATE SEQUENCE plain_s; {Kept} {Tables("plain_s")}", token);
         Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT bool_and(state = 'active') FROM worf.sequence_ranges", token),
             "node_a drawing from a block of each sequence");
         string file = Path.Join(nodeA.Cluster.DataDirectory, "written_rows.txt");
-        await File.WriteAllLinesAsync(file, Enumerable.Range(1, 20000).Select(row => row.ToString(CultureInfo.InvariantCulture)), token);
-        (string What, string Statement)[] forms =
+        await File.WriteAllLinesAsync(file, Enumerable.Range(1, 10000).Select(row => row.ToString(CultureInfo.InvariantCulture)), token);
+        const string Select = "INSERT INTO {0} (v) SELECT g FROM generate_series(1, 10000) g";
+        const string Loop = "DO $$ BEGIN FOR i IN 1..500 LOOP INSERT INTO {0} (v) VALUES (i); END LOOP; END $$";
+        string copy = $"COPY {{0}} (v) FROM '{file}'";
+        (string What, string Statement, string Column, string Into)[] forms =
         [
-            ("an INSERT ... SELECT of 20,000 rows", "INSERT INTO {0} (v) SELECT g FROM generate_series(1, 20000) g"),
-            ("a COPY of 20,000 rows", $"COPY {{0}} (v) FROM '{file}'"),
-            ("1,000 single-row inserts", "DO $$ BEGIN FOR i IN 1..1000 LOOP INSERT INTO {0} (v) VALUES (i); END LOOP; END $$"),
+            .. new[]
+            {
+                ("dt", "a table whose default draws"), ("identified", "a table with an identity column"),
+                ("parted", "a partitioned table whose default draws"), ("before", "a table with a row trigger before its inserts"),
+            }.SelectMany(table => new[]
+            {
+                ("an INSERT ... SELECT of 10,000 rows", Select, table.Item1, table.Item2), ("a COPY of 10,000 rows", copy, table.Item1, table.Item2),
+                ("500 single-row inserts", Loop, table.Item1, table.Item2),
+            }),
+            ("a MERGE that inserts 10,000 rows", "MERGE INTO {0} t USING generate_series(1, 10000) g ON false WHEN NOT MATCHED THEN INSERT (v) VALUES (g)",
+                "dt", "a table whose default draws"),
+            ("an insert ON CONFLICT DO UPDATE of 10,000 rows", Select + " ON CONFLICT (id) DO UPDATE SET v = excluded.v", "keyed",
+                "a table whose default draws"),
         ];
         await using NpgsqlConnection with = await nodeA.OpenAsync(Database, token);
         await using NpgsqlConnection without = await nodeA.OpenAsync("bare", token);
         List<string> slow = [];
-        foreach (string column in new[] { "dt", "identified", "parted" })
+        foreach ((string what, string statement, string column, string into) in forms)
         {
-            (NpgsqlConnection Connection, string Table, string Name)[] runs =
-                [(with, $"{column}_s1", "managed"), (with, $"{column}_plain_s", "plain"), (without, $"{column}_plain_s", "bare")];
-
-            // A partition's copy of the guard's trigger is made as the partition's first row comes, and checks that
-            // row, which a statement of one row pays for each time, so only the statements of many rows are compared.
-            foreach ((string what, string statement) in forms.Where(form => column != "parted" || !form.Statement.StartsWith("DO ", StringComparison.Ordinal)))
+            // What worf reads of a table once, after each change to it, as the TRUNCATE before each run, weighs on a
+            // statement of a few milliseconds, so only the statements that run hundreds of times are compared with
+            // a database without worf.
+            bool single = statement == Loop;
+            (NpgsqlConnection Connection, string Table, string Name)[] runs = single
+                ? [(with, $"{column}_s1", "managed"), (with, $"{column}_plain_s", "plain"), (without, $"{column}_plain_s", "bare")]
+                : [(with, $"{column}_s1", "managed"), (with, $"{column}_plain_s", "plain")];
+            Dictionary<string, TimeSpan> fastest = runs.ToDictionary(run => run.Name, _ => TimeSpan.MaxValue);
+            for (int attempt = 0; attempt < 5 && (attempt == 0 || fastest["managed"] >= fastest["plain"] * 1.1 ||
+                (single && fastest["plain"] >= fastest["bare"] * 1.3)); attempt++)
             {
-                Dictionary<string, List<TimeSpan>> times = runs.ToDictionary(run => run.Name, _ => new List<TimeSpan>());
-                for (int i = 0; i < 14; i++)
+                for (int i = 0; i < 10; i++)
                 {
                     foreach ((NpgsqlConnection connection, string table, string name) in i % 2 == 0 ? runs : [.. runs.Reverse()])
                     {
@@ -5801,43 +5869,29 @@ public sealed partial class SequenceRangeTests
                             Stopwatch timing = Stopwatch.StartNew();
                             _ = await run.ExecuteNonQueryAsync(token);
                             timing.Stop();
-                            if (i >= 2)
+                            if (i >= 2 && timing.Elapsed < fastest[name])
                             {
-                                times[name].Add(timing.Elapsed);
+                                fastest[name] = timing.Elapsed;
                             }
                         }
 
                         await ExecuteAsync(connection, $"TRUNCATE {table}", token);
                     }
                 }
+            }
 
-                TimeSpan Fastest(string name) => TimeSpan.FromTicks(times[name].Order().Take(8).Sum(time => time.Ticks));
-                string into = column switch
-                {
-                    "dt" => "a table whose default draws",
-                    "identified" => "a table with an identity column",
-                    _ => "a partitioned table whose default draws",
-                };
-                // A statement of one row pays for what worf reads of its plan each time, a few microseconds, which
-                // weighs more the faster the server runs the statement: its bound is wider, and passed only by a
-                // statement that takes 12 microseconds longer too, 96 ms over the 8,000 statements counted.
-                bool single = statement.StartsWith("DO ", StringComparison.Ordinal);
-                if (Fastest("managed") >= Fastest("plain") * (single ? 1.7 : 1.5) &&
-                    (!single || Fastest("managed") - Fastest("plain") >= TimeSpan.FromMilliseconds(96)))
-                {
-                    slow.Add($"{what} into {into} from a managed sequence took {Fastest("managed")}, against {Fastest("plain")} from a plain one (2901)");
-                }
+            if (fastest["managed"] >= fastest["plain"] * 1.1)
+            {
+                slow.Add($"{what} into {into} from a managed sequence took {fastest["managed"]}, against {fastest["plain"]} from a plain one (2901)");
+            }
 
-                // What worf reads of a table once, after each change to it, as the TRUNCATE before each run, weighs on
-                // a statement of a few milliseconds, so only the statements that run a thousand times are compared.
-                if (statement.StartsWith("DO ", StringComparison.Ordinal) && Fastest("plain") >= Fastest("bare") * 1.3)
-                {
-                    slow.Add($"{what} into {into} from a plain sequence took {Fastest("plain")}, against {Fastest("bare")} in a database without worf (2902)");
-                }
+            if (single && fastest["plain"] >= fastest["bare"] * 1.3)
+            {
+                slow.Add($"{what} into {into} from a plain sequence took {fastest["plain"]}, against {fastest["bare"]} in a database without worf (2902)");
             }
         }
 
-        Assert.IsEmpty(slow, $"the writes, the fastest 8 of 12 runs of each, that took too long: {string.Join("; ", slow)}");
+        Assert.IsEmpty(slow, $"the writes, the fastest run of each, that took too long: {string.Join("; ", slow)}");
     }
 
     /// <summary>
@@ -6439,10 +6493,11 @@ public sealed partial class SequenceRangeTests
     }
 
     /// <summary>
-    /// A session's first draw reads the blocks with JIT off, as worf's tables have no statistics until they're analyzed
-    /// and the read's estimated cost would have JIT compile it (2142, 2202). auto_explain lists a setting with a statement
-    /// only where it differs from the server's built-in value, so in a session with jit on, the read is logged with
-    /// jit off where jit is on by default, and without jit on where it's off by default.
+    /// A session's first draw reads the blocks with no statement of worf's, so none that JIT compiles: worf's tables
+    /// have no statistics until they're analyzed, and a query's estimated cost over them would have JIT compile it
+    /// (2142, 2202). The read was a query that ran with JIT off, and is now a read of the tables row by row (3000).
+    /// In a session with jit on, auto_explain logs every statement that runs, those within others too, and logs the
+    /// session's own draw alone.
     /// </summary>
     /// <returns>The test.</returns>
     [TestMethod]
@@ -6455,7 +6510,6 @@ public sealed partial class SequenceRangeTests
             SELECT worf.enable_sequence_range('s1', participants := '{}', range_size := 100);
             """, token);
         Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT state = 'active' FROM worf.sequence_ranges", token), "node_a drawing");
-        string builtIn = await nodeA.SafePsqlAsync(Database, "SELECT boot_val FROM pg_settings WHERE name = 'jit'", token);
         int logpos = nodeA.ReadLog().Length;
         _ = await nodeA.SafePsqlAsync(Database, """
             LOAD 'auto_explain';
@@ -6465,20 +6519,132 @@ public sealed partial class SequenceRangeTests
             SET jit = on;
             SELECT nextval('s1');
             """, token);
-        string log = nodeA.ReadLog()[logpos..];
-        int read = log.IndexOf("LEFT JOIN worf.sequence_range_block b ON b.seqoid = r.seqoid AND b.kind IN ('n', 'i')", StringComparison.Ordinal);
-        Assert.IsGreaterThanOrEqualTo(0, read, "the logged read of the blocks");
-        int settings = log.IndexOf("Settings:", read, StringComparison.Ordinal);
-        Assert.IsGreaterThanOrEqualTo(0, settings, "the read's settings");
-        string listed = log[settings..log.IndexOf('\n', settings)];
-        if (builtIn == "on")
+        string[] logged = [.. LoggedStatements(nodeA.ReadLog()[logpos..])];
+        Assert.HasCount(1, logged, $"the statements the draw ran: {string.Join("; ", logged)}");
+        Assert.StartsWith("SELECT nextval('s1')", logged[0], "the statement logged");
+    }
+
+    // The texts of the statements auto_explain logged, in a part of a server's log.
+    private static IEnumerable<string> LoggedStatements(string log)
+    {
+        const string Text = "Query Text: ";
+        for (int at = log.IndexOf(Text, StringComparison.Ordinal); at >= 0; at = log.IndexOf(Text, at + Text.Length, StringComparison.Ordinal))
         {
-            Assert.Contains("jit = 'off'", listed, "the read's JIT, where it's on by default");
+            int end = log.IndexOf('\n', at);
+            yield return log[(at + Text.Length)..(end < 0 ? log.Length : end)].Trim();
         }
-        else
+    }
+
+    /// <summary>
+    /// A session keeps nothing of what worf reads for its writes but the entries of worf's own tables in
+    /// PostgreSQL's cache (3000). worf read its tables, and the triggers, defaults and constraints of the tables a
+    /// statement writes, with queries, and what PostgreSQL looked up to plan each one stayed in the session's cache
+    /// for good: half a megabyte after a COPY, of a table with no default too, which a server built with assertions
+    /// checks at the end of every statement, so each later statement of the session took 40 microseconds longer.
+    /// Into a table with no default, one whose default draws from a managed sequence, one whose default draws from
+    /// a plain one, one with an identity column, a partitioned one and one with a row trigger before its inserts, a
+    /// COPY and an INSERT ... SELECT run no statement of worf's, as auto_explain logs every statement that runs,
+    /// and after 20 COPYs, each followed by a TRUNCATE, the session holds less than 200 kB more than a session that
+    /// did the same in a database without worf. What worf reads straight from the catalogs differs by version, so
+    /// the test runs on every version.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [TestCategory("EveryVersion")]
+    public async Task SessionsKeepNoPlansOfWorfsReads()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        static string Tables(string sequence) => $"""
+            CREATE TABLE dt_{sequence} (id bigint DEFAULT nextval('{sequence}'), v int);
+            CREATE TABLE identified_{sequence} (id bigint GENERATED ALWAYS AS IDENTITY, v int);
+            CREATE TABLE parted_{sequence} (id bigint DEFAULT nextval('{sequence}'), v int) PARTITION BY RANGE (v);
+            CREATE TABLE parted_{sequence}_low PARTITION OF parted_{sequence} FOR VALUES FROM (MINVALUE) TO (101);
+            CREATE TABLE parted_{sequence}_high PARTITION OF parted_{sequence} FOR VALUES FROM (101) TO (MAXVALUE);
+            CREATE TABLE before_{sequence} (id bigint DEFAULT nextval('{sequence}'), v int);
+            CREATE TRIGGER kept BEFORE INSERT ON before_{sequence} FOR EACH ROW EXECUTE FUNCTION kept();
+            """;
+        const string Shared = """
+            CREATE SEQUENCE plain_s;
+            CREATE FUNCTION kept() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;
+            CREATE TABLE tn (v int);
+            """;
+        _ = await nodeA.SafePsqlAsync(Database, $"""
+            CREATE SEQUENCE s1;
+            {Shared}
+            {Tables("s1")}
+            {Tables("plain_s")}
+            SELECT worf.enable_sequence_range('s1', participants := '{"{}"}', range_size := 1000000);
+            SELECT worf.enable_sequence_range('identified_s1_id_seq', participants := '{"{}"}', range_size := 1000000);
+            """, token);
+        _ = await nodeA.SafePsqlAsync(Database, "CREATE DATABASE bare", token);
+        _ = await nodeA.SafePsqlAsync("bare", $"{Shared} {Tables("plain_s")}", token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT bool_and(state = 'active') FROM worf.sequence_ranges", token),
+            "node_a drawing from a block of each sequence");
+        string file = Path.Join(nodeA.Cluster.DataDirectory, "written_rows.txt");
+        await File.WriteAllLinesAsync(file, Enumerable.Range(1, 200).Select(row => row.ToString(CultureInfo.InvariantCulture)), token);
+
+        // Each write in a session of its own, whose first statements they are.
+        (string Managed, string Plain)[] tables =
+        [
+            ("tn", "tn"), ("dt_s1", "dt_plain_s"), ("dt_plain_s", "dt_plain_s"), ("identified_s1", "identified_plain_s"), ("parted_s1", "parted_plain_s"),
+            ("before_s1", "before_plain_s"),
+        ];
+        List<string> ran = [];
+        foreach ((string table, _) in tables)
         {
-            Assert.DoesNotContain("jit = 'on'", listed, "the read's JIT, where it's off by default");
+            int logpos = nodeA.ReadLog().Length;
+            await using (NpgsqlConnection writer = await nodeA.OpenAsync(Database, token))
+            {
+                await ExecuteAsync(writer, """
+                    LOAD 'auto_explain';
+                    SET auto_explain.log_min_duration = 0;
+                    SET auto_explain.log_nested_statements = on;
+                    """, token);
+                await ExecuteAsync(writer, $"COPY {table} (v) FROM '{file}'", token);
+                await ExecuteAsync(writer, $"INSERT INTO {table} (v) SELECT g FROM generate_series(1, 200) g", token);
+            }
+
+            ran.AddRange(LoggedStatements(nodeA.ReadLog()[logpos..]).Where(statement => !statement.StartsWith("INSERT INTO ", StringComparison.Ordinal))
+                .Select(statement => $"for {table}: {statement}"));
         }
+
+        Assert.IsEmpty(ran, $"the statements of worf's that a COPY and an INSERT ... SELECT ran: {string.Join("; ", ran)}");
+
+        // What a session holds after its COPYs, over what one holds in a database without worf.
+        const string Held = "SELECT sum(used_bytes)::bigint FROM pg_backend_memory_contexts";
+        async Task<long> KeptAsync(string database, string table)
+        {
+            await using NpgsqlConnection writer = await nodeA.OpenAsync(database, token);
+            long before = 0;
+            for (int i = 0; i < 2; i++)
+            {
+                await using NpgsqlCommand held = new(Held, writer);
+                before = (long)(await held.ExecuteScalarAsync(token))!;
+            }
+
+            for (int i = 0; i < 20; i++)
+            {
+                await ExecuteAsync(writer, $"COPY {table} (v) FROM '{file}'", token);
+                await ExecuteAsync(writer, $"TRUNCATE {table}", token);
+            }
+
+            await using NpgsqlCommand after = new(Held, writer);
+            return (long)(await after.ExecuteScalarAsync(token))! - before;
+        }
+
+        List<string> kept = [];
+        foreach ((string managed, string plain) in tables)
+        {
+            long with = await KeptAsync(Database, managed);
+            long without = await KeptAsync("bare", plain);
+            if (with - without >= 200 * 1024)
+            {
+                kept.Add($"{managed}: {with / 1024} kB, against {without / 1024} kB without worf");
+            }
+        }
+
+        Assert.IsEmpty(kept, $"the sessions that held too much after 20 COPYs: {string.Join("; ", kept)}");
     }
 
     /// <summary>
@@ -11971,9 +12137,9 @@ public sealed partial class SequenceRangeTests
 
     /// <summary>
     /// A switch waits for the statements that hold the sequence's switch gate, as for a lock, and statements waiting for
-    /// the switch wait for it, however long, rather than fail. The table has a row trigger before its inserts, which
-    /// may change a row, so the guard's trigger checks each row and the statements hold the gate, as those whose rows
-    /// take the column's default alone don't: a multi-row insert ON CONFLICT DO NOTHING waiting for a
+    /// the switch wait for it, however long, rather than fail. The table has a row trigger whose argument names the
+    /// sequence, which its function may draw from, so the statements hold the gate, as those whose rows take the
+    /// column's default alone don't, a row trigger before them or not: a multi-row insert ON CONFLICT DO NOTHING waiting for a
     /// key another transaction holds draws its later rows from the bounds it then has, a COPY FROM STDIN paused for its
     /// client and a statement in pg_sleep hold the switch up until they go on, though not the range row, which the switch
     /// takes only once it has the gate, and a cycle through the gate, an insert
@@ -11989,7 +12155,7 @@ public sealed partial class SequenceRangeTests
         _ = await node.SafePsqlAsync(Database, """
             CREATE TABLE k (id bigserial PRIMARY KEY, u int UNIQUE);
             CREATE FUNCTION kept() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;
-            CREATE TRIGGER kept BEFORE INSERT ON k FOR EACH ROW EXECUTE FUNCTION kept();
+            CREATE TRIGGER kept BEFORE INSERT ON k FOR EACH ROW EXECUTE FUNCTION kept('k_id_seq');
             SELECT worf.enable_sequence_range('k_id_seq', participants := '{}', range_size := 100, max_range_size := 100);
             """, token);
         const string Ready = "SELECT state = 'active' AND next_lo IS NOT NULL FROM worf.sequence_ranges WHERE sequence = 'k_id_seq'::regclass";

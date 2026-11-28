@@ -131,7 +131,7 @@ public sealed class CreateSubscriberTests
             }
 
             run.Environment["PGPORT"] = pgport.ToString(CultureInfo.InvariantCulture);
-            using Process tool = Process.Start(run)!;
+            using Process tool = await ProcessRunner.StartAsync(run, token);
             Task<string> output = tool.StandardOutput.ReadToEndAsync(token);
             Task<string> errors = tool.StandardError.ReadToEndAsync(token);
             await tool.WaitForExitAsync(token);
@@ -249,7 +249,7 @@ public sealed class CreateSubscriberTests
             }
 
             start.Environment["PGPORT"] = pgport.ToString(CultureInfo.InvariantCulture);
-            using Process tool = Process.Start(start)!;
+            using Process tool = await ProcessRunner.StartAsync(start, token);
             Task<string> output = tool.StandardOutput.ReadToEndAsync(token);
             Task<string> errors = tool.StandardError.ReadToEndAsync(token);
             await tool.WaitForExitAsync(token);
@@ -464,7 +464,7 @@ public sealed class CreateSubscriberTests
         string[] arguments = [.. start.ArgumentList];
         try
         {
-            using Process tool = Process.Start(start)!;
+            using Process tool = await ProcessRunner.StartAsync(start, token);
             Task<string> errors = tool.StandardError.ReadToEndAsync(token);
             Task<string> output = tool.StandardOutput.ReadToEndAsync(token);
 
@@ -756,7 +756,7 @@ public sealed class CreateSubscriberTests
                 paused = true;
             }
 
-            using Process tool = Process.Start(start)!;
+            using Process tool = await ProcessRunner.StartAsync(start, token);
             await using RunningTool running = new(tool);
             Task<string> errors = tool.StandardError.ReadToEndAsync(token);
             StringBuilder seen = new();
@@ -1019,7 +1019,7 @@ public sealed class CreateSubscriberTests
         Task<bool>? streamed = null;
         try
         {
-            using Process tool = Process.Start(start)!;
+            using Process tool = await ProcessRunner.StartAsync(start, token);
             await using RunningTool running = new(tool);
             Task<string> errors = tool.StandardError.ReadToEndAsync(token);
             StringBuilder seen = new();
@@ -2067,7 +2067,7 @@ public sealed class CreateSubscriberTests
         }
 
         start.Environment["PGPORT"] = port;
-        using Process tool = Process.Start(start)!;
+        using Process tool = await ProcessRunner.StartAsync(start, token);
         Task<string> output = tool.StandardOutput.ReadToEndAsync(token);
         Task<string> errors = tool.StandardError.ReadToEndAsync(token);
         bool timedOut = false;

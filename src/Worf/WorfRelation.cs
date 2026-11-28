@@ -88,6 +88,12 @@ internal sealed unsafe class WorfRelation
     public bool HasRechecks { get; set; }
 
     /// <summary>
+    /// Gets or sets whether the local relation has triggers of the sequence range guard's that hold no condition,
+    /// which <see cref="ReplicaRechecks"/> has the rows apply writes skip. Only valid as long as relation mapping is.
+    /// </summary>
+    public bool HasGuards { get; set; }
+
+    /// <summary>
     /// Gets the type a local column's values are sent in.
     /// </summary>
     /// <param name="attid">The local column.</param>
