@@ -211,6 +211,14 @@ internal static partial class SequenceRangeGuard
     private const int SequenceCacheId = 61;
 #endif
 
+#if !ANKUS_PG19
+    // AUTHMEMROLEMEM, AUTHOID and DATABASEOID, the ids of the catalog caches of memberships, roles and databases,
+    // the same in every version before PostgreSQL 19, whose bindings name them.
+    private const int MembershipCacheId = 9;
+    private const int RoleCacheId = 11;
+    private const int DatabaseCacheId = 21;
+#endif
+
     [PgNativeCallback(nameof(TableInvalidated))]
 #if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
     private static partial RelcacheCallbackFunction TableCallback { get; }
@@ -220,6 +228,9 @@ internal static partial class SequenceRangeGuard
 
     [PgNativeCallback(nameof(TypeInvalidated))]
     private static partial SyscacheCallbackFunction TypeCallback { get; }
+
+    [PgNativeCallback(nameof(PrivilegeInvalidated))]
+    private static partial SyscacheCallbackFunction PrivilegeCallback { get; }
 
     // Whether each table has the guard's triggers, which only tables numbered by a managed sequence have, and a trigger
     // that takes arguments, which may name a sequence it draws from, as of the versions of the shared and this backend's
@@ -518,7 +529,7 @@ internal static partial class SequenceRangeGuard
     /// skip, as one PostgreSQL's apply of another subscription writes, and checks the row as the condition would.
     /// </summary>
     /// <param name="context">The trigger's context.</param>
-    /// <returns>Nothing, as an AFTER trigger returns.</returns>
+    /// <returns>Nothing, as an AFTER trigger returns, or the row as it is for one that fires before the write.</returns>
     [PgTrigger]
     [PgFunction(Sql = """
         CREATE FUNCTION worf.sequence_range_guard()
@@ -526,10 +537,12 @@ internal static partial class SequenceRangeGuard
         """)]
     internal static PgHeapTuple? Guard(PgTriggerContext context)
     {
+        // A trigger that fires before the write gives the row back as it is, and one that fires after it none.
+        PgHeapTuple? result = context.Timing == PgTriggerTiming.Before ? context.New : null;
         bool inserted = context.Operation == PgTriggerOperation.Insert;
         if (context.New is not PgHeapTuple row || (!inserted && context.Operation != PgTriggerOperation.Update) || WritesAsWorker())
         {
-            return null;
+            return result;
         }
 
         foreach ((short column, bool numeric, uint[] sequences) in GuardedColumns(context.RelationOid, [.. context.Arguments]))
@@ -557,7 +570,7 @@ internal static partial class SequenceRangeGuard
             }
         }
 
-        return null;
+        return result;
     }
 
     // Whether this backend is one of worf's own apply or sync workers, which write other nodes' rows.
@@ -638,8 +651,12 @@ internal static partial class SequenceRangeGuard
     /// columns. worf's own apply and sync workers write other nodes' rows, which it leaves alone.
     /// </summary>
     /// <param name="fcinfo">The call of the trigger's function.</param>
-    internal static unsafe void GuardRow(FunctionCallInfoBaseData* fcinfo)
+    /// <returns>What the trigger's function returns: the row as it is for a trigger that fires before the write, and no row for one that fires after it.</returns>
+    internal static unsafe ulong GuardRow(FunctionCallInfoBaseData* fcinfo)
     {
+        // TRIGGER_EVENT_TIMINGMASK and TRIGGER_EVENT_BEFORE from commands/trigger.h.
+        const uint EventTiming = 0x18;
+        const uint EventBefore = 0x8;
         const uint EventOperation = 3;
         const uint EventUpdate = 2;
         const uint EventRow = 4;
@@ -647,9 +664,16 @@ internal static partial class SequenceRangeGuard
         const uint Int4Oid = 23;
         const uint NumericOut = 1702;
         TriggerData* fired = (TriggerData*)fcinfo->context;
-        if (fired is null || fired->type != NodeTag.T_TriggerData || (fired->tg_event & EventRow) == 0 || WritesAsWorker())
+        if (fired is null || fired->type != NodeTag.T_TriggerData)
         {
-            return;
+            return 0;
+        }
+
+        // A trigger that fires before the write gives the row back as it is, and one that fires after it none.
+        ulong result = (fired->tg_event & EventTiming) == EventBefore ? (ulong)(nint)fired->tg_trigtuple : 0;
+        if ((fired->tg_event & EventRow) == 0 || WritesAsWorker())
+        {
+            return result;
         }
 
         uint operation = fired->tg_event & EventOperation;
@@ -658,7 +682,7 @@ internal static partial class SequenceRangeGuard
         HeapTupleData* old = inserted ? null : fired->tg_trigtuple;
         if ((!inserted && operation != EventUpdate) || row is null || fired->tg_relation is null || fired->tg_trigger is null)
         {
-            return;
+            return result;
         }
 
         List<string> arguments = [];
@@ -697,6 +721,8 @@ internal static partial class SequenceRangeGuard
                 }
             }
         }
+
+        return result;
     }
 
     /// <summary>
@@ -2550,7 +2576,10 @@ internal static partial class SequenceRangeGuard
     /// <param name="inserts">Whether the statement may insert rows.</param>
     /// <param name="updates">Whether the statement may update rows.</param>
     /// <param name="memory">The statement's memory.</param>
-    private static unsafe void AttachGuards(ResultRelInfo* written, bool takes, bool inserts, bool updates, MemoryContextData* memory)
+    /// <param name="early">Whether the statement inserts every row its table's triggers leave it, as one with no
+    /// ON CONFLICT clause does, so that a row set against the value its default drew can be checked before its
+    /// insert, as the last of the table's triggers before it, which costs a row less than a trigger after it.</param>
+    private static unsafe void AttachGuards(ResultRelInfo* written, bool takes, bool inserts, bool updates, MemoryContextData* memory, bool early = false)
     {
         const int Row = 1 << 0;
         const int Before = 1 << 1;
@@ -2584,6 +2613,8 @@ internal static partial class SequenceRangeGuard
         bool worker = Worker.MyWorfWorker >= 0 && Worker.MyWorker.WorkerType is WorfWorkerType.Apply or WorfWorkerType.Sync;
         uint relid = written->ri_RelationDesc->rd_id;
         bool fires = false;
+        Trigger* noted = null;
+        nint noting = 0;
         for (int i = 0; i < triggers->numtriggers; i++)
         {
             Trigger* trigger = &triggers->triggers[i];
@@ -2598,6 +2629,16 @@ internal static partial class SequenceRangeGuard
                 else if (insert ? inserts : updates)
                 {
                     nint condition = insert && s_noting.State != 0 ? NotingCondition(trigger, relid) : 0;
+                    if (condition != 0 && early && memory is not null && noted is null)
+                    {
+                        // The row is set against the value it drew before its insert, by a trigger the
+                        // statement's copy takes on below, and the trigger after the insert rests.
+                        noted = trigger;
+                        noting = condition;
+                        trigger->tgenabled = Disabled;
+                        continue;
+                    }
+
                     if (condition == 0)
                     {
                         condition = Condition(trigger, relid, update);
@@ -2628,45 +2669,63 @@ internal static partial class SequenceRangeGuard
         nint check = routed is null ? 0 : Condition(routed, relid, false);
         if (check != 0)
         {
-            int count = triggers->numtriggers;
-            TriggerDesc* own = (TriggerDesc*)NativeMethods.MemoryContextAlloc(memory, (nuint)sizeof(TriggerDesc));
-            *own = *triggers;
-            own->triggers = (Trigger*)NativeMethods.MemoryContextAllocZero(memory, (nuint)((count + 1) * sizeof(Trigger)));
-            Buffer.MemoryCopy(triggers->triggers, own->triggers, (long)(count + 1) * sizeof(Trigger), (long)count * sizeof(Trigger));
-            Trigger* added = &own->triggers[count];
-            added->tgoid = uint.MaxValue - 1;
-            added->tgname = (sbyte*)GuardNameText();
-            added->tgfoid = routed->tgfoid;
-            added->tgtype = Row | TriggerTypeInsert;
-            added->tgenabled = Always;
-            added->tgisinternal = true;
-            added->tgnargs = routed->tgnargs;
-            added->tgargs = routed->tgargs;
-            added->tgqual = (sbyte*)s_conditionMark;
-            own->numtriggers = count + 1;
-            own->trig_insert_after_row = true;
-            FmgrInfo* functions = (FmgrInfo*)NativeMethods.MemoryContextAllocZero(memory, (nuint)((count + 1) * sizeof(FmgrInfo)));
-            Buffer.MemoryCopy(written->ri_TrigFunctions, functions, (long)(count + 1) * sizeof(FmgrInfo), (long)count * sizeof(FmgrInfo));
-            ExprState** conditions = (ExprState**)NativeMethods.MemoryContextAllocZero(memory, (nuint)((count + 1) * sizeof(nint)));
-            Buffer.MemoryCopy(written->ri_TrigWhenExprs, conditions, (long)(count + 1) * sizeof(nint), (long)count * sizeof(nint));
-            conditions[count] = (ExprState*)check;
-            // What EXPLAIN ANALYZE notes of each trigger, which PostgreSQL 19 keeps in a type of its own.
-            if (written->ri_TrigInstrument is not null)
-            {
-#if ANKUS_PG19
-                TriggerInstrumentation* timings = (TriggerInstrumentation*)NativeMethods.MemoryContextAllocZero(memory, (nuint)((count + 1) * sizeof(TriggerInstrumentation)));
-                Buffer.MemoryCopy(written->ri_TrigInstrument, timings, (long)(count + 1) * sizeof(TriggerInstrumentation), (long)count * sizeof(TriggerInstrumentation));
-#else
-                Instrumentation* timings = (Instrumentation*)NativeMethods.MemoryContextAllocZero(memory, (nuint)((count + 1) * sizeof(Instrumentation)));
-                Buffer.MemoryCopy(written->ri_TrigInstrument, timings, (long)(count + 1) * sizeof(Instrumentation), (long)count * sizeof(Instrumentation));
-#endif
-                written->ri_TrigInstrument = timings;
-            }
-
-            written->ri_TrigDesc = own;
-            written->ri_TrigFunctions = functions;
-            written->ri_TrigWhenExprs = conditions;
+            AddGuard(written, routed, Row | TriggerTypeInsert, check, memory);
+            written->ri_TrigDesc->trig_insert_after_row = true;
         }
+
+        // The trigger that sets a row against the value it drew comes last of those before the insert, once the
+        // table's own have had the row, and fires only for a row that differs.
+        if (noted is not null)
+        {
+            AddGuard(written, noted, Row | Before | TriggerTypeInsert, noting, memory);
+            written->ri_TrigDesc->trig_insert_before_row = true;
+        }
+    }
+
+    // Has a statement's copy of a table's triggers take on one more of the guard's, like one the table has, of a
+    // type and with a condition given, after all the others.
+    private static unsafe void AddGuard(ResultRelInfo* written, Trigger* like, int type, nint check, MemoryContextData* memory)
+    {
+        const sbyte Always = (sbyte)'A';
+        TriggerDesc* triggers = written->ri_TrigDesc;
+        int count = triggers->numtriggers;
+        TriggerDesc* own = (TriggerDesc*)NativeMethods.MemoryContextAlloc(memory, (nuint)sizeof(TriggerDesc));
+        *own = *triggers;
+        own->triggers = (Trigger*)NativeMethods.MemoryContextAllocZero(memory, (nuint)((count + 1) * sizeof(Trigger)));
+        Buffer.MemoryCopy(triggers->triggers, own->triggers, (long)(count + 1) * sizeof(Trigger), (long)count * sizeof(Trigger));
+        Trigger* added = &own->triggers[count];
+        added->tgoid = uint.MaxValue - 1;
+        added->tgname = (sbyte*)GuardNameText();
+        added->tgfoid = like->tgfoid;
+        added->tgtype = (short)type;
+        added->tgenabled = Always;
+        added->tgisinternal = true;
+        added->tgnargs = like->tgnargs;
+        added->tgargs = like->tgargs;
+        added->tgqual = (sbyte*)s_conditionMark;
+        own->numtriggers = count + 1;
+        FmgrInfo* functions = (FmgrInfo*)NativeMethods.MemoryContextAllocZero(memory, (nuint)((count + 1) * sizeof(FmgrInfo)));
+        Buffer.MemoryCopy(written->ri_TrigFunctions, functions, (long)(count + 1) * sizeof(FmgrInfo), (long)count * sizeof(FmgrInfo));
+        ExprState** conditions = (ExprState**)NativeMethods.MemoryContextAllocZero(memory, (nuint)((count + 1) * sizeof(nint)));
+        Buffer.MemoryCopy(written->ri_TrigWhenExprs, conditions, (long)(count + 1) * sizeof(nint), (long)count * sizeof(nint));
+        conditions[count] = (ExprState*)check;
+
+        // What EXPLAIN ANALYZE notes of each trigger, which PostgreSQL 19 keeps in a type of its own.
+        if (written->ri_TrigInstrument is not null)
+        {
+#if ANKUS_PG19
+            TriggerInstrumentation* timings = (TriggerInstrumentation*)NativeMethods.MemoryContextAllocZero(memory, (nuint)((count + 1) * sizeof(TriggerInstrumentation)));
+            Buffer.MemoryCopy(written->ri_TrigInstrument, timings, (long)(count + 1) * sizeof(TriggerInstrumentation), (long)count * sizeof(TriggerInstrumentation));
+#else
+            Instrumentation* timings = (Instrumentation*)NativeMethods.MemoryContextAllocZero(memory, (nuint)((count + 1) * sizeof(Instrumentation)));
+            Buffer.MemoryCopy(written->ri_TrigInstrument, timings, (long)(count + 1) * sizeof(Instrumentation), (long)count * sizeof(Instrumentation));
+#endif
+            written->ri_TrigInstrument = timings;
+        }
+
+        written->ri_TrigDesc = own;
+        written->ri_TrigFunctions = functions;
+        written->ri_TrigWhenExprs = conditions;
     }
 
     // The guard trigger's name as PostgreSQL holds a trigger's, kept for the backend.
@@ -2685,12 +2744,12 @@ internal static partial class SequenceRangeGuard
     }
 
     // Has the guard triggers of every table a statement has opened to write do what the statement needs.
-    private static unsafe void AttachGuards(EState* state, bool takes, bool inserts, bool updates)
+    private static unsafe void AttachGuards(EState* state, bool takes, bool inserts, bool updates, bool early)
     {
         List* opened = state is null ? null : state->es_opened_result_relations;
         for (int i = 0; opened is not null && i < opened->length; i++)
         {
-            AttachGuards((ResultRelInfo*)opened->elements[i].ptr_value, takes, inserts, updates, state->es_query_cxt);
+            AttachGuards((ResultRelInfo*)opened->elements[i].ptr_value, takes, inserts, updates, state->es_query_cxt, early);
         }
     }
 
@@ -4418,8 +4477,22 @@ internal static partial class SequenceRangeGuard
     private static long s_callbackCode;
     private static long s_constantCode;
     private static long s_valueCode;
+    private static long s_uncheckedCode;
     private static nint s_interpreter;
     private static bool s_stepCodesRead;
+
+    // PostgreSQL's GetUserId, called straight from the step before a bracketed draw: it reads one value and can't
+    // fail. Null where the server doesn't give its address.
+    private static unsafe delegate* unmanaged[Cdecl, SuppressGCTransition]<uint> s_currentUser;
+
+    // How often this backend has heard of a change to what a privilege on a sequence rests on: a table or sequence,
+    // a role, a membership or a database.
+    private static long s_privilegesStamp;
+
+    // The forms a bracketed draw's step takes.
+    private const byte GuardedForm = 0;
+    private const byte OwnForm = 1;
+    private const byte UncheckedForm = 2;
 
     // Whether each kind of step seen so far, as an expression's state marks it, jumps to another step, by what none
     // of them does that the guard brackets a draw among.
@@ -4435,18 +4508,19 @@ internal static partial class SequenceRangeGuard
         {
             ExprState* made = (ExprState*)NativeMethods.palloc0((nuint)sizeof(ExprState));
             made->type = NodeTag.T_ExprState;
-            made->steps = (ExprEvalStep*)NativeMethods.palloc0((nuint)(4 * sizeof(ExprEvalStep)));
-            made->steps_len = 4;
-            made->steps_alloc = 4;
+            made->steps = (ExprEvalStep*)NativeMethods.palloc0((nuint)(5 * sizeof(ExprEvalStep)));
+            made->steps_len = 5;
+            made->steps_alloc = 5;
             made->steps[0].opcode = (long)ExprEvalOp.EEOP_PARAM_CALLBACK;
             made->steps[1].opcode = (long)ExprEvalOp.EEOP_CONST;
             made->steps[2].opcode = (long)ExprEvalOp.EEOP_CASE_TESTVAL;
+            made->steps[3].opcode = (long)ExprEvalOp.EEOP_NEXTVALUEEXPR;
 #if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
-            made->steps[3].opcode = (long)ExprEvalOp.EEOP_DONE;
+            made->steps[4].opcode = (long)ExprEvalOp.EEOP_DONE;
 #else
-            made->steps[3].opcode = (long)ExprEvalOp.EEOP_DONE_RETURN;
+            made->steps[4].opcode = (long)ExprEvalOp.EEOP_DONE_RETURN;
 #endif
-            for (int i = 0; i < 4; i++)
+            for (int i = 0; i < 5; i++)
             {
                 made->steps[i].resvalue = &made->resvalue;
                 made->steps[i].resnull = &made->resnull;
@@ -4456,7 +4530,10 @@ internal static partial class SequenceRangeGuard
             s_callbackCode = made->steps[0].opcode;
             s_constantCode = made->steps[1].opcode;
             s_valueCode = made->steps[2].opcode;
+            s_uncheckedCode = made->steps[3].opcode;
             s_interpreter = (nint)made->evalfunc_private;
+            s_currentUser = NativeLibrary.TryGetExport(NativeLibrary.GetMainProgramHandle(), "GetUserId", out nint currentUser)
+                ? (delegate* unmanaged[Cdecl, SuppressGCTransition]<uint>)currentUser : null;
             NativeMethods.pfree(made->steps);
             NativeMethods.pfree(made);
             s_stepCodesRead = true;
@@ -4540,6 +4617,9 @@ internal static partial class SequenceRangeGuard
         bracket->Seqoid = seqoid;
         bracket->Own = own;
         bracket->Guarded = guarded;
+        bracket->CheckedAt = -1;
+        bracket->CheckingAt = -1;
+        bracket->Unchecks = UncheckedDraw(state, own, seqoid, out bracket->Unchecked);
         ExprEvalStep* steps = state->steps;
         Buffer.MemoryCopy(&steps[index + 1], &steps[index + 3], (long)(state->steps_alloc - index - 3) * sizeof(ExprEvalStep),
             (long)(state->steps_len - index - 1) * sizeof(ExprEvalStep));
@@ -4556,6 +4636,78 @@ internal static partial class SequenceRangeGuard
         steps[index + 2].resnull = &bracket->Unread;
         state->steps_len += 2;
         return (nint)bracket;
+    }
+
+    // Gives the form of a draw's own step that checks no privilege, the step PostgreSQL draws an identity column's
+    // value with, which draws as nextval does: for a default's call of nextval that names its sequence with a
+    // constant, in a step that counts no calls, where the server gives the address of its GetUserId.
+    private static unsafe bool UncheckedDraw(ExprState* state, ExprEvalStep own, uint seqoid, out ExprEvalStep without)
+    {
+        without = default;
+        if (s_uncheckedCode == 0 || s_currentUser is null || s_nextval == 0 || (nint)own.d.func.fn_addr.DangerousGetAddress() != s_nextval)
+        {
+            return false;
+        }
+
+        ExprEvalOp kind = StepKind(state, &own);
+#if ANKUS_PG15 || ANKUS_PG16 || ANKUS_PG17
+        bool calls = kind is ExprEvalOp.EEOP_FUNCEXPR or ExprEvalOp.EEOP_FUNCEXPR_STRICT;
+#else
+        bool calls = kind is ExprEvalOp.EEOP_FUNCEXPR or ExprEvalOp.EEOP_FUNCEXPR_STRICT or ExprEvalOp.EEOP_FUNCEXPR_STRICT_1;
+#endif
+        NullableDatum* named = own.d.func.fcinfo_data is null ? null : (NullableDatum*)((byte*)own.d.func.fcinfo_data + sizeof(FunctionCallInfoBaseData));
+        if (!calls || own.d.func.nargs != 1 || named is null || named->isnull || (uint)named->value != seqoid)
+        {
+            return false;
+        }
+
+        // A step that works the sequence out as the expression runs writes it where the call reads it.
+        for (int i = 0; i < state->steps_len; i++)
+        {
+            if (state->steps[i].resvalue == &named->value)
+            {
+                return false;
+            }
+        }
+
+        WatchTables();
+        without.opcode = s_uncheckedCode;
+        without.resvalue = own.resvalue;
+        without.resnull = own.resnull;
+        without.d.nextvalueexpr.seqid = seqoid;
+        without.d.nextvalueexpr.seqtypid = BigintOid;
+        return true;
+    }
+
+    // The form a bracketed draw that may go on at once takes. PostgreSQL's own call checks each time that the user
+    // may draw from the sequence. The form that doesn't check serves while the user is the one whose draw
+    // PostgreSQL's call last checked, and this backend has heard of no change since to what the privilege rests on,
+    // so that the check would pass again: the draw before this one went through it where it was left to.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe byte DirectForm(WorfDrawBracket* bracket)
+    {
+        if (!bracket->Unchecks)
+        {
+            return OwnForm;
+        }
+
+        uint user = s_currentUser();
+        long stamp = s_privilegesStamp;
+        if (bracket->CheckedBy == user && bracket->CheckedAt == stamp)
+        {
+            return UncheckedForm;
+        }
+
+        if (bracket->Form == OwnForm && bracket->CheckingBy == user && bracket->CheckingAt == stamp)
+        {
+            bracket->CheckedBy = user;
+            bracket->CheckedAt = stamp;
+            return UncheckedForm;
+        }
+
+        bracket->CheckingBy = user;
+        bracket->CheckingAt = stamp;
+        return OwnForm;
     }
 
     // The draws found and those bracketed as a statement's plan started, by the expression's state each is in, the
@@ -4739,7 +4891,7 @@ internal static partial class SequenceRangeGuard
 
                 nint bracket = PutBracket(works, step, seqoid, own, guarded);
                 made.Add(bracket);
-                ((WorfDrawBracket*)bracket)->Direct = true;
+                ((WorfDrawBracket*)bracket)->Form = OwnForm;
                 works->steps[step + 1] = own;
             }
 
@@ -4850,8 +5002,11 @@ internal static partial class SequenceRangeGuard
 
         try
         {
+            // An INSERT with no ON CONFLICT clause inserts every row its table's triggers leave it.
+            bool early = query->operation == CmdType.CMD_INSERT && !modifying && statement is not null && statement->planTree is not null &&
+                statement->planTree->type == NodeTag.T_ModifyTable && ((ModifyTable*)statement->planTree)->onConflictAction == OnConflictAction.ONCONFLICT_NONE;
             AttachGuards(query->estate, takes, modifying || query->operation is CmdType.CMD_INSERT or CmdType.CMD_MERGE,
-                modifying || upserts || query->operation is CmdType.CMD_UPDATE or CmdType.CMD_MERGE);
+                modifying || upserts || query->operation is CmdType.CMD_UPDATE or CmdType.CMD_MERGE, early);
         }
         finally
         {
@@ -4945,6 +5100,7 @@ internal static partial class SequenceRangeGuard
 
     // Whether a bracketed draw may go on at once: this backend holds no gate and runs no check, and counts its draw
     // under way before it looks for a switch, as a call that goes through the fmgr hook does.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static unsafe bool DrawsBracketed()
     {
         if (s_gating.Count != 0 || s_gates.Count != 0 || s_countingDown || s_namingGrantors || Worf.InOwnSql)
@@ -5000,13 +5156,13 @@ internal static partial class SequenceRangeGuard
     private static unsafe void DrawStep(ExprState* state, ExprEvalStep* step, ExprContext* context)
     {
         WorfDrawBracket* bracket = (WorfDrawBracket*)step->d.cparam.paramarg;
-        bool direct = false;
+        byte form = GuardedForm;
         try
         {
-            direct = ((bracket->Budget > 0 && bracket->Epoch == s_allowanceEpoch) || FillBracket(bracket)) && DrawsBracketed();
-            if (direct)
+            if (((bracket->Budget > 0 && bracket->Epoch == s_allowanceEpoch) || FillBracket(bracket)) && DrawsBracketed())
             {
                 bracket->Budget--;
+                form = DirectForm(bracket);
             }
         }
         catch (Exception failure) when (failure is NullReferenceException or InvalidOperationException or ArgumentException or
@@ -5014,13 +5170,13 @@ internal static partial class SequenceRangeGuard
         {
             // Nothing above throws unless worf's own state is wrong. The next statement that starts reports it.
             Executor.NoteHookFailure(failure);
-            direct = false;
+            form = GuardedForm;
         }
 
-        if (direct != bracket->Direct)
+        if (form != bracket->Form)
         {
-            step[1] = direct ? bracket->Own : bracket->Guarded;
-            bracket->Direct = direct;
+            step[1] = form == OwnForm ? bracket->Own : form == UncheckedForm ? bracket->Unchecked : bracket->Guarded;
+            bracket->Form = form;
         }
     }
 
@@ -7322,12 +7478,18 @@ internal static partial class SequenceRangeGuard
             NativeMethods.CacheRegisterSyscacheCallback(SysCacheIdentifier.PROCOID, TypeCallback, 0);
             NativeMethods.CacheRegisterSyscacheCallback(SysCacheIdentifier.NAMESPACEOID, TypeCallback, 0);
             NativeMethods.CacheRegisterSyscacheCallback(SysCacheIdentifier.SUBSCRIPTIONRELMAP, TypeCallback, 0);
+            NativeMethods.CacheRegisterSyscacheCallback(SysCacheIdentifier.AUTHMEMROLEMEM, PrivilegeCallback, 0);
+            NativeMethods.CacheRegisterSyscacheCallback(SysCacheIdentifier.AUTHOID, PrivilegeCallback, 0);
+            NativeMethods.CacheRegisterSyscacheCallback(SysCacheIdentifier.DATABASEOID, PrivilegeCallback, 0);
 #else
             NativeMethods.CacheRegisterSyscacheCallback(TypeCacheId, TypeCallback, 0);
             NativeMethods.CacheRegisterSyscacheCallback(ConstraintCacheId, TypeCallback, 0);
             NativeMethods.CacheRegisterSyscacheCallback(ProcedureCacheId, TypeCallback, 0);
             NativeMethods.CacheRegisterSyscacheCallback(NamespaceCacheId, TypeCallback, 0);
             NativeMethods.CacheRegisterSyscacheCallback(SubscriptionRelCacheId, TypeCallback, 0);
+            NativeMethods.CacheRegisterSyscacheCallback(MembershipCacheId, PrivilegeCallback, 0);
+            NativeMethods.CacheRegisterSyscacheCallback(RoleCacheId, PrivilegeCallback, 0);
+            NativeMethods.CacheRegisterSyscacheCallback(DatabaseCacheId, PrivilegeCallback, 0);
 #endif
         }
 
@@ -7353,6 +7515,9 @@ internal static partial class SequenceRangeGuard
         s_writtenCalls.Clear();
         Worf.ForgetCatalogs();
         s_tablesStamp++;
+
+        // A sequence's privileges and its owner are in its row of pg_class, which this hears of a change to.
+        s_privilegesStamp++;
 
         // What a table's triggers draw counts its partitions' too, which a change to a partition changes.
         s_drawnBy.Clear();
@@ -7387,6 +7552,20 @@ internal static partial class SequenceRangeGuard
         {
             _ = s_defaultsText.Remove(key);
         }
+    }
+
+    // Notes a change to a role, a membership or a database, which whether a user may draw from a sequence rests on
+    // beside the sequence's own row: a draw then goes through PostgreSQL's check again before any skips it.
+#if ANKUS_PG19
+    private static void PrivilegeInvalidated(ulong arg, SysCacheIdentifier cacheid, uint hashvalue)
+#else
+    private static void PrivilegeInvalidated(ulong arg, int cacheid, uint hashvalue)
+#endif
+    {
+        _ = arg;
+        _ = cacheid;
+        _ = hashvalue;
+        s_privilegesStamp++;
     }
 
     // Forgets the defaults' text, which holds the CHECKs of their domains and the bodies of the SQL functions they
@@ -11369,7 +11548,7 @@ internal static partial class SequenceRangeGuard
                     SkipGuard(written);
                 }
 
-                AttachGuards(written, takes && found && verify == 0, true, false, state->es_query_cxt);
+                AttachGuards(written, takes && found && verify == 0, true, false, state->es_query_cxt, early: true);
             }
         }
         finally

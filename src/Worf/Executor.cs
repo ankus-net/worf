@@ -1033,11 +1033,11 @@ internal static unsafe partial class Executor
         fcinfo->flinfo->fn_addr = new PGFunction((void*)address);
 
         // The guard's own trigger function checks the row here, as PostgreSQL holds it, and returns no row, as a
-        // trigger that fires after the write does.
+        // trigger that fires after the write does, or the row as it is, as one that fires before the write and
+        // leaves it does.
         if (SequenceRangeGuard.IsGuardFunction(fcinfo->flinfo->fn_oid))
         {
-            SequenceRangeGuard.GuardRow(fcinfo);
-            return 0;
+            return SequenceRangeGuard.GuardRow(fcinfo);
         }
 
         SequenceRangeGuard.StartingTrigger(fcinfo->flinfo->fn_oid);

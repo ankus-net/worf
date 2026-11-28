@@ -5781,8 +5781,8 @@ public sealed partial class SequenceRangeTests
     /// Writes into a table whose default draws from a managed sequence cost what they cost over a plain one (2901),
     /// and a default that draws from a plain sequence costs what it costs in a database without worf (2902): for a
     /// column with a default, an identity column, a partitioned table and a table with a row trigger before its
-    /// inserts, an INSERT ... SELECT and a COPY of 10,000 rows and 500 single-row inserts in a PL/pgSQL loop, and
-    /// for a MERGE that inserts 10,000 rows and an insert ON CONFLICT DO UPDATE of as many, each takes less than
+    /// inserts, an INSERT ... SELECT and a COPY of 20,000 rows and 1,000 single-row inserts in a PL/pgSQL loop, and
+    /// for a MERGE that inserts 20,000 rows and an insert ON CONFLICT DO UPDATE of as many, each takes less than
     /// 1.1 times as long over the managed sequence. They took from 1.2 to 9 times as long: the guard's trigger
     /// checked each row of a table with a trigger before its inserts, of a MERGE and of an insert that may update,
     /// in a call into worf that read the sequence, PostgreSQL copied the guard's triggers and built their
@@ -5804,8 +5804,8 @@ public sealed partial class SequenceRangeTests
             CREATE TABLE dt_{sequence} (id bigint DEFAULT nextval('{sequence}'), v int);
             CREATE TABLE identified_{sequence} (id bigint GENERATED ALWAYS AS IDENTITY, v int);
             CREATE TABLE parted_{sequence} (id bigint DEFAULT nextval('{sequence}'), v int) PARTITION BY RANGE (v);
-            CREATE TABLE parted_{sequence}_low PARTITION OF parted_{sequence} FOR VALUES FROM (MINVALUE) TO (5001);
-            CREATE TABLE parted_{sequence}_high PARTITION OF parted_{sequence} FOR VALUES FROM (5001) TO (MAXVALUE);
+            CREATE TABLE parted_{sequence}_low PARTITION OF parted_{sequence} FOR VALUES FROM (MINVALUE) TO (10001);
+            CREATE TABLE parted_{sequence}_high PARTITION OF parted_{sequence} FOR VALUES FROM (10001) TO (MAXVALUE);
             CREATE TABLE before_{sequence} (id bigint DEFAULT nextval('{sequence}'), v int);
             CREATE TRIGGER kept BEFORE INSERT ON before_{sequence} FOR EACH ROW EXECUTE FUNCTION kept();
             CREATE TABLE keyed_{sequence} (id bigint DEFAULT nextval('{sequence}') PRIMARY KEY, v int);
@@ -5824,9 +5824,9 @@ public sealed partial class SequenceRangeTests
         Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT bool_and(state = 'active') FROM worf.sequence_ranges", token),
             "node_a drawing from a block of each sequence");
         string file = Path.Join(nodeA.Cluster.DataDirectory, "written_rows.txt");
-        await File.WriteAllLinesAsync(file, Enumerable.Range(1, 10000).Select(row => row.ToString(CultureInfo.InvariantCulture)), token);
-        const string Select = "INSERT INTO {0} (v) SELECT g FROM generate_series(1, 10000) g";
-        const string Loop = "DO $$ BEGIN FOR i IN 1..500 LOOP INSERT INTO {0} (v) VALUES (i); END LOOP; END $$";
+        await File.WriteAllLinesAsync(file, Enumerable.Range(1, 20000).Select(row => row.ToString(CultureInfo.InvariantCulture)), token);
+        const string Select = "INSERT INTO {0} (v) SELECT g FROM generate_series(1, 20000) g";
+        const string Loop = "DO $$ BEGIN FOR i IN 1..1000 LOOP INSERT INTO {0} (v) VALUES (i); END LOOP; END $$";
         string copy = $"COPY {{0}} (v) FROM '{file}'";
         (string What, string Statement, string Column, string Into)[] forms =
         [
@@ -5836,12 +5836,12 @@ public sealed partial class SequenceRangeTests
                 ("parted", "a partitioned table whose default draws"), ("before", "a table with a row trigger before its inserts"),
             }.SelectMany(table => new[]
             {
-                ("an INSERT ... SELECT of 10,000 rows", Select, table.Item1, table.Item2), ("a COPY of 10,000 rows", copy, table.Item1, table.Item2),
-                ("500 single-row inserts", Loop, table.Item1, table.Item2),
+                ("an INSERT ... SELECT of 20,000 rows", Select, table.Item1, table.Item2), ("a COPY of 20,000 rows", copy, table.Item1, table.Item2),
+                ("1,000 single-row inserts", Loop, table.Item1, table.Item2),
             }),
-            ("a MERGE that inserts 10,000 rows", "MERGE INTO {0} t USING generate_series(1, 10000) g ON false WHEN NOT MATCHED THEN INSERT (v) VALUES (g)",
+            ("a MERGE that inserts 20,000 rows", "MERGE INTO {0} t USING generate_series(1, 20000) g ON false WHEN NOT MATCHED THEN INSERT (v) VALUES (g)",
                 "dt", "a table whose default draws"),
-            ("an insert ON CONFLICT DO UPDATE of 10,000 rows", Select + " ON CONFLICT (id) DO UPDATE SET v = excluded.v", "keyed",
+            ("an insert ON CONFLICT DO UPDATE of 20,000 rows", Select + " ON CONFLICT (id) DO UPDATE SET v = excluded.v", "keyed",
                 "a table whose default draws"),
         ];
         await using NpgsqlConnection with = await nodeA.OpenAsync(Database, token);
@@ -6645,6 +6645,129 @@ public sealed partial class SequenceRangeTests
         }
 
         Assert.IsEmpty(kept, $"the sessions that held too much after 20 COPYs: {string.Join("; ", kept)}");
+    }
+
+    /// <summary>
+    /// The rows of a statement that take a managed sequence's values from a default draw under the privilege
+    /// PostgreSQL checks for each row's draw, as rows that draw from a plain sequence do. Each case takes away, at
+    /// the fifth of ten rows, what lets the user draw: its own grant, its membership of the role that holds the
+    /// grant, the role it acts as, its being a superuser, and its owning the database. The INSERT ... SELECT, and
+    /// the COPY into a table whose row trigger takes the grant away, then fail with 42501 and leave no row, as with
+    /// a plain sequence, and the same statements insert every row while nothing changes. What the privilege rests
+    /// on is found by version, so the test runs on every version.
+    /// </summary>
+    /// <returns>The test.</returns>
+    [TestMethod]
+    [TestCategory("EveryVersion")]
+    public async Task DrawsCheckTheUsersPrivilegeForEachRow()
+    {
+        CancellationToken token = TestContext.CancellationToken;
+        await using TestNode nodeA = await StartNodeAsync("node_a", token);
+        string[] kinds = ["plain", "managed"];
+        string[] cases = ["grant", "membership", "role", "superuser", "owner", "copy"];
+        _ = await nodeA.SafePsqlAsync(Database, """
+            CREATE ROLE writer;
+            CREATE ROLE drawers;
+            CREATE ROLE other;
+            CREATE ROLE mighty SUPERUSER;
+            CREATE ROLE owning;
+            GRANT drawers, other, pg_read_server_files TO writer;
+            CREATE FUNCTION changed(what text, g int) RETURNS int LANGUAGE plpgsql SECURITY DEFINER AS $$
+            BEGIN
+              IF g = 5 THEN
+                IF what LIKE 'revoke %' THEN EXECUTE format('REVOKE USAGE ON SEQUENCE %I FROM writer', split_part(what, ' ', 2));
+                ELSIF what = 'membership' THEN REVOKE drawers FROM writer;
+                ELSIF what = 'superuser' THEN ALTER ROLE mighty NOSUPERUSER;
+                ELSIF what = 'owner' THEN EXECUTE format('ALTER DATABASE %I OWNER TO %I', current_database(), session_user);
+                END IF;
+              END IF;
+              RETURN g;
+            END$$;
+            CREATE FUNCTION acting(g int) RETURNS int LANGUAGE plpgsql AS $$
+            BEGIN IF g = 5 THEN PERFORM set_config('role', 'other', true); END IF; RETURN g; END$$;
+            CREATE FUNCTION changing() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN PERFORM changed(TG_ARGV[0], NEW.v); RETURN NEW; END$$;
+            """, token);
+        foreach (string kind in kinds)
+        {
+            foreach (string name in cases)
+            {
+                _ = await nodeA.SafePsqlAsync(Database, $"""
+                    CREATE SEQUENCE {kind}_{name}_s;
+                    CREATE TABLE {kind}_{name} (id bigint DEFAULT nextval('{kind}_{name}_s'), v int);
+                    GRANT INSERT ON {kind}_{name} TO writer, other, owning;
+                    """, token);
+            }
+
+            _ = await nodeA.SafePsqlAsync(Database, $"""
+                GRANT USAGE ON SEQUENCE {kind}_grant_s, {kind}_role_s, {kind}_copy_s TO writer;
+                GRANT USAGE ON SEQUENCE {kind}_membership_s TO drawers;
+                GRANT USAGE ON SEQUENCE {kind}_owner_s TO pg_database_owner;
+                CREATE TRIGGER changing BEFORE INSERT ON {kind}_copy FOR EACH ROW EXECUTE FUNCTION changing('revoke {kind}_copy_s');
+                """, token);
+        }
+
+        _ = await nodeA.SafePsqlAsync(Database, $"""
+            SELECT count(worf.enable_sequence_range(c.oid::regclass, participants := '{"{}"}', range_size := 100000))
+            FROM pg_class c WHERE c.relkind = 'S' AND c.relname LIKE 'managed%'
+            """, token);
+        Assert.IsTrue(await nodeA.PollQueryUntilAsync(Database, "SELECT count(*) = 6 AND bool_and(state = 'active') FROM worf.sequence_ranges", token),
+            "node_a drawing from a block of each managed sequence");
+        string owner = await nodeA.SafePsqlAsync(Database, "SELECT datdba::regrole::text FROM pg_database WHERE datname = current_database()", token);
+        string kept = Path.Join(nodeA.Cluster.DataDirectory, "kept_rows.txt");
+        await File.WriteAllLinesAsync(kept, Enumerable.Range(11, 4).Select(row => row.ToString(CultureInfo.InvariantCulture)), token);
+        string cut = Path.Join(nodeA.Cluster.DataDirectory, "cut_rows.txt");
+        await File.WriteAllLinesAsync(cut, Enumerable.Range(1, 10).Select(row => row.ToString(CultureInfo.InvariantCulture)), token);
+
+        // What each case's statements come to: the rows the first leaves, and the second's error.
+        async Task<string> RunAsync(string role, string table, string first, string second)
+        {
+            _ = await nodeA.SafePsqlAsync(Database, $"SET ROLE {role}; {first}", token);
+            string state = "none";
+            try
+            {
+                _ = await nodeA.SafePsqlAsync(Database, $"SET ROLE {role}; {second}", token);
+            }
+            catch (PostgresException error)
+            {
+                state = $"{error.SqlState} {error.MessageText.Replace("managed", "plain", StringComparison.Ordinal)}";
+            }
+
+            return $"{await nodeA.SafePsqlAsync(Database, $"SELECT count(*) FROM {table}", token)} rows, then {state}";
+        }
+
+        Dictionary<string, List<string>> came = [];
+        foreach (string kind in kinds)
+        {
+            string Rows(string name, string value) => $"INSERT INTO {kind}_{name} (v) SELECT {value} FROM generate_series(1, 10) g";
+            came[kind] =
+            [
+                await RunAsync("writer", $"{kind}_grant", Rows("grant", "g"), Rows("grant", $"changed('revoke {kind}_grant_s', g)")),
+                await RunAsync("writer", $"{kind}_membership", Rows("membership", "g"), Rows("membership", "changed('membership', g)")),
+                await RunAsync("writer", $"{kind}_role", Rows("role", "g"), Rows("role", "acting(g)")),
+                await RunAsync("mighty", $"{kind}_superuser", Rows("superuser", "g"), Rows("superuser", "changed('superuser', g)")),
+            ];
+            _ = await nodeA.SafePsqlAsync(Database, $"ALTER DATABASE {Database} OWNER TO owning", token);
+            came[kind].Add(await RunAsync("owning", $"{kind}_owner", Rows("owner", "g"), Rows("owner", "changed('owner', g)")));
+            came[kind].Add(await RunAsync("writer", $"{kind}_copy", $"COPY {kind}_copy (v) FROM '{kept}'", $"COPY {kind}_copy (v) FROM '{cut}'"));
+            _ = await nodeA.SafePsqlAsync(Database, $"""
+                GRANT drawers TO writer;
+                ALTER ROLE mighty SUPERUSER;
+                ALTER DATABASE {Database} OWNER TO {owner};
+                """, token);
+        }
+
+        string[] expected =
+        [
+            "10 rows, then 42501 permission denied for sequence plain_grant_s",
+            "10 rows, then 42501 permission denied for sequence plain_membership_s",
+            "10 rows, then 42501 permission denied for sequence plain_role_s",
+            "10 rows, then 42501 permission denied for sequence plain_superuser_s",
+            "10 rows, then 42501 permission denied for sequence plain_owner_s",
+            "4 rows, then 42501 permission denied for sequence plain_copy_s",
+        ];
+        Assert.AreSequenceEqual(expected, came["plain"], $"what the statements came to with plain sequences: {string.Join("; ", came["plain"])}");
+        Assert.AreSequenceEqual(expected, came["managed"], $"what the statements came to with managed sequences: {string.Join("; ", came["managed"])}");
     }
 
     /// <summary>
